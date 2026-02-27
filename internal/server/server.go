@@ -22,7 +22,7 @@ func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks
 	registerAPIRoutes(mux, store, controls)
 
 	fileServer := http.FileServer(http.FS(staticFS))
-	mux.HandleFunc("/", serveSPA(fileServer))
+	mux.HandleFunc("/", serveSPA(staticFS, fileServer))
 
 	return mux, nil
 }
@@ -37,7 +37,13 @@ func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls C
 	return http.ListenAndServe(addr, h)
 }
 
-func serveSPA(fileServer http.Handler) func(http.ResponseWriter, *http.Request) {
+func serveSPA(staticFS fs.FS, fileServer http.Handler) func(http.ResponseWriter, *http.Request) {
+	// Read index.html once at startup for SPA fallback
+	indexHTML, err := fs.ReadFile(staticFS, "index.html")
+	if err != nil {
+		log.Fatalf("failed to read index.html from static assets: %v", err)
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/ws" {
 			http.NotFound(w, r)
@@ -53,14 +59,14 @@ func serveSPA(fileServer http.Handler) func(http.ResponseWriter, *http.Request) 
 		}
 
 		cleanPath := path.Clean(strings.TrimPrefix(r.URL.Path, "/"))
-		if cleanPath == "." || cleanPath == "" {
-			r.URL.Path = "/"
-		} else if !strings.Contains(cleanPath, ".") {
-			r.URL.Path = "/index.html"
-		} else {
-			r.URL.Path = "/" + cleanPath
+		if cleanPath == "." || cleanPath == "" || !strings.Contains(cleanPath, ".") {
+			// SPA route: serve index.html directly (avoids FileServer redirect loop)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(indexHTML)
+			return
 		}
 
+		r.URL.Path = "/" + cleanPath
 		fileServer.ServeHTTP(w, r)
 	}
 }
