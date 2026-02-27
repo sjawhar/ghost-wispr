@@ -28,6 +28,7 @@ export interface SummaryReadyEvent extends BaseEvent {
   session_id: string
   summary: string
   status: 'pending' | 'running' | 'completed' | 'failed'
+  summary_preset?: string
 }
 
 export interface StatusChangedEvent extends BaseEvent {
@@ -63,6 +64,7 @@ export interface SessionSummary {
   status: string
   summary: string
   summary_status: 'pending' | 'running' | 'completed' | 'failed'
+  summary_preset: string
   audio_path: string
 }
 
@@ -75,3 +77,5 @@ export interface StatusResponse {
   paused: boolean
   warnings: string[]
 }
+
+export type PresetMap = Record<string, string>

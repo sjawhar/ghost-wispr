@@ -1,21 +1,27 @@
 <script lang="ts">
   import Markdown from '@humanspeak/svelte-markdown'
   import AudioPlayer from './AudioPlayer.svelte'
-  import type { SessionDetailResponse, SessionSummary } from '../lib/types'
+  import type { PresetMap, SessionDetailResponse, SessionSummary } from '../lib/types'
 
   let {
     session,
     detail,
     expanded,
+    presets,
     onToggle,
     onLoadDetail,
+    onResummarize,
   }: {
     session: SessionSummary
     detail: SessionDetailResponse | undefined
     expanded: boolean
+    presets: PresetMap
     onToggle: () => void
     onLoadDetail: (id: string) => Promise<void>
+    onResummarize: (sessionId: string, preset: string) => Promise<void>
   } = $props()
+
+  let showPresetMenu = $state(false)
 
   const timeRange = $derived.by(() => {
     const start = new Date(session.started_at)
@@ -50,6 +56,11 @@
       await onLoadDetail(session.id)
     }
   }
+
+  async function handleResummarize(preset: string) {
+    showPresetMenu = false
+    await onResummarize(session.id, preset)
+  }
 </script>
 
 <article class="session-card">
@@ -69,6 +80,42 @@
     <p class="summary-preview">Summary unavailable</p>
   {/if}
 
+  {#if (session.summary_status === 'completed' || session.summary_status === 'failed') && Object.keys(presets).length > 0}
+    <div class="resummarize-wrap">
+      {#if Object.keys(presets).length === 1}
+        <button
+          type="button"
+          class="resummarize-btn"
+          onclick={() => handleResummarize(Object.keys(presets)[0])}
+        >
+          Resummarize
+        </button>
+      {:else}
+        <button
+          type="button"
+          class="resummarize-btn"
+          onclick={() => (showPresetMenu = !showPresetMenu)}
+        >
+          Resummarize ▾
+        </button>
+        {#if showPresetMenu}
+          <div class="preset-menu">
+            {#each Object.entries(presets) as [name, description] (name)}
+              <button
+                type="button"
+                class="preset-option"
+                onclick={() => handleResummarize(name)}
+                title={description}
+              >
+                {name}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+
   {#if expanded}
     <div class="session-details">
       {#if detail}
@@ -85,3 +132,46 @@
     </div>
   {/if}
 </article>
+
+<style>
+  .resummarize-wrap {
+    position: relative;
+    margin-top: 0.5rem;
+  }
+
+  .resummarize-btn {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .preset-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 10;
+    background: var(--surface, #fff);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-top: 0.25rem;
+    min-width: 10rem;
+  }
+
+  .preset-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.5rem;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 0.8rem;
+  }
+
+  .preset-option:hover {
+    background: var(--hover, #f5f5f5);
+  }
+</style>

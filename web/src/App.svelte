@@ -7,16 +7,19 @@
     appState,
     setDates,
     setPaused,
+    setPresets,
     setSessionDetail,
     setSessionsForDate,
     setWarnings,
   } from './lib/state.svelte'
   import {
     fetchDates,
+    fetchPresets,
     fetchSession,
     fetchSessions,
     fetchStatus,
     pauseRecording,
+    resummarize,
     resumeRecording,
   } from './lib/api'
   import { connect, disconnect } from './lib/ws.svelte'
@@ -53,6 +56,10 @@
     setPaused(true)
   }
 
+  async function handleResummarize(sessionId: string, preset: string): Promise<void> {
+    await resummarize(sessionId, preset)
+  }
+
   function onToggleSession(id: string): void {
     expandedSessionId = expandedSessionId === id ? '' : id
     if (expandedSessionId) {
@@ -66,7 +73,11 @@
     let mounted = true
     const bootstrap = async () => {
       try {
-        const [status, dates] = await Promise.all([fetchStatus(), fetchDates()])
+        const [status, dates, presets] = await Promise.all([
+          fetchStatus(),
+          fetchDates(),
+          fetchPresets(),
+        ])
         if (!mounted) {
           return
         }
@@ -74,6 +85,7 @@
         setPaused(status.paused)
         setWarnings(status.warnings)
         setDates(dates)
+        setPresets(presets)
 
         for (const date of dates.slice(0, 3)) {
           await loadDate(date)
@@ -141,10 +153,12 @@
       dates={appState.dates}
       sessionsByDate={appState.sessionsByDate}
       sessionDetails={appState.sessionDetails}
+      presets={appState.presets}
       {expandedSessionId}
       {onToggleSession}
       onLoadDate={loadDate}
       onLoadDetail={loadSession}
+      onResummarize={handleResummarize}
     />
   </section>
 </main>

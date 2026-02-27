@@ -14,7 +14,7 @@ type Store interface {
 	EndSession(id string, endedAt time.Time, audioPath string) error
 	AppendSegment(sessionID string, seg transcribe.Segment) error
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
-	UpdateSummary(sessionID, summary, status string) error
+	UpdateSummary(sessionID, summary, status, preset string) error
 }
 
 type Recorder interface {
@@ -23,14 +23,14 @@ type Recorder interface {
 }
 
 type Summarizer interface {
-	Summarize(ctx context.Context, sessionID, transcript string) (string, error)
+	Summarize(ctx context.Context, sessionID, transcript string) (summary, preset string, err error)
 }
 
 type EventBroadcaster interface {
 	BroadcastLiveTranscript(seg transcribe.Segment)
 	BroadcastSessionStarted(sessionID string)
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
-	BroadcastSummaryReady(sessionID, summary, status string)
+	BroadcastSummaryReady(sessionID, summary, status, preset string)
 }
 
 type LifecycleManager interface {

@@ -14,8 +14,8 @@ func clearEnv(t *testing.T) {
 	for _, key := range []string{
 		"DB_PATH", "AUDIO_DIR", "SILENCE_TIMEOUT",
 		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES",
-		"OPENAI_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
-		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "CONFIG",
+		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
+		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
 	}
@@ -41,8 +41,15 @@ func TestDefaults(t *testing.T) {
 	if cfg.MicSampleRate != 16000 {
 		t.Fatalf("expected default mic_sample_rate 16000, got %d", cfg.MicSampleRate)
 	}
-	if cfg.OpenAIModel != "gpt-4o-mini" {
-		t.Fatalf("expected default openai_model, got %q", cfg.OpenAIModel)
+	if cfg.Summarization.Model != "openai/gpt-4o-mini" {
+		t.Fatalf("expected default summarization.model, got %q", cfg.Summarization.Model)
+	}
+	preset, ok := cfg.Summarization.Presets["default"]
+	if !ok {
+		t.Fatal("expected default summarization preset")
+	}
+	if preset.UserTemplate != "{{transcript}}" {
+		t.Fatalf("expected default preset user_template, got %q", preset.UserTemplate)
 	}
 }
 
@@ -57,7 +64,18 @@ audio_dir: /custom/audio
 silence_timeout: 45s
 mic_sample_rate: 48000
 mic_sample_rates: [44100, 32000]
-openai_model: gpt-4o
+summarization:
+  model: anthropic/claude-3-5-sonnet-latest
+  presets:
+    default:
+      description: Team sync summary
+      system_prompt: Summarize in bullet points
+      user_template: "{{transcript}}"
+    concise:
+      description: Short summary
+      system_prompt: Return three bullets max
+      user_template: "Meeting:\n{{transcript}}"
+      model: gemini/gemini-2.5-flash
 gdrive_folder_id: my-folder
 google_credentials_file: /path/to/creds.json
 `
@@ -85,8 +103,14 @@ google_credentials_file: /path/to/creds.json
 	if !reflect.DeepEqual(cfg.MicSampleRates, []int{44100, 32000}) {
 		t.Fatalf("expected yaml mic_sample_rates, got %v", cfg.MicSampleRates)
 	}
-	if cfg.OpenAIModel != "gpt-4o" {
-		t.Fatalf("expected yaml openai_model, got %q", cfg.OpenAIModel)
+	if cfg.Summarization.Model != "anthropic/claude-3-5-sonnet-latest" {
+		t.Fatalf("expected yaml summarization.model, got %q", cfg.Summarization.Model)
+	}
+	if len(cfg.Summarization.Presets) != 2 {
+		t.Fatalf("expected yaml summarization presets, got %#v", cfg.Summarization.Presets)
+	}
+	if cfg.Summarization.Presets["concise"].Model != "gemini/gemini-2.5-flash" {
+		t.Fatalf("expected yaml concise preset model, got %q", cfg.Summarization.Presets["concise"].Model)
 	}
 	if cfg.GDriveFolderID != "my-folder" {
 		t.Fatalf("expected yaml gdrive_folder_id, got %q", cfg.GDriveFolderID)
@@ -101,7 +125,8 @@ func TestEnvOverridesYAML(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	yamlContent := `
 db_path: /from/yaml
-openai_model: gpt-yaml
+summarization:
+  model: anthropic/claude-3-5-haiku-latest
 `
 	if err := os.WriteFile(configPath, []byte(yamlContent), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -109,7 +134,7 @@ openai_model: gpt-yaml
 
 	clearEnv(t)
 	t.Setenv(EnvPrefix+"DB_PATH", "/from/env")
-	t.Setenv(EnvPrefix+"OPENAI_MODEL", "gpt-env")
+	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "openai/gpt-4.1-mini")
 	t.Setenv(EnvPrefix+"AUDIO_DIR", "/env/audio")
 
 	cfg, _, err := Load(configPath)
@@ -120,11 +145,25 @@ openai_model: gpt-yaml
 	if cfg.DBPath != "/from/env" {
 		t.Fatalf("expected env override for db_path, got %q", cfg.DBPath)
 	}
-	if cfg.OpenAIModel != "gpt-env" {
-		t.Fatalf("expected env override for openai_model, got %q", cfg.OpenAIModel)
+	if cfg.Summarization.Model != "openai/gpt-4.1-mini" {
+		t.Fatalf("expected env override for summarization.model, got %q", cfg.Summarization.Model)
 	}
 	if cfg.AudioDir != "/env/audio" {
 		t.Fatalf("expected env override for audio_dir, got %q", cfg.AudioDir)
+	}
+}
+
+func TestEnvOverrideSummarizationModel(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "gemini/gemini-2.5-flash")
+
+	cfg, _, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.Summarization.Model != "gemini/gemini-2.5-flash" {
+		t.Fatalf("expected env summarization.model override, got %q", cfg.Summarization.Model)
 	}
 }
 
@@ -132,6 +171,8 @@ func TestSecretsFromEnvOnly(t *testing.T) {
 	clearEnv(t)
 	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "dg-secret")
 	t.Setenv(EnvPrefix+"OPENAI_API_KEY", "oai-secret")
+	t.Setenv(EnvPrefix+"ANTHROPIC_API_KEY", "anth-secret")
+	t.Setenv(EnvPrefix+"GEMINI_API_KEY", "gem-secret")
 
 	cfg, _, err := Load("")
 	if err != nil {
@@ -144,6 +185,12 @@ func TestSecretsFromEnvOnly(t *testing.T) {
 	if cfg.OpenAIAPIKey != "oai-secret" {
 		t.Fatalf("expected openai key from env, got %q", cfg.OpenAIAPIKey)
 	}
+	if cfg.AnthropicAPIKey != "anth-secret" {
+		t.Fatalf("expected anthropic key from env, got %q", cfg.AnthropicAPIKey)
+	}
+	if cfg.GeminiAPIKey != "gem-secret" {
+		t.Fatalf("expected gemini key from env, got %q", cfg.GeminiAPIKey)
+	}
 }
 
 func TestSecretsIgnoredInYAML(t *testing.T) {
@@ -154,6 +201,8 @@ func TestSecretsIgnoredInYAML(t *testing.T) {
 	yamlContent := `
 deepgram_api_key: should-be-ignored
 openai_api_key: also-ignored
+anthropic_api_key: no
+gemini_api_key: no
 `
 	if err := os.WriteFile(configPath, []byte(yamlContent), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -169,6 +218,12 @@ openai_api_key: also-ignored
 	}
 	if cfg.OpenAIAPIKey != "" {
 		t.Fatalf("expected empty openai key (yaml should be ignored), got %q", cfg.OpenAIAPIKey)
+	}
+	if cfg.AnthropicAPIKey != "" {
+		t.Fatalf("expected empty anthropic key (yaml should be ignored), got %q", cfg.AnthropicAPIKey)
+	}
+	if cfg.GeminiAPIKey != "" {
+		t.Fatalf("expected empty gemini key (yaml should be ignored), got %q", cfg.GeminiAPIKey)
 	}
 }
 
@@ -210,6 +265,29 @@ func TestValidationNoWarningsWhenConfigured(t *testing.T) {
 
 	if len(warnings) != 0 {
 		t.Fatalf("expected no warnings when fully configured, got: %v", warnings)
+	}
+}
+
+func TestValidationWarningsWhenProviderAPIKeyMissing(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "key")
+	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "anthropic/claude-3-5-haiku-latest")
+
+	_, warnings, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	var anthropicWarning bool
+	for _, w := range warnings {
+		if strings.Contains(w, "Anthropic") {
+			anthropicWarning = true
+			break
+		}
+	}
+
+	if !anthropicWarning {
+		t.Fatalf("expected Anthropic warning when key is missing, got warnings: %v", warnings)
 	}
 }
 

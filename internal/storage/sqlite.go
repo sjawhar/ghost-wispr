@@ -28,6 +28,7 @@ type Session struct {
 	Status        string     `json:"status"`
 	Summary       string     `json:"summary"`
 	SummaryStatus string     `json:"summary_status"`
+	SummaryPreset string     `json:"summary_preset"`
 	AudioPath     string     `json:"audio_path"`
 }
 
@@ -81,11 +82,15 @@ func (s *SQLiteStore) init() error {
 			status TEXT NOT NULL,
 			summary TEXT NOT NULL DEFAULT '',
 			summary_status TEXT NOT NULL DEFAULT 'pending',
+			summary_preset TEXT NOT NULL DEFAULT '',
 			audio_path TEXT NOT NULL DEFAULT ''
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
 	}
+
+	// Migrate: add summary_preset column if it doesn't exist (for pre-existing DBs).
+	_, _ = s.db.Exec(`ALTER TABLE sessions ADD COLUMN summary_preset TEXT NOT NULL DEFAULT ''`)
 
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS segments (
@@ -190,7 +195,7 @@ func (s *SQLiteStore) AppendSegment(sessionID string, seg transcribe.Segment) er
 
 func (s *SQLiteStore) GetSessionsByDate(date string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, started_at, ended_at, status, summary, summary_status, audio_path
+		`SELECT id, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?
 		 ORDER BY started_at DESC`,
@@ -230,14 +235,14 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, started_at, ended_at, status, summary, summary_status, audio_path FROM sessions WHERE id = ?`,
+		`SELECT id, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path FROM sessions WHERE id = ?`,
 		id,
 	)
 
 	var sess Session
 	var startedAt string
 	var endedAt sql.NullString
-	if err := row.Scan(&sess.ID, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.AudioPath); err != nil {
+	if err := row.Scan(&sess.ID, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -295,11 +300,12 @@ func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error
 	return segments, nil
 }
 
-func (s *SQLiteStore) UpdateSummary(sessionID, summary, status string) error {
+func (s *SQLiteStore) UpdateSummary(sessionID, summary, status, preset string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET summary = ?, summary_status = ? WHERE id = ?`,
+		`UPDATE sessions SET summary = ?, summary_status = ?, summary_preset = ? WHERE id = ?`,
 		summary,
 		status,
+		preset,
 		sessionID,
 	)
 	if err != nil {
@@ -341,7 +347,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var sess Session
 		var startedAt string
 		var endedAt sql.NullString
-		if err := rows.Scan(&sess.ID, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.AudioPath); err != nil {
+		if err := rows.Scan(&sess.ID, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
