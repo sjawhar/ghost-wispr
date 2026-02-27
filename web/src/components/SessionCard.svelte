@@ -37,7 +37,10 @@
   })
 
   function summaryPreview(summary: string): string {
-    const lines = summary.split('\n').map((line) => line.trim()).filter(Boolean)
+    const lines = summary
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
     return lines.slice(0, 2).join(' ')
   }
 

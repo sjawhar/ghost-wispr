@@ -5,6 +5,7 @@ import (
 	"time"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
+
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 

@@ -110,9 +110,6 @@ func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
 func main() {
 	log.Println("ghost-wispr: starting")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	dbPath := envOrDefault("DB_PATH", "data/ghost-wispr.db")
 	audioDir := envOrDefault("AUDIO_DIR", "data/audio")
 	silenceTimeout := durationOrDefault("SILENCE_TIMEOUT", 30*time.Second)
@@ -122,7 +119,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("storage init failed: %v", err)
 	}
-	defer store.Close()
+
+	assets, err := fs.Sub(staticFiles, "static")
+	if err != nil {
+		log.Fatalf("static assets init failed: %v", err)
+	}
 
 	hub := server.NewHub()
 	detector := session.NewDetector(silenceTimeout)
@@ -134,11 +135,6 @@ func main() {
 	}
 
 	manager := session.NewManager(store, audioRecorder, summarizer, hub, detector)
-
-	assets, err := fs.Sub(staticFiles, "static")
-	if err != nil {
-		log.Fatalf("static assets init failed: %v", err)
-	}
 
 	recState := &recorderState{}
 
@@ -153,6 +149,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer func() { _ = store.Close() }()
 
 	httpServer := &http.Server{Addr: ":8080", Handler: handler}
 	go func() {
@@ -268,7 +268,7 @@ func main() {
 		dgStop()
 	}
 	if mic != nil {
-		mic.Stop()
+		_ = mic.Stop()
 	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {

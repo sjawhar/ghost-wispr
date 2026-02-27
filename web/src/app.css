@@ -1,4 +1,4 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 @plugin "@tailwindcss/typography";
 
 :root {
@@ -28,8 +28,7 @@ body {
   color: var(--ink);
   background:
     radial-gradient(1200px 500px at 90% -10%, #d6ebe2 0%, transparent 55%),
-    radial-gradient(900px 400px at 0% 0%, #f2d9be 0%, transparent 50%),
-    var(--bg);
+    radial-gradient(900px 400px at 0% 0%, #f2d9be 0%, transparent 50%), var(--bg);
 }
 
 #app {
@@ -117,7 +116,9 @@ h1 {
   padding: 0.5rem 0.85rem;
   font: inherit;
   cursor: pointer;
-  transition: transform 120ms ease, opacity 120ms ease;
+  transition:
+    transform 120ms ease,
+    opacity 120ms ease;
 }
 
 .toggle-btn:hover,

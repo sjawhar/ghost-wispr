@@ -58,6 +58,7 @@
   })
 
   $effect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reactive dependency tracking
     segments.length
     if (stickToBottom && container) {
       requestAnimationFrame(() => {
@@ -78,7 +79,7 @@
   <div class="live-stream" bind:this={container} onscroll={handleScroll}>
     {#if segments.length === 0}
       <div class="idle-state">
-        <span class="pulse" class:connected={connected}></span>
+        <span class="pulse" class:connected></span>
         <span>{connected ? 'Listening...' : 'Waiting for connection...'}</span>
       </div>
     {/if}

@@ -46,7 +46,7 @@ func TestSummarizeReturnsMarkdown(t *testing.T) {
 	config := openai.DefaultConfig("test-key")
 	config.BaseURL = server.URL + "/v1"
 
-	summarizer := NewOpenAIWithConfig(config, "gpt-4o-mini", mockStore{claimFn: func(_, _ string) (bool, error) {
+	summarizer := NewOpenAIWithConfig(&config, "gpt-4o-mini", mockStore{claimFn: func(_, _ string) (bool, error) {
 		return true, nil
 	}})
 	summarizer.sleep = func(_ time.Duration) {}
@@ -72,7 +72,7 @@ func TestSummarizeSkipsShortTranscript(t *testing.T) {
 	config := openai.DefaultConfig("test-key")
 	config.BaseURL = server.URL + "/v1"
 
-	summarizer := NewOpenAIWithConfig(config, "gpt-4o-mini", nil)
+	summarizer := NewOpenAIWithConfig(&config, "gpt-4o-mini", nil)
 	got, err := summarizer.Summarize(context.Background(), "s2", "too short")
 	if err != nil {
 		t.Fatalf("Summarize returned error: %v", err)
@@ -114,7 +114,7 @@ func TestSummarizeRetriesOnFailure(t *testing.T) {
 	config := openai.DefaultConfig("test-key")
 	config.BaseURL = server.URL + "/v1"
 
-	summarizer := NewOpenAIWithConfig(config, "gpt-4o-mini", mockStore{claimFn: func(_, _ string) (bool, error) {
+	summarizer := NewOpenAIWithConfig(&config, "gpt-4o-mini", mockStore{claimFn: func(_, _ string) (bool, error) {
 		return true, nil
 	}})
 	summarizer.sleep = func(_ time.Duration) {}
@@ -146,7 +146,7 @@ func TestSummarizeIdempotencySkipsDuplicate(t *testing.T) {
 	store := mockStore{claimFn: func(_, _ string) (bool, error) {
 		return false, nil
 	}}
-	summarizer := NewOpenAIWithConfig(config, "gpt-4o-mini", store)
+	summarizer := NewOpenAIWithConfig(&config, "gpt-4o-mini", store)
 
 	text := strings.Repeat("token ", 30)
 	got, err := summarizer.Summarize(context.Background(), "s4", text)
