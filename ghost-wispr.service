@@ -1,0 +1,15 @@
+[Unit]
+Description=Ghost Wispr continuous transcription
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/ghost-wispr/ghost-wispr
+WorkingDirectory=/opt/ghost-wispr
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/ghost-wispr/.env
+
+[Install]
+WantedBy=multi-user.target
