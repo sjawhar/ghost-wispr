@@ -199,7 +199,7 @@ func (s *SQLiteStore) GetSessionsByDate(date string) ([]Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query sessions by date %s: %w", date, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	return scanSessions(rows)
 }
@@ -211,7 +211,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query dates: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var dates []string
 	for rows.Next() {
@@ -269,7 +269,7 @@ func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error
 	if err != nil {
 		return nil, fmt.Errorf("query segments for session %s: %w", sessionID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	segments := make([]transcribe.Segment, 0, 32)
 	for rows.Next() {

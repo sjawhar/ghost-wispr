@@ -20,7 +20,7 @@ func registerWSRoute(mux *http.ServeMux, hub *Hub) {
 			log.Printf("ws upgrade error: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		connectionEvent := ConnectionEvent{
 			Event:     newEvent("connection", time.Now().UTC()),

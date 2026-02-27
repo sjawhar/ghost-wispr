@@ -76,7 +76,7 @@
               detail={sessionDetails.get(session.id)}
               expanded={expandedSessionId === session.id}
               onToggle={() => onToggleSession(session.id)}
-              onLoadDetail={onLoadDetail}
+              {onLoadDetail}
             />
           {/each}
         </div>

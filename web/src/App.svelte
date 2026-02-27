@@ -10,7 +10,14 @@
     setSessionDetail,
     setSessionsForDate,
   } from './lib/state.svelte'
-  import { fetchDates, fetchSession, fetchSessions, fetchStatus, pauseRecording, resumeRecording } from './lib/api'
+  import {
+    fetchDates,
+    fetchSession,
+    fetchSessions,
+    fetchStatus,
+    pauseRecording,
+    resumeRecording,
+  } from './lib/api'
   import { connect, disconnect } from './lib/ws.svelte'
 
   let expandedSessionId = $state('')
@@ -122,7 +129,7 @@
       sessionsByDate={appState.sessionsByDate}
       sessionDetails={appState.sessionDetails}
       {expandedSessionId}
-      onToggleSession={onToggleSession}
+      {onToggleSession}
       onLoadDate={loadDate}
       onLoadDetail={loadSession}
     />

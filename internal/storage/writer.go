@@ -34,7 +34,7 @@ func (w *Writer) Append(seg transcribe.Segment) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if _, err := fmt.Fprintln(f, seg.FormatMarkdown()); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)

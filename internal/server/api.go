@@ -99,7 +99,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 			writeJSONError(w, http.StatusNotFound, "audio file not found")
 			return
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 
 		info, err := f.Stat()
 		if err != nil {
