@@ -24,7 +24,10 @@ function scheduleReconnect(): void {
 export function connect(): void {
   shouldReconnect = true
 
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+  if (
+    socket &&
+    (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
+  ) {
     return
   }
 

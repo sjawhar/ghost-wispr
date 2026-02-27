@@ -24,16 +24,16 @@ type OpenAI struct {
 
 func NewOpenAI(apiKey, model string, store IdempotencyStore) *OpenAI {
 	config := openai.DefaultConfig(apiKey)
-	return NewOpenAIWithConfig(config, model, store)
+	return NewOpenAIWithConfig(&config, model, store)
 }
 
-func NewOpenAIWithConfig(config openai.ClientConfig, model string, store IdempotencyStore) *OpenAI {
+func NewOpenAIWithConfig(config *openai.ClientConfig, model string, store IdempotencyStore) *OpenAI {
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-4o-mini"
 	}
 
 	return &OpenAI{
-		client: openai.NewClientWithConfig(config),
+		client: openai.NewClientWithConfig(*config),
 		model:  model,
 		store:  store,
 		sleep:  time.Sleep,

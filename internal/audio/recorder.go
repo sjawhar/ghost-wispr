@@ -191,7 +191,7 @@ func pcmToWav(rawPath, wavPath string, sampleRate int) error {
 	if err != nil {
 		return fmt.Errorf("open wav output: %w", err)
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
 	header, err := wavHeader(len(pcmData), sampleRate, pcmChannels, pcmBitDepth)
 	if err != nil {

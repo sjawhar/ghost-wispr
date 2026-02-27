@@ -62,7 +62,10 @@ func serveSPA(staticFS fs.FS, fileServer http.Handler) func(http.ResponseWriter,
 		if cleanPath == "." || cleanPath == "" || !strings.Contains(cleanPath, ".") {
 			// SPA route: serve index.html directly (avoids FileServer redirect loop)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write(indexHTML)
+			if _, err := w.Write(indexHTML); err != nil {
+				log.Printf("write index.html: %v", err)
+				return
+			}
 			return
 		}
 

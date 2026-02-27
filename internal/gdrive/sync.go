@@ -24,7 +24,7 @@ func NewSyncer(ctx context.Context, credPath, folderID string) (*Syncer, error) 
 		return nil, fmt.Errorf("read credentials: %w", err)
 	}
 
-	config, err := google.CredentialsFromJSON(ctx, creds, drive.DriveFileScope)
+	config, err := google.CredentialsFromJSONWithTypeAndParams(ctx, creds, google.ServiceAccount, google.CredentialsParams{Scopes: []string{drive.DriveFileScope}})
 	if err != nil {
 		return nil, fmt.Errorf("parse credentials: %w", err)
 	}
@@ -49,7 +49,7 @@ func (s *Syncer) Sync(localPath, date string) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", localPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	name := fmt.Sprintf("ghost-wispr-%s", date)
 
