@@ -13,6 +13,7 @@ type ControlHooks struct {
 	Resume          func()
 	IsPaused        func() bool
 	OnStatusChanged func(paused bool)
+	Warnings        func() []string
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks) (http.Handler, error) {

@@ -196,3 +196,68 @@ func TestAPIAudioPathTraversalBlocked(t *testing.T) {
 		t.Fatalf("expected forbidden/notfound for traversal, got %d body=%s", rr.Code, string(body))
 	}
 }
+
+func TestAPIStatusWithWarnings(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, ControlHooks{
+		IsPaused: func() bool { return false },
+		Warnings: func() []string {
+			return []string{"Deepgram API key not configured"}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, `"paused":false`) {
+		t.Fatalf("expected paused:false in response, got %s", body)
+	}
+	if !strings.Contains(body, `"warnings"`) {
+		t.Fatalf("expected warnings field in response, got %s", body)
+	}
+	if !strings.Contains(body, "Deepgram API key not configured") {
+		t.Fatalf("expected warning message in response, got %s", body)
+	}
+}
+
+func TestAPIStatusNoWarnings(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, ControlHooks{})
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, `"warnings":[]`) {
+		t.Fatalf("expected empty warnings array in response, got %s", body)
+	}
+}

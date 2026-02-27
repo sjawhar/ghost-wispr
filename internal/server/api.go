@@ -147,7 +147,14 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 		if controls.IsPaused != nil {
 			paused = controls.IsPaused()
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"paused": paused})
+		var warnings []string
+		if controls.Warnings != nil {
+			warnings = controls.Warnings()
+		}
+		if warnings == nil {
+			warnings = []string{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"paused": paused, "warnings": warnings})
 	})
 }
 

@@ -11,7 +11,7 @@ func TestEventSerialization(t *testing.T) {
 		LiveTranscriptEvent{Event: newEvent("live_transcript", time.Unix(1, 0)), Speaker: 1, Text: "hello", StartTime: 0.1, EndTime: 1.2},
 		SessionStartedEvent{Event: newEvent("session_started", time.Unix(1, 0)), SessionID: "abc"},
 		SessionEndedEvent{Event: newEvent("session_ended", time.Unix(1, 0)), SessionID: "abc", Duration: 30},
-		SummaryReadyEvent{Event: newEvent("summary_ready", time.Unix(1, 0)), SessionID: "abc", Summary: "ok"},
+		SummaryReadyEvent{Event: newEvent("summary_ready", time.Unix(1, 0)), SessionID: "abc", Summary: "ok", Status: "completed"},
 		StatusChangedEvent{Event: newEvent("status_changed", time.Unix(1, 0)), Paused: true},
 	}
 

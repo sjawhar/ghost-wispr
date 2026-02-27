@@ -30,7 +30,7 @@ type EventBroadcaster interface {
 	BroadcastLiveTranscript(seg transcribe.Segment)
 	BroadcastSessionStarted(sessionID string)
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
-	BroadcastSummaryReady(sessionID, summary string)
+	BroadcastSummaryReady(sessionID, summary, status string)
 }
 
 type LifecycleManager interface {
