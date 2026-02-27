@@ -190,6 +190,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	segments, err := m.store.GetSegments(sessionID)
 	if err != nil {
 		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed)
+		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed)
 		return
 	}
 
@@ -205,16 +206,22 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	summaryText, err := m.summarizer.Summarize(ctx, sessionID, b.String())
 	if err != nil {
 		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed)
+		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed)
 		return
 	}
 
 	if err := m.store.UpdateSummary(sessionID, summaryText, storage.SummaryCompleted); err != nil {
 		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed)
+		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed)
 		return
 	}
 
+	m.broadcastSummaryStatus(sessionID, summaryText, storage.SummaryCompleted)
+}
+
+func (m *Manager) broadcastSummaryStatus(sessionID, summary, status string) {
 	if m.hub != nil {
-		m.hub.BroadcastSummaryReady(sessionID, summaryText)
+		m.hub.BroadcastSummaryReady(sessionID, summary, status)
 	}
 }
 

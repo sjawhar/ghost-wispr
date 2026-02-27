@@ -413,6 +413,24 @@ h1 {
   color: var(--muted);
 }
 
+.warnings-banner {
+  background: #fff5d8;
+  border: 1px solid #edd38e;
+  border-radius: 0.8rem;
+  padding: 0.6rem 0.8rem;
+  margin-top: 1rem;
+}
+
+.warning-item {
+  margin: 0;
+  color: #7a5b0b;
+  font-size: 0.88rem;
+}
+
+.warning-item + .warning-item {
+  margin-top: 0.35rem;
+}
+
 .load-more {
   margin-top: 0.8rem;
 }

@@ -111,6 +111,7 @@ type hubMock struct {
 	summaryReady  int
 	latestSession string
 	latestSummary string
+	latestStatus  string
 }
 
 func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
@@ -133,11 +134,12 @@ func (h *hubMock) BroadcastSessionEnded(sessionID string, _ time.Duration) {
 	h.mu.Unlock()
 }
 
-func (h *hubMock) BroadcastSummaryReady(sessionID, summary string) {
+func (h *hubMock) BroadcastSummaryReady(sessionID, summary, status string) {
 	h.mu.Lock()
 	h.summaryReady++
 	h.latestSession = sessionID
 	h.latestSummary = summary
+	h.latestStatus = status
 	h.mu.Unlock()
 }
 

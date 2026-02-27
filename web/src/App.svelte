@@ -9,6 +9,7 @@
     setPaused,
     setSessionDetail,
     setSessionsForDate,
+    setWarnings,
   } from './lib/state.svelte'
   import {
     fetchDates,
@@ -71,6 +72,7 @@
         }
 
         setPaused(status.paused)
+        setWarnings(status.warnings)
         setDates(dates)
 
         for (const date of dates.slice(0, 3)) {
@@ -85,7 +87,10 @@
 
     const refreshTimer = setInterval(() => {
       void fetchStatus()
-        .then((status) => setPaused(status.paused))
+        .then((status) => {
+          setPaused(status.paused)
+          setWarnings(status.warnings)
+        })
         .catch((error) => {
           void error
         })
@@ -115,6 +120,14 @@
 
   {#if loadingError}
     <p class="load-error">{loadingError}</p>
+  {/if}
+
+  {#if appState.warnings.length > 0}
+    <aside class="warnings-banner" data-testid="warnings-banner">
+      {#each appState.warnings as warning (warning)}
+        <p class="warning-item">{warning}</p>
+      {/each}
+    </aside>
   {/if}
 
   <section class="layout">

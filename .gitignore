@@ -290,3 +290,4 @@ web/node_modules/
 web/dist/
 cmd/ghost-wispr/static/
 mise.toml
+ghost-wispr.yaml
