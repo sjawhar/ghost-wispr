@@ -8,6 +8,7 @@ require (
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/oauth2 v0.35.0
 	google.golang.org/api v0.269.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.38.2
 )
 

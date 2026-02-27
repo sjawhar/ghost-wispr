@@ -3,14 +3,12 @@ package main
 import (
 	"context"
 	"embed"
-	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +20,7 @@ import (
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
@@ -110,12 +109,20 @@ func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
 func main() {
 	log.Println("ghost-wispr: starting")
 
-	dbPath := envOrDefault("DB_PATH", "data/ghost-wispr.db")
-	audioDir := envOrDefault("AUDIO_DIR", "data/audio")
-	silenceTimeout := durationOrDefault("SILENCE_TIMEOUT", 30*time.Second)
-	model := envOrDefault("OPENAI_MODEL", "gpt-4o-mini")
+	configPath := os.Getenv(config.EnvPrefix + "CONFIG")
+	if configPath == "" {
+		configPath = "ghost-wispr.yaml"
+	}
 
-	store, err := storage.NewSQLiteStore(dbPath)
+	cfg, cfgWarnings, err := config.Load(configPath)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	for _, w := range cfgWarnings {
+		log.Printf("config: %s", w)
+	}
+
+	store, err := storage.NewSQLiteStore(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("storage init failed: %v", err)
 	}
@@ -126,17 +133,18 @@ func main() {
 	}
 
 	hub := server.NewHub()
-	detector := session.NewDetector(silenceTimeout)
-	audioRecorder := audio.NewRecorder(audioDir)
+	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
+	audioRecorder := audio.NewRecorder(cfg.AudioDir)
 
 	var summarizer session.Summarizer
-	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-		summarizer = summary.NewOpenAI(key, model, store)
+	if cfg.OpenAIAPIKey != "" {
+		summarizer = summary.NewOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIModel, store)
 	}
 
 	manager := session.NewManager(store, audioRecorder, summarizer, hub, detector)
 
 	recState := &recorderState{}
+	warnings := append([]string{}, cfgWarnings...)
 
 	handler, err := server.Handler(assets, hub, store, server.ControlHooks{
 		Pause:    recState.Pause,
@@ -145,6 +153,7 @@ func main() {
 		OnStatusChanged: func(paused bool) {
 			hub.BroadcastStatusChanged(paused)
 		},
+		Warnings: func() []string { return warnings },
 	})
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
@@ -154,18 +163,11 @@ func main() {
 	defer cancel()
 	defer func() { _ = store.Close() }()
 
-	httpServer := &http.Server{Addr: ":8080", Handler: handler}
-	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("http server error: %v", err)
-		}
-	}()
-
-	if folderID := os.Getenv("GDRIVE_FOLDER_ID"); folderID != "" {
-		credPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
-		syncer, syncErr := gdrive.NewSyncer(ctx, credPath, folderID)
+	if cfg.GDriveFolderID != "" {
+		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
+			warnings = append(warnings, "Google Drive sync failed to initialize \u2014 backups are disabled")
 		} else {
 			go func() {
 				ticker := time.NewTicker(5 * time.Minute)
@@ -176,7 +178,7 @@ func main() {
 						return
 					case <-ticker.C:
 						date := time.Now().UTC().Format("2006-01-02")
-						if err := syncer.Sync(dbPath, date); err != nil {
+						if err := syncer.Sync(cfg.DBPath, date); err != nil {
 							log.Printf("gdrive sync error: %v", err)
 						}
 					}
@@ -188,14 +190,14 @@ func main() {
 	var mic *microphone.Microphone
 	var dgWriter io.Writer
 	var dgStop func()
-	selectedSampleRate := 16000
+	selectedSampleRate := cfg.MicSampleRate
 
 	microphone.Initialize()
 	defer microphone.Teardown()
 
 	client.Init(client.InitLib{LogLevel: client.LogLevelDefault})
 
-	for _, rate := range sampleRateCandidates() {
+	for _, rate := range cfg.SampleRateCandidates() {
 		mic, err = microphone.New(microphone.AudioConfig{InputChannels: 1, SamplingRate: float32(rate)})
 		if err != nil {
 			log.Printf("warning: microphone open failed at %d Hz: %v", rate, err)
@@ -207,6 +209,7 @@ func main() {
 
 	if mic == nil {
 		log.Printf("warning: microphone unavailable, running API/UI only")
+		warnings = append(warnings, "Microphone unavailable \u2014 recording and live transcription are disabled")
 	} else {
 		audioRecorder.SetSampleRate(selectedSampleRate)
 		recState.SetMic(mic)
@@ -214,12 +217,13 @@ func main() {
 			log.Printf("warning: microphone start failed at %d Hz, running API/UI only: %v", selectedSampleRate, err)
 			mic = nil
 			recState.SetMic(nil)
+			warnings = append(warnings, "Microphone failed to start \u2014 recording and live transcription are disabled")
 		} else {
 			log.Printf("microphone started at %d Hz", selectedSampleRate)
 		}
 	}
 
-	if mic != nil {
+	if mic != nil && cfg.DeepgramAPIKey != "" {
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := &interfaces.LiveTranscriptionOptions{
 			Model:       "nova-2",
@@ -232,11 +236,13 @@ func main() {
 			Channels:    1,
 		}
 
-		dgClient, err := client.NewWSUsingCallback(ctx, "", cOptions, tOptions, transcriptCallback{manager: manager})
+		dgClient, err := client.NewWSUsingCallback(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, transcriptCallback{manager: manager})
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
+			warnings = append(warnings, "Deepgram initialization failed \u2014 live transcription is disabled")
 		} else if ok := dgClient.Connect(); !ok {
 			log.Printf("warning: deepgram connect failed, running API/UI only")
+			warnings = append(warnings, "Deepgram connection failed \u2014 live transcription is disabled")
 		} else {
 			dgWriter = dgClient
 			dgStop = func() {
@@ -247,6 +253,13 @@ func main() {
 			}()
 		}
 	}
+
+	httpServer := &http.Server{Addr: ":8080", Handler: handler}
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("http server error: %v", err)
+		}
+	}()
 
 	log.Println("ghost-wispr: web UI on http://127.0.0.1:8080")
 
@@ -274,75 +287,6 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("warning: http shutdown failed: %v", err)
 	}
-}
-
-func envOrDefault(key, fallback string) string {
-	val := os.Getenv(key)
-	if val == "" {
-		return fallback
-	}
-	return val
-}
-
-func durationOrDefault(key string, fallback time.Duration) time.Duration {
-	val := os.Getenv(key)
-	if val == "" {
-		return fallback
-	}
-	d, err := time.ParseDuration(val)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid %s duration %q, using %s\n", key, val, fallback)
-		return fallback
-	}
-	return d
-}
-
-func parseSampleRates(raw string) []int {
-	parts := strings.Split(raw, ",")
-	seen := make(map[int]struct{}, len(parts))
-	result := make([]int, 0, len(parts))
-
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed == "" {
-			continue
-		}
-		rate, err := strconv.Atoi(trimmed)
-		if err != nil || rate <= 0 {
-			continue
-		}
-		if _, ok := seen[rate]; ok {
-			continue
-		}
-		seen[rate] = struct{}{}
-		result = append(result, rate)
-	}
-
-	return result
-}
-
-func sampleRateCandidates() []int {
-	defaults := []int{16000, 48000, 44100, 32000, 24000}
-	combined := make([]int, 0, 8)
-
-	if preferred := strings.TrimSpace(os.Getenv("MIC_SAMPLE_RATE")); preferred != "" {
-		combined = append(combined, parseSampleRates(preferred)...)
-	}
-
-	combined = append(combined, parseSampleRates(os.Getenv("MIC_SAMPLE_RATES"))...)
-	combined = append(combined, defaults...)
-
-	seen := make(map[int]struct{}, len(combined))
-	result := make([]int, 0, len(combined))
-	for _, rate := range combined {
-		if _, ok := seen[rate]; ok {
-			continue
-		}
-		seen[rate] = struct{}{}
-		result = append(result, rate)
-	}
-
-	return result
 }
 
 type micStreamer interface {

@@ -1,0 +1,28 @@
+# Ghost Wispr Configuration
+# Copy to ghost-wispr.yaml and customize as needed.
+# All settings below show their default values.
+#
+# Any setting can also be overridden with an environment variable
+# using the GHOST_WISPR_ prefix (e.g. GHOST_WISPR_DB_PATH).
+#
+# API keys are configured ONLY via environment variables:
+#   GHOST_WISPR_DEEPGRAM_API_KEY  (required for live transcription)
+#   GHOST_WISPR_OPENAI_API_KEY    (required for session summaries)
+
+# Database
+db_path: data/ghost-wispr.db
+
+# Audio recording
+audio_dir: data/audio
+silence_timeout: 30s
+
+# Microphone — preferred sample rate tried first, then alternatives
+mic_sample_rate: 16000
+mic_sample_rates: [48000, 44100, 32000, 24000]
+
+# AI model for session summaries
+openai_model: gpt-4o-mini
+
+# Google Drive sync (optional)
+# gdrive_folder_id:
+# google_credentials_file: ./service-account.json

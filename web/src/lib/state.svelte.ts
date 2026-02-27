@@ -13,6 +13,7 @@ type AppState = {
   sessionsByDate: Map<string, SessionSummary[]>
   sessionDetails: Map<string, SessionDetailResponse>
   dates: string[]
+  warnings: string[]
   activeSessionId: string
   activeSessionStartedAt: number
   activeAudioSessionId: string
@@ -25,6 +26,7 @@ export const appState = $state<AppState>({
   sessionsByDate: new Map(),
   sessionDetails: new Map(),
   dates: [],
+  warnings: [],
   activeSessionId: '',
   activeSessionStartedAt: 0,
   activeAudioSessionId: '',
@@ -45,6 +47,10 @@ export function setPaused(paused: boolean): void {
 
 export function setDates(dates: string[]): void {
   appState.dates = dates
+}
+
+export function setWarnings(warnings: string[]): void {
+  appState.warnings = warnings
 }
 
 export function setSessionsForDate(date: string, sessions: SessionSummary[]): void {
@@ -83,7 +89,7 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
       date,
       sessions.map((session) =>
         session.id === event.session_id
-          ? { ...session, summary: event.summary, summary_status: 'completed' }
+          ? { ...session, summary: event.summary, summary_status: event.status }
           : session,
       ),
     )
@@ -98,7 +104,7 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
       session: {
         ...detail.session,
         summary: event.summary,
-        summary_status: 'completed',
+        summary_status: event.status,
       },
     })
     appState.sessionDetails = nextDetails
@@ -143,4 +149,5 @@ export function resetState(): void {
   appState.activeSessionId = ''
   appState.activeSessionStartedAt = 0
   appState.activeAudioSessionId = ''
+  appState.warnings = []
 }

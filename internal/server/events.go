@@ -33,6 +33,7 @@ type SummaryReadyEvent struct {
 	Event
 	SessionID string `json:"session_id"`
 	Summary   string `json:"summary"`
+	Status    string `json:"status"`
 }
 
 type StatusChangedEvent struct {

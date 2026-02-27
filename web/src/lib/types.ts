@@ -27,6 +27,7 @@ export interface SummaryReadyEvent extends BaseEvent {
   type: 'summary_ready'
   session_id: string
   summary: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
 }
 
 export interface StatusChangedEvent extends BaseEvent {
@@ -72,4 +73,5 @@ export interface SessionDetailResponse {
 
 export interface StatusResponse {
   paused: boolean
+  warnings: string[]
 }
