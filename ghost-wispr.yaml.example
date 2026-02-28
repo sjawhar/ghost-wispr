@@ -1,13 +1,11 @@
 # Ghost Wispr Configuration
 # Copy to ghost-wispr.yaml and customize as needed.
-# All settings below show their default values.
-#
-# Any setting can also be overridden with an environment variable
-# using the GHOST_WISPR_ prefix (e.g. GHOST_WISPR_DB_PATH).
 #
 # API keys are configured ONLY via environment variables:
-#   GHOST_WISPR_DEEPGRAM_API_KEY  (required for live transcription)
-#   GHOST_WISPR_OPENAI_API_KEY    (required for session summaries)
+#   GHOST_WISPR_DEEPGRAM_API_KEY    (required for live transcription)
+#   GHOST_WISPR_OPENAI_API_KEY      (for OpenAI summarization)
+#   GHOST_WISPR_ANTHROPIC_API_KEY   (for Anthropic summarization)
+#   GHOST_WISPR_GEMINI_API_KEY      (for Gemini summarization)
 
 # Database
 db_path: data/ghost-wispr.db
@@ -20,8 +18,16 @@ silence_timeout: 30s
 mic_sample_rate: 16000
 mic_sample_rates: [48000, 44100, 32000, 24000]
 
-# AI model for session summaries
-openai_model: gpt-4o-mini
+# Summarization — model format is provider/model_name
+summarization:
+  model: openai/gpt-4o-mini
+  # base_url: ""  # Optional: for OpenAI-compatible endpoints (Ollama, OpenRouter, etc.)
+
+  presets:
+    default:
+      description: "General-purpose meeting summary with key topics, decisions, and action items"
+      system_prompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics, decisions made, and action items if any."
+      user_template: "{{transcript}}"
 
 # Google Drive sync (optional)
 # gdrive_folder_id:

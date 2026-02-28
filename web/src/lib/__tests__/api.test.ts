@@ -6,6 +6,7 @@ import {
   fetchStatus,
   pauseRecording,
   resumeRecording,
+  resummarize,
 } from '../api'
 
 afterEach(() => {
@@ -78,5 +79,29 @@ describe('api client', () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/pause', { method: 'POST' })
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/resume', { method: 'POST' })
+  })
+
+  it('resummarize resolves on 202', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 202,
+      }),
+    )
+
+    await expect(resummarize('s1')).resolves.toBeUndefined()
+  })
+
+  it('resummarize throws on 503', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+      }),
+    )
+
+    await expect(resummarize('s1')).rejects.toThrow(/503/)
   })
 })

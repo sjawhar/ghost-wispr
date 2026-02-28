@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -93,6 +95,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 			writeJSONError(w, http.StatusForbidden, "invalid audio path")
 			return
 		}
+		if filepath.IsAbs(cleanPath) {
+			writeJSONError(w, http.StatusForbidden, "invalid audio path")
+			return
+		}
 
 		f, err := os.Open(cleanPath)
 		if err != nil {
@@ -118,6 +124,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get dates: %v", err))
 			return
+		}
+		if dates == nil {
+			dates = []string{}
 		}
 		writeJSON(w, http.StatusOK, dates)
 	})
@@ -155,6 +164,48 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 			warnings = []string{}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"paused": paused, "warnings": warnings})
+	})
+
+	mux.HandleFunc("GET /api/presets", func(w http.ResponseWriter, r *http.Request) {
+		if controls.Presets == nil {
+			writeJSON(w, http.StatusOK, map[string]any{})
+			return
+		}
+		presets := controls.Presets()
+		result := make(map[string]string, len(presets))
+		for name, p := range presets {
+			result[name] = p.Description
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/resummarize", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		var body struct {
+			Preset string `json:"preset"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+				writeJSONError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+		}
+
+		if controls.Resummarize == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "summarization not configured")
+			return
+		}
+
+		go func() {
+			_ = controls.Resummarize(context.Background(), sessionID, body.Preset)
+		}()
+
+		w.WriteHeader(http.StatusAccepted)
 	})
 }
 

@@ -1,11 +1,14 @@
 package server
 
 import (
+	"context"
 	"io/fs"
 	"log"
 	"net/http"
 	"path"
 	"strings"
+
+	"github.com/sjawhar/ghost-wispr/internal/config"
 )
 
 type ControlHooks struct {
@@ -14,6 +17,8 @@ type ControlHooks struct {
 	IsPaused        func() bool
 	OnStatusChanged func(paused bool)
 	Warnings        func() []string
+	Presets         func() map[string]config.Preset
+	Resummarize     func(ctx context.Context, sessionID, preset string) error
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks) (http.Handler, error) {

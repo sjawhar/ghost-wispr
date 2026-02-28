@@ -1,5 +1,6 @@
 import type {
   LiveTranscriptEvent,
+  PresetMap,
   SessionDetailResponse,
   SessionSummary,
   SummaryReadyEvent,
@@ -14,6 +15,7 @@ type AppState = {
   sessionDetails: Map<string, SessionDetailResponse>
   dates: string[]
   warnings: string[]
+  presets: PresetMap
   activeSessionId: string
   activeSessionStartedAt: number
   activeAudioSessionId: string
@@ -27,6 +29,7 @@ export const appState = $state<AppState>({
   sessionDetails: new Map(),
   dates: [],
   warnings: [],
+  presets: {},
   activeSessionId: '',
   activeSessionStartedAt: 0,
   activeAudioSessionId: '',
@@ -51,6 +54,10 @@ export function setDates(dates: string[]): void {
 
 export function setWarnings(warnings: string[]): void {
   appState.warnings = warnings
+}
+
+export function setPresets(presets: PresetMap): void {
+  appState.presets = presets
 }
 
 export function setSessionsForDate(date: string, sessions: SessionSummary[]): void {
@@ -89,7 +96,12 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
       date,
       sessions.map((session) =>
         session.id === event.session_id
-          ? { ...session, summary: event.summary, summary_status: event.status }
+          ? {
+              ...session,
+              summary: event.summary,
+              summary_status: event.status,
+              summary_preset: event.summary_preset ?? session.summary_preset,
+            }
           : session,
       ),
     )
@@ -105,6 +117,7 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
         ...detail.session,
         summary: event.summary,
         summary_status: event.status,
+        summary_preset: event.summary_preset ?? detail.session.summary_preset,
       },
     })
     appState.sessionDetails = nextDetails
@@ -150,4 +163,5 @@ export function resetState(): void {
   appState.activeSessionStartedAt = 0
   appState.activeAudioSessionId = ''
   appState.warnings = []
+  appState.presets = {}
 }

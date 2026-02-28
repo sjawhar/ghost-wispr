@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/llm"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -15,19 +17,34 @@ const EnvPrefix = "GHOST_WISPR_"
 
 // Config holds all application configuration. Secrets (API keys) are loaded
 // exclusively from environment variables and never appear in the config file.
+type Preset struct {
+	Description  string `yaml:"description"`
+	SystemPrompt string `yaml:"system_prompt"`
+	UserTemplate string `yaml:"user_template"`
+	Model        string `yaml:"model"`
+}
+
+type Summarization struct {
+	Model   string            `yaml:"model"`
+	BaseURL string            `yaml:"base_url"`
+	Presets map[string]Preset `yaml:"presets"`
+}
+
 type Config struct {
-	DBPath                string `yaml:"db_path"`
-	AudioDir              string `yaml:"audio_dir"`
-	SilenceTimeout        string `yaml:"silence_timeout"`
-	MicSampleRate         int    `yaml:"mic_sample_rate"`
-	MicSampleRates        []int  `yaml:"mic_sample_rates"`
-	OpenAIModel           string `yaml:"openai_model"`
-	GDriveFolderID        string `yaml:"gdrive_folder_id"`
-	GoogleCredentialsFile string `yaml:"google_credentials_file"`
+	DBPath                string        `yaml:"db_path"`
+	AudioDir              string        `yaml:"audio_dir"`
+	SilenceTimeout        string        `yaml:"silence_timeout"`
+	MicSampleRate         int           `yaml:"mic_sample_rate"`
+	MicSampleRates        []int         `yaml:"mic_sample_rates"`
+	GDriveFolderID        string        `yaml:"gdrive_folder_id"`
+	GoogleCredentialsFile string        `yaml:"google_credentials_file"`
+	Summarization         Summarization `yaml:"summarization"`
 
 	// Secrets — env vars only, never serialized to YAML.
-	DeepgramAPIKey string `yaml:"-"`
-	OpenAIAPIKey   string `yaml:"-"`
+	DeepgramAPIKey  string `yaml:"-"`
+	OpenAIAPIKey    string `yaml:"-"`
+	AnthropicAPIKey string `yaml:"-"`
+	GeminiAPIKey    string `yaml:"-"`
 }
 
 func defaults() Config {
@@ -37,8 +54,17 @@ func defaults() Config {
 		SilenceTimeout:        "30s",
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
-		OpenAIModel:           "gpt-4o-mini",
 		GoogleCredentialsFile: "./service-account.json",
+		Summarization: Summarization{
+			Model: "openai/gpt-4o-mini",
+			Presets: map[string]Preset{
+				"default": {
+					Description:  "General-purpose meeting summary with key topics, decisions, and action items",
+					SystemPrompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics, decisions made, and action items if any.",
+					UserTemplate: "{{transcript}}",
+				},
+			},
+		},
 	}
 }
 
@@ -122,8 +148,8 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "MIC_SAMPLE_RATES"); v != "" {
 		cfg.MicSampleRates = parseSampleRates(v)
 	}
-	if v := os.Getenv(EnvPrefix + "OPENAI_MODEL"); v != "" {
-		cfg.OpenAIModel = v
+	if v := os.Getenv(EnvPrefix + "SUMMARIZATION_MODEL"); v != "" {
+		cfg.Summarization.Model = v
 	}
 	if v := os.Getenv(EnvPrefix + "GDRIVE_FOLDER_ID"); v != "" {
 		cfg.GDriveFolderID = v
@@ -136,19 +162,59 @@ func applyEnvOverrides(cfg *Config) {
 func loadSecrets(cfg *Config) {
 	cfg.DeepgramAPIKey = os.Getenv(EnvPrefix + "DEEPGRAM_API_KEY")
 	cfg.OpenAIAPIKey = os.Getenv(EnvPrefix + "OPENAI_API_KEY")
+	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
+	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
 }
 
 func validate(cfg *Config) []string {
 	var warnings []string
 
 	if cfg.DeepgramAPIKey == "" {
-		warnings = append(warnings, "Deepgram API key not configured \u2014 live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
 	}
-	if cfg.OpenAIAPIKey == "" {
-		warnings = append(warnings, "OpenAI API key not configured \u2014 session summaries are disabled. Set "+EnvPrefix+"OPENAI_API_KEY.")
+
+	providers := make(map[string]struct{})
+	addModelProvider := func(scope, model string) {
+		provider, _, err := llm.ParseModel(model)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("Invalid %s model %q — %v.", scope, model, err))
+			return
+		}
+		providers[provider] = struct{}{}
 	}
+
+	addModelProvider("summarization", cfg.Summarization.Model)
+
+	if _, ok := cfg.Summarization.Presets["default"]; !ok {
+		warnings = append(warnings, "No default summarization preset configured — set summarization.presets.default.")
+	}
+
+	for name, preset := range cfg.Summarization.Presets {
+		if strings.TrimSpace(preset.Model) == "" {
+			continue
+		}
+		addModelProvider(fmt.Sprintf("summarization preset %q", name), preset.Model)
+	}
+
+	for provider := range providers {
+		switch provider {
+		case "openai":
+			if cfg.OpenAIAPIKey == "" {
+				warnings = append(warnings, "OpenAI API key not configured — set "+EnvPrefix+"OPENAI_API_KEY.")
+			}
+		case "anthropic":
+			if cfg.AnthropicAPIKey == "" {
+				warnings = append(warnings, "Anthropic API key not configured — set "+EnvPrefix+"ANTHROPIC_API_KEY.")
+			}
+		case "gemini":
+			if cfg.GeminiAPIKey == "" {
+				warnings = append(warnings, "Gemini API key not configured — set "+EnvPrefix+"GEMINI_API_KEY.")
+			}
+		}
+	}
+
 	if _, err := time.ParseDuration(cfg.SilenceTimeout); err != nil {
-		warnings = append(warnings, fmt.Sprintf("Invalid silence_timeout %q \u2014 using default 30s.", cfg.SilenceTimeout))
+		warnings = append(warnings, fmt.Sprintf("Invalid silence_timeout %q — using default 30s.", cfg.SilenceTimeout))
 	}
 
 	return warnings

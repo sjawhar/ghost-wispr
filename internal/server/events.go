@@ -34,6 +34,7 @@ type SummaryReadyEvent struct {
 	SessionID string `json:"session_id"`
 	Summary   string `json:"summary"`
 	Status    string `json:"status"`
+	Preset    string `json:"summary_preset"`
 }
 
 type StatusChangedEvent struct {

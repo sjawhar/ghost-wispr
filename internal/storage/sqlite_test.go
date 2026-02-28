@@ -65,7 +65,7 @@ func TestSQLiteCRUD(t *testing.T) {
 		t.Fatalf("AppendSegment failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "## Summary\n- done", SummaryCompleted); err != nil {
+	if err := store.UpdateSummary(sessionID, "## Summary\n- done", SummaryCompleted, "default"); err != nil {
 		t.Fatalf("UpdateSummary failed: %v", err)
 	}
 
@@ -82,6 +82,9 @@ func TestSQLiteCRUD(t *testing.T) {
 	}
 	if session.SummaryStatus != SummaryCompleted {
 		t.Fatalf("expected summary_status %q, got %q", SummaryCompleted, session.SummaryStatus)
+	}
+	if session.SummaryPreset != "default" {
+		t.Fatalf("expected summary_preset %q, got %q", "default", session.SummaryPreset)
 	}
 
 	segments, err := store.GetSegments(sessionID)
@@ -109,6 +112,29 @@ func TestSQLiteCRUD(t *testing.T) {
 	}
 	if len(dates) != 1 || dates[0] != "2026-02-26" {
 		t.Fatalf("expected dates [2026-02-26], got %#v", dates)
+	}
+}
+
+func TestUpdateSummaryWithPreset(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startedAt := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
+	sessionID := startedAt.Format("20060102150405")
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if err := store.UpdateSummary(sessionID, "## Summary\n- done", SummaryCompleted, "concise"); err != nil {
+		t.Fatalf("UpdateSummary failed: %v", err)
+	}
+
+	session, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+
+	if session.SummaryPreset != "concise" {
+		t.Fatalf("expected summary_preset %q, got %q", "concise", session.SummaryPreset)
 	}
 }
 
