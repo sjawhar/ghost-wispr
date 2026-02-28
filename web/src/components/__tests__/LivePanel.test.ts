@@ -4,7 +4,13 @@ import LivePanel from '../LivePanel.svelte'
 
 describe('LivePanel', () => {
   it('shows listening state when empty', () => {
-    render(LivePanel, { segments: [], connected: true, activeSessionStartedAt: 0 })
+    render(LivePanel, {
+      segments: [],
+      connected: true,
+      activeSessionStartedAt: 0,
+      interimText: '',
+      interimSpeaker: -1,
+    })
     expect(screen.getByText('Listening...')).toBeTruthy()
   })
 
@@ -23,9 +29,34 @@ describe('LivePanel', () => {
       ],
       connected: true,
       activeSessionStartedAt: Date.now(),
+      interimText: '',
+      interimSpeaker: -1,
     })
 
     expect(screen.getByText('Speaker 2')).toBeTruthy()
     expect(screen.getByText('Ship it')).toBeTruthy()
+  })
+
+  it('shows interim text when provided', () => {
+    render(LivePanel, {
+      segments: [],
+      connected: true,
+      activeSessionStartedAt: Date.now(),
+      interimText: 'being transcribed now',
+      interimSpeaker: 0,
+    })
+    expect(screen.getByText('being transcribed now')).toBeTruthy()
+    expect(screen.getByText('Speaker 0')).toBeTruthy()
+  })
+
+  it('shows ellipsis for unknown speaker in interim', () => {
+    render(LivePanel, {
+      segments: [],
+      connected: true,
+      activeSessionStartedAt: Date.now(),
+      interimText: 'some speech',
+      interimSpeaker: -1,
+    })
+    expect(screen.getByText('...')).toBeTruthy()
   })
 })

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -65,5 +66,77 @@ func TestBuffer_AddWords_MultipleCallsAccumulate(t *testing.T) {
 	flushed := buf.Flush()
 	if len(flushed) != 2 {
 		t.Fatalf("expected 2 flushed words, got %d", len(flushed))
+	}
+}
+
+func TestBuffer_Words_ReturnsCopyWithoutClearing(t *testing.T) {
+	buf := NewUtteranceBuffer()
+	words := []transcribe.Word{
+		{Speaker: intPtrBuf(0), PunctuatedWord: "Hello", Start: 0.0, End: 0.5},
+		{Speaker: intPtrBuf(0), PunctuatedWord: "world.", Start: 0.5, End: 1.0},
+	}
+	buf.AddWords(words)
+
+	got := buf.Words()
+	if len(got) != 2 {
+		t.Fatalf("expected Words() to return 2 words, got %d", len(got))
+	}
+	// Buffer must still contain words after Words() call
+	if buf.Len() != 2 {
+		t.Fatalf("expected buffer to still have 2 words after Words(), got %d", buf.Len())
+	}
+	// Verify it's a copy — mutating the returned slice must not affect the buffer
+	got[0].PunctuatedWord = "MUTATED"
+	remaining := buf.Flush()
+	if remaining[0].PunctuatedWord != "Hello" {
+		t.Errorf("expected buffer word unchanged after mutating Words() copy, got %q", remaining[0].PunctuatedWord)
+	}
+}
+
+func TestBuffer_Words_EmptyBufferReturnsNil(t *testing.T) {
+	buf := NewUtteranceBuffer()
+	if got := buf.Words(); got != nil {
+		t.Fatalf("expected nil from empty Words(), got %v", got)
+	}
+}
+
+func TestBuffer_ConcurrentAccess(t *testing.T) {
+	buf := NewUtteranceBuffer()
+	var wg sync.WaitGroup
+
+	word := transcribe.Word{Speaker: intPtrBuf(0), PunctuatedWord: "hi", Start: 0, End: 0.5}
+
+	// 10 goroutines adding words concurrently
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf.AddWords([]transcribe.Word{word})
+		}()
+	}
+
+	// 5 goroutines calling Words() concurrently
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = buf.Words()
+		}()
+	}
+
+	// 3 goroutines calling Len() concurrently
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = buf.Len()
+		}()
+	}
+
+	wg.Wait()
+	// Drain — Flush and verify we got some words (race detector will catch data races)
+	result := buf.Flush()
+	if len(result) == 0 {
+		t.Fatal("expected some words after concurrent AddWords")
 	}
 }

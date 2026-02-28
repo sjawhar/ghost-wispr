@@ -128,7 +128,13 @@
       <h1>Ghost Wispr</h1>
       <p class="subtitle">Live capture first, session memory second.</p>
     </div>
-    <Controls connected={appState.connected} paused={appState.paused} activeSessionId={appState.activeSessionId} onToggle={togglePause} onEndSession={endSession} />
+    <Controls
+      connected={appState.connected}
+      paused={appState.paused}
+      activeSessionId={appState.activeSessionId}
+      onToggle={togglePause}
+      onEndSession={endSession}
+    />
   </header>
 
   {#if loadingError}

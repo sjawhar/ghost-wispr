@@ -21,6 +21,8 @@
     busy = true
     try {
       await onToggle()
+    } catch (err) {
+      console.error('Failed to toggle recording:', err)
     } finally {
       busy = false
     }
@@ -31,6 +33,8 @@
     endBusy = true
     try {
       await onEndSession()
+    } catch (err) {
+      console.error('Failed to end session:', err)
     } finally {
       endBusy = false
     }

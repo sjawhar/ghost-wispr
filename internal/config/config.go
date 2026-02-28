@@ -233,6 +233,17 @@ func validate(cfg *Config) []string {
 		warnings = append(warnings, fmt.Sprintf("Invalid silence_timeout %q — using default 30s.", cfg.SilenceTimeout))
 	}
 
+	if v := cfg.Transcription.Endpointing; v != "" {
+		if n, err := strconv.Atoi(v); err != nil || n < 0 {
+			warnings = append(warnings, fmt.Sprintf("Invalid transcription.endpointing %q — must be a non-negative integer (ms). Using Deepgram default.", v))
+		}
+	}
+	if v := cfg.Transcription.UtteranceEndMs; v != "" {
+		if n, err := strconv.Atoi(v); err != nil || n < 0 {
+			warnings = append(warnings, fmt.Sprintf("Invalid transcription.utterance_end_ms %q — must be a non-negative integer (ms). Using Deepgram default.", v))
+		}
+	}
+
 	return warnings
 }
 

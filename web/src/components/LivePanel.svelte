@@ -64,6 +64,8 @@
   $effect(() => {
     // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reactive dependency tracking
     segments.length
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reactive dependency tracking
+    interimText
     if (stickToBottom && container) {
       requestAnimationFrame(() => {
         if (container) {
@@ -102,7 +104,7 @@
       <article class="segment-row interim">
         <span class="segment-time"></span>
         <strong class={`segment-speaker ${speakerClass(interimSpeaker)}`}>
-          Speaker {interimSpeaker}
+          {interimSpeaker >= 0 ? `Speaker ${interimSpeaker}` : '...'}
         </strong>
         <span class="segment-text">{interimText}</span>
       </article>

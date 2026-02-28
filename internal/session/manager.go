@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ type Manager struct {
 	summarizer Summarizer
 	hub        EventBroadcaster
 	detector   *Detector
-	buffer   *UtteranceBuffer
+	buffer     *UtteranceBuffer
 
 	mu               sync.Mutex
 	currentSessionID string
@@ -70,25 +71,71 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 		})
 	}
 
-	// Interim result (not final) — broadcast for faded live display.
+	// Interim result (not final) — prepend any buffered words for context, then broadcast.
 	if !mr.IsFinal {
 		if m.hub != nil {
 			speaker := -1
 			startTime := 0.0
-			if len(words) > 0 {
+			broadcastText := sentence
+
+			// Prepend buffered text so the interim display shows the full ongoing utterance.
+			if buffered := m.buffer.Words(); len(buffered) > 0 {
+				var b strings.Builder
+				for _, w := range buffered {
+					if b.Len() > 0 {
+						b.WriteByte(' ')
+					}
+					b.WriteString(w.PunctuatedWord)
+					if speaker == -1 && w.Speaker != nil {
+						speaker = *w.Speaker
+						startTime = w.Start
+					}
+				}
+				if b.Len() > 0 {
+					broadcastText = b.String() + " " + sentence
+				}
+			}
+			// Fall back to current message words for speaker/start.
+			if speaker == -1 && len(words) > 0 {
 				if words[0].Speaker != nil {
 					speaker = *words[0].Speaker
 				}
 				startTime = words[0].Start
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, sentence, startTime)
+			m.hub.BroadcastLiveTranscriptInterim(speaker, broadcastText, startTime)
 		}
 		return nil
+	}
+
+	// If is_final but no word timings provided, create a fallback word (Fix #7).
+	if len(words) == 0 {
+		words = []transcribe.Word{{PunctuatedWord: sentence, Start: 0, End: 0}}
 	}
 
 	// Final result — buffer words until speech_final.
 	m.buffer.AddWords(words)
 	m.detector.OnSpeech()
+
+	// After buffering, broadcast an interim event with full buffer contents
+	// so the UI always reflects what has been confirmed so far.
+	if m.hub != nil {
+		if buffered := m.buffer.Words(); len(buffered) > 0 {
+			var b strings.Builder
+			speaker := -1
+			startTime := 0.0
+			for _, w := range buffered {
+				if b.Len() > 0 {
+					b.WriteByte(' ')
+				}
+				b.WriteString(w.PunctuatedWord)
+				if speaker == -1 && w.Speaker != nil {
+					speaker = *w.Speaker
+					startTime = w.Start
+				}
+			}
+			m.hub.BroadcastLiveTranscriptInterim(speaker, b.String(), startTime)
+		}
+	}
 
 	// If speech_final, flush the buffer and persist/broadcast.
 	if mr.SpeechFinal {
@@ -136,6 +183,11 @@ func (m *Manager) flushBuffer() error {
 }
 
 func (m *Manager) ForceEndSession(ctx context.Context) error {
+	// Flush any buffered words before ending — is_final=true words not yet persisted.
+	if err := m.flushBuffer(); err != nil && !errors.Is(err, ErrNoActiveSession) {
+		// Log flush failure but don't block session end.
+		_ = err
+	}
 	return m.endCurrentSession(ctx)
 }
 
@@ -187,7 +239,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	startedAt := m.currentStartedAt
 	if sessionID == "" {
 		m.mu.Unlock()
-		return nil
+		return ErrNoActiveSession
 	}
 
 	m.mu.Unlock()

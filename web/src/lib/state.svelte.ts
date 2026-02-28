@@ -140,10 +140,14 @@ export function applyEvent(event: WebSocketEvent): void {
       appState.activeSessionId = event.session_id
       appState.activeSessionStartedAt = Date.parse(event.timestamp)
       appState.liveSegments = []
+      appState.interimText = ''
+      appState.interimSpeaker = -1
       return
     case 'session_ended':
       appState.activeSessionId = ''
       appState.activeSessionStartedAt = 0
+      appState.interimText = ''
+      appState.interimSpeaker = -1
       return
     case 'summary_ready':
       applySummaryUpdate(event)
