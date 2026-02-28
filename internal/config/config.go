@@ -18,10 +18,10 @@ const EnvPrefix = "GHOST_WISPR_"
 // Config holds all application configuration. Secrets (API keys) are loaded
 // exclusively from environment variables and never appear in the config file.
 type Preset struct {
-	Description  string `yaml:"description"`
-	SystemPrompt string `yaml:"system_prompt"`
-	UserTemplate string `yaml:"user_template"`
-	Model        string `yaml:"model"`
+	Description  string `yaml:"description" json:"description"`
+	SystemPrompt string `yaml:"system_prompt" json:"system_prompt"`
+	UserTemplate string `yaml:"user_template" json:"user_template"`
+	Model        string `yaml:"model" json:"model"`
 }
 
 type Summarization struct {

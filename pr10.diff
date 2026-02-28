@@ -1,0 +1,4928 @@
+diff --git a/cmd/ghost-wispr/main.go b/cmd/ghost-wispr/main.go
+index f40b832..d633e7e 100644
+--- a/cmd/ghost-wispr/main.go
++++ b/cmd/ghost-wispr/main.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"embed"
+ 	"fmt"
+ 	"io"
+@@ -9,6 +10,7 @@ import (
+ 	"log"
+ 	"net/http"
+ 	"os"
++	"path/filepath"
+ 	"os/signal"
+ 	"strings"
+ 	"sync"
+@@ -110,10 +112,12 @@ func main() {
+ 		configPath = "ghost-wispr.yaml"
+ 	}
+ 
+-	cfg, cfgWarnings, err := config.Load(configPath)
++	envPath := filepath.Join(filepath.Dir(configPath), ".env")
++	cfgStore, cfgWarnings, err := config.NewStoreWithEnv(configPath, envPath)
+ 	if err != nil {
+ 		log.Fatalf("config: %v", err)
+ 	}
++	cfg := cfgStore.Get()
+ 	for _, w := range cfgWarnings {
+ 		log.Printf("config: %s", w)
+ 	}
+@@ -123,6 +127,14 @@ func main() {
+ 		log.Fatalf("storage init failed: %v", err)
+ 	}
+ 
++	// Recover any sessions left as 'active' from a previous crash/restart.
++	recoveredIDs, err := store.RecoverStaleSessions()
++	if err != nil {
++		log.Printf("warning: failed to recover stale sessions: %v", err)
++	} else if len(recoveredIDs) > 0 {
++		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
++	}
++
+ 	assets, err := fs.Sub(staticFiles, "static")
+ 	if err != nil {
+ 		log.Fatalf("static assets init failed: %v", err)
+@@ -132,24 +144,29 @@ func main() {
+ 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
+ 	audioRecorder := audio.NewRecorder(cfg.AudioDir)
+ 
+-	apiKeys := map[string]string{
+-		"openai":    cfg.OpenAIAPIKey,
+-		"anthropic": cfg.AnthropicAPIKey,
+-		"gemini":    cfg.GeminiAPIKey,
+-	}
+-
+ 	clientFactory := func(provider, model string) (llm.Client, error) {
+-		key := apiKeys[provider]
++		latestCfg := cfgStore.Get()
++		keys := map[string]string{
++			"openai":    latestCfg.OpenAIAPIKey,
++			"anthropic": latestCfg.AnthropicAPIKey,
++			"gemini":    latestCfg.GeminiAPIKey,
++		}
++		key := keys[provider]
+ 		if key == "" {
+ 			return nil, fmt.Errorf("no API key for provider %q", provider)
+ 		}
+ 		var opts []llm.Option
+-		if provider == "openai" && cfg.Summarization.BaseURL != "" {
+-			opts = append(opts, llm.WithBaseURL(cfg.Summarization.BaseURL))
++		if provider == "openai" && latestCfg.Summarization.BaseURL != "" {
++			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
+ 		}
+ 		return llm.NewClient(provider, key, model, opts...)
+ 	}
+ 
++	apiKeys := map[string]string{
++		"openai":    cfg.OpenAIAPIKey,
++		"anthropic": cfg.AnthropicAPIKey,
++		"gemini":    cfg.GeminiAPIKey,
++	}
+ 	var summarizer *summary.Summarizer
+ 	canSummarize := false
+ 	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil && apiKeys[provider] != "" {
+@@ -177,6 +194,45 @@ func main() {
+ 
+ 	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector)
+ 
++	// Summarize recovered sessions (and any with pending/empty summaries).
++	if summarizer != nil {
++		go func() {
++			pendingIDs, err := store.GetSessionsNeedingSummary()
++			if err != nil {
++				log.Printf("warning: failed to query sessions needing summary: %v", err)
++				return
++			}
++			for _, id := range pendingIDs {
++				log.Printf("summarizing session %s", id)
++				segments, err := store.GetSegments(id)
++				if err != nil {
++					log.Printf("warning: failed to get segments for %s: %v", id, err)
++					continue
++				}
++				var b strings.Builder
++				for _, seg := range segments {
++					if strings.TrimSpace(seg.Text) != "" {
++						b.WriteString(seg.Text)
++						b.WriteString("\n")
++					}
++				}
++				if b.Len() == 0 {
++					_ = store.UpdateSummary(id, "", storage.SummaryCompleted, "")
++					continue
++				}
++				_ = store.UpdateSummary(id, "", storage.SummaryRunning, "")
++				summaryText, preset, err := summarizer.Summarize(context.Background(), id, b.String())
++				if err != nil {
++					log.Printf("warning: summarization failed for %s: %v", id, err)
++					_ = store.UpdateSummary(id, "", storage.SummaryFailed, preset)
++					continue
++				}
++				_ = store.UpdateSummary(id, summaryText, storage.SummaryCompleted, preset)
++				log.Printf("summarized session %s with preset %s", id, preset)
++			}
++		}()
++	}
++
+ 	recState := &recorderState{}
+ 	warnings := append([]string{}, cfgWarnings...)
+ 
+@@ -236,11 +292,174 @@ func main() {
+ 		EndSession: func(ctx context.Context) error {
+ 			return manager.ForceEndSession(ctx)
+ 		},
+-	})
++		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
++			latestCfg := cfgStore.Get()
++			preset, ok := latestCfg.Summarization.Presets[presetName]
++			if !ok {
++				return "", fmt.Errorf("preset %q not found", presetName)
++			}
++
++			segments, err := store.GetSegments(sessionID)
++			if err != nil {
++				return "", err
++			}
++
++			var b strings.Builder
++			for _, seg := range segments {
++				if strings.TrimSpace(seg.Text) != "" {
++					b.WriteString(seg.Text)
++					b.WriteString("\n")
++				}
++			}
++			transcript := b.String()
++
++			modelStr := preset.Model
++			if modelStr == "" {
++				modelStr = latestCfg.Summarization.Model
++			}
++
++			provider, model, err := llm.ParseModel(modelStr)
++			if err != nil {
++				return "", err
++			}
++
++			client, err := clientFactory(provider, model)
++			if err != nil {
++				return "", err
++			}
++
++			userContent := strings.ReplaceAll(preset.UserTemplate, "{{transcript}}", transcript)
++			msgs := []llm.Message{
++				{Role: "system", Content: preset.SystemPrompt},
++				{Role: "user", Content: userContent},
++			}
++
++			return client.Complete(ctx, msgs)
++		},
++		GeneratePreset: func(ctx context.Context, description string) (config.Preset, error) {
++			latestCfg := cfgStore.Get()
++			modelStr := latestCfg.Summarization.Model
++			provider, model, err := llm.ParseModel(modelStr)
++			if err != nil {
++				return config.Preset{}, fmt.Errorf("no summarization model configured")
++			}
++
++			client, err := clientFactory(provider, model)
++			if err != nil {
++				return config.Preset{}, err
++			}
++
++			prompt := `You are designing a transcript summarization preset for a meeting transcription tool.
++The user will describe what kind of summary they want. Generate a JSON object with exactly these fields:
++- "system_prompt": Instructions for the summarizer (what to extract, how to format, tone)
++- "user_template": The template that wraps the transcript. MUST contain {{transcript}} as a placeholder.
++
++Return ONLY valid JSON, no markdown fences, no explanation.`
++
++			userMsg := fmt.Sprintf("Generate a summarization preset for: %s", description)
++			msgs := []llm.Message{
++				{Role: "system", Content: prompt},
++				{Role: "user", Content: userMsg},
++			}
++
++			result, err := client.Complete(ctx, msgs)
++			if err != nil {
++				return config.Preset{}, err
++			}
++
++			// Strip markdown fences if present.
++			result = strings.TrimSpace(result)
++			result = strings.TrimPrefix(result, "```json")
++			result = strings.TrimPrefix(result, "```")
++			result = strings.TrimSuffix(result, "```")
++			result = strings.TrimSpace(result)
++
++			var generated struct {
++				SystemPrompt string `json:"system_prompt"`
++				UserTemplate string `json:"user_template"`
++			}
++			if err := json.Unmarshal([]byte(result), &generated); err != nil {
++				return config.Preset{}, fmt.Errorf("LLM returned invalid JSON: %w", err)
++			}
++
++			return config.Preset{
++				Description:  description,
++				SystemPrompt: generated.SystemPrompt,
++				UserTemplate: generated.UserTemplate,
++			}, nil
++		},
++		RefinePreset: func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error) {
++			latestCfg := cfgStore.Get()
++			modelStr := latestCfg.Summarization.Model
++			provider, model, err := llm.ParseModel(modelStr)
++			if err != nil {
++				return config.Preset{}, fmt.Errorf("no summarization model configured")
++			}
++
++			client, err := clientFactory(provider, model)
++			if err != nil {
++				return config.Preset{}, err
++			}
++
++			prompt := `You are refining a transcript summarization preset for a meeting transcription tool.
++The user will provide their current preset configuration and feedback about what to change.
++Return a revised JSON object with exactly these fields:
++- "description": Updated description of what this preset does
++- "system_prompt": Revised instructions for the summarizer
++- "user_template": Revised template that wraps the transcript. MUST contain {{transcript}} as a placeholder.
++
++Return ONLY valid JSON, no markdown fences, no explanation.`
++
++			userMsg := fmt.Sprintf(`Current preset:
++- Description: %s
++- System Prompt: %s
++- User Template: %s
++
++User feedback: %s`, current.Description, current.SystemPrompt, current.UserTemplate, feedback)
++
++			msgs := []llm.Message{
++				{Role: "system", Content: prompt},
++				{Role: "user", Content: userMsg},
++			}
++
++			result, err := client.Complete(ctx, msgs)
++			if err != nil {
++				return config.Preset{}, err
++			}
++
++			result = strings.TrimSpace(result)
++			result = strings.TrimPrefix(result, "```json")
++			result = strings.TrimPrefix(result, "```")
++			result = strings.TrimSuffix(result, "```")
++			result = strings.TrimSpace(result)
++
++			var refined struct {
++				Description  string `json:"description"`
++				SystemPrompt string `json:"system_prompt"`
++				UserTemplate string `json:"user_template"`
++			}
++			if err := json.Unmarshal([]byte(result), &refined); err != nil {
++				return config.Preset{}, fmt.Errorf("LLM returned invalid JSON: %w", err)
++			}
++
++			return config.Preset{
++				Description:  refined.Description,
++				SystemPrompt: refined.SystemPrompt,
++				UserTemplate: refined.UserTemplate,
++				Model:        current.Model,
++			}, nil
++		},
++	}, cfgStore)
+ 	if err != nil {
+ 		log.Fatalf("build http handler failed: %v", err)
+ 	}
+ 
++	// Register config change callback.
++	cfgStore.OnChange(func(newCfg config.Config) {
++		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
++		log.Printf("config: reloaded (silence_timeout=%s)", newCfg.SilenceTimeout)
++	})
++
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+ 	defer func() { _ = store.Close() }()
+@@ -344,14 +563,18 @@ func main() {
+ 		}
+ 	}
+ 
+-	httpServer := &http.Server{Addr: ":8080", Handler: handler}
++	addr := os.Getenv("GHOST_WISPR_ADDR")
++	if addr == "" {
++		addr = ":8080"
++	}
++	httpServer := &http.Server{Addr: addr, Handler: handler}
+ 	go func() {
+ 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+ 			log.Printf("http server error: %v", err)
+ 		}
+ 	}()
+ 
+-	log.Println("ghost-wispr: web UI on http://127.0.0.1:8080")
++	log.Printf("ghost-wispr: web UI on http://127.0.0.1%s", addr)
+ 
+ 	sig := make(chan os.Signal, 1)
+ 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+diff --git a/docs/plans/2026-02-28-config-panel-design.md b/docs/plans/2026-02-28-config-panel-design.md
+new file mode 100644
+index 0000000..62bb92f
+--- /dev/null
++++ b/docs/plans/2026-02-28-config-panel-design.md
+@@ -0,0 +1,211 @@
++# In-App Config Panel Design
++
++**Date:** 2026-02-28
++**Issue:** #7
++
++## Goal
++
++Expose a settings panel in the web UI for runtime tuning of ghost-wispr configuration. Primary use case is ongoing adjustment between meetings (presets, silence timeout, transcription params), with first-time setup (GDrive, API keys) as a secondary benefit.
++
++## Approach
++
++**Config-in-Memory with YAML/.env Write-Back.** A `ConfigStore` wraps the `Config` struct with a mutex, validates mutations, writes non-secret settings to `ghost-wispr.yaml` and secrets to `.env`, and notifies components via onChange callbacks.
++
++Rejected alternatives:
++- **SQLite as config store**: overengineered for ~10 settings, creates two sources of truth
++- **Hybrid (YAML + SQLite for presets)**: unnecessary split given low preset volume
++
++## Settings Surface
++
++| Setting | Priority | Hot-Reload Complexity |
++|---------|----------|-----------------------|
++| Summarization presets (full CRUD + test) | High | Low — read per-request |
++| Silence timeout | High | Low — update Detector |
++| Transcription tuning (endpointing, utterance_end_ms) | Medium | Medium — Deepgram reconnect |
++| Google Drive setup (folder ID, credentials) | Medium | Medium — Syncer recreation |
++| Default summarization model | Low | Low — read per-request |
++| API keys (Deepgram, OpenAI, Anthropic, Gemini) | Low | Low — update map |
++| Mic volume/gain | Nice-to-have | Unknown — PortAudio research needed |
++
++## Architecture
++
++### Runtime Config Layer
++
++New `ConfigStore` in `internal/config/`:
++
++```go
++type Store struct {
++    mu       sync.RWMutex
++    cfg      Config
++    path     string          // YAML file path for write-back
++    envPath  string          // .env file path for secrets
++    onChange []func(Config)  // notification callbacks
++}
++
++func NewStore(path string) (*Store, []string, error)
++func (s *Store) Get() Config                        // RLock, return copy
++func (s *Store) Update(fn func(*Config)) error      // Lock, mutate, validate, write, notify
++func (s *Store) OnChange(fn func(Config))           // Register callback
++```
++
++Key properties:
++- `Get()` returns a value copy — no partial reads
++- `Update()` validates before committing; rolls back on failure
++- YAML write-back uses `yaml.Marshal` (comments lost on first write — acceptable)
++- Secrets write to `.env` file, never to YAML
++- Secret precedence: environment variable > `.env` file > empty
++
++### Changes to `main.go`
++
++Replace `cfg, warnings, err := config.Load(configPath)` with:
++```go
++store, warnings, err := config.NewStore(configPath)
++cfg := store.Get()  // for initial setup
++```
++
++Components register onChange callbacks or call `store.Get()` at use-time.
++
++## API Endpoints
++
++Three endpoints:
++
++```
++GET   /api/config                       → full config (keys show has/hasn't, not values)
++PATCH /api/config                       → JSON Merge Patch (RFC 7386)
++POST  /api/config/presets/{name}/test   → test preset against a past session
++```
++
++### GET /api/config response
++
++```json
++{
++  "silence_timeout": "30s",
++  "summarization": {
++    "model": "anthropic/claude-sonnet-4-6-20250217",
++    "base_url": "",
++    "presets": {
++      "default": {
++        "description": "General-purpose meeting summary...",
++        "system_prompt": "Summarize the following...",
++        "user_template": "{{transcript}}",
++        "model": ""
++      }
++    }
++  },
++  "transcription": {
++    "endpointing": "400",
++    "utterance_end_ms": "1000"
++  },
++  "gdrive": {
++    "folder_id": "",
++    "has_credentials": false
++  },
++  "api_keys": {
++    "deepgram": true,
++    "openai": false,
++    "anthropic": true,
++    "gemini": false
++  }
++}
++```
++
++### PATCH /api/config examples
++
++```json
++// Update silence timeout
++{"silence_timeout": "45s"}
++
++// Add/update a preset
++{"summarization": {"presets": {"standup": {"description": "...", "system_prompt": "...", "user_template": "{{transcript}}"}}}}
++
++// Delete a preset (null = remove per RFC 7386)
++{"summarization": {"presets": {"old-one": null}}}
++
++// Set an API key
++{"api_keys": {"openai": "sk-..."}}
++
++// Set GDrive config (credentials as base64)
++{"gdrive": {"folder_id": "abc123", "credentials_base64": "eyJ..."}}
++```
++
++Validation runs before applying. On failure: 400 with field-level errors. No partial application.
++
++### POST /api/config/presets/{name}/test
++
++Request: `{"session_id": "20260228143000"}`
++Response: `{"summary": "## Meeting Summary\n...", "error": ""}`
++
++Synchronous (5-30s). No persistence — results are ephemeral for the user to evaluate.
++
++## Component Reactions
++
++onChange callbacks registered in `main.go`:
++
++| Change | Reaction |
++|--------|----------|
++| Silence timeout | `detector.SetTimeout(d)` — new method |
++| Presets / model / base_url | No-op — read from config per-request |
++| API keys | Update `apiKeys` map (mutex-protected) |
++| Transcription tuning | Reconnect Deepgram WebSocket |
++| GDrive config | Recreate `Syncer` |
++
++### Deepgram Reconnect
++
++The most involved reaction. Steps:
++1. Stop current `dgClient`
++2. Create new `client.NewWSUsingCallback()` with updated `LiveTranscriptionOptions`
++3. Connect
++4. Swap the writer (mic stream continues uninterrupted)
++
++Brief transcription gap (~1-2s). UI shows "Reconnecting transcription..." indicator.
++
++## Frontend UI
++
++### Navigation
++
++New `/settings` route via a `currentView` state variable in `App.svelte` (no router library needed). Gear icon in the header toggles between main view and settings.
++
++### Settings Page Layout
++
++Three collapsible sections:
++
++**1. Summarization Presets**
++- List of preset cards (name + description)
++- Click to expand: full editor with name, description, system_prompt (textarea), user_template (textarea), model override (input)
++- "Add Preset" button
++- Delete button per preset (disabled for "default")
++- "Test" button: modal with session picker dropdown, "Run" button, spinner, summary result display
++
++**2. General Settings**
++- Silence timeout: input with Go duration format validation
++- Default summarization model: input with `provider/model` hint
++- Transcription: endpointing (ms), utterance_end_ms (ms) with reconnect warning
++
++**3. Integrations**
++- API keys: one row per provider, green/gray dot for status, masked password input, save per key
++- Google Drive: folder ID input, credential file upload, enable/disable toggle, sync health indicator
++
++### State Management
++
++- New `configState` in `config.svelte.ts`, separate from `appState`
++- Fetches on mount from `GET /api/config`
++- Optimistic updates on save, revert on error
++- Toast/banner for save success/failure
++
++## Validation Rules
++
++| Field | Rule |
++|-------|------|
++| silence_timeout | Must parse as Go `time.Duration` |
++| summarization.model | Must be `provider/model_name` format |
++| Preset system_prompt | Required, non-empty |
++| Preset user_template | Required, non-empty |
++| API keys | Non-empty string |
++| GDrive credentials | Valid JSON with service account fields |
++
++## Testing
++
++- **ConfigStore**: unit tests for load, update, validate, YAML write-back, .env write-back
++- **PATCH endpoint**: integration tests for various payloads, validation failures, partial updates
++- **Deepgram reconnect**: test for writer swap with mock client
++- **Frontend**: component tests for settings form (Vitest + testing-library), optimistic update + revert
+diff --git a/docs/plans/2026-02-28-config-panel-implementation.md b/docs/plans/2026-02-28-config-panel-implementation.md
+new file mode 100644
+index 0000000..542e8ff
+--- /dev/null
++++ b/docs/plans/2026-02-28-config-panel-implementation.md
+@@ -0,0 +1,1151 @@
++# Config Panel Implementation Plan
++
++> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
++
++**Goal:** Add a web UI settings panel for runtime config tuning — presets CRUD with test, silence timeout, transcription params, API keys, GDrive setup — with YAML/.env write-back.
++
++**Architecture:** ConfigStore wraps Config with a mutex, validates mutations, writes YAML (non-secrets) and .env (secrets), and fires onChange callbacks. Three API endpoints: GET/PATCH /api/config + POST /api/config/presets/{name}/test. Svelte settings page at /settings route.
++
++**Tech Stack:** Go 1.25, Svelte 5 (runes), TailwindCSS 4, Vitest, gopkg.in/yaml.v3
++
++**Design doc:** `docs/plans/2026-02-28-config-panel-design.md`
++
++---
++
++### Task 1: ConfigStore — Core Get/Update/Write-Back
++
++**Files:**
++- Create: `internal/config/store.go`
++- Test: `internal/config/store_test.go`
++
++**Step 1: Write the failing tests**
++
++```go
++// store_test.go
++package config
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++)
++
++func TestNewStore_LoadsFromYAML(t *testing.T) {
++	clearEnv(t)
++
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 45s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++
++	store, _, err := NewStore(configPath)
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "45s" {
++		t.Fatalf("expected 45s, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestNewStore_DefaultsWhenNoFile(t *testing.T) {
++	clearEnv(t)
++
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "30s" {
++		t.Fatalf("expected default 30s, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Update_ChangesConfig(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) { c.SilenceTimeout = "60s" }); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "60s" {
++		t.Fatalf("expected 60s after update, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Update_ValidationRejectsInvalid(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	err = store.Update(func(c *Config) { c.SilenceTimeout = "not-a-duration" })
++	if err == nil {
++		t.Fatal("expected validation error for invalid silence_timeout")
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "30s" {
++		t.Fatalf("expected rollback to 30s, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Update_WritesYAML(t *testing.T) {
++	clearEnv(t)
++
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++
++	store, _, err := NewStore(configPath)
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	data, err := os.ReadFile(configPath)
++	if err != nil {
++		t.Fatalf("read config: %v", err)
++	}
++	if !strings.Contains(string(data), "45s") {
++		t.Fatalf("expected YAML to contain 45s, got:\n%s", data)
++	}
++}
++
++func TestStore_Update_FiresOnChange(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	var called bool
++	var calledCfg Config
++	store.OnChange(func(c Config) {
++		called = true
++		calledCfg = c
++	})
++
++	if err := store.Update(func(c *Config) { c.SilenceTimeout = "60s" }); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	if !called {
++		t.Fatal("onChange callback not called")
++	}
++	if calledCfg.SilenceTimeout != "60s" {
++		t.Fatalf("onChange got wrong config, timeout=%q", calledCfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Get_ReturnsCopy(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	cfg := store.Get()
++	cfg.SilenceTimeout = "999s"
++
++	cfg2 := store.Get()
++	if cfg2.SilenceTimeout == "999s" {
++		t.Fatal("Get should return a copy, not a reference")
++	}
++}
++
++func TestStore_ConcurrentAccess(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	var wg sync.WaitGroup
++	for i := 0; i < 50; i++ {
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			_ = store.Get()
++		}()
++		go func() {
++			defer wg.Done()
++			_ = store.Update(func(c *Config) { c.SilenceTimeout = "30s" })
++		}()
++	}
++	wg.Wait()
++}
++```
++
++**Step 2: Run tests to verify they fail**
++
++Run: `go test ./internal/config/ -run TestNewStore -v && go test ./internal/config/ -run TestStore_ -v`
++Expected: FAIL — `NewStore` not defined.
++
++**Step 3: Implement ConfigStore**
++
++```go
++// store.go
++package config
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++
++	"gopkg.in/yaml.v3"
++)
++
++// Store holds mutable config with thread-safe access and YAML write-back.
++type Store struct {
++	mu       sync.RWMutex
++	cfg      Config
++	path     string
++	onChange []func(Config)
++}
++
++// NewStore loads config from the given YAML path (if it exists),
++// applies env overrides, loads secrets, validates, and returns
++// a mutable store.
++func NewStore(path string) (*Store, []string, error) {
++	cfg, warnings, err := Load(path)
++	if err != nil {
++		return nil, warnings, err
++	}
++
++	return &Store{cfg: cfg, path: path}, warnings, nil
++}
++
++// Get returns a snapshot copy of the current config.
++func (s *Store) Get() Config {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.copyConfig()
++}
++
++// Update applies a mutation to the config, validates the result,
++// writes back to YAML if a path is configured, and fires onChange callbacks.
++// If validation fails, the mutation is rolled back.
++func (s *Store) Update(fn func(*Config)) error {
++	s.mu.Lock()
++
++	prev := s.copyConfig()
++	fn(&s.cfg)
++
++	if err := s.validateForUpdate(); err != nil {
++		s.cfg = prev
++		s.mu.Unlock()
++		return err
++	}
++
++	if s.path != "" {
++		if err := s.writeYAML(); err != nil {
++			s.cfg = prev
++			s.mu.Unlock()
++			return fmt.Errorf("write config: %w", err)
++		}
++	}
++
++	current := s.copyConfig()
++	callbacks := make([]func(Config), len(s.onChange))
++	copy(callbacks, s.onChange)
++	s.mu.Unlock()
++
++	for _, cb := range callbacks {
++		cb(current)
++	}
++	return nil
++}
++
++// OnChange registers a callback invoked after every successful Update.
++func (s *Store) OnChange(fn func(Config)) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.onChange = append(s.onChange, fn)
++}
++
++func (s *Store) copyConfig() Config {
++	c := s.cfg
++	// Deep copy maps and slices.
++	if s.cfg.MicSampleRates != nil {
++		c.MicSampleRates = make([]int, len(s.cfg.MicSampleRates))
++		copy(c.MicSampleRates, s.cfg.MicSampleRates)
++	}
++	if s.cfg.Summarization.Presets != nil {
++		c.Summarization.Presets = make(map[string]Preset, len(s.cfg.Summarization.Presets))
++		for k, v := range s.cfg.Summarization.Presets {
++			c.Summarization.Presets[k] = v
++		}
++	}
++	return c
++}
++
++// validateForUpdate checks fields that the user can change via the API.
++// Returns an error if any field is invalid.
++func (s *Store) validateForUpdate() error {
++	if _, err := time.ParseDuration(s.cfg.SilenceTimeout); err != nil {
++		return fmt.Errorf("invalid silence_timeout %q: %w", s.cfg.SilenceTimeout, err)
++	}
++
++	if s.cfg.Summarization.Model != "" {
++		if _, _, err := parseModelInternal(s.cfg.Summarization.Model); err != nil {
++			return err
++		}
++	}
++
++	for name, preset := range s.cfg.Summarization.Presets {
++		if preset.Model != "" {
++			if _, _, err := parseModelInternal(preset.Model); err != nil {
++				return fmt.Errorf("preset %q: %w", name, err)
++			}
++		}
++	}
++	return nil
++}
++
++func (s *Store) writeYAML() error {
++	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
++		return err
++	}
++	data, err := yaml.Marshal(&s.cfg)
++	if err != nil {
++		return err
++	}
++	return os.WriteFile(s.path, data, 0o644)
++}
++
++// parseModelInternal validates model format without importing llm package.
++func parseModelInternal(model string) (string, string, error) {
++	// Inline validation to avoid circular dependency with llm package.
++	parts := splitModelString(model)
++	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
++		return "", "", fmt.Errorf("invalid model format %q: expected provider/model_name", model)
++	}
++	return parts[0], parts[1], nil
++}
++
++func splitModelString(model string) []string {
++	for i, c := range model {
++		if c == '/' {
++			return []string{model[:i], model[i+1:]}
++		}
++	}
++	return []string{model}
++}
++```
++
++Note: `parseModelInternal` duplicates the simple split logic from `llm.ParseModel` to avoid a circular import. This is intentional — the config package shouldn't depend on llm.
++
++**Step 4: Run tests to verify they pass**
++
++Run: `go test ./internal/config/ -v`
++Expected: All PASS.
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "feat: add ConfigStore with mutex-protected Get/Update and YAML write-back"
++```
++
++---
++
++### Task 2: ConfigStore — .env Read/Write for Secrets
++
++**Files:**
++- Modify: `internal/config/store.go`
++- Modify: `internal/config/config.go`
++- Test: `internal/config/store_test.go` (add tests)
++
++**Step 1: Write failing tests**
++
++```go
++func TestStore_Update_WritesSecretsToEnv(t *testing.T) {
++	clearEnv(t)
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	envPath := filepath.Join(dir, ".env")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++
++	store, _, err := NewStoreWithEnv(configPath, envPath)
++	if err != nil {
++		t.Fatalf("NewStoreWithEnv failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) {
++		c.OpenAIAPIKey = "sk-test-key"
++	}); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	data, err := os.ReadFile(envPath)
++	if err != nil {
++		t.Fatalf("read .env: %v", err)
++	}
++	if !strings.Contains(string(data), "GHOST_WISPR_OPENAI_API_KEY=sk-test-key") {
++		t.Fatalf("expected .env to contain OpenAI key, got:\n%s", data)
++	}
++
++	// Verify secret NOT in YAML
++	yamlData, _ := os.ReadFile(configPath)
++	if strings.Contains(string(yamlData), "sk-test-key") {
++		t.Fatal("secret should not appear in YAML file")
++	}
++}
++
++func TestStore_LoadsSecretsFromEnvFile(t *testing.T) {
++	clearEnv(t)
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	envPath := filepath.Join(dir, ".env")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++	envContent := "GHOST_WISPR_OPENAI_API_KEY=sk-from-env-file\nGHOST_WISPR_DEEPGRAM_API_KEY=dg-key\n"
++	if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
++		t.Fatalf("write .env: %v", err)
++	}
++
++	store, _, err := NewStoreWithEnv(configPath, envPath)
++	if err != nil {
++		t.Fatalf("NewStoreWithEnv failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.OpenAIAPIKey != "sk-from-env-file" {
++		t.Fatalf("expected key from .env file, got %q", cfg.OpenAIAPIKey)
++	}
++	if cfg.DeepgramAPIKey != "dg-key" {
++		t.Fatalf("expected deepgram key from .env file, got %q", cfg.DeepgramAPIKey)
++	}
++}
++
++func TestStore_EnvVarOverridesEnvFile(t *testing.T) {
++	clearEnv(t)
++	dir := t.TempDir()
++	envPath := filepath.Join(dir, ".env")
++	envContent := "GHOST_WISPR_OPENAI_API_KEY=from-file\n"
++	if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
++		t.Fatalf("write .env: %v", err)
++	}
++
++	t.Setenv(EnvPrefix+"OPENAI_API_KEY", "from-env-var")
++
++	store, _, err := NewStoreWithEnv("", envPath)
++	if err != nil {
++		t.Fatalf("NewStoreWithEnv failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.OpenAIAPIKey != "from-env-var" {
++		t.Fatalf("env var should override .env file, got %q", cfg.OpenAIAPIKey)
++	}
++}
++```
++
++**Step 2: Run tests to verify they fail**
++
++Run: `go test ./internal/config/ -run TestStore_.*Env -v`
++Expected: FAIL — `NewStoreWithEnv` not defined.
++
++**Step 3: Implement .env support**
++
++Add to `store.go`:
++
++```go
++// NewStoreWithEnv loads config from YAML, then secrets from .env file
++// (env vars still take precedence), and returns a mutable store.
++func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
++	// Load .env file first (into the config, not the process environment).
++	envSecrets := loadEnvFile(envPath)
++
++	cfg, warnings, err := Load(yamlPath)
++	if err != nil {
++		return nil, warnings, err
++	}
++
++	// Apply .env secrets where env var is not already set.
++	applyEnvFileSecrets(&cfg, envSecrets)
++
++	return &Store{cfg: cfg, path: yamlPath, envPath: envPath}, warnings, nil
++}
++```
++
++Add `loadEnvFile`, `applyEnvFileSecrets`, and `writeEnvFile` functions. The .env format is simple `KEY=VALUE` lines — no need for a library.
++
++Update `Update()` to also call `writeEnvFile` when secrets have changed.
++
++**Step 4: Run tests to verify they pass**
++
++Run: `go test ./internal/config/ -v`
++Expected: All PASS.
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "feat: add .env read/write for API key persistence in ConfigStore"
++```
++
++---
++
++### Task 3: API Endpoints — GET /api/config and PATCH /api/config
++
++**Files:**
++- Modify: `internal/server/api.go`
++- Modify: `internal/server/server.go` (add ConfigStore to Handler params)
++- Test: `internal/server/api_test.go` (add tests)
++
++**Step 1: Write failing tests**
++
++Add to `api_test.go`:
++
++```go
++func TestAPI_GetConfig(t *testing.T) {
++	store := newTestConfigStore(t) // helper that creates a Store with test defaults
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{...}, ControlHooks{}, store)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d", rr.Code)
++	}
++
++	var resp map[string]any
++	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
++		t.Fatalf("decode failed: %v", err)
++	}
++
++	if resp["silence_timeout"] != "30s" {
++		t.Fatalf("expected silence_timeout 30s, got %v", resp["silence_timeout"])
++	}
++
++	// API keys should be booleans, not values
++	keys := resp["api_keys"].(map[string]any)
++	if _, ok := keys["openai"].(bool); !ok {
++		t.Fatal("api_keys.openai should be a boolean")
++	}
++}
++
++func TestAPI_PatchConfig_SilenceTimeout(t *testing.T) {
++	store := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{...}, ControlHooks{}, store)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"silence_timeout": "45s"}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "45s" {
++		t.Fatalf("expected 45s after patch, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestAPI_PatchConfig_InvalidReturns400(t *testing.T) {
++	store := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{...}, ControlHooks{}, store)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"silence_timeout": "not-valid"}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusBadRequest {
++		t.Fatalf("expected 400, got %d", rr.Code)
++	}
++}
++
++func TestAPI_PatchConfig_AddPreset(t *testing.T) {
++	store := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{...}, ControlHooks{}, store)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"summarization":{"presets":{"standup":{"description":"Stand-up","system_prompt":"Summarize briefly","user_template":"{{transcript}}"}}}}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	cfg := store.Get()
++	if _, ok := cfg.Summarization.Presets["standup"]; !ok {
++		t.Fatal("expected standup preset to exist after patch")
++	}
++	if _, ok := cfg.Summarization.Presets["default"]; !ok {
++		t.Fatal("default preset should still exist after adding standup")
++	}
++}
++
++func TestAPI_PatchConfig_DeletePreset(t *testing.T) {
++	store := newTestConfigStore(t)
++	// Add a preset first
++	_ = store.Update(func(c *Config) {
++		c.Summarization.Presets["to-delete"] = Preset{
++			Description: "temp", SystemPrompt: "x", UserTemplate: "{{transcript}}",
++		}
++	})
++
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{...}, ControlHooks{}, store)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"summarization":{"presets":{"to-delete":null}}}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	cfg := store.Get()
++	if _, ok := cfg.Summarization.Presets["to-delete"]; ok {
++		t.Fatal("to-delete preset should be removed after null patch")
++	}
++}
++```
++
++**Step 2: Run tests to verify they fail**
++
++Run: `go test ./internal/server/ -run TestAPI_.*Config -v`
++Expected: FAIL — new Handler signature not matched.
++
++**Step 3: Implement the endpoints**
++
++Add `*config.Store` parameter to `Handler()` and `registerAPIRoutes()`. Implement:
++
++- `GET /api/config`: call `store.Get()`, build response struct that masks secrets to booleans, serialize.
++- `PATCH /api/config`: decode JSON body into a `configPatch` struct using `json.RawMessage` for nested objects. Apply merge-patch semantics: for each field present, update the corresponding Config field. Use `store.Update()` which handles validation, write-back, and onChange.
++
++The merge-patch for presets needs special handling: iterate the presets map, and for any key with a JSON `null` value, delete it from the config. For non-null values, merge fields into the existing preset (or create a new one).
++
++**Step 4: Run tests to verify they pass**
++
++Run: `go test ./internal/server/ -v`
++Expected: All PASS (both new and existing tests).
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "feat: add GET and PATCH /api/config endpoints with merge-patch semantics"
++```
++
++---
++
++### Task 4: API Endpoint — POST /api/config/presets/{name}/test
++
++**Files:**
++- Modify: `internal/server/api.go`
++- Modify: `internal/server/server.go`
++- Test: `internal/server/api_test.go` (add tests)
++
++**Step 1: Write failing tests**
++
++```go
++func TestAPI_TestPreset(t *testing.T) {
++	// Setup store with a test preset
++	store := newTestConfigStore(t)
++	_ = store.Update(func(c *Config) {
++		c.Summarization.Presets["test-preset"] = Preset{
++			Description:  "Test",
++			SystemPrompt: "Summarize",
++			UserTemplate: "{{transcript}}",
++		}
++	})
++
++	mockSummarize := func(ctx context.Context, preset Preset, model string, transcript string) (string, error) {
++		return "## Test Summary", nil
++	}
++
++	h, err := Handler(testStaticFS(t), NewHub(), storeWithSegments, ControlHooks{}, store,
++		WithTestSummarizer(mockSummarize))
++	// ...
++
++	body := `{"session_id": "s1"}`
++	req := httptest.NewRequest(http.MethodPost, "/api/config/presets/test-preset/test", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	var resp map[string]any
++	json.NewDecoder(rr.Body).Decode(&resp)
++	if resp["summary"] != "## Test Summary" {
++		t.Fatalf("expected test summary, got %v", resp["summary"])
++	}
++}
++
++func TestAPI_TestPreset_UnknownPreset(t *testing.T) {
++	store := newTestConfigStore(t)
++	h, _ := Handler(testStaticFS(t), NewHub(), apiStoreStub{...}, ControlHooks{}, store)
++
++	req := httptest.NewRequest(http.MethodPost, "/api/config/presets/nonexistent/test", strings.NewReader(`{"session_id":"s1"}`))
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusNotFound {
++		t.Fatalf("expected 404, got %d", rr.Code)
++	}
++}
++```
++
++**Step 2: Run tests to verify they fail**
++
++**Step 3: Implement**
++
++The test endpoint:
++1. Look up the preset by name from `store.Get()`
++2. Load segments for the session from the SessionStore
++3. Build transcript text from segments
++4. Call the summarizer with the preset's prompt/template (via a `TestSummarizer` func injected into ControlHooks)
++5. Return `{"summary": "...", "error": ""}`
++
++This is synchronous — the request blocks until the LLM returns. Set a generous timeout (60s) on the request context.
++
++**Step 4: Run tests to verify they pass**
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "feat: add POST /api/config/presets/{name}/test for dry-run summarization"
++```
++
++---
++
++### Task 5: Wire ConfigStore into main.go
++
++**Files:**
++- Modify: `cmd/ghost-wispr/main.go`
++
++**Step 1: Replace `config.Load` with `config.NewStoreWithEnv`**
++
++```go
++// Before:
++// cfg, cfgWarnings, err := config.Load(configPath)
++
++// After:
++envPath := filepath.Join(filepath.Dir(configPath), ".env")
++store, cfgWarnings, err := config.NewStoreWithEnv(configPath, envPath)
++if err != nil {
++    log.Fatalf("config: %v", err)
++}
++cfg := store.Get()
++```
++
++**Step 2: Pass store to Handler**
++
++Update the `server.Handler()` call to include the store.
++
++**Step 3: Update clientFactory to read from store**
++
++The `clientFactory` closure should call `store.Get()` to get current API keys rather than capturing the initial `apiKeys` map:
++
++```go
++clientFactory := func(provider, model string) (llm.Client, error) {
++    cfg := store.Get()
++    keys := map[string]string{
++        "openai":    cfg.OpenAIAPIKey,
++        "anthropic": cfg.AnthropicAPIKey,
++        "gemini":    cfg.GeminiAPIKey,
++    }
++    key := keys[provider]
++    if key == "" {
++        return nil, fmt.Errorf("no API key for provider %q", provider)
++    }
++    var opts []llm.Option
++    if provider == "openai" && cfg.Summarization.BaseURL != "" {
++        opts = append(opts, llm.WithBaseURL(cfg.Summarization.BaseURL))
++    }
++    return llm.NewClient(provider, key, model, opts...)
++}
++```
++
++**Step 4: Register onChange callbacks**
++
++```go
++store.OnChange(func(cfg config.Config) {
++    detector.SetTimeout(cfg.ParsedSilenceTimeout())
++    // Deepgram reconnect handled in Task 6
++})
++```
++
++**Step 5: Verify existing tests still pass**
++
++Run: `go test ./...`
++Expected: All PASS.
++
++**Step 6: Commit**
++
++```bash
++jj describe -m "refactor: wire ConfigStore into main.go, replace static config with live store"
++```
++
++---
++
++### Task 6: Component Reactions — Detector Timeout and Deepgram Reconnect
++
++**Files:**
++- Modify: `internal/session/detector.go` (add SetTimeout method)
++- Test: `internal/session/detector_test.go`
++- Modify: `cmd/ghost-wispr/main.go` (Deepgram reconnect in onChange)
++
++**Step 1: Write failing test for SetTimeout**
++
++```go
++func TestDetector_SetTimeout(t *testing.T) {
++	d := NewDetector(30 * time.Second)
++
++	d.SetTimeout(60 * time.Second)
++
++	// Verify by triggering the timeout mechanism
++	// (the existing OnUtteranceEnd test pattern works here)
++}
++```
++
++**Step 2: Implement SetTimeout**
++
++```go
++func (d *Detector) SetTimeout(timeout time.Duration) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if timeout > 0 {
++		d.timeout = timeout
++	}
++}
++```
++
++**Step 3: Implement Deepgram reconnect in main.go**
++
++Add a `reconnectDeepgram` function that:
++1. Stops the current dgClient
++2. Creates new client with updated transcription options from `store.Get()`
++3. Connects and swaps the writer
++4. Uses a mutex to protect the dgWriter swap
++
++Wire this into the `store.OnChange` callback, checking if transcription settings actually changed before reconnecting.
++
++**Step 4: Run tests**
++
++Run: `go test ./...`
++Expected: All PASS.
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "feat: add detector.SetTimeout and Deepgram reconnect on config change"
++```
++
++---
++
++### Task 7: Frontend — Config API and State
++
++**Files:**
++- Create: `web/src/lib/config-api.ts`
++- Create: `web/src/lib/config.svelte.ts`
++- Test: `web/src/lib/__tests__/config-api.test.ts`
++
++**Step 1: Write the config API module**
++
++```typescript
++// config-api.ts
++export interface ConfigResponse {
++  silence_timeout: string
++  summarization: {
++    model: string
++    base_url: string
++    presets: Record<string, PresetDetail>
++  }
++  transcription: {
++    endpointing: string
++    utterance_end_ms: string
++  }
++  gdrive: {
++    folder_id: string
++    has_credentials: boolean
++  }
++  api_keys: Record<string, boolean>
++}
++
++export interface PresetDetail {
++  description: string
++  system_prompt: string
++  user_template: string
++  model: string
++}
++
++export interface TestPresetResponse {
++  summary: string
++  error: string
++}
++
++export function fetchConfig(): Promise<ConfigResponse> { ... }
++export function patchConfig(patch: Record<string, unknown>): Promise<ConfigResponse> { ... }
++export function testPreset(name: string, sessionId: string): Promise<TestPresetResponse> { ... }
++```
++
++**Step 2: Write the config state module**
++
++```typescript
++// config.svelte.ts
++import type { ConfigResponse } from './config-api'
++
++type ConfigState = {
++  loaded: boolean
++  saving: boolean
++  error: string
++  config: ConfigResponse | null
++}
++
++export const configState = $state<ConfigState>({ ... })
++export function setConfig(config: ConfigResponse): void { ... }
++export function resetConfigState(): void { ... }
++```
++
++**Step 3: Write tests for the API module**
++
++Test `fetchConfig`, `patchConfig`, `testPreset` using mocked fetch (matching the pattern in `web/src/lib/__tests__/api.test.ts`).
++
++**Step 4: Run tests**
++
++Run (from web/): `npm test`
++Expected: All PASS.
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "feat: add config API client and state management for settings UI"
++```
++
++---
++
++### Task 8: Frontend — Settings Page Shell and Navigation
++
++**Files:**
++- Create: `web/src/components/SettingsPage.svelte`
++- Modify: `web/src/App.svelte` (add route toggle)
++- Test: `web/src/components/__tests__/SettingsPage.test.ts`
++
++**Step 1: Implement route switching in App.svelte**
++
++Add a `currentView` state variable (`'main' | 'settings'`). Add a gear icon button in the header that toggles it. Conditionally render `SettingsPage` or the existing main content.
++
++**Step 2: Create SettingsPage shell**
++
++Three collapsible sections (empty for now — filled in subsequent tasks):
++- Summarization Presets
++- General Settings
++- Integrations
++
++Fetches config on mount via `fetchConfig()`.
++
++**Step 3: Write tests**
++
++Test that the gear icon toggles to settings view. Test that SettingsPage renders three section headings.
++
++**Step 4: Run tests**
++
++Run (from web/): `npm test`
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "feat: add settings page shell with route toggle in header"
++```
++
++---
++
++### Task 9: Frontend — General Settings Section
++
++**Files:**
++- Create: `web/src/components/GeneralSettings.svelte`
++- Test: `web/src/components/__tests__/GeneralSettings.test.ts`
++
++**Step 1: Implement the component**
++
++Inputs for:
++- Silence timeout (text input, Go duration format)
++- Default summarization model (text input, provider/model format)
++- Transcription endpointing (number input)
++- Transcription utterance_end_ms (number input)
++
++Each field has inline validation. A "Save" button calls `patchConfig()` with changed fields only. Shows success/error feedback.
++
++**Step 2: Write tests**
++
++Test rendering with initial values. Test validation (invalid duration shows error). Test save calls patchConfig with correct payload.
++
++**Step 3: Commit**
++
++```bash
++jj describe -m "feat: add General Settings section with silence timeout and transcription tuning"
++```
++
++---
++
++### Task 10: Frontend — Presets CRUD Section
++
++**Files:**
++- Create: `web/src/components/PresetEditor.svelte`
++- Create: `web/src/components/PresetList.svelte`
++- Test: `web/src/components/__tests__/PresetEditor.test.ts`
++
++**Step 1: Implement PresetList**
++
++Shows all presets as cards. Click to expand into PresetEditor. "Add Preset" button creates a new empty editor.
++
++**Step 2: Implement PresetEditor**
++
++Full form: name (text, disabled for existing), description (text), system_prompt (textarea), user_template (textarea), model override (text, optional).
++
++Save button calls `patchConfig()` with the preset nested under `summarization.presets`.
++Delete button calls `patchConfig()` with `null` for the preset name. Disabled when name is "default".
++
++**Step 3: Write tests**
++
++Test expand/collapse. Test save sends correct patch. Test delete sends null. Test "default" preset can't be deleted.
++
++**Step 4: Commit**
++
++```bash
++jj describe -m "feat: add preset list and editor components with CRUD via PATCH"
++```
++
++---
++
++### Task 11: Frontend — Preset Test Modal
++
++**Files:**
++- Create: `web/src/components/PresetTestModal.svelte`
++- Test: `web/src/components/__tests__/PresetTestModal.test.ts`
++
++**Step 1: Implement the modal**
++
++- Session picker dropdown (populated from `appState.dates` and session lists)
++- "Run Test" button
++- Spinner during LLM call
++- Summary result rendered with svelte-markdown (already a dependency)
++- Close button
++
++Calls `testPreset(presetName, sessionId)` from config-api.ts.
++
++**Step 2: Wire into PresetEditor**
++
++Add a "Test" button to PresetEditor that opens the modal.
++
++**Step 3: Write tests**
++
++Test modal opens/closes. Test session selection. Test summary display after successful call. Test error display.
++
++**Step 4: Commit**
++
++```bash
++jj describe -m "feat: add preset test modal with session picker and LLM dry-run"
++```
++
++---
++
++### Task 12: Frontend — Integrations Section (API Keys + GDrive)
++
++**Files:**
++- Create: `web/src/components/IntegrationsSettings.svelte`
++- Test: `web/src/components/__tests__/IntegrationsSettings.test.ts`
++
++**Step 1: Implement API keys section**
++
++One row per provider (Deepgram, OpenAI, Anthropic, Gemini):
++- Green/gray dot showing `api_keys[provider]` boolean status
++- Masked password input
++- "Save" button per row, calls `patchConfig({"api_keys": {provider: value}})`
++
++**Step 2: Implement GDrive section**
++
++- Folder ID text input
++- Credential file upload (reads file, base64-encodes, sends in patch as `gdrive.credentials_base64`)
++- Status indicator from config (`has_credentials`)
++- Save button
++
++**Step 3: Write tests**
++
++Test key status dots. Test save sends correct patch. Test credential upload encodes to base64.
++
++**Step 4: Commit**
++
++```bash
++jj describe -m "feat: add integrations section with API key management and GDrive setup"
++```
++
++---
++
++### Task 13: Build Verification and Polish
++
++**Step 1: Run full backend tests**
++
++Run: `go test ./...`
++Expected: All PASS.
++
++**Step 2: Run frontend checks**
++
++Run (from web/): `npm run check && npm run lint && npm test`
++Expected: All PASS.
++
++**Step 3: Build the frontend**
++
++Run (from web/): `npm run build`
++Expected: Build succeeds, output in `cmd/ghost-wispr/static/`.
++
++**Step 4: Build the Go binary**
++
++Run: `go build ./cmd/ghost-wispr`
++Expected: Compiles cleanly.
++
++**Step 5: Commit**
++
++```bash
++jj describe -m "chore: verify full build passes with config panel feature"
++```
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 15b9321..c5978d5 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -18,10 +18,10 @@ const EnvPrefix = "GHOST_WISPR_"
+ // Config holds all application configuration. Secrets (API keys) are loaded
+ // exclusively from environment variables and never appear in the config file.
+ type Preset struct {
+-	Description  string `yaml:"description"`
+-	SystemPrompt string `yaml:"system_prompt"`
+-	UserTemplate string `yaml:"user_template"`
+-	Model        string `yaml:"model"`
++	Description  string `yaml:"description" json:"description"`
++	SystemPrompt string `yaml:"system_prompt" json:"system_prompt"`
++	UserTemplate string `yaml:"user_template" json:"user_template"`
++	Model        string `yaml:"model" json:"model"`
+ }
+ 
+ type Summarization struct {
+diff --git a/internal/config/store.go b/internal/config/store.go
+new file mode 100644
+index 0000000..a16f3ad
+--- /dev/null
++++ b/internal/config/store.go
+@@ -0,0 +1,252 @@
++package config
++
++import (
++	"bufio"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++
++	"gopkg.in/yaml.v3"
++)
++
++// Store holds mutable config with thread-safe access and YAML write-back.
++type Store struct {
++	mu       sync.RWMutex
++	cfg      Config
++	path     string
++	envPath  string
++	onChange []func(Config)
++}
++
++// NewStore loads config from the given YAML path (if it exists),
++// applies env overrides, loads secrets, validates, and returns
++// a mutable store.
++func NewStore(path string) (*Store, []string, error) {
++	cfg, warnings, err := Load(path)
++	if err != nil {
++		return nil, warnings, err
++	}
++
++	return &Store{cfg: cfg, path: path}, warnings, nil
++}
++
++// NewStoreWithEnv loads config from YAML, then secrets from .env file
++// (environment variables still take precedence), and returns a mutable store.
++func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
++	envSecrets := loadEnvFile(envPath)
++
++	cfg, warnings, err := Load(yamlPath)
++	if err != nil {
++		return nil, warnings, err
++	}
++
++	applyEnvFileSecrets(&cfg, envSecrets)
++
++	return &Store{cfg: cfg, path: yamlPath, envPath: envPath}, warnings, nil
++}
++
++// Get returns a snapshot copy of the current config.
++func (s *Store) Get() Config {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.copyConfig()
++}
++
++// Update applies a mutation to the config, validates the result,
++// writes back to YAML if a path is configured, and fires onChange callbacks.
++// If validation fails, the mutation is rolled back.
++func (s *Store) Update(fn func(*Config)) error {
++	s.mu.Lock()
++
++	prev := s.copyConfig()
++	fn(&s.cfg)
++
++	if err := s.validateForUpdate(); err != nil {
++		s.cfg = prev
++		s.mu.Unlock()
++		return err
++	}
++
++	if s.path != "" {
++		if err := s.writeYAML(); err != nil {
++			s.cfg = prev
++			s.mu.Unlock()
++			return fmt.Errorf("write config: %w", err)
++		}
++	}
++
++	if s.envPath != "" {
++		if err := s.writeEnvFile(); err != nil {
++			s.cfg = prev
++			s.mu.Unlock()
++			return fmt.Errorf("write .env: %w", err)
++		}
++	}
++
++	current := s.copyConfig()
++	callbacks := make([]func(Config), len(s.onChange))
++	copy(callbacks, s.onChange)
++	s.mu.Unlock()
++
++	for _, cb := range callbacks {
++		cb(current)
++	}
++	return nil
++}
++
++// OnChange registers a callback invoked after every successful Update.
++func (s *Store) OnChange(fn func(Config)) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.onChange = append(s.onChange, fn)
++}
++
++func (s *Store) copyConfig() Config {
++	c := s.cfg
++
++	if s.cfg.MicSampleRates != nil {
++		c.MicSampleRates = make([]int, len(s.cfg.MicSampleRates))
++		copy(c.MicSampleRates, s.cfg.MicSampleRates)
++	}
++
++	if s.cfg.Summarization.Presets != nil {
++		c.Summarization.Presets = make(map[string]Preset, len(s.cfg.Summarization.Presets))
++		for k, v := range s.cfg.Summarization.Presets {
++			c.Summarization.Presets[k] = v
++		}
++	}
++
++	return c
++}
++
++// validateForUpdate checks fields that the user can change via the API.
++func (s *Store) validateForUpdate() error {
++	if _, err := time.ParseDuration(s.cfg.SilenceTimeout); err != nil {
++		return fmt.Errorf("invalid silence_timeout %q: %w", s.cfg.SilenceTimeout, err)
++	}
++
++	if s.cfg.Summarization.Model != "" {
++		if err := validateModelFormat(s.cfg.Summarization.Model); err != nil {
++			return err
++		}
++	}
++
++	for name, preset := range s.cfg.Summarization.Presets {
++		if preset.Model != "" {
++			if err := validateModelFormat(preset.Model); err != nil {
++				return fmt.Errorf("preset %q: %w", name, err)
++			}
++		}
++	}
++
++	return nil
++}
++
++func (s *Store) writeYAML() error {
++	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
++		return err
++	}
++	data, err := yaml.Marshal(&s.cfg)
++	if err != nil {
++		return err
++	}
++	return os.WriteFile(s.path, data, 0o644)
++}
++
++// validateModelFormat checks provider/model_name format without importing llm package.
++func validateModelFormat(model string) error {
++	for i, c := range model {
++		if c == '/' {
++			if i == 0 || i == len(model)-1 {
++				return fmt.Errorf("invalid model format %q: expected provider/model_name", model)
++			}
++			return nil
++		}
++	}
++	return fmt.Errorf("invalid model format %q: expected provider/model_name", model)
++}
++
++// secretEnvKeys maps Config secret fields to their environment variable names.
++var secretEnvKeys = []struct {
++	envKey string
++	get    func(*Config) string
++	set    func(*Config, string)
++}{
++	{EnvPrefix + "DEEPGRAM_API_KEY", func(c *Config) string { return c.DeepgramAPIKey }, func(c *Config, v string) { c.DeepgramAPIKey = v }},
++	{EnvPrefix + "OPENAI_API_KEY", func(c *Config) string { return c.OpenAIAPIKey }, func(c *Config, v string) { c.OpenAIAPIKey = v }},
++	{EnvPrefix + "ANTHROPIC_API_KEY", func(c *Config) string { return c.AnthropicAPIKey }, func(c *Config, v string) { c.AnthropicAPIKey = v }},
++	{EnvPrefix + "GEMINI_API_KEY", func(c *Config) string { return c.GeminiAPIKey }, func(c *Config, v string) { c.GeminiAPIKey = v }},
++}
++
++// loadEnvFile reads KEY=VALUE pairs from a .env file.
++func loadEnvFile(path string) map[string]string {
++	result := make(map[string]string)
++	if path == "" {
++		return result
++	}
++
++	f, err := os.Open(path)
++	if err != nil {
++		return result
++	}
++	defer func() { _ = f.Close() }()
++
++	scanner := bufio.NewScanner(f)
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		key, value, ok := strings.Cut(line, "=")
++		if !ok {
++			continue
++		}
++		result[strings.TrimSpace(key)] = strings.TrimSpace(value)
++	}
++
++	return result
++}
++
++// applyEnvFileSecrets sets secret fields from the .env map,
++// but only if the corresponding environment variable is not already set.
++func applyEnvFileSecrets(cfg *Config, envMap map[string]string) {
++	for _, sk := range secretEnvKeys {
++		// Environment variable already set by loadSecrets — don't override.
++		if sk.get(cfg) != "" {
++			continue
++		}
++		if v, ok := envMap[sk.envKey]; ok && v != "" {
++			sk.set(cfg, v)
++		}
++	}
++}
++
++// writeEnvFile writes all non-empty secret values to the .env file.
++func (s *Store) writeEnvFile() error {
++	if err := os.MkdirAll(filepath.Dir(s.envPath), 0o755); err != nil {
++		return err
++	}
++
++	// Read existing .env to preserve non-secret entries.
++	existing := loadEnvFile(s.envPath)
++
++	// Update secret entries.
++	for _, sk := range secretEnvKeys {
++		v := sk.get(&s.cfg)
++		if v != "" {
++			existing[sk.envKey] = v
++		} else {
++			delete(existing, sk.envKey)
++		}
++	}
++
++	var b strings.Builder
++	for key, value := range existing {
++		fmt.Fprintf(&b, "%s=%s\n", key, value)
++	}
++
++	return os.WriteFile(s.envPath, []byte(b.String()), 0o600)
++}
+diff --git a/internal/config/store_test.go b/internal/config/store_test.go
+new file mode 100644
+index 0000000..b0df949
+--- /dev/null
++++ b/internal/config/store_test.go
+@@ -0,0 +1,409 @@
++package config
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++)
++
++func TestNewStore_LoadsFromYAML(t *testing.T) {
++	clearEnv(t)
++
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 45s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++
++	store, _, err := NewStore(configPath)
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "45s" {
++		t.Fatalf("expected 45s, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestNewStore_DefaultsWhenNoFile(t *testing.T) {
++	clearEnv(t)
++
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "30s" {
++		t.Fatalf("expected default 30s, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Update_ChangesConfig(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) { c.SilenceTimeout = "60s" }); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "60s" {
++		t.Fatalf("expected 60s after update, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Update_ValidationRejectsInvalid(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	err = store.Update(func(c *Config) { c.SilenceTimeout = "not-a-duration" })
++	if err == nil {
++		t.Fatal("expected validation error for invalid silence_timeout")
++	}
++
++	cfg := store.Get()
++	if cfg.SilenceTimeout != "30s" {
++		t.Fatalf("expected rollback to 30s, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Update_ValidationRejectsInvalidModel(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	err = store.Update(func(c *Config) { c.Summarization.Model = "no-slash" })
++	if err == nil {
++		t.Fatal("expected validation error for invalid model format")
++	}
++
++	cfg := store.Get()
++	if cfg.Summarization.Model != "openai/gpt-4o-mini" {
++		t.Fatalf("expected rollback to default model, got %q", cfg.Summarization.Model)
++	}
++}
++
++func TestStore_Update_WritesYAML(t *testing.T) {
++	clearEnv(t)
++
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++
++	store, _, err := NewStore(configPath)
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	data, err := os.ReadFile(configPath)
++	if err != nil {
++		t.Fatalf("read config: %v", err)
++	}
++	if !strings.Contains(string(data), "45s") {
++		t.Fatalf("expected YAML to contain 45s, got:\n%s", data)
++	}
++}
++
++func TestStore_Update_DoesNotWriteSecretsToYAML(t *testing.T) {
++	clearEnv(t)
++	t.Setenv(EnvPrefix+"OPENAI_API_KEY", "sk-secret-key")
++
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++
++	store, _, err := NewStore(configPath)
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) { c.SilenceTimeout = "45s" }); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	data, err := os.ReadFile(configPath)
++	if err != nil {
++		t.Fatalf("read config: %v", err)
++	}
++	if strings.Contains(string(data), "sk-secret-key") {
++		t.Fatal("secrets should not be written to YAML")
++	}
++}
++
++func TestStore_Update_FiresOnChange(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	var called bool
++	var calledCfg Config
++	store.OnChange(func(c Config) {
++		called = true
++		calledCfg = c
++	})
++
++	if err := store.Update(func(c *Config) { c.SilenceTimeout = "60s" }); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	if !called {
++		t.Fatal("onChange callback not called")
++	}
++	if calledCfg.SilenceTimeout != "60s" {
++		t.Fatalf("onChange got wrong config, timeout=%q", calledCfg.SilenceTimeout)
++	}
++}
++
++func TestStore_Update_DoesNotFireOnChangeOnFailure(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	var called bool
++	store.OnChange(func(c Config) { called = true })
++
++	_ = store.Update(func(c *Config) { c.SilenceTimeout = "bad" })
++
++	if called {
++		t.Fatal("onChange should not be called when update fails validation")
++	}
++}
++
++func TestStore_Get_ReturnsCopy(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	cfg := store.Get()
++	cfg.SilenceTimeout = "999s"
++
++	cfg2 := store.Get()
++	if cfg2.SilenceTimeout == "999s" {
++		t.Fatal("Get should return a copy, not a reference")
++	}
++}
++
++func TestStore_Get_ReturnsCopyOfPresets(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	cfg := store.Get()
++	cfg.Summarization.Presets["injected"] = Preset{Description: "bad"}
++
++	cfg2 := store.Get()
++	if _, ok := cfg2.Summarization.Presets["injected"]; ok {
++		t.Fatal("modifying returned preset map should not affect store")
++	}
++}
++
++func TestStore_ConcurrentAccess(t *testing.T) {
++	clearEnv(t)
++	store, _, err := NewStore("")
++	if err != nil {
++		t.Fatalf("NewStore failed: %v", err)
++	}
++
++	var wg sync.WaitGroup
++	for i := 0; i < 50; i++ {
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			_ = store.Get()
++		}()
++		go func() {
++			defer wg.Done()
++			_ = store.Update(func(c *Config) { c.SilenceTimeout = "30s" })
++		}()
++	}
++	wg.Wait()
++}
++
++func TestValidateModelFormat(t *testing.T) {
++	tests := []struct {
++		model string
++		valid bool
++	}{
++		{"openai/gpt-4o", true},
++		{"anthropic/claude-3-5-sonnet-latest", true},
++		{"gemini/gemini-2.5-flash", true},
++		{"no-slash", false},
++		{"/no-provider", false},
++		{"no-model/", false},
++		{"", false},
++	}
++
++	for _, tt := range tests {
++		err := validateModelFormat(tt.model)
++		if tt.valid && err != nil {
++			t.Errorf("expected %q to be valid, got error: %v", tt.model, err)
++		}
++		if !tt.valid && err == nil {
++			t.Errorf("expected %q to be invalid, got nil error", tt.model)
++		}
++	}
++}
++
++func TestNewStoreWithEnv_LoadsSecretsFromEnvFile(t *testing.T) {
++	clearEnv(t)
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	envPath := filepath.Join(dir, ".env")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++	envContent := "GHOST_WISPR_OPENAI_API_KEY=sk-from-env-file\nGHOST_WISPR_DEEPGRAM_API_KEY=dg-key\n"
++	if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
++		t.Fatalf("write .env: %v", err)
++	}
++
++	store, _, err := NewStoreWithEnv(configPath, envPath)
++	if err != nil {
++		t.Fatalf("NewStoreWithEnv failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.OpenAIAPIKey != "sk-from-env-file" {
++		t.Fatalf("expected key from .env file, got %q", cfg.OpenAIAPIKey)
++	}
++	if cfg.DeepgramAPIKey != "dg-key" {
++		t.Fatalf("expected deepgram key from .env file, got %q", cfg.DeepgramAPIKey)
++	}
++}
++
++func TestNewStoreWithEnv_EnvVarOverridesEnvFile(t *testing.T) {
++	clearEnv(t)
++	dir := t.TempDir()
++	envPath := filepath.Join(dir, ".env")
++	envContent := "GHOST_WISPR_OPENAI_API_KEY=from-file\n"
++	if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
++		t.Fatalf("write .env: %v", err)
++	}
++
++	t.Setenv(EnvPrefix+"OPENAI_API_KEY", "from-env-var")
++
++	store, _, err := NewStoreWithEnv("", envPath)
++	if err != nil {
++		t.Fatalf("NewStoreWithEnv failed: %v", err)
++	}
++
++	cfg := store.Get()
++	if cfg.OpenAIAPIKey != "from-env-var" {
++		t.Fatalf("env var should override .env file, got %q", cfg.OpenAIAPIKey)
++	}
++}
++
++func TestStore_Update_WritesSecretsToEnvFile(t *testing.T) {
++	clearEnv(t)
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.yaml")
++	envPath := filepath.Join(dir, ".env")
++	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
++		t.Fatalf("write config: %v", err)
++	}
++
++	store, _, err := NewStoreWithEnv(configPath, envPath)
++	if err != nil {
++		t.Fatalf("NewStoreWithEnv failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) {
++		c.OpenAIAPIKey = "sk-test-key"
++	}); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	data, err := os.ReadFile(envPath)
++	if err != nil {
++		t.Fatalf("read .env: %v", err)
++	}
++	if !strings.Contains(string(data), "GHOST_WISPR_OPENAI_API_KEY=sk-test-key") {
++		t.Fatalf("expected .env to contain OpenAI key, got:\n%s", data)
++	}
++
++	// Verify secret NOT in YAML
++	yamlData, _ := os.ReadFile(configPath)
++	if strings.Contains(string(yamlData), "sk-test-key") {
++		t.Fatal("secret should not appear in YAML file")
++	}
++}
++
++func TestStore_Update_PreservesExistingEnvEntries(t *testing.T) {
++	clearEnv(t)
++	dir := t.TempDir()
++	envPath := filepath.Join(dir, ".env")
++	if err := os.WriteFile(envPath, []byte("GHOST_WISPR_DEEPGRAM_API_KEY=dg-existing\nCUSTOM_VAR=keep-me\n"), 0o644); err != nil {
++		t.Fatalf("write .env: %v", err)
++	}
++
++	store, _, err := NewStoreWithEnv("", envPath)
++	if err != nil {
++		t.Fatalf("NewStoreWithEnv failed: %v", err)
++	}
++
++	if err := store.Update(func(c *Config) {
++		c.OpenAIAPIKey = "sk-new"
++	}); err != nil {
++		t.Fatalf("Update failed: %v", err)
++	}
++
++	data, err := os.ReadFile(envPath)
++	if err != nil {
++		t.Fatalf("read .env: %v", err)
++	}
++	content := string(data)
++	if !strings.Contains(content, "CUSTOM_VAR=keep-me") {
++		t.Fatalf("expected existing entries preserved, got:\n%s", content)
++	}
++	if !strings.Contains(content, "GHOST_WISPR_OPENAI_API_KEY=sk-new") {
++		t.Fatalf("expected new key in .env, got:\n%s", content)
++	}
++}
++
++func TestLoadEnvFile_HandlesComments(t *testing.T) {
++	dir := t.TempDir()
++	envPath := filepath.Join(dir, ".env")
++	content := "# This is a comment\nKEY1=val1\n\n  # Another comment\nKEY2=val2\n"
++	if err := os.WriteFile(envPath, []byte(content), 0o644); err != nil {
++		t.Fatalf("write .env: %v", err)
++	}
++
++	result := loadEnvFile(envPath)
++	if result["KEY1"] != "val1" {
++		t.Fatalf("expected KEY1=val1, got %q", result["KEY1"])
++	}
++	if result["KEY2"] != "val2" {
++		t.Fatalf("expected KEY2=val2, got %q", result["KEY2"])
++	}
++	if len(result) != 2 {
++		t.Fatalf("expected 2 entries, got %d: %v", len(result), result)
++	}
++}
+diff --git a/internal/server/api.go b/internal/server/api.go
+index a0b3aaa..3372be0 100644
+--- a/internal/server/api.go
++++ b/internal/server/api.go
+@@ -14,6 +14,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/sjawhar/ghost-wispr/internal/config"
+ 	"github.com/sjawhar/ghost-wispr/internal/session"
+ 	"github.com/sjawhar/ghost-wispr/internal/storage"
+ 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+@@ -28,7 +29,7 @@ type SessionStore interface {
+ 	GetDates() ([]string, error)
+ }
+ 
+-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlHooks) {
++func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlHooks, cfgStore *config.Store) {
+ 	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
+ 		date := r.URL.Query().Get("date")
+ 		if date == "" {
+@@ -226,6 +227,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
+ 
+ 		w.WriteHeader(http.StatusAccepted)
+ 	})
++
++	// Config endpoints — only registered if cfgStore is provided.
++	if cfgStore != nil {
++		mux.HandleFunc("GET /api/config", handleGetConfig(cfgStore))
++		mux.HandleFunc("PATCH /api/config", handlePatchConfig(cfgStore))
++		if controls.TestPreset != nil {
++			mux.HandleFunc("POST /api/config/presets/{name}/test", handleTestPreset(cfgStore, controls.TestPreset))
++		}
++		if controls.GeneratePreset != nil {
++			mux.HandleFunc("POST /api/config/presets/generate", handleGeneratePreset(controls.GeneratePreset))
++		}
++		if controls.RefinePreset != nil {
++			mux.HandleFunc("POST /api/config/presets/refine", handleRefinePreset(cfgStore, controls.RefinePreset))
++		}
++	}
+ }
+ 
+ func validSessionID(id string) bool {
+@@ -253,3 +269,276 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
+ func writeJSONError(w http.ResponseWriter, status int, msg string) {
+ 	writeJSON(w, status, map[string]string{"error": msg})
+ }
++
++// configResponse is the shape returned by GET /api/config.
++type configResponse struct {
++	SilenceTimeout string                       `json:"silence_timeout"`
++	Summarization  configSummarizationResponse   `json:"summarization"`
++	Transcription  configTranscriptionResponse   `json:"transcription"`
++	GDrive         configGDriveResponse          `json:"gdrive"`
++	APIKeys        map[string]bool               `json:"api_keys"`
++}
++
++type configSummarizationResponse struct {
++	Model   string                           `json:"model"`
++	BaseURL string                           `json:"base_url"`
++	Presets map[string]config.Preset         `json:"presets"`
++}
++
++type configTranscriptionResponse struct {
++	Endpointing    string `json:"endpointing"`
++	UtteranceEndMs string `json:"utterance_end_ms"`
++}
++
++type configGDriveResponse struct {
++	FolderID       string `json:"folder_id"`
++	HasCredentials bool   `json:"has_credentials"`
++}
++
++func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		cfg := cfgStore.Get()
++		resp := configResponse{
++			SilenceTimeout: cfg.SilenceTimeout,
++			Summarization: configSummarizationResponse{
++				Model:   cfg.Summarization.Model,
++				BaseURL: cfg.Summarization.BaseURL,
++				Presets: cfg.Summarization.Presets,
++			},
++			Transcription: configTranscriptionResponse{
++				Endpointing:    cfg.Transcription.Endpointing,
++				UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
++			},
++			GDrive: configGDriveResponse{
++				FolderID:       cfg.GDriveFolderID,
++				HasCredentials: cfg.GoogleCredentialsFile != "" && fileExists(cfg.GoogleCredentialsFile),
++			},
++			APIKeys: map[string]bool{
++				"deepgram":  cfg.DeepgramAPIKey != "",
++				"openai":    cfg.OpenAIAPIKey != "",
++				"anthropic": cfg.AnthropicAPIKey != "",
++				"gemini":    cfg.GeminiAPIKey != "",
++			},
++		}
++		if resp.Summarization.Presets == nil {
++			resp.Summarization.Presets = map[string]config.Preset{}
++		}
++		writeJSON(w, http.StatusOK, resp)
++	}
++}
++
++// configPatch represents the JSON merge-patch body for PATCH /api/config.
++type configPatch struct {
++	SilenceTimeout *string                 `json:"silence_timeout,omitempty"`
++	Summarization  *summarizationPatch     `json:"summarization,omitempty"`
++	Transcription  *transcriptionPatch     `json:"transcription,omitempty"`
++	APIKeys        map[string]string       `json:"api_keys,omitempty"`
++	GDrive         *gdrivePatch            `json:"gdrive,omitempty"`
++}
++
++type summarizationPatch struct {
++	Model   *string                              `json:"model,omitempty"`
++	BaseURL *string                              `json:"base_url,omitempty"`
++	Presets map[string]*config.Preset            `json:"presets,omitempty"` // null value = delete
++}
++
++type transcriptionPatch struct {
++	Endpointing    *string `json:"endpointing,omitempty"`
++	UtteranceEndMs *string `json:"utterance_end_ms,omitempty"`
++}
++
++type gdrivePatch struct {
++	FolderID          *string `json:"folder_id,omitempty"`
++	CredentialsBase64 *string `json:"credentials_base64,omitempty"`
++}
++
++func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		var patch configPatch
++		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
++			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
++			return
++		}
++
++		err := cfgStore.Update(func(c *config.Config) {
++			applyConfigPatch(c, &patch)
++		})
++		if err != nil {
++			writeJSONError(w, http.StatusBadRequest, err.Error())
++			return
++		}
++
++		// Return updated config.
++		handleGetConfig(cfgStore)(w, r)
++	}
++}
++
++func applyConfigPatch(c *config.Config, p *configPatch) {
++	if p.SilenceTimeout != nil {
++		c.SilenceTimeout = *p.SilenceTimeout
++	}
++
++	if p.Summarization != nil {
++		if p.Summarization.Model != nil {
++			c.Summarization.Model = *p.Summarization.Model
++		}
++		if p.Summarization.BaseURL != nil {
++			c.Summarization.BaseURL = *p.Summarization.BaseURL
++		}
++		if p.Summarization.Presets != nil {
++			if c.Summarization.Presets == nil {
++				c.Summarization.Presets = make(map[string]config.Preset)
++			}
++			for name, preset := range p.Summarization.Presets {
++				if preset == nil {
++					// null = delete per RFC 7386
++					delete(c.Summarization.Presets, name)
++				} else {
++					c.Summarization.Presets[name] = *preset
++				}
++			}
++		}
++	}
++
++	if p.Transcription != nil {
++		if p.Transcription.Endpointing != nil {
++			c.Transcription.Endpointing = *p.Transcription.Endpointing
++		}
++		if p.Transcription.UtteranceEndMs != nil {
++			c.Transcription.UtteranceEndMs = *p.Transcription.UtteranceEndMs
++		}
++	}
++
++	if p.APIKeys != nil {
++		for provider, key := range p.APIKeys {
++			switch provider {
++			case "deepgram":
++				c.DeepgramAPIKey = key
++			case "openai":
++				c.OpenAIAPIKey = key
++			case "anthropic":
++				c.AnthropicAPIKey = key
++			case "gemini":
++				c.GeminiAPIKey = key
++			}
++		}
++	}
++
++	if p.GDrive != nil {
++		if p.GDrive.FolderID != nil {
++			c.GDriveFolderID = *p.GDrive.FolderID
++		}
++		// credentials_base64 handling deferred to GDrive integration task
++	}
++}
++
++func fileExists(path string) bool {
++	_, err := os.Stat(path)
++	return err == nil
++}
++
++func handleTestPreset(cfgStore *config.Store, testFn func(ctx context.Context, presetName, sessionID string) (string, error)) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		presetName := r.PathValue("name")
++		if presetName == "" {
++			writeJSONError(w, http.StatusBadRequest, "preset name is required")
++			return
++		}
++
++		// Verify preset exists.
++		cfg := cfgStore.Get()
++		if _, ok := cfg.Summarization.Presets[presetName]; !ok {
++			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("preset %q not found", presetName))
++			return
++		}
++
++		var body struct {
++			SessionID string `json:"session_id"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			writeJSONError(w, http.StatusBadRequest, "invalid request body")
++			return
++		}
++		if body.SessionID == "" {
++			writeJSONError(w, http.StatusBadRequest, "session_id is required")
++			return
++		}
++
++		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
++		defer cancel()
++
++		summary, err := testFn(ctx, presetName, body.SessionID)
++		if err != nil {
++			writeJSON(w, http.StatusOK, map[string]string{"summary": "", "error": err.Error()})
++			return
++		}
++
++		writeJSON(w, http.StatusOK, map[string]string{"summary": summary, "error": ""})
++	}
++}
++
++func handleGeneratePreset(generateFn func(ctx context.Context, description string) (config.Preset, error)) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		var body struct {
++			Description string `json:"description"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			writeJSONError(w, http.StatusBadRequest, "invalid request body")
++			return
++		}
++		if body.Description == "" {
++			writeJSONError(w, http.StatusBadRequest, "description is required")
++			return
++		}
++
++		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
++		defer cancel()
++
++		preset, err := generateFn(ctx, body.Description)
++		if err != nil {
++			writeJSONError(w, http.StatusInternalServerError, err.Error())
++			return
++		}
++
++		writeJSON(w, http.StatusOK, preset)
++	}
++}
++
++func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error)) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		var body struct {
++			Name     string `json:"name"`
++			Feedback string `json:"feedback"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			writeJSONError(w, http.StatusBadRequest, "invalid request body")
++			return
++		}
++		if body.Name == "" {
++			writeJSONError(w, http.StatusBadRequest, "name is required")
++			return
++		}
++		if body.Feedback == "" {
++			writeJSONError(w, http.StatusBadRequest, "feedback is required")
++			return
++		}
++
++		cfg := cfgStore.Get()
++		current, ok := cfg.Summarization.Presets[body.Name]
++		if !ok {
++			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("preset %q not found", body.Name))
++			return
++		}
++
++		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
++		defer cancel()
++
++		refined, err := refineFn(ctx, current, body.Feedback)
++		if err != nil {
++			writeJSONError(w, http.StatusInternalServerError, err.Error())
++			return
++		}
++
++		writeJSON(w, http.StatusOK, refined)
++	}
++}
+diff --git a/internal/server/api_test.go b/internal/server/api_test.go
+index f132d54..32dd65a 100644
+--- a/internal/server/api_test.go
++++ b/internal/server/api_test.go
+@@ -624,3 +624,329 @@ func TestEndSession_NotConfigured(t *testing.T) {
+ 		t.Fatalf("expected 503, got %d body=%s", rr.Code, rr.Body.String())
+ 	}
+ }
++
++func newTestConfigStore(t *testing.T) *config.Store {
++	t.Helper()
++	for _, key := range []string{
++		"DB_PATH", "AUDIO_DIR", "SILENCE_TIMEOUT",
++		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES",
++		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
++		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
++	} {
++		t.Setenv(config.EnvPrefix+key, "")
++	}
++	store, _, err := config.NewStore("")
++	if err != nil {
++		t.Fatalf("newTestConfigStore: %v", err)
++	}
++	return store
++}
++
++func TestAPI_GetConfig(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	var resp map[string]any
++	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
++		t.Fatalf("decode failed: %v", err)
++	}
++
++	if resp["silence_timeout"] != "30s" {
++		t.Fatalf("expected silence_timeout 30s, got %v", resp["silence_timeout"])
++	}
++
++	// API keys should be booleans, not values
++	keys := resp["api_keys"].(map[string]any)
++	if _, ok := keys["openai"].(bool); !ok {
++		t.Fatal("api_keys.openai should be a boolean")
++	}
++
++	// Presets should be present with full detail
++	summ := resp["summarization"].(map[string]any)
++	presets := summ["presets"].(map[string]any)
++	if _, ok := presets["default"]; !ok {
++		t.Fatal("expected default preset in config response")
++	}
++}
++
++func TestAPI_GetConfig_NoStoreReturns404(t *testing.T) {
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{})
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusNotFound {
++		t.Fatalf("expected 404 when no config store, got %d", rr.Code)
++	}
++}
++
++func TestAPI_PatchConfig_SilenceTimeout(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"silence_timeout": "45s"}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	cfg := cfgStore.Get()
++	if cfg.SilenceTimeout != "45s" {
++		t.Fatalf("expected 45s after patch, got %q", cfg.SilenceTimeout)
++	}
++}
++
++func TestAPI_PatchConfig_InvalidReturns400(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"silence_timeout": "not-valid"}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusBadRequest {
++		t.Fatalf("expected 400, got %d body=%s", rr.Code, rr.Body.String())
++	}
++}
++
++func TestAPI_PatchConfig_AddPreset(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"summarization":{"presets":{"standup":{"description":"Stand-up","system_prompt":"Summarize briefly","user_template":"{{transcript}}"}}}}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	cfg := cfgStore.Get()
++	if _, ok := cfg.Summarization.Presets["standup"]; !ok {
++		t.Fatal("expected standup preset after patch")
++	}
++	if _, ok := cfg.Summarization.Presets["default"]; !ok {
++		t.Fatal("default preset should still exist")
++	}
++}
++
++func TestAPI_PatchConfig_DeletePreset(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	_ = cfgStore.Update(func(c *config.Config) {
++		c.Summarization.Presets["to-delete"] = config.Preset{
++			Description: "temp", SystemPrompt: "x", UserTemplate: "{{transcript}}",
++		}
++	})
++
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"summarization":{"presets":{"to-delete":null}}}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	cfg := cfgStore.Get()
++	if _, ok := cfg.Summarization.Presets["to-delete"]; ok {
++		t.Fatal("to-delete preset should be removed")
++	}
++}
++
++func TestAPI_PatchConfig_SetAPIKey(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"api_keys":{"openai":"sk-test"}}`
++	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	cfg := cfgStore.Get()
++	if cfg.OpenAIAPIKey != "sk-test" {
++		t.Fatalf("expected OpenAI key to be set, got %q", cfg.OpenAIAPIKey)
++	}
++
++	// Verify GET response shows key as present
++	req2 := httptest.NewRequest(http.MethodGet, "/api/config", nil)
++	rr2 := httptest.NewRecorder()
++	h.ServeHTTP(rr2, req2)
++
++	var resp map[string]any
++	json.NewDecoder(rr2.Body).Decode(&resp)
++	keys := resp["api_keys"].(map[string]any)
++	if keys["openai"] != true {
++		t.Fatalf("expected openai key to show as true, got %v", keys["openai"])
++	}
++}
++
++func TestAPI_TestPreset_Success(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	storeStub := apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}
++
++	h, err := Handler(testStaticFS(t), NewHub(), storeStub, ControlHooks{
++		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
++			if presetName != "default" {
++				return "", errors.New("wrong preset")
++			}
++			if sessionID != "s1" {
++				return "", errors.New("wrong session")
++			}
++			return "## Test Summary\nThis is a test.", nil
++		},
++	}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"session_id": "s1"}`
++	req := httptest.NewRequest(http.MethodPost, "/api/config/presets/default/test", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
++	}
++
++	var resp map[string]string
++	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
++		t.Fatalf("decode failed: %v", err)
++	}
++	if resp["summary"] == "" {
++		t.Fatal("expected non-empty summary")
++	}
++	if resp["error"] != "" {
++		t.Fatalf("expected empty error, got %q", resp["error"])
++	}
++}
++
++func TestAPI_TestPreset_UnknownPreset(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{
++		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
++			return "", nil
++		},
++	}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{"session_id": "s1"}`
++	req := httptest.NewRequest(http.MethodPost, "/api/config/presets/nonexistent/test", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusNotFound {
++		t.Fatalf("expected 404, got %d body=%s", rr.Code, rr.Body.String())
++	}
++}
++
++func TestAPI_TestPreset_MissingSessionID(t *testing.T) {
++	cfgStore := newTestConfigStore(t)
++	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
++		sessionsByDate: map[string][]storage.Session{},
++		sessions:       map[string]storage.Session{},
++		segments:       map[string][]transcribe.Segment{},
++	}, ControlHooks{
++		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
++			return "", nil
++		},
++	}, cfgStore)
++	if err != nil {
++		t.Fatalf("Handler failed: %v", err)
++	}
++
++	body := `{}`
++	req := httptest.NewRequest(http.MethodPost, "/api/config/presets/default/test", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	h.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusBadRequest {
++		t.Fatalf("expected 400, got %d body=%s", rr.Code, rr.Body.String())
++	}
++}
+diff --git a/internal/server/server.go b/internal/server/server.go
+index a2acdba..f4d2066 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -20,13 +20,20 @@ type ControlHooks struct {
+ 	Presets         func() map[string]config.Preset
+ 	Resummarize     func(ctx context.Context, sessionID, preset string) error
+ 	EndSession      func(ctx context.Context) error
++	TestPreset      func(ctx context.Context, presetName, sessionID string) (string, error)
++	GeneratePreset  func(ctx context.Context, description string) (config.Preset, error)
++	RefinePreset    func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error)
+ }
+ 
+-func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks) (http.Handler, error) {
++func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks, cfgStore ...*config.Store) (http.Handler, error) {
+ 	mux := http.NewServeMux()
+ 
+ 	registerWSRoute(mux, hub)
+-	registerAPIRoutes(mux, store, controls)
++	var cs *config.Store
++	if len(cfgStore) > 0 {
++		cs = cfgStore[0]
++	}
++	registerAPIRoutes(mux, store, controls, cs)
+ 
+ 	fileServer := http.FileServer(http.FS(staticFS))
+ 	mux.HandleFunc("/", serveSPA(staticFS, fileServer))
+@@ -34,8 +41,8 @@ func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks
+ 	return mux, nil
+ }
+ 
+-func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks) error {
+-	h, err := Handler(staticFS, hub, store, controls)
++func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks, cfgStore ...*config.Store) error {
++	h, err := Handler(staticFS, hub, store, controls, cfgStore...)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/internal/session/detector.go b/internal/session/detector.go
+index c350953..5e139bc 100644
+--- a/internal/session/detector.go
++++ b/internal/session/detector.go
+@@ -54,3 +54,13 @@ func (d *Detector) OnUtteranceEnd() {
+ 		}
+ 	})
+ }
++
++// SetTimeout updates the silence timeout duration.
++// The new timeout takes effect on the next OnUtteranceEnd call.
++func (d *Detector) SetTimeout(timeout time.Duration) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if timeout > 0 {
++		d.timeout = timeout
++	}
++}
+diff --git a/internal/session/detector_test.go b/internal/session/detector_test.go
+index b8de263..014c902 100644
+--- a/internal/session/detector_test.go
++++ b/internal/session/detector_test.go
+@@ -72,3 +72,42 @@ func TestDetectorSupportsConfigurableTimeout(t *testing.T) {
+ 		t.Fatal("expected long detector callback")
+ 	}
+ }
++
++func TestDetector_SetTimeout(t *testing.T) {
++	d := NewDetector(10 * time.Second) // Long timeout initially
++
++	var called atomic.Int32
++	d.OnSessionEnd(func() { called.Add(1) })
++
++	// Update to very short timeout.
++	d.SetTimeout(20 * time.Millisecond)
++
++	// Trigger utterance end — should use new short timeout.
++	d.OnUtteranceEnd()
++
++	select {
++	case <-time.After(200 * time.Millisecond):
++	}
++
++	if called.Load() != 1 {
++		t.Fatalf("expected callback to fire with new timeout, called=%d", called.Load())
++	}
++}
++
++func TestDetector_SetTimeout_IgnoresZero(t *testing.T) {
++	d := NewDetector(50 * time.Millisecond)
++	d.SetTimeout(0) // Should be ignored
++
++	var called atomic.Int32
++	d.OnSessionEnd(func() { called.Add(1) })
++
++	d.OnUtteranceEnd()
++
++	select {
++	case <-time.After(200 * time.Millisecond):
++	}
++
++	if called.Load() != 1 {
++		t.Fatalf("expected callback with original timeout, called=%d", called.Load())
++	}
++}
+diff --git a/internal/session/manager.go b/internal/session/manager.go
+index 741a6bb..80f067a 100644
+--- a/internal/session/manager.go
++++ b/internal/session/manager.go
+@@ -273,7 +273,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
+ 
+ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
+ 	if m.summarizer == nil {
+-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryCompleted, "")
++		// No summarizer available — leave as pending so it can be summarized later.
+ 		return
+ 	}
+ 
+diff --git a/internal/storage/sqlite.go b/internal/storage/sqlite.go
+index 0a18158..6660f34 100644
+--- a/internal/storage/sqlite.go
++++ b/internal/storage/sqlite.go
+@@ -373,3 +373,63 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
+ 
+ 	return sessions, nil
+ }
++
++// RecoverStaleSessions ends any sessions still marked as 'active' and returns their IDs.
++// This handles the case where the app was restarted while a session was in progress.
++func (s *SQLiteStore) RecoverStaleSessions() ([]string, error) {
++	now := time.Now().UTC().Format(time.RFC3339Nano)
++
++	rows, err := s.db.Query(`SELECT id FROM sessions WHERE status = 'active'`)
++	if err != nil {
++		return nil, fmt.Errorf("query active sessions: %w", err)
++	}
++	defer func() { _ = rows.Close() }()
++
++	var ids []string
++	for rows.Next() {
++		var id string
++		if err := rows.Scan(&id); err != nil {
++			return nil, fmt.Errorf("scan active session: %w", err)
++		}
++		ids = append(ids, id)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fmt.Errorf("iterate active sessions: %w", err)
++	}
++
++	for _, id := range ids {
++		_, err := s.db.Exec(
++			`UPDATE sessions SET ended_at = ?, status = 'ended' WHERE id = ? AND status = 'active'`,
++			now, id,
++		)
++		if err != nil {
++			return nil, fmt.Errorf("end stale session %s: %w", id, err)
++		}
++	}
++
++	return ids, nil
++}
++
++// GetSessionsNeedingSummary returns IDs of ended sessions with pending or empty summaries.
++func (s *SQLiteStore) GetSessionsNeedingSummary() ([]string, error) {
++	rows, err := s.db.Query(
++		`SELECT id FROM sessions WHERE status = 'ended' AND (summary_status IN ('pending', 'running') OR (summary_status = 'completed' AND (summary IS NULL OR summary = '')))`,
++	)
++	if err != nil {
++		return nil, fmt.Errorf("query sessions needing summary: %w", err)
++	}
++	defer func() { _ = rows.Close() }()
++
++	var ids []string
++	for rows.Next() {
++		var id string
++		if err := rows.Scan(&id); err != nil {
++			return nil, fmt.Errorf("scan session: %w", err)
++		}
++		ids = append(ids, id)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fmt.Errorf("iterate sessions: %w", err)
++	}
++	return ids, nil
++}
+diff --git a/web/src/App.svelte b/web/src/App.svelte
+index c179ec2..aecf1bb 100644
+--- a/web/src/App.svelte
++++ b/web/src/App.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+   import { onDestroy, onMount } from 'svelte'
+   import Controls from './components/Controls.svelte'
++  import SettingsPage from './components/SettingsPage.svelte'
+   import LivePanel from './components/LivePanel.svelte'
+   import SessionList from './components/SessionList.svelte'
+   import {
+@@ -27,6 +28,7 @@
+ 
+   let expandedSessionId = $state('')
+   let loadingError = $state('')
++  let currentView = $state<'main' | 'settings'>('main')
+ 
+   async function loadDate(date: string): Promise<void> {
+     if (appState.sessionsByDate.has(date)) {
+@@ -128,46 +130,79 @@
+       <h1>Ghost Wispr</h1>
+       <p class="subtitle">Live capture first, session memory second.</p>
+     </div>
+-    <Controls
+-      connected={appState.connected}
+-      paused={appState.paused}
+-      activeSessionId={appState.activeSessionId}
+-      onToggle={togglePause}
+-      onEndSession={endSession}
+-    />
++    <div class="header-actions">
++      <Controls connected={appState.connected} paused={appState.paused} activeSessionId={appState.activeSessionId} onToggle={togglePause} onEndSession={endSession} />
++      <button
++        class="settings-btn"
++        type="button"
++        title="Settings"
++        data-testid="settings-toggle"
++        onclick={() => { currentView = currentView === 'main' ? 'settings' : 'main' }}
++      >
++        &#9881;
++      </button>
++    </div>
+   </header>
+ 
+   {#if loadingError}
+     <p class="load-error">{loadingError}</p>
+   {/if}
+ 
+-  {#if appState.warnings.length > 0}
+-    <aside class="warnings-banner" data-testid="warnings-banner">
+-      {#each appState.warnings as warning (warning)}
+-        <p class="warning-item">{warning}</p>
+-      {/each}
+-    </aside>
++  {#if currentView === 'settings'}
++    <SettingsPage onBack={() => { currentView = 'main' }} />
++  {:else}
++    {#if appState.warnings.length > 0}
++      <aside class="warnings-banner" data-testid="warnings-banner">
++        {#each appState.warnings as warning (warning)}
++          <p class="warning-item">{warning}</p>
++        {/each}
++      </aside>
++    {/if}
++
++    <section class="layout">
++      <LivePanel
++        segments={appState.liveSegments}
++        connected={appState.connected}
++        activeSessionStartedAt={appState.activeSessionStartedAt}
++        interimText={appState.interimText}
++        interimSpeaker={appState.interimSpeaker}
++      />
++
++      <SessionList
++        dates={appState.dates}
++        sessionsByDate={appState.sessionsByDate}
++        sessionDetails={appState.sessionDetails}
++        presets={appState.presets}
++        {expandedSessionId}
++        {onToggleSession}
++        onLoadDate={loadDate}
++        onLoadDetail={loadSession}
++        onResummarize={handleResummarize}
++      />
++    </section>
+   {/if}
+-
+-  <section class="layout">
+-    <LivePanel
+-      segments={appState.liveSegments}
+-      connected={appState.connected}
+-      activeSessionStartedAt={appState.activeSessionStartedAt}
+-      interimText={appState.interimText}
+-      interimSpeaker={appState.interimSpeaker}
+-    />
+-
+-    <SessionList
+-      dates={appState.dates}
+-      sessionsByDate={appState.sessionsByDate}
+-      sessionDetails={appState.sessionDetails}
+-      presets={appState.presets}
+-      {expandedSessionId}
+-      {onToggleSession}
+-      onLoadDate={loadDate}
+-      onLoadDetail={loadSession}
+-      onResummarize={handleResummarize}
+-    />
+-  </section>
+ </main>
++
++<style>
++  .header-actions {
++    display: flex;
++    align-items: center;
++    gap: 0.75rem;
++  }
++
++  .settings-btn {
++    background: none;
++    border: 1px solid var(--line);
++    border-radius: 8px;
++    padding: 0.4rem 0.6rem;
++    font-size: 1.3rem;
++    cursor: pointer;
++    color: var(--muted);
++    line-height: 1;
++  }
++
++  .settings-btn:hover {
++    background: var(--accent-soft);
++    color: var(--accent);
++  }
++</style>
+diff --git a/web/src/components/GeneralSettings.svelte b/web/src/components/GeneralSettings.svelte
+new file mode 100644
+index 0000000..ef67f09
+--- /dev/null
++++ b/web/src/components/GeneralSettings.svelte
+@@ -0,0 +1,178 @@
++<script lang="ts">
++  import type { ConfigResponse } from '../lib/config-api'
++  import { patchConfig } from '../lib/config-api'
++  import { configState, setConfig, setError } from '../lib/config.svelte'
++
++  let config = $derived(configState.config!)
++
++  let silenceTimeout = $state(config.silence_timeout)
++  let model = $state(config.summarization.model)
++  let endpointing = $state(config.transcription.endpointing)
++  let utteranceEndMs = $state(config.transcription.utterance_end_ms)
++
++  let saving = $state(false)
++  let feedback = $state('')
++
++  $effect(() => {
++    if (configState.config) {
++      silenceTimeout = configState.config.silence_timeout
++      model = configState.config.summarization.model
++      endpointing = configState.config.transcription.endpointing
++      utteranceEndMs = configState.config.transcription.utterance_end_ms
++    }
++  })
++
++  async function save(): Promise<void> {
++    saving = true
++    feedback = ''
++    try {
++      const patch: Record<string, unknown> = {}
++
++      if (silenceTimeout !== config.silence_timeout) {
++        patch.silence_timeout = silenceTimeout
++      }
++      if (model !== config.summarization.model) {
++        patch.summarization = { model }
++      }
++      if (
++        endpointing !== config.transcription.endpointing ||
++        utteranceEndMs !== config.transcription.utterance_end_ms
++      ) {
++        patch.transcription = { endpointing, utterance_end_ms: utteranceEndMs }
++      }
++
++      if (Object.keys(patch).length === 0) {
++        feedback = 'No changes to save.'
++        return
++      }
++
++      const updated = await patchConfig(patch)
++      setConfig(updated)
++      feedback = 'Saved!'
++    } catch (error) {
++      feedback = error instanceof Error ? error.message : 'Save failed'
++      setError(feedback)
++    } finally {
++      saving = false
++    }
++  }
++</script>
++
++<div class="general-settings" data-testid="general-settings">
++  <div class="field">
++    <label for="silence-timeout">Silence Timeout</label>
++    <input
++      id="silence-timeout"
++      type="text"
++      bind:value={silenceTimeout}
++      placeholder="30s"
++    />
++    <span class="hint">Go duration format (e.g. 30s, 1m, 1m30s)</span>
++  </div>
++
++  <div class="field">
++    <label for="default-model">Default Summarization Model</label>
++    <input
++      id="default-model"
++      type="text"
++      bind:value={model}
++      placeholder="openai/gpt-4o-mini"
++    />
++    <span class="hint">Format: provider/model_name</span>
++  </div>
++
++  <div class="field">
++    <label for="endpointing">Transcription Endpointing (ms)</label>
++    <input
++      id="endpointing"
++      type="text"
++      bind:value={endpointing}
++      placeholder="400"
++    />
++  </div>
++
++  <div class="field">
++    <label for="utterance-end">Utterance End (ms)</label>
++    <input
++      id="utterance-end"
++      type="text"
++      bind:value={utteranceEndMs}
++      placeholder="1000"
++    />
++    <span class="hint">Changes to transcription settings will reconnect Deepgram</span>
++  </div>
++
++  <div class="actions">
++    <button class="save-btn" type="button" onclick={save} disabled={saving}>
++      {saving ? 'Saving...' : 'Save'}
++    </button>
++    {#if feedback}
++      <span class="feedback" class:error={feedback !== 'Saved!' && feedback !== 'No changes to save.'}>{feedback}</span>
++    {/if}
++  </div>
++</div>
++
++<style>
++  .general-settings {
++    display: flex;
++    flex-direction: column;
++    gap: 1rem;
++  }
++
++  .field {
++    display: flex;
++    flex-direction: column;
++    gap: 0.25rem;
++  }
++
++  .field label {
++    font-weight: 600;
++    font-size: 0.85rem;
++    color: var(--ink);
++  }
++
++  .field input {
++    padding: 0.5rem;
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    font-family: 'Source Code Pro', monospace;
++    font-size: 0.9rem;
++    background: var(--panel);
++  }
++
++  .hint {
++    font-size: 0.75rem;
++    color: var(--muted);
++  }
++
++  .actions {
++    display: flex;
++    align-items: center;
++    gap: 0.75rem;
++  }
++
++  .save-btn {
++    background: var(--accent);
++    color: white;
++    border: none;
++    border-radius: 6px;
++    padding: 0.5rem 1.2rem;
++    cursor: pointer;
++    font-family: inherit;
++    font-weight: 600;
++  }
++
++  .save-btn:disabled {
++    opacity: 0.6;
++    cursor: not-allowed;
++  }
++
++  .feedback {
++    font-size: 0.85rem;
++    color: var(--accent);
++  }
++
++  .feedback.error {
++    color: var(--danger);
++  }
++</style>
+diff --git a/web/src/components/IntegrationsSettings.svelte b/web/src/components/IntegrationsSettings.svelte
+new file mode 100644
+index 0000000..11c9b83
+--- /dev/null
++++ b/web/src/components/IntegrationsSettings.svelte
+@@ -0,0 +1,255 @@
++<script lang="ts">
++  import type { ConfigResponse } from '../lib/config-api'
++  import { patchConfig } from '../lib/config-api'
++  import { setConfig } from '../lib/config.svelte'
++
++  let {
++    config,
++  }: {
++    config: ConfigResponse
++  } = $props()
++
++  const providers = ['deepgram', 'openai', 'anthropic', 'gemini'] as const
++
++  let keyInputs = $state<Record<string, string>>({})
++  let keySaving = $state<Record<string, boolean>>({})
++  let keyFeedback = $state<Record<string, string>>({})
++
++  let gdriveFolder = $state(config.gdrive.folder_id)
++  let gdriveSaving = $state(false)
++  let gdriveFeedback = $state('')
++
++  async function saveKey(provider: string): Promise<void> {
++    const value = keyInputs[provider]?.trim()
++    if (!value) return
++
++    keySaving[provider] = true
++    keyFeedback[provider] = ''
++    try {
++      const updated = await patchConfig({ api_keys: { [provider]: value } })
++      setConfig(updated)
++      keyInputs[provider] = ''
++      keyFeedback[provider] = 'Saved!'
++    } catch (error) {
++      keyFeedback[provider] = error instanceof Error ? error.message : 'Save failed'
++    } finally {
++      keySaving[provider] = false
++    }
++  }
++
++  async function saveGDrive(): Promise<void> {
++    gdriveSaving = true
++    gdriveFeedback = ''
++    try {
++      const updated = await patchConfig({
++        gdrive: { folder_id: gdriveFolder.trim() },
++      })
++      setConfig(updated)
++      gdriveFeedback = 'Saved!'
++    } catch (error) {
++      gdriveFeedback = error instanceof Error ? error.message : 'Save failed'
++    } finally {
++      gdriveSaving = false
++    }
++  }
++
++  async function uploadCredentials(event: Event): Promise<void> {
++    const input = event.target as HTMLInputElement
++    const file = input.files?.[0]
++    if (!file) return
++
++    gdriveSaving = true
++    gdriveFeedback = ''
++    try {
++      const text = await file.text()
++      const base64 = btoa(text)
++      const updated = await patchConfig({
++        gdrive: { credentials_base64: base64 },
++      })
++      setConfig(updated)
++      gdriveFeedback = 'Credentials uploaded!'
++    } catch (error) {
++      gdriveFeedback = error instanceof Error ? error.message : 'Upload failed'
++    } finally {
++      gdriveSaving = false
++      input.value = ''
++    }
++  }
++</script>
++
++<div class="integrations" data-testid="integrations-settings">
++  <h4>API Keys</h4>
++  <div class="key-list">
++    {#each providers as provider (provider)}
++      <div class="key-row">
++        <span class="key-status" class:active={config.api_keys[provider]}>
++          {config.api_keys[provider] ? '●' : '○'}
++        </span>
++        <span class="key-name">{provider}</span>
++        <input
++          type="password"
++          placeholder={config.api_keys[provider] ? '••••••••' : 'Not set'}
++          bind:value={keyInputs[provider]}
++        />
++        <button
++          class="save-btn"
++          type="button"
++          onclick={() => saveKey(provider)}
++          disabled={keySaving[provider] || !keyInputs[provider]?.trim()}
++        >
++          {keySaving[provider] ? '...' : 'Save'}
++        </button>
++        {#if keyFeedback[provider]}
++          <span class="feedback" class:error={keyFeedback[provider] !== 'Saved!'}>{keyFeedback[provider]}</span>
++        {/if}
++      </div>
++    {/each}
++  </div>
++
++  <h4>Google Drive Sync</h4>
++  <div class="gdrive-section">
++    <div class="field">
++      <label for="gdrive-folder">Folder ID</label>
++      <input id="gdrive-folder" type="text" bind:value={gdriveFolder} placeholder="Google Drive folder ID" />
++    </div>
++
++    <div class="field">
++      <label for="gdrive-creds">Service Account Credentials</label>
++      <div class="cred-row">
++        <input id="gdrive-creds" type="file" accept=".json" onchange={uploadCredentials} />
++        <span class="cred-status" class:active={config.gdrive.has_credentials}>
++          {config.gdrive.has_credentials ? 'Credentials uploaded' : 'No credentials'}
++        </span>
++      </div>
++    </div>
++
++    <div class="form-actions">
++      <button class="save-btn" type="button" onclick={saveGDrive} disabled={gdriveSaving}>
++        {gdriveSaving ? 'Saving...' : 'Save'}
++      </button>
++      {#if gdriveFeedback}
++        <span class="feedback" class:error={!gdriveFeedback.includes('Saved') && !gdriveFeedback.includes('uploaded')}>{gdriveFeedback}</span>
++      {/if}
++    </div>
++  </div>
++</div>
++
++<style>
++  .integrations h4 {
++    margin: 0 0 0.75rem;
++    font-size: 1rem;
++  }
++
++  .key-list {
++    display: flex;
++    flex-direction: column;
++    gap: 0.5rem;
++    margin-bottom: 1.5rem;
++  }
++
++  .key-row {
++    display: flex;
++    align-items: center;
++    gap: 0.5rem;
++    flex-wrap: wrap;
++  }
++
++  .key-status {
++    font-size: 0.8rem;
++    color: var(--muted);
++  }
++
++  .key-status.active {
++    color: var(--accent);
++  }
++
++  .key-name {
++    font-weight: 600;
++    font-size: 0.85rem;
++    min-width: 6rem;
++    text-transform: capitalize;
++  }
++
++  .key-row input {
++    flex: 1;
++    min-width: 12rem;
++    padding: 0.4rem 0.5rem;
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    font-family: 'Source Code Pro', monospace;
++    font-size: 0.85rem;
++    background: var(--panel);
++  }
++
++  .gdrive-section {
++    display: flex;
++    flex-direction: column;
++    gap: 0.75rem;
++  }
++
++  .field {
++    display: flex;
++    flex-direction: column;
++    gap: 0.25rem;
++  }
++
++  .field label {
++    font-weight: 600;
++    font-size: 0.85rem;
++  }
++
++  .field input[type="text"] {
++    padding: 0.5rem;
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    font-family: 'Source Code Pro', monospace;
++    font-size: 0.85rem;
++    background: var(--panel);
++  }
++
++  .cred-row {
++    display: flex;
++    align-items: center;
++    gap: 0.75rem;
++  }
++
++  .cred-status {
++    font-size: 0.8rem;
++    color: var(--muted);
++  }
++
++  .cred-status.active {
++    color: var(--accent);
++  }
++
++  .form-actions {
++    display: flex;
++    align-items: center;
++    gap: 0.5rem;
++  }
++
++  .save-btn {
++    background: var(--accent);
++    color: white;
++    border: none;
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++    font-weight: 600;
++  }
++
++  .save-btn:disabled {
++    opacity: 0.6;
++    cursor: not-allowed;
++  }
++
++  .feedback {
++    font-size: 0.85rem;
++    color: var(--accent);
++  }
++
++  .feedback.error {
++    color: var(--danger);
++  }
++</style>
+diff --git a/web/src/components/PresetEditor.svelte b/web/src/components/PresetEditor.svelte
+new file mode 100644
+index 0000000..63679cc
+--- /dev/null
++++ b/web/src/components/PresetEditor.svelte
+@@ -0,0 +1,742 @@
++<script lang="ts">
++  import type { PresetDetail } from '../lib/config-api'
++  import type { SessionSummary, Segment } from '../lib/types'
++  import { generatePreset, refinePreset, patchConfig, testPreset } from '../lib/config-api'
++  import { fetchDates, fetchSessions, fetchSession } from '../lib/api'
++  import { configState, setConfig, setError } from '../lib/config.svelte'
++
++  let {
++    presets,
++  }: {
++    presets: Record<string, PresetDetail>
++  } = $props()
++
++  let expandedPreset = $state('')
++  let editName = $state('')
++  let editDesc = $state('')
++  let editPrompt = $state('')
++  let editTemplate = $state('')
++  let editModel = $state('')
++  let isNew = $state(false)
++  let newStep = $state<'describe' | 'form'>('describe')
++  let generating = $state(false)
++  let saving = $state(false)
++  let feedback = $state('')
++
++  // Test modal state
++  let testingPreset = $state('')
++  let testSessionId = $state('')
++  let testRunning = $state(false)
++  let testResult = $state('')
++  let testError = $state('')
++  let testSessions = $state<SessionSummary[]>([])
++  let testSessionsLoading = $state(false)
++  let selectedSessionDetail = $state<{ summary: string; transcript: string } | null>(null)
++  let selectedDetailLoading = $state(false)
++
++  // Refine state
++  let refiningPreset = $state('')
++  let refineFeedback = $state('')
++  let refineRunning = $state(false)
++
++  function expand(name: string): void {
++    if (expandedPreset === name && !isNew) {
++      expandedPreset = ''
++      return
++    }
++    const preset = presets[name]
++    expandedPreset = name
++    editName = name
++    editDesc = preset.description
++    editPrompt = preset.system_prompt
++    editTemplate = preset.user_template
++    editModel = preset.model
++    isNew = false
++    feedback = ''
++  }
++
++  function discardChanges(): void {
++    if (isNew) {
++      expandedPreset = ''
++      isNew = false
++      return
++    }
++    const preset = presets[expandedPreset]
++    if (preset) {
++      editDesc = preset.description
++      editPrompt = preset.system_prompt
++      editTemplate = preset.user_template
++      editModel = preset.model
++      feedback = 'Changes discarded.'
++    }
++  }
++
++  function startNew(): void {
++    expandedPreset = '__new__'
++    editName = ''
++    editDesc = ''
++    editPrompt = ''
++    editTemplate = '{{transcript}}'
++    editModel = ''
++    isNew = true
++    newStep = 'describe'
++    generating = false
++    feedback = ''
++  }
++
++  function editManually(): void {
++    newStep = 'form'
++  }
++
++  async function generateFromLLM(): Promise<void> {
++    if (!editDesc.trim()) {
++      feedback = 'Description is required'
++      return
++    }
++    generating = true
++    feedback = ''
++    try {
++      const result = await generatePreset(editDesc.trim())
++      editPrompt = result.system_prompt
++      editTemplate = result.user_template || '{{transcript}}'
++      newStep = 'form'
++    } catch (error) {
++      feedback = error instanceof Error ? error.message : 'Generation failed'
++    } finally {
++      generating = false
++    }
++  }
++
++  async function save(): Promise<void> {
++    const name = isNew ? editName.trim() : expandedPreset
++    if (!name) {
++      feedback = 'Preset name is required'
++      return
++    }
++    if (!editPrompt.trim()) {
++      feedback = 'System prompt is required'
++      return
++    }
++    if (!editTemplate.trim()) {
++      feedback = 'User template is required'
++      return
++    }
++
++    saving = true
++    feedback = ''
++    try {
++      const updated = await patchConfig({
++        summarization: {
++          presets: {
++            [name]: {
++              description: editDesc,
++              system_prompt: editPrompt,
++              user_template: editTemplate,
++              model: editModel,
++            },
++          },
++        },
++      })
++      setConfig(updated)
++      feedback = 'Saved!'
++      if (isNew) {
++        isNew = false
++        expandedPreset = name
++      }
++    } catch (error) {
++      feedback = error instanceof Error ? error.message : 'Save failed'
++    } finally {
++      saving = false
++    }
++  }
++
++  async function remove(name: string): Promise<void> {
++    if (name === 'default') return
++    saving = true
++    try {
++      const updated = await patchConfig({
++        summarization: { presets: { [name]: null } },
++      })
++      setConfig(updated)
++      expandedPreset = ''
++    } catch (error) {
++      feedback = error instanceof Error ? error.message : 'Delete failed'
++    } finally {
++      saving = false
++    }
++  }
++
++  function openRefine(name: string): void {
++    refiningPreset = name
++    refineFeedback = ''
++  }
++
++  async function runRefine(): Promise<void> {
++    if (!refineFeedback.trim()) return
++    refineRunning = true
++    feedback = ''
++    try {
++      const result = await refinePreset(refiningPreset, refineFeedback.trim())
++      editDesc = result.description
++      editPrompt = result.system_prompt
++      editTemplate = result.user_template || '{{transcript}}'
++      refiningPreset = ''
++      feedback = 'Refined! Review the changes and Save.'
++    } catch (error) {
++      feedback = error instanceof Error ? error.message : 'Refine failed'
++    } finally {
++      refineRunning = false
++    }
++  }
++
++  async function openTest(name: string): Promise<void> {
++    testingPreset = name
++    testSessionId = ''
++    testResult = ''
++    testError = ''
++    testSessions = []
++    selectedSessionDetail = null
++
++    // Load recent sessions for the dropdown.
++    testSessionsLoading = true
++    try {
++      const dates = await fetchDates()
++      const recentDates = dates.slice(0, 5)
++      const allSessions: SessionSummary[] = []
++      for (const date of recentDates) {
++        const sessions = await fetchSessions(date)
++        allSessions.push(...sessions)
++      }
++      // Most recent first, only completed sessions with transcripts.
++      testSessions = allSessions
++        .filter(s => s.status === 'completed' || s.status === 'active')
++        .sort((a, b) => b.id.localeCompare(a.id))
++        .slice(0, 20)
++    } catch {
++      testError = 'Failed to load sessions'
++    } finally {
++      testSessionsLoading = false
++    }
++  }
++
++  async function selectTestSession(sessionId: string): Promise<void> {
++    testSessionId = sessionId
++    selectedSessionDetail = null
++    if (!sessionId) return
++
++    selectedDetailLoading = true
++    try {
++      const detail = await fetchSession(sessionId)
++      const transcript = detail.segments
++        .map((s: Segment) => s.text)
++        .filter((t: string) => t.trim())
++        .join('\n')
++      selectedSessionDetail = {
++        summary: detail.session.summary || '(no summary)',
++        transcript: transcript || '(no transcript)',
++      }
++    } catch {
++      selectedSessionDetail = { summary: '(failed to load)', transcript: '(failed to load)' }
++    } finally {
++      selectedDetailLoading = false
++    }
++  }
++
++  async function runTest(): Promise<void> {
++    if (!testSessionId.trim()) return
++    testRunning = true
++    testResult = ''
++    testError = ''
++    try {
++      const resp = await testPreset(testingPreset, testSessionId.trim())
++      if (resp.error) {
++        testError = resp.error
++      } else {
++        testResult = resp.summary
++      }
++    } catch (error) {
++      testError = error instanceof Error ? error.message : 'Test failed'
++    } finally {
++      testRunning = false
++    }
++  }
++</script>
++
++<div class="preset-editor" data-testid="preset-editor">
++  <div class="preset-actions">
++    <button class="add-btn" type="button" onclick={startNew}>+ Add Preset</button>
++  </div>
++
++  {#each Object.entries(presets) as [name, preset] (name)}
++    <div class="preset-card" class:expanded={expandedPreset === name}>
++      <button class="preset-header" type="button" onclick={() => expand(name)}>
++        <strong>{name}</strong>
++        <span class="preset-desc">{preset.description}</span>
++      </button>
++
++      {#if expandedPreset === name}
++        <div class="preset-form">
++          <div class="field">
++            <label>Name</label>
++            <input type="text" value={name} disabled />
++          </div>
++          <div class="field">
++            <label>Description</label>
++            <input type="text" bind:value={editDesc} />
++          </div>
++          <div class="field">
++            <label>System Prompt</label>
++            <textarea rows="6" bind:value={editPrompt}></textarea>
++          </div>
++          <div class="field">
++            <label>User Template</label>
++            <textarea rows="3" bind:value={editTemplate}></textarea>
++            <span class="hint">Use {"{{transcript}}"} as placeholder</span>
++          </div>
++          <div class="field">
++            <label>Model Override (optional)</label>
++            <input type="text" bind:value={editModel} placeholder="provider/model_name" />
++          </div>
++          <div class="form-actions">
++            <button class="save-btn" type="button" onclick={save} disabled={saving}>
++              {saving ? 'Saving...' : 'Save'}
++            </button>
++            <button class="test-btn" type="button" onclick={() => openTest(name)}>
++              Test
++            </button>
++            <button class="refine-btn" type="button" onclick={() => openRefine(name)}>
++              Refine
++            </button>
++            {#if name !== 'default'}
++              <button class="delete-btn" type="button" onclick={() => remove(name)} disabled={saving}>
++                Delete
++              </button>
++            {/if}
++            <button class="cancel-btn" type="button" onclick={discardChanges}>
++              Discard
++            </button>
++            {#if feedback}
++              <span class="feedback" class:error={feedback !== 'Saved!' && feedback !== 'Changes discarded.' && feedback !== 'Refined! Review the changes and Save.'}>{feedback}</span>
++            {/if}
++          </div>
++        </div>
++      {/if}
++    </div>
++  {/each}
++
++  {#if isNew && expandedPreset === '__new__'}
++    <div class="preset-card expanded">
++      <div class="preset-form">
++        <div class="field">
++          <label>Name</label>
++          <input type="text" bind:value={editName} placeholder="my-preset" />
++        </div>
++        <div class="field">
++          <label>Description</label>
++          <input type="text" bind:value={editDesc} placeholder="What kind of summary do you want?" />
++        </div>
++
++        {#if newStep === 'describe'}
++          <div class="form-actions">
++            <button class="generate-btn" type="button" onclick={generateFromLLM} disabled={generating || !editDesc.trim()}>
++              {generating ? 'Generating...' : 'Generate with LLM'}
++            </button>
++            <button class="cancel-btn" type="button" onclick={editManually}>
++              Edit manually
++            </button>
++            <button class="cancel-btn" type="button" onclick={() => { expandedPreset = ''; isNew = false }}>
++              Cancel
++            </button>
++            {#if feedback}
++              <span class="feedback error">{feedback}</span>
++            {/if}
++          </div>
++        {:else}
++          <div class="field">
++            <label>System Prompt</label>
++            <textarea rows="6" bind:value={editPrompt}></textarea>
++          </div>
++          <div class="field">
++            <label>User Template</label>
++            <textarea rows="3" bind:value={editTemplate}></textarea>
++            <span class="hint">Use {"{{transcript}}"} as placeholder</span>
++          </div>
++          <div class="field">
++            <label>Model Override (optional)</label>
++            <input type="text" bind:value={editModel} placeholder="provider/model_name" />
++          </div>
++          <div class="form-actions">
++            <button class="save-btn" type="button" onclick={save} disabled={saving}>
++              {saving ? 'Creating...' : 'Create'}
++            </button>
++            <button class="cancel-btn" type="button" onclick={() => { expandedPreset = ''; isNew = false }}>
++              Cancel
++            </button>
++            {#if feedback}
++              <span class="feedback" class:error={feedback !== 'Saved!'}>{feedback}</span>
++            {/if}
++          </div>
++        {/if}
++      </div>
++    </div>
++  {/if}
++
++  {#if testingPreset}
++    <div class="test-modal-overlay" onclick={() => { testingPreset = '' }} role="presentation">
++      <div class="test-modal" onclick={(e) => e.stopPropagation()} role="dialog">
++        <h4>Test Preset: {testingPreset}</h4>
++
++        <div class="field">
++          <label for="test-session-select">Select Session</label>
++          {#if testSessionsLoading}
++            <p class="hint">Loading sessions...</p>
++          {:else if testSessions.length === 0}
++            <p class="hint">No sessions found</p>
++          {:else}
++            <select
++              id="test-session-select"
++              value={testSessionId}
++              onchange={(e) => selectTestSession((e.target as HTMLSelectElement).value)}
++            >
++              <option value="">Choose a session...</option>
++              {#each testSessions as session (session.id)}
++                <option value={session.id}>
++                  {new Date(session.started_at).toLocaleString()} — {session.summary ? session.summary.slice(0, 60) + (session.summary.length > 60 ? '...' : '') : '(no summary)'}
++                </option>
++              {/each}
++            </select>
++          {/if}
++        </div>
++
++        {#if selectedDetailLoading}
++          <p class="hint">Loading session detail...</p>
++        {/if}
++
++        {#if selectedSessionDetail}
++          <div class="session-preview">
++            <div class="preview-section">
++              <h5>Current Summary</h5>
++              <pre class="preview-text">{selectedSessionDetail.summary}</pre>
++            </div>
++            <div class="preview-section">
++              <h5>Transcript</h5>
++              <pre class="preview-text transcript">{selectedSessionDetail.transcript}</pre>
++            </div>
++          </div>
++        {/if}
++
++        <div class="form-actions">
++          <button class="save-btn" type="button" onclick={runTest} disabled={testRunning || !testSessionId}>
++            {testRunning ? 'Running...' : 'Run Test'}
++          </button>
++          <button class="cancel-btn" type="button" onclick={() => { testingPreset = '' }}>
++            Close
++          </button>
++        </div>
++
++        {#if testError}
++          <p class="test-error">{testError}</p>
++        {/if}
++        {#if testResult}
++          <div class="test-result">
++            <h5>Generated Summary:</h5>
++            <pre>{testResult}</pre>
++          </div>
++        {/if}
++      </div>
++    </div>
++  {/if}
++
++  {#if refiningPreset}
++    <div class="test-modal-overlay" onclick={() => { refiningPreset = '' }} role="presentation">
++      <div class="test-modal" onclick={(e) => e.stopPropagation()} role="dialog">
++        <h4>Refine Preset: {refiningPreset}</h4>
++        <div class="field">
++          <label for="refine-feedback">What would you like to change?</label>
++          <textarea
++            id="refine-feedback"
++            rows="4"
++            bind:value={refineFeedback}
++            placeholder="e.g. Make it more concise, focus on action items, add a section for follow-ups..."
++          ></textarea>
++        </div>
++        <div class="form-actions">
++          <button class="generate-btn" type="button" onclick={runRefine} disabled={refineRunning || !refineFeedback.trim()}>
++            {refineRunning ? 'Refining...' : 'Refine with LLM'}
++          </button>
++          <button class="cancel-btn" type="button" onclick={() => { refiningPreset = '' }}>
++            Cancel
++          </button>
++        </div>
++      </div>
++    </div>
++  {/if}
++</div>
++
++<style>
++  .preset-editor {
++    display: flex;
++    flex-direction: column;
++    gap: 0.5rem;
++  }
++
++  .preset-actions {
++    margin-bottom: 0.5rem;
++  }
++
++  .add-btn {
++    background: var(--accent-soft);
++    color: var(--accent);
++    border: 1px solid var(--accent);
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++    font-weight: 600;
++  }
++
++  .preset-card {
++    border: 1px solid var(--line);
++    border-radius: 8px;
++    overflow: hidden;
++    background: var(--panel);
++  }
++
++  .preset-card.expanded {
++    border-color: var(--accent);
++  }
++
++  .preset-header {
++    display: flex;
++    align-items: center;
++    gap: 1rem;
++    width: 100%;
++    padding: 0.75rem 1rem;
++    background: none;
++    border: none;
++    cursor: pointer;
++    text-align: left;
++    font-family: inherit;
++  }
++
++  .preset-header:hover {
++    background: var(--accent-soft);
++  }
++
++  .preset-desc {
++    color: var(--muted);
++    font-size: 0.85rem;
++  }
++
++  .preset-form {
++    padding: 1rem;
++    display: flex;
++    flex-direction: column;
++    gap: 0.75rem;
++    border-top: 1px solid var(--line);
++  }
++
++  .field {
++    display: flex;
++    flex-direction: column;
++    gap: 0.25rem;
++  }
++
++  .field label {
++    font-weight: 600;
++    font-size: 0.85rem;
++  }
++
++  .field input, .field textarea {
++    padding: 0.5rem;
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    font-family: 'Source Code Pro', monospace;
++    font-size: 0.85rem;
++    background: var(--card);
++    resize: vertical;
++  }
++
++  .hint {
++    font-size: 0.75rem;
++    color: var(--muted);
++  }
++
++  .form-actions {
++    display: flex;
++    align-items: center;
++    gap: 0.5rem;
++    flex-wrap: wrap;
++  }
++
++  .save-btn {
++    background: var(--accent);
++    color: white;
++    border: none;
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++    font-weight: 600;
++  }
++
++  .save-btn:disabled {
++    opacity: 0.6;
++    cursor: not-allowed;
++  }
++
++  .generate-btn {
++    background: var(--accent);
++    color: white;
++    border: none;
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++    font-weight: 600;
++  }
++
++  .generate-btn:disabled {
++    opacity: 0.6;
++    cursor: not-allowed;
++  }
++
++  .test-btn {
++    background: var(--accent-soft);
++    color: var(--accent);
++    border: 1px solid var(--accent);
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++  }
++
++  .refine-btn {
++    background: var(--accent-soft);
++    color: var(--accent);
++    border: 1px solid var(--accent);
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++  }
++
++  .delete-btn {
++    background: none;
++    color: var(--danger);
++    border: 1px solid var(--danger);
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++  }
++
++  .cancel-btn {
++    background: none;
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    padding: 0.4rem 1rem;
++    cursor: pointer;
++    font-family: inherit;
++  }
++
++  .feedback {
++    font-size: 0.85rem;
++    color: var(--accent);
++  }
++
++  .feedback.error {
++    color: var(--danger);
++  }
++
++  .test-modal-overlay {
++    position: fixed;
++    top: 0; left: 0; right: 0; bottom: 0;
++    background: rgba(0,0,0,0.4);
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    z-index: 100;
++  }
++
++  .test-modal {
++    background: var(--card);
++    border-radius: 12px;
++    padding: 1.5rem;
++    width: 90%;
++    max-width: 700px;
++    max-height: 80vh;
++    overflow-y: auto;
++  }
++
++  .test-modal h4 {
++    margin: 0 0 1rem;
++  }
++
++  .test-error {
++    color: var(--danger);
++    margin: 0.5rem 0;
++  }
++
++  .test-result {
++    margin-top: 1rem;
++    border-top: 1px solid var(--line);
++    padding-top: 0.75rem;
++  }
++
++  .test-result h5 {
++    margin: 0 0 0.5rem;
++  }
++
++  .test-result pre {
++    background: var(--panel);
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    padding: 0.75rem;
++    white-space: pre-wrap;
++    font-size: 0.85rem;
++    max-height: 300px;
++    overflow-y: auto;
++  }
++
++  select {
++    padding: 0.5rem;
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    font-family: inherit;
++    font-size: 0.85rem;
++    background: var(--panel);
++    width: 100%;
++  }
++
++  .session-preview {
++    display: flex;
++    flex-direction: column;
++    gap: 0.75rem;
++    margin: 0.75rem 0;
++  }
++
++  .preview-section h5 {
++    margin: 0 0 0.25rem;
++    font-size: 0.85rem;
++    color: var(--muted);
++  }
++
++  .preview-text {
++    background: var(--panel);
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    padding: 0.5rem;
++    white-space: pre-wrap;
++    font-size: 0.8rem;
++    max-height: 150px;
++    overflow-y: auto;
++    margin: 0;
++  }
++
++  .preview-text.transcript {
++    max-height: 100px;
++    color: var(--muted);
++  }
++
++</style>
+diff --git a/web/src/components/SettingsPage.svelte b/web/src/components/SettingsPage.svelte
+new file mode 100644
+index 0000000..a761cfd
+--- /dev/null
++++ b/web/src/components/SettingsPage.svelte
+@@ -0,0 +1,116 @@
++<script lang="ts">
++  import { onMount } from 'svelte'
++  import { fetchConfig } from '../lib/config-api'
++  import { configState, setConfig, setError } from '../lib/config.svelte'
++  import GeneralSettings from './GeneralSettings.svelte'
++  import PresetEditor from './PresetEditor.svelte'
++  import IntegrationsSettings from './IntegrationsSettings.svelte'
++
++  let { onBack }: { onBack: () => void } = $props()
++
++  onMount(() => {
++    const load = async () => {
++      try {
++        const config = await fetchConfig()
++        setConfig(config)
++      } catch (error) {
++        setError(error instanceof Error ? error.message : 'Failed to load config')
++      }
++    }
++    void load()
++  })
++</script>
++
++<div class="settings-page" data-testid="settings-page">
++  <header class="settings-header">
++    <button class="back-btn" type="button" onclick={onBack}>
++      ← Back
++    </button>
++    <h2>Settings</h2>
++  </header>
++
++  {#if configState.error}
++    <p class="settings-error">{configState.error}</p>
++  {/if}
++
++  {#if !configState.loaded}
++    <p class="settings-loading">Loading configuration...</p>
++  {:else if configState.config}
++    <section class="settings-section">
++      <h3 class="section-heading">Summarization Presets</h3>
++      <PresetEditor presets={configState.config.summarization.presets} />
++    </section>
++
++    <section class="settings-section">
++      <h3 class="section-heading">General Settings</h3>
++      <GeneralSettings />
++    </section>
++
++    <section class="settings-section">
++      <h3 class="section-heading">Integrations</h3>
++      <IntegrationsSettings config={configState.config} />
++    </section>
++  {/if}
++</div>
++
++<style>
++  .settings-page {
++    padding: 1rem;
++  }
++
++  .settings-header {
++    display: flex;
++    align-items: center;
++    gap: 1rem;
++    margin-bottom: 1.5rem;
++  }
++
++  .settings-header h2 {
++    margin: 0;
++    font-size: 1.5rem;
++  }
++
++  .back-btn {
++    background: none;
++    border: 1px solid var(--line);
++    border-radius: 6px;
++    padding: 0.3rem 0.8rem;
++    cursor: pointer;
++    font-family: inherit;
++    color: var(--ink);
++  }
++
++  .back-btn:hover {
++    background: var(--accent-soft);
++  }
++
++  .settings-error {
++    color: var(--danger);
++    padding: 0.5rem;
++  }
++
++  .settings-loading {
++    color: var(--muted);
++    font-style: italic;
++  }
++
++  .settings-section {
++    background: var(--card);
++    border: 1px solid var(--line);
++    border-radius: 10px;
++    padding: 1.25rem;
++    margin-bottom: 1rem;
++  }
++
++  .section-heading {
++    font-size: 1.1rem;
++    margin: 0 0 0.75rem;
++    color: var(--ink);
++  }
++
++  .section-placeholder {
++    color: var(--muted);
++    font-style: italic;
++    margin: 0;
++  }
++</style>
+diff --git a/web/src/lib/__tests__/config-api.test.ts b/web/src/lib/__tests__/config-api.test.ts
+new file mode 100644
+index 0000000..cd14a02
+--- /dev/null
++++ b/web/src/lib/__tests__/config-api.test.ts
+@@ -0,0 +1,105 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { fetchConfig, patchConfig, testPreset } from '../config-api'
++
++afterEach(() => {
++  vi.restoreAllMocks()
++})
++
++describe('config api client', () => {
++  it('fetches config', async () => {
++    const mockConfig = {
++      silence_timeout: '30s',
++      summarization: { model: 'openai/gpt-4o-mini', base_url: '', presets: {} },
++      transcription: { endpointing: '400', utterance_end_ms: '1000' },
++      gdrive: { folder_id: '', has_credentials: false },
++      api_keys: { deepgram: false, openai: false, anthropic: false, gemini: false },
++    }
++
++    vi.stubGlobal(
++      'fetch',
++      vi.fn().mockResolvedValue({
++        ok: true,
++        status: 200,
++        json: async () => mockConfig,
++      }),
++    )
++
++    await expect(fetchConfig()).resolves.toEqual(mockConfig)
++  })
++
++  it('patches config and returns updated result', async () => {
++    const updated = {
++      silence_timeout: '45s',
++      summarization: { model: 'openai/gpt-4o-mini', base_url: '', presets: {} },
++      transcription: { endpointing: '400', utterance_end_ms: '1000' },
++      gdrive: { folder_id: '', has_credentials: false },
++      api_keys: { deepgram: false, openai: false, anthropic: false, gemini: false },
++    }
++
++    const fetchMock = vi.fn().mockResolvedValue({
++      ok: true,
++      status: 200,
++      json: async () => updated,
++    })
++    vi.stubGlobal('fetch', fetchMock)
++
++    const result = await patchConfig({ silence_timeout: '45s' })
++    expect(result).toEqual(updated)
++
++    expect(fetchMock).toHaveBeenCalledWith('/api/config', {
++      method: 'PATCH',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ silence_timeout: '45s' }),
++    })
++  })
++
++  it('patchConfig throws on validation error', async () => {
++    vi.stubGlobal(
++      'fetch',
++      vi.fn().mockResolvedValue({
++        ok: false,
++        status: 400,
++        text: async () => '{"error":"invalid silence_timeout"}',
++      }),
++    )
++
++    await expect(patchConfig({ silence_timeout: 'bad' })).rejects.toThrow(/invalid/)
++  })
++
++  it('tests preset against session', async () => {
++    const mockResponse = { summary: '## Summary', error: '' }
++
++    const fetchMock = vi.fn().mockResolvedValue({
++      ok: true,
++      status: 200,
++      json: async () => mockResponse,
++    })
++    vi.stubGlobal('fetch', fetchMock)
++
++    const result = await testPreset('default', 's1')
++    expect(result).toEqual(mockResponse)
++
++    expect(fetchMock).toHaveBeenCalledWith('/api/config/presets/default/test', {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ session_id: 's1' }),
++    })
++  })
++
++  it('testPreset returns error field on LLM failure', async () => {
++    const mockResponse = { summary: '', error: 'model unavailable' }
++
++    vi.stubGlobal(
++      'fetch',
++      vi.fn().mockResolvedValue({
++        ok: true,
++        status: 200,
++        json: async () => mockResponse,
++      }),
++    )
++
++    const result = await testPreset('default', 's1')
++    expect(result.error).toBe('model unavailable')
++    expect(result.summary).toBe('')
++  })
++})
+diff --git a/web/src/lib/config-api.ts b/web/src/lib/config-api.ts
+new file mode 100644
+index 0000000..4c3a950
+--- /dev/null
++++ b/web/src/lib/config-api.ts
+@@ -0,0 +1,84 @@
++export interface PresetDetail {
++  description: string
++  system_prompt: string
++  user_template: string
++  model: string
++}
++
++export interface ConfigResponse {
++  silence_timeout: string
++  summarization: {
++    model: string
++    base_url: string
++    presets: Record<string, PresetDetail>
++  }
++  transcription: {
++    endpointing: string
++    utterance_end_ms: string
++  }
++  gdrive: {
++    folder_id: string
++    has_credentials: boolean
++  }
++  api_keys: Record<string, boolean>
++}
++
++export interface TestPresetResponse {
++  summary: string
++  error: string
++}
++
++async function configRequest<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
++  const response = await fetch(input, init)
++  if (!response.ok) {
++    const text = await response.text()
++    throw new Error(text || `request failed: ${response.status}`)
++  }
++  return (await response.json()) as T
++}
++
++export function fetchConfig(): Promise<ConfigResponse> {
++  return configRequest<ConfigResponse>('/api/config')
++}
++
++export function patchConfig(patch: Record<string, unknown>): Promise<ConfigResponse> {
++  return configRequest<ConfigResponse>('/api/config', {
++    method: 'PATCH',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(patch),
++  })
++}
++
++export function testPreset(name: string, sessionId: string): Promise<TestPresetResponse> {
++  return configRequest<TestPresetResponse>(
++    `/api/config/presets/${encodeURIComponent(name)}/test`,
++    {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ session_id: sessionId }),
++    },
++  )
++}
++
++export interface GeneratePresetResponse {
++  description: string
++  system_prompt: string
++  user_template: string
++  model: string
++}
++
++export function generatePreset(description: string): Promise<GeneratePresetResponse> {
++  return configRequest<GeneratePresetResponse>('/api/config/presets/generate', {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({ description }),
++  })
++}
++
++export function refinePreset(name: string, feedback: string): Promise<GeneratePresetResponse> {
++  return configRequest<GeneratePresetResponse>('/api/config/presets/refine', {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({ name, feedback }),
++  })
++}
+diff --git a/web/src/lib/config.svelte.ts b/web/src/lib/config.svelte.ts
+new file mode 100644
+index 0000000..55a2b33
+--- /dev/null
++++ b/web/src/lib/config.svelte.ts
+@@ -0,0 +1,36 @@
++import type { ConfigResponse } from './config-api'
++
++type ConfigState = {
++  loaded: boolean
++  saving: boolean
++  error: string
++  config: ConfigResponse | null
++}
++
++export const configState = $state<ConfigState>({
++  loaded: false,
++  saving: false,
++  error: '',
++  config: null,
++})
++
++export function setConfig(config: ConfigResponse): void {
++  configState.loaded = true
++  configState.config = config
++  configState.error = ''
++}
++
++export function setSaving(saving: boolean): void {
++  configState.saving = saving
++}
++
++export function setError(error: string): void {
++  configState.error = error
++}
++
++export function resetConfigState(): void {
++  configState.loaded = false
++  configState.saving = false
++  configState.error = ''
++  configState.config = null
++}
