@@ -19,6 +19,7 @@ type ControlHooks struct {
 	Warnings        func() []string
 	Presets         func() map[string]config.Preset
 	Resummarize     func(ctx context.Context, sessionID, preset string) error
+	EndSession      func(ctx context.Context) error
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks) (http.Handler, error) {

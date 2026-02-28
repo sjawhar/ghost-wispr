@@ -31,6 +31,7 @@ type EventBroadcaster interface {
 	BroadcastSessionStarted(sessionID string)
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
 	BroadcastSummaryReady(sessionID, summary, status, preset string)
+	BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64)
 }
 
 type LifecycleManager interface {

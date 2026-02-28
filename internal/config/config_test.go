@@ -51,6 +51,12 @@ func TestDefaults(t *testing.T) {
 	if preset.UserTemplate != "{{transcript}}" {
 		t.Fatalf("expected default preset user_template, got %q", preset.UserTemplate)
 	}
+	if cfg.Transcription.Endpointing != "400" {
+		t.Fatalf("expected default transcription.endpointing '400', got %q", cfg.Transcription.Endpointing)
+	}
+	if cfg.Transcription.UtteranceEndMs != "1000" {
+		t.Fatalf("expected default transcription.utterance_end_ms '1000', got %q", cfg.Transcription.UtteranceEndMs)
+	}
 }
 
 func TestYAMLLoading(t *testing.T) {

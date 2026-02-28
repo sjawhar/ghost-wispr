@@ -6,10 +6,14 @@
     segments,
     connected,
     activeSessionStartedAt,
+    interimText,
+    interimSpeaker,
   }: {
     segments: LiveTranscriptEvent[]
     connected: boolean
     activeSessionStartedAt: number
+    interimText: string
+    interimSpeaker: number
   } = $props()
 
   let container: HTMLDivElement | null = null
@@ -60,6 +64,8 @@
   $effect(() => {
     // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reactive dependency tracking
     segments.length
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reactive dependency tracking
+    interimText
     if (stickToBottom && container) {
       requestAnimationFrame(() => {
         if (container) {
@@ -93,5 +99,15 @@
         <span class="segment-text">{segment.text}</span>
       </article>
     {/each}
+
+    {#if interimText}
+      <article class="segment-row interim">
+        <span class="segment-time"></span>
+        <strong class={`segment-speaker ${speakerClass(interimSpeaker)}`}>
+          {interimSpeaker >= 0 ? `Speaker ${interimSpeaker}` : '...'}
+        </strong>
+        <span class="segment-text">{interimText}</span>
+      </article>
+    {/if}
   </div>
 </section>
