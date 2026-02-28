@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -151,11 +152,18 @@ type hubMock struct {
 	latestSummary string
 	latestStatus  string
 	latestPreset  string
+	interimCount  int
 }
 
 func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
 	h.mu.Lock()
 	h.liveCount++
+	h.mu.Unlock()
+}
+
+func (h *hubMock) BroadcastLiveTranscriptInterim(_ int, _ string, _ float64) {
+	h.mu.Lock()
+	h.interimCount++
 	h.mu.Unlock()
 }
 
@@ -196,6 +204,7 @@ func TestManagerLifecycle(t *testing.T) {
 	var msg api.MessageResponse
 	raw := []byte(`{
 		"is_final": true,
+		"speech_final": true,
 		"channel": {
 			"alternatives": [
 				{
@@ -378,5 +387,172 @@ func TestManager_StartSession_RecorderFailureRollsBack(t *testing.T) {
 	defer store.mu.Unlock()
 	if store.endSessionCalls != 1 {
 		t.Fatalf("expected EndSession rollback to be called once, got %d", store.endSessionCalls)
+	}
+}
+
+// buildMsg creates a Deepgram MessageResponse from JSON for testing.
+func buildMsg(t *testing.T, raw string) *api.MessageResponse {
+	t.Helper()
+	var msg api.MessageResponse
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	return &msg
+}
+
+func TestManager_BuffersUntilSpeechFinal(t *testing.T) {
+	store := newStoreMock()
+	hub := &hubMock{}
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+
+	// First is_final without speech_final — should buffer but NOT persist.
+	msg1 := buildMsg(t, `{
+		"is_final": true,
+		"speech_final": false,
+		"channel": {"alternatives": [{
+			"transcript": "hello world",
+			"words": [{"speaker": 0, "punctuated_word": "hello", "start": 0, "end": 0.5},
+			           {"speaker": 0, "punctuated_word": "world", "start": 0.5, "end": 1.0}]
+		}]}}`)
+	if err := manager.Message(msg1); err != nil {
+		t.Fatalf("Message msg1 failed: %v", err)
+	}
+
+	// Words buffered but nothing persisted yet.
+	if len(store.segments) != 0 {
+		t.Fatalf("expected no persisted segments after is_final without speech_final, got %d sessions with segments", len(store.segments))
+	}
+
+	// Second is_final with speech_final — should flush and persist ALL words.
+	msg2 := buildMsg(t, `{
+		"is_final": true,
+		"speech_final": true,
+		"channel": {"alternatives": [{
+			"transcript": "how are you",
+			"words": [{"speaker": 0, "punctuated_word": "how", "start": 1.1, "end": 1.4},
+			           {"speaker": 0, "punctuated_word": "are", "start": 1.4, "end": 1.7},
+			           {"speaker": 0, "punctuated_word": "you", "start": 1.7, "end": 2.0}]
+		}]}}`)
+	if err := manager.Message(msg2); err != nil {
+		t.Fatalf("Message msg2 failed: %v", err)
+	}
+
+	// Should have persisted segments with all 5 words from both messages.
+	sessionID := hub.latestSession
+	if sessionID == "" {
+		t.Fatal("expected session to have started")
+	}
+	segs := store.segments[sessionID]
+	if len(segs) == 0 {
+		t.Fatal("expected segments after speech_final flush")
+	}
+	// All words should be accumulated — verify total text coverage.
+	var allText string
+	for _, s := range segs {
+		allText += s.Text + " "
+	}
+	if !strings.Contains(allText, "hello") || !strings.Contains(allText, "you") {
+		t.Errorf("expected all words in persisted segments, got %q", allText)
+	}
+}
+
+func TestManager_InterimBroadcast(t *testing.T) {
+	store := newStoreMock()
+	hub := &hubMock{}
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+
+	// Send interim (not is_final) message.
+	msg := buildMsg(t, `{
+		"is_final": false,
+		"speech_final": false,
+		"channel": {"alternatives": [{
+			"transcript": "hello",
+			"words": [{"speaker": 0, "punctuated_word": "hello", "start": 0, "end": 0.5}]
+		}]}}`)
+	if err := manager.Message(msg); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+
+	hub.mu.Lock()
+	gotInterim := hub.interimCount
+	hub.mu.Unlock()
+
+	if gotInterim == 0 {
+		t.Fatal("expected BroadcastLiveTranscriptInterim to be called for interim message")
+	}
+	if len(store.segments) != 0 {
+		t.Fatal("expected no persisted segments for interim message")
+	}
+}
+
+func TestManager_UtteranceEndFlushesBuffer(t *testing.T) {
+	store := newStoreMock()
+	hub := &hubMock{}
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+
+	// Buffer words via is_final without speech_final.
+	msg := buildMsg(t, `{
+		"is_final": true,
+		"speech_final": false,
+		"channel": {"alternatives": [{
+			"transcript": "testing one two",
+			"words": [{"speaker": 0, "punctuated_word": "testing", "start": 0, "end": 0.5},
+			           {"speaker": 0, "punctuated_word": "one", "start": 0.5, "end": 0.8},
+			           {"speaker": 0, "punctuated_word": "two", "start": 0.8, "end": 1.0}]
+		}]}}`)
+	if err := manager.Message(msg); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+	if len(store.segments) != 0 {
+		t.Fatal("expected no segments before UtteranceEnd")
+	}
+
+	// UtteranceEnd should flush the buffer.
+	if err := manager.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatalf("UtteranceEnd failed: %v", err)
+	}
+
+	sessionID := hub.latestSession
+	segs := store.segments[sessionID]
+	if len(segs) == 0 {
+		t.Fatal("expected segments after UtteranceEnd flush")
+	}
+}
+
+func TestManager_ForceEndFlushesBuffer(t *testing.T) {
+	store := newStoreMock()
+	hub := &hubMock{}
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+
+	// Buffer words via is_final without speech_final.
+	msg := buildMsg(t, `{
+		"is_final": true,
+		"speech_final": false,
+		"channel": {"alternatives": [{
+			"transcript": "before force end",
+			"words": [{"speaker": 0, "punctuated_word": "before", "start": 0, "end": 0.4},
+			           {"speaker": 0, "punctuated_word": "force", "start": 0.4, "end": 0.8},
+			           {"speaker": 0, "punctuated_word": "end", "start": 0.8, "end": 1.0}]
+		}]}}`)
+	if err := manager.Message(msg); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+	// Verify no segments persisted yet (buffer not flushed).
+	if len(store.segments) != 0 {
+		t.Fatal("expected no segments before ForceEndSession")
+	}
+
+	// ForceEndSession should flush buffer THEN end the session.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := manager.ForceEndSession(ctx); err != nil && !errors.Is(err, ErrNoActiveSession) {
+		t.Fatalf("ForceEndSession failed unexpectedly: %v", err)
+	}
+
+	// sessionID is set after flush (BroadcastSessionStarted fires inside flushBuffer).
+	sessionID := hub.latestSession
+	segs := store.segments[sessionID]
+	if len(segs) == 0 {
+		t.Fatal("expected buffered words to be flushed by ForceEndSession")
 	}
 }

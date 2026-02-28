@@ -2,25 +2,41 @@
   let {
     connected,
     paused,
+    activeSessionId,
     onToggle,
+    onEndSession,
   }: {
     connected: boolean
     paused: boolean
+    activeSessionId: string
     onToggle: () => Promise<void>
+    onEndSession: () => Promise<void>
   } = $props()
 
   let busy = $state(false)
+  let endBusy = $state(false)
 
   async function handleToggle() {
-    if (busy) {
-      return
-    }
-
+    if (busy) return
     busy = true
     try {
       await onToggle()
+    } catch (err) {
+      console.error('Failed to toggle recording:', err)
     } finally {
       busy = false
+    }
+  }
+
+  async function handleEndSession() {
+    if (endBusy) return
+    endBusy = true
+    try {
+      await onEndSession()
+    } catch (err) {
+      console.error('Failed to end session:', err)
+    } finally {
+      endBusy = false
     }
   }
 </script>
@@ -39,4 +55,10 @@
       Pause
     {/if}
   </button>
+
+  {#if activeSessionId}
+    <button class="end-btn" type="button" onclick={handleEndSession} disabled={endBusy}>
+      End Session
+    </button>
+  {/if}
 </div>

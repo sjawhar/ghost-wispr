@@ -233,6 +233,9 @@ func main() {
 			hub.BroadcastSummaryReady(sessionID, summaryText, status, presetUsed)
 			return err
 		},
+		EndSession: func(ctx context.Context) error {
+			return manager.ForceEndSession(ctx)
+		},
 	})
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
@@ -309,14 +312,18 @@ func main() {
 	if mic != nil && cfg.DeepgramAPIKey != "" {
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := &interfaces.LiveTranscriptionOptions{
-			Model:       "nova-2",
-			Language:    "en-US",
-			Diarize:     true,
-			Punctuate:   true,
-			SmartFormat: true,
-			Encoding:    "linear16",
-			SampleRate:  selectedSampleRate,
-			Channels:    1,
+			Model:          "nova-2",
+			Language:       "en-US",
+			Diarize:        true,
+			Punctuate:      true,
+			SmartFormat:    true,
+			Encoding:       "linear16",
+			SampleRate:     selectedSampleRate,
+			Channels:       1,
+			Endpointing:    cfg.Transcription.Endpointing,
+			InterimResults: true,
+			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
+			VadEvents:      true,
 		}
 
 		dgClient, err := client.NewWSUsingCallback(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, transcriptCallback{manager: manager})

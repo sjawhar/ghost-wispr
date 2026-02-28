@@ -18,6 +18,13 @@ type LiveTranscriptEvent struct {
 	EndTime   float64 `json:"end_time"`
 }
 
+type LiveTranscriptInterimEvent struct {
+	Event
+	Speaker   int     `json:"speaker"`
+	Text      string  `json:"text"`
+	StartTime float64 `json:"start_time"`
+}
+
 type SessionStartedEvent struct {
 	Event
 	SessionID string `json:"session_id"`

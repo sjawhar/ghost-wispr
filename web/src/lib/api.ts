@@ -52,3 +52,7 @@ export async function resummarize(sessionId: string, preset?: string): Promise<v
     throw new Error(`resummarize failed: ${response.status}`)
   }
 }
+
+export function endSession(): Promise<void> {
+  return request<void>('/api/session/end', { method: 'POST' })
+}

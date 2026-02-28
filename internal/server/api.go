@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -147,6 +148,24 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 		}
 		if controls.OnStatusChanged != nil {
 			controls.OnStatusChanged(false)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("POST /api/session/end", func(w http.ResponseWriter, r *http.Request) {
+		if controls.EndSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := controls.EndSession(ctx); err != nil {
+			if errors.Is(err, session.ErrNoActiveSession) {
+				writeJSONError(w, http.StatusConflict, "no active session")
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})

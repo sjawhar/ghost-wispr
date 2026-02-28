@@ -12,6 +12,13 @@ export interface LiveTranscriptEvent extends BaseEvent {
   end_time: number
 }
 
+export interface LiveTranscriptInterimEvent extends BaseEvent {
+  type: 'live_transcript_interim'
+  speaker: number
+  text: string
+  start_time: number
+}
+
 export interface SessionStartedEvent extends BaseEvent {
   type: 'session_started'
   session_id: string
@@ -43,6 +50,7 @@ export interface ConnectionEvent extends BaseEvent {
 
 export type WebSocketEvent =
   | LiveTranscriptEvent
+  | LiveTranscriptInterimEvent
   | SessionStartedEvent
   | SessionEndedEvent
   | SummaryReadyEvent
