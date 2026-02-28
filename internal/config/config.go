@@ -30,6 +30,11 @@ type Summarization struct {
 	Presets map[string]Preset `yaml:"presets"`
 }
 
+type Transcription struct {
+	Endpointing    string `yaml:"endpointing"`
+	UtteranceEndMs string `yaml:"utterance_end_ms"`
+}
+
 type Config struct {
 	DBPath                string        `yaml:"db_path"`
 	AudioDir              string        `yaml:"audio_dir"`
@@ -39,6 +44,7 @@ type Config struct {
 	GDriveFolderID        string        `yaml:"gdrive_folder_id"`
 	GoogleCredentialsFile string        `yaml:"google_credentials_file"`
 	Summarization         Summarization `yaml:"summarization"`
+	Transcription         Transcription `yaml:"transcription"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
@@ -64,6 +70,10 @@ func defaults() Config {
 					UserTemplate: "{{transcript}}",
 				},
 			},
+		},
+		Transcription: Transcription{
+			Endpointing:    "400",
+			UtteranceEndMs: "1000",
 		},
 	}
 }
@@ -156,6 +166,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv(EnvPrefix + "GOOGLE_CREDENTIALS_FILE"); v != "" {
 		cfg.GoogleCredentialsFile = v
+	}
+	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_ENDPOINTING"); v != "" {
+		cfg.Transcription.Endpointing = v
+	}
+	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_UTTERANCE_END_MS"); v != "" {
+		cfg.Transcription.UtteranceEndMs = v
 	}
 }
 

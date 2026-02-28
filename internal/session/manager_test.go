@@ -159,6 +159,11 @@ func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
 	h.mu.Unlock()
 }
 
+func (h *hubMock) BroadcastLiveTranscriptInterim(_ int, _ string, _ float64) {
+	h.mu.Lock()
+	h.mu.Unlock()
+}
+
 func (h *hubMock) BroadcastSessionStarted(sessionID string) {
 	h.mu.Lock()
 	h.startedCount++
@@ -196,6 +201,7 @@ func TestManagerLifecycle(t *testing.T) {
 	var msg api.MessageResponse
 	raw := []byte(`{
 		"is_final": true,
+		"speech_final": true,
 		"channel": {
 			"alternatives": [
 				{

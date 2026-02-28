@@ -19,6 +19,8 @@ type AppState = {
   activeSessionId: string
   activeSessionStartedAt: number
   activeAudioSessionId: string
+  interimText: string
+  interimSpeaker: number
 }
 
 export const appState = $state<AppState>({
@@ -33,6 +35,8 @@ export const appState = $state<AppState>({
   activeSessionId: '',
   activeSessionStartedAt: 0,
   activeAudioSessionId: '',
+  interimText: '',
+  interimSpeaker: -1,
 })
 
 export function getTodaysSessions(): SessionSummary[] {
@@ -144,7 +148,13 @@ export function applyEvent(event: WebSocketEvent): void {
     case 'summary_ready':
       applySummaryUpdate(event)
       return
+    case 'live_transcript_interim':
+      appState.interimText = event.text
+      appState.interimSpeaker = event.speaker
+      return
     case 'live_transcript':
+      appState.interimText = ''
+      appState.interimSpeaker = -1
       appendLiveSegment(event)
       return
     default:
@@ -164,4 +174,6 @@ export function resetState(): void {
   appState.activeAudioSessionId = ''
   appState.warnings = []
   appState.presets = {}
+  appState.interimText = ''
+  appState.interimSpeaker = -1
 }

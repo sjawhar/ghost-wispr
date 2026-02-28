@@ -151,6 +151,20 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	mux.HandleFunc("POST /api/session/end", func(w http.ResponseWriter, r *http.Request) {
+		if controls.EndSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := controls.EndSession(ctx); err != nil {
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf("end session: %v", err))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		paused := false
 		if controls.IsPaused != nil {

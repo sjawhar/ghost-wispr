@@ -19,6 +19,7 @@ type Manager struct {
 	summarizer Summarizer
 	hub        EventBroadcaster
 	detector   *Detector
+	buffer   *UtteranceBuffer
 
 	mu               sync.Mutex
 	currentSessionID string
@@ -36,6 +37,7 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 		summarizer: summarizer,
 		hub:        hub,
 		detector:   detector,
+		buffer:     NewUtteranceBuffer(),
 	}
 
 	detector.OnSessionEnd(func() {
@@ -53,10 +55,11 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 	}
 
 	sentence := strings.TrimSpace(mr.Channel.Alternatives[0].Transcript)
-	if sentence == "" || !mr.IsFinal {
+	if sentence == "" {
 		return nil
 	}
 
+	// Extract words from the Deepgram response.
 	words := make([]transcribe.Word, 0, len(mr.Channel.Alternatives[0].Words))
 	for _, word := range mr.Channel.Alternatives[0].Words {
 		words = append(words, transcribe.Word{
@@ -67,15 +70,51 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 		})
 	}
 
+	// Interim result (not final) — broadcast for faded live display.
+	if !mr.IsFinal {
+		if m.hub != nil {
+			speaker := -1
+			startTime := 0.0
+			if len(words) > 0 {
+				if words[0].Speaker != nil {
+					speaker = *words[0].Speaker
+				}
+				startTime = words[0].Start
+			}
+			m.hub.BroadcastLiveTranscriptInterim(speaker, sentence, startTime)
+		}
+		return nil
+	}
+
+	// Final result — buffer words until speech_final.
+	m.buffer.AddWords(words)
+	m.detector.OnSpeech()
+
+	// If speech_final, flush the buffer and persist/broadcast.
+	if mr.SpeechFinal {
+		return m.flushBuffer()
+	}
+
+	return nil
+}
+
+func (m *Manager) UtteranceEnd(_ *api.UtteranceEndResponse) error {
+	if err := m.flushBuffer(); err != nil {
+		return err
+	}
+	m.detector.OnUtteranceEnd()
+	return nil
+}
+
+func (m *Manager) flushBuffer() error {
+	words := m.buffer.Flush()
+	if len(words) == 0 {
+		return nil
+	}
+
 	segments := transcribe.GroupWordsBySpeaker(words)
 	if len(segments) == 0 {
-		segments = []transcribe.Segment{{
-			Speaker:   -1,
-			Text:      sentence,
-			StartTime: 0,
-			EndTime:   0,
-			Timestamp: time.Now().UTC(),
-		}}
+		return nil
 	}
 
 	for i := range segments {
@@ -93,13 +132,6 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 			m.hub.BroadcastLiveTranscript(segments[i])
 		}
 	}
-
-	m.detector.OnSpeech()
-	return nil
-}
-
-func (m *Manager) UtteranceEnd(_ *api.UtteranceEndResponse) error {
-	m.detector.OnUtteranceEnd()
 	return nil
 }
 

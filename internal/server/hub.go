@@ -55,6 +55,15 @@ func (h *Hub) BroadcastLiveTranscript(seg transcribe.Segment) {
 	})
 }
 
+func (h *Hub) BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64) {
+	h.broadcastEvent(LiveTranscriptInterimEvent{
+		Event:     newEvent("live_transcript_interim", time.Now().UTC()),
+		Speaker:   speaker,
+		Text:      text,
+		StartTime: startTime,
+	})
+}
+
 func (h *Hub) BroadcastSessionStarted(sessionID string) {
 	h.broadcastEvent(SessionStartedEvent{
 		Event:     newEvent("session_started", time.Now().UTC()),
