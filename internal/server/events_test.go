@@ -36,4 +36,32 @@ func TestEventSerialization(t *testing.T) {
 			t.Fatalf("missing timestamp in payload: %s", string(b))
 		}
 	}
+
+}
+func TestSummaryReadyEventIncludesPreset(t *testing.T) {
+	event := SummaryReadyEvent{
+		Event:     newEvent("summary_ready", time.Unix(1, 0)),
+		SessionID: "abc",
+		Summary:   "ok",
+		Status:    "completed",
+		Preset:    "meeting-notes",
+	}
+
+	b, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(b, &payload); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	preset, ok := payload["summary_preset"]
+	if !ok {
+		t.Fatalf("missing summary_preset in payload: %s", string(b))
+	}
+	if preset != "meeting-notes" {
+		t.Fatalf("expected summary_preset=meeting-notes, got %v", preset)
+	}
 }

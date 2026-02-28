@@ -133,6 +133,11 @@ func (m *Manager) ensureSessionStarted(now time.Time) error {
 
 	if m.recorder != nil {
 		if err := m.recorder.StartSession(sessionID); err != nil {
+			m.mu.Lock()
+			m.currentSessionID = ""
+			m.currentStartedAt = time.Time{}
+			m.mu.Unlock()
+			_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
 			return fmt.Errorf("start audio recorder session: %w", err)
 		}
 	}
@@ -153,8 +158,6 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 		return nil
 	}
 
-	m.currentSessionID = ""
-	m.currentStartedAt = time.Time{}
 	m.mu.Unlock()
 
 	endedAt := time.Now().UTC()
@@ -171,26 +174,31 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 		return fmt.Errorf("end session: %w", err)
 	}
 
+	m.mu.Lock()
+	m.currentSessionID = ""
+	m.currentStartedAt = time.Time{}
+	m.mu.Unlock()
+
 	if m.hub != nil {
 		m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 	}
 
-	go m.generateSummary(ctx, sessionID)
+	go m.generateSummary(context.Background(), sessionID)
 	return nil
 }
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	if m.summarizer == nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryCompleted)
+		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryCompleted, "")
 		return
 	}
 
-	_ = m.store.UpdateSummary(sessionID, "", storage.SummaryRunning)
+	_ = m.store.UpdateSummary(sessionID, "", storage.SummaryRunning, "")
 
 	segments, err := m.store.GetSegments(sessionID)
 	if err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed)
-		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed)
+		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed, "")
+		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed, "")
 		return
 	}
 
@@ -203,25 +211,25 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 		b.WriteString("\n")
 	}
 
-	summaryText, err := m.summarizer.Summarize(ctx, sessionID, b.String())
+	summaryText, preset, err := m.summarizer.Summarize(ctx, sessionID, b.String())
 	if err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed)
-		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed)
+		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed, preset)
+		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed, preset)
 		return
 	}
 
-	if err := m.store.UpdateSummary(sessionID, summaryText, storage.SummaryCompleted); err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed)
-		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed)
+	if err := m.store.UpdateSummary(sessionID, summaryText, storage.SummaryCompleted, preset); err != nil {
+		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed, preset)
+		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed, preset)
 		return
 	}
 
-	m.broadcastSummaryStatus(sessionID, summaryText, storage.SummaryCompleted)
+	m.broadcastSummaryStatus(sessionID, summaryText, storage.SummaryCompleted, preset)
 }
 
-func (m *Manager) broadcastSummaryStatus(sessionID, summary, status string) {
+func (m *Manager) broadcastSummaryStatus(sessionID, summary, status, preset string) {
 	if m.hub != nil {
-		m.hub.BroadcastSummaryReady(sessionID, summary, status)
+		m.hub.BroadcastSummaryReady(sessionID, summary, status, preset)
 	}
 }
 

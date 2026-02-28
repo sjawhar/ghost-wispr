@@ -1,4 +1,4 @@
-import type { SessionDetailResponse, SessionSummary, StatusResponse } from './types'
+import type { PresetMap, SessionDetailResponse, SessionSummary, StatusResponse } from './types'
 
 async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init)
@@ -30,10 +30,25 @@ export function fetchStatus(): Promise<StatusResponse> {
   return request<StatusResponse>('/api/status')
 }
 
+export function fetchPresets(): Promise<PresetMap> {
+  return request<PresetMap>('/api/presets')
+}
+
 export function pauseRecording(): Promise<void> {
   return request<void>('/api/pause', { method: 'POST' })
 }
 
 export function resumeRecording(): Promise<void> {
   return request<void>('/api/resume', { method: 'POST' })
+}
+
+export async function resummarize(sessionId: string, preset?: string): Promise<void> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/resummarize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(preset ? { preset } : {}),
+  })
+  if (!response.ok) {
+    throw new Error(`resummarize failed: ${response.status}`)
+  }
 }

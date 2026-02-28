@@ -8,10 +8,12 @@ describe('SessionList', () => {
       dates: [],
       sessionsByDate: new Map(),
       sessionDetails: new Map(),
+      presets: {},
       expandedSessionId: '',
       onToggleSession: vi.fn(),
       onLoadDate: vi.fn().mockResolvedValue(undefined),
       onLoadDetail: vi.fn().mockResolvedValue(undefined),
+      onResummarize: vi.fn().mockResolvedValue(undefined),
     })
 
     expect(screen.getByText('No sessions yet.')).toBeTruthy()
@@ -28,10 +30,12 @@ describe('SessionList', () => {
         ['2026-02-23', []],
       ]),
       sessionDetails: new Map(),
+      presets: {},
       expandedSessionId: '',
       onToggleSession: vi.fn(),
       onLoadDate: vi.fn().mockResolvedValue(undefined),
       onLoadDetail: vi.fn().mockResolvedValue(undefined),
+      onResummarize: vi.fn().mockResolvedValue(undefined),
     })
 
     const button = screen.getByRole('button', { name: 'Load previous' })

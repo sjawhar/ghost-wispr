@@ -1,23 +1,27 @@
 <script lang="ts">
   import SessionCard from './SessionCard.svelte'
-  import type { SessionDetailResponse, SessionSummary } from '../lib/types'
+  import type { PresetMap, SessionDetailResponse, SessionSummary } from '../lib/types'
 
   let {
     dates,
     sessionsByDate,
     sessionDetails,
+    presets,
     expandedSessionId,
     onToggleSession,
     onLoadDate,
     onLoadDetail,
+    onResummarize,
   }: {
     dates: string[]
     sessionsByDate: Map<string, SessionSummary[]>
     sessionDetails: Map<string, SessionDetailResponse>
+    presets: PresetMap
     expandedSessionId: string
     onToggleSession: (id: string) => void
     onLoadDate: (date: string) => Promise<void>
     onLoadDetail: (id: string) => Promise<void>
+    onResummarize: (sessionId: string, preset: string) => Promise<void>
   } = $props()
 
   let loadedDates = $state(3)
@@ -75,8 +79,10 @@
               {session}
               detail={sessionDetails.get(session.id)}
               expanded={expandedSessionId === session.id}
+              {presets}
               onToggle={() => onToggleSession(session.id)}
               {onLoadDetail}
+              {onResummarize}
             />
           {/each}
         </div>

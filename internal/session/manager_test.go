@@ -3,12 +3,14 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -18,7 +20,11 @@ type storeMock struct {
 	segments map[string][]transcribe.Segment
 	summary  map[string]string
 	status   map[string]string
+	preset   map[string]string
 	audio    map[string]string
+
+	endSessionErr   error
+	endSessionCalls int
 }
 
 func newStoreMock() *storeMock {
@@ -27,6 +33,7 @@ func newStoreMock() *storeMock {
 		segments: map[string][]transcribe.Segment{},
 		summary:  map[string]string{},
 		status:   map[string]string{},
+		preset:   map[string]string{},
 		audio:    map[string]string{},
 	}
 }
@@ -42,6 +49,10 @@ func (s *storeMock) CreateSession(id string, startedAt time.Time) error {
 func (s *storeMock) EndSession(id string, _ time.Time, audioPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.endSessionCalls++
+	if s.endSessionErr != nil {
+		return s.endSessionErr
+	}
 	s.status[id] = "ended"
 	s.audio[id] = audioPath
 	return nil
@@ -61,11 +72,12 @@ func (s *storeMock) GetSegments(sessionID string) ([]transcribe.Segment, error) 
 	return list, nil
 }
 
-func (s *storeMock) UpdateSummary(sessionID, summary, status string) error {
+func (s *storeMock) UpdateSummary(sessionID, summary, status, preset string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.summary[sessionID] = summary
 	s.status[sessionID] = status
+	s.preset[sessionID] = preset
 	return nil
 }
 
@@ -73,11 +85,16 @@ type recorderMock struct {
 	mu      sync.Mutex
 	started []string
 	ended   int
+
+	startErr error
 }
 
 func (r *recorderMock) StartSession(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.startErr != nil {
+		return r.startErr
+	}
 	r.started = append(r.started, id)
 	return nil
 }
@@ -96,11 +113,32 @@ type summarizerMock struct {
 	called chan string
 }
 
-func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, error) {
+func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, error) {
 	if s.called != nil {
 		s.called <- sessionID
 	}
-	return "## Summary\n- " + transcript, nil
+	return "## Summary\n- " + transcript, "default", nil
+}
+
+type contextProbeSummarizer struct {
+	delay  time.Duration
+	stateC chan error
+}
+
+func (s contextProbeSummarizer) Summarize(ctx context.Context, _ string, transcript string) (string, string, error) {
+	time.Sleep(s.delay)
+	select {
+	case <-ctx.Done():
+		if s.stateC != nil {
+			s.stateC <- ctx.Err()
+		}
+		return "", "default", ctx.Err()
+	default:
+		if s.stateC != nil {
+			s.stateC <- nil
+		}
+		return "## Summary\n- " + transcript, "default", nil
+	}
 }
 
 type hubMock struct {
@@ -112,6 +150,7 @@ type hubMock struct {
 	latestSession string
 	latestSummary string
 	latestStatus  string
+	latestPreset  string
 }
 
 func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
@@ -134,12 +173,13 @@ func (h *hubMock) BroadcastSessionEnded(sessionID string, _ time.Duration) {
 	h.mu.Unlock()
 }
 
-func (h *hubMock) BroadcastSummaryReady(sessionID, summary, status string) {
+func (h *hubMock) BroadcastSummaryReady(sessionID, summary, status, preset string) {
 	h.mu.Lock()
 	h.summaryReady++
 	h.latestSession = sessionID
 	h.latestSummary = summary
 	h.latestStatus = status
+	h.latestPreset = preset
 	h.mu.Unlock()
 }
 
@@ -217,5 +257,126 @@ func TestManagerLifecycle(t *testing.T) {
 
 	if recorder.ended == 0 {
 		t.Fatal("expected recorder EndSession to be called")
+	}
+}
+
+func TestManager_AutoSummaryContextNotCanceled(t *testing.T) {
+	store := newStoreMock()
+	stateC := make(chan error, 1)
+	summarizer := contextProbeSummarizer{delay: 20 * time.Millisecond, stateC: stateC}
+	manager := NewManager(store, nil, summarizer, nil, NewDetector(time.Hour))
+
+	now := time.Now().UTC()
+	if err := manager.ensureSessionStarted(now); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "hello"}); err != nil {
+		t.Fatalf("AppendSegment failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	if err := manager.endCurrentSession(ctx); err != nil {
+		t.Fatalf("endCurrentSession failed: %v", err)
+	}
+	cancel()
+
+	select {
+	case err := <-stateC:
+		if err != nil {
+			t.Fatalf("expected summary context to remain active after endCurrentSession returns, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for summary call")
+	}
+}
+
+func TestManager_ForceEndSession_SummaryCompletes(t *testing.T) {
+	store := newStoreMock()
+	stateC := make(chan error, 1)
+	summarizer := contextProbeSummarizer{delay: 20 * time.Millisecond, stateC: stateC}
+	manager := NewManager(store, nil, summarizer, nil, NewDetector(time.Hour))
+
+	now := time.Now().UTC()
+	if err := manager.ensureSessionStarted(now); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "hello"}); err != nil {
+		t.Fatalf("AppendSegment failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if err := manager.ForceEndSession(ctx); err != nil {
+		t.Fatalf("ForceEndSession failed: %v", err)
+	}
+
+	select {
+	case err := <-stateC:
+		if err != nil {
+			t.Fatalf("expected summary generation to continue after ForceEndSession returns, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for summary call")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		store.mu.Lock()
+		status := store.status[sessionID]
+		store.mu.Unlock()
+		if status == storage.SummaryCompleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected summary status %q, got %q", storage.SummaryCompleted, status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestManager_EndSession_StoreFailurePreservesState(t *testing.T) {
+	store := newStoreMock()
+	store.endSessionErr = errors.New("store end failed")
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour))
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+
+	startedSessionID := manager.currentSession()
+	if startedSessionID == "" {
+		t.Fatal("expected active session")
+	}
+
+	err := manager.endCurrentSession(context.Background())
+	if err == nil {
+		t.Fatal("expected endCurrentSession to fail")
+	}
+
+	if got := manager.currentSession(); got == "" {
+		t.Fatal("expected manager to preserve currentSessionID on end failure")
+	}
+}
+
+func TestManager_StartSession_RecorderFailureRollsBack(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{startErr: errors.New("recorder start failed")}
+	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour))
+
+	err := manager.ensureSessionStarted(time.Now().UTC())
+	if err == nil {
+		t.Fatal("expected ensureSessionStarted to fail")
+	}
+
+	if got := manager.currentSession(); got != "" {
+		t.Fatalf("expected currentSessionID to be cleared, got %q", got)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.endSessionCalls != 1 {
+		t.Fatalf("expected EndSession rollback to be called once, got %d", store.endSessionCalls)
 	}
 }

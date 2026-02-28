@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -15,13 +16,14 @@ import (
 	"time"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
-	microphone "github.com/deepgram/deepgram-go-sdk/v3/pkg/audio/microphone"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
+	"github.com/gordonklaus/portaudio"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
+	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -32,7 +34,7 @@ import (
 var staticFiles embed.FS
 
 type recorderState struct {
-	mic    *microphone.Microphone
+	mic    *audio.Mic
 	mu     sync.RWMutex
 	paused bool
 }
@@ -41,18 +43,12 @@ func (r *recorderState) Pause() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.paused = true
-	if r.mic != nil {
-		r.mic.Mute()
-	}
 }
 
 func (r *recorderState) Resume() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.paused = false
-	if r.mic != nil {
-		r.mic.Unmute()
-	}
 }
 
 func (r *recorderState) IsPaused() bool {
@@ -61,7 +57,7 @@ func (r *recorderState) IsPaused() bool {
 	return r.paused
 }
 
-func (r *recorderState) SetMic(mic *microphone.Microphone) {
+func (r *recorderState) SetMic(mic *audio.Mic) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.mic = mic
@@ -136,12 +132,50 @@ func main() {
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
 	audioRecorder := audio.NewRecorder(cfg.AudioDir)
 
-	var summarizer session.Summarizer
-	if cfg.OpenAIAPIKey != "" {
-		summarizer = summary.NewOpenAI(cfg.OpenAIAPIKey, cfg.OpenAIModel, store)
+	apiKeys := map[string]string{
+		"openai":    cfg.OpenAIAPIKey,
+		"anthropic": cfg.AnthropicAPIKey,
+		"gemini":    cfg.GeminiAPIKey,
 	}
 
-	manager := session.NewManager(store, audioRecorder, summarizer, hub, detector)
+	clientFactory := func(provider, model string) (llm.Client, error) {
+		key := apiKeys[provider]
+		if key == "" {
+			return nil, fmt.Errorf("no API key for provider %q", provider)
+		}
+		var opts []llm.Option
+		if provider == "openai" && cfg.Summarization.BaseURL != "" {
+			opts = append(opts, llm.WithBaseURL(cfg.Summarization.BaseURL))
+		}
+		return llm.NewClient(provider, key, model, opts...)
+	}
+
+	var summarizer *summary.Summarizer
+	canSummarize := false
+	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil && apiKeys[provider] != "" {
+		canSummarize = true
+	}
+	if !canSummarize {
+		for _, preset := range cfg.Summarization.Presets {
+			if preset.Model == "" {
+				continue
+			}
+			if provider, _, err := llm.ParseModel(preset.Model); err == nil && apiKeys[provider] != "" {
+				canSummarize = true
+				break
+			}
+		}
+	}
+	if canSummarize {
+		summarizer = summary.New(cfg.Summarization, clientFactory)
+	}
+
+	var sessionSummarizer session.Summarizer
+	if summarizer != nil {
+		sessionSummarizer = summarizer
+	}
+
+	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector)
 
 	recState := &recorderState{}
 	warnings := append([]string{}, cfgWarnings...)
@@ -154,6 +188,51 @@ func main() {
 			hub.BroadcastStatusChanged(paused)
 		},
 		Warnings: func() []string { return warnings },
+		Presets: func() map[string]config.Preset {
+			if summarizer == nil {
+				return nil
+			}
+			return summarizer.Presets()
+		},
+		Resummarize: func(ctx context.Context, sessionID, preset string) error {
+			if summarizer == nil {
+				return fmt.Errorf("summarization not configured")
+			}
+
+			segments, err := store.GetSegments(sessionID)
+			if err != nil {
+				return err
+			}
+
+			var b strings.Builder
+			for _, seg := range segments {
+				if strings.TrimSpace(seg.Text) != "" {
+					b.WriteString(seg.Text)
+					b.WriteString("\n")
+				}
+			}
+			transcript := b.String()
+
+			_ = store.UpdateSummary(sessionID, "", storage.SummaryRunning, "")
+			hub.BroadcastSummaryReady(sessionID, "", storage.SummaryRunning, "")
+
+			var summaryText string
+			var presetUsed string
+			if preset != "" {
+				presetUsed = preset
+				summaryText, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
+			} else {
+				summaryText, presetUsed, err = summarizer.Summarize(ctx, sessionID, transcript)
+			}
+
+			status := storage.SummaryCompleted
+			if err != nil {
+				status = storage.SummaryFailed
+			}
+			_ = store.UpdateSummary(sessionID, summaryText, status, presetUsed)
+			hub.BroadcastSummaryReady(sessionID, summaryText, status, presetUsed)
+			return err
+		},
 	})
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
@@ -187,18 +266,22 @@ func main() {
 		}
 	}
 
-	var mic *microphone.Microphone
+	var mic *audio.Mic
 	var dgWriter io.Writer
 	var dgStop func()
 	selectedSampleRate := cfg.MicSampleRate
 
-	microphone.Initialize()
-	defer microphone.Teardown()
+	paErr := portaudio.Initialize()
+	//nolint:errcheck // Terminate is best-effort cleanup
+	defer portaudio.Terminate()
+	if paErr != nil {
+		log.Fatalf("portaudio init failed: %v", paErr) //nolint:gocritic // Terminate is no-op if Initialize failed
+	}
 
 	client.Init(client.InitLib{LogLevel: client.LogLevelDefault})
 
 	for _, rate := range cfg.SampleRateCandidates() {
-		mic, err = microphone.New(microphone.AudioConfig{InputChannels: 1, SamplingRate: float32(rate)})
+		mic, err = audio.NewMic(rate, rate/4) // 250ms buffer
 		if err != nil {
 			log.Printf("warning: microphone open failed at %d Hz: %v", rate, err)
 			continue
