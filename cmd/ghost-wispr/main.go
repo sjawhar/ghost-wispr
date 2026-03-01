@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,10 +30,22 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 //go:embed static/*
 var staticFiles embed.FS
+
+func buildTranscript(segments []transcribe.Segment) string {
+	var b strings.Builder
+	for _, seg := range segments {
+		if strings.TrimSpace(seg.Text) != "" {
+			b.WriteString(seg.Text)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
 
 type recorderState struct {
 	mic    *audio.Mic
@@ -110,10 +124,12 @@ func main() {
 		configPath = "ghost-wispr.yaml"
 	}
 
-	cfg, cfgWarnings, err := config.Load(configPath)
+	envPath := filepath.Join(filepath.Dir(configPath), ".env")
+	cfgStore, cfgWarnings, err := config.NewStoreWithEnv(configPath, envPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	cfg := cfgStore.Get()
 	for _, w := range cfgWarnings {
 		log.Printf("config: %s", w)
 	}
@@ -121,6 +137,14 @@ func main() {
 	store, err := storage.NewSQLiteStore(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("storage init failed: %v", err)
+	}
+
+	// Recover any sessions left as 'active' from a previous crash/restart.
+	recoveredIDs, err := store.RecoverStaleSessions()
+	if err != nil {
+		log.Printf("warning: failed to recover stale sessions: %v", err)
+	} else if len(recoveredIDs) > 0 {
+		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
 	}
 
 	assets, err := fs.Sub(staticFiles, "static")
@@ -132,24 +156,29 @@ func main() {
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
 	audioRecorder := audio.NewRecorder(cfg.AudioDir)
 
+	clientFactory := func(provider, model string) (llm.Client, error) {
+		latestCfg := cfgStore.Get()
+		keys := map[string]string{
+			"openai":    latestCfg.OpenAIAPIKey,
+			"anthropic": latestCfg.AnthropicAPIKey,
+			"gemini":    latestCfg.GeminiAPIKey,
+		}
+		key := keys[provider]
+		if key == "" {
+			return nil, fmt.Errorf("no API key for provider %q", provider)
+		}
+		var opts []llm.Option
+		if provider == "openai" && latestCfg.Summarization.BaseURL != "" {
+			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
+		}
+		return llm.NewClient(provider, key, model, opts...)
+	}
+
 	apiKeys := map[string]string{
 		"openai":    cfg.OpenAIAPIKey,
 		"anthropic": cfg.AnthropicAPIKey,
 		"gemini":    cfg.GeminiAPIKey,
 	}
-
-	clientFactory := func(provider, model string) (llm.Client, error) {
-		key := apiKeys[provider]
-		if key == "" {
-			return nil, fmt.Errorf("no API key for provider %q", provider)
-		}
-		var opts []llm.Option
-		if provider == "openai" && cfg.Summarization.BaseURL != "" {
-			opts = append(opts, llm.WithBaseURL(cfg.Summarization.BaseURL))
-		}
-		return llm.NewClient(provider, key, model, opts...)
-	}
-
 	var summarizer *summary.Summarizer
 	canSummarize := false
 	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil && apiKeys[provider] != "" {
@@ -177,10 +206,15 @@ func main() {
 
 	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector)
 
+	// Summarize recovered sessions (and any with pending/empty summaries).
+	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
+	var startupSummarizer = summarizer // capture for goroutine below
+
 	recState := &recorderState{}
 	warnings := append([]string{}, cfgWarnings...)
+	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
 
-	handler, err := server.Handler(assets, hub, store, server.ControlHooks{
+	handler, err := server.Handler(assets, hub, store, &server.ControlHooks{
 		Pause:    recState.Pause,
 		Resume:   recState.Resume,
 		IsPaused: recState.IsPaused,
@@ -204,14 +238,7 @@ func main() {
 				return err
 			}
 
-			var b strings.Builder
-			for _, seg := range segments {
-				if strings.TrimSpace(seg.Text) != "" {
-					b.WriteString(seg.Text)
-					b.WriteString("\n")
-				}
-			}
-			transcript := b.String()
+			transcript := buildTranscript(segments)
 
 			_ = store.UpdateSummary(sessionID, "", storage.SummaryRunning, "")
 			hub.BroadcastSummaryReady(sessionID, "", storage.SummaryRunning, "")
@@ -236,13 +263,217 @@ func main() {
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
 		},
-	})
+		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
+			latestCfg := cfgStore.Get()
+			preset, ok := latestCfg.Summarization.Presets[presetName]
+			if !ok {
+				return "", fmt.Errorf("preset %q not found", presetName)
+			}
+
+			segments, err := store.GetSegments(sessionID)
+			if err != nil {
+				return "", err
+			}
+
+			transcript := buildTranscript(segments)
+
+			modelStr := preset.Model
+			if modelStr == "" {
+				modelStr = latestCfg.Summarization.Model
+			}
+
+			provider, model, err := llm.ParseModel(modelStr)
+			if err != nil {
+				return "", err
+			}
+
+			client, err := clientFactory(provider, model)
+			if err != nil {
+				return "", err
+			}
+
+			userContent := strings.ReplaceAll(preset.UserTemplate, "{{transcript}}", transcript)
+			msgs := []llm.Message{
+				{Role: "system", Content: preset.SystemPrompt},
+				{Role: "user", Content: userContent},
+			}
+
+			return client.Complete(ctx, msgs)
+		},
+		GeneratePreset: func(ctx context.Context, description string) (config.Preset, error) {
+			latestCfg := cfgStore.Get()
+			modelStr := latestCfg.Summarization.Model
+			provider, model, err := llm.ParseModel(modelStr)
+			if err != nil {
+				return config.Preset{}, fmt.Errorf("no summarization model configured")
+			}
+
+			client, err := clientFactory(provider, model)
+			if err != nil {
+				return config.Preset{}, err
+			}
+
+			prompt := `You are designing a transcript summarization preset for a meeting transcription tool.
+The user will describe what kind of summary they want. Generate a JSON object with exactly these fields:
+- "system_prompt": Instructions for the summarizer (what to extract, how to format, tone)
+- "user_template": The template that wraps the transcript. MUST contain {{transcript}} as a placeholder.
+
+Return ONLY valid JSON, no markdown fences, no explanation.`
+
+			userMsg := fmt.Sprintf("Generate a summarization preset for: %s", description)
+			msgs := []llm.Message{
+				{Role: "system", Content: prompt},
+				{Role: "user", Content: userMsg},
+			}
+
+			result, err := client.Complete(ctx, msgs)
+			if err != nil {
+				return config.Preset{}, err
+			}
+
+			// Extract JSON from response (handles markdown fences and preamble).
+			result = strings.TrimSpace(result)
+			if start := strings.Index(result, "{"); start != -1 {
+				if end := strings.LastIndex(result, "}"); end > start {
+					result = result[start : end+1]
+				}
+			}
+
+			var generated struct {
+				SystemPrompt string `json:"system_prompt"`
+				UserTemplate string `json:"user_template"`
+			}
+			if err := json.Unmarshal([]byte(result), &generated); err != nil {
+				return config.Preset{}, fmt.Errorf("LLM returned invalid JSON: %w", err)
+			}
+
+			return config.Preset{
+				Description:  description,
+				SystemPrompt: generated.SystemPrompt,
+				UserTemplate: generated.UserTemplate,
+			}, nil
+		},
+		RefinePreset: func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error) {
+			latestCfg := cfgStore.Get()
+			modelStr := latestCfg.Summarization.Model
+			provider, model, err := llm.ParseModel(modelStr)
+			if err != nil {
+				return config.Preset{}, fmt.Errorf("no summarization model configured")
+			}
+
+			client, err := clientFactory(provider, model)
+			if err != nil {
+				return config.Preset{}, err
+			}
+
+			prompt := `You are refining a transcript summarization preset for a meeting transcription tool.
+The user will provide their current preset configuration and feedback about what to change.
+Return a revised JSON object with exactly these fields:
+- "description": Updated description of what this preset does
+- "system_prompt": Revised instructions for the summarizer
+- "user_template": Revised template that wraps the transcript. MUST contain {{transcript}} as a placeholder.
+
+Return ONLY valid JSON, no markdown fences, no explanation.`
+
+			userMsg := fmt.Sprintf(`Current preset:
+- Description: %s
+- System Prompt: %s
+- User Template: %s
+
+User feedback: %s`, current.Description, current.SystemPrompt, current.UserTemplate, feedback)
+
+			msgs := []llm.Message{
+				{Role: "system", Content: prompt},
+				{Role: "user", Content: userMsg},
+			}
+
+			result, err := client.Complete(ctx, msgs)
+			if err != nil {
+				return config.Preset{}, err
+			}
+
+			// Extract JSON from response (handles markdown fences and preamble).
+			result = strings.TrimSpace(result)
+			if start := strings.Index(result, "{"); start != -1 {
+				if end := strings.LastIndex(result, "}"); end > start {
+					result = result[start : end+1]
+				}
+			}
+
+			var refined struct {
+				Description  string `json:"description"`
+				SystemPrompt string `json:"system_prompt"`
+				UserTemplate string `json:"user_template"`
+			}
+			if err := json.Unmarshal([]byte(result), &refined); err != nil {
+				return config.Preset{}, fmt.Errorf("LLM returned invalid JSON: %w", err)
+			}
+
+			return config.Preset{
+				Description:  refined.Description,
+				SystemPrompt: refined.SystemPrompt,
+				UserTemplate: refined.UserTemplate,
+				Model:        current.Model,
+			}, nil
+		},
+	}, authToken, cfgStore)
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
 	}
 
+	// Register config change callback.
+	cfgStore.OnChange(func(newCfg config.Config) {
+		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
+		log.Printf("config: reloaded (silence_timeout=%s)", newCfg.SilenceTimeout)
+
+		// Recreate summarizer if API keys or model changed.
+		newAPIKeys := map[string]string{
+			"openai":    newCfg.OpenAIAPIKey,
+			"anthropic": newCfg.AnthropicAPIKey,
+			"gemini":    newCfg.GeminiAPIKey,
+		}
+		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && newAPIKeys[provider] != "" {
+			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
+			manager.SetSummarizer(newSummarizer)
+			log.Printf("config: summarizer updated for provider %s", provider)
+		}
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Summarize recovered sessions (and any with pending/empty summaries).
+	if startupSummarizer != nil {
+		go func() {
+			pendingIDs, err := store.GetSessionsNeedingSummary()
+			if err != nil {
+				log.Printf("warning: failed to query sessions needing summary: %v", err)
+				return
+			}
+			for _, id := range pendingIDs {
+				log.Printf("summarizing session %s", id)
+				segments, err := store.GetSegments(id)
+				if err != nil {
+					log.Printf("warning: failed to get segments for %s: %v", id, err)
+					continue
+				}
+				transcript := buildTranscript(segments)
+				if transcript == "" {
+					_ = store.UpdateSummary(id, "", storage.SummaryCompleted, "")
+					continue
+				}
+				_ = store.UpdateSummary(id, "", storage.SummaryRunning, "")
+				summaryText, preset, err := startupSummarizer.Summarize(ctx, id, transcript)
+				if err != nil {
+					log.Printf("warning: summarization failed for %s: %v", id, err)
+					_ = store.UpdateSummary(id, "", storage.SummaryFailed, preset)
+					continue
+				}
+				_ = store.UpdateSummary(id, summaryText, storage.SummaryCompleted, preset)
+				log.Printf("summarized session %s with preset %s", id, preset)
+			}
+		}()
+	}
 	defer func() { _ = store.Close() }()
 
 	if cfg.GDriveFolderID != "" {
@@ -344,14 +575,18 @@ func main() {
 		}
 	}
 
-	httpServer := &http.Server{Addr: ":8080", Handler: handler}
+	addr := os.Getenv("GHOST_WISPR_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+	httpServer := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("http server error: %v", err)
 		}
 	}()
 
-	log.Println("ghost-wispr: web UI on http://127.0.0.1:8080")
+	log.Printf("ghost-wispr: web UI on http://127.0.0.1%s", addr)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
