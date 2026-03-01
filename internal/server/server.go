@@ -20,22 +20,29 @@ type ControlHooks struct {
 	Presets         func() map[string]config.Preset
 	Resummarize     func(ctx context.Context, sessionID, preset string) error
 	EndSession      func(ctx context.Context) error
+	TestPreset      func(ctx context.Context, presetName, sessionID string) (string, error)
+	GeneratePreset  func(ctx context.Context, description string) (config.Preset, error)
+	RefinePreset    func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error)
 }
 
-func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks) (http.Handler, error) {
+func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, cfgStore ...*config.Store) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	registerWSRoute(mux, hub)
-	registerAPIRoutes(mux, store, controls)
+	var cs *config.Store
+	if len(cfgStore) > 0 {
+		cs = cfgStore[0]
+	}
+	registerAPIRoutes(mux, store, controls, cs)
 
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer))
 
-	return mux, nil
+	return BasicAuthMiddleware(authToken)(mux), nil
 }
 
-func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls ControlHooks) error {
-	h, err := Handler(staticFS, hub, store, controls)
+func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, cfgStore ...*config.Store) error {
+	h, err := Handler(staticFS, hub, store, controls, authToken, cfgStore...)
 	if err != nil {
 		return err
 	}

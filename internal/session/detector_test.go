@@ -72,3 +72,38 @@ func TestDetectorSupportsConfigurableTimeout(t *testing.T) {
 		t.Fatal("expected long detector callback")
 	}
 }
+
+func TestDetector_SetTimeout(t *testing.T) {
+	d := NewDetector(10 * time.Second) // Long timeout initially
+
+	var called atomic.Int32
+	d.OnSessionEnd(func() { called.Add(1) })
+
+	// Update to very short timeout.
+	d.SetTimeout(20 * time.Millisecond)
+
+	// Trigger utterance end — should use new short timeout.
+	d.OnUtteranceEnd()
+
+	<-time.After(200 * time.Millisecond)
+
+	if called.Load() != 1 {
+		t.Fatalf("expected callback to fire with new timeout, called=%d", called.Load())
+	}
+}
+
+func TestDetector_SetTimeout_IgnoresZero(t *testing.T) {
+	d := NewDetector(50 * time.Millisecond)
+	d.SetTimeout(0) // Should be ignored
+
+	var called atomic.Int32
+	d.OnSessionEnd(func() { called.Add(1) })
+
+	d.OnUtteranceEnd()
+
+	<-time.After(200 * time.Millisecond)
+
+	if called.Load() != 1 {
+		t.Fatalf("expected callback with original timeout, called=%d", called.Load())
+	}
+}

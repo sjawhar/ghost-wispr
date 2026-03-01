@@ -54,3 +54,13 @@ func (d *Detector) OnUtteranceEnd() {
 		}
 	})
 }
+
+// SetTimeout updates the silence timeout duration.
+// The new timeout takes effect on the next OnUtteranceEnd call.
+func (d *Detector) SetTimeout(timeout time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if timeout > 0 {
+		d.timeout = timeout
+	}
+}

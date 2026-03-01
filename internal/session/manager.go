@@ -273,7 +273,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	if m.summarizer == nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryCompleted, "")
+		// No summarizer available — leave as pending so it can be summarized later.
 		return
 	}
 
@@ -321,4 +321,12 @@ func (m *Manager) currentSession() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.currentSessionID
+}
+
+// SetSummarizer replaces the summarizer used for new sessions.
+// Safe to call concurrently.
+func (m *Manager) SetSummarizer(s Summarizer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.summarizer = s
 }

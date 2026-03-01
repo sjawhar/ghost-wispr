@@ -373,3 +373,63 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 
 	return sessions, nil
 }
+
+// RecoverStaleSessions ends any sessions still marked as 'active' and returns their IDs.
+// This handles the case where the app was restarted while a session was in progress.
+func (s *SQLiteStore) RecoverStaleSessions() ([]string, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	rows, err := s.db.Query(`SELECT id FROM sessions WHERE status = 'active'`)
+	if err != nil {
+		return nil, fmt.Errorf("query active sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan active session: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active sessions: %w", err)
+	}
+
+	for _, id := range ids {
+		_, err := s.db.Exec(
+			`UPDATE sessions SET ended_at = ?, status = 'ended' WHERE id = ? AND status = 'active'`,
+			now, id,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("end stale session %s: %w", id, err)
+		}
+	}
+
+	return ids, nil
+}
+
+// GetSessionsNeedingSummary returns IDs of ended sessions with pending or empty summaries.
+func (s *SQLiteStore) GetSessionsNeedingSummary() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT id FROM sessions WHERE status = 'ended' AND (summary_status IN ('pending', 'running') OR (summary_status = 'completed' AND (summary IS NULL OR summary = '')))`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query sessions needing summary: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions: %w", err)
+	}
+	return ids, nil
+}

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
   import Controls from './components/Controls.svelte'
+  import SettingsPage from './components/SettingsPage.svelte'
   import LivePanel from './components/LivePanel.svelte'
   import SessionList from './components/SessionList.svelte'
   import {
@@ -27,6 +28,7 @@
 
   let expandedSessionId = $state('')
   let loadingError = $state('')
+  let currentView = $state<'main' | 'settings'>('main')
 
   async function loadDate(date: string): Promise<void> {
     if (appState.sessionsByDate.has(date)) {
@@ -128,46 +130,91 @@
       <h1>Ghost Wispr</h1>
       <p class="subtitle">Live capture first, session memory second.</p>
     </div>
-    <Controls
-      connected={appState.connected}
-      paused={appState.paused}
-      activeSessionId={appState.activeSessionId}
-      onToggle={togglePause}
-      onEndSession={endSession}
-    />
+    <div class="header-actions">
+      <Controls
+        connected={appState.connected}
+        paused={appState.paused}
+        activeSessionId={appState.activeSessionId}
+        onToggle={togglePause}
+        onEndSession={endSession}
+      />
+      <button
+        class="settings-btn"
+        type="button"
+        title="Settings"
+        data-testid="settings-toggle"
+        onclick={() => {
+          currentView = currentView === 'main' ? 'settings' : 'main'
+        }}
+      >
+        &#9881;
+      </button>
+    </div>
   </header>
 
   {#if loadingError}
     <p class="load-error">{loadingError}</p>
   {/if}
 
-  {#if appState.warnings.length > 0}
-    <aside class="warnings-banner" data-testid="warnings-banner">
-      {#each appState.warnings as warning (warning)}
-        <p class="warning-item">{warning}</p>
-      {/each}
-    </aside>
+  {#if currentView === 'settings'}
+    <SettingsPage
+      onBack={() => {
+        currentView = 'main'
+      }}
+    />
+  {:else}
+    {#if appState.warnings.length > 0}
+      <aside class="warnings-banner" data-testid="warnings-banner">
+        {#each appState.warnings as warning (warning)}
+          <p class="warning-item">{warning}</p>
+        {/each}
+      </aside>
+    {/if}
+
+    <section class="layout">
+      <LivePanel
+        segments={appState.liveSegments}
+        connected={appState.connected}
+        activeSessionStartedAt={appState.activeSessionStartedAt}
+        interimText={appState.interimText}
+        interimSpeaker={appState.interimSpeaker}
+      />
+
+      <SessionList
+        dates={appState.dates}
+        sessionsByDate={appState.sessionsByDate}
+        sessionDetails={appState.sessionDetails}
+        presets={appState.presets}
+        {expandedSessionId}
+        {onToggleSession}
+        onLoadDate={loadDate}
+        onLoadDetail={loadSession}
+        onResummarize={handleResummarize}
+      />
+    </section>
   {/if}
-
-  <section class="layout">
-    <LivePanel
-      segments={appState.liveSegments}
-      connected={appState.connected}
-      activeSessionStartedAt={appState.activeSessionStartedAt}
-      interimText={appState.interimText}
-      interimSpeaker={appState.interimSpeaker}
-    />
-
-    <SessionList
-      dates={appState.dates}
-      sessionsByDate={appState.sessionsByDate}
-      sessionDetails={appState.sessionDetails}
-      presets={appState.presets}
-      {expandedSessionId}
-      {onToggleSession}
-      onLoadDate={loadDate}
-      onLoadDetail={loadSession}
-      onResummarize={handleResummarize}
-    />
-  </section>
 </main>
+
+<style>
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .settings-btn {
+    background: none;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.4rem 0.6rem;
+    font-size: 1.3rem;
+    cursor: pointer;
+    color: var(--muted);
+    line-height: 1;
+  }
+
+  .settings-btn:hover {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+</style>

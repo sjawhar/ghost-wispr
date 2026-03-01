@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -28,7 +29,7 @@ type SessionStore interface {
 	GetDates() ([]string, error)
 }
 
-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlHooks) {
+func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, cfgStore *config.Store) {
 	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		date := r.URL.Query().Get("date")
 		if date == "" {
@@ -226,6 +227,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls ControlH
 
 		w.WriteHeader(http.StatusAccepted)
 	})
+
+	// Config endpoints — only registered if cfgStore is provided.
+	if cfgStore != nil {
+		mux.HandleFunc("GET /api/config", handleGetConfig(cfgStore))
+		mux.HandleFunc("PATCH /api/config", handlePatchConfig(cfgStore))
+		if controls.TestPreset != nil {
+			mux.HandleFunc("POST /api/config/presets/{name}/test", handleTestPreset(cfgStore, controls.TestPreset))
+		}
+		if controls.GeneratePreset != nil {
+			mux.HandleFunc("POST /api/config/presets/generate", handleGeneratePreset(controls.GeneratePreset))
+		}
+		if controls.RefinePreset != nil {
+			mux.HandleFunc("POST /api/config/presets/refine", handleRefinePreset(cfgStore, controls.RefinePreset))
+		}
+	}
 }
 
 func validSessionID(id string) bool {
@@ -252,4 +268,303 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// configResponse is the shape returned by GET /api/config.
+type configResponse struct {
+	SilenceTimeout string                      `json:"silence_timeout"`
+	Summarization  configSummarizationResponse `json:"summarization"`
+	Transcription  configTranscriptionResponse `json:"transcription"`
+	GDrive         configGDriveResponse        `json:"gdrive"`
+	APIKeys        map[string]bool             `json:"api_keys"`
+}
+
+type configSummarizationResponse struct {
+	Model   string                   `json:"model"`
+	BaseURL string                   `json:"base_url"`
+	Presets map[string]config.Preset `json:"presets"`
+}
+
+type configTranscriptionResponse struct {
+	Endpointing    string `json:"endpointing"`
+	UtteranceEndMs string `json:"utterance_end_ms"`
+}
+
+type configGDriveResponse struct {
+	FolderID       string `json:"folder_id"`
+	HasCredentials bool   `json:"has_credentials"`
+}
+
+func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := cfgStore.Get()
+		resp := configResponse{
+			SilenceTimeout: cfg.SilenceTimeout,
+			Summarization: configSummarizationResponse{
+				Model:   cfg.Summarization.Model,
+				BaseURL: cfg.Summarization.BaseURL,
+				Presets: cfg.Summarization.Presets,
+			},
+			Transcription: configTranscriptionResponse{
+				Endpointing:    cfg.Transcription.Endpointing,
+				UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
+			},
+			GDrive: configGDriveResponse{
+				FolderID:       cfg.GDriveFolderID,
+				HasCredentials: cfg.GoogleCredentialsFile != "" && fileExists(cfg.GoogleCredentialsFile),
+			},
+			APIKeys: map[string]bool{
+				"deepgram":  cfg.DeepgramAPIKey != "",
+				"openai":    cfg.OpenAIAPIKey != "",
+				"anthropic": cfg.AnthropicAPIKey != "",
+				"gemini":    cfg.GeminiAPIKey != "",
+			},
+		}
+		if resp.Summarization.Presets == nil {
+			resp.Summarization.Presets = map[string]config.Preset{}
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// configPatch represents the JSON merge-patch body for PATCH /api/config.
+type configPatch struct {
+	SilenceTimeout *string             `json:"silence_timeout,omitempty"`
+	Summarization  *summarizationPatch `json:"summarization,omitempty"`
+	Transcription  *transcriptionPatch `json:"transcription,omitempty"`
+	APIKeys        map[string]string   `json:"api_keys,omitempty"`
+	GDrive         *gdrivePatch        `json:"gdrive,omitempty"`
+}
+
+type summarizationPatch struct {
+	Model   *string                   `json:"model,omitempty"`
+	BaseURL *string                   `json:"base_url,omitempty"`
+	Presets map[string]*config.Preset `json:"presets,omitempty"` // null value = delete
+}
+
+type transcriptionPatch struct {
+	Endpointing    *string `json:"endpointing,omitempty"`
+	UtteranceEndMs *string `json:"utterance_end_ms,omitempty"`
+}
+
+type gdrivePatch struct {
+	FolderID          *string `json:"folder_id,omitempty"`
+	CredentialsBase64 *string `json:"credentials_base64,omitempty"`
+}
+
+func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var patch configPatch
+		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
+			return
+		}
+
+		var patchErr error
+		err := cfgStore.Update(func(c *config.Config) {
+			patchErr = applyConfigPatch(c, &patch)
+		})
+		if patchErr != nil {
+			writeJSONError(w, http.StatusBadRequest, patchErr.Error())
+			return
+		}
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		// Return updated config.
+		handleGetConfig(cfgStore)(w, r)
+	}
+}
+
+func applyConfigPatch(c *config.Config, p *configPatch) error {
+	if p.SilenceTimeout != nil {
+		c.SilenceTimeout = *p.SilenceTimeout
+	}
+
+	if p.Summarization != nil {
+		if p.Summarization.Model != nil {
+			c.Summarization.Model = *p.Summarization.Model
+		}
+		if p.Summarization.BaseURL != nil {
+			c.Summarization.BaseURL = *p.Summarization.BaseURL
+		}
+		if p.Summarization.Presets != nil {
+			if c.Summarization.Presets == nil {
+				c.Summarization.Presets = make(map[string]config.Preset)
+			}
+			for name, preset := range p.Summarization.Presets {
+				if preset == nil {
+					// null = delete per RFC 7386
+					delete(c.Summarization.Presets, name)
+				} else {
+					// Merge: only overwrite non-zero fields.
+					existing := c.Summarization.Presets[name]
+					if preset.Description != "" {
+						existing.Description = preset.Description
+					}
+					if preset.SystemPrompt != "" {
+						existing.SystemPrompt = preset.SystemPrompt
+					}
+					if preset.UserTemplate != "" {
+						existing.UserTemplate = preset.UserTemplate
+					}
+					if preset.Model != "" {
+						existing.Model = preset.Model
+					}
+					c.Summarization.Presets[name] = existing
+				}
+			}
+		}
+	}
+
+	if p.Transcription != nil {
+		if p.Transcription.Endpointing != nil {
+			c.Transcription.Endpointing = *p.Transcription.Endpointing
+		}
+		if p.Transcription.UtteranceEndMs != nil {
+			c.Transcription.UtteranceEndMs = *p.Transcription.UtteranceEndMs
+		}
+	}
+
+	if p.APIKeys != nil {
+		for provider, key := range p.APIKeys {
+			switch provider {
+			case "deepgram":
+				c.DeepgramAPIKey = key
+			case "openai":
+				c.OpenAIAPIKey = key
+			case "anthropic":
+				c.AnthropicAPIKey = key
+			case "gemini":
+				c.GeminiAPIKey = key
+			default:
+				return fmt.Errorf("unknown API key provider %q", provider)
+			}
+		}
+	}
+
+	if p.GDrive != nil {
+		if p.GDrive.FolderID != nil {
+			c.GDriveFolderID = *p.GDrive.FolderID
+		}
+		// credentials_base64 handling deferred to GDrive integration task
+	}
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func handleTestPreset(cfgStore *config.Store, testFn func(ctx context.Context, presetName, sessionID string) (string, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		presetName := r.PathValue("name")
+		if presetName == "" {
+			writeJSONError(w, http.StatusBadRequest, "preset name is required")
+			return
+		}
+
+		// Verify preset exists.
+		cfg := cfgStore.Get()
+		if _, ok := cfg.Summarization.Presets[presetName]; !ok {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("preset %q not found", presetName))
+			return
+		}
+
+		var body struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if body.SessionID == "" {
+			writeJSONError(w, http.StatusBadRequest, "session_id is required")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		summary, err := testFn(ctx, presetName, body.SessionID)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]string{"summary": "", "error": err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]string{"summary": summary, "error": ""})
+	}
+}
+
+func handleGeneratePreset(generateFn func(ctx context.Context, description string) (config.Preset, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if body.Description == "" {
+			writeJSONError(w, http.StatusBadRequest, "description is required")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		preset, err := generateFn(ctx, body.Description)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, preset)
+	}
+}
+
+func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			Name     string `json:"name"`
+			Feedback string `json:"feedback"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if body.Name == "" {
+			writeJSONError(w, http.StatusBadRequest, "name is required")
+			return
+		}
+		if body.Feedback == "" {
+			writeJSONError(w, http.StatusBadRequest, "feedback is required")
+			return
+		}
+
+		cfg := cfgStore.Get()
+		current, ok := cfg.Summarization.Presets[body.Name]
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("preset %q not found", body.Name))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+
+		refined, err := refineFn(ctx, current, body.Feedback)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, refined)
+	}
 }
