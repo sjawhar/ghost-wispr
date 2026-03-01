@@ -39,6 +39,7 @@ type SessionEndedEvent struct {
 type SummaryReadyEvent struct {
 	Event
 	SessionID string `json:"session_id"`
+	Title     string `json:"title"`
 	Summary   string `json:"summary"`
 	Status    string `json:"status"`
 	Preset    string `json:"summary_preset"`

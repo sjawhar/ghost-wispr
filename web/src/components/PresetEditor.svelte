@@ -613,7 +613,7 @@
     padding: 0.5rem;
     border: 1px solid var(--line);
     border-radius: 6px;
-    font-family: 'Source Code Pro', monospace;
+    font-family: var(--font-mono);
     font-size: 0.85rem;
     background: var(--card);
     resize: vertical;

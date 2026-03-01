@@ -19,6 +19,7 @@ type storeMock struct {
 	mu       sync.Mutex
 	sessions map[string]time.Time
 	segments map[string][]transcribe.Segment
+	title    map[string]string
 	summary  map[string]string
 	status   map[string]string
 	preset   map[string]string
@@ -32,6 +33,7 @@ func newStoreMock() *storeMock {
 	return &storeMock{
 		sessions: map[string]time.Time{},
 		segments: map[string][]transcribe.Segment{},
+		title:    map[string]string{},
 		summary:  map[string]string{},
 		status:   map[string]string{},
 		preset:   map[string]string{},
@@ -73,13 +75,34 @@ func (s *storeMock) GetSegments(sessionID string) ([]transcribe.Segment, error) 
 	return list, nil
 }
 
-func (s *storeMock) UpdateSummary(sessionID, summary, status, preset string) error {
+func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.title[sessionID] = title
 	s.summary[sessionID] = summary
 	s.status[sessionID] = status
 	s.preset[sessionID] = preset
 	return nil
+}
+
+func (s *storeMock) UpdateTitle(sessionID, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.title[sessionID] = title
+	return nil
+}
+
+func (s *storeMock) DiscardSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status[id] = "discarded"
+	return nil
+}
+
+func (s *storeMock) CountSegments(sessionID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.segments[sessionID]), nil
 }
 
 type recorderMock struct {
@@ -114,11 +137,11 @@ type summarizerMock struct {
 	called chan string
 }
 
-func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, error) {
+func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, error) {
 	if s.called != nil {
 		s.called <- sessionID
 	}
-	return "## Summary\n- " + transcript, "default", nil
+	return "Auto title", "## Summary\n- " + transcript, "default", nil
 }
 
 type contextProbeSummarizer struct {
@@ -126,19 +149,19 @@ type contextProbeSummarizer struct {
 	stateC chan error
 }
 
-func (s contextProbeSummarizer) Summarize(ctx context.Context, _ string, transcript string) (string, string, error) {
+func (s contextProbeSummarizer) Summarize(ctx context.Context, _ string, transcript string) (string, string, string, error) {
 	time.Sleep(s.delay)
 	select {
 	case <-ctx.Done():
 		if s.stateC != nil {
 			s.stateC <- ctx.Err()
 		}
-		return "", "default", ctx.Err()
+		return "", "", "default", ctx.Err()
 	default:
 		if s.stateC != nil {
 			s.stateC <- nil
 		}
-		return "## Summary\n- " + transcript, "default", nil
+		return "Auto title", "## Summary\n- " + transcript, "default", nil
 	}
 }
 
@@ -149,6 +172,7 @@ type hubMock struct {
 	endedCount    int
 	summaryReady  int
 	latestSession string
+	latestTitle   string
 	latestSummary string
 	latestStatus  string
 	latestPreset  string
@@ -181,10 +205,11 @@ func (h *hubMock) BroadcastSessionEnded(sessionID string, _ time.Duration) {
 	h.mu.Unlock()
 }
 
-func (h *hubMock) BroadcastSummaryReady(sessionID, summary, status, preset string) {
+func (h *hubMock) BroadcastSummaryReady(sessionID, title, summary, status, preset string) {
 	h.mu.Lock()
 	h.summaryReady++
 	h.latestSession = sessionID
+	h.latestTitle = title
 	h.latestSummary = summary
 	h.latestStatus = status
 	h.latestPreset = preset
@@ -199,7 +224,7 @@ func TestManagerLifecycle(t *testing.T) {
 	summarizer := summarizerMock{called: summaryCalled}
 
 	detector := NewDetector(20 * time.Millisecond)
-	manager := NewManager(store, recorder, summarizer, hub, detector)
+	manager := NewManager(store, recorder, summarizer, hub, detector, 0)
 
 	var msg api.MessageResponse
 	raw := []byte(`{
@@ -273,7 +298,7 @@ func TestManager_AutoSummaryContextNotCanceled(t *testing.T) {
 	store := newStoreMock()
 	stateC := make(chan error, 1)
 	summarizer := contextProbeSummarizer{delay: 20 * time.Millisecond, stateC: stateC}
-	manager := NewManager(store, nil, summarizer, nil, NewDetector(time.Hour))
+	manager := NewManager(store, nil, summarizer, nil, NewDetector(time.Hour), 0)
 
 	now := time.Now().UTC()
 	if err := manager.ensureSessionStarted(now); err != nil {
@@ -304,7 +329,7 @@ func TestManager_ForceEndSession_SummaryCompletes(t *testing.T) {
 	store := newStoreMock()
 	stateC := make(chan error, 1)
 	summarizer := contextProbeSummarizer{delay: 20 * time.Millisecond, stateC: stateC}
-	manager := NewManager(store, nil, summarizer, nil, NewDetector(time.Hour))
+	manager := NewManager(store, nil, summarizer, nil, NewDetector(time.Hour), 0)
 
 	now := time.Now().UTC()
 	if err := manager.ensureSessionStarted(now); err != nil {
@@ -348,7 +373,7 @@ func TestManager_ForceEndSession_SummaryCompletes(t *testing.T) {
 func TestManager_EndSession_StoreFailurePreservesState(t *testing.T) {
 	store := newStoreMock()
 	store.endSessionErr = errors.New("store end failed")
-	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour))
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
 
 	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
 		t.Fatalf("ensureSessionStarted failed: %v", err)
@@ -372,7 +397,7 @@ func TestManager_EndSession_StoreFailurePreservesState(t *testing.T) {
 func TestManager_StartSession_RecorderFailureRollsBack(t *testing.T) {
 	store := newStoreMock()
 	recorder := &recorderMock{startErr: errors.New("recorder start failed")}
-	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour))
+	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour), 0)
 
 	err := manager.ensureSessionStarted(time.Now().UTC())
 	if err == nil {
@@ -403,7 +428,7 @@ func buildMsg(t *testing.T, raw string) *api.MessageResponse {
 func TestManager_BuffersUntilSpeechFinal(t *testing.T) {
 	store := newStoreMock()
 	hub := &hubMock{}
-	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour), 0)
 
 	// First is_final without speech_final — should buffer but NOT persist.
 	msg1 := buildMsg(t, `{
@@ -459,7 +484,7 @@ func TestManager_BuffersUntilSpeechFinal(t *testing.T) {
 func TestManager_InterimBroadcast(t *testing.T) {
 	store := newStoreMock()
 	hub := &hubMock{}
-	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour), 0)
 
 	// Send interim (not is_final) message.
 	msg := buildMsg(t, `{
@@ -488,7 +513,7 @@ func TestManager_InterimBroadcast(t *testing.T) {
 func TestManager_UtteranceEndFlushesBuffer(t *testing.T) {
 	store := newStoreMock()
 	hub := &hubMock{}
-	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour), 0)
 
 	// Buffer words via is_final without speech_final.
 	msg := buildMsg(t, `{
@@ -522,7 +547,7 @@ func TestManager_UtteranceEndFlushesBuffer(t *testing.T) {
 func TestManager_ForceEndFlushesBuffer(t *testing.T) {
 	store := newStoreMock()
 	hub := &hubMock{}
-	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour))
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour), 0)
 
 	// Buffer words via is_final without speech_final.
 	msg := buildMsg(t, `{

@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -71,4 +72,35 @@ func (c *geminiClient) Complete(ctx context.Context, messages []Message) (string
 		return "", fmt.Errorf("gemini: empty response text")
 	}
 	return text, nil
+}
+
+func (c *geminiClient) CompleteJSON(ctx context.Context, messages []Message, schema map[string]any) (json.RawMessage, error) {
+	systemInstruction, contents := convertGeminiMessages(messages)
+
+	hasUserMessage := false
+	for _, m := range messages {
+		if m.Role == "user" {
+			hasUserMessage = true
+			break
+		}
+	}
+	if !hasUserMessage {
+		return nil, fmt.Errorf("gemini: no user message provided")
+	}
+
+	config := &genai.GenerateContentConfig{
+		SystemInstruction:  systemInstruction,
+		ResponseMIMEType:   "application/json",
+		ResponseJsonSchema: schema,
+	}
+	result, err := c.client.Models.GenerateContent(ctx, c.model, contents, config)
+	if err != nil {
+		return nil, fmt.Errorf("gemini json completion: %w", err)
+	}
+
+	text := strings.TrimSpace(result.Text())
+	if text == "" {
+		return nil, fmt.Errorf("gemini: empty response text")
+	}
+	return json.RawMessage(text), nil
 }

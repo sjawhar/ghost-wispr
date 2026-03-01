@@ -12,9 +12,12 @@ import (
 type Store interface {
 	CreateSession(id string, startedAt time.Time) error
 	EndSession(id string, endedAt time.Time, audioPath string) error
+	DiscardSession(id string) error
 	AppendSegment(sessionID string, seg transcribe.Segment) error
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
-	UpdateSummary(sessionID, summary, status, preset string) error
+	CountSegments(sessionID string) (int, error)
+	UpdateSummary(sessionID, title, summary, status, preset string) error
+	UpdateTitle(sessionID, title string) error
 }
 
 type Recorder interface {
@@ -23,14 +26,14 @@ type Recorder interface {
 }
 
 type Summarizer interface {
-	Summarize(ctx context.Context, sessionID, transcript string) (summary, preset string, err error)
+	Summarize(ctx context.Context, sessionID, transcript string) (title, summary, preset string, err error)
 }
 
 type EventBroadcaster interface {
 	BroadcastLiveTranscript(seg transcribe.Segment)
 	BroadcastSessionStarted(sessionID string)
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
-	BroadcastSummaryReady(sessionID, summary, status, preset string)
+	BroadcastSummaryReady(sessionID, title, summary, status, preset string)
 	BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64)
 }
 

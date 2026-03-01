@@ -56,3 +56,11 @@ export async function resummarize(sessionId: string, preset?: string): Promise<v
 export function endSession(): Promise<void> {
   return request<void>('/api/session/end', { method: 'POST' })
 }
+
+export function updateSessionTitle(sessionId: string, title: string): Promise<SessionSummary> {
+  return request<SessionSummary>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })
+}
