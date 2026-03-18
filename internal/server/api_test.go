@@ -44,7 +44,7 @@ func newTestConfigStore(t *testing.T) *config.Store {
 	return store
 }
 
-func (s apiStoreStub) GetSessionsByDate(date string) ([]storage.Session, error) {
+func (s apiStoreStub) GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error) {
 	return s.sessionsByDate[date], nil
 }
 
@@ -61,6 +61,16 @@ func (s apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, error
 
 func (s apiStoreStub) GetDates() ([]string, error) {
 	return s.dates, nil
+}
+
+func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return os.ErrNotExist
+	}
+	sess.Title = title
+	s.sessions[sessionID] = sess
+	return nil
 }
 
 func testStaticFS(t *testing.T) fs.FS {

@@ -79,10 +79,11 @@ func (h *Hub) BroadcastSessionEnded(sessionID string, duration time.Duration) {
 	})
 }
 
-func (h *Hub) BroadcastSummaryReady(sessionID, summary, status, preset string) {
+func (h *Hub) BroadcastSummaryReady(sessionID, title, summary, status, preset string) {
 	h.broadcastEvent(SummaryReadyEvent{
 		Event:     newEvent("summary_ready", time.Now().UTC()),
 		SessionID: sessionID,
+		Title:     title,
 		Summary:   summary,
 		Status:    status,
 		Preset:    preset,

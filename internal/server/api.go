@@ -23,20 +23,37 @@ import (
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 type SessionStore interface {
-	GetSessionsByDate(date string) ([]storage.Session, error)
+	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
 	GetSession(id string) (storage.Session, error)
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
+	UpdateTitle(sessionID, title string) error
 }
 
+// VersionInfo holds build metadata exposed via /api/version.
+type VersionInfo struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildTime string `json:"build_time"`
+}
+
+var versionInfo VersionInfo
+
+// SetVersionInfo sets the build metadata for the /api/version endpoint.
+func SetVersionInfo(v VersionInfo) { versionInfo = v }
+
 func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, cfgStore *config.Store) {
+	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, versionInfo)
+	})
+
 	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		date := r.URL.Query().Get("date")
 		if date == "" {
 			date = time.Now().UTC().Format("2006-01-02")
 		}
 
-		sessions, err := store.GetSessionsByDate(date)
+		sessions, err := store.GetSessionsByDate(date, r.URL.Query().Get("include_discarded") == "true")
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("list sessions: %v", err))
 			return
@@ -72,6 +89,51 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"session":  sessionData,
 			"segments": segments,
 		})
+	})
+
+	mux.HandleFunc("PATCH /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			Title *string `json:"title"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+
+		if body.Title != nil && len(*body.Title) > 500 {
+			writeJSONError(w, http.StatusBadRequest, "title too long (max 500 characters)")
+			return
+		}
+
+		if body.Title != nil {
+			if err := store.UpdateTitle(sessionID, *body.Title); err != nil {
+				status := http.StatusInternalServerError
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+					status = http.StatusNotFound
+				}
+				writeJSONError(w, status, fmt.Sprintf("update session title: %v", err))
+				return
+			}
+		}
+
+		sessionData, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, sessionData)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {
@@ -272,11 +334,12 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 
 // configResponse is the shape returned by GET /api/config.
 type configResponse struct {
-	SilenceTimeout string                      `json:"silence_timeout"`
-	Summarization  configSummarizationResponse `json:"summarization"`
-	Transcription  configTranscriptionResponse `json:"transcription"`
-	GDrive         configGDriveResponse        `json:"gdrive"`
-	APIKeys        map[string]bool             `json:"api_keys"`
+	SilenceTimeout     string                      `json:"silence_timeout"`
+	MinSessionSegments int                         `json:"min_session_segments"`
+	Summarization      configSummarizationResponse `json:"summarization"`
+	Transcription      configTranscriptionResponse `json:"transcription"`
+	GDrive             configGDriveResponse        `json:"gdrive"`
+	APIKeys            map[string]bool             `json:"api_keys"`
 }
 
 type configSummarizationResponse struct {
@@ -299,7 +362,8 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg := cfgStore.Get()
 		resp := configResponse{
-			SilenceTimeout: cfg.SilenceTimeout,
+			SilenceTimeout:     cfg.SilenceTimeout,
+			MinSessionSegments: cfg.MinSessionSegments,
 			Summarization: configSummarizationResponse{
 				Model:   cfg.Summarization.Model,
 				BaseURL: cfg.Summarization.BaseURL,
@@ -329,11 +393,12 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 
 // configPatch represents the JSON merge-patch body for PATCH /api/config.
 type configPatch struct {
-	SilenceTimeout *string             `json:"silence_timeout,omitempty"`
-	Summarization  *summarizationPatch `json:"summarization,omitempty"`
-	Transcription  *transcriptionPatch `json:"transcription,omitempty"`
-	APIKeys        map[string]string   `json:"api_keys,omitempty"`
-	GDrive         *gdrivePatch        `json:"gdrive,omitempty"`
+	SilenceTimeout     *string             `json:"silence_timeout,omitempty"`
+	MinSessionSegments *int                `json:"min_session_segments,omitempty"`
+	Summarization      *summarizationPatch `json:"summarization,omitempty"`
+	Transcription      *transcriptionPatch `json:"transcription,omitempty"`
+	APIKeys            map[string]string   `json:"api_keys,omitempty"`
+	GDrive             *gdrivePatch        `json:"gdrive,omitempty"`
 }
 
 type summarizationPatch struct {
@@ -382,6 +447,12 @@ func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
 func applyConfigPatch(c *config.Config, p *configPatch) error {
 	if p.SilenceTimeout != nil {
 		c.SilenceTimeout = *p.SilenceTimeout
+	}
+	if p.MinSessionSegments != nil {
+		if *p.MinSessionSegments < 0 {
+			return fmt.Errorf("min_session_segments must be non-negative")
+		}
+		c.MinSessionSegments = *p.MinSessionSegments
 	}
 
 	if p.Summarization != nil {

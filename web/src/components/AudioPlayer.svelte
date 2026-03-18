@@ -1,6 +1,7 @@
 <script lang="ts">
   import { appState, setActiveAudioSession } from '../lib/state.svelte'
   import type { Segment } from '../lib/types'
+  import { copyText } from '../lib/clipboard'
 
   let {
     sessionId,
@@ -16,6 +17,19 @@
   let loading = $state(true)
   let playing = $state(false)
   let error = $state('')
+
+  let transcriptCopied = $state(false)
+
+  async function copyTranscript() {
+    const text = segments
+      .map((s) => `[${prettyTime(s.start_time)}] Speaker ${s.speaker}: ${s.text}`)
+      .join('\n')
+    const ok = await copyText(text)
+    if (ok) {
+      transcriptCopied = true
+      setTimeout(() => (transcriptCopied = false), 2000)
+    }
+  }
 
   const activeSegmentIndex = $derived.by(() => {
     if (segments.length === 0) {
@@ -115,6 +129,13 @@
   {:else if error}
     <p class="audio-error">{error}</p>
   {/if}
+
+  <div class="transcript-header">
+    <span class="transcript-label">Transcript</span>
+    <button type="button" class="copy-btn" onclick={copyTranscript}>
+      {transcriptCopied ? 'Copied!' : 'Copy transcript'}
+    </button>
+  </div>
 
   <div class="transcript-sync">
     {#each segments as segment, index (segment.timestamp + segment.text + index)}
