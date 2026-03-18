@@ -39,6 +39,7 @@ type Config struct {
 	DBPath                string        `yaml:"db_path"`
 	AudioDir              string        `yaml:"audio_dir"`
 	SilenceTimeout        string        `yaml:"silence_timeout"`
+	MinSessionSegments    int           `yaml:"min_session_segments"`
 	MicSampleRate         int           `yaml:"mic_sample_rate"`
 	MicSampleRates        []int         `yaml:"mic_sample_rates"`
 	GDriveFolderID        string        `yaml:"gdrive_folder_id"`
@@ -58,6 +59,7 @@ func defaults() Config {
 		DBPath:                "data/ghost-wispr.db",
 		AudioDir:              "data/audio",
 		SilenceTimeout:        "30s",
+		MinSessionSegments:    5,
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
 		GoogleCredentialsFile: "./service-account.json",

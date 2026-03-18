@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -15,30 +16,35 @@ import (
 )
 
 type Manager struct {
-	store      Store
-	recorder   Recorder
-	summarizer Summarizer
-	hub        EventBroadcaster
-	detector   *Detector
-	buffer     *UtteranceBuffer
+	store              Store
+	recorder           Recorder
+	summarizer         Summarizer
+	hub                EventBroadcaster
+	detector           *Detector
+	buffer             *UtteranceBuffer
+	minSessionSegments int
 
 	mu               sync.Mutex
 	currentSessionID string
 	currentStartedAt time.Time
 }
 
-func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector) *Manager {
+func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int) *Manager {
 	if detector == nil {
 		detector = NewDetector(30 * time.Second)
 	}
+	if minSessionSegments < 0 {
+		minSessionSegments = 0
+	}
 
 	m := &Manager{
-		store:      store,
-		recorder:   recorder,
-		summarizer: summarizer,
-		hub:        hub,
-		detector:   detector,
-		buffer:     NewUtteranceBuffer(),
+		store:              store,
+		recorder:           recorder,
+		summarizer:         summarizer,
+		hub:                hub,
+		detector:           detector,
+		buffer:             NewUtteranceBuffer(),
+		minSessionSegments: minSessionSegments,
 	}
 
 	detector.OnSessionEnd(func() {
@@ -261,7 +267,24 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	m.mu.Lock()
 	m.currentSessionID = ""
 	m.currentStartedAt = time.Time{}
+	minSegs := m.minSessionSegments
 	m.mu.Unlock()
+
+	// Check if session meets minimum segment threshold.
+	if minSegs > 0 {
+		count, err := m.store.CountSegments(sessionID)
+		if err == nil && count < minSegs {
+			if m.hub != nil {
+				m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
+			}
+			if discardErr := m.store.DiscardSession(sessionID); discardErr != nil {
+				log.Printf("warning: failed to discard short session %s: %v", sessionID, discardErr)
+			} else {
+				log.Printf("discarded short session %s (%d segments < %d minimum)", sessionID, count, minSegs)
+			}
+			return nil
+		}
+	}
 
 	if m.hub != nil {
 		m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
@@ -277,12 +300,12 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 		return
 	}
 
-	_ = m.store.UpdateSummary(sessionID, "", storage.SummaryRunning, "")
+	_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
 
 	segments, err := m.store.GetSegments(sessionID)
 	if err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed, "")
-		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed, "")
+		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, "")
+		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, "")
 		return
 	}
 
@@ -295,25 +318,25 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 		b.WriteString("\n")
 	}
 
-	summaryText, preset, err := m.summarizer.Summarize(ctx, sessionID, b.String())
+	title, summaryText, preset, err := m.summarizer.Summarize(ctx, sessionID, b.String())
 	if err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed, preset)
-		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed, preset)
+		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
+		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
 		return
 	}
 
-	if err := m.store.UpdateSummary(sessionID, summaryText, storage.SummaryCompleted, preset); err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", storage.SummaryFailed, preset)
-		m.broadcastSummaryStatus(sessionID, "", storage.SummaryFailed, preset)
+	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset); err != nil {
+		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
+		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
 		return
 	}
 
-	m.broadcastSummaryStatus(sessionID, summaryText, storage.SummaryCompleted, preset)
+	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 }
 
-func (m *Manager) broadcastSummaryStatus(sessionID, summary, status, preset string) {
+func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {
 	if m.hub != nil {
-		m.hub.BroadcastSummaryReady(sessionID, summary, status, preset)
+		m.hub.BroadcastSummaryReady(sessionID, title, summary, status, preset)
 	}
 }
 
@@ -329,4 +352,13 @@ func (m *Manager) SetSummarizer(s Summarizer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.summarizer = s
+}
+
+func (m *Manager) SetMinSessionSegments(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	m.minSessionSegments = n
 }

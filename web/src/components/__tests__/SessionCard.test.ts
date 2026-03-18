@@ -4,6 +4,7 @@ import SessionCard from '../SessionCard.svelte'
 
 const baseSession = {
   id: 's1',
+  title: '',
   started_at: new Date('2026-02-26T10:00:00Z').toISOString(),
   ended_at: new Date('2026-02-26T10:10:00Z').toISOString(),
   status: 'ended',
@@ -42,7 +43,7 @@ describe('SessionCard', () => {
       onResummarize: vi.fn(),
     })
 
-    await fireEvent.click(screen.getByRole('button'))
+    await fireEvent.click(screen.getByRole('button', { name: /10:00/ }))
     expect(onToggle).toHaveBeenCalledTimes(1)
     expect(onLoadDetail).toHaveBeenCalledWith('s1')
   })

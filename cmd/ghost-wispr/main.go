@@ -33,6 +33,12 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+)
+
 //go:embed static/*
 var staticFiles embed.FS
 
@@ -204,7 +210,7 @@ func main() {
 		sessionSummarizer = summarizer
 	}
 
-	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector)
+	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -213,6 +219,8 @@ func main() {
 	recState := &recorderState{}
 	warnings := append([]string{}, cfgWarnings...)
 	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
+
+	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 
 	handler, err := server.Handler(assets, hub, store, &server.ControlHooks{
 		Pause:    recState.Pause,
@@ -240,24 +248,25 @@ func main() {
 
 			transcript := buildTranscript(segments)
 
-			_ = store.UpdateSummary(sessionID, "", storage.SummaryRunning, "")
-			hub.BroadcastSummaryReady(sessionID, "", storage.SummaryRunning, "")
+			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
+			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
+			var title string
 			var summaryText string
 			var presetUsed string
 			if preset != "" {
 				presetUsed = preset
-				summaryText, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
+				title, summaryText, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
 			} else {
-				summaryText, presetUsed, err = summarizer.Summarize(ctx, sessionID, transcript)
+				title, summaryText, presetUsed, err = summarizer.Summarize(ctx, sessionID, transcript)
 			}
 
 			status := storage.SummaryCompleted
 			if err != nil {
 				status = storage.SummaryFailed
 			}
-			_ = store.UpdateSummary(sessionID, summaryText, status, presetUsed)
-			hub.BroadcastSummaryReady(sessionID, summaryText, status, presetUsed)
+			_ = store.UpdateSummary(sessionID, title, summaryText, status, presetUsed)
+			hub.BroadcastSummaryReady(sessionID, title, summaryText, status, presetUsed)
 			return err
 		},
 		EndSession: func(ctx context.Context) error {
@@ -424,6 +433,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
+		manager.SetMinSessionSegments(newCfg.MinSessionSegments)
 		log.Printf("config: reloaded (silence_timeout=%s)", newCfg.SilenceTimeout)
 
 		// Recreate summarizer if API keys or model changed.
@@ -459,17 +469,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 				transcript := buildTranscript(segments)
 				if transcript == "" {
-					_ = store.UpdateSummary(id, "", storage.SummaryCompleted, "")
+					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "")
 					continue
 				}
-				_ = store.UpdateSummary(id, "", storage.SummaryRunning, "")
-				summaryText, preset, err := startupSummarizer.Summarize(ctx, id, transcript)
+				_ = store.UpdateSummary(id, "", "", storage.SummaryRunning, "")
+				title, summaryText, preset, err := startupSummarizer.Summarize(ctx, id, transcript)
 				if err != nil {
 					log.Printf("warning: summarization failed for %s: %v", id, err)
-					_ = store.UpdateSummary(id, "", storage.SummaryFailed, preset)
+					_ = store.UpdateSummary(id, "", "", storage.SummaryFailed, preset)
 					continue
 				}
-				_ = store.UpdateSummary(id, summaryText, storage.SummaryCompleted, preset)
+				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset)
 				log.Printf("summarized session %s with preset %s", id, preset)
 			}
 		}()
@@ -586,7 +596,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}()
 
-	log.Printf("ghost-wispr: web UI on http://127.0.0.1%s", addr)
+	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://127.0.0.1%s", Version, Commit, BuildTime, addr)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

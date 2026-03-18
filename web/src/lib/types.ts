@@ -33,6 +33,7 @@ export interface SessionEndedEvent extends BaseEvent {
 export interface SummaryReadyEvent extends BaseEvent {
   type: 'summary_ready'
   session_id: string
+  title: string
   summary: string
   status: 'pending' | 'running' | 'completed' | 'failed'
   summary_preset?: string
@@ -67,6 +68,7 @@ export interface Segment {
 
 export interface SessionSummary {
   id: string
+  title: string
   started_at: string
   ended_at?: string
   status: string

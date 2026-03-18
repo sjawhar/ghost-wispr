@@ -102,6 +102,7 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
         session.id === event.session_id
           ? {
               ...session,
+              title: event.title || session.title,
               summary: event.summary,
               summary_status: event.status,
               summary_preset: event.summary_preset ?? session.summary_preset,
@@ -119,6 +120,7 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
       ...detail,
       session: {
         ...detail.session,
+        title: event.title || detail.session.title,
         summary: event.summary,
         summary_status: event.status,
         summary_preset: event.summary_preset ?? detail.session.summary_preset,
