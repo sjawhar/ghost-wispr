@@ -84,7 +84,8 @@ func (r *recorderState) SetMic(mic *audio.Mic) {
 }
 
 type transcriptCallback struct {
-	manager session.LifecycleManager
+	manager   session.LifecycleManager
+	resilient *transcribe.ResilientClient
 }
 
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
@@ -96,6 +97,9 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 
 func (c transcriptCallback) Open(*api.OpenResponse) error {
 	log.Println("connected to Deepgram")
+	if c.resilient != nil {
+		c.resilient.SetConnected()
+	}
 	return nil
 }
 
@@ -112,6 +116,9 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 
 func (c transcriptCallback) Close(*api.CloseResponse) error {
 	log.Println("disconnected from Deepgram")
+	if mgr, ok := c.manager.(*session.Manager); ok {
+		mgr.OnTranscriptionDisconnect()
+	}
 	return nil
 }
 
@@ -121,6 +128,34 @@ func (c transcriptCallback) Error(er *api.ErrorResponse) error {
 }
 
 func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
+
+type deepgramWriter struct {
+	client interface {
+		io.Writer
+		Finalize() error
+	}
+}
+
+func (dw *deepgramWriter) Write(p []byte) (int, error) {
+	return dw.client.Write(p)
+}
+
+func (dw *deepgramWriter) Close() error {
+	return dw.client.Finalize()
+}
+
+func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback) transcribe.ClientFactory {
+	return func(factoryCtx context.Context) (io.WriteCloser, error) {
+		dgClient, err := client.NewWSUsingCallback(factoryCtx, apiKey, cOptions, tOptions, callback)
+		if err != nil {
+			return nil, err
+		}
+		if !dgClient.Connect() {
+			return nil, fmt.Errorf("deepgram connect failed")
+		}
+		return &deepgramWriter{client: dgClient}, nil
+	}
+}
 
 func main() {
 	log.Println("ghost-wispr: starting")
@@ -567,17 +602,27 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			VadEvents:      true,
 		}
 
-		dgClient, err := client.NewWSUsingCallback(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, transcriptCallback{manager: manager})
+		callback := transcriptCallback{manager: manager}
+		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback)
+
+		resilientConfig := transcribe.ResilientConfig{
+			BufferSize:            cfg.DeepgramBufferSize,
+			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
+			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
+		}
+
+		resilientClient := transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, nil)
+		callback.resilient = resilientClient
+
+		initialClient, err := factory(ctx)
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
-			warnings = append(warnings, "Deepgram initialization failed \u2014 live transcription is disabled")
-		} else if ok := dgClient.Connect(); !ok {
-			log.Printf("warning: deepgram connect failed, running API/UI only")
-			warnings = append(warnings, "Deepgram connection failed \u2014 live transcription is disabled")
+			warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
 		} else {
-			dgWriter = dgClient
+			resilientClient.Client = initialClient
+			dgWriter = resilientClient
 			dgStop = func() {
-				dgClient.Stop()
+				resilientClient.Close()
 			}
 			go func() {
 				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf)

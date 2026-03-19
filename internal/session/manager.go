@@ -362,3 +362,23 @@ func (m *Manager) SetMinSessionSegments(n int) {
 	}
 	m.minSessionSegments = n
 }
+
+func (m *Manager) OnTranscriptionDisconnect() {
+	m.mu.Lock()
+	if m.buffer == nil {
+		m.mu.Unlock()
+		return
+	}
+	detector := m.detector
+	m.mu.Unlock()
+
+	// Persist buffered words — flushBuffer handles its own locking
+	// via ensureSessionStarted/currentSession, so m.mu must NOT be held.
+	if err := m.flushBuffer(); err != nil {
+		log.Printf("error persisting buffered words on disconnect: %v", err)
+	}
+
+	if detector != nil {
+		detector.OnSpeech()
+	}
+}

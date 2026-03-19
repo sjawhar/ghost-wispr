@@ -46,6 +46,9 @@ type Config struct {
 	GoogleCredentialsFile string        `yaml:"google_credentials_file"`
 	Summarization         Summarization `yaml:"summarization"`
 	Transcription         Transcription `yaml:"transcription"`
+	DeepgramBufferSize    int           `yaml:"deepgram_buffer_size"`
+	DeepgramReconnectInitialDelay string `yaml:"deepgram_reconnect_initial_delay"`
+	DeepgramReconnectMaxBackoff   string `yaml:"deepgram_reconnect_max_backoff"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
@@ -77,6 +80,9 @@ func defaults() Config {
 			Endpointing:    "400",
 			UtteranceEndMs: "1000",
 		},
+		DeepgramBufferSize:                1920000,
+		DeepgramReconnectInitialDelay:     "500ms",
+		DeepgramReconnectMaxBackoff:       "30s",
 	}
 }
 
@@ -111,6 +117,22 @@ func Load(path string) (Config, []string, error) {
 // falling back to 30s if the value is invalid.
 func (c *Config) ParsedSilenceTimeout() time.Duration {
 	d, err := time.ParseDuration(c.SilenceTimeout)
+	if err != nil {
+		return 30 * time.Second
+	}
+	return d
+}
+
+func (c *Config) ParsedDeepgramReconnectInitialDelay() time.Duration {
+	d, err := time.ParseDuration(c.DeepgramReconnectInitialDelay)
+	if err != nil {
+		return 500 * time.Millisecond
+	}
+	return d
+}
+
+func (c *Config) ParsedDeepgramReconnectMaxBackoff() time.Duration {
+	d, err := time.ParseDuration(c.DeepgramReconnectMaxBackoff)
 	if err != nil {
 		return 30 * time.Second
 	}
@@ -174,6 +196,17 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_UTTERANCE_END_MS"); v != "" {
 		cfg.Transcription.UtteranceEndMs = v
+	}
+	if v := os.Getenv(EnvPrefix + "DEEPGRAM_BUFFER_SIZE"); v != "" {
+		if size, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && size > 0 {
+			cfg.DeepgramBufferSize = size
+		}
+	}
+	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_INITIAL_DELAY"); v != "" {
+		cfg.DeepgramReconnectInitialDelay = v
+	}
+	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_MAX_BACKOFF"); v != "" {
+		cfg.DeepgramReconnectMaxBackoff = v
 	}
 }
 
