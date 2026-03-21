@@ -24,6 +24,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -465,6 +466,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		log.Fatalf("build http handler failed: %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var syncOrchestrator *gdrive.Orchestrator
+
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
@@ -482,10 +488,19 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)
 		}
-	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
+			if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID); err == nil {
+				syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+				manager.SetSyncer(syncOrchestrator)
+				log.Printf("config: gdrive sync enabled")
+			}
+		} else if !newCfg.GDriveSyncEnabled && syncOrchestrator != nil {
+			manager.SetSyncer(nil)
+			syncOrchestrator = nil
+			log.Printf("config: gdrive sync disabled")
+		}
+	})
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	if startupSummarizer != nil {
@@ -521,12 +536,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	defer func() { _ = store.Close() }()
 
-	if cfg.GDriveFolderID != "" {
+	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
 		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
-			warnings = append(warnings, "Google Drive sync failed to initialize \u2014 backups are disabled")
+			warnings = append(warnings, "Google Drive sync failed to initialize — backups are disabled")
 		} else {
+			syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			manager.SetSyncer(syncOrchestrator)
+
 			go func() {
 				ticker := time.NewTicker(5 * time.Minute)
 				defer ticker.Stop()
@@ -535,14 +553,51 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					case <-ctx.Done():
 						return
 					case <-ticker.C:
-						date := time.Now().UTC().Format("2006-01-02")
-						if err := syncer.Sync(cfg.DBPath, date); err != nil {
-							log.Printf("gdrive sync error: %v", err)
+						ids, err := store.GetSessionsNeedingSync()
+						if err != nil {
+							log.Printf("gdrive sweep error: %v", err)
+							continue
+						}
+						for _, id := range ids {
+							if err := syncOrchestrator.SyncSession(ctx, id); err != nil {
+								log.Printf("gdrive sweep: session %s: %v", id, err)
+							}
 						}
 					}
 				}
 			}()
 		}
+	}
+
+	if cfg.GCEnabled {
+		go func() {
+			ticker := time.NewTicker(1 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					latestCfg := cfgStore.Get()
+					if !latestCfg.GCEnabled {
+						continue
+					}
+					syncGated := latestCfg.GDriveSyncEnabled && syncOrchestrator != nil
+					collector := gc.New(store, gc.Config{
+						MaxAgeDays:     latestCfg.GCMaxAgeDays,
+						MaxAudioSizeMB: latestCfg.GCMaxAudioSizeMB,
+						SyncGated:      syncGated,
+						AudioDir:       latestCfg.AudioDir,
+					})
+					deleted, err := collector.Run()
+					if err != nil {
+						log.Printf("gc error: %v", err)
+					} else if len(deleted) > 0 {
+						log.Printf("gc: deleted %d sessions", len(deleted))
+					}
+				}
+			}
+		}()
 	}
 
 	var mic *audio.Mic

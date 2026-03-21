@@ -20,6 +20,7 @@ type Manager struct {
 	recorder           Recorder
 	summarizer         Summarizer
 	hub                EventBroadcaster
+	syncer             SessionSyncer
 	detector           *Detector
 	buffer             *UtteranceBuffer
 	minSessionSegments int
@@ -296,7 +297,9 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	if m.summarizer == nil {
-		// No summarizer available — leave as pending so it can be summarized later.
+		if m.syncer != nil {
+			go m.syncer.SyncSession(context.Background(), sessionID)
+		}
 		return
 	}
 
@@ -332,6 +335,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	}
 
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+
+	if m.syncer != nil {
+		go m.syncer.SyncSession(context.Background(), sessionID)
+	}
 }
 
 func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {
@@ -352,6 +359,12 @@ func (m *Manager) SetSummarizer(s Summarizer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.summarizer = s
+}
+
+func (m *Manager) SetSyncer(s SessionSyncer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncer = s
 }
 
 func (m *Manager) SetMinSessionSegments(n int) {
