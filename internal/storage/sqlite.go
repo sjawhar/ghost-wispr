@@ -540,3 +540,56 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	}
 	return ids, nil
 }
+
+// GetGCEligibleSessions returns session IDs eligible for garbage collection.
+// Sessions must be ended. If maxAgeDays > 0, only sessions older than that are returned.
+// If maxAgeDays == 0, all ended sessions are eligible (used for disk-pressure GC).
+// If syncGated is true, only synced sessions are returned.
+// Results are ordered oldest first (for disk-pressure GC to delete oldest).
+func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+	query := `SELECT id FROM sessions WHERE status = 'ended'`
+	var args []any
+	if maxAgeDays > 0 {
+		cutoff := time.Now().UTC().Add(-time.Duration(maxAgeDays) * 24 * time.Hour).Format(time.RFC3339Nano)
+		query += ` AND started_at < ?`
+		args = append(args, cutoff)
+	}
+	if syncGated {
+		query += ` AND sync_status = 'synced'`
+	}
+	query += ` ORDER BY started_at ASC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query gc eligible sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions: %w", err)
+	}
+	return ids, nil
+}
+
+func (s *SQLiteStore) DeleteSession(id string) error {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete session rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
