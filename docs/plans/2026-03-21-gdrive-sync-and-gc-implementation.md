@@ -131,7 +131,7 @@ func (s *SQLiteStore) UpdateSyncStatus(sessionID, status, driveFolderID string) 
 
 func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended' AND summary_status = 'completed' AND sync_status != 'synced'`,
+		`SELECT id FROM sessions WHERE status = 'ended' AND sync_status != 'synced'`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing sync: %w", err)
@@ -240,18 +240,24 @@ Expected: FAIL — `GetGCEligibleSessions` doesn't exist.
 
 ```go
 // GetGCEligibleSessions returns session IDs eligible for garbage collection.
-// Sessions must be ended and older than maxAgeDays.
+// Sessions must be ended. If maxAgeDays > 0, only sessions older than that are returned.
+// If maxAgeDays == 0, all ended sessions are eligible (used for disk-pressure GC).
 // If syncGated is true, only synced sessions are returned.
 // Results are ordered oldest first (for disk-pressure GC to delete oldest).
 func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
-	cutoff := time.Now().UTC().Add(-time.Duration(maxAgeDays) * 24 * time.Hour).Format(time.RFC3339Nano)
-	query := `SELECT id FROM sessions WHERE status = 'ended' AND started_at < ?`
+	query := `SELECT id FROM sessions WHERE status = 'ended'`
+	var args []any
+	if maxAgeDays > 0 {
+		cutoff := time.Now().UTC().Add(-time.Duration(maxAgeDays) * 24 * time.Hour).Format(time.RFC3339Nano)
+		query += ` AND started_at < ?`
+		args = append(args, cutoff)
+	}
 	if syncGated {
 		query += ` AND sync_status = 'synced'`
 	}
 	query += ` ORDER BY started_at ASC`
 
-	rows, err := s.db.Query(query, cutoff)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible sessions: %w", err)
 	}
@@ -400,6 +406,7 @@ package gdrive
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -456,6 +463,7 @@ func RenderTranscriptMarkdown(s SyncSession, segments []transcribe.Segment) stri
 	for sp := range speakerSet {
 		speakers = append(speakers, sp)
 	}
+	sort.Ints(speakers)
 
 	b.WriteString("---\n")
 	b.WriteString("schema_version: 1\n")
@@ -574,6 +582,68 @@ func TestSyncerBuildsSyncData(t *testing.T) {
 		t.Error("missing audio.mp3")
 	}
 }
+
+func TestSyncerBuildsSyncDataNoAudio(t *testing.T) {
+	started := time.Date(2026, 3, 21, 14, 30, 22, 0, time.UTC)
+	ended := started.Add(32 * time.Minute)
+
+	sess := SyncSession{
+		ID:            "20260321-143022",
+		Title:         "Quick Chat",
+		StartedAt:     started,
+		EndedAt:       &ended,
+		Summary:       "Brief discussion.",
+		SummaryPreset: "default",
+	}
+	segments := []transcribe.Segment{
+		{Speaker: 0, Text: "Hello", StartTime: 0.0, EndTime: 1.0, Timestamp: started},
+	}
+
+	// No audio file — audioPath is empty.
+	files, _, err := BuildSyncFiles(sess, segments, "")
+	if err != nil {
+		t.Fatalf("build sync files: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files (no audio), got %d", len(files))
+	}
+}
+
+func TestSyncerBuildsSyncDataNoSummary(t *testing.T) {
+	started := time.Date(2026, 3, 21, 14, 30, 22, 0, time.UTC)
+	ended := started.Add(32 * time.Minute)
+
+	sess := SyncSession{
+		ID:        "20260321-143022",
+		Title:     "No Summary Session",
+		StartedAt: started,
+		EndedAt:   &ended,
+		Summary:   "", // no summary
+	}
+	segments := []transcribe.Segment{
+		{Speaker: 0, Text: "Hello", StartTime: 0.0, EndTime: 1.0, Timestamp: started},
+	}
+
+	dir := t.TempDir()
+	audioPath := filepath.Join(dir, "test.mp3")
+	if err := os.WriteFile(audioPath, []byte("fake-mp3"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, _, err := BuildSyncFiles(sess, segments, audioPath)
+	if err != nil {
+		t.Fatalf("build sync files: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files (no summary), got %d", len(files))
+	}
+	// Verify no summary.md, only transcript.md and audio.
+	for _, f := range files {
+		if f.Name == "summary.md" {
+			t.Error("should not include summary.md when summary is empty")
+		}
+	}
+}
 ```
 
 **Step 2: Run test to verify it fails**
@@ -590,11 +660,15 @@ Rewrite `internal/gdrive/sync.go` to:
    - `BuildSyncFiles(sess, segments, audioPath)` — pure function that produces the file set and folder name.
    - `Upload(ctx, folderName string, files []SyncFile)` — creates the folder on Drive and uploads files.
 3. `SyncFile` struct: `Name string`, `MimeType string` (target MIME on Drive), `Content []byte` or `LocalPath string` (for audio).
-4. Folder creation: use `service.Files.Create` with `MimeType: "application/vnd.google-apps.folder"`.
-5. Markdown upload: set `MimeType: "application/vnd.google-apps.document"` on the Drive `File` metadata — the Drive API auto-converts when the target MIME is a Google Workspace type.
-6. Audio upload: set appropriate MIME type (`audio/mpeg` for MP3, `audio/wav` for WAV).
-7. Folder slug: `YYYY-MM-DD-<slugified-title>` — lowercase, spaces to hyphens, strip non-alphanumeric.
-8. Return the created folder's Drive ID (for sync tracking).
+4. `BuildSyncFiles` handles edge cases:
+   - If `audioPath` is empty or file doesn't exist, skip audio file (2 files instead of 3).
+   - If `sess.Summary` is empty, skip summary.md (transcript + audio only).
+   - Always include transcript.md.
+5. Folder creation: use `service.Files.Create` with `MimeType: "application/vnd.google-apps.folder"`.
+6. Markdown upload: set `MimeType: "application/vnd.google-apps.document"` on the Drive `File` metadata, upload content with `googleapi.ContentType("text/plain")` — the Drive API auto-converts when the target MIME is a Google Workspace type. Note: markdown formatting (headers, bold) won't render in the Google Doc — it's stored as plain text. This is acceptable for now.
+7. Audio upload: set appropriate MIME type (`audio/mpeg` for MP3, `audio/wav` for WAV).
+8. Folder slug: `YYYY-MM-DD-<slugified-title>` — lowercase, spaces to hyphens, strip non-alphanumeric.
+9. Return the created folder's Drive ID (for sync tracking).
 
 **Step 4: Run tests**
 
@@ -880,51 +954,75 @@ func New(store Store, config Config) *Collector {
 }
 
 func (c *Collector) Run() ([]string, error) {
+	// Phase 1: age-based GC.
 	ids, err := c.store.GetGCEligibleSessions(c.config.MaxAgeDays, c.config.SyncGated)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible: %w", err)
 	}
 
-	// Check disk pressure: if audio dir exceeds max size, we'll GC even
-	// sessions within the age threshold. For now, age-based only in this pass.
-	// Disk-pressure GC uses the same sorted-oldest-first list.
-	diskPressure := c.checkDiskPressure()
-
 	var deleted []string
 	for _, id := range ids {
-		sess, err := c.store.GetSession(id)
-		if err != nil {
+		if err := c.deleteSession(id); err != nil {
 			log.Printf("gc: skip session %s: %v", id, err)
 			continue
 		}
-
-		// Delete audio file if it exists.
-		if sess.AudioPath != "" {
-			audioPath := sess.AudioPath
-			if !filepath.IsAbs(audioPath) && c.config.AudioDir != "" {
-				// audio_path may be relative; resolve against audio_dir parent.
-			}
-			if err := os.Remove(audioPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("gc: failed to remove audio %s: %v", audioPath, err)
-				continue // Don't delete DB row if audio deletion failed.
-			}
-		}
-
-		// Delete session from DB (cascades to segments).
-		if err := c.store.DeleteSession(id); err != nil {
-			log.Printf("gc: failed to delete session %s: %v", id, err)
-			continue
-		}
-
 		deleted = append(deleted, id)
+	}
 
-		// If we were in disk pressure mode but now under the limit, stop.
-		if diskPressure && !c.checkDiskPressure() {
-			break
+	// Phase 2: disk-pressure GC.
+	// If audio dir exceeds max size, delete oldest synced sessions regardless of age
+	// until we're under the limit.
+	if c.checkDiskPressure() {
+		// Query ALL synced ended sessions (maxAgeDays=0), oldest first.
+		allSynced, err := c.store.GetGCEligibleSessions(0, c.config.SyncGated)
+		if err != nil {
+			return deleted, fmt.Errorf("query disk-pressure gc: %w", err)
+		}
+		deletedSet := make(map[string]struct{}, len(deleted))
+		for _, id := range deleted {
+			deletedSet[id] = struct{}{}
+		}
+		for _, id := range allSynced {
+			if _, already := deletedSet[id]; already {
+				continue
+			}
+			if err := c.deleteSession(id); err != nil {
+				log.Printf("gc: disk-pressure skip session %s: %v", id, err)
+				continue
+			}
+			deleted = append(deleted, id)
+			if !c.checkDiskPressure() {
+				break // Under the limit now.
+			}
 		}
 	}
 
 	return deleted, nil
+}
+
+func (c *Collector) deleteSession(id string) error {
+	sess, err := c.store.GetSession(id)
+	if err != nil {
+		return fmt.Errorf("get session: %w", err)
+	}
+
+	// Delete audio file if it exists.
+	if sess.AudioPath != "" {
+		audioPath := sess.AudioPath
+		if !filepath.IsAbs(audioPath) && c.config.AudioDir != "" {
+			audioPath = filepath.Join(c.config.AudioDir, filepath.Base(audioPath))
+		}
+		if err := os.Remove(audioPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove audio %s: %w", audioPath, err)
+		}
+	}
+
+	// Delete session from DB (cascades to segments via foreign key).
+	if err := c.store.DeleteSession(id); err != nil {
+		return fmt.Errorf("delete from db: %w", err)
+	}
+
+	return nil
 }
 
 func (c *Collector) checkDiskPressure() bool {
@@ -970,6 +1068,7 @@ jj new
 ### Task 7: Wire sync and GC into main.go
 
 **Files:**
+- Create: `internal/gdrive/orchestrator.go`
 - Modify: `cmd/ghost-wispr/main.go`
 - Modify: `internal/session/types.go`
 - Modify: `internal/session/manager.go`
@@ -990,27 +1089,185 @@ In `internal/session/manager.go`:
 
 1. Add `syncer SessionSyncer` field to the `Manager` struct.
 2. Add `SetSyncer(s SessionSyncer)` method.
-3. At the end of `generateSummary`, after successful summarization (status == `SummaryCompleted`), trigger sync:
+3. At the end of `generateSummary`, after the `m.hub.BroadcastSummaryReady(...)` call, trigger sync:
 ```go
 if m.syncer != nil {
 	go m.syncer.SyncSession(context.Background(), sessionID)
 }
 ```
+4. Also add sync trigger at the end of `endCurrentSession`, BEFORE `generateSummary` is spawned, for sessions that don't have a summarizer (so they still sync transcript + audio):
+```go
+if m.summarizer == nil && m.syncer != nil {
+	go m.syncer.SyncSession(context.Background(), sessionID)
+}
+```
 
-**Step 3: Wire everything in main.go**
+**Step 3: Create the SyncOrchestrator**
+
+Create `internal/gdrive/orchestrator.go`:
+
+```go
+package gdrive
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+)
+
+// OrchestratorStore is the subset of storage.SQLiteStore needed by the orchestrator.
+type OrchestratorStore interface {
+	GetSession(id string) (storage.Session, error)
+	GetSegments(sessionID string) ([]transcribe.Segment, error)
+	UpdateSyncStatus(sessionID, status, driveFolderID string) error
+}
+
+// Orchestrator coordinates fetching session data, building files, and uploading.
+type Orchestrator struct {
+	syncer *Syncer
+	store  OrchestratorStore
+}
+
+func NewOrchestrator(syncer *Syncer, store OrchestratorStore) *Orchestrator {
+	return &Orchestrator{syncer: syncer, store: store}
+}
+
+// SyncSession implements session.SessionSyncer.
+func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error {
+	sess, err := o.store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("get session %s: %w", sessionID, err)
+	}
+
+	segments, err := o.store.GetSegments(sessionID)
+	if err != nil {
+		return fmt.Errorf("get segments %s: %w", sessionID, err)
+	}
+
+	syncSess := SyncSession{
+		ID:            sess.ID,
+		Title:         sess.Title,
+		StartedAt:     sess.StartedAt,
+		EndedAt:       sess.EndedAt,
+		Summary:       sess.Summary,
+		SummaryPreset: sess.SummaryPreset,
+	}
+
+	files, folderName, err := BuildSyncFiles(syncSess, segments, sess.AudioPath)
+	if err != nil {
+		_ = o.store.UpdateSyncStatus(sessionID, storage.SyncFailed, "")
+		return fmt.Errorf("build sync files %s: %w", sessionID, err)
+	}
+
+	driveFolderID, err := o.syncer.Upload(ctx, folderName, files)
+	if err != nil {
+		_ = o.store.UpdateSyncStatus(sessionID, storage.SyncFailed, "")
+		return fmt.Errorf("upload %s: %w", sessionID, err)
+	}
+
+	if err := o.store.UpdateSyncStatus(sessionID, storage.SyncSynced, driveFolderID); err != nil {
+		return fmt.Errorf("update sync status %s: %w", sessionID, err)
+	}
+
+	log.Printf("gdrive: synced session %s to folder %s", sessionID, driveFolderID)
+	return nil
+}
+```
+
+**Step 4: Wire everything in main.go**
 
 Replace the existing gdrive ticker block (lines 489-511) with:
 
-1. Create a `SyncOrchestrator` that wraps the gdrive `Syncer` and storage store — responsible for:
-   - Fetching session + segments from store
-   - Calling `BuildSyncFiles`
-   - Calling `syncer.Upload`
-   - Calling `store.UpdateSyncStatus`
-2. Pass the orchestrator to `manager.SetSyncer()` for event-driven sync.
-3. Start a periodic sweep goroutine (5 min) that calls `store.GetSessionsNeedingSync()` and syncs each.
-4. Start a GC sweep goroutine (1 hour) that creates a `gc.Collector` with current config and calls `Run()`.
-5. Register `cfgStore.OnChange` to update sync/GC config dynamically.
+```go
+// Google Drive sync.
+var syncOrchestrator *gdrive.Orchestrator
+if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
+	syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
+	if syncErr != nil {
+		log.Printf("warning: gdrive sync disabled: %v", syncErr)
+		warnings = append(warnings, "Google Drive sync failed to initialize \u2014 backups are disabled")
+	} else {
+		syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+		manager.SetSyncer(syncOrchestrator)
 
+		// Periodic sweep: sync any sessions missed by event-driven trigger.
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					ids, err := store.GetSessionsNeedingSync()
+					if err != nil {
+						log.Printf("gdrive sweep error: %v", err)
+						continue
+					}
+					for _, id := range ids {
+						if err := syncOrchestrator.SyncSession(ctx, id); err != nil {
+							log.Printf("gdrive sweep: session %s: %v", id, err)
+						}
+					}
+				}
+			}
+		}()
+	}
+}
+
+// Garbage collection sweep.
+if cfg.GCEnabled {
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				latestCfg := cfgStore.Get()
+				if !latestCfg.GCEnabled {
+					continue
+				}
+				syncGated := latestCfg.GDriveSyncEnabled && syncOrchestrator != nil
+				collector := gc.New(store, gc.Config{
+					MaxAgeDays:     latestCfg.GCMaxAgeDays,
+					MaxAudioSizeMB: latestCfg.GCMaxAudioSizeMB,
+					SyncGated:      syncGated,
+					AudioDir:       latestCfg.AudioDir,
+				})
+				deleted, err := collector.Run()
+				if err != nil {
+					log.Printf("gc error: %v", err)
+				} else if len(deleted) > 0 {
+					log.Printf("gc: deleted %d sessions", len(deleted))
+				}
+			}
+		}
+	}()
+}
+```
+
+**Step 5: Handle dynamic config changes**
+
+In the existing `cfgStore.OnChange` callback, add:
+
+```go
+// Recreate sync orchestrator if gdrive config changed.
+if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
+	if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID); err == nil {
+		syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+		manager.SetSyncer(syncOrchestrator)
+		log.Printf("config: gdrive sync enabled")
+	}
+} else if !newCfg.GDriveSyncEnabled && syncOrchestrator != nil {
+	manager.SetSyncer(nil)
+	log.Printf("config: gdrive sync disabled")
+}
+```
 **Step 4: Run all tests**
 
 Run: `go test ./... -count=1`
@@ -1037,12 +1294,99 @@ Add a test that GETs config and verifies the new fields are present:
 
 ```go
 func TestConfigIncludesSyncAndGC(t *testing.T) {
-	// Use existing test pattern — build a stub, call handleGetConfig.
-	// Verify response includes gdrive.sync_enabled, gc.enabled, gc.max_age_days, gc.max_audio_size_mb.
+	cfgStore, _, err := config.NewStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stub := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+	}
+
+	handler := buildTestHandler(t, stub, cfgStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// Verify gdrive.sync_enabled exists.
+	gdrive, ok := resp["gdrive"].(map[string]any)
+	if !ok {
+		t.Fatal("missing gdrive in response")
+	}
+	if _, ok := gdrive["sync_enabled"]; !ok {
+		t.Error("missing gdrive.sync_enabled")
+	}
+
+	// Verify gc section exists with all fields.
+	gc, ok := resp["gc"].(map[string]any)
+	if !ok {
+		t.Fatal("missing gc in response")
+	}
+	for _, field := range []string{"enabled", "max_age_days", "max_audio_size_mb"} {
+		if _, ok := gc[field]; !ok {
+			t.Errorf("missing gc.%s", field)
+		}
+	}
+}
+
+func TestPatchSyncAndGCConfig(t *testing.T) {
+	cfgStore, _, err := config.NewStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stub := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+	}
+
+	handler := buildTestHandler(t, stub, cfgStore)
+
+	patch := `{"gdrive":{"sync_enabled":true},"gc":{"enabled":true,"max_age_days":60,"max_audio_size_mb":512}}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(patch))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify the returned config reflects the changes.
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	gdrive := resp["gdrive"].(map[string]any)
+	if gdrive["sync_enabled"] != true {
+		t.Error("expected sync_enabled true")
+	}
+
+	gc := resp["gc"].(map[string]any)
+	if gc["enabled"] != true {
+		t.Error("expected gc.enabled true")
+	}
+	if gc["max_age_days"] != float64(60) {
+		t.Errorf("expected gc.max_age_days 60, got %v", gc["max_age_days"])
+	}
+	if gc["max_audio_size_mb"] != float64(512) {
+		t.Errorf("expected gc.max_audio_size_mb 512, got %v", gc["max_audio_size_mb"])
+	}
 }
 ```
 
-Also test PATCH with the new fields.
+Note: `buildTestHandler` is a helper that follows the existing `api_test.go` pattern. Adapt to match the actual test setup used in the codebase.
 
 **Step 2: Run test to verify it fails**
 
