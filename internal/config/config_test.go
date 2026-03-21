@@ -15,9 +15,50 @@ func clearEnv(t *testing.T) {
 		"DB_PATH", "AUDIO_DIR", "SILENCE_TIMEOUT",
 		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES",
 		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
+		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
+	}
+}
+
+func TestSyncAndGCDefaults(t *testing.T) {
+	cfg := defaults()
+	if cfg.GDriveSyncEnabled {
+		t.Error("gdrive_sync_enabled should default to false")
+	}
+	if cfg.GCEnabled {
+		t.Error("gc_enabled should default to false")
+	}
+	if cfg.GCMaxAgeDays != 30 {
+		t.Errorf("expected gc_max_age_days 30, got %d", cfg.GCMaxAgeDays)
+	}
+	if cfg.GCMaxAudioSizeMB != 1024 {
+		t.Errorf("expected gc_max_audio_size_mb 1024, got %d", cfg.GCMaxAudioSizeMB)
+	}
+}
+
+func TestSyncAndGCEnvOverrides(t *testing.T) {
+	t.Setenv(EnvPrefix+"GDRIVE_SYNC_ENABLED", "true")
+	t.Setenv(EnvPrefix+"GC_ENABLED", "true")
+	t.Setenv(EnvPrefix+"GC_MAX_AGE_DAYS", "60")
+	t.Setenv(EnvPrefix+"GC_MAX_AUDIO_SIZE_MB", "512")
+
+	cfg, _, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.GDriveSyncEnabled {
+		t.Error("expected gdrive_sync_enabled true")
+	}
+	if !cfg.GCEnabled {
+		t.Error("expected gc_enabled true")
+	}
+	if cfg.GCMaxAgeDays != 60 {
+		t.Errorf("expected gc_max_age_days 60, got %d", cfg.GCMaxAgeDays)
+	}
+	if cfg.GCMaxAudioSizeMB != 512 {
+		t.Errorf("expected gc_max_audio_size_mb 512, got %d", cfg.GCMaxAudioSizeMB)
 	}
 }
 

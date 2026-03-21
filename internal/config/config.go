@@ -36,19 +36,23 @@ type Transcription struct {
 }
 
 type Config struct {
-	DBPath                string        `yaml:"db_path"`
-	AudioDir              string        `yaml:"audio_dir"`
-	SilenceTimeout        string        `yaml:"silence_timeout"`
-	MinSessionSegments    int           `yaml:"min_session_segments"`
-	MicSampleRate         int           `yaml:"mic_sample_rate"`
-	MicSampleRates        []int         `yaml:"mic_sample_rates"`
-	GDriveFolderID        string        `yaml:"gdrive_folder_id"`
-	GoogleCredentialsFile string        `yaml:"google_credentials_file"`
-	Summarization         Summarization `yaml:"summarization"`
-	Transcription         Transcription `yaml:"transcription"`
-	DeepgramBufferSize    int           `yaml:"deepgram_buffer_size"`
-	DeepgramReconnectInitialDelay string `yaml:"deepgram_reconnect_initial_delay"`
-	DeepgramReconnectMaxBackoff   string `yaml:"deepgram_reconnect_max_backoff"`
+	DBPath                        string        `yaml:"db_path"`
+	AudioDir                      string        `yaml:"audio_dir"`
+	SilenceTimeout                string        `yaml:"silence_timeout"`
+	MinSessionSegments            int           `yaml:"min_session_segments"`
+	MicSampleRate                 int           `yaml:"mic_sample_rate"`
+	MicSampleRates                []int         `yaml:"mic_sample_rates"`
+	GDriveFolderID                string        `yaml:"gdrive_folder_id"`
+	GoogleCredentialsFile         string        `yaml:"google_credentials_file"`
+	GDriveSyncEnabled             bool          `yaml:"gdrive_sync_enabled"`
+	GCEnabled                     bool          `yaml:"gc_enabled"`
+	GCMaxAgeDays                  int           `yaml:"gc_max_age_days"`
+	GCMaxAudioSizeMB              int           `yaml:"gc_max_audio_size_mb"`
+	Summarization                 Summarization `yaml:"summarization"`
+	Transcription                 Transcription `yaml:"transcription"`
+	DeepgramBufferSize            int           `yaml:"deepgram_buffer_size"`
+	DeepgramReconnectInitialDelay string        `yaml:"deepgram_reconnect_initial_delay"`
+	DeepgramReconnectMaxBackoff   string        `yaml:"deepgram_reconnect_max_backoff"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
@@ -66,6 +70,8 @@ func defaults() Config {
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
 		GoogleCredentialsFile: "./service-account.json",
+		GCMaxAgeDays:          30,
+		GCMaxAudioSizeMB:      1024,
 		Summarization: Summarization{
 			Model: "openai/gpt-4o-mini",
 			Presets: map[string]Preset{
@@ -80,9 +86,9 @@ func defaults() Config {
 			Endpointing:    "400",
 			UtteranceEndMs: "1000",
 		},
-		DeepgramBufferSize:                1920000,
-		DeepgramReconnectInitialDelay:     "500ms",
-		DeepgramReconnectMaxBackoff:       "30s",
+		DeepgramBufferSize:            1920000,
+		DeepgramReconnectInitialDelay: "500ms",
+		DeepgramReconnectMaxBackoff:   "30s",
 	}
 }
 
@@ -208,6 +214,22 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_MAX_BACKOFF"); v != "" {
 		cfg.DeepgramReconnectMaxBackoff = v
 	}
+	if v := os.Getenv(EnvPrefix + "GDRIVE_SYNC_ENABLED"); v != "" {
+		cfg.GDriveSyncEnabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv(EnvPrefix + "GC_ENABLED"); v != "" {
+		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv(EnvPrefix + "GC_MAX_AGE_DAYS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			cfg.GCMaxAgeDays = n
+		}
+	}
+	if v := os.Getenv(EnvPrefix + "GC_MAX_AUDIO_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			cfg.GCMaxAudioSizeMB = n
+		}
+	}
 }
 
 func loadSecrets(cfg *Config) {
@@ -277,6 +299,15 @@ func validate(cfg *Config) []string {
 		if n, err := strconv.Atoi(v); err != nil || n < 0 {
 			warnings = append(warnings, fmt.Sprintf("Invalid transcription.utterance_end_ms %q — must be a non-negative integer (ms). Using Deepgram default.", v))
 		}
+	}
+
+	if cfg.GCMaxAgeDays <= 0 {
+		warnings = append(warnings, "gc_max_age_days must be positive — using default 30.")
+		cfg.GCMaxAgeDays = 30
+	}
+	if cfg.GCMaxAudioSizeMB <= 0 {
+		warnings = append(warnings, "gc_max_audio_size_mb must be positive — using default 1024.")
+		cfg.GCMaxAudioSizeMB = 1024
 	}
 
 	return warnings
