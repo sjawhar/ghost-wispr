@@ -818,3 +818,99 @@ func TestAPI_RefinePreset_Success(t *testing.T) {
 		t.Fatalf("expected refined prompt, got %q", resp.SystemPrompt)
 	}
 }
+
+func TestAPI_GetConfig_ExposesGDriveSyncAndGCDefaults(t *testing.T) {
+	cfgStore := newTestConfigStore(t)
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", cfgStore)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		GDrive struct {
+			SyncEnabled bool `json:"sync_enabled"`
+		} `json:"gdrive"`
+		GC struct {
+			Enabled        bool `json:"enabled"`
+			MaxAgeDays     int  `json:"max_age_days"`
+			MaxAudioSizeMB int  `json:"max_audio_size_mb"`
+		} `json:"gc"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if resp.GDrive.SyncEnabled {
+		t.Fatalf("expected gdrive.sync_enabled default false")
+	}
+	if resp.GC.Enabled {
+		t.Fatalf("expected gc.enabled default false")
+	}
+	if resp.GC.MaxAgeDays != 30 {
+		t.Fatalf("expected gc.max_age_days default 30, got %d", resp.GC.MaxAgeDays)
+	}
+	if resp.GC.MaxAudioSizeMB != 1024 {
+		t.Fatalf("expected gc.max_audio_size_mb default 1024, got %d", resp.GC.MaxAudioSizeMB)
+	}
+}
+
+func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
+	cfgStore := newTestConfigStore(t)
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", cfgStore)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	body := `{"gdrive":{"sync_enabled":true},"gc":{"enabled":true,"max_age_days":7,"max_audio_size_mb":256}}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		GDrive struct {
+			SyncEnabled bool `json:"sync_enabled"`
+		} `json:"gdrive"`
+		GC struct {
+			Enabled        bool `json:"enabled"`
+			MaxAgeDays     int  `json:"max_age_days"`
+			MaxAudioSizeMB int  `json:"max_audio_size_mb"`
+		} `json:"gc"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if !resp.GDrive.SyncEnabled {
+		t.Fatalf("expected gdrive.sync_enabled true after patch")
+	}
+	if !resp.GC.Enabled {
+		t.Fatalf("expected gc.enabled true after patch")
+	}
+	if resp.GC.MaxAgeDays != 7 {
+		t.Fatalf("expected gc.max_age_days 7, got %d", resp.GC.MaxAgeDays)
+	}
+	if resp.GC.MaxAudioSizeMB != 256 {
+		t.Fatalf("expected gc.max_audio_size_mb 256, got %d", resp.GC.MaxAudioSizeMB)
+	}
+}
