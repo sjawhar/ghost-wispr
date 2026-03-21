@@ -23,18 +23,24 @@ const (
 	SessionActive    = "active"
 	SessionEnded     = "ended"
 	SessionDiscarded = "discarded"
+
+	SyncPending = "pending"
+	SyncSynced  = "synced"
+	SyncFailed  = "failed"
 )
 
 type Session struct {
-	ID            string     `json:"id"`
-	Title         string     `json:"title"`
-	StartedAt     time.Time  `json:"started_at"`
-	EndedAt       *time.Time `json:"ended_at,omitempty"`
-	Status        string     `json:"status"`
-	Summary       string     `json:"summary"`
-	SummaryStatus string     `json:"summary_status"`
-	SummaryPreset string     `json:"summary_preset"`
-	AudioPath     string     `json:"audio_path"`
+	ID             string     `json:"id"`
+	Title          string     `json:"title"`
+	StartedAt      time.Time  `json:"started_at"`
+	EndedAt        *time.Time `json:"ended_at,omitempty"`
+	Status         string     `json:"status"`
+	Summary        string     `json:"summary"`
+	SummaryStatus  string     `json:"summary_status"`
+	SummaryPreset  string     `json:"summary_preset"`
+	AudioPath      string     `json:"audio_path"`
+	SyncStatus     string     `json:"sync_status"`
+	GDriveFolderID string     `json:"gdrive_folder_id"`
 }
 
 type SQLiteStore struct {
@@ -100,6 +106,8 @@ func (s *SQLiteStore) init() error {
 	for _, stmt := range []string{
 		`ALTER TABLE sessions ADD COLUMN summary_preset TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'pending'`,
+		`ALTER TABLE sessions ADD COLUMN gdrive_folder_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -231,7 +239,7 @@ func (s *SQLiteStore) AppendSegment(sessionID string, seg transcribe.Segment) er
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -274,14 +282,14 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id FROM sessions WHERE id = ?`,
 		id,
 	)
 
 	var sess Session
 	var startedAt string
 	var endedAt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -381,6 +389,24 @@ func (s *SQLiteStore) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
+func (s *SQLiteStore) UpdateSyncStatus(sessionID, status, driveFolderID string) error {
+	res, err := s.db.Exec(
+		`UPDATE sessions SET sync_status = ?, gdrive_folder_id = ? WHERE id = ?`,
+		status, driveFolderID, sessionID,
+	)
+	if err != nil {
+		return fmt.Errorf("update sync status for session %s: %w", sessionID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update sync status rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *SQLiteStore) ClaimSummaryRequest(sessionID, promptHash string) (bool, error) {
 	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO summary_requests(session_id, prompt_hash) VALUES(?, ?)`,
@@ -405,7 +431,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var sess Session
 		var startedAt string
 		var endedAt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -475,6 +501,29 @@ func (s *SQLiteStore) GetSessionsNeedingSummary() ([]string, error) {
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing summary: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions: %w", err)
+	}
+	return ids, nil
+}
+
+func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT id FROM sessions WHERE status = 'ended' AND sync_status != 'synced'`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query sessions needing sync: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 

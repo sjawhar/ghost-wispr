@@ -158,6 +158,53 @@ func TestSQLiteSummaryClaimIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSyncStatusTracking(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "sync-test-1"
+	started := time.Date(2026, 3, 21, 10, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary: %v", err)
+	}
+
+	ids, err := store.GetSessionsNeedingSync()
+	if err != nil {
+		t.Fatalf("get sessions needing sync: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("expected [%s], got %v", sessionID, ids)
+	}
+
+	if err := store.UpdateSyncStatus(sessionID, SyncSynced, "drive-folder-id-123"); err != nil {
+		t.Fatalf("update sync status: %v", err)
+	}
+
+	ids, err = store.GetSessionsNeedingSync()
+	if err != nil {
+		t.Fatalf("get sessions needing sync after update: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected empty, got %v", ids)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.SyncStatus != SyncSynced {
+		t.Fatalf("expected sync_status %q, got %q", SyncSynced, sess.SyncStatus)
+	}
+	if sess.GDriveFolderID != "drive-folder-id-123" {
+		t.Fatalf("expected gdrive_folder_id %q, got %q", "drive-folder-id-123", sess.GDriveFolderID)
+	}
+}
+
 func TestSQLiteConcurrentAccess(t *testing.T) {
 	store := newTestSQLiteStore(t)
 
