@@ -281,7 +281,7 @@ $RECYCLE.BIN/
 .sisyphus/*
 !.sisyphus/rules/
 !.sisyphus/rules/**
-ghost-wispr
+/ghost-wispr
 .env
 service-account.json
 transcripts/

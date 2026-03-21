@@ -626,6 +626,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 type micStreamer interface {
 	Stream(writer io.Writer) error
+	Reopen() error
 }
 
 func streamMicWithRetry(
@@ -635,6 +636,14 @@ func streamMicWithRetry(
 	wait func(time.Duration),
 	logf func(string, ...any),
 ) {
+	const (
+		overflowWait = 250 * time.Millisecond
+		baseBackoff  = time.Second
+		maxBackoff   = 30 * time.Second
+	)
+
+	backoff := baseBackoff
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -647,11 +656,24 @@ func streamMicWithRetry(
 
 		if strings.Contains(strings.ToLower(err.Error()), "overflow") {
 			logf("warning: mic input overflow, restarting stream")
-			wait(250 * time.Millisecond)
+			wait(overflowWait)
 			continue
 		}
 
-		logf("mic stream error: %v", err)
-		return
+		logf("mic stream error (retrying in %v): %v", backoff, err)
+		wait(backoff)
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		if reopenErr := streamer.Reopen(); reopenErr != nil {
+			logf("mic reopen failed: %v", reopenErr)
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+
+		logf("mic reopened successfully")
+		backoff = baseBackoff
 	}
 }
