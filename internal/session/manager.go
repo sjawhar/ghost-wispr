@@ -296,9 +296,18 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 }
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
-	if m.summarizer == nil {
-		if m.syncer != nil {
-			go m.syncer.SyncSession(context.Background(), sessionID)
+	m.mu.Lock()
+	summarizer := m.summarizer
+	syncer := m.syncer
+	m.mu.Unlock()
+
+	if summarizer == nil {
+		if syncer != nil {
+			go func() {
+				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+					log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+				}
+			}()
 		}
 		return
 	}
@@ -321,7 +330,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 		b.WriteString("\n")
 	}
 
-	title, summaryText, preset, err := m.summarizer.Summarize(ctx, sessionID, b.String())
+	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, b.String())
 	if err != nil {
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
@@ -336,8 +345,12 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 
-	if m.syncer != nil {
-		go m.syncer.SyncSession(context.Background(), sessionID)
+	if syncer != nil {
+		go func() {
+			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+				log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+			}
+		}()
 	}
 }
 

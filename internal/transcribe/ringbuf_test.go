@@ -45,7 +45,7 @@ func TestRingBuf_Overflow(t *testing.T) {
 	rb := NewRingBuf(5)
 
 	// Write 5 bytes (fill buffer)
-	rb.Write([]byte{1, 2, 3, 4, 5})
+	_, _ = rb.Write([]byte{1, 2, 3, 4, 5})
 	if rb.Len() != 5 {
 		t.Errorf("Len() = %d, expected 5", rb.Len())
 	}
@@ -84,11 +84,11 @@ func TestRingBuf_WrapAround(t *testing.T) {
 	rb := NewRingBuf(8)
 
 	// Write 6 bytes
-	rb.Write([]byte{1, 2, 3, 4, 5, 6})
+	_, _ = rb.Write([]byte{1, 2, 3, 4, 5, 6})
 
 	// Read 4 bytes
 	buf := make([]byte, 4)
-	rb.Read(buf)
+	_, _ = rb.Read(buf)
 	if rb.Len() != 2 {
 		t.Errorf("Len() after partial read = %d, expected 2", rb.Len())
 	}
@@ -143,7 +143,7 @@ func TestRingBuf_ReadPartial(t *testing.T) {
 	rb := NewRingBuf(10)
 
 	// Write 8 bytes
-	rb.Write([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	_, _ = rb.Write([]byte{1, 2, 3, 4, 5, 6, 7, 8})
 
 	// Read only 3 bytes
 	buf := make([]byte, 3)
@@ -190,7 +190,7 @@ func TestRingBuf_Reset(t *testing.T) {
 	rb := NewRingBuf(10)
 
 	// Write some data
-	rb.Write([]byte{1, 2, 3, 4, 5})
+	_, _ = rb.Write([]byte{1, 2, 3, 4, 5})
 	if rb.Len() != 5 {
 		t.Errorf("Len() before reset = %d, expected 5", rb.Len())
 	}

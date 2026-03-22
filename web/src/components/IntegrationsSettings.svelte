@@ -178,7 +178,6 @@
         >
       {/if}
     </div>
-
   </div>
 
   <h4>Garbage Collection</h4>

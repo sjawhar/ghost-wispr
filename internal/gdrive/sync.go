@@ -10,11 +10,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
+
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 type Syncer struct {
@@ -53,7 +54,7 @@ func NewSyncer(ctx context.Context, credPath, folderID string) (*Syncer, error) 
 	}, nil
 }
 
-func BuildSyncFiles(sess SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
+func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
 	date := sess.StartedAt.UTC().Format("2006-01-02")
 	slug := slugify(sess.Title)
 	folderName := date + "-" + slug
@@ -112,16 +113,19 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 
 	for _, f := range files {
 		var reader io.Reader
-		if f.Content != nil {
+		var file *os.File
+
+		switch {
+		case f.Content != nil:
 			reader = bytes.NewReader(f.Content)
-		} else if f.LocalPath != "" {
-			file, err := os.Open(f.LocalPath)
+		case f.LocalPath != "":
+			openedFile, err := os.Open(f.LocalPath)
 			if err != nil {
 				return folder.Id, fmt.Errorf("open %s: %w", f.LocalPath, err)
 			}
-			defer func() { _ = file.Close() }()
+			file = openedFile
 			reader = file
-		} else {
+		default:
 			continue
 		}
 
@@ -130,6 +134,9 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 			MimeType: f.MimeType,
 			Parents:  []string{folder.Id},
 		}).SupportsAllDrives(true).Media(reader, googleapi.ContentType(f.ContentType)).Context(ctx).Fields("id").Do()
+		if file != nil {
+			_ = file.Close()
+		}
 		if err != nil {
 			return folder.Id, fmt.Errorf("upload %s: %w", f.Name, err)
 		}

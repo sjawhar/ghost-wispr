@@ -81,11 +81,11 @@ type ResilientClient struct {
 	OnStateChange ConnectionCallback
 
 	// ctx is the application context; cancellation stops the reconnect loop.
-	ctx    context.Context
+	ctx context.Context
 	// cancel cancels ctx, stopping the reconnect goroutine on Close().
 	cancel context.CancelFunc
 	// log is a printf-style logger.
-	log    func(string, ...any)
+	log func(string, ...any)
 
 	// reconnectDelay tracks the current exponential backoff delay.
 	reconnectDelay time.Duration

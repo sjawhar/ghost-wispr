@@ -60,7 +60,9 @@ func (rc *ResilientClient) Write(p []byte) (int, error) {
 		}
 
 		rc.Mu.Lock()
-		rc.Buffer.Write(p)
+		if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
+			rc.log("failed to buffer audio after write error: %v", writeErr)
+		}
 		rc.setStateLocked(StateDisconnected)
 		rc.Mu.Unlock()
 
@@ -70,7 +72,9 @@ func (rc *ResilientClient) Write(p []byte) (int, error) {
 	}
 
 	rc.Mu.Lock()
-	rc.Buffer.Write(p)
+	if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
+		rc.log("failed to buffer audio while disconnected: %v", writeErr)
+	}
 	rc.Mu.Unlock()
 
 	return len(p), nil
@@ -136,7 +140,7 @@ func (rc *ResilientClient) reconnect() {
 		newClient, err := rc.Factory(rc.ctx)
 		if err != nil {
 			rc.log("deepgram reconnect failed (retrying in %v): %v", delay, err)
-			delay = delay * 2
+			delay *= 2
 			if delay > rc.Config.MaxReconnectBackoff {
 				delay = rc.Config.MaxReconnectBackoff
 			}
@@ -177,6 +181,8 @@ func (rc *ResilientClient) drainBuffer() {
 		if n == 0 || client == nil {
 			break
 		}
-		client.Write(buf[:n])
+		if _, err := client.Write(buf[:n]); err != nil {
+			rc.log("failed to drain buffered audio: %v", err)
+		}
 	}
 }

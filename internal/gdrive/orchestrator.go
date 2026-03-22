@@ -44,7 +44,7 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 		SummaryPreset: sess.SummaryPreset,
 	}
 
-	files, folderName, err := BuildSyncFiles(syncSess, segments, sess.AudioPath)
+	files, folderName, err := BuildSyncFiles(&syncSess, segments, sess.AudioPath)
 	if err != nil {
 		_ = o.store.UpdateSyncStatus(sessionID, storage.SyncFailed, "")
 		return fmt.Errorf("build sync files %s: %w", sessionID, err)

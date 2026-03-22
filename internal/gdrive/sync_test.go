@@ -31,7 +31,7 @@ func TestBuildSyncFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, folderName, err := BuildSyncFiles(sess, segments, audioPath)
+	files, folderName, err := BuildSyncFiles(&sess, segments, audioPath)
 	if err != nil {
 		t.Fatalf("build sync files: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestBuildSyncFilesNoAudio(t *testing.T) {
 		{Speaker: 0, Text: "Hello", StartTime: 0.0, EndTime: 1.0, Timestamp: started},
 	}
 
-	files, _, err := BuildSyncFiles(sess, segments, "")
+	files, _, err := BuildSyncFiles(&sess, segments, "")
 	if err != nil {
 		t.Fatalf("build sync files: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestBuildSyncFilesNoSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, _, err := BuildSyncFiles(sess, segments, audioPath)
+	files, _, err := BuildSyncFiles(&sess, segments, audioPath)
 	if err != nil {
 		t.Fatalf("build sync files: %v", err)
 	}

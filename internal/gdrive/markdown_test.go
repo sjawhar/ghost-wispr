@@ -12,7 +12,7 @@ func TestRenderSummaryMarkdown(t *testing.T) {
 	started := time.Date(2026, 3, 21, 14, 30, 22, 0, time.UTC)
 	ended := started.Add(32 * time.Minute)
 
-	md := RenderSummaryMarkdown(SyncSession{
+	md := RenderSummaryMarkdown(&SyncSession{
 		ID:            "20260321-143022",
 		Title:         "Weekly Standup",
 		StartedAt:     started,
@@ -44,7 +44,7 @@ func TestRenderTranscriptMarkdown(t *testing.T) {
 		{Speaker: 1, Text: "Hi, let's begin", StartTime: 2.0, EndTime: 3.5, Timestamp: started.Add(2 * time.Second)},
 	}
 
-	md := RenderTranscriptMarkdown(SyncSession{
+	md := RenderTranscriptMarkdown(&SyncSession{
 		ID:        "20260321-143022",
 		Title:     "Weekly Standup",
 		StartedAt: started,

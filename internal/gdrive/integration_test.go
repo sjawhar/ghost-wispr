@@ -44,7 +44,7 @@ func TestSyncToRealDrive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, folderName, err := BuildSyncFiles(sess, segments, tmpAudio)
+	files, folderName, err := BuildSyncFiles(&sess, segments, tmpAudio)
 	if err != nil {
 		t.Fatalf("build sync files: %v", err)
 	}

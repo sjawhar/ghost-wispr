@@ -18,7 +18,7 @@ type SyncSession struct {
 	SummaryPreset string
 }
 
-func RenderSummaryMarkdown(s SyncSession) string {
+func RenderSummaryMarkdown(s *SyncSession) string {
 	var b strings.Builder
 
 	b.WriteString("---\n")
@@ -44,7 +44,7 @@ func RenderSummaryMarkdown(s SyncSession) string {
 	return b.String()
 }
 
-func RenderTranscriptMarkdown(s SyncSession, segments []transcribe.Segment) string {
+func RenderTranscriptMarkdown(s *SyncSession, segments []transcribe.Segment) string {
 	var b strings.Builder
 
 	speakerSet := make(map[int]struct{})

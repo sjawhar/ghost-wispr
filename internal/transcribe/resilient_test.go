@@ -203,7 +203,7 @@ func TestResilientClient_ReconnectDrainsBuffer(t *testing.T) {
 
 	// Write data that will fail and be buffered
 	bufferedData := []byte{1, 2, 3, 4, 5}
-	rc.Write(bufferedData)
+	_, _ = rc.Write(bufferedData)
 
 	// Trigger reconnect
 	rc.startReconnect()
@@ -288,7 +288,7 @@ func TestResilientClient_ConcurrentWriteAndReconnect(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			data := []byte{byte(idx)}
-			rc.Write(data)
+			_, _ = rc.Write(data)
 		}(i)
 	}
 

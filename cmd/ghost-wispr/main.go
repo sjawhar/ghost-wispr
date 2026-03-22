@@ -677,7 +677,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			resilientClient.Client = initialClient
 			dgWriter = resilientClient
 			dgStop = func() {
-				resilientClient.Close()
+				if err := resilientClient.Close(); err != nil {
+					log.Printf("warning: close resilient deepgram client failed: %v", err)
+				}
 			}
 			go func() {
 				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf)
