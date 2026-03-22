@@ -90,6 +90,28 @@
         setDates(dates)
         setPresets(presets)
 
+        // Restore active session's live transcript if one exists
+        if (status.active_session_id) {
+          appState.activeSessionId = status.active_session_id
+          appState.activeSessionStartedAt = Date.parse(status.active_session_started_at)
+
+          try {
+            const detail = await fetchSession(status.active_session_id)
+            setSessionDetail(detail)
+            appState.liveSegments = detail.segments.map((seg) => ({
+              type: 'live_transcript' as const,
+              version: 1,
+              timestamp: seg.timestamp,
+              speaker: seg.speaker,
+              text: seg.text,
+              start_time: seg.start_time,
+              end_time: seg.end_time,
+            }))
+          } catch {
+            // Session may have ended between status and detail fetch — that's OK
+          }
+        }
+
         for (const date of dates.slice(0, 3)) {
           await loadDate(date)
         }
