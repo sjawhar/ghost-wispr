@@ -460,6 +460,35 @@ h1 {
   line-height: 1.5;
 }
 
+.summary-preview-md {
+    margin: 0 0.85rem 0.7rem;
+    max-height: 4em;
+    overflow: hidden;
+    position: relative;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
+}
+
+.summary-preview-md :global(h1),
+.summary-preview-md :global(h2),
+.summary-preview-md :global(h3) {
+    margin: 0 0 0.2rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+.summary-preview-md :global(p) {
+    margin: 0 0 0.2rem;
+}
+
+.summary-preview-md :global(ul),
+.summary-preview-md :global(ol) {
+    margin: 0;
+    padding-left: 1.2rem;
+}
+
 .session-details {
   border-top: 1px solid var(--line);
   padding: 1rem;

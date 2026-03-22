@@ -83,13 +83,6 @@
     return `${mm}:${ss}`
   })
 
-  function summaryPreview(summary: string): string {
-    const lines = summary
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-    return lines.slice(0, 2).join(' ')
-  }
 
   async function openCard() {
     onToggle()
@@ -137,7 +130,9 @@
   </button>
 
   {#if session.summary_status === 'completed' && session.summary}
-    <p class="summary-preview">{summaryPreview(session.summary)}</p>
+    <div class="summary-preview-md prose">
+        <Markdown source={session.summary} />
+    </div>
   {:else if session.summary_status === 'running' || session.summary_status === 'pending'}
     <p class="summary-preview">Summarizing...</p>
   {:else if session.summary_status === 'failed'}
