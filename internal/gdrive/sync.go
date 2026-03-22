@@ -105,7 +105,7 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 		Name:     folderName,
 		MimeType: "application/vnd.google-apps.folder",
 		Parents:  []string{s.folderID},
-	}).Context(ctx).Fields("id").Do()
+	}).SupportsAllDrives(true).Context(ctx).Fields("id").Do()
 	if err != nil {
 		return "", fmt.Errorf("create folder %s: %w", folderName, err)
 	}
@@ -129,7 +129,7 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 			Name:     f.Name,
 			MimeType: f.MimeType,
 			Parents:  []string{folder.Id},
-		}).Media(reader, googleapi.ContentType(f.ContentType)).Context(ctx).Fields("id").Do()
+		}).SupportsAllDrives(true).Media(reader, googleapi.ContentType(f.ContentType)).Context(ctx).Fields("id").Do()
 		if err != nil {
 			return folder.Id, fmt.Errorf("upload %s: %w", f.Name, err)
 		}
