@@ -5,12 +5,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 type Store interface {
-	GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error)
+	GetGCEligibleSessions(maxAgeDays int, syncGated bool, diskPressure bool) ([]string, error)
 	GetSession(id string) (storage.Session, error)
 	DeleteSession(id string) error
 }
@@ -32,7 +33,7 @@ func New(store Store, config Config) *Collector {
 }
 
 func (c *Collector) Run() ([]string, error) {
-	ids, err := c.store.GetGCEligibleSessions(c.config.MaxAgeDays, c.config.SyncGated)
+	ids, err := c.store.GetGCEligibleSessions(c.config.MaxAgeDays, c.config.SyncGated, false)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible: %w", err)
 	}
@@ -47,7 +48,7 @@ func (c *Collector) Run() ([]string, error) {
 	}
 
 	if c.checkDiskPressure() {
-		allSynced, err := c.store.GetGCEligibleSessions(0, c.config.SyncGated)
+		allSynced, err := c.store.GetGCEligibleSessions(0, c.config.SyncGated, true)
 		if err != nil {
 			return deleted, fmt.Errorf("query disk-pressure gc: %w", err)
 		}
@@ -79,18 +80,27 @@ func (c *Collector) deleteSession(id string) error {
 		return fmt.Errorf("get session: %w", err)
 	}
 
-	if sess.AudioPath != "" {
-		audioPath := sess.AudioPath
-		if !filepath.IsAbs(audioPath) && c.config.AudioDir != "" {
-			audioPath = filepath.Join(c.config.AudioDir, filepath.Base(audioPath))
-		}
-		if err := os.Remove(audioPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove audio %s: %w", audioPath, err)
-		}
-	}
-
+	// Delete DB record first — if this fails, audio files remain (recoverable).
+	// Reverse order (delete files first) risks permanent audio loss on DB failure.
 	if err := c.store.DeleteSession(id); err != nil {
 		return fmt.Errorf("delete from db: %w", err)
+	}
+
+	// Clean up audio files (may be comma-separated for merged sessions).
+	if sess.AudioPath != "" {
+		for _, p := range strings.Split(sess.AudioPath, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			audioPath := p
+			if !filepath.IsAbs(audioPath) && c.config.AudioDir != "" {
+				audioPath = filepath.Join(c.config.AudioDir, filepath.Base(audioPath))
+			}
+			if err := os.Remove(audioPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("gc: failed to remove audio %s for session %s: %v", audioPath, id, err)
+			}
+		}
 	}
 
 	return nil

@@ -114,7 +114,9 @@
   {#each visibleDates as date (date)}
     {@const allSessions = sessionsByDate.get(date) ?? []}
     {@const hiddenCount = showHidden[date] ? 0 : allSessions.filter(isShortSession).length}
-    {@const visibleSessions = showHidden[date] ? allSessions : allSessions.filter((s) => !isShortSession(s))}
+    {@const visibleSessions = showHidden[date]
+      ? allSessions
+      : allSessions.filter((s) => !isShortSession(s))}
     <section class="date-group">
       <h3>{headingForDate(date)}</h3>
 

@@ -219,11 +219,17 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default"); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := store.CreateSession("gc-unsynced", old); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,8 +242,11 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default"); err != nil {
+		t.Fatal(err)
+	}
 
-	ids, err := store.GetGCEligibleSessions(30, true)
+	ids, err := store.GetGCEligibleSessions(30, true, false)
 	if err != nil {
 		t.Fatalf("get gc eligible: %v", err)
 	}
@@ -245,7 +254,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatalf("expected [gc-eligible], got %v", ids)
 	}
 
-	ids, err = store.GetGCEligibleSessions(30, false)
+	ids, err = store.GetGCEligibleSessions(30, false, false)
 	if err != nil {
 		t.Fatalf("get gc eligible no gate: %v", err)
 	}
@@ -253,7 +262,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatalf("expected 2 sessions, got %d: %v", len(ids), ids)
 	}
 
-	ids, err = store.GetGCEligibleSessions(0, true)
+	ids, err = store.GetGCEligibleSessions(0, true, true)
 	if err != nil {
 		t.Fatalf("get gc eligible disk pressure: %v", err)
 	}

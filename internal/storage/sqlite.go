@@ -630,12 +630,17 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 }
 
 // GetGCEligibleSessions returns session IDs eligible for garbage collection.
-// Sessions must be ended. If maxAgeDays > 0, only sessions older than that are returned.
-// If maxAgeDays == 0, all ended sessions are eligible (used for disk-pressure GC).
-// If syncGated is true, only synced sessions are returned.
+// Sessions must be ended. For normal GC, summary must be completed.
+// For disk-pressure GC (diskPressure=true), failed/pending summaries are also eligible
+// as long as the session has been synced (if syncGated) — this is the last line of defense.
+// If maxAgeDays > 0, only sessions older than that are returned.
+// If maxAgeDays == 0, all eligible sessions are returned.
 // Results are ordered oldest first (for disk-pressure GC to delete oldest).
-func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool, diskPressure bool) ([]string, error) {
 	query := `SELECT id FROM sessions WHERE status = 'ended'`
+	if !diskPressure {
+		query += ` AND summary_status = 'completed'`
+	}
 	var args []any
 	if maxAgeDays > 0 {
 		cutoff := time.Now().UTC().Add(-time.Duration(maxAgeDays) * 24 * time.Hour).Format(time.RFC3339Nano)
@@ -680,4 +685,64 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// ImportSession inserts a fully-formed session and its segments in a single transaction.
+// Returns an error containing "already exists" if the session ID is already present.
+func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment) error {
+	// Check for existing session first.
+	var exists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, sess.ID).Scan(&exists); err != nil {
+		return fmt.Errorf("check existing session %s: %w", sess.ID, err)
+	}
+	if exists > 0 {
+		return fmt.Errorf("session %s already exists", sess.ID)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin import tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	endedAt := ""
+	if sess.EndedAt != nil {
+		endedAt = sess.EndedAt.UTC().Format(time.RFC3339Nano)
+	}
+
+	_, err = tx.Exec(
+		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sess.ID,
+		sess.Title,
+		sess.StartedAt.UTC().Format(time.RFC3339Nano),
+		endedAt,
+		sess.Status,
+		sess.Summary,
+		sess.SummaryStatus,
+		sess.SummaryPreset,
+		sess.AudioPath,
+		sess.SyncStatus,
+		sess.GDriveFolderID,
+	)
+	if err != nil {
+		return fmt.Errorf("insert session %s: %w", sess.ID, err)
+	}
+
+	for _, seg := range segments {
+		_, err = tx.Exec(
+			`INSERT INTO segments(session_id, speaker, text, start_time, end_time, timestamp) VALUES(?, ?, ?, ?, ?, ?)`,
+			sess.ID,
+			seg.Speaker,
+			strings.TrimSpace(seg.Text),
+			seg.StartTime,
+			seg.EndTime,
+			seg.Timestamp.UTC().Format(time.RFC3339Nano),
+		)
+		if err != nil {
+			return fmt.Errorf("insert segment for session %s: %w", sess.ID, err)
+		}
+	}
+
+	return tx.Commit()
 }

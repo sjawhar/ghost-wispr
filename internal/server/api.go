@@ -48,6 +48,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
+	registerRestoreRoutes(mux, controls)
 
 	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		date := r.URL.Query().Get("date")
@@ -154,14 +155,24 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
 			return
 		}
-
-		if sessionData.AudioPath != "" {
-			_ = os.Remove(sessionData.AudioPath)
+		if sessionData.Status == "active" {
+			writeJSONError(w, http.StatusConflict, "cannot delete active session")
+			return
 		}
 
 		if err := store.DeleteSession(sessionID); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 			return
+		}
+
+		// Clean up audio files after successful DB deletion.
+		if sessionData.AudioPath != "" {
+			for _, p := range strings.Split(sessionData.AudioPath, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					_ = os.Remove(p)
+				}
+			}
 		}
 
 		w.WriteHeader(http.StatusNoContent)
@@ -781,4 +792,24 @@ func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Contex
 
 		writeJSON(w, http.StatusOK, refined)
 	}
+}
+
+func registerRestoreRoutes(mux *http.ServeMux, controls *ControlHooks) {
+	mux.HandleFunc("POST /api/restore/gdrive", func(w http.ResponseWriter, r *http.Request) {
+		if controls.RestoreFromGDrive == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "Google Drive sync is not configured")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+		defer cancel()
+
+		result, err := controls.RestoreFromGDrive(ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("restore: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, result)
+	})
 }

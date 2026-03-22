@@ -89,7 +89,6 @@
     return `${mm}:${ss}`
   })
 
-
   async function openCard() {
     onToggle()
     if (!expanded && !detail) {
@@ -103,14 +102,18 @@
   }
 </script>
 
-<article class="session-card" class:selected={selected}>
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div 
-    class="session-header" 
-    role="button" 
-    tabindex="0" 
+<article class="session-card" class:selected>
+  <div
+    class="session-header"
+    role="button"
+    tabindex="0"
     onclick={openCard}
-    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openCard(); } }}
+    onkeydown={(e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        openCard()
+      }
+    }}
   >
     <div class="header-left">
       <input
@@ -142,7 +145,12 @@
             {:else}
               {timeRange}
             {/if}
-            <button type="button" class="edit-title-btn" onclick={startEditTitle} title="Edit title">
+            <button
+              type="button"
+              class="edit-title-btn"
+              onclick={startEditTitle}
+              title="Edit title"
+            >
               &#9998;
             </button>
           </h4>
@@ -152,9 +160,9 @@
     </div>
     <div class="header-right">
       <span class={`summary-badge ${session.summary_status}`}>{session.summary_status}</span>
-      <button 
-        type="button" 
-        class="quick-delete-btn" 
+      <button
+        type="button"
+        class="quick-delete-btn"
         title="Delete session"
         onclick={async (e) => {
           e.stopPropagation()
@@ -170,7 +178,7 @@
 
   {#if session.summary_status === 'completed' && session.summary}
     <div class="summary-preview-md prose">
-        <Markdown source={session.summary} />
+      <Markdown source={session.summary} />
     </div>
   {:else if session.summary_status === 'running' || session.summary_status === 'pending'}
     <p class="summary-preview">Summarizing...</p>
@@ -278,7 +286,7 @@
     top: 100%;
     left: 0;
     z-index: 10;
-    background: var(--surface, #fff);
+    background: var(--surface);
     border: 1px solid var(--line);
     border-radius: 4px;
     margin-top: 0.25rem;
@@ -297,13 +305,13 @@
   }
 
   .preset-option:hover {
-    background: var(--hover, #f5f5f5);
+    background: var(--hover);
   }
 
   .title-input {
-    font-family: var(--font-serif);
-    font-size: 1rem;
-    font-weight: 400;
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    font-weight: 500;
     border: 1px solid var(--accent);
     border-radius: 0.3rem;
     padding: 0.15rem 0.4rem;

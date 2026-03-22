@@ -246,15 +246,15 @@
   .header-actions {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.6rem;
   }
 
   .settings-btn {
     background: none;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 0.4rem 0.6rem;
-    font-size: 1.3rem;
+    border-radius: 0.4rem;
+    padding: 0.3rem 0.5rem;
+    font-size: 1.15rem;
     cursor: pointer;
     color: var(--muted);
     line-height: 1;

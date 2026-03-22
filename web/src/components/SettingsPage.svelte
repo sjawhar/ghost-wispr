@@ -53,26 +53,26 @@
 
 <style>
   .settings-page {
-    padding: 1rem;
+    padding: 0.75rem;
   }
 
   .settings-header {
     display: flex;
     align-items: center;
     gap: 1rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 1rem;
   }
 
   .settings-header h2 {
     margin: 0;
-    font-size: 1.5rem;
+    font-size: 1.15rem;
   }
 
   .back-btn {
     background: none;
     border: 1px solid var(--line);
     border-radius: 6px;
-    padding: 0.3rem 0.8rem;
+    padding: 0.25rem 0.65rem;
     cursor: pointer;
     font-family: inherit;
     color: var(--ink);
@@ -95,14 +95,14 @@
   .settings-section {
     background: var(--card);
     border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 1.25rem;
-    margin-bottom: 1rem;
+    border-radius: 0.5rem;
+    padding: 0.85rem;
+    margin-bottom: 0.65rem;
   }
 
   .section-heading {
-    font-size: 1.1rem;
-    margin: 0 0 0.75rem;
+    font-size: 0.95rem;
+    margin: 0 0 0.55rem;
     color: var(--ink);
   }
 

@@ -493,6 +493,43 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				Model:        current.Model,
 			}, nil
 		},
+		RestoreFromGDrive: func(ctx context.Context) (map[string]any, error) {
+			latestCfg := cfgStore.Get()
+			if latestCfg.GDriveFolderID == "" {
+				return nil, fmt.Errorf("google drive folder ID not configured")
+			}
+			syncer, err := gdrive.NewSyncer(ctx, latestCfg.GoogleCredentialsFile, latestCfg.GDriveFolderID)
+			if err != nil {
+				return nil, fmt.Errorf("create syncer: %w", err)
+			}
+			result, err := syncer.RestoreFromDrive(ctx, func(rs gdrive.RestoredSession) error {
+				summaryStatus := storage.SummaryPending
+				if rs.Summary != "" {
+					summaryStatus = storage.SummaryCompleted
+				}
+				sess := storage.Session{
+					ID:             rs.ID,
+					Title:          rs.Title,
+					StartedAt:      rs.StartedAt,
+					EndedAt:        rs.EndedAt,
+					Status:         storage.SessionEnded,
+					Summary:        rs.Summary,
+					SummaryStatus:  summaryStatus,
+					SummaryPreset:  rs.SummaryPreset,
+					SyncStatus:     storage.SyncSynced,
+					GDriveFolderID: rs.DriveFolderID,
+				}
+				return store.ImportSession(&sess, rs.Segments)
+			})
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"restored": result.Restored,
+				"skipped":  result.Skipped,
+				"errors":   result.Errors,
+			}, nil
+		},
 	}, authToken, cfgStore)
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
