@@ -28,6 +28,8 @@ type SessionStore interface {
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
+	DeleteSession(id string) error
+	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -46,6 +48,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
+	registerRestoreRoutes(mux, controls)
 
 	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		date := r.URL.Query().Get("date")
@@ -134,6 +137,100 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		writeJSON(w, http.StatusOK, sessionData)
+	})
+
+	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		sessionData, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+		if sessionData.Status == "active" {
+			writeJSONError(w, http.StatusConflict, "cannot delete active session")
+			return
+		}
+
+		if err := store.DeleteSession(sessionID); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
+			return
+		}
+
+		// Clean up audio files after successful DB deletion.
+		if sessionData.AudioPath != "" {
+			for _, p := range strings.Split(sessionData.AudioPath, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					_ = os.Remove(p)
+				}
+			}
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("POST /api/sessions/merge", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			SessionIDs []string `json:"session_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if len(body.SessionIDs) < 2 {
+			writeJSONError(w, http.StatusBadRequest, "at least 2 session IDs required")
+			return
+		}
+
+		var earliest time.Time
+		var latest time.Time
+		for _, id := range body.SessionIDs {
+			if !validSessionID(id) {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid session id: %s", id))
+				return
+			}
+
+			sess, err := store.GetSession(id)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("session not found: %s", id))
+				return
+			}
+
+			if earliest.IsZero() || sess.StartedAt.Before(earliest) {
+				earliest = sess.StartedAt
+			}
+			if sess.EndedAt != nil && (latest.IsZero() || sess.EndedAt.After(latest)) {
+				latest = *sess.EndedAt
+			}
+		}
+
+		newID := earliest.UTC().Format("20060102150405") + "-merged"
+		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("merge sessions: %v", err))
+			return
+		}
+
+		if controls.OnSessionMerged != nil {
+			go controls.OnSessionMerged(context.Background(), newID)
+		}
+
+		merged, err := store.GetSession(newID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get merged session: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, merged)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +342,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if warnings == nil {
 			warnings = []string{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"paused": paused, "warnings": warnings})
+		var activeSessionID string
+		var activeSessionStartedAt string
+		if controls.ActiveSession != nil {
+			id, startedAt := controls.ActiveSession()
+			activeSessionID = id
+			if id != "" {
+				activeSessionStartedAt = startedAt.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"paused":                    paused,
+			"warnings":                  warnings,
+			"active_session_id":         activeSessionID,
+			"active_session_started_at": activeSessionStartedAt,
+		})
 	})
 
 	mux.HandleFunc("GET /api/presets", func(w http.ResponseWriter, r *http.Request) {
@@ -681,4 +792,24 @@ func handleRefinePreset(cfgStore *config.Store, refineFn func(ctx context.Contex
 
 		writeJSON(w, http.StatusOK, refined)
 	}
+}
+
+func registerRestoreRoutes(mux *http.ServeMux, controls *ControlHooks) {
+	mux.HandleFunc("POST /api/restore/gdrive", func(w http.ResponseWriter, r *http.Request) {
+		if controls.RestoreFromGDrive == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "Google Drive sync is not configured")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+		defer cancel()
+
+		result, err := controls.RestoreFromGDrive(ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("restore: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, result)
+	})
 }

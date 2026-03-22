@@ -12,6 +12,8 @@
     onLoadDate,
     onLoadDetail,
     onResummarize,
+    onDelete,
+    onMerge,
   }: {
     dates: string[]
     sessionsByDate: Map<string, SessionSummary[]>
@@ -22,10 +24,42 @@
     onLoadDate: (date: string) => Promise<void>
     onLoadDetail: (id: string) => Promise<void>
     onResummarize: (sessionId: string, preset: string) => Promise<void>
+    onDelete: (id: string) => Promise<void>
+    onMerge: (sessionIds: string[]) => Promise<void>
   } = $props()
 
   let loadedDates = $state(3)
+  let showHidden = $state<Record<string, boolean>>({})
+  let selectedIds = $state<Set<string>>(new Set())
 
+  function toggleSelect(id: string) {
+    const next = new Set(selectedIds)
+    if (next.has(id)) {
+      next.delete(id)
+    } else {
+      next.add(id)
+    }
+    selectedIds = next
+  }
+
+  function exitSelectMode() {
+    selectedIds = new Set()
+  }
+
+  async function handleMerge() {
+    if (selectedIds.size < 2) return
+    await onMerge([...selectedIds])
+    exitSelectMode()
+  }
+  function isShortSession(session: SessionSummary): boolean {
+    if (!session.ended_at) return false
+    const durationMs = Date.parse(session.ended_at) - Date.parse(session.started_at)
+    const durationMins = durationMs / 60000
+    if (durationMins >= 2) return false
+    if (!session.summary || session.summary_status !== 'completed') return true
+    const content = session.summary.replace(/^#{1,6}\s+.*$/gm, '').trim()
+    return content.length < 50
+  }
   const visibleDates = $derived.by(() => dates.slice(0, loadedDates))
   const missingVisibleDates = $derived.by(() =>
     visibleDates.filter((date) => !sessionsByDate.has(date)),
@@ -59,6 +93,15 @@
 <section class="history-panel" data-testid="history-panel">
   <header class="panel-head">
     <h2>Session History</h2>
+    {#if selectedIds.size > 0}
+      <div class="select-controls">
+        <span class="selection-count">{selectedIds.size} selected</span>
+        {#if selectedIds.size >= 2}
+          <button type="button" class="merge-btn" onclick={handleMerge}>Merge</button>
+        {/if}
+        <button type="button" class="select-action-btn" onclick={exitSelectMode}>Cancel</button>
+      </div>
+    {/if}
   </header>
 
   {#if dates.length === 0}
@@ -69,23 +112,43 @@
   {/if}
 
   {#each visibleDates as date (date)}
+    {@const allSessions = sessionsByDate.get(date) ?? []}
+    {@const hiddenCount = showHidden[date] ? 0 : allSessions.filter(isShortSession).length}
+    {@const visibleSessions = showHidden[date]
+      ? allSessions
+      : allSessions.filter((s) => !isShortSession(s))}
     <section class="date-group">
       <h3>{headingForDate(date)}</h3>
 
-      {#if sessionsByDate.get(date)?.length}
-        <div class="card-stack">
-          {#each sessionsByDate.get(date) ?? [] as session (session.id)}
-            <SessionCard
-              {session}
-              detail={sessionDetails.get(session.id)}
-              expanded={expandedSessionId === session.id}
-              {presets}
-              onToggle={() => onToggleSession(session.id)}
-              {onLoadDetail}
-              {onResummarize}
-            />
-          {/each}
-        </div>
+      {#if allSessions.length > 0}
+        {#if visibleSessions.length > 0}
+          <div class="card-stack">
+            {#each visibleSessions as session (session.id)}
+              <SessionCard
+                {session}
+                detail={sessionDetails.get(session.id)}
+                expanded={expandedSessionId === session.id}
+                {presets}
+                selected={selectedIds.has(session.id)}
+                onToggle={() => onToggleSession(session.id)}
+                onToggleSelect={() => toggleSelect(session.id)}
+                {onLoadDetail}
+                {onResummarize}
+                {onDelete}
+              />
+            {/each}
+          </div>
+        {/if}
+
+        {#if hiddenCount > 0}
+          <button
+            type="button"
+            class="show-hidden"
+            onclick={() => (showHidden = { ...showHidden, [date]: true })}
+          >
+            {hiddenCount} short session{hiddenCount > 1 ? 's' : ''} hidden
+          </button>
+        {/if}
       {:else}
         <p class="date-loading">Loading {date}...</p>
       {/if}

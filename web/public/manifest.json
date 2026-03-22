@@ -4,8 +4,8 @@
   "description": "Live transcription with session playback and summaries",
   "start_url": "/",
   "display": "standalone",
-  "theme_color": "#0f1720",
-  "background_color": "#f5f0e8",
+  "theme_color": "#0f1114",
+  "background_color": "#0f1114",
   "icons": [
     {
       "src": "/icons/icon-192.png",

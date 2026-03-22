@@ -366,6 +366,12 @@ func (m *Manager) currentSession() string {
 	return m.currentSessionID
 }
 
+func (m *Manager) ActiveSession() (string, time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentSessionID, m.currentStartedAt
+}
+
 // SetSummarizer replaces the summarizer used for new sessions.
 // Safe to call concurrently.
 func (m *Manager) SetSummarizer(s Summarizer) {

@@ -259,9 +259,10 @@ func main() {
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 
 	handler, err := server.Handler(assets, hub, store, &server.ControlHooks{
-		Pause:    recState.Pause,
-		Resume:   recState.Resume,
-		IsPaused: recState.IsPaused,
+		Pause:         recState.Pause,
+		Resume:        recState.Resume,
+		IsPaused:      recState.IsPaused,
+		ActiveSession: manager.ActiveSession,
 		OnStatusChanged: func(paused bool) {
 			hub.BroadcastStatusChanged(paused)
 		},
@@ -304,6 +305,37 @@ func main() {
 			_ = store.UpdateSummary(sessionID, title, summaryText, status, presetUsed)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, status, presetUsed)
 			return err
+		},
+		OnSessionMerged: func(ctx context.Context, sessionID string) {
+			if summarizer == nil {
+				return
+			}
+
+			segments, err := store.GetSegments(sessionID)
+			if err != nil {
+				log.Printf("warning: failed to get segments for merged session %s: %v", sessionID, err)
+				return
+			}
+
+			transcript := buildTranscript(segments)
+			if transcript == "" {
+				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "")
+				return
+			}
+
+			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
+			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
+
+			title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, transcript)
+			if err != nil {
+				log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
+				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
+				hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryFailed, preset)
+				return
+			}
+
+			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 		},
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
@@ -459,6 +491,43 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				SystemPrompt: refined.SystemPrompt,
 				UserTemplate: refined.UserTemplate,
 				Model:        current.Model,
+			}, nil
+		},
+		RestoreFromGDrive: func(ctx context.Context) (map[string]any, error) {
+			latestCfg := cfgStore.Get()
+			if latestCfg.GDriveFolderID == "" {
+				return nil, fmt.Errorf("google drive folder ID not configured")
+			}
+			syncer, err := gdrive.NewSyncer(ctx, latestCfg.GoogleCredentialsFile, latestCfg.GDriveFolderID)
+			if err != nil {
+				return nil, fmt.Errorf("create syncer: %w", err)
+			}
+			result, err := syncer.RestoreFromDrive(ctx, func(rs gdrive.RestoredSession) error {
+				summaryStatus := storage.SummaryPending
+				if rs.Summary != "" {
+					summaryStatus = storage.SummaryCompleted
+				}
+				sess := storage.Session{
+					ID:             rs.ID,
+					Title:          rs.Title,
+					StartedAt:      rs.StartedAt,
+					EndedAt:        rs.EndedAt,
+					Status:         storage.SessionEnded,
+					Summary:        rs.Summary,
+					SummaryStatus:  summaryStatus,
+					SummaryPreset:  rs.SummaryPreset,
+					SyncStatus:     storage.SyncSynced,
+					GDriveFolderID: rs.DriveFolderID,
+				}
+				return store.ImportSession(&sess, rs.Segments)
+			})
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"restored": result.Restored,
+				"skipped":  result.Skipped,
+				"errors":   result.Errors,
 			}, nil
 		},
 	}, authToken, cfgStore)

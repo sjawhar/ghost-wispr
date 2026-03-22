@@ -86,6 +86,8 @@ export interface SessionDetailResponse {
 export interface StatusResponse {
   paused: boolean
   warnings: string[]
+  active_session_id: string
+  active_session_started_at: string
 }
 
 export type PresetMap = Record<string, string>
