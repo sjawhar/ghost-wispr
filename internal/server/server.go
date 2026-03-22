@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 )
@@ -17,6 +18,7 @@ type ControlHooks struct {
 	IsPaused        func() bool
 	OnStatusChanged func(paused bool)
 	Warnings        func() []string
+	ActiveSession   func() (string, time.Time)
 	Presets         func() map[string]config.Preset
 	Resummarize     func(ctx context.Context, sessionID, preset string) error
 	EndSession      func(ctx context.Context) error

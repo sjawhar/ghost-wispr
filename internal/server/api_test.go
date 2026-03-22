@@ -274,6 +274,12 @@ func TestAPIStatusWithWarnings(t *testing.T) {
 	if !strings.Contains(body, "Deepgram API key not configured") {
 		t.Fatalf("expected warning message in response, got %s", body)
 	}
+	if !strings.Contains(body, `"active_session_id":""`) {
+		t.Fatalf("expected empty active_session_id in response, got %s", body)
+	}
+	if !strings.Contains(body, `"active_session_started_at":""`) {
+		t.Fatalf("expected empty active_session_started_at in response, got %s", body)
+	}
 }
 
 func TestAPIStatusNoWarnings(t *testing.T) {
@@ -300,6 +306,81 @@ func TestAPIStatusNoWarnings(t *testing.T) {
 	body := rr.Body.String()
 	if !strings.Contains(body, `"warnings":[]`) {
 		t.Fatalf("expected empty warnings array in response, got %s", body)
+	}
+	if !strings.Contains(body, `"active_session_id":""`) {
+		t.Fatalf("expected empty active_session_id in response, got %s", body)
+	}
+	if !strings.Contains(body, `"active_session_started_at":""`) {
+		t.Fatalf("expected empty active_session_started_at in response, got %s", body)
+	}
+}
+
+func TestAPIStatusWithActiveSession(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	startedAt := time.Date(2026, 3, 22, 18, 4, 5, 123456789, time.UTC)
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		ActiveSession: func() (string, time.Time) {
+			return "session-123", startedAt
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, `"active_session_id":"session-123"`) {
+		t.Fatalf("expected active session id in response, got %s", body)
+	}
+	if !strings.Contains(body, `"active_session_started_at":"2026-03-22T18:04:05.123456789Z"`) {
+		t.Fatalf("expected active session start timestamp in response, got %s", body)
+	}
+}
+
+func TestAPIStatusWithNoActiveSession(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		ActiveSession: func() (string, time.Time) {
+			return "", time.Time{}
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, `"active_session_id":""`) {
+		t.Fatalf("expected empty active_session_id in response, got %s", body)
+	}
+	if !strings.Contains(body, `"active_session_started_at":""`) {
+		t.Fatalf("expected empty active_session_started_at in response, got %s", body)
 	}
 }
 

@@ -245,7 +245,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if warnings == nil {
 			warnings = []string{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"paused": paused, "warnings": warnings})
+		var activeSessionID string
+		var activeSessionStartedAt string
+		if controls.ActiveSession != nil {
+			id, startedAt := controls.ActiveSession()
+			activeSessionID = id
+			if id != "" {
+				activeSessionStartedAt = startedAt.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"paused":                    paused,
+			"warnings":                  warnings,
+			"active_session_id":         activeSessionID,
+			"active_session_started_at": activeSessionStartedAt,
+		})
 	})
 
 	mux.HandleFunc("GET /api/presets", func(w http.ResponseWriter, r *http.Request) {

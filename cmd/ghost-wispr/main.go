@@ -259,9 +259,10 @@ func main() {
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 
 	handler, err := server.Handler(assets, hub, store, &server.ControlHooks{
-		Pause:    recState.Pause,
-		Resume:   recState.Resume,
-		IsPaused: recState.IsPaused,
+		Pause:         recState.Pause,
+		Resume:        recState.Resume,
+		IsPaused:      recState.IsPaused,
+		ActiveSession: manager.ActiveSession,
 		OnStatusChanged: func(paused bool) {
 			hub.BroadcastStatusChanged(paused)
 		},
