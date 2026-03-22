@@ -28,6 +28,7 @@ type SessionStore interface {
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
+	DeleteSession(id string) error
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -134,6 +135,35 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		writeJSON(w, http.StatusOK, sessionData)
+	})
+
+	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		sessionData, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+
+		if sessionData.AudioPath != "" {
+			_ = os.Remove(sessionData.AudioPath)
+		}
+
+		if err := store.DeleteSession(sessionID); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {

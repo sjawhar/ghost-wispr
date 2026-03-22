@@ -73,6 +73,14 @@ func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
+func (s apiStoreStub) DeleteSession(id string) error {
+	if _, ok := s.sessions[id]; !ok {
+		return os.ErrNotExist
+	}
+	delete(s.sessions, id)
+	return nil
+}
+
 func testStaticFS(t *testing.T) fs.FS {
 	t.Helper()
 	dir := t.TempDir()
@@ -141,6 +149,74 @@ func TestAPISessionDetail(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "segments") {
 		t.Fatalf("expected detail response to contain segments, got %s", rr.Body.String())
+	}
+}
+
+func TestDeleteSession_Success(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1"},
+		},
+		segments: map[string][]transcribe.Segment{},
+		dates:    nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteSession_NotFound(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/does-not-exist", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteSession_InvalidID(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/sessions/%2e%2e", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
