@@ -14,7 +14,7 @@ type mockStore struct {
 	deletedIDs []string
 }
 
-func (m *mockStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+func (m *mockStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool, diskPressure bool) ([]string, error) {
 	if ids, ok := m.gcEligible[maxAgeDays]; ok {
 		return ids, nil
 	}

@@ -183,3 +183,20 @@ export function resetState(): void {
   appState.interimText = ''
   appState.interimSpeaker = -1
 }
+
+export function removeSession(sessionId: string): void {
+  const nextByDate = new Map(appState.sessionsByDate)
+  for (const [date, sessions] of nextByDate) {
+    const filtered = sessions.filter((s) => s.id !== sessionId)
+    if (filtered.length !== sessions.length) {
+      nextByDate.set(date, filtered)
+    }
+  }
+  appState.sessionsByDate = nextByDate
+
+  if (appState.sessionDetails.has(sessionId)) {
+    const nextDetails = new Map(appState.sessionDetails)
+    nextDetails.delete(sessionId)
+    appState.sessionDetails = nextDetails
+  }
+}

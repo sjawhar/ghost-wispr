@@ -13,14 +13,20 @@
     onToggle,
     onLoadDetail,
     onResummarize,
+    onDelete,
+    selected = false,
+    onToggleSelect = () => {},
   }: {
     session: SessionSummary
     detail: SessionDetailResponse | undefined
     expanded: boolean
     presets: PresetMap
+    selected?: boolean
     onToggle: () => void
     onLoadDetail: (id: string) => Promise<void>
     onResummarize: (sessionId: string, preset: string) => Promise<void>
+    onDelete: (id: string) => Promise<void>
+    onToggleSelect?: () => void
   } = $props()
 
   let showPresetMenu = $state(false)
@@ -83,14 +89,6 @@
     return `${mm}:${ss}`
   })
 
-  function summaryPreview(summary: string): string {
-    const lines = summary
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-    return lines.slice(0, 2).join(' ')
-  }
-
   async function openCard() {
     onToggle()
     if (!expanded && !detail) {
@@ -104,40 +102,84 @@
   }
 </script>
 
-<article class="session-card">
-  <button type="button" class="session-header" onclick={openCard}>
-    <div>
-      {#if editingTitle}
-        <!-- svelte-ignore a11y_autofocus -->
-        <input
-          class="title-input"
-          type="text"
-          bind:value={titleDraft}
-          onblur={saveTitle}
-          onkeydown={handleTitleKeydown}
-          onclick={(e) => e.stopPropagation()}
-          autofocus
-        />
-      {:else}
-        <h4>
-          {#if session.title}
-            <span>{session.title}</span>
-            <span class="session-time-sub">{timeRange}</span>
-          {:else}
-            {timeRange}
-          {/if}
-          <button type="button" class="edit-title-btn" onclick={startEditTitle} title="Edit title">
-            &#9998;
-          </button>
-        </h4>
-      {/if}
-      <p class="session-duration">Duration {durationLabel}</p>
+<article class="session-card" class:selected>
+  <div
+    class="session-header"
+    role="button"
+    tabindex="0"
+    onclick={openCard}
+    onkeydown={(e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        openCard()
+      }
+    }}
+  >
+    <div class="header-left">
+      <input
+        type="checkbox"
+        class="session-checkbox"
+        checked={selected}
+        onclick={(e) => {
+          e.stopPropagation()
+          if (onToggleSelect) onToggleSelect()
+        }}
+      />
+      <div class="title-time-wrapper">
+        {#if editingTitle}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="title-input"
+            type="text"
+            bind:value={titleDraft}
+            onblur={saveTitle}
+            onkeydown={handleTitleKeydown}
+            onclick={(e) => e.stopPropagation()}
+            autofocus
+          />
+        {:else}
+          <h4>
+            {#if session.title}
+              <span>{session.title}</span>
+              <span class="session-time-sub">{timeRange}</span>
+            {:else}
+              {timeRange}
+            {/if}
+            <button
+              type="button"
+              class="edit-title-btn"
+              onclick={startEditTitle}
+              title="Edit title"
+            >
+              &#9998;
+            </button>
+          </h4>
+        {/if}
+        <p class="session-duration">Duration {durationLabel}</p>
+      </div>
     </div>
-    <span class={`summary-badge ${session.summary_status}`}>{session.summary_status}</span>
-  </button>
+    <div class="header-right">
+      <span class={`summary-badge ${session.summary_status}`}>{session.summary_status}</span>
+      <button
+        type="button"
+        class="quick-delete-btn"
+        title="Delete session"
+        onclick={async (e) => {
+          e.stopPropagation()
+          if (confirm('Delete this session? This cannot be undone.')) {
+            await onDelete(session.id)
+          }
+        }}
+      >
+        ×
+      </button>
+    </div>
+  </div>
 
   {#if session.summary_status === 'completed' && session.summary}
-    <p class="summary-preview">{summaryPreview(session.summary)}</p>
+    <div class="summary-preview-md prose">
+      <Markdown source={session.summary} />
+    </div>
   {:else if session.summary_status === 'running' || session.summary_status === 'pending'}
     <p class="summary-preview">Summarizing...</p>
   {:else if session.summary_status === 'failed'}
@@ -198,6 +240,20 @@
             </div>
           </div>
         {/if}
+        <div class="session-actions">
+          <button
+            type="button"
+            class="delete-btn"
+            onclick={async (e) => {
+              e.stopPropagation()
+              if (confirm('Delete this session? This cannot be undone.')) {
+                await onDelete(session.id)
+              }
+            }}
+          >
+            Delete session
+          </button>
+        </div>
       {:else}
         <p class="summary-preview">Loading session...</p>
       {/if}
@@ -206,6 +262,11 @@
 </article>
 
 <style>
+  .session-card.selected {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+
   .resummarize-wrap {
     position: relative;
     margin-top: 0.5rem;
@@ -225,7 +286,7 @@
     top: 100%;
     left: 0;
     z-index: 10;
-    background: var(--surface, #fff);
+    background: var(--surface);
     border: 1px solid var(--line);
     border-radius: 4px;
     margin-top: 0.25rem;
@@ -244,13 +305,13 @@
   }
 
   .preset-option:hover {
-    background: var(--hover, #f5f5f5);
+    background: var(--hover);
   }
 
   .title-input {
-    font-family: var(--font-serif);
-    font-size: 1rem;
-    font-weight: 400;
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    font-weight: 500;
     border: 1px solid var(--accent);
     border-radius: 0.3rem;
     padding: 0.15rem 0.4rem;
@@ -286,5 +347,27 @@
 
   .edit-title-btn:hover {
     color: var(--accent);
+  }
+
+  .session-actions {
+    border-top: 1px solid var(--line);
+    padding: 0.5rem 1rem;
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  .delete-btn {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--danger);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--danger);
+    cursor: pointer;
+  }
+
+  .delete-btn:hover {
+    background: var(--danger);
+    color: #fff;
   }
 </style>

@@ -717,7 +717,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.4);
+    background: rgba(0, 0, 0, 0.6);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -726,8 +726,8 @@
 
   .test-modal {
     background: var(--card);
-    border-radius: 12px;
-    padding: 1.5rem;
+    border-radius: 0.6rem;
+    padding: 1rem;
     width: 90%;
     max-width: 700px;
     max-height: 80vh;
@@ -735,7 +735,7 @@
   }
 
   .test-modal h4 {
-    margin: 0 0 1rem;
+    margin: 0 0 0.75rem;
   }
 
   .test-error {

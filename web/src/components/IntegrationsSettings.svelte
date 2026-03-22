@@ -363,12 +363,12 @@
   }
 
   .warning-banner {
-    padding: 0.75rem;
-    background: var(--danger-bg, #fff3cd);
-    border: 1px solid var(--danger-border, #ffc107);
-    border-radius: 6px;
-    font-size: 0.85rem;
-    color: var(--danger-text, #856404);
+    padding: 0.55rem;
+    background: rgba(201, 160, 78, 0.08);
+    border: 1px solid rgba(201, 160, 78, 0.2);
+    border-radius: 0.35rem;
+    font-size: 0.8rem;
+    color: #c9a04e;
   }
 
   .field input[type='number'] {

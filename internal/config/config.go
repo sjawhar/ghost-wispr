@@ -66,7 +66,7 @@ func defaults() Config {
 		DBPath:                "data/ghost-wispr.db",
 		AudioDir:              "data/audio",
 		SilenceTimeout:        "30s",
-		MinSessionSegments:    5,
+		MinSessionSegments:    0,
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
 		GoogleCredentialsFile: "./service-account.json",

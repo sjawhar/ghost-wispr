@@ -14,6 +14,8 @@ describe('SessionList', () => {
       onLoadDate: vi.fn().mockResolvedValue(undefined),
       onLoadDetail: vi.fn().mockResolvedValue(undefined),
       onResummarize: vi.fn().mockResolvedValue(undefined),
+      onDelete: vi.fn().mockResolvedValue(undefined),
+      onMerge: vi.fn().mockResolvedValue(undefined),
     })
 
     expect(screen.getByText('No sessions yet.')).toBeTruthy()
@@ -36,6 +38,8 @@ describe('SessionList', () => {
       onLoadDate: vi.fn().mockResolvedValue(undefined),
       onLoadDetail: vi.fn().mockResolvedValue(undefined),
       onResummarize: vi.fn().mockResolvedValue(undefined),
+      onDelete: vi.fn().mockResolvedValue(undefined),
+      onMerge: vi.fn().mockResolvedValue(undefined),
     })
 
     const button = screen.getByRole('button', { name: 'Load previous' })

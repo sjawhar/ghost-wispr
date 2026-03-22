@@ -219,11 +219,17 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default"); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := store.CreateSession("gc-unsynced", old); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,8 +242,11 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default"); err != nil {
+		t.Fatal(err)
+	}
 
-	ids, err := store.GetGCEligibleSessions(30, true)
+	ids, err := store.GetGCEligibleSessions(30, true, false)
 	if err != nil {
 		t.Fatalf("get gc eligible: %v", err)
 	}
@@ -245,7 +254,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatalf("expected [gc-eligible], got %v", ids)
 	}
 
-	ids, err = store.GetGCEligibleSessions(30, false)
+	ids, err = store.GetGCEligibleSessions(30, false, false)
 	if err != nil {
 		t.Fatalf("get gc eligible no gate: %v", err)
 	}
@@ -253,7 +262,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatalf("expected 2 sessions, got %d: %v", len(ids), ids)
 	}
 
-	ids, err = store.GetGCEligibleSessions(0, true)
+	ids, err = store.GetGCEligibleSessions(0, true, true)
 	if err != nil {
 		t.Fatalf("get gc eligible disk pressure: %v", err)
 	}
@@ -334,5 +343,112 @@ func TestSQLiteConcurrentAccess(t *testing.T) {
 	}
 	if len(segments) != 20 {
 		t.Fatalf("expected 20 segments, got %d", len(segments))
+	}
+}
+
+func TestMergeSessions(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startA := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	startB := startA.Add(2 * time.Minute)
+
+	if err := store.CreateSession("source-a", startA); err != nil {
+		t.Fatalf("CreateSession source-a failed: %v", err)
+	}
+	if err := store.CreateSession("source-b", startB); err != nil {
+		t.Fatalf("CreateSession source-b failed: %v", err)
+	}
+
+	if err := store.AppendSegment("source-a", transcribe.Segment{Speaker: 0, Text: "A1", StartTime: 0, EndTime: 1, Timestamp: startA.Add(time.Second)}); err != nil {
+		t.Fatalf("AppendSegment source-a failed: %v", err)
+	}
+	if err := store.AppendSegment("source-b", transcribe.Segment{Speaker: 1, Text: "B1", StartTime: 0, EndTime: 1, Timestamp: startB.Add(time.Second)}); err != nil {
+		t.Fatalf("AppendSegment source-b failed: %v", err)
+	}
+
+	if err := store.EndSession("source-a", startA.Add(90*time.Second), "data/audio/a.mp3"); err != nil {
+		t.Fatalf("EndSession source-a failed: %v", err)
+	}
+	if err := store.EndSession("source-b", startB.Add(90*time.Second), "data/audio/b.mp3"); err != nil {
+		t.Fatalf("EndSession source-b failed: %v", err)
+	}
+
+	mergedStart := startA
+	mergedEnd := startB.Add(90 * time.Second)
+	if err := store.MergeSessions("merged-1", []string{"source-a", "source-b"}, mergedStart, mergedEnd); err != nil {
+		t.Fatalf("MergeSessions failed: %v", err)
+	}
+
+	merged, err := store.GetSession("merged-1")
+	if err != nil {
+		t.Fatalf("GetSession merged failed: %v", err)
+	}
+	if merged.StartedAt.UTC() != mergedStart.UTC() {
+		t.Fatalf("expected merged started_at %s, got %s", mergedStart.UTC(), merged.StartedAt.UTC())
+	}
+	if merged.EndedAt == nil || merged.EndedAt.UTC() != mergedEnd.UTC() {
+		t.Fatalf("expected merged ended_at %s, got %v", mergedEnd.UTC(), merged.EndedAt)
+	}
+
+	mergedSegments, err := store.GetSegments("merged-1")
+	if err != nil {
+		t.Fatalf("GetSegments merged failed: %v", err)
+	}
+	if len(mergedSegments) != 2 {
+		t.Fatalf("expected 2 merged segments, got %d", len(mergedSegments))
+	}
+
+	sourceA, err := store.GetSession("source-a")
+	if err != nil {
+		t.Fatalf("GetSession source-a failed: %v", err)
+	}
+	if sourceA.Status != "merged" {
+		t.Fatalf("expected source-a status merged, got %q", sourceA.Status)
+	}
+	if sourceA.MergedInto != "merged-1" {
+		t.Fatalf("expected source-a merged_into merged-1, got %q", sourceA.MergedInto)
+	}
+
+	sourceB, err := store.GetSession("source-b")
+	if err != nil {
+		t.Fatalf("GetSession source-b failed: %v", err)
+	}
+	if sourceB.Status != "merged" {
+		t.Fatalf("expected source-b status merged, got %q", sourceB.Status)
+	}
+	if sourceB.MergedInto != "merged-1" {
+		t.Fatalf("expected source-b merged_into merged-1, got %q", sourceB.MergedInto)
+	}
+}
+
+func TestGetSessionsByDate_ExcludesMerged(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	base := time.Date(2026, 3, 5, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("source-1", base); err != nil {
+		t.Fatalf("CreateSession source-1 failed: %v", err)
+	}
+	if err := store.CreateSession("source-2", base.Add(30*time.Minute)); err != nil {
+		t.Fatalf("CreateSession source-2 failed: %v", err)
+	}
+	if err := store.EndSession("source-1", base.Add(10*time.Minute), ""); err != nil {
+		t.Fatalf("EndSession source-1 failed: %v", err)
+	}
+	if err := store.EndSession("source-2", base.Add(40*time.Minute), ""); err != nil {
+		t.Fatalf("EndSession source-2 failed: %v", err)
+	}
+
+	if err := store.MergeSessions("merged-day", []string{"source-1", "source-2"}, base, base.Add(40*time.Minute)); err != nil {
+		t.Fatalf("MergeSessions failed: %v", err)
+	}
+
+	activeDate, err := store.GetSessionsByDate("2026-03-05", false)
+	if err != nil {
+		t.Fatalf("GetSessionsByDate includeDiscarded=false failed: %v", err)
+	}
+	for _, sess := range activeDate {
+		if sess.Status == "merged" {
+			t.Fatalf("expected merged sessions excluded, got session %q with status merged", sess.ID)
+		}
 	}
 }

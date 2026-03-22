@@ -12,6 +12,7 @@
     setSessionDetail,
     setSessionsForDate,
     setWarnings,
+    removeSession,
   } from './lib/state.svelte'
   import {
     endSession,
@@ -23,6 +24,8 @@
     pauseRecording,
     resummarize,
     resumeRecording,
+    deleteSession,
+    mergeSessions,
   } from './lib/api'
   import { connect, disconnect } from './lib/ws.svelte'
 
@@ -70,6 +73,26 @@
     }
   }
 
+  async function handleDeleteSession(id: string): Promise<void> {
+    await deleteSession(id)
+    removeSession(id)
+  }
+
+  async function handleMerge(sessionIds: string[]): Promise<void> {
+    await mergeSessions(sessionIds)
+    // Refresh sessions for affected dates
+    const affectedDates = new Set<string>()
+    for (const [date, sessions] of appState.sessionsByDate) {
+      if (sessions.some((s) => sessionIds.includes(s.id))) {
+        affectedDates.add(date)
+      }
+    }
+    for (const date of affectedDates) {
+      const sessions = await fetchSessions(date)
+      setSessionsForDate(date, sessions)
+    }
+  }
+
   onMount(() => {
     connect()
 
@@ -89,6 +112,28 @@
         setWarnings(status.warnings)
         setDates(dates)
         setPresets(presets)
+
+        // Restore active session's live transcript if one exists
+        if (status.active_session_id) {
+          appState.activeSessionId = status.active_session_id
+          appState.activeSessionStartedAt = Date.parse(status.active_session_started_at)
+
+          try {
+            const detail = await fetchSession(status.active_session_id)
+            setSessionDetail(detail)
+            appState.liveSegments = detail.segments.map((seg) => ({
+              type: 'live_transcript' as const,
+              version: 1,
+              timestamp: seg.timestamp,
+              speaker: seg.speaker,
+              text: seg.text,
+              start_time: seg.start_time,
+              end_time: seg.end_time,
+            }))
+          } catch {
+            // Session may have ended between status and detail fetch — that's OK
+          }
+        }
 
         for (const date of dates.slice(0, 3)) {
           await loadDate(date)
@@ -190,6 +235,8 @@
         onLoadDate={loadDate}
         onLoadDetail={loadSession}
         onResummarize={handleResummarize}
+        onDelete={handleDeleteSession}
+        onMerge={handleMerge}
       />
     </section>
   {/if}
@@ -199,15 +246,15 @@
   .header-actions {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.6rem;
   }
 
   .settings-btn {
     background: none;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 0.4rem 0.6rem;
-    font-size: 1.3rem;
+    border-radius: 0.4rem;
+    padding: 0.3rem 0.5rem;
+    font-size: 1.15rem;
     cursor: pointer;
     color: var(--muted);
     line-height: 1;
