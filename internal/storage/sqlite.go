@@ -23,6 +23,7 @@ const (
 	SessionActive    = "active"
 	SessionEnded     = "ended"
 	SessionDiscarded = "discarded"
+	SessionMerged    = "merged"
 
 	SyncPending = "pending"
 	SyncSynced  = "synced"
@@ -41,6 +42,7 @@ type Session struct {
 	AudioPath      string     `json:"audio_path"`
 	SyncStatus     string     `json:"sync_status"`
 	GDriveFolderID string     `json:"gdrive_folder_id"`
+	MergedInto     string     `json:"merged_into"`
 }
 
 type SQLiteStore struct {
@@ -108,6 +110,7 @@ func (s *SQLiteStore) init() error {
 		`ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'pending'`,
 		`ALTER TABLE sessions ADD COLUMN gdrive_folder_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN merged_into TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -238,12 +241,97 @@ func (s *SQLiteStore) AppendSegment(sessionID string, seg transcribe.Segment) er
 	return nil
 }
 
+func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
+	if strings.TrimSpace(newID) == "" {
+		return errors.New("new session id is required")
+	}
+	if len(sourceIDs) == 0 {
+		return errors.New("at least one source session id is required")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin merge tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.Exec(
+		`INSERT INTO sessions(id, started_at, ended_at, status, summary_status) VALUES(?, ?, ?, 'ended', 'pending')`,
+		newID,
+		startedAt.UTC().Format(time.RFC3339Nano),
+		endedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("create merged session: %w", err)
+	}
+
+	placeholders := make([]string, len(sourceIDs))
+	args := make([]any, 0, len(sourceIDs)+1)
+	args = append(args, newID)
+	for i, id := range sourceIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+
+	segQuery := fmt.Sprintf(
+		`UPDATE segments SET session_id = ? WHERE session_id IN (%s)`,
+		strings.Join(placeholders, ","),
+	)
+	if _, err := tx.Exec(segQuery, args...); err != nil {
+		return fmt.Errorf("move segments: %w", err)
+	}
+
+	audioQuery := fmt.Sprintf(
+		`SELECT audio_path FROM sessions WHERE id IN (%s) AND audio_path != '' ORDER BY started_at ASC`,
+		strings.Join(placeholders, ","),
+	)
+	rows, err := tx.Query(audioQuery, args[1:]...)
+	if err != nil {
+		return fmt.Errorf("query audio paths: %w", err)
+	}
+
+	var audioPaths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan audio path: %w", err)
+		}
+		audioPaths = append(audioPaths, p)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate audio paths: %w", err)
+	}
+	_ = rows.Close()
+
+	if len(audioPaths) > 0 {
+		_, err = tx.Exec(`UPDATE sessions SET audio_path = ? WHERE id = ?`, strings.Join(audioPaths, ","), newID)
+		if err != nil {
+			return fmt.Errorf("set merged audio paths: %w", err)
+		}
+	}
+
+	markQuery := fmt.Sprintf(
+		`UPDATE sessions SET status = 'merged', merged_into = ? WHERE id IN (%s)`,
+		strings.Join(placeholders, ","),
+	)
+	markArgs := make([]any, 0, len(sourceIDs)+1)
+	markArgs = append(markArgs, newID)
+	markArgs = append(markArgs, args[1:]...)
+	if _, err := tx.Exec(markQuery, markArgs...); err != nil {
+		return fmt.Errorf("mark sources merged: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id, merged_into
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
-		query += ` AND status != 'discarded'`
+		query += ` AND status NOT IN ('discarded', 'merged')`
 	}
 	query += ` ORDER BY started_at DESC`
 
@@ -282,14 +370,14 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id, merged_into FROM sessions WHERE id = ?`,
 		id,
 	)
 
 	var sess Session
 	var startedAt string
 	var endedAt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -431,7 +519,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var sess Session
 		var startedAt string
 		var endedAt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
