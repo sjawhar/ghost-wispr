@@ -30,7 +30,6 @@
 
   let loadedDates = $state(3)
   let showHidden = $state<Record<string, boolean>>({})
-  let selectMode = $state(false)
   let selectedIds = $state<Set<string>>(new Set())
 
   function toggleSelect(id: string) {
@@ -44,7 +43,6 @@
   }
 
   function exitSelectMode() {
-    selectMode = false
     selectedIds = new Set()
   }
 
@@ -95,18 +93,15 @@
 <section class="history-panel" data-testid="history-panel">
   <header class="panel-head">
     <h2>Session History</h2>
-    <div class="select-controls">
-      {#if selectMode}
-        <button type="button" class="select-action-btn" onclick={exitSelectMode}>Cancel</button>
+    {#if selectedIds.size > 0}
+      <div class="select-controls">
+        <span class="selection-count">{selectedIds.size} selected</span>
         {#if selectedIds.size >= 2}
-          <button type="button" class="merge-btn" onclick={handleMerge}>
-            Merge ({selectedIds.size})
-          </button>
+          <button type="button" class="merge-btn" onclick={handleMerge}>Merge</button>
         {/if}
-      {:else}
-        <button type="button" class="select-action-btn" onclick={() => (selectMode = true)}>Select</button>
-      {/if}
-    </div>
+        <button type="button" class="select-action-btn" onclick={exitSelectMode}>Cancel</button>
+      </div>
+    {/if}
   </header>
 
   {#if dates.length === 0}
@@ -132,7 +127,6 @@
                 detail={sessionDetails.get(session.id)}
                 expanded={expandedSessionId === session.id}
                 {presets}
-                {selectMode}
                 selected={selectedIds.has(session.id)}
                 onToggle={() => onToggleSession(session.id)}
                 onToggleSelect={() => toggleSelect(session.id)}

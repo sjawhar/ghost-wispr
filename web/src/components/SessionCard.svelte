@@ -14,7 +14,6 @@
     onLoadDetail,
     onResummarize,
     onDelete,
-    selectMode = false,
     selected = false,
     onToggleSelect = () => {},
   }: {
@@ -22,7 +21,6 @@
     detail: SessionDetailResponse | undefined
     expanded: boolean
     presets: PresetMap
-    selectMode?: boolean
     selected?: boolean
     onToggle: () => void
     onLoadDetail: (id: string) => Promise<void>
@@ -105,46 +103,70 @@
   }
 </script>
 
-<article class="session-card" class:selected={selectMode && selected}>
-  <button type="button" class="session-header" onclick={selectMode ? onToggleSelect : openCard}>
-    {#if selectMode}
+<article class="session-card" class:selected={selected}>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div 
+    class="session-header" 
+    role="button" 
+    tabindex="0" 
+    onclick={openCard}
+    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openCard(); } }}
+  >
+    <div class="header-left">
       <input
         type="checkbox"
         class="session-checkbox"
         checked={selected}
-        onclick={(e) => e.stopPropagation()}
-        onchange={onToggleSelect}
+        onclick={(e) => {
+          e.stopPropagation()
+          if (onToggleSelect) onToggleSelect()
+        }}
       />
-    {/if}
-    <div>
-      {#if editingTitle}
-        <!-- svelte-ignore a11y_autofocus -->
-        <input
-          class="title-input"
-          type="text"
-          bind:value={titleDraft}
-          onblur={saveTitle}
-          onkeydown={handleTitleKeydown}
-          onclick={(e) => e.stopPropagation()}
-          autofocus
-        />
-      {:else}
-        <h4>
-          {#if session.title}
-            <span>{session.title}</span>
-            <span class="session-time-sub">{timeRange}</span>
-          {:else}
-            {timeRange}
-          {/if}
-          <button type="button" class="edit-title-btn" onclick={startEditTitle} title="Edit title">
-            &#9998;
-          </button>
-        </h4>
-      {/if}
-      <p class="session-duration">Duration {durationLabel}</p>
+      <div class="title-time-wrapper">
+        {#if editingTitle}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="title-input"
+            type="text"
+            bind:value={titleDraft}
+            onblur={saveTitle}
+            onkeydown={handleTitleKeydown}
+            onclick={(e) => e.stopPropagation()}
+            autofocus
+          />
+        {:else}
+          <h4>
+            {#if session.title}
+              <span>{session.title}</span>
+              <span class="session-time-sub">{timeRange}</span>
+            {:else}
+              {timeRange}
+            {/if}
+            <button type="button" class="edit-title-btn" onclick={startEditTitle} title="Edit title">
+              &#9998;
+            </button>
+          </h4>
+        {/if}
+        <p class="session-duration">Duration {durationLabel}</p>
+      </div>
     </div>
-    <span class={`summary-badge ${session.summary_status}`}>{session.summary_status}</span>
-  </button>
+    <div class="header-right">
+      <span class={`summary-badge ${session.summary_status}`}>{session.summary_status}</span>
+      <button 
+        type="button" 
+        class="quick-delete-btn" 
+        title="Delete session"
+        onclick={async (e) => {
+          e.stopPropagation()
+          if (confirm('Delete this session? This cannot be undone.')) {
+            await onDelete(session.id)
+          }
+        }}
+      >
+        ×
+      </button>
+    </div>
+  </div>
 
   {#if session.summary_status === 'completed' && session.summary}
     <div class="summary-preview-md prose">
@@ -232,15 +254,6 @@
 </article>
 
 <style>
-  .session-checkbox {
-    margin-right: 0.5rem;
-    width: 1rem;
-    height: 1rem;
-    accent-color: var(--accent);
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-
   .session-card.selected {
     border-color: var(--accent);
     background: var(--accent-soft);
