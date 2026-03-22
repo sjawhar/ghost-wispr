@@ -64,3 +64,7 @@ export function updateSessionTitle(sessionId: string, title: string): Promise<Se
     body: JSON.stringify({ title }),
   })
 }
+
+export function deleteSession(id: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}

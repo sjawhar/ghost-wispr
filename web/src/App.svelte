@@ -12,6 +12,7 @@
     setSessionDetail,
     setSessionsForDate,
     setWarnings,
+    removeSession,
   } from './lib/state.svelte'
   import {
     endSession,
@@ -23,6 +24,7 @@
     pauseRecording,
     resummarize,
     resumeRecording,
+    deleteSession,
   } from './lib/api'
   import { connect, disconnect } from './lib/ws.svelte'
 
@@ -68,6 +70,11 @@
     if (expandedSessionId) {
       void loadSession(expandedSessionId)
     }
+  }
+
+  async function handleDeleteSession(id: string): Promise<void> {
+    await deleteSession(id)
+    removeSession(id)
   }
 
   onMount(() => {
@@ -212,6 +219,7 @@
         onLoadDate={loadDate}
         onLoadDetail={loadSession}
         onResummarize={handleResummarize}
+        onDelete={handleDeleteSession}
       />
     </section>
   {/if}

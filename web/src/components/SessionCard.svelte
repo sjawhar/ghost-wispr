@@ -21,6 +21,7 @@
     onToggle: () => void
     onLoadDetail: (id: string) => Promise<void>
     onResummarize: (sessionId: string, preset: string) => Promise<void>
+    onDelete: (id: string) => Promise<void>
   } = $props()
 
   let showPresetMenu = $state(false)
@@ -193,6 +194,20 @@
             </div>
           </div>
         {/if}
+        <div class="session-actions">
+          <button
+            type="button"
+            class="delete-btn"
+            onclick={async (e) => {
+              e.stopPropagation()
+              if (confirm('Delete this session? This cannot be undone.')) {
+                await onDelete(session.id)
+              }
+            }}
+          >
+            Delete session
+          </button>
+        </div>
       {:else}
         <p class="summary-preview">Loading session...</p>
       {/if}
@@ -281,5 +296,27 @@
 
   .edit-title-btn:hover {
     color: var(--accent);
+  }
+
+  .session-actions {
+    border-top: 1px solid var(--line);
+    padding: 0.5rem 1rem;
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  .delete-btn {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--danger);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--danger);
+    cursor: pointer;
+  }
+
+  .delete-btn:hover {
+    background: var(--danger);
+    color: #fff;
   }
 </style>

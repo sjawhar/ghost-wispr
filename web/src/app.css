@@ -767,3 +767,22 @@ select:focus {
   background: var(--hover);
   color: var(--accent);
 }
+
+.show-hidden {
+  display: block;
+  width: 100%;
+  padding: 0.4rem;
+  margin-top: 0.25rem;
+  border: 1px dashed var(--line);
+  border-radius: 0.4rem;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.75rem;
+  cursor: pointer;
+  text-align: center;
+}
+
+.show-hidden:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
