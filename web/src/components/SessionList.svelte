@@ -12,6 +12,8 @@
     onLoadDate,
     onLoadDetail,
     onResummarize,
+    onDelete,
+    onMerge,
   }: {
     dates: string[]
     sessionsByDate: Map<string, SessionSummary[]>
@@ -23,11 +25,34 @@
     onLoadDetail: (id: string) => Promise<void>
     onResummarize: (sessionId: string, preset: string) => Promise<void>
     onDelete: (id: string) => Promise<void>
+    onMerge: (sessionIds: string[]) => Promise<void>
   } = $props()
 
   let loadedDates = $state(3)
   let showHidden = $state<Record<string, boolean>>({})
+  let selectMode = $state(false)
+  let selectedIds = $state<Set<string>>(new Set())
 
+  function toggleSelect(id: string) {
+    const next = new Set(selectedIds)
+    if (next.has(id)) {
+      next.delete(id)
+    } else {
+      next.add(id)
+    }
+    selectedIds = next
+  }
+
+  function exitSelectMode() {
+    selectMode = false
+    selectedIds = new Set()
+  }
+
+  async function handleMerge() {
+    if (selectedIds.size < 2) return
+    await onMerge([...selectedIds])
+    exitSelectMode()
+  }
   function isShortSession(session: SessionSummary): boolean {
     if (!session.ended_at) return false
     const durationMs = Date.parse(session.ended_at) - Date.parse(session.started_at)
@@ -70,6 +95,18 @@
 <section class="history-panel" data-testid="history-panel">
   <header class="panel-head">
     <h2>Session History</h2>
+    <div class="select-controls">
+      {#if selectMode}
+        <button type="button" class="select-action-btn" onclick={exitSelectMode}>Cancel</button>
+        {#if selectedIds.size >= 2}
+          <button type="button" class="merge-btn" onclick={handleMerge}>
+            Merge ({selectedIds.size})
+          </button>
+        {/if}
+      {:else}
+        <button type="button" class="select-action-btn" onclick={() => (selectMode = true)}>Select</button>
+      {/if}
+    </div>
   </header>
 
   {#if dates.length === 0}
@@ -95,7 +132,10 @@
                 detail={sessionDetails.get(session.id)}
                 expanded={expandedSessionId === session.id}
                 {presets}
+                {selectMode}
+                selected={selectedIds.has(session.id)}
                 onToggle={() => onToggleSession(session.id)}
+                onToggleSelect={() => toggleSelect(session.id)}
                 {onLoadDetail}
                 {onResummarize}
                 {onDelete}

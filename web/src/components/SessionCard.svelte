@@ -13,15 +13,22 @@
     onToggle,
     onLoadDetail,
     onResummarize,
+    onDelete,
+    selectMode = false,
+    selected = false,
+    onToggleSelect = () => {},
   }: {
     session: SessionSummary
     detail: SessionDetailResponse | undefined
     expanded: boolean
     presets: PresetMap
+    selectMode?: boolean
+    selected?: boolean
     onToggle: () => void
     onLoadDetail: (id: string) => Promise<void>
     onResummarize: (sessionId: string, preset: string) => Promise<void>
     onDelete: (id: string) => Promise<void>
+    onToggleSelect?: () => void
   } = $props()
 
   let showPresetMenu = $state(false)
@@ -98,8 +105,17 @@
   }
 </script>
 
-<article class="session-card">
-  <button type="button" class="session-header" onclick={openCard}>
+<article class="session-card" class:selected={selectMode && selected}>
+  <button type="button" class="session-header" onclick={selectMode ? onToggleSelect : openCard}>
+    {#if selectMode}
+      <input
+        type="checkbox"
+        class="session-checkbox"
+        checked={selected}
+        onclick={(e) => e.stopPropagation()}
+        onchange={onToggleSelect}
+      />
+    {/if}
     <div>
       {#if editingTitle}
         <!-- svelte-ignore a11y_autofocus -->
@@ -216,6 +232,20 @@
 </article>
 
 <style>
+  .session-checkbox {
+    margin-right: 0.5rem;
+    width: 1rem;
+    height: 1rem;
+    accent-color: var(--accent);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .session-card.selected {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+
   .resummarize-wrap {
     position: relative;
     margin-top: 0.5rem;

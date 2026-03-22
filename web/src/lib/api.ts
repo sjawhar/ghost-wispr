@@ -68,3 +68,11 @@ export function updateSessionTitle(sessionId: string, title: string): Promise<Se
 export function deleteSession(id: string): Promise<void> {
   return request<void>(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
+
+export function mergeSessions(sessionIds: string[]): Promise<SessionSummary> {
+  return request<SessionSummary>('/api/sessions/merge', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_ids: sessionIds }),
+  })
+}

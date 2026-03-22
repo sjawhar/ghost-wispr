@@ -25,6 +25,7 @@
     resummarize,
     resumeRecording,
     deleteSession,
+    mergeSessions,
   } from './lib/api'
   import { connect, disconnect } from './lib/ws.svelte'
 
@@ -75,6 +76,21 @@
   async function handleDeleteSession(id: string): Promise<void> {
     await deleteSession(id)
     removeSession(id)
+  }
+
+  async function handleMerge(sessionIds: string[]): Promise<void> {
+    await mergeSessions(sessionIds)
+    // Refresh sessions for affected dates
+    const affectedDates = new Set<string>()
+    for (const [date, sessions] of appState.sessionsByDate) {
+      if (sessions.some((s) => sessionIds.includes(s.id))) {
+        affectedDates.add(date)
+      }
+    }
+    for (const date of affectedDates) {
+      const sessions = await fetchSessions(date)
+      setSessionsForDate(date, sessions)
+    }
   }
 
   onMount(() => {
@@ -220,6 +236,7 @@
         onLoadDetail={loadSession}
         onResummarize={handleResummarize}
         onDelete={handleDeleteSession}
+        onMerge={handleMerge}
       />
     </section>
   {/if}

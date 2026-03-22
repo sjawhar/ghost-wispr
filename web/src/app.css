@@ -786,3 +786,42 @@ select:focus {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* ── Select controls ── */
+
+.select-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.select-action-btn {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.select-action-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.merge-btn {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.3rem;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.merge-btn:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}

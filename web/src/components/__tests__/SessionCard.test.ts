@@ -24,6 +24,7 @@ describe('SessionCard', () => {
       onToggle: vi.fn(),
       onLoadDetail: vi.fn(),
       onResummarize: vi.fn(),
+      onDelete: vi.fn(),
     })
 
     expect(screen.getByText('pending')).toBeTruthy()
@@ -41,6 +42,7 @@ describe('SessionCard', () => {
       onToggle,
       onLoadDetail,
       onResummarize: vi.fn(),
+      onDelete: vi.fn(),
     })
 
     await fireEvent.click(screen.getByRole('button', { name: /10:00/ }))
@@ -61,6 +63,7 @@ describe('SessionCard', () => {
       onToggle: vi.fn(),
       onLoadDetail: vi.fn(),
       onResummarize: vi.fn(),
+      onDelete: vi.fn(),
     })
 
     expect(screen.getByRole('button', { name: 'Resummarize ▾' })).toBeTruthy()
