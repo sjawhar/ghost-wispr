@@ -20,6 +20,7 @@ type Manager struct {
 	recorder           Recorder
 	summarizer         Summarizer
 	hub                EventBroadcaster
+	syncer             SessionSyncer
 	detector           *Detector
 	buffer             *UtteranceBuffer
 	minSessionSegments int
@@ -295,8 +296,19 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 }
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
-	if m.summarizer == nil {
-		// No summarizer available — leave as pending so it can be summarized later.
+	m.mu.Lock()
+	summarizer := m.summarizer
+	syncer := m.syncer
+	m.mu.Unlock()
+
+	if summarizer == nil {
+		if syncer != nil {
+			go func() {
+				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+					log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+				}
+			}()
+		}
 		return
 	}
 
@@ -318,7 +330,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 		b.WriteString("\n")
 	}
 
-	title, summaryText, preset, err := m.summarizer.Summarize(ctx, sessionID, b.String())
+	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, b.String())
 	if err != nil {
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
@@ -332,6 +344,14 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	}
 
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+
+	if syncer != nil {
+		go func() {
+			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+				log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+			}
+		}()
+	}
 }
 
 func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {
@@ -354,6 +374,12 @@ func (m *Manager) SetSummarizer(s Summarizer) {
 	m.summarizer = s
 }
 
+func (m *Manager) SetSyncer(s SessionSyncer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncer = s
+}
+
 func (m *Manager) SetMinSessionSegments(n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -361,4 +387,24 @@ func (m *Manager) SetMinSessionSegments(n int) {
 		n = 0
 	}
 	m.minSessionSegments = n
+}
+
+func (m *Manager) OnTranscriptionDisconnect() {
+	m.mu.Lock()
+	if m.buffer == nil {
+		m.mu.Unlock()
+		return
+	}
+	detector := m.detector
+	m.mu.Unlock()
+
+	// Persist buffered words — flushBuffer handles its own locking
+	// via ensureSessionStarted/currentSession, so m.mu must NOT be held.
+	if err := m.flushBuffer(); err != nil {
+		log.Printf("error persisting buffered words on disconnect: %v", err)
+	}
+
+	if detector != nil {
+		detector.OnSpeech()
+	}
 }

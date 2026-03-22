@@ -24,6 +24,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -84,7 +85,8 @@ func (r *recorderState) SetMic(mic *audio.Mic) {
 }
 
 type transcriptCallback struct {
-	manager session.LifecycleManager
+	manager   session.LifecycleManager
+	resilient *transcribe.ResilientClient
 }
 
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
@@ -96,6 +98,9 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 
 func (c transcriptCallback) Open(*api.OpenResponse) error {
 	log.Println("connected to Deepgram")
+	if c.resilient != nil {
+		c.resilient.SetConnected()
+	}
 	return nil
 }
 
@@ -112,6 +117,9 @@ func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
 
 func (c transcriptCallback) Close(*api.CloseResponse) error {
 	log.Println("disconnected from Deepgram")
+	if mgr, ok := c.manager.(*session.Manager); ok {
+		mgr.OnTranscriptionDisconnect()
+	}
 	return nil
 }
 
@@ -121,6 +129,34 @@ func (c transcriptCallback) Error(er *api.ErrorResponse) error {
 }
 
 func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
+
+type deepgramWriter struct {
+	client interface {
+		io.Writer
+		Finalize() error
+	}
+}
+
+func (dw *deepgramWriter) Write(p []byte) (int, error) {
+	return dw.client.Write(p)
+}
+
+func (dw *deepgramWriter) Close() error {
+	return dw.client.Finalize()
+}
+
+func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback) transcribe.ClientFactory {
+	return func(factoryCtx context.Context) (io.WriteCloser, error) {
+		dgClient, err := client.NewWSUsingCallback(factoryCtx, apiKey, cOptions, tOptions, callback)
+		if err != nil {
+			return nil, err
+		}
+		if !dgClient.Connect() {
+			return nil, fmt.Errorf("deepgram connect failed")
+		}
+		return &deepgramWriter{client: dgClient}, nil
+	}
+}
 
 func main() {
 	log.Println("ghost-wispr: starting")
@@ -430,6 +466,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		log.Fatalf("build http handler failed: %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var syncOrchestrator *gdrive.Orchestrator
+
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
@@ -447,10 +488,19 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)
 		}
-	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
+			if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID); err == nil {
+				syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+				manager.SetSyncer(syncOrchestrator)
+				log.Printf("config: gdrive sync enabled")
+			}
+		} else if !newCfg.GDriveSyncEnabled && syncOrchestrator != nil {
+			manager.SetSyncer(nil)
+			syncOrchestrator = nil
+			log.Printf("config: gdrive sync disabled")
+		}
+	})
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	if startupSummarizer != nil {
@@ -486,12 +536,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	defer func() { _ = store.Close() }()
 
-	if cfg.GDriveFolderID != "" {
+	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
 		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
-			warnings = append(warnings, "Google Drive sync failed to initialize \u2014 backups are disabled")
+			warnings = append(warnings, "Google Drive sync failed to initialize — backups are disabled")
 		} else {
+			syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			manager.SetSyncer(syncOrchestrator)
+
 			go func() {
 				ticker := time.NewTicker(5 * time.Minute)
 				defer ticker.Stop()
@@ -500,14 +553,51 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					case <-ctx.Done():
 						return
 					case <-ticker.C:
-						date := time.Now().UTC().Format("2006-01-02")
-						if err := syncer.Sync(cfg.DBPath, date); err != nil {
-							log.Printf("gdrive sync error: %v", err)
+						ids, err := store.GetSessionsNeedingSync()
+						if err != nil {
+							log.Printf("gdrive sweep error: %v", err)
+							continue
+						}
+						for _, id := range ids {
+							if err := syncOrchestrator.SyncSession(ctx, id); err != nil {
+								log.Printf("gdrive sweep: session %s: %v", id, err)
+							}
 						}
 					}
 				}
 			}()
 		}
+	}
+
+	if cfg.GCEnabled {
+		go func() {
+			ticker := time.NewTicker(1 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					latestCfg := cfgStore.Get()
+					if !latestCfg.GCEnabled {
+						continue
+					}
+					syncGated := latestCfg.GDriveSyncEnabled && syncOrchestrator != nil
+					collector := gc.New(store, gc.Config{
+						MaxAgeDays:     latestCfg.GCMaxAgeDays,
+						MaxAudioSizeMB: latestCfg.GCMaxAudioSizeMB,
+						SyncGated:      syncGated,
+						AudioDir:       latestCfg.AudioDir,
+					})
+					deleted, err := collector.Run()
+					if err != nil {
+						log.Printf("gc error: %v", err)
+					} else if len(deleted) > 0 {
+						log.Printf("gc: deleted %d sessions", len(deleted))
+					}
+				}
+			}
+		}()
 	}
 
 	var mic *audio.Mic
@@ -567,17 +657,29 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			VadEvents:      true,
 		}
 
-		dgClient, err := client.NewWSUsingCallback(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, transcriptCallback{manager: manager})
+		callback := transcriptCallback{manager: manager}
+		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback)
+
+		resilientConfig := transcribe.ResilientConfig{
+			BufferSize:            cfg.DeepgramBufferSize,
+			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
+			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
+		}
+
+		resilientClient := transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, nil)
+		callback.resilient = resilientClient
+
+		initialClient, err := factory(ctx)
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
-			warnings = append(warnings, "Deepgram initialization failed \u2014 live transcription is disabled")
-		} else if ok := dgClient.Connect(); !ok {
-			log.Printf("warning: deepgram connect failed, running API/UI only")
-			warnings = append(warnings, "Deepgram connection failed \u2014 live transcription is disabled")
+			warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
 		} else {
-			dgWriter = dgClient
+			resilientClient.Client = initialClient
+			dgWriter = resilientClient
 			dgStop = func() {
-				dgClient.Stop()
+				if err := resilientClient.Close(); err != nil {
+					log.Printf("warning: close resilient deepgram client failed: %v", err)
+				}
 			}
 			go func() {
 				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf)
