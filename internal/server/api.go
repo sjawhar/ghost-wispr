@@ -29,6 +29,7 @@ type SessionStore interface {
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
 	DeleteSession(id string) error
+	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -164,6 +165,61 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("POST /api/sessions/merge", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			SessionIDs []string `json:"session_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if len(body.SessionIDs) < 2 {
+			writeJSONError(w, http.StatusBadRequest, "at least 2 session IDs required")
+			return
+		}
+
+		var earliest time.Time
+		var latest time.Time
+		for _, id := range body.SessionIDs {
+			if !validSessionID(id) {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid session id: %s", id))
+				return
+			}
+
+			sess, err := store.GetSession(id)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("session not found: %s", id))
+				return
+			}
+
+			if earliest.IsZero() || sess.StartedAt.Before(earliest) {
+				earliest = sess.StartedAt
+			}
+			if sess.EndedAt != nil && (latest.IsZero() || sess.EndedAt.After(latest)) {
+				latest = *sess.EndedAt
+			}
+		}
+
+		newID := earliest.UTC().Format("20060102150405") + "-merged"
+		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("merge sessions: %v", err))
+			return
+		}
+
+		if controls.OnSessionMerged != nil {
+			go controls.OnSessionMerged(context.Background(), newID)
+		}
+
+		merged, err := store.GetSession(newID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get merged session: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, merged)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {

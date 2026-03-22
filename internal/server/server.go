@@ -21,6 +21,7 @@ type ControlHooks struct {
 	ActiveSession   func() (string, time.Time)
 	Presets         func() map[string]config.Preset
 	Resummarize     func(ctx context.Context, sessionID, preset string) error
+	OnSessionMerged func(ctx context.Context, sessionID string)
 	EndSession      func(ctx context.Context) error
 	TestPreset      func(ctx context.Context, presetName, sessionID string) (string, error)
 	GeneratePreset  func(ctx context.Context, description string) (config.Preset, error)

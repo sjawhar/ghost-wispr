@@ -306,6 +306,37 @@ func main() {
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, status, presetUsed)
 			return err
 		},
+		OnSessionMerged: func(ctx context.Context, sessionID string) {
+			if summarizer == nil {
+				return
+			}
+
+			segments, err := store.GetSegments(sessionID)
+			if err != nil {
+				log.Printf("warning: failed to get segments for merged session %s: %v", sessionID, err)
+				return
+			}
+
+			transcript := buildTranscript(segments)
+			if transcript == "" {
+				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "")
+				return
+			}
+
+			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
+			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
+
+			title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, transcript)
+			if err != nil {
+				log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
+				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
+				hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryFailed, preset)
+				return
+			}
+
+			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+		},
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
 		},

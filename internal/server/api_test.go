@@ -81,6 +81,26 @@ func (s apiStoreStub) DeleteSession(id string) error {
 	return nil
 }
 
+func (s apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
+	endedAtPtr := &endedAt
+	s.sessions[newID] = storage.Session{
+		ID:            newID,
+		StartedAt:     startedAt,
+		EndedAt:       endedAtPtr,
+		Status:        storage.SessionEnded,
+		SummaryStatus: storage.SummaryPending,
+	}
+
+	for _, id := range sourceIDs {
+		sess := s.sessions[id]
+		sess.Status = storage.SessionMerged
+		sess.MergedInto = newID
+		s.sessions[id] = sess
+	}
+
+	return nil
+}
+
 func testStaticFS(t *testing.T) fs.FS {
 	t.Helper()
 	dir := t.TempDir()
@@ -217,6 +237,108 @@ func TestDeleteSession_InvalidID(t *testing.T) {
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected status 403, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMergeSession_Success(t *testing.T) {
+	start1 := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
+	end1 := start1.Add(10 * time.Minute)
+	start2 := time.Date(2026, 2, 26, 11, 0, 0, 0, time.UTC)
+	end2 := start2.Add(20 * time.Minute)
+
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: start1, EndedAt: &end1, Status: storage.SessionEnded},
+			"s2": {ID: "s2", StartedAt: start2, EndedAt: &end2, Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{},
+		dates:    nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/merge", strings.NewReader(`{"session_ids":["s1","s2"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var merged storage.Session
+	if err := json.NewDecoder(rr.Body).Decode(&merged); err != nil {
+		t.Fatalf("decode merged session failed: %v", err)
+	}
+
+	if merged.ID != "20260226100000-merged" {
+		t.Fatalf("expected merged session id 20260226100000-merged, got %q", merged.ID)
+	}
+	if merged.Status != storage.SessionEnded {
+		t.Fatalf("expected merged status ended, got %q", merged.Status)
+	}
+	if merged.SummaryStatus != storage.SummaryPending {
+		t.Fatalf("expected summary status pending, got %q", merged.SummaryStatus)
+	}
+}
+
+func TestMergeSession_TooFewSessions(t *testing.T) {
+	start := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
+	end := start.Add(10 * time.Minute)
+
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: start, EndedAt: &end, Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{},
+		dates:    nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/merge", strings.NewReader(`{"session_ids":["s1"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMergeSession_SessionNotFound(t *testing.T) {
+	start := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
+	end := start.Add(10 * time.Minute)
+
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: start, EndedAt: &end, Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{},
+		dates:    nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/merge", strings.NewReader(`{"session_ids":["s1","does-not-exist"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
