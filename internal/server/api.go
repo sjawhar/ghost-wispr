@@ -339,6 +339,7 @@ type configResponse struct {
 	Summarization      configSummarizationResponse `json:"summarization"`
 	Transcription      configTranscriptionResponse `json:"transcription"`
 	GDrive             configGDriveResponse        `json:"gdrive"`
+	GC                 configGCResponse            `json:"gc"`
 	APIKeys            map[string]bool             `json:"api_keys"`
 }
 
@@ -356,6 +357,13 @@ type configTranscriptionResponse struct {
 type configGDriveResponse struct {
 	FolderID       string `json:"folder_id"`
 	HasCredentials bool   `json:"has_credentials"`
+	SyncEnabled    bool   `json:"sync_enabled"`
+}
+
+type configGCResponse struct {
+	Enabled        bool `json:"enabled"`
+	MaxAgeDays     int  `json:"max_age_days"`
+	MaxAudioSizeMB int  `json:"max_audio_size_mb"`
 }
 
 func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
@@ -376,6 +384,12 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 			GDrive: configGDriveResponse{
 				FolderID:       cfg.GDriveFolderID,
 				HasCredentials: cfg.GoogleCredentialsFile != "" && fileExists(cfg.GoogleCredentialsFile),
+				SyncEnabled:    cfg.GDriveSyncEnabled,
+			},
+			GC: configGCResponse{
+				Enabled:        cfg.GCEnabled,
+				MaxAgeDays:     cfg.GCMaxAgeDays,
+				MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
 			},
 			APIKeys: map[string]bool{
 				"deepgram":  cfg.DeepgramAPIKey != "",
@@ -399,6 +413,7 @@ type configPatch struct {
 	Transcription      *transcriptionPatch `json:"transcription,omitempty"`
 	APIKeys            map[string]string   `json:"api_keys,omitempty"`
 	GDrive             *gdrivePatch        `json:"gdrive,omitempty"`
+	GC                 *gcPatch            `json:"gc,omitempty"`
 }
 
 type summarizationPatch struct {
@@ -415,6 +430,13 @@ type transcriptionPatch struct {
 type gdrivePatch struct {
 	FolderID          *string `json:"folder_id,omitempty"`
 	CredentialsBase64 *string `json:"credentials_base64,omitempty"`
+	SyncEnabled       *bool   `json:"sync_enabled,omitempty"`
+}
+
+type gcPatch struct {
+	Enabled        *bool `json:"enabled,omitempty"`
+	MaxAgeDays     *int  `json:"max_age_days,omitempty"`
+	MaxAudioSizeMB *int  `json:"max_audio_size_mb,omitempty"`
 }
 
 func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
@@ -521,7 +543,28 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 		if p.GDrive.FolderID != nil {
 			c.GDriveFolderID = *p.GDrive.FolderID
 		}
+		if p.GDrive.SyncEnabled != nil {
+			c.GDriveSyncEnabled = *p.GDrive.SyncEnabled
+		}
 		// credentials_base64 handling deferred to GDrive integration task
+	}
+
+	if p.GC != nil {
+		if p.GC.Enabled != nil {
+			c.GCEnabled = *p.GC.Enabled
+		}
+		if p.GC.MaxAgeDays != nil {
+			if *p.GC.MaxAgeDays <= 0 {
+				return fmt.Errorf("gc.max_age_days must be positive")
+			}
+			c.GCMaxAgeDays = *p.GC.MaxAgeDays
+		}
+		if p.GC.MaxAudioSizeMB != nil {
+			if *p.GC.MaxAudioSizeMB <= 0 {
+				return fmt.Errorf("gc.max_audio_size_mb must be positive")
+			}
+			c.GCMaxAudioSizeMB = *p.GC.MaxAudioSizeMB
+		}
 	}
 	return nil
 }

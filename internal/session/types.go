@@ -29,6 +29,10 @@ type Summarizer interface {
 	Summarize(ctx context.Context, sessionID, transcript string) (title, summary, preset string, err error)
 }
 
+type SessionSyncer interface {
+	SyncSession(ctx context.Context, sessionID string) error
+}
+
 type EventBroadcaster interface {
 	BroadcastLiveTranscript(seg transcribe.Segment)
 	BroadcastSessionStarted(sessionID string)

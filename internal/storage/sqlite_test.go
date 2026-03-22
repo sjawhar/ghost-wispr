@@ -158,6 +158,150 @@ func TestSQLiteSummaryClaimIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSyncStatusTracking(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "sync-test-1"
+	started := time.Date(2026, 3, 21, 10, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary: %v", err)
+	}
+
+	ids, err := store.GetSessionsNeedingSync()
+	if err != nil {
+		t.Fatalf("get sessions needing sync: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("expected [%s], got %v", sessionID, ids)
+	}
+
+	if err := store.UpdateSyncStatus(sessionID, SyncSynced, "drive-folder-id-123"); err != nil {
+		t.Fatalf("update sync status: %v", err)
+	}
+
+	ids, err = store.GetSessionsNeedingSync()
+	if err != nil {
+		t.Fatalf("get sessions needing sync after update: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected empty, got %v", ids)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.SyncStatus != SyncSynced {
+		t.Fatalf("expected sync_status %q, got %q", SyncSynced, sess.SyncStatus)
+	}
+	if sess.GDriveFolderID != "drive-folder-id-123" {
+		t.Fatalf("expected gdrive_folder_id %q, got %q", "drive-folder-id-123", sess.GDriveFolderID)
+	}
+}
+
+func TestGetGCEligibleSessions(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	now := time.Now().UTC()
+	old := now.Add(-45 * 24 * time.Hour)
+
+	if err := store.CreateSession("gc-eligible", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("gc-eligible", old.Add(time.Minute), "data/audio/gc-eligible.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.CreateSession("gc-unsynced", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.CreateSession("gc-recent", now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("gc-recent", now.Add(-30*time.Minute), "data/audio/gc-recent.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := store.GetGCEligibleSessions(30, true)
+	if err != nil {
+		t.Fatalf("get gc eligible: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "gc-eligible" {
+		t.Fatalf("expected [gc-eligible], got %v", ids)
+	}
+
+	ids, err = store.GetGCEligibleSessions(30, false)
+	if err != nil {
+		t.Fatalf("get gc eligible no gate: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 sessions, got %d: %v", len(ids), ids)
+	}
+
+	ids, err = store.GetGCEligibleSessions(0, true)
+	if err != nil {
+		t.Fatalf("get gc eligible disk pressure: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 synced sessions, got %d: %v", len(ids), ids)
+	}
+}
+
+func TestDeleteSession(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "delete-test-1"
+	started := time.Now().UTC()
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(sessionID, started.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	seg := transcribe.Segment{Speaker: 0, Text: "hello", StartTime: 0, EndTime: 1, Timestamp: started}
+	if err := store.AppendSegment(sessionID, seg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.DeleteSession(sessionID); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	_, err := store.GetSession(sessionID)
+	if err == nil {
+		t.Fatal("expected error getting deleted session")
+	}
+
+	segs, err := store.GetSegments(sessionID)
+	if err != nil {
+		t.Fatalf("get segments: %v", err)
+	}
+	if len(segs) != 0 {
+		t.Fatalf("expected 0 segments, got %d", len(segs))
+	}
+
+	err = store.DeleteSession("nonexistent")
+	if err == nil {
+		t.Fatal("expected error deleting nonexistent session")
+	}
+}
+
 func TestSQLiteConcurrentAccess(t *testing.T) {
 	store := newTestSQLiteStore(t)
 

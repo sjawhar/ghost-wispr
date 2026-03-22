@@ -137,6 +137,17 @@ type summarizerMock struct {
 	called chan string
 }
 
+type syncerMock struct {
+	called chan string
+}
+
+func (s syncerMock) SyncSession(_ context.Context, sessionID string) error {
+	if s.called != nil {
+		s.called <- sessionID
+	}
+	return nil
+}
+
 func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, error) {
 	if s.called != nil {
 		s.called <- sessionID
@@ -579,5 +590,55 @@ func TestManager_ForceEndFlushesBuffer(t *testing.T) {
 	segs := store.segments[sessionID]
 	if len(segs) == 0 {
 		t.Fatal("expected buffered words to be flushed by ForceEndSession")
+	}
+}
+
+func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T) {
+	store := newStoreMock()
+	syncCalled := make(chan string, 1)
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetSyncer(syncerMock{called: syncCalled})
+
+	manager.generateSummary(context.Background(), "session-no-summarizer")
+
+	select {
+	case got := <-syncCalled:
+		if got != "session-no-summarizer" {
+			t.Fatalf("expected sync session id %q, got %q", "session-no-summarizer", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected sync to trigger when summarizer is nil")
+	}
+}
+
+func TestManager_GenerateSummary_TriggersSyncAfterSummaryCompleted(t *testing.T) {
+	store := newStoreMock()
+	if err := store.CreateSession("session-with-summary", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if err := store.AppendSegment("session-with-summary", transcribe.Segment{Text: "hello sync"}); err != nil {
+		t.Fatalf("AppendSegment failed: %v", err)
+	}
+
+	summaryCalled := make(chan string, 1)
+	syncCalled := make(chan string, 1)
+	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, nil, NewDetector(time.Hour), 0)
+	manager.SetSyncer(syncerMock{called: syncCalled})
+
+	manager.generateSummary(context.Background(), "session-with-summary")
+
+	select {
+	case <-summaryCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected summarizer to run")
+	}
+
+	select {
+	case got := <-syncCalled:
+		if got != "session-with-summary" {
+			t.Fatalf("expected sync session id %q, got %q", "session-with-summary", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected sync to trigger after summary completion")
 	}
 }

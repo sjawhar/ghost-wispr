@@ -19,6 +19,12 @@ export interface ConfigResponse {
   gdrive: {
     folder_id: string
     has_credentials: boolean
+    sync_enabled: boolean
+  }
+  gc: {
+    enabled: boolean
+    max_age_days: number
+    max_audio_size_mb: number
   }
   api_keys: Record<string, boolean>
 }

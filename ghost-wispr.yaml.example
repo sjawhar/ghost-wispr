@@ -32,3 +32,9 @@ summarization:
 # Google Drive sync (optional)
 # gdrive_folder_id:
 # google_credentials_file: ./service-account.json
+# gdrive_sync_enabled: false
+
+# Garbage collection
+# gc_enabled: false
+# gc_max_age_days: 30
+# gc_max_audio_size_mb: 1024
