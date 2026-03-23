@@ -51,6 +51,7 @@ type Config struct {
 	GCMaxAudioSizeMB              int           `yaml:"gc_max_audio_size_mb"`
 	Summarization                 Summarization `yaml:"summarization"`
 	Transcription                 Transcription `yaml:"transcription"`
+	DeepgramModel                 string        `yaml:"deepgram_model"`
 	DeepgramBufferSize            int           `yaml:"deepgram_buffer_size"`
 	DeepgramReconnectInitialDelay string        `yaml:"deepgram_reconnect_initial_delay"`
 	DeepgramReconnectMaxBackoff   string        `yaml:"deepgram_reconnect_max_backoff"`
@@ -87,10 +88,11 @@ func defaults() Config {
 		Transcription: Transcription{
 			Endpointing:    "400",
 			UtteranceEndMs: "1000",
-		},
-		DeepgramBufferSize:            1920000,
-		DeepgramReconnectInitialDelay: "500ms",
-		DeepgramReconnectMaxBackoff:   "30s",
+	},
+	DeepgramModel:                "nova-3",
+	DeepgramBufferSize:            1920000,
+	DeepgramReconnectInitialDelay: "500ms",
+	DeepgramReconnectMaxBackoff:   "30s",
 	}
 }
 
@@ -215,6 +217,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_INITIAL_DELAY"); v != "" {
 		cfg.DeepgramReconnectInitialDelay = v
+	}
+	if v := os.Getenv(EnvPrefix + "DEEPGRAM_MODEL"); v != "" {
+		cfg.DeepgramModel = v
 	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_MAX_BACKOFF"); v != "" {
 		cfg.DeepgramReconnectMaxBackoff = v

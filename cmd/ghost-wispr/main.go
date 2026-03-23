@@ -719,7 +719,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if mic != nil && cfg.DeepgramAPIKey != "" {
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := &interfaces.LiveTranscriptionOptions{
-			Model:          "nova-2",
+			Model:          cfg.DeepgramModel,
 			Language:       "en-US",
 			Diarize:        true,
 			Punctuate:      true,
