@@ -38,6 +38,7 @@ type Transcription struct {
 type Config struct {
 	DBPath                        string        `yaml:"db_path"`
 	AudioDir                      string        `yaml:"audio_dir"`
+	LogLevel                      string        `yaml:"log_level"`
 	SilenceTimeout                string        `yaml:"silence_timeout"`
 	MinSessionSegments            int           `yaml:"min_session_segments"`
 	MicSampleRate                 int           `yaml:"mic_sample_rate"`
@@ -65,6 +66,7 @@ func defaults() Config {
 	return Config{
 		DBPath:                "data/ghost-wispr.db",
 		AudioDir:              "data/audio",
+		LogLevel:              "info",
 		SilenceTimeout:        "30s",
 		MinSessionSegments:    0,
 		MicSampleRate:         16000,
@@ -176,6 +178,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv(EnvPrefix + "AUDIO_DIR"); v != "" {
 		cfg.AudioDir = v
+	}
+	if v := os.Getenv(EnvPrefix + "LOG_LEVEL"); v != "" {
+		cfg.LogLevel = v
 	}
 	if v := os.Getenv(EnvPrefix + "SILENCE_TIMEOUT"); v != "" {
 		cfg.SilenceTimeout = v

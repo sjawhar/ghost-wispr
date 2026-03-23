@@ -2,20 +2,27 @@ package server
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 type Hub struct {
 	mu      sync.RWMutex
 	clients map[chan []byte]struct{}
+	logger  *slog.Logger
 }
 
-func NewHub() *Hub {
-	return &Hub{clients: make(map[chan []byte]struct{})}
+func NewHub(logger ...*slog.Logger) *Hub {
+	l := logging.WithModule(slog.Default(), "server")
+	if len(logger) > 0 && logger[0] != nil {
+		l = logging.WithModule(logger[0], "server")
+	}
+
+	return &Hub{clients: make(map[chan []byte]struct{}), logger: l}
 }
 
 func (h *Hub) Subscribe() chan []byte {
@@ -100,7 +107,7 @@ func (h *Hub) BroadcastStatusChanged(paused bool) {
 func (h *Hub) broadcastEvent(event any) {
 	payload, err := json.Marshal(event)
 	if err != nil {
-		log.Printf("event marshal error: %v", err)
+		h.logger.Error("failed to marshal websocket event", "operation", "marshal_event", "error", err)
 		return
 	}
 	h.Broadcast(payload)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,6 +28,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -172,6 +174,8 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	cfg := cfgStore.Get()
+	appLogger := logging.New(os.Stdout, cfg.LogLevel)
+	slog.SetDefault(appLogger)
 	for _, w := range cfgWarnings {
 		log.Printf("config: %s", w)
 	}
@@ -194,7 +198,7 @@ func main() {
 		log.Fatalf("static assets init failed: %v", err)
 	}
 
-	hub := server.NewHub()
+	hub := server.NewHub(appLogger)
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
 	audioRecorder := audio.NewRecorder(cfg.AudioDir)
 
@@ -246,7 +250,7 @@ func main() {
 		sessionSummarizer = summarizer
 	}
 
-	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments)
+	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments, appLogger)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -258,7 +262,7 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 
-	handler, err := server.Handler(assets, hub, store, &server.ControlHooks{
+	handler, err := server.HandlerWithLogger(assets, hub, store, &server.ControlHooks{
 		Pause:         recState.Pause,
 		Resume:        recState.Resume,
 		IsPaused:      recState.IsPaused,
@@ -530,7 +534,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"errors":   result.Errors,
 			}, nil
 		},
-	}, authToken, cfgStore)
+	}, authToken, appLogger, cfgStore)
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
 	}
@@ -542,6 +546,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {
+		appLogger = logging.New(os.Stdout, newCfg.LogLevel)
+		slog.SetDefault(appLogger)
+
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
 		manager.SetMinSessionSegments(newCfg.MinSessionSegments)
 		log.Printf("config: reloaded (silence_timeout=%s)", newCfg.SilenceTimeout)
@@ -559,8 +566,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
-			if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID); err == nil {
-				syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID, appLogger); err == nil {
+				syncOrchestrator = gdrive.NewOrchestrator(syncer, store, appLogger)
 				manager.SetSyncer(syncOrchestrator)
 				log.Printf("config: gdrive sync enabled")
 			}
@@ -606,12 +613,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	defer func() { _ = store.Close() }()
 
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
-		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
+		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID, appLogger)
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
 			warnings = append(warnings, "Google Drive sync failed to initialize — backups are disabled")
 		} else {
-			syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			syncOrchestrator = gdrive.NewOrchestrator(syncer, store, appLogger)
 			manager.SetSyncer(syncOrchestrator)
 
 			go func() {
@@ -657,7 +664,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 						MaxAudioSizeMB: latestCfg.GCMaxAudioSizeMB,
 						SyncGated:      syncGated,
 						AudioDir:       latestCfg.AudioDir,
-					})
+					}, appLogger)
 					deleted, err := collector.Run()
 					if err != nil {
 						log.Printf("gc error: %v", err)

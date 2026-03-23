@@ -2,11 +2,12 @@ package gc
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -26,10 +27,16 @@ type Config struct {
 type Collector struct {
 	store  Store
 	config Config
+	logger *slog.Logger
 }
 
-func New(store Store, config Config) *Collector {
-	return &Collector{store: store, config: config}
+func New(store Store, config Config, logger ...*slog.Logger) *Collector {
+	l := logging.WithModule(slog.Default(), "gc")
+	if len(logger) > 0 && logger[0] != nil {
+		l = logging.WithModule(logger[0], "gc")
+	}
+
+	return &Collector{store: store, config: config, logger: l}
 }
 
 func (c *Collector) Run() ([]string, error) {
@@ -41,7 +48,7 @@ func (c *Collector) Run() ([]string, error) {
 	var deleted []string
 	for _, id := range ids {
 		if err := c.deleteSession(id); err != nil {
-			log.Printf("gc: skip session %s: %v", id, err)
+			c.logger.Warn("gc skipped session", "operation", "delete_session", "session_id", id, "error", err)
 			continue
 		}
 		deleted = append(deleted, id)
@@ -61,7 +68,7 @@ func (c *Collector) Run() ([]string, error) {
 				continue
 			}
 			if err := c.deleteSession(id); err != nil {
-				log.Printf("gc: disk-pressure skip session %s: %v", id, err)
+				c.logger.Warn("gc disk pressure skipped session", "operation", "delete_session_disk_pressure", "session_id", id, "error", err)
 				continue
 			}
 			deleted = append(deleted, id)
@@ -98,7 +105,7 @@ func (c *Collector) deleteSession(id string) error {
 				audioPath = filepath.Join(c.config.AudioDir, filepath.Base(audioPath))
 			}
 			if err := os.Remove(audioPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("gc: failed to remove audio %s for session %s: %v", audioPath, id, err)
+				c.logger.Warn("gc failed to remove audio file", "operation", "remove_audio", "session_id", id, "audio_path", audioPath, "error", err)
 			}
 		}
 	}

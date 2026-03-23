@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,12 +16,14 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 type Syncer struct {
 	service  *drive.Service
 	folderID string
+	logger   *slog.Logger
 	mu       sync.Mutex
 }
 
@@ -32,7 +35,7 @@ type SyncFile struct {
 	ContentType string
 }
 
-func NewSyncer(ctx context.Context, credPath, folderID string) (*Syncer, error) {
+func NewSyncer(ctx context.Context, credPath, folderID string, logger ...*slog.Logger) (*Syncer, error) {
 	creds, err := os.ReadFile(credPath)
 	if err != nil {
 		return nil, fmt.Errorf("read credentials: %w", err)
@@ -48,9 +51,15 @@ func NewSyncer(ctx context.Context, credPath, folderID string) (*Syncer, error) 
 		return nil, fmt.Errorf("create drive service: %w", err)
 	}
 
+	l := logging.WithModule(slog.Default(), "gdrive")
+	if len(logger) > 0 && logger[0] != nil {
+		l = logging.WithModule(logger[0], "gdrive")
+	}
+
 	return &Syncer{
 		service:  svc,
 		folderID: folderID,
+		logger:   l,
 	}, nil
 }
 

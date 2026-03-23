@@ -3,8 +3,9 @@ package gdrive
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -18,10 +19,16 @@ type OrchestratorStore interface {
 type Orchestrator struct {
 	syncer *Syncer
 	store  OrchestratorStore
+	logger *slog.Logger
 }
 
-func NewOrchestrator(syncer *Syncer, store OrchestratorStore) *Orchestrator {
-	return &Orchestrator{syncer: syncer, store: store}
+func NewOrchestrator(syncer *Syncer, store OrchestratorStore, logger ...*slog.Logger) *Orchestrator {
+	l := logging.WithModule(slog.Default(), "gdrive")
+	if len(logger) > 0 && logger[0] != nil {
+		l = logging.WithModule(logger[0], "gdrive")
+	}
+
+	return &Orchestrator{syncer: syncer, store: store, logger: l}
 }
 
 func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error {
@@ -60,6 +67,6 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 		return fmt.Errorf("update sync status %s: %w", sessionID, err)
 	}
 
-	log.Printf("gdrive: synced session %s to folder %s", sessionID, driveFolderID)
+	o.logger.Info("gdrive session synced", "operation", "sync_session", "session_id", sessionID, "drive_folder_id", driveFolderID)
 	return nil
 }

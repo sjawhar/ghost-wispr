@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -24,18 +25,24 @@ type Manager struct {
 	detector           *Detector
 	buffer             *UtteranceBuffer
 	minSessionSegments int
+	logger             *slog.Logger
 
 	mu               sync.Mutex
 	currentSessionID string
 	currentStartedAt time.Time
 }
 
-func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int) *Manager {
+func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int, logger ...*slog.Logger) *Manager {
 	if detector == nil {
 		detector = NewDetector(30 * time.Second)
 	}
 	if minSessionSegments < 0 {
 		minSessionSegments = 0
+	}
+
+	l := logging.WithModule(slog.Default(), "session")
+	if len(logger) > 0 && logger[0] != nil {
+		l = logging.WithModule(logger[0], "session")
 	}
 
 	m := &Manager{
@@ -46,6 +53,7 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 		detector:           detector,
 		buffer:             NewUtteranceBuffer(),
 		minSessionSegments: minSessionSegments,
+		logger:             l,
 	}
 
 	detector.OnSessionEnd(func() {
@@ -279,9 +287,9 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 				m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 			}
 			if discardErr := m.store.DiscardSession(sessionID); discardErr != nil {
-				log.Printf("warning: failed to discard short session %s: %v", sessionID, discardErr)
+				m.logger.Warn("failed to discard short session", "operation", "discard_short_session", "session_id", sessionID, "error", discardErr)
 			} else {
-				log.Printf("discarded short session %s (%d segments < %d minimum)", sessionID, count, minSegs)
+				m.logger.Info("discarded short session", "operation", "discard_short_session", "session_id", sessionID, "segments", count, "minimum_segments", minSegs)
 			}
 			return nil
 		}
@@ -305,7 +313,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 		if syncer != nil {
 			go func() {
 				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-					log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+					m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 				}
 			}()
 		}
@@ -348,7 +356,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	if syncer != nil {
 		go func() {
 			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-				log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+				m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 			}
 		}()
 	}
@@ -407,7 +415,7 @@ func (m *Manager) OnTranscriptionDisconnect() {
 	// Persist buffered words — flushBuffer handles its own locking
 	// via ensureSessionStarted/currentSession, so m.mu must NOT be held.
 	if err := m.flushBuffer(); err != nil {
-		log.Printf("error persisting buffered words on disconnect: %v", err)
+		m.logger.Error("failed to persist buffered words on disconnect", "operation", "flush_buffer", "error", err)
 	}
 
 	if detector != nil {

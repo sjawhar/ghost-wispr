@@ -3,13 +3,14 @@ package server
 import (
 	"context"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net/http"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 )
 
 type ControlHooks struct {
@@ -30,9 +31,16 @@ type ControlHooks struct {
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, cfgStore ...*config.Store) (http.Handler, error) {
+	logger := logging.WithModule(slog.Default(), "server")
+
+	return HandlerWithLogger(staticFS, hub, store, controls, authToken, logger, cfgStore...)
+}
+
+func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, logger *slog.Logger, cfgStore ...*config.Store) (http.Handler, error) {
+	moduleLogger := logging.WithModule(logger, "server")
 	mux := http.NewServeMux()
 
-	registerWSRoute(mux, hub)
+	registerWSRoute(mux, hub, moduleLogger)
 	var cs *config.Store
 	if len(cfgStore) > 0 {
 		cs = cfgStore[0]
@@ -40,26 +48,31 @@ func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHook
 	registerAPIRoutes(mux, store, controls, cs)
 
 	fileServer := http.FileServer(http.FS(staticFS))
-	mux.HandleFunc("/", serveSPA(staticFS, fileServer))
+	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))
 
-	return BasicAuthMiddleware(authToken)(mux), nil
+	withAuth := BasicAuthMiddleware(authToken)(mux)
+	withRequestID := logging.RequestIDMiddleware(moduleLogger, nil)(withAuth)
+	return withRequestID, nil
 }
 
 func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, cfgStore ...*config.Store) error {
-	h, err := Handler(staticFS, hub, store, controls, authToken, cfgStore...)
+	logger := logging.WithModule(slog.Default(), "server")
+	h, err := HandlerWithLogger(staticFS, hub, store, controls, authToken, logger, cfgStore...)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("web UI at http://%s", addr)
+	logger.Info("web UI available", "operation", "serve_http", "address", addr)
 	return http.ListenAndServe(addr, h)
 }
 
-func serveSPA(staticFS fs.FS, fileServer http.Handler) func(http.ResponseWriter, *http.Request) {
+func serveSPA(staticFS fs.FS, fileServer http.Handler, logger *slog.Logger) func(http.ResponseWriter, *http.Request) {
+	moduleLogger := logging.WithModule(logger, "server")
 	// Read index.html once at startup for SPA fallback
 	indexHTML, err := fs.ReadFile(staticFS, "index.html")
 	if err != nil {
-		log.Fatalf("failed to read index.html from static assets: %v", err)
+		moduleLogger.Error("failed to read index.html from static assets", "operation", "load_static_index", "error", err)
+		panic(err)
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +94,7 @@ func serveSPA(staticFS fs.FS, fileServer http.Handler) func(http.ResponseWriter,
 			// SPA route: serve index.html directly (avoids FileServer redirect loop)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			if _, err := w.Write(indexHTML); err != nil {
-				log.Printf("write index.html: %v", err)
+				logging.FromContext(r.Context(), moduleLogger).Warn("failed to write index.html", "operation", "write_index", "error", err)
 				return
 			}
 			return
