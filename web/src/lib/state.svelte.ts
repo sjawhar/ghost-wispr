@@ -1,4 +1,5 @@
 import type {
+  ComponentStatusEvent,
   LiveTranscriptEvent,
   PresetMap,
   SessionDetailResponse,
@@ -6,6 +7,12 @@ import type {
   SummaryReadyEvent,
   WebSocketEvent,
 } from './types'
+
+export type ComponentStatus = {
+  status: string
+  message: string
+  timestamp: string
+}
 
 type AppState = {
   connected: boolean
@@ -21,6 +28,7 @@ type AppState = {
   activeAudioSessionId: string
   interimText: string
   interimSpeaker: number
+  componentStatuses: Record<string, ComponentStatus>
 }
 
 export const appState = $state<AppState>({
@@ -37,6 +45,7 @@ export const appState = $state<AppState>({
   activeAudioSessionId: '',
   interimText: '',
   interimSpeaker: -1,
+  componentStatuses: {},
 })
 
 export function getTodaysSessions(): SessionSummary[] {
@@ -163,8 +172,22 @@ export function applyEvent(event: WebSocketEvent): void {
       appState.interimSpeaker = -1
       appendLiveSegment(event)
       return
+    case 'component_status':
+      applyComponentStatus(event)
+      return
     default:
       return
+  }
+}
+
+export function applyComponentStatus(event: ComponentStatusEvent): void {
+  appState.componentStatuses = {
+    ...appState.componentStatuses,
+    [event.component]: {
+      status: event.status,
+      message: event.message,
+      timestamp: event.timestamp,
+    },
   }
 }
 
@@ -182,6 +205,7 @@ export function resetState(): void {
   appState.presets = {}
   appState.interimText = ''
   appState.interimSpeaker = -1
+  appState.componentStatuses = {}
 }
 
 export function removeSession(sessionId: string): void {

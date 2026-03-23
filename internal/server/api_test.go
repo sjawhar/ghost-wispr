@@ -1193,3 +1193,94 @@ func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 		t.Fatalf("expected gc.max_audio_size_mb 256, got %d", resp.GC.MaxAudioSizeMB)
 	}
 }
+
+func TestFaultInjectionDisabledWithoutTestMode(t *testing.T) {
+	store := apiStoreStub{
+		sessions: map[string]storage.Session{},
+		segments: map[string][]transcribe.Segment{},
+	}
+
+	closed := false
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		FaultDeepgramDisconnect: func() error {
+			closed = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/test/fault/deepgram-disconnect", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when test mode not enabled, got %d", rr.Code)
+	}
+	if closed {
+		t.Fatal("expected fault NOT to be triggered without test mode")
+	}
+}
+
+func TestFaultInjectionEnabledWithTestMode(t *testing.T) {
+	t.Setenv("GHOST_WISPR_TEST_MODE", "true")
+
+	store := apiStoreStub{
+		sessions: map[string]storage.Session{},
+		segments: map[string][]transcribe.Segment{},
+	}
+
+	closed := false
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		FaultDeepgramDisconnect: func() error {
+			closed = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/test/fault/deepgram-disconnect", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 with test mode, got %d", rr.Code)
+	}
+
+	var result map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result["triggered"] != true {
+		t.Fatalf("expected triggered=true, got %v", result["triggered"])
+	}
+	if !closed {
+		t.Fatal("expected fault to be triggered")
+	}
+}
+
+func TestFaultInjectionNoHandler(t *testing.T) {
+	t.Setenv("GHOST_WISPR_TEST_MODE", "true")
+
+	store := apiStoreStub{
+		sessions: map[string]storage.Session{},
+		segments: map[string][]transcribe.Segment{},
+	}
+
+	// No FaultDeepgramDisconnect set
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/test/fault/deepgram-disconnect", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no handler configured, got %d", rr.Code)
+	}
+}

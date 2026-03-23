@@ -4,6 +4,7 @@
   import SettingsPage from './components/SettingsPage.svelte'
   import LivePanel from './components/LivePanel.svelte'
   import SessionList from './components/SessionList.svelte'
+  import StatusBanner from './components/StatusBanner.svelte'
   import {
     appState,
     setDates,
@@ -208,6 +209,11 @@
       }}
     />
   {:else}
+    <StatusBanner
+      connected={appState.connected}
+      componentStatuses={appState.componentStatuses}
+    />
+
     {#if appState.warnings.length > 0}
       <aside class="warnings-banner" data-testid="warnings-banner">
         {#each appState.warnings as warning (warning)}

@@ -49,6 +49,13 @@ export interface ConnectionEvent extends BaseEvent {
   connected: boolean
 }
 
+export interface ComponentStatusEvent extends BaseEvent {
+  type: 'component_status'
+  component: 'deepgram' | 'summary' | 'sync' | 'mic'
+  status: 'connected' | 'disconnected' | 'error' | 'reconnecting' | 'draining'
+  message: string
+}
+
 export type WebSocketEvent =
   | LiveTranscriptEvent
   | LiveTranscriptInterimEvent
@@ -57,6 +64,7 @@ export type WebSocketEvent =
   | SummaryReadyEvent
   | StatusChangedEvent
   | ConnectionEvent
+  | ComponentStatusEvent
 
 export interface Segment {
   speaker: number

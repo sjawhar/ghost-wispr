@@ -104,6 +104,15 @@ func (h *Hub) BroadcastStatusChanged(paused bool) {
 	})
 }
 
+func (h *Hub) BroadcastComponentStatus(component, status, message string) {
+	h.broadcastEvent(ComponentStatusEvent{
+		Event:     newEvent("component_status", time.Now().UTC()),
+		Component: component,
+		Status:    status,
+		Message:   message,
+	})
+}
+
 func (h *Hub) broadcastEvent(event any) {
 	payload, err := json.Marshal(event)
 	if err != nil {

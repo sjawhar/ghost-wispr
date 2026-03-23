@@ -227,6 +227,14 @@ func (h *hubMock) BroadcastSummaryReady(sessionID, title, summary, status, prese
 	h.mu.Unlock()
 }
 
+func (h *hubMock) BroadcastComponentStatus(component, status, message string) {
+	h.mu.Lock()
+	_ = component
+	_ = status
+	_ = message
+	h.mu.Unlock()
+}
+
 func TestManagerLifecycle(t *testing.T) {
 	store := newStoreMock()
 	recorder := &recorderMock{}

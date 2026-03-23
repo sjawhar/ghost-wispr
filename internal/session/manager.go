@@ -314,6 +314,9 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 			go func() {
 				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
 					m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
+					if m.hub != nil {
+						m.hub.BroadcastComponentStatus("sync", "error", fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+					}
 				}
 			}()
 		}
@@ -326,6 +329,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	if err != nil {
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, "")
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, "")
+		m.logger.Error("failed to get segments for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("summary", "error", fmt.Sprintf("Failed to retrieve segments for session %s", sessionID))
+		}
 		return
 	}
 
@@ -340,14 +347,22 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 
 	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, b.String())
 	if err != nil {
+		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("summary", "error", fmt.Sprintf("Summarization failed for session %s", sessionID))
+		}
 		return
 	}
 
 	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset); err != nil {
+		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("summary", "error", fmt.Sprintf("Failed to store summary for session %s", sessionID))
+		}
 		return
 	}
 
@@ -357,6 +372,9 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 		go func() {
 			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
 				m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
+				if m.hub != nil {
+					m.hub.BroadcastComponentStatus("sync", "error", fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+				}
 			}
 		}()
 	}

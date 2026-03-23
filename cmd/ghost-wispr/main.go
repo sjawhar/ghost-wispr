@@ -262,7 +262,7 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 
-	handler, err := server.HandlerWithLogger(assets, hub, store, &server.ControlHooks{
+	controlHooks := &server.ControlHooks{
 		Pause:         recState.Pause,
 		Resume:        recState.Resume,
 		IsPaused:      recState.IsPaused,
@@ -534,7 +534,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"errors":   result.Errors,
 			}, nil
 		},
-	}, authToken, nil, appLogger, cfgStore)
+	}
+	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, nil, appLogger, cfgStore)
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
 	}
@@ -742,8 +743,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
 
-		resilientClient := transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, nil)
+		resillientStateCallback := func(state transcribe.ConnectionState) {
+			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
+		}
+		resilientClient := transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, resillientStateCallback)
 		callback.resilient = resilientClient
+		controlHooks.FaultDeepgramDisconnect = resilientClient.Close
 
 		initialClient, err := factory(ctx)
 		if err != nil {

@@ -54,6 +54,23 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		handleHealthzReady(w, r, healthChecker)
 	})
 
+	// Fault injection endpoint — only available in test mode
+	mux.HandleFunc("POST /api/test/fault/deepgram-disconnect", func(w http.ResponseWriter, r *http.Request) {
+		if os.Getenv("GHOST_WISPR_TEST_MODE") != "true" {
+			writeJSONError(w, http.StatusForbidden, "test mode not enabled")
+			return
+		}
+		if controls.FaultDeepgramDisconnect == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "deepgram not configured")
+			return
+		}
+		if err := controls.FaultDeepgramDisconnect(); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("fault injection failed: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+	})
+
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
