@@ -30,14 +30,15 @@ type ControlHooks struct {
 	RestoreFromGDrive func(ctx context.Context) (map[string]any, error)
 }
 
-func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, cfgStore ...*config.Store) (http.Handler, error) {
-	logger := logging.WithModule(slog.Default(), "server")
-
-	return HandlerWithLogger(staticFS, hub, store, controls, authToken, logger, cfgStore...)
+func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {
+	return HandlerWithLogger(staticFS, hub, store, controls, authToken, healthChecker, slog.Default(), cfgStore...)
 }
 
-func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, logger *slog.Logger, cfgStore ...*config.Store) (http.Handler, error) {
-	moduleLogger := logging.WithModule(logger, "server")
+func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, logger *slog.Logger, cfgStore ...*config.Store) (http.Handler, error) {
+moduleLogger := logging.WithModule(logger, "server")
+	if healthChecker == nil {
+		healthChecker = &DefaultHealthChecker{}
+	}
 	mux := http.NewServeMux()
 
 	registerWSRoute(mux, hub, moduleLogger)
@@ -45,7 +46,7 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	if len(cfgStore) > 0 {
 		cs = cfgStore[0]
 	}
-	registerAPIRoutes(mux, store, controls, cs)
+	registerAPIRoutes(mux, store, controls, healthChecker, cs)
 
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))
@@ -55,9 +56,9 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	return withRequestID, nil
 }
 
-func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, cfgStore ...*config.Store) error {
+func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) error {
 	logger := logging.WithModule(slog.Default(), "server")
-	h, err := HandlerWithLogger(staticFS, hub, store, controls, authToken, logger, cfgStore...)
+	h, err := HandlerWithLogger(staticFS, hub, store, controls, authToken, healthChecker, logger, cfgStore...)
 	if err != nil {
 		return err
 	}

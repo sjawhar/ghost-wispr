@@ -59,3 +59,8 @@ func (m *Mic) Stream(w io.Writer) error {
 		}
 	}
 }
+
+// IsOpen returns true if the mic stream is currently active.
+func (m *Mic) IsOpen() bool {
+	return m.stream != nil
+}

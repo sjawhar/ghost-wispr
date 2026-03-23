@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -745,4 +746,9 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 	}
 
 	return tx.Commit()
+}
+
+// Ping checks if the database is accessible.
+func (s *SQLiteStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
 }

@@ -534,7 +534,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"errors":   result.Errors,
 			}, nil
 		},
-	}, authToken, appLogger, cfgStore)
+	}, authToken, nil, appLogger, cfgStore)
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
 	}

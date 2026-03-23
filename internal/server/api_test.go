@@ -122,7 +122,7 @@ func TestAPISessionsList(t *testing.T) {
 	}
 
 	hub := NewHub()
-	h, err := Handler(testStaticFS(t), hub, store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), hub, store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestAPISessionDetail(t *testing.T) {
 		dates: []string{"2026-02-26"},
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestDeleteSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestDeleteSession_NotFound(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestDeleteSession_InvalidID(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestMergeSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestMergeSession_TooFewSessions(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestMergeSession_SessionNotFound(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestAPIAudioRange(t *testing.T) {
 		dates:    []string{"2026-02-26"},
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestAPIDates(t *testing.T) {
 		dates:          []string{"2026-02-26", "2026-02-25"},
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestAPIAudioPathTraversalBlocked(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -449,7 +449,7 @@ func TestAPIStatusWithWarnings(t *testing.T) {
 		Warnings: func() []string {
 			return []string{"Deepgram API key not configured"}
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -488,7 +488,7 @@ func TestAPIStatusNoWarnings(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -526,7 +526,7 @@ func TestAPIStatusWithActiveSession(t *testing.T) {
 		ActiveSession: func() (string, time.Time) {
 			return "session-123", startedAt
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestAPIStatusWithNoActiveSession(t *testing.T) {
 		ActiveSession: func() (string, time.Time) {
 			return "", time.Time{}
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -603,7 +603,7 @@ func TestGetPresets(t *testing.T) {
 				},
 			}
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -640,7 +640,7 @@ func TestGetPresetsEmpty(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -681,7 +681,7 @@ func TestResummarize(t *testing.T) {
 			called <- resummarizeCall{sessionID: sessionID, preset: preset}
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -716,7 +716,7 @@ func TestResummarizeNotConfigured(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -742,7 +742,7 @@ func TestResummarizeInvalidSessionID(t *testing.T) {
 		Resummarize: func(ctx context.Context, sessionID, preset string) error {
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -770,7 +770,7 @@ func TestAPI_Resummarize_InvalidJSONReturns400(t *testing.T) {
 			called <- struct{}{}
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -804,7 +804,7 @@ func TestAPI_Resummarize_ValidRequestStill202(t *testing.T) {
 			called <- struct{}{}
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -835,7 +835,7 @@ func TestAPI_SessionAudio_RejectsAbsolutePath(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -856,7 +856,7 @@ func TestEndSession_Success(t *testing.T) {
 		segments:       map[string][]transcribe.Segment{},
 	}, &ControlHooks{
 		EndSession: func(_ context.Context) error { return nil },
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -877,7 +877,7 @@ func TestEndSession_NoActiveSession(t *testing.T) {
 		segments:       map[string][]transcribe.Segment{},
 	}, &ControlHooks{
 		EndSession: func(_ context.Context) error { return session.ErrNoActiveSession },
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -898,7 +898,7 @@ func TestEndSession_InternalError(t *testing.T) {
 		segments:       map[string][]transcribe.Segment{},
 	}, &ControlHooks{
 		EndSession: func(_ context.Context) error { return errors.New("db exploded") },
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -917,7 +917,7 @@ func TestEndSession_NotConfigured(t *testing.T) {
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
-	}, &ControlHooks{}, "")
+	}, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -941,7 +941,7 @@ func TestAPI_GeneratePreset_MissingDescription(t *testing.T) {
 		GeneratePreset: func(ctx context.Context, description string) (config.Preset, error) {
 			return config.Preset{}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -974,7 +974,7 @@ func TestAPI_GeneratePreset_Success(t *testing.T) {
 				UserTemplate: "{{transcript}}",
 			}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1008,7 +1008,7 @@ func TestAPI_RefinePreset_MissingFields(t *testing.T) {
 		RefinePreset: func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error) {
 			return config.Preset{}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1044,7 +1044,7 @@ func TestAPI_RefinePreset_UnknownPreset(t *testing.T) {
 		RefinePreset: func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error) {
 			return config.Preset{}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1074,7 +1074,7 @@ func TestAPI_RefinePreset_Success(t *testing.T) {
 				UserTemplate: "{{transcript}}",
 			}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1104,7 +1104,7 @@ func TestAPI_GetConfig_ExposesGDriveSyncAndGCDefaults(t *testing.T) {
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
-	}, &ControlHooks{}, "", cfgStore)
+	}, &ControlHooks{}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1151,7 +1151,7 @@ func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
-	}, &ControlHooks{}, "", cfgStore)
+	}, &ControlHooks{}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}

@@ -44,7 +44,16 @@ var versionInfo VersionInfo
 // SetVersionInfo sets the build metadata for the /api/version endpoint.
 func SetVersionInfo(v VersionInfo) { versionInfo = v }
 
-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, cfgStore *config.Store) {
+func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store) {
+
+	// Health check endpoints
+	mux.HandleFunc("GET /healthz/live", func(w http.ResponseWriter, r *http.Request) {
+		handleHealthzLive(w, r, healthChecker)
+	})
+	mux.HandleFunc("GET /healthz/ready", func(w http.ResponseWriter, r *http.Request) {
+		handleHealthzReady(w, r, healthChecker)
+	})
+
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
