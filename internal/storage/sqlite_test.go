@@ -102,7 +102,7 @@ func TestPreMigrationBackupCreatedEvenForFreshInstall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backup is not a valid SQLite database: %v", err)
 	}
-	defer func() { _ = backupStore.Close() }()
+	_ = backupStore.Close()
 }
 
 func TestPreMigrationBackupOverwritesPrevious(t *testing.T) {
@@ -154,7 +154,7 @@ func TestPreMigrationBackupOverwritesPrevious(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backup is not a valid SQLite database: %v", err)
 	}
-	defer func() { _ = backupStore.Close() }()
+	_ = backupStore.Close()
 }
 
 func TestSQLitePragmas(t *testing.T) {

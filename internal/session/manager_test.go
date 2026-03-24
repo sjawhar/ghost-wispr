@@ -25,8 +25,8 @@ type storeMock struct {
 	preset   map[string]string
 	audio    map[string]string
 
-	refinementStatus  map[string]string
-	refinedTranscript map[string]string
+	refinementStatus    map[string]string
+	refinedTranscript   map[string]string
 	canonicalTranscript map[string]string
 	transcriptSource    map[string]string
 
@@ -36,14 +36,14 @@ type storeMock struct {
 
 func newStoreMock() *storeMock {
 	return &storeMock{
-		sessions:          map[string]time.Time{},
-		segments:          map[string][]transcribe.Segment{},
-		title:             map[string]string{},
-		summary:           map[string]string{},
-		status:            map[string]string{},
-		preset:            map[string]string{},
-		audio:             map[string]string{},
-		refinementStatus:  map[string]string{},
+		sessions:            map[string]time.Time{},
+		segments:            map[string][]transcribe.Segment{},
+		title:               map[string]string{},
+		summary:             map[string]string{},
+		status:              map[string]string{},
+		preset:              map[string]string{},
+		audio:               map[string]string{},
+		refinementStatus:    map[string]string{},
 		refinedTranscript:   map[string]string{},
 		canonicalTranscript: map[string]string{},
 		transcriptSource:    map[string]string{},

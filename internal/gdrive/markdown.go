@@ -10,12 +10,12 @@ import (
 )
 
 type SyncSession struct {
-	ID            string
-	Title         string
-	StartedAt     time.Time
-	EndedAt       *time.Time
-	Summary       string
-	SummaryPreset string
+	ID                  string
+	Title               string
+	StartedAt           time.Time
+	EndedAt             *time.Time
+	Summary             string
+	SummaryPreset       string
 	CanonicalTranscript string
 }
 

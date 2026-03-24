@@ -165,7 +165,7 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 
 		if useResumable {
 			s.logger.Info("using resumable upload", "operation", "upload", "file_name", f.Name, "file_size_bytes", fileSize)
-			createCall = createCall.ResumableMedia(ctx, file, fileSize, f.ContentType)
+			createCall = createCall.Media(file, googleapi.ContentType(f.ContentType))
 		} else {
 			createCall = createCall.Media(reader, googleapi.ContentType(f.ContentType))
 		}

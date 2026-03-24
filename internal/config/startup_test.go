@@ -13,7 +13,7 @@ func TestValidateStartup_AllConfigured(t *testing.T) {
 	cfg.GDriveSyncEnabled = true
 	cfg.GDriveFolderID = "folder-123"
 
-	status := ValidateStartup(cfg)
+	status := ValidateStartup(&cfg)
 
 	if status.Deepgram.Status != "connected" {
 		t.Errorf("expected deepgram connected, got %q", status.Deepgram.Status)
@@ -30,7 +30,7 @@ func TestValidateStartup_MissingDeepgramKey(t *testing.T) {
 	cfg := defaults()
 	cfg.DeepgramAPIKey = ""
 
-	status := ValidateStartup(cfg)
+	status := ValidateStartup(&cfg)
 
 	if status.Deepgram.Status != "unavailable" {
 		t.Errorf("expected deepgram unavailable, got %q", status.Deepgram.Status)
@@ -45,7 +45,7 @@ func TestValidateStartup_DriveSyncDisabled(t *testing.T) {
 	cfg.DeepgramAPIKey = "key"
 	cfg.GDriveSyncEnabled = false
 
-	status := ValidateStartup(cfg)
+	status := ValidateStartup(&cfg)
 
 	if status.DriveSync.Status != "disabled" {
 		t.Errorf("expected drive sync disabled, got %q", status.DriveSync.Status)
@@ -58,7 +58,7 @@ func TestValidateStartup_DriveSyncEnabledNoFolderID(t *testing.T) {
 	cfg.GDriveSyncEnabled = true
 	cfg.GDriveFolderID = ""
 
-	status := ValidateStartup(cfg)
+	status := ValidateStartup(&cfg)
 
 	if status.DriveSync.Status != "disabled" {
 		t.Errorf("expected drive sync disabled when folder ID missing, got %q", status.DriveSync.Status)
@@ -74,7 +74,7 @@ func TestValidateStartup_DriveSyncFullyConfigured(t *testing.T) {
 	cfg.GDriveSyncEnabled = true
 	cfg.GDriveFolderID = "folder-abc"
 
-	status := ValidateStartup(cfg)
+	status := ValidateStartup(&cfg)
 
 	if status.DriveSync.Status != "connected" {
 		t.Errorf("expected drive sync connected, got %q", status.DriveSync.Status)
@@ -86,7 +86,7 @@ func TestValidateStartup_EnabledDisabledLists(t *testing.T) {
 	cfg.DeepgramAPIKey = ""
 	cfg.GDriveSyncEnabled = false
 
-	status := ValidateStartup(cfg)
+	status := ValidateStartup(&cfg)
 
 	enabled := status.Enabled()
 	disabled := status.Disabled()
@@ -169,7 +169,7 @@ func TestLogStartupBanner_Output(t *testing.T) {
 		LogLevel:  "debug",
 	}
 
-	LogStartupBanner(logger, status, "1.0.0", "abc123", "2025-01-01")
+	LogStartupBanner(logger, &status, "1.0.0", "abc123", "2025-01-01")
 
 	output := buf.String()
 	if !strings.Contains(output, "startup config summary") {
@@ -195,7 +195,7 @@ func TestLogStartupBanner_AllDisabled(t *testing.T) {
 		LogLevel:  "info",
 	}
 
-	LogStartupBanner(logger, status, "dev", "unknown", "unknown")
+	LogStartupBanner(logger, &status, "dev", "unknown", "unknown")
 
 	output := buf.String()
 	if !strings.Contains(output, "startup config summary") {

@@ -39,7 +39,9 @@ func getJSON(t *testing.T, path string) (int, map[string]any) {
 	if err != nil {
 		t.Fatalf("GET %s failed: %v", path, err)
 	}
-	defer resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("warning: failed to close response body: %v", err)
+	}
 	body, _ := io.ReadAll(resp.Body)
 	var result map[string]any
 	_ = json.Unmarshal(body, &result)
@@ -52,7 +54,9 @@ func getJSONArray(t *testing.T, path string) (int, []any) {
 	if err != nil {
 		t.Fatalf("GET %s failed: %v", path, err)
 	}
-	defer resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("warning: failed to close response body: %v", err)
+	}
 	body, _ := io.ReadAll(resp.Body)
 	var result []any
 	_ = json.Unmarshal(body, &result)
@@ -65,7 +69,9 @@ func postJSON(t *testing.T, path string, body string) (int, map[string]any) {
 	if err != nil {
 		t.Fatalf("POST %s failed: %v", path, err)
 	}
-	defer resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("warning: failed to close response body: %v", err)
+	}
 	respBody, _ := io.ReadAll(resp.Body)
 	var result map[string]any
 	_ = json.Unmarshal(respBody, &result)
@@ -192,7 +198,9 @@ func TestSmoke_WebUI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET / failed: %v", err)
 	}
-	defer resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("warning: failed to close response body: %v", err)
+	}
 
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200 for web UI, got %d", resp.StatusCode)

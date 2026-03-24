@@ -5,8 +5,9 @@ import (
 	"strings"
 	"time"
 
-	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 	"google.golang.org/api/googleapi"
+
+	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 )
 
 type SyncState string

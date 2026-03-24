@@ -56,7 +56,7 @@ func (s *LogSink) GetLogs(level string, limit int, since time.Time) []LogEntry {
 	defer s.mu.RUnlock()
 
 	var result []LogEntry
-	
+
 	// Iterate backwards from head
 	for i := 0; i < s.count; i++ {
 		idx := (s.head - 1 - i + s.maxSize) % s.maxSize

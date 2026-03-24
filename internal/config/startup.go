@@ -24,7 +24,7 @@ type StartupStatus struct {
 }
 
 // Enabled returns the names of enabled/connected components.
-func (s StartupStatus) Enabled() []string {
+func (s *StartupStatus) Enabled() []string {
 	var enabled []string
 	for _, c := range s.Components() {
 		if c.Status == gwstatus.ComponentStatusConnected || c.Status == gwstatus.ComponentStatusOK {
@@ -35,7 +35,7 @@ func (s StartupStatus) Enabled() []string {
 }
 
 // Disabled returns the names of unavailable/disabled components.
-func (s StartupStatus) Disabled() []string {
+func (s *StartupStatus) Disabled() []string {
 	var disabled []string
 	for _, c := range s.Components() {
 		if c.Status != gwstatus.ComponentStatusConnected && c.Status != gwstatus.ComponentStatusOK {
@@ -46,14 +46,14 @@ func (s StartupStatus) Disabled() []string {
 }
 
 // Components returns all component states as a slice.
-func (s StartupStatus) Components() []ComponentState {
+func (s *StartupStatus) Components() []ComponentState {
 	return []ComponentState{s.Deepgram, s.Database, s.Mic, s.DriveSync}
 }
 
 // ValidateStartup checks component readiness based on config values.
 // Components that require runtime checks (DB, mic) are set to a pending
 // state here and updated later during actual initialization.
-func ValidateStartup(cfg Config) StartupStatus {
+func ValidateStartup(cfg *Config) StartupStatus {
 	status := StartupStatus{
 		LogLevel: cfg.LogLevel,
 	}
@@ -88,19 +88,20 @@ func ValidateStartup(cfg Config) StartupStatus {
 	}
 
 	// Drive sync
-	if !cfg.GDriveSyncEnabled {
+	switch {
+	case !cfg.GDriveSyncEnabled:
 		status.DriveSync = ComponentState{
 			Name:    "sync",
 			Status:  "disabled",
 			Message: "Drive sync disabled in config",
 		}
-	} else if cfg.GDriveFolderID == "" {
+	case cfg.GDriveFolderID == "":
 		status.DriveSync = ComponentState{
 			Name:    "sync",
 			Status:  "disabled",
 			Message: "Drive folder ID not configured — sync disabled",
 		}
-	} else {
+	default:
 		status.DriveSync = ComponentState{
 			Name:    "sync",
 			Status:  gwstatus.ComponentStatusConnected,
@@ -124,7 +125,7 @@ func MaskAPIKey(key string) string {
 }
 
 // LogStartupBanner logs a structured startup summary at INFO level.
-func LogStartupBanner(logger *slog.Logger, status StartupStatus, version, commit, buildTime string) {
+func LogStartupBanner(logger *slog.Logger, status *StartupStatus, version, commit, buildTime string) {
 	enabled := status.Enabled()
 	disabled := status.Disabled()
 

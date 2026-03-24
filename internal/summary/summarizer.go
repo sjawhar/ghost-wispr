@@ -166,10 +166,10 @@ func (s *Summarizer) structuredMessages(preset config.Preset, transcript string)
 		"Summarize the transcript in BLUF style.",
 		"Output requirements:",
 		`- title: 4-10 words, specific, non-empty`,
-	`- summary: markdown starting with '## BLUF', followed by sections for Decisions, Key Outcomes, and Risks/Notes`,
+		`- summary: markdown starting with '## BLUF', followed by sections for Decisions, Key Outcomes, and Risks/Notes`,
 		"Respond as JSON only.",
 		"Example output:",
-	`{"title":"Q2 roadmap alignment","summary":"## BLUF\nTeam aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint."}`,
+		`{"title":"Q2 roadmap alignment","summary":"## BLUF\nTeam aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint."}`,
 		"Transcript:",
 		rendered,
 	}, "\n\n"))
@@ -399,7 +399,6 @@ func splitTranscript(transcript string, chunkSize, overlap int) []string {
 
 	return chunks
 }
-
 
 func (s *Summarizer) selectPreset(ctx context.Context, transcript string) (string, error) {
 	if s.router == nil {

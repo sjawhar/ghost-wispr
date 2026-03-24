@@ -14,27 +14,27 @@ import (
 )
 
 type ControlHooks struct {
-	Pause             func()
-	Resume            func()
-	IsPaused          func() bool
-	OnStatusChanged   func(paused bool)
-	Warnings          func() []string
-	ActiveSession     func() (string, time.Time)
-	Presets           func() map[string]config.Preset
-	Resummarize       func(ctx context.Context, sessionID, preset string) error
-	OnSessionMerged   func(ctx context.Context, sessionID string)
-	EndSession        func(ctx context.Context) error
-	StartSession      func(ctx context.Context, titleHint string) (string, error)
-	StopSession       func(ctx context.Context, sessionID string) error
-	TestPreset        func(ctx context.Context, presetName, sessionID string) (string, error)
-	GeneratePreset    func(ctx context.Context, description string) (config.Preset, error)
-	RefinePreset      func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error)
-	RestoreFromGDrive func(ctx context.Context) (map[string]any, error)
+	Pause                   func()
+	Resume                  func()
+	IsPaused                func() bool
+	OnStatusChanged         func(paused bool)
+	Warnings                func() []string
+	ActiveSession           func() (string, time.Time)
+	Presets                 func() map[string]config.Preset
+	Resummarize             func(ctx context.Context, sessionID, preset string) error
+	OnSessionMerged         func(ctx context.Context, sessionID string)
+	EndSession              func(ctx context.Context) error
+	StartSession            func(ctx context.Context, titleHint string) (string, error)
+	StopSession             func(ctx context.Context, sessionID string) error
+	TestPreset              func(ctx context.Context, presetName, sessionID string) (string, error)
+	GeneratePreset          func(ctx context.Context, description string) (config.Preset, error)
+	RefinePreset            func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error)
+	RestoreFromGDrive       func(ctx context.Context) (map[string]any, error)
 	FaultDeepgramDisconnect func() error
-	GetLogs           func(level string, limit int, since time.Time) []logging.LogEntry
-	RetrySync         func(ctx context.Context, sessionID string) error
-	RetryRefinement   func(ctx context.Context, sessionID string) error
-	DiagnoseMic       func(ctx context.Context) (map[string]any, error)
+	GetLogs                 func(level string, limit int, since time.Time) []logging.LogEntry
+	RetrySync               func(ctx context.Context, sessionID string) error
+	RetryRefinement         func(ctx context.Context, sessionID string) error
+	DiagnoseMic             func(ctx context.Context) (map[string]any, error)
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {
@@ -42,7 +42,7 @@ func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHook
 }
 
 func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, logger *slog.Logger, cfgStore ...*config.Store) (http.Handler, error) {
-moduleLogger := logging.WithModule(logger, "server")
+	moduleLogger := logging.WithModule(logger, "server")
 	if healthChecker == nil {
 		healthChecker = &DefaultHealthChecker{}
 	}

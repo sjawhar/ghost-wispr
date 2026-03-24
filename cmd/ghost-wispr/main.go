@@ -69,11 +69,11 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	return streamingTranscript
 }
 
-func makeBatchTranscriber(cfg config.Config) (transcribe.BatchTranscriber, error) {
+func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.BatchTranscription.Provider)) {
 	case "", "deepgram":
 		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
-			return nil, fmt.Errorf("Deepgram API key not configured")
+			return nil, fmt.Errorf("deepgram API key not configured")
 		}
 		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
 			APIKey: cfg.DeepgramAPIKey,
@@ -212,7 +212,7 @@ func main() {
 	}
 
 	// Startup validation: check component readiness from config.
-	startupStatus := config.ValidateStartup(cfg)
+	startupStatus := config.ValidateStartup(&cfg)
 
 	store, err := storage.NewSQLiteStore(cfg.DBPath)
 	if err != nil {
@@ -232,7 +232,8 @@ func main() {
 	if err != nil {
 		log.Printf("warning: failed to query sessions with empty titles: %v", err)
 	} else if len(emptyTitleSessions) > 0 {
-		for _, sess := range emptyTitleSessions {
+		for i := range emptyTitleSessions {
+			sess := &emptyTitleSessions[i]
 			segments, _ := store.GetSegments(sess.ID)
 			var transcript string
 			for _, seg := range segments {
@@ -313,7 +314,7 @@ func main() {
 
 	recState := &recorderState{}
 	warnings := append([]string{}, cfgWarnings...)
-	if batchTranscriber, err := makeBatchTranscriber(cfg); err != nil {
+	if batchTranscriber, err := makeBatchTranscriber(&cfg); err != nil {
 		log.Printf("warning: batch transcription disabled: %v", err)
 		warnings = append(warnings, "Batch transcription unavailable — using streaming transcript fallback")
 	} else {
@@ -642,7 +643,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("config: summarizer updated for provider %s", provider)
 		}
 
-		if batchTranscriber, err := makeBatchTranscriber(newCfg); err != nil {
+		if batchTranscriber, err := makeBatchTranscriber(&newCfg); err != nil {
 			manager.SetBatchTranscriber(nil)
 			log.Printf("config: batch transcriber disabled: %v", err)
 		} else {
@@ -732,7 +733,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 							seen[id] = struct{}{}
 						}
 
-						for _, sess := range retryScheduled {
+						for i := range retryScheduled {
+							sess := &retryScheduled[i]
 							if !gdrive.IsRetryReady(now, sess.RetryCount, sess.LastSyncAttempt) {
 								continue
 							}
@@ -903,7 +905,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, cfgStore)
 	if err != nil {
-		log.Fatalf("build http handler failed: %v", err)
+		panic(fmt.Sprintf("build http handler failed: %v", err))
 	}
 
 	addr := os.Getenv("GHOST_WISPR_ADDR")
@@ -918,7 +920,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}()
 
 	// Log structured startup banner.
-	config.LogStartupBanner(appLogger, startupStatus, Version, Commit, BuildTime)
+	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)
 	slog.Info("deepgram API key", "status", config.MaskAPIKey(cfg.DeepgramAPIKey))
 	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://127.0.0.1%s", Version, Commit, BuildTime, addr)
 
