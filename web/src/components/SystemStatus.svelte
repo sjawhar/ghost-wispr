@@ -84,20 +84,20 @@
 <div class="system-status" data-testid="system-status-header">
   <div class="status-item" data-testid="status-overall">
     <span class="status-dot" style="background-color: {getHealthColor(overallHealth)}"></span>
-    <span class="status-label">System: {overallHealth}</span>
+    <span class="status-label" style="color: {getHealthColor(overallHealth)}">System: {overallHealth}</span>
   </div>
   <div class="status-divider">|</div>
   <div class="status-item" data-testid="status-deepgram">
     <span class="status-dot" style="background-color: {getStatusColor(deepgramStatus?.status)}"></span>
-    <span class="status-label">Deepgram: {deepgramStatus?.status || 'unknown'}</span>
+    <span class="status-label" style="color: {getStatusColor(deepgramStatus?.status)}">Deepgram: {deepgramStatus?.status || 'unknown'}</span>
   </div>
   <div class="status-item" data-testid="status-sync">
     <span class="status-dot" style="background-color: {getStatusColor(syncStatus?.status)}"></span>
-    <span class="status-label">Drive Sync: {syncStatus?.status || 'unknown'}</span>
+    <span class="status-label" style="color: {getStatusColor(syncStatus?.status)}">Drive Sync: {syncStatus?.status || 'unknown'}</span>
   </div>
   <div class="status-item" data-testid="status-mic">
     <span class="status-dot" style="background-color: {getStatusColor(micStatus?.status)}"></span>
-    <span class="status-label">Mic: {micStatus?.status || 'unknown'}</span>
+    <span class="status-label" style="color: {getStatusColor(micStatus?.status)}">Mic: {micStatus?.status || 'unknown'}</span>
   </div>
 </div>
 
