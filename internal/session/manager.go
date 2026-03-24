@@ -4,14 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -24,18 +26,29 @@ type Manager struct {
 	detector           *Detector
 	buffer             *UtteranceBuffer
 	minSessionSegments int
+	logger             *slog.Logger
+	batchLogger        *slog.Logger
+	batchTranscriber   transcribe.BatchTranscriber
+	refinementWait     time.Duration
 
 	mu               sync.Mutex
 	currentSessionID string
 	currentStartedAt time.Time
+	manualSession    bool
+	prevTimeout      time.Duration
 }
 
-func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int) *Manager {
+func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int, logger ...*slog.Logger) *Manager {
 	if detector == nil {
 		detector = NewDetector(30 * time.Second)
 	}
 	if minSessionSegments < 0 {
 		minSessionSegments = 0
+	}
+
+	l := logging.WithModule(slog.Default(), "session")
+	if len(logger) > 0 && logger[0] != nil {
+		l = logging.WithModule(logger[0], "session")
 	}
 
 	m := &Manager{
@@ -46,6 +59,9 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 		detector:           detector,
 		buffer:             NewUtteranceBuffer(),
 		minSessionSegments: minSessionSegments,
+		logger:             l,
+		batchLogger:        logging.WithModule(l, "transcribe"),
+		refinementWait:     30 * time.Second,
 	}
 
 	detector.OnSessionEnd(func() {
@@ -193,9 +209,9 @@ func (m *Manager) ForceEndSession(ctx context.Context) error {
 	// Flush any buffered words before ending — is_final=true words not yet persisted.
 	if err := m.flushBuffer(); err != nil && !errors.Is(err, ErrNoActiveSession) {
 		// Log flush failure but don't block session end.
-		_ = err
+		m.logger.Warn("flush buffer failed", "error", err)
 	}
-	return m.endCurrentSession(ctx)
+	return m.endCurrentSessionAndRestore(ctx)
 }
 
 func (m *Manager) ensureSessionStarted(now time.Time) error {
@@ -279,9 +295,9 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 				m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 			}
 			if discardErr := m.store.DiscardSession(sessionID); discardErr != nil {
-				log.Printf("warning: failed to discard short session %s: %v", sessionID, discardErr)
+				m.logger.Warn("failed to discard short session", "operation", "discard_short_session", "session_id", sessionID, "error", discardErr)
 			} else {
-				log.Printf("discarded short session %s (%d segments < %d minimum)", sessionID, count, minSegs)
+				m.logger.Info("discarded short session", "operation", "discard_short_session", "session_id", sessionID, "segments", count, "minimum_segments", minSegs)
 			}
 			return nil
 		}
@@ -291,21 +307,78 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 		m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 	}
 
-	go m.generateSummary(context.Background(), sessionID)
+	m.mu.Lock()
+	batchTranscriber := m.batchTranscriber
+	m.mu.Unlock()
+
+	if batchTranscriber != nil && strings.TrimSpace(audioPath) != "" {
+		go m.runBatchRefinement(context.Background(), sessionID, audioPath)
+	}
+
+	go m.generateSummary(context.Background(), sessionID, startedAt)
 	return nil
 }
 
-func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
+func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath string) {
+	m.mu.Lock()
+	batchTranscriber := m.batchTranscriber
+	m.mu.Unlock()
+	if batchTranscriber == nil {
+		return
+	}
+
+	if err := m.store.UpdateRefinement(sessionID, "", storage.RefinementRunning); err != nil {
+		m.batchLogger.Error("failed to mark refinement running", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		return
+	}
+
+	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
+	transcript, err := batchTranscriber.Transcribe(ctx, audioPath)
+	if err != nil {
+		if updateErr := m.store.UpdateRefinement(sessionID, "", storage.RefinementFailed); updateErr != nil {
+			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
+		}
+		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusError, fmt.Sprintf("Batch refinement failed for session %s", sessionID))
+		}
+		return
+	}
+
+	if err := m.store.UpdateRefinement(sessionID, transcript, storage.RefinementCompleted); err != nil {
+		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		return
+	}
+
+	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID)
+	if m.hub != nil {
+		m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
+	}
+
+	// Re-canonicalize now that refined transcript is available.
+	if err := m.store.Canonicalize(sessionID); err != nil {
+		m.batchLogger.Error("failed to re-canonicalize after batch refinement", "operation", "batch_refinement", "session_id", sessionID, "error", err)
+	}
+}
+
+func (m *Manager) generateSummary(ctx context.Context, sessionID string, startedAt time.Time) {
 	m.mu.Lock()
 	summarizer := m.summarizer
 	syncer := m.syncer
 	m.mu.Unlock()
 
 	if summarizer == nil {
+		// Still canonicalize for GDrive sync even without summarizer.
+		if err := m.store.Canonicalize(sessionID); err != nil {
+			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		}
 		if syncer != nil {
 			go func() {
 				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-					log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+					m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
+					if m.hub != nil {
+						m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+					}
 				}
 			}()
 		}
@@ -314,32 +387,58 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 
 	_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
 
-	segments, err := m.store.GetSegments(sessionID)
+	// Wait for batch refinement if configured, then canonicalize.
+	m.mu.Lock()
+	batchConfigured := m.batchTranscriber != nil
+	m.mu.Unlock()
+	if batchConfigured {
+		_ = m.waitForRefinedTranscript(ctx, sessionID)
+	}
+
+	// Canonicalize the transcript (picks refined if available, else assembles streaming).
+	if err := m.store.Canonicalize(sessionID); err != nil {
+		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+	}
+
+	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
 	if err != nil {
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, "")
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, "")
+		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to retrieve transcript for session %s", sessionID))
+		}
 		return
 	}
 
-	var b strings.Builder
-	for _, segment := range segments {
-		if strings.TrimSpace(segment.Text) == "" {
-			continue
-		}
-		b.WriteString(segment.Text)
-		b.WriteString("\n")
+	// For title fallback, still need segments.
+	segments, err := m.store.GetSegments(sessionID)
+	if err != nil {
+		m.logger.Warn("failed to get segments for title fallback", "operation", "generate_summary", "session_id", sessionID, "error", err)
 	}
 
-	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, b.String())
+	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, transcript)
+	// Safety net: ensure title is never empty using fallback chain.
+	if strings.TrimSpace(title) == "" {
+		title = summary.GenerateTitle("", transcript, segments, startedAt)
+	}
 	if err != nil {
+		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
+		}
 		return
 	}
 
 	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset); err != nil {
+		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
+		}
 		return
 	}
 
@@ -348,7 +447,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	if syncer != nil {
 		go func() {
 			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-				log.Printf("gdrive sync error for session %s: %v", sessionID, err)
+				m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
+				if m.hub != nil {
+					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+				}
 			}
 		}()
 	}
@@ -395,6 +497,59 @@ func (m *Manager) SetMinSessionSegments(n int) {
 	m.minSessionSegments = n
 }
 
+func (m *Manager) SetBatchTranscriber(t transcribe.BatchTranscriber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchTranscriber = t
+}
+
+func (m *Manager) SetRefinementWaitTimeout(timeout time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if timeout <= 0 {
+		m.refinementWait = 30 * time.Second
+		return
+	}
+	m.refinementWait = timeout
+}
+
+func (m *Manager) waitForRefinedTranscript(ctx context.Context, sessionID string) string {
+	m.mu.Lock()
+	waitTimeout := m.refinementWait
+	m.mu.Unlock()
+
+	if waitTimeout <= 0 {
+		waitTimeout = 30 * time.Second
+	}
+
+	deadline := time.Now().Add(waitTimeout)
+	for {
+		transcript, status, err := m.store.GetRefinement(sessionID)
+		if err != nil {
+			m.batchLogger.Warn("failed to read refinement state", "operation", "wait_refinement", "session_id", sessionID, "error", err)
+			return ""
+		}
+
+		switch status {
+		case storage.RefinementCompleted:
+			return strings.TrimSpace(transcript)
+		case storage.RefinementFailed:
+			return ""
+		case storage.RefinementPending, storage.RefinementRunning:
+			if time.Now().After(deadline) {
+				return ""
+			}
+			select {
+			case <-ctx.Done():
+				return ""
+			case <-time.After(100 * time.Millisecond):
+			}
+		default:
+			return ""
+		}
+	}
+}
+
 func (m *Manager) OnTranscriptionDisconnect() {
 	m.mu.Lock()
 	if m.buffer == nil {
@@ -407,10 +562,116 @@ func (m *Manager) OnTranscriptionDisconnect() {
 	// Persist buffered words — flushBuffer handles its own locking
 	// via ensureSessionStarted/currentSession, so m.mu must NOT be held.
 	if err := m.flushBuffer(); err != nil {
-		log.Printf("error persisting buffered words on disconnect: %v", err)
+		m.logger.Error("failed to persist buffered words on disconnect", "operation", "flush_buffer", "error", err)
 	}
 
 	if detector != nil {
 		detector.OnSpeech()
 	}
+}
+
+// ManualStartSession starts a new session manually. Returns the session ID.
+// If a session is already active, returns ErrSessionAlreadyActive.
+// Manual sessions use a 5-minute silence timeout instead of the default 30s.
+func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (string, error) {
+	now := time.Now().UTC()
+
+	m.mu.Lock()
+	if m.currentSessionID != "" {
+		m.mu.Unlock()
+		return "", ErrSessionAlreadyActive
+	}
+
+	sessionID := now.Format("20060102150405")
+	if m.currentStartedAt.Format("20060102150405") == sessionID {
+		sessionID = now.Add(time.Second).Format("20060102150405")
+	}
+	m.currentSessionID = sessionID
+	m.currentStartedAt = now
+	m.manualSession = true
+	m.mu.Unlock()
+
+	if err := m.store.CreateSession(sessionID, now); err != nil {
+		m.mu.Lock()
+		m.currentSessionID = ""
+		m.currentStartedAt = time.Time{}
+		m.manualSession = false
+		m.mu.Unlock()
+		return "", fmt.Errorf("create session: %w", err)
+	}
+
+	// Set title hint if provided.
+	if titleHint != "" {
+		if err := m.store.UpdateTitle(sessionID, titleHint); err != nil {
+			m.logger.Warn("failed to set title hint on manual session", "operation", "manual_start", "session_id", sessionID, "error", err)
+		}
+	}
+
+	if m.recorder != nil {
+		if err := m.recorder.StartSession(sessionID); err != nil {
+			m.mu.Lock()
+			m.currentSessionID = ""
+			m.currentStartedAt = time.Time{}
+			m.manualSession = false
+			m.mu.Unlock()
+			_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
+			return "", fmt.Errorf("start audio recorder session: %w", err)
+		}
+	}
+
+	// Extend silence timeout for manual sessions (5 min vs default 30s).
+	m.mu.Lock()
+	detector := m.detector
+	m.mu.Unlock()
+	if detector != nil {
+		m.mu.Lock()
+		m.prevTimeout = detector.timeout
+		m.mu.Unlock()
+		detector.SetTimeout(5 * time.Minute)
+	}
+
+	if m.hub != nil {
+		m.hub.BroadcastSessionStarted(sessionID)
+	}
+
+	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint", titleHint)
+	return sessionID, nil
+}
+
+// StopSession ends a specific session by ID. If the given sessionID does not
+// match the currently active session, returns ErrNoActiveSession.
+func (m *Manager) StopSession(ctx context.Context, sessionID string) error {
+	m.mu.Lock()
+	if m.currentSessionID != sessionID {
+		m.mu.Unlock()
+		return ErrNoActiveSession
+	}
+	m.mu.Unlock()
+
+	return m.endCurrentSessionAndRestore(ctx)
+}
+
+// endCurrentSessionAndRestore ends the current session and restores the
+// silence timeout if it was changed for a manual session.
+func (m *Manager) endCurrentSessionAndRestore(ctx context.Context) error {
+	m.mu.Lock()
+	wasManual := m.manualSession
+	prevTimeout := m.prevTimeout
+	m.mu.Unlock()
+
+	err := m.endCurrentSession(ctx)
+
+	// Restore previous silence timeout if this was a manual session.
+	if wasManual && prevTimeout > 0 {
+		m.mu.Lock()
+		detector := m.detector
+		m.manualSession = false
+		m.prevTimeout = 0
+		m.mu.Unlock()
+		if detector != nil {
+			detector.SetTimeout(prevTimeout)
+		}
+	}
+
+	return err
 }

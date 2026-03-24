@@ -1,0 +1,15 @@
+This is a test fixture for Ghost Whisper transcription testing.
+
+The audio file (sample-speech.wav) contains synthetic audio with varying frequencies
+(200 Hz for 2 seconds, then 400 Hz for 2 seconds) at 16 kHz sample rate, mono channel.
+
+This fixture is used to verify that:
+1. The Deepgram nova-3 model is correctly configured
+2. Audio injection via virtual audio device works
+3. Transcription pipeline processes audio without errors
+
+Expected transcription accuracy: This synthetic audio will not produce meaningful speech
+transcription. The reference is provided for baseline comparison and to verify the
+transcription pipeline completes without errors.
+
+For real speech testing, replace this file with actual recorded speech samples.

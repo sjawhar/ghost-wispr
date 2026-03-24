@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PresetDetail } from '../lib/config-api'
-  import type { SessionSummary, Segment } from '../lib/types'
+  import { SessionStatus, type SessionSummary, type Segment } from '../lib/types'
   import { generatePreset, refinePreset, patchConfig, testPreset } from '../lib/config-api'
   import { fetchDates, fetchSessions, fetchSession } from '../lib/api'
   import { setConfig } from '../lib/config.svelte'
@@ -207,7 +207,7 @@
       allSessions.push(...sessionArrays.flat())
       // Most recent first, only completed sessions with transcripts.
       testSessions = allSessions
-        .filter((s) => s.status === 'ended')
+        .filter((s) => s.status === SessionStatus.Ended)
         .sort((a, b) => b.id.localeCompare(a.id))
         .slice(0, 20)
     } catch {

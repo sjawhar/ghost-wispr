@@ -17,21 +17,51 @@ type mockLLMClient struct {
 	failUntil    int // fail until calls reaches this number (default: 0 = never fail)
 	response     string
 	err          error
+	jsonQueue    []mockJSONResult
+	textQueue    []mockTextResult
 	lastMessages []llm.Message
+	lastSchema   map[string]any
+}
+
+type mockJSONResult struct {
+	response string
+	err      error
+}
+
+type mockTextResult struct {
+	response string
+	err      error
 }
 
 func (m *mockLLMClient) Complete(_ context.Context, messages []llm.Message) (string, error) {
 	m.calls++
 	m.lastMessages = append([]llm.Message(nil), messages...)
+	if len(m.textQueue) > 0 {
+		item := m.textQueue[0]
+		m.textQueue = m.textQueue[1:]
+		if item.err != nil {
+			return "", item.err
+		}
+		return item.response, nil
+	}
 	if m.err != nil && m.calls <= m.failUntil {
 		return "", m.err
 	}
 	return m.response, nil
 }
 
-func (m *mockLLMClient) CompleteJSON(_ context.Context, messages []llm.Message, _ map[string]any) (json.RawMessage, error) {
+func (m *mockLLMClient) CompleteJSON(_ context.Context, messages []llm.Message, schema map[string]any) (json.RawMessage, error) {
 	m.calls++
 	m.lastMessages = append([]llm.Message(nil), messages...)
+	m.lastSchema = schema
+	if len(m.jsonQueue) > 0 {
+		item := m.jsonQueue[0]
+		m.jsonQueue = m.jsonQueue[1:]
+		if item.err != nil {
+			return nil, item.err
+		}
+		return json.RawMessage(item.response), nil
+	}
 	if m.err != nil && m.calls <= m.failUntil {
 		return nil, m.err
 	}
@@ -109,8 +139,8 @@ func TestSummarizeSkipsShortTranscript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Summarize returned error: %v", err)
 	}
-	if title != "" {
-		t.Fatalf("expected empty title, got %q", title)
+	if title == "" {
+		t.Fatal("expected non-empty fallback title")
 	}
 	if summaryText != "" {
 		t.Fatalf("expected empty summary, got %q", summaryText)
@@ -202,7 +232,13 @@ func TestSummarizeWithPreset(t *testing.T) {
 
 func TestSummarizeRetries(t *testing.T) {
 	transcript := buildTranscript(25)
-	client := &mockLLMClient{response: `{"title":"Retry title","summary":"retry-success"}`, err: errors.New("temporary"), failUntil: 4}
+	client := &mockLLMClient{jsonQueue: []mockJSONResult{
+		{err: errors.New("openai json completion: status 429 rate limit")},
+		{err: errors.New("openai json completion: status 429 rate limit")},
+		{err: errors.New("openai json completion: status 429 rate limit")},
+		{err: errors.New("openai json completion: status 429 rate limit")},
+		{response: `{"title":"Retry title","summary":"retry-success"}`},
+	}}
 	var sleeps []time.Duration
 
 	cfg := config.Summarization{
@@ -233,16 +269,170 @@ func TestSummarizeRetries(t *testing.T) {
 	if summaryText != "retry-success" {
 		t.Fatalf("expected retry-success, got %q", summaryText)
 	}
-	// Flow: CompleteJSON fail (1), Complete fallback fail (2), retry CompleteJSON fail (3), sleep,
-	// retry CompleteJSON fail (4), sleep, retry CompleteJSON succeed (5).
 	if client.calls != 5 {
 		t.Fatalf("expected 5 llm calls, got %d", client.calls)
 	}
-	if len(sleeps) != 2 {
-		t.Fatalf("expected 2 sleep calls, got %d", len(sleeps))
+	if len(sleeps) != 4 {
+		t.Fatalf("expected 4 sleep calls, got %d", len(sleeps))
 	}
-	if sleeps[0] != time.Second || sleeps[1] != 4*time.Second {
+	if sleeps[0] != time.Second || sleeps[1] != 2*time.Second || sleeps[2] != 4*time.Second || sleeps[3] != 8*time.Second {
 		t.Fatalf("unexpected sleep durations: %#v", sleeps)
+	}
+}
+
+func TestRetryOnRateLimit429(t *testing.T) {
+	transcript := buildTranscript(25)
+	client := &mockLLMClient{jsonQueue: []mockJSONResult{
+		{err: errors.New("openai json completion: status 429 rate_limit")},
+		{err: errors.New("openai json completion: status 429 rate_limit")},
+		{response: `{"title":"Recovered","summary":"done"}`},
+	}}
+	var sleeps []time.Duration
+
+	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+		Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
+	}}}
+
+	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+	s.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
+
+	title, summaryText, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	if err != nil {
+		t.Fatalf("SummarizeWithPreset failed: %v", err)
+	}
+	if title != "Recovered" || summaryText != "done" {
+		t.Fatalf("unexpected output title=%q summary=%q", title, summaryText)
+	}
+	if client.calls != 3 {
+		t.Fatalf("expected 3 llm calls, got %d", client.calls)
+	}
+	if len(sleeps) != 2 || sleeps[0] != time.Second || sleeps[1] != 2*time.Second {
+		t.Fatalf("unexpected sleep pattern: %#v", sleeps)
+	}
+}
+
+func TestNoRetryOnBadRequest400(t *testing.T) {
+	transcript := buildTranscript(25)
+	client := &mockLLMClient{jsonQueue: []mockJSONResult{{err: errors.New("openai json completion: status 400 invalid_schema")}}}
+	var sleeps []time.Duration
+
+	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+		Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
+	}}}
+
+	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+	s.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
+
+	_, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if client.calls != 1 {
+		t.Fatalf("expected single attempt on 400, got %d", client.calls)
+	}
+	if len(sleeps) != 0 {
+		t.Fatalf("expected no sleeps, got %#v", sleeps)
+	}
+}
+
+func TestChunkingLongTranscriptAndMerge(t *testing.T) {
+	transcript := buildTranscript(120)
+	client := &mockLLMClient{
+		textQueue: []mockTextResult{{response: "chunk one summary"}, {response: "chunk two summary"}},
+		jsonQueue: []mockJSONResult{{response: `{"title":"Merged Title","summary":"Merged BLUF summary"}`}},
+	}
+
+	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+		Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
+	}}}
+
+	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+	s.chunkTokenThreshold = 20
+	s.chunkSizeTokens = 80
+	s.chunkOverlapTokens = 20
+
+	title, summaryText, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	if err != nil {
+		t.Fatalf("SummarizeWithPreset failed: %v", err)
+	}
+	if title != "Merged Title" {
+		t.Fatalf("expected merged title, got %q", title)
+	}
+	if summaryText != "Merged BLUF summary" {
+		t.Fatalf("expected merged summary, got %q", summaryText)
+	}
+	if client.calls != 3 {
+		t.Fatalf("expected 3 calls (2 chunk + 1 merge), got %d", client.calls)
+	}
+}
+
+func TestPromptAndSchemaStructuredConstraints(t *testing.T) {
+	transcript := buildTranscript(25)
+	client := &mockLLMClient{response: `{"title":"Prompt title","summary":"Prompt summary"}`}
+
+	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+		Description: "general", SystemPrompt: "legacy system", UserTemplate: "{{transcript}}",
+	}}}
+
+	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+
+	_, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	if err != nil {
+		t.Fatalf("SummarizeWithPreset failed: %v", err)
+	}
+	if len(client.lastMessages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(client.lastMessages))
+	}
+	if !strings.Contains(strings.ToLower(client.lastMessages[0].Content), "strategic meeting analyst") {
+		t.Fatalf("expected structured system prompt, got %q", client.lastMessages[0].Content)
+	}
+	if !strings.Contains(client.lastMessages[1].Content, "BLUF") {
+		t.Fatalf("expected BLUF instruction in user prompt, got %q", client.lastMessages[1].Content)
+	}
+	if client.lastSchema == nil {
+		t.Fatal("expected JSON schema to be passed")
+	}
+	props, ok := client.lastSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected properties object in schema, got %#v", client.lastSchema)
+	}
+	titleProp, ok := props["title"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected title schema, got %#v", props["title"])
+	}
+	if _, ok := titleProp["description"]; !ok {
+		t.Fatalf("expected title description in schema, got %#v", titleProp)
+	}
+}
+
+func TestContextOverflowFallsBackToChunking(t *testing.T) {
+	transcript := buildTranscript(60)
+	client := &mockLLMClient{
+		jsonQueue: []mockJSONResult{
+			{err: errors.New("openai json completion: status 400 context length exceeded")},
+			{response: `{"title":"Chunked Title","summary":"final"}`},
+		},
+		textQueue: []mockTextResult{{response: "chunk a"}, {response: "chunk b"}},
+	}
+
+	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+		Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
+	}}}
+
+	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+	s.chunkTokenThreshold = 1000
+	s.chunkSizeTokens = 40
+	s.chunkOverlapTokens = 20
+
+	title, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	if err != nil {
+		t.Fatalf("SummarizeWithPreset failed: %v", err)
+	}
+	if title != "Chunked Title" {
+		t.Fatalf("expected chunked title, got %q", title)
+	}
+	if client.calls != 4 {
+		t.Fatalf("expected 4 calls (1 failed json + 2 chunks + 1 merge), got %d", client.calls)
 	}
 }
 

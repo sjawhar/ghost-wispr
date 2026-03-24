@@ -1,3 +1,57 @@
+export enum ComponentStatus {
+  Connected = 'connected',
+  Disconnected = 'disconnected',
+  Reconnecting = 'reconnecting',
+  Error = 'error',
+  Open = 'open',
+  Closed = 'closed',
+  Synced = 'synced',
+  Ok = 'ok',
+  Draining = 'draining',
+}
+
+export enum SessionStatus {
+  Active = 'active',
+  Ended = 'ended',
+  Discarded = 'discarded',
+}
+
+export enum SummaryStatus {
+  Pending = 'pending',
+  Running = 'running',
+  Completed = 'completed',
+  Failed = 'failed',
+}
+
+export enum SyncState {
+  Pending = 'PENDING',
+  Syncing = 'SYNCING',
+  Synced = 'SYNCED',
+  Failed = 'FAILED',
+  RetryScheduled = 'RETRY_SCHEDULED',
+}
+
+export enum SyncStatus {
+  Pending = 'pending',
+  Syncing = 'syncing',
+  Synced = 'synced',
+  Failed = 'failed',
+}
+
+export enum RefinementStatus {
+  Pending = 'pending',
+  Running = 'running',
+  Completed = 'completed',
+  Failed = 'failed',
+}
+
+export enum HealthStatus {
+  Healthy = 'healthy',
+  Degraded = 'degraded',
+  Error = 'error',
+  Loading = 'loading',
+}
+
 export interface BaseEvent {
   type: string
   version: number
@@ -35,7 +89,7 @@ export interface SummaryReadyEvent extends BaseEvent {
   session_id: string
   title: string
   summary: string
-  status: 'pending' | 'running' | 'completed' | 'failed'
+  status: SummaryStatus
   summary_preset?: string
 }
 
@@ -49,6 +103,13 @@ export interface ConnectionEvent extends BaseEvent {
   connected: boolean
 }
 
+export interface ComponentStatusEvent extends BaseEvent {
+  type: 'component_status'
+  component: 'deepgram' | 'summary' | 'sync' | 'mic'
+  status: ComponentStatus
+  message: string
+}
+
 export type WebSocketEvent =
   | LiveTranscriptEvent
   | LiveTranscriptInterimEvent
@@ -57,6 +118,7 @@ export type WebSocketEvent =
   | SummaryReadyEvent
   | StatusChangedEvent
   | ConnectionEvent
+  | ComponentStatusEvent
 
 export interface Segment {
   speaker: number
@@ -71,11 +133,14 @@ export interface SessionSummary {
   title: string
   started_at: string
   ended_at?: string
-  status: string
+  status: SessionStatus | string
   summary: string
-  summary_status: 'pending' | 'running' | 'completed' | 'failed'
+  summary_status: SummaryStatus
   summary_preset: string
   audio_path: string
+  sync_status?: SyncStatus
+  refinement_status?: RefinementStatus
+  transcript_source?: string
 }
 
 export interface SessionDetailResponse {
@@ -88,6 +153,13 @@ export interface StatusResponse {
   warnings: string[]
   active_session_id: string
   active_session_started_at: string
+}
+
+export interface SearchResult {
+  session_id: string
+  title: string
+  snippet: string
+  rank: number
 }
 
 export type PresetMap = Record<string, string>

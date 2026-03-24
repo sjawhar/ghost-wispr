@@ -186,3 +186,10 @@ func (rc *ResilientClient) drainBuffer() {
 		}
 	}
 }
+
+// IsConnected returns true if the Deepgram connection is currently connected.
+func (rc *ResilientClient) IsConnected() bool {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	return rc.State == StateConnected
+}

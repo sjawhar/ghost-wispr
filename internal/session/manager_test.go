@@ -25,19 +25,28 @@ type storeMock struct {
 	preset   map[string]string
 	audio    map[string]string
 
+	refinementStatus    map[string]string
+	refinedTranscript   map[string]string
+	canonicalTranscript map[string]string
+	transcriptSource    map[string]string
+
 	endSessionErr   error
 	endSessionCalls int
 }
 
 func newStoreMock() *storeMock {
 	return &storeMock{
-		sessions: map[string]time.Time{},
-		segments: map[string][]transcribe.Segment{},
-		title:    map[string]string{},
-		summary:  map[string]string{},
-		status:   map[string]string{},
-		preset:   map[string]string{},
-		audio:    map[string]string{},
+		sessions:            map[string]time.Time{},
+		segments:            map[string][]transcribe.Segment{},
+		title:               map[string]string{},
+		summary:             map[string]string{},
+		status:              map[string]string{},
+		preset:              map[string]string{},
+		audio:               map[string]string{},
+		refinementStatus:    map[string]string{},
+		refinedTranscript:   map[string]string{},
+		canonicalTranscript: map[string]string{},
+		transcriptSource:    map[string]string{},
 	}
 }
 
@@ -46,6 +55,7 @@ func (s *storeMock) CreateSession(id string, startedAt time.Time) error {
 	defer s.mu.Unlock()
 	s.sessions[id] = startedAt
 	s.status[id] = "active"
+	s.refinementStatus[id] = "pending"
 	return nil
 }
 
@@ -105,6 +115,51 @@ func (s *storeMock) CountSegments(sessionID string) (int, error) {
 	return len(s.segments[sessionID]), nil
 }
 
+func (s *storeMock) UpdateRefinement(sessionID, transcript, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refinementStatus[sessionID] = status
+	if transcript != "" {
+		s.refinedTranscript[sessionID] = transcript
+	}
+	return nil
+}
+
+func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refinedTranscript[sessionID], s.refinementStatus[sessionID], nil
+}
+
+func (s *storeMock) Canonicalize(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status := s.refinementStatus[sessionID]
+	if status == "completed" && strings.TrimSpace(s.refinedTranscript[sessionID]) != "" {
+		s.canonicalTranscript[sessionID] = s.refinedTranscript[sessionID]
+		s.transcriptSource[sessionID] = "refined"
+	} else {
+		var b strings.Builder
+		for _, seg := range s.segments[sessionID] {
+			text := strings.TrimSpace(seg.Text)
+			if text == "" {
+				continue
+			}
+			b.WriteString(text)
+			b.WriteByte('\n')
+		}
+		s.canonicalTranscript[sessionID] = b.String()
+		s.transcriptSource[sessionID] = "streaming"
+	}
+	return nil
+}
+
+func (s *storeMock) GetCanonicalTranscript(sessionID string) (string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.canonicalTranscript[sessionID], s.transcriptSource[sessionID], nil
+}
+
 type recorderMock struct {
 	mu      sync.Mutex
 	started []string
@@ -135,6 +190,41 @@ func (r *recorderMock) EndSession() (string, error) {
 
 type summarizerMock struct {
 	called chan string
+}
+
+type transcriptCapturingSummarizer struct {
+	called      chan string
+	transcriptC chan string
+}
+
+func (s transcriptCapturingSummarizer) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, error) {
+	if s.called != nil {
+		s.called <- sessionID
+	}
+	if s.transcriptC != nil {
+		s.transcriptC <- transcript
+	}
+	return "Auto title", "## Summary\n- " + transcript, "default", nil
+}
+
+type batchTranscriberMock struct {
+	transcript string
+	err        error
+	delay      time.Duration
+	calledPath chan string
+}
+
+func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (string, error) {
+	if b.calledPath != nil {
+		b.calledPath <- audioPath
+	}
+	if b.delay > 0 {
+		time.Sleep(b.delay)
+	}
+	if b.err != nil {
+		return "", b.err
+	}
+	return b.transcript, nil
 }
 
 type syncerMock struct {
@@ -224,6 +314,14 @@ func (h *hubMock) BroadcastSummaryReady(sessionID, title, summary, status, prese
 	h.latestSummary = summary
 	h.latestStatus = status
 	h.latestPreset = preset
+	h.mu.Unlock()
+}
+
+func (h *hubMock) BroadcastComponentStatus(component, status, message string) {
+	h.mu.Lock()
+	_ = component
+	_ = status
+	_ = message
 	h.mu.Unlock()
 }
 
@@ -599,7 +697,7 @@ func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T)
 	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
 	manager.SetSyncer(syncerMock{called: syncCalled})
 
-	manager.generateSummary(context.Background(), "session-no-summarizer")
+	manager.generateSummary(context.Background(), "session-no-summarizer", time.Time{})
 
 	select {
 	case got := <-syncCalled:
@@ -625,7 +723,7 @@ func TestManager_GenerateSummary_TriggersSyncAfterSummaryCompleted(t *testing.T)
 	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, nil, NewDetector(time.Hour), 0)
 	manager.SetSyncer(syncerMock{called: syncCalled})
 
-	manager.generateSummary(context.Background(), "session-with-summary")
+	manager.generateSummary(context.Background(), "session-with-summary", time.Time{})
 
 	select {
 	case <-summaryCalled:
@@ -640,5 +738,206 @@ func TestManager_GenerateSummary_TriggersSyncAfterSummaryCompleted(t *testing.T)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected sync to trigger after summary completion")
+	}
+}
+
+func TestManager_BatchRefinement_SubmitsAndStoresRefinedTranscript(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	calledPath := make(chan string, 1)
+	transcriptC := make(chan string, 1)
+
+	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{
+		transcript: "refined canonical transcript",
+		calledPath: calledPath,
+	})
+	manager.SetRefinementWaitTimeout(500 * time.Millisecond)
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "streaming transcript"}); err != nil {
+		t.Fatalf("append segment failed: %v", err)
+	}
+
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("endCurrentSession failed: %v", err)
+	}
+
+	select {
+	case gotPath := <-calledPath:
+		if gotPath == "" || !strings.HasSuffix(gotPath, ".mp3") {
+			t.Fatalf("expected mp3 audio path for batch refinement, got %q", gotPath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected batch transcription submission")
+	}
+
+	select {
+	case usedTranscript := <-transcriptC:
+		if !strings.Contains(usedTranscript, "refined canonical transcript") {
+			t.Fatalf("expected summary to use refined transcript, got %q", usedTranscript)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected summarization call")
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got := store.refinementStatus[sessionID]; got != "completed" {
+		t.Fatalf("expected refinement status completed, got %q", got)
+	}
+	if got := store.refinedTranscript[sessionID]; got != "refined canonical transcript" {
+		t.Fatalf("expected refined transcript stored, got %q", got)
+	}
+}
+
+func TestManager_BatchRefinement_TimeoutFallsBackToStreamingTranscript(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	transcriptC := make(chan string, 1)
+
+	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{
+		transcript: "late refinement transcript",
+		delay:      250 * time.Millisecond,
+	})
+	manager.SetRefinementWaitTimeout(25 * time.Millisecond)
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "streaming transcript only"}); err != nil {
+		t.Fatalf("append segment failed: %v", err)
+	}
+
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("endCurrentSession failed: %v", err)
+	}
+
+	select {
+	case usedTranscript := <-transcriptC:
+		if strings.Contains(usedTranscript, "late refinement transcript") {
+			t.Fatalf("expected streaming fallback transcript on timeout, got %q", usedTranscript)
+		}
+		if !strings.Contains(usedTranscript, "streaming transcript only") {
+			t.Fatalf("expected summary to use streaming transcript, got %q", usedTranscript)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected summarization call")
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got := store.refinementStatus[sessionID]; got != "completed" {
+		t.Fatalf("expected refinement status eventually completed, got %q", got)
+	}
+	if got := store.refinedTranscript[sessionID]; got != "late refinement transcript" {
+		t.Fatalf("expected late refined transcript persisted, got %q", got)
+	}
+}
+
+func TestManager_Canonicalization_UsesCanonicalTranscriptForSummary(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	transcriptC := make(chan string, 1)
+
+	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{
+		transcript: "refined canonical transcript",
+	})
+	manager.SetRefinementWaitTimeout(500 * time.Millisecond)
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "streaming text"}); err != nil {
+		t.Fatalf("append segment failed: %v", err)
+	}
+
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("endCurrentSession failed: %v", err)
+	}
+
+	// Verify the transcript passed to summarizer came from canonical (which should be refined).
+	select {
+	case usedTranscript := <-transcriptC:
+		// The canonical transcript should have been set via Canonicalize,
+		// which picks the refined version since batch refinement completed.
+		if !strings.Contains(usedTranscript, "refined canonical transcript") {
+			t.Fatalf("expected summary to use canonical (refined) transcript, got %q", usedTranscript)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected summarization call")
+	}
+
+	// Verify canonical state in store.
+	store.mu.Lock()
+	source := store.transcriptSource[sessionID]
+	canonical := store.canonicalTranscript[sessionID]
+	store.mu.Unlock()
+
+	if source != "refined" {
+		t.Fatalf("expected transcript source 'refined', got %q", source)
+	}
+	if !strings.Contains(canonical, "refined canonical transcript") {
+		t.Fatalf("expected canonical transcript to contain refined, got %q", canonical)
+	}
+}
+
+func TestManager_BatchRefinement_LateCompletionRecanonicalizes(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	transcriptC := make(chan string, 1)
+
+	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{
+		transcript: "late refined transcript",
+		delay:      250 * time.Millisecond,
+	})
+	manager.SetRefinementWaitTimeout(25 * time.Millisecond)
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "streaming text"}); err != nil {
+		t.Fatalf("append segment failed: %v", err)
+	}
+
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("endCurrentSession failed: %v", err)
+	}
+
+	// Summary should use streaming fallback since refinement timed out.
+	select {
+	case usedTranscript := <-transcriptC:
+		if strings.Contains(usedTranscript, "late refined transcript") {
+			t.Fatalf("expected streaming fallback transcript on timeout, got %q", usedTranscript)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected summarization call")
+	}
+
+	// Wait for late refinement to complete and re-canonicalize.
+	time.Sleep(400 * time.Millisecond)
+
+	store.mu.Lock()
+	source := store.transcriptSource[sessionID]
+	canonical := store.canonicalTranscript[sessionID]
+	store.mu.Unlock()
+
+	// After late refinement, re-canonicalization should have updated to refined.
+	if source != "refined" {
+		t.Fatalf("expected transcript source 'refined' after late re-canonicalization, got %q", source)
+	}
+	if canonical != "late refined transcript" {
+		t.Fatalf("expected re-canonicalized transcript to contain late refined, got %q", canonical)
 	}
 }

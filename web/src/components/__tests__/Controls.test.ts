@@ -10,6 +10,8 @@ describe('Controls', () => {
       activeSessionId: '',
       onToggle: vi.fn(),
       onEndSession: vi.fn(),
+      onStartSession: vi.fn(),
+      onStopSession: vi.fn(),
     })
 
     expect(screen.getByText('Connected')).toBeTruthy()
@@ -25,6 +27,8 @@ describe('Controls', () => {
       activeSessionId: '',
       onToggle,
       onEndSession: vi.fn(),
+      onStartSession: vi.fn(),
+      onStopSession: vi.fn(),
     })
 
     await fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
@@ -38,6 +42,8 @@ describe('Controls', () => {
       activeSessionId: 'ses_123',
       onToggle: vi.fn(),
       onEndSession: vi.fn(),
+      onStartSession: vi.fn(),
+      onStopSession: vi.fn(),
     })
 
     expect(screen.getByRole('button', { name: 'End Session' })).toBeTruthy()
@@ -50,6 +56,8 @@ describe('Controls', () => {
       activeSessionId: '',
       onToggle: vi.fn(),
       onEndSession: vi.fn(),
+      onStartSession: vi.fn(),
+      onStopSession: vi.fn(),
     })
 
     expect(screen.queryByRole('button', { name: 'End Session' })).toBeNull()

@@ -1,4 +1,10 @@
-import type { PresetMap, SessionDetailResponse, SessionSummary, StatusResponse } from './types'
+import type {
+  PresetMap,
+  SearchResult,
+  SessionDetailResponse,
+  SessionSummary,
+  StatusResponse,
+} from './types'
 
 async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init)
@@ -32,6 +38,10 @@ export function fetchStatus(): Promise<StatusResponse> {
 
 export function fetchPresets(): Promise<PresetMap> {
   return request<PresetMap>('/api/presets')
+}
+
+export function fetchSearch(query: string): Promise<SearchResult[]> {
+  return request<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}`)
 }
 
 export function pauseRecording(): Promise<void> {
@@ -75,4 +85,67 @@ export function mergeSessions(sessionIds: string[]): Promise<SessionSummary> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_ids: sessionIds }),
   })
+}
+
+export function startSession(titleHint?: string): Promise<{ session_id: string }> {
+  return request<{ session_id: string }>('/api/sessions/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(titleHint ? { title_hint: titleHint } : {}),
+  })
+}
+
+export function stopCurrentSession(): Promise<{ status: string }> {
+  return request<{ status: string }>('/api/sessions/current/stop', { method: 'POST' })
+}
+
+export function stopSession(sessionId: string): Promise<{ status: string }> {
+  return request<{ status: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, {
+    method: 'POST',
+  })
+}
+
+export function retrySummary(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-summary`, {
+    method: 'POST',
+  })
+}
+
+export function retrySync(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-sync`, {
+    method: 'POST',
+  })
+}
+
+export function retryRefinement(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-refinement`, {
+    method: 'POST',
+  })
+}
+
+export interface LogEntry {
+  timestamp: string
+  level: string
+  module?: string
+  message: string
+  raw: string
+}
+
+export function fetchLogs(level?: string, limit?: number, since?: string): Promise<LogEntry[]> {
+  const params = new URLSearchParams()
+  if (level && level !== 'ALL') params.set('level', level)
+  if (limit) params.set('limit', limit.toString())
+  if (since) params.set('since', since)
+  const qs = params.toString()
+  return request<LogEntry[]>(`/api/logs${qs ? '?' + qs : ''}`)
+}
+
+export interface HealthResponse {
+  deepgram: string
+  db: string
+  mic: string
+}
+
+export function fetchHealth(): Promise<HealthResponse> {
+  return request<HealthResponse>('/healthz/ready')
 }

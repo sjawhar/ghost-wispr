@@ -5,6 +5,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 )
 
 // ConnectionState represents the state of the Deepgram websocket connection.
@@ -21,11 +23,11 @@ const (
 func (s ConnectionState) String() string {
 	switch s {
 	case StateConnected:
-		return "connected"
+		return gwstatus.ComponentStatusConnected
 	case StateDisconnected:
-		return "disconnected"
+		return gwstatus.ComponentStatusDisconnected
 	case StateReconnecting:
-		return "reconnecting"
+		return gwstatus.ComponentStatusReconnecting
 	case StateDraining:
 		return "draining"
 	default:
@@ -55,6 +57,10 @@ type ClientFactory func(ctx context.Context) (io.WriteCloser, error)
 // ConnectionCallback is a function type for state change notifications.
 // It's called whenever the connection state changes (e.g., for logging or metrics).
 type ConnectionCallback func(state ConnectionState)
+
+type BatchTranscriber interface {
+	Transcribe(ctx context.Context, audioPath string) (string, error)
+}
 
 // ResilientClient wraps an io.WriteCloser (Deepgram client) and buffers audio during disconnects.
 // All fields are exported for testing purposes.
