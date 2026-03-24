@@ -1,9 +1,49 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { appState } from '../lib/state.svelte'
+  import { fetchHealth } from '../lib/api'
 
   const deepgramStatus = $derived(appState.componentStatuses['deepgram'])
   const syncStatus = $derived(appState.componentStatuses['sync'])
   const micStatus = $derived(appState.componentStatuses['mic'])
+
+  onMount(async () => {
+    try {
+      const health = await fetchHealth()
+      // Map health response to componentStatuses format
+      if (health.deepgram) {
+        appState.componentStatuses['deepgram'] = {
+          status: health.deepgram === 'connected' ? 'connected' : 'disconnected',
+          message: '',
+          timestamp: new Date().toISOString(),
+        }
+      }
+      if (health.mic) {
+        appState.componentStatuses['mic'] = {
+          status: health.mic === 'open' ? 'connected' : 'closed',
+          message: '',
+          timestamp: new Date().toISOString(),
+        }
+      }
+      if (health.db) {
+        appState.componentStatuses['db'] = {
+          status: health.db === 'ok' ? 'connected' : 'error',
+          message: '',
+          timestamp: new Date().toISOString(),
+        }
+      }
+      // Map db status to sync for display purposes
+      if (health.db) {
+        appState.componentStatuses['sync'] = {
+          status: health.db === 'ok' ? 'synced' : 'error',
+          message: '',
+          timestamp: new Date().toISOString(),
+        }
+      }
+    } catch (error) {
+      console.error('Failed to fetch health:', error)
+    }
+  })
 
   function getStatusColor(status?: string) {
     switch (status) {
@@ -22,6 +62,8 @@
 
   const overallHealth = $derived.by(() => {
     const statuses = [deepgramStatus?.status, syncStatus?.status, micStatus?.status]
+    const hasAnyStatus = statuses.some(s => s !== undefined)
+    if (!hasAnyStatus) return 'loading'
     if (statuses.includes('error') || statuses.includes('disconnected')) return 'error'
     if (statuses.includes('reconnecting') || statuses.includes('draining')) return 'degraded'
     if (statuses.every(s => s === 'connected' || s === 'synced' || !s)) return 'healthy'
@@ -33,6 +75,7 @@
       case 'healthy': return 'var(--success)'
       case 'degraded': return 'var(--warning)'
       case 'error': return 'var(--danger)'
+      case 'loading': return 'var(--muted)'
       default: return 'var(--muted)'
     }
   }

@@ -139,3 +139,13 @@ export function fetchLogs(level?: string, limit?: number, since?: string): Promi
   const qs = params.toString()
   return request<LogEntry[]>(`/api/logs${qs ? '?' + qs : ''}`)
 }
+
+export interface HealthResponse {
+  deepgram: string
+  db: string
+  mic: string
+}
+
+export function fetchHealth(): Promise<HealthResponse> {
+  return request<HealthResponse>('/healthz/ready')
+}
