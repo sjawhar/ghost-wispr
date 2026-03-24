@@ -181,6 +181,9 @@ func main() {
 		log.Printf("config: %s", w)
 	}
 
+	// Startup validation: check component readiness from config.
+	startupStatus := config.ValidateStartup(cfg)
+
 	store, err := storage.NewSQLiteStore(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("storage init failed: %v", err)
@@ -727,35 +730,42 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	paErr := portaudio.Initialize()
 	//nolint:errcheck // Terminate is best-effort cleanup
 	defer portaudio.Terminate()
+	paInitFailed := false
 	if paErr != nil {
-		log.Fatalf("portaudio init failed: %v", paErr) //nolint:gocritic // Terminate is no-op if Initialize failed
+		log.Printf("warning: portaudio init failed: %v — microphone unavailable", paErr)
+		paInitFailed = true
 	}
 
 	client.Init(client.InitLib{LogLevel: client.LogLevelDefault})
 
-	for _, rate := range cfg.SampleRateCandidates() {
-		mic, err = audio.NewMic(rate, rate/4) // 250ms buffer
-		if err != nil {
-			log.Printf("warning: microphone open failed at %d Hz: %v", rate, err)
-			continue
+	if !paInitFailed {
+		for _, rate := range cfg.SampleRateCandidates() {
+			mic, err = audio.NewMic(rate, rate/4) // 250ms buffer
+			if err != nil {
+				log.Printf("warning: microphone open failed at %d Hz: %v", rate, err)
+				continue
+			}
+			selectedSampleRate = rate
+			break
 		}
-		selectedSampleRate = rate
-		break
 	}
 
 	if mic == nil {
-		log.Printf("warning: microphone unavailable, running API/UI only")
+		slog.Warn("microphone unavailable, running API/UI only")
 		warnings = append(warnings, "Microphone unavailable \u2014 recording and live transcription are disabled")
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 	} else {
 		audioRecorder.SetSampleRate(selectedSampleRate)
 		recState.SetMic(mic)
 		if err := mic.Start(); err != nil {
-			log.Printf("warning: microphone start failed at %d Hz, running API/UI only: %v", selectedSampleRate, err)
+			slog.Warn("microphone start failed, running API/UI only", "sample_rate", selectedSampleRate, "error", err)
 			mic = nil
 			recState.SetMic(nil)
 			warnings = append(warnings, "Microphone failed to start \u2014 recording and live transcription are disabled")
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
 		} else {
 			log.Printf("microphone started at %d Hz", selectedSampleRate)
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: "connected", Message: fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate)}
 		}
 	}
 
@@ -821,7 +831,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}()
 
+	// Log structured startup banner.
+	config.LogStartupBanner(appLogger, startupStatus, Version, Commit, BuildTime)
+	slog.Info("deepgram API key", "status", config.MaskAPIKey(cfg.DeepgramAPIKey))
 	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://127.0.0.1%s", Version, Commit, BuildTime, addr)
+
+	// Broadcast initial component status to any connected WebSocket clients.
+	for _, c := range startupStatus.Components() {
+		hub.BroadcastComponentStatus(c.Name, c.Status, c.Message)
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -830,7 +848,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	log.Println("ghost-wispr: shutting down")
 	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
