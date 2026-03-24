@@ -30,6 +30,8 @@ type Manager struct {
 	mu               sync.Mutex
 	currentSessionID string
 	currentStartedAt time.Time
+	manualSession    bool
+	prevTimeout      time.Duration
 }
 
 func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int, logger ...*slog.Logger) *Manager {
@@ -203,7 +205,7 @@ func (m *Manager) ForceEndSession(ctx context.Context) error {
 		// Log flush failure but don't block session end.
 		_ = err
 	}
-	return m.endCurrentSession(ctx)
+	return m.endCurrentSessionAndRestore(ctx)
 }
 
 func (m *Manager) ensureSessionStarted(now time.Time) error {
@@ -439,4 +441,110 @@ func (m *Manager) OnTranscriptionDisconnect() {
 	if detector != nil {
 		detector.OnSpeech()
 	}
+}
+
+// ManualStartSession starts a new session manually. Returns the session ID.
+// If a session is already active, returns ErrSessionAlreadyActive.
+// Manual sessions use a 5-minute silence timeout instead of the default 30s.
+func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (string, error) {
+	now := time.Now().UTC()
+
+	m.mu.Lock()
+	if m.currentSessionID != "" {
+		m.mu.Unlock()
+		return "", ErrSessionAlreadyActive
+	}
+
+	sessionID := now.Format("20060102150405")
+	if m.currentStartedAt.Format("20060102150405") == sessionID {
+		sessionID = now.Add(time.Second).Format("20060102150405")
+	}
+	m.currentSessionID = sessionID
+	m.currentStartedAt = now
+	m.manualSession = true
+	m.mu.Unlock()
+
+	if err := m.store.CreateSession(sessionID, now); err != nil {
+		m.mu.Lock()
+		m.currentSessionID = ""
+		m.currentStartedAt = time.Time{}
+		m.manualSession = false
+		m.mu.Unlock()
+		return "", fmt.Errorf("create session: %w", err)
+	}
+
+	// Set title hint if provided.
+	if titleHint != "" {
+		if err := m.store.UpdateTitle(sessionID, titleHint); err != nil {
+			m.logger.Warn("failed to set title hint on manual session", "operation", "manual_start", "session_id", sessionID, "error", err)
+		}
+	}
+
+	if m.recorder != nil {
+		if err := m.recorder.StartSession(sessionID); err != nil {
+			m.mu.Lock()
+			m.currentSessionID = ""
+			m.currentStartedAt = time.Time{}
+			m.manualSession = false
+			m.mu.Unlock()
+			_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
+			return "", fmt.Errorf("start audio recorder session: %w", err)
+		}
+	}
+
+	// Extend silence timeout for manual sessions (5 min vs default 30s).
+	m.mu.Lock()
+	detector := m.detector
+	m.mu.Unlock()
+	if detector != nil {
+		m.mu.Lock()
+		m.prevTimeout = detector.timeout
+		m.mu.Unlock()
+		detector.SetTimeout(5 * time.Minute)
+	}
+
+	if m.hub != nil {
+		m.hub.BroadcastSessionStarted(sessionID)
+	}
+
+	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint", titleHint)
+	return sessionID, nil
+}
+
+// StopSession ends a specific session by ID. If the given sessionID does not
+// match the currently active session, returns ErrNoActiveSession.
+func (m *Manager) StopSession(ctx context.Context, sessionID string) error {
+	m.mu.Lock()
+	if m.currentSessionID != sessionID {
+		m.mu.Unlock()
+		return ErrNoActiveSession
+	}
+	m.mu.Unlock()
+
+	return m.endCurrentSessionAndRestore(ctx)
+}
+
+// endCurrentSessionAndRestore ends the current session and restores the
+// silence timeout if it was changed for a manual session.
+func (m *Manager) endCurrentSessionAndRestore(ctx context.Context) error {
+	m.mu.Lock()
+	wasManual := m.manualSession
+	prevTimeout := m.prevTimeout
+	m.mu.Unlock()
+
+	err := m.endCurrentSession(ctx)
+
+	// Restore previous silence timeout if this was a manual session.
+	if wasManual && prevTimeout > 0 {
+		m.mu.Lock()
+		detector := m.detector
+		m.manualSession = false
+		m.prevTimeout = 0
+		m.mu.Unlock()
+		if detector != nil {
+			detector.SetTimeout(prevTimeout)
+		}
+	}
+
+	return err
 }

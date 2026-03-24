@@ -76,3 +76,21 @@ export function mergeSessions(sessionIds: string[]): Promise<SessionSummary> {
     body: JSON.stringify({ session_ids: sessionIds }),
   })
 }
+
+export function startSession(titleHint?: string): Promise<{ session_id: string }> {
+  return request<{ session_id: string }>('/api/sessions/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(titleHint ? { title_hint: titleHint } : {}),
+  })
+}
+
+export function stopCurrentSession(): Promise<{ status: string }> {
+  return request<{ status: string }>('/api/sessions/current/stop', { method: 'POST' })
+}
+
+export function stopSession(sessionId: string): Promise<{ status: string }> {
+  return request<{ status: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, {
+    method: 'POST',
+  })
+}

@@ -27,6 +27,8 @@
     resumeRecording,
     deleteSession,
     mergeSessions,
+    startSession,
+    stopCurrentSession,
   } from './lib/api'
   import { connect, disconnect } from './lib/ws.svelte'
 
@@ -61,6 +63,14 @@
 
     await pauseRecording()
     setPaused(true)
+  }
+
+  async function handleStartSession(): Promise<void> {
+    await startSession()
+  }
+
+  async function handleStopSession(): Promise<void> {
+    await stopCurrentSession()
   }
 
   async function handleResummarize(sessionId: string, preset: string): Promise<void> {
@@ -183,6 +193,8 @@
         activeSessionId={appState.activeSessionId}
         onToggle={togglePause}
         onEndSession={endSession}
+        onStartSession={handleStartSession}
+        onStopSession={handleStopSession}
       />
       <button
         class="settings-btn"

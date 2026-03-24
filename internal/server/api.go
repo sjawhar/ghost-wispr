@@ -76,6 +76,78 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 	})
 	registerRestoreRoutes(mux, controls)
 
+	// Manual session control endpoints
+	mux.HandleFunc("POST /api/sessions/start", func(w http.ResponseWriter, r *http.Request) {
+		if controls.StartSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			TitleHint string `json:"title_hint"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+				writeJSONError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		sessionID, err := controls.StartSession(ctx, body.TitleHint)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionAlreadyActive) {
+				writeJSONError(w, http.StatusConflict, "session already active")
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"session_id": sessionID})
+	})
+
+	// POST /api/sessions/current/stop must be registered before POST /api/sessions/{id}/stop
+	// to avoid the ServeMux matching "current" as an {id}.
+	mux.HandleFunc("POST /api/sessions/current/stop", func(w http.ResponseWriter, r *http.Request) {
+		if controls.EndSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := controls.EndSession(ctx); err != nil {
+			if errors.Is(err, session.ErrNoActiveSession) {
+				writeJSONError(w, http.StatusConflict, "no active session")
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+		if controls.StopSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := controls.StopSession(ctx, sessionID); err != nil {
+			if errors.Is(err, session.ErrNoActiveSession) {
+				writeJSONError(w, http.StatusNotFound, fmt.Sprintf("session %s is not active", sessionID))
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+	})
 	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		date := r.URL.Query().Get("date")
 		if date == "" {

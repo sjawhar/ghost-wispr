@@ -24,6 +24,8 @@ type ControlHooks struct {
 	Resummarize       func(ctx context.Context, sessionID, preset string) error
 	OnSessionMerged   func(ctx context.Context, sessionID string)
 	EndSession        func(ctx context.Context) error
+	StartSession      func(ctx context.Context, titleHint string) (string, error)
+	StopSession       func(ctx context.Context, sessionID string) error
 	TestPreset        func(ctx context.Context, presetName, sessionID string) (string, error)
 	GeneratePreset    func(ctx context.Context, description string) (config.Preset, error)
 	RefinePreset      func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error)

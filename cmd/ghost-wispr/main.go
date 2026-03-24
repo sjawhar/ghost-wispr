@@ -344,6 +344,12 @@ func main() {
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
 		},
+		StartSession: func(ctx context.Context, titleHint string) (string, error) {
+			return manager.ManualStartSession(ctx, titleHint)
+		},
+		StopSession: func(ctx context.Context, sessionID string) error {
+			return manager.StopSession(ctx, sessionID)
+		},
 		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
 			latestCfg := cfgStore.Get()
 			preset, ok := latestCfg.Summarization.Presets[presetName]

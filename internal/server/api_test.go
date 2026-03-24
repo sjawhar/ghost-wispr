@@ -1284,3 +1284,264 @@ func TestFaultInjectionNoHandler(t *testing.T) {
 		t.Fatalf("expected 503 when no handler configured, got %d", rr.Code)
 	}
 }
+
+// --- Manual Session Trigger Tests ---
+
+func TestManualSessionStart_Success(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StartSession: func(_ context.Context, titleHint string) (string, error) {
+			if titleHint != "My Meeting" {
+				return "", errors.New("unexpected title hint")
+			}
+			return "20260323120000", nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", strings.NewReader(`{"title_hint":"My Meeting"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["session_id"] != "20260323120000" {
+		t.Fatalf("expected session_id 20260323120000, got %q", resp["session_id"])
+	}
+}
+
+func TestManualSessionStart_NoBody(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StartSession: func(_ context.Context, titleHint string) (string, error) {
+			if titleHint != "" {
+				return "", errors.New("expected empty title hint")
+			}
+			return "20260323120000", nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStart_AlreadyActive(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StartSession: func(_ context.Context, titleHint string) (string, error) {
+			return "", session.ErrSessionAlreadyActive
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStart_NotConfigured(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_ByID_Success(t *testing.T) {
+	stopped := ""
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StopSession: func(_ context.Context, sessionID string) error {
+			stopped = sessionID
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-session/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if stopped != "test-session" {
+		t.Fatalf("expected stopped session test-session, got %q", stopped)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["status"] != "stopped" {
+		t.Fatalf("expected status stopped, got %q", resp["status"])
+	}
+}
+
+func TestManualSessionStop_ByID_NotFound(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StopSession: func(_ context.Context, sessionID string) error {
+			return session.ErrNoActiveSession
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/nonexistent/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_ByID_InvalidID(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StopSession: func(_ context.Context, sessionID string) error { return nil },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/%2e%2e/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_Current_Success(t *testing.T) {
+	called := false
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		EndSession: func(_ context.Context) error {
+			called = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/current/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !called {
+		t.Fatal("expected EndSession to be called")
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["status"] != "stopped" {
+		t.Fatalf("expected status stopped, got %q", resp["status"])
+	}
+}
+
+func TestManualSessionStop_Current_NoActive(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		EndSession: func(_ context.Context) error { return session.ErrNoActiveSession },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/current/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_NotConfigured(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-session/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
