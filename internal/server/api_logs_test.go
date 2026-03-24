@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,19 +77,19 @@ func TestGetLogs(t *testing.T) {
 }
 
 func TestRetryEndpoints(t *testing.T) {
-	var summaryCalled, syncCalled, refinementCalled bool
+	var summaryCalled, syncCalled, refinementCalled atomic.Bool
 
 	controls := &ControlHooks{
 		Resummarize: func(ctx context.Context, sessionID, preset string) error {
-			summaryCalled = true
+			summaryCalled.Store(true)
 			return nil
 		},
 		RetrySync: func(ctx context.Context, sessionID string) error {
-			syncCalled = true
+			syncCalled.Store(true)
 			return nil
 		},
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
-			refinementCalled = true
+			refinementCalled.Store(true)
 			return nil
 		},
 	}
@@ -101,14 +102,16 @@ func TestRetryEndpoints(t *testing.T) {
 		endpoint string
 		check    func() bool
 	}{
-		{"Retry Summary", "/api/sessions/test-session/retry-summary", func() bool { return summaryCalled }},
-		{"Retry Sync", "/api/sessions/test-session/retry-sync", func() bool { return syncCalled }},
-		{"Retry Refinement", "/api/sessions/test-session/retry-refinement", func() bool { return refinementCalled }},
+		{"Retry Summary", "/api/sessions/test-session/retry-summary", summaryCalled.Load},
+		{"Retry Sync", "/api/sessions/test-session/retry-sync", syncCalled.Load},
+		{"Retry Refinement", "/api/sessions/test-session/retry-refinement", refinementCalled.Load},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			summaryCalled, syncCalled, refinementCalled = false, false, false
+			summaryCalled.Store(false)
+			syncCalled.Store(false)
+			refinementCalled.Store(false)
 			req := httptest.NewRequest(http.MethodPost, tt.endpoint, nil)
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
