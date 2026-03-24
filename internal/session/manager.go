@@ -339,6 +339,9 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
 		}
 		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		if m.hub != nil {
+			m.hub.BroadcastComponentStatus("refinement", "error", fmt.Sprintf("Batch refinement failed for session %s", sessionID))
+		}
 		return
 	}
 
@@ -348,6 +351,9 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 
 	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID)
+	if m.hub != nil {
+		m.hub.BroadcastComponentStatus("refinement", "connected", fmt.Sprintf("Batch refinement completed for session %s", sessionID))
+	}
 
 	// Re-canonicalize now that refined transcript is available.
 	if err := m.store.Canonicalize(sessionID); err != nil {

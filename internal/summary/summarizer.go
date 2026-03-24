@@ -308,7 +308,7 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 	chunkSummaries := make([]string, 0, len(chunks))
 	for i, chunk := range chunks {
 		messages := []llm.Message{
-			{Role: "system", Content: "You are a strategic meeting analyst. Summarize this transcript chunk with key facts, decisions, action items, and risks."},
+			{Role: "system", Content: "You are a strategic meeting analyst. Summarize this transcript chunk with key facts, decisions, and risks."},
 			{Role: "user", Content: fmt.Sprintf("Chunk %d/%d\n\n%s", i+1, len(chunks), chunk)},
 		}
 		text, err := s.completeTextWithRetry(ctx, client, messages, logger)

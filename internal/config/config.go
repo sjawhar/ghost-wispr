@@ -85,8 +85,8 @@ func defaults() Config {
 			Model: "openai/gpt-4o-mini",
 			Presets: map[string]Preset{
 				"default": {
-					Description:  "General-purpose meeting summary with key topics, decisions, and action items",
-					SystemPrompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics, decisions made, and action items if any.",
+					Description:  "General-purpose meeting summary with key topics and decisions",
+					SystemPrompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics and decisions made.",
 					UserTemplate: "{{transcript}}",
 				},
 			},
