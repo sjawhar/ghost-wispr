@@ -209,7 +209,7 @@ func (m *Manager) ForceEndSession(ctx context.Context) error {
 	// Flush any buffered words before ending — is_final=true words not yet persisted.
 	if err := m.flushBuffer(); err != nil && !errors.Is(err, ErrNoActiveSession) {
 		// Log flush failure but don't block session end.
-		_ = err
+		m.logger.Warn("flush buffer failed", "error", err)
 	}
 	return m.endCurrentSessionAndRestore(ctx)
 }

@@ -60,8 +60,8 @@
       const updated = await updateSessionTitle(session.id, newTitle)
       session.title = updated.title
     } catch {
-      // revert on failure
-    }
+      // API failed — title stays unchanged in UI, user can retry
+      titleDraft = session.title || ''
   }
 
   function handleTitleKeydown(event: KeyboardEvent) {

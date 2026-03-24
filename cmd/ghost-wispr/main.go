@@ -892,7 +892,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 			}
 			go func() {
-				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf)
+			go func() {
+				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf, hub)
+			}()
 			}()
 		}
 	}
@@ -962,6 +964,7 @@ func streamMicWithRetry(
 	writer io.Writer,
 	wait func(time.Duration),
 	logf func(string, ...any),
+	hub *server.Hub,
 ) {
 	const (
 		overflowWait = 250 * time.Millisecond
@@ -983,11 +986,17 @@ func streamMicWithRetry(
 
 		if strings.Contains(strings.ToLower(err.Error()), "overflow") {
 			logf("warning: mic input overflow, restarting stream")
+			if hub != nil {
+				hub.BroadcastComponentStatus("mic", "warning", "Mic input overflow, restarting stream")
+			}
 			wait(overflowWait)
 			continue
 		}
 
 		logf("mic stream error (retrying in %v): %v", backoff, err)
+		if hub != nil {
+			hub.BroadcastComponentStatus("mic", "error", err.Error())
+		}
 		wait(backoff)
 
 		if ctx.Err() != nil {
@@ -996,6 +1005,9 @@ func streamMicWithRetry(
 
 		if reopenErr := streamer.Reopen(); reopenErr != nil {
 			logf("mic reopen failed: %v", reopenErr)
+			if hub != nil {
+				hub.BroadcastComponentStatus("mic", "error", reopenErr.Error())
+			}
 			backoff = min(backoff*2, maxBackoff)
 			continue
 		}
