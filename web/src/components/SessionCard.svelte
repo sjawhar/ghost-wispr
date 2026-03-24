@@ -62,6 +62,7 @@
     } catch {
       // API failed — title stays unchanged in UI, user can retry
       titleDraft = session.title || ''
+    }
   }
 
   function handleTitleKeydown(event: KeyboardEvent) {
