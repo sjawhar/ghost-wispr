@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,6 +25,136 @@ func newTestSQLiteStore(t *testing.T) *SQLiteStore {
 	})
 
 	return store
+}
+
+func TestPreMigrationBackupCreated(t *testing.T) {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	// Create store (which triggers backup creation)
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Verify backup file exists
+	backupPath := dbPath + ".pre-migrate.bak"
+	_, err = os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("backup file not found at %s: %v", backupPath, err)
+	}
+
+	// Verify backup has content (not empty)
+	backupInfo, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("stat backup: %v", err)
+	}
+	if backupInfo.Size() == 0 {
+		t.Fatal("backup file is empty")
+	}
+
+	// Verify backup is a valid SQLite database by opening it
+	backupStore, err := NewSQLiteStore(backupPath)
+	if err != nil {
+		t.Fatalf("backup is not a valid SQLite database: %v", err)
+	}
+	defer func() { _ = backupStore.Close() }()
+
+	// Verify we can query the backup
+	var count int
+	if err := backupStore.DB().QueryRow("SELECT COUNT(*) FROM sessions").Scan(&count); err != nil {
+		t.Fatalf("query backup failed: %v", err)
+	}
+}
+
+func TestPreMigrationBackupCreatedEvenForFreshInstall(t *testing.T) {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "fresh.db")
+
+	// Verify DB file doesn't exist yet
+	_, err := os.Stat(dbPath)
+	if err == nil {
+		t.Fatal("DB file should not exist yet")
+	}
+
+	// Create store (which creates DB file via pragmas, then backs it up)
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Verify backup file IS created even for fresh install
+	// (because pragmas create the DB file, then backup runs)
+	backupPath := dbPath + ".pre-migrate.bak"
+	_, err = os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("backup file should be created: %v", err)
+	}
+
+	// Verify backup is a valid SQLite database
+	backupStore, err := NewSQLiteStore(backupPath)
+	if err != nil {
+		t.Fatalf("backup is not a valid SQLite database: %v", err)
+	}
+	defer func() { _ = backupStore.Close() }()
+}
+
+func TestPreMigrationBackupOverwritesPrevious(t *testing.T) {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "overwrite.db")
+
+	// Create first store and backup
+	store1, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("first NewSQLiteStore failed: %v", err)
+	}
+	backupPath := dbPath + ".pre-migrate.bak"
+
+	// Get first backup's modification time
+	backupInfo1, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("stat first backup: %v", err)
+	}
+	firstModTime := backupInfo1.ModTime()
+
+	_ = store1.Close()
+
+	// Wait a bit to ensure different modification time
+	time.Sleep(10 * time.Millisecond)
+
+	// Create second store (should overwrite backup)
+	store2, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("second NewSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store2.Close() }()
+
+	// Get second backup's modification time
+	backupInfo2, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("stat second backup: %v", err)
+	}
+	secondModTime := backupInfo2.ModTime()
+
+	// Verify backup was overwritten (newer modification time)
+	if !secondModTime.After(firstModTime) {
+		t.Fatalf("backup was not overwritten: first=%v, second=%v", firstModTime, secondModTime)
+	}
+
+	// Verify backup is still valid
+	backupStore, err := NewSQLiteStore(backupPath)
+	if err != nil {
+		t.Fatalf("backup is not a valid SQLite database: %v", err)
+	}
+	defer func() { _ = backupStore.Close() }()
 }
 
 func TestSQLitePragmas(t *testing.T) {

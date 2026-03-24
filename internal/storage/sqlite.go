@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -120,7 +122,8 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	db.SetMaxIdleConns(1)
 
 	store := &SQLiteStore{db: db}
-	if err := store.init(); err != nil {
+
+	if err := store.init(dbPath); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -128,7 +131,50 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	return store, nil
 }
 
-func (s *SQLiteStore) init() error {
+// createPreMigrationBackup copies the database file to a backup before migrations run.
+// If the DB file doesn't exist (fresh install), the backup is skipped.
+// If backup fails, a warning is logged but startup continues (degraded is better than dead).
+func createPreMigrationBackup(db *sql.DB, dbPath string) error {
+	// Check if DB file exists (skip backup for fresh installs)
+	_, err := os.Stat(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Fresh install, no backup needed
+			return nil
+		}
+		return fmt.Errorf("stat db file: %w", err)
+	}
+
+	// Flush WAL to main DB file to ensure consistent backup
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		return fmt.Errorf("wal checkpoint: %w", err)
+	}
+
+	// Open source DB file
+	src, err := os.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open source db: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+
+	// Create/overwrite backup file
+	backupPath := dbPath + ".pre-migrate.bak"
+	dst, err := os.Create(backupPath)
+	if err != nil {
+		return fmt.Errorf("create backup file: %w", err)
+	}
+	defer func() { _ = dst.Close() }()
+
+	// Copy file content
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("copy db to backup: %w", err)
+	}
+
+	slog.Info("pre-migration backup created", "path", backupPath)
+	return nil
+}
+
+func (s *SQLiteStore) init(dbPath string) error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA busy_timeout = 5000",
@@ -138,6 +184,11 @@ func (s *SQLiteStore) init() error {
 		if _, err := s.db.Exec(p); err != nil {
 			return fmt.Errorf("apply pragma %q: %w", p, err)
 		}
+	}
+
+	// Create pre-migration backup after pragmas are set (which creates the DB file)
+	if err := createPreMigrationBackup(s.db, dbPath); err != nil {
+		slog.Warn("failed to create pre-migration backup", "path", dbPath, "error", err)
 	}
 
 	if _, err := s.db.Exec(`
