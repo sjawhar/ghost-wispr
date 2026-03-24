@@ -27,6 +27,8 @@ type Syncer struct {
 	mu       sync.Mutex
 }
 
+const resumableUploadThresholdBytes int64 = 5 * 1024 * 1024
+
 type SyncFile struct {
 	Name        string
 	MimeType    string
@@ -123,6 +125,8 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	for _, f := range files {
 		var reader io.Reader
 		var file *os.File
+		var fileSize int64
+		var useResumable bool
 
 		switch {
 		case f.Content != nil:
@@ -134,15 +138,33 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 			}
 			file = openedFile
 			reader = file
+			info, err := file.Stat()
+			if err != nil {
+				_ = file.Close()
+				return folder.Id, fmt.Errorf("stat %s: %w", f.LocalPath, err)
+			}
+			fileSize = info.Size()
+			if shouldUseResumableUpload(fileSize) {
+				useResumable = true
+			}
 		default:
 			continue
 		}
 
-		_, err := s.service.Files.Create(&drive.File{
+		createCall := s.service.Files.Create(&drive.File{
 			Name:     f.Name,
 			MimeType: f.MimeType,
 			Parents:  []string{folder.Id},
-		}).SupportsAllDrives(true).Media(reader, googleapi.ContentType(f.ContentType)).Context(ctx).Fields("id").Do()
+		}).SupportsAllDrives(true).Context(ctx).Fields("id")
+
+		if useResumable {
+			s.logger.Info("using resumable upload", "operation", "upload", "file_name", f.Name, "file_size_bytes", fileSize)
+			createCall = createCall.ResumableMedia(ctx, file, fileSize, f.ContentType)
+		} else {
+			createCall = createCall.Media(reader, googleapi.ContentType(f.ContentType))
+		}
+
+		_, err := createCall.Do()
 		if file != nil {
 			_ = file.Close()
 		}
@@ -152,6 +174,10 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	}
 
 	return folder.Id, nil
+}
+
+func shouldUseResumableUpload(fileSize int64) bool {
+	return fileSize > resumableUploadThresholdBytes
 }
 
 func slugify(s string) string {

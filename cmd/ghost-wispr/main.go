@@ -641,6 +641,30 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 							log.Printf("gdrive sweep error: %v", err)
 							continue
 						}
+
+						retryScheduled, err := store.GetSessionsBySyncState(storage.SyncStateRetryScheduled)
+						if err != nil {
+							log.Printf("gdrive retry sweep error: %v", err)
+							continue
+						}
+
+						now := time.Now().UTC()
+						seen := make(map[string]struct{}, len(ids)+len(retryScheduled))
+						for _, id := range ids {
+							seen[id] = struct{}{}
+						}
+
+						for _, sess := range retryScheduled {
+							if !gdrive.IsRetryReady(now, sess.RetryCount, sess.LastSyncAttempt) {
+								continue
+							}
+							if _, ok := seen[sess.ID]; ok {
+								continue
+							}
+							ids = append(ids, sess.ID)
+							seen[sess.ID] = struct{}{}
+						}
+
 						for _, id := range ids {
 							if err := syncOrchestrator.SyncSession(ctx, id); err != nil {
 								log.Printf("gdrive sweep: session %s: %v", id, err)

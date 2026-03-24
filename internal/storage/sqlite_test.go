@@ -452,3 +452,78 @@ func TestGetSessionsByDate_ExcludesMerged(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncStateMetadataAndRetryQuery(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "sync-state-retry-1"
+	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "data/audio/sync-state-retry-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	attempt := started.Add(10 * time.Minute)
+	if err := store.UpdateSyncState(sessionID, SyncStateRetryScheduled, "", 2, &attempt, "temporary upload failure"); err != nil {
+		t.Fatalf("update sync state: %v", err)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.SyncState != SyncStateRetryScheduled {
+		t.Fatalf("expected sync_state %q, got %q", SyncStateRetryScheduled, sess.SyncState)
+	}
+	if sess.RetryCount != 2 {
+		t.Fatalf("expected retry_count 2, got %d", sess.RetryCount)
+	}
+	if sess.LastSyncAttempt == nil || !sess.LastSyncAttempt.Equal(attempt) {
+		t.Fatalf("expected last_sync_attempt %s, got %v", attempt, sess.LastSyncAttempt)
+	}
+	if sess.ErrorMessage != "temporary upload failure" {
+		t.Fatalf("expected error_message %q, got %q", "temporary upload failure", sess.ErrorMessage)
+	}
+
+	retrySessions, err := store.GetSessionsBySyncState(SyncStateRetryScheduled)
+	if err != nil {
+		t.Fatalf("get retry scheduled sessions: %v", err)
+	}
+	if len(retrySessions) != 1 || retrySessions[0].ID != sessionID {
+		t.Fatalf("expected retry sessions [%s], got %+v", sessionID, retrySessions)
+	}
+}
+
+func TestRemoteDeletedIsSoftDelete(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "sync-state-remote-deleted-1"
+	started := time.Date(2026, 3, 23, 11, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(4*time.Minute), "data/audio/sync-state-remote-deleted-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	attempt := started.Add(5 * time.Minute)
+	if err := store.UpdateSyncState(sessionID, SyncStateRemoteDeleted, "", 0, &attempt, "remote folder deleted"); err != nil {
+		t.Fatalf("update sync state remote deleted: %v", err)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.SyncState != SyncStateRemoteDeleted {
+		t.Fatalf("expected sync_state %q, got %q", SyncStateRemoteDeleted, sess.SyncState)
+	}
+	if sess.Status != "ended" {
+		t.Fatalf("expected local session status ended, got %q", sess.Status)
+	}
+	if sess.AudioPath == "" {
+		t.Fatal("expected local audio path preserved for soft-delete")
+	}
+}

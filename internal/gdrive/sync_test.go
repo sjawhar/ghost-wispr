@@ -137,3 +137,24 @@ func TestSlugify(t *testing.T) {
 		}
 	}
 }
+
+func TestShouldUseResumableUpload(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileSize int64
+		want     bool
+	}{
+		{name: "below threshold uses regular upload", fileSize: 5*1024*1024 - 1, want: false},
+		{name: "exact threshold uses regular upload", fileSize: 5 * 1024 * 1024, want: false},
+		{name: "above threshold uses resumable", fileSize: 5*1024*1024 + 1, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldUseResumableUpload(tc.fileSize)
+			if got != tc.want {
+				t.Fatalf("shouldUseResumableUpload(%d) = %v, want %v", tc.fileSize, got, tc.want)
+			}
+		})
+	}
+}

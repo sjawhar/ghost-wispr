@@ -29,25 +29,46 @@ const (
 	SyncPending = "pending"
 	SyncSynced  = "synced"
 	SyncFailed  = "failed"
+
+	SyncStatePending        = "PENDING"
+	SyncStateSyncing        = "SYNCING"
+	SyncStateSynced         = "SYNCED"
+	SyncStateFailed         = "FAILED"
+	SyncStateRetryScheduled = "RETRY_SCHEDULED"
+	SyncStateRemoteDeleted  = "REMOTE_DELETED"
 )
 
 type Session struct {
-	ID             string     `json:"id"`
-	Title          string     `json:"title"`
-	StartedAt      time.Time  `json:"started_at"`
-	EndedAt        *time.Time `json:"ended_at,omitempty"`
-	Status         string     `json:"status"`
-	Summary        string     `json:"summary"`
-	SummaryStatus  string     `json:"summary_status"`
-	SummaryPreset  string     `json:"summary_preset"`
-	AudioPath      string     `json:"audio_path"`
-	SyncStatus     string     `json:"sync_status"`
-	GDriveFolderID string     `json:"gdrive_folder_id"`
-	MergedInto     string     `json:"merged_into"`
+	ID              string     `json:"id"`
+	Title           string     `json:"title"`
+	StartedAt       time.Time  `json:"started_at"`
+	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	Status          string     `json:"status"`
+	Summary         string     `json:"summary"`
+	SummaryStatus   string     `json:"summary_status"`
+	SummaryPreset   string     `json:"summary_preset"`
+	AudioPath       string     `json:"audio_path"`
+	SyncStatus      string     `json:"sync_status"`
+	SyncState       string     `json:"sync_state"`
+	RetryCount      int        `json:"retry_count"`
+	LastSyncAttempt *time.Time `json:"last_sync_attempt,omitempty"`
+	ErrorMessage    string     `json:"error_message"`
+	GDriveFolderID  string     `json:"gdrive_folder_id"`
+	MergedInto      string     `json:"merged_into"`
 }
 
 type SQLiteStore struct {
 	db *sql.DB
+}
+
+func syncStatusFromState(syncState string) string {
+	if syncState == SyncStateSynced {
+		return SyncSynced
+	}
+	if syncState == SyncStatePending || syncState == SyncStateSyncing {
+		return SyncPending
+	}
+	return SyncFailed
 }
 
 func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
@@ -98,7 +119,14 @@ func (s *SQLiteStore) init() error {
 			summary TEXT NOT NULL DEFAULT '',
 			summary_status TEXT NOT NULL DEFAULT 'pending',
 			summary_preset TEXT NOT NULL DEFAULT '',
-			audio_path TEXT NOT NULL DEFAULT ''
+			audio_path TEXT NOT NULL DEFAULT '',
+			sync_status TEXT NOT NULL DEFAULT 'pending',
+			gdrive_folder_id TEXT NOT NULL DEFAULT '',
+			merged_into TEXT NOT NULL DEFAULT '',
+			retry_count INTEGER NOT NULL DEFAULT 0,
+			last_sync_attempt TEXT,
+			error_message TEXT NOT NULL DEFAULT '',
+			sync_state TEXT NOT NULL DEFAULT 'PENDING'
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
@@ -112,6 +140,10 @@ func (s *SQLiteStore) init() error {
 		`ALTER TABLE sessions ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'pending'`,
 		`ALTER TABLE sessions ADD COLUMN gdrive_folder_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN merged_into TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN last_sync_attempt TEXT`,
+		`ALTER TABLE sessions ADD COLUMN error_message TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'PENDING'`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -328,7 +360,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id, merged_into
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -371,14 +403,15 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id, merged_into FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into FROM sessions WHERE id = ?`,
 		id,
 	)
 
 	var sess Session
 	var startedAt string
 	var endedAt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
+	var lastSyncAttempt sql.NullString
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -394,6 +427,14 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 			return Session{}, fmt.Errorf("parse session %s ended_at: %w", id, err)
 		}
 		sess.EndedAt = &parsedEnd
+	}
+
+	if lastSyncAttempt.Valid {
+		parsedAttempt, err := time.Parse(time.RFC3339Nano, lastSyncAttempt.String)
+		if err != nil {
+			return Session{}, fmt.Errorf("parse session %s last_sync_attempt: %w", id, err)
+		}
+		sess.LastSyncAttempt = &parsedAttempt
 	}
 
 	return sess, nil
@@ -479,9 +520,17 @@ func (s *SQLiteStore) UpdateTitle(sessionID, title string) error {
 }
 
 func (s *SQLiteStore) UpdateSyncStatus(sessionID, status, driveFolderID string) error {
+	syncState := SyncStatePending
+	switch status {
+	case SyncSynced:
+		syncState = SyncStateSynced
+	case SyncFailed:
+		syncState = SyncStateFailed
+	}
+
 	res, err := s.db.Exec(
-		`UPDATE sessions SET sync_status = ?, gdrive_folder_id = ? WHERE id = ?`,
-		status, driveFolderID, sessionID,
+		`UPDATE sessions SET sync_status = ?, sync_state = ?, gdrive_folder_id = ? WHERE id = ?`,
+		status, syncState, driveFolderID, sessionID,
 	)
 	if err != nil {
 		return fmt.Errorf("update sync status for session %s: %w", sessionID, err)
@@ -493,6 +542,41 @@ func (s *SQLiteStore) UpdateSyncStatus(sessionID, status, driveFolderID string) 
 	if rows == 0 {
 		return sql.ErrNoRows
 	}
+	return nil
+}
+
+func (s *SQLiteStore) UpdateSyncState(sessionID, state, driveFolderID string, retryCount int, lastSyncAttempt *time.Time, errorMessage string) error {
+	var lastAttempt any
+	if lastSyncAttempt != nil {
+		lastAttempt = lastSyncAttempt.UTC().Format(time.RFC3339Nano)
+	}
+
+	res, err := s.db.Exec(
+		`UPDATE sessions
+		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
+		     retry_count = ?, last_sync_attempt = ?, error_message = ?
+		 WHERE id = ?`,
+		state,
+		syncStatusFromState(state),
+		driveFolderID,
+		driveFolderID,
+		retryCount,
+		lastAttempt,
+		errorMessage,
+		sessionID,
+	)
+	if err != nil {
+		return fmt.Errorf("update sync state for session %s: %w", sessionID, err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update sync state rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+
 	return nil
 }
 
@@ -520,7 +604,8 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var sess Session
 		var startedAt string
 		var endedAt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
+		var lastSyncAttempt sql.NullString
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -536,6 +621,14 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 				return nil, fmt.Errorf("parse ended_at: %w", err)
 			}
 			sess.EndedAt = &parsedEnd
+		}
+
+		if lastSyncAttempt.Valid {
+			parsedAttempt, err := time.Parse(time.RFC3339Nano, lastSyncAttempt.String)
+			if err != nil {
+				return nil, fmt.Errorf("parse last_sync_attempt: %w", err)
+			}
+			sess.LastSyncAttempt = &parsedAttempt
 		}
 
 		sessions = append(sessions, sess)
@@ -609,7 +702,8 @@ func (s *SQLiteStore) GetSessionsNeedingSummary() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended' AND sync_status != 'synced'`,
+		`SELECT id FROM sessions WHERE status = 'ended' AND sync_state = ?`,
+		SyncStatePending,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing sync: %w", err)
@@ -628,6 +722,22 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 		return nil, fmt.Errorf("iterate sessions: %w", err)
 	}
 	return ids, nil
+}
+
+func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
+	rows, err := s.db.Query(
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into
+		 FROM sessions
+		 WHERE status = 'ended' AND sync_state = ?
+		 ORDER BY started_at ASC`,
+		syncState,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query sessions by sync state %s: %w", syncState, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanSessions(rows)
 }
 
 // GetGCEligibleSessions returns session IDs eligible for garbage collection.
@@ -712,8 +822,8 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 	}
 
 	_, err = tx.Exec(
-		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, gdrive_folder_id)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ID,
 		sess.Title,
 		sess.StartedAt.UTC().Format(time.RFC3339Nano),
@@ -724,6 +834,15 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		sess.SummaryPreset,
 		sess.AudioPath,
 		sess.SyncStatus,
+		sess.SyncState,
+		sess.RetryCount,
+		func() any {
+			if sess.LastSyncAttempt == nil {
+				return nil
+			}
+			return sess.LastSyncAttempt.UTC().Format(time.RFC3339Nano)
+		}(),
+		sess.ErrorMessage,
 		sess.GDriveFolderID,
 	)
 	if err != nil {
