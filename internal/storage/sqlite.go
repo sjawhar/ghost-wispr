@@ -69,7 +69,7 @@ type SearchResult struct {
 	Rank      float64 `json:"rank"`
 }
 
-var ftsQueryTokenPattern = regexp.MustCompile(`[\p{L}\p{N}_]+`)
+var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
 	db *sql.DB
@@ -1083,6 +1083,14 @@ func buildFTS5MatchQuery(query string) string {
 	quoted := make([]string, 0, len(tokens))
 	for _, token := range tokens {
 		clean := strings.TrimSpace(token)
+		if strings.HasPrefix(clean, "-") {
+			continue
+		}
+		clean = strings.TrimPrefix(clean, "+")
+		upper := strings.ToUpper(clean)
+		if upper == "AND" || upper == "OR" || upper == "NOT" || upper == "NEAR" {
+			continue
+		}
 		if clean == "" {
 			continue
 		}

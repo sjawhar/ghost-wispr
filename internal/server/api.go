@@ -92,9 +92,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	// Full-text search endpoint
 	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("q")
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		if q == "" {
-			writeJSON(w, http.StatusOK, []any{})
+			writeJSON(w, http.StatusOK, []storage.SearchResult{})
 			return
 		}
 		results, err := store.Search(q)

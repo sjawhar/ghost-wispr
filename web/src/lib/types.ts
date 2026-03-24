@@ -101,4 +101,11 @@ export interface StatusResponse {
   active_session_started_at: string
 }
 
+export interface SearchResult {
+  session_id: string
+  title: string
+  snippet: string
+  rank: number
+}
+
 export type PresetMap = Record<string, string>

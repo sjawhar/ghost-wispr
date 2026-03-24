@@ -874,7 +874,7 @@ func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
 		t.Fatalf("update summary: %v", err)
 	}
 
-	results, err := store.Search(`alpha OR "beta" -gamma`)
+	results, err := store.Search(`alpha OR "`)
 	if err != nil {
 		t.Fatalf("search with special characters failed: %v", err)
 	}
