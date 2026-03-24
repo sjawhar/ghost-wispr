@@ -1,4 +1,10 @@
-import type { PresetMap, SessionDetailResponse, SessionSummary, StatusResponse } from './types'
+import type {
+  PresetMap,
+  SearchResult,
+  SessionDetailResponse,
+  SessionSummary,
+  StatusResponse,
+} from './types'
 
 async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init)
@@ -32,6 +38,10 @@ export function fetchStatus(): Promise<StatusResponse> {
 
 export function fetchPresets(): Promise<PresetMap> {
   return request<PresetMap>('/api/presets')
+}
+
+export function fetchSearch(query: string): Promise<SearchResult[]> {
+  return request<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}`)
 }
 
 export function pauseRecording(): Promise<void> {
@@ -96,15 +106,21 @@ export function stopSession(sessionId: string): Promise<{ status: string }> {
 }
 
 export function retrySummary(sessionId: string): Promise<void> {
-  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-summary`, { method: 'POST' })
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-summary`, {
+    method: 'POST',
+  })
 }
 
 export function retrySync(sessionId: string): Promise<void> {
-  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-sync`, { method: 'POST' })
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-sync`, {
+    method: 'POST',
+  })
 }
 
 export function retryRefinement(sessionId: string): Promise<void> {
-  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-refinement`, { method: 'POST' })
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-refinement`, {
+    method: 'POST',
+  })
 }
 
 export interface LogEntry {
@@ -122,15 +138,4 @@ export function fetchLogs(level?: string, limit?: number, since?: string): Promi
   if (since) params.set('since', since)
   const qs = params.toString()
   return request<LogEntry[]>(`/api/logs${qs ? '?' + qs : ''}`)
-}
-
-export interface SearchResult {
-  session_id: string
-  title: string
-  snippet: string
-  rank: number
-}
-
-export function searchSessions(query: string): Promise<SearchResult[]> {
-  return request<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}`)
 }
