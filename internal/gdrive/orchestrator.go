@@ -58,12 +58,13 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	}
 
 	syncSess := SyncSession{
-		ID:            sess.ID,
-		Title:         sess.Title,
-		StartedAt:     sess.StartedAt,
-		EndedAt:       sess.EndedAt,
-		Summary:       sess.Summary,
-		SummaryPreset: sess.SummaryPreset,
+		ID:                  sess.ID,
+		Title:               sess.Title,
+		StartedAt:           sess.StartedAt,
+		EndedAt:             sess.EndedAt,
+		Summary:             sess.Summary,
+		SummaryPreset:       sess.SummaryPreset,
+		CanonicalTranscript: sess.CanonicalTranscript,
 	}
 
 	now := time.Now().UTC()

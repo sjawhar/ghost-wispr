@@ -16,6 +16,7 @@ type SyncSession struct {
 	EndedAt       *time.Time
 	Summary       string
 	SummaryPreset string
+	CanonicalTranscript string
 }
 
 func RenderSummaryMarkdown(s *SyncSession) string {
@@ -82,6 +83,32 @@ func RenderTranscriptMarkdown(s *SyncSession, segments []transcribe.Segment) str
 		}
 		fmt.Fprintf(&b, "**[%s] Speaker %d:** %s\n\n", ts, seg.Speaker+1, text)
 	}
+
+	return b.String()
+}
+
+// RenderCanonicalTranscriptMarkdown renders the canonical (refined) transcript
+// with frontmatter metadata.
+func RenderCanonicalTranscriptMarkdown(s *SyncSession) string {
+	var b strings.Builder
+
+	b.WriteString("---\n")
+	b.WriteString("schema_version: 1\n")
+	fmt.Fprintf(&b, "id: %q\n", s.ID)
+	fmt.Fprintf(&b, "started_at: %q\n", s.StartedAt.UTC().Format(time.RFC3339))
+	if s.EndedAt != nil {
+		fmt.Fprintf(&b, "ended_at: %q\n", s.EndedAt.UTC().Format(time.RFC3339))
+	}
+	b.WriteString("source: refined\n")
+	b.WriteString("---\n\n")
+
+	title := s.Title
+	if title == "" {
+		title = s.ID
+	}
+	fmt.Fprintf(&b, "# %s\n\n", title)
+	b.WriteString(s.CanonicalTranscript)
+	b.WriteString("\n")
 
 	return b.String()
 }

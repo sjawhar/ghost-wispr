@@ -833,6 +833,19 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}
 
+	// Wire up mic diagnostic hook now that mic is initialized.
+	controlHooks.DiagnoseMic = func(ctx context.Context) (map[string]any, error) {
+		if mic == nil {
+			return nil, fmt.Errorf("microphone not available")
+		}
+		return map[string]any{
+			"mic_open":    mic.IsOpen(),
+			"sample_rate": selectedSampleRate,
+			"status":      "operational",
+			"message":     fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate),
+		}, nil
+	}
+
 	if mic != nil && cfg.DeepgramAPIKey != "" {
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := &interfaces.LiveTranscriptionOptions{

@@ -82,11 +82,17 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		})
 	}
 
-	transcriptMD := RenderTranscriptMarkdown(sess, segments)
+	// Use canonical transcript if available; fall back to segment-based rendering.
+	var transcriptContent string
+	if strings.TrimSpace(sess.CanonicalTranscript) != "" {
+		transcriptContent = RenderCanonicalTranscriptMarkdown(sess)
+	} else {
+		transcriptContent = RenderTranscriptMarkdown(sess, segments)
+	}
 	files = append(files, SyncFile{
 		Name:        "transcript.md",
 		MimeType:    "application/vnd.google-apps.document",
-		Content:     []byte(transcriptMD),
+		Content:     []byte(transcriptContent),
 		ContentType: "text/plain",
 	})
 

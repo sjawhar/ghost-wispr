@@ -34,6 +34,7 @@ type ControlHooks struct {
 	GetLogs           func(level string, limit int, since time.Time) []logging.LogEntry
 	RetrySync         func(ctx context.Context, sessionID string) error
 	RetryRefinement   func(ctx context.Context, sessionID string) error
+	DiagnoseMic       func(ctx context.Context) (map[string]any, error)
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {

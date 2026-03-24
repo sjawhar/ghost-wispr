@@ -564,3 +564,173 @@ func TestRemoteDeletedIsSoftDelete(t *testing.T) {
 		t.Fatal("expected local audio path preserved for soft-delete")
 	}
 }
+
+func TestCanonicalize_FromRefinedTranscript(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-refined-1"
+	started := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	// Add streaming segments.
+	for _, text := range []string{"hello world", "how are you"} {
+		if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: text, StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+			t.Fatalf("append segment: %v", err)
+		}
+	}
+
+	// Set refined transcript.
+	if err := store.UpdateRefinement(sessionID, "refined hello world. how are you doing?", "completed"); err != nil {
+		t.Fatalf("update refinement: %v", err)
+	}
+
+	// Canonicalize should use refined transcript.
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "refined" {
+		t.Fatalf("expected transcript_source 'refined', got %q", source)
+	}
+	if transcript != "refined hello world. how are you doing?" {
+		t.Fatalf("expected refined transcript, got %q", transcript)
+	}
+
+	// Verify session struct also has the fields.
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.TranscriptSource != "refined" {
+		t.Fatalf("expected session.TranscriptSource 'refined', got %q", sess.TranscriptSource)
+	}
+	if sess.CanonicalTranscript != "refined hello world. how are you doing?" {
+		t.Fatalf("expected session.CanonicalTranscript to match refined, got %q", sess.CanonicalTranscript)
+	}
+}
+
+func TestCanonicalize_FallbackToStreaming(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-streaming-1"
+	started := time.Date(2026, 3, 23, 13, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	// Add streaming segments.
+	for _, text := range []string{"segment one", "segment two"} {
+		if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: text, StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+			t.Fatalf("append segment: %v", err)
+		}
+	}
+
+	// Refinement pending (default) — should fall back to streaming.
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "streaming" {
+		t.Fatalf("expected transcript_source 'streaming', got %q", source)
+	}
+	if transcript != "segment one\nsegment two\n" {
+		t.Fatalf("expected assembled streaming transcript, got %q", transcript)
+	}
+}
+
+func TestCanonicalize_RefinementFailed_FallsBackToStreaming(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-failed-1"
+	started := time.Date(2026, 3, 23, 14, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: "fallback text", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+		t.Fatalf("append segment: %v", err)
+	}
+
+	// Mark refinement as failed.
+	if err := store.UpdateRefinement(sessionID, "", "failed"); err != nil {
+		t.Fatalf("update refinement: %v", err)
+	}
+
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	_, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "streaming" {
+		t.Fatalf("expected transcript_source 'streaming' after failed refinement, got %q", source)
+	}
+}
+
+func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-recanon-1"
+	started := time.Date(2026, 3, 23, 15, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: "initial streaming", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+		t.Fatalf("append segment: %v", err)
+	}
+
+	// First canonicalization — streaming (refinement pending).
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("first canonicalize: %v", err)
+	}
+	_, source, _ := store.GetCanonicalTranscript(sessionID)
+	if source != "streaming" {
+		t.Fatalf("expected initial source 'streaming', got %q", source)
+	}
+
+	// Late refinement completes.
+	if err := store.UpdateRefinement(sessionID, "late refined transcript", "completed"); err != nil {
+		t.Fatalf("update refinement: %v", err)
+	}
+
+	// Re-canonicalize — should now use refined.
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("re-canonicalize: %v", err)
+	}
+
+	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "refined" {
+		t.Fatalf("expected re-canonicalized source 'refined', got %q", source)
+	}
+	if transcript != "late refined transcript" {
+		t.Fatalf("expected re-canonicalized transcript, got %q", transcript)
+	}
+}

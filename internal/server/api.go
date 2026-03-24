@@ -71,6 +71,20 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
 	})
 
+	// Mic diagnostic endpoint
+	mux.HandleFunc("POST /api/diagnostic/mic", func(w http.ResponseWriter, r *http.Request) {
+		if controls.DiagnoseMic == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "mic diagnostic not available")
+			return
+		}
+		report, err := controls.DiagnoseMic(r.Context())
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("mic diagnostic failed: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, report)
+	})
+
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, versionInfo)
 	})

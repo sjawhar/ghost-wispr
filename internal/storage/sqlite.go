@@ -57,6 +57,8 @@ type Session struct {
 	ErrorMessage      string     `json:"error_message"`
 	GDriveFolderID    string     `json:"gdrive_folder_id"`
 	MergedInto        string     `json:"merged_into"`
+	CanonicalTranscript string     `json:"canonical_transcript"`
+	TranscriptSource    string     `json:"transcript_source"`
 }
 
 type SQLiteStore struct {
@@ -130,7 +132,9 @@ func (s *SQLiteStore) init() error {
 			retry_count INTEGER NOT NULL DEFAULT 0,
 			last_sync_attempt TEXT,
 			error_message TEXT NOT NULL DEFAULT '',
-			sync_state TEXT NOT NULL DEFAULT 'PENDING'
+			sync_state TEXT NOT NULL DEFAULT 'PENDING',
+			canonical_transcript TEXT NOT NULL DEFAULT '',
+			transcript_source TEXT NOT NULL DEFAULT ''
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
@@ -150,6 +154,8 @@ func (s *SQLiteStore) init() error {
 		`ALTER TABLE sessions ADD COLUMN last_sync_attempt TEXT`,
 		`ALTER TABLE sessions ADD COLUMN error_message TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'PENDING'`,
+		`ALTER TABLE sessions ADD COLUMN canonical_transcript TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN transcript_source TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -366,7 +372,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -410,7 +416,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -423,7 +429,7 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -431,7 +437,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -553,6 +559,60 @@ func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {
 	return transcript, status, nil
 }
 
+// Canonicalize sets the canonical_transcript and transcript_source for a session.
+// If refinement is completed, uses the refined transcript; otherwise assembles streaming segments.
+func (s *SQLiteStore) Canonicalize(sessionID string) error {
+	var refinedTranscript, refinementStatus string
+	if err := s.db.QueryRow(`SELECT refined_transcript, refinement_status FROM sessions WHERE id = ?`, sessionID).Scan(&refinedTranscript, &refinementStatus); err != nil {
+		return fmt.Errorf("query refinement for canonicalize %s: %w", sessionID, err)
+	}
+
+	var canonical, source string
+	if refinementStatus == "completed" && strings.TrimSpace(refinedTranscript) != "" {
+		canonical = strings.TrimSpace(refinedTranscript)
+		source = "refined"
+	} else {
+		// Assemble from streaming segments.
+		segs, err := s.GetSegments(sessionID)
+		if err != nil {
+			return fmt.Errorf("get segments for canonicalize %s: %w", sessionID, err)
+		}
+		var b strings.Builder
+		for _, seg := range segs {
+			text := strings.TrimSpace(seg.Text)
+			if text == "" {
+				continue
+			}
+			b.WriteString(text)
+			b.WriteByte('\n')
+		}
+		canonical = b.String()
+		source = "streaming"
+	}
+
+	res, err := s.db.Exec(`UPDATE sessions SET canonical_transcript = ?, transcript_source = ? WHERE id = ?`, canonical, source, sessionID)
+	if err != nil {
+		return fmt.Errorf("update canonical transcript for session %s: %w", sessionID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("canonicalize rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// GetCanonicalTranscript returns the canonical transcript and its source for a session.
+func (s *SQLiteStore) GetCanonicalTranscript(sessionID string) (string, string, error) {
+	var transcript, source string
+	if err := s.db.QueryRow(`SELECT canonical_transcript, transcript_source FROM sessions WHERE id = ?`, sessionID).Scan(&transcript, &source); err != nil {
+		return "", "", fmt.Errorf("query canonical transcript for session %s: %w", sessionID, err)
+	}
+	return transcript, source, nil
+}
+
 func (s *SQLiteStore) UpdateTitle(sessionID, title string) error {
 	res, err := s.db.Exec(`UPDATE sessions SET title = ? WHERE id = ?`, title, sessionID)
 	if err != nil {
@@ -656,7 +716,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -777,7 +837,7 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -873,8 +933,8 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 	}
 
 	_, err = tx.Exec(
-		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, canonical_transcript, transcript_source)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ID,
 		sess.Title,
 		sess.StartedAt.UTC().Format(time.RFC3339Nano),
@@ -897,6 +957,8 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		}(),
 		sess.ErrorMessage,
 		sess.GDriveFolderID,
+		sess.CanonicalTranscript,
+		sess.TranscriptSource,
 	)
 	if err != nil {
 		return fmt.Errorf("insert session %s: %w", sess.ID, err)

@@ -20,6 +20,8 @@ type Store interface {
 	UpdateRefinement(sessionID, transcript, status string) error
 	GetRefinement(sessionID string) (transcript, status string, err error)
 	UpdateTitle(sessionID, title string) error
+	Canonicalize(sessionID string) error
+	GetCanonicalTranscript(sessionID string) (transcript, source string, err error)
 }
 
 type Recorder interface {

@@ -1545,3 +1545,54 @@ func TestManualSessionStop_NotConfigured(t *testing.T) {
 		t.Fatalf("expected 503, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestAPISessionDetail_IncludesTranscriptSource(t *testing.T) {
+	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {
+				ID:                  "s1",
+				StartedAt:           started,
+				Summary:             "test",
+				SummaryStatus:       storage.SummaryCompleted,
+				TranscriptSource:    "refined",
+				CanonicalTranscript: "refined transcript content",
+			},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {{Speaker: 0, Text: "line", StartTime: 0, EndTime: 1, Timestamp: started}},
+		},
+		dates: []string{"2026-03-23"},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Session struct {
+			TranscriptSource    string `json:"transcript_source"`
+			CanonicalTranscript string `json:"canonical_transcript"`
+		} `json:"session"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if resp.Session.TranscriptSource != "refined" {
+		t.Fatalf("expected transcript_source 'refined' in API response, got %q", resp.Session.TranscriptSource)
+	}
+	if resp.Session.CanonicalTranscript != "refined transcript content" {
+		t.Fatalf("expected canonical_transcript in API response, got %q", resp.Session.CanonicalTranscript)
+	}
+}
