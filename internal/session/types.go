@@ -17,6 +17,8 @@ type Store interface {
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	CountSegments(sessionID string) (int, error)
 	UpdateSummary(sessionID, title, summary, status, preset string) error
+	UpdateRefinement(sessionID, transcript, status string) error
+	GetRefinement(sessionID string) (transcript, status string, err error)
 	UpdateTitle(sessionID, title string) error
 }
 

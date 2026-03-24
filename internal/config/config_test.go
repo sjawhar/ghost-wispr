@@ -15,10 +15,40 @@ func clearEnv(t *testing.T) {
 		"DB_PATH", "AUDIO_DIR", "LOG_LEVEL", "SILENCE_TIMEOUT",
 		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES",
 		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
+		"BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL",
 		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
+	}
+}
+
+func TestBatchRefinementConfigDefaultsAndOverrides(t *testing.T) {
+	clearEnv(t)
+
+	cfg, _, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.BatchTranscription.Provider != "deepgram" {
+		t.Fatalf("expected default batch provider deepgram, got %q", cfg.BatchTranscription.Provider)
+	}
+	if cfg.BatchTranscription.Model != "nova-3" {
+		t.Fatalf("expected default batch model nova-3, got %q", cfg.BatchTranscription.Model)
+	}
+
+	t.Setenv(EnvPrefix+"BATCH_TRANSCRIPTION_PROVIDER", "openai")
+	t.Setenv(EnvPrefix+"BATCH_TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
+
+	cfg, _, err = Load("")
+	if err != nil {
+		t.Fatalf("Load with env overrides failed: %v", err)
+	}
+	if cfg.BatchTranscription.Provider != "openai" {
+		t.Fatalf("expected env batch provider openai, got %q", cfg.BatchTranscription.Provider)
+	}
+	if cfg.BatchTranscription.Model != "gpt-4o-transcribe" {
+		t.Fatalf("expected env batch model gpt-4o-transcribe, got %q", cfg.BatchTranscription.Model)
 	}
 }
 

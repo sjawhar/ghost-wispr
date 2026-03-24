@@ -56,6 +56,36 @@ func buildTranscript(segments []transcribe.Segment) string {
 	return b.String()
 }
 
+func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segments []transcribe.Segment) string {
+	streamingTranscript := buildTranscript(segments)
+	refined, status, err := store.GetRefinement(sessionID)
+	if err != nil {
+		return streamingTranscript
+	}
+	if status == "completed" && strings.TrimSpace(refined) != "" {
+		return refined
+	}
+
+	return streamingTranscript
+}
+
+func makeBatchTranscriber(cfg config.Config) (transcribe.BatchTranscriber, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.BatchTranscription.Provider)) {
+	case "", "deepgram":
+		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
+			return nil, fmt.Errorf("Deepgram API key not configured")
+		}
+		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
+			APIKey: cfg.DeepgramAPIKey,
+			Model:  cfg.BatchTranscription.Model,
+		}), nil
+	case "groq", "openai":
+		return nil, fmt.Errorf("batch transcription provider %q is not implemented yet", cfg.BatchTranscription.Provider)
+	default:
+		return nil, fmt.Errorf("unsupported batch transcription provider %q", cfg.BatchTranscription.Provider)
+	}
+}
+
 type recorderState struct {
 	mic    *audio.Mic
 	mu     sync.RWMutex
@@ -283,6 +313,12 @@ func main() {
 
 	recState := &recorderState{}
 	warnings := append([]string{}, cfgWarnings...)
+	if batchTranscriber, err := makeBatchTranscriber(cfg); err != nil {
+		log.Printf("warning: batch transcription disabled: %v", err)
+		warnings = append(warnings, "Batch transcription unavailable — using streaming transcript fallback")
+	} else {
+		manager.SetBatchTranscriber(batchTranscriber)
+	}
 	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
@@ -324,7 +360,7 @@ func main() {
 				return err
 			}
 
-			transcript := buildTranscript(segments)
+			transcript := buildCanonicalTranscript(store, sessionID, segments)
 
 			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
 			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
@@ -358,7 +394,7 @@ func main() {
 				return
 			}
 
-			transcript := buildTranscript(segments)
+			transcript := buildCanonicalTranscript(store, sessionID, segments)
 			if transcript == "" {
 				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "")
 				return
@@ -399,7 +435,7 @@ func main() {
 				return "", err
 			}
 
-			transcript := buildTranscript(segments)
+			transcript := buildCanonicalTranscript(store, sessionID, segments)
 
 			modelStr := preset.Model
 			if modelStr == "" {
@@ -586,7 +622,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {
 		appLogger = logging.New(os.Stdout, newCfg.LogLevel)
@@ -606,6 +641,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)
+		}
+
+		if batchTranscriber, err := makeBatchTranscriber(newCfg); err != nil {
+			manager.SetBatchTranscriber(nil)
+			log.Printf("config: batch transcriber disabled: %v", err)
+		} else {
+			manager.SetBatchTranscriber(batchTranscriber)
+			log.Printf("config: batch transcriber updated for provider %s", newCfg.BatchTranscription.Provider)
 		}
 
 		if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
@@ -636,7 +679,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					log.Printf("warning: failed to get segments for %s: %v", id, err)
 					continue
 				}
-				transcript := buildTranscript(segments)
+				transcript := buildCanonicalTranscript(store, id, segments)
 				if transcript == "" {
 					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "")
 					continue

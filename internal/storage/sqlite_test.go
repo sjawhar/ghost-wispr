@@ -138,6 +138,43 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 	}
 }
 
+func TestBatchRefinement_StoreStatusAndTranscript(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startedAt := time.Date(2026, 3, 23, 9, 0, 0, 0, time.UTC)
+	sessionID := startedAt.Format("20060102150405")
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	session, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if session.RefinementStatus != "pending" {
+		t.Fatalf("expected default refinement_status pending, got %q", session.RefinementStatus)
+	}
+
+	if err := store.UpdateRefinement(sessionID, "", "running"); err != nil {
+		t.Fatalf("UpdateRefinement running failed: %v", err)
+	}
+
+	if err := store.UpdateRefinement(sessionID, "refined canonical transcript", "completed"); err != nil {
+		t.Fatalf("UpdateRefinement completed failed: %v", err)
+	}
+
+	session, err = store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession after refinement failed: %v", err)
+	}
+	if session.RefinementStatus != "completed" {
+		t.Fatalf("expected refinement_status completed, got %q", session.RefinementStatus)
+	}
+	if session.RefinedTranscript != "refined canonical transcript" {
+		t.Fatalf("expected refined transcript to persist, got %q", session.RefinedTranscript)
+	}
+}
+
 func TestSQLiteSummaryClaimIsIdempotent(t *testing.T) {
 	store := newTestSQLiteStore(t)
 

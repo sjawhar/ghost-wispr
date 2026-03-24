@@ -13,8 +13,8 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
-	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 type Manager struct {
@@ -27,6 +27,9 @@ type Manager struct {
 	buffer             *UtteranceBuffer
 	minSessionSegments int
 	logger             *slog.Logger
+	batchLogger        *slog.Logger
+	batchTranscriber   transcribe.BatchTranscriber
+	refinementWait     time.Duration
 
 	mu               sync.Mutex
 	currentSessionID string
@@ -57,6 +60,8 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 		buffer:             NewUtteranceBuffer(),
 		minSessionSegments: minSessionSegments,
 		logger:             l,
+		batchLogger:        logging.WithModule(l, "transcribe"),
+		refinementWait:     30 * time.Second,
 	}
 
 	detector.OnSessionEnd(func() {
@@ -302,8 +307,47 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 		m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 	}
 
+	m.mu.Lock()
+	batchTranscriber := m.batchTranscriber
+	m.mu.Unlock()
+
+	if batchTranscriber != nil && strings.TrimSpace(audioPath) != "" {
+		go m.runBatchRefinement(context.Background(), sessionID, audioPath)
+	}
+
 	go m.generateSummary(context.Background(), sessionID, startedAt)
 	return nil
+}
+
+func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath string) {
+	m.mu.Lock()
+	batchTranscriber := m.batchTranscriber
+	m.mu.Unlock()
+	if batchTranscriber == nil {
+		return
+	}
+
+	if err := m.store.UpdateRefinement(sessionID, "", "running"); err != nil {
+		m.batchLogger.Error("failed to mark refinement running", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		return
+	}
+
+	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
+	transcript, err := batchTranscriber.Transcribe(ctx, audioPath)
+	if err != nil {
+		if updateErr := m.store.UpdateRefinement(sessionID, "", "failed"); updateErr != nil {
+			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
+		}
+		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		return
+	}
+
+	if err := m.store.UpdateRefinement(sessionID, transcript, "completed"); err != nil {
+		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		return
+	}
+
+	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID)
 }
 
 func (m *Manager) generateSummary(ctx context.Context, sessionID string, startedAt time.Time) {
@@ -348,10 +392,20 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		b.WriteString("\n")
 	}
 
-	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, b.String())
+	transcript := b.String()
+	m.mu.Lock()
+	batchConfigured := m.batchTranscriber != nil
+	m.mu.Unlock()
+	if batchConfigured {
+		if refined := m.waitForRefinedTranscript(ctx, sessionID); refined != "" {
+			transcript = refined
+		}
+	}
+
+	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, transcript)
 	// Safety net: ensure title is never empty using fallback chain.
 	if strings.TrimSpace(title) == "" {
-		title = summary.GenerateTitle("", b.String(), segments, startedAt)
+		title = summary.GenerateTitle("", transcript, segments, startedAt)
 	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
@@ -426,6 +480,59 @@ func (m *Manager) SetMinSessionSegments(n int) {
 		n = 0
 	}
 	m.minSessionSegments = n
+}
+
+func (m *Manager) SetBatchTranscriber(t transcribe.BatchTranscriber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchTranscriber = t
+}
+
+func (m *Manager) SetRefinementWaitTimeout(timeout time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if timeout <= 0 {
+		m.refinementWait = 30 * time.Second
+		return
+	}
+	m.refinementWait = timeout
+}
+
+func (m *Manager) waitForRefinedTranscript(ctx context.Context, sessionID string) string {
+	m.mu.Lock()
+	waitTimeout := m.refinementWait
+	m.mu.Unlock()
+
+	if waitTimeout <= 0 {
+		waitTimeout = 30 * time.Second
+	}
+
+	deadline := time.Now().Add(waitTimeout)
+	for {
+		transcript, status, err := m.store.GetRefinement(sessionID)
+		if err != nil {
+			m.batchLogger.Warn("failed to read refinement state", "operation", "wait_refinement", "session_id", sessionID, "error", err)
+			return ""
+		}
+
+		switch status {
+		case "completed":
+			return strings.TrimSpace(transcript)
+		case "failed":
+			return ""
+		case "pending", "running":
+			if time.Now().After(deadline) {
+				return ""
+			}
+			select {
+			case <-ctx.Done():
+				return ""
+			case <-time.After(100 * time.Millisecond):
+			}
+		default:
+			return ""
+		}
+	}
 }
 
 func (m *Manager) OnTranscriptionDisconnect() {

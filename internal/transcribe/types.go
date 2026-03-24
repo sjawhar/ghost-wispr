@@ -56,6 +56,10 @@ type ClientFactory func(ctx context.Context) (io.WriteCloser, error)
 // It's called whenever the connection state changes (e.g., for logging or metrics).
 type ConnectionCallback func(state ConnectionState)
 
+type BatchTranscriber interface {
+	Transcribe(ctx context.Context, audioPath string) (string, error)
+}
+
 // ResilientClient wraps an io.WriteCloser (Deepgram client) and buffers audio during disconnects.
 // All fields are exported for testing purposes.
 type ResilientClient struct {
