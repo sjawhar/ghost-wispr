@@ -1,36 +1,47 @@
 <script lang="ts">
-  import type { ComponentStatus } from '../lib/state.svelte'
+  import type { ComponentStatus as ComponentStatusState } from '../lib/state.svelte'
+  import { ComponentStatus, HealthStatus } from '../lib/types'
 
   let {
     connected,
     componentStatuses,
   }: {
     connected: boolean
-    componentStatuses: Record<string, ComponentStatus>
+    componentStatuses: Record<string, ComponentStatusState>
   } = $props()
 
   const overallLevel = $derived.by(() => {
-    if (!connected) return 'error'
+    if (!connected) return HealthStatus.Error
 
     const statuses = Object.values(componentStatuses)
-    if (statuses.some((s) => s.status === 'error' || s.status === 'disconnected')) return 'error'
-    if (statuses.some((s) => s.status === 'reconnecting' || s.status === 'draining'))
-      return 'warning'
-    return 'ok'
+    if (
+      statuses.some(
+        (s) => s.status === ComponentStatus.Error || s.status === ComponentStatus.Disconnected,
+      )
+    )
+      return HealthStatus.Error
+    if (
+      statuses.some(
+        (s) => s.status === ComponentStatus.Reconnecting || s.status === ComponentStatus.Draining,
+      )
+    ) {
+      return HealthStatus.Degraded
+    }
+    return HealthStatus.Healthy
   })
 
   const lastError = $derived.by(() => {
     if (!connected) return 'WebSocket disconnected'
 
     const errorStatuses = Object.entries(componentStatuses).filter(
-      ([, s]) => s.status === 'error' || s.status === 'disconnected',
+      ([, s]) => s.status === ComponentStatus.Error || s.status === ComponentStatus.Disconnected,
     )
     if (errorStatuses.length > 0) {
       return errorStatuses.map(([, s]) => s.message).join('; ')
     }
 
     const reconnecting = Object.entries(componentStatuses).filter(
-      ([, s]) => s.status === 'reconnecting',
+      ([, s]) => s.status === ComponentStatus.Reconnecting,
     )
     if (reconnecting.length > 0) {
       return reconnecting.map(([, s]) => s.message).join('; ')
@@ -41,30 +52,30 @@
 
   const componentEntries = $derived(Object.entries(componentStatuses))
 
-  function statusIcon(status: string): string {
+  function statusIcon(status: ComponentStatus): string {
     switch (status) {
-      case 'connected':
+      case ComponentStatus.Connected:
         return '●'
-      case 'disconnected':
-      case 'error':
+      case ComponentStatus.Disconnected:
+      case ComponentStatus.Error:
         return '○'
-      case 'reconnecting':
-      case 'draining':
+      case ComponentStatus.Reconnecting:
+      case ComponentStatus.Draining:
         return '◐'
       default:
         return '?'
     }
   }
 
-  function statusColor(status: string): string {
+  function statusColor(status: ComponentStatus): string {
     switch (status) {
-      case 'connected':
+      case ComponentStatus.Connected:
         return 'var(--status-green)'
-      case 'reconnecting':
-      case 'draining':
+      case ComponentStatus.Reconnecting:
+      case ComponentStatus.Draining:
         return 'var(--status-yellow)'
-      case 'disconnected':
-      case 'error':
+      case ComponentStatus.Disconnected:
+      case ComponentStatus.Error:
         return 'var(--status-red)'
       default:
         return 'var(--muted)'
@@ -72,17 +83,21 @@
   }
 </script>
 
-{#if overallLevel !== 'ok'}
+{#if overallLevel !== HealthStatus.Healthy}
   <aside
     class="status-banner"
-    class:status-error={overallLevel === 'error'}
-    class:status-warning={overallLevel === 'warning'}
+    class:status-error={overallLevel === HealthStatus.Error}
+    class:status-warning={overallLevel === HealthStatus.Degraded}
     data-testid="status-banner"
     role="status"
     aria-live="polite"
   >
     <div class="banner-main">
-      <span class="banner-indicator" class:error={overallLevel === 'error'} class:warning={overallLevel === 'warning'}></span>
+      <span
+        class="banner-indicator"
+        class:error={overallLevel === HealthStatus.Error}
+        class:warning={overallLevel === HealthStatus.Degraded}
+      ></span>
       <span class="banner-text">{lastError}</span>
     </div>
 
@@ -90,7 +105,9 @@
       <div class="component-breakdown" data-testid="component-breakdown">
         {#each componentEntries as [name, cs] (name)}
           <span class="component-chip" title={cs.message}>
-            <span class="chip-dot" style="color: {statusColor(cs.status)}">{statusIcon(cs.status)}</span>
+            <span class="chip-dot" style="color: {statusColor(cs.status)}"
+              >{statusIcon(cs.status)}</span
+            >
             <span class="chip-label">{name}</span>
           </span>
         {/each}

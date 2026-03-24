@@ -125,7 +125,9 @@
     border: 1px solid var(--line);
     background: var(--bg);
     color: var(--text);
-    transition: background 0.15s, border-color 0.15s;
+    transition:
+      background 0.15s,
+      border-color 0.15s;
   }
 
   .record-btn:hover {

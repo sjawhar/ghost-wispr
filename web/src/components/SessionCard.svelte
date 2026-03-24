@@ -1,7 +1,14 @@
 <script lang="ts">
   import Markdown from '@humanspeak/svelte-markdown'
   import AudioPlayer from './AudioPlayer.svelte'
-  import type { PresetMap, SessionDetailResponse, SessionSummary } from '../lib/types'
+  import {
+    RefinementStatus,
+    SummaryStatus,
+    SyncStatus,
+    type PresetMap,
+    type SessionDetailResponse,
+    type SessionSummary,
+  } from '../lib/types'
   import { copyText } from '../lib/clipboard'
   import { updateSessionTitle, retrySummary, retrySync, retryRefinement } from '../lib/api'
 
@@ -111,7 +118,7 @@
     try {
       await retrySummary(session.id)
     } finally {
-      setTimeout(() => retryingSummary = false, 1000)
+      setTimeout(() => (retryingSummary = false), 1000)
     }
   }
 
@@ -121,7 +128,7 @@
     try {
       await retrySync(session.id)
     } finally {
-      setTimeout(() => retryingSync = false, 1000)
+      setTimeout(() => (retryingSync = false), 1000)
     }
   }
 
@@ -131,7 +138,7 @@
     try {
       await retryRefinement(session.id)
     } finally {
-      setTimeout(() => retryingRefinement = false, 1000)
+      setTimeout(() => (retryingRefinement = false), 1000)
     }
   }
 </script>
@@ -198,13 +205,18 @@
         {#if !session.ended_at}
           <span class="recording-dot" title="Recording active" data-testid="recording-dot"></span>
         {/if}
-        
+
         <div class="badge-group">
           <span class={`status-badge ${session.summary_status}`} data-testid="summary-badge">
             Summary: {session.summary_status}
           </span>
-          {#if session.summary_status === 'failed'}
-            <button class="retry-btn" onclick={handleRetrySummary} disabled={retryingSummary} data-testid="retry-summary-btn">
+          {#if session.summary_status === SummaryStatus.Failed}
+            <button
+              class="retry-btn"
+              onclick={handleRetrySummary}
+              disabled={retryingSummary}
+              data-testid="retry-summary-btn"
+            >
               {retryingSummary ? '...' : '↻'}
             </button>
           {/if}
@@ -215,8 +227,13 @@
             <span class={`status-badge ${session.sync_status}`} data-testid="sync-badge">
               Sync: {session.sync_status}
             </span>
-            {#if session.sync_status === 'failed'}
-              <button class="retry-btn" onclick={handleRetrySync} disabled={retryingSync} data-testid="retry-sync-btn">
+            {#if session.sync_status === SyncStatus.Failed}
+              <button
+                class="retry-btn"
+                onclick={handleRetrySync}
+                disabled={retryingSync}
+                data-testid="retry-sync-btn"
+              >
                 {retryingSync ? '...' : '↻'}
               </button>
             {/if}
@@ -225,11 +242,19 @@
 
         {#if session.refinement_status}
           <div class="badge-group">
-            <span class={`status-badge ${session.refinement_status}`} data-testid="refinement-badge">
+            <span
+              class={`status-badge ${session.refinement_status}`}
+              data-testid="refinement-badge"
+            >
               Refine: {session.refinement_status}
             </span>
-            {#if session.refinement_status === 'failed'}
-              <button class="retry-btn" onclick={handleRetryRefinement} disabled={retryingRefinement} data-testid="retry-refinement-btn">
+            {#if session.refinement_status === RefinementStatus.Failed}
+              <button
+                class="retry-btn"
+                onclick={handleRetryRefinement}
+                disabled={retryingRefinement}
+                data-testid="retry-refinement-btn"
+              >
                 {retryingRefinement ? '...' : '↻'}
               </button>
             {/if}
@@ -258,17 +283,17 @@
     </div>
   </div>
 
-  {#if session.summary_status === 'completed' && session.summary}
+  {#if session.summary_status === SummaryStatus.Completed && session.summary}
     <div class="summary-preview-md prose">
       <Markdown source={session.summary} />
     </div>
-  {:else if session.summary_status === 'running' || session.summary_status === 'pending'}
+  {:else if session.summary_status === SummaryStatus.Running || session.summary_status === SummaryStatus.Pending}
     <p class="summary-preview">Summarizing...</p>
-  {:else if session.summary_status === 'failed'}
+  {:else if session.summary_status === SummaryStatus.Failed}
     <p class="summary-preview">Summary unavailable</p>
   {/if}
 
-  {#if (session.summary_status === 'completed' || session.summary_status === 'failed') && Object.keys(presets).length > 0}
+  {#if (session.summary_status === SummaryStatus.Completed || session.summary_status === SummaryStatus.Failed) && Object.keys(presets).length > 0}
     <div class="resummarize-wrap">
       {#if Object.keys(presets).length === 1}
         <button
@@ -309,7 +334,7 @@
       {#if detail}
         <AudioPlayer sessionId={session.id} segments={detail.segments} />
 
-        {#if session.summary_status === 'completed' && session.summary}
+        {#if session.summary_status === SummaryStatus.Completed && session.summary}
           <div class="summary-section">
             <div class="section-header">
               <span class="section-label">Summary</span>
@@ -373,12 +398,15 @@
     color: var(--muted);
   }
 
-  .status-badge.completed, .status-badge.synced {
+  .status-badge.completed,
+  .status-badge.synced {
     background: var(--success-soft);
     color: var(--success);
   }
 
-  .status-badge.pending, .status-badge.running, .status-badge.syncing {
+  .status-badge.pending,
+  .status-badge.running,
+  .status-badge.syncing {
     background: var(--warning-soft);
     color: var(--warning);
   }
@@ -422,9 +450,18 @@
   }
 
   @keyframes pulse {
-    0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
-    70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
-    100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+    0% {
+      transform: scale(0.95);
+      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+    }
+    70% {
+      transform: scale(1);
+      box-shadow: 0 0 0 6px rgba(239, 68, 68, 0);
+    }
+    100% {
+      transform: scale(0.95);
+      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+    }
   }
 
   .resummarize-wrap {

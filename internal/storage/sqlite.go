@@ -13,30 +13,47 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 const (
-	SummaryPending   = "pending"
-	SummaryRunning   = "running"
-	SummaryCompleted = "completed"
-	SummaryFailed    = "failed"
+	SummaryPending   = gwstatus.SummaryPending
+	SummaryRunning   = gwstatus.SummaryRunning
+	SummaryCompleted = gwstatus.SummaryCompleted
+	SummaryFailed    = gwstatus.SummaryFailed
 
-	SessionActive    = "active"
-	SessionEnded     = "ended"
-	SessionDiscarded = "discarded"
-	SessionMerged    = "merged"
+	RefinementPending   = gwstatus.RefinementPending
+	RefinementRunning   = gwstatus.RefinementRunning
+	RefinementCompleted = gwstatus.RefinementCompleted
+	RefinementFailed    = gwstatus.RefinementFailed
 
-	SyncPending = "pending"
-	SyncSynced  = "synced"
-	SyncFailed  = "failed"
+	SessionActive    = gwstatus.SessionActive
+	SessionEnded     = gwstatus.SessionEnded
+	SessionDiscarded = gwstatus.SessionDiscarded
+	SessionMerged    = gwstatus.SessionMerged
 
-	SyncStatePending        = "PENDING"
-	SyncStateSyncing        = "SYNCING"
-	SyncStateSynced         = "SYNCED"
-	SyncStateFailed         = "FAILED"
-	SyncStateRetryScheduled = "RETRY_SCHEDULED"
-	SyncStateRemoteDeleted  = "REMOTE_DELETED"
+	SyncPending = gwstatus.SyncPending
+	SyncSynced  = gwstatus.SyncSynced
+	SyncFailed  = gwstatus.SyncFailed
+
+	SyncStatePending        = gwstatus.SyncStatePending
+	SyncStateSyncing        = gwstatus.SyncStateSyncing
+	SyncStateSynced         = gwstatus.SyncStateSynced
+	SyncStateFailed         = gwstatus.SyncStateFailed
+	SyncStateRetryScheduled = gwstatus.SyncStateRetryScheduled
+	SyncStateRemoteDeleted  = gwstatus.SyncStateRemoteDeleted
+
+	TranscriptSourceStreaming = gwstatus.TranscriptSourceStreaming
+	TranscriptSourceRefined   = gwstatus.TranscriptSourceRefined
+
+	ComponentStatusConnected    = gwstatus.ComponentStatusConnected
+	ComponentStatusDisconnected = gwstatus.ComponentStatusDisconnected
+	ComponentStatusReconnecting = gwstatus.ComponentStatusReconnecting
+	ComponentStatusError        = gwstatus.ComponentStatusError
+	ComponentStatusOK           = gwstatus.ComponentStatusOK
+	ComponentStatusOpen         = gwstatus.ComponentStatusOpen
+	ComponentStatusClosed       = gwstatus.ComponentStatusClosed
 )
 
 type Session struct {
@@ -612,9 +629,9 @@ func (s *SQLiteStore) Canonicalize(sessionID string) error {
 	}
 
 	var canonical, source string
-	if refinementStatus == "completed" && strings.TrimSpace(refinedTranscript) != "" {
+	if refinementStatus == RefinementCompleted && strings.TrimSpace(refinedTranscript) != "" {
 		canonical = strings.TrimSpace(refinedTranscript)
-		source = "refined"
+		source = TranscriptSourceRefined
 	} else {
 		// Assemble from streaming segments.
 		segs, err := s.GetSegments(sessionID)
@@ -631,7 +648,7 @@ func (s *SQLiteStore) Canonicalize(sessionID string) error {
 			b.WriteByte('\n')
 		}
 		canonical = b.String()
-		source = "streaming"
+		source = TranscriptSourceStreaming
 	}
 
 	res, err := s.db.Exec(`UPDATE sessions SET canonical_transcript = ?, transcript_source = ? WHERE id = ?`, canonical, source, sessionID)

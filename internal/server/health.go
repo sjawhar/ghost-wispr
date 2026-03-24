@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 // HealthChecker defines the interface for checking component health
@@ -53,19 +54,19 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 	w.Header().Set("Content-Type", "application/json")
 
 	// Check component health
-	deepgramStatus := "disconnected"
+	deepgramStatus := storage.ComponentStatusDisconnected
 	if checker.IsDeepgramConnected() {
-		deepgramStatus = "connected"
+		deepgramStatus = storage.ComponentStatusConnected
 	}
 
-	dbStatus := "error"
+	dbStatus := storage.ComponentStatusError
 	if checker.IsDBHealthy(r.Context()) {
-		dbStatus = "ok"
+		dbStatus = storage.ComponentStatusOK
 	}
 
-	micStatus := "closed"
+	micStatus := storage.ComponentStatusClosed
 	if checker.IsMicOpen() {
-		micStatus = "open"
+		micStatus = storage.ComponentStatusOpen
 	}
 
 	resp := HealthzReadyResponse{
@@ -75,7 +76,7 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 	}
 
 	// Determine overall health
-	allHealthy := deepgramStatus == "connected" && dbStatus == "ok" && micStatus == "open"
+	allHealthy := deepgramStatus == storage.ComponentStatusConnected && dbStatus == storage.ComponentStatusOK && micStatus == storage.ComponentStatusOpen
 
 	if allHealthy {
 		w.WriteHeader(http.StatusOK)
@@ -104,7 +105,9 @@ type DefaultHealthChecker struct {
 }
 
 // NewDefaultHealthChecker creates a new DefaultHealthChecker
-func NewDefaultHealthChecker(resilientClient interface{ IsConnected() bool }, store interface{ Ping(ctx context.Context) error }, mic interface{ IsOpen() bool }) *DefaultHealthChecker {
+func NewDefaultHealthChecker(resilientClient interface{ IsConnected() bool }, store interface {
+	Ping(ctx context.Context) error
+}, mic interface{ IsOpen() bool }) *DefaultHealthChecker {
 	return &DefaultHealthChecker{
 		resilientClient: resilientClient,
 		store:           store,

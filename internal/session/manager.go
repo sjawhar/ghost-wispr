@@ -327,7 +327,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinement(sessionID, "", "running"); err != nil {
+	if err := m.store.UpdateRefinement(sessionID, "", storage.RefinementRunning); err != nil {
 		m.batchLogger.Error("failed to mark refinement running", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}
@@ -335,24 +335,24 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
 	transcript, err := batchTranscriber.Transcribe(ctx, audioPath)
 	if err != nil {
-		if updateErr := m.store.UpdateRefinement(sessionID, "", "failed"); updateErr != nil {
+		if updateErr := m.store.UpdateRefinement(sessionID, "", storage.RefinementFailed); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
 		}
 		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("refinement", "error", fmt.Sprintf("Batch refinement failed for session %s", sessionID))
+			m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusError, fmt.Sprintf("Batch refinement failed for session %s", sessionID))
 		}
 		return
 	}
 
-	if err := m.store.UpdateRefinement(sessionID, transcript, "completed"); err != nil {
+	if err := m.store.UpdateRefinement(sessionID, transcript, storage.RefinementCompleted); err != nil {
 		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}
 
 	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID)
 	if m.hub != nil {
-		m.hub.BroadcastComponentStatus("refinement", "connected", fmt.Sprintf("Batch refinement completed for session %s", sessionID))
+		m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
 	}
 
 	// Re-canonicalize now that refined transcript is available.
@@ -377,7 +377,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
 					m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 					if m.hub != nil {
-						m.hub.BroadcastComponentStatus("sync", "error", fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+						m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
 					}
 				}
 			}()
@@ -406,7 +406,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, "")
 		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("summary", "error", fmt.Sprintf("Failed to retrieve transcript for session %s", sessionID))
+			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to retrieve transcript for session %s", sessionID))
 		}
 		return
 	}
@@ -427,7 +427,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
 		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("summary", "error", fmt.Sprintf("Summarization failed for session %s", sessionID))
+			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
 		return
 	}
@@ -437,7 +437,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
 		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("summary", "error", fmt.Sprintf("Failed to store summary for session %s", sessionID))
+			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
 		return
 	}
@@ -449,7 +449,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
 				m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 				if m.hub != nil {
-					m.hub.BroadcastComponentStatus("sync", "error", fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
 				}
 			}
 		}()
@@ -531,11 +531,11 @@ func (m *Manager) waitForRefinedTranscript(ctx context.Context, sessionID string
 		}
 
 		switch status {
-		case "completed":
+		case storage.RefinementCompleted:
 			return strings.TrimSpace(transcript)
-		case "failed":
+		case storage.RefinementFailed:
 			return ""
-		case "pending", "running":
+		case storage.RefinementPending, storage.RefinementRunning:
 			if time.Now().After(deadline) {
 				return ""
 			}

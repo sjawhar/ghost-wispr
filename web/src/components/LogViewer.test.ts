@@ -4,7 +4,7 @@ import LogViewer from './LogViewer.svelte'
 import * as api from '../lib/api'
 
 vi.mock('../lib/api', () => ({
-  fetchLogs: vi.fn()
+  fetchLogs: vi.fn(),
 }))
 
 describe('LogViewer', () => {
@@ -20,17 +20,17 @@ describe('LogViewer', () => {
 
   it('opens and fetches logs when toggled', async () => {
     const mockLogs = [
-      { timestamp: '2026-03-23T10:00:00Z', level: 'INFO', message: 'test log', raw: '' }
+      { timestamp: '2026-03-23T10:00:00Z', level: 'INFO', message: 'test log', raw: '' },
     ]
     vi.mocked(api.fetchLogs).mockResolvedValue(mockLogs)
 
     render(LogViewer)
-    
+
     const toggle = screen.getByTestId('log-viewer-toggle')
     await fireEvent.click(toggle)
 
     expect(api.fetchLogs).toHaveBeenCalledWith('ALL', 100)
-    
+
     // Wait for logs to render
     const entry = await screen.findByTestId('log-entry')
     expect(entry).toBeTruthy()
@@ -41,7 +41,7 @@ describe('LogViewer', () => {
     vi.mocked(api.fetchLogs).mockResolvedValue([])
 
     render(LogViewer)
-    
+
     const toggle = screen.getByTestId('log-viewer-toggle')
     await fireEvent.click(toggle)
 

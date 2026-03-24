@@ -224,10 +224,7 @@
       }}
     />
   {:else}
-    <StatusBanner
-      connected={appState.connected}
-      componentStatuses={appState.componentStatuses}
-    />
+    <StatusBanner connected={appState.connected} componentStatuses={appState.componentStatuses} />
 
     {#if appState.warnings.length > 0}
       <aside class="warnings-banner" data-testid="warnings-banner">

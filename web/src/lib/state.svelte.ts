@@ -1,4 +1,5 @@
 import type {
+  ComponentStatus as ComponentStatusValue,
   ComponentStatusEvent,
   LiveTranscriptEvent,
   PresetMap,
@@ -9,7 +10,7 @@ import type {
 } from './types'
 
 export type ComponentStatus = {
-  status: string
+  status: ComponentStatusValue
   message: string
   timestamp: string
 }

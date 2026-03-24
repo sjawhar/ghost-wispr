@@ -5,18 +5,19 @@ import (
 	"strings"
 	"time"
 
+	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 	"google.golang.org/api/googleapi"
 )
 
 type SyncState string
 
 const (
-	SyncStatePending        SyncState = "PENDING"
-	SyncStateSyncing        SyncState = "SYNCING"
-	SyncStateSynced         SyncState = "SYNCED"
-	SyncStateFailed         SyncState = "FAILED"
-	SyncStateRetryScheduled SyncState = "RETRY_SCHEDULED"
-	SyncStateRemoteDeleted  SyncState = "REMOTE_DELETED"
+	SyncStatePending        SyncState = gwstatus.SyncStatePending
+	SyncStateSyncing        SyncState = gwstatus.SyncStateSyncing
+	SyncStateSynced         SyncState = gwstatus.SyncStateSynced
+	SyncStateFailed         SyncState = gwstatus.SyncStateFailed
+	SyncStateRetryScheduled SyncState = gwstatus.SyncStateRetryScheduled
+	SyncStateRemoteDeleted  SyncState = gwstatus.SyncStateRemoteDeleted
 )
 
 const MaxSyncRetries = 5

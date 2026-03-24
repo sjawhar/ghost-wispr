@@ -5,6 +5,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 )
 
 // ConnectionState represents the state of the Deepgram websocket connection.
@@ -21,11 +23,11 @@ const (
 func (s ConnectionState) String() string {
 	switch s {
 	case StateConnected:
-		return "connected"
+		return gwstatus.ComponentStatusConnected
 	case StateDisconnected:
-		return "disconnected"
+		return gwstatus.ComponentStatusDisconnected
 	case StateReconnecting:
-		return "reconnecting"
+		return gwstatus.ComponentStatusReconnecting
 	case StateDraining:
 		return "draining"
 	default:

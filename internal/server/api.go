@@ -284,7 +284,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
 			return
 		}
-		if sessionData.Status == "active" {
+		if sessionData.Status == storage.SessionActive {
 			writeJSONError(w, http.StatusConflict, "cannot delete active session")
 			return
 		}

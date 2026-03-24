@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte'
+  import { onMount } from 'svelte'
   import { fetchLogs, type LogEntry } from '../lib/api'
 
   let isOpen = $state(false)
@@ -58,17 +58,29 @@
 
   function getLevelColor(level: string) {
     switch (level.toUpperCase()) {
-      case 'ERROR': return 'var(--danger)'
-      case 'WARN': return 'var(--warning)'
-      case 'INFO': return 'var(--success)'
-      case 'DEBUG': return 'var(--muted)'
-      default: return 'var(--muted)'
+      case 'ERROR':
+        return 'var(--danger)'
+      case 'WARN':
+        return 'var(--warning)'
+      case 'INFO':
+        return 'var(--success)'
+      case 'DEBUG':
+        return 'var(--muted)'
+      default:
+        return 'var(--muted)'
     }
   }
 </script>
 
 <div class="log-viewer" class:open={isOpen} data-testid="log-viewer">
-  <div class="log-header" role="button" tabindex="0" onclick={toggle} onkeydown={(e) => e.key === 'Enter' && toggle()} data-testid="log-viewer-toggle">
+  <div
+    class="log-header"
+    role="button"
+    tabindex="0"
+    onclick={toggle}
+    onkeydown={(e) => e.key === 'Enter' && toggle()}
+    data-testid="log-viewer-toggle"
+  >
     <span class="title">System Logs</span>
     <span class="toggle-icon">{isOpen ? '▼' : '▲'}</span>
   </div>
@@ -76,7 +88,7 @@
   {#if isOpen}
     <div class="log-controls">
       <div class="filters">
-        {#each levels as level}
+        {#each levels as level (level)}
           <button
             class="filter-btn"
             class:active={filterLevel === level}
@@ -94,7 +106,7 @@
     </div>
 
     <div class="log-content" bind:this={logContainer} onscroll={handleScroll}>
-      {#each logs as log}
+      {#each logs as log (log.raw)}
         <div class="log-entry" data-testid="log-entry">
           <span class="log-time">{new Date(log.timestamp).toLocaleTimeString()}</span>
           <span class="log-level" style="color: {getLevelColor(log.level)}">[{log.level}]</span>

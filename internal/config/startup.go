@@ -3,6 +3,8 @@ package config
 import (
 	"log/slog"
 	"strings"
+
+	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 )
 
 // ComponentState represents the startup state of a single component.
@@ -25,7 +27,7 @@ type StartupStatus struct {
 func (s StartupStatus) Enabled() []string {
 	var enabled []string
 	for _, c := range s.Components() {
-		if c.Status == "connected" || c.Status == "ok" {
+		if c.Status == gwstatus.ComponentStatusConnected || c.Status == gwstatus.ComponentStatusOK {
 			enabled = append(enabled, c.Name)
 		}
 	}
@@ -36,7 +38,7 @@ func (s StartupStatus) Enabled() []string {
 func (s StartupStatus) Disabled() []string {
 	var disabled []string
 	for _, c := range s.Components() {
-		if c.Status != "connected" && c.Status != "ok" {
+		if c.Status != gwstatus.ComponentStatusConnected && c.Status != gwstatus.ComponentStatusOK {
 			disabled = append(disabled, c.Name)
 		}
 	}
@@ -66,7 +68,7 @@ func ValidateStartup(cfg Config) StartupStatus {
 	} else {
 		status.Deepgram = ComponentState{
 			Name:    "deepgram",
-			Status:  "connected",
+			Status:  gwstatus.ComponentStatusConnected,
 			Message: "Deepgram API key present",
 		}
 	}
@@ -74,14 +76,14 @@ func ValidateStartup(cfg Config) StartupStatus {
 	// Database — initialized to pending; main.go sets the real state.
 	status.Database = ComponentState{
 		Name:    "database",
-		Status:  "ok",
+		Status:  gwstatus.ComponentStatusOK,
 		Message: "pending initialization",
 	}
 
 	// Mic — initialized to pending; main.go sets the real state.
 	status.Mic = ComponentState{
 		Name:    "mic",
-		Status:  "connected",
+		Status:  gwstatus.ComponentStatusConnected,
 		Message: "pending initialization",
 	}
 
@@ -101,7 +103,7 @@ func ValidateStartup(cfg Config) StartupStatus {
 	} else {
 		status.DriveSync = ComponentState{
 			Name:    "sync",
-			Status:  "connected",
+			Status:  gwstatus.ComponentStatusConnected,
 			Message: "Drive sync enabled",
 		}
 	}

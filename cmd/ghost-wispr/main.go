@@ -62,7 +62,7 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	if err != nil {
 		return streamingTranscript
 	}
-	if status == "completed" && strings.TrimSpace(refined) != "" {
+	if status == storage.RefinementCompleted && strings.TrimSpace(refined) != "" {
 		return refined
 	}
 
@@ -829,7 +829,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
 		} else {
 			log.Printf("microphone started at %d Hz", selectedSampleRate)
-			startupStatus.Mic = config.ComponentState{Name: "mic", Status: "connected", Message: fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate)}
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusConnected, Message: fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate)}
 		}
 	}
 
@@ -892,9 +892,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 			}
 			go func() {
-			go func() {
-				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf, hub)
-			}()
+				go func() {
+					streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf, hub)
+				}()
 			}()
 		}
 	}
@@ -995,7 +995,7 @@ func streamMicWithRetry(
 
 		logf("mic stream error (retrying in %v): %v", backoff, err)
 		if hub != nil {
-			hub.BroadcastComponentStatus("mic", "error", err.Error())
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
 		}
 		wait(backoff)
 
@@ -1006,7 +1006,7 @@ func streamMicWithRetry(
 		if reopenErr := streamer.Reopen(); reopenErr != nil {
 			logf("mic reopen failed: %v", reopenErr)
 			if hub != nil {
-				hub.BroadcastComponentStatus("mic", "error", reopenErr.Error())
+				hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
 			}
 			backoff = min(backoff*2, maxBackoff)
 			continue

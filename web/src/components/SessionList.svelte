@@ -1,7 +1,16 @@
 <script lang="ts">
   import SessionCard from './SessionCard.svelte'
   import { fetchSearch } from '../lib/api'
-  import type { PresetMap, SearchResult, SessionDetailResponse, SessionSummary } from '../lib/types'
+  import {
+    SessionStatus,
+    SummaryStatus,
+    RefinementStatus,
+    SyncStatus,
+    type PresetMap,
+    type SearchResult,
+    type SessionDetailResponse,
+    type SessionSummary,
+  } from '../lib/types'
 
   let {
     dates,
@@ -67,7 +76,7 @@
     const durationMs = Date.parse(session.ended_at) - Date.parse(session.started_at)
     const durationMins = durationMs / 60000
     if (durationMins >= 2) return false
-    if (!session.summary || session.summary_status !== 'completed') return true
+    if (!session.summary || session.summary_status !== SummaryStatus.Completed) return true
     const content = session.summary.replace(/^#{1,6}\s+.*$/gm, '').trim()
     return content.length < 50
   }
@@ -162,17 +171,6 @@
     await onLoadDetail(sessionID)
     onToggleSession(sessionID)
   }
-
-  function sanitizeSnippet(snippet: string): string {
-    const escaped = snippet
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&#39;')
-
-    return escaped.replaceAll('&lt;mark&gt;', '<mark>').replaceAll('&lt;/mark&gt;', '</mark>')
-  }
 </script>
 
 <section class="history-panel" data-testid="history-panel">
@@ -193,9 +191,9 @@
       </select>
       <select bind:value={statusFilter} class="filter-select" data-testid="status-filter">
         <option value="all">All Status</option>
-        <option value="active">Active</option>
-        <option value="completed">Completed</option>
-        <option value="failed">Failed</option>
+        <option value={SessionStatus.Active}>Active</option>
+        <option value={SummaryStatus.Completed}>Completed</option>
+        <option value={SummaryStatus.Failed}>Failed</option>
       </select>
     </div>
     {#if selectedIds.size > 0}
@@ -229,7 +227,7 @@
               >
                 {result.title || result.session_id}
               </button>
-              <p class="search-snippet">{@html sanitizeSnippet(result.snippet)}</p>
+              <p class="search-snippet">{result.snippet}</p>
             </li>
           {/each}
         </ul>
@@ -248,13 +246,14 @@
     {@const allSessions = sessionsByDate.get(date) ?? []}
     {@const statusFilteredSessions = allSessions.filter((s) => {
       if (statusFilter === 'all') return true
-      if (statusFilter === 'active') return !s.ended_at
-      if (statusFilter === 'completed') return s.summary_status === 'completed'
-      if (statusFilter === 'failed') {
+      if (statusFilter === SessionStatus.Active) return !s.ended_at
+      if (statusFilter === SummaryStatus.Completed)
+        return s.summary_status === SummaryStatus.Completed
+      if (statusFilter === SummaryStatus.Failed) {
         return (
-          s.summary_status === 'failed' ||
-          s.sync_status === 'failed' ||
-          s.refinement_status === 'failed'
+          s.summary_status === SummaryStatus.Failed ||
+          s.sync_status === SyncStatus.Failed ||
+          s.refinement_status === RefinementStatus.Failed
         )
       }
       return true

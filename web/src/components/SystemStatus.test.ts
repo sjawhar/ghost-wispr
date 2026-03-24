@@ -1,14 +1,15 @@
 import { render, screen } from '@testing-library/svelte'
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import SystemStatus from './SystemStatus.svelte'
 import { appState } from '../lib/state.svelte'
+import { ComponentStatus } from '../lib/types'
 
 describe('SystemStatus', () => {
   it('renders all status items', () => {
     appState.componentStatuses = {
-      deepgram: { status: 'connected', message: '' },
-      sync: { status: 'disconnected', message: '' },
-      mic: { status: 'error', message: '' }
+      deepgram: { status: ComponentStatus.Connected, message: '', timestamp: '' },
+      sync: { status: ComponentStatus.Disconnected, message: '', timestamp: '' },
+      mic: { status: ComponentStatus.Error, message: '', timestamp: '' },
     }
     render(SystemStatus)
 
