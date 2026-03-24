@@ -1,6 +1,7 @@
 <script lang="ts">
   import SessionCard from './SessionCard.svelte'
   import type { PresetMap, SessionDetailResponse, SessionSummary } from '../lib/types'
+  import { searchSessions, type SearchResult } from '../lib/api'
 
   let {
     dates,
@@ -105,11 +106,37 @@
   }
 </script>
 
+  let searchQuery = $state('')
+  let searchResults = $state<SearchResult[]>([])
+  let searchTimeout: ReturnType<typeof setTimeout> | null = null
+  let isSearching = $state(false)
+
+  function handleSearchInput(e: Event) {
+    const value = (e.target as HTMLInputElement).value
+    searchQuery = value
+    if (searchTimeout) clearTimeout(searchTimeout)
+    if (!value.trim()) {
+      searchResults = []
+      isSearching = false
+      return
+    }
+    isSearching = true
+    searchTimeout = setTimeout(async () => {
+      try {
+        searchResults = await searchSessions(value)
+      } catch {
+        searchResults = []
+      } finally {
+        isSearching = false
+      }
+    }, 300)
+  }
+
 <section class="history-panel" data-testid="history-panel">
   <header class="panel-head">
     <h2>Session History</h2>
     <div class="filter-controls">
-      <input type="text" class="search-input" placeholder="Search available after FTS5 setup" disabled data-testid="search-input" />
+      <input type="text" class="search-input" placeholder="Search sessions..." value={searchQuery} oninput={handleSearchInput} data-testid="search-input" />
       <select bind:value={dateFilter} class="filter-select" data-testid="date-filter">
         <option value="all">All Time</option>
         <option value="today">Today</option>
@@ -132,6 +159,24 @@
       </div>
     {/if}
   </header>
+
+  {#if searchQuery.trim() && searchResults.length > 0}
+    <div class="search-results" data-testid="search-results">
+      <h3>Search Results ({searchResults.length})</h3>
+      {#each searchResults as result (result.session_id)}
+        <div class="search-result-item" data-testid="search-result">
+          <a href="#" onclick={(e) => { e.preventDefault(); onToggleSession(result.session_id) }}>
+            <strong>{result.title}</strong>
+          </a>
+          <p class="search-snippet">{@html result.snippet}</p>
+        </div>
+      {/each}
+    </div>
+  {:else if searchQuery.trim() && !isSearching}
+    <div class="search-results empty" data-testid="search-results-empty">
+      <p>No results found for "{searchQuery}"</p>
+    </div>
+  {/if}
 
   {#if dates.length === 0}
     <div class="empty-state">

@@ -30,6 +30,7 @@ type SessionStore interface {
 	UpdateTitle(sessionID, title string) error
 	DeleteSession(id string) error
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
+	Search(query string) ([]storage.SearchResult, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -87,6 +88,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, versionInfo)
+	})
+
+	// Full-text search endpoint
+	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if q == "" {
+			writeJSON(w, http.StatusOK, []any{})
+			return
+		}
+		results, err := store.Search(q)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("search failed: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, results)
 	})
 	registerRestoreRoutes(mux, controls)
 	registerLogRoutes(mux, controls)

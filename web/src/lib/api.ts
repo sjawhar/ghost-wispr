@@ -123,3 +123,14 @@ export function fetchLogs(level?: string, limit?: number, since?: string): Promi
   const qs = params.toString()
   return request<LogEntry[]>(`/api/logs${qs ? '?' + qs : ''}`)
 }
+
+export interface SearchResult {
+  session_id: string
+  title: string
+  snippet: string
+  rank: number
+}
+
+export function searchSessions(query: string): Promise<SearchResult[]> {
+  return request<SearchResult[]>(`/api/search?q=${encodeURIComponent(query)}`)
+}

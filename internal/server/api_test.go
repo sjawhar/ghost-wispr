@@ -25,6 +25,8 @@ type apiStoreStub struct {
 	sessions       map[string]storage.Session
 	segments       map[string][]transcribe.Segment
 	dates          []string
+	searchResults  map[string][]storage.SearchResult
+	searchErr      error
 }
 
 func newTestConfigStore(t *testing.T) *config.Store {
@@ -61,6 +63,16 @@ func (s apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, error
 
 func (s apiStoreStub) GetDates() ([]string, error) {
 	return s.dates, nil
+}
+
+func (s apiStoreStub) Search(query string) ([]storage.SearchResult, error) {
+	if s.searchErr != nil {
+		return nil, s.searchErr
+	}
+	if s.searchResults == nil {
+		return []storage.SearchResult{}, nil
+	}
+	return s.searchResults[query], nil
 }
 
 func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
@@ -139,6 +151,74 @@ func TestAPISessionsList(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "s1") {
 		t.Fatalf("expected body to contain session id, got %s", rr.Body.String())
+	}
+}
+
+func TestAPISearchReturnsResults(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+		searchResults: map[string][]storage.SearchResult{
+			"alpha": {
+				{SessionID: "s1", Title: "Alpha planning", Snippet: "<mark>alpha</mark> snippet", Rank: -1.25},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=alpha", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode search results: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 search result, got %d", len(results))
+	}
+	if results[0].SessionID != "s1" || !strings.Contains(results[0].Snippet, "<mark>") {
+		t.Fatalf("unexpected search result payload: %+v", results[0])
+	}
+}
+
+func TestAPISearchEmptyQueryReturnsEmptyArray(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=%20%20%20", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode search results: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected empty search results, got %+v", results)
 	}
 }
 

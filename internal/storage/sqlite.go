@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -39,27 +40,36 @@ const (
 )
 
 type Session struct {
-	ID                string     `json:"id"`
-	Title             string     `json:"title"`
-	StartedAt         time.Time  `json:"started_at"`
-	EndedAt           *time.Time `json:"ended_at,omitempty"`
-	Status            string     `json:"status"`
-	Summary           string     `json:"summary"`
-	SummaryStatus     string     `json:"summary_status"`
-	SummaryPreset     string     `json:"summary_preset"`
-	RefinedTranscript string     `json:"refined_transcript"`
-	RefinementStatus  string     `json:"refinement_status"`
-	AudioPath         string     `json:"audio_path"`
-	SyncStatus        string     `json:"sync_status"`
-	SyncState         string     `json:"sync_state"`
-	RetryCount        int        `json:"retry_count"`
-	LastSyncAttempt   *time.Time `json:"last_sync_attempt,omitempty"`
-	ErrorMessage      string     `json:"error_message"`
-	GDriveFolderID    string     `json:"gdrive_folder_id"`
-	MergedInto        string     `json:"merged_into"`
+	ID                  string     `json:"id"`
+	Title               string     `json:"title"`
+	StartedAt           time.Time  `json:"started_at"`
+	EndedAt             *time.Time `json:"ended_at,omitempty"`
+	Status              string     `json:"status"`
+	Summary             string     `json:"summary"`
+	SummaryStatus       string     `json:"summary_status"`
+	SummaryPreset       string     `json:"summary_preset"`
+	RefinedTranscript   string     `json:"refined_transcript"`
+	RefinementStatus    string     `json:"refinement_status"`
+	AudioPath           string     `json:"audio_path"`
+	SyncStatus          string     `json:"sync_status"`
+	SyncState           string     `json:"sync_state"`
+	RetryCount          int        `json:"retry_count"`
+	LastSyncAttempt     *time.Time `json:"last_sync_attempt,omitempty"`
+	ErrorMessage        string     `json:"error_message"`
+	GDriveFolderID      string     `json:"gdrive_folder_id"`
+	MergedInto          string     `json:"merged_into"`
 	CanonicalTranscript string     `json:"canonical_transcript"`
 	TranscriptSource    string     `json:"transcript_source"`
 }
+
+type SearchResult struct {
+	SessionID string  `json:"session_id"`
+	Title     string  `json:"title"`
+	Snippet   string  `json:"snippet"`
+	Rank      float64 `json:"rank"`
+}
+
+var ftsQueryTokenPattern = regexp.MustCompile(`[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
 	db *sql.DB
@@ -140,6 +150,15 @@ func (s *SQLiteStore) init() error {
 		return fmt.Errorf("create sessions table: %w", err)
 	}
 
+	if _, err := s.db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+			title, summary, canonical_transcript,
+			content='sessions', content_rowid='rowid'
+		);
+	`); err != nil {
+		return fmt.Errorf("create sessions_fts table: %w", err)
+	}
+
 	// Migrate: add columns if they don't exist (for pre-existing DBs).
 	// Only ignore "duplicate column" errors; propagate other failures.
 	for _, stmt := range []string{
@@ -160,6 +179,31 @@ func (s *SQLiteStore) init() error {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
 		}
+	}
+
+	for _, stmt := range []string{
+		`CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+			INSERT INTO sessions_fts(rowid, title, summary, canonical_transcript)
+			VALUES (new.rowid, new.title, new.summary, new.canonical_transcript);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+			INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, canonical_transcript)
+			VALUES('delete', old.rowid, old.title, old.summary, old.canonical_transcript);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+			INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, canonical_transcript)
+			VALUES('delete', old.rowid, old.title, old.summary, old.canonical_transcript);
+			INSERT INTO sessions_fts(rowid, title, summary, canonical_transcript)
+			VALUES (new.rowid, new.title, new.summary, new.canonical_transcript);
+		END;`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("create sessions_fts trigger: %w", err)
+		}
+	}
+
+	if _, err := s.db.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("rebuild sessions_fts index: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -985,4 +1029,66 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 // Ping checks if the database is accessible.
 func (s *SQLiteStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
+}
+
+func (s *SQLiteStore) Search(query string) ([]SearchResult, error) {
+	matchQuery := buildFTS5MatchQuery(query)
+	if matchQuery == "" {
+		return []SearchResult{}, nil
+	}
+
+	rows, err := s.db.Query(
+		`SELECT sessions.id,
+		        sessions.title,
+		        COALESCE(
+		          NULLIF(snippet(sessions_fts, 2, '<mark>', '</mark>', ' … ', 24), ''),
+		          NULLIF(snippet(sessions_fts, 1, '<mark>', '</mark>', ' … ', 24), ''),
+		          sessions.title
+		        ) AS snippet,
+		        bm25(sessions_fts) AS rank
+		 FROM sessions_fts
+		 JOIN sessions ON sessions.rowid = sessions_fts.rowid
+		 WHERE sessions_fts MATCH ?
+		   AND sessions.status NOT IN ('discarded', 'merged')
+		 ORDER BY rank ASC
+		 LIMIT 50`,
+		matchQuery,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	results := make([]SearchResult, 0, 16)
+	for rows.Next() {
+		var result SearchResult
+		if err := rows.Scan(&result.SessionID, &result.Title, &result.Snippet, &result.Rank); err != nil {
+			return nil, fmt.Errorf("scan search result: %w", err)
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate search results: %w", err)
+	}
+
+	return results, nil
+}
+
+func buildFTS5MatchQuery(query string) string {
+	tokens := ftsQueryTokenPattern.FindAllString(query, -1)
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	quoted := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		clean := strings.TrimSpace(token)
+		if clean == "" {
+			continue
+		}
+		clean = strings.ReplaceAll(clean, `"`, `""`)
+		quoted = append(quoted, `"`+clean+`"`)
+	}
+
+	return strings.Join(quoted, " AND ")
 }

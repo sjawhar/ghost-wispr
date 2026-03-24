@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -732,5 +733,152 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	}
 	if transcript != "late refined transcript" {
 		t.Fatalf("expected re-canonicalized transcript, got %q", transcript)
+	}
+}
+
+func TestFTS5IndexAndTriggersAreCreated(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	var ftsSQL string
+	if err := store.DB().QueryRow(`SELECT sql FROM sqlite_master WHERE name = 'sessions_fts'`).Scan(&ftsSQL); err != nil {
+		t.Fatalf("sessions_fts schema lookup failed: %v", err)
+	}
+
+	lowerSQL := strings.ToLower(ftsSQL)
+	if !strings.Contains(lowerSQL, "using fts5") {
+		t.Fatalf("expected sessions_fts to use fts5, got %q", ftsSQL)
+	}
+	if !strings.Contains(lowerSQL, "content='sessions'") {
+		t.Fatalf("expected sessions_fts to be external-content table, got %q", ftsSQL)
+	}
+
+	for _, trigger := range []string{"sessions_ai", "sessions_au", "sessions_ad"} {
+		var count int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil {
+			t.Fatalf("trigger lookup %s failed: %v", trigger, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected trigger %s to exist", trigger)
+		}
+	}
+}
+
+func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	started := time.Date(2026, 3, 23, 16, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("fts-1", started); err != nil {
+		t.Fatalf("create session fts-1: %v", err)
+	}
+	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary fts-1: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha appears once in transcript", "fts-1"); err != nil {
+		t.Fatalf("update canonical transcript fts-1: %v", err)
+	}
+
+	if err := store.CreateSession("fts-2", started.Add(time.Minute)); err != nil {
+		t.Fatalf("create session fts-2: %v", err)
+	}
+	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary fts-2: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha alpha alpha and alpha again", "fts-2"); err != nil {
+		t.Fatalf("update canonical transcript fts-2: %v", err)
+	}
+
+	results, err := store.Search("alpha")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(results) < 2 {
+		t.Fatalf("expected at least 2 search results, got %d", len(results))
+	}
+
+	if !strings.Contains(results[0].Snippet, "<mark>") {
+		t.Fatalf("expected highlighted snippet, got %q", results[0].Snippet)
+	}
+	if results[0].SessionID == "" || results[0].Title == "" {
+		t.Fatalf("expected search result identifiers, got %+v", results[0])
+	}
+
+	if results[0].Rank > results[1].Rank {
+		t.Fatalf("expected first result to be equal/better rank ordering, got %f > %f", results[0].Rank, results[1].Rank)
+	}
+}
+
+func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	started := time.Date(2026, 3, 23, 17, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("fts-sync", started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary initial: %v", err)
+	}
+
+	results, err := store.Search("delta")
+	if err != nil {
+		t.Fatalf("search initial: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no matches before update, got %d", len(results))
+	}
+
+	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary delta: %v", err)
+	}
+
+	results, err = store.Search("delta")
+	if err != nil {
+		t.Fatalf("search after update: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "fts-sync" {
+		t.Fatalf("expected one updated match for fts-sync, got %+v", results)
+	}
+
+	if err := store.DeleteSession("fts-sync"); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	results, err = store.Search("delta")
+	if err != nil {
+		t.Fatalf("search after delete: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no matches after delete, got %+v", results)
+	}
+}
+
+func TestFTS5SearchEmptyQueryReturnsEmptyResults(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	results, err := store.Search("   ")
+	if err != nil {
+		t.Fatalf("search empty query failed: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected empty results for empty query, got %+v", results)
+	}
+}
+
+func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	started := time.Date(2026, 3, 23, 18, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("fts-escape", started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary: %v", err)
+	}
+
+	results, err := store.Search(`alpha OR "beta" -gamma`)
+	if err != nil {
+		t.Fatalf("search with special characters failed: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "fts-escape" {
+		t.Fatalf("expected escaped query to return fts-escape, got %+v", results)
 	}
 }
