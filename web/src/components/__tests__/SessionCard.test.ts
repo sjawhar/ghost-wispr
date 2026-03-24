@@ -1,15 +1,16 @@
 import { fireEvent, render, screen } from '@testing-library/svelte'
 import { describe, expect, it, vi } from 'vitest'
 import SessionCard from '../SessionCard.svelte'
+import { SessionStatus, SummaryStatus, type SessionSummary } from '../../lib/types'
 
-const baseSession = {
+const baseSession: SessionSummary = {
   id: 's1',
   title: '',
   started_at: new Date('2026-02-26T10:00:00Z').toISOString(),
   ended_at: new Date('2026-02-26T10:10:00Z').toISOString(),
-  status: 'ended',
+  status: SessionStatus.Ended,
   summary: '',
-  summary_status: 'pending' as const,
+  summary_status: SummaryStatus.Pending,
   summary_preset: 'default',
   audio_path: 'data/audio/s1.mp3',
 }
@@ -27,7 +28,7 @@ describe('SessionCard', () => {
       onDelete: vi.fn(),
     })
 
-    expect(screen.getByText('pending')).toBeTruthy()
+    expect(screen.getByText(`Summary: ${SummaryStatus.Pending}`)).toBeTruthy()
     expect(screen.getByText('Summarizing...')).toBeTruthy()
   })
 
@@ -54,7 +55,7 @@ describe('SessionCard', () => {
     render(SessionCard, {
       session: {
         ...baseSession,
-        summary_status: 'completed',
+        summary_status: SummaryStatus.Completed,
         summary: 'Done summary',
       },
       detail: undefined,

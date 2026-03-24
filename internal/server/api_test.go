@@ -25,6 +25,8 @@ type apiStoreStub struct {
 	sessions       map[string]storage.Session
 	segments       map[string][]transcribe.Segment
 	dates          []string
+	searchResults  map[string][]storage.SearchResult
+	searchErr      error
 }
 
 func newTestConfigStore(t *testing.T) *config.Store {
@@ -61,6 +63,16 @@ func (s apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, error
 
 func (s apiStoreStub) GetDates() ([]string, error) {
 	return s.dates, nil
+}
+
+func (s apiStoreStub) Search(query string) ([]storage.SearchResult, error) {
+	if s.searchErr != nil {
+		return nil, s.searchErr
+	}
+	if s.searchResults == nil {
+		return []storage.SearchResult{}, nil
+	}
+	return s.searchResults[query], nil
 }
 
 func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
@@ -122,7 +134,7 @@ func TestAPISessionsList(t *testing.T) {
 	}
 
 	hub := NewHub()
-	h, err := Handler(testStaticFS(t), hub, store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), hub, store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -142,6 +154,74 @@ func TestAPISessionsList(t *testing.T) {
 	}
 }
 
+func TestAPISearchReturnsResults(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+		searchResults: map[string][]storage.SearchResult{
+			"alpha": {
+				{SessionID: "s1", Title: "Alpha planning", Snippet: "<mark>alpha</mark> snippet", Rank: -1.25},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=alpha", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode search results: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 search result, got %d", len(results))
+	}
+	if results[0].SessionID != "s1" || !strings.Contains(results[0].Snippet, "<mark>") {
+		t.Fatalf("unexpected search result payload: %+v", results[0])
+	}
+}
+
+func TestAPISearchEmptyQueryReturnsEmptyArray(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=%20%20%20", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode search results: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected empty search results, got %+v", results)
+	}
+}
+
 func TestAPISessionDetail(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	store := apiStoreStub{
@@ -155,7 +235,7 @@ func TestAPISessionDetail(t *testing.T) {
 		dates: []string{"2026-02-26"},
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -182,7 +262,7 @@ func TestDeleteSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -204,7 +284,7 @@ func TestDeleteSession_NotFound(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -226,7 +306,7 @@ func TestDeleteSession_InvalidID(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -256,7 +336,7 @@ func TestMergeSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -299,7 +379,7 @@ func TestMergeSession_TooFewSessions(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -327,7 +407,7 @@ func TestMergeSession_SessionNotFound(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -367,7 +447,7 @@ func TestAPIAudioRange(t *testing.T) {
 		dates:    []string{"2026-02-26"},
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -396,7 +476,7 @@ func TestAPIDates(t *testing.T) {
 		dates:          []string{"2026-02-26", "2026-02-25"},
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -421,7 +501,7 @@ func TestAPIAudioPathTraversalBlocked(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -449,7 +529,7 @@ func TestAPIStatusWithWarnings(t *testing.T) {
 		Warnings: func() []string {
 			return []string{"Deepgram API key not configured"}
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -488,7 +568,7 @@ func TestAPIStatusNoWarnings(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -526,7 +606,7 @@ func TestAPIStatusWithActiveSession(t *testing.T) {
 		ActiveSession: func() (string, time.Time) {
 			return "session-123", startedAt
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -560,7 +640,7 @@ func TestAPIStatusWithNoActiveSession(t *testing.T) {
 		ActiveSession: func() (string, time.Time) {
 			return "", time.Time{}
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -603,7 +683,7 @@ func TestGetPresets(t *testing.T) {
 				},
 			}
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -640,7 +720,7 @@ func TestGetPresetsEmpty(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -681,7 +761,7 @@ func TestResummarize(t *testing.T) {
 			called <- resummarizeCall{sessionID: sessionID, preset: preset}
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -716,7 +796,7 @@ func TestResummarizeNotConfigured(t *testing.T) {
 		dates:          nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -742,7 +822,7 @@ func TestResummarizeInvalidSessionID(t *testing.T) {
 		Resummarize: func(ctx context.Context, sessionID, preset string) error {
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -770,7 +850,7 @@ func TestAPI_Resummarize_InvalidJSONReturns400(t *testing.T) {
 			called <- struct{}{}
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -804,7 +884,7 @@ func TestAPI_Resummarize_ValidRequestStill202(t *testing.T) {
 			called <- struct{}{}
 			return nil
 		},
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -835,7 +915,7 @@ func TestAPI_SessionAudio_RejectsAbsolutePath(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "")
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -856,7 +936,7 @@ func TestEndSession_Success(t *testing.T) {
 		segments:       map[string][]transcribe.Segment{},
 	}, &ControlHooks{
 		EndSession: func(_ context.Context) error { return nil },
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -877,7 +957,7 @@ func TestEndSession_NoActiveSession(t *testing.T) {
 		segments:       map[string][]transcribe.Segment{},
 	}, &ControlHooks{
 		EndSession: func(_ context.Context) error { return session.ErrNoActiveSession },
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -898,7 +978,7 @@ func TestEndSession_InternalError(t *testing.T) {
 		segments:       map[string][]transcribe.Segment{},
 	}, &ControlHooks{
 		EndSession: func(_ context.Context) error { return errors.New("db exploded") },
-	}, "")
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -917,7 +997,7 @@ func TestEndSession_NotConfigured(t *testing.T) {
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
-	}, &ControlHooks{}, "")
+	}, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -941,7 +1021,7 @@ func TestAPI_GeneratePreset_MissingDescription(t *testing.T) {
 		GeneratePreset: func(ctx context.Context, description string) (config.Preset, error) {
 			return config.Preset{}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -974,7 +1054,7 @@ func TestAPI_GeneratePreset_Success(t *testing.T) {
 				UserTemplate: "{{transcript}}",
 			}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1008,7 +1088,7 @@ func TestAPI_RefinePreset_MissingFields(t *testing.T) {
 		RefinePreset: func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error) {
 			return config.Preset{}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1044,7 +1124,7 @@ func TestAPI_RefinePreset_UnknownPreset(t *testing.T) {
 		RefinePreset: func(ctx context.Context, current config.Preset, feedback string) (config.Preset, error) {
 			return config.Preset{}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1074,7 +1154,7 @@ func TestAPI_RefinePreset_Success(t *testing.T) {
 				UserTemplate: "{{transcript}}",
 			}, nil
 		},
-	}, "", cfgStore)
+	}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1104,7 +1184,7 @@ func TestAPI_GetConfig_ExposesGDriveSyncAndGCDefaults(t *testing.T) {
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
-	}, &ControlHooks{}, "", cfgStore)
+	}, &ControlHooks{}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1151,7 +1231,7 @@ func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
-	}, &ControlHooks{}, "", cfgStore)
+	}, &ControlHooks{}, "", nil, cfgStore)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -1191,5 +1271,408 @@ func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 	}
 	if resp.GC.MaxAudioSizeMB != 256 {
 		t.Fatalf("expected gc.max_audio_size_mb 256, got %d", resp.GC.MaxAudioSizeMB)
+	}
+}
+
+func TestFaultInjectionDisabledWithoutTestMode(t *testing.T) {
+	store := apiStoreStub{
+		sessions: map[string]storage.Session{},
+		segments: map[string][]transcribe.Segment{},
+	}
+
+	closed := false
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		FaultDeepgramDisconnect: func() error {
+			closed = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/test/fault/deepgram-disconnect", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when test mode not enabled, got %d", rr.Code)
+	}
+	if closed {
+		t.Fatal("expected fault NOT to be triggered without test mode")
+	}
+}
+
+func TestFaultInjectionEnabledWithTestMode(t *testing.T) {
+	t.Setenv("GHOST_WISPR_TEST_MODE", "true")
+
+	store := apiStoreStub{
+		sessions: map[string]storage.Session{},
+		segments: map[string][]transcribe.Segment{},
+	}
+
+	closed := false
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		FaultDeepgramDisconnect: func() error {
+			closed = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/test/fault/deepgram-disconnect", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 with test mode, got %d", rr.Code)
+	}
+
+	var result map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result["triggered"] != true {
+		t.Fatalf("expected triggered=true, got %v", result["triggered"])
+	}
+	if !closed {
+		t.Fatal("expected fault to be triggered")
+	}
+}
+
+func TestFaultInjectionNoHandler(t *testing.T) {
+	t.Setenv("GHOST_WISPR_TEST_MODE", "true")
+
+	store := apiStoreStub{
+		sessions: map[string]storage.Session{},
+		segments: map[string][]transcribe.Segment{},
+	}
+
+	// No FaultDeepgramDisconnect set
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/test/fault/deepgram-disconnect", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no handler configured, got %d", rr.Code)
+	}
+}
+
+// --- Manual Session Trigger Tests ---
+
+func TestManualSessionStart_Success(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StartSession: func(_ context.Context, titleHint string) (string, error) {
+			if titleHint != "My Meeting" {
+				return "", errors.New("unexpected title hint")
+			}
+			return "20260323120000", nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", strings.NewReader(`{"title_hint":"My Meeting"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["session_id"] != "20260323120000" {
+		t.Fatalf("expected session_id 20260323120000, got %q", resp["session_id"])
+	}
+}
+
+func TestManualSessionStart_NoBody(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StartSession: func(_ context.Context, titleHint string) (string, error) {
+			if titleHint != "" {
+				return "", errors.New("expected empty title hint")
+			}
+			return "20260323120000", nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStart_AlreadyActive(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StartSession: func(_ context.Context, titleHint string) (string, error) {
+			return "", session.ErrSessionAlreadyActive
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStart_NotConfigured(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_ByID_Success(t *testing.T) {
+	stopped := ""
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StopSession: func(_ context.Context, sessionID string) error {
+			stopped = sessionID
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-session/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if stopped != "test-session" {
+		t.Fatalf("expected stopped session test-session, got %q", stopped)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["status"] != "stopped" {
+		t.Fatalf("expected status stopped, got %q", resp["status"])
+	}
+}
+
+func TestManualSessionStop_ByID_NotFound(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StopSession: func(_ context.Context, sessionID string) error {
+			return session.ErrNoActiveSession
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/nonexistent/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_ByID_InvalidID(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StopSession: func(_ context.Context, sessionID string) error { return nil },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/%2e%2e/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_Current_Success(t *testing.T) {
+	called := false
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		EndSession: func(_ context.Context) error {
+			called = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/current/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !called {
+		t.Fatal("expected EndSession to be called")
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["status"] != "stopped" {
+		t.Fatalf("expected status stopped, got %q", resp["status"])
+	}
+}
+
+func TestManualSessionStop_Current_NoActive(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		EndSession: func(_ context.Context) error { return session.ErrNoActiveSession },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/current/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStop_NotConfigured(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/test-session/stop", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAPISessionDetail_IncludesTranscriptSource(t *testing.T) {
+	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {
+				ID:                  "s1",
+				StartedAt:           started,
+				Summary:             "test",
+				SummaryStatus:       storage.SummaryCompleted,
+				TranscriptSource:    "refined",
+				CanonicalTranscript: "refined transcript content",
+			},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {{Speaker: 0, Text: "line", StartTime: 0, EndTime: 1, Timestamp: started}},
+		},
+		dates: []string{"2026-03-23"},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Session struct {
+			TranscriptSource    string `json:"transcript_source"`
+			CanonicalTranscript string `json:"canonical_transcript"`
+		} `json:"session"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if resp.Session.TranscriptSource != "refined" {
+		t.Fatalf("expected transcript_source 'refined' in API response, got %q", resp.Session.TranscriptSource)
+	}
+	if resp.Session.CanonicalTranscript != "refined transcript content" {
+		t.Fatalf("expected canonical_transcript in API response, got %q", resp.Session.CanonicalTranscript)
 	}
 }

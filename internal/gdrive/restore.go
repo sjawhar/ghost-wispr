@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -123,7 +122,7 @@ func (s *Syncer) RestoreFromDrive(ctx context.Context, importFn func(RestoredSes
 		return nil, err
 	}
 
-	log.Printf("restore: found %d folders to process", len(folders))
+	s.logger.Info("gdrive restore folders discovered", "operation", "restore_list_folders", "folders", len(folders))
 
 	const workers = 10
 	type folderResult struct {
@@ -179,11 +178,11 @@ func (s *Syncer) RestoreFromDrive(ctx context.Context, importFn func(RestoredSes
 
 		result.Restored++
 		if result.Restored%50 == 0 {
-			log.Printf("restore: imported %d sessions so far", result.Restored)
+			s.logger.Info("gdrive restore progress", "operation", "restore_import", "restored", result.Restored)
 		}
 	}
 
-	log.Printf("restore: complete — restored=%d skipped=%d errors=%d", result.Restored, result.Skipped, len(result.Errors))
+	s.logger.Info("gdrive restore complete", "operation", "restore_complete", "restored", result.Restored, "skipped", result.Skipped, "errors", len(result.Errors))
 	return result, nil
 }
 
@@ -234,7 +233,7 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 	if summaryFileID != "" {
 		summaryText, err := s.ExportGoogleDoc(ctx, summaryFileID)
 		if err != nil {
-			log.Printf("restore: skip summary for %s: %v", meta.ID, err)
+			s.logger.Warn("gdrive restore skipped summary", "operation", "restore_summary", "session_id", meta.ID, "error", err)
 		} else {
 			sumMeta, summaryBody := ParseSummaryMarkdown(summaryText)
 			sess.Summary = summaryBody

@@ -44,7 +44,7 @@ func TestStreamMicWithRetryRetriesOverflow(t *testing.T) {
 
 	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(_ time.Duration) {
 		waits++
-	}, func(string, ...any) {})
+	}, func(string, ...any) {}, nil)
 
 	if streamer.calls != 2 {
 		t.Fatalf("expected 2 stream calls, got %d", streamer.calls)
@@ -59,7 +59,7 @@ func TestStreamMicWithRetryOverflowDoesNotReopen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(_ time.Duration) {}, func(string, ...any) {})
+	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(_ time.Duration) {}, func(string, ...any) {}, nil)
 
 	if streamer.reopens != 0 {
 		t.Fatalf("expected 0 reopen calls for overflow, got %d", streamer.reopens)
@@ -74,7 +74,7 @@ func TestStreamMicWithRetryRetriesDeviceError(t *testing.T) {
 
 	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(d time.Duration) {
 		waits = append(waits, d)
-	}, func(string, ...any) {})
+	}, func(string, ...any) {}, nil)
 
 	if streamer.calls != 2 {
 		t.Fatalf("expected 2 stream calls, got %d", streamer.calls)
@@ -106,7 +106,7 @@ func TestStreamMicWithRetryBacksOffOnReopenFailure(t *testing.T) {
 	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(d time.Duration) {
 		waits = append(waits, d)
 		waitCount <- struct{}{}
-	}, func(string, ...any) {})
+	}, func(string, ...any) {}, nil)
 
 	if waits[0] != time.Second {
 		t.Fatalf("expected first wait 1s, got %v", waits[0])
@@ -130,7 +130,7 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 
 	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(d time.Duration) {
 		waits = append(waits, d)
-	}, func(string, ...any) {})
+	}, func(string, ...any) {}, nil)
 
 	// err1 → 1s wait, reopen fails → err2 (still in loop) → 2s wait, reopen succeeds (reset) → err3 → 1s wait, reopen succeeds → nil
 	if len(waits) != 3 {

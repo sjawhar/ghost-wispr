@@ -36,6 +36,10 @@
   --accent-hover: #2fa08c;
   --danger: #e05c4d;
   --danger-soft: rgba(224, 92, 77, 0.1);
+  --success: #4ade80;
+  --success-soft: rgba(74, 222, 128, 0.1);
+  --warning: #facc15;
+  --warning-soft: rgba(250, 204, 21, 0.1);
 
   --speaker-0: #5ba8c8;
   --speaker-1: #c07aab;

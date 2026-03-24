@@ -35,24 +35,32 @@ type Transcription struct {
 	UtteranceEndMs string `yaml:"utterance_end_ms"`
 }
 
+type BatchTranscription struct {
+	Provider string `yaml:"provider"`
+	Model    string `yaml:"model"`
+}
+
 type Config struct {
-	DBPath                        string        `yaml:"db_path"`
-	AudioDir                      string        `yaml:"audio_dir"`
-	SilenceTimeout                string        `yaml:"silence_timeout"`
-	MinSessionSegments            int           `yaml:"min_session_segments"`
-	MicSampleRate                 int           `yaml:"mic_sample_rate"`
-	MicSampleRates                []int         `yaml:"mic_sample_rates"`
-	GDriveFolderID                string        `yaml:"gdrive_folder_id"`
-	GoogleCredentialsFile         string        `yaml:"google_credentials_file"`
-	GDriveSyncEnabled             bool          `yaml:"gdrive_sync_enabled"`
-	GCEnabled                     bool          `yaml:"gc_enabled"`
-	GCMaxAgeDays                  int           `yaml:"gc_max_age_days"`
-	GCMaxAudioSizeMB              int           `yaml:"gc_max_audio_size_mb"`
-	Summarization                 Summarization `yaml:"summarization"`
-	Transcription                 Transcription `yaml:"transcription"`
-	DeepgramBufferSize            int           `yaml:"deepgram_buffer_size"`
-	DeepgramReconnectInitialDelay string        `yaml:"deepgram_reconnect_initial_delay"`
-	DeepgramReconnectMaxBackoff   string        `yaml:"deepgram_reconnect_max_backoff"`
+	DBPath                        string             `yaml:"db_path"`
+	AudioDir                      string             `yaml:"audio_dir"`
+	LogLevel                      string             `yaml:"log_level"`
+	SilenceTimeout                string             `yaml:"silence_timeout"`
+	MinSessionSegments            int                `yaml:"min_session_segments"`
+	MicSampleRate                 int                `yaml:"mic_sample_rate"`
+	MicSampleRates                []int              `yaml:"mic_sample_rates"`
+	GDriveFolderID                string             `yaml:"gdrive_folder_id"`
+	GoogleCredentialsFile         string             `yaml:"google_credentials_file"`
+	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
+	GCEnabled                     bool               `yaml:"gc_enabled"`
+	GCMaxAgeDays                  int                `yaml:"gc_max_age_days"`
+	GCMaxAudioSizeMB              int                `yaml:"gc_max_audio_size_mb"`
+	Summarization                 Summarization      `yaml:"summarization"`
+	Transcription                 Transcription      `yaml:"transcription"`
+	BatchTranscription            BatchTranscription `yaml:"batch_transcription"`
+	DeepgramModel                 string             `yaml:"deepgram_model"`
+	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size"`
+	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
+	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
@@ -65,6 +73,7 @@ func defaults() Config {
 	return Config{
 		DBPath:                "data/ghost-wispr.db",
 		AudioDir:              "data/audio",
+		LogLevel:              "info",
 		SilenceTimeout:        "30s",
 		MinSessionSegments:    0,
 		MicSampleRate:         16000,
@@ -76,8 +85,8 @@ func defaults() Config {
 			Model: "openai/gpt-4o-mini",
 			Presets: map[string]Preset{
 				"default": {
-					Description:  "General-purpose meeting summary with key topics, decisions, and action items",
-					SystemPrompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics, decisions made, and action items if any.",
+					Description:  "General-purpose meeting summary with key topics and decisions",
+					SystemPrompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics and decisions made.",
 					UserTemplate: "{{transcript}}",
 				},
 			},
@@ -86,6 +95,11 @@ func defaults() Config {
 			Endpointing:    "400",
 			UtteranceEndMs: "1000",
 		},
+		BatchTranscription: BatchTranscription{
+			Provider: "deepgram",
+			Model:    "nova-3",
+		},
+		DeepgramModel:                 "nova-3",
 		DeepgramBufferSize:            1920000,
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
@@ -177,6 +191,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "AUDIO_DIR"); v != "" {
 		cfg.AudioDir = v
 	}
+	if v := os.Getenv(EnvPrefix + "LOG_LEVEL"); v != "" {
+		cfg.LogLevel = v
+	}
 	if v := os.Getenv(EnvPrefix + "SILENCE_TIMEOUT"); v != "" {
 		cfg.SilenceTimeout = v
 	}
@@ -203,6 +220,12 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_UTTERANCE_END_MS"); v != "" {
 		cfg.Transcription.UtteranceEndMs = v
 	}
+	if v := os.Getenv(EnvPrefix + "BATCH_TRANSCRIPTION_PROVIDER"); v != "" {
+		cfg.BatchTranscription.Provider = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv(EnvPrefix + "BATCH_TRANSCRIPTION_MODEL"); v != "" {
+		cfg.BatchTranscription.Model = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_BUFFER_SIZE"); v != "" {
 		if size, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && size > 0 {
 			cfg.DeepgramBufferSize = size
@@ -210,6 +233,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_INITIAL_DELAY"); v != "" {
 		cfg.DeepgramReconnectInitialDelay = v
+	}
+	if v := os.Getenv(EnvPrefix + "DEEPGRAM_MODEL"); v != "" {
+		cfg.DeepgramModel = v
 	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_RECONNECT_MAX_BACKOFF"); v != "" {
 		cfg.DeepgramReconnectMaxBackoff = v
@@ -299,6 +325,19 @@ func validate(cfg *Config) []string {
 		if n, err := strconv.Atoi(v); err != nil || n < 0 {
 			warnings = append(warnings, fmt.Sprintf("Invalid transcription.utterance_end_ms %q — must be a non-negative integer (ms). Using Deepgram default.", v))
 		}
+	}
+
+	if cfg.BatchTranscription.Provider == "" {
+		cfg.BatchTranscription.Provider = "deepgram"
+	}
+	if cfg.BatchTranscription.Model == "" {
+		cfg.BatchTranscription.Model = cfg.DeepgramModel
+	}
+	switch cfg.BatchTranscription.Provider {
+	case "deepgram", "groq", "openai":
+	default:
+		warnings = append(warnings, fmt.Sprintf("Invalid batch_transcription.provider %q — using default deepgram.", cfg.BatchTranscription.Provider))
+		cfg.BatchTranscription.Provider = "deepgram"
 	}
 
 	if cfg.GCMaxAgeDays <= 0 {

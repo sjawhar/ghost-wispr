@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,6 +28,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -52,6 +54,36 @@ func buildTranscript(segments []transcribe.Segment) string {
 		}
 	}
 	return b.String()
+}
+
+func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segments []transcribe.Segment) string {
+	streamingTranscript := buildTranscript(segments)
+	refined, status, err := store.GetRefinement(sessionID)
+	if err != nil {
+		return streamingTranscript
+	}
+	if status == storage.RefinementCompleted && strings.TrimSpace(refined) != "" {
+		return refined
+	}
+
+	return streamingTranscript
+}
+
+func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.BatchTranscription.Provider)) {
+	case "", "deepgram":
+		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
+			return nil, fmt.Errorf("deepgram API key not configured")
+		}
+		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
+			APIKey: cfg.DeepgramAPIKey,
+			Model:  cfg.BatchTranscription.Model,
+		}), nil
+	case "groq", "openai":
+		return nil, fmt.Errorf("batch transcription provider %q is not implemented yet", cfg.BatchTranscription.Provider)
+	default:
+		return nil, fmt.Errorf("unsupported batch transcription provider %q", cfg.BatchTranscription.Provider)
+	}
 }
 
 type recorderState struct {
@@ -172,9 +204,15 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	cfg := cfgStore.Get()
+	logSink := logging.NewLogSink(1000)
+	appLogger := logging.New(io.MultiWriter(os.Stdout, logSink), cfg.LogLevel)
+	slog.SetDefault(appLogger)
 	for _, w := range cfgWarnings {
 		log.Printf("config: %s", w)
 	}
+
+	// Startup validation: check component readiness from config.
+	startupStatus := config.ValidateStartup(&cfg)
 
 	store, err := storage.NewSQLiteStore(cfg.DBPath)
 	if err != nil {
@@ -189,12 +227,34 @@ func main() {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
 	}
 
+	// Backfill sessions with empty titles.
+	emptyTitleSessions, err := store.GetSessionsWithEmptyTitles()
+	if err != nil {
+		log.Printf("warning: failed to query sessions with empty titles: %v", err)
+	} else if len(emptyTitleSessions) > 0 {
+		for i := range emptyTitleSessions {
+			sess := &emptyTitleSessions[i]
+			segments, _ := store.GetSegments(sess.ID)
+			var transcript string
+			for _, seg := range segments {
+				if strings.TrimSpace(seg.Text) != "" {
+					transcript += seg.Text + "\n"
+				}
+			}
+			title := summary.GenerateTitle("", transcript, segments, sess.StartedAt)
+			if err := store.UpdateTitle(sess.ID, title); err != nil {
+				log.Printf("warning: failed to backfill title for session %s: %v", sess.ID, err)
+			}
+		}
+		log.Printf("backfilled %d session(s) with empty titles", len(emptyTitleSessions))
+	}
+
 	assets, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		log.Fatalf("static assets init failed: %v", err)
 	}
 
-	hub := server.NewHub()
+	hub := server.NewHub(appLogger)
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
 	audioRecorder := audio.NewRecorder(cfg.AudioDir)
 
@@ -246,7 +306,7 @@ func main() {
 		sessionSummarizer = summarizer
 	}
 
-	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments)
+	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments, appLogger)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -254,11 +314,18 @@ func main() {
 
 	recState := &recorderState{}
 	warnings := append([]string{}, cfgWarnings...)
+	if batchTranscriber, err := makeBatchTranscriber(&cfg); err != nil {
+		log.Printf("warning: batch transcription disabled: %v", err)
+		warnings = append(warnings, "Batch transcription unavailable — using streaming transcript fallback")
+	} else {
+		manager.SetBatchTranscriber(batchTranscriber)
+	}
 	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
+	var syncOrchestrator *gdrive.Orchestrator
 
-	handler, err := server.Handler(assets, hub, store, &server.ControlHooks{
+	controlHooks := &server.ControlHooks{
 		Pause:         recState.Pause,
 		Resume:        recState.Resume,
 		IsPaused:      recState.IsPaused,
@@ -267,6 +334,17 @@ func main() {
 			hub.BroadcastStatusChanged(paused)
 		},
 		Warnings: func() []string { return warnings },
+		GetLogs:  logSink.GetLogs,
+		RetrySync: func(ctx context.Context, sessionID string) error {
+			if syncOrchestrator == nil {
+				return fmt.Errorf("gdrive sync not configured")
+			}
+			return syncOrchestrator.SyncSession(ctx, sessionID)
+		},
+		RetryRefinement: func(ctx context.Context, sessionID string) error {
+			// Placeholder for T10 batch refinement
+			return nil
+		},
 		Presets: func() map[string]config.Preset {
 			if summarizer == nil {
 				return nil
@@ -283,7 +361,7 @@ func main() {
 				return err
 			}
 
-			transcript := buildTranscript(segments)
+			transcript := buildCanonicalTranscript(store, sessionID, segments)
 
 			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
 			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
@@ -317,7 +395,7 @@ func main() {
 				return
 			}
 
-			transcript := buildTranscript(segments)
+			transcript := buildCanonicalTranscript(store, sessionID, segments)
 			if transcript == "" {
 				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "")
 				return
@@ -340,6 +418,12 @@ func main() {
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
 		},
+		StartSession: func(ctx context.Context, titleHint string) (string, error) {
+			return manager.ManualStartSession(ctx, titleHint)
+		},
+		StopSession: func(ctx context.Context, sessionID string) error {
+			return manager.StopSession(ctx, sessionID)
+		},
 		TestPreset: func(ctx context.Context, presetName, sessionID string) (string, error) {
 			latestCfg := cfgStore.Get()
 			preset, ok := latestCfg.Summarization.Presets[presetName]
@@ -352,7 +436,7 @@ func main() {
 				return "", err
 			}
 
-			transcript := buildTranscript(segments)
+			transcript := buildCanonicalTranscript(store, sessionID, segments)
 
 			modelStr := preset.Model
 			if modelStr == "" {
@@ -530,7 +614,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"errors":   result.Errors,
 			}, nil
 		},
-	}, authToken, cfgStore)
+	}
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
 	}
@@ -538,10 +622,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var syncOrchestrator *gdrive.Orchestrator
-
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {
+		appLogger = logging.New(os.Stdout, newCfg.LogLevel)
+		slog.SetDefault(appLogger)
+
 		detector.SetTimeout(newCfg.ParsedSilenceTimeout())
 		manager.SetMinSessionSegments(newCfg.MinSessionSegments)
 		log.Printf("config: reloaded (silence_timeout=%s)", newCfg.SilenceTimeout)
@@ -558,9 +643,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("config: summarizer updated for provider %s", provider)
 		}
 
+		if batchTranscriber, err := makeBatchTranscriber(&newCfg); err != nil {
+			manager.SetBatchTranscriber(nil)
+			log.Printf("config: batch transcriber disabled: %v", err)
+		} else {
+			manager.SetBatchTranscriber(batchTranscriber)
+			log.Printf("config: batch transcriber updated for provider %s", newCfg.BatchTranscription.Provider)
+		}
+
 		if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
-			if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID); err == nil {
-				syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID, appLogger); err == nil {
+				syncOrchestrator = gdrive.NewOrchestrator(syncer, store, appLogger)
 				manager.SetSyncer(syncOrchestrator)
 				log.Printf("config: gdrive sync enabled")
 			}
@@ -586,7 +679,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					log.Printf("warning: failed to get segments for %s: %v", id, err)
 					continue
 				}
-				transcript := buildTranscript(segments)
+				transcript := buildCanonicalTranscript(store, id, segments)
 				if transcript == "" {
 					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "")
 					continue
@@ -606,12 +699,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	defer func() { _ = store.Close() }()
 
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
-		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
+		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID, appLogger)
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
 			warnings = append(warnings, "Google Drive sync failed to initialize — backups are disabled")
 		} else {
-			syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			syncOrchestrator = gdrive.NewOrchestrator(syncer, store, appLogger)
 			manager.SetSyncer(syncOrchestrator)
 
 			go func() {
@@ -627,6 +720,31 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 							log.Printf("gdrive sweep error: %v", err)
 							continue
 						}
+
+						retryScheduled, err := store.GetSessionsBySyncState(storage.SyncStateRetryScheduled)
+						if err != nil {
+							log.Printf("gdrive retry sweep error: %v", err)
+							continue
+						}
+
+						now := time.Now().UTC()
+						seen := make(map[string]struct{}, len(ids)+len(retryScheduled))
+						for _, id := range ids {
+							seen[id] = struct{}{}
+						}
+
+						for i := range retryScheduled {
+							sess := &retryScheduled[i]
+							if !gdrive.IsRetryReady(now, sess.RetryCount, sess.LastSyncAttempt) {
+								continue
+							}
+							if _, ok := seen[sess.ID]; ok {
+								continue
+							}
+							ids = append(ids, sess.ID)
+							seen[sess.ID] = struct{}{}
+						}
+
 						for _, id := range ids {
 							if err := syncOrchestrator.SyncSession(ctx, id); err != nil {
 								log.Printf("gdrive sweep: session %s: %v", id, err)
@@ -657,7 +775,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 						MaxAudioSizeMB: latestCfg.GCMaxAudioSizeMB,
 						SyncGated:      syncGated,
 						AudioDir:       latestCfg.AudioDir,
-					})
+					}, appLogger)
 					deleted, err := collector.Run()
 					if err != nil {
 						log.Printf("gc error: %v", err)
@@ -669,6 +787,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}()
 	}
 
+	var resilientClient *transcribe.ResilientClient
 	var mic *audio.Mic
 	var dgWriter io.Writer
 	var dgStop func()
@@ -677,42 +796,62 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	paErr := portaudio.Initialize()
 	//nolint:errcheck // Terminate is best-effort cleanup
 	defer portaudio.Terminate()
+	paInitFailed := false
 	if paErr != nil {
-		log.Fatalf("portaudio init failed: %v", paErr) //nolint:gocritic // Terminate is no-op if Initialize failed
+		log.Printf("warning: portaudio init failed: %v — microphone unavailable", paErr)
+		paInitFailed = true
 	}
 
 	client.Init(client.InitLib{LogLevel: client.LogLevelDefault})
 
-	for _, rate := range cfg.SampleRateCandidates() {
-		mic, err = audio.NewMic(rate, rate/4) // 250ms buffer
-		if err != nil {
-			log.Printf("warning: microphone open failed at %d Hz: %v", rate, err)
-			continue
+	if !paInitFailed {
+		for _, rate := range cfg.SampleRateCandidates() {
+			mic, err = audio.NewMic(rate, rate/4) // 250ms buffer
+			if err != nil {
+				log.Printf("warning: microphone open failed at %d Hz: %v", rate, err)
+				continue
+			}
+			selectedSampleRate = rate
+			break
 		}
-		selectedSampleRate = rate
-		break
 	}
 
 	if mic == nil {
-		log.Printf("warning: microphone unavailable, running API/UI only")
+		slog.Warn("microphone unavailable, running API/UI only")
 		warnings = append(warnings, "Microphone unavailable \u2014 recording and live transcription are disabled")
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 	} else {
 		audioRecorder.SetSampleRate(selectedSampleRate)
 		recState.SetMic(mic)
 		if err := mic.Start(); err != nil {
-			log.Printf("warning: microphone start failed at %d Hz, running API/UI only: %v", selectedSampleRate, err)
+			slog.Warn("microphone start failed, running API/UI only", "sample_rate", selectedSampleRate, "error", err)
 			mic = nil
 			recState.SetMic(nil)
 			warnings = append(warnings, "Microphone failed to start \u2014 recording and live transcription are disabled")
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
 		} else {
 			log.Printf("microphone started at %d Hz", selectedSampleRate)
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusConnected, Message: fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate)}
 		}
+	}
+
+	// Wire up mic diagnostic hook now that mic is initialized.
+	controlHooks.DiagnoseMic = func(ctx context.Context) (map[string]any, error) {
+		if mic == nil {
+			return nil, fmt.Errorf("microphone not available")
+		}
+		return map[string]any{
+			"mic_open":    mic.IsOpen(),
+			"sample_rate": selectedSampleRate,
+			"status":      "operational",
+			"message":     fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate),
+		}, nil
 	}
 
 	if mic != nil && cfg.DeepgramAPIKey != "" {
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := &interfaces.LiveTranscriptionOptions{
-			Model:          "nova-2",
+			Model:          cfg.DeepgramModel,
 			Language:       "en-US",
 			Diarize:        true,
 			Punctuate:      true,
@@ -735,8 +874,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
 
-		resilientClient := transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, nil)
+		resillientStateCallback := func(state transcribe.ConnectionState) {
+			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
+		}
+		resilientClient = transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, resillientStateCallback)
 		callback.resilient = resilientClient
+		controlHooks.FaultDeepgramDisconnect = resilientClient.Close
 
 		initialClient, err := factory(ctx)
 		if err != nil {
@@ -751,9 +894,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 			}
 			go func() {
-				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf)
+				go func() {
+					streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf, hub)
+				}()
 			}()
 		}
+	}
+
+	// Create health checker with actual component references
+	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic)
+	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, cfgStore)
+	if err != nil {
+		panic(fmt.Sprintf("build http handler failed: %v", err))
 	}
 
 	addr := os.Getenv("GHOST_WISPR_ADDR")
@@ -767,7 +919,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}()
 
+	// Log structured startup banner.
+	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)
+	slog.Info("deepgram API key", "status", config.MaskAPIKey(cfg.DeepgramAPIKey))
 	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://127.0.0.1%s", Version, Commit, BuildTime, addr)
+
+	// Broadcast initial component status to any connected WebSocket clients.
+	for _, c := range startupStatus.Components() {
+		hub.BroadcastComponentStatus(c.Name, c.Status, c.Message)
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -776,7 +936,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	log.Println("ghost-wispr: shutting down")
 	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
@@ -806,6 +966,7 @@ func streamMicWithRetry(
 	writer io.Writer,
 	wait func(time.Duration),
 	logf func(string, ...any),
+	hub *server.Hub,
 ) {
 	const (
 		overflowWait = 250 * time.Millisecond
@@ -827,11 +988,17 @@ func streamMicWithRetry(
 
 		if strings.Contains(strings.ToLower(err.Error()), "overflow") {
 			logf("warning: mic input overflow, restarting stream")
+			if hub != nil {
+				hub.BroadcastComponentStatus("mic", "warning", "Mic input overflow, restarting stream")
+			}
 			wait(overflowWait)
 			continue
 		}
 
 		logf("mic stream error (retrying in %v): %v", backoff, err)
+		if hub != nil {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
+		}
 		wait(backoff)
 
 		if ctx.Err() != nil {
@@ -840,6 +1007,9 @@ func streamMicWithRetry(
 
 		if reopenErr := streamer.Reopen(); reopenErr != nil {
 			logf("mic reopen failed: %v", reopenErr)
+			if hub != nil {
+				hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
+			}
 			backoff = min(backoff*2, maxBackoff)
 			continue
 		}

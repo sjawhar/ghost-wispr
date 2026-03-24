@@ -4,6 +4,9 @@
   import SettingsPage from './components/SettingsPage.svelte'
   import LivePanel from './components/LivePanel.svelte'
   import SessionList from './components/SessionList.svelte'
+  import StatusBanner from './components/StatusBanner.svelte'
+  import SystemStatus from './components/SystemStatus.svelte'
+  import LogViewer from './components/LogViewer.svelte'
   import {
     appState,
     setDates,
@@ -26,6 +29,8 @@
     resumeRecording,
     deleteSession,
     mergeSessions,
+    startSession,
+    stopCurrentSession,
   } from './lib/api'
   import { connect, disconnect } from './lib/ws.svelte'
 
@@ -60,6 +65,14 @@
 
     await pauseRecording()
     setPaused(true)
+  }
+
+  async function handleStartSession(): Promise<void> {
+    await startSession()
+  }
+
+  async function handleStopSession(): Promise<void> {
+    await stopCurrentSession()
   }
 
   async function handleResummarize(sessionId: string, preset: string): Promise<void> {
@@ -169,6 +182,7 @@
 </script>
 
 <main class="app-shell">
+  <SystemStatus />
   <header class="hero">
     <div class="title-wrap">
       <p class="eyebrow">Realtime Transcript Appliance</p>
@@ -182,6 +196,8 @@
         activeSessionId={appState.activeSessionId}
         onToggle={togglePause}
         onEndSession={endSession}
+        onStartSession={handleStartSession}
+        onStopSession={handleStopSession}
       />
       <button
         class="settings-btn"
@@ -208,6 +224,8 @@
       }}
     />
   {:else}
+    <StatusBanner connected={appState.connected} componentStatuses={appState.componentStatuses} />
+
     {#if appState.warnings.length > 0}
       <aside class="warnings-banner" data-testid="warnings-banner">
         {#each appState.warnings as warning (warning)}
@@ -240,6 +258,8 @@
       />
     </section>
   {/if}
+
+  <LogViewer />
 </main>
 
 <style>

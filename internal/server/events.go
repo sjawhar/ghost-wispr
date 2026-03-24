@@ -55,6 +55,13 @@ type ConnectionEvent struct {
 	Connected bool `json:"connected"`
 }
 
+type ComponentStatusEvent struct {
+	Event
+	Component string `json:"component"`
+	Status    string `json:"status"`
+	Message   string `json:"message"`
+}
+
 func newEvent(eventType string, now time.Time) Event {
 	if now.IsZero() {
 		now = time.Now().UTC()

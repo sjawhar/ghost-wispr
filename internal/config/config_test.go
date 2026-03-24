@@ -12,13 +12,43 @@ import (
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
-		"DB_PATH", "AUDIO_DIR", "SILENCE_TIMEOUT",
+		"DB_PATH", "AUDIO_DIR", "LOG_LEVEL", "SILENCE_TIMEOUT",
 		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES",
 		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
+		"BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL",
 		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
+	}
+}
+
+func TestBatchRefinementConfigDefaultsAndOverrides(t *testing.T) {
+	clearEnv(t)
+
+	cfg, _, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.BatchTranscription.Provider != "deepgram" {
+		t.Fatalf("expected default batch provider deepgram, got %q", cfg.BatchTranscription.Provider)
+	}
+	if cfg.BatchTranscription.Model != "nova-3" {
+		t.Fatalf("expected default batch model nova-3, got %q", cfg.BatchTranscription.Model)
+	}
+
+	t.Setenv(EnvPrefix+"BATCH_TRANSCRIPTION_PROVIDER", "openai")
+	t.Setenv(EnvPrefix+"BATCH_TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
+
+	cfg, _, err = Load("")
+	if err != nil {
+		t.Fatalf("Load with env overrides failed: %v", err)
+	}
+	if cfg.BatchTranscription.Provider != "openai" {
+		t.Fatalf("expected env batch provider openai, got %q", cfg.BatchTranscription.Provider)
+	}
+	if cfg.BatchTranscription.Model != "gpt-4o-transcribe" {
+		t.Fatalf("expected env batch model gpt-4o-transcribe, got %q", cfg.BatchTranscription.Model)
 	}
 }
 
@@ -76,6 +106,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.AudioDir != "data/audio" {
 		t.Fatalf("expected default audio_dir, got %q", cfg.AudioDir)
 	}
+	if cfg.LogLevel != "info" {
+		t.Fatalf("expected default log_level, got %q", cfg.LogLevel)
+	}
 	if cfg.SilenceTimeout != "30s" {
 		t.Fatalf("expected default silence_timeout, got %q", cfg.SilenceTimeout)
 	}
@@ -108,6 +141,7 @@ func TestYAMLLoading(t *testing.T) {
 	yamlContent := `
 db_path: /custom/db.sqlite
 audio_dir: /custom/audio
+log_level: debug
 silence_timeout: 45s
 mic_sample_rate: 48000
 mic_sample_rates: [44100, 32000]
@@ -140,6 +174,9 @@ google_credentials_file: /path/to/creds.json
 	}
 	if cfg.AudioDir != "/custom/audio" {
 		t.Fatalf("expected yaml audio_dir, got %q", cfg.AudioDir)
+	}
+	if cfg.LogLevel != "debug" {
+		t.Fatalf("expected yaml log_level, got %q", cfg.LogLevel)
 	}
 	if cfg.SilenceTimeout != "45s" {
 		t.Fatalf("expected yaml silence_timeout, got %q", cfg.SilenceTimeout)
@@ -183,6 +220,7 @@ summarization:
 	t.Setenv(EnvPrefix+"DB_PATH", "/from/env")
 	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "openai/gpt-4.1-mini")
 	t.Setenv(EnvPrefix+"AUDIO_DIR", "/env/audio")
+	t.Setenv(EnvPrefix+"LOG_LEVEL", "error")
 
 	cfg, _, err := Load(configPath)
 	if err != nil {
@@ -197,6 +235,9 @@ summarization:
 	}
 	if cfg.AudioDir != "/env/audio" {
 		t.Fatalf("expected env override for audio_dir, got %q", cfg.AudioDir)
+	}
+	if cfg.LogLevel != "error" {
+		t.Fatalf("expected env override for log_level, got %q", cfg.LogLevel)
 	}
 }
 

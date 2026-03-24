@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,14 +16,18 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
+	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 type Syncer struct {
 	service  *drive.Service
 	folderID string
+	logger   *slog.Logger
 	mu       sync.Mutex
 }
+
+const resumableUploadThresholdBytes int64 = 5 * 1024 * 1024
 
 type SyncFile struct {
 	Name        string
@@ -32,7 +37,7 @@ type SyncFile struct {
 	ContentType string
 }
 
-func NewSyncer(ctx context.Context, credPath, folderID string) (*Syncer, error) {
+func NewSyncer(ctx context.Context, credPath, folderID string, logger ...*slog.Logger) (*Syncer, error) {
 	creds, err := os.ReadFile(credPath)
 	if err != nil {
 		return nil, fmt.Errorf("read credentials: %w", err)
@@ -48,9 +53,15 @@ func NewSyncer(ctx context.Context, credPath, folderID string) (*Syncer, error) 
 		return nil, fmt.Errorf("create drive service: %w", err)
 	}
 
+	l := logging.WithModule(slog.Default(), "gdrive")
+	if len(logger) > 0 && logger[0] != nil {
+		l = logging.WithModule(logger[0], "gdrive")
+	}
+
 	return &Syncer{
 		service:  svc,
 		folderID: folderID,
+		logger:   l,
 	}, nil
 }
 
@@ -71,11 +82,17 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		})
 	}
 
-	transcriptMD := RenderTranscriptMarkdown(sess, segments)
+	// Use canonical transcript if available; fall back to segment-based rendering.
+	var transcriptContent string
+	if strings.TrimSpace(sess.CanonicalTranscript) != "" {
+		transcriptContent = RenderCanonicalTranscriptMarkdown(sess)
+	} else {
+		transcriptContent = RenderTranscriptMarkdown(sess, segments)
+	}
 	files = append(files, SyncFile{
 		Name:        "transcript.md",
 		MimeType:    "application/vnd.google-apps.document",
-		Content:     []byte(transcriptMD),
+		Content:     []byte(transcriptContent),
 		ContentType: "text/plain",
 	})
 
@@ -114,6 +131,8 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	for _, f := range files {
 		var reader io.Reader
 		var file *os.File
+		var fileSize int64
+		var useResumable bool
 
 		switch {
 		case f.Content != nil:
@@ -125,15 +144,33 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 			}
 			file = openedFile
 			reader = file
+			info, err := file.Stat()
+			if err != nil {
+				_ = file.Close()
+				return folder.Id, fmt.Errorf("stat %s: %w", f.LocalPath, err)
+			}
+			fileSize = info.Size()
+			if shouldUseResumableUpload(fileSize) {
+				useResumable = true
+			}
 		default:
 			continue
 		}
 
-		_, err := s.service.Files.Create(&drive.File{
+		createCall := s.service.Files.Create(&drive.File{
 			Name:     f.Name,
 			MimeType: f.MimeType,
 			Parents:  []string{folder.Id},
-		}).SupportsAllDrives(true).Media(reader, googleapi.ContentType(f.ContentType)).Context(ctx).Fields("id").Do()
+		}).SupportsAllDrives(true).Context(ctx).Fields("id")
+
+		if useResumable {
+			s.logger.Info("using resumable upload", "operation", "upload", "file_name", f.Name, "file_size_bytes", fileSize)
+			createCall = createCall.Media(file, googleapi.ContentType(f.ContentType))
+		} else {
+			createCall = createCall.Media(reader, googleapi.ContentType(f.ContentType))
+		}
+
+		_, err := createCall.Do()
 		if file != nil {
 			_ = file.Close()
 		}
@@ -143,6 +180,10 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	}
 
 	return folder.Id, nil
+}
+
+func shouldUseResumableUpload(fileSize int64) bool {
+	return fileSize > resumableUploadThresholdBytes
 }
 
 func slugify(s string) string {

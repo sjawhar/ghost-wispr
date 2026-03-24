@@ -17,7 +17,11 @@ type Store interface {
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	CountSegments(sessionID string) (int, error)
 	UpdateSummary(sessionID, title, summary, status, preset string) error
+	UpdateRefinement(sessionID, transcript, status string) error
+	GetRefinement(sessionID string) (transcript, status string, err error)
 	UpdateTitle(sessionID, title string) error
+	Canonicalize(sessionID string) error
+	GetCanonicalTranscript(sessionID string) (transcript, source string, err error)
 }
 
 type Recorder interface {
@@ -39,6 +43,7 @@ type EventBroadcaster interface {
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
 	BroadcastSummaryReady(sessionID, title, summary, status, preset string)
 	BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64)
+	BroadcastComponentStatus(component, status, message string)
 }
 
 type LifecycleManager interface {

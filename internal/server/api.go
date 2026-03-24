@@ -30,6 +30,7 @@ type SessionStore interface {
 	UpdateTitle(sessionID, title string) error
 	DeleteSession(id string) error
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
+	Search(query string) ([]storage.SearchResult, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -44,12 +45,140 @@ var versionInfo VersionInfo
 // SetVersionInfo sets the build metadata for the /api/version endpoint.
 func SetVersionInfo(v VersionInfo) { versionInfo = v }
 
-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, cfgStore *config.Store) {
+func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store) {
+
+	// Health check endpoints
+	mux.HandleFunc("GET /healthz/live", func(w http.ResponseWriter, r *http.Request) {
+		handleHealthzLive(w, r, healthChecker)
+	})
+	mux.HandleFunc("GET /healthz/ready", func(w http.ResponseWriter, r *http.Request) {
+		handleHealthzReady(w, r, healthChecker)
+	})
+
+	// Fault injection endpoint — only available in test mode
+	mux.HandleFunc("POST /api/test/fault/deepgram-disconnect", func(w http.ResponseWriter, r *http.Request) {
+		if os.Getenv("GHOST_WISPR_TEST_MODE") != "true" {
+			writeJSONError(w, http.StatusForbidden, "test mode not enabled")
+			return
+		}
+		if controls.FaultDeepgramDisconnect == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "deepgram not configured")
+			return
+		}
+		if err := controls.FaultDeepgramDisconnect(); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("fault injection failed: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+	})
+
+	// Mic diagnostic endpoint
+	mux.HandleFunc("POST /api/diagnostic/mic", func(w http.ResponseWriter, r *http.Request) {
+		if controls.DiagnoseMic == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "mic diagnostic not available")
+			return
+		}
+		report, err := controls.DiagnoseMic(r.Context())
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("mic diagnostic failed: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, report)
+	})
+
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
-	registerRestoreRoutes(mux, controls)
 
+	// Full-text search endpoint
+	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			writeJSON(w, http.StatusOK, []storage.SearchResult{})
+			return
+		}
+		results, err := store.Search(q)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("search failed: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, results)
+	})
+	registerRestoreRoutes(mux, controls)
+	registerLogRoutes(mux, controls)
+
+	// Manual session control endpoints
+	mux.HandleFunc("POST /api/sessions/start", func(w http.ResponseWriter, r *http.Request) {
+		if controls.StartSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			TitleHint string `json:"title_hint"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+				writeJSONError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		sessionID, err := controls.StartSession(ctx, body.TitleHint)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionAlreadyActive) {
+				writeJSONError(w, http.StatusConflict, "session already active")
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"session_id": sessionID})
+	})
+
+	// POST /api/sessions/current/stop must be registered before POST /api/sessions/{id}/stop
+	// to avoid the ServeMux matching "current" as an {id}.
+	mux.HandleFunc("POST /api/sessions/current/stop", func(w http.ResponseWriter, r *http.Request) {
+		if controls.EndSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := controls.EndSession(ctx); err != nil {
+			if errors.Is(err, session.ErrNoActiveSession) {
+				writeJSONError(w, http.StatusConflict, "no active session")
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+		if controls.StopSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "session management not available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := controls.StopSession(ctx, sessionID); err != nil {
+			if errors.Is(err, session.ErrNoActiveSession) {
+				writeJSONError(w, http.StatusNotFound, fmt.Sprintf("session %s is not active", sessionID))
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+	})
 	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		date := r.URL.Query().Get("date")
 		if date == "" {
@@ -155,7 +284,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
 			return
 		}
-		if sessionData.Status == "active" {
+		if sessionData.Status == storage.SessionActive {
 			writeJSONError(w, http.StatusConflict, "cannot delete active session")
 			return
 		}
@@ -399,6 +528,63 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}()
 
 		w.WriteHeader(http.StatusAccepted)
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/retry-summary", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		if controls.Resummarize == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "summarization not configured")
+			return
+		}
+
+		go func() {
+			_ = controls.Resummarize(context.Background(), sessionID, "")
+		}()
+
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/retry-sync", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		if controls.RetrySync == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "sync not configured")
+			return
+		}
+
+		go func() {
+			_ = controls.RetrySync(context.Background(), sessionID)
+		}()
+
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/retry-refinement", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		if controls.RetryRefinement == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "refinement not configured")
+			return
+		}
+
+		go func() {
+			_ = controls.RetryRefinement(context.Background(), sessionID)
+		}()
+
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
 	})
 
 	// Config endpoints — only registered if cfgStore is provided.

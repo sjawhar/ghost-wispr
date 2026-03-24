@@ -2,7 +2,9 @@ package storage
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +25,136 @@ func newTestSQLiteStore(t *testing.T) *SQLiteStore {
 	})
 
 	return store
+}
+
+func TestPreMigrationBackupCreated(t *testing.T) {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	// Create store (which triggers backup creation)
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Verify backup file exists
+	backupPath := dbPath + ".pre-migrate.bak"
+	_, err = os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("backup file not found at %s: %v", backupPath, err)
+	}
+
+	// Verify backup has content (not empty)
+	backupInfo, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("stat backup: %v", err)
+	}
+	if backupInfo.Size() == 0 {
+		t.Fatal("backup file is empty")
+	}
+
+	// Verify backup is a valid SQLite database by opening it
+	backupStore, err := NewSQLiteStore(backupPath)
+	if err != nil {
+		t.Fatalf("backup is not a valid SQLite database: %v", err)
+	}
+	defer func() { _ = backupStore.Close() }()
+
+	// Verify we can query the backup
+	var count int
+	if err := backupStore.DB().QueryRow("SELECT COUNT(*) FROM sessions").Scan(&count); err != nil {
+		t.Fatalf("query backup failed: %v", err)
+	}
+}
+
+func TestPreMigrationBackupCreatedEvenForFreshInstall(t *testing.T) {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "fresh.db")
+
+	// Verify DB file doesn't exist yet
+	_, err := os.Stat(dbPath)
+	if err == nil {
+		t.Fatal("DB file should not exist yet")
+	}
+
+	// Create store (which creates DB file via pragmas, then backs it up)
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Verify backup file IS created even for fresh install
+	// (because pragmas create the DB file, then backup runs)
+	backupPath := dbPath + ".pre-migrate.bak"
+	_, err = os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("backup file should be created: %v", err)
+	}
+
+	// Verify backup is a valid SQLite database
+	backupStore, err := NewSQLiteStore(backupPath)
+	if err != nil {
+		t.Fatalf("backup is not a valid SQLite database: %v", err)
+	}
+	_ = backupStore.Close()
+}
+
+func TestPreMigrationBackupOverwritesPrevious(t *testing.T) {
+	t.Helper()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "overwrite.db")
+
+	// Create first store and backup
+	store1, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("first NewSQLiteStore failed: %v", err)
+	}
+	backupPath := dbPath + ".pre-migrate.bak"
+
+	// Get first backup's modification time
+	backupInfo1, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("stat first backup: %v", err)
+	}
+	firstModTime := backupInfo1.ModTime()
+
+	_ = store1.Close()
+
+	// Wait a bit to ensure different modification time
+	time.Sleep(10 * time.Millisecond)
+
+	// Create second store (should overwrite backup)
+	store2, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("second NewSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store2.Close() }()
+
+	// Get second backup's modification time
+	backupInfo2, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("stat second backup: %v", err)
+	}
+	secondModTime := backupInfo2.ModTime()
+
+	// Verify backup was overwritten (newer modification time)
+	if !secondModTime.After(firstModTime) {
+		t.Fatalf("backup was not overwritten: first=%v, second=%v", firstModTime, secondModTime)
+	}
+
+	// Verify backup is still valid
+	backupStore, err := NewSQLiteStore(backupPath)
+	if err != nil {
+		t.Fatalf("backup is not a valid SQLite database: %v", err)
+	}
+	_ = backupStore.Close()
 }
 
 func TestSQLitePragmas(t *testing.T) {
@@ -135,6 +267,43 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 
 	if session.SummaryPreset != "concise" {
 		t.Fatalf("expected summary_preset %q, got %q", "concise", session.SummaryPreset)
+	}
+}
+
+func TestBatchRefinement_StoreStatusAndTranscript(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startedAt := time.Date(2026, 3, 23, 9, 0, 0, 0, time.UTC)
+	sessionID := startedAt.Format("20060102150405")
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	session, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if session.RefinementStatus != "pending" {
+		t.Fatalf("expected default refinement_status pending, got %q", session.RefinementStatus)
+	}
+
+	if err := store.UpdateRefinement(sessionID, "", "running"); err != nil {
+		t.Fatalf("UpdateRefinement running failed: %v", err)
+	}
+
+	if err := store.UpdateRefinement(sessionID, "refined canonical transcript", "completed"); err != nil {
+		t.Fatalf("UpdateRefinement completed failed: %v", err)
+	}
+
+	session, err = store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession after refinement failed: %v", err)
+	}
+	if session.RefinementStatus != "completed" {
+		t.Fatalf("expected refinement_status completed, got %q", session.RefinementStatus)
+	}
+	if session.RefinedTranscript != "refined canonical transcript" {
+		t.Fatalf("expected refined transcript to persist, got %q", session.RefinedTranscript)
 	}
 }
 
@@ -450,5 +619,397 @@ func TestGetSessionsByDate_ExcludesMerged(t *testing.T) {
 		if sess.Status == "merged" {
 			t.Fatalf("expected merged sessions excluded, got session %q with status merged", sess.ID)
 		}
+	}
+}
+
+func TestSyncStateMetadataAndRetryQuery(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "sync-state-retry-1"
+	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), "data/audio/sync-state-retry-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	attempt := started.Add(10 * time.Minute)
+	if err := store.UpdateSyncState(sessionID, SyncStateRetryScheduled, "", 2, &attempt, "temporary upload failure"); err != nil {
+		t.Fatalf("update sync state: %v", err)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.SyncState != SyncStateRetryScheduled {
+		t.Fatalf("expected sync_state %q, got %q", SyncStateRetryScheduled, sess.SyncState)
+	}
+	if sess.RetryCount != 2 {
+		t.Fatalf("expected retry_count 2, got %d", sess.RetryCount)
+	}
+	if sess.LastSyncAttempt == nil || !sess.LastSyncAttempt.Equal(attempt) {
+		t.Fatalf("expected last_sync_attempt %s, got %v", attempt, sess.LastSyncAttempt)
+	}
+	if sess.ErrorMessage != "temporary upload failure" {
+		t.Fatalf("expected error_message %q, got %q", "temporary upload failure", sess.ErrorMessage)
+	}
+
+	retrySessions, err := store.GetSessionsBySyncState(SyncStateRetryScheduled)
+	if err != nil {
+		t.Fatalf("get retry scheduled sessions: %v", err)
+	}
+	if len(retrySessions) != 1 || retrySessions[0].ID != sessionID {
+		t.Fatalf("expected retry sessions [%s], got %+v", sessionID, retrySessions)
+	}
+}
+
+func TestRemoteDeletedIsSoftDelete(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "sync-state-remote-deleted-1"
+	started := time.Date(2026, 3, 23, 11, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(4*time.Minute), "data/audio/sync-state-remote-deleted-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	attempt := started.Add(5 * time.Minute)
+	if err := store.UpdateSyncState(sessionID, SyncStateRemoteDeleted, "", 0, &attempt, "remote folder deleted"); err != nil {
+		t.Fatalf("update sync state remote deleted: %v", err)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.SyncState != SyncStateRemoteDeleted {
+		t.Fatalf("expected sync_state %q, got %q", SyncStateRemoteDeleted, sess.SyncState)
+	}
+	if sess.Status != "ended" {
+		t.Fatalf("expected local session status ended, got %q", sess.Status)
+	}
+	if sess.AudioPath == "" {
+		t.Fatal("expected local audio path preserved for soft-delete")
+	}
+}
+
+func TestCanonicalize_FromRefinedTranscript(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-refined-1"
+	started := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	// Add streaming segments.
+	for _, text := range []string{"hello world", "how are you"} {
+		if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: text, StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+			t.Fatalf("append segment: %v", err)
+		}
+	}
+
+	// Set refined transcript.
+	if err := store.UpdateRefinement(sessionID, "refined hello world. how are you doing?", "completed"); err != nil {
+		t.Fatalf("update refinement: %v", err)
+	}
+
+	// Canonicalize should use refined transcript.
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "refined" {
+		t.Fatalf("expected transcript_source 'refined', got %q", source)
+	}
+	if transcript != "refined hello world. how are you doing?" {
+		t.Fatalf("expected refined transcript, got %q", transcript)
+	}
+
+	// Verify session struct also has the fields.
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.TranscriptSource != "refined" {
+		t.Fatalf("expected session.TranscriptSource 'refined', got %q", sess.TranscriptSource)
+	}
+	if sess.CanonicalTranscript != "refined hello world. how are you doing?" {
+		t.Fatalf("expected session.CanonicalTranscript to match refined, got %q", sess.CanonicalTranscript)
+	}
+}
+
+func TestCanonicalize_FallbackToStreaming(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-streaming-1"
+	started := time.Date(2026, 3, 23, 13, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	// Add streaming segments.
+	for _, text := range []string{"segment one", "segment two"} {
+		if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: text, StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+			t.Fatalf("append segment: %v", err)
+		}
+	}
+
+	// Refinement pending (default) — should fall back to streaming.
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "streaming" {
+		t.Fatalf("expected transcript_source 'streaming', got %q", source)
+	}
+	if transcript != "segment one\nsegment two\n" {
+		t.Fatalf("expected assembled streaming transcript, got %q", transcript)
+	}
+}
+
+func TestCanonicalize_RefinementFailed_FallsBackToStreaming(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-failed-1"
+	started := time.Date(2026, 3, 23, 14, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: "fallback text", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+		t.Fatalf("append segment: %v", err)
+	}
+
+	// Mark refinement as failed.
+	if err := store.UpdateRefinement(sessionID, "", "failed"); err != nil {
+		t.Fatalf("update refinement: %v", err)
+	}
+
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	_, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "streaming" {
+		t.Fatalf("expected transcript_source 'streaming' after failed refinement, got %q", source)
+	}
+}
+
+func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "canon-recanon-1"
+	started := time.Date(2026, 3, 23, 15, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(5*time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Speaker: 0, Text: "initial streaming", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+		t.Fatalf("append segment: %v", err)
+	}
+
+	// First canonicalization — streaming (refinement pending).
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("first canonicalize: %v", err)
+	}
+	_, source, _ := store.GetCanonicalTranscript(sessionID)
+	if source != "streaming" {
+		t.Fatalf("expected initial source 'streaming', got %q", source)
+	}
+
+	// Late refinement completes.
+	if err := store.UpdateRefinement(sessionID, "late refined transcript", "completed"); err != nil {
+		t.Fatalf("update refinement: %v", err)
+	}
+
+	// Re-canonicalize — should now use refined.
+	if err := store.Canonicalize(sessionID); err != nil {
+		t.Fatalf("re-canonicalize: %v", err)
+	}
+
+	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	if err != nil {
+		t.Fatalf("get canonical: %v", err)
+	}
+	if source != "refined" {
+		t.Fatalf("expected re-canonicalized source 'refined', got %q", source)
+	}
+	if transcript != "late refined transcript" {
+		t.Fatalf("expected re-canonicalized transcript, got %q", transcript)
+	}
+}
+
+func TestFTS5IndexAndTriggersAreCreated(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	var ftsSQL string
+	if err := store.DB().QueryRow(`SELECT sql FROM sqlite_master WHERE name = 'sessions_fts'`).Scan(&ftsSQL); err != nil {
+		t.Fatalf("sessions_fts schema lookup failed: %v", err)
+	}
+
+	lowerSQL := strings.ToLower(ftsSQL)
+	if !strings.Contains(lowerSQL, "using fts5") {
+		t.Fatalf("expected sessions_fts to use fts5, got %q", ftsSQL)
+	}
+	if !strings.Contains(lowerSQL, "content='sessions'") {
+		t.Fatalf("expected sessions_fts to be external-content table, got %q", ftsSQL)
+	}
+
+	for _, trigger := range []string{"sessions_ai", "sessions_au", "sessions_ad"} {
+		var count int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigger).Scan(&count); err != nil {
+			t.Fatalf("trigger lookup %s failed: %v", trigger, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected trigger %s to exist", trigger)
+		}
+	}
+}
+
+func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	started := time.Date(2026, 3, 23, 16, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("fts-1", started); err != nil {
+		t.Fatalf("create session fts-1: %v", err)
+	}
+	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary fts-1: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha appears once in transcript", "fts-1"); err != nil {
+		t.Fatalf("update canonical transcript fts-1: %v", err)
+	}
+
+	if err := store.CreateSession("fts-2", started.Add(time.Minute)); err != nil {
+		t.Fatalf("create session fts-2: %v", err)
+	}
+	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary fts-2: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha alpha alpha and alpha again", "fts-2"); err != nil {
+		t.Fatalf("update canonical transcript fts-2: %v", err)
+	}
+
+	results, err := store.Search("alpha")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(results) < 2 {
+		t.Fatalf("expected at least 2 search results, got %d", len(results))
+	}
+
+	if !strings.Contains(results[0].Snippet, "<mark>") {
+		t.Fatalf("expected highlighted snippet, got %q", results[0].Snippet)
+	}
+	if results[0].SessionID == "" || results[0].Title == "" {
+		t.Fatalf("expected search result identifiers, got %+v", results[0])
+	}
+
+	if results[0].Rank > results[1].Rank {
+		t.Fatalf("expected first result to be equal/better rank ordering, got %f > %f", results[0].Rank, results[1].Rank)
+	}
+}
+
+func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	started := time.Date(2026, 3, 23, 17, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("fts-sync", started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary initial: %v", err)
+	}
+
+	results, err := store.Search("delta")
+	if err != nil {
+		t.Fatalf("search initial: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no matches before update, got %d", len(results))
+	}
+
+	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary delta: %v", err)
+	}
+
+	results, err = store.Search("delta")
+	if err != nil {
+		t.Fatalf("search after update: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "fts-sync" {
+		t.Fatalf("expected one updated match for fts-sync, got %+v", results)
+	}
+
+	if err := store.DeleteSession("fts-sync"); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	results, err = store.Search("delta")
+	if err != nil {
+		t.Fatalf("search after delete: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no matches after delete, got %+v", results)
+	}
+}
+
+func TestFTS5SearchEmptyQueryReturnsEmptyResults(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	results, err := store.Search("   ")
+	if err != nil {
+		t.Fatalf("search empty query failed: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected empty results for empty query, got %+v", results)
+	}
+}
+
+func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	started := time.Date(2026, 3, 23, 18, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("fts-escape", started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default"); err != nil {
+		t.Fatalf("update summary: %v", err)
+	}
+
+	results, err := store.Search(`alpha OR "`)
+	if err != nil {
+		t.Fatalf("search with special characters failed: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "fts-escape" {
+		t.Fatalf("expected escaped query to return fts-escape, got %+v", results)
 	}
 }

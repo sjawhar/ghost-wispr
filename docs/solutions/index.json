@@ -1,0 +1,56 @@
+{
+  "cmd/ghost-wispr": [
+    "component-wiring-in-main.md",
+    "ui-first-observability.md"
+  ],
+  "internal/storage": [
+    "schema-migration-safety.md",
+    "status-constants-and-type-safety.md",
+    "dual-pass-transcription-and-canonicalization.md"
+  ],
+  "internal/status": [
+    "status-constants-and-type-safety.md"
+  ],
+  "internal/server": [
+    "ui-first-observability.md",
+    "component-wiring-in-main.md"
+  ],
+  "internal/session": [
+    "dual-pass-transcription-and-canonicalization.md",
+    "component-wiring-in-main.md"
+  ],
+  "internal/transcribe": [
+    "dual-pass-transcription-and-canonicalization.md"
+  ],
+  "internal/summary": [
+    "dual-pass-transcription-and-canonicalization.md"
+  ],
+  "internal/logging": [
+    "ui-first-observability.md"
+  ],
+  "internal/config": [
+    "ui-first-observability.md",
+    "component-wiring-in-main.md"
+  ],
+  "internal/gdrive": [
+    "schema-migration-safety.md"
+  ],
+  "internal/audio": [
+    "component-wiring-in-main.md"
+  ],
+  "web/src/components": [
+    "ui-first-observability.md",
+    "status-constants-and-type-safety.md"
+  ],
+  "web/src/lib": [
+    "status-constants-and-type-safety.md",
+    "ui-first-observability.md"
+  ],
+  "web/src": [
+    "ui-first-observability.md",
+    "status-constants-and-type-safety.md"
+  ],
+  "tests": [
+    "schema-migration-safety.md"
+  ]
+}
