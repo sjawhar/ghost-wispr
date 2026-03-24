@@ -48,6 +48,9 @@
   function getStatusColor(status?: string) {
     switch (status) {
       case 'connected':
+      case 'synced':
+      case 'open':
+      case 'ok':
         return 'var(--success)'
       case 'disconnected':
       case 'error':
