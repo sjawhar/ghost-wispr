@@ -94,3 +94,32 @@ export function stopSession(sessionId: string): Promise<{ status: string }> {
     method: 'POST',
   })
 }
+
+export function retrySummary(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-summary`, { method: 'POST' })
+}
+
+export function retrySync(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-sync`, { method: 'POST' })
+}
+
+export function retryRefinement(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}/retry-refinement`, { method: 'POST' })
+}
+
+export interface LogEntry {
+  timestamp: string
+  level: string
+  module?: string
+  message: string
+  raw: string
+}
+
+export function fetchLogs(level?: string, limit?: number, since?: string): Promise<LogEntry[]> {
+  const params = new URLSearchParams()
+  if (level && level !== 'ALL') params.set('level', level)
+  if (limit) params.set('limit', limit.toString())
+  if (since) params.set('since', since)
+  const qs = params.toString()
+  return request<LogEntry[]>(`/api/logs${qs ? '?' + qs : ''}`)
+}

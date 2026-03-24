@@ -31,6 +31,8 @@
   let loadedDates = $state(3)
   let showHidden = $state<Record<string, boolean>>({})
   let selectedIds = $state<Set<string>>(new Set())
+  let dateFilter = $state('all')
+  let statusFilter = $state('all')
 
   function toggleSelect(id: string) {
     const next = new Set(selectedIds)
@@ -60,7 +62,20 @@
     const content = session.summary.replace(/^#{1,6}\s+.*$/gm, '').trim()
     return content.length < 50
   }
-  const visibleDates = $derived.by(() => dates.slice(0, loadedDates))
+  const visibleDates = $derived.by(() => {
+    let filtered = dates
+    if (dateFilter === 'today') {
+      const today = new Date().toISOString().split('T')[0]
+      filtered = dates.filter(d => d === today)
+    } else if (dateFilter === 'week') {
+      const weekAgo = new Date()
+      weekAgo.setDate(weekAgo.getDate() - 7)
+      const weekAgoStr = weekAgo.toISOString().split('T')[0]
+      filtered = dates.filter(d => d >= weekAgoStr)
+    }
+    return filtered.slice(0, loadedDates)
+  })
+
   const missingVisibleDates = $derived.by(() =>
     visibleDates.filter((date) => !sessionsByDate.has(date)),
   )
@@ -93,6 +108,20 @@
 <section class="history-panel" data-testid="history-panel">
   <header class="panel-head">
     <h2>Session History</h2>
+    <div class="filter-controls">
+      <input type="text" class="search-input" placeholder="Search available after FTS5 setup" disabled data-testid="search-input" />
+      <select bind:value={dateFilter} class="filter-select" data-testid="date-filter">
+        <option value="all">All Time</option>
+        <option value="today">Today</option>
+        <option value="week">This Week</option>
+      </select>
+      <select bind:value={statusFilter} class="filter-select" data-testid="status-filter">
+        <option value="all">All Status</option>
+        <option value="active">Active</option>
+        <option value="completed">Completed</option>
+        <option value="failed">Failed</option>
+      </select>
+    </div>
     {#if selectedIds.size > 0}
       <div class="select-controls">
         <span class="selection-count">{selectedIds.size} selected</span>
@@ -113,9 +142,17 @@
 
   {#each visibleDates as date (date)}
     {@const allSessions = sessionsByDate.get(date) ?? []}
-    {@const hiddenCount = showHidden[date] ? 0 : allSessions.filter(isShortSession).length}
+    {@const statusFilteredSessions = allSessions.filter(s => {
+      if (statusFilter === 'all') return true
+      if (statusFilter === 'active') return !s.ended_at
+      if (statusFilter === 'completed') return s.summary_status === 'completed'
+      if (statusFilter === 'failed') return s.summary_status === 'failed' || s.sync_status === 'failed' || s.refinement_status === 'failed'
+      return true
+    })}
+    {@const hiddenCount = showHidden[date] ? 0 : statusFilteredSessions.filter(isShortSession).length}
     {@const visibleSessions = showHidden[date]
-      ? allSessions
+      ? statusFilteredSessions
+      : statusFilteredSessions.filter((s) => !isShortSession(s))}
       : allSessions.filter((s) => !isShortSession(s))}
     <section class="date-group">
       <h3>{headingForDate(date)}</h3>
@@ -159,3 +196,36 @@
     <button type="button" class="load-more" onclick={loadPreviousDates}>Load previous</button>
   {/if}
 </section>
+
+<style>
+  .filter-controls {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    align-items: center;
+  }
+
+  .search-input {
+    flex: 1;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.875rem;
+  }
+
+  .search-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .filter-select {
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.875rem;
+  }
+</style>

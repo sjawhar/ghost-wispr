@@ -75,6 +75,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
 	registerRestoreRoutes(mux, controls)
+	registerLogRoutes(mux, controls)
 
 	// Manual session control endpoints
 	mux.HandleFunc("POST /api/sessions/start", func(w http.ResponseWriter, r *http.Request) {
@@ -497,6 +498,63 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}()
 
 		w.WriteHeader(http.StatusAccepted)
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/retry-summary", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		if controls.Resummarize == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "summarization not configured")
+			return
+		}
+
+		go func() {
+			_ = controls.Resummarize(context.Background(), sessionID, "")
+		}()
+
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/retry-sync", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		if controls.RetrySync == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "sync not configured")
+			return
+		}
+
+		go func() {
+			_ = controls.RetrySync(context.Background(), sessionID)
+		}()
+
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+	})
+
+	mux.HandleFunc("POST /api/sessions/{id}/retry-refinement", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		if controls.RetryRefinement == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "refinement not configured")
+			return
+		}
+
+		go func() {
+			_ = controls.RetryRefinement(context.Background(), sessionID)
+		}()
+
+		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
 	})
 
 	// Config endpoints — only registered if cfgStore is provided.

@@ -27,7 +27,7 @@ describe('SessionCard', () => {
       onDelete: vi.fn(),
     })
 
-    expect(screen.getByText('pending')).toBeTruthy()
+    expect(screen.getByText('Summary: pending')).toBeTruthy()
     expect(screen.getByText('Summarizing...')).toBeTruthy()
   })
 

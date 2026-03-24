@@ -174,7 +174,8 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	cfg := cfgStore.Get()
-	appLogger := logging.New(os.Stdout, cfg.LogLevel)
+	logSink := logging.NewLogSink(1000)
+	appLogger := logging.New(io.MultiWriter(os.Stdout, logSink), cfg.LogLevel)
 	slog.SetDefault(appLogger)
 	for _, w := range cfgWarnings {
 		log.Printf("config: %s", w)
@@ -261,6 +262,7 @@ func main() {
 	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
+	var syncOrchestrator *gdrive.Orchestrator
 
 	controlHooks := &server.ControlHooks{
 		Pause:         recState.Pause,
@@ -271,6 +273,17 @@ func main() {
 			hub.BroadcastStatusChanged(paused)
 		},
 		Warnings: func() []string { return warnings },
+		GetLogs:  logSink.GetLogs,
+		RetrySync: func(ctx context.Context, sessionID string) error {
+			if syncOrchestrator == nil {
+				return fmt.Errorf("gdrive sync not configured")
+			}
+			return syncOrchestrator.SyncSession(ctx, sessionID)
+		},
+		RetryRefinement: func(ctx context.Context, sessionID string) error {
+			// Placeholder for T10 batch refinement
+			return nil
+		},
 		Presets: func() map[string]config.Preset {
 			if summarizer == nil {
 				return nil
@@ -549,7 +562,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var syncOrchestrator *gdrive.Orchestrator
 
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {

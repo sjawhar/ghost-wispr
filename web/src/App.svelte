@@ -5,6 +5,8 @@
   import LivePanel from './components/LivePanel.svelte'
   import SessionList from './components/SessionList.svelte'
   import StatusBanner from './components/StatusBanner.svelte'
+  import SystemStatus from './components/SystemStatus.svelte'
+  import LogViewer from './components/LogViewer.svelte'
   import {
     appState,
     setDates,
@@ -180,6 +182,7 @@
 </script>
 
 <main class="app-shell">
+  <SystemStatus />
   <header class="hero">
     <div class="title-wrap">
       <p class="eyebrow">Realtime Transcript Appliance</p>
@@ -258,6 +261,8 @@
       />
     </section>
   {/if}
+
+  <LogViewer />
 </main>
 
 <style>

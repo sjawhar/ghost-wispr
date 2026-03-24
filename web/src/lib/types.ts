@@ -84,6 +84,9 @@ export interface SessionSummary {
   summary_status: 'pending' | 'running' | 'completed' | 'failed'
   summary_preset: string
   audio_path: string
+  sync_status?: 'pending' | 'syncing' | 'synced' | 'failed'
+  refinement_status?: 'pending' | 'running' | 'completed' | 'failed'
+  transcript_source?: string
 }
 
 export interface SessionDetailResponse {

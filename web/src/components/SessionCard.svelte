@@ -3,7 +3,7 @@
   import AudioPlayer from './AudioPlayer.svelte'
   import type { PresetMap, SessionDetailResponse, SessionSummary } from '../lib/types'
   import { copyText } from '../lib/clipboard'
-  import { updateSessionTitle } from '../lib/api'
+  import { updateSessionTitle, retrySummary, retrySync, retryRefinement } from '../lib/api'
 
   let {
     session,
@@ -33,6 +33,9 @@
   let summaryCopied = $state(false)
   let editingTitle = $state(false)
   let titleDraft = $state('')
+  let retryingSummary = $state(false)
+  let retryingSync = $state(false)
+  let retryingRefinement = $state(false)
 
   async function copySummary() {
     if (!session.summary) return
@@ -100,6 +103,36 @@
     showPresetMenu = false
     await onResummarize(session.id, preset)
   }
+
+  async function handleRetrySummary(e: Event) {
+    e.stopPropagation()
+    retryingSummary = true
+    try {
+      await retrySummary(session.id)
+    } finally {
+      setTimeout(() => retryingSummary = false, 1000)
+    }
+  }
+
+  async function handleRetrySync(e: Event) {
+    e.stopPropagation()
+    retryingSync = true
+    try {
+      await retrySync(session.id)
+    } finally {
+      setTimeout(() => retryingSync = false, 1000)
+    }
+  }
+
+  async function handleRetryRefinement(e: Event) {
+    e.stopPropagation()
+    retryingRefinement = true
+    try {
+      await retryRefinement(session.id)
+    } finally {
+      setTimeout(() => retryingRefinement = false, 1000)
+    }
+  }
 </script>
 
 <article class="session-card" class:selected>
@@ -143,7 +176,8 @@
               <span>{session.title}</span>
               <span class="session-time-sub">{timeRange}</span>
             {:else}
-              {timeRange}
+              <span>Untitled Session</span>
+              <span class="session-time-sub">{timeRange}</span>
             {/if}
             <button
               type="button"
@@ -159,7 +193,54 @@
       </div>
     </div>
     <div class="header-right">
-      <span class={`summary-badge ${session.summary_status}`}>{session.summary_status}</span>
+      <div class="status-badges">
+        {#if !session.ended_at}
+          <span class="recording-dot" title="Recording active" data-testid="recording-dot"></span>
+        {/if}
+        
+        <div class="badge-group">
+          <span class={`status-badge ${session.summary_status}`} data-testid="summary-badge">
+            Summary: {session.summary_status}
+          </span>
+          {#if session.summary_status === 'failed'}
+            <button class="retry-btn" onclick={handleRetrySummary} disabled={retryingSummary} data-testid="retry-summary-btn">
+              {retryingSummary ? '...' : '↻'}
+            </button>
+          {/if}
+        </div>
+
+        {#if session.sync_status}
+          <div class="badge-group">
+            <span class={`status-badge ${session.sync_status}`} data-testid="sync-badge">
+              Sync: {session.sync_status}
+            </span>
+            {#if session.sync_status === 'failed'}
+              <button class="retry-btn" onclick={handleRetrySync} disabled={retryingSync} data-testid="retry-sync-btn">
+                {retryingSync ? '...' : '↻'}
+              </button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if session.refinement_status}
+          <div class="badge-group">
+            <span class={`status-badge ${session.refinement_status}`} data-testid="refinement-badge">
+              Refine: {session.refinement_status}
+            </span>
+            {#if session.refinement_status === 'failed'}
+              <button class="retry-btn" onclick={handleRetryRefinement} disabled={retryingRefinement} data-testid="retry-refinement-btn">
+                {retryingRefinement ? '...' : '↻'}
+              </button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if session.transcript_source}
+          <span class="status-badge info" data-testid="source-badge">
+            {session.transcript_source}
+          </span>
+        {/if}
+      </div>
       <button
         type="button"
         class="quick-delete-btn"
@@ -265,6 +346,84 @@
   .session-card.selected {
     border-color: var(--accent);
     background: var(--accent-soft);
+  }
+
+  .status-badges {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-right: 0.5rem;
+  }
+
+  .badge-group {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .status-badge {
+    font-size: 0.65rem;
+    padding: 0.15rem 0.4rem;
+    border-radius: 1rem;
+    text-transform: uppercase;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    background: var(--surface-hover);
+    color: var(--muted);
+  }
+
+  .status-badge.completed, .status-badge.synced {
+    background: var(--success-soft);
+    color: var(--success);
+  }
+
+  .status-badge.pending, .status-badge.running, .status-badge.syncing {
+    background: var(--warning-soft);
+    color: var(--warning);
+  }
+
+  .status-badge.failed {
+    background: var(--danger-soft);
+    color: var(--danger);
+  }
+
+  .status-badge.info {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .retry-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.8rem;
+    padding: 0.1rem 0.3rem;
+    border-radius: 4px;
+  }
+
+  .retry-btn:hover:not(:disabled) {
+    background: var(--surface-hover);
+    color: var(--text);
+  }
+
+  .retry-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .recording-dot {
+    width: 8px;
+    height: 8px;
+    background-color: var(--danger);
+    border-radius: 50%;
+    animation: pulse 1.5s infinite;
+  }
+
+  @keyframes pulse {
+    0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+    70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+    100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
   }
 
   .resummarize-wrap {
