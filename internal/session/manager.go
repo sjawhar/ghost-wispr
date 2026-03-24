@@ -14,6 +14,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"github.com/sjawhar/ghost-wispr/internal/summary"
 )
 
 type Manager struct {
@@ -301,11 +302,11 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 		m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 	}
 
-	go m.generateSummary(context.Background(), sessionID)
+	go m.generateSummary(context.Background(), sessionID, startedAt)
 	return nil
 }
 
-func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
+func (m *Manager) generateSummary(ctx context.Context, sessionID string, startedAt time.Time) {
 	m.mu.Lock()
 	summarizer := m.summarizer
 	syncer := m.syncer
@@ -348,6 +349,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string) {
 	}
 
 	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, b.String())
+	// Safety net: ensure title is never empty using fallback chain.
+	if strings.TrimSpace(title) == "" {
+		title = summary.GenerateTitle("", b.String(), segments, startedAt)
+	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)

@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
@@ -401,83 +400,6 @@ func splitTranscript(transcript string, chunkSize, overlap int) []string {
 	return chunks
 }
 
-func guaranteedTitle(transcript string) string {
-	sentences := splitSentences(transcript)
-	for _, sentence := range sentences {
-		clean := strings.TrimSpace(sentence)
-		if clean == "" {
-			continue
-		}
-		words := strings.Fields(clean)
-		if len(words) <= 5 {
-			continue
-		}
-		if isFillerSentence(words) {
-			continue
-		}
-		return normalizeTitle(clean)
-	}
-	for _, sentence := range sentences {
-		clean := strings.TrimSpace(sentence)
-		if clean != "" {
-			return normalizeTitle(clean)
-		}
-	}
-	return "Meeting Summary"
-}
-
-func splitSentences(text string) []string {
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-	replacer := strings.NewReplacer("\n", ". ", "!", ". ", "?", ". ")
-	normalized := replacer.Replace(text)
-	parts := strings.Split(normalized, ".")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
-func isFillerSentence(words []string) bool {
-	filler := map[string]struct{}{
-		"um": {}, "uh": {}, "yeah": {}, "so": {}, "like": {}, "okay": {}, "ok": {}, "well": {}, "hmm": {}, "huh": {},
-	}
-	nonFiller := 0
-	for _, word := range words {
-		clean := strings.TrimFunc(strings.ToLower(word), func(r rune) bool {
-			return !unicode.IsLetter(r) && !unicode.IsNumber(r)
-		})
-		if clean == "" {
-			continue
-		}
-		if _, ok := filler[clean]; ok {
-			continue
-		}
-		nonFiller++
-	}
-	return nonFiller == 0
-}
-
-func normalizeTitle(title string) string {
-	trimmed := strings.TrimSpace(title)
-	if trimmed == "" {
-		return "Meeting Summary"
-	}
-	words := strings.Fields(trimmed)
-	if len(words) > 12 {
-		trimmed = strings.Join(words[:12], " ")
-	}
-	if utf8.RuneCountInString(trimmed) > 100 {
-		runes := []rune(trimmed)
-		trimmed = string(runes[:100])
-	}
-	return strings.TrimSpace(trimmed)
-}
 
 func (s *Summarizer) selectPreset(ctx context.Context, transcript string) (string, error) {
 	if s.router == nil {

@@ -401,6 +401,20 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 	return dates, nil
 }
 
+// GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
+func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
+	rows, err := s.db.Query(
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into
+		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query sessions with empty titles: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanSessions(rows)
+}
+
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
 		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into FROM sessions WHERE id = ?`,

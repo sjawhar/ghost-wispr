@@ -607,7 +607,7 @@ func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T)
 	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
 	manager.SetSyncer(syncerMock{called: syncCalled})
 
-	manager.generateSummary(context.Background(), "session-no-summarizer")
+	manager.generateSummary(context.Background(), "session-no-summarizer", time.Time{})
 
 	select {
 	case got := <-syncCalled:
@@ -633,7 +633,7 @@ func TestManager_GenerateSummary_TriggersSyncAfterSummaryCompleted(t *testing.T)
 	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, nil, NewDetector(time.Hour), 0)
 	manager.SetSyncer(syncerMock{called: syncCalled})
 
-	manager.generateSummary(context.Background(), "session-with-summary")
+	manager.generateSummary(context.Background(), "session-with-summary", time.Time{})
 
 	select {
 	case <-summaryCalled:

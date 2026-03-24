@@ -197,6 +197,27 @@ func main() {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
 	}
 
+	// Backfill sessions with empty titles.
+	emptyTitleSessions, err := store.GetSessionsWithEmptyTitles()
+	if err != nil {
+		log.Printf("warning: failed to query sessions with empty titles: %v", err)
+	} else if len(emptyTitleSessions) > 0 {
+		for _, sess := range emptyTitleSessions {
+			segments, _ := store.GetSegments(sess.ID)
+			var transcript string
+			for _, seg := range segments {
+				if strings.TrimSpace(seg.Text) != "" {
+					transcript += seg.Text + "\n"
+				}
+			}
+			title := summary.GenerateTitle("", transcript, segments, sess.StartedAt)
+			if err := store.UpdateTitle(sess.ID, title); err != nil {
+				log.Printf("warning: failed to backfill title for session %s: %v", sess.ID, err)
+			}
+		}
+		log.Printf("backfilled %d session(s) with empty titles", len(emptyTitleSessions))
+	}
+
 	assets, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		log.Fatalf("static assets init failed: %v", err)
