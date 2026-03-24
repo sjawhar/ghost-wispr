@@ -614,7 +614,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			}, nil
 		},
 	}
-	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, nil, appLogger, cfgStore)
 	if err != nil {
 		log.Fatalf("build http handler failed: %v", err)
 	}
@@ -786,6 +785,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}()
 	}
 
+	var resilientClient *transcribe.ResilientClient
 	var mic *audio.Mic
 	var dgWriter io.Writer
 	var dgStop func()
@@ -875,7 +875,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		resillientStateCallback := func(state transcribe.ConnectionState) {
 			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
 		}
-		resilientClient := transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, resillientStateCallback)
+		resilientClient = transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, resillientStateCallback)
 		callback.resilient = resilientClient
 		controlHooks.FaultDeepgramDisconnect = resilientClient.Close
 
@@ -895,6 +895,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf)
 			}()
 		}
+	}
+
+	// Create health checker with actual component references
+	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic)
+	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, cfgStore)
+	if err != nil {
+		log.Fatalf("build http handler failed: %v", err)
 	}
 
 	addr := os.Getenv("GHOST_WISPR_ADDR")
