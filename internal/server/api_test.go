@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -28,8 +29,10 @@ type apiStoreStub struct {
 	dates               []string
 	searchResults       map[string][]storage.SearchResult
 	searchErr           error
+	searchFunc          func(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 	aggregateResult     *storage.AggregateResult
 	aggregateErr        error
+	aggregateFunc       func(opts storage.AggregateOptions) (storage.AggregateResult, error)
 	allEmbeddings       []storage.StoredEmbedding
 	allEmbeddingsErr    error
 	getEventsSinceFunc  func(cursor int64, limit int) ([]storage.StoredEvent, error)
@@ -97,6 +100,9 @@ func (s apiStoreStub) GetDates() ([]string, error) {
 }
 
 func (s apiStoreStub) Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error) {
+	if s.searchFunc != nil {
+		return s.searchFunc(query, opts)
+	}
 	if s.searchErr != nil {
 		return nil, s.searchErr
 	}
@@ -107,6 +113,9 @@ func (s apiStoreStub) Search(query string, opts storage.SearchOptions) ([]storag
 }
 
 func (s apiStoreStub) AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error) {
+	if s.aggregateFunc != nil {
+		return s.aggregateFunc(opts)
+	}
 	if s.aggregateErr != nil {
 		return storage.AggregateResult{}, s.aggregateErr
 	}
@@ -1824,19 +1833,17 @@ func TestAPISessionDetail_IncludesTranscriptSource(t *testing.T) {
 
 func TestSearchEndpointWithFilters(t *testing.T) {
 	mux := http.NewServeMux()
+	var capturedOpts storage.SearchOptions
 	store := &apiStoreStub{
-		searchResults: map[string][]storage.SearchResult{
-			"test": {
-				{SessionID: "sess-1", Title: "Meeting 1", Snippet: "test content", Rank: 0.5},
-				{SessionID: "sess-2", Title: "Meeting 2", Snippet: "test content", Rank: 0.3},
-			},
+		searchFunc: func(query string, opts storage.SearchOptions) ([]storage.SearchResult, error) {
+			capturedOpts = opts
+			return []storage.SearchResult{{SessionID: "sess-1", Title: "Meeting 1", Snippet: "test content", Rank: 0.5}}, nil
 		},
 	}
 
 	cfgStore := newTestConfigStore(t)
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
 
-	// Test with date_from filter
 	req := httptest.NewRequest("GET", "/api/search?q=test&date_from=2026-03-25T00:00:00Z", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -1844,31 +1851,24 @@ func TestSearchEndpointWithFilters(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", w.Code)
 	}
-
-	var results []storage.SearchResult
-	if err := json.NewDecoder(w.Body).Decode(&results); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	if len(results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(results))
+	if capturedOpts.DateFrom != "2026-03-25T00:00:00Z" {
+		t.Fatalf("expected DateFrom=2026-03-25T00:00:00Z, got %q", capturedOpts.DateFrom)
 	}
 }
 
 func TestSearchEndpointWithPresetFilter(t *testing.T) {
 	mux := http.NewServeMux()
+	var capturedOpts storage.SearchOptions
 	store := &apiStoreStub{
-		searchResults: map[string][]storage.SearchResult{
-			"test": {
-				{SessionID: "sess-1", Title: "Meeting", Snippet: "test content", Rank: 0.5},
-			},
+		searchFunc: func(query string, opts storage.SearchOptions) ([]storage.SearchResult, error) {
+			capturedOpts = opts
+			return []storage.SearchResult{{SessionID: "sess-1", Title: "Meeting", Snippet: "test content", Rank: 0.5}}, nil
 		},
 	}
 
 	cfgStore := newTestConfigStore(t)
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
 
-	// Test with preset filter
 	req := httptest.NewRequest("GET", "/api/search?q=test&preset=meeting", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -1876,14 +1876,8 @@ func TestSearchEndpointWithPresetFilter(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", w.Code)
 	}
-
-	var results []storage.SearchResult
-	if err := json.NewDecoder(w.Body).Decode(&results); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
+	if capturedOpts.Preset != "meeting" {
+		t.Fatalf("expected Preset=meeting, got %q", capturedOpts.Preset)
 	}
 }
 
@@ -1947,7 +1941,6 @@ func TestSemanticSearch_Success(t *testing.T) {
 		Results []struct {
 			SessionID  string  `json:"session_id"`
 			Title      string  `json:"title"`
-			ChunkText  string  `json:"chunk_text"`
 			Similarity float32 `json:"similarity"`
 			ChunkIndex int     `json:"chunk_index"`
 		} `json:"results"`
@@ -2253,33 +2246,42 @@ func TestAggregateEndpoint_Success(t *testing.T) {
 }
 
 func TestAggregateEndpoint_WithQueryParams(t *testing.T) {
-	store := apiStoreStub{
-		sessionsByDate: map[string][]storage.Session{},
-		sessions:       map[string]storage.Session{},
-		segments:       map[string][]transcribe.Segment{},
-		aggregateResult: &storage.AggregateResult{
-			SessionCount: 1,
-			Groups: []storage.AggregateGroup{
-				{Key: "meeting", Count: 1, Sessions: []storage.SessionSummary{{ID: "s1", Title: "Meeting", SummaryPreset: "meeting"}}},
-			},
+	mux := http.NewServeMux()
+	var capturedOpts storage.AggregateOptions
+	store := &apiStoreStub{
+		aggregateFunc: func(opts storage.AggregateOptions) (storage.AggregateResult, error) {
+			capturedOpts = opts
+			return storage.AggregateResult{
+				SessionCount: 1,
+				Groups: []storage.AggregateGroup{
+					{Key: "meeting", Count: 1, Sessions: []storage.SessionSummary{{ID: "s1", Title: "Meeting", SummaryPreset: "meeting"}}},
+				},
+			}, nil
 		},
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
-	if err != nil {
-		t.Fatalf("Handler failed: %v", err)
-	}
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/sessions/aggregate?group_by=preset&preset=meeting&date_from=2026-03-20T00:00:00Z", nil)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if capturedOpts.GroupBy != "preset" {
+		t.Fatalf("expected GroupBy=preset, got %q", capturedOpts.GroupBy)
+	}
+	if capturedOpts.Preset != "meeting" {
+		t.Fatalf("expected Preset=meeting, got %q", capturedOpts.Preset)
+	}
+	if capturedOpts.DateFrom != "2026-03-20T00:00:00Z" {
+		t.Fatalf("expected DateFrom=2026-03-20T00:00:00Z, got %q", capturedOpts.DateFrom)
 	}
 
 	var result storage.AggregateResult
-	if err := json.NewDecoder(rr.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if result.SessionCount != 1 {
@@ -2949,5 +2951,142 @@ func testNonRegressionPresets(t *testing.T) {
 	}
 	if resp["default"] != "Default summary" {
 		t.Fatalf("expected 'Default summary' description, got %q", resp["default"])
+	}
+}
+
+func TestSearchEndpointWithDateTo(t *testing.T) {
+	mux := http.NewServeMux()
+	var capturedOpts storage.SearchOptions
+	store := &apiStoreStub{
+		searchFunc: func(query string, opts storage.SearchOptions) ([]storage.SearchResult, error) {
+			capturedOpts = opts
+			return []storage.SearchResult{{SessionID: "s1", Title: "M1", Snippet: "test", Rank: 0.5}}, nil
+		},
+	}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+
+	req := httptest.NewRequest("GET", "/api/search?q=test&date_to=2026-03-26T00:00:00Z", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if capturedOpts.DateTo != "2026-03-26T00:00:00Z" {
+		t.Fatalf("expected DateTo=2026-03-26T00:00:00Z, got %q", capturedOpts.DateTo)
+	}
+}
+
+func TestSemanticSearch_DateFilter(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{
+			"sess-new": {ID: "sess-new", Title: "New Session", StartedAt: time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC)},
+			"sess-old": {ID: "sess-old", Title: "Old Session", StartedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)},
+		},
+		allEmbeddings: []storage.StoredEmbedding{
+			{SessionID: "sess-new", ChunkIndex: 0, Vector: []float32{1, 0}},
+			{SessionID: "sess-old", ChunkIndex: 0, Vector: []float32{1, 0}},
+		},
+	}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, embeddingClientStub{vectors: [][]float32{{1, 0}}})
+
+	req := httptest.NewRequest("GET", "/api/search/semantic?q=test&date_from=2026-03-24T00:00:00Z&date_to=2026-03-26T00:00:00Z", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var payload struct {
+		Results []struct {
+			SessionID string `json:"session_id"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Results) != 1 {
+		t.Fatalf("expected 1 result (only in-range session), got %d", len(payload.Results))
+	}
+	if payload.Results[0].SessionID != "sess-new" {
+		t.Fatalf("expected sess-new, got %q", payload.Results[0].SessionID)
+	}
+}
+
+func TestEventsEndpoint_CursorFollowUp(t *testing.T) {
+	mux := http.NewServeMux()
+	allEvents := []storage.StoredEvent{
+		{ID: 1, EventType: "session_started", Payload: "{}", CreatedAt: time.Now()},
+		{ID: 2, EventType: "session_ended", Payload: "{}", CreatedAt: time.Now()},
+		{ID: 3, EventType: "summary_ready", Payload: "{}", CreatedAt: time.Now()},
+	}
+	store := &apiStoreStub{
+		getEventsSinceFunc: func(cursor int64, limit int) ([]storage.StoredEvent, error) {
+			var result []storage.StoredEvent
+			for _, ev := range allEvents {
+				if ev.ID > cursor {
+					result = append(result, ev)
+				}
+				if len(result) >= limit {
+					break
+				}
+			}
+			return result, nil
+		},
+	}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+
+	// First request: get first 2 events
+	req1 := httptest.NewRequest("GET", "/api/events?limit=2", nil)
+	w1 := httptest.NewRecorder()
+	mux.ServeHTTP(w1, req1)
+
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first request: expected 200, got %d", w1.Code)
+	}
+	var resp1 struct {
+		Events     []map[string]interface{} `json:"events"`
+		NextCursor float64                  `json:"next_cursor"`
+		HasMore    bool                     `json:"has_more"`
+	}
+	if err := json.NewDecoder(w1.Body).Decode(&resp1); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if len(resp1.Events) != 2 {
+		t.Fatalf("first request: expected 2 events, got %d", len(resp1.Events))
+	}
+	if !resp1.HasMore {
+		t.Fatal("first request: expected has_more=true")
+	}
+
+	// Second request: use cursor from first response
+	req2 := httptest.NewRequest("GET", fmt.Sprintf("/api/events?cursor=%d&limit=2", int64(resp1.NextCursor)), nil)
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second request: expected 200, got %d", w2.Code)
+	}
+	var resp2 struct {
+		Events     []map[string]interface{} `json:"events"`
+		NextCursor float64                  `json:"next_cursor"`
+		HasMore    bool                     `json:"has_more"`
+	}
+	if err := json.NewDecoder(w2.Body).Decode(&resp2); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if len(resp2.Events) != 1 {
+		t.Fatalf("second request: expected 1 event, got %d", len(resp2.Events))
+	}
+	if resp2.HasMore {
+		t.Fatal("second request: expected has_more=false")
 	}
 }
