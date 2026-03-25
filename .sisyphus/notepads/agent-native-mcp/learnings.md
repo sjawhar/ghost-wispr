@@ -394,3 +394,32 @@
 - All 4 endpoint tests pass
 - Full test suite passes (14 packages)
 - Evidence captured at `.sisyphus/evidence/task-13-polling.json`
+
+## 2026-03-25 — Task 14: Update OpenAPI Spec with All New Endpoints
+
+### Implementation Pattern
+- **Spec location**: `internal/server/openapi.go` — static Go struct approach
+- **New endpoints added**: `/api/search/semantic`, `/api/events`, `/api/sessions/{id}/segments`
+- **Updated endpoints**: `/api/search` and `/api/sessions/{id}/segments` with speaker parameter
+- **Test updated**: `TestOpenAPISpec` in `api_test.go` now checks for all new paths
+
+### Key Decisions
+- Semantic search endpoint includes `limit`, `date_from`, `date_to` parameters
+- Events endpoint includes `cursor`, `limit`, `types` parameters for pagination and filtering
+- Segments endpoint includes `speaker` parameter for filtering by speaker name or index
+- All new endpoints documented with descriptions and parameter details
+
+### Testing Approach
+- TDD: Updated test to assert new paths are present in spec
+- Verified: `go test ./internal/server/... -run TestOpenAPISpec -v` → PASS
+- Full suite: `go test ./... -v` → PASS (all packages)
+
+### Spec Coverage
+- Total paths: 35 (including health checks)
+- API paths: 33
+- All Wave 1-3 endpoints documented
+- Security scheme: basicAuth documented
+- Response descriptions provided for all endpoints
+
+### Evidence
+- `.sisyphus/evidence/task-14-spec-complete.json` — spec verification and test results

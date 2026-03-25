@@ -2373,9 +2373,12 @@ func TestOpenAPISpec(t *testing.T) {
 		"/healthz/live",
 		"/api/version",
 		"/api/search",
+		"/api/search/semantic",
+		"/api/events",
 		"/api/sessions",
 		"/api/sessions/aggregate",
 		"/api/sessions/{id}",
+		"/api/sessions/{id}/segments",
 		"/api/sessions/{id}/context",
 	}
 	for _, path := range expectedPaths {
