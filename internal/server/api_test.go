@@ -65,7 +65,7 @@ func (s apiStoreStub) GetDates() ([]string, error) {
 	return s.dates, nil
 }
 
-func (s apiStoreStub) Search(query string) ([]storage.SearchResult, error) {
+func (s apiStoreStub) Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error) {
 	if s.searchErr != nil {
 		return nil, s.searchErr
 	}
@@ -113,6 +113,11 @@ func (s apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt,
 	return nil
 }
 
+type healthCheckerStub struct{}
+
+func (h *healthCheckerStub) IsDeepgramConnected() bool { return true }
+func (h *healthCheckerStub) IsDBHealthy(ctx context.Context) bool { return true }
+func (h *healthCheckerStub) IsMicOpen() bool { return true }
 func testStaticFS(t *testing.T) fs.FS {
 	t.Helper()
 	dir := t.TempDir()
@@ -1674,5 +1679,102 @@ func TestAPISessionDetail_IncludesTranscriptSource(t *testing.T) {
 	}
 	if resp.Session.CanonicalTranscript != "refined transcript content" {
 		t.Fatalf("expected canonical_transcript in API response, got %q", resp.Session.CanonicalTranscript)
+	}
+}
+
+func TestSearchEndpointWithFilters(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{
+		searchResults: map[string][]storage.SearchResult{
+			"test": {
+				{SessionID: "sess-1", Title: "Meeting 1", Snippet: "test content", Rank: 0.5},
+				{SessionID: "sess-2", Title: "Meeting 2", Snippet: "test content", Rank: 0.3},
+			},
+		},
+	}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore)
+
+	// Test with date_from filter
+	req := httptest.NewRequest("GET", "/api/search?q=test&date_from=2026-03-25T00:00:00Z", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(w.Body).Decode(&results); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+}
+
+func TestSearchEndpointWithPresetFilter(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{
+		searchResults: map[string][]storage.SearchResult{
+			"test": {
+				{SessionID: "sess-1", Title: "Meeting", Snippet: "test content", Rank: 0.5},
+			},
+		},
+	}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore)
+
+	// Test with preset filter
+	req := httptest.NewRequest("GET", "/api/search?q=test&preset=meeting", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(w.Body).Decode(&results); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func TestSearchEndpointBackwardCompatible(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{
+		searchResults: map[string][]storage.SearchResult{
+			"test": {
+				{SessionID: "sess-1", Title: "Test", Snippet: "test content", Rank: 0.5},
+			},
+		},
+	}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore)
+
+	// Test backward compatibility: ?q=term without filters should work
+	req := httptest.NewRequest("GET", "/api/search?q=test", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(w.Body).Decode(&results); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
 	}
 }

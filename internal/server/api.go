@@ -30,7 +30,7 @@ type SessionStore interface {
 	UpdateTitle(sessionID, title string) error
 	DeleteSession(id string) error
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
-	Search(query string) ([]storage.SearchResult, error)
+	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -97,7 +97,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSON(w, http.StatusOK, []storage.SearchResult{})
 			return
 		}
-		results, err := store.Search(q)
+		opts := storage.SearchOptions{
+			DateFrom: strings.TrimSpace(r.URL.Query().Get("date_from")),
+			DateTo:   strings.TrimSpace(r.URL.Query().Get("date_to")),
+			Preset:   strings.TrimSpace(r.URL.Query().Get("preset")),
+		}
+		results, err := store.Search(q, opts)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("search failed: %v", err))
 			return

@@ -918,7 +918,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 		t.Fatalf("update canonical transcript fts-2: %v", err)
 	}
 
-	results, err := store.Search("alpha")
+	results, err := store.Search("alpha", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -949,7 +949,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("update summary initial: %v", err)
 	}
 
-	results, err := store.Search("delta")
+	results, err := store.Search("delta", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search initial: %v", err)
 	}
@@ -961,7 +961,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("update summary delta: %v", err)
 	}
 
-	results, err = store.Search("delta")
+	results, err = store.Search("delta", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search after update: %v", err)
 	}
@@ -973,7 +973,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("delete session: %v", err)
 	}
 
-	results, err = store.Search("delta")
+	results, err = store.Search("delta", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search after delete: %v", err)
 	}
@@ -985,7 +985,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 func TestFTS5SearchEmptyQueryReturnsEmptyResults(t *testing.T) {
 	store := newTestSQLiteStore(t)
 
-	results, err := store.Search("   ")
+	results, err := store.Search("   ", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search empty query failed: %v", err)
 	}
@@ -1005,11 +1005,135 @@ func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
 		t.Fatalf("update summary: %v", err)
 	}
 
-	results, err := store.Search(`alpha OR "`)
+	results, err := store.Search(`alpha OR "`, SearchOptions{})
 	if err != nil {
 		t.Fatalf("search with special characters failed: %v", err)
 	}
 	if len(results) != 1 || results[0].SessionID != "fts-escape" {
 		t.Fatalf("expected escaped query to return fts-escape, got %+v", results)
+	}
+}
+
+func TestSearchWithDateFromFilter(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different dates
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	for i, date := range []time.Time{date1, date2, date3} {
+		id := fmt.Sprintf("date-test-%d", i)
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default"); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with date_from filter
+	results, err := store.Search("test", SearchOptions{
+		DateFrom: date2.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("search with date_from failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (date2 and date3), got %d", len(results))
+	}
+}
+
+func TestSearchWithDateToFilter(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different dates
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	for i, date := range []time.Time{date1, date2, date3} {
+		id := fmt.Sprintf("date-to-test-%d", i)
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default"); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with date_to filter
+	results, err := store.Search("test", SearchOptions{
+		DateTo: date2.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("search with date_to failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (date1 and date2), got %d", len(results))
+	}
+}
+
+func TestSearchWithPresetFilter(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different presets
+	presets := []string{"default", "meeting", "default"}
+	for i, preset := range presets {
+		id := fmt.Sprintf("preset-test-%d", i)
+		date := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with preset filter
+	results, err := store.Search("test", SearchOptions{
+		Preset: "meeting",
+	})
+	if err != nil {
+		t.Fatalf("search with preset failed: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "preset-test-1" {
+		t.Fatalf("expected 1 result for preset 'meeting', got %+v", results)
+	}
+}
+
+func TestSearchWithMultipleFilters(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different dates and presets
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	for i, date := range []time.Time{date1, date2, date3} {
+		id := fmt.Sprintf("multi-test-%d", i)
+		preset := "default"
+		if i == 1 {
+			preset = "meeting"
+		}
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with both date and preset filters
+	results, err := store.Search("test", SearchOptions{
+		DateFrom: date2.Format(time.RFC3339Nano),
+		DateTo:   date3.Format(time.RFC3339Nano),
+		Preset:   "meeting",
+	})
+	if err != nil {
+		t.Fatalf("search with multiple filters failed: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "multi-test-1" {
+		t.Fatalf("expected 1 result matching all filters, got %+v", results)
 	}
 }

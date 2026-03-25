@@ -88,6 +88,12 @@ type SearchResult struct {
 	Rank      float64 `json:"rank"`
 }
 
+type SearchOptions struct {
+	DateFrom string // RFC3339 format, optional
+	DateTo   string // RFC3339 format, optional
+	Preset   string // summary_preset value, optional
+}
+
 var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
@@ -1099,29 +1105,54 @@ func (s *SQLiteStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
-func (s *SQLiteStore) Search(query string) ([]SearchResult, error) {
+func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, error) {
 	matchQuery := buildFTS5MatchQuery(query)
 	if matchQuery == "" {
 		return []SearchResult{}, nil
 	}
 
-	rows, err := s.db.Query(
-		`SELECT sessions.id,
-		        sessions.title,
-		        COALESCE(
-		          NULLIF(snippet(sessions_fts, 2, '<mark>', '</mark>', ' … ', 24), ''),
-		          NULLIF(snippet(sessions_fts, 1, '<mark>', '</mark>', ' … ', 24), ''),
-		          sessions.title
-		        ) AS snippet,
-		        bm25(sessions_fts) AS rank
-		 FROM sessions_fts
-		 JOIN sessions ON sessions.rowid = sessions_fts.rowid
-		 WHERE sessions_fts MATCH ?
-		   AND sessions.status NOT IN ('discarded', 'merged')
-		 ORDER BY rank ASC
-		 LIMIT 50`,
-		matchQuery,
-	)
+	// Build WHERE clause with optional filters
+	whereConditions := []string{
+		"sessions_fts MATCH ?",
+		"sessions.status NOT IN ('discarded', 'merged')",
+	}
+	args := []any{matchQuery}
+
+	// Add date_from filter if provided
+	if opts.DateFrom != "" {
+		whereConditions = append(whereConditions, "sessions.started_at >= ?")
+		args = append(args, opts.DateFrom)
+	}
+
+	// Add date_to filter if provided
+	if opts.DateTo != "" {
+		whereConditions = append(whereConditions, "sessions.started_at <= ?")
+		args = append(args, opts.DateTo)
+	}
+
+	// Add preset filter if provided
+	if opts.Preset != "" {
+		whereConditions = append(whereConditions, "sessions.summary_preset = ?")
+		args = append(args, opts.Preset)
+	}
+
+	whereClause := strings.Join(whereConditions, " AND ")
+
+	sqlQuery := fmt.Sprintf(`SELECT sessions.id,
+	        sessions.title,
+	        COALESCE(
+	          NULLIF(snippet(sessions_fts, 2, '<mark>', '</mark>', ' … ', 24), ''),
+	          NULLIF(snippet(sessions_fts, 1, '<mark>', '</mark>', ' … ', 24), ''),
+	          sessions.title
+	        ) AS snippet,
+	        bm25(sessions_fts) AS rank
+	 FROM sessions_fts
+	 JOIN sessions ON sessions.rowid = sessions_fts.rowid
+	 WHERE %s
+	 ORDER BY rank ASC
+	 LIMIT 50`, whereClause)
+
+	rows, err := s.db.Query(sqlQuery, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search sessions: %w", err)
 	}
