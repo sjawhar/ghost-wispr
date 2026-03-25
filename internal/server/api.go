@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -228,17 +229,34 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		type scoredEmbedding struct {
 			sessionID  string
-			chunkText  string
+			title      string
 			similarity float32
 			chunkIndex int
 		}
 
-		scored := make([]scoredEmbedding, 0, len(allEmbeddings))
+		// Build a session cache and pre-filter embeddings by date
+		sessionCache := make(map[string]*storage.Session)
 		queryVector := vectors[0]
+		scored := make([]scoredEmbedding, 0, len(allEmbeddings))
 		for _, emb := range allEmbeddings {
+			sess, ok := sessionCache[emb.SessionID]
+			if !ok {
+				s, err := store.GetSession(emb.SessionID)
+				if err != nil {
+					continue
+				}
+				sess = &s
+				sessionCache[emb.SessionID] = sess
+			}
+			if dateFrom != nil && sess.StartedAt.Before(*dateFrom) {
+				continue
+			}
+			if dateTo != nil && sess.StartedAt.After(*dateTo) {
+				continue
+			}
 			scored = append(scored, scoredEmbedding{
 				sessionID:  emb.SessionID,
-				chunkText:  emb.TextHash,
+				title:      sess.Title,
 				similarity: cosineSimilarity(queryVector, emb.Vector),
 				chunkIndex: emb.ChunkIndex,
 			})
@@ -255,22 +273,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		results := make([]map[string]any, 0, len(top))
 		for _, item := range top {
-			sess, err := store.GetSession(item.sessionID)
-			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load session %s: %v", item.sessionID, err))
-				return
-			}
-			if dateFrom != nil && sess.StartedAt.Before(*dateFrom) {
-				continue
-			}
-			if dateTo != nil && sess.StartedAt.After(*dateTo) {
-				continue
-			}
-
 			results = append(results, map[string]any{
 				"session_id":  item.sessionID,
-				"title":       sess.Title,
-				"chunk_text":  item.chunkText,
+				"title":       item.title,
 				"similarity":  item.similarity,
 				"chunk_index": item.chunkIndex,
 			})
@@ -297,22 +302,24 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("search failed: %v", err))
 			return
 		}
-		
+
 		// Filter results by speaker if specified
 		if opts.Speaker != "" {
 			filtered := make([]storage.SearchResult, 0, len(results))
 			for _, result := range results {
 				sess, err := store.GetSession(result.SessionID)
 				if err != nil {
+					slog.Warn("speaker filter: failed to load session", "session_id", result.SessionID, "error", err)
 					continue
 				}
-				
+
 				// Get segments for this session
 				segs, err := store.GetSegments(result.SessionID)
 				if err != nil {
+					slog.Warn("speaker filter: failed to load segments", "session_id", result.SessionID, "error", err)
 					continue
 				}
-				
+
 				// Check if any segment matches the speaker filter
 				if hasSegmentForSpeaker(segs, opts.Speaker, sess.SpeakerNames) {
 					filtered = append(filtered, result)
@@ -320,7 +327,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			results = filtered
 		}
-		
+
 		writeJSON(w, http.StatusOK, results)
 	})
 
@@ -336,7 +343,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			cursor = parsedCursor
 		}
-		
+
 		// Parse limit (default 50, max 200)
 		limit := 50
 		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
@@ -350,7 +357,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			limit = parsedLimit
 		}
-		
+
 		// Parse types filter (comma-separated)
 		var typeFilter map[string]bool
 		if rawTypes := strings.TrimSpace(r.URL.Query().Get("types")); rawTypes != "" {
@@ -361,20 +368,20 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				}
 			}
 		}
-		
+
 		// Fetch events with limit+1 to detect has_more
 		events, err := store.GetEventsSince(cursor, limit+1)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("fetch events: %v", err))
 			return
 		}
-		
+
 		// Determine has_more and trim to limit
 		hasMore := len(events) > limit
 		if hasMore {
 			events = events[:limit]
 		}
-		
+
 		// Filter by types if specified
 		if len(typeFilter) > 0 {
 			filtered := make([]storage.StoredEvent, 0, len(events))
@@ -385,21 +392,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			events = filtered
 		}
-		
+
 		// Calculate next_cursor (ID of last event, or cursor if no events)
 		nextCursor := cursor
 		if len(events) > 0 {
 			nextCursor = events[len(events)-1].ID
 		}
-		
+
 		// Parse payloads into map[string]any
 		type EventResponse struct {
 			ID        int64                  `json:"id"`
 			EventType string                 `json:"event_type"`
 			Payload   map[string]interface{} `json:"payload"`
-			CreatedAt time.Time             `json:"created_at"`
+			CreatedAt time.Time              `json:"created_at"`
 		}
-		
+
 		responseEvents := make([]EventResponse, 0, len(events))
 		for _, ev := range events {
 			var payload map[string]interface{}
@@ -414,13 +421,13 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				CreatedAt: ev.CreatedAt,
 			})
 		}
-		
+
 		response := map[string]interface{}{
-			"events":     responseEvents,
+			"events":      responseEvents,
 			"next_cursor": nextCursor,
 			"has_more":    hasMore,
 		}
-		
+
 		writeJSON(w, http.StatusOK, response)
 	})
 	registerRestoreRoutes(mux, controls)

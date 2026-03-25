@@ -106,16 +106,16 @@ func OpenAPISpec() map[string]any {
 							"description": "Filter by summary preset name",
 							"required":    false,
 							"schema":      map[string]any{"type": "string"},
+						},
+						{
+							"name":        "speaker",
+							"in":          "query",
+							"description": "Filter by speaker name or index (e.g., 'Ben' or '0')",
+							"required":    false,
+							"schema":      map[string]any{"type": "string"},
+						},
 					},
-					{
-						"name":        "speaker",
-						"in":          "query",
-						"description": "Filter by speaker name or index (e.g., 'Ben' or '0')",
-						"required":    false,
-						"schema":      map[string]any{"type": "string"},
-					},
-				},
-				"responses": map[string]any{
+					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Search results",
 						},
@@ -123,91 +123,91 @@ func OpenAPISpec() map[string]any {
 				},
 			},
 
-		// Semantic search endpoint
-		"/api/search/semantic": map[string]any{
-			"get": map[string]any{
-				"summary":     "Semantic search",
-				"description": "Search across sessions using semantic similarity (embedding-based)",
-				"tags":        []string{"search"},
-				"security":    []map[string][]string{{"basicAuth": {}}},
-				"parameters": []map[string]any{
-					{
-						"name":        "q",
-						"in":          "query",
-						"description": "Query text for semantic search",
-						"required":    true,
-						"schema":      map[string]any{"type": "string"},
+			// Semantic search endpoint
+			"/api/search/semantic": map[string]any{
+				"get": map[string]any{
+					"summary":     "Semantic search",
+					"description": "Search across sessions using semantic similarity (embedding-based)",
+					"tags":        []string{"search"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "q",
+							"in":          "query",
+							"description": "Query text for semantic search",
+							"required":    true,
+							"schema":      map[string]any{"type": "string"},
+						},
+						{
+							"name":        "limit",
+							"in":          "query",
+							"description": "Maximum number of results (default 10)",
+							"required":    false,
+							"schema":      map[string]any{"type": "integer"},
+						},
+						{
+							"name":        "date_from",
+							"in":          "query",
+							"description": "Filter results from this date (RFC3339Nano format)",
+							"required":    false,
+							"schema":      map[string]any{"type": "string"},
+						},
+						{
+							"name":        "date_to",
+							"in":          "query",
+							"description": "Filter results until this date (RFC3339Nano format)",
+							"required":    false,
+							"schema":      map[string]any{"type": "string"},
+						},
 					},
-					{
-						"name":        "limit",
-						"in":          "query",
-						"description": "Maximum number of results (default 10)",
-						"required":    false,
-						"schema":      map[string]any{"type": "integer"},
-					},
-					{
-						"name":        "date_from",
-						"in":          "query",
-						"description": "Filter results from this date (RFC3339Nano format)",
-						"required":    false,
-						"schema":      map[string]any{"type": "string"},
-					},
-					{
-						"name":        "date_to",
-						"in":          "query",
-						"description": "Filter results until this date (RFC3339Nano format)",
-						"required":    false,
-						"schema":      map[string]any{"type": "string"},
-					},
-				},
-				"responses": map[string]any{
-					"200": map[string]any{
-						"description": "Semantic search results with similarity scores",
-					},
-					"501": map[string]any{
-						"description": "Semantic search unavailable (no embedding provider configured)",
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "Semantic search results with similarity scores",
+						},
+						"501": map[string]any{
+							"description": "Semantic search unavailable (no embedding provider configured)",
+						},
 					},
 				},
 			},
-		},
 
-		// Event polling endpoint
-		"/api/events": map[string]any{
-			"get": map[string]any{
-				"summary":     "Poll for events",
-				"description": "Get events with cursor-based pagination and optional type filtering",
-				"tags":        []string{"events"},
-				"security":    []map[string][]string{{"basicAuth": {}}},
-				"parameters": []map[string]any{
-					{
-						"name":        "cursor",
-						"in":          "query",
-						"description": "Event ID cursor for pagination (default 0)",
-						"required":    false,
-						"schema":      map[string]any{"type": "integer"},
+			// Event polling endpoint
+			"/api/events": map[string]any{
+				"get": map[string]any{
+					"summary":     "Poll for events",
+					"description": "Get events with cursor-based pagination and optional type filtering",
+					"tags":        []string{"events"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "cursor",
+							"in":          "query",
+							"description": "Event ID cursor for pagination (default 0)",
+							"required":    false,
+							"schema":      map[string]any{"type": "integer"},
+						},
+						{
+							"name":        "limit",
+							"in":          "query",
+							"description": "Maximum number of events to return (default 50, max 200)",
+							"required":    false,
+							"schema":      map[string]any{"type": "integer"},
+						},
+						{
+							"name":        "types",
+							"in":          "query",
+							"description": "Comma-separated event types to filter (e.g., 'session_ended,summary_ready')",
+							"required":    false,
+							"schema":      map[string]any{"type": "string"},
+						},
 					},
-					{
-						"name":        "limit",
-						"in":          "query",
-						"description": "Maximum number of events to return (default 50, max 200)",
-						"required":    false,
-						"schema":      map[string]any{"type": "integer"},
-					},
-					{
-						"name":        "types",
-						"in":          "query",
-						"description": "Comma-separated event types to filter (e.g., 'session_ended,summary_ready')",
-						"required":    false,
-						"schema":      map[string]any{"type": "string"},
-					},
-				},
-				"responses": map[string]any{
-					"200": map[string]any{
-						"description": "Events with pagination info",
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "Events with pagination info",
+						},
 					},
 				},
 			},
-		},
 			// Session management endpoints
 			"/api/sessions/start": map[string]any{
 				"post": map[string]any{
@@ -477,36 +477,36 @@ func OpenAPISpec() map[string]any {
 				},
 			},
 
-		// Session segments endpoint
-		"/api/sessions/{id}/segments": map[string]any{
-			"get": map[string]any{
-				"summary":     "Get session segments",
-				"description": "Get transcript segments for a session with optional speaker filter",
-				"tags":        []string{"sessions"},
-				"security":    []map[string][]string{{"basicAuth": {}}},
-				"parameters": []map[string]any{
-					{
-						"name":        "id",
-						"in":          "path",
-						"description": "Session ID",
-						"required":    true,
-						"schema":      map[string]any{"type": "string"},
+			// Session segments endpoint
+			"/api/sessions/{id}/segments": map[string]any{
+				"get": map[string]any{
+					"summary":     "Get session segments",
+					"description": "Get transcript segments for a session with optional speaker filter",
+					"tags":        []string{"sessions"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "id",
+							"in":          "path",
+							"description": "Session ID",
+							"required":    true,
+							"schema":      map[string]any{"type": "string"},
+						},
+						{
+							"name":        "speaker",
+							"in":          "query",
+							"description": "Filter by speaker name or index (e.g., 'Ben' or '0')",
+							"required":    false,
+							"schema":      map[string]any{"type": "string"},
+						},
 					},
-					{
-						"name":        "speaker",
-						"in":          "query",
-						"description": "Filter by speaker name or index (e.g., 'Ben' or '0')",
-						"required":    false,
-						"schema":      map[string]any{"type": "string"},
-					},
-				},
-				"responses": map[string]any{
-					"200": map[string]any{
-						"description": "Transcript segments",
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "Transcript segments",
+						},
 					},
 				},
 			},
-		},
 			"/api/sessions/{id}/context": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get context window",
