@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -123,6 +125,14 @@ type SessionSummary struct {
 	SummaryPreset string    `json:"summary_preset"`
 }
 
+type StoredEmbedding struct {
+	SessionID  string
+	ChunkIndex int
+	Vector     []float32
+	TextHash   string
+	Model      string
+	CreatedAt  time.Time
+}
 var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
@@ -333,6 +343,21 @@ func (s *SQLiteStore) init(dbPath string) error {
 		);
 	`); err != nil {
 		return fmt.Errorf("create summary_requests table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS embeddings (
+			session_id TEXT NOT NULL,
+			chunk_index INTEGER NOT NULL,
+			embedding BLOB NOT NULL,
+			text_hash TEXT NOT NULL,
+			model TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (session_id, chunk_index),
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create embeddings table: %w", err)
 	}
 
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at)"); err != nil {
@@ -1346,4 +1371,144 @@ func (s *SQLiteStore) AggregateSessions(opts AggregateOptions) (AggregateResult,
 		SessionCount: totalCount,
 		Groups:       groups,
 	}, nil
+}
+
+// StoreEmbedding stores an embedding vector for a session chunk.
+func (s *SQLiteStore) StoreEmbedding(sessionID string, chunkIndex int, vector []float32, textHash, model string) error {
+	// Serialize vector to BLOB
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, vector); err != nil {
+		return fmt.Errorf("serialize embedding vector: %w", err)
+	}
+	
+	_, err := s.db.Exec(
+		`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES(?, ?, ?, ?, ?)`,
+		sessionID, chunkIndex, buf.Bytes(), textHash, model,
+	)
+	if err != nil {
+		return fmt.Errorf("store embedding for session %s chunk %d: %w", sessionID, chunkIndex, err)
+	}
+	return nil
+}
+
+// GetEmbeddings retrieves all embeddings for a session.
+func (s *SQLiteStore) GetEmbeddings(sessionID string) ([]StoredEmbedding, error) {
+	rows, err := s.db.Query(
+		`SELECT session_id, chunk_index, embedding, text_hash, model, created_at FROM embeddings WHERE session_id = ? ORDER BY chunk_index ASC`,
+		sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query embeddings for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	
+	var embeddings []StoredEmbedding
+	for rows.Next() {
+		var emb StoredEmbedding
+		var embeddingBlob []byte
+		var createdAtStr string
+		
+		if err := rows.Scan(&emb.SessionID, &emb.ChunkIndex, &embeddingBlob, &emb.TextHash, &emb.Model, &createdAtStr); err != nil {
+			return nil, fmt.Errorf("scan embedding for session %s: %w", sessionID, err)
+		}
+		
+		// Deserialize vector from BLOB
+		buf := bytes.NewReader(embeddingBlob)
+		var vector []float32
+		for {
+			var f float32
+			if err := binary.Read(buf, binary.LittleEndian, &f); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("deserialize embedding vector for session %s: %w", sessionID, err)
+			}
+			vector = append(vector, f)
+		}
+		emb.Vector = vector
+		
+		// Parse timestamp
+		parsedTime, err := time.Parse(time.RFC3339Nano, createdAtStr)
+		if err != nil {
+			// Fallback to parsing as SQLite datetime format
+			parsedTime, err = time.Parse("2006-01-02 15:04:05", createdAtStr)
+			if err != nil {
+				return nil, fmt.Errorf("parse created_at for session %s: %w", sessionID, err)
+			}
+		}
+		emb.CreatedAt = parsedTime
+		
+		embeddings = append(embeddings, emb)
+	}
+	
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate embeddings for session %s: %w", sessionID, err)
+	}
+	
+	return embeddings, nil
+}
+
+// GetAllEmbeddings retrieves all embeddings across all sessions.
+func (s *SQLiteStore) GetAllEmbeddings() ([]StoredEmbedding, error) {
+	rows, err := s.db.Query(
+		`SELECT session_id, chunk_index, embedding, text_hash, model, created_at FROM embeddings ORDER BY session_id ASC, chunk_index ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query all embeddings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	
+	var embeddings []StoredEmbedding
+	for rows.Next() {
+		var emb StoredEmbedding
+		var embeddingBlob []byte
+		var createdAtStr string
+		
+		if err := rows.Scan(&emb.SessionID, &emb.ChunkIndex, &embeddingBlob, &emb.TextHash, &emb.Model, &createdAtStr); err != nil {
+			return nil, fmt.Errorf("scan embedding: %w", err)
+		}
+		
+		// Deserialize vector from BLOB
+		buf := bytes.NewReader(embeddingBlob)
+		var vector []float32
+		for {
+			var f float32
+			if err := binary.Read(buf, binary.LittleEndian, &f); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("deserialize embedding vector: %w", err)
+			}
+			vector = append(vector, f)
+		}
+		emb.Vector = vector
+		
+		// Parse timestamp
+		parsedTime, err := time.Parse(time.RFC3339Nano, createdAtStr)
+		if err != nil {
+			// Fallback to parsing as SQLite datetime format
+			parsedTime, err = time.Parse("2006-01-02 15:04:05", createdAtStr)
+			if err != nil {
+				return nil, fmt.Errorf("parse created_at: %w", err)
+			}
+		}
+		emb.CreatedAt = parsedTime
+		
+		embeddings = append(embeddings, emb)
+	}
+	
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate all embeddings: %w", err)
+	}
+	
+	return embeddings, nil
+}
+
+// DeleteEmbeddings deletes all embeddings for a session.
+func (s *SQLiteStore) DeleteEmbeddings(sessionID string) error {
+	_, err := s.db.Exec(`DELETE FROM embeddings WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return fmt.Errorf("delete embeddings for session %s: %w", sessionID, err)
+	}
+	return nil
 }

@@ -1328,3 +1328,138 @@ func TestAggregateSessions(t *testing.T) {
 		}
 	})
 }
+
+func TestStoreEmbedding(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "embed-test-1"
+	startedAt := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	
+	// Create test vector
+	vector := []float32{0.1, 0.2, 0.3, 0.4, 0.5}
+	textHash := "hash-abc123"
+	model := "openai/text-embedding-3-small"
+	
+	// Store embedding
+	if err := store.StoreEmbedding(sessionID, 0, vector, textHash, model); err != nil {
+		t.Fatalf("store embedding: %v", err)
+	}
+	
+	// Retrieve and verify
+	embeddings, err := store.GetEmbeddings(sessionID)
+	if err != nil {
+		t.Fatalf("get embeddings: %v", err)
+	}
+	if len(embeddings) != 1 {
+		t.Fatalf("expected 1 embedding, got %d", len(embeddings))
+	}
+	
+	emb := embeddings[0]
+	if emb.SessionID != sessionID {
+		t.Fatalf("expected session_id %q, got %q", sessionID, emb.SessionID)
+	}
+	if emb.ChunkIndex != 0 {
+		t.Fatalf("expected chunk_index 0, got %d", emb.ChunkIndex)
+	}
+	if emb.TextHash != textHash {
+		t.Fatalf("expected text_hash %q, got %q", textHash, emb.TextHash)
+	}
+	if emb.Model != model {
+		t.Fatalf("expected model %q, got %q", model, emb.Model)
+	}
+	if len(emb.Vector) != len(vector) {
+		t.Fatalf("expected vector length %d, got %d", len(vector), len(emb.Vector))
+	}
+	for i, v := range vector {
+		if emb.Vector[i] != v {
+			t.Fatalf("vector[%d]: expected %f, got %f", i, v, emb.Vector[i])
+		}
+	}
+	if emb.CreatedAt.IsZero() {
+		t.Fatal("expected CreatedAt to be set")
+	}
+}
+
+func TestDeleteEmbeddings(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "embed-delete-1"
+	startedAt := time.Date(2026, 3, 25, 11, 0, 0, 0, time.UTC)
+	
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	
+	// Store multiple embeddings
+	for i := 0; i < 3; i++ {
+		vector := []float32{float32(i) * 0.1, float32(i) * 0.2}
+		if err := store.StoreEmbedding(sessionID, i, vector, fmt.Sprintf("hash-%d", i), "openai/text-embedding-3-small"); err != nil {
+			t.Fatalf("store embedding %d: %v", i, err)
+		}
+	}
+	
+	// Verify stored
+	embeddings, err := store.GetEmbeddings(sessionID)
+	if err != nil {
+		t.Fatalf("get embeddings before delete: %v", err)
+	}
+	if len(embeddings) != 3 {
+		t.Fatalf("expected 3 embeddings, got %d", len(embeddings))
+	}
+	
+	// Delete
+	if err := store.DeleteEmbeddings(sessionID); err != nil {
+		t.Fatalf("delete embeddings: %v", err)
+	}
+	
+	// Verify deleted
+	embeddings, err = store.GetEmbeddings(sessionID)
+	if err != nil {
+		t.Fatalf("get embeddings after delete: %v", err)
+	}
+	if len(embeddings) != 0 {
+		t.Fatalf("expected 0 embeddings after delete, got %d", len(embeddings))
+	}
+}
+
+func TestGetAllEmbeddings(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	
+	// Create two sessions with embeddings
+	for sessionIdx := 0; sessionIdx < 2; sessionIdx++ {
+		sessionID := fmt.Sprintf("embed-all-%d", sessionIdx)
+		startedAt := time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC).Add(time.Duration(sessionIdx) * time.Hour)
+		
+		if err := store.CreateSession(sessionID, startedAt); err != nil {
+			t.Fatalf("create session %s: %v", sessionID, err)
+		}
+		
+		// Store 2 embeddings per session
+		for chunkIdx := 0; chunkIdx < 2; chunkIdx++ {
+			vector := []float32{float32(sessionIdx)*0.1 + float32(chunkIdx)*0.01}
+			if err := store.StoreEmbedding(sessionID, chunkIdx, vector, fmt.Sprintf("hash-%d-%d", sessionIdx, chunkIdx), "openai/text-embedding-3-small"); err != nil {
+				t.Fatalf("store embedding %s[%d]: %v", sessionID, chunkIdx, err)
+			}
+		}
+	}
+	
+	// Get all embeddings
+	all, err := store.GetAllEmbeddings()
+	if err != nil {
+		t.Fatalf("get all embeddings: %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("expected 4 total embeddings, got %d", len(all))
+	}
+	
+	// Verify we have embeddings from both sessions
+	sessionIDs := make(map[string]bool)
+	for _, emb := range all {
+		sessionIDs[emb.SessionID] = true
+	}
+	if len(sessionIDs) != 2 {
+		t.Fatalf("expected embeddings from 2 sessions, got %d unique sessions", len(sessionIDs))
+	}
+}

@@ -163,3 +163,34 @@
 ### Testing Pattern
 - TDD executed: created failing tests first, then implemented package to green.
 - Required tests added: `TestEmbedReturnsVectors`, `TestUnknownProvider`, `TestBatchEmbedding` using mock clients (no external API calls).
+
+## 2026-03-25 — Task 7: Embedding Storage Schema and CRUD
+
+### Implementation Pattern
+- **StoredEmbedding struct**: SessionID, ChunkIndex, Vector []float32, TextHash, Model, CreatedAt
+- **Table schema**: embeddings(session_id, chunk_index, embedding BLOB, text_hash, model, created_at)
+- **Primary key**: (session_id, chunk_index) — one embedding per chunk per session
+- **Foreign key**: session_id references sessions(id) ON DELETE CASCADE
+
+### Vector Serialization
+- **Serialization**: `binary.Write(buf, binary.LittleEndian, vector)` → BLOB
+- **Deserialization**: `binary.Read(buf, binary.LittleEndian, &f)` in loop until EOF
+- **Imports**: Added `"bytes"` and `"encoding/binary"` to sqlite.go
+
+### CRUD Methods
+- **StoreEmbedding(sessionID, chunkIndex, vector, textHash, model)**: Insert with serialized vector
+- **GetEmbeddings(sessionID)**: Query by session, deserialize vectors, return ordered by chunk_index
+- **GetAllEmbeddings()**: Query all embeddings (for brute-force cosine similarity), ordered by session_id, chunk_index
+- **DeleteEmbeddings(sessionID)**: Delete all embeddings for a session
+
+### Testing Approach
+- TDD: 3 tests written first, then implementation
+- TestStoreEmbedding: Store + retrieve, verify all fields and vector values
+- TestDeleteEmbeddings: Store multiple, delete, verify gone
+- TestGetAllEmbeddings: Multiple sessions, verify cross-session retrieval
+- Full suite: 14 packages, 0 regressions
+
+### Migration Pattern
+- Added to ensureSchema() after summary_requests table
+- CREATE TABLE IF NOT EXISTS for idempotency
+- Follows existing pattern: no ALTER TABLE needed for fresh installs
