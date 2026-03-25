@@ -621,6 +621,43 @@ func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error
 	return segments, nil
 }
 
+func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
+	rows, err := s.db.Query(
+		`SELECT speaker, text, start_time, end_time, timestamp
+		 FROM segments
+		 WHERE session_id = ? AND start_time >= ? AND end_time <= ?
+		 ORDER BY start_time`,
+		sessionID, startTime, endTime,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query segments in time range for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	segments := make([]transcribe.Segment, 0, 32)
+	for rows.Next() {
+		var seg transcribe.Segment
+		var ts string
+		if err := rows.Scan(&seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
+		}
+
+		parsedTS, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			return nil, fmt.Errorf("parse segment timestamp in time range for session %s: %w", sessionID, err)
+		}
+		seg.Timestamp = parsedTS
+
+		segments = append(segments, seg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate segment rows in time range for session %s: %w", sessionID, err)
+	}
+
+	return segments, nil
+}
+
 func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset string) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions SET title = CASE WHEN ? != '' THEN ? ELSE title END, summary = ?, summary_status = ?, summary_preset = ? WHERE id = ?`,

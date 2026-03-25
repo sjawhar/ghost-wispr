@@ -61,6 +61,17 @@ func (s apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, error
 	return s.segments[sessionID], nil
 }
 
+func (s apiStoreStub) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
+	all := s.segments[sessionID]
+	var result []transcribe.Segment
+	for _, seg := range all {
+		if seg.StartTime >= startTime && seg.EndTime <= endTime {
+			result = append(result, seg)
+		}
+	}
+	return result, nil
+}
+
 func (s apiStoreStub) GetDates() ([]string, error) {
 	return s.dates, nil
 }
@@ -1776,5 +1787,175 @@ func TestSearchEndpointBackwardCompatible(t *testing.T) {
 
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func TestContextEndpoint_Success(t *testing.T) {
+	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "early talk", StartTime: 10.0, EndTime: 15.0, Timestamp: started},
+				{Speaker: 1, Text: "the budget discussion", StartTime: 60.0, EndTime: 65.0, Timestamp: started},
+				{Speaker: 0, Text: "follow up items", StartTime: 120.0, EndTime: 125.0, Timestamp: started},
+				{Speaker: 1, Text: "unrelated later", StartTime: 600.0, EndTime: 605.0, Timestamp: started},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1/context?q=budget&seconds=200", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		SessionID     string               `json:"session_id"`
+		Query         string               `json:"query"`
+		MatchTime     float64              `json:"match_time"`
+		Segments      []transcribe.Segment `json:"segments"`
+		WindowSeconds float64              `json:"window_seconds"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if resp.SessionID != "s1" {
+		t.Fatalf("expected session_id s1, got %q", resp.SessionID)
+	}
+	if resp.Query != "budget" {
+		t.Fatalf("expected query 'budget', got %q", resp.Query)
+	}
+	if resp.MatchTime != 60.0 {
+		t.Fatalf("expected match_time 60.0, got %f", resp.MatchTime)
+	}
+	if resp.WindowSeconds != 200.0 {
+		t.Fatalf("expected window_seconds 200.0, got %f", resp.WindowSeconds)
+	}
+	// Window: [60-100, 60+100] = [-40, 160] — segments at 10-15, 60-65, 120-125 should match
+	if len(resp.Segments) != 3 {
+		t.Fatalf("expected 3 segments in context window, got %d", len(resp.Segments))
+	}
+}
+
+func TestContextEndpoint_DefaultSeconds(t *testing.T) {
+	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "keyword here", StartTime: 100.0, EndTime: 105.0, Timestamp: started},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1/context?q=keyword", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		WindowSeconds float64 `json:"window_seconds"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.WindowSeconds != 300.0 {
+		t.Fatalf("expected default window_seconds 300.0, got %f", resp.WindowSeconds)
+	}
+}
+
+func TestContextEndpoint_SessionNotFound(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/nonexistent/context?q=test", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestContextEndpoint_NoMatch(t *testing.T) {
+	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "nothing relevant", StartTime: 10.0, EndTime: 15.0, Timestamp: started},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1/context?q=nonexistent", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected status 422, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestContextEndpoint_MissingQuery(t *testing.T) {
+	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1/context", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }

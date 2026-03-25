@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type SessionStore interface {
 	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
 	GetSession(id string) (storage.Session, error)
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
+	GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
 	DeleteSession(id string) error
@@ -412,6 +414,79 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("Content-Type", contentTypeForAudio(cleanPath))
 		http.ServeContent(w, r, filepath.Base(cleanPath), info.ModTime(), f)
+	})
+
+	mux.HandleFunc("GET /api/sessions/{id}/context", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		// Verify session exists
+		if _, err := store.GetSession(sessionID); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("session not found: %v", err))
+			return
+		}
+
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			writeJSONError(w, http.StatusBadRequest, "q parameter is required")
+			return
+		}
+
+		windowSeconds := 300.0
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			parsed, err := strconv.ParseFloat(s, 64)
+			if err != nil || parsed <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "seconds must be a positive number")
+				return
+			}
+			windowSeconds = parsed
+		}
+
+		// Load all segments to find the first text match
+		segments, err := store.GetSegments(sessionID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get segments: %v", err))
+			return
+		}
+
+		qLower := strings.ToLower(q)
+		var matchTime float64
+		found := false
+		for _, seg := range segments {
+			if strings.Contains(strings.ToLower(seg.Text), qLower) {
+				matchTime = seg.StartTime
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("no match found for query %q", q))
+			return
+		}
+
+		// Get segments within the time window around the match
+		half := windowSeconds / 2
+		contextSegments, err := store.GetSegmentsInTimeRange(sessionID, matchTime-half, matchTime+half)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get context segments: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session_id":      sessionID,
+			"query":           q,
+			"match_time":      matchTime,
+			"segments":        contextSegments,
+			"window_seconds":  windowSeconds,
+		})
 	})
 
 	mux.HandleFunc("GET /api/dates", func(w http.ResponseWriter, r *http.Request) {

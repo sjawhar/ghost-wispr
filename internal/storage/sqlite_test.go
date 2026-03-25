@@ -1137,3 +1137,69 @@ func TestSearchWithMultipleFilters(t *testing.T) {
 		t.Fatalf("expected 1 result matching all filters, got %+v", results)
 	}
 }
+
+func TestSegmentsInTimeRange(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startedAt := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	sessionID := "time-range-test"
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if err := store.EndSession(sessionID, startedAt.Add(30*time.Minute), ""); err != nil {
+		t.Fatalf("EndSession failed: %v", err)
+	}
+
+	// Insert segments at different times
+	for i, seg := range []transcribe.Segment{
+		{Speaker: 0, Text: "early segment", StartTime: 10.0, EndTime: 15.0, Timestamp: startedAt.Add(10 * time.Second)},
+		{Speaker: 1, Text: "match segment", StartTime: 60.0, EndTime: 65.0, Timestamp: startedAt.Add(60 * time.Second)},
+		{Speaker: 0, Text: "nearby segment", StartTime: 120.0, EndTime: 125.0, Timestamp: startedAt.Add(120 * time.Second)},
+		{Speaker: 1, Text: "far segment", StartTime: 600.0, EndTime: 605.0, Timestamp: startedAt.Add(600 * time.Second)},
+		{Speaker: 0, Text: "very far segment", StartTime: 1200.0, EndTime: 1205.0, Timestamp: startedAt.Add(1200 * time.Second)},
+	} {
+		if err := store.AppendSegment(sessionID, seg); err != nil {
+			t.Fatalf("AppendSegment %d failed: %v", i, err)
+		}
+	}
+
+	// Query a time range that should include segments 1-3 (60-600 range, using 0-200)
+	segs, err := store.GetSegmentsInTimeRange(sessionID, 50.0, 200.0)
+	if err != nil {
+		t.Fatalf("GetSegmentsInTimeRange failed: %v", err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("expected 2 segments in range [50,200], got %d", len(segs))
+	}
+	if segs[0].Text != "match segment" {
+		t.Fatalf("expected first segment 'match segment', got %q", segs[0].Text)
+	}
+	if segs[1].Text != "nearby segment" {
+		t.Fatalf("expected second segment 'nearby segment', got %q", segs[1].Text)
+	}
+
+	// Query range with no matches
+	segs, err = store.GetSegmentsInTimeRange(sessionID, 300.0, 500.0)
+	if err != nil {
+		t.Fatalf("GetSegmentsInTimeRange empty range failed: %v", err)
+	}
+	if len(segs) != 0 {
+		t.Fatalf("expected 0 segments in range [300,500], got %d", len(segs))
+	}
+
+	// Query range covering all segments
+	segs, err = store.GetSegmentsInTimeRange(sessionID, 0.0, 2000.0)
+	if err != nil {
+		t.Fatalf("GetSegmentsInTimeRange full range failed: %v", err)
+	}
+	if len(segs) != 5 {
+		t.Fatalf("expected 5 segments in range [0,2000], got %d", len(segs))
+	}
+
+	// Verify segments are ordered by start_time
+	for i := 1; i < len(segs); i++ {
+		if segs[i].StartTime < segs[i-1].StartTime {
+			t.Fatalf("segments not ordered by start_time: %f < %f", segs[i].StartTime, segs[i-1].StartTime)
+		}
+	}
+}
