@@ -244,3 +244,25 @@
   - `TestSemanticSearch_NoClient`
   - `TestSemanticSearch_NoEmbeddings`
 - Verified no regressions with `go test ./... -v`.
+
+## 2026-03-25 — Task 10: Speaker Name Extraction in Summaries
+
+### Implementation Pattern
+- Extended `internal/summary/summarizer.go` structured schema and prompt to include a `speakers` object keyed by diarized speaker ID.
+- Summarizer now parses speaker metadata from structured JSON and returns normalized `speakerNames` JSON (defaults to `{}` when absent or invalid).
+- Session summary pipeline plumbs `speakerNames` through `session.Summarizer` + `store.UpdateSummary(...)` so metadata persists with summary writes.
+
+### Storage Pattern
+- Added `speaker_names TEXT NOT NULL DEFAULT '{}'` to sessions schema and migration list in `ensureSchema()`.
+- Added `Session.SpeakerNames string` field and threaded it through session SELECT/scan paths plus `ImportSession` insert mapping.
+- Updated `UpdateSummary` signature to `UpdateSummary(sessionID, title, summary, status, preset, speakerNames string)` and wired all callers with explicit `{}` fallback on non-success paths.
+
+### Testing + Verification
+- TDD flow used:
+  - `TestSpeakerNameExtraction` (summary package) covers explicit mention (`Ben`) and empty-speaker fallback.
+  - `TestSpeakerNames` (storage package) covers persistence + default `{}`.
+- Verification commands passed:
+  - `go test ./internal/summary/... -run TestSpeakerNameExtraction -v`
+  - `go test ./internal/storage/... -run TestSpeakerNames -v`
+  - `go test ./... -v`
+- Evidence captured at `.sisyphus/evidence/task-10-speaker-names.txt`.

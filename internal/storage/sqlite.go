@@ -69,6 +69,7 @@ type Session struct {
 	Summary             string     `json:"summary"`
 	SummaryStatus       string     `json:"summary_status"`
 	SummaryPreset       string     `json:"summary_preset"`
+	SpeakerNames        string     `json:"speaker_names"`
 	RefinedTranscript   string     `json:"refined_transcript"`
 	RefinementStatus    string     `json:"refinement_status"`
 	AudioPath           string     `json:"audio_path"`
@@ -247,6 +248,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			summary TEXT NOT NULL DEFAULT '',
 			summary_status TEXT NOT NULL DEFAULT 'pending',
 			summary_preset TEXT NOT NULL DEFAULT '',
+			speaker_names TEXT NOT NULL DEFAULT '{}',
 			refined_transcript TEXT NOT NULL DEFAULT '',
 			refinement_status TEXT NOT NULL DEFAULT 'pending',
 			audio_path TEXT NOT NULL DEFAULT '',
@@ -277,6 +279,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 	// Only ignore "duplicate column" errors; propagate other failures.
 	for _, stmt := range []string{
 		`ALTER TABLE sessions ADD COLUMN summary_preset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN speaker_names TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'pending'`,
 		`ALTER TABLE sessions ADD COLUMN gdrive_folder_id TEXT NOT NULL DEFAULT ''`,
@@ -545,7 +548,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -589,7 +592,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -602,7 +605,7 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -610,7 +613,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -713,14 +716,15 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	return segments, nil
 }
 
-func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset string) error {
+func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET title = CASE WHEN ? != '' THEN ? ELSE title END, summary = ?, summary_status = ?, summary_preset = ? WHERE id = ?`,
+		`UPDATE sessions SET title = CASE WHEN ? != '' THEN ? ELSE title END, summary = ?, summary_status = ?, summary_preset = ?, speaker_names = ? WHERE id = ?`,
 		title,
 		title,
 		summary,
 		status,
 		preset,
+		speakerNames,
 		sessionID,
 	)
 	if err != nil {
@@ -926,7 +930,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -1047,7 +1051,7 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -1143,8 +1147,8 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 	}
 
 	_, err = tx.Exec(
-		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, canonical_transcript, transcript_source)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, canonical_transcript, transcript_source)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ID,
 		sess.Title,
 		sess.StartedAt.UTC().Format(time.RFC3339Nano),
@@ -1153,6 +1157,7 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		sess.Summary,
 		sess.SummaryStatus,
 		sess.SummaryPreset,
+		sess.SpeakerNames,
 		sess.RefinedTranscript,
 		sess.RefinementStatus,
 		sess.AudioPath,

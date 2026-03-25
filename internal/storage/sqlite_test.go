@@ -197,7 +197,7 @@ func TestSQLiteCRUD(t *testing.T) {
 		t.Fatalf("AppendSegment failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("UpdateSummary failed: %v", err)
 	}
 
@@ -256,7 +256,7 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise"); err != nil {
+	if err := store.UpdateSummary(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise", "{}"); err != nil {
 		t.Fatalf("UpdateSummary failed: %v", err)
 	}
 
@@ -268,6 +268,46 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 	if session.SummaryPreset != "concise" {
 		t.Fatalf("expected summary_preset %q, got %q", "concise", session.SummaryPreset)
 	}
+}
+
+func TestSpeakerNames(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startedAt := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	sessionID := startedAt.Format("20060102150405")
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	t.Run("UpdateSummary persists speaker_names", func(t *testing.T) {
+		speakerNames := `{"1":{"name":"Ben","confidence":"mentioned"}}`
+		if err := store.UpdateSummary(sessionID, "Speaker notes", "## Summary\n- discussed", SummaryCompleted, "default", speakerNames); err != nil {
+			t.Fatalf("UpdateSummary failed: %v", err)
+		}
+
+		session, err := store.GetSession(sessionID)
+		if err != nil {
+			t.Fatalf("GetSession failed: %v", err)
+		}
+		if session.SpeakerNames != speakerNames {
+			t.Fatalf("expected speaker_names %q, got %q", speakerNames, session.SpeakerNames)
+		}
+	})
+
+	t.Run("speaker_names defaults to empty JSON", func(t *testing.T) {
+		emptyID := "speaker-default-empty"
+		if err := store.CreateSession(emptyID, startedAt.Add(1*time.Minute)); err != nil {
+			t.Fatalf("CreateSession failed: %v", err)
+		}
+
+		var speakerNames string
+		if err := store.DB().QueryRow(`SELECT speaker_names FROM sessions WHERE id = ?`, emptyID).Scan(&speakerNames); err != nil {
+			t.Fatalf("query speaker_names failed: %v", err)
+		}
+		if speakerNames != "{}" {
+			t.Fatalf("expected default speaker_names {}, got %q", speakerNames)
+		}
+	})
 }
 
 func TestBatchRefinement_StoreStatusAndTranscript(t *testing.T) {
@@ -338,7 +378,7 @@ func TestSyncStatusTracking(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -388,7 +428,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default"); err != nil {
+	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -398,7 +438,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default"); err != nil {
+	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -411,7 +451,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default"); err != nil {
+	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -901,7 +941,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-1", started); err != nil {
 		t.Fatalf("create session fts-1: %v", err)
 	}
-	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary fts-1: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha appears once in transcript", "fts-1"); err != nil {
@@ -911,7 +951,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-2", started.Add(time.Minute)); err != nil {
 		t.Fatalf("create session fts-2: %v", err)
 	}
-	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary fts-2: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha alpha alpha and alpha again", "fts-2"); err != nil {
@@ -945,7 +985,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 	if err := store.CreateSession("fts-sync", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary initial: %v", err)
 	}
 
@@ -957,7 +997,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected no matches before update, got %d", len(results))
 	}
 
-	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary delta: %v", err)
 	}
 
@@ -1001,7 +1041,7 @@ func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
 	if err := store.CreateSession("fts-escape", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -1027,7 +1067,7 @@ func TestSearchWithDateFromFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default"); err != nil {
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -1057,7 +1097,7 @@ func TestSearchWithDateToFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default"); err != nil {
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -1085,7 +1125,7 @@ func TestSearchWithPresetFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset); err != nil {
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -1119,7 +1159,7 @@ func TestSearchWithMultipleFilters(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset); err != nil {
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -1231,7 +1271,7 @@ func TestAggregateSessions(t *testing.T) {
 		if err := store.EndSession(s.id, s.date.Add(30*time.Minute), ""); err != nil {
 			t.Fatalf("end session %s: %v", s.id, err)
 		}
-		if err := store.UpdateSummary(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset); err != nil {
+		if err := store.UpdateSummary(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset, "{}"); err != nil {
 			t.Fatalf("update summary %s: %v", s.id, err)
 		}
 	}
@@ -1333,21 +1373,21 @@ func TestStoreEmbedding(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	sessionID := "embed-test-1"
 	startedAt := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	
+
 	if err := store.CreateSession(sessionID, startedAt); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	
+
 	// Create test vector
 	vector := []float32{0.1, 0.2, 0.3, 0.4, 0.5}
 	textHash := "hash-abc123"
 	model := "openai/text-embedding-3-small"
-	
+
 	// Store embedding
 	if err := store.StoreEmbedding(sessionID, 0, vector, textHash, model); err != nil {
 		t.Fatalf("store embedding: %v", err)
 	}
-	
+
 	// Retrieve and verify
 	embeddings, err := store.GetEmbeddings(sessionID)
 	if err != nil {
@@ -1356,7 +1396,7 @@ func TestStoreEmbedding(t *testing.T) {
 	if len(embeddings) != 1 {
 		t.Fatalf("expected 1 embedding, got %d", len(embeddings))
 	}
-	
+
 	emb := embeddings[0]
 	if emb.SessionID != sessionID {
 		t.Fatalf("expected session_id %q, got %q", sessionID, emb.SessionID)
@@ -1387,11 +1427,11 @@ func TestDeleteEmbeddings(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	sessionID := "embed-delete-1"
 	startedAt := time.Date(2026, 3, 25, 11, 0, 0, 0, time.UTC)
-	
+
 	if err := store.CreateSession(sessionID, startedAt); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	
+
 	// Store multiple embeddings
 	for i := 0; i < 3; i++ {
 		vector := []float32{float32(i) * 0.1, float32(i) * 0.2}
@@ -1399,7 +1439,7 @@ func TestDeleteEmbeddings(t *testing.T) {
 			t.Fatalf("store embedding %d: %v", i, err)
 		}
 	}
-	
+
 	// Verify stored
 	embeddings, err := store.GetEmbeddings(sessionID)
 	if err != nil {
@@ -1408,12 +1448,12 @@ func TestDeleteEmbeddings(t *testing.T) {
 	if len(embeddings) != 3 {
 		t.Fatalf("expected 3 embeddings, got %d", len(embeddings))
 	}
-	
+
 	// Delete
 	if err := store.DeleteEmbeddings(sessionID); err != nil {
 		t.Fatalf("delete embeddings: %v", err)
 	}
-	
+
 	// Verify deleted
 	embeddings, err = store.GetEmbeddings(sessionID)
 	if err != nil {
@@ -1426,16 +1466,16 @@ func TestDeleteEmbeddings(t *testing.T) {
 
 func TestGetAllEmbeddings(t *testing.T) {
 	store := newTestSQLiteStore(t)
-	
+
 	// Create two sessions with embeddings
 	for sessionIdx := 0; sessionIdx < 2; sessionIdx++ {
 		sessionID := fmt.Sprintf("embed-all-%d", sessionIdx)
 		startedAt := time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC).Add(time.Duration(sessionIdx) * time.Hour)
-		
+
 		if err := store.CreateSession(sessionID, startedAt); err != nil {
 			t.Fatalf("create session %s: %v", sessionID, err)
 		}
-		
+
 		// Store 2 embeddings per session
 		for chunkIdx := 0; chunkIdx < 2; chunkIdx++ {
 			vector := []float32{float32(sessionIdx)*0.1 + float32(chunkIdx)*0.01}
@@ -1444,7 +1484,7 @@ func TestGetAllEmbeddings(t *testing.T) {
 			}
 		}
 	}
-	
+
 	// Get all embeddings
 	all, err := store.GetAllEmbeddings()
 	if err != nil {
@@ -1453,7 +1493,7 @@ func TestGetAllEmbeddings(t *testing.T) {
 	if len(all) != 4 {
 		t.Fatalf("expected 4 total embeddings, got %d", len(all))
 	}
-	
+
 	// Verify we have embeddings from both sessions
 	sessionIDs := make(map[string]bool)
 	for _, emb := range all {

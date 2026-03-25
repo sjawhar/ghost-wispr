@@ -391,7 +391,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		return
 	}
 
-	_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
+	_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "", "{}")
 
 	// Wait for batch refinement if configured, then canonicalize.
 	m.mu.Lock()
@@ -408,7 +408,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
 	if err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, "")
+		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, "", "{}")
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, "")
 		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		if m.hub != nil {
@@ -423,14 +423,14 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Warn("failed to get segments for title fallback", "operation", "generate_summary", "session_id", sessionID, "error", err)
 	}
 
-	title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, transcript)
+	title, summaryText, preset, speakerNames, err := summarizer.Summarize(ctx, sessionID, transcript)
 	// Safety net: ensure title is never empty using fallback chain.
 	if strings.TrimSpace(title) == "" {
 		title = summary.GenerateTitle("", transcript, segments, startedAt)
 	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
+		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset, "{}")
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
 		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
@@ -439,9 +439,9 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		return
 	}
 
-	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset); err != nil {
+	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
+		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset, "{}")
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
 		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
