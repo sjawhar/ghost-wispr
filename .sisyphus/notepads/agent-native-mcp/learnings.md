@@ -109,3 +109,37 @@
 ### Interface Pattern
 - `SessionStore` interface extended with `AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)`
 - `apiStoreStub` extended with `aggregateResult *storage.AggregateResult` and `aggregateErr error` fields
+
+## 2026-03-25 — Task 5: OpenAPI 3.1 Spec Endpoint
+
+### Implementation Pattern
+- **Static Go struct approach**: `OpenAPISpec()` returns `map[string]any` with full OpenAPI 3.1.0 structure
+- **No code generation**: Manually defined spec covers all 32 registered routes (existing + Wave 1 additions)
+- **Endpoint registration**: `GET /api/openapi.json` registered in `registerAPIRoutes()` after version endpoint
+- **Handler**: Simple `writeJSON(w, http.StatusOK, OpenAPISpec())` with automatic JSON encoding
+
+### Key Decisions
+- **Spec location**: `internal/server/openapi.go` — dedicated file for spec definition
+- **Route coverage**: All 32 paths documented including health checks, sessions CRUD, context, aggregate, config, logs, diagnostics
+- **Security scheme**: `basicAuth` with HTTP Basic auth type, documented at top level and in components
+- **No external dependencies**: Pure Go, no swaggo or oapi-codegen
+- **Spec completeness**: Includes parameters, request bodies, response descriptions, tags, and security requirements
+
+### Testing Approach
+- TDD: Write failing test first (`TestOpenAPISpec`)
+- Verify: OpenAPI 3.1.0 structure, info field, paths field, security schemes, expected paths present
+- Full suite: 14 packages, 0 regressions
+
+### Paths Documented (32 total)
+- Health: `/healthz/live`, `/healthz/ready`
+- System: `/api/version`, `/api/status`, `/api/logs`, `/api/openapi.json`
+- Search: `/api/search` (with date_from, date_to, preset filters)
+- Sessions: `/api/sessions`, `/api/sessions/aggregate`, `/api/sessions/{id}`, `/api/sessions/{id}/audio`, `/api/sessions/{id}/context`
+- Session actions: `/api/sessions/{id}/resummarize`, `/api/sessions/{id}/retry-summary`, `/api/sessions/{id}/retry-sync`, `/api/sessions/{id}/retry-refinement`
+- Session control: `/api/sessions/start`, `/api/sessions/current/stop`, `/api/sessions/{id}/stop`, `/api/sessions/merge`
+- Control: `/api/pause`, `/api/resume`, `/api/session/end`
+- Config: `/api/config`, `/api/presets`, `/api/config/presets/{name}/test`, `/api/config/presets/generate`, `/api/config/presets/refine`
+- Dates: `/api/dates`
+- Restore: `/api/restore/gdrive`
+- Diagnostic: `/api/diagnostic/mic`
+- Test: `/api/test/fault/deepgram-disconnect`

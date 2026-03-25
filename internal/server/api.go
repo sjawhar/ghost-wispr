@@ -93,6 +93,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
 
+	mux.HandleFunc("GET /api/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, OpenAPISpec())
+	})
+
 	// Full-text search endpoint
 	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))

@@ -2092,3 +2092,80 @@ func TestAggregateEndpoint_InvalidGroupBy(t *testing.T) {
 		t.Fatalf("expected status 400, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestOpenAPISpec(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/openapi.json", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("expected Content-Type application/json, got %q", ct)
+	}
+
+	var spec map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&spec); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// Verify OpenAPI 3.1 structure
+	if openapi, ok := spec["openapi"]; !ok || openapi != "3.1.0" {
+		t.Fatalf("expected openapi 3.1.0, got %v", openapi)
+	}
+
+	if _, ok := spec["info"]; !ok {
+		t.Fatalf("expected info field")
+	}
+
+	if _, ok := spec["paths"]; !ok {
+		t.Fatalf("expected paths field")
+	}
+
+	paths := spec["paths"].(map[string]any)
+	if len(paths) == 0 {
+		t.Fatalf("expected paths to have entries")
+	}
+
+	// Verify security scheme
+	components, ok := spec["components"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected components field")
+	}
+	securitySchemes, ok := components["securitySchemes"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected securitySchemes field")
+	}
+	if _, ok := securitySchemes["basicAuth"]; !ok {
+		t.Fatalf("expected basicAuth security scheme")
+	}
+
+	// Verify some expected paths exist
+	expectedPaths := []string{
+		"/healthz/live",
+		"/api/version",
+		"/api/search",
+		"/api/sessions",
+		"/api/sessions/aggregate",
+		"/api/sessions/{id}",
+		"/api/sessions/{id}/context",
+	}
+	for _, path := range expectedPaths {
+		if _, ok := paths[path]; !ok {
+			t.Errorf("expected path %q in spec", path)
+		}
+	}
+}
