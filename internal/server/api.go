@@ -7,15 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -26,6 +29,7 @@ var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 type SessionStore interface {
 	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
 	GetSession(id string) (storage.Session, error)
+	GetAllEmbeddings() ([]storage.StoredEmbedding, error)
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
@@ -48,7 +52,7 @@ var versionInfo VersionInfo
 // SetVersionInfo sets the build metadata for the /api/version endpoint.
 func SetVersionInfo(v VersionInfo) { versionInfo = v }
 
-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store) {
+func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
 
 	// Health check endpoints
 	mux.HandleFunc("GET /healthz/live", func(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +99,122 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("GET /api/openapi.json", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, OpenAPISpec())
+	})
+
+	mux.HandleFunc("GET /api/search/semantic", func(w http.ResponseWriter, r *http.Request) {
+		if embeddingClient == nil {
+			writeJSON(w, http.StatusNotImplemented, map[string]string{
+				"error":      "semantic search unavailable",
+				"suggestion": "use /api/search for keyword search",
+			})
+			return
+		}
+
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			writeJSONError(w, http.StatusBadRequest, "q parameter is required")
+			return
+		}
+
+		limit := 10
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			parsedLimit, err := strconv.Atoi(rawLimit)
+			if err != nil || parsedLimit <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be a positive integer")
+				return
+			}
+			limit = parsedLimit
+		}
+
+		var dateFrom, dateTo *time.Time
+		if rawDateFrom := strings.TrimSpace(r.URL.Query().Get("date_from")); rawDateFrom != "" {
+			parsed, err := time.Parse(time.RFC3339, rawDateFrom)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "date_from must be RFC3339")
+				return
+			}
+			dateFrom = &parsed
+		}
+		if rawDateTo := strings.TrimSpace(r.URL.Query().Get("date_to")); rawDateTo != "" {
+			parsed, err := time.Parse(time.RFC3339, rawDateTo)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "date_to must be RFC3339")
+				return
+			}
+			dateTo = &parsed
+		}
+
+		vectors, err := embeddingClient.Embed(r.Context(), []string{q})
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("embed query: %v", err))
+			return
+		}
+		if len(vectors) == 0 {
+			writeJSONError(w, http.StatusInternalServerError, "embed query: no vectors returned")
+			return
+		}
+
+		allEmbeddings, err := store.GetAllEmbeddings()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load embeddings: %v", err))
+			return
+		}
+		if len(allEmbeddings) == 0 {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "no embeddings indexed yet"})
+			return
+		}
+
+		type scoredEmbedding struct {
+			sessionID  string
+			chunkText  string
+			similarity float32
+			chunkIndex int
+		}
+
+		scored := make([]scoredEmbedding, 0, len(allEmbeddings))
+		queryVector := vectors[0]
+		for _, emb := range allEmbeddings {
+			scored = append(scored, scoredEmbedding{
+				sessionID:  emb.SessionID,
+				chunkText:  emb.TextHash,
+				similarity: cosineSimilarity(queryVector, emb.Vector),
+				chunkIndex: emb.ChunkIndex,
+			})
+		}
+
+		sort.Slice(scored, func(i, j int) bool {
+			return scored[i].similarity > scored[j].similarity
+		})
+
+		if limit > len(scored) {
+			limit = len(scored)
+		}
+		top := scored[:limit]
+
+		results := make([]map[string]any, 0, len(top))
+		for _, item := range top {
+			sess, err := store.GetSession(item.sessionID)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load session %s: %v", item.sessionID, err))
+				return
+			}
+			if dateFrom != nil && sess.StartedAt.Before(*dateFrom) {
+				continue
+			}
+			if dateTo != nil && sess.StartedAt.After(*dateTo) {
+				continue
+			}
+
+			results = append(results, map[string]any{
+				"session_id":  item.sessionID,
+				"title":       sess.Title,
+				"chunk_text":  item.chunkText,
+				"similarity":  item.similarity,
+				"chunk_index": item.chunkIndex,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{"results": results})
 	})
 
 	// Full-text search endpoint
@@ -508,11 +628,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"session_id":      sessionID,
-			"query":           q,
-			"match_time":      matchTime,
-			"segments":        contextSegments,
-			"window_seconds":  windowSeconds,
+			"session_id":     sessionID,
+			"query":          q,
+			"match_time":     matchTime,
+			"segments":       contextSegments,
+			"window_seconds": windowSeconds,
 		})
 	})
 
@@ -708,6 +828,26 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			mux.HandleFunc("POST /api/config/presets/refine", handleRefinePreset(cfgStore, controls.RefinePreset))
 		}
 	}
+}
+
+func cosineSimilarity(a, b []float32) float32 {
+	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
+		return 0
+	}
+
+	var dot, normA, normB float64
+	for i := range a {
+		av := float64(a[i])
+		bv := float64(b[i])
+		dot += av * bv
+		normA += av * av
+		normB += bv * bv
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+
+	return float32(dot / (math.Sqrt(normA) * math.Sqrt(normB)))
 }
 
 func validSessionID(id string) bool {

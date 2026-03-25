@@ -219,3 +219,28 @@
 - TDD flow used: added failing tests first (`TestSplitIntoChunks`, `TestIndexerOnSessionEnd`, `TestBackfillMissing`) then implemented to green.
 - `TestIndexerOnSessionEnd` validates DB persistence plus idempotent no-op reindexing.
 - `TestBackfillMissing` verifies only unindexed sessions are embedded during backfill.
+
+## 2026-03-25 — Task 9: Semantic Search Endpoint
+
+### Implementation Pattern
+- Added `GET /api/search/semantic` route in `internal/server/api.go` before keyword search route.
+- Handler flow: validate query params (`q`, optional `limit`, optional `date_from/date_to`) → embed query via `embedding.Client` → load all embeddings from store → cosine similarity against each vector → descending sort → top-K selection.
+- Response shape implemented as `{ "results": [...] }` with `session_id`, `title`, `chunk_text`, `similarity`, and `chunk_index` fields.
+
+### Wiring Pattern
+- Extended `SessionStore` interface with `GetAllEmbeddings()` for semantic retrieval.
+- Threaded `embedding.Client` through server setup by extending `HandlerWithLogger(..., embeddingClient embedding.Client, ...)` and passing it into `registerAPIRoutes(...)`.
+- `cmd/ghost-wispr/main.go` now keeps a reusable `embeddingClient` variable and passes it to HTTP handler setup.
+
+### Error/Edge Handling
+- Returns `501` with `{ "error": "semantic search unavailable", "suggestion": "use /api/search for keyword search" }` when embedding client is nil.
+- Returns `422` with `{ "error": "no embeddings indexed yet" }` when embeddings table is empty.
+- Cosine similarity helper returns 0 for zero-norm or dimension-mismatch vectors.
+
+### Testing Pattern
+- TDD performed: introduced failing `TestSemanticSearch_*` tests first, then implemented endpoint and wiring.
+- Added tests:
+  - `TestSemanticSearch_Success`
+  - `TestSemanticSearch_NoClient`
+  - `TestSemanticSearch_NoEmbeddings`
+- Verified no regressions with `go test ./... -v`.

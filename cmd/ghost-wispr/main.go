@@ -307,9 +307,10 @@ func main() {
 		sessionSummarizer = summarizer
 	}
 
+	var embeddingClient embedding.Client
 	var indexer *embedding.Indexer
 	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		embeddingClient, err := embedding.NewClient(cfg.EmbeddingModel)
+		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel)
 		if err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
 		} else {
@@ -925,7 +926,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Create health checker with actual component references
 	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic)
-	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, cfgStore)
+	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
 	}

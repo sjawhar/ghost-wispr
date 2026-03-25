@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -29,7 +30,23 @@ type apiStoreStub struct {
 	searchErr        error
 	aggregateResult  *storage.AggregateResult
 	aggregateErr     error
+	allEmbeddings    []storage.StoredEmbedding
+	allEmbeddingsErr error
 }
+
+type embeddingClientStub struct {
+	vectors [][]float32
+	err     error
+}
+
+func (s embeddingClientStub) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.vectors, nil
+}
+
+var _ embedding.Client = embeddingClientStub{}
 
 func newTestConfigStore(t *testing.T) *config.Store {
 	t.Helper()
@@ -98,6 +115,16 @@ func (s apiStoreStub) AggregateSessions(opts storage.AggregateOptions) (storage.
 	return storage.AggregateResult{Groups: []storage.AggregateGroup{}}, nil
 }
 
+func (s apiStoreStub) GetAllEmbeddings() ([]storage.StoredEmbedding, error) {
+	if s.allEmbeddingsErr != nil {
+		return nil, s.allEmbeddingsErr
+	}
+	if s.allEmbeddings == nil {
+		return []storage.StoredEmbedding{}, nil
+	}
+	return s.allEmbeddings, nil
+}
+
 func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
 	sess, ok := s.sessions[sessionID]
 	if !ok {
@@ -138,9 +165,9 @@ func (s apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt,
 
 type healthCheckerStub struct{}
 
-func (h *healthCheckerStub) IsDeepgramConnected() bool { return true }
+func (h *healthCheckerStub) IsDeepgramConnected() bool            { return true }
 func (h *healthCheckerStub) IsDBHealthy(ctx context.Context) bool { return true }
-func (h *healthCheckerStub) IsMicOpen() bool { return true }
+func (h *healthCheckerStub) IsMicOpen() bool                      { return true }
 func testStaticFS(t *testing.T) fs.FS {
 	t.Helper()
 	dir := t.TempDir()
@@ -1717,7 +1744,7 @@ func TestSearchEndpointWithFilters(t *testing.T) {
 	}
 
 	cfgStore := newTestConfigStore(t)
-	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
 
 	// Test with date_from filter
 	req := httptest.NewRequest("GET", "/api/search?q=test&date_from=2026-03-25T00:00:00Z", nil)
@@ -1749,7 +1776,7 @@ func TestSearchEndpointWithPresetFilter(t *testing.T) {
 	}
 
 	cfgStore := newTestConfigStore(t)
-	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
 
 	// Test with preset filter
 	req := httptest.NewRequest("GET", "/api/search?q=test&preset=meeting", nil)
@@ -1781,7 +1808,7 @@ func TestSearchEndpointBackwardCompatible(t *testing.T) {
 	}
 
 	cfgStore := newTestConfigStore(t)
-	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
 
 	// Test backward compatibility: ?q=term without filters should work
 	req := httptest.NewRequest("GET", "/api/search?q=test", nil)
@@ -1799,6 +1826,104 @@ func TestSearchEndpointBackwardCompatible(t *testing.T) {
 
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func TestSemanticSearch_Success(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{
+			"sess-top": {ID: "sess-top", Title: "Top Session", StartedAt: time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC)},
+			"sess-low": {ID: "sess-low", Title: "Lower Session", StartedAt: time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)},
+		},
+		allEmbeddings: []storage.StoredEmbedding{
+			{SessionID: "sess-top", ChunkIndex: 0, Vector: []float32{1, 0}},
+			{SessionID: "sess-low", ChunkIndex: 0, Vector: []float32{0, 1}},
+		},
+	}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, embeddingClientStub{vectors: [][]float32{{1, 0}}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search/semantic?q=planning&limit=1", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var payload struct {
+		Results []struct {
+			SessionID  string  `json:"session_id"`
+			Title      string  `json:"title"`
+			ChunkText  string  `json:"chunk_text"`
+			Similarity float32 `json:"similarity"`
+			ChunkIndex int     `json:"chunk_index"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(payload.Results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(payload.Results))
+	}
+	if payload.Results[0].SessionID != "sess-top" {
+		t.Fatalf("expected top session to be sess-top, got %q", payload.Results[0].SessionID)
+	}
+	if payload.Results[0].Title != "Top Session" {
+		t.Fatalf("expected title Top Session, got %q", payload.Results[0].Title)
+	}
+}
+
+func TestSemanticSearch_NoClient(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{}, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search/semantic?q=planning", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("expected status 501, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["error"] != "semantic search unavailable" {
+		t.Fatalf("expected semantic unavailable error, got %q", payload["error"])
+	}
+	if payload["suggestion"] != "use /api/search for keyword search" {
+		t.Fatalf("expected keyword search suggestion, got %q", payload["suggestion"])
+	}
+}
+
+func TestSemanticSearch_NoEmbeddings(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{}
+
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, embeddingClientStub{vectors: [][]float32{{1, 0}}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search/semantic?q=planning", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected status 422, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["error"] != "no embeddings indexed yet" {
+		t.Fatalf("expected no embeddings error, got %q", payload["error"])
 	}
 }
 

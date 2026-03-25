@@ -95,7 +95,7 @@ func TestRetryEndpoints(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	registerAPIRoutes(mux, &apiStoreStub{}, controls, nil, nil)
+	registerAPIRoutes(mux, &apiStoreStub{}, controls, nil, nil, nil)
 
 	tests := []struct {
 		name     string
