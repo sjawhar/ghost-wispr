@@ -59,3 +59,53 @@
 ### Testing Stubs
 - Added `healthCheckerStub` type to api_test.go for test support
 - Updated `apiStoreStub.Search()` signature to match interface
+
+## 2026-03-25 — Task 3: Context Window Endpoint
+
+### Implementation Pattern
+- **GetSegmentsInTimeRange**: SQL query on `segments` table with `start_time >= ? AND end_time <= ?`, ordered by `start_time`
+- **Context handler**: Two-phase — first load all segments to find text match (case-insensitive), then use SQL range query for the window
+- **No full transcript in memory**: Only loads all segments for matching; context window uses efficient SQL range query
+
+### Key Decisions
+- `q` param is required (400 if missing), `seconds` defaults to 300
+- Match: `strings.Contains(strings.ToLower(seg.Text), strings.ToLower(q))` — first segment wins
+- Window: `[matchTime - seconds/2, matchTime + seconds/2]` — symmetric around match
+- 404 if session not found, 422 if no segment matches the query text
+- Added `strconv` import to api.go for ParseFloat on seconds param
+
+### Testing
+- Storage: 1 test covering multiple range scenarios (partial, empty, full, ordering)
+- Handler: 5 tests (success, default seconds, session not found, no match, missing query)
+- `apiStoreStub.GetSegmentsInTimeRange` filters in-memory for test simplicity
+- Full suite: 14 packages, 0 regressions
+
+### Interface Pattern
+- `SessionStore` interface extended with `GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error)`
+- Route registered after `GET /api/sessions/{id}/audio` in registerAPIRoutes()
+
+## 2026-03-25 — Task 4: Cross-Session Aggregation Endpoint
+
+### Implementation Pattern
+- **AggregateOptions struct**: DateFrom, DateTo, Preset (filter), GroupBy ("date"|"preset")
+- **AggregateResult struct**: SessionCount int, Groups []AggregateGroup
+- **AggregateGroup struct**: Key string, Count int, Sessions []SessionSummary
+- **SessionSummary struct**: Lightweight — ID, Title, StartedAt, SummaryPreset (not full Session)
+- **SQL approach**: Query sessions table with optional WHERE filters, group in Go (not SQL GROUP BY)
+- **Group ordering**: Preserves SQL ORDER BY started_at DESC order — first-seen key wins
+
+### Key Decisions
+- Route `GET /api/sessions/aggregate` registered BEFORE `GET /api/sessions/{id}` to avoid path conflict
+- GroupBy defaults to "date" if omitted; validates against "date"|"preset" only
+- Discarded and merged sessions excluded via `status NOT IN ('discarded', 'merged')`
+- Handler validates group_by and returns 400 for invalid values
+
+### Testing Approach
+- TDD: Storage tests first (5 subtests), then API endpoint tests (3 tests)
+- Storage tests: no filters, group by preset, date range filter, preset filter, field population
+- API tests: success response structure, query param forwarding, invalid group_by rejection
+- Full suite: 14 packages, 0 regressions
+
+### Interface Pattern
+- `SessionStore` interface extended with `AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)`
+- `apiStoreStub` extended with `aggregateResult *storage.AggregateResult` and `aggregateErr error` fields

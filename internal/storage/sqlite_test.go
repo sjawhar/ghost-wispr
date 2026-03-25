@@ -1203,3 +1203,128 @@ func TestSegmentsInTimeRange(t *testing.T) {
 		}
 	}
 }
+
+func TestAggregateSessions(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions across different dates and presets
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 20, 14, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date4 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	sessions := []struct {
+		id     string
+		date   time.Time
+		preset string
+	}{
+		{"agg-1", date1, "meeting"},
+		{"agg-2", date2, "standup"},
+		{"agg-3", date3, "meeting"},
+		{"agg-4", date4, "standup"},
+	}
+
+	for _, s := range sessions {
+		if err := store.CreateSession(s.id, s.date); err != nil {
+			t.Fatalf("create session %s: %v", s.id, err)
+		}
+		if err := store.EndSession(s.id, s.date.Add(30*time.Minute), ""); err != nil {
+			t.Fatalf("end session %s: %v", s.id, err)
+		}
+		if err := store.UpdateSummary(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset); err != nil {
+			t.Fatalf("update summary %s: %v", s.id, err)
+		}
+	}
+
+	// Also create a discarded session to ensure it's excluded
+	if err := store.CreateSession("agg-discarded", date1); err != nil {
+		t.Fatalf("create discarded session: %v", err)
+	}
+	if err := store.DiscardSession("agg-discarded"); err != nil {
+		t.Fatalf("discard session: %v", err)
+	}
+
+	t.Run("no filters group by date", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 4 {
+			t.Fatalf("expected 4 sessions, got %d", result.SessionCount)
+		}
+		if len(result.Groups) != 3 {
+			t.Fatalf("expected 3 date groups, got %d", len(result.Groups))
+		}
+		// Sessions ordered DESC, so most recent date first
+		if result.Groups[0].Key != "2026-03-30" {
+			t.Fatalf("expected first group 2026-03-30, got %q", result.Groups[0].Key)
+		}
+		if result.Groups[1].Key != "2026-03-25" {
+			t.Fatalf("expected second group 2026-03-25, got %q", result.Groups[1].Key)
+		}
+		if result.Groups[2].Key != "2026-03-20" {
+			t.Fatalf("expected third group 2026-03-20, got %q", result.Groups[2].Key)
+		}
+		// Date 2026-03-20 has 2 sessions
+		if result.Groups[2].Count != 2 {
+			t.Fatalf("expected 2 sessions on 2026-03-20, got %d", result.Groups[2].Count)
+		}
+	})
+
+	t.Run("group by preset", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{GroupBy: "preset"})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 4 {
+			t.Fatalf("expected 4 sessions, got %d", result.SessionCount)
+		}
+		if len(result.Groups) != 2 {
+			t.Fatalf("expected 2 preset groups, got %d", len(result.Groups))
+		}
+	})
+
+	t.Run("filter by date range", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{
+			DateFrom: date3.Format(time.RFC3339Nano),
+			DateTo:   date4.Add(time.Hour).Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 2 {
+			t.Fatalf("expected 2 sessions in date range, got %d", result.SessionCount)
+		}
+	})
+
+	t.Run("filter by preset", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{Preset: "meeting"})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 2 {
+			t.Fatalf("expected 2 meeting sessions, got %d", result.SessionCount)
+		}
+		for _, g := range result.Groups {
+			for _, s := range g.Sessions {
+				if s.SummaryPreset != "meeting" {
+					t.Fatalf("expected all sessions to be meeting preset, got %q", s.SummaryPreset)
+				}
+			}
+		}
+	})
+
+	t.Run("session summary fields populated", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{Preset: "standup", GroupBy: "date"})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 2 {
+			t.Fatalf("expected 2 standup sessions, got %d", result.SessionCount)
+		}
+		s := result.Groups[0].Sessions[0]
+		if s.ID == "" || s.Title == "" || s.StartedAt.IsZero() || s.SummaryPreset != "standup" {
+			t.Fatalf("session summary missing fields: %+v", s)
+		}
+	})
+}

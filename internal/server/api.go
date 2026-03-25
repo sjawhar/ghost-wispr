@@ -33,6 +33,7 @@ type SessionStore interface {
 	DeleteSession(id string) error
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
+	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -199,6 +200,28 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		writeJSON(w, http.StatusOK, sessions)
+	})
+
+	mux.HandleFunc("GET /api/sessions/aggregate", func(w http.ResponseWriter, r *http.Request) {
+		opts := storage.AggregateOptions{
+			DateFrom: strings.TrimSpace(r.URL.Query().Get("date_from")),
+			DateTo:   strings.TrimSpace(r.URL.Query().Get("date_to")),
+			Preset:   strings.TrimSpace(r.URL.Query().Get("preset")),
+			GroupBy:  strings.TrimSpace(r.URL.Query().Get("group_by")),
+		}
+		if opts.GroupBy == "" {
+			opts.GroupBy = "date"
+		}
+		if opts.GroupBy != "date" && opts.GroupBy != "preset" {
+			writeJSONError(w, http.StatusBadRequest, "group_by must be 'date' or 'preset'")
+			return
+		}
+		result, err := store.AggregateSessions(opts)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("aggregate sessions: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {

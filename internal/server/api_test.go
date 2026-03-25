@@ -21,12 +21,14 @@ import (
 )
 
 type apiStoreStub struct {
-	sessionsByDate map[string][]storage.Session
-	sessions       map[string]storage.Session
-	segments       map[string][]transcribe.Segment
-	dates          []string
-	searchResults  map[string][]storage.SearchResult
-	searchErr      error
+	sessionsByDate   map[string][]storage.Session
+	sessions         map[string]storage.Session
+	segments         map[string][]transcribe.Segment
+	dates            []string
+	searchResults    map[string][]storage.SearchResult
+	searchErr        error
+	aggregateResult  *storage.AggregateResult
+	aggregateErr     error
 }
 
 func newTestConfigStore(t *testing.T) *config.Store {
@@ -84,6 +86,16 @@ func (s apiStoreStub) Search(query string, opts storage.SearchOptions) ([]storag
 		return []storage.SearchResult{}, nil
 	}
 	return s.searchResults[query], nil
+}
+
+func (s apiStoreStub) AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error) {
+	if s.aggregateErr != nil {
+		return storage.AggregateResult{}, s.aggregateErr
+	}
+	if s.aggregateResult != nil {
+		return *s.aggregateResult, nil
+	}
+	return storage.AggregateResult{Groups: []storage.AggregateGroup{}}, nil
 }
 
 func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
@@ -1952,6 +1964,127 @@ func TestContextEndpoint_MissingQuery(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1/context", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAggregateEndpoint_Success(t *testing.T) {
+	started1 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	started2 := time.Date(2026, 3, 25, 14, 0, 0, 0, time.UTC)
+	started3 := time.Date(2026, 3, 26, 10, 0, 0, 0, time.UTC)
+
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		aggregateResult: &storage.AggregateResult{
+			SessionCount: 3,
+			Groups: []storage.AggregateGroup{
+				{
+					Key:   "2026-03-26",
+					Count: 1,
+					Sessions: []storage.SessionSummary{
+						{ID: "s3", Title: "Standup", StartedAt: started3, SummaryPreset: "standup"},
+					},
+				},
+				{
+					Key:   "2026-03-25",
+					Count: 2,
+					Sessions: []storage.SessionSummary{
+						{ID: "s1", Title: "Meeting", StartedAt: started1, SummaryPreset: "meeting"},
+						{ID: "s2", Title: "Review", StartedAt: started2, SummaryPreset: "meeting"},
+					},
+				},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/aggregate", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var result storage.AggregateResult
+	if err := json.NewDecoder(rr.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result.SessionCount != 3 {
+		t.Fatalf("expected session_count 3, got %d", result.SessionCount)
+	}
+	if len(result.Groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(result.Groups))
+	}
+	if result.Groups[0].Key != "2026-03-26" {
+		t.Fatalf("expected first group key 2026-03-26, got %q", result.Groups[0].Key)
+	}
+	if result.Groups[1].Count != 2 {
+		t.Fatalf("expected second group count 2, got %d", result.Groups[1].Count)
+	}
+	if result.Groups[1].Sessions[0].ID != "s1" {
+		t.Fatalf("expected first session ID s1, got %q", result.Groups[1].Sessions[0].ID)
+	}
+}
+
+func TestAggregateEndpoint_WithQueryParams(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		aggregateResult: &storage.AggregateResult{
+			SessionCount: 1,
+			Groups: []storage.AggregateGroup{
+				{Key: "meeting", Count: 1, Sessions: []storage.SessionSummary{{ID: "s1", Title: "Meeting", SummaryPreset: "meeting"}}},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/aggregate?group_by=preset&preset=meeting&date_from=2026-03-20T00:00:00Z", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var result storage.AggregateResult
+	if err := json.NewDecoder(rr.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result.SessionCount != 1 {
+		t.Fatalf("expected session_count 1, got %d", result.SessionCount)
+	}
+}
+
+func TestAggregateEndpoint_InvalidGroupBy(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/aggregate?group_by=invalid", nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 

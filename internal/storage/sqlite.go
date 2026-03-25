@@ -94,6 +94,35 @@ type SearchOptions struct {
 	Preset   string // summary_preset value, optional
 }
 
+// AggregateOptions controls filtering and grouping for cross-session aggregation.
+type AggregateOptions struct {
+	DateFrom string // RFC3339 format, optional
+	DateTo   string // RFC3339 format, optional
+	Preset   string // summary_preset value, optional
+	GroupBy  string // "date" (default) or "preset"
+}
+
+// AggregateResult holds cross-session statistics.
+type AggregateResult struct {
+	SessionCount int              `json:"session_count"`
+	Groups       []AggregateGroup `json:"groups"`
+}
+
+// AggregateGroup is a single grouping bucket.
+type AggregateGroup struct {
+	Key      string           `json:"key"`
+	Count    int              `json:"count"`
+	Sessions []SessionSummary `json:"sessions"`
+}
+
+// SessionSummary is a lightweight session representation for aggregation.
+type SessionSummary struct {
+	ID            string    `json:"id"`
+	Title         string    `json:"title"`
+	StartedAt     time.Time `json:"started_at"`
+	SummaryPreset string    `json:"summary_preset"`
+}
+
 var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
@@ -1235,4 +1264,86 @@ func buildFTS5MatchQuery(query string) string {
 	}
 
 	return strings.Join(quoted, " AND ")
+}
+
+// AggregateSessions returns cross-session statistics grouped by date or preset.
+func (s *SQLiteStore) AggregateSessions(opts AggregateOptions) (AggregateResult, error) {
+	query := `SELECT id, title, started_at, summary_preset FROM sessions WHERE status NOT IN ('discarded', 'merged')`
+	var args []any
+
+	if opts.DateFrom != "" {
+		query += ` AND started_at >= ?`
+		args = append(args, opts.DateFrom)
+	}
+	if opts.DateTo != "" {
+		query += ` AND started_at <= ?`
+		args = append(args, opts.DateTo)
+	}
+	if opts.Preset != "" {
+		query += ` AND summary_preset = ?`
+		args = append(args, opts.Preset)
+	}
+	query += ` ORDER BY started_at DESC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return AggregateResult{}, fmt.Errorf("aggregate sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	groupBy := opts.GroupBy
+	if groupBy == "" {
+		groupBy = "date"
+	}
+
+	groupMap := make(map[string]*AggregateGroup)
+	var groupOrder []string
+	var totalCount int
+
+	for rows.Next() {
+		var id, title, startedAtStr, preset string
+		if err := rows.Scan(&id, &title, &startedAtStr, &preset); err != nil {
+			return AggregateResult{}, fmt.Errorf("scan aggregate session: %w", err)
+		}
+
+		parsedStart, err := time.Parse(time.RFC3339Nano, startedAtStr)
+		if err != nil {
+			return AggregateResult{}, fmt.Errorf("parse aggregate started_at: %w", err)
+		}
+
+		var key string
+		if groupBy == "preset" {
+			key = preset
+		} else {
+			key = parsedStart.Format("2006-01-02")
+		}
+
+		g, ok := groupMap[key]
+		if !ok {
+			g = &AggregateGroup{Key: key}
+			groupMap[key] = g
+			groupOrder = append(groupOrder, key)
+		}
+		g.Count++
+		g.Sessions = append(g.Sessions, SessionSummary{
+			ID:            id,
+			Title:         title,
+			StartedAt:     parsedStart,
+			SummaryPreset: preset,
+		})
+		totalCount++
+	}
+	if err := rows.Err(); err != nil {
+		return AggregateResult{}, fmt.Errorf("iterate aggregate rows: %w", err)
+	}
+
+	groups := make([]AggregateGroup, 0, len(groupOrder))
+	for _, key := range groupOrder {
+		groups = append(groups, *groupMap[key])
+	}
+
+	return AggregateResult{
+		SessionCount: totalCount,
+		Groups:       groups,
+	}, nil
 }
