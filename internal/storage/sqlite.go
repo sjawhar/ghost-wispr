@@ -95,6 +95,7 @@ type SearchOptions struct {
 	DateFrom string // RFC3339 format, optional
 	DateTo   string // RFC3339 format, optional
 	Preset   string // summary_preset value, optional
+	Speaker  string // speaker name or numeric index, optional
 }
 
 // AggregateOptions controls filtering and grouping for cross-session aggregation.

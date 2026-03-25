@@ -52,6 +52,67 @@ var versionInfo VersionInfo
 // SetVersionInfo sets the build metadata for the /api/version endpoint.
 func SetVersionInfo(v VersionInfo) { versionInfo = v }
 
+// hasSegmentForSpeaker checks if any segment in the list matches the speaker filter.
+// speaker can be a numeric index (e.g., "0", "1") or a speaker name (e.g., "Ben").
+// speakerNames is a JSON string like {"0": {"name": "Ben", ...}, ...}
+func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speakerNames string) bool {
+	if speaker == "" {
+		return true
+	}
+
+	// Try to parse as numeric index first
+	if idx, err := strconv.Atoi(speaker); err == nil {
+		// Numeric speaker index
+		for _, seg := range segments {
+			if seg.Speaker == idx {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Parse as speaker name (case-insensitive)
+	speakerIndex := getSpeakerIndexByName(speakerNames, speaker)
+	if speakerIndex == -1 {
+		return false
+	}
+
+	for _, seg := range segments {
+		if seg.Speaker == speakerIndex {
+			return true
+		}
+	}
+	return false
+}
+
+// getSpeakerIndexByName looks up a speaker index by name in the speakerNames JSON.
+// Returns -1 if not found. Matching is case-insensitive.
+func getSpeakerIndexByName(speakerNames string, name string) int {
+	if speakerNames == "" || speakerNames == "{}" {
+		return -1
+	}
+
+	var speakers map[string]map[string]interface{}
+	if err := json.Unmarshal([]byte(speakerNames), &speakers); err != nil {
+		return -1
+	}
+
+	lowerName := strings.ToLower(name)
+	for idxStr, speakerMap := range speakers {
+		if nameVal, ok := speakerMap["name"]; ok {
+			if speakerName, ok := nameVal.(string); ok {
+				if strings.ToLower(speakerName) == lowerName {
+					if idx, err := strconv.Atoi(idxStr); err == nil {
+						return idx
+					}
+				}
+			}
+		}
+	}
+
+	return -1
+}
+
 func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
 
 	// Health check endpoints
@@ -228,12 +289,37 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			DateFrom: strings.TrimSpace(r.URL.Query().Get("date_from")),
 			DateTo:   strings.TrimSpace(r.URL.Query().Get("date_to")),
 			Preset:   strings.TrimSpace(r.URL.Query().Get("preset")),
+			Speaker:  strings.TrimSpace(r.URL.Query().Get("speaker")),
 		}
 		results, err := store.Search(q, opts)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("search failed: %v", err))
 			return
 		}
+		
+		// Filter results by speaker if specified
+		if opts.Speaker != "" {
+			filtered := make([]storage.SearchResult, 0, len(results))
+			for _, result := range results {
+				sess, err := store.GetSession(result.SessionID)
+				if err != nil {
+					continue
+				}
+				
+				// Get segments for this session
+				segs, err := store.GetSegments(result.SessionID)
+				if err != nil {
+					continue
+				}
+				
+				// Check if any segment matches the speaker filter
+				if hasSegmentForSpeaker(segs, opts.Speaker, sess.SpeakerNames) {
+					filtered = append(filtered, result)
+				}
+			}
+			results = filtered
+		}
+		
 		writeJSON(w, http.StatusOK, results)
 	})
 	registerRestoreRoutes(mux, controls)
@@ -375,6 +461,46 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"session":  sessionData,
 			"segments": segments,
 		})
+	})
+
+	mux.HandleFunc("GET /api/sessions/{id}/segments", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		// Get session to access speaker names
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+
+		// Get all segments for the session
+		segments, err := store.GetSegments(sessionID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get segments: %v", err))
+			return
+		}
+
+		// Filter by speaker if specified
+		speaker := strings.TrimSpace(r.URL.Query().Get("speaker"))
+		if speaker != "" {
+			filtered := make([]transcribe.Segment, 0, len(segments))
+			for _, seg := range segments {
+				if hasSegmentForSpeaker([]transcribe.Segment{seg}, speaker, sess.SpeakerNames) {
+					filtered = append(filtered, seg)
+				}
+			}
+			segments = filtered
+		}
+
+		writeJSON(w, http.StatusOK, segments)
 	})
 
 	mux.HandleFunc("PATCH /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {

@@ -277,6 +277,88 @@ func TestAPISearchEmptyQueryReturnsEmptyArray(t *testing.T) {
 	}
 }
 
+func TestSpeakerFilter_ByName(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Title: "Meeting", SpeakerNames: `{"0": {"name": "Ben", "confidence": "mentioned"}, "1": {"name": "Alice", "confidence": "mentioned"}}`},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "budget discussion", StartTime: 0, EndTime: 1},
+				{Speaker: 1, Text: "timeline", StartTime: 1, EndTime: 2},
+			},
+		},
+		searchResults: map[string][]storage.SearchResult{
+			"budget": {
+				{SessionID: "s1", Title: "Meeting", Snippet: "<mark>budget</mark> discussion", Rank: -1.0},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=budget&speaker=Ben", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode search results: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for speaker Ben, got %d", len(results))
+	}
+}
+
+func TestSpeakerFilter_ByIndex(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Title: "Meeting", SpeakerNames: `{"0": {"name": "Ben", "confidence": "mentioned"}, "1": {"name": "Alice", "confidence": "mentioned"}}`},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "budget discussion", StartTime: 0, EndTime: 1},
+				{Speaker: 1, Text: "timeline", StartTime: 1, EndTime: 2},
+			},
+		},
+		searchResults: map[string][]storage.SearchResult{
+			"budget": {
+				{SessionID: "s1", Title: "Meeting", Snippet: "<mark>budget</mark> discussion", Rank: -1.0},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=budget&speaker=0", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode search results: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for speaker 0, got %d", len(results))
+	}
+}
+
 func TestAPISessionDetail(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	store := apiStoreStub{
@@ -2292,5 +2374,73 @@ func TestOpenAPISpec(t *testing.T) {
 		if _, ok := paths[path]; !ok {
 			t.Errorf("expected path %q in spec", path)
 		}
+	}
+}
+
+func TestSegmentsSpeakerFilter(t *testing.T) {
+	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
+	store := apiStoreStub{
+		sessions: map[string]storage.Session{
+			"s1": {
+				ID:           "s1",
+				Title:        "Meeting",
+				StartedAt:    started,
+				SpeakerNames: `{"0": {"name": "Ben", "confidence": "mentioned"}, "1": {"name": "Alice", "confidence": "mentioned"}}`,
+			},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "budget discussion", StartTime: 0, EndTime: 1, Timestamp: started},
+				{Speaker: 1, Text: "timeline", StartTime: 1, EndTime: 2, Timestamp: started},
+				{Speaker: 0, Text: "next steps", StartTime: 2, EndTime: 3, Timestamp: started},
+			},
+		},
+	}
+
+	mux := http.NewServeMux()
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+
+	// Test filtering by speaker name
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/s1/segments?speaker=Ben", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var segments []transcribe.Segment
+	if err := json.NewDecoder(w.Body).Decode(&segments); err != nil {
+		t.Fatalf("decode segments: %v", err)
+	}
+
+	if len(segments) != 2 {
+		t.Fatalf("expected 2 segments for speaker Ben, got %d", len(segments))
+	}
+	for _, seg := range segments {
+		if seg.Speaker != 0 {
+			t.Fatalf("expected speaker 0, got %d", seg.Speaker)
+		}
+	}
+
+	// Test filtering by speaker index
+	req = httptest.NewRequest(http.MethodGet, "/api/sessions/s1/segments?speaker=1", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	if err := json.NewDecoder(w.Body).Decode(&segments); err != nil {
+		t.Fatalf("decode segments: %v", err)
+	}
+
+	if len(segments) != 1 {
+		t.Fatalf("expected 1 segment for speaker 1, got %d", len(segments))
+	}
+	if segments[0].Speaker != 1 {
+		t.Fatalf("expected speaker 1, got %d", segments[0].Speaker)
 	}
 }
