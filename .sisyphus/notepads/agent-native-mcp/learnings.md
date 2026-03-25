@@ -423,3 +423,24 @@
 
 ### Evidence
 - `.sisyphus/evidence/task-14-spec-complete.json` — spec verification and test results
+
+## 2026-03-25 — Task 16: Non-Regression Test Suite
+
+### Implementation Pattern
+- **Test location**: `internal/server/api_test.go` — added `TestNonRegression` with 8 subtests
+- **Test structure**: Each subtest creates minimal `apiStoreStub`, calls endpoint via `httptest`, verifies HTTP status + JSON validity + key fields
+- **Endpoints tested**: GET /api/status, GET /api/dates, GET /api/search, POST /api/pause, POST /api/resume, GET /api/config, GET /api/version, GET /api/presets
+
+### Key Decisions
+- **Subtests**: Grouped under `TestNonRegression` for clarity and organization
+- **Minimal stubs**: Each test uses only the data needed for that endpoint (no unnecessary setup)
+- **Verification**: HTTP status code + JSON parsing + presence of expected fields (not full schema validation)
+- **No new dependencies**: Uses existing test patterns and `apiStoreStub` mock
+
+### Testing Approach
+- TDD: Tests written to verify existing behavior is unchanged
+- All 8 subtests pass immediately (behavior unchanged)
+- Full test suite: 14 packages, all pass, no regressions
+
+### Evidence
+- `.sisyphus/evidence/task-16-non-regression.json` — test results and endpoint coverage

@@ -2662,3 +2662,292 @@ func TestEventsEndpoint_Pagination(t *testing.T) {
 		t.Fatalf("expected has_more=true, got %v", hasMore)
 	}
 }
+
+// --- Non-Regression Test Suite ---
+// Verifies all existing REST API endpoints are unchanged after new additions.
+
+func TestNonRegression(t *testing.T) {
+	t.Run("status", testNonRegressionStatus)
+	t.Run("dates", testNonRegressionDates)
+	t.Run("search", testNonRegressionSearch)
+	t.Run("pause", testNonRegressionPause)
+	t.Run("resume", testNonRegressionResume)
+	t.Run("config", testNonRegressionConfig)
+	t.Run("version", testNonRegressionVersion)
+	t.Run("presets", testNonRegressionPresets)
+}
+
+func testNonRegressionStatus(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		IsPaused: func() bool { return false },
+		Warnings: func() []string { return []string{} },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	if !strings.Contains(rr.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("expected application/json content-type, got %q", rr.Header().Get("Content-Type"))
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if _, ok := resp["paused"]; !ok {
+		t.Fatalf("expected 'paused' field in response")
+	}
+	if _, ok := resp["warnings"]; !ok {
+		t.Fatalf("expected 'warnings' field in response")
+	}
+}
+
+func testNonRegressionDates(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          []string{"2026-03-25", "2026-03-24"},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/dates", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	var dates []string
+	if err := json.NewDecoder(rr.Body).Decode(&dates); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if len(dates) != 2 {
+		t.Fatalf("expected 2 dates, got %d", len(dates))
+	}
+}
+
+func testNonRegressionSearch(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+		searchResults: map[string][]storage.SearchResult{
+			"test": {
+				{SessionID: "s1", Title: "Test Session", Snippet: "<mark>test</mark> content", Rank: -1.0},
+			},
+		},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=test", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	var results []storage.SearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].SessionID != "s1" {
+		t.Fatalf("expected session s1, got %s", results[0].SessionID)
+	}
+}
+
+func testNonRegressionPause(t *testing.T) {
+	called := false
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		Pause: func() {
+			called = true
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/pause", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", rr.Code)
+	}
+	if !called {
+		t.Fatalf("expected Pause to be called")
+	}
+}
+
+func testNonRegressionResume(t *testing.T) {
+	called := false
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		Resume: func() {
+			called = true
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/resume", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", rr.Code)
+	}
+	if !called {
+		t.Fatalf("expected Resume to be called")
+	}
+}
+
+func testNonRegressionConfig(t *testing.T) {
+	cfgStore := newTestConfigStore(t)
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, cfgStore)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if _, ok := resp["silence_timeout"]; !ok {
+		t.Fatalf("expected 'silence_timeout' field in response")
+	}
+	if _, ok := resp["summarization"]; !ok {
+		t.Fatalf("expected 'summarization' field in response")
+	}
+}
+
+func testNonRegressionVersion(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if _, ok := resp["version"]; !ok {
+		t.Fatalf("expected 'version' field in response")
+	}
+}
+
+func testNonRegressionPresets(t *testing.T) {
+	store := apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		Presets: func() map[string]config.Preset {
+			return map[string]config.Preset{
+				"default": {
+					Description:  "Default summary",
+					SystemPrompt: "Summarize",
+				},
+			}
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/presets", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 preset, got %d", len(resp))
+	}
+	if resp["default"] != "Default summary" {
+		t.Fatalf("expected 'Default summary' description, got %q", resp["default"])
+	}
+}
