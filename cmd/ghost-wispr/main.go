@@ -256,6 +256,7 @@ func main() {
 	}
 
 	hub := server.NewHub(appLogger)
+	hub.SetEventStore(store)
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
 	audioRecorder := audio.NewRecorder(cfg.AudioDir)
 

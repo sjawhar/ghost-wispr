@@ -1503,3 +1503,136 @@ func TestGetAllEmbeddings(t *testing.T) {
 		t.Fatalf("expected embeddings from 2 sessions, got %d unique sessions", len(sessionIDs))
 	}
 }
+
+func TestStoreEvent(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Store events
+	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {
+		t.Fatalf("StoreEvent session_started: %v", err)
+	}
+	if err := store.StoreEvent("session_ended", `{"session_id":"s1","duration":30}`); err != nil {
+		t.Fatalf("StoreEvent session_ended: %v", err)
+	}
+	if err := store.StoreEvent("summary_ready", `{"session_id":"s1","title":"Test"}`); err != nil {
+		t.Fatalf("StoreEvent summary_ready: %v", err)
+	}
+
+	// Retrieve all from cursor 0
+	events, err := store.GetEventsSince(0, 100)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Verify fields
+	if events[0].EventType != "session_started" {
+		t.Fatalf("expected event_type session_started, got %q", events[0].EventType)
+	}
+	if events[0].Payload != `{"session_id":"s1"}` {
+		t.Fatalf("expected payload, got %q", events[0].Payload)
+	}
+	if events[0].ID <= 0 {
+		t.Fatalf("expected positive ID, got %d", events[0].ID)
+	}
+	if events[0].CreatedAt.IsZero() {
+		t.Fatal("expected CreatedAt to be set")
+	}
+
+	// IDs are ascending
+	if events[1].ID <= events[0].ID {
+		t.Fatalf("expected ascending IDs: %d <= %d", events[1].ID, events[0].ID)
+	}
+}
+
+func TestPurgeOldEvents(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Store an event
+	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {
+		t.Fatalf("StoreEvent: %v", err)
+	}
+
+	// Backdate it to 10 days ago
+	oldTime := time.Now().UTC().Add(-10 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := store.DB().Exec(`UPDATE mcp_events SET created_at = ?`, oldTime); err != nil {
+		t.Fatalf("backdate event: %v", err)
+	}
+
+	// Store a recent event
+	if err := store.StoreEvent("session_ended", `{"session_id":"s2"}`); err != nil {
+		t.Fatalf("StoreEvent: %v", err)
+	}
+
+	// Purge events older than 7 days
+	if err := store.PurgeOldEvents(7 * 24 * time.Hour); err != nil {
+		t.Fatalf("PurgeOldEvents: %v", err)
+	}
+
+	// Only the recent event should remain
+	events, err := store.GetEventsSince(0, 100)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event after purge, got %d", len(events))
+	}
+	if events[0].EventType != "session_ended" {
+		t.Fatalf("expected session_ended to survive purge, got %q", events[0].EventType)
+	}
+}
+
+func TestGetEventsSince_Pagination(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Store 5 events
+	for i := 0; i < 5; i++ {
+		if err := store.StoreEvent("status_changed", fmt.Sprintf(`{"index":%d}`, i)); err != nil {
+			t.Fatalf("StoreEvent %d: %v", i, err)
+		}
+	}
+
+	// Get first 2
+	events, err := store.GetEventsSince(0, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince page 1: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+
+	// Get next 2 using cursor from last event
+	cursor := events[1].ID
+	events2, err := store.GetEventsSince(cursor, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince page 2: %v", err)
+	}
+	if len(events2) != 2 {
+		t.Fatalf("expected 2 events on page 2, got %d", len(events2))
+	}
+	if events2[0].ID <= cursor {
+		t.Fatalf("expected events after cursor %d, got ID %d", cursor, events2[0].ID)
+	}
+
+	// Get remaining
+	cursor2 := events2[1].ID
+	events3, err := store.GetEventsSince(cursor2, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince page 3: %v", err)
+	}
+	if len(events3) != 1 {
+		t.Fatalf("expected 1 event on page 3, got %d", len(events3))
+	}
+
+	// Get past end — empty
+	cursor3 := events3[0].ID
+	events4, err := store.GetEventsSince(cursor3, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince past end: %v", err)
+	}
+	if len(events4) != 0 {
+		t.Fatalf("expected 0 events past end, got %d", len(events4))
+	}
+}

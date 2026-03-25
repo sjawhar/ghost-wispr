@@ -266,3 +266,81 @@
   - `go test ./internal/storage/... -run TestSpeakerNames -v`
   - `go test ./... -v`
 - Evidence captured at `.sisyphus/evidence/task-10-speaker-names.txt`.
+
+## 2026-03-25 — Task 11: Speaker Filter for Search and Segments
+
+### Implementation Pattern
+- **SearchOptions struct**: Extended with `Speaker string` field (optional, like DateFrom/DateTo/Preset)
+- **Speaker matching logic**: Applied in Go after fetching results, not in SQL
+  - If speaker param is numeric (e.g., "0", "1"): filter segments where `segment.Speaker == int(speaker)`
+  - If speaker param is a name (e.g., "Ben"): lookup speaker index from session's `SpeakerNames` JSON, then filter by that index
+  - Case-insensitive name matching via `strings.ToLower()`
+- **Helper functions**:
+  - `hasSegmentForSpeaker(segments, speaker, speakerNames)`: Checks if any segment matches speaker filter
+  - `getSpeakerIndexByName(speakerNames, name)`: Parses JSON and returns speaker index by name
+
+### API Endpoints
+- **GET /api/search?q=term&speaker=Ben**: Returns search results filtered to only include results with matching segments from speaker "Ben"
+- **GET /api/search?q=term&speaker=0**: Returns search results filtered to only include results with matching segments from speaker index 0
+- **GET /api/sessions/{id}/segments?speaker=Ben**: Returns only segments from speaker "Ben"
+- **GET /api/sessions/{id}/segments?speaker=1**: Returns only segments from speaker index 1
+- Backward compatible: endpoints work without speaker parameter (returns all results)
+
+### Key Decisions
+- Speaker filtering applied in Go after SQL query, not in SQL WHERE clause (simpler, reuses existing search logic)
+- For search endpoint: filter results to only include those with at least one matching segment
+- For segments endpoint: filter segment list directly
+- SpeakerNames JSON format: `{"0": {"name": "Ben", "confidence": "mentioned"}, ...}`
+- Segment.Speaker is int (Deepgram speaker index), not string
+
+### Testing Approach
+- TDD: 3 new tests written first, then implementation
+- `TestSpeakerFilter_ByName`: Search with speaker=Ben, verify only Ben's segments included
+- `TestSpeakerFilter_ByIndex`: Search with speaker=0, verify only speaker 0's segments included
+- `TestSegmentsSpeakerFilter`: Segments endpoint with both name and index filtering
+- Full suite: 14 packages, 0 regressions
+
+### Code Patterns
+- Handler parses `speaker` query param and passes to filtering logic
+- Filtering logic handles both numeric and name-based speaker identification
+- JSON unmarshaling with error handling (returns -1 if parse fails)
+- Case-insensitive string comparison for speaker names
+
+### Evidence
+- All 3 speaker filter tests pass
+- Full test suite passes (14 packages)
+- Evidence captured at `.sisyphus/evidence/task-11-speaker-filter.json`
+
+## 2026-03-25 — Task 12: Durable Event Queue with GC Integration
+
+### Implementation Pattern
+- **mcp_events table**: `id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, payload TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+- **StoredEvent struct**: ID int64, EventType string, Payload string, CreatedAt time.Time
+- **StoreEvent(eventType, payload)**: Simple INSERT into mcp_events
+- **GetEventsSince(cursor, limit)**: `WHERE id > cursor ORDER BY id ASC LIMIT limit` — cursor-based pagination
+- **PurgeOldEvents(maxAge)**: `DELETE WHERE created_at < cutoff` — called in GC cycle with 7-day retention
+- **Index**: `idx_mcp_events_created_at` on created_at for efficient purge queries
+
+### Hub Wiring Pattern
+- **EventStore interface**: `StoreEvent(eventType, payload string) error` — minimal interface on Hub
+- **SetEventStore(store)**: Optional setter on Hub (backward-compatible, like logger pattern)
+- **Event type filtering**: Only 6 event types persisted: session_started, session_ended, summary_ready, status_changed, component_status, live_transcript
+- **Best-effort storage**: broadcastEvent marshals JSON, broadcasts to WebSocket clients, then stores to DB — errors logged but never block broadcast
+- **Type extraction**: Added `eventType()` method on embedded Event struct, used via interface assertion in broadcastEvent
+
+### GC Integration
+- Extended `gc.Store` interface with `PurgeOldEvents(maxAge time.Duration) error`
+- Called at end of `gc.Run()` with `7 * 24 * time.Hour` retention
+- Best-effort: errors logged as warnings, don't fail the GC cycle
+
+### Wiring in main.go
+- `hub.SetEventStore(store)` called right after `server.NewHub(appLogger)`
+- SQLiteStore already implements both EventStore and gc.Store interfaces
+
+### Testing Approach
+- TDD: 3 failing tests written first, then implementation
+- TestStoreEvent: Store + retrieve by cursor, verify all fields
+- TestPurgeOldEvents: Backdate event, purge, verify only recent survives
+- TestGetEventsSince_Pagination: 5 events, paginate with limit=2, verify cursor advances
+- Full suite: 14 packages, 0 regressions
+- Evidence captured at `.sisyphus/evidence/task-12-event-queue.txt`

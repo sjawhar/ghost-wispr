@@ -136,6 +136,13 @@ type StoredEmbedding struct {
 	CreatedAt  time.Time
 }
 
+type StoredEvent struct {
+	ID        int64     `json:"id"`
+	EventType string    `json:"event_type"`
+	Payload   string    `json:"payload"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
@@ -370,6 +377,21 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_segments_session_id ON segments(session_id, timestamp)"); err != nil {
 		return fmt.Errorf("create segments index: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS mcp_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_type TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+	`); err != nil {
+		return fmt.Errorf("create mcp_events table: %w", err)
+	}
+
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_mcp_events_created_at ON mcp_events(created_at)"); err != nil {
+		return fmt.Errorf("create mcp_events index: %w", err)
 	}
 
 	return nil
@@ -1551,6 +1573,62 @@ func (s *SQLiteStore) DeleteEmbeddings(sessionID string) error {
 	_, err := s.db.Exec(`DELETE FROM embeddings WHERE session_id = ?`, sessionID)
 	if err != nil {
 		return fmt.Errorf("delete embeddings for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// StoreEvent inserts an event into the mcp_events table.
+func (s *SQLiteStore) StoreEvent(eventType, payload string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO mcp_events(event_type, payload) VALUES(?, ?)`,
+		eventType, payload,
+	)
+	if err != nil {
+		return fmt.Errorf("store event %s: %w", eventType, err)
+	}
+	return nil
+}
+
+// GetEventsSince returns events with id > cursor, ordered by id ASC, limited to limit.
+func (s *SQLiteStore) GetEventsSince(cursor int64, limit int) ([]StoredEvent, error) {
+	rows, err := s.db.Query(
+		`SELECT id, event_type, payload, created_at FROM mcp_events WHERE id > ? ORDER BY id ASC LIMIT ?`,
+		cursor, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get events since %d: %w", cursor, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var events []StoredEvent
+	for rows.Next() {
+		var ev StoredEvent
+		var createdAtStr string
+		if err := rows.Scan(&ev.ID, &ev.EventType, &ev.Payload, &createdAtStr); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		parsedTime, err := time.Parse("2006-01-02 15:04:05", createdAtStr)
+		if err != nil {
+			parsedTime, err = time.Parse(time.RFC3339Nano, createdAtStr)
+			if err != nil {
+				return nil, fmt.Errorf("parse event created_at: %w", err)
+			}
+		}
+		ev.CreatedAt = parsedTime
+		events = append(events, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate events: %w", err)
+	}
+	return events, nil
+}
+
+// PurgeOldEvents deletes events older than maxAge.
+func (s *SQLiteStore) PurgeOldEvents(maxAge time.Duration) error {
+	cutoff := time.Now().UTC().Add(-maxAge).Format("2006-01-02 15:04:05")
+	_, err := s.db.Exec(`DELETE FROM mcp_events WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return fmt.Errorf("purge old events: %w", err)
 	}
 	return nil
 }
