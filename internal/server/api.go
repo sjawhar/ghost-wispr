@@ -99,11 +99,10 @@ func getSpeakerIndexByName(speakerNames string, name string) int {
 		return -1
 	}
 
-	lowerName := strings.ToLower(name)
 	for idxStr, speakerMap := range speakers {
 		if nameVal, ok := speakerMap["name"]; ok {
 			if speakerName, ok := nameVal.(string); ok {
-				if strings.ToLower(speakerName) == lowerName {
+				if strings.EqualFold(speakerName, name) {
 					if idx, err := strconv.Atoi(idxStr); err == nil {
 						return idx
 					}

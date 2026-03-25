@@ -23,19 +23,19 @@ import (
 )
 
 type apiStoreStub struct {
-	sessionsByDate      map[string][]storage.Session
-	sessions            map[string]storage.Session
-	segments            map[string][]transcribe.Segment
-	dates               []string
-	searchResults       map[string][]storage.SearchResult
-	searchErr           error
-	searchFunc          func(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
-	aggregateResult     *storage.AggregateResult
-	aggregateErr        error
-	aggregateFunc       func(opts storage.AggregateOptions) (storage.AggregateResult, error)
-	allEmbeddings       []storage.StoredEmbedding
-	allEmbeddingsErr    error
-	getEventsSinceFunc  func(cursor int64, limit int) ([]storage.StoredEvent, error)
+	sessionsByDate     map[string][]storage.Session
+	sessions           map[string]storage.Session
+	segments           map[string][]transcribe.Segment
+	dates              []string
+	searchResults      map[string][]storage.SearchResult
+	searchErr          error
+	searchFunc         func(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
+	aggregateResult    *storage.AggregateResult
+	aggregateErr       error
+	aggregateFunc      func(opts storage.AggregateOptions) (storage.AggregateResult, error)
+	allEmbeddings      []storage.StoredEmbedding
+	allEmbeddingsErr   error
+	getEventsSinceFunc func(cursor int64, limit int) ([]storage.StoredEvent, error)
 }
 
 type embeddingClientStub struct {
@@ -69,22 +69,22 @@ func newTestConfigStore(t *testing.T) *config.Store {
 	return store
 }
 
-func (s apiStoreStub) GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error) {
+func (s *apiStoreStub) GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error) {
 	return s.sessionsByDate[date], nil
 }
 
-func (s apiStoreStub) GetSession(id string) (storage.Session, error) {
+func (s *apiStoreStub) GetSession(id string) (storage.Session, error) {
 	if sess, ok := s.sessions[id]; ok {
 		return sess, nil
 	}
 	return storage.Session{}, os.ErrNotExist
 }
 
-func (s apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, error) {
+func (s *apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, error) {
 	return s.segments[sessionID], nil
 }
 
-func (s apiStoreStub) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
+func (s *apiStoreStub) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
 	all := s.segments[sessionID]
 	var result []transcribe.Segment
 	for _, seg := range all {
@@ -95,11 +95,11 @@ func (s apiStoreStub) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	return result, nil
 }
 
-func (s apiStoreStub) GetDates() ([]string, error) {
+func (s *apiStoreStub) GetDates() ([]string, error) {
 	return s.dates, nil
 }
 
-func (s apiStoreStub) Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error) {
+func (s *apiStoreStub) Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error) {
 	if s.searchFunc != nil {
 		return s.searchFunc(query, opts)
 	}
@@ -112,7 +112,7 @@ func (s apiStoreStub) Search(query string, opts storage.SearchOptions) ([]storag
 	return s.searchResults[query], nil
 }
 
-func (s apiStoreStub) AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error) {
+func (s *apiStoreStub) AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error) {
 	if s.aggregateFunc != nil {
 		return s.aggregateFunc(opts)
 	}
@@ -125,7 +125,7 @@ func (s apiStoreStub) AggregateSessions(opts storage.AggregateOptions) (storage.
 	return storage.AggregateResult{Groups: []storage.AggregateGroup{}}, nil
 }
 
-func (s apiStoreStub) GetAllEmbeddings() ([]storage.StoredEmbedding, error) {
+func (s *apiStoreStub) GetAllEmbeddings() ([]storage.StoredEmbedding, error) {
 	if s.allEmbeddingsErr != nil {
 		return nil, s.allEmbeddingsErr
 	}
@@ -135,14 +135,14 @@ func (s apiStoreStub) GetAllEmbeddings() ([]storage.StoredEmbedding, error) {
 	return s.allEmbeddings, nil
 }
 
-func (s apiStoreStub) GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error) {
+func (s *apiStoreStub) GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error) {
 	if s.getEventsSinceFunc != nil {
 		return s.getEventsSinceFunc(cursor, limit)
 	}
 	return []storage.StoredEvent{}, nil
 }
 
-func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
+func (s *apiStoreStub) UpdateTitle(sessionID, title string) error {
 	sess, ok := s.sessions[sessionID]
 	if !ok {
 		return os.ErrNotExist
@@ -152,7 +152,7 @@ func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
-func (s apiStoreStub) DeleteSession(id string) error {
+func (s *apiStoreStub) DeleteSession(id string) error {
 	if _, ok := s.sessions[id]; !ok {
 		return os.ErrNotExist
 	}
@@ -160,7 +160,7 @@ func (s apiStoreStub) DeleteSession(id string) error {
 	return nil
 }
 
-func (s apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
+func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	endedAtPtr := &endedAt
 	s.sessions[newID] = storage.Session{
 		ID:            newID,
@@ -196,7 +196,7 @@ func testStaticFS(t *testing.T) fs.FS {
 
 func TestAPISessionsList(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{
 			"2026-02-26": {{ID: "s1", StartedAt: started, SummaryStatus: storage.SummaryCompleted}},
 		},
@@ -227,7 +227,7 @@ func TestAPISessionsList(t *testing.T) {
 }
 
 func TestAPISearchReturnsResults(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -265,7 +265,7 @@ func TestAPISearchReturnsResults(t *testing.T) {
 }
 
 func TestAPISearchEmptyQueryReturnsEmptyArray(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -295,7 +295,7 @@ func TestAPISearchEmptyQueryReturnsEmptyArray(t *testing.T) {
 }
 
 func TestSpeakerFilter_ByName(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", Title: "Meeting", SpeakerNames: `{"0": {"name": "Ben", "confidence": "mentioned"}, "1": {"name": "Alice", "confidence": "mentioned"}}`},
@@ -336,7 +336,7 @@ func TestSpeakerFilter_ByName(t *testing.T) {
 }
 
 func TestSpeakerFilter_ByIndex(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", Title: "Meeting", SpeakerNames: `{"0": {"name": "Ben", "confidence": "mentioned"}, "1": {"name": "Alice", "confidence": "mentioned"}}`},
@@ -378,7 +378,7 @@ func TestSpeakerFilter_ByIndex(t *testing.T) {
 
 func TestAPISessionDetail(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: started, Summary: "hello", SummaryStatus: storage.SummaryCompleted},
@@ -407,7 +407,7 @@ func TestAPISessionDetail(t *testing.T) {
 }
 
 func TestDeleteSession_Success(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1"},
@@ -431,7 +431,7 @@ func TestDeleteSession_Success(t *testing.T) {
 }
 
 func TestDeleteSession_NotFound(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -453,7 +453,7 @@ func TestDeleteSession_NotFound(t *testing.T) {
 }
 
 func TestDeleteSession_InvalidID(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -480,7 +480,7 @@ func TestMergeSession_Success(t *testing.T) {
 	start2 := time.Date(2026, 2, 26, 11, 0, 0, 0, time.UTC)
 	end2 := start2.Add(20 * time.Minute)
 
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: start1, EndedAt: &end1, Status: storage.SessionEnded},
@@ -524,7 +524,7 @@ func TestMergeSession_TooFewSessions(t *testing.T) {
 	start := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	end := start.Add(10 * time.Minute)
 
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: start, EndedAt: &end, Status: storage.SessionEnded},
@@ -552,7 +552,7 @@ func TestMergeSession_SessionNotFound(t *testing.T) {
 	start := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	end := start.Add(10 * time.Minute)
 
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: start, EndedAt: &end, Status: storage.SessionEnded},
@@ -592,7 +592,7 @@ func TestAPIAudioRange(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(oldWd) })
 
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", AudioPath: audioFile},
@@ -623,7 +623,7 @@ func TestAPIAudioRange(t *testing.T) {
 }
 
 func TestAPIDates(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -648,7 +648,7 @@ func TestAPIDates(t *testing.T) {
 }
 
 func TestAPIAudioPathTraversalBlocked(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -671,7 +671,7 @@ func TestAPIAudioPathTraversalBlocked(t *testing.T) {
 }
 
 func TestAPIStatusWithWarnings(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -715,7 +715,7 @@ func TestAPIStatusWithWarnings(t *testing.T) {
 }
 
 func TestAPIStatusNoWarnings(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -748,7 +748,7 @@ func TestAPIStatusNoWarnings(t *testing.T) {
 }
 
 func TestAPIStatusWithActiveSession(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -783,7 +783,7 @@ func TestAPIStatusWithActiveSession(t *testing.T) {
 }
 
 func TestAPIStatusWithNoActiveSession(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -817,7 +817,7 @@ func TestAPIStatusWithNoActiveSession(t *testing.T) {
 }
 
 func TestGetPresets(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -867,7 +867,7 @@ func TestGetPresets(t *testing.T) {
 }
 
 func TestGetPresetsEmpty(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -897,7 +897,7 @@ func TestGetPresetsEmpty(t *testing.T) {
 }
 
 func TestResummarize(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -943,7 +943,7 @@ func TestResummarize(t *testing.T) {
 }
 
 func TestResummarizeNotConfigured(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -965,7 +965,7 @@ func TestResummarizeNotConfigured(t *testing.T) {
 }
 
 func TestResummarizeInvalidSessionID(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -991,7 +991,7 @@ func TestResummarizeInvalidSessionID(t *testing.T) {
 }
 
 func TestAPI_Resummarize_InvalidJSONReturns400(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1025,7 +1025,7 @@ func TestAPI_Resummarize_InvalidJSONReturns400(t *testing.T) {
 }
 
 func TestAPI_Resummarize_ValidRequestStill202(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1060,7 +1060,7 @@ func TestAPI_Resummarize_ValidRequestStill202(t *testing.T) {
 }
 
 func TestAPI_SessionAudio_RejectsAbsolutePath(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", AudioPath: "/etc/passwd"},
@@ -1084,7 +1084,7 @@ func TestAPI_SessionAudio_RejectsAbsolutePath(t *testing.T) {
 }
 
 func TestEndSession_Success(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1105,7 +1105,7 @@ func TestEndSession_Success(t *testing.T) {
 }
 
 func TestEndSession_NoActiveSession(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1126,7 +1126,7 @@ func TestEndSession_NoActiveSession(t *testing.T) {
 }
 
 func TestEndSession_InternalError(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1147,7 +1147,7 @@ func TestEndSession_InternalError(t *testing.T) {
 }
 
 func TestEndSession_NotConfigured(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1167,7 +1167,7 @@ func TestEndSession_NotConfigured(t *testing.T) {
 
 func TestAPI_GeneratePreset_MissingDescription(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1193,7 +1193,7 @@ func TestAPI_GeneratePreset_MissingDescription(t *testing.T) {
 
 func TestAPI_GeneratePreset_Success(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1234,7 +1234,7 @@ func TestAPI_GeneratePreset_Success(t *testing.T) {
 
 func TestAPI_RefinePreset_MissingFields(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1270,7 +1270,7 @@ func TestAPI_RefinePreset_MissingFields(t *testing.T) {
 
 func TestAPI_RefinePreset_UnknownPreset(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1296,7 +1296,7 @@ func TestAPI_RefinePreset_UnknownPreset(t *testing.T) {
 
 func TestAPI_RefinePreset_Success(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1334,7 +1334,7 @@ func TestAPI_RefinePreset_Success(t *testing.T) {
 
 func TestAPI_GetConfig_ExposesGDriveSyncAndGCDefaults(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1381,7 +1381,7 @@ func TestAPI_GetConfig_ExposesGDriveSyncAndGCDefaults(t *testing.T) {
 
 func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1429,7 +1429,7 @@ func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 }
 
 func TestFaultInjectionDisabledWithoutTestMode(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
 		segments: map[string][]transcribe.Segment{},
 	}
@@ -1460,7 +1460,7 @@ func TestFaultInjectionDisabledWithoutTestMode(t *testing.T) {
 func TestFaultInjectionEnabledWithTestMode(t *testing.T) {
 	t.Setenv("GHOST_WISPR_TEST_MODE", "true")
 
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
 		segments: map[string][]transcribe.Segment{},
 	}
@@ -1499,7 +1499,7 @@ func TestFaultInjectionEnabledWithTestMode(t *testing.T) {
 func TestFaultInjectionNoHandler(t *testing.T) {
 	t.Setenv("GHOST_WISPR_TEST_MODE", "true")
 
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
 		segments: map[string][]transcribe.Segment{},
 	}
@@ -1522,7 +1522,7 @@ func TestFaultInjectionNoHandler(t *testing.T) {
 // --- Manual Session Trigger Tests ---
 
 func TestManualSessionStart_Success(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1557,7 +1557,7 @@ func TestManualSessionStart_Success(t *testing.T) {
 }
 
 func TestManualSessionStart_NoBody(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1583,7 +1583,7 @@ func TestManualSessionStart_NoBody(t *testing.T) {
 }
 
 func TestManualSessionStart_AlreadyActive(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1606,7 +1606,7 @@ func TestManualSessionStart_AlreadyActive(t *testing.T) {
 }
 
 func TestManualSessionStart_NotConfigured(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1626,7 +1626,7 @@ func TestManualSessionStart_NotConfigured(t *testing.T) {
 
 func TestManualSessionStop_ByID_Success(t *testing.T) {
 	stopped := ""
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1661,7 +1661,7 @@ func TestManualSessionStop_ByID_Success(t *testing.T) {
 }
 
 func TestManualSessionStop_ByID_NotFound(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1684,7 +1684,7 @@ func TestManualSessionStop_ByID_NotFound(t *testing.T) {
 }
 
 func TestManualSessionStop_ByID_InvalidID(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1706,7 +1706,7 @@ func TestManualSessionStop_ByID_InvalidID(t *testing.T) {
 
 func TestManualSessionStop_Current_Success(t *testing.T) {
 	called := false
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1741,7 +1741,7 @@ func TestManualSessionStop_Current_Success(t *testing.T) {
 }
 
 func TestManualSessionStop_Current_NoActive(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1762,7 +1762,7 @@ func TestManualSessionStop_Current_NoActive(t *testing.T) {
 }
 
 func TestManualSessionStop_NotConfigured(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -1782,7 +1782,7 @@ func TestManualSessionStop_NotConfigured(t *testing.T) {
 
 func TestAPISessionDetail_IncludesTranscriptSource(t *testing.T) {
 	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {
@@ -1961,7 +1961,7 @@ func TestSemanticSearch_Success(t *testing.T) {
 }
 
 func TestSemanticSearch_NoClient(t *testing.T) {
-	h, err := Handler(testStaticFS(t), NewHub(), apiStoreStub{}, &ControlHooks{}, "", nil)
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -2012,7 +2012,7 @@ func TestSemanticSearch_NoEmbeddings(t *testing.T) {
 
 func TestContextEndpoint_Success(t *testing.T) {
 	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
@@ -2071,7 +2071,7 @@ func TestContextEndpoint_Success(t *testing.T) {
 
 func TestContextEndpoint_DefaultSeconds(t *testing.T) {
 	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
@@ -2108,7 +2108,7 @@ func TestContextEndpoint_DefaultSeconds(t *testing.T) {
 }
 
 func TestContextEndpoint_SessionNotFound(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2130,7 +2130,7 @@ func TestContextEndpoint_SessionNotFound(t *testing.T) {
 
 func TestContextEndpoint_NoMatch(t *testing.T) {
 	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
@@ -2158,7 +2158,7 @@ func TestContextEndpoint_NoMatch(t *testing.T) {
 
 func TestContextEndpoint_MissingQuery(t *testing.T) {
 	started := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions: map[string]storage.Session{
 			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionEnded},
@@ -2185,7 +2185,7 @@ func TestAggregateEndpoint_Success(t *testing.T) {
 	started2 := time.Date(2026, 3, 25, 14, 0, 0, 0, time.UTC)
 	started3 := time.Date(2026, 3, 26, 10, 0, 0, 0, time.UTC)
 
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2290,7 +2290,7 @@ func TestAggregateEndpoint_WithQueryParams(t *testing.T) {
 }
 
 func TestAggregateEndpoint_InvalidGroupBy(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2311,7 +2311,7 @@ func TestAggregateEndpoint_InvalidGroupBy(t *testing.T) {
 }
 
 func TestOpenAPISpec(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2392,7 +2392,7 @@ func TestOpenAPISpec(t *testing.T) {
 
 func TestSegmentsSpeakerFilter(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessions: map[string]storage.Session{
 			"s1": {
 				ID:           "s1",
@@ -2462,7 +2462,7 @@ func TestEventsEndpoint_Success(t *testing.T) {
 	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
 	}
-	
+
 	// Mock GetEventsSince to return some events
 	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
 		if cursor == 0 && limit == 51 { // limit+1 for has_more detection
@@ -2474,38 +2474,38 @@ func TestEventsEndpoint_Success(t *testing.T) {
 		}
 		return []storage.StoredEvent{}, nil
 	}
-	
+
 	mux := http.NewServeMux()
 	cfgStore := newTestConfigStore(t)
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
-	
+
 	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
-	
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
 	}
-	
+
 	var resp map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	
+
 	events, ok := resp["events"].([]interface{})
 	if !ok {
 		t.Fatalf("expected events array in response")
 	}
-	
+
 	if len(events) != 3 {
 		t.Fatalf("expected 3 events, got %d", len(events))
 	}
-	
+
 	nextCursor, ok := resp["next_cursor"].(float64)
 	if !ok || int64(nextCursor) != 3 {
 		t.Fatalf("expected next_cursor=3, got %v", nextCursor)
 	}
-	
+
 	hasMore, ok := resp["has_more"].(bool)
 	if !ok || hasMore {
 		t.Fatalf("expected has_more=false, got %v", hasMore)
@@ -2516,7 +2516,7 @@ func TestEventsEndpoint_TypeFilter(t *testing.T) {
 	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
 	}
-	
+
 	// Mock GetEventsSince to return events with different types
 	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
 		if cursor == 0 && limit == 51 { // limit+1 for has_more detection
@@ -2528,29 +2528,29 @@ func TestEventsEndpoint_TypeFilter(t *testing.T) {
 		}
 		return []storage.StoredEvent{}, nil
 	}
-	
+
 	mux := http.NewServeMux()
 	cfgStore := newTestConfigStore(t)
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
-	
+
 	req := httptest.NewRequest(http.MethodGet, "/api/events?types=session_ended,summary_ready", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
-	
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
 	}
-	
+
 	var resp map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	
+
 	events, ok := resp["events"].([]interface{})
 	if !ok {
 		t.Fatalf("expected events array in response")
 	}
-	
+
 	if len(events) != 2 {
 		t.Fatalf("expected 2 filtered events, got %d", len(events))
 	}
@@ -2560,43 +2560,43 @@ func TestEventsEndpoint_EmptyQueue(t *testing.T) {
 	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
 	}
-	
+
 	// Mock GetEventsSince to return no events
 	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
 		return []storage.StoredEvent{}, nil
 	}
-	
+
 	mux := http.NewServeMux()
 	cfgStore := newTestConfigStore(t)
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
-	
+
 	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
-	
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
 	}
-	
+
 	var resp map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	
+
 	events, ok := resp["events"].([]interface{})
 	if !ok {
 		t.Fatalf("expected events array in response")
 	}
-	
+
 	if len(events) != 0 {
 		t.Fatalf("expected 0 events, got %d", len(events))
 	}
-	
+
 	nextCursor, ok := resp["next_cursor"].(float64)
 	if !ok || int64(nextCursor) != 0 {
 		t.Fatalf("expected next_cursor=0, got %v", nextCursor)
 	}
-	
+
 	hasMore, ok := resp["has_more"].(bool)
 	if !ok || hasMore {
 		t.Fatalf("expected has_more=false, got %v", hasMore)
@@ -2607,7 +2607,7 @@ func TestEventsEndpoint_Pagination(t *testing.T) {
 	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
 	}
-	
+
 	// Mock GetEventsSince to simulate pagination
 	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
 		if cursor == 0 && limit == 3 { // limit+1 for has_more detection
@@ -2626,39 +2626,39 @@ func TestEventsEndpoint_Pagination(t *testing.T) {
 		}
 		return []storage.StoredEvent{}, nil
 	}
-	
+
 	mux := http.NewServeMux()
 	cfgStore := newTestConfigStore(t)
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
-	
+
 	// First page
 	req := httptest.NewRequest(http.MethodGet, "/api/events?limit=2", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
-	
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
 	}
-	
+
 	var resp map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	
+
 	events, ok := resp["events"].([]interface{})
 	if !ok {
 		t.Fatalf("expected events array in response")
 	}
-	
+
 	if len(events) != 2 {
 		t.Fatalf("expected 2 events on first page, got %d", len(events))
 	}
-	
+
 	nextCursor, ok := resp["next_cursor"].(float64)
 	if !ok || int64(nextCursor) != 2 {
 		t.Fatalf("expected next_cursor=2, got %v", nextCursor)
 	}
-	
+
 	hasMore, ok := resp["has_more"].(bool)
 	if !ok || !hasMore {
 		t.Fatalf("expected has_more=true, got %v", hasMore)
@@ -2680,7 +2680,7 @@ func TestNonRegression(t *testing.T) {
 }
 
 func testNonRegressionStatus(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2721,7 +2721,7 @@ func testNonRegressionStatus(t *testing.T) {
 }
 
 func testNonRegressionDates(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2752,7 +2752,7 @@ func testNonRegressionDates(t *testing.T) {
 }
 
 func testNonRegressionSearch(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2792,7 +2792,7 @@ func testNonRegressionSearch(t *testing.T) {
 
 func testNonRegressionPause(t *testing.T) {
 	called := false
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2821,7 +2821,7 @@ func testNonRegressionPause(t *testing.T) {
 
 func testNonRegressionResume(t *testing.T) {
 	called := false
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2850,7 +2850,7 @@ func testNonRegressionResume(t *testing.T) {
 
 func testNonRegressionConfig(t *testing.T) {
 	cfgStore := newTestConfigStore(t)
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2883,7 +2883,7 @@ func testNonRegressionConfig(t *testing.T) {
 }
 
 func testNonRegressionVersion(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},
@@ -2913,7 +2913,7 @@ func testNonRegressionVersion(t *testing.T) {
 }
 
 func testNonRegressionPresets(t *testing.T) {
-	store := apiStoreStub{
+	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{},
 		segments:       map[string][]transcribe.Segment{},

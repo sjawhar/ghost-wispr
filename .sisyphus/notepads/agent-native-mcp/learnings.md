@@ -444,3 +444,25 @@
 
 ### Evidence
 - `.sisyphus/evidence/task-16-non-regression.json` — test results and endpoint coverage
+
+## 2026-03-25 — Final Verification Wave
+
+### F1: Plan Compliance Audit — APPROVE
+- All 13 Must Have items verified present
+- All Must NOT Have items verified absent
+- All 16 tasks verified complete
+
+### F2: Code Quality Review — APPROVE (after fixes)
+- Initial review found 4 issues: chunk_text bug, date filter order, gofmt, silent error swallowing
+- All 4 fixed in commit ktkwqouk
+- Re-verified: go vet clean, go build clean, all tests pass, gofmt compliant
+
+### F3: Real QA via Tests — APPROVE (after fixes)
+- Initial review REJECTED: stubs ignored filter opts, missing date_to/cursor/semantic-date tests, dead chunk_text field
+- Fixed: searchFunc/aggregateFunc callbacks for opts capture, 3 new tests added, chunk_text removed from decode struct
+- Re-verified: 26 endpoint tests + 8 non-regression subtests all pass
+
+### F4: Scope Fidelity Check — APPROVE
+- 16/16 tasks compliant
+- Zero Must NOT Have violations
+- No scope creep detected
