@@ -37,6 +37,10 @@ type SessionSyncer interface {
 	SyncSession(ctx context.Context, sessionID string) error
 }
 
+type EmbeddingIndexer interface {
+	IndexSession(ctx context.Context, sessionID, transcript string) error
+}
+
 type EventBroadcaster interface {
 	BroadcastLiveTranscript(seg transcribe.Segment)
 	BroadcastSessionStarted(sessionID string)

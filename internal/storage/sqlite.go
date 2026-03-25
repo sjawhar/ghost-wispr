@@ -133,6 +133,7 @@ type StoredEmbedding struct {
 	Model      string
 	CreatedAt  time.Time
 }
+
 var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
@@ -1380,9 +1381,12 @@ func (s *SQLiteStore) StoreEmbedding(sessionID string, chunkIndex int, vector []
 	if err := binary.Write(buf, binary.LittleEndian, vector); err != nil {
 		return fmt.Errorf("serialize embedding vector: %w", err)
 	}
-	
+
 	_, err := s.db.Exec(
-		`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES(?, ?, ?, ?, ?)`,
+		`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model)
+		 VALUES(?, ?, ?, ?, ?)
+		 ON CONFLICT(session_id, chunk_index)
+		 DO UPDATE SET embedding = excluded.embedding, text_hash = excluded.text_hash, model = excluded.model, created_at = CURRENT_TIMESTAMP`,
 		sessionID, chunkIndex, buf.Bytes(), textHash, model,
 	)
 	if err != nil {
@@ -1401,17 +1405,17 @@ func (s *SQLiteStore) GetEmbeddings(sessionID string) ([]StoredEmbedding, error)
 		return nil, fmt.Errorf("query embeddings for session %s: %w", sessionID, err)
 	}
 	defer func() { _ = rows.Close() }()
-	
+
 	var embeddings []StoredEmbedding
 	for rows.Next() {
 		var emb StoredEmbedding
 		var embeddingBlob []byte
 		var createdAtStr string
-		
+
 		if err := rows.Scan(&emb.SessionID, &emb.ChunkIndex, &embeddingBlob, &emb.TextHash, &emb.Model, &createdAtStr); err != nil {
 			return nil, fmt.Errorf("scan embedding for session %s: %w", sessionID, err)
 		}
-		
+
 		// Deserialize vector from BLOB
 		buf := bytes.NewReader(embeddingBlob)
 		var vector []float32
@@ -1426,7 +1430,7 @@ func (s *SQLiteStore) GetEmbeddings(sessionID string) ([]StoredEmbedding, error)
 			vector = append(vector, f)
 		}
 		emb.Vector = vector
-		
+
 		// Parse timestamp
 		parsedTime, err := time.Parse(time.RFC3339Nano, createdAtStr)
 		if err != nil {
@@ -1437,14 +1441,14 @@ func (s *SQLiteStore) GetEmbeddings(sessionID string) ([]StoredEmbedding, error)
 			}
 		}
 		emb.CreatedAt = parsedTime
-		
+
 		embeddings = append(embeddings, emb)
 	}
-	
+
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate embeddings for session %s: %w", sessionID, err)
 	}
-	
+
 	return embeddings, nil
 }
 
@@ -1457,17 +1461,17 @@ func (s *SQLiteStore) GetAllEmbeddings() ([]StoredEmbedding, error) {
 		return nil, fmt.Errorf("query all embeddings: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	
+
 	var embeddings []StoredEmbedding
 	for rows.Next() {
 		var emb StoredEmbedding
 		var embeddingBlob []byte
 		var createdAtStr string
-		
+
 		if err := rows.Scan(&emb.SessionID, &emb.ChunkIndex, &embeddingBlob, &emb.TextHash, &emb.Model, &createdAtStr); err != nil {
 			return nil, fmt.Errorf("scan embedding: %w", err)
 		}
-		
+
 		// Deserialize vector from BLOB
 		buf := bytes.NewReader(embeddingBlob)
 		var vector []float32
@@ -1482,7 +1486,7 @@ func (s *SQLiteStore) GetAllEmbeddings() ([]StoredEmbedding, error) {
 			vector = append(vector, f)
 		}
 		emb.Vector = vector
-		
+
 		// Parse timestamp
 		parsedTime, err := time.Parse(time.RFC3339Nano, createdAtStr)
 		if err != nil {
@@ -1493,15 +1497,47 @@ func (s *SQLiteStore) GetAllEmbeddings() ([]StoredEmbedding, error) {
 			}
 		}
 		emb.CreatedAt = parsedTime
-		
+
 		embeddings = append(embeddings, emb)
 	}
-	
+
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate all embeddings: %w", err)
 	}
-	
+
 	return embeddings, nil
+}
+
+func (s *SQLiteStore) GetSessionsWithoutEmbeddings() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT s.id
+		 FROM sessions s
+		 LEFT JOIN embeddings e ON e.session_id = s.id
+		 WHERE s.status = 'ended'
+		   AND s.canonical_transcript IS NOT NULL
+		   AND TRIM(s.canonical_transcript) != ''
+		 GROUP BY s.id
+		 HAVING COUNT(e.session_id) = 0
+		 ORDER BY s.started_at ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query sessions without embeddings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	ids := make([]string, 0, 16)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan session without embeddings: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions without embeddings: %w", err)
+	}
+
+	return ids, nil
 }
 
 // DeleteEmbeddings deletes all embeddings for a session.

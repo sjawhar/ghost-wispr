@@ -25,6 +25,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
@@ -306,7 +307,21 @@ func main() {
 		sessionSummarizer = summarizer
 	}
 
+	var indexer *embedding.Indexer
+	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
+		embeddingClient, err := embedding.NewClient(cfg.EmbeddingModel)
+		if err != nil {
+			log.Printf("warning: embedding indexer disabled: %v", err)
+		} else {
+			indexer = embedding.NewIndexer(embeddingClient, store, 500)
+			indexer.SetModel(cfg.EmbeddingModel)
+		}
+	}
+
 	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments, appLogger)
+	if indexer != nil {
+		manager.SetIndexer(indexer)
+	}
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -621,6 +636,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if indexer != nil {
+		go func() {
+			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("warning: embedding backfill failed: %v", err)
+			}
+		}()
+	}
 
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {

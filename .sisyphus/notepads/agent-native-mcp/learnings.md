@@ -194,3 +194,28 @@
 - Added to ensureSchema() after summary_requests table
 - CREATE TABLE IF NOT EXISTS for idempotency
 - Follows existing pattern: no ALTER TABLE needed for fresh installs
+
+## 2026-03-25 — Task 8: Embedding Indexer Pipeline
+
+### Implementation Pattern
+- New `internal/embedding/indexer.go` owns chunking, hash-based idempotency, embedding generation, and persistence.
+- `SplitIntoChunks(text, chunkSize)` uses word-based chunking with fixed overlap (50 words) and sane defaults (`chunkSize=500`).
+- `IndexSession(ctx, sessionID, transcript)` computes per-chunk SHA-256 hashes and skips unchanged chunks by comparing against stored `text_hash`.
+
+### Backfill Pattern
+- Added `SQLiteStore.GetSessionsWithoutEmbeddings()` query for ended sessions with canonical transcripts and zero embedding rows.
+- `BackfillMissing(ctx)` processes those sessions with bounded concurrency (semaphore via buffered channel, max 2 workers).
+- Backfill loads canonical transcript per session and reuses `IndexSession` so idempotency and storage logic are centralized.
+
+### Wiring Pattern
+- `session.Manager` now supports optional `EmbeddingIndexer` via `SetIndexer`.
+- After canonical transcript is available in `generateSummary`, manager triggers indexing as best-effort async work (logs errors, never fails session flow).
+- `cmd/ghost-wispr/main.go` now creates indexer when `embedding_model` is configured, wires it into manager, and starts startup backfill goroutine.
+
+### Storage Detail
+- `StoreEmbedding` switched to SQLite UPSERT on `(session_id, chunk_index)` so changed chunks are updated in-place while unchanged chunks are skipped.
+
+### Testing Pattern
+- TDD flow used: added failing tests first (`TestSplitIntoChunks`, `TestIndexerOnSessionEnd`, `TestBackfillMissing`) then implemented to green.
+- `TestIndexerOnSessionEnd` validates DB persistence plus idempotent no-op reindexing.
+- `TestBackfillMissing` verifies only unindexed sessions are embedded during backfill.

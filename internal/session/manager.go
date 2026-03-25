@@ -23,6 +23,7 @@ type Manager struct {
 	summarizer         Summarizer
 	hub                EventBroadcaster
 	syncer             SessionSyncer
+	indexer            EmbeddingIndexer
 	detector           *Detector
 	buffer             *UtteranceBuffer
 	minSessionSegments int
@@ -372,6 +373,11 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		if err := m.store.Canonicalize(sessionID); err != nil {
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
+		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
+			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		} else {
+			m.triggerEmbeddingIndex(sessionID, transcript)
+		}
 		if syncer != nil {
 			go func() {
 				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
@@ -426,6 +432,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
@@ -436,6 +443,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
 		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
@@ -443,6 +451,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+	m.triggerEmbeddingIndex(sessionID, transcript)
 
 	if syncer != nil {
 		go func() {
@@ -486,6 +495,12 @@ func (m *Manager) SetSyncer(s SessionSyncer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.syncer = s
+}
+
+func (m *Manager) SetIndexer(indexer EmbeddingIndexer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.indexer = indexer
 }
 
 func (m *Manager) SetMinSessionSegments(n int) {
@@ -548,6 +563,24 @@ func (m *Manager) waitForRefinedTranscript(ctx context.Context, sessionID string
 			return ""
 		}
 	}
+}
+
+func (m *Manager) triggerEmbeddingIndex(sessionID, transcript string) {
+	m.mu.Lock()
+	indexer := m.indexer
+	m.mu.Unlock()
+
+	if indexer == nil || strings.TrimSpace(transcript) == "" {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if err := indexer.IndexSession(ctx, sessionID, transcript); err != nil {
+			m.logger.Error("embedding index failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		}
+	}()
 }
 
 func (m *Manager) OnTranscriptionDisconnect() {
