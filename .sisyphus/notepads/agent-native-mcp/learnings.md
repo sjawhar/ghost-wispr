@@ -143,3 +143,23 @@
 - Restore: `/api/restore/gdrive`
 - Diagnostic: `/api/diagnostic/mic`
 - Test: `/api/test/fault/deepgram-disconnect`
+## 2026-03-25 — Task 6: Embedding Client Abstraction
+
+### Implementation Pattern
+- New `internal/embedding` package mirrors `internal/llm` style: `Client` interface + `ParseModel` + `NewClient` provider factory.
+- Model format is `provider/model` and factory routes by provider (`openai`, `gemini`) with descriptive unknown-provider errors.
+- Provider clients return `[][]float32` for batch input and preserve per-input ordering.
+
+### Provider Notes
+- OpenAI uses `go-openai` `CreateEmbeddings` with `EmbeddingRequestStrings` and wraps API failures as `openai embedding: ...`.
+- Gemini uses `genai` `Models.EmbedContent` with a `[]*genai.Content` batch built via `NewContentFromText`.
+- Both providers treat empty input as empty output and validate missing/partial embedding responses.
+
+### Config Pattern
+- Added `EmbeddingModel string` (`yaml:"embedding_model"`) to config with default empty string (feature disabled by default).
+- Added env override `GHOST_WISPR_EMBEDDING_MODEL`.
+- Validation now includes embedding model provider checks when `embedding_model` is configured.
+
+### Testing Pattern
+- TDD executed: created failing tests first, then implemented package to green.
+- Required tests added: `TestEmbedReturnsVectors`, `TestUnknownProvider`, `TestBatchEmbedding` using mock clients (no external API calls).

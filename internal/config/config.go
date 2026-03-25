@@ -57,6 +57,7 @@ type Config struct {
 	Summarization                 Summarization      `yaml:"summarization"`
 	Transcription                 Transcription      `yaml:"transcription"`
 	BatchTranscription            BatchTranscription `yaml:"batch_transcription"`
+	EmbeddingModel                string             `yaml:"embedding_model"`
 	DeepgramModel                 string             `yaml:"deepgram_model"`
 	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size"`
 	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
@@ -99,6 +100,7 @@ func defaults() Config {
 			Provider: "deepgram",
 			Model:    "nova-3",
 		},
+		EmbeddingModel:                "",
 		DeepgramModel:                 "nova-3",
 		DeepgramBufferSize:            1920000,
 		DeepgramReconnectInitialDelay: "500ms",
@@ -226,6 +228,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "BATCH_TRANSCRIPTION_MODEL"); v != "" {
 		cfg.BatchTranscription.Model = strings.TrimSpace(v)
 	}
+	if v := os.Getenv(EnvPrefix + "EMBEDDING_MODEL"); v != "" {
+		cfg.EmbeddingModel = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "DEEPGRAM_BUFFER_SIZE"); v != "" {
 		if size, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && size > 0 {
 			cfg.DeepgramBufferSize = size
@@ -283,6 +288,9 @@ func validate(cfg *Config) []string {
 	}
 
 	addModelProvider("summarization", cfg.Summarization.Model)
+	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
+		addModelProvider("embedding", cfg.EmbeddingModel)
+	}
 
 	if _, ok := cfg.Summarization.Presets["default"]; !ok {
 		warnings = append(warnings, "No default summarization preset configured — set summarization.presets.default.")
