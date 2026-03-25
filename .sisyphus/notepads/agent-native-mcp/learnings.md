@@ -344,3 +344,53 @@
 - TestGetEventsSince_Pagination: 5 events, paginate with limit=2, verify cursor advances
 - Full suite: 14 packages, 0 regressions
 - Evidence captured at `.sisyphus/evidence/task-12-event-queue.txt`
+
+## 2026-03-25 — Task 13: Event Polling Endpoint
+
+### Implementation Pattern
+- **GET /api/events** route registered in `registerAPIRoutes()` after semantic search endpoint
+- **Query parameters**: `cursor` (int64, default 0), `limit` (int, default 50, max 200), `types` (comma-separated filter)
+- **Pagination strategy**: Fetch `limit+1` events to detect `has_more`, return only `limit`
+- **Type filtering**: Applied in-memory after fetching from storage
+- **Payload handling**: JSON string from `StoredEvent.Payload` parsed into `map[string]interface{}` for response
+
+### Response Structure
+```json
+{
+  "events": [
+    {
+      "id": 1,
+      "event_type": "session_started",
+      "payload": {...},
+      "created_at": "2026-03-25T..."
+    }
+  ],
+  "next_cursor": 3,
+  "has_more": false
+}
+```
+
+### Key Decisions
+- `next_cursor`: ID of last event in results (or `cursor` if no results)
+- `has_more`: true if fetched `limit+1` events (indicating more exist)
+- Type filter: optional, comma-separated values (e.g., `?types=session_ended,summary_ready`)
+- Limit capped at 200 to prevent abuse
+- Payload parsing: invalid JSON results in empty map (graceful degradation)
+
+### Testing Approach
+- TDD: 4 failing tests written first, then implementation
+- `TestEventsEndpoint_Success`: Returns events with correct cursor and has_more
+- `TestEventsEndpoint_TypeFilter`: Filters events by comma-separated types
+- `TestEventsEndpoint_EmptyQueue`: Returns empty array with has_more=false
+- `TestEventsEndpoint_Pagination`: Correctly advances cursor and detects more events
+- Full suite: 14 packages, 0 regressions
+
+### Interface Pattern
+- `SessionStore` interface extended with `GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error)`
+- `apiStoreStub` extended with `getEventsSinceFunc` field for test mocking
+- Route registered at end of `registerAPIRoutes()` before helper route registrations
+
+### Evidence
+- All 4 endpoint tests pass
+- Full test suite passes (14 packages)
+- Evidence captured at `.sisyphus/evidence/task-13-polling.json`

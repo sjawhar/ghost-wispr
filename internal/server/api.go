@@ -38,6 +38,7 @@ type SessionStore interface {
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
+	GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -321,6 +322,106 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 		
 		writeJSON(w, http.StatusOK, results)
+	})
+
+	// Event polling endpoint
+	mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
+		// Parse cursor (default 0)
+		cursor := int64(0)
+		if rawCursor := strings.TrimSpace(r.URL.Query().Get("cursor")); rawCursor != "" {
+			parsedCursor, err := strconv.ParseInt(rawCursor, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "cursor must be a valid integer")
+				return
+			}
+			cursor = parsedCursor
+		}
+		
+		// Parse limit (default 50, max 200)
+		limit := 50
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			parsedLimit, err := strconv.Atoi(rawLimit)
+			if err != nil || parsedLimit <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be a positive integer")
+				return
+			}
+			if parsedLimit > 200 {
+				parsedLimit = 200
+			}
+			limit = parsedLimit
+		}
+		
+		// Parse types filter (comma-separated)
+		var typeFilter map[string]bool
+		if rawTypes := strings.TrimSpace(r.URL.Query().Get("types")); rawTypes != "" {
+			typeFilter = make(map[string]bool)
+			for _, t := range strings.Split(rawTypes, ",") {
+				if trimmed := strings.TrimSpace(t); trimmed != "" {
+					typeFilter[trimmed] = true
+				}
+			}
+		}
+		
+		// Fetch events with limit+1 to detect has_more
+		events, err := store.GetEventsSince(cursor, limit+1)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("fetch events: %v", err))
+			return
+		}
+		
+		// Determine has_more and trim to limit
+		hasMore := len(events) > limit
+		if hasMore {
+			events = events[:limit]
+		}
+		
+		// Filter by types if specified
+		if len(typeFilter) > 0 {
+			filtered := make([]storage.StoredEvent, 0, len(events))
+			for _, ev := range events {
+				if typeFilter[ev.EventType] {
+					filtered = append(filtered, ev)
+				}
+			}
+			events = filtered
+		}
+		
+		// Calculate next_cursor (ID of last event, or cursor if no events)
+		nextCursor := cursor
+		if len(events) > 0 {
+			nextCursor = events[len(events)-1].ID
+		}
+		
+		// Parse payloads into map[string]any
+		type EventResponse struct {
+			ID        int64                  `json:"id"`
+			EventType string                 `json:"event_type"`
+			Payload   map[string]interface{} `json:"payload"`
+			CreatedAt time.Time             `json:"created_at"`
+		}
+		
+		responseEvents := make([]EventResponse, 0, len(events))
+		for _, ev := range events {
+			var payload map[string]interface{}
+			if err := json.Unmarshal([]byte(ev.Payload), &payload); err != nil {
+				// If payload is not valid JSON, use empty map
+				payload = make(map[string]interface{})
+			}
+			responseEvents = append(responseEvents, EventResponse{
+				ID:        ev.ID,
+				EventType: ev.EventType,
+				Payload:   payload,
+				CreatedAt: ev.CreatedAt,
+			})
+		}
+		
+		response := map[string]interface{}{
+			"events":     responseEvents,
+			"next_cursor": nextCursor,
+			"has_more":    hasMore,
+		}
+		
+		writeJSON(w, http.StatusOK, response)
 	})
 	registerRestoreRoutes(mux, controls)
 	registerLogRoutes(mux, controls)

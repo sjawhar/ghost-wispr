@@ -22,16 +22,17 @@ import (
 )
 
 type apiStoreStub struct {
-	sessionsByDate   map[string][]storage.Session
-	sessions         map[string]storage.Session
-	segments         map[string][]transcribe.Segment
-	dates            []string
-	searchResults    map[string][]storage.SearchResult
-	searchErr        error
-	aggregateResult  *storage.AggregateResult
-	aggregateErr     error
-	allEmbeddings    []storage.StoredEmbedding
-	allEmbeddingsErr error
+	sessionsByDate      map[string][]storage.Session
+	sessions            map[string]storage.Session
+	segments            map[string][]transcribe.Segment
+	dates               []string
+	searchResults       map[string][]storage.SearchResult
+	searchErr           error
+	aggregateResult     *storage.AggregateResult
+	aggregateErr        error
+	allEmbeddings       []storage.StoredEmbedding
+	allEmbeddingsErr    error
+	getEventsSinceFunc  func(cursor int64, limit int) ([]storage.StoredEvent, error)
 }
 
 type embeddingClientStub struct {
@@ -123,6 +124,13 @@ func (s apiStoreStub) GetAllEmbeddings() ([]storage.StoredEmbedding, error) {
 		return []storage.StoredEmbedding{}, nil
 	}
 	return s.allEmbeddings, nil
+}
+
+func (s apiStoreStub) GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error) {
+	if s.getEventsSinceFunc != nil {
+		return s.getEventsSinceFunc(cursor, limit)
+	}
+	return []storage.StoredEvent{}, nil
 }
 
 func (s apiStoreStub) UpdateTitle(sessionID, title string) error {
@@ -2442,5 +2450,212 @@ func TestSegmentsSpeakerFilter(t *testing.T) {
 	}
 	if segments[0].Speaker != 1 {
 		t.Fatalf("expected speaker 1, got %d", segments[0].Speaker)
+	}
+}
+
+func TestEventsEndpoint_Success(t *testing.T) {
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{},
+	}
+	
+	// Mock GetEventsSince to return some events
+	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
+		if cursor == 0 && limit == 51 { // limit+1 for has_more detection
+			return []storage.StoredEvent{
+				{ID: 1, EventType: "session_started", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+				{ID: 2, EventType: "session_ended", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+				{ID: 3, EventType: "summary_ready", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+			}, nil
+		}
+		return []storage.StoredEvent{}, nil
+	}
+	
+	mux := http.NewServeMux()
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+	
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	
+	events, ok := resp["events"].([]interface{})
+	if !ok {
+		t.Fatalf("expected events array in response")
+	}
+	
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+	
+	nextCursor, ok := resp["next_cursor"].(float64)
+	if !ok || int64(nextCursor) != 3 {
+		t.Fatalf("expected next_cursor=3, got %v", nextCursor)
+	}
+	
+	hasMore, ok := resp["has_more"].(bool)
+	if !ok || hasMore {
+		t.Fatalf("expected has_more=false, got %v", hasMore)
+	}
+}
+
+func TestEventsEndpoint_TypeFilter(t *testing.T) {
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{},
+	}
+	
+	// Mock GetEventsSince to return events with different types
+	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
+		if cursor == 0 && limit == 51 { // limit+1 for has_more detection
+			return []storage.StoredEvent{
+				{ID: 1, EventType: "session_started", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+				{ID: 2, EventType: "session_ended", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+				{ID: 3, EventType: "summary_ready", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+			}, nil
+		}
+		return []storage.StoredEvent{}, nil
+	}
+	
+	mux := http.NewServeMux()
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+	
+	req := httptest.NewRequest(http.MethodGet, "/api/events?types=session_ended,summary_ready", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	
+	events, ok := resp["events"].([]interface{})
+	if !ok {
+		t.Fatalf("expected events array in response")
+	}
+	
+	if len(events) != 2 {
+		t.Fatalf("expected 2 filtered events, got %d", len(events))
+	}
+}
+
+func TestEventsEndpoint_EmptyQueue(t *testing.T) {
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{},
+	}
+	
+	// Mock GetEventsSince to return no events
+	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
+		return []storage.StoredEvent{}, nil
+	}
+	
+	mux := http.NewServeMux()
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+	
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	
+	events, ok := resp["events"].([]interface{})
+	if !ok {
+		t.Fatalf("expected events array in response")
+	}
+	
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events, got %d", len(events))
+	}
+	
+	nextCursor, ok := resp["next_cursor"].(float64)
+	if !ok || int64(nextCursor) != 0 {
+		t.Fatalf("expected next_cursor=0, got %v", nextCursor)
+	}
+	
+	hasMore, ok := resp["has_more"].(bool)
+	if !ok || hasMore {
+		t.Fatalf("expected has_more=false, got %v", hasMore)
+	}
+}
+
+func TestEventsEndpoint_Pagination(t *testing.T) {
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{},
+	}
+	
+	// Mock GetEventsSince to simulate pagination
+	store.getEventsSinceFunc = func(cursor int64, limit int) ([]storage.StoredEvent, error) {
+		if cursor == 0 && limit == 3 { // limit+1 for has_more detection
+			// Return 3 events (limit+1) to indicate has_more=true
+			return []storage.StoredEvent{
+				{ID: 1, EventType: "session_started", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+				{ID: 2, EventType: "session_ended", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+				{ID: 3, EventType: "summary_ready", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+			}, nil
+		}
+		if cursor == 2 && limit == 3 {
+			return []storage.StoredEvent{
+				{ID: 3, EventType: "summary_ready", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+				{ID: 4, EventType: "status_changed", Payload: `{"session_id":"s1"}`, CreatedAt: time.Now()},
+			}, nil
+		}
+		return []storage.StoredEvent{}, nil
+	}
+	
+	mux := http.NewServeMux()
+	cfgStore := newTestConfigStore(t)
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+	
+	// First page
+	req := httptest.NewRequest(http.MethodGet, "/api/events?limit=2", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	
+	events, ok := resp["events"].([]interface{})
+	if !ok {
+		t.Fatalf("expected events array in response")
+	}
+	
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events on first page, got %d", len(events))
+	}
+	
+	nextCursor, ok := resp["next_cursor"].(float64)
+	if !ok || int64(nextCursor) != 2 {
+		t.Fatalf("expected next_cursor=2, got %v", nextCursor)
+	}
+	
+	hasMore, ok := resp["has_more"].(bool)
+	if !ok || !hasMore {
+		t.Fatalf("expected has_more=true, got %v", hasMore)
 	}
 }
