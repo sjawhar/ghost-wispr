@@ -59,23 +59,23 @@ func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
 	}
 }
 
-func (s *Summarizer) Summarize(ctx context.Context, sessionID, transcript string) (string, string, string, error) {
+func (s *Summarizer) Summarize(ctx context.Context, sessionID, transcript string) (string, string, string, string, error) {
 	presetName, err := s.selectPreset(ctx, transcript)
 	if err != nil {
-		return "", "", "", fmt.Errorf("select preset: %w", err)
+		return "", "", "", "{}", fmt.Errorf("select preset: %w", err)
 	}
-	title, summary, err := s.SummarizeWithPreset(ctx, sessionID, transcript, presetName)
-	return title, summary, presetName, err
+	title, summary, speakerNames, err := s.SummarizeWithPreset(ctx, sessionID, transcript, presetName)
+	return title, summary, presetName, speakerNames, err
 }
 
-func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcript, presetName string) (string, string, error) {
+func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcript, presetName string) (string, string, string, error) {
 	if len(strings.Fields(transcript)) < minSummaryWords {
-		return guaranteedTitle(transcript), "", nil
+		return guaranteedTitle(transcript), "", "{}", nil
 	}
 
 	preset, ok := s.cfg.Presets[presetName]
 	if !ok {
-		return "", "", fmt.Errorf("unknown preset %q", presetName)
+		return "", "", "{}", fmt.Errorf("unknown preset %q", presetName)
 	}
 
 	modelStr := preset.Model
@@ -85,24 +85,24 @@ func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcri
 
 	provider, model, err := llm.ParseModel(modelStr)
 	if err != nil {
-		return "", "", err
+		return "", "", "{}", err
 	}
 
 	client, err := s.factory(provider, model)
 	if err != nil {
-		return "", "", fmt.Errorf("create llm client: %w", err)
+		return "", "", "{}", fmt.Errorf("create llm client: %w", err)
 	}
 
 	logger := logging.WithModule(logging.FromContext(ctx, nil), "summary")
 	if s.shouldChunk(transcript) {
-		title, summary, err := s.summarizeChunked(ctx, client, preset, transcript, logger)
+		title, summary, speakerNames, err := s.summarizeChunked(ctx, client, preset, transcript, logger)
 		if err != nil {
-			return guaranteedTitle(transcript), "", err
+			return guaranteedTitle(transcript), "", "{}", err
 		}
 		if strings.TrimSpace(title) == "" {
 			title = guaranteedTitle(transcript)
 		}
-		return title, strings.TrimSpace(summary), nil
+		return title, strings.TrimSpace(summary), speakerNames, nil
 	}
 
 	messages := s.structuredMessages(preset, transcript)
@@ -110,32 +110,38 @@ func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcri
 	raw, err := s.completeJSONWithRetry(ctx, client, messages, schema, logger)
 	if err != nil {
 		if isContextOverflow(err) {
-			title, summary, chunkErr := s.summarizeChunked(ctx, client, preset, transcript, logger)
+			title, summary, speakerNames, chunkErr := s.summarizeChunked(ctx, client, preset, transcript, logger)
 			if chunkErr == nil {
 				if strings.TrimSpace(title) == "" {
 					title = guaranteedTitle(transcript)
 				}
-				return title, strings.TrimSpace(summary), nil
+				return title, strings.TrimSpace(summary), speakerNames, nil
 			}
-			return guaranteedTitle(transcript), "", fmt.Errorf("summarize chunked after overflow: %w", chunkErr)
+			return guaranteedTitle(transcript), "", "{}", fmt.Errorf("summarize chunked after overflow: %w", chunkErr)
 		}
-		return guaranteedTitle(transcript), "", err
+		return guaranteedTitle(transcript), "", "{}", err
 	}
 
 	parsed, parseErr := parseStructuredSummary(raw)
 	if parseErr != nil {
-		return guaranteedTitle(transcript), strings.TrimSpace(string(raw)), nil
+		return guaranteedTitle(transcript), strings.TrimSpace(string(raw)), "{}", nil
 	}
 	if strings.TrimSpace(parsed.Title) == "" {
 		parsed.Title = guaranteedTitle(transcript)
 	}
 
-	return strings.TrimSpace(parsed.Title), strings.TrimSpace(parsed.Summary), nil
+	return strings.TrimSpace(parsed.Title), strings.TrimSpace(parsed.Summary), parsed.speakerNamesJSON(), nil
 }
 
 type parsedSummary struct {
-	Title   string `json:"title"`
-	Summary string `json:"summary"`
+	Title    string                         `json:"title"`
+	Summary  string                         `json:"summary"`
+	Speakers map[string]speakerNameMetadata `json:"speakers,omitempty"`
+}
+
+type speakerNameMetadata struct {
+	Name       string `json:"name"`
+	Confidence string `json:"confidence"`
 }
 
 func parseStructuredSummary(raw json.RawMessage) (parsedSummary, error) {
@@ -143,7 +149,30 @@ func parseStructuredSummary(raw json.RawMessage) (parsedSummary, error) {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return parsedSummary{}, err
 	}
+	for speakerID, meta := range parsed.Speakers {
+		meta.Name = strings.TrimSpace(meta.Name)
+		meta.Confidence = strings.TrimSpace(meta.Confidence)
+		if meta.Name == "" {
+			delete(parsed.Speakers, speakerID)
+			continue
+		}
+		if meta.Confidence != "mentioned" && meta.Confidence != "inferred" {
+			meta.Confidence = "inferred"
+		}
+		parsed.Speakers[speakerID] = meta
+	}
 	return parsed, nil
+}
+
+func (p parsedSummary) speakerNamesJSON() string {
+	if len(p.Speakers) == 0 {
+		return "{}"
+	}
+	b, err := json.Marshal(p.Speakers)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 func (s *Summarizer) shouldChunk(transcript string) bool {
@@ -164,12 +193,14 @@ func (s *Summarizer) structuredMessages(preset config.Preset, transcript string)
 
 	user := strings.TrimSpace(strings.Join([]string{
 		"Summarize the transcript in BLUF style.",
+		"Also extract speaker names if mentioned in the transcript. Use 'mentioned' confidence if the name was explicitly said, 'inferred' if you're guessing from context.",
 		"Output requirements:",
 		`- title: 4-10 words, specific, non-empty`,
 		`- summary: markdown starting with '## BLUF', followed by sections for Decisions, Key Outcomes, and Risks/Notes`,
+		`- speakers: object keyed by speaker ID (for example "0", "1"), each value with fields {"name":"<speaker name>","confidence":"mentioned|inferred"}`,
 		"Respond as JSON only.",
 		"Example output:",
-		`{"title":"Q2 roadmap alignment","summary":"## BLUF\nTeam aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint."}`,
+		`{"title":"Q2 roadmap alignment","summary":"## BLUF\nTeam aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint.","speakers":{"0":{"name":"Ben","confidence":"mentioned"}}}`,
 		"Transcript:",
 		rendered,
 	}, "\n\n"))
@@ -193,6 +224,19 @@ func structuredSchema() map[string]any {
 			"summary": map[string]any{
 				"type":        "string",
 				"description": "Markdown BLUF summary with Decisions, Key Outcomes, and Risks/Notes sections.",
+			},
+			"speakers": map[string]any{
+				"type": "object",
+				"additionalProperties": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"name": map[string]any{"type": "string"},
+						"confidence": map[string]any{
+							"type": "string",
+							"enum": []string{"mentioned", "inferred"},
+						},
+					},
+				},
 			},
 		},
 		"required":             required,
@@ -299,10 +343,10 @@ func isContextOverflow(err error) bool {
 	return false
 }
 
-func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, preset config.Preset, transcript string, logger *slog.Logger) (string, string, error) {
+func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, preset config.Preset, transcript string, logger *slog.Logger) (string, string, string, error) {
 	chunks := splitTranscript(transcript, s.chunkSizeTokens, s.chunkOverlapTokens)
 	if len(chunks) == 0 {
-		return guaranteedTitle(transcript), "", nil
+		return guaranteedTitle(transcript), "", "{}", nil
 	}
 
 	chunkSummaries := make([]string, 0, len(chunks))
@@ -313,7 +357,7 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 		}
 		text, err := s.completeTextWithRetry(ctx, client, messages, logger)
 		if err != nil {
-			return "", "", fmt.Errorf("summarize chunk %d: %w", i+1, err)
+			return "", "", "{}", fmt.Errorf("summarize chunk %d: %w", i+1, err)
 		}
 		chunkSummaries = append(chunkSummaries, strings.TrimSpace(text))
 	}
@@ -322,16 +366,16 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 	mergeMessages := s.structuredMessages(preset, mergeTranscript)
 	mergeRaw, err := s.completeJSONWithRetry(ctx, client, mergeMessages, structuredSchema(), logger)
 	if err != nil {
-		return "", "", fmt.Errorf("merge chunk summaries: %w", err)
+		return "", "", "{}", fmt.Errorf("merge chunk summaries: %w", err)
 	}
 	merged, parseErr := parseStructuredSummary(mergeRaw)
 	if parseErr != nil {
-		return guaranteedTitle(transcript), strings.TrimSpace(string(mergeRaw)), nil
+		return guaranteedTitle(transcript), strings.TrimSpace(string(mergeRaw)), "{}", nil
 	}
 	if strings.TrimSpace(merged.Title) == "" {
 		merged.Title = guaranteedTitle(transcript)
 	}
-	return strings.TrimSpace(merged.Title), strings.TrimSpace(merged.Summary), nil
+	return strings.TrimSpace(merged.Title), strings.TrimSpace(merged.Summary), merged.speakerNamesJSON(), nil
 }
 
 func (s *Summarizer) completeTextWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, logger *slog.Logger) (string, error) {

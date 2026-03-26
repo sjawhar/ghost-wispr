@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 )
 
@@ -38,10 +39,10 @@ type ControlHooks struct {
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {
-	return HandlerWithLogger(staticFS, hub, store, controls, authToken, healthChecker, slog.Default(), cfgStore...)
+	return HandlerWithLogger(staticFS, hub, store, controls, authToken, healthChecker, slog.Default(), nil, cfgStore...)
 }
 
-func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, logger *slog.Logger, cfgStore ...*config.Store) (http.Handler, error) {
+func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, logger *slog.Logger, embeddingClient embedding.Client, cfgStore ...*config.Store) (http.Handler, error) {
 	moduleLogger := logging.WithModule(logger, "server")
 	if healthChecker == nil {
 		healthChecker = &DefaultHealthChecker{}
@@ -53,7 +54,7 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	if len(cfgStore) > 0 {
 		cs = cfgStore[0]
 	}
-	registerAPIRoutes(mux, store, controls, healthChecker, cs)
+	registerAPIRoutes(mux, store, controls, healthChecker, cs, embeddingClient)
 
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))
@@ -65,7 +66,7 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 
 func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) error {
 	logger := logging.WithModule(slog.Default(), "server")
-	h, err := HandlerWithLogger(staticFS, hub, store, controls, authToken, healthChecker, logger, cfgStore...)
+	h, err := HandlerWithLogger(staticFS, hub, store, controls, authToken, healthChecker, logger, nil, cfgStore...)
 	if err != nil {
 		return err
 	}

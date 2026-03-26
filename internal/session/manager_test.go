@@ -85,7 +85,7 @@ func (s *storeMock) GetSegments(sessionID string) ([]transcribe.Segment, error) 
 	return list, nil
 }
 
-func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset string) error {
+func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.title[sessionID] = title
@@ -197,14 +197,14 @@ type transcriptCapturingSummarizer struct {
 	transcriptC chan string
 }
 
-func (s transcriptCapturingSummarizer) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, error) {
+func (s transcriptCapturingSummarizer) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, string, error) {
 	if s.called != nil {
 		s.called <- sessionID
 	}
 	if s.transcriptC != nil {
 		s.transcriptC <- transcript
 	}
-	return "Auto title", "## Summary\n- " + transcript, "default", nil
+	return "Auto title", "## Summary\n- " + transcript, "default", "{}", nil
 }
 
 type batchTranscriberMock struct {
@@ -238,11 +238,11 @@ func (s syncerMock) SyncSession(_ context.Context, sessionID string) error {
 	return nil
 }
 
-func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, error) {
+func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, string, error) {
 	if s.called != nil {
 		s.called <- sessionID
 	}
-	return "Auto title", "## Summary\n- " + transcript, "default", nil
+	return "Auto title", "## Summary\n- " + transcript, "default", "{}", nil
 }
 
 type contextProbeSummarizer struct {
@@ -250,19 +250,19 @@ type contextProbeSummarizer struct {
 	stateC chan error
 }
 
-func (s contextProbeSummarizer) Summarize(ctx context.Context, _ string, transcript string) (string, string, string, error) {
+func (s contextProbeSummarizer) Summarize(ctx context.Context, _ string, transcript string) (string, string, string, string, error) {
 	time.Sleep(s.delay)
 	select {
 	case <-ctx.Done():
 		if s.stateC != nil {
 			s.stateC <- ctx.Err()
 		}
-		return "", "", "default", ctx.Err()
+		return "", "", "default", "{}", ctx.Err()
 	default:
 		if s.stateC != nil {
 			s.stateC <- nil
 		}
-		return "Auto title", "## Summary\n- " + transcript, "default", nil
+		return "Auto title", "## Summary\n- " + transcript, "default", "{}", nil
 	}
 }
 

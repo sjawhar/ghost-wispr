@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -67,6 +69,7 @@ type Session struct {
 	Summary             string     `json:"summary"`
 	SummaryStatus       string     `json:"summary_status"`
 	SummaryPreset       string     `json:"summary_preset"`
+	SpeakerNames        string     `json:"speaker_names"`
 	RefinedTranscript   string     `json:"refined_transcript"`
 	RefinementStatus    string     `json:"refinement_status"`
 	AudioPath           string     `json:"audio_path"`
@@ -86,6 +89,58 @@ type SearchResult struct {
 	Title     string  `json:"title"`
 	Snippet   string  `json:"snippet"`
 	Rank      float64 `json:"rank"`
+}
+
+type SearchOptions struct {
+	DateFrom string // RFC3339 format, optional
+	DateTo   string // RFC3339 format, optional
+	Preset   string // summary_preset value, optional
+	Speaker  string // speaker name or numeric index, optional
+}
+
+// AggregateOptions controls filtering and grouping for cross-session aggregation.
+type AggregateOptions struct {
+	DateFrom string // RFC3339 format, optional
+	DateTo   string // RFC3339 format, optional
+	Preset   string // summary_preset value, optional
+	GroupBy  string // "date" (default) or "preset"
+}
+
+// AggregateResult holds cross-session statistics.
+type AggregateResult struct {
+	SessionCount int              `json:"session_count"`
+	Groups       []AggregateGroup `json:"groups"`
+}
+
+// AggregateGroup is a single grouping bucket.
+type AggregateGroup struct {
+	Key      string           `json:"key"`
+	Count    int              `json:"count"`
+	Sessions []SessionSummary `json:"sessions"`
+}
+
+// SessionSummary is a lightweight session representation for aggregation.
+type SessionSummary struct {
+	ID            string    `json:"id"`
+	Title         string    `json:"title"`
+	StartedAt     time.Time `json:"started_at"`
+	SummaryPreset string    `json:"summary_preset"`
+}
+
+type StoredEmbedding struct {
+	SessionID  string
+	ChunkIndex int
+	Vector     []float32
+	TextHash   string
+	Model      string
+	CreatedAt  time.Time
+}
+
+type StoredEvent struct {
+	ID        int64     `json:"id"`
+	EventType string    `json:"event_type"`
+	Payload   string    `json:"payload"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
@@ -201,6 +256,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			summary TEXT NOT NULL DEFAULT '',
 			summary_status TEXT NOT NULL DEFAULT 'pending',
 			summary_preset TEXT NOT NULL DEFAULT '',
+			speaker_names TEXT NOT NULL DEFAULT '{}',
 			refined_transcript TEXT NOT NULL DEFAULT '',
 			refinement_status TEXT NOT NULL DEFAULT 'pending',
 			audio_path TEXT NOT NULL DEFAULT '',
@@ -231,6 +287,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 	// Only ignore "duplicate column" errors; propagate other failures.
 	for _, stmt := range []string{
 		`ALTER TABLE sessions ADD COLUMN summary_preset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN speaker_names TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'pending'`,
 		`ALTER TABLE sessions ADD COLUMN gdrive_folder_id TEXT NOT NULL DEFAULT ''`,
@@ -300,11 +357,41 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create summary_requests table: %w", err)
 	}
 
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS embeddings (
+			session_id TEXT NOT NULL,
+			chunk_index INTEGER NOT NULL,
+			embedding BLOB NOT NULL,
+			text_hash TEXT NOT NULL,
+			model TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (session_id, chunk_index),
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create embeddings table: %w", err)
+	}
+
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at)"); err != nil {
 		return fmt.Errorf("create sessions index: %w", err)
 	}
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_segments_session_id ON segments(session_id, timestamp)"); err != nil {
 		return fmt.Errorf("create segments index: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS mcp_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_type TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+	`); err != nil {
+		return fmt.Errorf("create mcp_events table: %w", err)
+	}
+
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_mcp_events_created_at ON mcp_events(created_at)"); err != nil {
+		return fmt.Errorf("create mcp_events index: %w", err)
 	}
 
 	return nil
@@ -484,7 +571,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -528,7 +615,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -541,7 +628,7 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -549,7 +636,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -615,14 +702,52 @@ func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error
 	return segments, nil
 }
 
-func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset string) error {
+func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
+	rows, err := s.db.Query(
+		`SELECT speaker, text, start_time, end_time, timestamp
+		 FROM segments
+		 WHERE session_id = ? AND start_time >= ? AND end_time <= ?
+		 ORDER BY start_time`,
+		sessionID, startTime, endTime,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query segments in time range for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	segments := make([]transcribe.Segment, 0, 32)
+	for rows.Next() {
+		var seg transcribe.Segment
+		var ts string
+		if err := rows.Scan(&seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
+		}
+
+		parsedTS, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			return nil, fmt.Errorf("parse segment timestamp in time range for session %s: %w", sessionID, err)
+		}
+		seg.Timestamp = parsedTS
+
+		segments = append(segments, seg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate segment rows in time range for session %s: %w", sessionID, err)
+	}
+
+	return segments, nil
+}
+
+func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET title = CASE WHEN ? != '' THEN ? ELSE title END, summary = ?, summary_status = ?, summary_preset = ? WHERE id = ?`,
+		`UPDATE sessions SET title = CASE WHEN ? != '' THEN ? ELSE title END, summary = ?, summary_status = ?, summary_preset = ?, speaker_names = ? WHERE id = ?`,
 		title,
 		title,
 		summary,
 		status,
 		preset,
+		speakerNames,
 		sessionID,
 	)
 	if err != nil {
@@ -828,7 +953,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -949,7 +1074,7 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -1045,8 +1170,8 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 	}
 
 	_, err = tx.Exec(
-		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, canonical_transcript, transcript_source)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, canonical_transcript, transcript_source)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ID,
 		sess.Title,
 		sess.StartedAt.UTC().Format(time.RFC3339Nano),
@@ -1055,6 +1180,7 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		sess.Summary,
 		sess.SummaryStatus,
 		sess.SummaryPreset,
+		sess.SpeakerNames,
 		sess.RefinedTranscript,
 		sess.RefinementStatus,
 		sess.AudioPath,
@@ -1099,29 +1225,54 @@ func (s *SQLiteStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
-func (s *SQLiteStore) Search(query string) ([]SearchResult, error) {
+func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, error) {
 	matchQuery := buildFTS5MatchQuery(query)
 	if matchQuery == "" {
 		return []SearchResult{}, nil
 	}
 
-	rows, err := s.db.Query(
-		`SELECT sessions.id,
-		        sessions.title,
-		        COALESCE(
-		          NULLIF(snippet(sessions_fts, 2, '<mark>', '</mark>', ' … ', 24), ''),
-		          NULLIF(snippet(sessions_fts, 1, '<mark>', '</mark>', ' … ', 24), ''),
-		          sessions.title
-		        ) AS snippet,
-		        bm25(sessions_fts) AS rank
-		 FROM sessions_fts
-		 JOIN sessions ON sessions.rowid = sessions_fts.rowid
-		 WHERE sessions_fts MATCH ?
-		   AND sessions.status NOT IN ('discarded', 'merged')
-		 ORDER BY rank ASC
-		 LIMIT 50`,
-		matchQuery,
-	)
+	// Build WHERE clause with optional filters
+	whereConditions := []string{
+		"sessions_fts MATCH ?",
+		"sessions.status NOT IN ('discarded', 'merged')",
+	}
+	args := []any{matchQuery}
+
+	// Add date_from filter if provided
+	if opts.DateFrom != "" {
+		whereConditions = append(whereConditions, "sessions.started_at >= ?")
+		args = append(args, opts.DateFrom)
+	}
+
+	// Add date_to filter if provided
+	if opts.DateTo != "" {
+		whereConditions = append(whereConditions, "sessions.started_at <= ?")
+		args = append(args, opts.DateTo)
+	}
+
+	// Add preset filter if provided
+	if opts.Preset != "" {
+		whereConditions = append(whereConditions, "sessions.summary_preset = ?")
+		args = append(args, opts.Preset)
+	}
+
+	whereClause := strings.Join(whereConditions, " AND ")
+
+	sqlQuery := fmt.Sprintf(`SELECT sessions.id,
+	        sessions.title,
+	        COALESCE(
+	          NULLIF(snippet(sessions_fts, 2, '<mark>', '</mark>', ' … ', 24), ''),
+	          NULLIF(snippet(sessions_fts, 1, '<mark>', '</mark>', ' … ', 24), ''),
+	          sessions.title
+	        ) AS snippet,
+	        bm25(sessions_fts) AS rank
+	 FROM sessions_fts
+	 JOIN sessions ON sessions.rowid = sessions_fts.rowid
+	 WHERE %s
+	 ORDER BY rank ASC
+	 LIMIT 50`, whereClause)
+
+	rows, err := s.db.Query(sqlQuery, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search sessions: %w", err)
 	}
@@ -1167,4 +1318,317 @@ func buildFTS5MatchQuery(query string) string {
 	}
 
 	return strings.Join(quoted, " AND ")
+}
+
+// AggregateSessions returns cross-session statistics grouped by date or preset.
+func (s *SQLiteStore) AggregateSessions(opts AggregateOptions) (AggregateResult, error) {
+	query := `SELECT id, title, started_at, summary_preset FROM sessions WHERE status NOT IN ('discarded', 'merged')`
+	var args []any
+
+	if opts.DateFrom != "" {
+		query += ` AND started_at >= ?`
+		args = append(args, opts.DateFrom)
+	}
+	if opts.DateTo != "" {
+		query += ` AND started_at <= ?`
+		args = append(args, opts.DateTo)
+	}
+	if opts.Preset != "" {
+		query += ` AND summary_preset = ?`
+		args = append(args, opts.Preset)
+	}
+	query += ` ORDER BY started_at DESC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return AggregateResult{}, fmt.Errorf("aggregate sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	groupBy := opts.GroupBy
+	if groupBy == "" {
+		groupBy = "date"
+	}
+
+	groupMap := make(map[string]*AggregateGroup)
+	var groupOrder []string
+	var totalCount int
+
+	for rows.Next() {
+		var id, title, startedAtStr, preset string
+		if err := rows.Scan(&id, &title, &startedAtStr, &preset); err != nil {
+			return AggregateResult{}, fmt.Errorf("scan aggregate session: %w", err)
+		}
+
+		parsedStart, err := time.Parse(time.RFC3339Nano, startedAtStr)
+		if err != nil {
+			return AggregateResult{}, fmt.Errorf("parse aggregate started_at: %w", err)
+		}
+
+		var key string
+		if groupBy == "preset" {
+			key = preset
+		} else {
+			key = parsedStart.Format("2006-01-02")
+		}
+
+		g, ok := groupMap[key]
+		if !ok {
+			g = &AggregateGroup{Key: key}
+			groupMap[key] = g
+			groupOrder = append(groupOrder, key)
+		}
+		g.Count++
+		g.Sessions = append(g.Sessions, SessionSummary{
+			ID:            id,
+			Title:         title,
+			StartedAt:     parsedStart,
+			SummaryPreset: preset,
+		})
+		totalCount++
+	}
+	if err := rows.Err(); err != nil {
+		return AggregateResult{}, fmt.Errorf("iterate aggregate rows: %w", err)
+	}
+
+	groups := make([]AggregateGroup, 0, len(groupOrder))
+	for _, key := range groupOrder {
+		groups = append(groups, *groupMap[key])
+	}
+
+	return AggregateResult{
+		SessionCount: totalCount,
+		Groups:       groups,
+	}, nil
+}
+
+// StoreEmbedding stores an embedding vector for a session chunk.
+func (s *SQLiteStore) StoreEmbedding(sessionID string, chunkIndex int, vector []float32, textHash, model string) error {
+	// Serialize vector to BLOB
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, vector); err != nil {
+		return fmt.Errorf("serialize embedding vector: %w", err)
+	}
+
+	_, err := s.db.Exec(
+		`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model)
+		 VALUES(?, ?, ?, ?, ?)
+		 ON CONFLICT(session_id, chunk_index)
+		 DO UPDATE SET embedding = excluded.embedding, text_hash = excluded.text_hash, model = excluded.model, created_at = CURRENT_TIMESTAMP`,
+		sessionID, chunkIndex, buf.Bytes(), textHash, model,
+	)
+	if err != nil {
+		return fmt.Errorf("store embedding for session %s chunk %d: %w", sessionID, chunkIndex, err)
+	}
+	return nil
+}
+
+// GetEmbeddings retrieves all embeddings for a session.
+func (s *SQLiteStore) GetEmbeddings(sessionID string) ([]StoredEmbedding, error) {
+	rows, err := s.db.Query(
+		`SELECT session_id, chunk_index, embedding, text_hash, model, created_at FROM embeddings WHERE session_id = ? ORDER BY chunk_index ASC`,
+		sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query embeddings for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var embeddings []StoredEmbedding
+	for rows.Next() {
+		var emb StoredEmbedding
+		var embeddingBlob []byte
+		var createdAtStr string
+
+		if err := rows.Scan(&emb.SessionID, &emb.ChunkIndex, &embeddingBlob, &emb.TextHash, &emb.Model, &createdAtStr); err != nil {
+			return nil, fmt.Errorf("scan embedding for session %s: %w", sessionID, err)
+		}
+
+		// Deserialize vector from BLOB
+		buf := bytes.NewReader(embeddingBlob)
+		var vector []float32
+		for {
+			var f float32
+			if err := binary.Read(buf, binary.LittleEndian, &f); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("deserialize embedding vector for session %s: %w", sessionID, err)
+			}
+			vector = append(vector, f)
+		}
+		emb.Vector = vector
+
+		// Parse timestamp
+		parsedTime, err := time.Parse(time.RFC3339Nano, createdAtStr)
+		if err != nil {
+			// Fallback to parsing as SQLite datetime format
+			parsedTime, err = time.Parse("2006-01-02 15:04:05", createdAtStr)
+			if err != nil {
+				return nil, fmt.Errorf("parse created_at for session %s: %w", sessionID, err)
+			}
+		}
+		emb.CreatedAt = parsedTime
+
+		embeddings = append(embeddings, emb)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate embeddings for session %s: %w", sessionID, err)
+	}
+
+	return embeddings, nil
+}
+
+// GetAllEmbeddings retrieves all embeddings across all sessions.
+func (s *SQLiteStore) GetAllEmbeddings() ([]StoredEmbedding, error) {
+	rows, err := s.db.Query(
+		`SELECT session_id, chunk_index, embedding, text_hash, model, created_at FROM embeddings ORDER BY session_id ASC, chunk_index ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query all embeddings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var embeddings []StoredEmbedding
+	for rows.Next() {
+		var emb StoredEmbedding
+		var embeddingBlob []byte
+		var createdAtStr string
+
+		if err := rows.Scan(&emb.SessionID, &emb.ChunkIndex, &embeddingBlob, &emb.TextHash, &emb.Model, &createdAtStr); err != nil {
+			return nil, fmt.Errorf("scan embedding: %w", err)
+		}
+
+		// Deserialize vector from BLOB
+		buf := bytes.NewReader(embeddingBlob)
+		var vector []float32
+		for {
+			var f float32
+			if err := binary.Read(buf, binary.LittleEndian, &f); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("deserialize embedding vector: %w", err)
+			}
+			vector = append(vector, f)
+		}
+		emb.Vector = vector
+
+		// Parse timestamp
+		parsedTime, err := time.Parse(time.RFC3339Nano, createdAtStr)
+		if err != nil {
+			// Fallback to parsing as SQLite datetime format
+			parsedTime, err = time.Parse("2006-01-02 15:04:05", createdAtStr)
+			if err != nil {
+				return nil, fmt.Errorf("parse created_at: %w", err)
+			}
+		}
+		emb.CreatedAt = parsedTime
+
+		embeddings = append(embeddings, emb)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate all embeddings: %w", err)
+	}
+
+	return embeddings, nil
+}
+
+func (s *SQLiteStore) GetSessionsWithoutEmbeddings() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT s.id
+		 FROM sessions s
+		 LEFT JOIN embeddings e ON e.session_id = s.id
+		 WHERE s.status = 'ended'
+		   AND s.canonical_transcript IS NOT NULL
+		   AND TRIM(s.canonical_transcript) != ''
+		 GROUP BY s.id
+		 HAVING COUNT(e.session_id) = 0
+		 ORDER BY s.started_at ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query sessions without embeddings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	ids := make([]string, 0, 16)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan session without embeddings: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions without embeddings: %w", err)
+	}
+
+	return ids, nil
+}
+
+// DeleteEmbeddings deletes all embeddings for a session.
+func (s *SQLiteStore) DeleteEmbeddings(sessionID string) error {
+	_, err := s.db.Exec(`DELETE FROM embeddings WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return fmt.Errorf("delete embeddings for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// StoreEvent inserts an event into the mcp_events table.
+func (s *SQLiteStore) StoreEvent(eventType, payload string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO mcp_events(event_type, payload) VALUES(?, ?)`,
+		eventType, payload,
+	)
+	if err != nil {
+		return fmt.Errorf("store event %s: %w", eventType, err)
+	}
+	return nil
+}
+
+// GetEventsSince returns events with id > cursor, ordered by id ASC, limited to limit.
+func (s *SQLiteStore) GetEventsSince(cursor int64, limit int) ([]StoredEvent, error) {
+	rows, err := s.db.Query(
+		`SELECT id, event_type, payload, created_at FROM mcp_events WHERE id > ? ORDER BY id ASC LIMIT ?`,
+		cursor, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get events since %d: %w", cursor, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var events []StoredEvent
+	for rows.Next() {
+		var ev StoredEvent
+		var createdAtStr string
+		if err := rows.Scan(&ev.ID, &ev.EventType, &ev.Payload, &createdAtStr); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		parsedTime, err := time.Parse("2006-01-02 15:04:05", createdAtStr)
+		if err != nil {
+			parsedTime, err = time.Parse(time.RFC3339Nano, createdAtStr)
+			if err != nil {
+				return nil, fmt.Errorf("parse event created_at: %w", err)
+			}
+		}
+		ev.CreatedAt = parsedTime
+		events = append(events, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate events: %w", err)
+	}
+	return events, nil
+}
+
+// PurgeOldEvents deletes events older than maxAge.
+func (s *SQLiteStore) PurgeOldEvents(maxAge time.Duration) error {
+	cutoff := time.Now().UTC().Add(-maxAge).Format("2006-01-02 15:04:05")
+	_, err := s.db.Exec(`DELETE FROM mcp_events WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return fmt.Errorf("purge old events: %w", err)
+	}
+	return nil
 }

@@ -96,7 +96,7 @@ func TestSummarizeSinglePreset(t *testing.T) {
 	})
 	s.sleep = func(time.Duration) {}
 
-	title, summaryText, preset, err := s.Summarize(context.Background(), "session-1", transcript)
+	title, summaryText, preset, _, err := s.Summarize(context.Background(), "session-1", transcript)
 	if err != nil {
 		t.Fatalf("Summarize failed: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestSummarizeSkipsShortTranscript(t *testing.T) {
 		return client, nil
 	})
 
-	title, summaryText, preset, err := s.Summarize(context.Background(), "session-1", "too short")
+	title, summaryText, preset, _, err := s.Summarize(context.Background(), "session-1", "too short")
 	if err != nil {
 		t.Fatalf("Summarize returned error: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestSummarizeRendersTemplate(t *testing.T) {
 		return client, nil
 	})
 
-	_, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	_, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset failed: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestSummarizeWithPreset(t *testing.T) {
 		return client, nil
 	})
 
-	title, summaryText, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "detailed")
+	title, summaryText, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "detailed")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset failed: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestSummarizeRetries(t *testing.T) {
 		sleeps = append(sleeps, d)
 	}
 
-	title, summaryText, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	title, summaryText, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset failed: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestRetryOnRateLimit429(t *testing.T) {
 	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
 	s.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
 
-	title, summaryText, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	title, summaryText, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset failed: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestNoRetryOnBadRequest400(t *testing.T) {
 	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
 	s.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
 
-	_, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	_, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -351,7 +351,7 @@ func TestChunkingLongTranscriptAndMerge(t *testing.T) {
 	s.chunkSizeTokens = 80
 	s.chunkOverlapTokens = 20
 
-	title, summaryText, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	title, summaryText, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset failed: %v", err)
 	}
@@ -376,7 +376,7 @@ func TestPromptAndSchemaStructuredConstraints(t *testing.T) {
 
 	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
 
-	_, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	_, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset failed: %v", err)
 	}
@@ -405,6 +405,51 @@ func TestPromptAndSchemaStructuredConstraints(t *testing.T) {
 	}
 }
 
+func TestSpeakerNameExtraction(t *testing.T) {
+	t.Run("mentioned speaker name extracted", func(t *testing.T) {
+		transcript := strings.Join([]string{
+			"Speaker 0: Let's review the launch checklist.",
+			"Speaker 1: Hey Ben, what do you think?",
+			"Speaker 0: We'll ship Friday if QA passes.",
+		}, " ")
+
+		client := &mockLLMClient{response: `{"title":"Launch readiness","summary":"## BLUF\nReady to ship Friday pending QA.","speakers":{"1":{"name":"Ben","confidence":"mentioned"}}}`}
+		cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+			Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
+		}}}
+
+		s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+
+		_, _, _, speakerNames, err := s.Summarize(context.Background(), "session-1", transcript)
+		if err != nil {
+			t.Fatalf("Summarize failed: %v", err)
+		}
+
+		expected := `{"1":{"name":"Ben","confidence":"mentioned"}}`
+		if speakerNames != expected {
+			t.Fatalf("expected speaker names %s, got %s", expected, speakerNames)
+		}
+	})
+
+	t.Run("no names stores empty json", func(t *testing.T) {
+		transcript := buildTranscript(25)
+		client := &mockLLMClient{response: `{"title":"General sync","summary":"## BLUF\nNo names mentioned.","speakers":{}}`}
+		cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+			Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
+		}}}
+
+		s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+
+		_, _, _, speakerNames, err := s.Summarize(context.Background(), "session-1", transcript)
+		if err != nil {
+			t.Fatalf("Summarize failed: %v", err)
+		}
+		if speakerNames != "{}" {
+			t.Fatalf("expected empty speaker names JSON {}, got %s", speakerNames)
+		}
+	})
+}
+
 func TestContextOverflowFallsBackToChunking(t *testing.T) {
 	transcript := buildTranscript(60)
 	client := &mockLLMClient{
@@ -424,7 +469,7 @@ func TestContextOverflowFallsBackToChunking(t *testing.T) {
 	s.chunkSizeTokens = 40
 	s.chunkOverlapTokens = 20
 
-	title, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	title, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
 		t.Fatalf("SummarizeWithPreset failed: %v", err)
 	}
@@ -452,7 +497,7 @@ func TestSummarizeUnknownPreset(t *testing.T) {
 		return &mockLLMClient{response: "ok"}, nil
 	})
 
-	_, _, err := s.SummarizeWithPreset(context.Background(), "session-1", buildTranscript(25), "missing")
+	_, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", buildTranscript(25), "missing")
 	if err == nil {
 		t.Fatal("expected unknown preset error")
 	}

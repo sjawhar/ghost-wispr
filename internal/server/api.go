@@ -7,14 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -25,12 +30,16 @@ var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 type SessionStore interface {
 	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
 	GetSession(id string) (storage.Session, error)
+	GetAllEmbeddings() ([]storage.StoredEmbedding, error)
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
+	GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
 	DeleteSession(id string) error
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
-	Search(query string) ([]storage.SearchResult, error)
+	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
+	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
+	GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -45,7 +54,67 @@ var versionInfo VersionInfo
 // SetVersionInfo sets the build metadata for the /api/version endpoint.
 func SetVersionInfo(v VersionInfo) { versionInfo = v }
 
-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store) {
+// hasSegmentForSpeaker checks if any segment in the list matches the speaker filter.
+// speaker can be a numeric index (e.g., "0", "1") or a speaker name (e.g., "Ben").
+// speakerNames is a JSON string like {"0": {"name": "Ben", ...}, ...}
+func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speakerNames string) bool {
+	if speaker == "" {
+		return true
+	}
+
+	// Try to parse as numeric index first
+	if idx, err := strconv.Atoi(speaker); err == nil {
+		// Numeric speaker index
+		for _, seg := range segments {
+			if seg.Speaker == idx {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Parse as speaker name (case-insensitive)
+	speakerIndex := getSpeakerIndexByName(speakerNames, speaker)
+	if speakerIndex == -1 {
+		return false
+	}
+
+	for _, seg := range segments {
+		if seg.Speaker == speakerIndex {
+			return true
+		}
+	}
+	return false
+}
+
+// getSpeakerIndexByName looks up a speaker index by name in the speakerNames JSON.
+// Returns -1 if not found. Matching is case-insensitive.
+func getSpeakerIndexByName(speakerNames string, name string) int {
+	if speakerNames == "" || speakerNames == "{}" {
+		return -1
+	}
+
+	var speakers map[string]map[string]interface{}
+	if err := json.Unmarshal([]byte(speakerNames), &speakers); err != nil {
+		return -1
+	}
+
+	for idxStr, speakerMap := range speakers {
+		if nameVal, ok := speakerMap["name"]; ok {
+			if speakerName, ok := nameVal.(string); ok {
+				if strings.EqualFold(speakerName, name) {
+					if idx, err := strconv.Atoi(idxStr); err == nil {
+						return idx
+					}
+				}
+			}
+		}
+	}
+
+	return -1
+}
+
+func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
 
 	// Health check endpoints
 	mux.HandleFunc("GET /healthz/live", func(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +159,130 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, versionInfo)
 	})
 
+	mux.HandleFunc("GET /api/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, OpenAPISpec())
+	})
+
+	mux.HandleFunc("GET /api/search/semantic", func(w http.ResponseWriter, r *http.Request) {
+		if embeddingClient == nil {
+			writeJSON(w, http.StatusNotImplemented, map[string]string{
+				"error":      "semantic search unavailable",
+				"suggestion": "use /api/search for keyword search",
+			})
+			return
+		}
+
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			writeJSONError(w, http.StatusBadRequest, "q parameter is required")
+			return
+		}
+
+		limit := 10
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			parsedLimit, err := strconv.Atoi(rawLimit)
+			if err != nil || parsedLimit <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be a positive integer")
+				return
+			}
+			limit = parsedLimit
+		}
+
+		var dateFrom, dateTo *time.Time
+		if rawDateFrom := strings.TrimSpace(r.URL.Query().Get("date_from")); rawDateFrom != "" {
+			parsed, err := time.Parse(time.RFC3339, rawDateFrom)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "date_from must be RFC3339")
+				return
+			}
+			dateFrom = &parsed
+		}
+		if rawDateTo := strings.TrimSpace(r.URL.Query().Get("date_to")); rawDateTo != "" {
+			parsed, err := time.Parse(time.RFC3339, rawDateTo)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "date_to must be RFC3339")
+				return
+			}
+			dateTo = &parsed
+		}
+
+		vectors, err := embeddingClient.Embed(r.Context(), []string{q})
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("embed query: %v", err))
+			return
+		}
+		if len(vectors) == 0 {
+			writeJSONError(w, http.StatusInternalServerError, "embed query: no vectors returned")
+			return
+		}
+
+		allEmbeddings, err := store.GetAllEmbeddings()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load embeddings: %v", err))
+			return
+		}
+		if len(allEmbeddings) == 0 {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "no embeddings indexed yet"})
+			return
+		}
+
+		type scoredEmbedding struct {
+			sessionID  string
+			title      string
+			similarity float32
+			chunkIndex int
+		}
+
+		// Build a session cache and pre-filter embeddings by date
+		sessionCache := make(map[string]*storage.Session)
+		queryVector := vectors[0]
+		scored := make([]scoredEmbedding, 0, len(allEmbeddings))
+		for _, emb := range allEmbeddings {
+			sess, ok := sessionCache[emb.SessionID]
+			if !ok {
+				s, err := store.GetSession(emb.SessionID)
+				if err != nil {
+					continue
+				}
+				sess = &s
+				sessionCache[emb.SessionID] = sess
+			}
+			if dateFrom != nil && sess.StartedAt.Before(*dateFrom) {
+				continue
+			}
+			if dateTo != nil && sess.StartedAt.After(*dateTo) {
+				continue
+			}
+			scored = append(scored, scoredEmbedding{
+				sessionID:  emb.SessionID,
+				title:      sess.Title,
+				similarity: cosineSimilarity(queryVector, emb.Vector),
+				chunkIndex: emb.ChunkIndex,
+			})
+		}
+
+		sort.Slice(scored, func(i, j int) bool {
+			return scored[i].similarity > scored[j].similarity
+		})
+
+		if limit > len(scored) {
+			limit = len(scored)
+		}
+		top := scored[:limit]
+
+		results := make([]map[string]any, 0, len(top))
+		for _, item := range top {
+			results = append(results, map[string]any{
+				"session_id":  item.sessionID,
+				"title":       item.title,
+				"similarity":  item.similarity,
+				"chunk_index": item.chunkIndex,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{"results": results})
+	})
+
 	// Full-text search endpoint
 	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -97,12 +290,144 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSON(w, http.StatusOK, []storage.SearchResult{})
 			return
 		}
-		results, err := store.Search(q)
+		opts := storage.SearchOptions{
+			DateFrom: strings.TrimSpace(r.URL.Query().Get("date_from")),
+			DateTo:   strings.TrimSpace(r.URL.Query().Get("date_to")),
+			Preset:   strings.TrimSpace(r.URL.Query().Get("preset")),
+			Speaker:  strings.TrimSpace(r.URL.Query().Get("speaker")),
+		}
+		results, err := store.Search(q, opts)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("search failed: %v", err))
 			return
 		}
+
+		// Filter results by speaker if specified
+		if opts.Speaker != "" {
+			filtered := make([]storage.SearchResult, 0, len(results))
+			for _, result := range results {
+				sess, err := store.GetSession(result.SessionID)
+				if err != nil {
+					slog.Warn("speaker filter: failed to load session", "session_id", result.SessionID, "error", err)
+					continue
+				}
+
+				// Get segments for this session
+				segs, err := store.GetSegments(result.SessionID)
+				if err != nil {
+					slog.Warn("speaker filter: failed to load segments", "session_id", result.SessionID, "error", err)
+					continue
+				}
+
+				// Check if any segment matches the speaker filter
+				if hasSegmentForSpeaker(segs, opts.Speaker, sess.SpeakerNames) {
+					filtered = append(filtered, result)
+				}
+			}
+			results = filtered
+		}
+
 		writeJSON(w, http.StatusOK, results)
+	})
+
+	// Event polling endpoint
+	mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
+		// Parse cursor (default 0)
+		cursor := int64(0)
+		if rawCursor := strings.TrimSpace(r.URL.Query().Get("cursor")); rawCursor != "" {
+			parsedCursor, err := strconv.ParseInt(rawCursor, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "cursor must be a valid integer")
+				return
+			}
+			cursor = parsedCursor
+		}
+
+		// Parse limit (default 50, max 200)
+		limit := 50
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			parsedLimit, err := strconv.Atoi(rawLimit)
+			if err != nil || parsedLimit <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be a positive integer")
+				return
+			}
+			if parsedLimit > 200 {
+				parsedLimit = 200
+			}
+			limit = parsedLimit
+		}
+
+		// Parse types filter (comma-separated)
+		var typeFilter map[string]bool
+		if rawTypes := strings.TrimSpace(r.URL.Query().Get("types")); rawTypes != "" {
+			typeFilter = make(map[string]bool)
+			for _, t := range strings.Split(rawTypes, ",") {
+				if trimmed := strings.TrimSpace(t); trimmed != "" {
+					typeFilter[trimmed] = true
+				}
+			}
+		}
+
+		// Fetch events with limit+1 to detect has_more
+		events, err := store.GetEventsSince(cursor, limit+1)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("fetch events: %v", err))
+			return
+		}
+
+		// Determine has_more and trim to limit
+		hasMore := len(events) > limit
+		if hasMore {
+			events = events[:limit]
+		}
+
+		// Filter by types if specified
+		if len(typeFilter) > 0 {
+			filtered := make([]storage.StoredEvent, 0, len(events))
+			for _, ev := range events {
+				if typeFilter[ev.EventType] {
+					filtered = append(filtered, ev)
+				}
+			}
+			events = filtered
+		}
+
+		// Calculate next_cursor (ID of last event, or cursor if no events)
+		nextCursor := cursor
+		if len(events) > 0 {
+			nextCursor = events[len(events)-1].ID
+		}
+
+		// Parse payloads into map[string]any
+		type EventResponse struct {
+			ID        int64                  `json:"id"`
+			EventType string                 `json:"event_type"`
+			Payload   map[string]interface{} `json:"payload"`
+			CreatedAt time.Time              `json:"created_at"`
+		}
+
+		responseEvents := make([]EventResponse, 0, len(events))
+		for _, ev := range events {
+			var payload map[string]interface{}
+			if err := json.Unmarshal([]byte(ev.Payload), &payload); err != nil {
+				// If payload is not valid JSON, use empty map
+				payload = make(map[string]interface{})
+			}
+			responseEvents = append(responseEvents, EventResponse{
+				ID:        ev.ID,
+				EventType: ev.EventType,
+				Payload:   payload,
+				CreatedAt: ev.CreatedAt,
+			})
+		}
+
+		response := map[string]interface{}{
+			"events":      responseEvents,
+			"next_cursor": nextCursor,
+			"has_more":    hasMore,
+		}
+
+		writeJSON(w, http.StatusOK, response)
 	})
 	registerRestoreRoutes(mux, controls)
 	registerLogRoutes(mux, controls)
@@ -194,6 +519,28 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, sessions)
 	})
 
+	mux.HandleFunc("GET /api/sessions/aggregate", func(w http.ResponseWriter, r *http.Request) {
+		opts := storage.AggregateOptions{
+			DateFrom: strings.TrimSpace(r.URL.Query().Get("date_from")),
+			DateTo:   strings.TrimSpace(r.URL.Query().Get("date_to")),
+			Preset:   strings.TrimSpace(r.URL.Query().Get("preset")),
+			GroupBy:  strings.TrimSpace(r.URL.Query().Get("group_by")),
+		}
+		if opts.GroupBy == "" {
+			opts.GroupBy = "date"
+		}
+		if opts.GroupBy != "date" && opts.GroupBy != "preset" {
+			writeJSONError(w, http.StatusBadRequest, "group_by must be 'date' or 'preset'")
+			return
+		}
+		result, err := store.AggregateSessions(opts)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("aggregate sessions: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+
 	mux.HandleFunc("GET /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !validSessionID(sessionID) {
@@ -221,6 +568,46 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"session":  sessionData,
 			"segments": segments,
 		})
+	})
+
+	mux.HandleFunc("GET /api/sessions/{id}/segments", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		// Get session to access speaker names
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+
+		// Get all segments for the session
+		segments, err := store.GetSegments(sessionID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get segments: %v", err))
+			return
+		}
+
+		// Filter by speaker if specified
+		speaker := strings.TrimSpace(r.URL.Query().Get("speaker"))
+		if speaker != "" {
+			filtered := make([]transcribe.Segment, 0, len(segments))
+			for _, seg := range segments {
+				if hasSegmentForSpeaker([]transcribe.Segment{seg}, speaker, sess.SpeakerNames) {
+					filtered = append(filtered, seg)
+				}
+			}
+			segments = filtered
+		}
+
+		writeJSON(w, http.StatusOK, segments)
 	})
 
 	mux.HandleFunc("PATCH /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -407,6 +794,79 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("Content-Type", contentTypeForAudio(cleanPath))
 		http.ServeContent(w, r, filepath.Base(cleanPath), info.ModTime(), f)
+	})
+
+	mux.HandleFunc("GET /api/sessions/{id}/context", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		// Verify session exists
+		if _, err := store.GetSession(sessionID); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("session not found: %v", err))
+			return
+		}
+
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			writeJSONError(w, http.StatusBadRequest, "q parameter is required")
+			return
+		}
+
+		windowSeconds := 300.0
+		if s := r.URL.Query().Get("seconds"); s != "" {
+			parsed, err := strconv.ParseFloat(s, 64)
+			if err != nil || parsed <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "seconds must be a positive number")
+				return
+			}
+			windowSeconds = parsed
+		}
+
+		// Load all segments to find the first text match
+		segments, err := store.GetSegments(sessionID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get segments: %v", err))
+			return
+		}
+
+		qLower := strings.ToLower(q)
+		var matchTime float64
+		found := false
+		for _, seg := range segments {
+			if strings.Contains(strings.ToLower(seg.Text), qLower) {
+				matchTime = seg.StartTime
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("no match found for query %q", q))
+			return
+		}
+
+		// Get segments within the time window around the match
+		half := windowSeconds / 2
+		contextSegments, err := store.GetSegmentsInTimeRange(sessionID, matchTime-half, matchTime+half)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get context segments: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session_id":     sessionID,
+			"query":          q,
+			"match_time":     matchTime,
+			"segments":       contextSegments,
+			"window_seconds": windowSeconds,
+		})
 	})
 
 	mux.HandleFunc("GET /api/dates", func(w http.ResponseWriter, r *http.Request) {
@@ -601,6 +1061,26 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			mux.HandleFunc("POST /api/config/presets/refine", handleRefinePreset(cfgStore, controls.RefinePreset))
 		}
 	}
+}
+
+func cosineSimilarity(a, b []float32) float32 {
+	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
+		return 0
+	}
+
+	var dot, normA, normB float64
+	for i := range a {
+		av := float64(a[i])
+		bv := float64(b[i])
+		dot += av * bv
+		normA += av * av
+		normB += bv * bv
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+
+	return float32(dot / (math.Sqrt(normA) * math.Sqrt(normB)))
 }
 
 func validSessionID(id string) bool {

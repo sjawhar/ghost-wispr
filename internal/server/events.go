@@ -10,6 +10,9 @@ type Event struct {
 	Timestamp string `json:"timestamp"`
 }
 
+// eventType returns the event type string for use in event storage filtering.
+func (e Event) eventType() string { return e.Type }
+
 type LiveTranscriptEvent struct {
 	Event
 	Speaker   int     `json:"speaker"`

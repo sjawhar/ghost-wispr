@@ -10,10 +10,16 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
+// EventStore is the interface for persisting broadcast events.
+type EventStore interface {
+	StoreEvent(eventType, payload string) error
+}
+
 type Hub struct {
-	mu      sync.RWMutex
-	clients map[chan []byte]struct{}
-	logger  *slog.Logger
+	mu         sync.RWMutex
+	clients    map[chan []byte]struct{}
+	logger     *slog.Logger
+	eventStore EventStore
 }
 
 func NewHub(logger ...*slog.Logger) *Hub {
@@ -23,6 +29,11 @@ func NewHub(logger ...*slog.Logger) *Hub {
 	}
 
 	return &Hub{clients: make(map[chan []byte]struct{}), logger: l}
+}
+
+// SetEventStore sets an optional event store for durable event persistence.
+func (h *Hub) SetEventStore(store EventStore) {
+	h.eventStore = store
 }
 
 func (h *Hub) Subscribe() chan []byte {
@@ -113,6 +124,16 @@ func (h *Hub) BroadcastComponentStatus(component, status, message string) {
 	})
 }
 
+// storedEventTypes is the set of event types persisted to the event queue.
+var storedEventTypes = map[string]struct{}{
+	"session_started":  {},
+	"session_ended":    {},
+	"summary_ready":    {},
+	"status_changed":   {},
+	"component_status": {},
+	"live_transcript":  {},
+}
+
 func (h *Hub) broadcastEvent(event any) {
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -120,4 +141,15 @@ func (h *Hub) broadcastEvent(event any) {
 		return
 	}
 	h.Broadcast(payload)
+
+	// Best-effort event persistence — never block the broadcast.
+	if h.eventStore != nil {
+		if evt, ok := event.(interface{ eventType() string }); ok {
+			if _, store := storedEventTypes[evt.eventType()]; store {
+				if err := h.eventStore.StoreEvent(evt.eventType(), string(payload)); err != nil {
+					h.logger.Warn("failed to store event", "operation", "store_event", "event_type", evt.eventType(), "error", err)
+				}
+			}
+		}
+	}
 }
