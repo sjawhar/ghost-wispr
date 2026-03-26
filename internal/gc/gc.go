@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -15,6 +16,7 @@ type Store interface {
 	GetGCEligibleSessions(maxAgeDays int, syncGated bool, diskPressure bool) ([]string, error)
 	GetSession(id string) (storage.Session, error)
 	DeleteSession(id string) error
+	PurgeOldEvents(maxAge time.Duration) error
 }
 
 type Config struct {
@@ -76,6 +78,11 @@ func (c *Collector) Run() ([]string, error) {
 				break
 			}
 		}
+	}
+
+	// Purge old events from the durable event queue (7-day default retention).
+	if err := c.store.PurgeOldEvents(7 * 24 * time.Hour); err != nil {
+		c.logger.Warn("gc failed to purge old events", "operation", "purge_events", "error", err)
 	}
 
 	return deleted, nil

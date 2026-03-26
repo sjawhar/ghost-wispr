@@ -197,7 +197,7 @@ func TestSQLiteCRUD(t *testing.T) {
 		t.Fatalf("AppendSegment failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("UpdateSummary failed: %v", err)
 	}
 
@@ -256,7 +256,7 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise"); err != nil {
+	if err := store.UpdateSummary(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise", "{}"); err != nil {
 		t.Fatalf("UpdateSummary failed: %v", err)
 	}
 
@@ -268,6 +268,46 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 	if session.SummaryPreset != "concise" {
 		t.Fatalf("expected summary_preset %q, got %q", "concise", session.SummaryPreset)
 	}
+}
+
+func TestSpeakerNames(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startedAt := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	sessionID := startedAt.Format("20060102150405")
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	t.Run("UpdateSummary persists speaker_names", func(t *testing.T) {
+		speakerNames := `{"1":{"name":"Ben","confidence":"mentioned"}}`
+		if err := store.UpdateSummary(sessionID, "Speaker notes", "## Summary\n- discussed", SummaryCompleted, "default", speakerNames); err != nil {
+			t.Fatalf("UpdateSummary failed: %v", err)
+		}
+
+		session, err := store.GetSession(sessionID)
+		if err != nil {
+			t.Fatalf("GetSession failed: %v", err)
+		}
+		if session.SpeakerNames != speakerNames {
+			t.Fatalf("expected speaker_names %q, got %q", speakerNames, session.SpeakerNames)
+		}
+	})
+
+	t.Run("speaker_names defaults to empty JSON", func(t *testing.T) {
+		emptyID := "speaker-default-empty"
+		if err := store.CreateSession(emptyID, startedAt.Add(1*time.Minute)); err != nil {
+			t.Fatalf("CreateSession failed: %v", err)
+		}
+
+		var speakerNames string
+		if err := store.DB().QueryRow(`SELECT speaker_names FROM sessions WHERE id = ?`, emptyID).Scan(&speakerNames); err != nil {
+			t.Fatalf("query speaker_names failed: %v", err)
+		}
+		if speakerNames != "{}" {
+			t.Fatalf("expected default speaker_names {}, got %q", speakerNames)
+		}
+	})
 }
 
 func TestBatchRefinement_StoreStatusAndTranscript(t *testing.T) {
@@ -338,7 +378,7 @@ func TestSyncStatusTracking(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -388,7 +428,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default"); err != nil {
+	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -398,7 +438,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default"); err != nil {
+	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -411,7 +451,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default"); err != nil {
+	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -901,7 +941,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-1", started); err != nil {
 		t.Fatalf("create session fts-1: %v", err)
 	}
-	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary fts-1: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha appears once in transcript", "fts-1"); err != nil {
@@ -911,14 +951,14 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-2", started.Add(time.Minute)); err != nil {
 		t.Fatalf("create session fts-2: %v", err)
 	}
-	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary fts-2: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha alpha alpha and alpha again", "fts-2"); err != nil {
 		t.Fatalf("update canonical transcript fts-2: %v", err)
 	}
 
-	results, err := store.Search("alpha")
+	results, err := store.Search("alpha", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -945,11 +985,11 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 	if err := store.CreateSession("fts-sync", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary initial: %v", err)
 	}
 
-	results, err := store.Search("delta")
+	results, err := store.Search("delta", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search initial: %v", err)
 	}
@@ -957,11 +997,11 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected no matches before update, got %d", len(results))
 	}
 
-	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary delta: %v", err)
 	}
 
-	results, err = store.Search("delta")
+	results, err = store.Search("delta", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search after update: %v", err)
 	}
@@ -973,7 +1013,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("delete session: %v", err)
 	}
 
-	results, err = store.Search("delta")
+	results, err = store.Search("delta", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search after delete: %v", err)
 	}
@@ -985,7 +1025,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 func TestFTS5SearchEmptyQueryReturnsEmptyResults(t *testing.T) {
 	store := newTestSQLiteStore(t)
 
-	results, err := store.Search("   ")
+	results, err := store.Search("   ", SearchOptions{})
 	if err != nil {
 		t.Fatalf("search empty query failed: %v", err)
 	}
@@ -1001,15 +1041,598 @@ func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
 	if err := store.CreateSession("fts-escape", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default"); err != nil {
+	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
-	results, err := store.Search(`alpha OR "`)
+	results, err := store.Search(`alpha OR "`, SearchOptions{})
 	if err != nil {
 		t.Fatalf("search with special characters failed: %v", err)
 	}
 	if len(results) != 1 || results[0].SessionID != "fts-escape" {
 		t.Fatalf("expected escaped query to return fts-escape, got %+v", results)
+	}
+}
+
+func TestSearchWithDateFromFilter(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different dates
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	for i, date := range []time.Time{date1, date2, date3} {
+		id := fmt.Sprintf("date-test-%d", i)
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with date_from filter
+	results, err := store.Search("test", SearchOptions{
+		DateFrom: date2.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("search with date_from failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (date2 and date3), got %d", len(results))
+	}
+}
+
+func TestSearchWithDateToFilter(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different dates
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	for i, date := range []time.Time{date1, date2, date3} {
+		id := fmt.Sprintf("date-to-test-%d", i)
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with date_to filter
+	results, err := store.Search("test", SearchOptions{
+		DateTo: date2.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("search with date_to failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (date1 and date2), got %d", len(results))
+	}
+}
+
+func TestSearchWithPresetFilter(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different presets
+	presets := []string{"default", "meeting", "default"}
+	for i, preset := range presets {
+		id := fmt.Sprintf("preset-test-%d", i)
+		date := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with preset filter
+	results, err := store.Search("test", SearchOptions{
+		Preset: "meeting",
+	})
+	if err != nil {
+		t.Fatalf("search with preset failed: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "preset-test-1" {
+		t.Fatalf("expected 1 result for preset 'meeting', got %+v", results)
+	}
+}
+
+func TestSearchWithMultipleFilters(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions with different dates and presets
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	for i, date := range []time.Time{date1, date2, date3} {
+		id := fmt.Sprintf("multi-test-%d", i)
+		preset := "default"
+		if i == 1 {
+			preset = "meeting"
+		}
+		if err := store.CreateSession(id, date); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
+			t.Fatalf("update summary: %v", err)
+		}
+	}
+
+	// Search with both date and preset filters
+	results, err := store.Search("test", SearchOptions{
+		DateFrom: date2.Format(time.RFC3339Nano),
+		DateTo:   date3.Format(time.RFC3339Nano),
+		Preset:   "meeting",
+	})
+	if err != nil {
+		t.Fatalf("search with multiple filters failed: %v", err)
+	}
+	if len(results) != 1 || results[0].SessionID != "multi-test-1" {
+		t.Fatalf("expected 1 result matching all filters, got %+v", results)
+	}
+}
+
+func TestSegmentsInTimeRange(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	startedAt := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	sessionID := "time-range-test"
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if err := store.EndSession(sessionID, startedAt.Add(30*time.Minute), ""); err != nil {
+		t.Fatalf("EndSession failed: %v", err)
+	}
+
+	// Insert segments at different times
+	for i, seg := range []transcribe.Segment{
+		{Speaker: 0, Text: "early segment", StartTime: 10.0, EndTime: 15.0, Timestamp: startedAt.Add(10 * time.Second)},
+		{Speaker: 1, Text: "match segment", StartTime: 60.0, EndTime: 65.0, Timestamp: startedAt.Add(60 * time.Second)},
+		{Speaker: 0, Text: "nearby segment", StartTime: 120.0, EndTime: 125.0, Timestamp: startedAt.Add(120 * time.Second)},
+		{Speaker: 1, Text: "far segment", StartTime: 600.0, EndTime: 605.0, Timestamp: startedAt.Add(600 * time.Second)},
+		{Speaker: 0, Text: "very far segment", StartTime: 1200.0, EndTime: 1205.0, Timestamp: startedAt.Add(1200 * time.Second)},
+	} {
+		if err := store.AppendSegment(sessionID, seg); err != nil {
+			t.Fatalf("AppendSegment %d failed: %v", i, err)
+		}
+	}
+
+	// Query a time range that should include segments 1-3 (60-600 range, using 0-200)
+	segs, err := store.GetSegmentsInTimeRange(sessionID, 50.0, 200.0)
+	if err != nil {
+		t.Fatalf("GetSegmentsInTimeRange failed: %v", err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("expected 2 segments in range [50,200], got %d", len(segs))
+	}
+	if segs[0].Text != "match segment" {
+		t.Fatalf("expected first segment 'match segment', got %q", segs[0].Text)
+	}
+	if segs[1].Text != "nearby segment" {
+		t.Fatalf("expected second segment 'nearby segment', got %q", segs[1].Text)
+	}
+
+	// Query range with no matches
+	segs, err = store.GetSegmentsInTimeRange(sessionID, 300.0, 500.0)
+	if err != nil {
+		t.Fatalf("GetSegmentsInTimeRange empty range failed: %v", err)
+	}
+	if len(segs) != 0 {
+		t.Fatalf("expected 0 segments in range [300,500], got %d", len(segs))
+	}
+
+	// Query range covering all segments
+	segs, err = store.GetSegmentsInTimeRange(sessionID, 0.0, 2000.0)
+	if err != nil {
+		t.Fatalf("GetSegmentsInTimeRange full range failed: %v", err)
+	}
+	if len(segs) != 5 {
+		t.Fatalf("expected 5 segments in range [0,2000], got %d", len(segs))
+	}
+
+	// Verify segments are ordered by start_time
+	for i := 1; i < len(segs); i++ {
+		if segs[i].StartTime < segs[i-1].StartTime {
+			t.Fatalf("segments not ordered by start_time: %f < %f", segs[i].StartTime, segs[i-1].StartTime)
+		}
+	}
+}
+
+func TestAggregateSessions(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create sessions across different dates and presets
+	date1 := time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC)
+	date2 := time.Date(2026, 3, 20, 14, 0, 0, 0, time.UTC)
+	date3 := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+	date4 := time.Date(2026, 3, 30, 10, 0, 0, 0, time.UTC)
+
+	sessions := []struct {
+		id     string
+		date   time.Time
+		preset string
+	}{
+		{"agg-1", date1, "meeting"},
+		{"agg-2", date2, "standup"},
+		{"agg-3", date3, "meeting"},
+		{"agg-4", date4, "standup"},
+	}
+
+	for _, s := range sessions {
+		if err := store.CreateSession(s.id, s.date); err != nil {
+			t.Fatalf("create session %s: %v", s.id, err)
+		}
+		if err := store.EndSession(s.id, s.date.Add(30*time.Minute), ""); err != nil {
+			t.Fatalf("end session %s: %v", s.id, err)
+		}
+		if err := store.UpdateSummary(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset, "{}"); err != nil {
+			t.Fatalf("update summary %s: %v", s.id, err)
+		}
+	}
+
+	// Also create a discarded session to ensure it's excluded
+	if err := store.CreateSession("agg-discarded", date1); err != nil {
+		t.Fatalf("create discarded session: %v", err)
+	}
+	if err := store.DiscardSession("agg-discarded"); err != nil {
+		t.Fatalf("discard session: %v", err)
+	}
+
+	t.Run("no filters group by date", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 4 {
+			t.Fatalf("expected 4 sessions, got %d", result.SessionCount)
+		}
+		if len(result.Groups) != 3 {
+			t.Fatalf("expected 3 date groups, got %d", len(result.Groups))
+		}
+		// Sessions ordered DESC, so most recent date first
+		if result.Groups[0].Key != "2026-03-30" {
+			t.Fatalf("expected first group 2026-03-30, got %q", result.Groups[0].Key)
+		}
+		if result.Groups[1].Key != "2026-03-25" {
+			t.Fatalf("expected second group 2026-03-25, got %q", result.Groups[1].Key)
+		}
+		if result.Groups[2].Key != "2026-03-20" {
+			t.Fatalf("expected third group 2026-03-20, got %q", result.Groups[2].Key)
+		}
+		// Date 2026-03-20 has 2 sessions
+		if result.Groups[2].Count != 2 {
+			t.Fatalf("expected 2 sessions on 2026-03-20, got %d", result.Groups[2].Count)
+		}
+	})
+
+	t.Run("group by preset", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{GroupBy: "preset"})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 4 {
+			t.Fatalf("expected 4 sessions, got %d", result.SessionCount)
+		}
+		if len(result.Groups) != 2 {
+			t.Fatalf("expected 2 preset groups, got %d", len(result.Groups))
+		}
+	})
+
+	t.Run("filter by date range", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{
+			DateFrom: date3.Format(time.RFC3339Nano),
+			DateTo:   date4.Add(time.Hour).Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 2 {
+			t.Fatalf("expected 2 sessions in date range, got %d", result.SessionCount)
+		}
+	})
+
+	t.Run("filter by preset", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{Preset: "meeting"})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 2 {
+			t.Fatalf("expected 2 meeting sessions, got %d", result.SessionCount)
+		}
+		for _, g := range result.Groups {
+			for _, s := range g.Sessions {
+				if s.SummaryPreset != "meeting" {
+					t.Fatalf("expected all sessions to be meeting preset, got %q", s.SummaryPreset)
+				}
+			}
+		}
+	})
+
+	t.Run("session summary fields populated", func(t *testing.T) {
+		result, err := store.AggregateSessions(AggregateOptions{Preset: "standup", GroupBy: "date"})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if result.SessionCount != 2 {
+			t.Fatalf("expected 2 standup sessions, got %d", result.SessionCount)
+		}
+		s := result.Groups[0].Sessions[0]
+		if s.ID == "" || s.Title == "" || s.StartedAt.IsZero() || s.SummaryPreset != "standup" {
+			t.Fatalf("session summary missing fields: %+v", s)
+		}
+	})
+}
+
+func TestStoreEmbedding(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "embed-test-1"
+	startedAt := time.Date(2026, 3, 25, 10, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Create test vector
+	vector := []float32{0.1, 0.2, 0.3, 0.4, 0.5}
+	textHash := "hash-abc123"
+	model := "openai/text-embedding-3-small"
+
+	// Store embedding
+	if err := store.StoreEmbedding(sessionID, 0, vector, textHash, model); err != nil {
+		t.Fatalf("store embedding: %v", err)
+	}
+
+	// Retrieve and verify
+	embeddings, err := store.GetEmbeddings(sessionID)
+	if err != nil {
+		t.Fatalf("get embeddings: %v", err)
+	}
+	if len(embeddings) != 1 {
+		t.Fatalf("expected 1 embedding, got %d", len(embeddings))
+	}
+
+	emb := embeddings[0]
+	if emb.SessionID != sessionID {
+		t.Fatalf("expected session_id %q, got %q", sessionID, emb.SessionID)
+	}
+	if emb.ChunkIndex != 0 {
+		t.Fatalf("expected chunk_index 0, got %d", emb.ChunkIndex)
+	}
+	if emb.TextHash != textHash {
+		t.Fatalf("expected text_hash %q, got %q", textHash, emb.TextHash)
+	}
+	if emb.Model != model {
+		t.Fatalf("expected model %q, got %q", model, emb.Model)
+	}
+	if len(emb.Vector) != len(vector) {
+		t.Fatalf("expected vector length %d, got %d", len(vector), len(emb.Vector))
+	}
+	for i, v := range vector {
+		if emb.Vector[i] != v {
+			t.Fatalf("vector[%d]: expected %f, got %f", i, v, emb.Vector[i])
+		}
+	}
+	if emb.CreatedAt.IsZero() {
+		t.Fatal("expected CreatedAt to be set")
+	}
+}
+
+func TestDeleteEmbeddings(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "embed-delete-1"
+	startedAt := time.Date(2026, 3, 25, 11, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, startedAt); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Store multiple embeddings
+	for i := 0; i < 3; i++ {
+		vector := []float32{float32(i) * 0.1, float32(i) * 0.2}
+		if err := store.StoreEmbedding(sessionID, i, vector, fmt.Sprintf("hash-%d", i), "openai/text-embedding-3-small"); err != nil {
+			t.Fatalf("store embedding %d: %v", i, err)
+		}
+	}
+
+	// Verify stored
+	embeddings, err := store.GetEmbeddings(sessionID)
+	if err != nil {
+		t.Fatalf("get embeddings before delete: %v", err)
+	}
+	if len(embeddings) != 3 {
+		t.Fatalf("expected 3 embeddings, got %d", len(embeddings))
+	}
+
+	// Delete
+	if err := store.DeleteEmbeddings(sessionID); err != nil {
+		t.Fatalf("delete embeddings: %v", err)
+	}
+
+	// Verify deleted
+	embeddings, err = store.GetEmbeddings(sessionID)
+	if err != nil {
+		t.Fatalf("get embeddings after delete: %v", err)
+	}
+	if len(embeddings) != 0 {
+		t.Fatalf("expected 0 embeddings after delete, got %d", len(embeddings))
+	}
+}
+
+func TestGetAllEmbeddings(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Create two sessions with embeddings
+	for sessionIdx := 0; sessionIdx < 2; sessionIdx++ {
+		sessionID := fmt.Sprintf("embed-all-%d", sessionIdx)
+		startedAt := time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC).Add(time.Duration(sessionIdx) * time.Hour)
+
+		if err := store.CreateSession(sessionID, startedAt); err != nil {
+			t.Fatalf("create session %s: %v", sessionID, err)
+		}
+
+		// Store 2 embeddings per session
+		for chunkIdx := 0; chunkIdx < 2; chunkIdx++ {
+			vector := []float32{float32(sessionIdx)*0.1 + float32(chunkIdx)*0.01}
+			if err := store.StoreEmbedding(sessionID, chunkIdx, vector, fmt.Sprintf("hash-%d-%d", sessionIdx, chunkIdx), "openai/text-embedding-3-small"); err != nil {
+				t.Fatalf("store embedding %s[%d]: %v", sessionID, chunkIdx, err)
+			}
+		}
+	}
+
+	// Get all embeddings
+	all, err := store.GetAllEmbeddings()
+	if err != nil {
+		t.Fatalf("get all embeddings: %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("expected 4 total embeddings, got %d", len(all))
+	}
+
+	// Verify we have embeddings from both sessions
+	sessionIDs := make(map[string]bool)
+	for _, emb := range all {
+		sessionIDs[emb.SessionID] = true
+	}
+	if len(sessionIDs) != 2 {
+		t.Fatalf("expected embeddings from 2 sessions, got %d unique sessions", len(sessionIDs))
+	}
+}
+
+func TestStoreEvent(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Store events
+	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {
+		t.Fatalf("StoreEvent session_started: %v", err)
+	}
+	if err := store.StoreEvent("session_ended", `{"session_id":"s1","duration":30}`); err != nil {
+		t.Fatalf("StoreEvent session_ended: %v", err)
+	}
+	if err := store.StoreEvent("summary_ready", `{"session_id":"s1","title":"Test"}`); err != nil {
+		t.Fatalf("StoreEvent summary_ready: %v", err)
+	}
+
+	// Retrieve all from cursor 0
+	events, err := store.GetEventsSince(0, 100)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Verify fields
+	if events[0].EventType != "session_started" {
+		t.Fatalf("expected event_type session_started, got %q", events[0].EventType)
+	}
+	if events[0].Payload != `{"session_id":"s1"}` {
+		t.Fatalf("expected payload, got %q", events[0].Payload)
+	}
+	if events[0].ID <= 0 {
+		t.Fatalf("expected positive ID, got %d", events[0].ID)
+	}
+	if events[0].CreatedAt.IsZero() {
+		t.Fatal("expected CreatedAt to be set")
+	}
+
+	// IDs are ascending
+	if events[1].ID <= events[0].ID {
+		t.Fatalf("expected ascending IDs: %d <= %d", events[1].ID, events[0].ID)
+	}
+}
+
+func TestPurgeOldEvents(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Store an event
+	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {
+		t.Fatalf("StoreEvent: %v", err)
+	}
+
+	// Backdate it to 10 days ago
+	oldTime := time.Now().UTC().Add(-10 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := store.DB().Exec(`UPDATE mcp_events SET created_at = ?`, oldTime); err != nil {
+		t.Fatalf("backdate event: %v", err)
+	}
+
+	// Store a recent event
+	if err := store.StoreEvent("session_ended", `{"session_id":"s2"}`); err != nil {
+		t.Fatalf("StoreEvent: %v", err)
+	}
+
+	// Purge events older than 7 days
+	if err := store.PurgeOldEvents(7 * 24 * time.Hour); err != nil {
+		t.Fatalf("PurgeOldEvents: %v", err)
+	}
+
+	// Only the recent event should remain
+	events, err := store.GetEventsSince(0, 100)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event after purge, got %d", len(events))
+	}
+	if events[0].EventType != "session_ended" {
+		t.Fatalf("expected session_ended to survive purge, got %q", events[0].EventType)
+	}
+}
+
+func TestGetEventsSince_Pagination(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	// Store 5 events
+	for i := 0; i < 5; i++ {
+		if err := store.StoreEvent("status_changed", fmt.Sprintf(`{"index":%d}`, i)); err != nil {
+			t.Fatalf("StoreEvent %d: %v", i, err)
+		}
+	}
+
+	// Get first 2
+	events, err := store.GetEventsSince(0, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince page 1: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+
+	// Get next 2 using cursor from last event
+	cursor := events[1].ID
+	events2, err := store.GetEventsSince(cursor, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince page 2: %v", err)
+	}
+	if len(events2) != 2 {
+		t.Fatalf("expected 2 events on page 2, got %d", len(events2))
+	}
+	if events2[0].ID <= cursor {
+		t.Fatalf("expected events after cursor %d, got ID %d", cursor, events2[0].ID)
+	}
+
+	// Get remaining
+	cursor2 := events2[1].ID
+	events3, err := store.GetEventsSince(cursor2, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince page 3: %v", err)
+	}
+	if len(events3) != 1 {
+		t.Fatalf("expected 1 event on page 3, got %d", len(events3))
+	}
+
+	// Get past end — empty
+	cursor3 := events3[0].ID
+	events4, err := store.GetEventsSince(cursor3, 2)
+	if err != nil {
+		t.Fatalf("GetEventsSince past end: %v", err)
+	}
+	if len(events4) != 0 {
+		t.Fatalf("expected 0 events past end, got %d", len(events4))
 	}
 }

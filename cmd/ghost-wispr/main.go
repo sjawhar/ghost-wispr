@@ -25,6 +25,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
@@ -255,6 +256,7 @@ func main() {
 	}
 
 	hub := server.NewHub(appLogger)
+	hub.SetEventStore(store)
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
 	audioRecorder := audio.NewRecorder(cfg.AudioDir)
 
@@ -306,7 +308,22 @@ func main() {
 		sessionSummarizer = summarizer
 	}
 
+	var embeddingClient embedding.Client
+	var indexer *embedding.Indexer
+	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
+		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel)
+		if err != nil {
+			log.Printf("warning: embedding indexer disabled: %v", err)
+		} else {
+			indexer = embedding.NewIndexer(embeddingClient, store, 500)
+			indexer.SetModel(cfg.EmbeddingModel)
+		}
+	}
+
 	manager := session.NewManager(store, audioRecorder, sessionSummarizer, hub, detector, cfg.MinSessionSegments, appLogger)
+	if indexer != nil {
+		manager.SetIndexer(indexer)
+	}
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -363,24 +380,28 @@ func main() {
 
 			transcript := buildCanonicalTranscript(store, sessionID, segments)
 
-			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
+			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "", "{}")
 			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
 			var title string
 			var summaryText string
 			var presetUsed string
+			var speakerNames string
 			if preset != "" {
 				presetUsed = preset
-				title, summaryText, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
+				title, summaryText, speakerNames, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
 			} else {
-				title, summaryText, presetUsed, err = summarizer.Summarize(ctx, sessionID, transcript)
+				title, summaryText, presetUsed, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
 			}
 
 			status := storage.SummaryCompleted
 			if err != nil {
 				status = storage.SummaryFailed
 			}
-			_ = store.UpdateSummary(sessionID, title, summaryText, status, presetUsed)
+			if status == storage.SummaryFailed {
+				speakerNames = "{}"
+			}
+			_ = store.UpdateSummary(sessionID, title, summaryText, status, presetUsed, speakerNames)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, status, presetUsed)
 			return err
 		},
@@ -397,22 +418,22 @@ func main() {
 
 			transcript := buildCanonicalTranscript(store, sessionID, segments)
 			if transcript == "" {
-				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "")
+				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "", "{}")
 				return
 			}
 
-			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "")
+			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "", "{}")
 			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
-			title, summaryText, preset, err := summarizer.Summarize(ctx, sessionID, transcript)
+			title, summaryText, preset, speakerNames, err := summarizer.Summarize(ctx, sessionID, transcript)
 			if err != nil {
 				log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
-				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset)
+				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset, "{}")
 				hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryFailed, preset)
 				return
 			}
 
-			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 		},
 		EndSession: func(ctx context.Context) error {
@@ -621,6 +642,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if indexer != nil {
+		go func() {
+			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("warning: embedding backfill failed: %v", err)
+			}
+		}()
+	}
 
 	// Register config change callback.
 	cfgStore.OnChange(func(newCfg config.Config) {
@@ -681,17 +709,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 				transcript := buildCanonicalTranscript(store, id, segments)
 				if transcript == "" {
-					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "")
+					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
 					continue
 				}
-				_ = store.UpdateSummary(id, "", "", storage.SummaryRunning, "")
-				title, summaryText, preset, err := startupSummarizer.Summarize(ctx, id, transcript)
+				_ = store.UpdateSummary(id, "", "", storage.SummaryRunning, "", "{}")
+				title, summaryText, preset, speakerNames, err := startupSummarizer.Summarize(ctx, id, transcript)
 				if err != nil {
 					log.Printf("warning: summarization failed for %s: %v", id, err)
-					_ = store.UpdateSummary(id, "", "", storage.SummaryFailed, preset)
+					_ = store.UpdateSummary(id, "", "", storage.SummaryFailed, preset, "{}")
 					continue
 				}
-				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset)
+				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
 				log.Printf("summarized session %s with preset %s", id, preset)
 			}
 		}()
@@ -903,7 +931,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Create health checker with actual component references
 	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic)
-	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, cfgStore)
+	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
 	}

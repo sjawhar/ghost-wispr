@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
@@ -30,6 +31,10 @@ func (m *mockStore) GetSession(id string) (storage.Session, error) {
 
 func (m *mockStore) DeleteSession(id string) error {
 	m.deletedIDs = append(m.deletedIDs, id)
+	return nil
+}
+
+func (m *mockStore) PurgeOldEvents(maxAge time.Duration) error {
 	return nil
 }
 
