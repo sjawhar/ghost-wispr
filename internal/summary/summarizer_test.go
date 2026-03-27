@@ -239,7 +239,6 @@ func TestSummarizeRetries(t *testing.T) {
 		{err: errors.New("openai json completion: status 429 rate limit")},
 		{response: `{"title":"Retry title","summary":"retry-success"}`},
 	}}
-	var sleeps []time.Duration
 
 	cfg := config.Summarization{
 		Model: "openai/gpt-4o-mini",
@@ -255,9 +254,6 @@ func TestSummarizeRetries(t *testing.T) {
 	s := New(cfg, func(_, _ string) (llm.Client, error) {
 		return client, nil
 	})
-	s.sleep = func(d time.Duration) {
-		sleeps = append(sleeps, d)
-	}
 
 	title, summaryText, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
@@ -272,12 +268,6 @@ func TestSummarizeRetries(t *testing.T) {
 	if client.calls != 5 {
 		t.Fatalf("expected 5 llm calls, got %d", client.calls)
 	}
-	if len(sleeps) != 4 {
-		t.Fatalf("expected 4 sleep calls, got %d", len(sleeps))
-	}
-	if sleeps[0] != time.Second || sleeps[1] != 2*time.Second || sleeps[2] != 4*time.Second || sleeps[3] != 8*time.Second {
-		t.Fatalf("unexpected sleep durations: %#v", sleeps)
-	}
 }
 
 func TestRetryOnRateLimit429(t *testing.T) {
@@ -287,14 +277,12 @@ func TestRetryOnRateLimit429(t *testing.T) {
 		{err: errors.New("openai json completion: status 429 rate_limit")},
 		{response: `{"title":"Recovered","summary":"done"}`},
 	}}
-	var sleeps []time.Duration
 
 	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
 		Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
 	}}}
 
 	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
-	s.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
 
 	title, summaryText, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err != nil {
@@ -306,22 +294,17 @@ func TestRetryOnRateLimit429(t *testing.T) {
 	if client.calls != 3 {
 		t.Fatalf("expected 3 llm calls, got %d", client.calls)
 	}
-	if len(sleeps) != 2 || sleeps[0] != time.Second || sleeps[1] != 2*time.Second {
-		t.Fatalf("unexpected sleep pattern: %#v", sleeps)
-	}
 }
 
 func TestNoRetryOnBadRequest400(t *testing.T) {
 	transcript := buildTranscript(25)
 	client := &mockLLMClient{jsonQueue: []mockJSONResult{{err: errors.New("openai json completion: status 400 invalid_schema")}}}
-	var sleeps []time.Duration
 
 	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
 		Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
 	}}}
 
 	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
-	s.sleep = func(d time.Duration) { sleeps = append(sleeps, d) }
 
 	_, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
 	if err == nil {
@@ -329,9 +312,6 @@ func TestNoRetryOnBadRequest400(t *testing.T) {
 	}
 	if client.calls != 1 {
 		t.Fatalf("expected single attempt on 400, got %d", client.calls)
-	}
-	if len(sleeps) != 0 {
-		t.Fatalf("expected no sleeps, got %#v", sleeps)
 	}
 }
 

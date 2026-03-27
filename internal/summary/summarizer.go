@@ -3,18 +3,18 @@ package summary
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/retry"
 )
 
 type ClientFactory func(provider, model string) (llm.Client, error)
@@ -32,14 +32,7 @@ type Summarizer struct {
 
 const (
 	minSummaryWords      = 20
-	maxRetryAttempts     = 5
 	tokenPerCharEstimate = 4
-)
-
-var (
-	default429Backoff = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
-	default503Backoff = []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second}
-	statusCodeRe      = regexp.MustCompile(`\b(400|429|503)\b`)
 )
 
 func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
@@ -245,85 +238,20 @@ func structuredSchema() map[string]any {
 }
 
 func (s *Summarizer) completeJSONWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, schema map[string]any, logger *slog.Logger) (json.RawMessage, error) {
-	var lastErr error
-	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
-		result, err := client.CompleteJSON(ctx, messages, schema)
-		if err == nil {
-			return result, nil
+	var result json.RawMessage
+	err := retry.Do(ctx, func() error {
+		var callErr error
+		result, callErr = client.CompleteJSON(ctx, messages, schema)
+		if callErr != nil && isContextOverflow(callErr) {
+			logger.Warn("structured summarize context overflow", "error", callErr)
+			return backoff.Permanent(callErr)
 		}
-
-		lastErr = err
-		status := classifyStatusCode(err)
-		if isContextOverflow(err) {
-			logger.Warn("structured summarize overflow", "attempt", attempt, "status_code", status, "error", err)
-			return nil, err
-		}
-		if status == 400 {
-			logger.Error("structured summarize non-retryable", "attempt", attempt, "status_code", status, "error", err)
-			return nil, fmt.Errorf("non-retryable summary error: %w", err)
-		}
-
-		delay, retryable := retryDelay(attempt, status)
-		if !retryable || attempt == maxRetryAttempts {
-			logger.Error("structured summarize failed", "attempt", attempt, "status_code", status, "error", err)
-			break
-		}
-
-		logger.Warn("structured summarize retry", "attempt", attempt, "status_code", status, "delay", delay, "error", err)
-		s.sleep(delay)
+		return callErr
+	}, retry.DefaultMaxRetries)
+	if err != nil {
+		return nil, fmt.Errorf("summarize failed after retries: %w", err)
 	}
-
-	if lastErr == nil {
-		lastErr = errors.New("unknown summary failure")
-	}
-	return nil, fmt.Errorf("summarize failed after retries: %w", lastErr)
-}
-
-func retryDelay(attempt int, status int) (time.Duration, bool) {
-	if attempt <= 0 {
-		return 0, false
-	}
-	var backoff []time.Duration
-	switch status {
-	case 429:
-		backoff = default429Backoff
-	case 503:
-		backoff = default503Backoff
-	default:
-		return 0, false
-	}
-	idx := attempt - 1
-	if idx >= len(backoff) {
-		idx = len(backoff) - 1
-	}
-	return backoff[idx], true
-}
-
-func classifyStatusCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "rate limit") {
-		return 429
-	}
-	if strings.Contains(msg, "service unavailable") {
-		return 503
-	}
-	matches := statusCodeRe.FindAllString(msg, -1)
-	if len(matches) > 0 {
-		last := matches[len(matches)-1]
-		if last == "400" {
-			return 400
-		}
-		if last == "429" {
-			return 429
-		}
-		if last == "503" {
-			return 503
-		}
-	}
-	return 0
+	return result, nil
 }
 
 func isContextOverflow(err error) bool {
@@ -379,34 +307,19 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 }
 
 func (s *Summarizer) completeTextWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, logger *slog.Logger) (string, error) {
-	var lastErr error
-	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
-		text, err := client.Complete(ctx, messages)
-		if err == nil {
-			return strings.TrimSpace(text), nil
+	var result string
+	err := retry.Do(ctx, func() error {
+		var callErr error
+		result, callErr = client.Complete(ctx, messages)
+		if callErr == nil {
+			result = strings.TrimSpace(result)
 		}
-
-		lastErr = err
-		status := classifyStatusCode(err)
-		if status == 400 {
-			logger.Error("chunk summarize non-retryable", "attempt", attempt, "status_code", status, "error", err)
-			return "", fmt.Errorf("non-retryable chunk summary error: %w", err)
-		}
-
-		delay, retryable := retryDelay(attempt, status)
-		if !retryable || attempt == maxRetryAttempts {
-			logger.Error("chunk summarize failed", "attempt", attempt, "status_code", status, "error", err)
-			break
-		}
-
-		logger.Warn("chunk summarize retry", "attempt", attempt, "status_code", status, "delay", delay, "error", err)
-		s.sleep(delay)
+		return callErr
+	}, retry.DefaultMaxRetries)
+	if err != nil {
+		return "", fmt.Errorf("chunk summarize failed after retries: %w", err)
 	}
-
-	if lastErr == nil {
-		lastErr = errors.New("unknown chunk summary failure")
-	}
-	return "", fmt.Errorf("chunk summarize failed after retries: %w", lastErr)
+	return result, nil
 }
 
 func splitTranscript(transcript string, chunkSize, overlap int) []string {
