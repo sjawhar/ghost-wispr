@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/llm"
 )
 
 type fakeStreamer struct {
@@ -145,4 +149,54 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 	if waits[2] != time.Second {
 		t.Fatalf("expected third wait 1s (reset), got %v", waits[2])
 	}
+}
+
+type mockLLMClient struct {
+	completeErr error
+}
+
+func (m *mockLLMClient) Complete(_ context.Context, _ []llm.Message) (string, error) {
+	return "", m.completeErr
+}
+
+func (m *mockLLMClient) CompleteJSON(_ context.Context, _ []llm.Message, _ map[string]any) (json.RawMessage, error) {
+	return nil, m.completeErr
+}
+
+func TestValidateLLMClient_ReturnsErrorForBadKey(t *testing.T) {
+	t.Run("factory error", func(t *testing.T) {
+		factory := func(provider, model string) (llm.Client, error) {
+			return nil, errors.New("invalid API key")
+		}
+		err := validateLLMClient(context.Background(), factory, "openai", "gpt-4")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid API key") {
+			t.Fatalf("expected error to contain 'invalid API key', got: %v", err)
+		}
+	})
+
+	t.Run("complete error", func(t *testing.T) {
+		factory := func(provider, model string) (llm.Client, error) {
+			return &mockLLMClient{completeErr: errors.New("401 Unauthorized")}, nil
+		}
+		err := validateLLMClient(context.Background(), factory, "openai", "gpt-4")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "401 Unauthorized") {
+			t.Fatalf("expected error to contain '401 Unauthorized', got: %v", err)
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		factory := func(provider, model string) (llm.Client, error) {
+			return &mockLLMClient{}, nil
+		}
+		err := validateLLMClient(context.Background(), factory, "openai", "gpt-4")
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+	})
 }

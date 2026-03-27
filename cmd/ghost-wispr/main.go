@@ -337,6 +337,17 @@ func main() {
 	} else {
 		manager.SetBatchTranscriber(batchTranscriber)
 	}
+	if summarizer != nil {
+		provider, model, _ := llm.ParseModel(cfg.Summarization.Model)
+		valCtx, valCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := validateLLMClient(valCtx, clientFactory, provider, model); err != nil {
+			log.Printf("ERROR: LLM validation failed — summaries will not work: %v", err)
+			warnings = append(warnings, fmt.Sprintf("LLM validation failed: %v", err))
+		} else {
+			log.Println("LLM validation passed")
+		}
+		valCancel()
+	}
 	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
@@ -1045,4 +1056,18 @@ func streamMicWithRetry(
 		logf("mic reopened successfully")
 		backoff = baseBackoff
 	}
+}
+
+// validateLLMClient creates an LLM client and sends a minimal completion
+// request to verify the API key works at startup.
+func validateLLMClient(ctx context.Context, factory func(string, string) (llm.Client, error), provider, model string) error {
+	client, err := factory(provider, model)
+	if err != nil {
+		return fmt.Errorf("create client: %w", err)
+	}
+	_, err = client.Complete(ctx, []llm.Message{{Role: "user", Content: "Say OK"}})
+	if err != nil {
+		return fmt.Errorf("test completion: %w", err)
+	}
+	return nil
 }
