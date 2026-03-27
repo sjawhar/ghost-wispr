@@ -180,6 +180,10 @@ func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt
 	return nil
 }
 
+func (s *apiStoreStub) GetSessionsForBackfill() ([]string, error) {
+	return nil, nil
+}
+
 type healthCheckerStub struct{}
 
 func (h *healthCheckerStub) IsDeepgramConnected() bool            { return true }

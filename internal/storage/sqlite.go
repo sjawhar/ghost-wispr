@@ -1069,6 +1069,33 @@ func (s *SQLiteStore) GetSessionsNeedingSummary() ([]string, error) {
 	return ids, nil
 }
 
+func (s *SQLiteStore) GetSessionsForBackfill() ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT id FROM sessions
+		WHERE status = 'ended'
+		AND (summary_status IN ('failed', 'pending', 'running')
+		     OR (summary_status = 'completed' AND (summary IS NULL OR summary = '')))
+		ORDER BY started_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query sessions for backfill: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan session id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions: %w", err)
+	}
+	return ids, nil
+}
+
 func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	rows, err := s.db.Query(
 		`SELECT id FROM sessions WHERE status = 'ended' AND sync_state = ?`,

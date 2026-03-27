@@ -40,6 +40,7 @@ type SessionStore interface {
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
 	GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error)
+	GetSessionsForBackfill() ([]string, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -839,6 +840,25 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"merged_sessions":  mergedIDs,
 			"groups_found":     len(groups),
 			"sessions_scanned": len(sessions),
+		})
+	})
+
+	mux.HandleFunc("POST /api/sessions/backfill", func(w http.ResponseWriter, r *http.Request) {
+		sessionIDs, err := store.GetSessionsForBackfill()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("query sessions: %v", err))
+			return
+		}
+		queued := 0
+		for _, id := range sessionIDs {
+			if controls.Resummarize != nil {
+				go controls.Resummarize(context.Background(), id, "")
+				queued++
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"queued": queued,
+			"found":  len(sessionIDs),
 		})
 	})
 
