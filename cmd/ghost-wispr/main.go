@@ -268,12 +268,15 @@ func main() {
 			"gemini":    latestCfg.GeminiAPIKey,
 		}
 		key := keys[provider]
-		if key == "" {
+		if key == "" && !(provider == "gemini" && latestCfg.GCPProject != "") {
 			return nil, fmt.Errorf("no API key for provider %q", provider)
 		}
 		var opts []llm.Option
 		if provider == "openai" && latestCfg.Summarization.BaseURL != "" {
 			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
+		}
+		if provider == "gemini" && latestCfg.GCPProject != "" {
+			opts = append(opts, llm.WithGCPProject(latestCfg.GCPProject, latestCfg.GCPLocation))
 		}
 		return llm.NewClient(provider, key, model, opts...)
 	}
@@ -283,19 +286,29 @@ func main() {
 		"anthropic": cfg.AnthropicAPIKey,
 		"gemini":    cfg.GeminiAPIKey,
 	}
+	providerHasAuth := func(provider string, c config.Config, keys map[string]string) bool {
+		if keys[provider] != "" {
+			return true
+		}
+		return provider == "gemini" && c.GCPProject != ""
+	}
 	var summarizer *summary.Summarizer
 	canSummarize := false
-	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil && apiKeys[provider] != "" {
-		canSummarize = true
+	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil {
+		if providerHasAuth(provider, cfg, apiKeys) {
+			canSummarize = true
+		}
 	}
 	if !canSummarize {
 		for _, preset := range cfg.Summarization.Presets {
 			if preset.Model == "" {
 				continue
 			}
-			if provider, _, err := llm.ParseModel(preset.Model); err == nil && apiKeys[provider] != "" {
-				canSummarize = true
-				break
+			if provider, _, err := llm.ParseModel(preset.Model); err == nil {
+				if providerHasAuth(provider, cfg, apiKeys) {
+					canSummarize = true
+					break
+				}
 			}
 		}
 	}
@@ -311,7 +324,13 @@ func main() {
 	var embeddingClient embedding.Client
 	var indexer *embedding.Indexer
 	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel)
+		var embeddingOpts []embedding.Option
+		if provider, _, err := embedding.ParseModel(cfg.EmbeddingModel); err == nil {
+			if provider == "gemini" && cfg.GCPProject != "" {
+				embeddingOpts = append(embeddingOpts, embedding.WithGCPProject(cfg.GCPProject, cfg.GCPLocation))
+			}
+		}
+		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embeddingOpts...)
 		if err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
 		} else {
@@ -676,7 +695,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			"anthropic": newCfg.AnthropicAPIKey,
 			"gemini":    newCfg.GeminiAPIKey,
 		}
-		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && newAPIKeys[provider] != "" {
+		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && providerHasAuth(provider, newCfg, newAPIKeys) {
 			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)
