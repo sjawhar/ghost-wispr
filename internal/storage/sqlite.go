@@ -765,6 +765,27 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 	return nil
 }
 
+func (s *SQLiteStore) UpdateSummaryError(sessionID, errMsg string) error {
+	res, err := s.db.Exec(
+		`UPDATE sessions SET error_message = ? WHERE id = ?`,
+		errMsg,
+		sessionID,
+	)
+	if err != nil {
+		return fmt.Errorf("update summary error for session %s: %w", sessionID, err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update summary error rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+
+	return nil
+}
+
 func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = ?`,

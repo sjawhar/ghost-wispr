@@ -81,3 +81,50 @@ func TestTeeWriterWritesToBothDestinations(t *testing.T) {
 		t.Fatalf("expected raw pcm temp file cleanup, file still exists with %d bytes", len(rawBytes))
 	}
 }
+
+func TestRecorderPrerollCapturesBeforeSessionStart(t *testing.T) {
+	dir := t.TempDir()
+	recorder := NewRecorder(dir)
+	recorder.encode = func(rawPath, sessionID string) (string, error) {
+		data, err := os.ReadFile(rawPath)
+		if err != nil {
+			return "", err
+		}
+		out := filepath.Join(dir, sessionID+".raw")
+		return out, os.WriteFile(out, data, 0o644)
+	}
+
+	// Write audio data with no active session (should go to preroll buffer)
+	writer := recorder.Writer(bytes.NewBuffer(nil))
+	prerollData := []byte{10, 20, 30, 40, 50}
+	if _, err := writer.Write(prerollData); err != nil {
+		t.Fatalf("Write during no session failed: %v", err)
+	}
+
+	// Start a session — preroll should be flushed to the file
+	if err := recorder.StartSession("preroll-test"); err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	// Write more data during session
+	sessionData := []byte{60, 70, 80}
+	if _, err := writer.Write(sessionData); err != nil {
+		t.Fatalf("Write during session failed: %v", err)
+	}
+
+	path, err := recorder.EndSession()
+	if err != nil {
+		t.Fatalf("EndSession failed: %v", err)
+	}
+
+	// Verify the output contains preroll + session data
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	expected := append(prerollData, sessionData...)
+	if !bytes.Equal(got, expected) {
+		t.Errorf("got %v, expected %v", got, expected)
+	}
+}

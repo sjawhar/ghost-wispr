@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 const (
@@ -26,6 +28,7 @@ type Recorder struct {
 	rawPath    string
 	rawFile    *os.File
 	sampleRate int
+	preroll    *transcribe.RingBuf
 
 	encode func(rawPath, sessionID string) (string, error)
 }
@@ -35,7 +38,11 @@ func NewRecorder(audioDir string) *Recorder {
 		audioDir = filepath.Join("data", "audio")
 	}
 
-	r := &Recorder{audioDir: audioDir, sampleRate: defaultSampleRate}
+	r := &Recorder{
+		audioDir:   audioDir,
+		sampleRate: defaultSampleRate,
+		preroll:    transcribe.NewRingBuf(5 * defaultSampleRate * pcmBitDepth / 8 * pcmChannels),
+	}
 	r.encode = r.defaultEncode
 	return r
 }
@@ -75,6 +82,16 @@ func (r *Recorder) StartSession(sessionID string) error {
 	r.rawPath = rawPath
 	r.rawFile = rawFile
 
+	// Flush preroll buffer into the new file
+	if n := r.preroll.Len(); n > 0 {
+		buf := make([]byte, n)
+		r.preroll.Read(buf)
+		r.preroll.Reset()
+		if _, err := r.rawFile.Write(buf); err != nil {
+			return fmt.Errorf("flush preroll buffer: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -112,6 +129,7 @@ func (r *Recorder) writePCM(data []byte) error {
 	defer r.mu.Unlock()
 
 	if r.rawFile == nil {
+		r.preroll.Write(data)
 		return nil
 	}
 

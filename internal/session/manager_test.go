@@ -29,6 +29,7 @@ type storeMock struct {
 	refinedTranscript   map[string]string
 	canonicalTranscript map[string]string
 	transcriptSource    map[string]string
+	errorMessage      map[string]string
 
 	endSessionErr   error
 	endSessionCalls int
@@ -47,6 +48,7 @@ func newStoreMock() *storeMock {
 		refinedTranscript:   map[string]string{},
 		canonicalTranscript: map[string]string{},
 		transcriptSource:    map[string]string{},
+		errorMessage:      map[string]string{},
 	}
 }
 
@@ -92,6 +94,13 @@ func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ s
 	s.summary[sessionID] = summary
 	s.status[sessionID] = status
 	s.preset[sessionID] = preset
+	return nil
+}
+
+func (s *storeMock) UpdateSummaryError(sessionID, errMsg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.errorMessage[sessionID] = errMsg
 	return nil
 }
 
@@ -939,5 +948,41 @@ func TestManager_BatchRefinement_LateCompletionRecanonicalizes(t *testing.T) {
 	}
 	if canonical != "late refined transcript" {
 		t.Fatalf("expected re-canonicalized transcript to contain late refined, got %q", canonical)
+	}
+}
+
+type failingSummarizerMock struct {
+	err error
+}
+
+func (s failingSummarizerMock) Summarize(_ context.Context, _, _ string) (string, string, string, string, error) {
+	return "", "", "default", "{}", s.err
+}
+
+func TestManager_GenerateSummary_StoresErrorOnFailure(t *testing.T) {
+	store := newStoreMock()
+	if err := store.CreateSession("sess-err", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if err := store.AppendSegment("sess-err", transcribe.Segment{Text: "hello world this is a test sentence"}); err != nil {
+		t.Fatalf("AppendSegment failed: %v", err)
+	}
+
+	summarizer := failingSummarizerMock{err: errors.New("gemini json completion: 401 invalid API key")}
+	manager := NewManager(store, nil, summarizer, nil, NewDetector(time.Hour), 0)
+
+	manager.generateSummary(context.Background(), "sess-err", time.Now().UTC())
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if store.status["sess-err"] != storage.SummaryFailed {
+		t.Fatalf("expected summary_status %q, got %q", storage.SummaryFailed, store.status["sess-err"])
+	}
+	if store.errorMessage["sess-err"] == "" {
+		t.Fatal("expected error_message to be set, got empty string")
+	}
+	if !strings.Contains(store.errorMessage["sess-err"], "gemini json completion: 401 invalid API key") {
+		t.Fatalf("expected error_message to contain original error, got %q", store.errorMessage["sess-err"])
 	}
 }
