@@ -363,11 +363,11 @@ func TestPromptAndSchemaStructuredConstraints(t *testing.T) {
 	if len(client.lastMessages) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(client.lastMessages))
 	}
-	if !strings.Contains(strings.ToLower(client.lastMessages[0].Content), "strategic meeting analyst") {
-		t.Fatalf("expected structured system prompt, got %q", client.lastMessages[0].Content)
+	if !strings.Contains(client.lastMessages[0].Content, "memory of a business") {
+		t.Fatalf("expected business memory system prompt, got %q", client.lastMessages[0].Content)
 	}
-	if !strings.Contains(client.lastMessages[1].Content, "BLUF") {
-		t.Fatalf("expected BLUF instruction in user prompt, got %q", client.lastMessages[1].Content)
+	if !strings.Contains(client.lastMessages[1].Content, "Decisions") {
+		t.Fatalf("expected Decisions section reference in user prompt, got %q", client.lastMessages[1].Content)
 	}
 	if client.lastSchema == nil {
 		t.Fatal("expected JSON schema to be passed")
@@ -428,6 +428,61 @@ func TestSpeakerNameExtraction(t *testing.T) {
 			t.Fatalf("expected empty speaker names JSON {}, got %s", speakerNames)
 		}
 	})
+}
+
+func TestParseStructuredSummaryHandlesJSONStringSpeakers(t *testing.T) {
+	raw := json.RawMessage(`{"title":"Nine-hour deadline task triage and QA alignment","summary":"## BLUF\nThe team is urgently prioritizing task unblocking.","speakers":"{\"0\":{\"name\":\"Santa\",\"confidence\":\"mentioned\"}}"}`)
+
+	parsed, err := parseStructuredSummary(raw)
+	if err != nil {
+		t.Fatalf("parseStructuredSummary failed: %v", err)
+	}
+
+	if parsed.Title != "Nine-hour deadline task triage and QA alignment" {
+		t.Fatalf("unexpected title: %q", parsed.Title)
+	}
+	if parsed.Summary != "## BLUF\nThe team is urgently prioritizing task unblocking." {
+		t.Fatalf("unexpected summary: %q", parsed.Summary)
+	}
+	if len(parsed.Speakers) != 1 {
+		t.Fatalf("expected one speaker, got %d", len(parsed.Speakers))
+	}
+	meta, ok := parsed.Speakers["0"]
+	if !ok {
+		t.Fatal("expected speaker 0")
+	}
+	if meta.Name != "Santa" || meta.Confidence != "mentioned" {
+		t.Fatalf("unexpected speaker metadata: %+v", meta)
+	}
+}
+
+func TestSummarizeWithPresetHandlesJSONStringSpeakersWithoutFallback(t *testing.T) {
+	transcript := buildTranscript(25)
+	client := &mockLLMClient{response: `{"title":"Nine-hour deadline task triage and QA alignment","summary":"## BLUF\nThe team is urgently prioritizing task unblocking.","speakers":"{\"0\":{\"name\":\"Santa\",\"confidence\":\"mentioned\"}}"}`}
+
+	cfg := config.Summarization{Model: "openai/gpt-4o-mini", Presets: map[string]config.Preset{"default": {
+		Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}",
+	}}}
+
+	s := New(cfg, func(_, _ string) (llm.Client, error) { return client, nil })
+
+	title, summaryText, speakerNames, err := s.SummarizeWithPreset(context.Background(), "session-1", transcript, "default")
+	if err != nil {
+		t.Fatalf("SummarizeWithPreset failed: %v", err)
+	}
+
+	if title != "Nine-hour deadline task triage and QA alignment" {
+		t.Fatalf("unexpected title: %q", title)
+	}
+	if summaryText != "## BLUF\nThe team is urgently prioritizing task unblocking." {
+		t.Fatalf("unexpected summary: %q", summaryText)
+	}
+	if strings.HasPrefix(summaryText, "{") {
+		t.Fatalf("summary unexpectedly fell back to raw JSON: %q", summaryText)
+	}
+	if speakerNames != `{"0":{"name":"Santa","confidence":"mentioned"}}` {
+		t.Fatalf("unexpected speaker names: %s", speakerNames)
+	}
 }
 
 func TestContextOverflowFallsBackToChunking(t *testing.T) {

@@ -17,7 +17,7 @@ describe('SystemStatus', () => {
     expect(screen.getByTestId('status-sync')).toBeTruthy()
     expect(screen.getByTestId('status-mic')).toBeTruthy()
 
-    expect(screen.getByText(/Deepgram: connected/)).toBeTruthy()
+    expect(screen.getByText(/Transcription: connected/)).toBeTruthy()
     expect(screen.getByText(/Drive Sync: disconnected/)).toBeTruthy()
     expect(screen.getByText(/Mic: error/)).toBeTruthy()
   })

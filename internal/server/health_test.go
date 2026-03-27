@@ -17,6 +17,7 @@ type MockHealthChecker struct {
 	deepgramConnected bool
 	dbHealthy         bool
 	micOpen           bool
+	llmStatus         string
 }
 
 func (m *MockHealthChecker) IsDeepgramConnected() bool {
@@ -29,6 +30,13 @@ func (m *MockHealthChecker) IsDBHealthy(ctx context.Context) bool {
 
 func (m *MockHealthChecker) IsMicOpen() bool {
 	return m.micOpen
+}
+
+func (m *MockHealthChecker) IsLLMHealthy() string {
+	if m.llmStatus == "" {
+		return llmStatusUnchecked
+	}
+	return m.llmStatus
 }
 
 func TestHealthzLiveAlwaysReturns200(t *testing.T) {
@@ -94,6 +102,69 @@ func TestHealthzReadyReturns200WhenAllHealthy(t *testing.T) {
 	}
 	if resp.Mic != "open" {
 		t.Errorf("expected mic 'open', got %q", resp.Mic)
+	}
+	if resp.LLM != llmStatusUnchecked {
+		t.Errorf("expected llm 'unchecked', got %q", resp.LLM)
+	}
+}
+
+func TestHealthzReadyReturns200WhenLLMUnchecked(t *testing.T) {
+	checker := &MockHealthChecker{
+		deepgramConnected: true,
+		dbHealthy:         true,
+		micOpen:           true,
+		llmStatus:         llmStatusUnchecked,
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleHealthzReady(w, r, checker)
+	})
+
+	req := httptest.NewRequest("GET", "/healthz/ready", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	var resp HealthzReadyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.LLM != llmStatusUnchecked {
+		t.Errorf("expected llm 'unchecked', got %q", resp.LLM)
+	}
+}
+
+func TestHealthzReadyReturns503WhenLLMUnhealthy(t *testing.T) {
+	checker := &MockHealthChecker{
+		deepgramConnected: true,
+		dbHealthy:         true,
+		micOpen:           true,
+		llmStatus:         "error",
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleHealthzReady(w, r, checker)
+	})
+
+	req := httptest.NewRequest("GET", "/healthz/ready", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", w.Code)
+	}
+
+	var resp HealthzReadyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.LLM != "error" {
+		t.Errorf("expected llm 'error', got %q", resp.LLM)
 	}
 }
 
@@ -291,6 +362,9 @@ func TestHealthzReadyJSONStructure(t *testing.T) {
 	if resp.Mic == "" {
 		t.Error("mic field is empty")
 	}
+	if resp.LLM == "" {
+		t.Error("llm field is empty")
+	}
 }
 
 func TestHealthzLiveWithLogging(t *testing.T) {
@@ -429,5 +503,32 @@ func TestHealthzReadyWithResilientClientDisconnected(t *testing.T) {
 
 	if resp.Deepgram != "disconnected" {
 		t.Errorf("expected deepgram 'disconnected', got %q", resp.Deepgram)
+	}
+}
+
+func TestLLMHealthTrackerTransitions(t *testing.T) {
+	tracker := NewLLMHealthTracker()
+
+	if got := tracker.Status(); got != llmStatusUnchecked {
+		t.Fatalf("expected initial status %q, got %q", llmStatusUnchecked, got)
+	}
+	if !tracker.IsHealthy() {
+		t.Fatal("expected unchecked tracker to be healthy")
+	}
+
+	tracker.SetError("timeout")
+	if got := tracker.Status(); got != "error" {
+		t.Fatalf("expected error status, got %q", got)
+	}
+	if tracker.IsHealthy() {
+		t.Fatal("expected error tracker to be unhealthy")
+	}
+
+	tracker.SetOK()
+	if got := tracker.Status(); got != "ok" {
+		t.Fatalf("expected ok status, got %q", got)
+	}
+	if !tracker.IsHealthy() {
+		t.Fatal("expected ok tracker to be healthy")
 	}
 }

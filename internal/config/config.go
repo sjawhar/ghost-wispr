@@ -25,9 +25,10 @@ type Preset struct {
 }
 
 type Summarization struct {
-	Model   string            `yaml:"model"`
-	BaseURL string            `yaml:"base_url"`
-	Presets map[string]Preset `yaml:"presets"`
+	Model           string            `yaml:"model"`
+	BaseURL         string            `yaml:"base_url"`
+	Presets         map[string]Preset `yaml:"presets"`
+	MinSummaryWords int               `yaml:"min_summary_words"`
 }
 
 type Transcription struct {
@@ -68,8 +69,6 @@ type Config struct {
 	OpenAIAPIKey    string `yaml:"-"`
 	AnthropicAPIKey string `yaml:"-"`
 	GeminiAPIKey    string `yaml:"-"`
-	GCPProject      string `yaml:"-"`
-	GCPLocation     string `yaml:"-"`
 }
 
 func defaults() Config {
@@ -85,11 +84,12 @@ func defaults() Config {
 		GCMaxAgeDays:          30,
 		GCMaxAudioSizeMB:      1024,
 		Summarization: Summarization{
-			Model: "openai/gpt-4o-mini",
+			Model:           "openai/gpt-4o-mini",
+			MinSummaryWords: 20,
 			Presets: map[string]Preset{
 				"default": {
-					Description:  "General-purpose meeting summary with key topics and decisions",
-					SystemPrompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics and decisions made.",
+					Description:  "General-purpose summary adapted to content depth",
+					SystemPrompt: "",
 					UserTemplate: "{{transcript}}",
 				},
 			},
@@ -107,7 +107,6 @@ func defaults() Config {
 		DeepgramBufferSize:            1920000,
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
-		GCPLocation:                   "us-central1",
 	}
 }
 
@@ -271,12 +270,6 @@ func loadSecrets(cfg *Config) {
 	cfg.OpenAIAPIKey = os.Getenv(EnvPrefix + "OPENAI_API_KEY")
 	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
 	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
-	if v := os.Getenv(EnvPrefix + "GCP_PROJECT"); v != "" {
-		cfg.GCPProject = v
-	}
-	if v := os.Getenv(EnvPrefix + "GCP_LOCATION"); v != "" {
-		cfg.GCPLocation = v
-	}
 }
 
 func validate(cfg *Config) []string {
@@ -323,8 +316,8 @@ func validate(cfg *Config) []string {
 				warnings = append(warnings, "Anthropic API key not configured — set "+EnvPrefix+"ANTHROPIC_API_KEY.")
 			}
 		case "gemini":
-			if cfg.GeminiAPIKey == "" && cfg.GCPProject == "" {
-				warnings = append(warnings, "Gemini API key not configured — set "+EnvPrefix+"GEMINI_API_KEY or configure "+EnvPrefix+"GCP_PROJECT for Vertex AI.")
+			if cfg.GeminiAPIKey == "" {
+				warnings = append(warnings, "Gemini API key not configured — set "+EnvPrefix+"GEMINI_API_KEY.")
 			}
 		}
 	}

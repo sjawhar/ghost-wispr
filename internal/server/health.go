@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -15,6 +16,48 @@ type HealthChecker interface {
 	IsDeepgramConnected() bool
 	IsDBHealthy(ctx context.Context) bool
 	IsMicOpen() bool
+	IsLLMHealthy() string
+}
+
+const llmStatusUnchecked = "unchecked"
+
+type LLMHealthTracker struct {
+	mu          sync.RWMutex
+	status      string
+	errorDetail string
+}
+
+func NewLLMHealthTracker() *LLMHealthTracker {
+	return &LLMHealthTracker{status: llmStatusUnchecked}
+}
+
+func (t *LLMHealthTracker) SetOK() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.status = storage.ComponentStatusOK
+	t.errorDetail = ""
+}
+
+func (t *LLMHealthTracker) SetError(msg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.status = storage.ComponentStatusError
+	t.errorDetail = msg
+}
+
+func (t *LLMHealthTracker) IsHealthy() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.status != storage.ComponentStatusError
+}
+
+func (t *LLMHealthTracker) Status() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.status == "" {
+		return llmStatusUnchecked
+	}
+	return t.status
 }
 
 // HealthzLiveResponse is the response for the liveness check
@@ -27,6 +70,7 @@ type HealthzReadyResponse struct {
 	Deepgram string `json:"deepgram"`
 	DB       string `json:"db"`
 	Mic      string `json:"mic"`
+	LLM      string `json:"llm"`
 }
 
 // handleHealthzLive handles the /healthz/live endpoint
@@ -69,21 +113,24 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 		micStatus = storage.ComponentStatusOpen
 	}
 
+	llmStatus := checker.IsLLMHealthy()
+
 	resp := HealthzReadyResponse{
 		Deepgram: deepgramStatus,
 		DB:       dbStatus,
 		Mic:      micStatus,
+		LLM:      llmStatus,
 	}
 
 	// Determine overall health
-	allHealthy := deepgramStatus == storage.ComponentStatusConnected && dbStatus == storage.ComponentStatusOK && micStatus == storage.ComponentStatusOpen
+	allHealthy := deepgramStatus == storage.ComponentStatusConnected && dbStatus == storage.ComponentStatusOK && micStatus == storage.ComponentStatusOpen && llmStatus != storage.ComponentStatusError
 
 	if allHealthy {
 		w.WriteHeader(http.StatusOK)
-		logger.Debug("readiness check passed", "deepgram", deepgramStatus, "db", dbStatus, "mic", micStatus)
+		logger.Debug("readiness check passed", "deepgram", deepgramStatus, "db", dbStatus, "mic", micStatus, "llm", llmStatus)
 	} else {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		logger.Warn("readiness check failed", "deepgram", deepgramStatus, "db", dbStatus, "mic", micStatus)
+		logger.Warn("readiness check failed", "deepgram", deepgramStatus, "db", dbStatus, "mic", micStatus, "llm", llmStatus)
 	}
 
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -102,16 +149,20 @@ type DefaultHealthChecker struct {
 	mic interface {
 		IsOpen() bool
 	}
+	llmTracker interface {
+		Status() string
+	}
 }
 
 // NewDefaultHealthChecker creates a new DefaultHealthChecker
 func NewDefaultHealthChecker(resilientClient interface{ IsConnected() bool }, store interface {
 	Ping(ctx context.Context) error
-}, mic interface{ IsOpen() bool }) *DefaultHealthChecker {
+}, mic interface{ IsOpen() bool }, llmTracker interface{ Status() string }) *DefaultHealthChecker {
 	return &DefaultHealthChecker{
 		resilientClient: resilientClient,
 		store:           store,
 		mic:             mic,
+		llmTracker:      llmTracker,
 	}
 }
 
@@ -137,4 +188,15 @@ func (d *DefaultHealthChecker) IsMicOpen() bool {
 		return false
 	}
 	return d.mic.IsOpen()
+}
+
+func (d *DefaultHealthChecker) IsLLMHealthy() string {
+	if d.llmTracker == nil {
+		return llmStatusUnchecked
+	}
+	status := d.llmTracker.Status()
+	if status == "" {
+		return llmStatusUnchecked
+	}
+	return status
 }

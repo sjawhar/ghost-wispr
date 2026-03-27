@@ -13,22 +13,12 @@ type geminiClient struct {
 }
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
-	var config *genai.ClientConfig
-
-	if opts.gcpProject != "" {
-		config = &genai.ClientConfig{
-			Project:  opts.gcpProject,
-			Location: opts.gcpLocation,
-			Backend:  genai.BackendVertexAI,
-		}
-	} else {
-		if apiKey == "" {
-			return nil, fmt.Errorf("gemini api key is required")
-		}
-		config = &genai.ClientConfig{
-			APIKey:  apiKey,
-			Backend: genai.BackendGeminiAPI,
-		}
+	if apiKey == "" {
+		return nil, fmt.Errorf("gemini api key is required")
+	}
+	config := &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
 	}
 
 	if opts.baseURL != "" {

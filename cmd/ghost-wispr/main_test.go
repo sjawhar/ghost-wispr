@@ -6,11 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/sjawhar/ghost-wispr/internal/llm"
 )
 
 type fakeStreamer struct {
@@ -151,52 +148,43 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 	}
 }
 
-type mockLLMClient struct {
-	completeErr error
+func TestParseStoredStructuredSummaryWithJSONStringSpeakers(t *testing.T) {
+	raw := `{"title":"Nine-hour deadline task triage and QA alignment","summary":"## BLUF\nThe team is urgently prioritizing task unblocking.","speakers":"{\"0\":{\"name\":\"Santa\",\"confidence\":\"mentioned\"}}"}`
+
+	title, summaryText, speakerNames, err := parseStoredStructuredSummary(raw)
+	if err != nil {
+		t.Fatalf("parseStoredStructuredSummary returned error: %v", err)
+	}
+	if title != "Nine-hour deadline task triage and QA alignment" {
+		t.Fatalf("unexpected title: %q", title)
+	}
+	if summaryText != "## BLUF\nThe team is urgently prioritizing task unblocking." {
+		t.Fatalf("unexpected summary: %q", summaryText)
+	}
+
+	var speakers map[string]repairSpeakerMetadata
+	if err := json.Unmarshal([]byte(speakerNames), &speakers); err != nil {
+		t.Fatalf("speaker names not valid JSON: %v", err)
+	}
+	if speakers["0"].Name != "Santa" || speakers["0"].Confidence != "mentioned" {
+		t.Fatalf("unexpected speakers: %#v", speakers)
+	}
 }
 
-func (m *mockLLMClient) Complete(_ context.Context, _ []llm.Message) (string, error) {
-	return "", m.completeErr
-}
+func TestParseStoredStructuredSummaryWithObjectSpeakers(t *testing.T) {
+	raw := `{"title":"Q2 roadmap alignment","summary":"## BLUF\nRoadmap aligned.","speakers":{"1":{"name":"Ben","confidence":"mentioned"}}}`
 
-func (m *mockLLMClient) CompleteJSON(_ context.Context, _ []llm.Message, _ map[string]any) (json.RawMessage, error) {
-	return nil, m.completeErr
-}
-
-func TestValidateLLMClient_ReturnsErrorForBadKey(t *testing.T) {
-	t.Run("factory error", func(t *testing.T) {
-		factory := func(provider, model string) (llm.Client, error) {
-			return nil, errors.New("invalid API key")
-		}
-		err := validateLLMClient(context.Background(), factory, "openai", "gpt-4")
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
-		if !strings.Contains(err.Error(), "invalid API key") {
-			t.Fatalf("expected error to contain 'invalid API key', got: %v", err)
-		}
-	})
-
-	t.Run("complete error", func(t *testing.T) {
-		factory := func(provider, model string) (llm.Client, error) {
-			return &mockLLMClient{completeErr: errors.New("401 Unauthorized")}, nil
-		}
-		err := validateLLMClient(context.Background(), factory, "openai", "gpt-4")
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
-		if !strings.Contains(err.Error(), "401 Unauthorized") {
-			t.Fatalf("expected error to contain '401 Unauthorized', got: %v", err)
-		}
-	})
-
-	t.Run("success", func(t *testing.T) {
-		factory := func(provider, model string) (llm.Client, error) {
-			return &mockLLMClient{}, nil
-		}
-		err := validateLLMClient(context.Background(), factory, "openai", "gpt-4")
-		if err != nil {
-			t.Fatalf("expected no error, got: %v", err)
-		}
-	})
+	title, summaryText, speakerNames, err := parseStoredStructuredSummary(raw)
+	if err != nil {
+		t.Fatalf("parseStoredStructuredSummary returned error: %v", err)
+	}
+	if title != "Q2 roadmap alignment" {
+		t.Fatalf("unexpected title: %q", title)
+	}
+	if summaryText != "## BLUF\nRoadmap aligned." {
+		t.Fatalf("unexpected summary: %q", summaryText)
+	}
+	if speakerNames != `{"1":{"name":"Ben","confidence":"mentioned"}}` {
+		t.Fatalf("unexpected speakerNames: %s", speakerNames)
+	}
 }

@@ -21,21 +21,12 @@ type Client interface {
 type Option func(*clientOptions)
 
 type clientOptions struct {
-	baseURL     string
-	gcpProject  string
-	gcpLocation string
+	baseURL string
 }
 
 func WithBaseURL(url string) Option {
 	return func(o *clientOptions) {
 		o.baseURL = url
-	}
-}
-
-func WithGCPProject(project, location string) Option {
-	return func(o *clientOptions) {
-		o.gcpProject = project
-		o.gcpLocation = location
 	}
 }
 

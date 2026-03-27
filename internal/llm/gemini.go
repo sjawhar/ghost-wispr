@@ -16,19 +16,9 @@ type geminiClient struct {
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
 	ctx := context.Background()
-	var config *genai.ClientConfig
-
-	if opts.gcpProject != "" {
-		config = &genai.ClientConfig{
-			Project:  opts.gcpProject,
-			Location: opts.gcpLocation,
-			Backend:  genai.BackendVertexAI,
-		}
-	} else {
-		config = &genai.ClientConfig{
-			APIKey:  apiKey,
-			Backend: genai.BackendGeminiAPI,
-		}
+	config := &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
 	}
 
 	if opts.baseURL != "" {

@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cenkalti/backoff/v5"
+
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
@@ -22,6 +23,7 @@ type ClientFactory func(provider, model string) (llm.Client, error)
 type Summarizer struct {
 	cfg                 config.Summarization
 	factory             ClientFactory
+	OnResult            func(err error)
 	router              *Router
 	sleep               func(time.Duration)
 	now                 func() time.Time
@@ -31,8 +33,8 @@ type Summarizer struct {
 }
 
 const (
-	minSummaryWords      = 20
-	tokenPerCharEstimate = 4
+	defaultMinSummaryWords = 20
+	tokenPerCharEstimate   = 4
 )
 
 func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
@@ -52,21 +54,39 @@ func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
 	}
 }
 
-func (s *Summarizer) Summarize(ctx context.Context, sessionID, transcript string) (string, string, string, string, error) {
-	presetName, err := s.selectPreset(ctx, transcript)
+func (s *Summarizer) Summarize(ctx context.Context, sessionID, transcript string) (title, summaryText, presetName, speakerNames string, err error) {
+	defer func() {
+		if s.OnResult != nil {
+			s.OnResult(err)
+		}
+	}()
+
+	presetName, err = s.selectPreset(ctx, transcript)
 	if err != nil {
 		return "", "", "", "{}", fmt.Errorf("select preset: %w", err)
 	}
-	title, summary, speakerNames, err := s.SummarizeWithPreset(ctx, sessionID, transcript, presetName)
-	return title, summary, presetName, speakerNames, err
+	title, summaryText, speakerNames, err = s.SummarizeWithPreset(ctx, sessionID, transcript, presetName)
+	return title, summaryText, presetName, speakerNames, err
 }
 
-func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcript, presetName string) (string, string, string, error) {
-	if len(strings.Fields(transcript)) < minSummaryWords {
+func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcript, presetName string) (title, summaryText, speakerNames string, err error) {
+	defer func() {
+		if s.OnResult != nil {
+			s.OnResult(err)
+		}
+	}()
+
+	minWords := s.cfg.MinSummaryWords
+	if minWords <= 0 {
+		minWords = defaultMinSummaryWords
+	}
+	if len(strings.Fields(transcript)) < minWords {
 		return guaranteedTitle(transcript), "", "{}", nil
 	}
 
-	preset, ok := s.cfg.Presets[presetName]
+	var preset config.Preset
+	var ok bool
+	preset, ok = s.cfg.Presets[presetName]
 	if !ok {
 		return "", "", "{}", fmt.Errorf("unknown preset %q", presetName)
 	}
@@ -98,8 +118,8 @@ func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcri
 		return title, strings.TrimSpace(summary), speakerNames, nil
 	}
 
-	messages := s.structuredMessages(preset, transcript)
-	schema := structuredSchema()
+	messages := s.BuildPromptMessages(preset, transcript)
+	schema := StructuredSchema()
 	raw, err := s.completeJSONWithRetry(ctx, client, messages, schema, logger)
 	if err != nil {
 		if isContextOverflow(err) {
@@ -138,10 +158,26 @@ type speakerNameMetadata struct {
 }
 
 func parseStructuredSummary(raw json.RawMessage) (parsedSummary, error) {
-	var parsed parsedSummary
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	var envelope struct {
+		Title    string          `json:"title"`
+		Summary  string          `json:"summary"`
+		Speakers json.RawMessage `json:"speakers,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return parsedSummary{}, err
 	}
+
+	parsed := parsedSummary{
+		Title:   envelope.Title,
+		Summary: envelope.Summary,
+	}
+
+	speakers, err := parseSpeakersField(envelope.Speakers)
+	if err != nil {
+		return parsedSummary{}, err
+	}
+	parsed.Speakers = speakers
+
 	for speakerID, meta := range parsed.Speakers {
 		meta.Name = strings.TrimSpace(meta.Name)
 		meta.Confidence = strings.TrimSpace(meta.Confidence)
@@ -155,6 +191,32 @@ func parseStructuredSummary(raw json.RawMessage) (parsedSummary, error) {
 		parsed.Speakers[speakerID] = meta
 	}
 	return parsed, nil
+}
+
+func parseSpeakersField(raw json.RawMessage) (map[string]speakerNameMetadata, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+
+	var speakers map[string]speakerNameMetadata
+	if err := json.Unmarshal(raw, &speakers); err == nil {
+		return speakers, nil
+	}
+
+	var encoded string
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		return nil, err
+	}
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" || encoded == "null" {
+		return nil, nil
+	}
+
+	if err := json.Unmarshal([]byte(encoded), &speakers); err != nil {
+		return nil, err
+	}
+	return speakers, nil
 }
 
 func (p parsedSummary) speakerNamesJSON() string {
@@ -173,30 +235,54 @@ func (s *Summarizer) shouldChunk(transcript string) bool {
 	return tokenEstimate > s.chunkTokenThreshold
 }
 
-func (s *Summarizer) structuredMessages(preset config.Preset, transcript string) []llm.Message {
+func (s *Summarizer) BuildPromptMessages(preset config.Preset, transcript string) []llm.Message {
 	rendered := strings.ReplaceAll(preset.UserTemplate, "{{transcript}}", transcript)
 	rendered = strings.ReplaceAll(rendered, "{{date}}", s.now().UTC().Format("2006-01-02"))
 
 	system := strings.TrimSpace(strings.Join([]string{
-		"You are a strategic meeting analyst.",
+		"You are the memory of a business. You process transcripts from an always-on",
+		"recorder that captures everything \u2014 meetings, quick conversations, instructions,",
+		"solo thinking, phone calls, and ambient moments.",
+		"",
+		"Your job: make every moment findable and legible later. Someone will search for",
+		"this in a week, a month, a year. The title is how they find it. The summary is",
+		"how they remember what happened without re-reading the transcript.",
+		"",
+		"Adapt your depth to the content:",
+		"- A brief instruction or aside \u2192 clear title + one-line summary",
+		"- A casual conversation \u2192 title + brief description of what was discussed",
+		"- A working session \u2192 title + key context, decisions, and outcomes",
+		"- A formal meeting \u2192 title + structured summary with sections",
+		"",
+		"The title describes WHAT happened, not how the transcript starts. Never quote",
+		"the transcript verbatim as the title.",
+		"",
 		"Return only valid JSON matching the provided schema.",
-		"The title must be non-empty and concise.",
 		strings.TrimSpace(preset.SystemPrompt),
 	}, "\n"))
 
 	user := strings.TrimSpace(strings.Join([]string{
-		"Summarize the transcript in BLUF style.",
-		"Also extract speaker names if mentioned in the transcript. Use 'mentioned' confidence if the name was explicitly said, 'inferred' if you're guessing from context.",
+		"Summarize this transcript. Match your depth to the content — a brief exchange",
+		"needs only a sentence, a long working session deserves structured sections.",
+		"",
 		"Output requirements:",
-		`- title: 4-10 words, specific, non-empty`,
-		`- summary: markdown starting with '## BLUF', followed by sections for Decisions, Key Outcomes, and Risks/Notes`,
-		`- speakers: object keyed by speaker ID (for example "0", "1"), each value with fields {"name":"<speaker name>","confidence":"mentioned|inferred"}`,
+		`- title: 4-10 words describing the topic, specific and non-empty`,
+		`- summary: markdown — for short content just a sentence or two; for substantial content start with a one-line bottom line, then use sections (## Decisions, ## Key Outcomes, ## Risks/Notes)`,
+		`- speakers: object keyed by speaker ID (e.g. "0", "1"), each with {"name":"<name>","confidence":"mentioned|inferred"}. Use 'mentioned' if the name was said, 'inferred' if guessed from context.`,
 		"Respond as JSON only.",
-		"Example output:",
-		`{"title":"Q2 roadmap alignment","summary":"## BLUF\nTeam aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint.","speakers":{"0":{"name":"Ben","confidence":"mentioned"}}}`,
+		"",
+		"Examples:",
+		"",
+		`Brief exchange:`,
+		`{"title":"Deploy moved to Friday","summary":"Quick decision to push the deploy from Thursday to Friday to give QA more time.","speakers":{}}`,
+		"",
+		`Working session:`,
+		`{"title":"Q2 roadmap alignment","summary":"Team aligned on Q2 roadmap and sequencing.\n\n## Decisions\n- Ship feature flags before rollout.\n\n## Key Outcomes\n- Roadmap finalized and communicated.\n\n## Risks/Notes\n- API dependency may delay launch by one sprint.","speakers":{"0":{"name":"Ben","confidence":"mentioned"}}}`,
+
+		"",
 		"Transcript:",
 		rendered,
-	}, "\n\n"))
+	}, "\n"))
 
 	return []llm.Message{
 		{Role: "system", Content: system},
@@ -204,7 +290,7 @@ func (s *Summarizer) structuredMessages(preset config.Preset, transcript string)
 	}
 }
 
-func structuredSchema() map[string]any {
+func StructuredSchema() map[string]any {
 	required := []string{"summary", "title"}
 	sort.Strings(required)
 	return map[string]any{
@@ -212,11 +298,11 @@ func structuredSchema() map[string]any {
 		"properties": map[string]any{
 			"title": map[string]any{
 				"type":        "string",
-				"description": "Non-empty meeting title in 4-10 words.",
+				"description": "Concise descriptive title in 4-10 words. Describes the topic, never quotes the transcript.",
 			},
 			"summary": map[string]any{
 				"type":        "string",
-				"description": "Markdown BLUF summary with Decisions, Key Outcomes, and Risks/Notes sections.",
+				"description": "Markdown summary. Brief for short content. For substantial content: one-line bottom line first, then ## Decisions, ## Key Outcomes, ## Risks/Notes sections.",
 			},
 			"speakers": map[string]any{
 				"type": "object",
@@ -291,8 +377,8 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 	}
 
 	mergeTranscript := strings.Join(chunkSummaries, "\n\n")
-	mergeMessages := s.structuredMessages(preset, mergeTranscript)
-	mergeRaw, err := s.completeJSONWithRetry(ctx, client, mergeMessages, structuredSchema(), logger)
+	mergeMessages := s.BuildPromptMessages(preset, mergeTranscript)
+	mergeRaw, err := s.completeJSONWithRetry(ctx, client, mergeMessages, StructuredSchema(), logger)
 	if err != nil {
 		return "", "", "{}", fmt.Errorf("merge chunk summaries: %w", err)
 	}

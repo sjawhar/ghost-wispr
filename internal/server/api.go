@@ -18,12 +18,13 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
-	"golang.org/x/sync/semaphore"
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -873,6 +874,58 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"queued": queued,
 			"found":  len(sessionIDs),
 		})
+	})
+
+	mux.HandleFunc("POST /api/sessions/repair-summaries", func(w http.ResponseWriter, r *http.Request) {
+		if controls.RepairSummaries == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "summary repair not configured")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+
+		repaired, err := controls.RepairSummaries(ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("repair summaries: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]int{"repaired": repaired})
+	})
+
+	mux.HandleFunc("POST /api/sessions/batch-backfill", func(w http.ResponseWriter, r *http.Request) {
+		if controls.BatchBackfill == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "batch backfill not configured")
+			return
+		}
+		batchName, count, err := controls.BatchBackfill(r.Context())
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("batch backfill: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"batch_job": batchName,
+			"sessions":  count,
+		})
+	})
+
+	mux.HandleFunc("GET /api/batches/{name...}", func(w http.ResponseWriter, r *http.Request) {
+		batchName := r.PathValue("name")
+		if batchName == "" {
+			writeJSONError(w, http.StatusBadRequest, "batch name is required")
+			return
+		}
+		if controls.BatchPoll == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "batch polling not configured")
+			return
+		}
+		result, err := controls.BatchPoll(r.Context(), batchName)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("batch poll: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {
