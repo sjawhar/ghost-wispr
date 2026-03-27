@@ -29,7 +29,7 @@ type storeMock struct {
 	refinedTranscript   map[string]string
 	canonicalTranscript map[string]string
 	transcriptSource    map[string]string
-	errorMessage      map[string]string
+	errorMessage        map[string]string
 
 	endSessionErr   error
 	endSessionCalls int
@@ -48,7 +48,7 @@ func newStoreMock() *storeMock {
 		refinedTranscript:   map[string]string{},
 		canonicalTranscript: map[string]string{},
 		transcriptSource:    map[string]string{},
-		errorMessage:      map[string]string{},
+		errorMessage:        map[string]string{},
 	}
 }
 

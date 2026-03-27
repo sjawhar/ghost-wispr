@@ -23,6 +23,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"golang.org/x/sync/semaphore"
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -782,7 +783,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		var currentGroup []string
 		var prevEnded *time.Time
 
-		for _, sess := range sessions {
+		for i := range sessions {
+			sess := &sessions[i]
 			if sess.Status == "merged" {
 				if len(currentGroup) >= 2 {
 					groups = append(groups, currentGroup)
@@ -849,13 +851,24 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("query sessions: %v", err))
 			return
 		}
-		queued := 0
-		for _, id := range sessionIDs {
-			if controls.Resummarize != nil {
-				go controls.Resummarize(context.Background(), id, "")
-				queued++
-			}
+
+		queued := len(sessionIDs)
+		if controls.Resummarize != nil && queued > 0 {
+			go func(ids []string) {
+				const maxConcurrent = 5
+				sem := semaphore.NewWeighted(maxConcurrent)
+				for _, id := range ids {
+					if err := sem.Acquire(context.Background(), 1); err != nil {
+						return // context cancelled
+					}
+					go func(sid string) {
+						defer sem.Release(1)
+						_ = controls.Resummarize(context.Background(), sid, "")
+					}(id)
+				}
+			}(sessionIDs)
 		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"queued": queued,
 			"found":  len(sessionIDs),

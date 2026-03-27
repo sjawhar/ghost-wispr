@@ -123,7 +123,9 @@ func TestRecorderPrerollCapturesBeforeSessionStart(t *testing.T) {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
 
-	expected := append(prerollData, sessionData...)
+	expected := make([]byte, 0, len(prerollData)+len(sessionData))
+	expected = append(expected, prerollData...)
+	expected = append(expected, sessionData...)
 	if !bytes.Equal(got, expected) {
 		t.Errorf("got %v, expected %v", got, expected)
 	}

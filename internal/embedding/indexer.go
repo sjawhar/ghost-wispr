@@ -5,12 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/sjawhar/ghost-wispr/internal/retry"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"github.com/sjawhar/ghost-wispr/internal/retry"
-	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 const (

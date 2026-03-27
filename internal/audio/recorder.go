@@ -85,7 +85,7 @@ func (r *Recorder) StartSession(sessionID string) error {
 	// Flush preroll buffer into the new file
 	if n := r.preroll.Len(); n > 0 {
 		buf := make([]byte, n)
-		r.preroll.Read(buf)
+		_, _ = r.preroll.Read(buf)
 		r.preroll.Reset()
 		if _, err := r.rawFile.Write(buf); err != nil {
 			return fmt.Errorf("flush preroll buffer: %w", err)
@@ -129,7 +129,7 @@ func (r *Recorder) writePCM(data []byte) error {
 	defer r.mu.Unlock()
 
 	if r.rawFile == nil {
-		r.preroll.Write(data)
+		_, _ = r.preroll.Write(data)
 		return nil
 	}
 

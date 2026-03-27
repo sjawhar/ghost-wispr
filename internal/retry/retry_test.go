@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/retry"
 )
@@ -59,8 +60,7 @@ func TestDo_ContextCancellationStopsRetries(t *testing.T) {
 	attempts := 0
 	go func() {
 		// Cancel after first attempt
-		for attempts == 0 {
-		}
+		time.Sleep(10 * time.Millisecond)
 		cancel()
 	}()
 	err := retry.Do(ctx, func() error {
