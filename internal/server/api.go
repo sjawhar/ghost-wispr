@@ -749,6 +749,99 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, merged)
 	})
 
+	mux.HandleFunc("POST /api/sessions/auto-merge", func(w http.ResponseWriter, r *http.Request) {
+		gapStr := r.URL.Query().Get("gap")
+		if gapStr == "" {
+			gapStr = "300"
+		}
+		gapSec, err := strconv.Atoi(gapStr)
+		if err != nil || gapSec <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "gap must be a positive integer (seconds)")
+			return
+		}
+		gap := time.Duration(gapSec) * time.Second
+
+		dateStr := r.URL.Query().Get("date")
+		if dateStr == "" {
+			writeJSONError(w, http.StatusBadRequest, "date parameter required (YYYY-MM-DD)")
+			return
+		}
+
+		sessions, err := store.GetSessionsByDate(dateStr, false)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get sessions: %v", err))
+			return
+		}
+
+		sort.Slice(sessions, func(i, j int) bool {
+			return sessions[i].StartedAt.Before(sessions[j].StartedAt)
+		})
+
+		var groups [][]string
+		var currentGroup []string
+		var prevEnded *time.Time
+
+		for _, sess := range sessions {
+			if sess.Status == "merged" {
+				if len(currentGroup) >= 2 {
+					groups = append(groups, currentGroup)
+				}
+				currentGroup = nil
+				prevEnded = nil
+				continue
+			}
+			if len(currentGroup) == 0 {
+				currentGroup = []string{sess.ID}
+				prevEnded = sess.EndedAt
+				continue
+			}
+			if prevEnded != nil && sess.StartedAt.Sub(*prevEnded) < gap {
+				currentGroup = append(currentGroup, sess.ID)
+			} else {
+				if len(currentGroup) >= 2 {
+					groups = append(groups, currentGroup)
+				}
+				currentGroup = []string{sess.ID}
+			}
+			prevEnded = sess.EndedAt
+		}
+		if len(currentGroup) >= 2 {
+			groups = append(groups, currentGroup)
+		}
+
+		var mergedIDs []string
+		for _, group := range groups {
+			var earliest, latest time.Time
+			for _, id := range group {
+				sess, err := store.GetSession(id)
+				if err != nil {
+					continue
+				}
+				if earliest.IsZero() || sess.StartedAt.Before(earliest) {
+					earliest = sess.StartedAt
+				}
+				if sess.EndedAt != nil && (latest.IsZero() || sess.EndedAt.After(latest)) {
+					latest = *sess.EndedAt
+				}
+			}
+			newID := earliest.UTC().Format("20060102150405") + "-merged"
+			if err := store.MergeSessions(newID, group, earliest, latest); err != nil {
+				slog.Error("auto-merge failed", "group", group, "error", err)
+				continue
+			}
+			mergedIDs = append(mergedIDs, newID)
+			if controls.OnSessionMerged != nil {
+				go controls.OnSessionMerged(context.Background(), newID)
+			}
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"merged_sessions":  mergedIDs,
+			"groups_found":     len(groups),
+			"sessions_scanned": len(sessions),
+		})
+	})
+
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !validSessionID(sessionID) {
