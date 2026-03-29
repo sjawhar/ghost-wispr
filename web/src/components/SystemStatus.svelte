@@ -7,6 +7,7 @@
   const deepgramStatus = $derived(appState.componentStatuses['deepgram'])
   const syncStatus = $derived(appState.componentStatuses['sync'])
   const micStatus = $derived(appState.componentStatuses['mic'])
+  const llmStatus = $derived(appState.componentStatuses['llm'])
 
   onMount(async () => {
     try {
@@ -48,6 +49,23 @@
           timestamp: new Date().toISOString(),
         }
       }
+      if (health.llm) {
+        if (health.llm === ComponentStatus.Ok) {
+          appState.componentStatuses['llm'] = {
+            status: ComponentStatus.Connected,
+            message: '',
+            timestamp: new Date().toISOString(),
+          }
+        } else if (health.llm === ComponentStatus.Error) {
+          appState.componentStatuses['llm'] = {
+            status: ComponentStatus.Error,
+            message: '',
+            timestamp: new Date().toISOString(),
+          }
+        } else {
+          delete appState.componentStatuses['llm']
+        }
+      }
     } catch (error) {
       console.error('Failed to fetch health:', error)
     }
@@ -73,7 +91,12 @@
   }
 
   const overallHealth = $derived.by(() => {
-    const statuses = [deepgramStatus?.status, syncStatus?.status, micStatus?.status]
+    const statuses = [
+      deepgramStatus?.status,
+      syncStatus?.status,
+      micStatus?.status,
+      llmStatus?.status,
+    ]
     const hasAnyStatus = statuses.some((s) => s !== undefined)
     if (!hasAnyStatus) return HealthStatus.Loading
     if (statuses.includes(ComponentStatus.Error) || statuses.includes(ComponentStatus.Disconnected))
@@ -118,7 +141,7 @@
     <span class="status-dot" style="background-color: {getStatusColor(deepgramStatus?.status)}"
     ></span>
     <span class="status-label" style="color: {getStatusColor(deepgramStatus?.status)}"
-      >Deepgram: {deepgramStatus?.status || 'unknown'}</span
+      >Transcription: {deepgramStatus?.status || 'unknown'}</span
     >
   </div>
   <div class="status-item" data-testid="status-sync">
@@ -131,6 +154,16 @@
     <span class="status-dot" style="background-color: {getStatusColor(micStatus?.status)}"></span>
     <span class="status-label" style="color: {getStatusColor(micStatus?.status)}"
       >Mic: {micStatus?.status || 'unknown'}</span
+    >
+  </div>
+  <div class="status-divider">|</div>
+  <div class="status-item" data-testid="status-llm">
+    <span
+      class="status-dot {llmStatus?.status ? '' : 'status-dot-hidden'}"
+      style="background-color: {getStatusColor(llmStatus?.status)}"
+    ></span>
+    <span class="status-label" style="color: {getStatusColor(llmStatus?.status)}"
+      >Summarization: {llmStatus?.status || 'unknown'}</span
     >
   </div>
 </div>
@@ -160,6 +193,10 @@
     height: 8px;
     border-radius: 50%;
     display: inline-block;
+  }
+
+  .status-dot-hidden {
+    visibility: hidden;
   }
 
   .status-label {

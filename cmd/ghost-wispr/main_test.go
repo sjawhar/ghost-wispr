@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"testing"
@@ -144,5 +145,46 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 	}
 	if waits[2] != time.Second {
 		t.Fatalf("expected third wait 1s (reset), got %v", waits[2])
+	}
+}
+
+func TestParseStoredStructuredSummaryWithJSONStringSpeakers(t *testing.T) {
+	raw := `{"title":"Nine-hour deadline task triage and QA alignment","summary":"## BLUF\nThe team is urgently prioritizing task unblocking.","speakers":"{\"0\":{\"name\":\"Santa\",\"confidence\":\"mentioned\"}}"}`
+
+	title, summaryText, speakerNames, err := parseStoredStructuredSummary(raw)
+	if err != nil {
+		t.Fatalf("parseStoredStructuredSummary returned error: %v", err)
+	}
+	if title != "Nine-hour deadline task triage and QA alignment" {
+		t.Fatalf("unexpected title: %q", title)
+	}
+	if summaryText != "## BLUF\nThe team is urgently prioritizing task unblocking." {
+		t.Fatalf("unexpected summary: %q", summaryText)
+	}
+
+	var speakers map[string]repairSpeakerMetadata
+	if err := json.Unmarshal([]byte(speakerNames), &speakers); err != nil {
+		t.Fatalf("speaker names not valid JSON: %v", err)
+	}
+	if speakers["0"].Name != "Santa" || speakers["0"].Confidence != "mentioned" {
+		t.Fatalf("unexpected speakers: %#v", speakers)
+	}
+}
+
+func TestParseStoredStructuredSummaryWithObjectSpeakers(t *testing.T) {
+	raw := `{"title":"Q2 roadmap alignment","summary":"## BLUF\nRoadmap aligned.","speakers":{"1":{"name":"Ben","confidence":"mentioned"}}}`
+
+	title, summaryText, speakerNames, err := parseStoredStructuredSummary(raw)
+	if err != nil {
+		t.Fatalf("parseStoredStructuredSummary returned error: %v", err)
+	}
+	if title != "Q2 roadmap alignment" {
+		t.Fatalf("unexpected title: %q", title)
+	}
+	if summaryText != "## BLUF\nRoadmap aligned." {
+		t.Fatalf("unexpected summary: %q", summaryText)
+	}
+	if speakerNames != `{"1":{"name":"Ben","confidence":"mentioned"}}` {
+		t.Fatalf("unexpected speakerNames: %s", speakerNames)
 	}
 }

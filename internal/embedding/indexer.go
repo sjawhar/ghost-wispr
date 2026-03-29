@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/sjawhar/ghost-wispr/internal/retry"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -122,8 +123,12 @@ func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string
 		return nil
 	}
 
-	vectors, err := i.client.Embed(ctx, texts)
-	if err != nil {
+	var vectors [][]float32
+	if err := retry.Do(ctx, func() error {
+		var embedErr error
+		vectors, embedErr = i.client.Embed(ctx, texts)
+		return embedErr
+	}, retry.DefaultMaxRetries); err != nil {
 		return fmt.Errorf("embed chunks: %w", err)
 	}
 	if len(vectors) != len(texts) {
