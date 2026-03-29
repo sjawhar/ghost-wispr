@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/session"
@@ -40,6 +42,7 @@ type SessionStore interface {
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
 	GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error)
+	GetSessionsForBackfill() ([]string, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.
@@ -747,6 +750,182 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		writeJSON(w, http.StatusOK, merged)
+	})
+
+	mux.HandleFunc("POST /api/sessions/auto-merge", func(w http.ResponseWriter, r *http.Request) {
+		gapStr := r.URL.Query().Get("gap")
+		if gapStr == "" {
+			gapStr = "300"
+		}
+		gapSec, err := strconv.Atoi(gapStr)
+		if err != nil || gapSec <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "gap must be a positive integer (seconds)")
+			return
+		}
+		gap := time.Duration(gapSec) * time.Second
+
+		dateStr := r.URL.Query().Get("date")
+		if dateStr == "" {
+			writeJSONError(w, http.StatusBadRequest, "date parameter required (YYYY-MM-DD)")
+			return
+		}
+
+		sessions, err := store.GetSessionsByDate(dateStr, false)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get sessions: %v", err))
+			return
+		}
+
+		sort.Slice(sessions, func(i, j int) bool {
+			return sessions[i].StartedAt.Before(sessions[j].StartedAt)
+		})
+
+		var groups [][]string
+		var currentGroup []string
+		var prevEnded *time.Time
+
+		for i := range sessions {
+			sess := &sessions[i]
+			if sess.Status == "merged" {
+				if len(currentGroup) >= 2 {
+					groups = append(groups, currentGroup)
+				}
+				currentGroup = nil
+				prevEnded = nil
+				continue
+			}
+			if len(currentGroup) == 0 {
+				currentGroup = []string{sess.ID}
+				prevEnded = sess.EndedAt
+				continue
+			}
+			if prevEnded != nil && sess.StartedAt.Sub(*prevEnded) < gap {
+				currentGroup = append(currentGroup, sess.ID)
+			} else {
+				if len(currentGroup) >= 2 {
+					groups = append(groups, currentGroup)
+				}
+				currentGroup = []string{sess.ID}
+			}
+			prevEnded = sess.EndedAt
+		}
+		if len(currentGroup) >= 2 {
+			groups = append(groups, currentGroup)
+		}
+
+		var mergedIDs []string
+		for _, group := range groups {
+			var earliest, latest time.Time
+			for _, id := range group {
+				sess, err := store.GetSession(id)
+				if err != nil {
+					continue
+				}
+				if earliest.IsZero() || sess.StartedAt.Before(earliest) {
+					earliest = sess.StartedAt
+				}
+				if sess.EndedAt != nil && (latest.IsZero() || sess.EndedAt.After(latest)) {
+					latest = *sess.EndedAt
+				}
+			}
+			newID := earliest.UTC().Format("20060102150405") + "-merged"
+			if err := store.MergeSessions(newID, group, earliest, latest); err != nil {
+				slog.Error("auto-merge failed", "group", group, "error", err)
+				continue
+			}
+			mergedIDs = append(mergedIDs, newID)
+			if controls.OnSessionMerged != nil {
+				go controls.OnSessionMerged(context.Background(), newID)
+			}
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"merged_sessions":  mergedIDs,
+			"groups_found":     len(groups),
+			"sessions_scanned": len(sessions),
+		})
+	})
+
+	mux.HandleFunc("POST /api/sessions/backfill", func(w http.ResponseWriter, r *http.Request) {
+		sessionIDs, err := store.GetSessionsForBackfill()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("query sessions: %v", err))
+			return
+		}
+
+		queued := len(sessionIDs)
+		if controls.Resummarize != nil && queued > 0 {
+			go func(ids []string) {
+				const maxConcurrent = 5
+				sem := semaphore.NewWeighted(maxConcurrent)
+				for _, id := range ids {
+					if err := sem.Acquire(context.Background(), 1); err != nil {
+						return // context cancelled
+					}
+					go func(sid string) {
+						defer sem.Release(1)
+						_ = controls.Resummarize(context.Background(), sid, "")
+					}(id)
+				}
+			}(sessionIDs)
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"queued": queued,
+			"found":  len(sessionIDs),
+		})
+	})
+
+	mux.HandleFunc("POST /api/sessions/repair-summaries", func(w http.ResponseWriter, r *http.Request) {
+		if controls.RepairSummaries == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "summary repair not configured")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+
+		repaired, err := controls.RepairSummaries(ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("repair summaries: %v", err))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]int{"repaired": repaired})
+	})
+
+	mux.HandleFunc("POST /api/sessions/batch-backfill", func(w http.ResponseWriter, r *http.Request) {
+		if controls.BatchBackfill == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "batch backfill not configured")
+			return
+		}
+		batchName, count, err := controls.BatchBackfill(r.Context())
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("batch backfill: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"batch_job": batchName,
+			"sessions":  count,
+		})
+	})
+
+	mux.HandleFunc("GET /api/batches/{name...}", func(w http.ResponseWriter, r *http.Request) {
+		batchName := r.PathValue("name")
+		if batchName == "" {
+			writeJSONError(w, http.StatusBadRequest, "batch name is required")
+			return
+		}
+		if controls.BatchPoll == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "batch polling not configured")
+			return
+		}
+		result, err := controls.BatchPoll(r.Context(), batchName)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("batch poll: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {

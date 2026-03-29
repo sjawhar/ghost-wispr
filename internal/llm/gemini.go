@@ -16,7 +16,11 @@ type geminiClient struct {
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
 	ctx := context.Background()
-	config := &genai.ClientConfig{APIKey: apiKey, Backend: genai.BackendGeminiAPI}
+	config := &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+	}
+
 	if opts.baseURL != "" {
 		config.HTTPOptions.BaseURL = opts.baseURL
 	}

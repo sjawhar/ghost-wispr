@@ -180,11 +180,16 @@ func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt
 	return nil
 }
 
+func (s *apiStoreStub) GetSessionsForBackfill() ([]string, error) {
+	return nil, nil
+}
+
 type healthCheckerStub struct{}
 
 func (h *healthCheckerStub) IsDeepgramConnected() bool            { return true }
 func (h *healthCheckerStub) IsDBHealthy(ctx context.Context) bool { return true }
 func (h *healthCheckerStub) IsMicOpen() bool                      { return true }
+func (h *healthCheckerStub) IsLLMHealthy() string                 { return "ok" }
 func testStaticFS(t *testing.T) fs.FS {
 	t.Helper()
 	dir := t.TempDir()
@@ -3088,5 +3093,49 @@ func TestEventsEndpoint_CursorFollowUp(t *testing.T) {
 	}
 	if resp2.HasMore {
 		t.Fatal("second request: expected has_more=false")
+	}
+}
+
+func TestRepairSummariesEndpoint(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{}
+	cfgStore := newTestConfigStore(t)
+
+	registerAPIRoutes(mux, store, &ControlHooks{
+		RepairSummaries: func(ctx context.Context) (int, error) {
+			return 22, nil
+		},
+	}, &healthCheckerStub{}, cfgStore, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/repair-summaries", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]int
+	if err := json.NewDecoder(w.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["repaired"] != 22 {
+		t.Fatalf("expected repaired=22, got %+v", payload)
+	}
+}
+
+func TestRepairSummariesEndpointUnavailableWithoutHook(t *testing.T) {
+	mux := http.NewServeMux()
+	store := &apiStoreStub{}
+	cfgStore := newTestConfigStore(t)
+
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/repair-summaries", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", w.Code, w.Body.String())
 	}
 }

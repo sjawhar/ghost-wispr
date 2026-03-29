@@ -144,6 +144,7 @@ export interface HealthResponse {
   deepgram: string
   db: string
   mic: string
+  llm: string
 }
 
 export function fetchHealth(): Promise<HealthResponse> {

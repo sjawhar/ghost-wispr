@@ -16,8 +16,11 @@ func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, 
 	if apiKey == "" {
 		return nil, fmt.Errorf("gemini api key is required")
 	}
+	config := &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+	}
 
-	config := &genai.ClientConfig{APIKey: apiKey, Backend: genai.BackendGeminiAPI}
 	if opts.baseURL != "" {
 		config.HTTPOptions.BaseURL = opts.baseURL
 	}

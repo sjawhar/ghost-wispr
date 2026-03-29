@@ -25,9 +25,10 @@ type Preset struct {
 }
 
 type Summarization struct {
-	Model   string            `yaml:"model"`
-	BaseURL string            `yaml:"base_url"`
-	Presets map[string]Preset `yaml:"presets"`
+	Model           string            `yaml:"model"`
+	BaseURL         string            `yaml:"base_url"`
+	Presets         map[string]Preset `yaml:"presets"`
+	MinSummaryWords int               `yaml:"min_summary_words"`
 }
 
 type Transcription struct {
@@ -83,11 +84,12 @@ func defaults() Config {
 		GCMaxAgeDays:          30,
 		GCMaxAudioSizeMB:      1024,
 		Summarization: Summarization{
-			Model: "openai/gpt-4o-mini",
+			Model:           "openai/gpt-4o-mini",
+			MinSummaryWords: 20,
 			Presets: map[string]Preset{
 				"default": {
-					Description:  "General-purpose meeting summary with key topics and decisions",
-					SystemPrompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics and decisions made.",
+					Description:  "General-purpose summary adapted to content depth",
+					SystemPrompt: "",
 					UserTemplate: "{{transcript}}",
 				},
 			},

@@ -35,6 +35,8 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+
+	"google.golang.org/genai"
 )
 
 var (
@@ -68,6 +70,85 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	}
 
 	return streamingTranscript
+}
+
+type repairSpeakerMetadata struct {
+	Name       string `json:"name"`
+	Confidence string `json:"confidence"`
+}
+
+func parseStoredStructuredSummary(rawSummary string) (title, summaryText, speakerNames string, err error) {
+	var payload struct {
+		Title    string          `json:"title"`
+		Summary  string          `json:"summary"`
+		Speakers json.RawMessage `json:"speakers,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(rawSummary), &payload); err != nil {
+		return "", "", "", err
+	}
+
+	speakers, err := parseStoredSummarySpeakers(payload.Speakers)
+	if err != nil {
+		return "", "", "", err
+	}
+	if len(speakers) == 0 {
+		return strings.TrimSpace(payload.Title), strings.TrimSpace(payload.Summary), "{}", nil
+	}
+
+	encodedSpeakers, err := json.Marshal(speakers)
+	if err != nil {
+		return strings.TrimSpace(payload.Title), strings.TrimSpace(payload.Summary), "{}", nil
+	}
+
+	return strings.TrimSpace(payload.Title), strings.TrimSpace(payload.Summary), string(encodedSpeakers), nil
+}
+
+func parseStoredSummarySpeakers(raw json.RawMessage) (map[string]repairSpeakerMetadata, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+
+	var speakers map[string]repairSpeakerMetadata
+	if err := json.Unmarshal(raw, &speakers); err == nil {
+		return normalizeRepairSpeakers(speakers), nil
+	}
+
+	var encoded string
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		return nil, err
+	}
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" || encoded == "null" {
+		return nil, nil
+	}
+
+	if err := json.Unmarshal([]byte(encoded), &speakers); err != nil {
+		return nil, err
+	}
+	return normalizeRepairSpeakers(speakers), nil
+}
+
+func normalizeRepairSpeakers(speakers map[string]repairSpeakerMetadata) map[string]repairSpeakerMetadata {
+	if len(speakers) == 0 {
+		return nil
+	}
+	normalized := make(map[string]repairSpeakerMetadata, len(speakers))
+	for speakerID, meta := range speakers {
+		meta.Name = strings.TrimSpace(meta.Name)
+		meta.Confidence = strings.TrimSpace(meta.Confidence)
+		if meta.Name == "" {
+			continue
+		}
+		if meta.Confidence != "mentioned" && meta.Confidence != "inferred" {
+			meta.Confidence = "inferred"
+		}
+		normalized[speakerID] = meta
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
 }
 
 func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, error) {
@@ -283,19 +364,24 @@ func main() {
 		"anthropic": cfg.AnthropicAPIKey,
 		"gemini":    cfg.GeminiAPIKey,
 	}
+	llmTracker := server.NewLLMHealthTracker()
 	var summarizer *summary.Summarizer
 	canSummarize := false
-	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil && apiKeys[provider] != "" {
-		canSummarize = true
+	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil {
+		if apiKeys[provider] != "" {
+			canSummarize = true
+		}
 	}
 	if !canSummarize {
 		for _, preset := range cfg.Summarization.Presets {
 			if preset.Model == "" {
 				continue
 			}
-			if provider, _, err := llm.ParseModel(preset.Model); err == nil && apiKeys[provider] != "" {
-				canSummarize = true
-				break
+			if provider, _, err := llm.ParseModel(preset.Model); err == nil {
+				if apiKeys[provider] != "" {
+					canSummarize = true
+					break
+				}
 			}
 		}
 	}
@@ -328,6 +414,19 @@ func main() {
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
 	var startupSummarizer = summarizer // capture for goroutine below
+	llmHealthOnResult := func(err error) {
+		if err != nil {
+			llmTracker.SetError(err.Error())
+			return
+		}
+		llmTracker.SetOK()
+	}
+	if summarizer != nil {
+		summarizer.OnResult = llmHealthOnResult
+	}
+	if startupSummarizer != nil {
+		startupSummarizer.OnResult = llmHealthOnResult
+	}
 
 	recState := &recorderState{}
 	warnings := append([]string{}, cfgWarnings...)
@@ -337,6 +436,7 @@ func main() {
 	} else {
 		manager.SetBatchTranscriber(batchTranscriber)
 	}
+
 	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
@@ -361,6 +461,57 @@ func main() {
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
 			// Placeholder for T10 batch refinement
 			return nil
+		},
+		RepairSummaries: func(ctx context.Context) (int, error) {
+			dates, err := store.GetDates()
+			if err != nil {
+				return 0, err
+			}
+
+			repaired := 0
+			seenSessionIDs := make(map[string]struct{})
+			for _, date := range dates {
+				select {
+				case <-ctx.Done():
+					return repaired, ctx.Err()
+				default:
+				}
+
+				sessions, err := store.GetSessionsByDate(date, true)
+				if err != nil {
+					return repaired, err
+				}
+
+				for i := range sessions {
+					if _, exists := seenSessionIDs[sessions[i].ID]; exists {
+						continue
+					}
+					seenSessionIDs[sessions[i].ID] = struct{}{}
+
+					trimmedSummary := strings.TrimSpace(sessions[i].Summary)
+					if !strings.HasPrefix(trimmedSummary, "{") {
+						continue
+					}
+
+					title, summaryText, speakerNames, err := parseStoredStructuredSummary(trimmedSummary)
+					if err != nil {
+						continue
+					}
+					if title == "" {
+						title = sessions[i].Title
+					}
+					if speakerNames == "" {
+						speakerNames = "{}"
+					}
+
+					if err := store.UpdateSummary(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames); err != nil {
+						return repaired, err
+					}
+					repaired++
+				}
+			}
+
+			return repaired, nil
 		},
 		Presets: func() map[string]config.Preset {
 			if summarizer == nil {
@@ -634,6 +785,139 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"skipped":  result.Skipped,
 				"errors":   result.Errors,
 			}, nil
+		},
+		BatchBackfill: func(ctx context.Context) (string, int, error) {
+			if summarizer == nil {
+				return "", 0, fmt.Errorf("summarization not configured")
+			}
+			latestCfg := cfgStore.Get()
+			if latestCfg.GeminiAPIKey == "" {
+				return "", 0, fmt.Errorf("gemini API key required for batch operations (AI Studio backend)")
+			}
+
+			sessionIDs, err := store.GetSessionsForBackfill()
+			if err != nil {
+				return "", 0, fmt.Errorf("query sessions: %w", err)
+			}
+			if len(sessionIDs) == 0 {
+				return "", 0, nil
+			}
+
+			var sessions []summary.BatchSession
+			for _, id := range sessionIDs {
+				sess, err := store.GetSession(id)
+				if err != nil {
+					continue
+				}
+				transcript := sess.CanonicalTranscript
+				if strings.TrimSpace(transcript) == "" {
+					continue
+				}
+				sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
+			}
+			if len(sessions) == 0 {
+				return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
+			}
+
+			requests, err := summarizer.BuildBatchRequests(ctx, sessions)
+			if err != nil {
+				return "", 0, fmt.Errorf("build batch requests: %w", err)
+			}
+
+			genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
+				APIKey:  latestCfg.GeminiAPIKey,
+				Backend: genai.BackendGeminiAPI,
+			})
+			if err != nil {
+				return "", 0, fmt.Errorf("create genai client: %w", err)
+			}
+
+			_, model, err := llm.ParseModel(latestCfg.Summarization.Model)
+			if err != nil {
+				return "", 0, fmt.Errorf("parse model: %w", err)
+			}
+
+			job, err := genaiClient.Batches.Create(ctx, model, &genai.BatchJobSource{
+				InlinedRequests: requests,
+			}, nil)
+			if err != nil {
+				return "", 0, fmt.Errorf("create batch job: %w", err)
+			}
+
+			return job.Name, len(sessions), nil
+		},
+		BatchPoll: func(ctx context.Context, batchName string) (map[string]any, error) {
+			latestCfg := cfgStore.Get()
+			if latestCfg.GeminiAPIKey == "" {
+				return nil, fmt.Errorf("gemini API key required for batch operations")
+			}
+
+			genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
+				APIKey:  latestCfg.GeminiAPIKey,
+				Backend: genai.BackendGeminiAPI,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("create genai client: %w", err)
+			}
+
+			job, err := genaiClient.Batches.Get(ctx, batchName, nil)
+			if err != nil {
+				return nil, fmt.Errorf("get batch job: %w", err)
+			}
+
+			result := map[string]any{
+				"name":  job.Name,
+				"state": string(job.State),
+			}
+
+			if job.State == genai.JobStateSucceeded || job.State == genai.JobStatePartiallySucceeded {
+				var sessions []summary.BatchSession
+				if job.Dest != nil {
+					for _, resp := range job.Dest.InlinedResponses {
+						id := ""
+						if resp.Metadata != nil {
+							id = resp.Metadata["session_id"]
+						}
+						transcript := ""
+						if id != "" {
+							if sess, err := store.GetSession(id); err == nil {
+								transcript = sess.CanonicalTranscript
+							}
+						}
+						sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
+					}
+				}
+
+				batchResults := summarizer.ProcessBatchResults(job, sessions)
+				var succeeded, failed int
+				for _, br := range batchResults {
+					if br.Error != nil {
+						failed++
+						if br.SessionID != "" {
+							_ = store.UpdateSummary(br.SessionID, "", "", storage.SummaryFailed, br.PresetName, "{}")
+						}
+						continue
+					}
+					if br.SessionID != "" {
+						_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
+						hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
+					}
+					succeeded++
+				}
+				result["succeeded"] = succeeded
+				result["failed"] = failed
+				result["total"] = len(batchResults)
+			}
+
+			if job.State == genai.JobStateFailed {
+				errMsg := "unknown error"
+				if job.Error != nil {
+					errMsg = job.Error.Message
+				}
+				result["error"] = errMsg
+			}
+
+			return result, nil
 		},
 	}
 	if err != nil {
@@ -930,7 +1214,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	// Create health checker with actual component references
-	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic)
+	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))

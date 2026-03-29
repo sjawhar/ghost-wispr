@@ -33,8 +33,8 @@ func ParseModel(model string) (provider, modelName string, err error) {
 	return parts[0], parts[1], nil
 }
 
-func NewClient(model string) (Client, error) {
-	return newClient(model)
+func NewClient(model string, opts ...Option) (Client, error) {
+	return newClient(model, opts...)
 }
 
 func newClient(model string, opts ...Option) (Client, error) {
