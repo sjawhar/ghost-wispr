@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"sync/atomic"
 
 	"github.com/gordonklaus/portaudio"
 )
@@ -14,6 +15,7 @@ type Mic struct {
 	buf             []int16
 	sampleRate      int
 	framesPerBuffer int
+	active          atomic.Bool
 }
 
 // NewMic opens a PortAudio capture stream with the given sample rate and buffer size (in frames).
@@ -26,8 +28,17 @@ func NewMic(sampleRate, framesPerBuffer int) (*Mic, error) {
 	return &Mic{stream: stream, buf: buf, sampleRate: sampleRate, framesPerBuffer: framesPerBuffer}, nil
 }
 
-func (m *Mic) Start() error { return m.stream.Start() }
-func (m *Mic) Stop() error  { return m.stream.Stop() }
+func (m *Mic) Start() error {
+	err := m.stream.Start()
+	if err == nil {
+		m.active.Store(true)
+	}
+	return err
+}
+func (m *Mic) Stop() error {
+	m.active.Store(false)
+	return m.stream.Stop()
+}
 
 // Reopen closes the current PortAudio stream and opens a fresh one with the
 // same parameters. This picks up new device nodes after a USB reconnect.
@@ -39,7 +50,11 @@ func (m *Mic) Reopen() error {
 		return err
 	}
 	m.stream = stream
-	return m.stream.Start()
+	err = m.stream.Start()
+	if err == nil {
+		m.active.Store(true)
+	}
+	return err
 }
 
 // Stream reads from the mic and writes PCM16-LE to w until an error or stop.
@@ -48,6 +63,7 @@ func (m *Mic) Stream(w io.Writer) error {
 	out.Grow(len(m.buf) * 2) // pre-allocate: int16 = 2 bytes per sample
 	for {
 		if err := m.stream.Read(); err != nil {
+			m.active.Store(false)
 			return err
 		}
 		out.Reset()
@@ -62,5 +78,5 @@ func (m *Mic) Stream(w io.Writer) error {
 
 // IsOpen returns true if the mic stream is currently active.
 func (m *Mic) IsOpen() bool {
-	return m.stream != nil
+	return m.stream != nil && m.active.Load()
 }
