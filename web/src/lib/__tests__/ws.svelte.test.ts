@@ -64,4 +64,23 @@ describe('ws manager', () => {
 
     expect(appState.paused).toBe(true)
   })
+
+  it('applies replayed component status events from websocket bootstrap', () => {
+    vi.stubGlobal('WebSocket', MockSocket as any)
+
+    connect()
+    MockSocket.instances[0].emit('message', {
+      data: JSON.stringify({
+        type: 'component_status',
+        version: 1,
+        timestamp: new Date().toISOString(),
+        component: 'mic',
+        status: 'unavailable',
+        message: 'Microphone unavailable',
+      }),
+    })
+
+    expect(appState.componentStatuses.mic?.status).toBe('unavailable')
+    expect(appState.componentStatuses.mic?.message).toBe('Microphone unavailable')
+  })
 })

@@ -7,6 +7,7 @@
   import StatusBanner from './components/StatusBanner.svelte'
   import SystemStatus from './components/SystemStatus.svelte'
   import LogViewer from './components/LogViewer.svelte'
+  import { filterVisibleWarnings } from './lib/warnings'
   import {
     appState,
     setDates,
@@ -37,6 +38,8 @@
   let expandedSessionId = $state('')
   let loadingError = $state('')
   let currentView = $state<'main' | 'settings'>('main')
+
+  const visibleWarnings = $derived(filterVisibleWarnings(appState.warnings))
 
   async function loadDate(date: string): Promise<void> {
     if (appState.sessionsByDate.has(date)) {
@@ -226,9 +229,9 @@
   {:else}
     <StatusBanner connected={appState.connected} componentStatuses={appState.componentStatuses} />
 
-    {#if appState.warnings.length > 0}
+    {#if visibleWarnings.length > 0}
       <aside class="warnings-banner" data-testid="warnings-banner">
-        {#each appState.warnings as warning (warning)}
+        {#each visibleWarnings as warning (warning)}
           <p class="warning-item">{warning}</p>
         {/each}
       </aside>
