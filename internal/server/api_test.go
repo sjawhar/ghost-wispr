@@ -1836,6 +1836,133 @@ func TestAPISessionDetail_IncludesTranscriptSource(t *testing.T) {
 	}
 }
 
+func TestCurrentTranscriptEndpoint_WithActiveSession(t *testing.T) {
+	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionActive},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "hello", StartTime: 0, EndTime: 1, Timestamp: started},
+				{Speaker: 1, Text: "world", StartTime: 1, EndTime: 2, Timestamp: started.Add(1 * time.Second)},
+			},
+		},
+		dates: []string{"2026-03-23"},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		ActiveSession: func() (string, time.Time) { return "s1", started },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/current/transcript", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Session struct {
+			ID        string    `json:"id"`
+			StartedAt time.Time `json:"started_at"`
+			Status    string    `json:"status"`
+		} `json:"session"`
+		Segments []transcribe.Segment `json:"segments"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if resp.Session.ID != "s1" {
+		t.Fatalf("expected session id 's1', got %q", resp.Session.ID)
+	}
+	if len(resp.Segments) != 2 {
+		t.Fatalf("expected 2 segments, got %d", len(resp.Segments))
+	}
+}
+
+func TestCurrentTranscriptEndpoint_NoActiveSession(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+		dates:          nil,
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		ActiveSession: func() (string, time.Time) { return "", time.Time{} },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/current/transcript", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "no active session") {
+		t.Fatalf("expected error message about no active session, got %s", rr.Body.String())
+	}
+}
+
+func TestCurrentTranscriptEndpoint_WithSinceFilter(t *testing.T) {
+	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", StartedAt: started, Status: storage.SessionActive},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {
+				{Speaker: 0, Text: "first", StartTime: 0, EndTime: 1, Timestamp: started},
+				{Speaker: 1, Text: "second", StartTime: 1, EndTime: 2, Timestamp: started.Add(1 * time.Second)},
+				{Speaker: 0, Text: "third", StartTime: 2, EndTime: 3, Timestamp: started.Add(2 * time.Second)},
+			},
+		},
+		dates: []string{"2026-03-23"},
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		ActiveSession: func() (string, time.Time) { return "s1", started },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	// Request with since filter - should only get segments after 1 second
+	sinceTime := started.Add(500 * time.Millisecond).UnixMilli()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/sessions/current/transcript?since=%d", sinceTime), nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Segments []transcribe.Segment `json:"segments"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(resp.Segments) != 2 {
+		t.Fatalf("expected 2 segments after filter, got %d", len(resp.Segments))
+	}
+	if resp.Segments[0].Text != "second" {
+		t.Fatalf("expected first segment to be 'second', got %q", resp.Segments[0].Text)
+	}
+}
+
 func TestSearchEndpointWithFilters(t *testing.T) {
 	mux := http.NewServeMux()
 	var capturedOpts storage.SearchOptions

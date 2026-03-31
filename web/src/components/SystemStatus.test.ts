@@ -19,6 +19,6 @@ describe('SystemStatus', () => {
 
     expect(screen.getByText(/Transcription: connected/)).toBeTruthy()
     expect(screen.getByText(/Drive Sync: disconnected/)).toBeTruthy()
-    expect(screen.getByText(/Mic: error/)).toBeTruthy()
+    expect(screen.getByText(/Host Mic: error/)).toBeTruthy()
   })
 })

@@ -53,17 +53,20 @@ func TestStreamMicWithRetryRetriesOverflow(t *testing.T) {
 	if waits != 1 {
 		t.Fatalf("expected 1 wait call, got %d", waits)
 	}
+	if streamer.reopens != 1 {
+		t.Fatalf("expected 1 reopen call for overflow, got %d", streamer.reopens)
+	}
 }
 
-func TestStreamMicWithRetryOverflowDoesNotReopen(t *testing.T) {
+func TestStreamMicWithRetryOverflowReopens(t *testing.T) {
 	streamer := &fakeStreamer{errs: []error{errors.New("Input overflowed"), nil}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(_ time.Duration) {}, func(string, ...any) {}, nil)
 
-	if streamer.reopens != 0 {
-		t.Fatalf("expected 0 reopen calls for overflow, got %d", streamer.reopens)
+	if streamer.reopens != 1 {
+		t.Fatalf("expected 1 reopen call for overflow, got %d", streamer.reopens)
 	}
 }
 

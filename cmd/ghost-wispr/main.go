@@ -1304,6 +1304,17 @@ func streamMicWithRetry(
 				hub.BroadcastComponentStatus("mic", "warning", "Mic input overflow, restarting stream")
 			}
 			wait(overflowWait)
+			if ctx.Err() != nil {
+				return
+			}
+			if reopenErr := streamer.Reopen(); reopenErr != nil {
+				logf("mic reopen failed: %v", reopenErr)
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
+				}
+				continue
+			}
+			logf("mic reopened successfully")
 			continue
 		}
 

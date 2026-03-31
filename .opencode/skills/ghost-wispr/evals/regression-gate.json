@@ -1,0 +1,70 @@
+{
+  "skill_name": "ghost-wispr",
+  "dataset_name": "regression-gate",
+  "description": "The three must-pass real-world Ghost Wispr cases. Any future skill change should be blocked if one of these regresses.",
+  "cases": [
+    {
+      "id": "gate-peter-blocked-exact-notes",
+      "prompt": "Search Ghost Whisper for Peter's (peteramcintyre / Peter) notes about how to prioritize issues on the GitHub board that are blocked, where the blocking issue is still open. This was a recent discussion. Return Peter's exact notes/recommendations about how to handle blocked issues, any prioritization framework he suggested, and any context about what 'blocked' means in this context.",
+      "required": {
+        "session_id": "20260327203708",
+        "must_quote_one_of": [
+          "And we can do that by saying it is blocked if it has a blocked by and the issue is still open.",
+          "So you see blocked by an issue that is currently open rather than blocked by an issue that is closed.",
+          "I think the thing that we want is tasks in final review that have no block, like, that have zero block by."
+        ],
+        "must_include_concepts": [
+          "blocked by relationship",
+          "blocking issue still open",
+          "closed issues should not count as blocked"
+        ],
+        "must_not_primary_session": [
+          "20260328073102",
+          "20260328044039"
+        ],
+        "max_api_calls": 10
+      }
+    },
+    {
+      "id": "gate-recent-priorities-broad-context",
+      "prompt": "Search Ghost Whisper for recent voice conversations from today and yesterday. Look for: (1) discussions about priorities, plans, or what to focus on, (2) mentions of issues, bugs, or blockers, and (3) strategic discussions about the project. Start with a broad semantic search like 'priorities today' and 'what to work on', then try 'tasks', 'issues', 'blocked', 'environment'. Return a summary of any relevant context found.",
+      "required": {
+        "must_include_session_ids": [
+          "20260330192953",
+          "20260327203708"
+        ],
+        "should_include_one_of": [
+          "20260327202956",
+          "20260330210052",
+          "20260330131053"
+        ],
+        "must_include_concepts": [
+          "priorities or plans",
+          "issues or blockers"
+        ],
+        "max_api_calls": 10
+      }
+    },
+    {
+      "id": "gate-sami-day-audit",
+      "prompt": "Read through all Ghost Whisper transcripts from today (March 26, 2026) and find any decisions that involve Sami (the user). Focus on longer sessions, use search first to identify the most relevant sessions, then summarize decisions, action items, priorities, and blockers that require Sami's attention.",
+      "required": {
+        "session_id": "20260326024958-merged",
+        "must_quote_one_of": [
+          "Sami, do you feel like you have what you need in order be able to investigate this, or do you need anything from them?",
+          "Are you happy to lead the investigation"
+        ],
+        "must_include_concepts": [
+          "March 26 only",
+          "investigation readiness",
+          "API key or security investigation"
+        ],
+        "must_not_primary_session": [
+          "20260328023411"
+        ],
+        "max_api_calls": 12,
+        "special_rule": "If session.segments is empty, the run must still inspect session.refined_transcript or session.canonical_transcript before concluding there is no answer."
+      }
+    }
+  ]
+}

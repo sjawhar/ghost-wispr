@@ -1,0 +1,27 @@
+{
+  "eval_id": 5,
+  "eval_name": "docker-build",
+  "prompt": "When did we have build system problems where the machine was running out of space? I think it was back in February.",
+  "assertions": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "type": "behavioral",
+      "check": "search_log contains calls to /api/search or /api/search/semantic before any /api/sessions?date= calls"
+    },
+    {
+      "text": "Agent found session 20260227234044 (the correct Docker issues session)",
+      "type": "correctness",
+      "check": "result.md references session ID 20260227234044"
+    },
+    {
+      "text": "Agent cited disk space as the cause of build failures",
+      "type": "correctness",
+      "check": "result.md mentions disk space or storage as the cause"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "type": "efficiency",
+      "check": "search_log contains 6 or fewer curl commands"
+    }
+  ]
+}

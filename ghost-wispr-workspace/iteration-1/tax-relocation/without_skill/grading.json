@@ -1,0 +1,43 @@
+{
+  "expectations": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "passed": true,
+      "evidence": "After reading OpenAPI spec (call 1), used /api/search for keyword searches. Never browsed sessions by date."
+    },
+    {
+      "text": "Agent found session 20260331020134 (the correct fundraising/tax session)",
+      "passed": true,
+      "evidence": "result.md: 'Session ID: 20260331020134' — found via keyword search for 'capital gains' on call 3"
+    },
+    {
+      "text": "Agent reported conclusion to fundraise before moving to avoid California taxes",
+      "passed": true,
+      "evidence": "result.md: 'The team should aim to fundraise BEFORE moving to the US to avoid California's high capital gains tax rates'"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "passed": true,
+      "evidence": "search_log.md shows exactly 6 calls: OpenAPI spec, 3 keyword searches, 1 broader search, 1 session detail"
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "openapi_spec": 1,
+      "search_keyword": 4,
+      "session_detail": 1
+    },
+    "total_tool_calls": 6,
+    "first_search_type": "keyword"
+  },
+  "timing": {
+    "duration_ms": 41000,
+    "total_duration_seconds": 41.0
+  }
+}

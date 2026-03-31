@@ -544,6 +544,58 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, result)
 	})
 
+	mux.HandleFunc("GET /api/sessions/current/transcript", func(w http.ResponseWriter, r *http.Request) {
+		if controls.ActiveSession == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "active session tracking not available")
+			return
+		}
+
+		sessionID, _ := controls.ActiveSession()
+		if sessionID == "" {
+			writeJSONError(w, http.StatusNotFound, "no active session")
+			return
+		}
+
+		sessionData, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+
+		segments, err := store.GetSegments(sessionID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("get segments: %v", err))
+			return
+		}
+
+		// Filter by ?since= query parameter for incremental polling
+		since := strings.TrimSpace(r.URL.Query().Get("since"))
+		if since != "" {
+			sinceTime, err := strconv.ParseInt(since, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "since must be a valid Unix timestamp")
+				return
+			}
+			sinceTimeObj := time.Unix(0, sinceTime*int64(time.Millisecond))
+			filtered := make([]transcribe.Segment, 0, len(segments))
+			for _, seg := range segments {
+				if seg.Timestamp.After(sinceTimeObj) {
+					filtered = append(filtered, seg)
+				}
+			}
+			segments = filtered
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session":  sessionData,
+			"segments": segments,
+		})
+	})
+
 	mux.HandleFunc("GET /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !validSessionID(sessionID) {

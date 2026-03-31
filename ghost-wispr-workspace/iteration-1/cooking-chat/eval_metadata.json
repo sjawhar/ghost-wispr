@@ -1,0 +1,27 @@
+{
+  "eval_id": 1,
+  "eval_name": "cooking-chat",
+  "prompt": "I remember someone in the office talking about food science — something about the specific temperature you need for browning food? It was a pretty casual conversation, maybe in the kitchen. Can you find that?",
+  "assertions": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "type": "behavioral",
+      "check": "search_log contains calls to /api/search or /api/search/semantic before any /api/sessions?date= calls"
+    },
+    {
+      "text": "Agent found session 20260325000501-merged (the correct kitchen chat session)",
+      "type": "correctness",
+      "check": "result.md references session ID 20260325000501-merged"
+    },
+    {
+      "text": "Agent cited content related to the Maillard reaction or cooking temperatures (~200°C)",
+      "type": "correctness",
+      "check": "result.md mentions Maillard or 200 degrees"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "type": "efficiency",
+      "check": "search_log contains 6 or fewer curl commands"
+    }
+  ]
+}

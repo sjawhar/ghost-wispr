@@ -1,0 +1,89 @@
+{
+  "metadata": {
+    "skill": "ghost-wispr",
+    "benchmark": "iteration-2-real-world-prompts",
+    "date": "2026-03-31",
+    "host_tested": "https://ghost-wispr.tailb86685.ts.net"
+  },
+  "cases": [
+    {
+      "case": "Peter exact-notes lookup",
+      "baseline_without_skill": {
+        "status": "correct",
+        "session_id": "20260327203708",
+        "call_count": 4,
+        "notes": "Found exact blocked-by/still-open quote and sharp framework."
+      },
+      "with_skill_v1": {
+        "status": "wrong-session",
+        "session_id": "20260328073102",
+        "call_count": 13,
+        "notes": "Drifted to backlog-triage / planner discussion."
+      },
+      "with_skill_v2": {
+        "status": "wrong-session",
+        "session_id": "20260328044039",
+        "call_count": 18,
+        "notes": "Drifted to blocked-label cleanup discussion."
+      },
+      "with_skill_final": {
+        "status": "correct",
+        "session_id": "20260327203708",
+        "call_count": 7,
+        "notes": "Concept-first exact-condition search (`blocked by still open`) recovered correct session and quotes."
+      }
+    },
+    {
+      "case": "Recent priorities broad-context query",
+      "baseline_without_skill": {
+        "status": "mostly-correct",
+        "session_ids": [
+          "20260330192953",
+          "20260327203708",
+          "20260328073102",
+          "20260327202956"
+        ],
+        "call_count": 10,
+        "notes": "Broader but noisier summary."
+      },
+      "with_skill_v1": {
+        "status": "mostly-correct",
+        "session_ids": [
+          "20260330192953",
+          "20260327203708",
+          "20260328023411"
+        ],
+        "call_count": 6,
+        "notes": "Cleaner search plan and lower call count."
+      }
+    },
+    {
+      "case": "Sami day-audit query",
+      "baseline_without_skill": {
+        "status": "date-drift",
+        "session_id": "20260328023411",
+        "call_count": 12,
+        "notes": "Found a Sami quote, but from March 28 instead of March 26."
+      },
+      "with_skill_v1": {
+        "status": "miss",
+        "session_id": "20260328023411",
+        "call_count": 16,
+        "notes": "Claimed no March 26 Sami mentions; ignored empty-segments fallback."
+      },
+      "with_skill_final": {
+        "status": "correct",
+        "session_id": "20260326024958-merged",
+        "call_count": 8,
+        "notes": "Date audit + refined/canonical transcript fallback recovered the March 26 Sami investigation quote."
+      }
+    }
+  ],
+  "findings": [
+    "Broad/contextual retrieval benefits from semantic-first guidance.",
+    "Exact-notes lookups fail if speaker filters are treated as primary selectors; concept/phrase-first retrieval works better.",
+    "Day-audit queries need date-bounded session listing plus transcript fallback when segments are empty.",
+    "The service can return empty `segments` alongside usable `session.refined_transcript` or `session.canonical_transcript`; the skill must treat those as first-class sources."
+  ],
+  "final_recommendation": "Use the updated skill. The biggest remaining risk was exact-notes retrieval, and the final concept-first patch fixed the measured regression on the Peter case."
+}

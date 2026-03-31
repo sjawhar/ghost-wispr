@@ -1,0 +1,27 @@
+{
+  "eval_id": 2,
+  "eval_name": "tax-relocation",
+  "prompt": "We had a conversation about tax consequences of moving to the States — specifically around capital gains. When was that and what was the conclusion?",
+  "assertions": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "type": "behavioral",
+      "check": "search_log contains calls to /api/search or /api/search/semantic before any /api/sessions?date= calls"
+    },
+    {
+      "text": "Agent found session 20260331020134 (the correct fundraising/tax session)",
+      "type": "correctness",
+      "check": "result.md references session ID 20260331020134"
+    },
+    {
+      "text": "Agent reported conclusion to fundraise before moving to avoid California taxes",
+      "type": "correctness",
+      "check": "result.md mentions fundraising before moving or avoiding California tax"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "type": "efficiency",
+      "check": "search_log contains 6 or fewer curl commands"
+    }
+  ]
+}

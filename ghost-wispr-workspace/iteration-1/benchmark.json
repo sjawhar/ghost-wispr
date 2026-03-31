@@ -1,0 +1,176 @@
+{
+  "metadata": {
+    "skill_name": "ghost-wispr",
+    "skill_path": ".opencode/skills/ghost-wispr/",
+    "timestamp": "2026-03-30T21:30:00Z",
+    "evals_run": ["cooking-chat", "tax-relocation", "docker-build"],
+    "runs_per_configuration": 1
+  },
+  "runs": [
+    {
+      "eval_id": 1,
+      "eval_name": "cooking-chat",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.75,
+        "passed": 3,
+        "failed": 1,
+        "total": 4,
+        "time_seconds": 45.0,
+        "tokens": null,
+        "tool_calls": 8,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Used search as primary discovery", "passed": true, "evidence": "Semantic search first"},
+        {"text": "Found correct session", "passed": true, "evidence": "20260325000501-merged"},
+        {"text": "Cited Maillard/cooking temps", "passed": true, "evidence": "Referenced Maillard reaction"},
+        {"text": "Completed in ≤6 calls", "passed": false, "evidence": "Used 8 calls"}
+      ],
+      "notes": ["Started with semantic search (skill guidance), fell back to keyword variations"]
+    },
+    {
+      "eval_id": 1,
+      "eval_name": "cooking-chat",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.75,
+        "passed": 3,
+        "failed": 1,
+        "total": 4,
+        "time_seconds": 75.0,
+        "tokens": null,
+        "tool_calls": 9,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Used search as primary discovery", "passed": true, "evidence": "Keyword search after reading spec"},
+        {"text": "Found correct session", "passed": true, "evidence": "20260325000501-merged"},
+        {"text": "Cited Maillard/cooking temps", "passed": true, "evidence": "Quoted '200 degrees Celsius' from transcript"},
+        {"text": "Completed in ≤6 calls", "passed": false, "evidence": "Used 9 calls"}
+      ],
+      "notes": ["Spent 1 call reading OpenAPI spec", "No semantic search attempted"]
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "tax-relocation",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 28.0,
+        "tokens": null,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Used search as primary discovery", "passed": true, "evidence": "Semantic search first"},
+        {"text": "Found correct session", "passed": true, "evidence": "20260331020134 (similarity 0.6123)"},
+        {"text": "Reported fundraise-before-moving conclusion", "passed": true, "evidence": "Explicitly stated conclusion"},
+        {"text": "Completed in ≤6 calls", "passed": true, "evidence": "2 calls total"}
+      ],
+      "notes": ["Semantic search hit target as top result on first try"]
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "tax-relocation",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 41.0,
+        "tokens": null,
+        "tool_calls": 6,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Used search as primary discovery", "passed": true, "evidence": "Keyword search after reading spec"},
+        {"text": "Found correct session", "passed": true, "evidence": "20260331020134"},
+        {"text": "Reported fundraise-before-moving conclusion", "passed": true, "evidence": "Explicitly stated conclusion"},
+        {"text": "Completed in ≤6 calls", "passed": true, "evidence": "6 calls total (barely)"}
+      ],
+      "notes": ["First compound keyword query failed; simpler 'capital gains' succeeded", "No semantic search attempted"]
+    },
+    {
+      "eval_id": 5,
+      "eval_name": "docker-build",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 36.0,
+        "tokens": null,
+        "tool_calls": 4,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Used search as primary discovery", "passed": true, "evidence": "Semantic search first, fell back to keyword"},
+        {"text": "Found correct session", "passed": true, "evidence": "20260227234044"},
+        {"text": "Cited disk space as cause", "passed": true, "evidence": "Builder ran out of space / exhausted disk space"},
+        {"text": "Completed in ≤6 calls", "passed": true, "evidence": "4 calls total"}
+      ],
+      "notes": ["Semantic search returned no results; keyword with date filter found it immediately", "Output files not persisted (subagent cwd issue)"]
+    },
+    {
+      "eval_id": 5,
+      "eval_name": "docker-build",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 41.0,
+        "tokens": null,
+        "tool_calls": 4,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Used search as primary discovery", "passed": true, "evidence": "Keyword search after reading spec"},
+        {"text": "Found correct session", "passed": true, "evidence": "20260227234044"},
+        {"text": "Cited disk space as cause", "passed": true, "evidence": "Quoted 'ran out of space' from transcript"},
+        {"text": "Completed in ≤6 calls", "passed": true, "evidence": "4 calls total"}
+      ],
+      "notes": ["Keyword hit on first attempt with 'build system space out of space'"]
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {"mean": 0.917, "stddev": 0.118, "min": 0.75, "max": 1.0},
+      "time_seconds": {"mean": 36.3, "stddev": 6.9, "min": 28.0, "max": 45.0},
+      "tool_calls": {"mean": 4.7, "stddev": 2.5, "min": 2, "max": 8}
+    },
+    "without_skill": {
+      "pass_rate": {"mean": 0.917, "stddev": 0.118, "min": 0.75, "max": 1.0},
+      "time_seconds": {"mean": 52.3, "stddev": 15.7, "min": 41.0, "max": 75.0},
+      "tool_calls": {"mean": 6.3, "stddev": 2.1, "min": 4, "max": 9}
+    },
+    "delta": {
+      "pass_rate": "+0.00",
+      "time_seconds": "-16.0",
+      "tool_calls": "-1.6"
+    }
+  },
+  "notes": [
+    "Pass rates are identical — both configurations found the correct session in all 3 evals",
+    "With-skill is 30% faster on average (36.3s vs 52.3s)",
+    "With-skill uses ~25% fewer tool calls on average (4.7 vs 6.3)",
+    "Biggest efficiency gain on conceptual queries: tax eval was 2 calls (with) vs 6 calls (without) — semantic search is the differentiator",
+    "Cooking chat was equally hard for both — neither knew 'Maillard' upfront, both exceeded 6-call budget",
+    "Without-skill agents always spend 1 call reading OpenAPI spec; with-skill agents skip this",
+    "Without-skill agents never attempted semantic search — they only used keyword search from the spec",
+    "The efficiency assertion (≤6 calls) may be too tight for hard queries — consider raising to 8"
+  ]
+}
