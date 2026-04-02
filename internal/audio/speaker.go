@@ -196,6 +196,22 @@ func (s *Speaker) Close() error {
 	return s.Stop()
 }
 
+// OutputStream is the exported version of outputStream for cross-package testing.
+type OutputStream interface {
+	Start() error
+	Stop() error
+	Write() error
+	Close() error
+}
+
+// SetOpenStreamForTest overrides the stream factory for testing.
+// It allows callers outside the audio package to inject a mock stream.
+func (s *Speaker) SetOpenStreamForTest(fn func(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (OutputStream, error)) {
+	s.openStream = func(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (outputStream, error) {
+		return fn(sampleRate, channels, framesPerBuffer, buf, deviceName)
+	}
+}
+
 func samplesToMs(totalSamples int64, channels, sampleRate int) int64 {
 	if channels <= 0 || sampleRate <= 0 {
 		return 0

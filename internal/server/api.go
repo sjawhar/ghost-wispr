@@ -1292,6 +1292,73 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			mux.HandleFunc("POST /api/config/presets/refine", handleRefinePreset(cfgStore, controls.RefinePreset))
 		}
 	}
+
+	// TTS speak endpoints — only registered if TTS hooks are wired.
+	if controls.TTSSpeak != nil {
+		mux.HandleFunc("POST /api/tts/speak", func(w http.ResponseWriter, r *http.Request) {
+			// Pre-flight: check speaker availability.
+			if controls.TTSHasSpeaker != nil && !controls.TTSHasSpeaker() {
+				writeJSONError(w, http.StatusServiceUnavailable, "speaker not available")
+				return
+			}
+			// Pre-flight: check TTS provider availability.
+			if controls.TTSHasProvider != nil && !controls.TTSHasProvider() {
+				writeJSONError(w, http.StatusNotImplemented, "no TTS provider configured")
+				return
+			}
+
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			var body struct {
+				Text     string `json:"text"`
+				Voice    string `json:"voice,omitempty"`
+				Provider string `json:"provider,omitempty"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSONError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+			if body.Text == "" {
+				writeJSONError(w, http.StatusBadRequest, "text is required")
+				return
+			}
+
+			id, err := controls.TTSSpeak(body.Text, body.Voice, body.Provider)
+			if err != nil {
+				switch err.Error() {
+				case "tts queue is full":
+					writeJSONError(w, http.StatusTooManyRequests, "TTS queue is full")
+				case "tts rate limit exceeded":
+					writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				default:
+					writeJSONError(w, http.StatusInternalServerError, err.Error())
+				}
+				return
+			}
+
+			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "queued"})
+		})
+
+		mux.HandleFunc("GET /api/tts/status/{id}", func(w http.ResponseWriter, r *http.Request) {
+			requestID := r.PathValue("id")
+			if requestID == "" {
+				writeJSONError(w, http.StatusBadRequest, "id is required")
+				return
+			}
+
+			if controls.TTSStatus == nil {
+				writeJSONError(w, http.StatusNotImplemented, "TTS status not available")
+				return
+			}
+
+			status, ok := controls.TTSStatus(requestID)
+			if !ok {
+				writeJSONError(w, http.StatusNotFound, "unknown request id")
+				return
+			}
+
+			writeJSON(w, http.StatusOK, status)
+		})
+	}
 }
 
 func cosineSimilarity(a, b []float32) float32 {
