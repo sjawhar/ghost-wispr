@@ -123,13 +123,21 @@ func (s *Speaker) Play(audioData []byte, format AudioFormat) (result *PlaybackRe
 		return &PlaybackResult{}, nil
 	}
 
-	// Open PortAudio output stream.
-	framesPerBuffer := sampleRate / 4 // 250ms buffer, matching mic pattern
+	// Open PortAudio output stream with sample rate fallback.
+	framesPerBuffer := sampleRate / 4 // 250ms buffer
 	outputBuf := make([]int16, framesPerBuffer*channels)
 
-	stream, err := s.openStream(sampleRate, channels, framesPerBuffer, outputBuf, s.deviceName)
+	stream, actualRate, err := s.openStreamWithFallback(sampleRate, channels, framesPerBuffer, outputBuf)
 	if err != nil {
 		return nil, fmt.Errorf("open output stream: %w", err)
+	}
+	defer stream.Close()
+
+	// Resample PCM if the actual stream rate differs from the source rate.
+	if actualRate != sampleRate {
+		samples = resamplePCM(samples, channels, sampleRate, actualRate)
+		sampleRate = actualRate
+		framesPerBuffer = sampleRate / 4
 	}
 	defer stream.Close()
 
@@ -222,6 +230,59 @@ func samplesToMs(totalSamples int64, channels, sampleRate int) int64 {
 
 func (s *Speaker) defaultOpenStream(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (outputStream, error) {
 	return openOutputStream(sampleRate, channels, framesPerBuffer, buf, deviceName)
+}
+
+// openStreamWithFallback tries the source sample rate first, then falls back to
+// common rates the hardware might support (same approach as mic.go).
+func (s *Speaker) openStreamWithFallback(srcRate, channels, framesPerBuffer int, buf []int16, rates ...int) (outputStream, int, error) {
+	// Try source rate first.
+	stream, err := s.openStream(srcRate, channels, framesPerBuffer, buf, s.deviceName)
+	if err == nil {
+		return stream, srcRate, nil
+	}
+	slog.Info("speaker: source rate failed, trying fallbacks", "source_rate", srcRate, "error", err)
+
+	// Fallback rates to try.
+	fallbackRates := []int{32000, 48000, 44100, 24000, 22050, 16000}
+	for _, rate := range fallbackRates {
+		if rate == srcRate {
+			continue
+		}
+		fb := rate / 4
+		fbBuf := make([]int16, fb*channels)
+		stream, tryErr := s.openStream(rate, channels, fb, fbBuf, s.deviceName)
+		if tryErr == nil {
+			slog.Info("speaker: opened at fallback rate", "rate", rate)
+			return stream, rate, nil
+		}
+	}
+	return nil, 0, fmt.Errorf("no supported output sample rate (tried %d and fallbacks): %w", srcRate, err)
+}
+
+// resamplePCM does simple linear interpolation resampling of int16 PCM.
+func resamplePCM(samples []int16, channels, srcRate, dstRate int) []int16 {
+	if srcRate == dstRate || len(samples) == 0 {
+		return samples
+	}
+	srcFrames := len(samples) / channels
+	dstFrames := int(float64(srcFrames) * float64(dstRate) / float64(srcRate))
+	out := make([]int16, dstFrames*channels)
+	ratio := float64(srcRate) / float64(dstRate)
+
+	for i := 0; i < dstFrames; i++ {
+		srcPos := float64(i) * ratio
+		idx := int(srcPos)
+		frac := srcPos - float64(idx)
+		for ch := 0; ch < channels; ch++ {
+			s0 := int(samples[idx*channels+ch])
+			s1 := s0
+			if idx+1 < srcFrames {
+				s1 = int(samples[(idx+1)*channels+ch])
+			}
+			out[i*channels+ch] = int16(float64(s0) + frac*float64(s1-s0))
+		}
+	}
+	return out
 }
 
 func openOutputStream(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (*portaudio.Stream, error) {

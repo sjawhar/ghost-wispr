@@ -409,8 +409,10 @@ func validate(cfg *Config) []string {
 		default:
 			warnings = append(warnings, fmt.Sprintf("Invalid tts_provider %q — supported providers are elevenlabs, google.", cfg.TTSProvider))
 		}
-		if cfg.TTSAPIKey == "" {
+		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" {
 			warnings = append(warnings, "TTS provider configured but API key not set — set "+EnvPrefix+"TTS_API_KEY.")
+		} else if cfg.TTSAPIKey == "" && cfg.TTSProvider == "google" && os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
+			warnings = append(warnings, "Google TTS requires "+EnvPrefix+"TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS.")
 		}
 		if cfg.TTSMaxLength <= 0 {
 			cfg.TTSMaxLength = 5000
