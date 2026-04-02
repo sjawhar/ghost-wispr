@@ -35,6 +35,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
+	"github.com/sjawhar/ghost-wispr/internal/tts"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 
 	"google.golang.org/genai"
@@ -1232,6 +1233,48 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}
 
+	// Initialize TTS orchestrator if both speaker and provider are configured.
+	var ttsOrchestrator *tts.Orchestrator
+	if speaker != nil && cfg.TTSProvider != "" && cfg.TTSAPIKey != "" {
+		var ttsProvider tts.Provider
+		var ttsErr error
+		switch cfg.TTSProvider {
+		case "elevenlabs":
+			ttsProvider, ttsErr = tts.NewElevenLabsProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+		case "google":
+			ttsProvider, ttsErr = tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+		default:
+			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
+		}
+		if ttsErr != nil {
+			log.Printf("warning: TTS disabled: %v", ttsErr)
+			warnings = append(warnings, fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
+		} else {
+			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, speaker, tts.OrchestratorOpts{})
+			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
+		}
+	}
+
+	// Wire up TTS hooks now that orchestrator is initialized.
+	if ttsOrchestrator != nil {
+		controlHooks.TTSSpeak = ttsOrchestrator.Speak
+		controlHooks.TTSStatus = func(id string) (map[string]any, bool) {
+			status, ok := ttsOrchestrator.Status(id)
+			if !ok {
+				return nil, false
+			}
+			return map[string]any{
+				"id":            status.ID,
+				"status":        status.Status,
+				"bytes_written": status.BytesWritten,
+				"duration_ms":   status.DurationMs,
+				"error":         status.Error,
+			}, true
+		}
+		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
+		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
+	}
+
 	// Wire up mic diagnostic hook now that mic is initialized.
 	controlHooks.DiagnoseMic = func(ctx context.Context) (map[string]any, error) {
 		if mic == nil {
@@ -1348,6 +1391,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	if mic != nil {
 		_ = mic.Stop()
+	}
+	if ttsOrchestrator != nil {
+		ttsOrchestrator.Stop()
 	}
 	if speaker != nil {
 		_ = speaker.Close()
