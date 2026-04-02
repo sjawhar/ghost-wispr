@@ -455,6 +455,160 @@ func main() {
 			}
 		}()
 	}
+	loadSessionTranscript := func(sessionID string) (string, bool) {
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			log.Printf("warning: failed to get session %s: %v", sessionID, err)
+			return "", false
+		}
+		transcript := strings.TrimSpace(sess.CanonicalTranscript)
+		if transcript != "" {
+			return transcript, true
+		}
+		segments, err := store.GetSegments(sessionID)
+		if err != nil {
+			log.Printf("warning: failed to get segments for %s: %v", sessionID, err)
+			return "", false
+		}
+		return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
+	}
+	buildBatchSessions := func(sessionIDs []string) ([]summary.BatchSession, []string) {
+		sessions := make([]summary.BatchSession, 0, len(sessionIDs))
+		emptyTranscriptIDs := make([]string, 0)
+		for _, id := range sessionIDs {
+			transcript, ok := loadSessionTranscript(id)
+			if !ok {
+				continue
+			}
+			if transcript == "" {
+				emptyTranscriptIDs = append(emptyTranscriptIDs, id)
+				continue
+			}
+			sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
+		}
+		return sessions, emptyTranscriptIDs
+	}
+	markEmptySummariesCompleted := func(sessionIDs []string) {
+		for _, id := range sessionIDs {
+			_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
+		}
+	}
+	submitSummaryBatch := func(ctx context.Context, sessionIDs []string) (string, int, error) {
+		if summarizer == nil {
+			return "", 0, fmt.Errorf("summarization not configured")
+		}
+		latestCfg := cfgStore.Get()
+		if latestCfg.GeminiAPIKey == "" {
+			return "", 0, fmt.Errorf("gemini API key required for batch operations (AI Studio backend)")
+		}
+
+		sessions, emptyTranscriptIDs := buildBatchSessions(sessionIDs)
+		markEmptySummariesCompleted(emptyTranscriptIDs)
+		if len(sessions) == 0 {
+			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
+		}
+
+		requests, err := summarizer.BuildBatchRequests(ctx, sessions)
+		if err != nil {
+			return "", 0, fmt.Errorf("build batch requests: %w", err)
+		}
+
+		genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
+			APIKey:  latestCfg.GeminiAPIKey,
+			Backend: genai.BackendGeminiAPI,
+		})
+		if err != nil {
+			return "", 0, fmt.Errorf("create genai client: %w", err)
+		}
+
+		_, model, err := llm.ParseModel(latestCfg.Summarization.Model)
+		if err != nil {
+			return "", 0, fmt.Errorf("parse model: %w", err)
+		}
+
+		job, err := genaiClient.Batches.Create(ctx, model, &genai.BatchJobSource{
+			InlinedRequests: requests,
+		}, nil)
+		if err != nil {
+			return "", 0, fmt.Errorf("create batch job: %w", err)
+		}
+
+		return job.Name, len(sessions), nil
+	}
+	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
+		latestCfg := cfgStore.Get()
+		if latestCfg.GeminiAPIKey == "" {
+			return nil, fmt.Errorf("gemini API key required for batch operations")
+		}
+
+		genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
+			APIKey:  latestCfg.GeminiAPIKey,
+			Backend: genai.BackendGeminiAPI,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create genai client: %w", err)
+		}
+
+		job, err := genaiClient.Batches.Get(ctx, batchName, nil)
+		if err != nil {
+			return nil, fmt.Errorf("get batch job: %w", err)
+		}
+
+		result := map[string]any{
+			"name":  job.Name,
+			"state": string(job.State),
+		}
+
+		if job.State == genai.JobStateSucceeded || job.State == genai.JobStatePartiallySucceeded {
+			var sessions []summary.BatchSession
+			if job.Dest != nil {
+				for _, resp := range job.Dest.InlinedResponses {
+					id := ""
+					if resp.Metadata != nil {
+						id = resp.Metadata["session_id"]
+					}
+					transcript := ""
+					if id != "" {
+						if loaded, ok := loadSessionTranscript(id); ok {
+							transcript = loaded
+						}
+					}
+					sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
+				}
+			}
+
+			batchResults := summarizer.ProcessBatchResults(job, sessions)
+			var succeeded, failed int
+			for _, br := range batchResults {
+				if br.Error != nil {
+					failed++
+					if br.SessionID != "" {
+						_ = store.UpdateSummary(br.SessionID, "", "", storage.SummaryFailed, br.PresetName, "{}")
+					}
+					continue
+				}
+				if br.SessionID != "" {
+					_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
+					hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
+					publishSummaryReady(br.SessionID)
+				}
+				succeeded++
+			}
+			result["succeeded"] = succeeded
+			result["failed"] = failed
+			result["total"] = len(batchResults)
+		}
+
+		if job.State == genai.JobStateFailed {
+			errMsg := "unknown error"
+			if job.Error != nil {
+				errMsg = job.Error.Message
+			}
+			result["error"] = errMsg
+		}
+
+		return result, nil
+	}
 
 	controlHooks := &server.ControlHooks{
 		Pause:         recState.Pause,
@@ -805,14 +959,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			}, nil
 		},
 		BatchBackfill: func(ctx context.Context) (string, int, error) {
-			if summarizer == nil {
-				return "", 0, fmt.Errorf("summarization not configured")
-			}
-			latestCfg := cfgStore.Get()
-			if latestCfg.GeminiAPIKey == "" {
-				return "", 0, fmt.Errorf("gemini API key required for batch operations (AI Studio backend)")
-			}
-
 			sessionIDs, err := store.GetSessionsForBackfill()
 			if err != nil {
 				return "", 0, fmt.Errorf("query sessions: %w", err)
@@ -820,123 +966,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if len(sessionIDs) == 0 {
 				return "", 0, nil
 			}
-
-			var sessions []summary.BatchSession
-			for _, id := range sessionIDs {
-				sess, err := store.GetSession(id)
-				if err != nil {
-					continue
-				}
-				transcript := sess.CanonicalTranscript
-				if strings.TrimSpace(transcript) == "" {
-					continue
-				}
-				sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
-			}
-			if len(sessions) == 0 {
-				return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
-			}
-
-			requests, err := summarizer.BuildBatchRequests(ctx, sessions)
-			if err != nil {
-				return "", 0, fmt.Errorf("build batch requests: %w", err)
-			}
-
-			genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-				APIKey:  latestCfg.GeminiAPIKey,
-				Backend: genai.BackendGeminiAPI,
-			})
-			if err != nil {
-				return "", 0, fmt.Errorf("create genai client: %w", err)
-			}
-
-			_, model, err := llm.ParseModel(latestCfg.Summarization.Model)
-			if err != nil {
-				return "", 0, fmt.Errorf("parse model: %w", err)
-			}
-
-			job, err := genaiClient.Batches.Create(ctx, model, &genai.BatchJobSource{
-				InlinedRequests: requests,
-			}, nil)
-			if err != nil {
-				return "", 0, fmt.Errorf("create batch job: %w", err)
-			}
-
-			return job.Name, len(sessions), nil
+			return submitSummaryBatch(ctx, sessionIDs)
 		},
 		BatchPoll: func(ctx context.Context, batchName string) (map[string]any, error) {
-			latestCfg := cfgStore.Get()
-			if latestCfg.GeminiAPIKey == "" {
-				return nil, fmt.Errorf("gemini API key required for batch operations")
-			}
-
-			genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-				APIKey:  latestCfg.GeminiAPIKey,
-				Backend: genai.BackendGeminiAPI,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("create genai client: %w", err)
-			}
-
-			job, err := genaiClient.Batches.Get(ctx, batchName, nil)
-			if err != nil {
-				return nil, fmt.Errorf("get batch job: %w", err)
-			}
-
-			result := map[string]any{
-				"name":  job.Name,
-				"state": string(job.State),
-			}
-
-			if job.State == genai.JobStateSucceeded || job.State == genai.JobStatePartiallySucceeded {
-				var sessions []summary.BatchSession
-				if job.Dest != nil {
-					for _, resp := range job.Dest.InlinedResponses {
-						id := ""
-						if resp.Metadata != nil {
-							id = resp.Metadata["session_id"]
-						}
-						transcript := ""
-						if id != "" {
-							if sess, err := store.GetSession(id); err == nil {
-								transcript = sess.CanonicalTranscript
-							}
-						}
-						sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
-					}
-				}
-
-				batchResults := summarizer.ProcessBatchResults(job, sessions)
-				var succeeded, failed int
-				for _, br := range batchResults {
-					if br.Error != nil {
-						failed++
-						if br.SessionID != "" {
-							_ = store.UpdateSummary(br.SessionID, "", "", storage.SummaryFailed, br.PresetName, "{}")
-						}
-						continue
-					}
-					if br.SessionID != "" {
-						_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
-						hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
-						publishSummaryReady(br.SessionID)
-					}
-					succeeded++
-				}
-				result["succeeded"] = succeeded
-				result["failed"] = failed
-				result["total"] = len(batchResults)
-			}
-
-			if job.State == genai.JobStateFailed {
-				errMsg := "unknown error"
-				if job.Error != nil {
-					errMsg = job.Error.Message
-				}
-				result["error"] = errMsg
-			}
-
-			return result, nil
+			return pollSummaryBatch(ctx, batchName)
 		},
 	}
 
@@ -1036,19 +1069,61 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	if startupSummarizer != nil {
 		go func() {
-			pendingIDs, err := store.GetSessionsNeedingSummary()
+			pendingIDs, err := store.GetSessionsForBackfill()
 			if err != nil {
 				log.Printf("warning: failed to query sessions needing summary: %v", err)
 				return
 			}
+			if len(pendingIDs) == 0 {
+				return
+			}
+			if len(pendingIDs) >= 4 {
+				batchName, count, err := submitSummaryBatch(ctx, pendingIDs)
+				if err == nil {
+					log.Printf("startup: submitting %d sessions to batch summarization", count)
+					go func(batchName string) {
+						ticker := time.NewTicker(30 * time.Second)
+						defer ticker.Stop()
+						for {
+							result, err := pollSummaryBatch(ctx, batchName)
+							if err != nil {
+								if ctx.Err() != nil {
+									return
+								}
+								log.Printf("warning: startup batch job %s poll failed: %v", batchName, err)
+							} else if state, _ := result["state"].(string); state != "" {
+								succeeded, _ := result["succeeded"].(int)
+								failed, _ := result["failed"].(int)
+								switch state {
+								case string(genai.JobStateSucceeded), string(genai.JobStatePartiallySucceeded):
+									log.Printf("startup: batch job %s complete: %d succeeded, %d failed", batchName, succeeded, failed)
+									return
+								case string(genai.JobStateFailed):
+									if errMsg, _ := result["error"].(string); errMsg != "" {
+										log.Printf("startup: batch job %s failed: %s", batchName, errMsg)
+									} else {
+										log.Printf("startup: batch job %s failed", batchName)
+									}
+									return
+								}
+							}
+							select {
+							case <-ctx.Done():
+								return
+							case <-ticker.C:
+							}
+						}
+					}(batchName)
+					return
+				}
+				log.Printf("warning: startup batch submission failed for %d sessions: %v; falling back to synchronous summarization", len(pendingIDs), err)
+			}
 			for _, id := range pendingIDs {
-				log.Printf("summarizing session %s", id)
-				segments, err := store.GetSegments(id)
-				if err != nil {
-					log.Printf("warning: failed to get segments for %s: %v", id, err)
+				log.Printf("startup: summarizing session %s synchronously", id)
+				transcript, ok := loadSessionTranscript(id)
+				if !ok {
 					continue
 				}
-				transcript := buildCanonicalTranscript(store, id, segments)
 				if transcript == "" {
 					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
 					continue
