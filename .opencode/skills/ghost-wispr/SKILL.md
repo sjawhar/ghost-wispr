@@ -129,6 +129,16 @@ curl -s -X POST "$GHOST_WISPR_HOST/api/resume"
 curl -s -X POST "$GHOST_WISPR_HOST/api/sessions/current/stop"
 ```
 
+### Read the live transcript for the current meeting
+
+```bash
+# Read current meeting transcript
+curl -s "$GHOST_WISPR_HOST/api/sessions/current/transcript" | jq
+
+# Incremental poll (only new segments since last check)
+curl -s "$GHOST_WISPR_HOST/api/sessions/current/transcript?since=$LAST_TS" | jq
+```
+
 ### Browse sessions
 
 ```bash
@@ -140,6 +150,16 @@ curl -s "$GHOST_WISPR_HOST/api/sessions?date=2026-03-25" | jq
 
 # Full session with transcript segments
 curl -s "$GHOST_WISPR_HOST/api/sessions/{id}" | jq
+```
+
+### Speak text through TTS
+
+```bash
+# Speak text through the speaker
+curl -s -X POST "$GHOST_WISPR_HOST/api/tts/speak" -H 'Content-Type: application/json' -d '{"text": "Hello, this is the agent"}'
+
+# Check status
+curl -s "$GHOST_WISPR_HOST/api/tts/status/{id}" | jq
 ```
 
 ### Audit one day for decisions or action items
@@ -167,8 +187,11 @@ curl -s "$GHOST_WISPR_HOST/api/sessions/{id}" | jq '{title: .session.title, refi
 | Aggregate | `GET /api/sessions/aggregate?group_by=date\|preset` |
 | Event polling | `GET /api/events?cursor=N` |
 | Session list | `GET /api/sessions?date=YYYY-MM-DD` |
+| Live transcript | `GET /api/sessions/current/transcript` |
 | Session detail | `GET /api/sessions/{id}` |
 | Start/stop | `POST /api/sessions/start`, `POST /api/sessions/current/stop` |
+| TTS speak | `POST /api/tts/speak` |
+| TTS status | `GET /api/tts/status/{id}` |
 | Resummarize | `POST /api/sessions/{id}/resummarize` |
 | Config | `GET /api/config`, `PATCH /api/config` |
 | OpenAPI spec | `GET /api/openapi.json` |
@@ -179,4 +202,5 @@ curl -s "$GHOST_WISPR_HOST/api/sessions/{id}" | jq '{title: .session.title, refi
 - Speaker filter accepts names (`Ben`, case-insensitive) or indices (`0`, `1`)
 - Semantic search returns HTTP 501 if no embedding provider configured — fall back to keyword search
 - Event polling uses cursor-based pagination: pass `next_cursor` from previous response
+- Ghost Wispr publishes `summary_ready` events to Envoy/NATS on topic `notifications.ghost-wispr.summary-ready` when a session summary completes. Subscribe via the meeting-actions skill.
 - Auth is disabled by default. If `GHOST_WISPR_AUTH_TOKEN` is set on the server, add `-u "ghost-wispr:$GHOST_WISPR_AUTH_TOKEN"` to requests.
