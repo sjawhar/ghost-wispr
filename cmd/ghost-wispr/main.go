@@ -35,8 +35,8 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
-	"github.com/sjawhar/ghost-wispr/internal/tts"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"github.com/sjawhar/ghost-wispr/internal/tts"
 
 	"google.golang.org/genai"
 )
@@ -938,9 +938,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 			return result, nil
 		},
-	}
-	if err != nil {
-		log.Fatalf("build http handler failed: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
