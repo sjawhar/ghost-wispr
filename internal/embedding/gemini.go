@@ -33,7 +33,7 @@ func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, 
 	return &geminiClient{client: client, model: model}, nil
 }
 
-func (c *geminiClient) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskType) ([][]float32, error) {
 	if len(texts) == 0 {
 		return [][]float32{}, nil
 	}
@@ -43,7 +43,12 @@ func (c *geminiClient) Embed(ctx context.Context, texts []string) ([][]float32, 
 		contents[i] = genai.NewContentFromText(text, genai.RoleUser)
 	}
 
-	resp, err := c.client.Models.EmbedContent(ctx, c.model, contents, nil)
+	config := &genai.EmbedContentConfig{}
+	if taskType != "" {
+		config.TaskType = string(taskType)
+	}
+
+	resp, err := c.client.Models.EmbedContent(ctx, c.model, contents, config)
 	if err != nil {
 		return nil, fmt.Errorf("gemini embedding: %w", err)
 	}

@@ -111,7 +111,7 @@ func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string
 	hashes := make([]string, 0, len(chunks))
 	for idx, chunk := range chunks {
 		h := textHash(chunk)
-		if emb, ok := byChunk[idx]; ok && emb.TextHash == h {
+		if emb, ok := byChunk[idx]; ok && emb.TextHash == h && emb.Model == i.model {
 			continue
 		}
 		texts = append(texts, chunk)
@@ -126,7 +126,7 @@ func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string
 	var vectors [][]float32
 	if err := retry.Do(ctx, func() error {
 		var embedErr error
-		vectors, embedErr = i.client.Embed(ctx, texts)
+		vectors, embedErr = i.client.Embed(ctx, texts, TaskTypeDocument)
 		return embedErr
 	}, retry.DefaultMaxRetries); err != nil {
 		return fmt.Errorf("embed chunks: %w", err)

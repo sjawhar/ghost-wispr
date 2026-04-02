@@ -29,7 +29,7 @@ func newOpenAIClient(apiKey, model string, opts *clientOptions) (*openaiClient, 
 	return &openaiClient{client: openai.NewClientWithConfig(config), model: model}, nil
 }
 
-func (c *openaiClient) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (c *openaiClient) Embed(ctx context.Context, texts []string, _ TaskType) ([][]float32, error) {
 	if len(texts) == 0 {
 		return [][]float32{}, nil
 	}

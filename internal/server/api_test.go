@@ -39,18 +39,20 @@ type apiStoreStub struct {
 }
 
 type embeddingClientStub struct {
-	vectors [][]float32
-	err     error
+	vectors   [][]float32
+	err       error
+	taskTypes []embedding.TaskType
 }
 
-func (s embeddingClientStub) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (s *embeddingClientStub) Embed(ctx context.Context, texts []string, taskType embedding.TaskType) ([][]float32, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
+	s.taskTypes = append(s.taskTypes, taskType)
 	return s.vectors, nil
 }
 
-var _ embedding.Client = embeddingClientStub{}
+var _ embedding.Client = (*embeddingClientStub)(nil)
 
 func newTestConfigStore(t *testing.T) *config.Store {
 	t.Helper()
@@ -2059,7 +2061,8 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 
 	cfgStore := newTestConfigStore(t)
-	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, embeddingClientStub{vectors: [][]float32{{1, 0}}})
+	client := &embeddingClientStub{vectors: [][]float32{{1, 0}}}
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, client)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/search/semantic?q=planning&limit=1", nil)
 	w := httptest.NewRecorder()
@@ -2089,6 +2092,9 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 	if payload.Results[0].Title != "Top Session" {
 		t.Fatalf("expected title Top Session, got %q", payload.Results[0].Title)
+	}
+	if len(client.taskTypes) != 1 || client.taskTypes[0] != embedding.TaskTypeQuery {
+		t.Fatalf("expected query task type, got %#v", client.taskTypes)
 	}
 }
 
@@ -2123,7 +2129,7 @@ func TestSemanticSearch_NoEmbeddings(t *testing.T) {
 	store := &apiStoreStub{}
 
 	cfgStore := newTestConfigStore(t)
-	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, embeddingClientStub{vectors: [][]float32{{1, 0}}})
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, &embeddingClientStub{vectors: [][]float32{{1, 0}}})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/search/semantic?q=planning", nil)
 	w := httptest.NewRecorder()
@@ -3125,7 +3131,7 @@ func TestSemanticSearch_DateFilter(t *testing.T) {
 	}
 
 	cfgStore := newTestConfigStore(t)
-	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, embeddingClientStub{vectors: [][]float32{{1, 0}}})
+	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, &embeddingClientStub{vectors: [][]float32{{1, 0}}})
 
 	req := httptest.NewRequest("GET", "/api/search/semantic?q=test&date_from=2026-03-24T00:00:00Z&date_to=2026-03-26T00:00:00Z", nil)
 	w := httptest.NewRecorder()
