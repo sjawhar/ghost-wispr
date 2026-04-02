@@ -52,6 +52,9 @@ type Config struct {
 	GDriveFolderID                string             `yaml:"gdrive_folder_id"`
 	GoogleCredentialsFile         string             `yaml:"google_credentials_file"`
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
+	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
+	NATSURL                       string             `yaml:"nats_url"`
+	EnvoyTopic                    string             `yaml:"envoy_topic"`
 	GCEnabled                     bool               `yaml:"gc_enabled"`
 	GCMaxAgeDays                  int                `yaml:"gc_max_age_days"`
 	GCMaxAudioSizeMB              int                `yaml:"gc_max_audio_size_mb"`
@@ -63,6 +66,8 @@ type Config struct {
 	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size"`
 	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
+	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
+	SpeakerDevice                 string             `yaml:"speaker_device"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
@@ -81,6 +86,7 @@ func defaults() Config {
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
 		GoogleCredentialsFile: "./service-account.json",
+		EnvoyTopic:            "notifications.ghost-wispr.summary-ready",
 		GCMaxAgeDays:          30,
 		GCMaxAudioSizeMB:      1024,
 		Summarization: Summarization{
@@ -250,6 +256,15 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "GDRIVE_SYNC_ENABLED"); v != "" {
 		cfg.GDriveSyncEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
+	if v := os.Getenv(EnvPrefix + "ENVOY_ENABLED"); v != "" {
+		cfg.EnvoyEnabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv(EnvPrefix + "NATS_URL"); v != "" {
+		cfg.NATSURL = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "ENVOY_TOPIC"); v != "" {
+		cfg.EnvoyTopic = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "GC_ENABLED"); v != "" {
 		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
@@ -262,6 +277,12 @@ func applyEnvOverrides(cfg *Config) {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
 			cfg.GCMaxAudioSizeMB = n
 		}
+	}
+	if v := os.Getenv(EnvPrefix + "SPEAKER_ENABLED"); v != "" {
+		cfg.SpeakerEnabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv(EnvPrefix + "SPEAKER_DEVICE"); v != "" {
+		cfg.SpeakerDevice = v
 	}
 }
 
@@ -339,6 +360,12 @@ func validate(cfg *Config) []string {
 
 	if cfg.BatchTranscription.Provider == "" {
 		cfg.BatchTranscription.Provider = "deepgram"
+	}
+	if cfg.EnvoyTopic == "" {
+		cfg.EnvoyTopic = "notifications.ghost-wispr.summary-ready"
+	}
+	if cfg.EnvoyEnabled && strings.TrimSpace(cfg.NATSURL) == "" {
+		warnings = append(warnings, "Envoy enabled but NATS URL not configured — set "+EnvPrefix+"NATS_URL or disable Envoy publishing.")
 	}
 	if cfg.BatchTranscription.Model == "" {
 		cfg.BatchTranscription.Model = cfg.DeepgramModel

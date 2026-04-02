@@ -38,6 +38,10 @@ type SessionSyncer interface {
 	SyncSession(ctx context.Context, sessionID string) error
 }
 
+type EventPublisher interface {
+	PublishSummaryReady(ctx context.Context, sessionID string) error
+}
+
 type EmbeddingIndexer interface {
 	IndexSession(ctx context.Context, sessionID, transcript string) error
 }
