@@ -26,6 +26,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
@@ -441,6 +442,18 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	var syncOrchestrator *gdrive.Orchestrator
+	var summaryPublisher *envoy.Publisher
+	publishSummaryReady := func(sessionID string) {
+		pub := summaryPublisher
+		if pub == nil {
+			return
+		}
+		go func() {
+			if err := pub.PublishSummaryReady(context.Background(), sessionID); err != nil {
+				log.Printf("warning: envoy publish failed for %s: %v", sessionID, err)
+			}
+		}()
+	}
 
 	controlHooks := &server.ControlHooks{
 		Pause:         recState.Pause,
@@ -554,6 +567,9 @@ func main() {
 			}
 			_ = store.UpdateSummary(sessionID, title, summaryText, status, presetUsed, speakerNames)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, status, presetUsed)
+			if status == storage.SummaryCompleted {
+				publishSummaryReady(sessionID)
+			}
 			return err
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
@@ -586,6 +602,7 @@ func main() {
 
 			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+			publishSummaryReady(sessionID)
 		},
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
@@ -901,6 +918,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					if br.SessionID != "" {
 						_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
 						hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
+						publishSummaryReady(br.SessionID)
 					}
 					succeeded++
 				}
@@ -926,6 +944,45 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	setSummaryPublisher := func(next *envoy.Publisher) {
+		if summaryPublisher != nil && summaryPublisher != next {
+			_ = summaryPublisher.Close()
+		}
+		summaryPublisher = next
+		manager.SetEventPublisher(next)
+	}
+	sweepEnvoy := func(pub *envoy.Publisher) {
+		if pub == nil {
+			return
+		}
+		ids, err := store.GetSessionsNeedingEnvoyPublish()
+		if err != nil {
+			log.Printf("envoy sweep error: %v", err)
+			return
+		}
+		for _, id := range ids {
+			if err := pub.PublishSummaryReady(ctx, id); err != nil {
+				log.Printf("envoy sweep: session %s: %v", id, err)
+			}
+		}
+	}
+	configureEnvoyPublisher := func(currentCfg config.Config) {
+		if !currentCfg.EnvoyEnabled {
+			setSummaryPublisher(nil)
+			return
+		}
+		pub, err := envoy.NewPublisher(currentCfg.NATSURL, currentCfg.EnvoyTopic, store, appLogger)
+		if err != nil {
+			log.Printf("warning: envoy publishing disabled: %v", err)
+			warnings = append(warnings, "Envoy publishing failed to initialize — summary notifications are disabled")
+			setSummaryPublisher(nil)
+			return
+		}
+		setSummaryPublisher(pub)
+		log.Printf("envoy publishing enabled (topic=%s)", currentCfg.EnvoyTopic)
+		go sweepEnvoy(pub)
+	}
+	configureEnvoyPublisher(cfg)
 	if indexer != nil {
 		go func() {
 			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
@@ -974,6 +1031,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			syncOrchestrator = nil
 			log.Printf("config: gdrive sync disabled")
 		}
+
+		configureEnvoyPublisher(newCfg)
 	})
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
@@ -1005,6 +1064,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
 				log.Printf("summarized session %s with preset %s", id, preset)
+				publishSummaryReady(id)
 			}
 		}()
 	}
@@ -1067,6 +1127,19 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			}()
 		}
 	}
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepEnvoy(summaryPublisher)
+			}
+		}
+	}()
 
 	if cfg.GCEnabled {
 		go func() {
@@ -1269,6 +1342,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	if dgStop != nil {
 		dgStop()
+	}
+	if summaryPublisher != nil {
+		_ = summaryPublisher.Close()
 	}
 	if mic != nil {
 		_ = mic.Stop()
