@@ -25,6 +25,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"github.com/sjawhar/ghost-wispr/internal/tts"
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -1293,9 +1294,14 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 	}
 
-	// TTS speak endpoints — only registered if TTS hooks are wired.
-	if controls.TTSSpeak != nil {
+	// TTS speak endpoints — always registered; return 501/503 when not configured.
+	{
 		mux.HandleFunc("POST /api/tts/speak", func(w http.ResponseWriter, r *http.Request) {
+			// Pre-flight: check if TTS is wired at all.
+			if controls.TTSSpeak == nil {
+				writeJSONError(w, http.StatusNotImplemented, "TTS not configured")
+				return
+			}
 			// Pre-flight: check speaker availability.
 			if controls.TTSHasSpeaker != nil && !controls.TTSHasSpeaker() {
 				writeJSONError(w, http.StatusServiceUnavailable, "speaker not available")
@@ -1324,10 +1330,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 			id, err := controls.TTSSpeak(body.Text, body.Voice, body.Provider)
 			if err != nil {
-				switch err.Error() {
-				case "tts queue is full":
+				switch {
+				case errors.Is(err, tts.ErrQueueFull):
 					writeJSONError(w, http.StatusTooManyRequests, "TTS queue is full")
-				case "tts rate limit exceeded":
+				case errors.Is(err, tts.ErrRateLimited):
 					writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
 				default:
 					writeJSONError(w, http.StatusInternalServerError, err.Error())
