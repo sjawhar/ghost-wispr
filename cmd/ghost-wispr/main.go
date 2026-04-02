@@ -1232,14 +1232,24 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Initialize TTS orchestrator if both speaker and provider are configured.
 	var ttsOrchestrator *tts.Orchestrator
-	if speaker != nil && cfg.TTSProvider != "" && cfg.TTSAPIKey != "" {
+	if speaker != nil && cfg.TTSProvider != "" {
 		var ttsProvider tts.Provider
 		var ttsErr error
 		switch cfg.TTSProvider {
 		case "elevenlabs":
-			ttsProvider, ttsErr = tts.NewElevenLabsProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+			if cfg.TTSAPIKey == "" {
+				ttsErr = fmt.Errorf("ElevenLabs requires GHOST_WISPR_TTS_API_KEY")
+			} else {
+				ttsProvider, ttsErr = tts.NewElevenLabsProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+			}
 		case "google":
-			ttsProvider, ttsErr = tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+			if cfg.TTSAPIKey != "" {
+				ttsProvider, ttsErr = tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+			} else if credPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credPath != "" {
+				ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithGoogleCredentialPath(credPath))
+			} else {
+				ttsErr = fmt.Errorf("Google TTS requires GHOST_WISPR_TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS")
+			}
 		default:
 			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
 		}
