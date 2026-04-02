@@ -1147,6 +1147,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}
 
+	// Initialize speaker output device (completely isolated from mic).
+	var speaker *audio.Speaker
+	if cfg.SpeakerEnabled {
+		if paInitFailed {
+			slog.Warn("speaker requested but portaudio init failed — speaker disabled")
+			warnings = append(warnings, "Speaker unavailable — PortAudio initialization failed")
+		} else {
+			speaker = audio.NewSpeaker(cfg.SpeakerDevice)
+			log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
+		}
+	}
+
 	// Wire up mic diagnostic hook now that mic is initialized.
 	controlHooks.DiagnoseMic = func(ctx context.Context) (map[string]any, error) {
 		if mic == nil {
@@ -1260,6 +1272,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	if mic != nil {
 		_ = mic.Stop()
+	}
+	if speaker != nil {
+		_ = speaker.Close()
 	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {

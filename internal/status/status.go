@@ -15,6 +15,10 @@ const (
 	SyncSynced  = "synced"
 	SyncFailed  = "failed"
 
+	EnvoyPublishPending   = "pending"
+	EnvoyPublishPublished = "published"
+	EnvoyPublishFailed    = "failed"
+
 	SyncStatePending        = "PENDING"
 	SyncStateSyncing        = "SYNCING"
 	SyncStateSynced         = "SYNCED"

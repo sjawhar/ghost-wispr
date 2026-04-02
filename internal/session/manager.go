@@ -23,6 +23,7 @@ type Manager struct {
 	summarizer         Summarizer
 	hub                EventBroadcaster
 	syncer             SessionSyncer
+	publisher          EventPublisher
 	indexer            EmbeddingIndexer
 	detector           *Detector
 	buffer             *UtteranceBuffer
@@ -366,6 +367,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.mu.Lock()
 	summarizer := m.summarizer
 	syncer := m.syncer
+	publisher := m.publisher
 	m.mu.Unlock()
 
 	if summarizer == nil {
@@ -466,6 +468,14 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 			}
 		}()
 	}
+
+	if publisher != nil {
+		go func() {
+			if err := publisher.PublishSummaryReady(context.Background(), sessionID); err != nil {
+				m.logger.Error("envoy publish failed", "operation", "publish_summary_ready", "session_id", sessionID, "error", err)
+			}
+		}()
+	}
 }
 
 func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {
@@ -498,6 +508,12 @@ func (m *Manager) SetSyncer(s SessionSyncer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.syncer = s
+}
+
+func (m *Manager) SetEventPublisher(p EventPublisher) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publisher = p
 }
 
 func (m *Manager) SetIndexer(indexer EmbeddingIndexer) {
