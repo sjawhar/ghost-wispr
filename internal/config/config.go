@@ -68,12 +68,16 @@ type Config struct {
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
 	SpeakerDevice                 string             `yaml:"speaker_device"`
+	TTSProvider                   string             `yaml:"tts_provider"`
+	TTSVoice                      string             `yaml:"tts_voice"`
+	TTSMaxLength                  int                `yaml:"tts_max_length"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
 	OpenAIAPIKey    string `yaml:"-"`
 	AnthropicAPIKey string `yaml:"-"`
 	GeminiAPIKey    string `yaml:"-"`
+	TTSAPIKey       string `yaml:"-"`
 }
 
 func defaults() Config {
@@ -113,6 +117,7 @@ func defaults() Config {
 		DeepgramBufferSize:            1920000,
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
+		TTSMaxLength:                  5000,
 	}
 }
 
@@ -284,6 +289,17 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "SPEAKER_DEVICE"); v != "" {
 		cfg.SpeakerDevice = v
 	}
+	if v := os.Getenv(EnvPrefix + "TTS_PROVIDER"); v != "" {
+		cfg.TTSProvider = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv(EnvPrefix + "TTS_VOICE"); v != "" {
+		cfg.TTSVoice = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "TTS_MAX_LENGTH"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			cfg.TTSMaxLength = n
+		}
+	}
 }
 
 func loadSecrets(cfg *Config) {
@@ -291,6 +307,7 @@ func loadSecrets(cfg *Config) {
 	cfg.OpenAIAPIKey = os.Getenv(EnvPrefix + "OPENAI_API_KEY")
 	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
 	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
+	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
 }
 
 func validate(cfg *Config) []string {
@@ -384,6 +401,20 @@ func validate(cfg *Config) []string {
 	if cfg.GCMaxAudioSizeMB <= 0 {
 		warnings = append(warnings, "gc_max_audio_size_mb must be positive — using default 1024.")
 		cfg.GCMaxAudioSizeMB = 1024
+	}
+
+	if cfg.TTSProvider != "" {
+		switch cfg.TTSProvider {
+		case "elevenlabs", "google":
+		default:
+			warnings = append(warnings, fmt.Sprintf("Invalid tts_provider %q — supported providers are elevenlabs, google.", cfg.TTSProvider))
+		}
+		if cfg.TTSAPIKey == "" {
+			warnings = append(warnings, "TTS provider configured but API key not set — set "+EnvPrefix+"TTS_API_KEY.")
+		}
+		if cfg.TTSMaxLength <= 0 {
+			cfg.TTSMaxLength = 5000
+		}
 	}
 
 	return warnings
