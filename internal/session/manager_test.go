@@ -247,6 +247,17 @@ func (s syncerMock) SyncSession(_ context.Context, sessionID string) error {
 	return nil
 }
 
+type publisherMock struct {
+	called chan string
+}
+
+func (p publisherMock) PublishSummaryReady(_ context.Context, sessionID string) error {
+	if p.called != nil {
+		p.called <- sessionID
+	}
+	return nil
+}
+
 func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, string, error) {
 	if s.called != nil {
 		s.called <- sessionID
@@ -747,6 +758,70 @@ func TestManager_GenerateSummary_TriggersSyncAfterSummaryCompleted(t *testing.T)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected sync to trigger after summary completion")
+	}
+}
+
+func TestManager_GenerateSummary_TriggersPublisherAfterSummaryCompleted(t *testing.T) {
+	store := newStoreMock()
+	if err := store.CreateSession("session-with-publish", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if err := store.AppendSegment("session-with-publish", transcribe.Segment{Text: "hello publish"}); err != nil {
+		t.Fatalf("AppendSegment failed: %v", err)
+	}
+
+	summaryCalled := make(chan string, 1)
+	publishCalled := make(chan string, 1)
+	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(publisherMock{called: publishCalled})
+
+	manager.generateSummary(context.Background(), "session-with-publish", time.Time{})
+
+	select {
+	case <-summaryCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected summarizer to run")
+	}
+
+	select {
+	case got := <-publishCalled:
+		if got != "session-with-publish" {
+			t.Fatalf("expected publish session id %q, got %q", "session-with-publish", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected publisher to trigger after summary completion")
+	}
+}
+
+func TestManager_DiscardedShortSession_DoesNotTriggerPublisher(t *testing.T) {
+	store := newStoreMock()
+	publishCalled := make(chan string, 1)
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 2)
+	manager.SetEventPublisher(publisherMock{called: publishCalled})
+
+	startedAt := time.Now().UTC()
+	if err := manager.ensureSessionStarted(startedAt); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "too short"}); err != nil {
+		t.Fatalf("AppendSegment failed: %v", err)
+	}
+
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("endCurrentSession failed: %v", err)
+	}
+
+	select {
+	case got := <-publishCalled:
+		t.Fatalf("expected no publish for discarded session, got %q", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got := store.status[sessionID]; got != storage.SessionDiscarded {
+		t.Fatalf("expected discarded session status, got %q", got)
 	}
 }
 
