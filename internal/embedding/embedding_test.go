@@ -10,7 +10,7 @@ type mockClient struct {
 	vectors [][]float32
 }
 
-func (m *mockClient) Embed(_ context.Context, texts []string) ([][]float32, error) {
+func (m *mockClient) Embed(_ context.Context, texts []string, _ TaskType) ([][]float32, error) {
 	if len(texts) > len(m.vectors) {
 		return nil, context.DeadlineExceeded
 	}
@@ -23,7 +23,7 @@ func (m *mockClient) Embed(_ context.Context, texts []string) ([][]float32, erro
 func TestEmbedReturnsVectors(t *testing.T) {
 	client := &mockClient{vectors: [][]float32{{0.1, 0.2, 0.3}, {0.4, 0.5, 0.6}}}
 
-	vectors, err := client.Embed(context.Background(), []string{"first", "second"})
+	vectors, err := client.Embed(context.Background(), []string{"first", "second"}, TaskTypeQuery)
 	if err != nil {
 		t.Fatalf("Embed returned error: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestUnknownProvider(t *testing.T) {
 func TestBatchEmbedding(t *testing.T) {
 	client := &mockClient{vectors: [][]float32{{0.1}, {0.2}, {0.3}}}
 
-	vectors, err := client.Embed(context.Background(), []string{"one", "two", "three"})
+	vectors, err := client.Embed(context.Background(), []string{"one", "two", "three"}, TaskTypeDocument)
 	if err != nil {
 		t.Fatalf("Embed returned error: %v", err)
 	}

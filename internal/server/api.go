@@ -210,7 +210,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			dateTo = &parsed
 		}
 
-		vectors, err := embeddingClient.Embed(r.Context(), []string{q})
+		vectors, err := embeddingClient.Embed(r.Context(), []string{q}, embedding.TaskTypeQuery)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("embed query: %v", err))
 			return

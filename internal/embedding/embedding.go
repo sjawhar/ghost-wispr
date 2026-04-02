@@ -9,8 +9,15 @@ import (
 
 const envPrefix = "GHOST_WISPR_"
 
+type TaskType string
+
+const (
+	TaskTypeDocument TaskType = "RETRIEVAL_DOCUMENT"
+	TaskTypeQuery    TaskType = "RETRIEVAL_QUERY"
+)
+
 type Client interface {
-	Embed(ctx context.Context, texts []string) ([][]float32, error)
+	Embed(ctx context.Context, texts []string, taskType TaskType) ([][]float32, error)
 }
 
 type Option func(*clientOptions)
