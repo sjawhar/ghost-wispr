@@ -29,6 +29,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
+	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -72,6 +73,28 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	}
 
 	return streamingTranscript
+}
+
+func genAIOptions(cfg config.Config, apiKey string) genaiconfig.Options {
+	return genaiconfig.Options{
+		Backend:  cfg.GenAIBackend,
+		Project:  cfg.GCPProject,
+		Location: cfg.GCPLocation,
+		APIKey:   apiKey,
+	}
+}
+
+func providerConfigured(cfg config.Config, provider string) bool {
+	switch provider {
+	case "openai":
+		return cfg.OpenAIAPIKey != ""
+	case "anthropic":
+		return cfg.AnthropicAPIKey != ""
+	case "gemini":
+		return genaiconfig.CanUse(genAIOptions(cfg, cfg.GeminiAPIKey))
+	default:
+		return false
+	}
 }
 
 type repairSpeakerMetadata struct {
@@ -351,26 +374,30 @@ func main() {
 			"gemini":    latestCfg.GeminiAPIKey,
 		}
 		key := keys[provider]
-		if key == "" {
+		if provider == "gemini" && !providerConfigured(latestCfg, provider) {
+			return nil, fmt.Errorf("no Vertex AI project or Gemini API key for provider %q", provider)
+		}
+		if provider != "gemini" && key == "" {
 			return nil, fmt.Errorf("no API key for provider %q", provider)
 		}
 		var opts []llm.Option
 		if provider == "openai" && latestCfg.Summarization.BaseURL != "" {
 			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
 		}
+		if provider == "gemini" {
+			opts = append(opts, llm.WithGenAIConfig(llm.GenAIConfig{
+				Backend:  latestCfg.GenAIBackend,
+				Project:  latestCfg.GCPProject,
+				Location: latestCfg.GCPLocation,
+			}))
+		}
 		return llm.NewClient(provider, key, model, opts...)
-	}
-
-	apiKeys := map[string]string{
-		"openai":    cfg.OpenAIAPIKey,
-		"anthropic": cfg.AnthropicAPIKey,
-		"gemini":    cfg.GeminiAPIKey,
 	}
 	llmTracker := server.NewLLMHealthTracker()
 	var summarizer *summary.Summarizer
 	canSummarize := false
 	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil {
-		if apiKeys[provider] != "" {
+		if providerConfigured(cfg, provider) {
 			canSummarize = true
 		}
 	}
@@ -380,7 +407,7 @@ func main() {
 				continue
 			}
 			if provider, _, err := llm.ParseModel(preset.Model); err == nil {
-				if apiKeys[provider] != "" {
+				if providerConfigured(cfg, provider) {
 					canSummarize = true
 					break
 				}
@@ -399,7 +426,11 @@ func main() {
 	var embeddingClient embedding.Client
 	var indexer *embedding.Indexer
 	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel)
+		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
+			Backend:  cfg.GenAIBackend,
+			Project:  cfg.GCPProject,
+			Location: cfg.GCPLocation,
+		}))
 		if err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
 		} else {
@@ -498,8 +529,9 @@ func main() {
 			return "", 0, fmt.Errorf("summarization not configured")
 		}
 		latestCfg := cfgStore.Get()
-		if latestCfg.GeminiAPIKey == "" {
-			return "", 0, fmt.Errorf("gemini API key required for batch operations (AI Studio backend)")
+		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(latestCfg, latestCfg.GeminiAPIKey))
+		if err != nil {
+			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
 
 		sessions, emptyTranscriptIDs := buildBatchSessions(sessionIDs)
@@ -513,10 +545,7 @@ func main() {
 			return "", 0, fmt.Errorf("build batch requests: %w", err)
 		}
 
-		genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-			APIKey:  latestCfg.GeminiAPIKey,
-			Backend: genai.BackendGeminiAPI,
-		})
+		genaiClient, err := genai.NewClient(ctx, clientConfig)
 		if err != nil {
 			return "", 0, fmt.Errorf("create genai client: %w", err)
 		}
@@ -537,14 +566,12 @@ func main() {
 	}
 	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
 		latestCfg := cfgStore.Get()
-		if latestCfg.GeminiAPIKey == "" {
-			return nil, fmt.Errorf("gemini API key required for batch operations")
+		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(latestCfg, latestCfg.GeminiAPIKey))
+		if err != nil {
+			return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
 
-		genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-			APIKey:  latestCfg.GeminiAPIKey,
-			Backend: genai.BackendGeminiAPI,
-		})
+		genaiClient, err := genai.NewClient(ctx, clientConfig)
 		if err != nil {
 			return nil, fmt.Errorf("create genai client: %w", err)
 		}
@@ -1037,7 +1064,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			"anthropic": newCfg.AnthropicAPIKey,
 			"gemini":    newCfg.GeminiAPIKey,
 		}
-		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && newAPIKeys[provider] != "" {
+		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && (provider != "gemini" && newAPIKeys[provider] != "" || provider == "gemini" && providerConfigured(newCfg, provider)) {
 			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)

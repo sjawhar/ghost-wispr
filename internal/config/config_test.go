@@ -15,12 +15,14 @@ func clearEnv(t *testing.T) {
 		"DB_PATH", "AUDIO_DIR", "LOG_LEVEL", "SILENCE_TIMEOUT",
 		"MIC_SAMPLE_RATE", "MIC_SAMPLE_RATES",
 		"SUMMARIZATION_MODEL", "GDRIVE_FOLDER_ID", "GOOGLE_CREDENTIALS_FILE",
+		"GCP_PROJECT", "GCP_LOCATION", "GENAI_BACKEND",
 		"BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL",
 		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
 	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 }
 
 func TestBatchRefinementConfigDefaultsAndOverrides(t *testing.T) {
@@ -131,6 +133,12 @@ func TestDefaults(t *testing.T) {
 	if cfg.Transcription.UtteranceEndMs != "1000" {
 		t.Fatalf("expected default transcription.utterance_end_ms '1000', got %q", cfg.Transcription.UtteranceEndMs)
 	}
+	if cfg.GCPLocation != "us-central1" {
+		t.Fatalf("expected default gcp_location, got %q", cfg.GCPLocation)
+	}
+	if cfg.GenAIBackend != "gemini" {
+		t.Fatalf("expected default genai_backend gemini, got %q", cfg.GenAIBackend)
+	}
 }
 
 func TestYAMLLoading(t *testing.T) {
@@ -159,6 +167,9 @@ summarization:
       model: gemini/gemini-2.5-flash
 gdrive_folder_id: my-folder
 google_credentials_file: /path/to/creds.json
+gcp_project: yaml-project
+gcp_location: europe-west4
+genai_backend: vertex
 `
 	if err := os.WriteFile(configPath, []byte(yamlContent), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -202,6 +213,15 @@ google_credentials_file: /path/to/creds.json
 	if cfg.GoogleCredentialsFile != "/path/to/creds.json" {
 		t.Fatalf("expected yaml google_credentials_file, got %q", cfg.GoogleCredentialsFile)
 	}
+	if cfg.GCPProject != "yaml-project" {
+		t.Fatalf("expected yaml gcp_project, got %q", cfg.GCPProject)
+	}
+	if cfg.GCPLocation != "europe-west4" {
+		t.Fatalf("expected yaml gcp_location, got %q", cfg.GCPLocation)
+	}
+	if cfg.GenAIBackend != "vertex" {
+		t.Fatalf("expected yaml genai_backend, got %q", cfg.GenAIBackend)
+	}
 }
 
 func TestEnvOverridesYAML(t *testing.T) {
@@ -221,6 +241,9 @@ summarization:
 	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "openai/gpt-4.1-mini")
 	t.Setenv(EnvPrefix+"AUDIO_DIR", "/env/audio")
 	t.Setenv(EnvPrefix+"LOG_LEVEL", "error")
+	t.Setenv(EnvPrefix+"GCP_PROJECT", "env-project")
+	t.Setenv(EnvPrefix+"GCP_LOCATION", "us-east5")
+	t.Setenv(EnvPrefix+"GENAI_BACKEND", "vertex")
 
 	cfg, _, err := Load(configPath)
 	if err != nil {
@@ -238,6 +261,36 @@ summarization:
 	}
 	if cfg.LogLevel != "error" {
 		t.Fatalf("expected env override for log_level, got %q", cfg.LogLevel)
+	}
+	if cfg.GCPProject != "env-project" {
+		t.Fatalf("expected env override for gcp_project, got %q", cfg.GCPProject)
+	}
+	if cfg.GCPLocation != "us-east5" {
+		t.Fatalf("expected env override for gcp_location, got %q", cfg.GCPLocation)
+	}
+	if cfg.GenAIBackend != "vertex" {
+		t.Fatalf("expected env override for genai_backend, got %q", cfg.GenAIBackend)
+	}
+}
+
+func TestGenAIProjectDefaultFromServiceAccount(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	credsPath := filepath.Join(dir, "service-account.json")
+	if err := os.WriteFile(credsPath, []byte(`{"project_id":"sa-project"}`), 0o644); err != nil {
+		t.Fatalf("write credentials: %v", err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsPath)
+
+	cfg, _, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.GCPProject != "sa-project" {
+		t.Fatalf("expected project discovered from service account, got %q", cfg.GCPProject)
+	}
+	if cfg.GenAIBackend != "vertex" {
+		t.Fatalf("expected Vertex backend when project is discovered, got %q", cfg.GenAIBackend)
 	}
 }
 
@@ -376,6 +429,24 @@ func TestValidationWarningsWhenProviderAPIKeyMissing(t *testing.T) {
 
 	if !anthropicWarning {
 		t.Fatalf("expected Anthropic warning when key is missing, got warnings: %v", warnings)
+	}
+}
+
+func TestValidationGeminiProviderAllowsVertexAI(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvPrefix+"DEEPGRAM_API_KEY", "key")
+	t.Setenv(EnvPrefix+"SUMMARIZATION_MODEL", "gemini/gemini-3.1-pro-preview")
+	t.Setenv(EnvPrefix+"GCP_PROJECT", "vertex-project")
+	t.Setenv(EnvPrefix+"GENAI_BACKEND", "vertex")
+
+	_, warnings, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	for _, warning := range warnings {
+		if strings.Contains(warning, "Gemini backend") {
+			t.Fatalf("unexpected Gemini warning with Vertex AI configured: %v", warnings)
+		}
 	}
 }
 
