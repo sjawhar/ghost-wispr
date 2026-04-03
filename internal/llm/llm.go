@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 )
 
 type Message struct {
@@ -20,13 +22,26 @@ type Client interface {
 
 type Option func(*clientOptions)
 
+type GenAIConfig struct {
+	Backend  string
+	Project  string
+	Location string
+}
+
 type clientOptions struct {
 	baseURL string
+	genai   GenAIConfig
 }
 
 func WithBaseURL(url string) Option {
 	return func(o *clientOptions) {
 		o.baseURL = url
+	}
+}
+
+func WithGenAIConfig(cfg GenAIConfig) Option {
+	return func(o *clientOptions) {
+		o.genai = cfg
 	}
 }
 
@@ -50,6 +65,9 @@ func NewClient(provider, apiKey, model string, opts ...Option) (Client, error) {
 	case "anthropic":
 		return newAnthropicClient(apiKey, model, o)
 	case "gemini":
+		if o.genai.Location == "" {
+			o.genai.Location = genaiconfig.DefaultLocation
+		}
 		return newGeminiClient(apiKey, model, o)
 	default:
 		return nil, fmt.Errorf("unknown LLM provider %q: supported providers are openai, anthropic, gemini", provider)

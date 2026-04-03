@@ -39,7 +39,11 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 
-	client, err := embedding.NewClient(cfg.EmbeddingModel)
+	client, err := embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
+		Backend:  cfg.GenAIBackend,
+		Project:  cfg.GCPProject,
+		Location: cfg.GCPLocation,
+	}))
 	if err != nil {
 		log.Fatalf("new embedding client: %v", err)
 	}

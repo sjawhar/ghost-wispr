@@ -1,12 +1,14 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 
 	"gopkg.in/yaml.v3"
@@ -51,6 +53,9 @@ type Config struct {
 	MicSampleRates                []int              `yaml:"mic_sample_rates"`
 	GDriveFolderID                string             `yaml:"gdrive_folder_id"`
 	GoogleCredentialsFile         string             `yaml:"google_credentials_file"`
+	GCPProject                    string             `yaml:"gcp_project"`
+	GCPLocation                   string             `yaml:"gcp_location"`
+	GenAIBackend                  string             `yaml:"genai_backend"`
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
 	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
 	NATSURL                       string             `yaml:"nats_url"`
@@ -90,6 +95,7 @@ func defaults() Config {
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
 		GoogleCredentialsFile: "./service-account.json",
+		GCPLocation:           genaiconfig.DefaultLocation,
 		EnvoyTopic:            "notifications.ghost-wispr.summary-ready",
 		GCMaxAgeDays:          30,
 		GCMaxAudioSizeMB:      1024,
@@ -142,6 +148,7 @@ func Load(path string) (Config, []string, error) {
 	}
 
 	applyEnvOverrides(&cfg)
+	applyGenAIConfigDefaults(&cfg)
 	loadSecrets(&cfg)
 
 	warnings := validate(&cfg)
@@ -229,6 +236,15 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "GOOGLE_CREDENTIALS_FILE"); v != "" {
 		cfg.GoogleCredentialsFile = v
 	}
+	if v := os.Getenv(EnvPrefix + "GCP_PROJECT"); v != "" {
+		cfg.GCPProject = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "GCP_LOCATION"); v != "" {
+		cfg.GCPLocation = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "GENAI_BACKEND"); v != "" {
+		cfg.GenAIBackend = strings.ToLower(strings.TrimSpace(v))
+	}
 	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_ENDPOINTING"); v != "" {
 		cfg.Transcription.Endpointing = v
 	}
@@ -302,6 +318,22 @@ func applyEnvOverrides(cfg *Config) {
 	}
 }
 
+func applyGenAIConfigDefaults(cfg *Config) {
+	if cfg.GCPProject == "" {
+		cfg.GCPProject = discoverServiceAccountProject(
+			os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+			cfg.GoogleCredentialsFile,
+		)
+	}
+	if strings.TrimSpace(cfg.GCPLocation) == "" {
+		cfg.GCPLocation = genaiconfig.DefaultLocation
+	}
+	cfg.GenAIBackend = strings.ToLower(strings.TrimSpace(cfg.GenAIBackend))
+	if cfg.GenAIBackend == "" {
+		cfg.GenAIBackend = genaiconfig.DefaultBackend(cfg.GCPProject)
+	}
+}
+
 func loadSecrets(cfg *Config) {
 	cfg.DeepgramAPIKey = os.Getenv(EnvPrefix + "DEEPGRAM_API_KEY")
 	cfg.OpenAIAPIKey = os.Getenv(EnvPrefix + "OPENAI_API_KEY")
@@ -310,11 +342,45 @@ func loadSecrets(cfg *Config) {
 	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
 }
 
+func discoverServiceAccountProject(paths ...string) string {
+	type serviceAccount struct {
+		ProjectID string `json:"project_id"`
+	}
+
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var creds serviceAccount
+		if err := json.Unmarshal(data, &creds); err != nil {
+			continue
+		}
+		if strings.TrimSpace(creds.ProjectID) != "" {
+			return strings.TrimSpace(creds.ProjectID)
+		}
+	}
+
+	return ""
+}
+
 func validate(cfg *Config) []string {
 	var warnings []string
 
 	if cfg.DeepgramAPIKey == "" {
 		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+	}
+
+	if cfg.GenAIBackend != "" && genaiconfig.NormalizeBackend(cfg.GenAIBackend) == "" {
+		warnings = append(warnings, fmt.Sprintf("Invalid genai_backend %q — using %s.", cfg.GenAIBackend, genaiconfig.DefaultBackend(cfg.GCPProject)))
+		cfg.GenAIBackend = genaiconfig.DefaultBackend(cfg.GCPProject)
+	}
+	if strings.TrimSpace(cfg.GCPLocation) == "" {
+		cfg.GCPLocation = genaiconfig.DefaultLocation
 	}
 
 	providers := make(map[string]struct{})
@@ -354,8 +420,13 @@ func validate(cfg *Config) []string {
 				warnings = append(warnings, "Anthropic API key not configured — set "+EnvPrefix+"ANTHROPIC_API_KEY.")
 			}
 		case "gemini":
-			if cfg.GeminiAPIKey == "" {
-				warnings = append(warnings, "Gemini API key not configured — set "+EnvPrefix+"GEMINI_API_KEY.")
+			if !genaiconfig.CanUse(genaiconfig.Options{
+				Backend:  cfg.GenAIBackend,
+				Project:  cfg.GCPProject,
+				Location: cfg.GCPLocation,
+				APIKey:   cfg.GeminiAPIKey,
+			}) {
+				warnings = append(warnings, "Gemini backend not configured — set "+EnvPrefix+"GCP_PROJECT for Vertex AI or "+EnvPrefix+"GEMINI_API_KEY for Gemini API.")
 			}
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"google.golang.org/genai"
 )
 
@@ -16,13 +17,15 @@ type geminiClient struct {
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
 	ctx := context.Background()
-	config := &genai.ClientConfig{
-		APIKey:  apiKey,
-		Backend: genai.BackendGeminiAPI,
-	}
-
-	if opts.baseURL != "" {
-		config.HTTPOptions.BaseURL = opts.baseURL
+	config, err := genaiconfig.BuildClientConfig(genaiconfig.Options{
+		Backend:  opts.genai.Backend,
+		Project:  opts.genai.Project,
+		Location: opts.genai.Location,
+		APIKey:   apiKey,
+		BaseURL:  opts.baseURL,
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := genai.NewClient(ctx, config)
