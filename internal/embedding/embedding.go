@@ -84,8 +84,12 @@ func newClient(model string, opts ...Option) (Client, error) {
 			o.genai.Project = os.Getenv(envPrefix + "GCP_PROJECT")
 		}
 		if o.genai.Location == "" {
+			o.genai.Location = os.Getenv(envPrefix + "EMBEDDING_LOCATION")
+		}
+		if o.genai.Location == "" {
 			o.genai.Location = os.Getenv(envPrefix + "GCP_LOCATION")
-		} else if strings.TrimSpace(o.genai.Location) == "" {
+		}
+		if strings.TrimSpace(o.genai.Location) == "" {
 			o.genai.Location = genaiconfig.DefaultLocation
 		}
 		return newGeminiClient(os.Getenv(envPrefix+"GEMINI_API_KEY"), modelName, o)
