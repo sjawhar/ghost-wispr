@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"google.golang.org/genai"
+
+	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 )
 
 type geminiClient struct {
@@ -13,16 +15,15 @@ type geminiClient struct {
 }
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
-	if apiKey == "" {
-		return nil, fmt.Errorf("gemini api key is required")
-	}
-	config := &genai.ClientConfig{
-		APIKey:  apiKey,
-		Backend: genai.BackendGeminiAPI,
-	}
-
-	if opts.baseURL != "" {
-		config.HTTPOptions.BaseURL = opts.baseURL
+	config, err := genaiconfig.BuildClientConfig(&genaiconfig.Options{
+		Backend:  opts.genai.Backend,
+		Project:  opts.genai.Project,
+		Location: opts.genai.Location,
+		APIKey:   apiKey,
+		BaseURL:  opts.baseURL,
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := genai.NewClient(context.Background(), config)
@@ -33,7 +34,7 @@ func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, 
 	return &geminiClient{client: client, model: model}, nil
 }
 
-func (c *geminiClient) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskType) ([][]float32, error) {
 	if len(texts) == 0 {
 		return [][]float32{}, nil
 	}
@@ -43,7 +44,12 @@ func (c *geminiClient) Embed(ctx context.Context, texts []string) ([][]float32, 
 		contents[i] = genai.NewContentFromText(text, genai.RoleUser)
 	}
 
-	resp, err := c.client.Models.EmbedContent(ctx, c.model, contents, nil)
+	config := &genai.EmbedContentConfig{}
+	if taskType != "" {
+		config.TaskType = string(taskType)
+	}
+
+	resp, err := c.client.Models.EmbedContent(ctx, c.model, contents, config)
 	if err != nil {
 		return nil, fmt.Errorf("gemini embedding: %w", err)
 	}

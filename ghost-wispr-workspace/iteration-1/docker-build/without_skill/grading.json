@@ -1,0 +1,44 @@
+{
+  "expectations": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "passed": true,
+      "evidence": "After reading OpenAPI spec (call 1), used /api/search on call 2. Never browsed sessions by date."
+    },
+    {
+      "text": "Agent found session 20260227234044 (the correct Docker issues session)",
+      "passed": true,
+      "evidence": "result.md: 'Session ID: 20260227234044' — found via keyword search for 'build system space out of space' on call 2"
+    },
+    {
+      "text": "Agent cited disk space as the cause of build failures",
+      "passed": true,
+      "evidence": "result.md quotes: 'It probably just, like, ran out of space and then now can't do anything.'"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "passed": true,
+      "evidence": "search_log.md shows exactly 4 calls: OpenAPI spec, keyword search, session detail, context window"
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "openapi_spec": 1,
+      "search_keyword": 1,
+      "session_detail": 1,
+      "session_context": 1
+    },
+    "total_tool_calls": 4,
+    "first_search_type": "keyword"
+  },
+  "timing": {
+    "duration_ms": 41000,
+    "total_duration_seconds": 41.0
+  }
+}

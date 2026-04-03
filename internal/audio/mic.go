@@ -3,6 +3,7 @@ package audio
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"sync/atomic"
 
@@ -21,7 +22,7 @@ type Mic struct {
 // NewMic opens a PortAudio capture stream with the given sample rate and buffer size (in frames).
 func NewMic(sampleRate, framesPerBuffer int) (*Mic, error) {
 	buf := make([]int16, framesPerBuffer)
-	stream, err := portaudio.OpenDefaultStream(1, 0, float64(sampleRate), framesPerBuffer, buf)
+	stream, err := openInputStream(sampleRate, framesPerBuffer, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +46,7 @@ func (m *Mic) Stop() error {
 func (m *Mic) Reopen() error {
 	_ = m.stream.Stop()
 	_ = m.stream.Close()
-	stream, err := portaudio.OpenDefaultStream(1, 0, float64(m.sampleRate), m.framesPerBuffer, m.buf)
+	stream, err := openInputStream(m.sampleRate, m.framesPerBuffer, m.buf)
 	if err != nil {
 		return err
 	}
@@ -79,4 +80,40 @@ func (m *Mic) Stream(w io.Writer) error {
 // IsOpen returns true if the mic stream is currently active.
 func (m *Mic) IsOpen() bool {
 	return m.stream != nil && m.active.Load()
+}
+
+func openInputStream(sampleRate, framesPerBuffer int, buf []int16) (*portaudio.Stream, error) {
+	stream, err := portaudio.OpenDefaultStream(1, 0, float64(sampleRate), framesPerBuffer, buf)
+	if err == nil {
+		return stream, nil
+	}
+
+	devices, devErr := portaudio.Devices()
+	if devErr != nil {
+		return nil, err
+	}
+
+	var firstErr error
+	for _, dev := range devices {
+		if dev == nil || dev.MaxInputChannels < 1 {
+			continue
+		}
+		params := portaudio.HighLatencyParameters(dev, nil)
+		params.Input.Channels = 1
+		params.SampleRate = float64(sampleRate)
+		params.FramesPerBuffer = framesPerBuffer
+
+		candidate, openErr := portaudio.OpenStream(params, buf)
+		if openErr == nil {
+			return candidate, nil
+		}
+		if firstErr == nil {
+			firstErr = openErr
+		}
+	}
+
+	if firstErr != nil {
+		return nil, fmt.Errorf("default input failed: %w; fallback device open failed: %w", err, firstErr)
+	}
+	return nil, err
 }

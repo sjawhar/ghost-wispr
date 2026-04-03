@@ -1,0 +1,26 @@
+PETER'S EXACT DISCUSSION ABOUT BLOCKED ISSUES
+From Session 20260328044039 - "Troubleshooting 1Password UI Issues and Agent Tasks"
+
+CONTEXT: Peter is reviewing tasks that were marked as "blocked by" other issues on the GitHub board.
+
+PETER'S EXACT WORDS:
+"I think what happened was it had the workable tag for some reason and then I just went through and added the workable locked by for all of the ones with that tag. But I'm just removing it now. So unblocked."
+
+SPECIFIC CASE DISCUSSED:
+Task: "Emails with settlement fraud v1"
+- Was labeled as a workable task
+- Was marked as "blocked by" workable
+- Peter's analysis: "I just I asked I I asked Claude to look through the ones that were flagged and to see which of them this one doesn't use or it won't."
+- Resolution: Peter determined the blocking label was added erroneously and removed it
+
+PETER'S APPROACH TO HANDLING BLOCKED ISSUES:
+1. Verification: Don't mark tasks as blocked without verifying the actual dependency exists
+2. Auditing: Review blocked items to ensure the blocking relationship is still valid
+3. Unblocking: Remove blocking labels when the dependency is no longer valid or was added in error
+4. Contextual Understanding: Understand the actual relationship between tasks (e.g., "Emails with settlement fraud" doesn't actually depend on workable tasks)
+
+KEY PRINCIPLE:
+"So unblocked" - Peter's action demonstrates a principle of keeping the board clean and accurate by only marking tasks as blocked when there's a genuine, verified dependency.
+
+RELATED PRINCIPLE FROM SAME SESSION:
+"Always be unblocking" - A broader principle suggesting that a key goal in task management is to actively work on removing blockers and unblocking work.

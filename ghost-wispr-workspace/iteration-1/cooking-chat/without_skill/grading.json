@@ -1,0 +1,44 @@
+{
+  "expectations": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "passed": true,
+      "evidence": "After reading OpenAPI spec (call 1), used /api/search for all discovery. Never browsed sessions by date."
+    },
+    {
+      "text": "Agent found session 20260325000501-merged (the correct kitchen chat session)",
+      "passed": true,
+      "evidence": "result.md: 'Session ID: 20260325000501-merged' — found via keyword search for 'Maillard' on call 5"
+    },
+    {
+      "text": "Agent cited content related to the Maillard reaction or cooking temperatures (~200°C)",
+      "passed": true,
+      "evidence": "result.md includes transcript excerpt with 'about 200 degrees Celsius' and discusses the Maillard reaction"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "passed": false,
+      "evidence": "search_log.md shows 9 calls: OpenAPI spec, 2 keyword searches, session detail, Maillard search, 2 context attempts, session detail, segment count"
+    }
+  ],
+  "summary": {
+    "passed": 3,
+    "failed": 1,
+    "total": 4,
+    "pass_rate": 0.75
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "openapi_spec": 1,
+      "search_keyword": 4,
+      "session_detail": 2,
+      "session_context": 2
+    },
+    "total_tool_calls": 9,
+    "first_search_type": "keyword"
+  },
+  "timing": {
+    "duration_ms": 75000,
+    "total_duration_seconds": 75.0
+  }
+}

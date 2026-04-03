@@ -40,3 +40,27 @@ func TestWSBroadcastEventShape(t *testing.T) {
 		t.Fatal("timeout waiting for websocket broadcast")
 	}
 }
+
+func TestHubSnapshotComponentStatusesReturnsLatestPerComponent(t *testing.T) {
+	hub := NewHub()
+	hub.BroadcastComponentStatus("mic", "unavailable", "Microphone unavailable")
+	hub.BroadcastComponentStatus("deepgram", "connected", "Deepgram connected")
+	hub.BroadcastComponentStatus("mic", "error", "Mic overflow")
+
+	snapshot := hub.SnapshotComponentStatuses()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 component statuses, got %d", len(snapshot))
+	}
+
+	statuses := map[string]ComponentStatusEvent{}
+	for _, ev := range snapshot {
+		statuses[ev.Component] = ev
+	}
+
+	if statuses["mic"].Status != "error" {
+		t.Fatalf("expected latest mic status to be error, got %q", statuses["mic"].Status)
+	}
+	if statuses["deepgram"].Status != "connected" {
+		t.Fatalf("expected deepgram connected, got %q", statuses["deepgram"].Status)
+	}
+}

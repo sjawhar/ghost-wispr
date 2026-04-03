@@ -1,0 +1,79 @@
+{
+  "skill_name": "ghost-wispr",
+  "dataset_name": "real-world-prompts",
+  "description": "Verified prompts recovered from OpenCode history. These are higher-signal than synthetic evals because they reflect how the user actually asks for transcript retrieval work.",
+  "cases": [
+    {
+      "id": "real-peter-blocked-issues",
+      "scope": "ghost-wispr-only",
+      "source_machine": "sami-agents-mx",
+      "source_session_id": "ses_2cea55796ffeT7PK6Bc9XA6zQe",
+      "source_session_title": "Find Peter's blocked issue notes (@explore subagent)",
+      "verified_prompt": "Search Ghost Whisper for Peter's (peteramcintyre / Peter) notes about how to prioritize issues on the GitHub board that are blocked, where the blocking issue is still open. This was a recent discussion.\n\nUse the ghost-wispr skill's search strategy:\n1. Start with semantic search: \"prioritize blocked issues\" and \"blocking issues still open\"\n2. Try keyword variations: \"Peter blocked\", \"board blocked\", \"blocking issue\", \"unblock\", \"dependency\"\n3. Try: \"prioritize board\", \"issue priority\", \"Peter priority\"\n4. Look for any discussions about parallelizing work on blocked issues\n\nReturn: Peter's exact notes/recommendations about how to handle blocked issues, any prioritization framework he suggested, and any context about what \"blocked\" means in this context (is it GitHub issue labels? Project board columns? Issue body references?).",
+      "expected_primary_sessions": [
+        "20260327203708",
+        "20260327175644",
+        "20260327153538"
+      ],
+      "expected_key_findings": [
+        "A task can be considered blocked when it has a blocked-by relationship and the blocking issue is still open",
+        "Peter discussed prioritization / parallelization strategy around blocked work"
+      ],
+      "why_it_matters": "Direct, real-world retrieval prompt with iterative search guidance and an exact expected conceptual answer."
+    },
+    {
+      "id": "real-sami-decisions-today",
+      "scope": "ghost-wispr-only",
+      "source_machine": "sami-agents-mx",
+      "source_session_id": "ses_2d3c4af79ffe8pzQrSbTKOh7XW",
+      "source_session_title": "Read all Ghost Whisper transcripts today (@general subagent)",
+      "verified_prompt": "Read through all Ghost Whisper transcripts from today (March 26, 2026) and find any decisions that involve Sami (the user). The Ghost Whisper host is https://ghost-wispr.tailb86685.ts.net.\n\n1. Get all sessions from today:\n```bash\ncurl -s \"https://ghost-wispr.tailb86685.ts.net/api/sessions?date=2026-03-26\" | jq '[.[] | {id, started_at, ended_at}]'\n```\n\n2. For the longer sessions (more than 1 minute duration), get the full transcript:\n```bash\n# Calculate duration and only read sessions longer than 60 seconds\n```\n\nFocus on sessions longer than 1 minute — short ones are likely ambient noise. For each substantive session, read the segments and look for:\n- Decisions made (especially anything assigned to Sami or about Sami's work)\n- Action items mentioned\n- Priorities discussed\n- Blockers called out\n- Anything where someone says \"Sami\" or \"Sammy\"\n\nUse semantic search first to find the most relevant sessions:\n```bash\ncurl -s \"https://ghost-wispr.tailb86685.ts.net/api/search?q=Sami&date_from=2026-03-26T00:00:00Z\" | jq '.'\ncurl -s \"https://ghost-wispr.tailb86685.ts.net/api/search?q=decision&date_from=2026-03-26T00:00:00Z\" | jq '.'\ncurl -s \"https://ghost-wispr.tailb86685.ts.net/api/search?q=priority&date_from=2026-03-26T00:00:00Z\" | jq '.'\ncurl -s \"https://ghost-wispr.tailb86685.ts.net/api/search?q=blocker&date_from=2026-03-26T00:00:00Z\" | jq '.'\n```\n\nThen for the most relevant hits, get full context:\n```bash\ncurl -s \"https://ghost-wispr.tailb86685.ts.net/api/sessions/{id}\" | jq '[.segments[] | .text]'\n```\n\nReport: a concise summary of each substantive conversation, with decisions and action items highlighted. Flag anything that requires Sami's attention or follow-up.",
+      "expected_primary_sessions": [
+        "20260326033604",
+        "20260326051627",
+        "20260326021950"
+      ],
+      "expected_key_findings": [
+        "Sami was asked to lead an investigation",
+        "Sami may take on more of trajectory / product leadership while someone else focuses on hiring",
+        "Outlook merge / related implementation work was assigned or discussed in connection with Sami"
+      ],
+      "why_it_matters": "Large-scale same-day transcript triage with multiple expected answers, not a single hit. Good test of breadth and summarization."
+    },
+    {
+      "id": "real-recent-priorities-context",
+      "scope": "ghost-wispr-only",
+      "source_machine": "sami-agents-mx",
+      "source_session_id": "ses_2ceafe6d7ffetO2r27UIJzFXrx",
+      "source_session_title": "Search Ghost Whisper recent (@explore subagent)",
+      "verified_prompt": "Search Ghost Whisper for recent voice conversations from today and yesterday. Look for:\n1. Any discussions about priorities, plans, or what to focus on\n2. Any mentions of issues, bugs, or blockers\n3. Any strategic discussions about the project\n\nStart with a broad semantic search like \"priorities today\" and \"what to work on\", then try \"tasks\", \"issues\", \"blocked\", \"environment\". Return a summary of any relevant context found.",
+      "expected_primary_sessions": [
+        "20260327203708",
+        "20260327202956",
+        "20260327174025",
+        "20260327153538"
+      ],
+      "expected_key_findings": [
+        "Recent discussions included blockers, priorities, and team coordination under deadline pressure",
+        "Blocked work and environment/tooling constraints were central themes"
+      ],
+      "why_it_matters": "Good real prompt for broad contextual retrieval rather than pinpoint lookup."
+    },
+    {
+      "id": "real-panama-apartment-research",
+      "scope": "hybrid-workspace-plus-transcripts",
+      "source_machine": "sami",
+      "source_session_id": "ses_2bde2a6fbffejUyO6ROjDs8yOY",
+      "source_session_title": "Search local notes for building and gym mentions (@explore subagent)",
+      "verified_prompt": "Search our local workspace, transcripts, and notes for any mentions of Panama City apartment buildings, gyms, or neighborhood fitness preferences that are relevant to apartment hunting. Look for: Luxor Tower, Bariloche, NUOVO, Allure at the Park, Colores, Victory Sport, The Regent, El Cangrejo gyms, Bella Vista gyms, strength training, squat rack, better gym.\n\nReturn file/session references and summaries only.",
+      "expected_primary_sources": [
+        "/home/sami/.dotfiles/.claude/transcripts/ses_2bde2a6fcffeYWrxzjAuvuHGgH.jsonl"
+      ],
+      "expected_key_findings": [
+        "Luxor Tower, The Regent, and NUOVO were all researched as apartment/gym leads",
+        "The transcript contains detailed building-by-building gym quality notes"
+      ],
+      "why_it_matters": "This is a real retrieval prompt, but it spans workspace + notes + transcripts, so it should not be treated as a pure Ghost Wispr API benchmark."
+    }
+  ]
+}

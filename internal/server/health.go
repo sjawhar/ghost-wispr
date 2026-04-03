@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"sync"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
@@ -166,9 +167,22 @@ func NewDefaultHealthChecker(resilientClient interface{ IsConnected() bool }, st
 	}
 }
 
+func isNilInterfaceValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
 // IsDeepgramConnected returns true if Deepgram is connected
 func (d *DefaultHealthChecker) IsDeepgramConnected() bool {
-	if d.resilientClient == nil {
+	if isNilInterfaceValue(d.resilientClient) {
 		return false
 	}
 	return d.resilientClient.IsConnected()
@@ -184,14 +198,14 @@ func (d *DefaultHealthChecker) IsDBHealthy(ctx context.Context) bool {
 
 // IsMicOpen returns true if the mic is open
 func (d *DefaultHealthChecker) IsMicOpen() bool {
-	if d.mic == nil {
+	if isNilInterfaceValue(d.mic) {
 		return false
 	}
 	return d.mic.IsOpen()
 }
 
 func (d *DefaultHealthChecker) IsLLMHealthy() string {
-	if d.llmTracker == nil {
+	if isNilInterfaceValue(d.llmTracker) {
 		return llmStatusUnchecked
 	}
 	status := d.llmTracker.Status()

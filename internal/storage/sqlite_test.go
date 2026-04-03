@@ -414,6 +414,81 @@ func TestSyncStatusTracking(t *testing.T) {
 	}
 }
 
+func TestEnvoyPublishStatusTracking(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "envoy-test-1"
+	started := time.Date(2026, 3, 21, 10, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-test-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("update summary: %v", err)
+	}
+
+	ids, err := store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("get sessions needing envoy publish: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("expected [%s], got %v", sessionID, ids)
+	}
+
+	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+		t.Fatalf("update envoy publish status: %v", err)
+	}
+
+	ids, err = store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("get sessions needing envoy publish after update: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected empty, got %v", ids)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.EnvoyPublishStatus != EnvoyPublishPublished {
+		t.Fatalf("expected envoy_publish_status %q, got %q", EnvoyPublishPublished, sess.EnvoyPublishStatus)
+	}
+}
+
+func TestUpdateSummaryRunningResetsEnvoyPublishStatus(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "envoy-reset-1"
+	started := time.Date(2026, 3, 21, 10, 0, 0, 0, time.UTC)
+
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-reset-1.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	if err := store.UpdateSummary(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("update summary completed: %v", err)
+	}
+	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+		t.Fatalf("update envoy publish status: %v", err)
+	}
+
+	if err := store.UpdateSummary(sessionID, "", "", SummaryRunning, "", "{}"); err != nil {
+		t.Fatalf("update summary running: %v", err)
+	}
+
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.EnvoyPublishStatus != EnvoyPublishPending {
+		t.Fatalf("expected envoy_publish_status reset to %q, got %q", EnvoyPublishPending, sess.EnvoyPublishStatus)
+	}
+}
+
 func TestGetGCEligibleSessions(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	now := time.Now().UTC()

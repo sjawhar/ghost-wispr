@@ -1,0 +1,42 @@
+{
+  "expectations": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "passed": true,
+      "evidence": "First and only search call was semantic: /api/search/semantic?q=tax+consequences+moving+States+capital+gains"
+    },
+    {
+      "text": "Agent found session 20260331020134 (the correct fundraising/tax session)",
+      "passed": true,
+      "evidence": "result.md: 'Session ID: 20260331020134' — found as top semantic result with similarity 0.6123"
+    },
+    {
+      "text": "Agent reported conclusion to fundraise before moving to avoid California taxes",
+      "passed": true,
+      "evidence": "result.md: 'The team should aim to fundraise BEFORE moving to the US to avoid California's high capital gains tax rates'"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "passed": true,
+      "evidence": "search_log.md shows exactly 2 calls: 1 semantic search + 1 session detail retrieval"
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "search_semantic": 1,
+      "session_detail": 1
+    },
+    "total_tool_calls": 2,
+    "first_search_type": "semantic"
+  },
+  "timing": {
+    "duration_ms": 28000,
+    "total_duration_seconds": 28.0
+  }
+}

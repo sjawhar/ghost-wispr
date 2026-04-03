@@ -1,0 +1,45 @@
+{
+  "expectations": [
+    {
+      "text": "Agent used /api/search or /api/search/semantic as primary discovery method (not /api/sessions listing)",
+      "passed": true,
+      "evidence": "Task output shows: started with semantic search (/api/search/semantic), then fell back to keyword search (/api/search). Never browsed sessions by date."
+    },
+    {
+      "text": "Agent found session 20260227234044 (the correct Docker issues session)",
+      "passed": true,
+      "evidence": "Task output: 'Session ID: 20260227234044 - Office Standup & Docker Issues'"
+    },
+    {
+      "text": "Agent cited disk space as the cause of build failures",
+      "passed": true,
+      "evidence": "Task output: 'Docker builder machine ran out of space, causing all builds to fail. The builder accumulated too much cache and exhausted disk space.'"
+    },
+    {
+      "text": "Agent completed the search in 6 or fewer curl calls",
+      "passed": true,
+      "evidence": "Task output: '4 curl calls total' — semantic search, keyword search with date filter, context, session detail"
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "search_semantic": 1,
+      "search_keyword": 1,
+      "session_detail": 1,
+      "session_context": 1
+    },
+    "total_tool_calls": 4,
+    "first_search_type": "semantic"
+  },
+  "timing": {
+    "duration_ms": 36000,
+    "total_duration_seconds": 36.0
+  },
+  "notes": "Output files were not persisted to disk (subagent working directory issue). Grading based on task output transcript."
+}
