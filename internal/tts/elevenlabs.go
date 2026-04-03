@@ -138,7 +138,7 @@ func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJS
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxAttempts-1 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			backoff := time.Duration(math.Pow(2, float64(attempt+1))) * time.Second
 			select {
 			case <-ctx.Done():
@@ -148,7 +148,7 @@ func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJS
 			}
 		}
 
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(resp.Body)

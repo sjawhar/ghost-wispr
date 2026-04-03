@@ -75,8 +75,8 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	return streamingTranscript
 }
 
-func genAIOptions(cfg config.Config, apiKey string) genaiconfig.Options {
-	return genaiconfig.Options{
+func genAIOptions(cfg config.Config, apiKey string) *genaiconfig.Options {
+	return &genaiconfig.Options{
 		Backend:  cfg.GenAIBackend,
 		Project:  cfg.GCPProject,
 		Location: cfg.GCPLocation,
@@ -1352,7 +1352,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			} else if credPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credPath != "" {
 				ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithGoogleCredentialPath(credPath))
 			} else {
-				ttsErr = fmt.Errorf("Google TTS requires GHOST_WISPR_TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS")
+				ttsErr = fmt.Errorf("google TTS requires GHOST_WISPR_TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS")
 			}
 		default:
 			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)

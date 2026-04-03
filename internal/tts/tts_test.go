@@ -97,7 +97,7 @@ func TestElevenLabs_Synthesize_Success(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "audio/mpeg")
-		w.Write(mp3)
+		_, _ = w.Write(mp3)
 	}))
 	defer srv.Close()
 
@@ -126,7 +126,7 @@ func TestElevenLabs_Synthesize_UsesDefaultVoice(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(r.URL.Path, "/")
 		requestedVoice = parts[len(parts)-1]
-		w.Write(fakeMP3())
+		_, _ = w.Write(fakeMP3())
 	}))
 	defer srv.Close()
 
@@ -149,7 +149,7 @@ func TestElevenLabs_Synthesize_OverridesVoice(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(r.URL.Path, "/")
 		requestedVoice = parts[len(parts)-1]
-		w.Write(fakeMP3())
+		_, _ = w.Write(fakeMP3())
 	}))
 	defer srv.Close()
 
@@ -196,7 +196,7 @@ func TestElevenLabs_Synthesize_APIError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"detail": map[string]any{
 				"status":  "bad_request",
 				"message": "invalid voice_id",
@@ -225,7 +225,7 @@ func TestElevenLabs_Synthesize_RateLimitRetry(t *testing.T) {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		w.Write(fakeMP3())
+		_, _ = w.Write(fakeMP3())
 	}))
 	defer srv.Close()
 
@@ -315,7 +315,7 @@ func TestGoogle_Synthesize_Success(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64Audio})
+		_ = json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64Audio})
 	}))
 	defer srv.Close()
 
@@ -343,10 +343,10 @@ func TestGoogle_Synthesize_UsesDefaultVoice(t *testing.T) {
 	var requestedVoice string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body googleTTSRequest
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		requestedVoice = body.Voice.Name
 		b64 := base64.StdEncoding.EncodeToString(fakeMP3())
-		json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64})
+		_ = json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64})
 	}))
 	defer srv.Close()
 
@@ -368,11 +368,11 @@ func TestGoogle_Synthesize_OverridesVoiceAndLanguage(t *testing.T) {
 	var reqVoice, reqLang string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body googleTTSRequest
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		reqVoice = body.Voice.Name
 		reqLang = body.Voice.LanguageCode
 		b64 := base64.StdEncoding.EncodeToString(fakeMP3())
-		json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64})
+		_ = json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64})
 	}))
 	defer srv.Close()
 
@@ -422,7 +422,7 @@ func TestGoogle_Synthesize_APIError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]any{
 				"code":    403,
 				"message": "permission denied",
@@ -448,7 +448,7 @@ func TestGoogle_Synthesize_APIError(t *testing.T) {
 func TestGoogle_Synthesize_EmptyAudioContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: ""})
+		_ = json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: ""})
 	}))
 	defer srv.Close()
 
@@ -468,7 +468,7 @@ func TestGoogle_Synthesize_EmptyAudioContent(t *testing.T) {
 func TestGoogle_Synthesize_InvalidBase64(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: "not-valid-base64!!!"})
+		_ = json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: "not-valid-base64!!!"})
 	}))
 	defer srv.Close()
 
@@ -494,7 +494,7 @@ func TestGoogle_Synthesize_RateLimitRetry(t *testing.T) {
 		}
 		b64 := base64.StdEncoding.EncodeToString(fakeMP3())
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64})
+		_ = json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: b64})
 	}))
 	defer srv.Close()
 

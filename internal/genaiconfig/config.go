@@ -50,7 +50,7 @@ func ResolveBackend(raw, project string) string {
 	return backend
 }
 
-func CanUse(opts Options) bool {
+func CanUse(opts *Options) bool {
 	switch ResolveBackend(opts.Backend, opts.Project) {
 	case BackendVertex:
 		return strings.TrimSpace(opts.Project) != ""
@@ -61,7 +61,7 @@ func CanUse(opts Options) bool {
 	}
 }
 
-func BuildClientConfig(opts Options) (*genai.ClientConfig, error) {
+func BuildClientConfig(opts *Options) (*genai.ClientConfig, error) {
 	project := strings.TrimSpace(opts.Project)
 	apiKey := strings.TrimSpace(opts.APIKey)
 	location := strings.TrimSpace(opts.Location)

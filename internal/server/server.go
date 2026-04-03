@@ -39,10 +39,10 @@ type ControlHooks struct {
 	DiagnoseMic             func(ctx context.Context) (map[string]any, error)
 	BatchBackfill           func(ctx context.Context) (batchName string, sessionCount int, err error)
 	BatchPoll               func(ctx context.Context, batchName string) (map[string]any, error)
-	TTSSpeak              func(text, voice, provider string) (string, error)
-	TTSStatus             func(id string) (map[string]any, bool)
-	TTSHasProvider        func() bool
-	TTSHasSpeaker         func() bool
+	TTSSpeak                func(text, voice, provider string) (string, error)
+	TTSStatus               func(id string) (map[string]any, bool)
+	TTSHasProvider          func() bool
+	TTSHasSpeaker           func() bool
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {

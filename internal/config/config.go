@@ -420,7 +420,7 @@ func validate(cfg *Config) []string {
 				warnings = append(warnings, "Anthropic API key not configured — set "+EnvPrefix+"ANTHROPIC_API_KEY.")
 			}
 		case "gemini":
-			if !genaiconfig.CanUse(genaiconfig.Options{
+			if !genaiconfig.CanUse(&genaiconfig.Options{
 				Backend:  cfg.GenAIBackend,
 				Project:  cfg.GCPProject,
 				Location: cfg.GCPLocation,
