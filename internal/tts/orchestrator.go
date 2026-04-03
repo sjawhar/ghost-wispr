@@ -29,11 +29,19 @@ const (
 
 // SpeakStatus represents the current state of a TTS speak request.
 type SpeakStatus struct {
-	ID           string `json:"id"`
-	Status       string `json:"status"`
-	BytesWritten int64  `json:"bytes_written"`
-	DurationMs   int64  `json:"duration_ms"`
-	Error        string `json:"error,omitempty"`
+	mu           sync.RWMutex `json:"-"`
+	ID           string       `json:"id"`
+	Status       string       `json:"status"`
+	BytesWritten int64        `json:"bytes_written"`
+	DurationMs   int64        `json:"duration_ms"`
+	Error        string       `json:"error,omitempty"`
+}
+
+// Snapshot returns a copy safe for concurrent read.
+func (s *SpeakStatus) Snapshot() SpeakStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return SpeakStatus{ID: s.ID, Status: s.Status, BytesWritten: s.BytesWritten, DurationMs: s.DurationMs, Error: s.Error}
 }
 
 // OrchestratorOpts configures the TTS orchestrator.
@@ -144,12 +152,12 @@ func (o *Orchestrator) Speak(text, voice, provider string) (string, error) {
 }
 
 // Status returns the current status of a speak request.
-func (o *Orchestrator) Status(id string) (*SpeakStatus, bool) {
+func (o *Orchestrator) Status(id string) (SpeakStatus, bool) {
 	val, ok := o.statuses.Load(id)
 	if !ok {
-		return nil, false
+		return SpeakStatus{}, false
 	}
-	return val.(*SpeakStatus), true
+	return val.(*SpeakStatus).Snapshot(), true
 }
 
 // HasProvider reports whether a TTS provider is configured.
@@ -222,12 +230,14 @@ func (o *Orchestrator) updateStatus(id, status string, bytesWritten, durationMs 
 		return
 	}
 	s := val.(*SpeakStatus)
+	s.mu.Lock()
 	s.Status = status
 	s.BytesWritten = bytesWritten
 	s.DurationMs = durationMs
 	s.Error = errMsg
-}
+	s.mu.Unlock()
 
+}
 // allowRequest checks and records a request against the per-minute rate limit.
 func (o *Orchestrator) allowRequest() bool {
 	o.rateMu.Lock()
