@@ -38,6 +38,16 @@ func registerWSRoute(mux *http.ServeMux, hub *Hub, logger *slog.Logger) {
 		ch := hub.Subscribe()
 		defer hub.Unsubscribe(ch)
 
+		for _, statusEvent := range hub.SnapshotComponentStatuses() {
+			payload, err := json.Marshal(statusEvent)
+			if err != nil {
+				continue
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return
+			}
+		}
+
 		for msg := range ch {
 			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return

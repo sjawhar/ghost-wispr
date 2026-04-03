@@ -26,8 +26,10 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
+	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -35,6 +37,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"github.com/sjawhar/ghost-wispr/internal/tts"
 
 	"google.golang.org/genai"
 )
@@ -70,6 +73,28 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	}
 
 	return streamingTranscript
+}
+
+func genAIOptions(cfg *config.Config, apiKey string) *genaiconfig.Options {
+	return &genaiconfig.Options{
+		Backend:  cfg.GenAIBackend,
+		Project:  cfg.GCPProject,
+		Location: cfg.GCPLocation,
+		APIKey:   apiKey,
+	}
+}
+
+func providerConfigured(cfg *config.Config, provider string) bool {
+	switch provider {
+	case "openai":
+		return cfg.OpenAIAPIKey != ""
+	case "anthropic":
+		return cfg.AnthropicAPIKey != ""
+	case "gemini":
+		return genaiconfig.CanUse(genAIOptions(cfg, cfg.GeminiAPIKey))
+	default:
+		return false
+	}
 }
 
 type repairSpeakerMetadata struct {
@@ -349,26 +374,30 @@ func main() {
 			"gemini":    latestCfg.GeminiAPIKey,
 		}
 		key := keys[provider]
-		if key == "" {
+		if provider == "gemini" && !providerConfigured(&latestCfg, provider) {
+			return nil, fmt.Errorf("no Vertex AI project or Gemini API key for provider %q", provider)
+		}
+		if provider != "gemini" && key == "" {
 			return nil, fmt.Errorf("no API key for provider %q", provider)
 		}
 		var opts []llm.Option
 		if provider == "openai" && latestCfg.Summarization.BaseURL != "" {
 			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
 		}
+		if provider == "gemini" {
+			opts = append(opts, llm.WithGenAIConfig(llm.GenAIConfig{
+				Backend:  latestCfg.GenAIBackend,
+				Project:  latestCfg.GCPProject,
+				Location: latestCfg.GCPLocation,
+			}))
+		}
 		return llm.NewClient(provider, key, model, opts...)
-	}
-
-	apiKeys := map[string]string{
-		"openai":    cfg.OpenAIAPIKey,
-		"anthropic": cfg.AnthropicAPIKey,
-		"gemini":    cfg.GeminiAPIKey,
 	}
 	llmTracker := server.NewLLMHealthTracker()
 	var summarizer *summary.Summarizer
 	canSummarize := false
 	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil {
-		if apiKeys[provider] != "" {
+		if providerConfigured(&cfg, provider) {
 			canSummarize = true
 		}
 	}
@@ -378,7 +407,7 @@ func main() {
 				continue
 			}
 			if provider, _, err := llm.ParseModel(preset.Model); err == nil {
-				if apiKeys[provider] != "" {
+				if providerConfigured(&cfg, provider) {
 					canSummarize = true
 					break
 				}
@@ -397,7 +426,13 @@ func main() {
 	var embeddingClient embedding.Client
 	var indexer *embedding.Indexer
 	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel)
+		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
+			// Backend left empty — embedding.NewClient reads GHOST_WISPR_EMBEDDING_BACKEND first,
+			// then falls back to GHOST_WISPR_GENAI_BACKEND. This allows Vertex AI for embeddings
+			// while LLM/batch uses Gemini API.
+			Project:  cfg.GCPProject,
+			Location: cfg.GCPLocation,
+		}))
 		if err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
 		} else {
@@ -441,6 +476,168 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	var syncOrchestrator *gdrive.Orchestrator
+	var summaryPublisher *envoy.Publisher
+	publishSummaryReady := func(sessionID string) {
+		pub := summaryPublisher
+		if pub == nil {
+			return
+		}
+		go func() {
+			if err := pub.PublishSummaryReady(context.Background(), sessionID); err != nil {
+				log.Printf("warning: envoy publish failed for %s: %v", sessionID, err)
+			}
+		}()
+	}
+	loadSessionTranscript := func(sessionID string) (string, bool) {
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			log.Printf("warning: failed to get session %s: %v", sessionID, err)
+			return "", false
+		}
+		transcript := strings.TrimSpace(sess.CanonicalTranscript)
+		if transcript != "" {
+			return transcript, true
+		}
+		segments, err := store.GetSegments(sessionID)
+		if err != nil {
+			log.Printf("warning: failed to get segments for %s: %v", sessionID, err)
+			return "", false
+		}
+		return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
+	}
+	buildBatchSessions := func(sessionIDs []string) ([]summary.BatchSession, []string) {
+		sessions := make([]summary.BatchSession, 0, len(sessionIDs))
+		emptyTranscriptIDs := make([]string, 0)
+		for _, id := range sessionIDs {
+			transcript, ok := loadSessionTranscript(id)
+			if !ok {
+				continue
+			}
+			if transcript == "" {
+				emptyTranscriptIDs = append(emptyTranscriptIDs, id)
+				continue
+			}
+			sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
+		}
+		return sessions, emptyTranscriptIDs
+	}
+	markEmptySummariesCompleted := func(sessionIDs []string) {
+		for _, id := range sessionIDs {
+			_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
+		}
+	}
+	submitSummaryBatch := func(ctx context.Context, sessionIDs []string) (string, int, error) {
+		if summarizer == nil {
+			return "", 0, fmt.Errorf("summarization not configured")
+		}
+		latestCfg := cfgStore.Get()
+		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
+		if err != nil {
+			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
+		}
+
+		sessions, emptyTranscriptIDs := buildBatchSessions(sessionIDs)
+		markEmptySummariesCompleted(emptyTranscriptIDs)
+		if len(sessions) == 0 {
+			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
+		}
+
+		requests, err := summarizer.BuildBatchRequests(ctx, sessions)
+		if err != nil {
+			return "", 0, fmt.Errorf("build batch requests: %w", err)
+		}
+
+		genaiClient, err := genai.NewClient(ctx, clientConfig)
+		if err != nil {
+			return "", 0, fmt.Errorf("create genai client: %w", err)
+		}
+
+		_, model, err := llm.ParseModel(latestCfg.Summarization.Model)
+		if err != nil {
+			return "", 0, fmt.Errorf("parse model: %w", err)
+		}
+
+		job, err := genaiClient.Batches.Create(ctx, model, &genai.BatchJobSource{
+			InlinedRequests: requests,
+		}, nil)
+		if err != nil {
+			return "", 0, fmt.Errorf("create batch job: %w", err)
+		}
+
+		return job.Name, len(sessions), nil
+	}
+	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
+		latestCfg := cfgStore.Get()
+		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
+		if err != nil {
+			return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
+		}
+
+		genaiClient, err := genai.NewClient(ctx, clientConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create genai client: %w", err)
+		}
+
+		job, err := genaiClient.Batches.Get(ctx, batchName, nil)
+		if err != nil {
+			return nil, fmt.Errorf("get batch job: %w", err)
+		}
+
+		result := map[string]any{
+			"name":  job.Name,
+			"state": string(job.State),
+		}
+
+		if job.State == genai.JobStateSucceeded || job.State == genai.JobStatePartiallySucceeded {
+			var sessions []summary.BatchSession
+			if job.Dest != nil {
+				for _, resp := range job.Dest.InlinedResponses {
+					id := ""
+					if resp.Metadata != nil {
+						id = resp.Metadata["session_id"]
+					}
+					transcript := ""
+					if id != "" {
+						if loaded, ok := loadSessionTranscript(id); ok {
+							transcript = loaded
+						}
+					}
+					sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
+				}
+			}
+
+			batchResults := summarizer.ProcessBatchResults(job, sessions)
+			var succeeded, failed int
+			for _, br := range batchResults {
+				if br.Error != nil {
+					failed++
+					if br.SessionID != "" {
+						_ = store.UpdateSummary(br.SessionID, "", "", storage.SummaryFailed, br.PresetName, "{}")
+					}
+					continue
+				}
+				if br.SessionID != "" {
+					_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
+					hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
+					publishSummaryReady(br.SessionID)
+				}
+				succeeded++
+			}
+			result["succeeded"] = succeeded
+			result["failed"] = failed
+			result["total"] = len(batchResults)
+		}
+
+		if job.State == genai.JobStateFailed {
+			errMsg := "unknown error"
+			if job.Error != nil {
+				errMsg = job.Error.Message
+			}
+			result["error"] = errMsg
+		}
+
+		return result, nil
+	}
 
 	controlHooks := &server.ControlHooks{
 		Pause:         recState.Pause,
@@ -554,6 +751,9 @@ func main() {
 			}
 			_ = store.UpdateSummary(sessionID, title, summaryText, status, presetUsed, speakerNames)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, status, presetUsed)
+			if status == storage.SummaryCompleted {
+				publishSummaryReady(sessionID)
+			}
 			return err
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
@@ -586,6 +786,7 @@ func main() {
 
 			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
+			publishSummaryReady(sessionID)
 		},
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
@@ -787,14 +988,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			}, nil
 		},
 		BatchBackfill: func(ctx context.Context) (string, int, error) {
-			if summarizer == nil {
-				return "", 0, fmt.Errorf("summarization not configured")
-			}
-			latestCfg := cfgStore.Get()
-			if latestCfg.GeminiAPIKey == "" {
-				return "", 0, fmt.Errorf("gemini API key required for batch operations (AI Studio backend)")
-			}
-
 			sessionIDs, err := store.GetSessionsForBackfill()
 			if err != nil {
 				return "", 0, fmt.Errorf("query sessions: %w", err)
@@ -802,130 +995,54 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if len(sessionIDs) == 0 {
 				return "", 0, nil
 			}
-
-			var sessions []summary.BatchSession
-			for _, id := range sessionIDs {
-				sess, err := store.GetSession(id)
-				if err != nil {
-					continue
-				}
-				transcript := sess.CanonicalTranscript
-				if strings.TrimSpace(transcript) == "" {
-					continue
-				}
-				sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
-			}
-			if len(sessions) == 0 {
-				return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
-			}
-
-			requests, err := summarizer.BuildBatchRequests(ctx, sessions)
-			if err != nil {
-				return "", 0, fmt.Errorf("build batch requests: %w", err)
-			}
-
-			genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-				APIKey:  latestCfg.GeminiAPIKey,
-				Backend: genai.BackendGeminiAPI,
-			})
-			if err != nil {
-				return "", 0, fmt.Errorf("create genai client: %w", err)
-			}
-
-			_, model, err := llm.ParseModel(latestCfg.Summarization.Model)
-			if err != nil {
-				return "", 0, fmt.Errorf("parse model: %w", err)
-			}
-
-			job, err := genaiClient.Batches.Create(ctx, model, &genai.BatchJobSource{
-				InlinedRequests: requests,
-			}, nil)
-			if err != nil {
-				return "", 0, fmt.Errorf("create batch job: %w", err)
-			}
-
-			return job.Name, len(sessions), nil
+			return submitSummaryBatch(ctx, sessionIDs)
 		},
 		BatchPoll: func(ctx context.Context, batchName string) (map[string]any, error) {
-			latestCfg := cfgStore.Get()
-			if latestCfg.GeminiAPIKey == "" {
-				return nil, fmt.Errorf("gemini API key required for batch operations")
-			}
-
-			genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-				APIKey:  latestCfg.GeminiAPIKey,
-				Backend: genai.BackendGeminiAPI,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("create genai client: %w", err)
-			}
-
-			job, err := genaiClient.Batches.Get(ctx, batchName, nil)
-			if err != nil {
-				return nil, fmt.Errorf("get batch job: %w", err)
-			}
-
-			result := map[string]any{
-				"name":  job.Name,
-				"state": string(job.State),
-			}
-
-			if job.State == genai.JobStateSucceeded || job.State == genai.JobStatePartiallySucceeded {
-				var sessions []summary.BatchSession
-				if job.Dest != nil {
-					for _, resp := range job.Dest.InlinedResponses {
-						id := ""
-						if resp.Metadata != nil {
-							id = resp.Metadata["session_id"]
-						}
-						transcript := ""
-						if id != "" {
-							if sess, err := store.GetSession(id); err == nil {
-								transcript = sess.CanonicalTranscript
-							}
-						}
-						sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
-					}
-				}
-
-				batchResults := summarizer.ProcessBatchResults(job, sessions)
-				var succeeded, failed int
-				for _, br := range batchResults {
-					if br.Error != nil {
-						failed++
-						if br.SessionID != "" {
-							_ = store.UpdateSummary(br.SessionID, "", "", storage.SummaryFailed, br.PresetName, "{}")
-						}
-						continue
-					}
-					if br.SessionID != "" {
-						_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
-						hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
-					}
-					succeeded++
-				}
-				result["succeeded"] = succeeded
-				result["failed"] = failed
-				result["total"] = len(batchResults)
-			}
-
-			if job.State == genai.JobStateFailed {
-				errMsg := "unknown error"
-				if job.Error != nil {
-					errMsg = job.Error.Message
-				}
-				result["error"] = errMsg
-			}
-
-			return result, nil
+			return pollSummaryBatch(ctx, batchName)
 		},
-	}
-	if err != nil {
-		log.Fatalf("build http handler failed: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	setSummaryPublisher := func(next *envoy.Publisher) {
+		if summaryPublisher != nil && summaryPublisher != next {
+			_ = summaryPublisher.Close()
+		}
+		summaryPublisher = next
+		manager.SetEventPublisher(next)
+	}
+	sweepEnvoy := func(pub *envoy.Publisher) {
+		if pub == nil {
+			return
+		}
+		ids, err := store.GetSessionsNeedingEnvoyPublish()
+		if err != nil {
+			log.Printf("envoy sweep error: %v", err)
+			return
+		}
+		for _, id := range ids {
+			if err := pub.PublishSummaryReady(ctx, id); err != nil {
+				log.Printf("envoy sweep: session %s: %v", id, err)
+			}
+		}
+	}
+	configureEnvoyPublisher := func(currentCfg config.Config) {
+		if !currentCfg.EnvoyEnabled {
+			setSummaryPublisher(nil)
+			return
+		}
+		pub, err := envoy.NewPublisher(currentCfg.NATSURL, currentCfg.EnvoyTopic, store, appLogger)
+		if err != nil {
+			log.Printf("warning: envoy publishing disabled: %v", err)
+			warnings = append(warnings, "Envoy publishing failed to initialize — summary notifications are disabled")
+			setSummaryPublisher(nil)
+			return
+		}
+		setSummaryPublisher(pub)
+		log.Printf("envoy publishing enabled (topic=%s)", currentCfg.EnvoyTopic)
+		go sweepEnvoy(pub)
+	}
+	configureEnvoyPublisher(cfg)
 	if indexer != nil {
 		go func() {
 			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
@@ -949,7 +1066,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			"anthropic": newCfg.AnthropicAPIKey,
 			"gemini":    newCfg.GeminiAPIKey,
 		}
-		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && newAPIKeys[provider] != "" {
+		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && (provider != "gemini" && newAPIKeys[provider] != "" || provider == "gemini" && providerConfigured(&newCfg, provider)) {
 			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)
@@ -974,24 +1091,68 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			syncOrchestrator = nil
 			log.Printf("config: gdrive sync disabled")
 		}
+
+		configureEnvoyPublisher(newCfg)
 	})
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	if startupSummarizer != nil {
 		go func() {
-			pendingIDs, err := store.GetSessionsNeedingSummary()
+			pendingIDs, err := store.GetSessionsForBackfill()
 			if err != nil {
 				log.Printf("warning: failed to query sessions needing summary: %v", err)
 				return
 			}
+			if len(pendingIDs) == 0 {
+				return
+			}
+			if len(pendingIDs) >= 4 {
+				batchName, count, err := submitSummaryBatch(ctx, pendingIDs)
+				if err == nil {
+					log.Printf("startup: submitting %d sessions to batch summarization", count)
+					go func(batchName string) {
+						ticker := time.NewTicker(30 * time.Second)
+						defer ticker.Stop()
+						for {
+							result, err := pollSummaryBatch(ctx, batchName)
+							if err != nil {
+								if ctx.Err() != nil {
+									return
+								}
+								log.Printf("warning: startup batch job %s poll failed: %v", batchName, err)
+							} else if state, _ := result["state"].(string); state != "" {
+								succeeded, _ := result["succeeded"].(int)
+								failed, _ := result["failed"].(int)
+								switch state {
+								case string(genai.JobStateSucceeded), string(genai.JobStatePartiallySucceeded):
+									log.Printf("startup: batch job %s complete: %d succeeded, %d failed", batchName, succeeded, failed)
+									return
+								case string(genai.JobStateFailed):
+									if errMsg, _ := result["error"].(string); errMsg != "" {
+										log.Printf("startup: batch job %s failed: %s", batchName, errMsg)
+									} else {
+										log.Printf("startup: batch job %s failed", batchName)
+									}
+									return
+								}
+							}
+							select {
+							case <-ctx.Done():
+								return
+							case <-ticker.C:
+							}
+						}
+					}(batchName)
+					return
+				}
+				log.Printf("warning: startup batch submission failed for %d sessions: %v; falling back to synchronous summarization", len(pendingIDs), err)
+			}
 			for _, id := range pendingIDs {
-				log.Printf("summarizing session %s", id)
-				segments, err := store.GetSegments(id)
-				if err != nil {
-					log.Printf("warning: failed to get segments for %s: %v", id, err)
+				log.Printf("startup: summarizing session %s synchronously", id)
+				transcript, ok := loadSessionTranscript(id)
+				if !ok {
 					continue
 				}
-				transcript := buildCanonicalTranscript(store, id, segments)
 				if transcript == "" {
 					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
 					continue
@@ -1005,6 +1166,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
 				log.Printf("summarized session %s with preset %s", id, preset)
+				publishSummaryReady(id)
 			}
 		}()
 	}
@@ -1067,6 +1229,19 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			}()
 		}
 	}
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepEnvoy(summaryPublisher)
+			}
+		}
+	}()
 
 	if cfg.GCEnabled {
 		go func() {
@@ -1145,6 +1320,70 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("microphone started at %d Hz", selectedSampleRate)
 			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusConnected, Message: fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate)}
 		}
+	}
+
+	// Initialize speaker output device (completely isolated from mic).
+	var speaker *audio.Speaker
+	if cfg.SpeakerEnabled {
+		if paInitFailed {
+			slog.Warn("speaker requested but portaudio init failed — speaker disabled")
+			warnings = append(warnings, "Speaker unavailable — PortAudio initialization failed")
+		} else {
+			speaker = audio.NewSpeaker(cfg.SpeakerDevice)
+			log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
+		}
+	}
+
+	// Initialize TTS orchestrator if both speaker and provider are configured.
+	var ttsOrchestrator *tts.Orchestrator
+	if speaker != nil && cfg.TTSProvider != "" {
+		var ttsProvider tts.Provider
+		var ttsErr error
+		switch cfg.TTSProvider {
+		case "elevenlabs":
+			if cfg.TTSAPIKey == "" {
+				ttsErr = fmt.Errorf("ElevenLabs requires GHOST_WISPR_TTS_API_KEY")
+			} else {
+				ttsProvider, ttsErr = tts.NewElevenLabsProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+			}
+		case "google":
+			if cfg.TTSAPIKey != "" {
+				ttsProvider, ttsErr = tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+			} else if credPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credPath != "" {
+				ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithGoogleCredentialPath(credPath))
+			} else {
+				ttsErr = fmt.Errorf("google TTS requires GHOST_WISPR_TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS")
+			}
+		default:
+			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
+		}
+		if ttsErr != nil {
+			log.Printf("warning: TTS disabled: %v", ttsErr)
+			warnings = append(warnings, fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
+		} else {
+			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, speaker, tts.OrchestratorOpts{})
+			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
+		}
+	}
+
+	// Wire up TTS hooks now that orchestrator is initialized.
+	if ttsOrchestrator != nil {
+		controlHooks.TTSSpeak = ttsOrchestrator.Speak
+		controlHooks.TTSStatus = func(id string) (map[string]any, bool) {
+			status, ok := ttsOrchestrator.Status(id)
+			if !ok {
+				return nil, false
+			}
+			return map[string]any{
+				"id":            status.ID,
+				"status":        status.Status,
+				"bytes_written": status.BytesWritten,
+				"duration_ms":   status.DurationMs,
+				"error":         status.Error,
+			}, true
+		}
+		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
+		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
 	}
 
 	// Wire up mic diagnostic hook now that mic is initialized.
@@ -1258,8 +1497,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if dgStop != nil {
 		dgStop()
 	}
+	if summaryPublisher != nil {
+		_ = summaryPublisher.Close()
+	}
 	if mic != nil {
 		_ = mic.Stop()
+	}
+	if ttsOrchestrator != nil {
+		ttsOrchestrator.Stop()
+	}
+	if speaker != nil {
+		_ = speaker.Close()
 	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
@@ -1304,6 +1552,17 @@ func streamMicWithRetry(
 				hub.BroadcastComponentStatus("mic", "warning", "Mic input overflow, restarting stream")
 			}
 			wait(overflowWait)
+			if ctx.Err() != nil {
+				return
+			}
+			if reopenErr := streamer.Reopen(); reopenErr != nil {
+				logf("mic reopen failed: %v", reopenErr)
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
+				}
+				continue
+			}
+			logf("mic reopened successfully")
 			continue
 		}
 

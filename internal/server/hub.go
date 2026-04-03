@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -16,10 +17,11 @@ type EventStore interface {
 }
 
 type Hub struct {
-	mu         sync.RWMutex
-	clients    map[chan []byte]struct{}
-	logger     *slog.Logger
-	eventStore EventStore
+	mu                sync.RWMutex
+	clients           map[chan []byte]struct{}
+	componentStatuses map[string]ComponentStatusEvent
+	logger            *slog.Logger
+	eventStore        EventStore
 }
 
 func NewHub(logger ...*slog.Logger) *Hub {
@@ -28,7 +30,11 @@ func NewHub(logger ...*slog.Logger) *Hub {
 		l = logging.WithModule(logger[0], "server")
 	}
 
-	return &Hub{clients: make(map[chan []byte]struct{}), logger: l}
+	return &Hub{
+		clients:           make(map[chan []byte]struct{}),
+		componentStatuses: make(map[string]ComponentStatusEvent),
+		logger:            l,
+	}
 }
 
 // SetEventStore sets an optional event store for durable event persistence.
@@ -42,6 +48,23 @@ func (h *Hub) Subscribe() chan []byte {
 	h.clients[ch] = struct{}{}
 	h.mu.Unlock()
 	return ch
+}
+
+func (h *Hub) SnapshotComponentStatuses() []ComponentStatusEvent {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	keys := make([]string, 0, len(h.componentStatuses))
+	for key := range h.componentStatuses {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	snapshot := make([]ComponentStatusEvent, 0, len(keys))
+	for _, key := range keys {
+		snapshot = append(snapshot, h.componentStatuses[key])
+	}
+	return snapshot
 }
 
 func (h *Hub) Unsubscribe(ch chan []byte) {
@@ -116,12 +139,18 @@ func (h *Hub) BroadcastStatusChanged(paused bool) {
 }
 
 func (h *Hub) BroadcastComponentStatus(component, status, message string) {
-	h.broadcastEvent(ComponentStatusEvent{
+	event := ComponentStatusEvent{
 		Event:     newEvent("component_status", time.Now().UTC()),
 		Component: component,
 		Status:    status,
 		Message:   message,
-	})
+	}
+
+	h.mu.Lock()
+	h.componentStatuses[component] = event
+	h.mu.Unlock()
+
+	h.broadcastEvent(event)
 }
 
 // storedEventTypes is the set of event types persisted to the event queue.

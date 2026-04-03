@@ -9,7 +9,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // MockHealthChecker implements HealthChecker for testing
@@ -255,6 +257,23 @@ func TestHealthzReadyReturns503WhenMicClosed(t *testing.T) {
 
 	if resp.Mic != "closed" {
 		t.Errorf("expected mic 'closed', got %q", resp.Mic)
+	}
+}
+
+func TestDefaultHealthCheckerHandlesTypedNilPointers(t *testing.T) {
+	var resilient *transcribe.ResilientClient
+	var mic *audio.Mic
+
+	checker := NewDefaultHealthChecker(resilient, nil, mic, nil)
+
+	if checker.IsDeepgramConnected() {
+		t.Fatal("expected typed-nil resilient client to be treated as disconnected")
+	}
+	if checker.IsMicOpen() {
+		t.Fatal("expected typed-nil mic to be treated as closed")
+	}
+	if checker.IsLLMHealthy() != llmStatusUnchecked {
+		t.Fatalf("expected unchecked llm status for nil tracker")
 	}
 }
 

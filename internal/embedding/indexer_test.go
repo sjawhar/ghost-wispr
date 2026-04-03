@@ -13,12 +13,14 @@ import (
 )
 
 type mockEmbedClient struct {
-	calls [][]string
+	calls     [][]string
+	taskTypes []TaskType
 }
 
-func (m *mockEmbedClient) Embed(_ context.Context, texts []string) ([][]float32, error) {
+func (m *mockEmbedClient) Embed(_ context.Context, texts []string, taskType TaskType) ([][]float32, error) {
 	batch := append([]string(nil), texts...)
 	m.calls = append(m.calls, batch)
+	m.taskTypes = append(m.taskTypes, taskType)
 
 	vectors := make([][]float32, len(texts))
 	for i := range texts {
@@ -108,6 +110,9 @@ func TestIndexerOnSessionEnd(t *testing.T) {
 	if len(client.calls) != 1 {
 		t.Fatalf("expected one embed API call due to idempotency, got %d", len(client.calls))
 	}
+	if len(client.taskTypes) != 1 || client.taskTypes[0] != TaskTypeDocument {
+		t.Fatalf("expected document task type, got %#v", client.taskTypes)
+	}
 }
 
 func TestBackfillMissing(t *testing.T) {
@@ -146,6 +151,14 @@ func TestBackfillMissing(t *testing.T) {
 	if len(client.calls) != 1 {
 		t.Fatalf("expected exactly one embed call for missing session, got %d", len(client.calls))
 	}
+	if len(client.taskTypes) == 0 {
+		t.Fatal("expected at least one embed call for missing session")
+	}
+	for _, tt := range client.taskTypes {
+		if tt != TaskTypeDocument {
+			t.Fatalf("expected document task type, got %#v", client.taskTypes)
+		}
+	}
 
 	indexedEmbeddings, err := store.GetEmbeddings(indexedID)
 	if err != nil {
@@ -161,5 +174,47 @@ func TestBackfillMissing(t *testing.T) {
 	}
 	if len(missingEmbeddings) != 1 {
 		t.Fatalf("expected missing session to be indexed with 1 embedding, got %d", len(missingEmbeddings))
+	}
+}
+
+func TestIndexerReembedsWhenModelChanges(t *testing.T) {
+	store := newTestStore(t)
+	client := &mockEmbedClient{}
+	indexer := NewIndexer(client, store, 500)
+
+	sessionID := "indexer-session-model-change"
+	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	transcript := makeTranscript(100)
+	indexer.SetModel("gemini/gemini-embedding-001")
+	if err := indexer.IndexSession(context.Background(), sessionID, transcript); err != nil {
+		t.Fatalf("initial IndexSession: %v", err)
+	}
+
+	indexer.SetModel("gemini/gemini-embedding-2")
+	if err := indexer.IndexSession(context.Background(), sessionID, transcript); err != nil {
+		t.Fatalf("reindex after model change: %v", err)
+	}
+
+	if len(client.calls) != 2 {
+		t.Fatalf("expected re-embed after model change, got %d embed calls", len(client.calls))
+	}
+	for _, taskType := range client.taskTypes {
+		if taskType != TaskTypeDocument {
+			t.Fatalf("expected document task type for reindex, got %#v", client.taskTypes)
+		}
+	}
+
+	embeddings, err := store.GetEmbeddings(sessionID)
+	if err != nil {
+		t.Fatalf("get embeddings: %v", err)
+	}
+	if len(embeddings) != 1 {
+		t.Fatalf("expected 1 embedding row, got %d", len(embeddings))
+	}
+	if embeddings[0].Model != "gemini/gemini-embedding-2" {
+		t.Fatalf("expected updated model, got %q", embeddings[0].Model)
 	}
 }

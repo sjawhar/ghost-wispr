@@ -1,0 +1,257 @@
+{
+  "skill_name": "ghost-wispr",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I remember someone in the office talking about food science — something about the specific temperature you need for browning food? It was a pretty casual conversation, maybe in the kitchen. Can you find that?",
+      "expected_output": "Agent finds session 20260325000501-merged ('Office Kitchen Chat on Political Calls and Cooking') which discusses the Maillard reaction requiring ~200°C",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260325000501-merged",
+        "date": "2026-03-25",
+        "key_terms_in_transcript": ["Maillard", "200 degrees", "garlic", "spinach"],
+        "topic": "Casual cooking chat discussing Maillard reaction temperatures"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-25 about cooking",
+        "Agent cited content related to the Maillard reaction or cooking temperatures",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "We had a conversation about tax consequences of moving to the States — specifically around capital gains. When was that and what was the conclusion?",
+      "expected_output": "Agent finds session 20260331020134 ('Fundraising timing to mitigate California capital gains tax') and reports the conclusion to fundraise before relocating to avoid CA tax rates",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260331020134",
+        "date": "2026-03-31",
+        "key_terms_in_transcript": ["California", "capital gains", "UK", "fundraise", "ordinary income"],
+        "topic": "Tax implications of US relocation and fundraising timing"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-31 about tax/fundraising",
+        "Agent reported that the conclusion was to fundraise before moving to avoid California taxes",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "There was a technical discussion about making API calls cheaper by not sending some header until it's actually needed. What was that about?",
+      "expected_output": "Agent finds session 20260301134426-merged ('Million Context Plugin Error Fallbacks and Optimization') about delaying the million context header until threshold is reached",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260301134426-merged",
+        "date": "2026-03-01",
+        "key_terms_in_transcript": ["million context", "header", "fallback", "billing", "authentication"],
+        "topic": "Optimizing million context plugin by delaying header and fixing model fallbacks"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-01 about the million context plugin",
+        "Agent cited the decision to delay sending the header until the threshold is reached",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Find the conversation where we were looking at apartments overseas and also talking about how to pitch our work volume to a potential partner company.",
+      "expected_output": "Agent finds session 20260331011254 ('Apartment search in Panama and xAI presentation strategy') covering Panama housing and xAI presentation ordering",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260331011254",
+        "date": "2026-03-31",
+        "key_terms_in_transcript": ["Panama", "gym", "xAI", "2500 tasks", "computer use", "presentation"],
+        "topic": "Panama apartment search and xAI presentation strategy"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-31 about Panama/xAI",
+        "Agent mentioned the decision to reorder the presentation to highlight task volume before 'computer use'",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "When did we have build system problems where the machine was running out of space? I think it was back in February.",
+      "expected_output": "Agent finds session 20260227234044 ('Office Standup & Docker Issues') about Docker build failures due to disk space",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260227234044",
+        "date": "2026-02-27",
+        "key_terms_in_transcript": ["Docker", "disk space", "builder", "unresponsive", "GitHub"],
+        "topic": "Docker build failures from disk space issues, viewer performance work"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-02-27 about Docker/build issues",
+        "Agent cited disk space as the cause of build failures",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "There was a design discussion about how the daemon should keep watching for new issues instead of just checking once. Something about the controller architecture. Find that.",
+      "expected_output": "Agent finds session 20260325133203 ('Legion Daemon and Controller Sync Design') about redesigning daemon-controller interaction for continuous issue monitoring",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260325133203",
+        "date": "2026-03-25",
+        "key_terms_in_transcript": ["Legion", "daemon", "controller", "issues", "permissions", "local machine"],
+        "topic": "Redesigning Legion daemon to continuously monitor issues via controller"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-25 about Legion daemon/controller design",
+        "Agent mentioned the decision to design a mechanism for continuous issue monitoring",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "Someone was telling a story about working at Bryan Johnson's company and getting burned out. When was that? What else came up in that conversation?",
+      "expected_output": "Agent finds session 20260329011726 ('Kernel history, AI agent coordination, and API costs') which includes discussion of burnout at Kernel (Bryan Johnson's startup), a zero-calorie guar gum coffee recipe, and autonomous AI agents",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260329011726",
+        "date": "2026-03-29",
+        "key_terms_in_transcript": ["Kernel", "Bryan Johnson", "burnout", "guar gum", "autonomous", "API costs"],
+        "topic": "Past burnout at Kernel, guar gum coffee recipe, AI agent philosophy"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-29 about Kernel/Bryan Johnson",
+        "Agent mentioned the burnout context and at least one other topic from the session",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "We hit a million in revenue at some point recently and someone mentioned it casually. There was also something about a satellite internet dish being moved. When was this?",
+      "expected_output": "Agent finds session 20260329171922 ('Revenue milestone, Starlink setup, and Inspect model configuration') about the $1M revenue milestone, Starlink repositioning, and an accidental automated grocery order via Claude",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260329171922",
+        "date": "2026-03-29",
+        "key_terms_in_transcript": ["million", "revenue", "Starlink", "dish", "grocery", "Claude", "Inspect"],
+        "topic": "$1M revenue milestone, Starlink connectivity fix, Claude grocery order mixup"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-29 about revenue/Starlink",
+        "Agent mentioned both the revenue milestone and the Starlink repositioning",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "There was a conversation where someone was really stressed out — like physically anxious, heart racing — about the workload. They were in Central America at the time I think. What was going on?",
+      "expected_output": "Agent finds session 20260320140031 about experiencing high anxiety in Panama due to maximum capacity workload",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260320140031-merged",
+        "date": "2026-03-20",
+        "key_terms_in_transcript": ["anxious", "racing heart", "Panama", "maximum capacity", "overwhelm", "delegation"],
+        "topic": "Work anxiety and overwhelm while in Panama, delegation strategy"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found a session from 2026-03-20 about anxiety/stress/overwhelm",
+        "Agent mentioned physical anxiety symptoms and the Panama location",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "Did we ever talk about decoupling the proxy layer from the agent framework? Something about one service only talking to the other through an API, not being embedded in it.",
+      "expected_output": "Agent finds session 20260330132456 ('Research presentation instructions and Envoy architectural decoupling') about decoupling Envoy from OpenCode",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260330132456",
+        "date": "2026-03-30",
+        "key_terms_in_transcript": ["Envoy", "OpenCode", "decouple", "API", "agent"],
+        "topic": "Architectural decision to decouple Envoy from OpenCode, interact only via API"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-30 about Envoy/OpenCode decoupling",
+        "Agent mentioned the decision for Envoy to only interact via the API",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "We were evaluating which third-party tools to support — there was debate about whether to include things like AWS CLI and some project management tools. We decided to test some MCP stuff overnight. Find that.",
+      "expected_output": "Agent finds session 20260331001028 ('Third-party integrations and MCP tool evaluation') about evaluating AWS CLI, Linear, PostHog, and Git platform support, with overnight MCP testing plan",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260331001028",
+        "date": "2026-03-31",
+        "key_terms_in_transcript": ["AWS CLI", "Linear", "PostHog", "MCP", "overnight", "data generation"],
+        "topic": "Evaluating third-party tool support and overnight MCP experimentation"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-31 about MCP/third-party tools",
+        "Agent mentioned the overnight testing plan",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "Someone rented a Starlink for the office wifi — how much did it cost per day? I think there was also talk about feeling guilty for empathizing with AI agents.",
+      "expected_output": "Agent finds session 20260327184141 ('Discussion on Empathy for Agents and Starlink Setup') — Starlink rented at $25/day, discussion about psychological impact of interacting with agents",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260327184141",
+        "date": "2026-03-27",
+        "key_terms_in_transcript": ["Starlink", "$25", "empathy", "agents", "gym"],
+        "topic": "Renting Starlink Wi-Fi ($25/day) and discussing empathy for AI agents"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-27 about Starlink/empathy",
+        "Agent reported the $25/day cost",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "Find the conversation where we talked about switching from reactive Slack management to actual focused work time. I think someone also mentioned protein powder.",
+      "expected_output": "Agent finds session 20260330165512 ('Deep work transition, office purchases, and AI gym coaching') about transitioning from reactive Slack to deep work, and purchasing protein powder",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260330165512",
+        "date": "2026-03-30",
+        "key_terms_in_transcript": ["deep work", "Slack", "protein powder", "office", "anxiety", "purchases"],
+        "topic": "Deep work transition, office expense anxiety, protein powder purchase"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-30 about deep work/Slack",
+        "Agent mentioned both the deep work transition and the protein powder",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "There was a meeting where the standup got thrown off because clocks changed in one country but not the other. Super short conversation. When was it?",
+      "expected_output": "Agent finds session 20260329182011 ('Resolving Scheduling Confusion Due to Daylight Savings Time') about US entering daylight savings before UK causing a scheduling mixup",
+      "files": [],
+      "ground_truth": {
+        "session_id": "20260329182011",
+        "date": "2026-03-29",
+        "key_terms_in_transcript": ["daylight savings", "US", "UK", "scheduling", "mix-up"],
+        "topic": "Scheduling confusion from US/UK daylight savings mismatch"
+      },
+      "expectations": [
+        "Agent used /api/search or /api/search/semantic (not /api/sessions browsing) as the primary discovery method",
+        "Agent found the session from 2026-03-29 about daylight savings",
+        "Agent identified the US/UK clock difference as the cause",
+        "Agent completed the search in 8 or fewer curl calls"
+      ]
+    }
+  ]
+}

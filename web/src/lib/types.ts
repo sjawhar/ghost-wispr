@@ -3,6 +3,8 @@ export enum ComponentStatus {
   Disconnected = 'disconnected',
   Reconnecting = 'reconnecting',
   Error = 'error',
+  Unavailable = 'unavailable',
+  Disabled = 'disabled',
   Open = 'open',
   Closed = 'closed',
   Synced = 'synced',

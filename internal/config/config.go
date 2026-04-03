@@ -1,12 +1,14 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 
 	"gopkg.in/yaml.v3"
@@ -51,7 +53,13 @@ type Config struct {
 	MicSampleRates                []int              `yaml:"mic_sample_rates"`
 	GDriveFolderID                string             `yaml:"gdrive_folder_id"`
 	GoogleCredentialsFile         string             `yaml:"google_credentials_file"`
+	GCPProject                    string             `yaml:"gcp_project"`
+	GCPLocation                   string             `yaml:"gcp_location"`
+	GenAIBackend                  string             `yaml:"genai_backend"`
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
+	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
+	NATSURL                       string             `yaml:"nats_url"`
+	EnvoyTopic                    string             `yaml:"envoy_topic"`
 	GCEnabled                     bool               `yaml:"gc_enabled"`
 	GCMaxAgeDays                  int                `yaml:"gc_max_age_days"`
 	GCMaxAudioSizeMB              int                `yaml:"gc_max_audio_size_mb"`
@@ -63,12 +71,18 @@ type Config struct {
 	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size"`
 	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
+	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
+	SpeakerDevice                 string             `yaml:"speaker_device"`
+	TTSProvider                   string             `yaml:"tts_provider"`
+	TTSVoice                      string             `yaml:"tts_voice"`
+	TTSMaxLength                  int                `yaml:"tts_max_length"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
 	OpenAIAPIKey    string `yaml:"-"`
 	AnthropicAPIKey string `yaml:"-"`
 	GeminiAPIKey    string `yaml:"-"`
+	TTSAPIKey       string `yaml:"-"`
 }
 
 func defaults() Config {
@@ -81,6 +95,8 @@ func defaults() Config {
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
 		GoogleCredentialsFile: "./service-account.json",
+		GCPLocation:           genaiconfig.DefaultLocation,
+		EnvoyTopic:            "notifications.ghost-wispr.summary-ready",
 		GCMaxAgeDays:          30,
 		GCMaxAudioSizeMB:      1024,
 		Summarization: Summarization{
@@ -107,6 +123,7 @@ func defaults() Config {
 		DeepgramBufferSize:            1920000,
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
+		TTSMaxLength:                  5000,
 	}
 }
 
@@ -131,6 +148,7 @@ func Load(path string) (Config, []string, error) {
 	}
 
 	applyEnvOverrides(&cfg)
+	applyGenAIConfigDefaults(&cfg)
 	loadSecrets(&cfg)
 
 	warnings := validate(&cfg)
@@ -218,6 +236,15 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "GOOGLE_CREDENTIALS_FILE"); v != "" {
 		cfg.GoogleCredentialsFile = v
 	}
+	if v := os.Getenv(EnvPrefix + "GCP_PROJECT"); v != "" {
+		cfg.GCPProject = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "GCP_LOCATION"); v != "" {
+		cfg.GCPLocation = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "GENAI_BACKEND"); v != "" {
+		cfg.GenAIBackend = strings.ToLower(strings.TrimSpace(v))
+	}
 	if v := os.Getenv(EnvPrefix + "TRANSCRIPTION_ENDPOINTING"); v != "" {
 		cfg.Transcription.Endpointing = v
 	}
@@ -250,6 +277,15 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "GDRIVE_SYNC_ENABLED"); v != "" {
 		cfg.GDriveSyncEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
+	if v := os.Getenv(EnvPrefix + "ENVOY_ENABLED"); v != "" {
+		cfg.EnvoyEnabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv(EnvPrefix + "NATS_URL"); v != "" {
+		cfg.NATSURL = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "ENVOY_TOPIC"); v != "" {
+		cfg.EnvoyTopic = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "GC_ENABLED"); v != "" {
 		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
@@ -263,6 +299,39 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.GCMaxAudioSizeMB = n
 		}
 	}
+	if v := os.Getenv(EnvPrefix + "SPEAKER_ENABLED"); v != "" {
+		cfg.SpeakerEnabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv(EnvPrefix + "SPEAKER_DEVICE"); v != "" {
+		cfg.SpeakerDevice = v
+	}
+	if v := os.Getenv(EnvPrefix + "TTS_PROVIDER"); v != "" {
+		cfg.TTSProvider = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv(EnvPrefix + "TTS_VOICE"); v != "" {
+		cfg.TTSVoice = strings.TrimSpace(v)
+	}
+	if v := os.Getenv(EnvPrefix + "TTS_MAX_LENGTH"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			cfg.TTSMaxLength = n
+		}
+	}
+}
+
+func applyGenAIConfigDefaults(cfg *Config) {
+	if cfg.GCPProject == "" {
+		cfg.GCPProject = discoverServiceAccountProject(
+			os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+			cfg.GoogleCredentialsFile,
+		)
+	}
+	if strings.TrimSpace(cfg.GCPLocation) == "" {
+		cfg.GCPLocation = genaiconfig.DefaultLocation
+	}
+	cfg.GenAIBackend = strings.ToLower(strings.TrimSpace(cfg.GenAIBackend))
+	if cfg.GenAIBackend == "" {
+		cfg.GenAIBackend = genaiconfig.DefaultBackend(cfg.GCPProject)
+	}
 }
 
 func loadSecrets(cfg *Config) {
@@ -270,6 +339,33 @@ func loadSecrets(cfg *Config) {
 	cfg.OpenAIAPIKey = os.Getenv(EnvPrefix + "OPENAI_API_KEY")
 	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
 	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
+	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
+}
+
+func discoverServiceAccountProject(paths ...string) string {
+	type serviceAccount struct {
+		ProjectID string `json:"project_id"`
+	}
+
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var creds serviceAccount
+		if err := json.Unmarshal(data, &creds); err != nil {
+			continue
+		}
+		if strings.TrimSpace(creds.ProjectID) != "" {
+			return strings.TrimSpace(creds.ProjectID)
+		}
+	}
+
+	return ""
 }
 
 func validate(cfg *Config) []string {
@@ -277,6 +373,14 @@ func validate(cfg *Config) []string {
 
 	if cfg.DeepgramAPIKey == "" {
 		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+	}
+
+	if cfg.GenAIBackend != "" && genaiconfig.NormalizeBackend(cfg.GenAIBackend) == "" {
+		warnings = append(warnings, fmt.Sprintf("Invalid genai_backend %q — using %s.", cfg.GenAIBackend, genaiconfig.DefaultBackend(cfg.GCPProject)))
+		cfg.GenAIBackend = genaiconfig.DefaultBackend(cfg.GCPProject)
+	}
+	if strings.TrimSpace(cfg.GCPLocation) == "" {
+		cfg.GCPLocation = genaiconfig.DefaultLocation
 	}
 
 	providers := make(map[string]struct{})
@@ -316,8 +420,13 @@ func validate(cfg *Config) []string {
 				warnings = append(warnings, "Anthropic API key not configured — set "+EnvPrefix+"ANTHROPIC_API_KEY.")
 			}
 		case "gemini":
-			if cfg.GeminiAPIKey == "" {
-				warnings = append(warnings, "Gemini API key not configured — set "+EnvPrefix+"GEMINI_API_KEY.")
+			if !genaiconfig.CanUse(&genaiconfig.Options{
+				Backend:  cfg.GenAIBackend,
+				Project:  cfg.GCPProject,
+				Location: cfg.GCPLocation,
+				APIKey:   cfg.GeminiAPIKey,
+			}) {
+				warnings = append(warnings, "Gemini backend not configured — set "+EnvPrefix+"GCP_PROJECT for Vertex AI or "+EnvPrefix+"GEMINI_API_KEY for Gemini API.")
 			}
 		}
 	}
@@ -340,6 +449,12 @@ func validate(cfg *Config) []string {
 	if cfg.BatchTranscription.Provider == "" {
 		cfg.BatchTranscription.Provider = "deepgram"
 	}
+	if cfg.EnvoyTopic == "" {
+		cfg.EnvoyTopic = "notifications.ghost-wispr.summary-ready"
+	}
+	if cfg.EnvoyEnabled && strings.TrimSpace(cfg.NATSURL) == "" {
+		warnings = append(warnings, "Envoy enabled but NATS URL not configured — set "+EnvPrefix+"NATS_URL or disable Envoy publishing.")
+	}
 	if cfg.BatchTranscription.Model == "" {
 		cfg.BatchTranscription.Model = cfg.DeepgramModel
 	}
@@ -357,6 +472,22 @@ func validate(cfg *Config) []string {
 	if cfg.GCMaxAudioSizeMB <= 0 {
 		warnings = append(warnings, "gc_max_audio_size_mb must be positive — using default 1024.")
 		cfg.GCMaxAudioSizeMB = 1024
+	}
+
+	if cfg.TTSProvider != "" {
+		switch cfg.TTSProvider {
+		case "elevenlabs", "google":
+		default:
+			warnings = append(warnings, fmt.Sprintf("Invalid tts_provider %q — supported providers are elevenlabs, google.", cfg.TTSProvider))
+		}
+		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" {
+			warnings = append(warnings, "TTS provider configured but API key not set — set "+EnvPrefix+"TTS_API_KEY.")
+		} else if cfg.TTSAPIKey == "" && cfg.TTSProvider == "google" && os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
+			warnings = append(warnings, "Google TTS requires "+EnvPrefix+"TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS.")
+		}
+		if cfg.TTSMaxLength <= 0 {
+			cfg.TTSMaxLength = 5000
+		}
 	}
 
 	return warnings

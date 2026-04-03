@@ -1,0 +1,82 @@
+[
+  {
+    "query": "can you search our transcripts for what Peter said about blocked issues on the GitHub board? i remember he had a specific rule about when something counts as blocked",
+    "should_trigger": true
+  },
+  {
+    "query": "find the conversation where we talked about tax consequences of moving to california before fundraising. i just need the transcript summary and exact recommendation",
+    "should_trigger": true
+  },
+  {
+    "query": "search ghost wispr for recent voice conversations about priorities and blockers from today + yesterday",
+    "should_trigger": true
+  },
+  {
+    "query": "read through today's meeting transcripts and pull out any action items assigned to Sami",
+    "should_trigger": true
+  },
+  {
+    "query": "look up what Ben said in standup about env config work. it was probably yesterday morning",
+    "should_trigger": true
+  },
+  {
+    "query": "find the conversation where someone mentioned the Maillard reaction and the temperature needed for browning food",
+    "should_trigger": true
+  },
+  {
+    "query": "can you search my voice transcripts for anything about panama apartments, gyms, or fitness preferences? i'm trying to remember what we already discussed",
+    "should_trigger": true
+  },
+  {
+    "query": "what did we discuss recently about xAI presentation ordering and showing task volume before computer use?",
+    "should_trigger": true
+  },
+  {
+    "query": "check if ghost wispr has any recordings from march 26 where someone asked me to lead an investigation",
+    "should_trigger": true
+  },
+  {
+    "query": "search the session history and transcripts for the conversation about a machine running out of disk space during builds",
+    "should_trigger": true
+  },
+  {
+    "query": "search Slack for what Peter said about blocked issues on the GitHub board",
+    "should_trigger": false
+  },
+  {
+    "query": "grep the codebase for the blocked-by logic in our GitHub board tooling",
+    "should_trigger": false
+  },
+  {
+    "query": "look through Linear comments and GitHub PR threads for any mention of panama apartment buildings",
+    "should_trigger": false
+  },
+  {
+    "query": "find the google doc where i wrote down notes about california capital gains before moving",
+    "should_trigger": false
+  },
+  {
+    "query": "search my local Downloads folder for transcripts from yesterday's calls",
+    "should_trigger": false
+  },
+  {
+    "query": "can you check the calendar invite notes from today's standup and summarize priorities?",
+    "should_trigger": false
+  },
+  {
+    "query": "search YouTube transcripts for interviews where Bryan Johnson talks about burnout",
+    "should_trigger": false
+  },
+  {
+    "query": "look up what someone said in the #daily-standup slack channel about env config work",
+    "should_trigger": false
+  },
+  {
+    "query": "open the local jsonl transcript file in .claude/transcripts and extract every mention of the Regent building",
+    "should_trigger": false
+  },
+  {
+    "query": "find the PR where we fixed the ghost-wispr host env var handling in the skill itself",
+    "should_trigger": false
+  }
+]

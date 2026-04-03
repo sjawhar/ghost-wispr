@@ -1,75 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte'
   import { appState } from '../lib/state.svelte'
-  import { fetchHealth } from '../lib/api'
   import { ComponentStatus, HealthStatus } from '../lib/types'
 
   const deepgramStatus = $derived(appState.componentStatuses['deepgram'])
   const syncStatus = $derived(appState.componentStatuses['sync'])
   const micStatus = $derived(appState.componentStatuses['mic'])
   const llmStatus = $derived(appState.componentStatuses['llm'])
-
-  onMount(async () => {
-    try {
-      const health = await fetchHealth()
-      // Map health response to componentStatuses format
-      if (health.deepgram) {
-        appState.componentStatuses['deepgram'] = {
-          status:
-            health.deepgram === ComponentStatus.Connected
-              ? ComponentStatus.Connected
-              : ComponentStatus.Disconnected,
-          message: '',
-          timestamp: new Date().toISOString(),
-        }
-      }
-      if (health.mic) {
-        appState.componentStatuses['mic'] = {
-          status:
-            health.mic === ComponentStatus.Open
-              ? ComponentStatus.Connected
-              : ComponentStatus.Closed,
-          message: '',
-          timestamp: new Date().toISOString(),
-        }
-      }
-      if (health.db) {
-        appState.componentStatuses['db'] = {
-          status:
-            health.db === ComponentStatus.Ok ? ComponentStatus.Connected : ComponentStatus.Error,
-          message: '',
-          timestamp: new Date().toISOString(),
-        }
-      }
-      // Map db status to sync for display purposes
-      if (health.db) {
-        appState.componentStatuses['sync'] = {
-          status: health.db === ComponentStatus.Ok ? ComponentStatus.Synced : ComponentStatus.Error,
-          message: '',
-          timestamp: new Date().toISOString(),
-        }
-      }
-      if (health.llm) {
-        if (health.llm === ComponentStatus.Ok) {
-          appState.componentStatuses['llm'] = {
-            status: ComponentStatus.Connected,
-            message: '',
-            timestamp: new Date().toISOString(),
-          }
-        } else if (health.llm === ComponentStatus.Error) {
-          appState.componentStatuses['llm'] = {
-            status: ComponentStatus.Error,
-            message: '',
-            timestamp: new Date().toISOString(),
-          }
-        } else {
-          delete appState.componentStatuses['llm']
-        }
-      }
-    } catch (error) {
-      console.error('Failed to fetch health:', error)
-    }
-  })
 
   function getStatusColor(status?: ComponentStatus) {
     switch (status) {
@@ -78,9 +14,12 @@
       case ComponentStatus.Open:
       case ComponentStatus.Ok:
         return 'var(--success)'
+      case ComponentStatus.Unavailable:
+      case ComponentStatus.Disabled:
+      case ComponentStatus.Closed:
+        return 'var(--warning)'
       case ComponentStatus.Disconnected:
       case ComponentStatus.Error:
-      case ComponentStatus.Closed:
         return 'var(--danger)'
       case ComponentStatus.Reconnecting:
       case ComponentStatus.Draining:
@@ -103,11 +42,21 @@
       return HealthStatus.Error
     if (
       statuses.includes(ComponentStatus.Reconnecting) ||
-      statuses.includes(ComponentStatus.Draining)
+      statuses.includes(ComponentStatus.Draining) ||
+      statuses.includes(ComponentStatus.Unavailable) ||
+      statuses.includes(ComponentStatus.Disabled) ||
+      statuses.includes(ComponentStatus.Closed)
     )
       return HealthStatus.Degraded
     if (
-      statuses.every((s) => s === ComponentStatus.Connected || s === ComponentStatus.Synced || !s)
+      statuses.every(
+        (s) =>
+          s === ComponentStatus.Connected ||
+          s === ComponentStatus.Synced ||
+          s === ComponentStatus.Open ||
+          s === ComponentStatus.Ok ||
+          !s,
+      )
     )
       return HealthStatus.Healthy
     return 'unknown'
@@ -153,7 +102,7 @@
   <div class="status-item" data-testid="status-mic">
     <span class="status-dot" style="background-color: {getStatusColor(micStatus?.status)}"></span>
     <span class="status-label" style="color: {getStatusColor(micStatus?.status)}"
-      >Mic: {micStatus?.status || 'unknown'}</span
+      >Host Mic: {micStatus?.status || 'unknown'}</span
     >
   </div>
   <div class="status-divider">|</div>
