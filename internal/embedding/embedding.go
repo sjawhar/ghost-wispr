@@ -75,6 +75,9 @@ func newClient(model string, opts ...Option) (Client, error) {
 		return newOpenAIClient(os.Getenv(envPrefix+"OPENAI_API_KEY"), modelName, o)
 	case "gemini":
 		if o.genai.Backend == "" {
+			o.genai.Backend = os.Getenv(envPrefix + "EMBEDDING_BACKEND")
+		}
+		if o.genai.Backend == "" {
 			o.genai.Backend = os.Getenv(envPrefix + "GENAI_BACKEND")
 		}
 		if o.genai.Project == "" {

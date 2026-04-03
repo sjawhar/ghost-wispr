@@ -427,7 +427,9 @@ func main() {
 	var indexer *embedding.Indexer
 	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
 		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
-			Backend:  cfg.GenAIBackend,
+			// Backend left empty — embedding.NewClient reads GHOST_WISPR_EMBEDDING_BACKEND first,
+			// then falls back to GHOST_WISPR_GENAI_BACKEND. This allows Vertex AI for embeddings
+			// while LLM/batch uses Gemini API.
 			Project:  cfg.GCPProject,
 			Location: cfg.GCPLocation,
 		}))
