@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -38,6 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
+	defer func() { _ = store.Close() }()
 
 	client, err := embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
 		Backend:  cfg.GenAIBackend,
@@ -46,17 +46,16 @@ func main() {
 	}))
 	if err != nil {
 		log.Printf("new embedding client: %v", err)
-		_ = store.Close()
-		os.Exit(1)
+		return
 	}
-	defer func() { _ = store.Close() }()
 
 	indexer := embedding.NewIndexer(client, store, 500)
 	indexer.SetModel(cfg.EmbeddingModel)
 
 	before, err := store.GetAllEmbeddings()
 	if err != nil {
-		log.Fatalf("list embeddings before delete: %v", err)
+		log.Printf("list embeddings before delete: %v", err)
+		return
 	}
 
 	sessionIDs := make(map[string]struct{}, len(before))
@@ -66,7 +65,8 @@ func main() {
 
 	for sessionID := range sessionIDs {
 		if err := store.DeleteEmbeddings(sessionID); err != nil {
-			log.Fatalf("delete embeddings for %s: %v", sessionID, err)
+			log.Printf("delete embeddings for %s: %v", sessionID, err)
+			return
 		}
 	}
 
@@ -74,12 +74,14 @@ func main() {
 	defer cancel()
 
 	if err := indexer.BackfillMissing(ctx); err != nil {
-		log.Fatalf("backfill missing: %v", err)
+		log.Printf("backfill missing: %v", err)
+		return
 	}
 
 	after, err := store.GetAllEmbeddings()
 	if err != nil {
-		log.Fatalf("list embeddings after backfill: %v", err)
+		log.Printf("list embeddings after backfill: %v", err)
+		return
 	}
 
 	fmt.Printf("deleted_sessions=%d embeddings_before=%d embeddings_after=%d model=%s\n", len(sessionIDs), len(before), len(after), cfg.EmbeddingModel)

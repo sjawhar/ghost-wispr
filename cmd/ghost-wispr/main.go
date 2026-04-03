@@ -75,7 +75,7 @@ func buildCanonicalTranscript(store *storage.SQLiteStore, sessionID string, segm
 	return streamingTranscript
 }
 
-func genAIOptions(cfg config.Config, apiKey string) *genaiconfig.Options {
+func genAIOptions(cfg *config.Config, apiKey string) *genaiconfig.Options {
 	return &genaiconfig.Options{
 		Backend:  cfg.GenAIBackend,
 		Project:  cfg.GCPProject,
@@ -84,7 +84,7 @@ func genAIOptions(cfg config.Config, apiKey string) *genaiconfig.Options {
 	}
 }
 
-func providerConfigured(cfg config.Config, provider string) bool {
+func providerConfigured(cfg *config.Config, provider string) bool {
 	switch provider {
 	case "openai":
 		return cfg.OpenAIAPIKey != ""
@@ -374,7 +374,7 @@ func main() {
 			"gemini":    latestCfg.GeminiAPIKey,
 		}
 		key := keys[provider]
-		if provider == "gemini" && !providerConfigured(latestCfg, provider) {
+		if provider == "gemini" && !providerConfigured(&latestCfg, provider) {
 			return nil, fmt.Errorf("no Vertex AI project or Gemini API key for provider %q", provider)
 		}
 		if provider != "gemini" && key == "" {
@@ -397,7 +397,7 @@ func main() {
 	var summarizer *summary.Summarizer
 	canSummarize := false
 	if provider, _, err := llm.ParseModel(cfg.Summarization.Model); err == nil {
-		if providerConfigured(cfg, provider) {
+		if providerConfigured(&cfg, provider) {
 			canSummarize = true
 		}
 	}
@@ -407,7 +407,7 @@ func main() {
 				continue
 			}
 			if provider, _, err := llm.ParseModel(preset.Model); err == nil {
-				if providerConfigured(cfg, provider) {
+				if providerConfigured(&cfg, provider) {
 					canSummarize = true
 					break
 				}
@@ -531,7 +531,7 @@ func main() {
 			return "", 0, fmt.Errorf("summarization not configured")
 		}
 		latestCfg := cfgStore.Get()
-		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(latestCfg, latestCfg.GeminiAPIKey))
+		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
 		if err != nil {
 			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
@@ -568,7 +568,7 @@ func main() {
 	}
 	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
 		latestCfg := cfgStore.Get()
-		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(latestCfg, latestCfg.GeminiAPIKey))
+		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
 		if err != nil {
 			return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
@@ -1066,7 +1066,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			"anthropic": newCfg.AnthropicAPIKey,
 			"gemini":    newCfg.GeminiAPIKey,
 		}
-		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && (provider != "gemini" && newAPIKeys[provider] != "" || provider == "gemini" && providerConfigured(newCfg, provider)) {
+		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && (provider != "gemini" && newAPIKeys[provider] != "" || provider == "gemini" && providerConfigured(&newCfg, provider)) {
 			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)

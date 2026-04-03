@@ -148,28 +148,36 @@ func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJS
 			}
 		}
 
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(resp.Body)
-			var apiErr elevenLabsErrorResponse
-			if json.Unmarshal(errBody, &apiErr) == nil && apiErr.Detail.Message != "" {
-				return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, apiErr.Detail.Message)
-			}
-			return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, string(errBody))
-		}
-
-		audioBytes, err := io.ReadAll(resp.Body)
+		// Successful response or non-retryable error
+		result, err := p.processResponse(resp)
+		_ = resp.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("elevenlabs: read response body: %w", err)
+			return nil, err
 		}
-		if len(audioBytes) == 0 {
-			return nil, fmt.Errorf("elevenlabs: empty audio response")
-		}
-
-		return audioBytes, nil
+		return result, nil
 	}
 
 	// Unreachable, but the compiler needs it.
 	return nil, fmt.Errorf("elevenlabs: exhausted retries")
+}
+
+func (p *ElevenLabsProvider) processResponse(resp *http.Response) ([]byte, error) {
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(resp.Body)
+		var apiErr elevenLabsErrorResponse
+		if json.Unmarshal(errBody, &apiErr) == nil && apiErr.Detail.Message != "" {
+			return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, apiErr.Detail.Message)
+		}
+		return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, string(errBody))
+	}
+
+	audioBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("elevenlabs: read response body: %w", err)
+	}
+	if len(audioBytes) == 0 {
+		return nil, fmt.Errorf("elevenlabs: empty audio response")
+	}
+
+	return audioBytes, nil
 }
