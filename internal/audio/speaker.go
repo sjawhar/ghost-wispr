@@ -131,20 +131,19 @@ func (s *Speaker) Play(audioData []byte, format AudioFormat) (result *PlaybackRe
 	if err != nil {
 		return nil, fmt.Errorf("open output stream: %w", err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	// Resample PCM if the actual stream rate differs from the source rate.
 	if actualRate != sampleRate {
 		samples = resamplePCM(samples, channels, sampleRate, actualRate)
 		sampleRate = actualRate
-		framesPerBuffer = sampleRate / 4
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	if err := stream.Start(); err != nil {
 		return nil, fmt.Errorf("start output stream: %w", err)
 	}
-	defer stream.Stop()
+	defer func() { _ = stream.Stop() }()
 
 	// Write samples in chunks.
 	var bytesWritten int64

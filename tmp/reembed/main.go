@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -37,7 +38,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
-	defer func() { _ = store.Close() }()
 
 	client, err := embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
 		Backend:  cfg.GenAIBackend,
@@ -45,8 +45,11 @@ func main() {
 		Location: cfg.GCPLocation,
 	}))
 	if err != nil {
-		log.Fatalf("new embedding client: %v", err)
+		log.Printf("new embedding client: %v", err)
+		_ = store.Close()
+		os.Exit(1)
 	}
+	defer func() { _ = store.Close() }()
 
 	indexer := embedding.NewIndexer(client, store, 500)
 	indexer.SetModel(cfg.EmbeddingModel)

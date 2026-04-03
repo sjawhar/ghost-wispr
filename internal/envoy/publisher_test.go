@@ -254,5 +254,6 @@ func runNATSServer(t *testing.T) (*natsserver.Server, string) {
 	if _, err := js.AddStream(&nats.StreamConfig{Name: "ENVOY_NOTIFICATIONS", Subjects: []string{"notifications.>"}}); err != nil {
 		t.Fatalf("AddStream: %v", err)
 	}
-	return server, server.ClientURL()
+	url := server.ClientURL()
+	return server, url
 }

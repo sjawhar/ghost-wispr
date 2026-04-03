@@ -30,7 +30,7 @@ func TestResolveBackend(t *testing.T) {
 }
 
 func TestBuildClientConfigVertex(t *testing.T) {
-	cfg, err := BuildClientConfig(Options{Backend: BackendVertex, Project: "proj-123"})
+	cfg, err := BuildClientConfig(&Options{Backend: BackendVertex, Project: "proj-123"})
 	if err != nil {
 		t.Fatalf("BuildClientConfig returned error: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestBuildClientConfigVertex(t *testing.T) {
 }
 
 func TestBuildClientConfigGemini(t *testing.T) {
-	cfg, err := BuildClientConfig(Options{Backend: BackendGemini, APIKey: "test-key", BaseURL: "http://example.test"})
+	cfg, err := BuildClientConfig(&Options{Backend: BackendGemini, APIKey: "test-key", BaseURL: "http://example.test"})
 	if err != nil {
 		t.Fatalf("BuildClientConfig returned error: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestBuildClientConfigGemini(t *testing.T) {
 }
 
 func TestBuildClientConfigFallsBackToGeminiWithoutProject(t *testing.T) {
-	cfg, err := BuildClientConfig(Options{Backend: BackendVertex, APIKey: "test-key"})
+	cfg, err := BuildClientConfig(&Options{Backend: BackendVertex, APIKey: "test-key"})
 	if err != nil {
 		t.Fatalf("BuildClientConfig returned error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestBuildClientConfigFallsBackToGeminiWithoutProject(t *testing.T) {
 }
 
 func TestBuildClientConfigErrorsWithoutCredentials(t *testing.T) {
-	_, err := BuildClientConfig(Options{Backend: BackendGemini})
+	_, err := BuildClientConfig(&Options{Backend: BackendGemini})
 	if err == nil {
 		t.Fatal("expected error when Gemini backend has no API key")
 	}

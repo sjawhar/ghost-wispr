@@ -226,7 +226,7 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxAttempts-1 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			backoff := time.Duration(math.Pow(2, float64(attempt+1))) * time.Second
 			select {
 			case <-ctx.Done():
@@ -236,7 +236,7 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 			}
 		}
 
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		respBodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
