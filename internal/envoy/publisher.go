@@ -50,7 +50,7 @@ type Envelope struct {
 	TraceID        string `json:"trace_id"`
 }
 
-func (e Envelope) Validate() error {
+func (e *Envelope) Validate() error {
 	if strings.TrimSpace(e.EventID) == "" {
 		return fmt.Errorf("event_id is required")
 	}
@@ -84,7 +84,7 @@ func (e Envelope) Validate() error {
 }
 
 type busPublisher interface {
-	Publish(item Envelope) error
+	Publish(item *Envelope) error
 	Close() error
 }
 
@@ -120,16 +120,12 @@ func NewPublisherWithClient(store Store, client busPublisher, topic string, logg
 		topic = DefaultTopic
 	}
 	return &Publisher{
-		store:  store,
-		client: client,
-		topic:  strings.TrimSpace(topic),
-		logger: l,
-		now: func() time.Time {
-			return time.Now().UTC()
-		},
-		id: func() string {
-			return uuid.NewString()
-		},
+		store:       store,
+		client:      client,
+		topic:       strings.TrimSpace(topic),
+		logger:      l,
+		now:         func() time.Time { return time.Now().UTC() },
+		id:          uuid.NewString,
 		sleep:       sleepWithContext,
 		retryDelays: append([]time.Duration(nil), defaultRetryDelays...),
 	}
@@ -151,11 +147,11 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 	if err != nil {
 		return fmt.Errorf("get session %s: %w", sessionID, err)
 	}
-	if !shouldPublish(sess) {
+	if !shouldPublish(&sess) {
 		return nil
 	}
 
-	item, err := p.buildEnvelope(sess)
+	item, err := p.buildEnvelope(&sess)
 	if err != nil {
 		return fmt.Errorf("build envelope for session %s: %w", sessionID, err)
 	}
@@ -164,7 +160,7 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 	}
 
 	p.logger.Info("publishing summary-ready event", "operation", "publish_summary_ready", "session_id", sessionID, "topic", item.Topic)
-	if err := p.publishWithRetry(ctx, item); err != nil {
+	if err := p.publishWithRetry(ctx, &item); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -181,7 +177,7 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 	return nil
 }
 
-func (p *Publisher) publishWithRetry(ctx context.Context, item Envelope) error {
+func (p *Publisher) publishWithRetry(ctx context.Context, item *Envelope) error {
 	if err := p.client.Publish(item); err == nil {
 		return nil
 	} else {
@@ -201,7 +197,7 @@ func (p *Publisher) publishWithRetry(ctx context.Context, item Envelope) error {
 	}
 }
 
-func (p *Publisher) buildEnvelope(sess storage.Session) (Envelope, error) {
+func (p *Publisher) buildEnvelope(sess *storage.Session) (Envelope, error) {
 	if sess.EndedAt == nil {
 		return Envelope{}, fmt.Errorf("ended_at is required")
 	}
@@ -233,7 +229,7 @@ func (p *Publisher) buildEnvelope(sess storage.Session) (Envelope, error) {
 	return item, nil
 }
 
-func shouldPublish(sess storage.Session) bool {
+func shouldPublish(sess *storage.Session) bool {
 	return sess.Status == storage.SessionEnded && sess.SummaryStatus == storage.SummaryCompleted && sess.EndedAt != nil
 }
 
@@ -285,7 +281,7 @@ func connectNATS(urls []string, logger ...*slog.Logger) (*natsClient, error) {
 	return &natsClient{logger: l, conn: nc, js: js, urls: urls}, nil
 }
 
-func (c *natsClient) Publish(item Envelope) error {
+func (c *natsClient) Publish(item *Envelope) error {
 	data, err := json.Marshal(item)
 	if err != nil {
 		return err

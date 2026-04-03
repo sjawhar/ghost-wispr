@@ -236,23 +236,32 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 			}
 		}
 
-		defer func() { _ = resp.Body.Close() }()
-
-		respBodyBytes, err := io.ReadAll(resp.Body)
+		// Successful response or non-retryable error
+		result, err := p.processResponse(resp)
+		_ = resp.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("google tts: read response body: %w", err)
+			return nil, err
 		}
-
-		if resp.StatusCode != http.StatusOK {
-			var apiErr googleTTSErrorResponse
-			if json.Unmarshal(respBodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
-				return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, apiErr.Error.Message)
-			}
-			return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, string(respBodyBytes))
-		}
-
-		return respBodyBytes, nil
+		return result, nil
 	}
 
+	// Unreachable, but the compiler needs it.
 	return nil, fmt.Errorf("google tts: exhausted retries")
+}
+
+func (p *GoogleProvider) processResponse(resp *http.Response) ([]byte, error) {
+	respBodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("google tts: read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var apiErr googleTTSErrorResponse
+		if json.Unmarshal(respBodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
+			return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, apiErr.Error.Message)
+		}
+		return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, string(respBodyBytes))
+	}
+
+	return respBodyBytes, nil
 }

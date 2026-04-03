@@ -43,7 +43,7 @@ type busStub struct {
 	published   []Envelope
 }
 
-func (b *busStub) Publish(item Envelope) error {
+func (b *busStub) Publish(item *Envelope) error {
 	if len(b.publishErrs) > 0 {
 		err := b.publishErrs[0]
 		b.publishErrs = b.publishErrs[1:]
@@ -51,7 +51,7 @@ func (b *busStub) Publish(item Envelope) error {
 			return err
 		}
 	}
-	b.published = append(b.published, item)
+	b.published = append(b.published, *item)
 	return nil
 }
 
