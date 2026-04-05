@@ -39,34 +39,24 @@ func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskT
 		return [][]float32{}, nil
 	}
 
-	contents := make([]*genai.Content, len(texts))
-	for i, text := range texts {
-		contents[i] = genai.NewContentFromText(text, genai.RoleUser)
-	}
-
 	config := &genai.EmbedContentConfig{}
 	if taskType != "" {
 		config.TaskType = string(taskType)
 	}
 
-	resp, err := c.client.Models.EmbedContent(ctx, c.model, contents, config)
-	if err != nil {
-		return nil, fmt.Errorf("gemini embedding: %w", err)
-	}
-	if len(resp.Embeddings) == 0 {
-		return nil, fmt.Errorf("gemini: no embeddings in response")
-	}
-	if len(resp.Embeddings) != len(texts) {
-		return nil, fmt.Errorf("gemini: embeddings count mismatch: got %d, want %d", len(resp.Embeddings), len(texts))
-	}
-
-	vectors := make([][]float32, len(resp.Embeddings))
-	for i, embedding := range resp.Embeddings {
-		if embedding == nil || len(embedding.Values) == 0 {
-			return nil, fmt.Errorf("gemini: missing embedding for input index %d", i)
+	// Embed one text at a time — gemini-embedding-2-preview only supports single content per call.
+	result := make([][]float32, 0, len(texts))
+	for _, text := range texts {
+		content := genai.NewContentFromText(text, genai.RoleUser)
+		resp, err := c.client.Models.EmbedContent(ctx, c.model, []*genai.Content{content}, config)
+		if err != nil {
+			return nil, fmt.Errorf("gemini embedding: %w", err)
 		}
-		vectors[i] = embedding.Values
+		if len(resp.Embeddings) == 0 {
+			return nil, fmt.Errorf("gemini: no embedding in response")
+		}
+		result = append(result, resp.Embeddings[0].Values)
 	}
 
-	return vectors, nil
+	return result, nil
 }

@@ -430,8 +430,9 @@ func main() {
 			// Backend left empty — embedding.NewClient reads GHOST_WISPR_EMBEDDING_BACKEND first,
 			// then falls back to GHOST_WISPR_GENAI_BACKEND. This allows Vertex AI for embeddings
 			// while LLM/batch uses Gemini API.
-			Project:  cfg.GCPProject,
-			Location: cfg.GCPLocation,
+			Project: cfg.GCPProject,
+			// Location intentionally omitted — let embedding.NewClient read
+			// GHOST_WISPR_EMBEDDING_LOCATION (us-central1), not cfg.GCPLocation (global)
 		}))
 		if err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
