@@ -117,6 +117,11 @@ func (s *Store) copyConfig() Config {
 		copy(c.MicSampleRates, s.cfg.MicSampleRates)
 	}
 
+	if s.cfg.Transcription.Keywords != nil {
+		c.Transcription.Keywords = make([]string, len(s.cfg.Transcription.Keywords))
+		copy(c.Transcription.Keywords, s.cfg.Transcription.Keywords)
+	}
+
 	if s.cfg.Summarization.Presets != nil {
 		c.Summarization.Presets = make(map[string]Preset, len(s.cfg.Summarization.Presets))
 		for k, v := range s.cfg.Summarization.Presets {
