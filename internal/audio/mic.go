@@ -10,6 +10,8 @@ import (
 	"github.com/gordonklaus/portaudio"
 )
 
+var openInputStreamFn = openInputStream
+
 // Mic wraps PortAudio with a configurable buffer size.
 type Mic struct {
 	stream          *portaudio.Stream
@@ -22,7 +24,7 @@ type Mic struct {
 // NewMic opens a PortAudio capture stream with the given sample rate and buffer size (in frames).
 func NewMic(sampleRate, framesPerBuffer int) (*Mic, error) {
 	buf := make([]int16, framesPerBuffer)
-	stream, err := openInputStream(sampleRate, framesPerBuffer, buf)
+	stream, err := openInputStreamFn(sampleRate, framesPerBuffer, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -30,6 +32,13 @@ func NewMic(sampleRate, framesPerBuffer int) (*Mic, error) {
 }
 
 func (m *Mic) Start() error {
+	if m == nil {
+		return fmt.Errorf("microphone stream unavailable")
+	}
+	if m.stream == nil {
+		m.active.Store(false)
+		return fmt.Errorf("microphone stream unavailable")
+	}
 	err := m.stream.Start()
 	if err == nil {
 		m.active.Store(true)
@@ -37,33 +46,57 @@ func (m *Mic) Start() error {
 	return err
 }
 func (m *Mic) Stop() error {
+	if m == nil {
+		return nil
+	}
 	m.active.Store(false)
+	if m.stream == nil {
+		return nil
+	}
 	return m.stream.Stop()
 }
 
 // Reopen closes the current PortAudio stream and opens a fresh one with the
 // same parameters. This picks up new device nodes after a USB reconnect.
 func (m *Mic) Reopen() error {
-	_ = m.stream.Stop()
-	_ = m.stream.Close()
-	stream, err := openInputStream(m.sampleRate, m.framesPerBuffer, m.buf)
+	m.active.Store(false)
+	if m.stream != nil {
+		_ = m.stream.Stop()
+		_ = m.stream.Close()
+		m.stream = nil
+	}
+	if err := ReinitPortAudio(); err != nil {
+		return fmt.Errorf("reinitialize portaudio: %w", err)
+	}
+	stream, err := openInputStreamFn(m.sampleRate, m.framesPerBuffer, m.buf)
 	if err != nil {
 		return err
 	}
 	m.stream = stream
 	err = m.stream.Start()
-	if err == nil {
-		m.active.Store(true)
+	if err != nil {
+		_ = m.stream.Close()
+		m.stream = nil
+		return err
 	}
+	m.active.Store(true)
 	return err
 }
 
 // Stream reads from the mic and writes PCM16-LE to w until an error or stop.
 func (m *Mic) Stream(w io.Writer) error {
+	if m == nil {
+		return fmt.Errorf("microphone stream unavailable")
+	}
+	if m.stream == nil {
+		m.active.Store(false)
+		return fmt.Errorf("microphone stream unavailable")
+	}
+	stream := m.stream
 	var out bytes.Buffer
 	out.Grow(len(m.buf) * 2) // pre-allocate: int16 = 2 bytes per sample
 	for {
-		if err := m.stream.Read(); err != nil {
+		if err := stream.Read(); err != nil {
 			m.active.Store(false)
 			return err
 		}
@@ -80,6 +113,13 @@ func (m *Mic) Stream(w io.Writer) error {
 // IsOpen returns true if the mic stream is currently active.
 func (m *Mic) IsOpen() bool {
 	return m.stream != nil && m.active.Load()
+}
+
+func (m *Mic) SampleRate() int {
+	if m == nil {
+		return 0
+	}
+	return m.sampleRate
 }
 
 func openInputStream(sampleRate, framesPerBuffer int, buf []int16) (*portaudio.Stream, error) {
