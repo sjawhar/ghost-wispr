@@ -122,6 +122,43 @@ func TestStore_Update_WritesYAML(t *testing.T) {
 	}
 }
 
+func TestStore_Update_KeywordsRoundTrip(t *testing.T) {
+	clearEnv(t)
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("transcription:\n  endpointing: \"400\"\n  utterance_end_ms: \"1000\"\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	store, _, err := NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+
+	expected := []string{"Taiga", "Anthropic", "Lyon"}
+	if err := store.Update(func(c *Config) {
+		c.Transcription.Keywords = expected
+	}); err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+
+	got := store.Get().Transcription.Keywords
+	if len(got) != 3 || got[0] != "Taiga" || got[1] != "Anthropic" || got[2] != "Lyon" {
+		t.Fatalf("expected keywords %v, got %v", expected, got)
+	}
+
+	reloaded, _, err := NewStore(configPath)
+	if err != nil {
+		t.Fatalf("reload store failed: %v", err)
+	}
+
+	reloadedKeywords := reloaded.Get().Transcription.Keywords
+	if len(reloadedKeywords) != 3 || reloadedKeywords[0] != "Taiga" || reloadedKeywords[1] != "Anthropic" || reloadedKeywords[2] != "Lyon" {
+		t.Fatalf("expected reloaded keywords %v, got %v", expected, reloadedKeywords)
+	}
+}
+
 func TestStore_Update_DoesNotWriteSecretsToYAML(t *testing.T) {
 	clearEnv(t)
 	t.Setenv(EnvPrefix+"OPENAI_API_KEY", "sk-secret-key")

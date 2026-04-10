@@ -34,8 +34,9 @@ type Summarization struct {
 }
 
 type Transcription struct {
-	Endpointing    string `yaml:"endpointing"`
-	UtteranceEndMs string `yaml:"utterance_end_ms"`
+	Endpointing    string   `yaml:"endpointing"`
+	UtteranceEndMs string   `yaml:"utterance_end_ms"`
+	Keywords       []string `yaml:"keywords"`
 }
 
 type BatchTranscription struct {
