@@ -587,6 +587,10 @@ h1 {
   color: var(--muted);
 }
 
+.audio-player.seeking .audio-time {
+  opacity: 0.5;
+}
+
 .audio-error {
   color: var(--danger);
 }
