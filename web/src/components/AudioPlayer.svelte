@@ -16,6 +16,7 @@
   let duration = $state(0)
   let loading = $state(true)
   let playing = $state(false)
+  let seeking = $state(false)
   let error = $state('')
 
   let transcriptCopied = $state(false)
@@ -76,8 +77,24 @@
     if (!audioEl) {
       return
     }
+    seeking = true
     audioEl.currentTime = seconds
     setActiveAudioSession(sessionId)
+    if (!audioEl.paused) {
+      void audioEl.play()
+    }
+  }
+
+  function onSeeking() {
+    seeking = true
+  }
+
+  function onSeeked() {
+    if (!audioEl) {
+      return
+    }
+    seeking = false
+    currentTime = audioEl.currentTime
   }
 
   function onLoadedMetadata() {
@@ -89,7 +106,7 @@
   }
 
   function onTimeUpdate() {
-    if (!audioEl) {
+    if (!audioEl || seeking) {
       return
     }
     currentTime = audioEl.currentTime
@@ -102,13 +119,15 @@
   })
 </script>
 
-<div class="audio-player" data-testid="audio-player">
+<div class="audio-player" class:seeking data-testid="audio-player">
   <audio
     bind:this={audioEl}
     src={`/api/sessions/${encodeURIComponent(sessionId)}/audio`}
-    preload="metadata"
+    preload="auto"
     onloadedmetadata={onLoadedMetadata}
     ontimeupdate={onTimeUpdate}
+    onseeking={onSeeking}
+    onseeked={onSeeked}
     onplay={() => (playing = true)}
     onpause={() => (playing = false)}
     onerror={() => {
