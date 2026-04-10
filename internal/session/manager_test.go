@@ -238,13 +238,14 @@ func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (s
 
 type syncerMock struct {
 	called chan string
+	err    error
 }
 
 func (s syncerMock) SyncSession(_ context.Context, sessionID string) error {
 	if s.called != nil {
 		s.called <- sessionID
 	}
-	return nil
+	return s.err
 }
 
 type publisherMock struct {
@@ -298,6 +299,10 @@ type hubMock struct {
 	latestStatus  string
 	latestPreset  string
 	interimCount  int
+	components    map[string]struct {
+		status  string
+		message string
+	}
 }
 
 func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
@@ -339,9 +344,16 @@ func (h *hubMock) BroadcastSummaryReady(sessionID, title, summary, status, prese
 
 func (h *hubMock) BroadcastComponentStatus(component, status, message string) {
 	h.mu.Lock()
-	_ = component
-	_ = status
-	_ = message
+	if h.components == nil {
+		h.components = map[string]struct {
+			status  string
+			message string
+		}{}
+	}
+	h.components[component] = struct {
+		status  string
+		message string
+	}{status: status, message: message}
 	h.mu.Unlock()
 }
 
@@ -1059,5 +1071,71 @@ func TestManager_GenerateSummary_StoresErrorOnFailure(t *testing.T) {
 	}
 	if !strings.Contains(store.errorMessage["sess-err"], "gemini json completion: 401 invalid API key") {
 		t.Fatalf("expected error_message to contain original error, got %q", store.errorMessage["sess-err"])
+	}
+}
+
+func TestManager_GenerateSummary_SyncSuccessClearsPriorSyncError(t *testing.T) {
+	store := newStoreMock()
+	hub := &hubMock{}
+
+	if err := store.CreateSession("sess-sync-fail", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if err := store.CreateSession("sess-sync-ok", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	failCalled := make(chan string, 1)
+	failManager := NewManager(store, nil, nil, hub, NewDetector(time.Hour), 0)
+	failManager.SetSyncer(syncerMock{called: failCalled, err: errors.New("drive down")})
+	failManager.generateSummary(context.Background(), "sess-sync-fail", time.Now().UTC())
+
+	select {
+	case <-failCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected failing sync to be called")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		hub.mu.Lock()
+		got := hub.components["sync"].status
+		hub.mu.Unlock()
+		if got == storage.ComponentStatusError {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected sync status %q after failure, got %q", storage.ComponentStatusError, got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	successCalled := make(chan string, 1)
+	successManager := NewManager(store, nil, nil, hub, NewDetector(time.Hour), 0)
+	successManager.SetSyncer(syncerMock{called: successCalled})
+	successManager.generateSummary(context.Background(), "sess-sync-ok", time.Now().UTC())
+
+	select {
+	case <-successCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected successful sync to be called")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		hub.mu.Lock()
+		status := hub.components["sync"].status
+		message := hub.components["sync"].message
+		hub.mu.Unlock()
+		if status == storage.ComponentStatusConnected {
+			if !strings.Contains(message, "sess-sync-ok") {
+				t.Fatalf("expected sync success message to mention session, got %q", message)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected sync status %q after later success, got %q", storage.ComponentStatusConnected, status)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
