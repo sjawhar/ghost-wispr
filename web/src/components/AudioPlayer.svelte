@@ -73,6 +73,22 @@
     }
   }
 
+  function skipBack() {
+    if (!audioEl) {
+      return
+    }
+    audioEl.currentTime = Math.max(0, audioEl.currentTime - 30)
+    setActiveAudioSession(sessionId)
+  }
+
+  function skipForward() {
+    if (!audioEl) {
+      return
+    }
+    audioEl.currentTime = Math.min(duration, audioEl.currentTime + 30)
+    setActiveAudioSession(sessionId)
+  }
+
   function seekTo(seconds: number) {
     if (!audioEl) {
       return
@@ -137,8 +153,20 @@
   ></audio>
 
   <div class="audio-controls">
+    <button type="button" class="audio-btn" onclick={skipBack} data-testid="skip-back" title="Back 30s">
+      -30s
+    </button>
     <button type="button" class="audio-btn" onclick={togglePlay}>
-      {playing ? 'Pause Audio' : 'Play Audio'}
+      {playing ? 'Pause' : 'Play'}
+    </button>
+    <button
+      type="button"
+      class="audio-btn"
+      onclick={skipForward}
+      data-testid="skip-forward"
+      title="Forward 30s"
+    >
+      +30s
     </button>
     <span class="audio-time">{prettyTime(currentTime)} / {prettyTime(duration)}</span>
   </div>
