@@ -153,7 +153,13 @@
   ></audio>
 
   <div class="audio-controls">
-    <button type="button" class="audio-btn" onclick={skipBack} data-testid="skip-back" title="Back 30s">
+    <button
+      type="button"
+      class="audio-btn"
+      onclick={skipBack}
+      data-testid="skip-back"
+      title="Back 30s"
+    >
       -30s
     </button>
     <button type="button" class="audio-btn" onclick={togglePlay}>

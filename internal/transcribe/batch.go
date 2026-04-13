@@ -29,7 +29,7 @@ type deepgramBatchTranscriber struct {
 	httpClient *http.Client
 }
 
-func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchTranscriber {
+func NewDeepgramBatchTranscriber(cfg *DeepgramBatchConfig) BatchTranscriber {
 	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if baseURL == "" {
 		baseURL = "https://api.deepgram.com"
