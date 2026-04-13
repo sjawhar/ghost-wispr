@@ -15,6 +15,7 @@ export interface ConfigResponse {
   transcription: {
     endpointing: string
     utterance_end_ms: string
+    keywords: string[]
   }
   gdrive: {
     folder_id: string

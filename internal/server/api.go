@@ -1435,8 +1435,9 @@ type configSummarizationResponse struct {
 }
 
 type configTranscriptionResponse struct {
-	Endpointing    string `json:"endpointing"`
-	UtteranceEndMs string `json:"utterance_end_ms"`
+	Endpointing    string   `json:"endpointing"`
+	UtteranceEndMs string   `json:"utterance_end_ms"`
+	Keywords       []string `json:"keywords"`
 }
 
 type configGDriveResponse struct {
@@ -1465,6 +1466,7 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 			Transcription: configTranscriptionResponse{
 				Endpointing:    cfg.Transcription.Endpointing,
 				UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
+				Keywords:       cfg.Transcription.Keywords,
 			},
 			GDrive: configGDriveResponse{
 				FolderID:       cfg.GDriveFolderID,
@@ -1508,8 +1510,9 @@ type summarizationPatch struct {
 }
 
 type transcriptionPatch struct {
-	Endpointing    *string `json:"endpointing,omitempty"`
-	UtteranceEndMs *string `json:"utterance_end_ms,omitempty"`
+	Endpointing    *string   `json:"endpointing,omitempty"`
+	UtteranceEndMs *string   `json:"utterance_end_ms,omitempty"`
+	Keywords       *[]string `json:"keywords,omitempty"`
 }
 
 type gdrivePatch struct {
@@ -1604,6 +1607,9 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 		}
 		if p.Transcription.UtteranceEndMs != nil {
 			c.Transcription.UtteranceEndMs = *p.Transcription.UtteranceEndMs
+		}
+		if p.Transcription.Keywords != nil {
+			c.Transcription.Keywords = *p.Transcription.Keywords
 		}
 	}
 
