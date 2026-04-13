@@ -1435,6 +1435,45 @@ func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 	}
 }
 
+func TestPatchConfig_Keywords(t *testing.T) {
+	cfgStore := newTestConfigStore(t)
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", nil, cfgStore)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	body := `{"transcription":{"keywords":["Taiga","Anthropic","Lyon"]}}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Transcription struct {
+			Keywords []string `json:"keywords"`
+		} `json:"transcription"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Transcription.Keywords) != 3 {
+		t.Fatalf("expected 3 keywords, got %v", resp.Transcription.Keywords)
+	}
+
+	got := cfgStore.Get().Transcription.Keywords
+	if len(got) != 3 || got[0] != "Taiga" {
+		t.Fatalf("keywords not persisted: %v", got)
+	}
+}
+
 func TestFaultInjectionDisabledWithoutTestMode(t *testing.T) {
 	store := &apiStoreStub{
 		sessions: map[string]storage.Session{},
