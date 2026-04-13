@@ -1442,6 +1442,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			InterimResults: true,
 			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
 			VadEvents:      true,
+			Keywords:       cfg.Transcription.Keywords,
 		}
 		resilientConfig := transcribe.ResilientConfig{
 			BufferSize:            cfg.DeepgramBufferSize,
