@@ -8,6 +8,7 @@
   let model = $state(config.summarization.model)
   let endpointing = $state(config.transcription.endpointing)
   let utteranceEndMs = $state(config.transcription.utterance_end_ms)
+  let keywords = $state((config.transcription.keywords ?? []).join(', '))
 
   let saving = $state(false)
   let feedback = $state('')
@@ -18,8 +19,16 @@
       model = configState.config.summarization.model
       endpointing = configState.config.transcription.endpointing
       utteranceEndMs = configState.config.transcription.utterance_end_ms
+      keywords = (configState.config.transcription.keywords ?? []).join(', ')
     }
   })
+
+  function parseKeywords(raw: string): string[] {
+    return raw
+      .split(',')
+      .map((keyword) => keyword.trim())
+      .filter((keyword) => keyword.length > 0)
+  }
 
   async function save(): Promise<void> {
     saving = true
@@ -38,6 +47,14 @@
         utteranceEndMs !== config.transcription.utterance_end_ms
       ) {
         patch.transcription = { endpointing, utterance_end_ms: utteranceEndMs }
+      }
+
+      const parsedKeywords = parseKeywords(keywords)
+      const currentKeywords = config.transcription.keywords ?? []
+      if (JSON.stringify(parsedKeywords) !== JSON.stringify(currentKeywords)) {
+        const transcriptionPatch = (patch.transcription as Record<string, unknown>) ?? {}
+        transcriptionPatch.keywords = parsedKeywords
+        patch.transcription = transcriptionPatch
       }
 
       if (Object.keys(patch).length === 0) {
@@ -81,6 +98,17 @@
     <span class="hint">Changes to transcription settings will reconnect Deepgram</span>
   </div>
 
+  <div class="field">
+    <label for="keywords">Custom Dictionary (Keywords)</label>
+    <textarea
+      id="keywords"
+      bind:value={keywords}
+      placeholder="Taiga, Anthropic, Lyon"
+      rows="3"
+    ></textarea>
+    <span class="hint">Comma-separated terms to boost in transcription. Takes effect on next recording.</span>
+  </div>
+
   <div class="actions">
     <button class="save-btn" type="button" onclick={save} disabled={saving}>
       {saving ? 'Saving...' : 'Save'}
@@ -120,6 +148,16 @@
     font-family: var(--font-mono);
     font-size: 0.9rem;
     background: var(--panel);
+  }
+
+  .field textarea {
+    padding: 0.5rem;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    background: var(--panel);
+    resize: vertical;
   }
 
   .hint {
