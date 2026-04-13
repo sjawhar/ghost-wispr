@@ -42,7 +42,7 @@ func TestBatchRefinement_DeepgramSubmissionAndTranscriptExtraction(t *testing.T)
 	}))
 	defer server.Close()
 
-	client := NewDeepgramBatchTranscriber(DeepgramBatchConfig{
+	client := NewDeepgramBatchTranscriber(&DeepgramBatchConfig{
 		APIKey:  "test-key",
 		Model:   "nova-3",
 		BaseURL: server.URL,
@@ -75,7 +75,7 @@ func TestBatchRefinement_DeepgramNonOKFails(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewDeepgramBatchTranscriber(DeepgramBatchConfig{
+	client := NewDeepgramBatchTranscriber(&DeepgramBatchConfig{
 		APIKey:  "test-key",
 		Model:   "nova-3",
 		BaseURL: server.URL,
@@ -94,7 +94,7 @@ func TestDeepgramBatchTranscriber_Keywords(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedURL = r.URL.String()
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"results":{"channels":[{"alternatives":[{"transcript":"test"}]}]}}`)
+		_, _ = fmt.Fprint(w, `{"results":{"channels":[{"alternatives":[{"transcript":"test"}]}]}}`)
 	}))
 	defer ts.Close()
 
@@ -104,7 +104,7 @@ func TestDeepgramBatchTranscriber_Keywords(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	transcriber := NewDeepgramBatchTranscriber(DeepgramBatchConfig{
+	transcriber := NewDeepgramBatchTranscriber(&DeepgramBatchConfig{
 		APIKey:     "test-key",
 		Model:      "nova-3",
 		BaseURL:    ts.URL,

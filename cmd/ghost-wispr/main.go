@@ -182,7 +182,7 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
 			return nil, fmt.Errorf("deepgram API key not configured")
 		}
-		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
+		return transcribe.NewDeepgramBatchTranscriber(&transcribe.DeepgramBatchConfig{
 			APIKey:   cfg.DeepgramAPIKey,
 			Model:    cfg.BatchTranscription.Model,
 			Keywords: cfg.Transcription.Keywords,
