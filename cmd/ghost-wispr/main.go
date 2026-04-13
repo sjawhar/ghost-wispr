@@ -183,8 +183,9 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 			return nil, fmt.Errorf("deepgram API key not configured")
 		}
 		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
-			APIKey: cfg.DeepgramAPIKey,
-			Model:  cfg.BatchTranscription.Model,
+			APIKey:   cfg.DeepgramAPIKey,
+			Model:    cfg.BatchTranscription.Model,
+			Keywords: cfg.Transcription.Keywords,
 		}), nil
 	case "groq", "openai":
 		return nil, fmt.Errorf("batch transcription provider %q is not implemented yet", cfg.BatchTranscription.Provider)
