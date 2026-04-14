@@ -139,6 +139,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		if err := controls.FaultDeepgramDisconnect(); err != nil {
+			if errors.Is(err, ErrDeepgramNotConfigured) {
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("fault injection failed: %v", err))
 			return
 		}

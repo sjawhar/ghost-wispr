@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 )
+
+var ErrDeepgramNotConfigured = errors.New("deepgram not configured")
 
 type ControlHooks struct {
 	Pause                   func()
