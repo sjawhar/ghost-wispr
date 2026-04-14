@@ -8,6 +8,9 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/server"
 )
 
 type fakeStreamer struct {
@@ -148,6 +151,162 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 	}
 	if waits[2] != time.Second {
 		t.Fatalf("expected third wait 1s (reset), got %v", waits[2])
+	}
+}
+
+func TestStreamMicWithRetryBroadcastsReconnectAndConnected(t *testing.T) {
+	hub := server.NewHub()
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
+	streamer := &fakeStreamer{errs: []error{errors.New("device disconnected"), nil}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(time.Duration) {}, func(string, ...any) {}, hub)
+
+	var statuses []string
+	deadline := time.After(time.Second)
+	for len(statuses) < 3 {
+		select {
+		case msg := <-ch:
+			var payload map[string]any
+			if err := json.Unmarshal(msg, &payload); err != nil {
+				t.Fatalf("unmarshal failed: %v", err)
+			}
+			if payload["type"] != "component_status" || payload["component"] != "mic" {
+				continue
+			}
+			status, ok := payload["status"].(string)
+			if !ok {
+				t.Fatalf("expected string status, got %#v", payload["status"])
+			}
+			statuses = append(statuses, status)
+		case <-deadline:
+			t.Fatalf("timeout waiting for mic status events, got %v", statuses)
+		}
+	}
+
+	want := []string{"error", "reconnecting", "connected"}
+	for i, status := range want {
+		if statuses[i] != status {
+			t.Fatalf("expected statuses %v, got %v", want, statuses)
+		}
+	}
+}
+
+func immediateAfter(time.Duration) <-chan time.Time {
+	ch := make(chan time.Time, 1)
+	ch <- time.Now()
+	return ch
+}
+
+func oneShotAfter() func(time.Duration) <-chan time.Time {
+	fired := false
+	return func(time.Duration) <-chan time.Time {
+		if fired {
+			return make(chan time.Time)
+		}
+		fired = true
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+}
+
+func TestRetryMicStartupRetriesUntilSuccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var retries int
+	var attempts int
+	var failures int
+	succeeded := false
+	errSequence := []error{errors.New("no mic"), nil}
+
+	retryMicStartup(
+		ctx,
+		time.Second,
+		immediateAfter,
+		func() { retries++ },
+		func() error {
+			attempts++
+			err := errSequence[0]
+			errSequence = errSequence[1:]
+			return err
+		},
+		func(error) { failures++ },
+		func() { succeeded = true },
+	)
+
+	if retries != 2 {
+		t.Fatalf("expected 2 retry notifications, got %d", retries)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 start attempts, got %d", attempts)
+	}
+	if failures != 1 {
+		t.Fatalf("expected 1 failure callback, got %d", failures)
+	}
+	if !succeeded {
+		t.Fatal("expected success callback")
+	}
+}
+
+func TestRetryMicStartupStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var attempts int
+	var failures int
+
+	retryMicStartup(
+		ctx,
+		time.Second,
+		oneShotAfter(),
+		nil,
+		func() error {
+			attempts++
+			return errors.New("still unavailable")
+		},
+		func(error) {
+			failures++
+			cancel()
+		},
+		nil,
+	)
+
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt before cancellation, got %d", attempts)
+	}
+	if failures != 1 {
+		t.Fatalf("expected 1 failure callback before cancellation, got %d", failures)
+	}
+}
+
+func TestStartMicMonitoringUsesRecorderWhenDownstreamMissing(t *testing.T) {
+	recorder := audio.NewRecorder(t.TempDir())
+	streamer := &fakeStreamer{}
+
+	original := streamMicLoopStarter
+	t.Cleanup(func() {
+		streamMicLoopStarter = original
+	})
+
+	var capturedWriter io.Writer
+	streamMicLoopStarter = func(_ context.Context, gotStreamer micStreamer, writer io.Writer, _ func(time.Duration), _ func(string, ...any), _ *server.Hub) {
+		if gotStreamer != streamer {
+			t.Fatalf("expected streamer %p, got %p", streamer, gotStreamer)
+		}
+		capturedWriter = writer
+	}
+
+	startMicMonitoring(context.Background(), streamer, recorder, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
+
+	if capturedWriter == nil {
+		t.Fatal("expected monitoring writer to be created")
+	}
+	if _, err := capturedWriter.Write([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatalf("expected writer to accept audio bytes, got %v", err)
 	}
 }
 

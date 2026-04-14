@@ -15,13 +15,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
-	"github.com/gordonklaus/portaudio"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
@@ -199,6 +199,22 @@ type recorderState struct {
 	paused bool
 }
 
+type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
+
+func (p *micProxy) IsOpen() bool {
+	mic := p.ref.Load()
+	return mic != nil && mic.IsOpen()
+}
+
+type resilientClientProxy struct {
+	ref *atomic.Pointer[transcribe.ResilientClient]
+}
+
+func (p *resilientClientProxy) IsConnected() bool {
+	client := p.ref.Load()
+	return client != nil && client.IsConnected()
+}
+
 func (r *recorderState) Pause() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -221,6 +237,45 @@ func (r *recorderState) SetMic(mic *audio.Mic) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.mic = mic
+}
+
+func retryMicStartup(
+	ctx context.Context,
+	retryInterval time.Duration,
+	after func(time.Duration) <-chan time.Time,
+	onRetry func(),
+	start func() error,
+	onError func(error),
+	onSuccess func(),
+) {
+	if after == nil {
+		after = time.After
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-after(retryInterval):
+		}
+
+		if onRetry != nil {
+			onRetry()
+		}
+
+		err := start()
+		if err != nil {
+			if onError != nil {
+				onError(err)
+			}
+			continue
+		}
+
+		if onSuccess != nil {
+			onSuccess()
+		}
+		return
+	}
 }
 
 type transcriptCallback struct {
@@ -274,6 +329,20 @@ type deepgramWriter struct {
 		io.Writer
 		Finalize() error
 	}
+}
+
+var streamMicLoopStarter = func(ctx context.Context, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+	go streamMicWithRetry(ctx, streamer, writer, wait, logf, hub)
+}
+
+func startMicMonitoring(ctx context.Context, streamer micStreamer, recorder *audio.Recorder, downstream io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+	if streamer == nil || recorder == nil {
+		return
+	}
+	if downstream == nil {
+		downstream = io.Discard
+	}
+	streamMicLoopStarter(ctx, streamer, recorder.Writer(downstream), wait, logf, hub)
 }
 
 func (dw *deepgramWriter) Write(p []byte) (int, error) {
@@ -430,8 +499,9 @@ func main() {
 			// Backend left empty — embedding.NewClient reads GHOST_WISPR_EMBEDDING_BACKEND first,
 			// then falls back to GHOST_WISPR_GENAI_BACKEND. This allows Vertex AI for embeddings
 			// while LLM/batch uses Gemini API.
-			Project:  cfg.GCPProject,
-			Location: cfg.GCPLocation,
+			Project: cfg.GCPProject,
+			// Location intentionally omitted — let embedding.NewClient read
+			// GHOST_WISPR_EMBEDDING_LOCATION (us-central1), not cfg.GCPLocation (global)
 		}))
 		if err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
@@ -1274,15 +1344,31 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}()
 	}
 
-	var resilientClient *transcribe.ResilientClient
-	var mic *audio.Mic
-	var dgWriter io.Writer
+	var resilientRef atomic.Pointer[transcribe.ResilientClient]
+	var micRef atomic.Pointer[audio.Mic]
 	var dgStop func()
-	selectedSampleRate := cfg.MicSampleRate
+	if cfg.DeepgramAPIKey != "" {
+		controlHooks.FaultDeepgramDisconnect = func() error {
+			current := resilientRef.Load()
+			if current == nil {
+				return server.ErrDeepgramNotConfigured
+			}
+			return current.Close()
+		}
+		dgStop = func() {
+			current := resilientRef.Load()
+			if current == nil {
+				return
+			}
+			if err := current.Close(); err != nil {
+				log.Printf("warning: close resilient deepgram client failed: %v", err)
+			}
+		}
+	}
 
-	paErr := portaudio.Initialize()
+	paErr := audio.InitializePortAudio()
 	//nolint:errcheck // Terminate is best-effort cleanup
-	defer portaudio.Terminate()
+	defer audio.TerminatePortAudio()
 	paInitFailed := false
 	if paErr != nil {
 		log.Printf("warning: portaudio init failed: %v — microphone unavailable", paErr)
@@ -1291,37 +1377,117 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	client.Init(client.InitLib{LogLevel: client.LogLevelDefault})
 
-	if !paInitFailed {
+	startMicPipeline := func(updateStartupState bool) error {
+		var (
+			mic        *audio.Mic
+			sampleRate int
+		)
+
 		for _, rate := range cfg.SampleRateCandidates() {
-			mic, err = audio.NewMic(rate, rate/4) // 250ms buffer
-			if err != nil {
-				log.Printf("warning: microphone open failed at %d Hz: %v", rate, err)
+			candidate, openErr := audio.NewMic(rate, rate/4) // 250ms buffer
+			if openErr != nil {
+				log.Printf("warning: microphone open failed at %d Hz: %v", rate, openErr)
 				continue
 			}
-			selectedSampleRate = rate
+			mic = candidate
+			sampleRate = rate
 			break
+		}
+
+		if mic == nil {
+			if updateStartupState {
+				warnings = append(warnings, "Microphone unavailable — recording and live transcription are disabled")
+				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
+			}
+			return fmt.Errorf("microphone unavailable")
+		}
+
+		audioRecorder.SetSampleRate(sampleRate)
+		recState.SetMic(mic)
+		if err := mic.Start(); err != nil {
+			recState.SetMic(nil)
+			micRef.Store(nil)
+			if updateStartupState {
+				warnings = append(warnings, "Microphone failed to start — recording and live transcription are disabled")
+				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
+			}
+			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
+		}
+
+		micRef.Store(mic)
+		log.Printf("microphone started at %d Hz", sampleRate)
+		message := fmt.Sprintf("Microphone open at %d Hz", sampleRate)
+		if updateStartupState {
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusConnected, Message: message}
+		} else if hub != nil {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, message)
+		}
+
+		if cfg.DeepgramAPIKey == "" {
+			startMicMonitoring(ctx, mic, audioRecorder, nil, time.Sleep, log.Printf, hub)
+			return nil
+		}
+
+		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
+		tOptions := &interfaces.LiveTranscriptionOptions{
+			Model:          cfg.DeepgramModel,
+			Language:       "en-US",
+			Diarize:        true,
+			Punctuate:      true,
+			SmartFormat:    true,
+			Encoding:       "linear16",
+			SampleRate:     sampleRate,
+			Channels:       1,
+			Endpointing:    cfg.Transcription.Endpointing,
+			InterimResults: true,
+			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
+			VadEvents:      true,
+		}
+		resilientConfig := transcribe.ResilientConfig{
+			BufferSize:            cfg.DeepgramBufferSize,
+			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
+			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
+		}
+		resillientStateCallback := func(state transcribe.ConnectionState) {
+			if hub != nil {
+				hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
+			}
+		}
+		candidateResilient := transcribe.NewResilientClient(ctx, nil, resilientConfig, log.Printf, resillientStateCallback)
+		callback := transcriptCallback{manager: manager, resilient: candidateResilient}
+		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback)
+		candidateResilient.Factory = factory
+
+		initialClient, err := factory(ctx)
+		if err != nil {
+			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
+			if updateStartupState {
+				warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
+			}
+			startMicMonitoring(ctx, mic, audioRecorder, nil, time.Sleep, log.Printf, hub)
+			return nil
+		}
+
+		candidateResilient.Client = initialClient
+		resilientRef.Store(candidateResilient)
+
+		startMicMonitoring(ctx, mic, audioRecorder, candidateResilient, time.Sleep, log.Printf, hub)
+		return nil
+	}
+
+	shouldRetryMicStartup := paInitFailed
+	if !paInitFailed {
+		if err := startMicPipeline(true); err != nil {
+			slog.Warn("microphone unavailable, running API/UI only", "error", err)
+			shouldRetryMicStartup = true
 		}
 	}
 
-	if mic == nil {
+	if paInitFailed {
 		slog.Warn("microphone unavailable, running API/UI only")
 		warnings = append(warnings, "Microphone unavailable \u2014 recording and live transcription are disabled")
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
-	} else {
-		audioRecorder.SetSampleRate(selectedSampleRate)
-		recState.SetMic(mic)
-		if err := mic.Start(); err != nil {
-			slog.Warn("microphone start failed, running API/UI only", "sample_rate", selectedSampleRate, "error", err)
-			mic = nil
-			recState.SetMic(nil)
-			warnings = append(warnings, "Microphone failed to start \u2014 recording and live transcription are disabled")
-			startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
-		} else {
-			log.Printf("microphone started at %d Hz", selectedSampleRate)
-			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusConnected, Message: fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate)}
-		}
 	}
-
 	// Initialize speaker output device (completely isolated from mic).
 	var speaker *audio.Speaker
 	if cfg.SpeakerEnabled {
@@ -1388,72 +1554,49 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Wire up mic diagnostic hook now that mic is initialized.
 	controlHooks.DiagnoseMic = func(ctx context.Context) (map[string]any, error) {
+		mic := micRef.Load()
 		if mic == nil {
 			return nil, fmt.Errorf("microphone not available")
 		}
+		sampleRate := mic.SampleRate()
 		return map[string]any{
 			"mic_open":    mic.IsOpen(),
-			"sample_rate": selectedSampleRate,
+			"sample_rate": sampleRate,
 			"status":      "operational",
-			"message":     fmt.Sprintf("Microphone open at %d Hz", selectedSampleRate),
+			"message":     fmt.Sprintf("Microphone open at %d Hz", sampleRate),
 		}, nil
 	}
 
-	if mic != nil && cfg.DeepgramAPIKey != "" {
-		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
-		tOptions := &interfaces.LiveTranscriptionOptions{
-			Model:          cfg.DeepgramModel,
-			Language:       "en-US",
-			Diarize:        true,
-			Punctuate:      true,
-			SmartFormat:    true,
-			Encoding:       "linear16",
-			SampleRate:     selectedSampleRate,
-			Channels:       1,
-			Endpointing:    cfg.Transcription.Endpointing,
-			InterimResults: true,
-			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
-			VadEvents:      true,
-		}
-
-		callback := transcriptCallback{manager: manager}
-		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback)
-
-		resilientConfig := transcribe.ResilientConfig{
-			BufferSize:            cfg.DeepgramBufferSize,
-			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
-			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
-		}
-
-		resillientStateCallback := func(state transcribe.ConnectionState) {
-			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
-		}
-		resilientClient = transcribe.NewResilientClient(ctx, factory, resilientConfig, log.Printf, resillientStateCallback)
-		callback.resilient = resilientClient
-		controlHooks.FaultDeepgramDisconnect = resilientClient.Close
-
-		initialClient, err := factory(ctx)
-		if err != nil {
-			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
-			warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
-		} else {
-			resilientClient.Client = initialClient
-			dgWriter = resilientClient
-			dgStop = func() {
-				if err := resilientClient.Close(); err != nil {
-					log.Printf("warning: close resilient deepgram client failed: %v", err)
+	if shouldRetryMicStartup {
+		go retryMicStartup(
+			ctx,
+			15*time.Second,
+			time.After,
+			func() {
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
 				}
-			}
-			go func() {
-				go func() {
-					streamMicWithRetry(ctx, mic, audioRecorder.Writer(dgWriter), time.Sleep, log.Printf, hub)
-				}()
-			}()
-		}
+			},
+			func() error {
+				if err := audio.ReinitPortAudio(); err != nil {
+					return err
+				}
+				return startMicPipeline(false)
+			},
+			func(err error) {
+				log.Printf("mic startup retry failed: %v", err)
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
+				}
+			},
+			func() {
+				log.Printf("mic startup retry succeeded")
+			},
+		)
 	}
 
 	// Create health checker with actual component references
-	healthChecker := server.NewDefaultHealthChecker(resilientClient, store, mic, llmTracker)
+	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, &micProxy{ref: &micRef}, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
@@ -1500,7 +1643,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if summaryPublisher != nil {
 		_ = summaryPublisher.Close()
 	}
-	if mic != nil {
+	if mic := micRef.Load(); mic != nil {
 		_ = mic.Stop()
 	}
 	if ttsOrchestrator != nil {
@@ -1555,6 +1698,9 @@ func streamMicWithRetry(
 			if ctx.Err() != nil {
 				return
 			}
+			if hub != nil {
+				hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
+			}
 			if reopenErr := streamer.Reopen(); reopenErr != nil {
 				logf("mic reopen failed: %v", reopenErr)
 				if hub != nil {
@@ -1563,6 +1709,9 @@ func streamMicWithRetry(
 				continue
 			}
 			logf("mic reopened successfully")
+			if hub != nil {
+				hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
+			}
 			continue
 		}
 
@@ -1575,6 +1724,9 @@ func streamMicWithRetry(
 		if ctx.Err() != nil {
 			return
 		}
+		if hub != nil {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
+		}
 
 		if reopenErr := streamer.Reopen(); reopenErr != nil {
 			logf("mic reopen failed: %v", reopenErr)
@@ -1586,6 +1738,9 @@ func streamMicWithRetry(
 		}
 
 		logf("mic reopened successfully")
+		if hub != nil {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
+		}
 		backoff = baseBackoff
 	}
 }
