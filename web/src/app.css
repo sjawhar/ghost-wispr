@@ -676,6 +676,63 @@ h1 {
   font-size: 0.8rem;
 }
 
+.transcript-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.transcript-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 0.25rem;
+  overflow: hidden;
+}
+
+.toggle-btn {
+  font-size: 0.65rem;
+  font-weight: 500;
+  padding: 0.15rem 0.4rem;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.toggle-btn + .toggle-btn {
+  border-left: 1px solid var(--line);
+}
+
+.toggle-btn:hover {
+  color: var(--ink);
+}
+
+.toggle-btn.active {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.refining-indicator {
+  font-size: 0.65rem;
+  font-style: italic;
+  color: var(--muted);
+}
+
+.transcript-refined {
+  margin-top: 0.35rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-height: 320px;
+  overflow: auto;
+}
+
 /* ── Summary markdown ── */
 
 .summary-markdown {
