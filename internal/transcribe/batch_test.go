@@ -2,9 +2,11 @@ package transcribe
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,7 +42,7 @@ func TestBatchRefinement_DeepgramSubmissionAndTranscriptExtraction(t *testing.T)
 	}))
 	defer server.Close()
 
-	client := NewDeepgramBatchTranscriber(DeepgramBatchConfig{
+	client := NewDeepgramBatchTranscriber(&DeepgramBatchConfig{
 		APIKey:  "test-key",
 		Model:   "nova-3",
 		BaseURL: server.URL,
@@ -73,7 +75,7 @@ func TestBatchRefinement_DeepgramNonOKFails(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewDeepgramBatchTranscriber(DeepgramBatchConfig{
+	client := NewDeepgramBatchTranscriber(&DeepgramBatchConfig{
 		APIKey:  "test-key",
 		Model:   "nova-3",
 		BaseURL: server.URL,
@@ -82,5 +84,42 @@ func TestBatchRefinement_DeepgramNonOKFails(t *testing.T) {
 	_, err := client.Transcribe(context.Background(), audioPath)
 	if err == nil {
 		t.Fatal("expected error when Deepgram returns non-200")
+	}
+}
+
+func TestDeepgramBatchTranscriber_Keywords(t *testing.T) {
+	expectedKeywords := []string{"Taiga", "Anthropic"}
+	var capturedURL string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedURL = r.URL.String()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"results":{"channels":[{"alternatives":[{"transcript":"test"}]}]}}`)
+	}))
+	defer ts.Close()
+
+	tmpDir := t.TempDir()
+	audioPath := filepath.Join(tmpDir, "session.mp3")
+	if err := os.WriteFile(audioPath, []byte("fake"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	transcriber := NewDeepgramBatchTranscriber(&DeepgramBatchConfig{
+		APIKey:     "test-key",
+		Model:      "nova-3",
+		BaseURL:    ts.URL,
+		Keywords:   expectedKeywords,
+		HTTPClient: ts.Client(),
+	})
+
+	_, err := transcriber.Transcribe(context.Background(), audioPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsed, _ := url.Parse(capturedURL)
+	gotKeywords := parsed.Query()["keywords"]
+	if len(gotKeywords) != 2 || gotKeywords[0] != "Taiga" || gotKeywords[1] != "Anthropic" {
+		t.Fatalf("expected keywords [Taiga Anthropic], got %v", gotKeywords)
 	}
 }

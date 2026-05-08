@@ -18,6 +18,7 @@
   let duration = $state(0)
   let loading = $state(true)
   let playing = $state(false)
+  let seeking = $state(false)
   let error = $state('')
 
   let transcriptCopied = $state(false)
@@ -111,12 +112,44 @@
     }
   }
 
+  function skipBack() {
+    if (!audioEl) {
+      return
+    }
+    audioEl.currentTime = Math.max(0, audioEl.currentTime - 30)
+    setActiveAudioSession(sessionId)
+  }
+
+  function skipForward() {
+    if (!audioEl) {
+      return
+    }
+    audioEl.currentTime = Math.min(duration, audioEl.currentTime + 30)
+    setActiveAudioSession(sessionId)
+  }
+
   function seekTo(seconds: number) {
     if (!audioEl) {
       return
     }
+    seeking = true
     audioEl.currentTime = seconds
     setActiveAudioSession(sessionId)
+    if (!audioEl.paused) {
+      void audioEl.play()
+    }
+  }
+
+  function onSeeking() {
+    seeking = true
+  }
+
+  function onSeeked() {
+    if (!audioEl) {
+      return
+    }
+    seeking = false
+    currentTime = audioEl.currentTime
   }
 
   function onLoadedMetadata() {
@@ -128,7 +161,7 @@
   }
 
   function onTimeUpdate() {
-    if (!audioEl) {
+    if (!audioEl || seeking) {
       return
     }
     currentTime = audioEl.currentTime
@@ -141,13 +174,15 @@
   })
 </script>
 
-<div class="audio-player" data-testid="audio-player">
+<div class="audio-player" class:seeking data-testid="audio-player">
   <audio
     bind:this={audioEl}
     src={`/api/sessions/${encodeURIComponent(sessionId)}/audio`}
-    preload="metadata"
+    preload="auto"
     onloadedmetadata={onLoadedMetadata}
     ontimeupdate={onTimeUpdate}
+    onseeking={onSeeking}
+    onseeked={onSeeked}
     onplay={() => (playing = true)}
     onpause={() => (playing = false)}
     onerror={() => {
@@ -157,8 +192,26 @@
   ></audio>
 
   <div class="audio-controls">
+    <button
+      type="button"
+      class="audio-btn"
+      onclick={skipBack}
+      data-testid="skip-back"
+      title="Back 30s"
+    >
+      -30s
+    </button>
     <button type="button" class="audio-btn" onclick={togglePlay}>
-      {playing ? 'Pause Audio' : 'Play Audio'}
+      {playing ? 'Pause' : 'Play'}
+    </button>
+    <button
+      type="button"
+      class="audio-btn"
+      onclick={skipForward}
+      data-testid="skip-forward"
+      title="Forward 30s"
+    >
+      +30s
     </button>
     <span class="audio-time">{prettyTime(currentTime)} / {prettyTime(duration)}</span>
   </div>

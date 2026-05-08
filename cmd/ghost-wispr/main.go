@@ -182,9 +182,10 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
 			return nil, fmt.Errorf("deepgram API key not configured")
 		}
-		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
-			APIKey: cfg.DeepgramAPIKey,
-			Model:  cfg.BatchTranscription.Model,
+		return transcribe.NewDeepgramBatchTranscriber(&transcribe.DeepgramBatchConfig{
+			APIKey:   cfg.DeepgramAPIKey,
+			Model:    cfg.BatchTranscription.Model,
+			Keywords: cfg.Transcription.Keywords,
 		}), nil
 	case "groq", "openai":
 		return nil, fmt.Errorf("batch transcription provider %q is not implemented yet", cfg.BatchTranscription.Provider)
@@ -1442,6 +1443,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			InterimResults: true,
 			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
 			VadEvents:      true,
+			Keywords:       cfg.Transcription.Keywords,
 		}
 		resilientConfig := transcribe.ResilientConfig{
 			BufferSize:            cfg.DeepgramBufferSize,

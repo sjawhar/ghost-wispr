@@ -17,6 +17,7 @@ type DeepgramBatchConfig struct {
 	APIKey     string
 	Model      string
 	BaseURL    string
+	Keywords   []string
 	HTTPClient *http.Client
 }
 
@@ -24,10 +25,11 @@ type deepgramBatchTranscriber struct {
 	apiKey     string
 	model      string
 	baseURL    string
+	keywords   []string
 	httpClient *http.Client
 }
 
-func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchTranscriber {
+func NewDeepgramBatchTranscriber(cfg *DeepgramBatchConfig) BatchTranscriber {
 	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if baseURL == "" {
 		baseURL = "https://api.deepgram.com"
@@ -41,6 +43,7 @@ func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchTranscriber {
 		apiKey:     strings.TrimSpace(cfg.APIKey),
 		model:      strings.TrimSpace(cfg.Model),
 		baseURL:    strings.TrimRight(baseURL, "/"),
+		keywords:   cfg.Keywords,
 		httpClient: httpClient,
 	}
 }
@@ -63,6 +66,9 @@ func (d *deepgramBatchTranscriber) Transcribe(ctx context.Context, audioPath str
 	}
 	q.Set("smart_format", "true")
 	q.Set("punctuate", "true")
+	for _, kw := range d.keywords {
+		q.Add("keywords", kw)
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(audioBytes))
