@@ -143,6 +143,8 @@ export interface SessionSummary {
   sync_status?: SyncStatus
   refinement_status?: RefinementStatus
   transcript_source?: string
+  refined_transcript?: string
+  canonical_transcript?: string
 }
 
 export interface SessionDetailResponse {
