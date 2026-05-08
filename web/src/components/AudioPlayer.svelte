@@ -1,14 +1,16 @@
 <script lang="ts">
   import { appState, setActiveAudioSession } from '../lib/state.svelte'
-  import type { Segment } from '../lib/types'
+  import { RefinementStatus, type Segment, type SessionSummary } from '../lib/types'
   import { copyText } from '../lib/clipboard'
 
   let {
     sessionId,
     segments,
+    session,
   }: {
     sessionId: string
     segments: Segment[]
+    session?: SessionSummary
   } = $props()
 
   let audioEl: HTMLAudioElement | null = null
@@ -20,10 +22,47 @@
 
   let transcriptCopied = $state(false)
 
-  async function copyTranscript() {
-    const text = segments
+  // Refined transcript: prefer the explicit refined_transcript, fall back to
+  // canonical_transcript when the source is 'refined' (covers historical sessions
+  // where the backend canonicalized into canonical_transcript).
+  const refinedText = $derived.by(() => {
+    if (!session) return ''
+    const refined = session.refined_transcript?.trim()
+    if (refined) return refined
+    if (session.transcript_source === 'refined') {
+      return session.canonical_transcript?.trim() ?? ''
+    }
+    return ''
+  })
+
+  const refinementCompleted = $derived(
+    session?.refinement_status === RefinementStatus.Completed && refinedText.length > 0,
+  )
+
+  const refinementInFlight = $derived(
+    session?.refinement_status === RefinementStatus.Pending ||
+      session?.refinement_status === RefinementStatus.Running,
+  )
+
+  type View = 'refined' | 'segments'
+  // Default to refined view whenever a refined transcript is available.
+  let view = $state<View>('segments')
+  $effect(() => {
+    if (refinementCompleted) {
+      view = 'refined'
+    } else {
+      view = 'segments'
+    }
+  })
+
+  function segmentsAsText(): string {
+    return segments
       .map((s) => `[${prettyTime(s.start_time)}] Speaker ${s.speaker}: ${s.text}`)
       .join('\n')
+  }
+
+  async function copyTranscript() {
+    const text = view === 'refined' && refinedText ? refinedText : segmentsAsText()
     const ok = await copyText(text)
     if (ok) {
       transcriptCopied = true
@@ -132,21 +171,56 @@
 
   <div class="transcript-header">
     <span class="transcript-label">Transcript</span>
-    <button type="button" class="copy-btn" onclick={copyTranscript}>
-      {transcriptCopied ? 'Copied!' : 'Copy transcript'}
-    </button>
+    <div class="transcript-header-actions">
+      {#if refinementCompleted}
+        <div
+          class="transcript-toggle"
+          role="group"
+          aria-label="Transcript view"
+          data-testid="transcript-view-toggle"
+        >
+          <button
+            type="button"
+            class={`toggle-btn ${view === 'refined' ? 'active' : ''}`}
+            aria-pressed={view === 'refined'}
+            onclick={() => (view = 'refined')}
+          >
+            Refined
+          </button>
+          <button
+            type="button"
+            class={`toggle-btn ${view === 'segments' ? 'active' : ''}`}
+            aria-pressed={view === 'segments'}
+            onclick={() => (view = 'segments')}
+          >
+            Segments
+          </button>
+        </div>
+      {:else if refinementInFlight}
+        <span class="refining-indicator" data-testid="refining-indicator">Refining…</span>
+      {/if}
+      <button type="button" class="copy-btn" onclick={copyTranscript}>
+        {transcriptCopied ? 'Copied!' : 'Copy transcript'}
+      </button>
+    </div>
   </div>
 
-  <div class="transcript-sync">
-    {#each segments as segment, index (segment.timestamp + segment.text + index)}
-      <button
-        type="button"
-        class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
-        onclick={() => seekTo(segment.start_time)}
-      >
-        <span class="line-time">{prettyTime(segment.start_time)}</span>
-        <span class="line-text">{segment.text}</span>
-      </button>
-    {/each}
-  </div>
+  {#if view === 'refined' && refinedText}
+    <div class="transcript-refined" data-testid="transcript-refined">
+      {refinedText}
+    </div>
+  {:else}
+    <div class="transcript-sync">
+      {#each segments as segment, index (segment.timestamp + segment.text + index)}
+        <button
+          type="button"
+          class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
+          onclick={() => seekTo(segment.start_time)}
+        >
+          <span class="line-time">{prettyTime(segment.start_time)}</span>
+          <span class="line-text">{segment.text}</span>
+        </button>
+      {/each}
+    </div>
+  {/if}
 </div>

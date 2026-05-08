@@ -332,7 +332,7 @@
   {#if expanded}
     <div class="session-details">
       {#if detail}
-        <AudioPlayer sessionId={session.id} segments={detail.segments} />
+        <AudioPlayer sessionId={session.id} segments={detail.segments} {session} />
 
         {#if session.summary_status === SummaryStatus.Completed && session.summary}
           <div class="summary-section">
