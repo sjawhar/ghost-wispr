@@ -286,18 +286,25 @@ func (s contextProbeSummarizer) Summarize(ctx context.Context, _ string, transcr
 	}
 }
 
+type componentStatusEvent struct {
+	component string
+	status    string
+	message   string
+}
+
 type hubMock struct {
-	mu            sync.Mutex
-	liveCount     int
-	startedCount  int
-	endedCount    int
-	summaryReady  int
-	latestSession string
-	latestTitle   string
-	latestSummary string
-	latestStatus  string
-	latestPreset  string
-	interimCount  int
+	mu                sync.Mutex
+	liveCount         int
+	startedCount      int
+	endedCount        int
+	summaryReady      int
+	latestSession     string
+	latestTitle       string
+	latestSummary     string
+	latestStatus      string
+	latestPreset      string
+	interimCount      int
+	componentStatuses []componentStatusEvent
 }
 
 func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
@@ -339,9 +346,7 @@ func (h *hubMock) BroadcastSummaryReady(sessionID, title, summary, status, prese
 
 func (h *hubMock) BroadcastComponentStatus(component, status, message string) {
 	h.mu.Lock()
-	_ = component
-	_ = status
-	_ = message
+	h.componentStatuses = append(h.componentStatuses, componentStatusEvent{component: component, status: status, message: message})
 	h.mu.Unlock()
 }
 
@@ -1059,5 +1064,42 @@ func TestManager_GenerateSummary_StoresErrorOnFailure(t *testing.T) {
 	}
 	if !strings.Contains(store.errorMessage["sess-err"], "gemini json completion: 401 invalid API key") {
 		t.Fatalf("expected error_message to contain original error, got %q", store.errorMessage["sess-err"])
+	}
+}
+
+func TestManager_GenerateSummary_BroadcastsSyncConnectedOnSuccess(t *testing.T) {
+	store := newStoreMock()
+	hub := &hubMock{}
+	syncCalled := make(chan string, 1)
+	manager := NewManager(store, nil, nil, hub, NewDetector(time.Hour), 0)
+	manager.SetSyncer(syncerMock{called: syncCalled})
+
+	manager.generateSummary(context.Background(), "session-sync-connected", time.Time{})
+
+	select {
+	case <-syncCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected sync to trigger when summarizer is nil")
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		hub.mu.Lock()
+		found := false
+		for _, e := range hub.componentStatuses {
+			if e.component == "sync" && e.status == storage.ComponentStatusConnected {
+				found = true
+				break
+			}
+		}
+		hub.mu.Unlock()
+		if found {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected sync=connected component status broadcast on successful sync")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
