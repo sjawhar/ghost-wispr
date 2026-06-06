@@ -1103,3 +1103,54 @@ func TestManager_GenerateSummary_BroadcastsSyncConnectedOnSuccess(t *testing.T) 
 		}
 	}
 }
+
+func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
+	store := newStoreMock()
+	if err := store.CreateSession("sess-refine", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	hub := &hubMock{}
+	summaryCalled := make(chan string, 1)
+	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, hub, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{transcript: "refined transcript text"})
+
+	err := manager.RefineSession(context.Background(), "sess-refine", "data/audio/sess-refine.mp3", time.Time{})
+	if err != nil {
+		t.Fatalf("RefineSession: %v", err)
+	}
+
+	transcript, status, _ := store.GetRefinement("sess-refine")
+	if status != storage.RefinementCompleted {
+		t.Fatalf("expected refinement status %q, got %q", storage.RefinementCompleted, status)
+	}
+	if transcript != "refined transcript text" {
+		t.Fatalf("expected refined transcript stored, got %q", transcript)
+	}
+
+	select {
+	case <-summaryCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected summarizer to run after refinement")
+	}
+}
+
+func TestManager_RefineSession_ErrorsWithoutBatchTranscriber(t *testing.T) {
+	store := newStoreMock()
+	manager := NewManager(store, nil, summarizerMock{}, &hubMock{}, NewDetector(time.Hour), 0)
+
+	err := manager.RefineSession(context.Background(), "sess-x", "data/audio/sess-x.mp3", time.Time{})
+	if err == nil {
+		t.Fatal("expected error when batch transcription is not configured")
+	}
+}
+
+func TestManager_RefineSession_ErrorsWithoutAudio(t *testing.T) {
+	store := newStoreMock()
+	manager := NewManager(store, nil, summarizerMock{}, &hubMock{}, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{transcript: "x"})
+
+	err := manager.RefineSession(context.Background(), "sess-x", "  ", time.Time{})
+	if err == nil {
+		t.Fatal("expected error when session has no audio")
+	}
+}

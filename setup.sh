@@ -58,6 +58,13 @@ if ! grep -q 'GHOST_WISPR_ADDR' "$DEPLOY_DIR/.env" 2>/dev/null; then
     echo "  Added GHOST_WISPR_ADDR=127.0.0.1:8080 to .env"
 fi
 
+# 3b. Install the startup network-readiness gate (used by ExecStartPre below).
+echo ""
+echo "Installing wait-for-network.sh..."
+cp wait-for-network.sh "$DEPLOY_DIR/wait-for-network.sh"
+chmod +x "$DEPLOY_DIR/wait-for-network.sh"
+echo "  Installed $DEPLOY_DIR/wait-for-network.sh"
+
 # 4. Install systemd user unit
 echo ""
 echo "Installing systemd user unit..."
@@ -67,10 +74,12 @@ cat > "$SERVICE_FILE" << EOF
 Description=Ghost Wispr continuous transcription
 After=network-online.target sound.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=$DEPLOY_DIR
+ExecStartPre=$DEPLOY_DIR/wait-for-network.sh
 ExecStart=$DEPLOY_DIR/ghost-wispr
 EnvironmentFile=$DEPLOY_DIR/.env
 Restart=always

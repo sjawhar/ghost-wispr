@@ -726,8 +726,11 @@ func main() {
 			return syncOrchestrator.SyncSession(ctx, sessionID)
 		},
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
-			// Placeholder for T10 batch refinement
-			return nil
+			sess, err := store.GetSession(sessionID)
+			if err != nil {
+				return fmt.Errorf("get session %s: %w", sessionID, err)
+			}
+			return manager.RefineSession(ctx, sessionID, sess.AudioPath, sess.StartedAt)
 		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			dates, err := store.GetDates()
