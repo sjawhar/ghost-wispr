@@ -197,3 +197,27 @@ func TestOrchestratorSyncSessionSoftDeletesRemoteDeletion(t *testing.T) {
 		t.Fatalf("expected final state %q, got %q", storage.SyncStateRemoteDeleted, last.state)
 	}
 }
+
+func TestOrchestratorSyncSessionAlreadySyncedIsNoop(t *testing.T) {
+	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
+	store := &fakeOrchestratorStore{
+		session: storage.Session{
+			ID:        "session-already-synced",
+			Title:     "Already synced session",
+			StartedAt: started,
+			Summary:   "summary",
+			SyncState: storage.SyncStateSynced,
+		},
+		segments: []transcribe.Segment{{Speaker: 0, Text: "hello", Timestamp: started}},
+	}
+	uploader := &fakeUploader{folderID: "folder-xyz"}
+
+	o := NewOrchestratorWithUploader(uploader, store)
+	if err := o.SyncSession(context.Background(), "session-already-synced"); err != nil {
+		t.Fatalf("expected re-syncing an already-synced session to be a no-op, got error: %v", err)
+	}
+
+	if len(store.updates) != 0 {
+		t.Fatalf("expected no sync state updates for already-synced session, got %d", len(store.updates))
+	}
+}
