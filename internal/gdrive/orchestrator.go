@@ -52,6 +52,11 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 		return fmt.Errorf("get session %s: %w", sessionID, err)
 	}
 
+	if sess.SyncState == storage.SyncStateSynced {
+		o.logger.Info("gdrive session already synced, skipping", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateSynced)
+		return nil
+	}
+
 	segments, err := o.store.GetSegments(sessionID)
 	if err != nil {
 		return fmt.Errorf("get segments %s: %w", sessionID, err)

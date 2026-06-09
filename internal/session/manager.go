@@ -387,6 +387,8 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 					if m.hub != nil {
 						m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
 					}
+				} else if m.hub != nil {
+					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
 				}
 			}()
 		}
@@ -465,6 +467,8 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 				if m.hub != nil {
 					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
 				}
+			} else if m.hub != nil {
+				m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
 			}
 		}()
 	}
