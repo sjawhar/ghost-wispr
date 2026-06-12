@@ -363,6 +363,28 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 }
 
+// RefineSession re-runs batch refinement for an already-ended session using its
+// recorded audio, then regenerates the summary from the refined transcript. It
+// recovers sessions that ended without a usable live transcript (e.g. when live
+// transcription was unavailable at capture time). Intended to run off the
+// request path.
+func (m *Manager) RefineSession(ctx context.Context, sessionID, audioPath string, startedAt time.Time) error {
+	if strings.TrimSpace(audioPath) == "" {
+		return fmt.Errorf("session %s has no audio to refine", sessionID)
+	}
+
+	m.mu.Lock()
+	batchTranscriber := m.batchTranscriber
+	m.mu.Unlock()
+	if batchTranscriber == nil {
+		return fmt.Errorf("batch transcription not configured")
+	}
+
+	m.runBatchRefinement(ctx, sessionID, audioPath)
+	m.generateSummary(ctx, sessionID, startedAt)
+	return nil
+}
+
 func (m *Manager) generateSummary(ctx context.Context, sessionID string, startedAt time.Time) {
 	m.mu.Lock()
 	summarizer := m.summarizer
