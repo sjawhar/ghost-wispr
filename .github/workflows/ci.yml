@@ -21,7 +21,15 @@ jobs:
           go-version-file: go.mod
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev pulseaudio
+
+      # PortAudio's PulseAudio host API fails to initialize without a sound server, and then
+      # internal/audio's mic reopen test fails before it reaches the open failure it checks.
+      - name: Start PulseAudio with a null sink
+        run: |
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=ci_null
+          pactl info
 
       - name: Create embed placeholder
         run: mkdir -p cmd/ghost-wispr/static && touch cmd/ghost-wispr/static/.gitkeep
