@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -347,6 +348,228 @@ func TestBatchRefinement_StoreStatusAndTranscript(t *testing.T) {
 	}
 }
 
+// A session that ends without a saved recording can never be refined, so it
+// ends with the terminal refinement status no_audio instead of staying pending.
+// One that ends with its recording stays pending for batch refinement.
+func TestEndSessionWithoutRecordingMarksRefinementNoAudio(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
+	for id, audioPath := range map[string]string{"20261106140930": "", "20261106140931": "/audio/20261106140931.wav"} {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+		if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+			t.Fatalf("EndSession %s: %v", id, err)
+		}
+		want := RefinementPending
+		if audioPath == "" {
+			want = RefinementNoAudio
+		}
+		session, err := store.GetSession(id)
+		if err != nil {
+			t.Fatalf("GetSession %s: %v", id, err)
+		}
+		if session.RefinementStatus != want {
+			t.Errorf("session %s ended with recording %q: refinement_status %q, want %q", id, audioPath, session.RefinementStatus, want)
+		}
+	}
+}
+
+// A session left active by a restart is ended with no recording, so it is
+// marked no_audio too.
+func TestRecoverStaleSessionsMarksRefinementNoAudio(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	if err := store.CreateSession("20261106140930", time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := store.RecoverStaleSessions(); err != nil {
+		t.Fatalf("RecoverStaleSessions: %v", err)
+	}
+	session, err := store.GetSession("20261106140930")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.Status != SessionEnded || session.RefinementStatus != RefinementNoAudio {
+		t.Errorf("recovered session is %q with refinement_status %q, want ended and %q", session.Status, session.RefinementStatus, RefinementNoAudio)
+	}
+}
+
+// Sessions that ended without a saved recording before no_audio existed (the
+// recordings given up since #35, or sessions recovered at startup) are moved
+// off pending when the store opens; sessions with a recording, still active,
+// or past pending are left alone.
+func TestOpeningTheStoreMarksEarlierSessionsWithoutRecordingNoAudio(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	started := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
+	for id, audioPath := range map[string]string{"20261106140000": "", "20261106140100": "/audio/20261106140100.wav", "20261106140200": ""} {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+		if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+			t.Fatalf("EndSession %s: %v", id, err)
+		}
+	}
+	if err := store.CreateSession("20261106140300", started); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// As before no_audio existed; one session without a recording was refined anyway.
+	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'pending'`); err != nil {
+		t.Fatalf("reset refinement status: %v", err)
+	}
+	if err := store.UpdateRefinement("20261106140200", "refined", RefinementCompleted); err != nil {
+		t.Fatalf("UpdateRefinement: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	store = newStoreAt(t, path)
+	for id, want := range map[string]string{
+		"20261106140000": RefinementNoAudio,   // ended without a recording
+		"20261106140100": RefinementPending,   // ended with one
+		"20261106140200": RefinementCompleted, // past pending
+		"20261106140300": RefinementPending,   // still active
+	} {
+		session, err := store.GetSession(id)
+		if err != nil {
+			t.Fatalf("GetSession %s: %v", id, err)
+		}
+		if session.RefinementStatus != want {
+			t.Errorf("session %s refinement_status %q after reopening, want %q", id, session.RefinementStatus, want)
+		}
+	}
+}
+
+func newStoreAt(t *testing.T, path string) *SQLiteStore {
+	t.Helper()
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// RemovableRecordings lists, oldest first, the sessions whose saved recording
+// disk pressure may remove: ended, with a recording, not being refined, and
+// synced when Drive sync gates GC. Any other sync state keeps the recording.
+func TestRemovableRecordings(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
+	end := func(id string, at time.Duration, audioPath, syncStatus string) {
+		t.Helper()
+		if err := store.CreateSession(id, started.Add(at)); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+		if err := store.EndSession(id, started.Add(at+time.Minute), audioPath); err != nil {
+			t.Fatalf("EndSession %s: %v", id, err)
+		}
+		if syncStatus != "" {
+			if err := store.UpdateSyncStatus(id, syncStatus, "folder"); err != nil {
+				t.Fatalf("UpdateSyncStatus %s: %v", id, err)
+			}
+		}
+	}
+	end("20261106140300", 3*time.Minute, "/audio/c.mp3", SyncSynced)
+	end("20261106140000", 0, "/audio/a.mp3,/audio/b.mp3", SyncSynced) // merged recordings
+	end("20261106140100", time.Minute, "/audio/pending.mp3", "")
+	end("20261106140200", 2*time.Minute, "/audio/failed.mp3", SyncFailed)
+	end("20261106140400", 4*time.Minute, "", SyncSynced) // no recording
+	end("20261106140500", 5*time.Minute, "/audio/discarded.mp3", SyncSynced)
+	if err := store.DiscardSession("20261106140500"); err != nil {
+		t.Fatalf("DiscardSession: %v", err)
+	}
+	end("20261106140600", 6*time.Minute, "/audio/refining.mp3", SyncSynced)
+	if err := store.UpdateRefinement("20261106140600", "", RefinementRunning); err != nil {
+		t.Fatalf("UpdateRefinement: %v", err)
+	}
+	if err := store.CreateSession("20261106140700", started.Add(7*time.Minute)); err != nil { // still recording
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	for _, tc := range []struct {
+		syncGated bool
+		want      []SessionRecording
+	}{
+		{syncGated: true, want: []SessionRecording{
+			{ID: "20261106140000", AudioPath: "/audio/a.mp3,/audio/b.mp3"},
+			{ID: "20261106140300", AudioPath: "/audio/c.mp3"},
+		}},
+		{syncGated: false, want: []SessionRecording{
+			{ID: "20261106140000", AudioPath: "/audio/a.mp3,/audio/b.mp3"},
+			{ID: "20261106140100", AudioPath: "/audio/pending.mp3"},
+			{ID: "20261106140200", AudioPath: "/audio/failed.mp3"},
+			{ID: "20261106140300", AudioPath: "/audio/c.mp3"},
+		}},
+	} {
+		got, err := store.RemovableRecordings(tc.syncGated)
+		if err != nil {
+			t.Fatalf("RemovableRecordings(%v): %v", tc.syncGated, err)
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("RemovableRecordings(%v) = %v, want %v", tc.syncGated, got, tc.want)
+		}
+	}
+}
+
+// MarkAudioRemoved keeps the session and records that disk pressure removed
+// its audio: the audio path becomes what is left, the marker is set, and a
+// refinement that can no longer run (pending or failed, with no audio left)
+// becomes no_audio. A completed refinement stays completed.
+func TestMarkAudioRemoved(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
+	removedAt := time.Date(2026, 11, 7, 9, 30, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		id, audioPath, refinement string
+		left                      string // the audio path left after the removal
+		wantRefinement            string
+	}{
+		{id: "20261106140000", audioPath: "/audio/a.mp3", refinement: RefinementPending, wantRefinement: RefinementNoAudio},
+		{id: "20261106140100", audioPath: "/audio/b.mp3", refinement: RefinementFailed, wantRefinement: RefinementNoAudio},
+		{id: "20261106140200", audioPath: "/audio/c.mp3", refinement: RefinementCompleted, wantRefinement: RefinementCompleted},
+		{id: "20261106140300", audioPath: "/audio/d1.mp3,/audio/d2.mp3", refinement: RefinementFailed, left: "/audio/d2.mp3", wantRefinement: RefinementFailed},
+	} {
+		if err := store.CreateSession(tc.id, started); err != nil {
+			t.Fatalf("CreateSession %s: %v", tc.id, err)
+		}
+		if err := store.EndSession(tc.id, started.Add(time.Minute), tc.audioPath); err != nil {
+			t.Fatalf("EndSession %s: %v", tc.id, err)
+		}
+		if err := store.UpdateRefinement(tc.id, "", tc.refinement); err != nil {
+			t.Fatalf("UpdateRefinement %s: %v", tc.id, err)
+		}
+		if err := store.MarkAudioRemoved(tc.id, tc.left, removedAt); err != nil {
+			t.Fatalf("MarkAudioRemoved %s: %v", tc.id, err)
+		}
+		session, err := store.GetSession(tc.id)
+		if err != nil {
+			t.Fatalf("GetSession %s: %v", tc.id, err)
+		}
+		if session.AudioPath != tc.left || session.AudioRemovedAt != removedAt.Format(time.RFC3339Nano) || session.RefinementStatus != tc.wantRefinement {
+			t.Errorf("session %s: audio_path %q, audio_removed_at %q, refinement_status %q; want %q, %q, %q", tc.id,
+				session.AudioPath, session.AudioRemovedAt, session.RefinementStatus, tc.left, removedAt.Format(time.RFC3339Nano), tc.wantRefinement)
+		}
+	}
+
+	listed, err := store.GetSessionsByDate("2026-11-06", false)
+	if err != nil {
+		t.Fatalf("GetSessionsByDate: %v", err)
+	}
+	for _, session := range listed {
+		if session.AudioRemovedAt == "" {
+			t.Errorf("session list shows %s without the audio-removed marker", session.ID)
+		}
+	}
+	if err := store.MarkAudioRemoved("20261106990000", "", removedAt); err == nil {
+		t.Error("MarkAudioRemoved succeeded for a session that does not exist")
+	}
+}
+
 func TestSQLiteSummaryClaimIsIdempotent(t *testing.T) {
 	store := newTestSQLiteStore(t)
 
@@ -530,7 +753,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ids, err := store.GetGCEligibleSessions(30, true, false)
+	ids, err := store.GetGCEligibleSessions(30, true)
 	if err != nil {
 		t.Fatalf("get gc eligible: %v", err)
 	}
@@ -538,7 +761,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatalf("expected [gc-eligible], got %v", ids)
 	}
 
-	ids, err = store.GetGCEligibleSessions(30, false, false)
+	ids, err = store.GetGCEligibleSessions(30, false)
 	if err != nil {
 		t.Fatalf("get gc eligible no gate: %v", err)
 	}
@@ -546,9 +769,9 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatalf("expected 2 sessions, got %d: %v", len(ids), ids)
 	}
 
-	ids, err = store.GetGCEligibleSessions(0, true, true)
+	ids, err = store.GetGCEligibleSessions(0, true)
 	if err != nil {
-		t.Fatalf("get gc eligible disk pressure: %v", err)
+		t.Fatalf("get gc eligible with no age limit: %v", err)
 	}
 	if len(ids) != 2 {
 		t.Fatalf("expected 2 synced sessions, got %d: %v", len(ids), ids)

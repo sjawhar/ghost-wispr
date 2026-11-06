@@ -363,7 +363,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	}()
 	endedAt := end.endedAt
 	if !end.saved && m.recorder != nil {
-		path, err := m.recorder.EndSession()
+		path, err := m.recorder.EndSession(sessionID)
 		if err != nil {
 			end.saveFailures++
 			if end.saveFailures < maxRecordingSaveAttempts {

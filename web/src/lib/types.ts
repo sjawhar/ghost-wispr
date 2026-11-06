@@ -46,6 +46,8 @@ export enum RefinementStatus {
   Running = 'running',
   Completed = 'completed',
   Failed = 'failed',
+  // The session ended without a saved recording, so it can never be refined.
+  NoAudio = 'no_audio',
 }
 
 export enum HealthStatus {
@@ -141,6 +143,9 @@ export interface SessionSummary {
   summary_status: SummaryStatus
   summary_preset: string
   audio_path: string
+  // When disk pressure removed the session's audio to free space (RFC 3339);
+  // empty or absent if it did not. The session itself is kept.
+  audio_removed_at?: string
   sync_status?: SyncStatus
   refinement_status?: RefinementStatus
   transcript_source?: string

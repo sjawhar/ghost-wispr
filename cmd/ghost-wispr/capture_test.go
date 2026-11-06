@@ -226,7 +226,7 @@ func TestPausedMicSendsNoAudioToRecorderOrDeepgram(t *testing.T) {
 	if err := recorder.StartSession("meeting"); err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
-	t.Cleanup(func() { _, _ = recorder.EndSession() })
+	t.Cleanup(func() { _, _ = recorder.EndSession("meeting") })
 	recording := filepath.Join(dir, "meeting.pcm")
 	deepgram := &lockedBuffer{}
 	capture := newCaptureGate(nil, nil, nil)
@@ -1467,6 +1467,9 @@ func TestPauseEndsASessionWhoseRecordingCannotBeSaved(t *testing.T) {
 	}
 	if got.Status != "ended" || got.AudioPath != "" {
 		t.Errorf("pre-pause session %s is %q with recording %q, want ended with none", before, got.Status, got.AudioPath)
+	}
+	if got.RefinementStatus != storage.RefinementNoAudio {
+		t.Errorf("pre-pause session %s refinement_status %q, want %q: it can never be refined", before, got.RefinementStatus, storage.RefinementNoAudio)
 	}
 	if size := fileSize(t, filepath.Join(audioDir, before+".pcm")); size != 3200 {
 		t.Errorf("raw recording kept for recovery has %d bytes, want the 3200 recorded", size)

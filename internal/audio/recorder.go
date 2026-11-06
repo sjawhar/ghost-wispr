@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,10 +44,12 @@ type Recorder struct {
 	sampleRate int
 	preroll    *transcribe.RingBuf
 	// unsavedID and unsavedPath name a recording EndSession closed but could
-	// not save; the next EndSession with no session open saves it, unless
-	// DiscardUnsaved gave up on it first.
+	// not save; EndSession for that session saves it, unless DiscardUnsaved
+	// gave up on it first.
 	unsavedID   string
 	unsavedPath string
+	// savingPath is the raw recording EndSession is saving now.
+	savingPath string
 
 	encode func(rawPath, sessionID string) (string, error)
 }
@@ -106,6 +109,10 @@ func (r *Recorder) StartSession(sessionID string) error {
 		_, _ = r.preroll.Read(buf)
 		r.preroll.Reset()
 		if _, err := r.rawFile.Write(buf); err != nil {
+			// Leave no session open: the caller rolls the session back, and
+			// later audio must not be appended to its file.
+			_ = r.rawFile.Close()
+			r.sessionID, r.rawPath, r.rawFile = "", "", nil
 			return fmt.Errorf("flush preroll buffer: %w", err)
 		}
 	}
@@ -113,30 +120,34 @@ func (r *Recorder) StartSession(sessionID string) error {
 	return nil
 }
 
-// EndSession closes the session's recording and saves it, returning the saved
-// file. With no session open, it saves a recording an earlier EndSession closed
-// but could not save, if there is one, so a session end that is retried keeps
-// its recording.
-func (r *Recorder) EndSession() (string, error) {
+// EndSession closes session sessionID's recording and saves it, returning the
+// saved file. If that session's recording was closed earlier but could not be
+// saved, it tries to save it again, so a session end that is retried keeps its
+// recording. For any other session it returns nothing: it never saves or
+// returns another session's recording.
+func (r *Recorder) EndSession(sessionID string) (string, error) {
 	r.mu.Lock()
-	sessionID, rawPath, rawFile := r.sessionID, r.rawPath, r.rawFile
-	if sessionID == "" || rawFile == nil {
-		sessionID, rawPath = r.unsavedID, r.unsavedPath
+	if sessionID == "" || sessionID != r.sessionID || r.rawFile == nil {
+		retry := sessionID != "" && sessionID == r.unsavedID
+		rawPath := r.unsavedPath
 		r.mu.Unlock()
-		if sessionID == "" {
+		if !retry {
 			return "", nil
 		}
 		return r.save(sessionID, rawPath)
 	}
 
+	rawPath, rawFile := r.rawPath, r.rawFile
 	r.sessionID = ""
 	r.rawPath = ""
 	r.rawFile = nil
+	r.savingPath = rawPath
 	r.mu.Unlock()
 
 	if err := rawFile.Close(); err != nil {
 		r.mu.Lock()
 		r.unsavedID, r.unsavedPath = sessionID, rawPath
+		r.savingPath = ""
 		r.mu.Unlock()
 		return "", fmt.Errorf("close raw pcm file: %w", err)
 	}
@@ -144,10 +155,13 @@ func (r *Recorder) EndSession() (string, error) {
 }
 
 // save encodes the closed recording of sessionID and removes its raw file. If
-// it cannot, the recording is kept for the next EndSession to save.
+// it cannot, the recording is kept for that session's next EndSession to save.
 func (r *Recorder) save(sessionID, rawPath string) (string, error) {
 	audioPath, err := r.encode(rawPath, sessionID)
 	r.mu.Lock()
+	if r.savingPath == rawPath {
+		r.savingPath = ""
+	}
 	if err != nil {
 		r.unsavedID, r.unsavedPath = sessionID, rawPath
 	} else if r.unsavedID == sessionID {
@@ -175,6 +189,50 @@ func (r *Recorder) writePCM(data []byte) error {
 		return fmt.Errorf("write raw pcm bytes: %w", err)
 	}
 	return nil
+}
+
+// KeptRawRecordings counts the raw recordings kept in the audio directory
+// because they could not be saved, and their total size: every .pcm there
+// except the recording under way, one being saved or waiting for its retry,
+// and one left beside its saved recording (<id>.mp3 or <id>.wav). Nothing
+// removes them; they are for recovery or deletion by hand.
+func (r *Recorder) KeptRawRecordings() (count int, size int64) {
+	entries, err := os.ReadDir(r.audioDir)
+	if err != nil {
+		return 0, 0
+	}
+	// Read after listing, so a session that started or ended meanwhile is
+	// still recognised.
+	r.mu.Lock()
+	live, saving, unsaved := r.rawPath, r.savingPath, r.unsavedPath
+	r.mu.Unlock()
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".pcm" {
+			continue
+		}
+		path := filepath.Join(r.audioDir, name)
+		if path == live || path == saving || path == unsaved {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".pcm")
+		if isFile(filepath.Join(r.audioDir, id+".mp3")) || isFile(filepath.Join(r.audioDir, id+".wav")) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		count++
+		size += info.Size()
+	}
+	return count, size
+}
+
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // DiscardUnsaved gives up on a recording EndSession closed but could not save:

@@ -13,7 +13,7 @@
     session?: SessionSummary
   } = $props()
 
-  let audioEl: HTMLAudioElement | null = null
+  let audioEl: HTMLAudioElement | null = $state(null)
   let currentTime = $state(0)
   let duration = $state(0)
   let loading = $state(true)
@@ -43,6 +43,11 @@
     session?.refinement_status === RefinementStatus.Pending ||
       session?.refinement_status === RefinementStatus.Running,
   )
+
+  // Disk pressure removed the session's audio to free space: nothing to play.
+  const audioRemoved = $derived(Boolean(session?.audio_removed_at))
+  // The session ended without a saved recording: nothing to play or refine.
+  const noRecording = $derived(session?.refinement_status === RefinementStatus.NoAudio)
 
   type View = 'refined' | 'segments'
   // Default to refined view whenever a refined transcript is available.
@@ -142,31 +147,41 @@
 </script>
 
 <div class="audio-player" data-testid="audio-player">
-  <audio
-    bind:this={audioEl}
-    src={`/api/sessions/${encodeURIComponent(sessionId)}/audio`}
-    preload="metadata"
-    onloadedmetadata={onLoadedMetadata}
-    ontimeupdate={onTimeUpdate}
-    onplay={() => (playing = true)}
-    onpause={() => (playing = false)}
-    onerror={() => {
-      loading = false
-      error = 'Audio unavailable'
-    }}
-  ></audio>
+  {#if audioRemoved}
+    <p class="audio-note">
+      The audio was removed to free space. The transcript and summary are kept.
+    </p>
+  {:else if noRecording}
+    <p class="audio-note">
+      No recording was saved for this session, so it cannot be played or refined.
+    </p>
+  {:else}
+    <audio
+      bind:this={audioEl}
+      src={`/api/sessions/${encodeURIComponent(sessionId)}/audio`}
+      preload="metadata"
+      onloadedmetadata={onLoadedMetadata}
+      ontimeupdate={onTimeUpdate}
+      onplay={() => (playing = true)}
+      onpause={() => (playing = false)}
+      onerror={() => {
+        loading = false
+        error = 'Audio unavailable'
+      }}
+    ></audio>
 
-  <div class="audio-controls">
-    <button type="button" class="audio-btn" onclick={togglePlay}>
-      {playing ? 'Pause Audio' : 'Play Audio'}
-    </button>
-    <span class="audio-time">{prettyTime(currentTime)} / {prettyTime(duration)}</span>
-  </div>
+    <div class="audio-controls">
+      <button type="button" class="audio-btn" onclick={togglePlay}>
+        {playing ? 'Pause Audio' : 'Play Audio'}
+      </button>
+      <span class="audio-time">{prettyTime(currentTime)} / {prettyTime(duration)}</span>
+    </div>
 
-  {#if loading}
-    <p class="audio-note">Loading audio...</p>
-  {:else if error}
-    <p class="audio-error">{error}</p>
+    {#if loading}
+      <p class="audio-note">Loading audio...</p>
+    {:else if error}
+      <p class="audio-error">{error}</p>
+    {/if}
   {/if}
 
   <div class="transcript-header">

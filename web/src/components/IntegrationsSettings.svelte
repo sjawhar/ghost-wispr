@@ -201,8 +201,13 @@
         <input id="gc-max-age" type="number" min="1" bind:value={gcMaxAgeDays} />
       </div>
       <div class="field">
-        <label for="gc-max-size">Max audio storage (MB)</label>
+        <label for="gc-max-size">Audio budget (MB)</label>
         <input id="gc-max-size" type="number" min="100" bind:value={gcMaxAudioSizeMB} />
+        <p class="hint">
+          Past this, the oldest sessions' audio is removed; the sessions, transcripts and summaries
+          are kept. Recordings that could not be saved, and audio not yet synced to Drive while sync
+          is on, are not counted or removed.
+        </p>
       </div>
     {/if}
 
