@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -301,18 +302,43 @@ type deepgramWriter struct {
 	}
 }
 
-var streamMicLoopStarter = func(ctx context.Context, capture *captureGate, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
-	go streamMicWithRetry(ctx, capture, streamer, writer, wait, logf, hub)
+// streamMicLoopStarter runs a mic loop in loops, the group shutdown waits for.
+var streamMicLoopStarter = func(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+	loops.Go(func() { streamMicWithRetry(ctx, capture, streamer, writer, wait, logf, hub) })
 }
 
-func startMicMonitoring(ctx context.Context, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
 	if streamer == nil || recorder == nil {
 		return
 	}
 	if downstream == nil {
 		downstream = io.Discard
 	}
-	streamMicLoopStarter(ctx, capture, streamer, recorder.Writer(downstream), wait, logf, hub)
+	streamMicLoopStarter(ctx, loops, capture, streamer, recorder.Writer(downstream), wait, logf, hub)
+}
+
+// micShutdownWait is how long shutdown waits for the mic loops to end. A loop
+// streaming from a working device ends at its next buffer (250 ms).
+const micShutdownWait = 5 * time.Second
+
+// joinMicLoops waits up to wait for the mic loops to end once shutdown has
+// cancelled their context. It reports false if one has not: it is stuck in a
+// read from a device that stopped delivering audio, and nothing may stop the
+// device or terminate PortAudio under it.
+func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		loops.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (dw *deepgramWriter) Write(p []byte) (int, error) {
@@ -508,12 +534,16 @@ func main() {
 		startupSummarizer.OnResult = llmHealthOnResult
 	}
 
+	// ctx ends at shutdown; the capture gate's pause and the mic loops stop with it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var resilientRef atomic.Pointer[transcribe.ResilientClient]
 	var micRef atomic.Pointer[audio.Mic]
 	micStatus := &micProxy{ref: &micRef}
 	// capture is the one pause switch: POST /api/pause and /api/resume (and any
 	// later hardware button) call its Pause and Resume.
-	capture := newSessionCaptureGate(manager, audioRecorder, func() deepgramFinalizer {
+	capture := newSessionCaptureGate(ctx, manager, audioRecorder, func() deepgramFinalizer {
 		if dg := resilientRef.Load(); dg != nil {
 			return dg
 		}
@@ -1062,8 +1092,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	setSummaryPublisher := func(next *envoy.Publisher) {
 		if summaryPublisher != nil && summaryPublisher != next {
 			_ = summaryPublisher.Close()
@@ -1355,8 +1383,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	paErr := audio.InitializePortAudio()
-	//nolint:errcheck // Terminate is best-effort cleanup
-	defer audio.TerminatePortAudio()
 	paInitFailed := false
 	if paErr != nil {
 		log.Printf("warning: portaudio init failed: %v — microphone unavailable", paErr)
@@ -1364,6 +1390,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	client.Init(client.InitLib{LogLevel: client.LogLevelDefault})
+
+	// micLoops holds every mic loop and the mic startup retry, so shutdown can
+	// wait for them before it stops the device and terminates PortAudio.
+	var micLoops sync.WaitGroup
+	micWait := func(d time.Duration) { capture.sleepUnlessPaused(ctx, d) }
 
 	startMicPipeline := func(updateStartupState bool) error {
 		var (
@@ -1410,7 +1441,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if cfg.DeepgramAPIKey == "" {
-			startMicMonitoring(ctx, capture, mic, audioRecorder, nil, capture.sleepUnlessPaused, log.Printf, hub)
+			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
 			return nil
 		}
 
@@ -1450,14 +1481,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if updateStartupState {
 				warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
 			}
-			startMicMonitoring(ctx, capture, mic, audioRecorder, nil, capture.sleepUnlessPaused, log.Printf, hub)
+			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
 			return nil
 		}
 
 		candidateResilient.Client = initialClient
 		resilientRef.Store(candidateResilient)
 
-		startMicMonitoring(ctx, capture, mic, audioRecorder, candidateResilient, capture.sleepUnlessPaused, log.Printf, hub)
+		startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub)
 		return nil
 	}
 
@@ -1554,31 +1585,33 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	if shouldRetryMicStartup {
-		go retryMicStartup(
-			ctx,
-			15*time.Second,
-			time.After,
-			func() {
-				if hub != nil {
-					hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
-				}
-			},
-			func() error {
-				if err := audio.ReinitPortAudio(); err != nil {
-					return err
-				}
-				return startMicPipeline(false)
-			},
-			func(err error) {
-				log.Printf("mic startup retry failed: %v", err)
-				if hub != nil {
-					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
-				}
-			},
-			func() {
-				log.Printf("mic startup retry succeeded")
-			},
-		)
+		micLoops.Go(func() {
+			retryMicStartup(
+				ctx,
+				15*time.Second,
+				time.After,
+				func() {
+					if hub != nil {
+						hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
+					}
+				},
+				func() error {
+					if err := audio.ReinitPortAudio(); err != nil {
+						return err
+					}
+					return startMicPipeline(false)
+				},
+				func(err error) {
+					log.Printf("mic startup retry failed: %v", err)
+					if hub != nil {
+						hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
+					}
+				},
+				func() {
+					log.Printf("mic startup retry succeeded")
+				},
+			)
+		})
 	}
 
 	// Create health checker with actual component references
@@ -1615,6 +1648,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	log.Println("ghost-wispr: shutting down")
 	cancel()
+	// The mic loops end at the device's next buffer. Stopping the device or
+	// terminating PortAudio while one is still inside a read crashes inside
+	// PortAudio, so neither happens before they end, nor at all if one is stuck
+	// in a read: the process exit releases the device then.
+	micLoopsEnded := joinMicLoops(&micLoops, micShutdownWait)
+	if !micLoopsEnded {
+		log.Printf("warning: microphone still reading %v after shutdown began; leaving the device and PortAudio to the process exit", micShutdownWait)
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -1629,7 +1670,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if summaryPublisher != nil {
 		_ = summaryPublisher.Close()
 	}
-	if mic := micRef.Load(); mic != nil {
+	if mic := micRef.Load(); mic != nil && micLoopsEnded {
 		_ = mic.Stop()
 	}
 	if ttsOrchestrator != nil {
@@ -1642,6 +1683,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("warning: http shutdown failed: %v", err)
 	}
+	if micLoopsEnded {
+		_ = audio.TerminatePortAudio() // best-effort cleanup
+	}
 }
 
 type micStreamer interface {
@@ -1649,6 +1693,20 @@ type micStreamer interface {
 	Start() error
 	Stop() error
 	Reopen() error
+}
+
+// shutdownWriter drops audio once ctx ends and returns ctx's error, which ends
+// Mic.Stream at the device's next buffer, so the mic loop ends at shutdown.
+type shutdownWriter struct {
+	ctx context.Context
+	dst io.Writer
+}
+
+func (w shutdownWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.dst.Write(p)
 }
 
 func streamMicWithRetry(
@@ -1667,7 +1725,7 @@ func streamMicWithRetry(
 	)
 
 	backoff := baseBackoff
-	gated := capture.Writer(writer)
+	gated := shutdownWriter{ctx: ctx, dst: capture.Writer(writer)}
 
 	for {
 		if ctx.Err() != nil {

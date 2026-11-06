@@ -681,7 +681,7 @@ func OpenAPISpec() map[string]any {
 			"/api/resume": map[string]any{
 				"post": map[string]any{
 					"summary":     "Resume recording",
-					"description": "Restart microphone capture after a pause. Returns at once; audio flows again once the paused session is saved and the microphone restarts",
+					"description": "Restart microphone capture after a pause. Returns at once; audio flows again once the paused session has ended (with its recording, or without it if five attempts to save it failed) and the microphone restarts",
 					"tags":        []string{"control"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

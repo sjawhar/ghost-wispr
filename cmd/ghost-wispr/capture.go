@@ -17,8 +17,9 @@ import (
 const captureFinalizeWait = 2 * time.Second
 
 // captureStallAfter is how long the switch may be on with the gate still closed
-// (the paused session is still being saved) before the capture is reported as
-// stalled, a fault, rather than resuming.
+// (the paused session is not ended yet) before the capture is reported as
+// stalled, a fault, rather than resuming. A stall does not always clear by
+// itself; see newSessionCaptureGate.
 const captureStallAfter = 30 * time.Second
 
 // captureWriteWait is how long a pause waits for an audio write that passed
@@ -266,9 +267,10 @@ func (g *captureGate) capturing(mic interface{ IsOpen() bool }) bool {
 	return !g.isClosed() && mic.IsOpen()
 }
 
-// sleepUnlessPaused sleeps for d, or until the gate closes. The mic loop backs
-// off with it, so a pause stops the device at once, not after the backoff.
-func (g *captureGate) sleepUnlessPaused(d time.Duration) {
+// sleepUnlessPaused sleeps for d, or until the gate closes or ctx ends. The mic
+// loop backs off with it, so a pause stops the device at once, and shutdown
+// ends the loop at once, not after the backoff.
+func (g *captureGate) sleepUnlessPaused(ctx context.Context, d time.Duration) {
 	g.mu.Lock()
 	closing := g.closing
 	g.mu.Unlock()
@@ -278,6 +280,7 @@ func (g *captureGate) sleepUnlessPaused(d time.Duration) {
 	select {
 	case <-timer.C:
 	case <-closing:
+	case <-ctx.Done():
 	}
 }
 
@@ -354,13 +357,19 @@ type deepgramFinalizer interface{ Finalize() error }
 // write does. A session end that fails is retried, first after endRetry, until
 // it succeeds. The gate stays closed through all of it: opening it while the
 // session from before the pause is still current would file speech after the
-// resume into it. So a stuck or failing database, or a recording that cannot
-// be written or saved, keeps the microphone off, and the capture reports
-// resuming, then stalled, until the session has ended.
-func newSessionCaptureGate(sessions captureSessions, preroll interface{ DiscardPreroll() }, deepgram func() deepgramFinalizer, finalizeWait, endRetry time.Duration, logf func(string, ...any)) *captureGate {
+// resume into it. A recording that cannot be saved is given up after five
+// attempts, and the session ends without it (its raw audio stays on disk), but
+// a database that stays stuck or keeps failing, or a write to the recording
+// file that never returns, keeps the microphone off until it recovers or the
+// process restarts; the capture reports resuming, then stalled, meanwhile.
+//
+// At shutdown (ctx ends) the pause stops retrying the session end. The gate
+// may then open, but it lets nothing through: the mic loops drop every buffer
+// written after shutdown began, and end.
+func newSessionCaptureGate(ctx context.Context, sessions captureSessions, preroll interface{ DiscardPreroll() }, deepgram func() deepgramFinalizer, finalizeWait, endRetry time.Duration, logf func(string, ...any)) *captureGate {
 	return newCaptureGate(
 		sessions.PauseCapture,
-		func() { settleCapturePause(sessions, deepgram(), finalizeWait, endRetry, logf) },
+		func() { settleCapturePause(ctx, sessions, deepgram(), finalizeWait, endRetry, logf) },
 		func() {
 			preroll.DiscardPreroll()
 			sessions.ResumeCapture()
@@ -368,7 +377,7 @@ func newSessionCaptureGate(sessions captureSessions, preroll interface{ DiscardP
 	)
 }
 
-func settleCapturePause(sessions captureSessions, dg deepgramFinalizer, finalizeWait, endRetry time.Duration, logf func(string, ...any)) {
+func settleCapturePause(ctx context.Context, sessions captureSessions, dg deepgramFinalizer, finalizeWait, endRetry time.Duration, logf func(string, ...any)) {
 	// A session start under way finishes before anything else, so its session
 	// is the one this pause ends. Its database writes are not bounded.
 	sessions.WaitForSessionStarts()
@@ -408,15 +417,22 @@ func settleCapturePause(sessions captureSessions, dg deepgramFinalizer, finalize
 	// already under way, then for the recorder's lock, then encodes (bounded by
 	// the recorder's encode time limit) and writes the database, which is not.
 	// An end that fails leaves the session current, so it is retried until it
-	// succeeds; giving up would open the gate onto that session.
+	// succeeds, or until shutdown; giving up would open the gate onto that
+	// session.
 	wait := endRetry
 	for {
-		err := sessions.ForceEndSession(context.Background())
-		if err == nil || errors.Is(err, session.ErrNoActiveSession) {
+		err := sessions.ForceEndSession(ctx)
+		if err == nil || errors.Is(err, session.ErrNoActiveSession) || ctx.Err() != nil {
 			return
 		}
 		logf("warning: end session on capture pause failed, retrying in %v: %v", wait, err)
-		time.Sleep(wait)
+		retry := time.NewTimer(wait)
+		select {
+		case <-retry.C:
+		case <-ctx.Done():
+			retry.Stop()
+			return
+		}
 		wait = min(2*wait, captureEndRetryMax)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -298,7 +299,7 @@ func TestStartMicMonitoringUsesRecorderWhenDownstreamMissing(t *testing.T) {
 
 	var capturedWriter io.Writer
 	var capturedGate *captureGate
-	streamMicLoopStarter = func(_ context.Context, gotCapture *captureGate, gotStreamer micStreamer, writer io.Writer, _ func(time.Duration), _ func(string, ...any), _ *server.Hub) {
+	streamMicLoopStarter = func(_ context.Context, _ *sync.WaitGroup, gotCapture *captureGate, gotStreamer micStreamer, writer io.Writer, _ func(time.Duration), _ func(string, ...any), _ *server.Hub) {
 		if gotStreamer != streamer {
 			t.Fatalf("expected streamer %p, got %p", streamer, gotStreamer)
 		}
@@ -307,7 +308,7 @@ func TestStartMicMonitoringUsesRecorderWhenDownstreamMissing(t *testing.T) {
 	}
 
 	capture := newCaptureGate(nil, nil, nil)
-	startMicMonitoring(context.Background(), capture, streamer, recorder, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
+	startMicMonitoring(context.Background(), &sync.WaitGroup{}, capture, streamer, recorder, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
 
 	if capturedGate != capture {
 		t.Fatal("mic loop did not get the app's capture gate, so pausing would not reach it")
@@ -317,6 +318,25 @@ func TestStartMicMonitoringUsesRecorderWhenDownstreamMissing(t *testing.T) {
 	}
 	if _, err := capturedWriter.Write([]byte{1, 2, 3, 4}); err != nil {
 		t.Fatalf("expected writer to accept audio bytes, got %v", err)
+	}
+}
+
+// Every mic loop runs in the group shutdown waits for, so shutdown can wait
+// for it to end before it stops the device and terminates PortAudio.
+func TestMicLoopRunsInTheShutdownGroup(t *testing.T) {
+	var loops sync.WaitGroup
+	mic := newScriptedMic()
+	ctx, cancel := context.WithCancel(context.Background())
+	startMicMonitoring(ctx, &loops, newCaptureGate(nil, nil, nil), mic, audio.NewRecorder(t.TempDir()), nil, func(time.Duration) {}, func(string, ...any) {}, nil)
+	mic.expectEvents(t, "stream")
+
+	if joinMicLoops(&loops, 50*time.Millisecond) {
+		t.Error("shutdown would not wait for the running mic loop")
+	}
+	cancel()
+	close(mic.chunks)
+	if !joinMicLoops(&loops, testWait) {
+		t.Fatal("mic loop not joined after shutdown")
 	}
 }
 
