@@ -62,6 +62,8 @@
       case ComponentStatus.Reconnecting:
       case ComponentStatus.Draining:
         return '◐'
+      case ComponentStatus.Paused:
+        return '◌'
       default:
         return '?'
     }

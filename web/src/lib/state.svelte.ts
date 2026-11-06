@@ -1,5 +1,5 @@
+import { ComponentStatus as ComponentStatusValue } from './types'
 import type {
-  ComponentStatus as ComponentStatusValue,
   ComponentStatusEvent,
   LiveTranscriptEvent,
   PresetMap,
@@ -18,6 +18,10 @@ export type ComponentStatus = {
 type AppState = {
   connected: boolean
   paused: boolean
+  // Whether the microphone is capturing, from GET /api/status and mic
+  // component_status events. After a resume it stays false until the
+  // microphone is back.
+  capturing: boolean
   liveSegments: LiveTranscriptEvent[]
   sessionsByDate: Map<string, SessionSummary[]>
   sessionDetails: Map<string, SessionDetailResponse>
@@ -35,6 +39,7 @@ type AppState = {
 export const appState = $state<AppState>({
   connected: false,
   paused: false,
+  capturing: false,
   liveSegments: [],
   sessionsByDate: new Map(),
   sessionDetails: new Map(),
@@ -60,6 +65,10 @@ export function setConnected(connected: boolean): void {
 
 export function setPaused(paused: boolean): void {
   appState.paused = paused
+}
+
+export function setCapturing(capturing: boolean): void {
+  appState.capturing = capturing
 }
 
 export function setDates(dates: string[]): void {
@@ -190,11 +199,17 @@ export function applyComponentStatus(event: ComponentStatusEvent): void {
       timestamp: event.timestamp,
     },
   }
+  if (event.component === 'mic') {
+    setCapturing(
+      event.status === ComponentStatusValue.Connected || event.status === ComponentStatusValue.Open,
+    )
+  }
 }
 
 export function resetState(): void {
   appState.connected = false
   appState.paused = false
+  appState.capturing = false
   appState.liveSegments = []
   appState.sessionsByDate = new Map()
   appState.sessionDetails = new Map()

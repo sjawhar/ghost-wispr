@@ -191,6 +191,7 @@ type healthCheckerStub struct{}
 func (h *healthCheckerStub) IsDeepgramConnected() bool            { return true }
 func (h *healthCheckerStub) IsDBHealthy(ctx context.Context) bool { return true }
 func (h *healthCheckerStub) IsMicOpen() bool                      { return true }
+func (h *healthCheckerStub) MicHold() string                      { return "" }
 func (h *healthCheckerStub) IsLLMHealthy() string                 { return "ok" }
 func testStaticFS(t *testing.T) fs.FS {
 	t.Helper()
@@ -820,6 +821,76 @@ func TestAPIStatusWithNoActiveSession(t *testing.T) {
 	}
 	if !strings.Contains(body, `"active_session_started_at":""`) {
 		t.Fatalf("expected empty active_session_started_at in response, got %s", body)
+	}
+}
+
+func TestAPIStatusReportsCapturing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook func() bool
+		want bool
+	}{
+		{name: "capturing", hook: func() bool { return true }, want: true},
+		{name: "not capturing", hook: func() bool { return false }, want: false},
+		{name: "no mic wiring", hook: nil, want: false},
+	} {
+		h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+			sessionsByDate: map[string][]storage.Session{},
+			sessions:       map[string]storage.Session{},
+			segments:       map[string][]transcribe.Segment{},
+		}, &ControlHooks{
+			IsCapturing: tc.hook,
+		}, "", nil)
+		if err != nil {
+			t.Fatalf("Handler failed: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode status: %v (body=%s)", err, rr.Body.String())
+		}
+		if resp["capturing"] != tc.want {
+			t.Fatalf("%s: capturing = %#v, want %v (body=%s)", tc.name, resp["capturing"], tc.want, rr.Body.String())
+		}
+	}
+}
+
+// A resume that has not brought the microphone back past the stall limit is
+// reported in the status and as a warning the UI shows, not as paused.
+func TestAPIStatusReportsAStalledCapture(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		IsPaused:     func() bool { return false },
+		CaptureState: func() string { return "stalled" },
+		Warnings:     func() []string { return []string{"existing warning"} },
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+
+	var resp struct {
+		Paused       bool     `json:"paused"`
+		CaptureState string   `json:"capture_state"`
+		Warnings     []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode status: %v (body=%s)", err, rr.Body.String())
+	}
+	if resp.Paused || resp.CaptureState != "stalled" {
+		t.Fatalf("paused=%v capture_state=%q, want false and stalled", resp.Paused, resp.CaptureState)
+	}
+	if len(resp.Warnings) != 2 || resp.Warnings[0] != "existing warning" || !strings.Contains(resp.Warnings[1], "not resumed") {
+		t.Fatalf("warnings = %q, want the existing one and a capture warning", resp.Warnings)
 	}
 }
 
@@ -1609,6 +1680,32 @@ func TestManualSessionStart_AlreadyActive(t *testing.T) {
 
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestManualSessionStart_CapturePaused(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{
+		StartSession: func(_ context.Context, titleHint string) (string, error) {
+			return "", session.ErrCapturePaused
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/start", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "capture is paused") {
+		t.Fatalf("expected the error to say capture is paused, got %s", rr.Body.String())
 	}
 }
 

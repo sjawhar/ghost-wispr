@@ -123,7 +123,10 @@ curl -s "$GHOST_WISPR_HOST/api/events?cursor=42&types=session_ended,summary_read
 ### Manage recordings
 
 ```bash
+# Returns 409 while capture is paused.
 curl -s -X POST "$GHOST_WISPR_HOST/api/sessions/start"
+# Pause stops the microphone and ends the active session until resume.
+# GET /api/status shows "paused" and "capturing".
 curl -s -X POST "$GHOST_WISPR_HOST/api/pause"
 curl -s -X POST "$GHOST_WISPR_HOST/api/resume"
 curl -s -X POST "$GHOST_WISPR_HOST/api/sessions/current/stop"

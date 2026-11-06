@@ -40,13 +40,17 @@ func (f *fakeStreamer) Reopen() error {
 	return err
 }
 
+func (f *fakeStreamer) Start() error { return nil }
+
+func (f *fakeStreamer) Stop() error { return nil }
+
 func TestStreamMicWithRetryRetriesOverflow(t *testing.T) {
 	streamer := &fakeStreamer{errs: []error{errors.New("Input overflowed"), nil}}
 	var waits int
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(_ time.Duration) {
+	streamMicWithRetry(ctx, newCaptureGate(nil, nil, nil), streamer, bytes.NewBuffer(nil), func(_ time.Duration) {
 		waits++
 	}, func(string, ...any) {}, nil)
 
@@ -66,7 +70,7 @@ func TestStreamMicWithRetryOverflowReopens(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(_ time.Duration) {}, func(string, ...any) {}, nil)
+	streamMicWithRetry(ctx, newCaptureGate(nil, nil, nil), streamer, bytes.NewBuffer(nil), func(_ time.Duration) {}, func(string, ...any) {}, nil)
 
 	if streamer.reopens != 1 {
 		t.Fatalf("expected 1 reopen call for overflow, got %d", streamer.reopens)
@@ -79,7 +83,7 @@ func TestStreamMicWithRetryRetriesDeviceError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(d time.Duration) {
+	streamMicWithRetry(ctx, newCaptureGate(nil, nil, nil), streamer, bytes.NewBuffer(nil), func(d time.Duration) {
 		waits = append(waits, d)
 	}, func(string, ...any) {}, nil)
 
@@ -110,7 +114,7 @@ func TestStreamMicWithRetryBacksOffOnReopenFailure(t *testing.T) {
 		cancel()
 	}()
 
-	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(d time.Duration) {
+	streamMicWithRetry(ctx, newCaptureGate(nil, nil, nil), streamer, bytes.NewBuffer(nil), func(d time.Duration) {
 		waits = append(waits, d)
 		waitCount <- struct{}{}
 	}, func(string, ...any) {}, nil)
@@ -135,7 +139,7 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(d time.Duration) {
+	streamMicWithRetry(ctx, newCaptureGate(nil, nil, nil), streamer, bytes.NewBuffer(nil), func(d time.Duration) {
 		waits = append(waits, d)
 	}, func(string, ...any) {}, nil)
 
@@ -163,7 +167,7 @@ func TestStreamMicWithRetryBroadcastsReconnectAndConnected(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	streamMicWithRetry(ctx, streamer, bytes.NewBuffer(nil), func(time.Duration) {}, func(string, ...any) {}, hub)
+	streamMicWithRetry(ctx, newCaptureGate(nil, nil, nil), streamer, bytes.NewBuffer(nil), func(time.Duration) {}, func(string, ...any) {}, hub)
 
 	var statuses []string
 	deadline := time.After(time.Second)
@@ -293,15 +297,21 @@ func TestStartMicMonitoringUsesRecorderWhenDownstreamMissing(t *testing.T) {
 	})
 
 	var capturedWriter io.Writer
-	streamMicLoopStarter = func(_ context.Context, gotStreamer micStreamer, writer io.Writer, _ func(time.Duration), _ func(string, ...any), _ *server.Hub) {
+	var capturedGate *captureGate
+	streamMicLoopStarter = func(_ context.Context, gotCapture *captureGate, gotStreamer micStreamer, writer io.Writer, _ func(time.Duration), _ func(string, ...any), _ *server.Hub) {
 		if gotStreamer != streamer {
 			t.Fatalf("expected streamer %p, got %p", streamer, gotStreamer)
 		}
+		capturedGate = gotCapture
 		capturedWriter = writer
 	}
 
-	startMicMonitoring(context.Background(), streamer, recorder, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
+	capture := newCaptureGate(nil, nil, nil)
+	startMicMonitoring(context.Background(), capture, streamer, recorder, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
 
+	if capturedGate != capture {
+		t.Fatal("mic loop did not get the app's capture gate, so pausing would not reach it")
+	}
 	if capturedWriter == nil {
 		t.Fatal("expected monitoring writer to be created")
 	}

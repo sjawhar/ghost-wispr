@@ -90,3 +90,35 @@ func TestMicStopIsSafeWhenStreamUnavailable(t *testing.T) {
 		t.Fatal("expected inactive mic after stop")
 	}
 }
+
+// IsOpen is read from HTTP handlers (status "capturing", health) while the mic
+// loop reopens the stream; under -race this must not be a data race.
+func TestMicIsOpenIsSafeDuringReopen(t *testing.T) {
+	original := openInputStreamFn
+	t.Cleanup(func() {
+		openInputStreamFn = original
+	})
+	// A stream that opens but cannot start makes Reopen set and then clear m.stream.
+	openInputStreamFn = func(sampleRate, framesPerBuffer int, buf []int16) (*portaudio.Stream, error) {
+		return &portaudio.Stream{}, nil
+	}
+
+	mic := &Mic{sampleRate: 16000, framesPerBuffer: 4000, buf: make([]int16, 4000)}
+	mic.active.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			_ = mic.IsOpen()
+		}
+	}()
+	for range 5 {
+		_ = mic.Reopen()
+	}
+	<-done
+
+	if mic.IsOpen() {
+		t.Fatal("expected a mic whose reopen failed to report closed")
+	}
+}
