@@ -21,4 +21,16 @@ describe('SystemStatus', () => {
     expect(screen.getByText(/Drive Sync: disconnected/)).toBeTruthy()
     expect(screen.getByText(/Host Mic: error/)).toBeTruthy()
   })
+
+  it('treats a paused mic as healthy, not degraded', () => {
+    appState.componentStatuses = {
+      deepgram: { status: ComponentStatus.Connected, message: '', timestamp: '' },
+      sync: { status: ComponentStatus.Synced, message: '', timestamp: '' },
+      mic: { status: ComponentStatus.Paused, message: '', timestamp: '' },
+    }
+    render(SystemStatus)
+
+    expect(screen.getByText(/Host Mic: paused/)).toBeTruthy()
+    expect(screen.getByText(/System: healthy/)).toBeTruthy()
+  })
 })

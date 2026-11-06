@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -460,9 +461,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		defer cancel()
 		sessionID, err := controls.StartSession(ctx, body.TitleHint)
 		if err != nil {
-			if errors.Is(err, session.ErrSessionAlreadyActive) {
+			switch {
+			case errors.Is(err, session.ErrSessionAlreadyActive):
 				writeJSONError(w, http.StatusConflict, "session already active")
-			} else {
+			case errors.Is(err, session.ErrCapturePaused):
+				writeJSONError(w, http.StatusConflict, "capture is paused; resume before starting a session")
+			default:
 				writeJSONError(w, http.StatusInternalServerError, "internal error")
 			}
 			return
@@ -1160,9 +1164,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if controls.IsPaused != nil {
 			paused = controls.IsPaused()
 		}
+		capturing := false
+		if controls.IsCapturing != nil {
+			capturing = controls.IsCapturing()
+		}
 		var warnings []string
 		if controls.Warnings != nil {
 			warnings = controls.Warnings()
+		}
+		captureState := ""
+		if controls.CaptureState != nil {
+			captureState = controls.CaptureState()
+		}
+		if captureState == storage.ComponentStatusStalled {
+			// Clip first: the hook may hand out a slice it keeps.
+			warnings = append(slices.Clip(warnings), "Microphone capture has not resumed: the paused session is still being saved")
 		}
 		if warnings == nil {
 			warnings = []string{}
@@ -1178,6 +1194,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"paused":                    paused,
+			"capturing":                 capturing,
+			"capture_state":             captureState,
 			"warnings":                  warnings,
 			"active_session_id":         activeSessionID,
 			"active_session_started_at": activeSessionStartedAt,

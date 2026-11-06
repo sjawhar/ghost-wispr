@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -384,6 +386,193 @@ func TestResilientClient_Close(t *testing.T) {
 
 	if !mock.isClosed() {
 		t.Error("underlying client was not closed")
+	}
+}
+
+// finalizingWriter is a mockWriter that also accepts Deepgram's Finalize message.
+type finalizingWriter struct {
+	mockWriter
+	finalizes   atomic.Int32
+	finalizeErr error
+}
+
+func (f *finalizingWriter) Finalize() error {
+	f.finalizes.Add(1)
+	return f.finalizeErr
+}
+
+func TestResilientClient_FinalizeSendsFinalizeWhenConnected(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &finalizingWriter{}
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1024}, nil, nil)
+	rc.State = StateConnected
+	rc.Client = client
+
+	if err := rc.Finalize(); err != nil {
+		t.Fatalf("Finalize failed: %v", err)
+	}
+	if got := client.finalizes.Load(); got != 1 {
+		t.Fatalf("underlying client got %d Finalize messages, want 1", got)
+	}
+}
+
+func TestResilientClient_FinalizeReportsTheClientsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wantErr := errors.New("socket closed")
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1024}, nil, nil)
+	rc.State = StateConnected
+	rc.Client = &finalizingWriter{finalizeErr: wantErr}
+
+	if err := rc.Finalize(); !errors.Is(err, wantErr) {
+		t.Fatalf("Finalize error = %v, want %v", err, wantErr)
+	}
+}
+
+// A client without Finalize (not a Deepgram socket) is left alone.
+func TestResilientClient_FinalizeIgnoresClientWithoutFinalize(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1024}, nil, nil)
+	rc.State = StateConnected
+	rc.Client = &mockWriter{}
+
+	if err := rc.Finalize(); err != nil {
+		t.Fatalf("Finalize failed: %v", err)
+	}
+}
+
+// Audio buffered during a Deepgram outage was captured before a capture pause.
+// Finalize drops it, so a reconnect during the pause sends Deepgram no audio.
+// The failed socket gets no Finalize: the SDK would redial it.
+func TestResilientClient_FinalizeDropsAudioBufferedWhileDisconnected(t *testing.T) {
+	for _, state := range []ConnectionState{StateDisconnected, StateReconnecting} {
+		ctx, cancel := context.WithCancel(context.Background())
+		stale := &finalizingWriter{}
+		rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1024}, nil, nil)
+		rc.State = state
+		rc.Client = stale
+		if _, err := rc.Write([]byte{1, 2, 3, 4, 5}); err != nil {
+			t.Fatalf("%v: Write failed: %v", state, err)
+		}
+
+		if err := rc.Finalize(); err != nil {
+			t.Fatalf("%v: Finalize failed: %v", state, err)
+		}
+		if got := stale.finalizes.Load(); got != 0 {
+			t.Fatalf("%v: failed socket got %d Finalize messages, want 0", state, got)
+		}
+
+		reconnected := &mockWriter{}
+		rc.Mu.Lock()
+		rc.Client = reconnected
+		rc.Mu.Unlock()
+		rc.drainBuffer()
+		if got := reconnected.getData(); len(got) != 0 {
+			t.Fatalf("%v: reconnect drained %d bytes of pre-pause audio to Deepgram, want 0", state, len(got))
+		}
+		cancel()
+	}
+}
+
+// While a reconnect drains buffered audio into the new socket, that socket is
+// live and holds pre-pause audio, so a pause must still finalize it.
+func TestResilientClient_FinalizeSendsFinalizeWhileDraining(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &finalizingWriter{}
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 1024}, nil, nil)
+	rc.State = StateDraining
+	rc.Client = client
+
+	if err := rc.Finalize(); err != nil {
+		t.Fatalf("Finalize failed: %v", err)
+	}
+	if got := client.finalizes.Load(); got != 1 {
+		t.Fatalf("draining socket got %d Finalize messages, want 1", got)
+	}
+}
+
+// orderedClient records Writes and Finalizes in order; its first Write blocks
+// until release is closed.
+type orderedClient struct {
+	mu      sync.Mutex
+	calls   []string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *orderedClient) record(call string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, call)
+}
+
+func (c *orderedClient) Write(p []byte) (int, error) {
+	c.once.Do(func() {
+		close(c.entered)
+		<-c.release
+	})
+	c.record(fmt.Sprintf("write %d", len(p)))
+	return len(p), nil
+}
+
+func (c *orderedClient) Finalize() error {
+	c.record("finalize")
+	return nil
+}
+
+func (c *orderedClient) Close() error { return nil }
+
+func (c *orderedClient) get() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...)
+}
+
+// A pause that lands while a reconnect is writing a buffered chunk waits for
+// that write, then sends Finalize after it, and no later chunk follows: every
+// pre-pause word comes back before the pause settles, none after it.
+func TestResilientClient_FinalizeWaitsForTheChunkBeingDrained(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &orderedClient{entered: make(chan struct{}), release: make(chan struct{})}
+	rc := NewResilientClient(ctx, nil, ResilientConfig{BufferSize: 3 * 4096}, nil, nil)
+	rc.State = StateDraining
+	rc.Client = client
+	if _, err := rc.Buffer.Write(make([]byte, 3*4096)); err != nil {
+		t.Fatalf("fill buffer: %v", err)
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		rc.drainBuffer()
+		close(drained)
+	}()
+	<-client.entered
+
+	finalized := make(chan error, 1)
+	go func() { finalized <- rc.Finalize() }()
+	select {
+	case <-finalized:
+		t.Fatal("Finalize returned while a drained chunk was still being written")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(client.release)
+	if err := <-finalized; err != nil {
+		t.Fatalf("Finalize failed: %v", err)
+	}
+	<-drained
+
+	if got, want := client.get(), []string{"write 4096", "finalize"}; !slices.Equal(got, want) {
+		t.Fatalf("socket calls = %v, want %v", got, want)
 	}
 }
 

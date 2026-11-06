@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,7 +15,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -193,12 +193,6 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 	}
 }
 
-type recorderState struct {
-	mic    *audio.Mic
-	mu     sync.RWMutex
-	paused bool
-}
-
 type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
 
 func (p *micProxy) IsOpen() bool {
@@ -213,30 +207,6 @@ type resilientClientProxy struct {
 func (p *resilientClientProxy) IsConnected() bool {
 	client := p.ref.Load()
 	return client != nil && client.IsConnected()
-}
-
-func (r *recorderState) Pause() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.paused = true
-}
-
-func (r *recorderState) Resume() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.paused = false
-}
-
-func (r *recorderState) IsPaused() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.paused
-}
-
-func (r *recorderState) SetMic(mic *audio.Mic) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.mic = mic
 }
 
 func retryMicStartup(
@@ -331,18 +301,18 @@ type deepgramWriter struct {
 	}
 }
 
-var streamMicLoopStarter = func(ctx context.Context, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
-	go streamMicWithRetry(ctx, streamer, writer, wait, logf, hub)
+var streamMicLoopStarter = func(ctx context.Context, capture *captureGate, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+	go streamMicWithRetry(ctx, capture, streamer, writer, wait, logf, hub)
 }
 
-func startMicMonitoring(ctx context.Context, streamer micStreamer, recorder *audio.Recorder, downstream io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+func startMicMonitoring(ctx context.Context, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
 	if streamer == nil || recorder == nil {
 		return
 	}
 	if downstream == nil {
 		downstream = io.Discard
 	}
-	streamMicLoopStarter(ctx, streamer, recorder.Writer(downstream), wait, logf, hub)
+	streamMicLoopStarter(ctx, capture, streamer, recorder.Writer(downstream), wait, logf, hub)
 }
 
 func (dw *deepgramWriter) Write(p []byte) (int, error) {
@@ -350,6 +320,11 @@ func (dw *deepgramWriter) Write(p []byte) (int, error) {
 }
 
 func (dw *deepgramWriter) Close() error {
+	return dw.client.Finalize()
+}
+
+// Finalize asks Deepgram to return final results for the audio it has.
+func (dw *deepgramWriter) Finalize() error {
 	return dw.client.Finalize()
 }
 
@@ -533,7 +508,17 @@ func main() {
 		startupSummarizer.OnResult = llmHealthOnResult
 	}
 
-	recState := &recorderState{}
+	var resilientRef atomic.Pointer[transcribe.ResilientClient]
+	var micRef atomic.Pointer[audio.Mic]
+	micStatus := &micProxy{ref: &micRef}
+	// capture is the one pause switch: POST /api/pause and /api/resume (and any
+	// later hardware button) call its Pause and Resume.
+	capture := newSessionCaptureGate(manager, audioRecorder, func() deepgramFinalizer {
+		if dg := resilientRef.Load(); dg != nil {
+			return dg
+		}
+		return nil
+	}, captureFinalizeWait, captureEndRetry, log.Printf)
 	warnings := append([]string{}, cfgWarnings...)
 	if batchTranscriber, err := makeBatchTranscriber(&cfg); err != nil {
 		log.Printf("warning: batch transcription disabled: %v", err)
@@ -710,9 +695,11 @@ func main() {
 	}
 
 	controlHooks := &server.ControlHooks{
-		Pause:         recState.Pause,
-		Resume:        recState.Resume,
-		IsPaused:      recState.IsPaused,
+		Pause:         capture.Pause,
+		Resume:        capture.Resume,
+		IsPaused:      capture.IsPaused,
+		IsCapturing:   func() bool { return capture.capturing(micStatus) },
+		CaptureState:  func() string { return capture.captureState(micStatus) },
 		ActiveSession: manager.ActiveSession,
 		OnStatusChanged: func(paused bool) {
 			hub.BroadcastStatusChanged(paused)
@@ -1347,8 +1334,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}()
 	}
 
-	var resilientRef atomic.Pointer[transcribe.ResilientClient]
-	var micRef atomic.Pointer[audio.Mic]
 	var dgStop func()
 	if cfg.DeepgramAPIKey != "" {
 		controlHooks.FaultDeepgramDisconnect = func() error {
@@ -1406,9 +1391,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		audioRecorder.SetSampleRate(sampleRate)
-		recState.SetMic(mic)
 		if err := mic.Start(); err != nil {
-			recState.SetMic(nil)
 			micRef.Store(nil)
 			if updateStartupState {
 				warnings = append(warnings, "Microphone failed to start — recording and live transcription are disabled")
@@ -1427,7 +1410,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if cfg.DeepgramAPIKey == "" {
-			startMicMonitoring(ctx, mic, audioRecorder, nil, time.Sleep, log.Printf, hub)
+			startMicMonitoring(ctx, capture, mic, audioRecorder, nil, capture.sleepUnlessPaused, log.Printf, hub)
 			return nil
 		}
 
@@ -1467,14 +1450,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if updateStartupState {
 				warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
 			}
-			startMicMonitoring(ctx, mic, audioRecorder, nil, time.Sleep, log.Printf, hub)
+			startMicMonitoring(ctx, capture, mic, audioRecorder, nil, capture.sleepUnlessPaused, log.Printf, hub)
 			return nil
 		}
 
 		candidateResilient.Client = initialClient
 		resilientRef.Store(candidateResilient)
 
-		startMicMonitoring(ctx, mic, audioRecorder, candidateResilient, time.Sleep, log.Printf, hub)
+		startMicMonitoring(ctx, capture, mic, audioRecorder, candidateResilient, capture.sleepUnlessPaused, log.Printf, hub)
 		return nil
 	}
 
@@ -1599,7 +1582,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	// Create health checker with actual component references
-	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, &micProxy{ref: &micRef}, llmTracker)
+	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
@@ -1663,11 +1646,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 type micStreamer interface {
 	Stream(writer io.Writer) error
+	Start() error
+	Stop() error
 	Reopen() error
 }
 
 func streamMicWithRetry(
 	ctx context.Context,
+	capture *captureGate,
 	streamer micStreamer,
 	writer io.Writer,
 	wait func(time.Duration),
@@ -1681,15 +1667,36 @@ func streamMicWithRetry(
 	)
 
 	backoff := baseBackoff
+	gated := capture.Writer(writer)
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		err := streamer.Stream(writer)
-		if err == nil || ctx.Err() != nil {
-			return
+		var err error
+		if capture.isClosed() {
+			if !holdMicWhilePaused(ctx, capture, streamer, logf, hub) || ctx.Err() != nil {
+				return
+			}
+			if err = streamer.Start(); err == nil {
+				logf("microphone restarted: capture resumed")
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone capture resumed")
+				}
+				continue
+			}
+			// The device did not come back (unplugged during the pause): reconnect below.
+		} else {
+			err = streamer.Stream(gated)
+			if err == nil || ctx.Err() != nil {
+				return
+			}
+			// A pause, or a device error that coincides with one: stop the
+			// device at the loop top instead of reporting a failure.
+			if errors.Is(err, errGateClosed) || capture.isClosed() {
+				continue
+			}
 		}
 
 		if strings.Contains(strings.ToLower(err.Error()), "overflow") {
@@ -1700,6 +1707,9 @@ func streamMicWithRetry(
 			wait(overflowWait)
 			if ctx.Err() != nil {
 				return
+			}
+			if capture.isClosed() {
+				continue
 			}
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
@@ -1727,6 +1737,9 @@ func streamMicWithRetry(
 		if ctx.Err() != nil {
 			return
 		}
+		if capture.isClosed() {
+			continue // never reopen the mic while paused; the loop top stops it
+		}
 		if hub != nil {
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 		}
@@ -1746,4 +1759,17 @@ func streamMicWithRetry(
 		}
 		backoff = baseBackoff
 	}
+}
+
+// holdMicWhilePaused stops the capture device and blocks until capture
+// resumes. It reports false if ctx ends first.
+func holdMicWhilePaused(ctx context.Context, capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) bool {
+	if err := streamer.Stop(); err != nil {
+		logf("warning: stop microphone for capture pause: %v", err)
+	}
+	logf("microphone stopped: capture paused")
+	if hub != nil {
+		hub.BroadcastComponentStatus("mic", storage.ComponentStatusPaused, "Microphone stopped while capture is paused")
+	}
+	return capture.waitResumed(ctx)
 }

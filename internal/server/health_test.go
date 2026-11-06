@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -19,6 +22,7 @@ type MockHealthChecker struct {
 	deepgramConnected bool
 	dbHealthy         bool
 	micOpen           bool
+	micHold           string
 	llmStatus         string
 }
 
@@ -32,6 +36,10 @@ func (m *MockHealthChecker) IsDBHealthy(ctx context.Context) bool {
 
 func (m *MockHealthChecker) IsMicOpen() bool {
 	return m.micOpen
+}
+
+func (m *MockHealthChecker) MicHold() string {
+	return m.micHold
 }
 
 func (m *MockHealthChecker) IsLLMHealthy() string {
@@ -260,11 +268,96 @@ func TestHealthzReadyReturns503WhenMicClosed(t *testing.T) {
 	}
 }
 
+// A paused capture stops the mic on purpose, and a resume waits a moment for
+// the paused session to be saved: readiness reports either state and stays
+// 200. A resume that has not brought the mic back past the stall limit is a
+// fault: 503 with mic "stalled", never "paused".
+func TestHealthzReadyReportsAHeldMic(t *testing.T) {
+	for _, tc := range []struct {
+		hold     string
+		wantCode int
+		wantMic  string
+	}{
+		{hold: "paused", wantCode: http.StatusOK, wantMic: "paused"},
+		{hold: "resuming", wantCode: http.StatusOK, wantMic: "resuming"},
+		{hold: "stalled", wantCode: http.StatusServiceUnavailable, wantMic: "stalled"},
+		{hold: "", wantCode: http.StatusServiceUnavailable, wantMic: "closed"},
+	} {
+		checker := &MockHealthChecker{deepgramConnected: true, dbHealthy: true, micHold: tc.hold}
+
+		w := httptest.NewRecorder()
+		handleHealthzReady(w, httptest.NewRequest("GET", "/healthz/ready", nil), checker)
+
+		if w.Code != tc.wantCode {
+			t.Errorf("hold %q: status %d, want %d", tc.hold, w.Code, tc.wantCode)
+		}
+		var resp HealthzReadyResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if resp.Mic != tc.wantMic {
+			t.Errorf("hold %q: mic %q, want %q", tc.hold, resp.Mic, tc.wantMic)
+		}
+	}
+}
+
+type holdState string
+
+func (h holdState) MicHold() string { return string(h) }
+
+func TestDefaultHealthCheckerReportsMicHold(t *testing.T) {
+	if got := NewDefaultHealthChecker(nil, nil, nil, holdState("stalled"), nil).MicHold(); got != "stalled" {
+		t.Fatalf("MicHold = %q, want the capture's %q", got, "stalled")
+	}
+	if got := NewDefaultHealthChecker(nil, nil, nil, nil, nil).MicHold(); got != "" {
+		t.Fatalf("MicHold with no capture switch = %q, want none", got)
+	}
+}
+
+// While a long query holds the database's one connection (the state a capture
+// stalled on the database is in), readiness still answers, with 503 and the
+// database as the fault, instead of waiting for the connection.
+func TestHealthzReadyAnswersWhileTheDatabaseIsBusy(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	conn, err := store.DB().Conn(context.Background())
+	if err != nil {
+		t.Fatalf("take the database connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	checker := NewDefaultHealthChecker(nil, store, nil, holdState("stalled"), nil)
+
+	w := httptest.NewRecorder()
+	answered := make(chan struct{})
+	go func() {
+		defer close(answered)
+		handleHealthzReady(w, httptest.NewRequest("GET", "/healthz/ready", nil), checker)
+	}()
+	select {
+	case <-answered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("readiness still waiting for the database after 10s")
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status %d, want 503", w.Code)
+	}
+	var resp HealthzReadyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.DB != storage.ComponentStatusError {
+		t.Errorf("db %q, want %q", resp.DB, storage.ComponentStatusError)
+	}
+}
+
 func TestDefaultHealthCheckerHandlesTypedNilPointers(t *testing.T) {
 	var resilient *transcribe.ResilientClient
 	var mic *audio.Mic
 
-	checker := NewDefaultHealthChecker(resilient, nil, mic, nil)
+	checker := NewDefaultHealthChecker(resilient, nil, mic, nil, nil)
 
 	if checker.IsDeepgramConnected() {
 		t.Fatal("expected typed-nil resilient client to be treated as disconnected")

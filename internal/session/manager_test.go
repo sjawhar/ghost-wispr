@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +34,8 @@ type storeMock struct {
 
 	endSessionErr   error
 	endSessionCalls int
+	// appendHook, when set, runs first in AppendSegment, outside the lock.
+	appendHook func()
 }
 
 func newStoreMock() *storeMock {
@@ -74,6 +77,9 @@ func (s *storeMock) EndSession(id string, _ time.Time, audioPath string) error {
 }
 
 func (s *storeMock) AppendSegment(sessionID string, seg transcribe.Segment) error {
+	if s.appendHook != nil {
+		s.appendHook()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.segments[sessionID] = append(s.segments[sessionID], seg)
@@ -175,9 +181,16 @@ type recorderMock struct {
 	ended   int
 
 	startErr error
+	// startHook and endHook, when set, run first in StartSession and
+	// EndSession, outside the mock's lock, so a test can hold a call open.
+	startHook func()
+	endHook   func()
 }
 
 func (r *recorderMock) StartSession(id string) error {
+	if r.startHook != nil {
+		r.startHook()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.startErr != nil {
@@ -188,6 +201,9 @@ func (r *recorderMock) StartSession(id string) error {
 }
 
 func (r *recorderMock) EndSession() (string, error) {
+	if r.endHook != nil {
+		r.endHook()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ended++
@@ -195,6 +211,12 @@ func (r *recorderMock) EndSession() (string, error) {
 		return "", nil
 	}
 	return "data/audio/" + r.started[len(r.started)-1] + ".mp3", nil
+}
+
+func (r *recorderMock) counts() (started, ended int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.started), r.ended
 }
 
 type summarizerMock struct {
@@ -526,6 +548,51 @@ func TestManager_EndSession_StoreFailurePreservesState(t *testing.T) {
 	if got := manager.currentSession(); got == "" {
 		t.Fatal("expected manager to preserve currentSessionID on end failure")
 	}
+}
+
+// A session end whose database write failed is retried with the recording the
+// failed end saved. The recorder is not asked again: it handed that recording
+// over already, and a retry that asked it would save the session without it.
+func TestManager_RetriedEndKeepsTheRecordingAFailedEndSaved(t *testing.T) {
+	store := newStoreMock()
+	store.endSessionErr = errors.New("disk I/O error")
+	recorder := &recorderMock{}
+	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour), 0)
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	id := manager.currentSession()
+
+	if err := manager.ForceEndSession(context.Background()); err == nil {
+		t.Fatal("ForceEndSession succeeded while the database refused the end")
+	}
+	store.mu.Lock()
+	store.endSessionErr = nil
+	store.mu.Unlock()
+	if err := manager.ForceEndSession(context.Background()); err != nil {
+		t.Fatalf("retried ForceEndSession failed: %v", err)
+	}
+
+	if _, ended := recorder.counts(); ended != 1 {
+		t.Errorf("recorder asked to end the session %d times, want once", ended)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got, want := store.audio[id], "data/audio/"+id+".mp3"; got != want {
+		t.Errorf("session ended with recording %q, want %q", got, want)
+	}
+}
+
+// Test helpers: start a session directly, and read the current one.
+func (m *Manager) ensureSessionStarted(now time.Time) error {
+	m.mu.Lock()
+	_, err := m.claimSessionLocked(now)
+	return err
+}
+
+func (m *Manager) currentSession() string {
+	id, _ := m.ActiveSession()
+	return id
 }
 
 func TestManager_StartSession_RecorderFailureRollsBack(t *testing.T) {
@@ -1152,5 +1219,495 @@ func TestManager_RefineSession_ErrorsWithoutAudio(t *testing.T) {
 	err := manager.RefineSession(context.Background(), "sess-x", "  ", time.Time{})
 	if err == nil {
 		t.Fatal("expected error when session has no audio")
+	}
+}
+
+const pausedCaptureSpeechFinal = `{
+	"is_final": true,
+	"speech_final": true,
+	"channel": {"alternatives": [{
+		"transcript": "said before the pause",
+		"words": [{"speaker": 0, "punctuated_word": "said", "start": 0, "end": 0.4},
+		           {"speaker": 0, "punctuated_word": "before", "start": 0.4, "end": 0.8},
+		           {"speaker": 0, "punctuated_word": "the", "start": 0.8, "end": 0.9},
+		           {"speaker": 0, "punctuated_word": "pause", "start": 0.9, "end": 1.2}]
+	}]}}`
+
+// Deepgram's reply to Finalize: final, not end of speech.
+const pausedCaptureFinalizeReply = `{
+	"is_final": true,
+	"speech_final": false,
+	"from_finalize": true,
+	"channel": {"alternatives": [{
+		"transcript": "last words",
+		"words": [{"speaker": 0, "punctuated_word": "last", "start": 1.3, "end": 1.6},
+		           {"speaker": 0, "punctuated_word": "words", "start": 1.6, "end": 2.0}]
+	}]}}`
+
+func segmentText(t *testing.T, store *storeMock, sessionID string) string {
+	t.Helper()
+	segments, err := store.GetSegments(sessionID)
+	if err != nil {
+		t.Fatalf("GetSegments failed: %v", err)
+	}
+	var text []string
+	for _, seg := range segments {
+		text = append(text, seg.Text)
+	}
+	return strings.Join(text, " ")
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// A transcript that Deepgram delivers while capture is paused must not open a
+// session or a recording file; after resume, the next transcript does.
+func TestManager_TranscriptWhilePausedStartsNoSessionOrRecording(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	hub := &hubMock{}
+	manager := NewManager(store, recorder, nil, hub, NewDetector(time.Hour), 0)
+
+	manager.PauseCapture()
+	if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+		t.Fatalf("Message while paused failed: %v", err)
+	}
+	if err := manager.UtteranceEnd(&api.UtteranceEndResponse{}); err != nil {
+		t.Fatalf("UtteranceEnd while paused failed: %v", err)
+	}
+
+	if got := len(store.sessions); got != 0 {
+		t.Fatalf("store has %d sessions after a transcript while paused, want 0", got)
+	}
+	if started, _ := recorder.counts(); started != 0 {
+		t.Fatalf("recorder started %d sessions while paused, want 0", started)
+	}
+	if id, _ := manager.ActiveSession(); id != "" {
+		t.Fatalf("active session %q while paused, want none", id)
+	}
+	hub.mu.Lock()
+	startedEvents := hub.startedCount
+	hub.mu.Unlock()
+	if startedEvents != 0 {
+		t.Fatalf("broadcast %d session_started events while paused, want 0", startedEvents)
+	}
+
+	manager.ResumeCapture()
+	if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+		t.Fatalf("Message after resume failed: %v", err)
+	}
+	if started, _ := recorder.counts(); started != 1 {
+		t.Fatalf("recorder started %d sessions after resume, want 1", started)
+	}
+	if id, _ := manager.ActiveSession(); id == "" {
+		t.Fatal("no active session after a transcript following resume")
+	}
+}
+
+// After a pause, Deepgram's reply to Finalize still belongs to the session that
+// was recording: AwaitFinalize reports when it is in, and ending the session
+// then saves those last words.
+func TestManager_FinalizeReplyAfterPauseIsSavedToTheEndingSession(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	manager := NewManager(store, recorder, nil, &hubMock{}, NewDetector(time.Hour), 0)
+
+	if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+	sessionID, _ := manager.ActiveSession()
+	if sessionID == "" {
+		t.Fatal("expected an active session before the pause")
+	}
+
+	manager.PauseCapture()
+	finalized := manager.AwaitFinalize()
+	select {
+	case <-finalized:
+		t.Fatal("AwaitFinalize reported before Deepgram replied")
+	default:
+	}
+	if err := manager.Message(buildMsg(t, pausedCaptureFinalizeReply)); err != nil {
+		t.Fatalf("Message (finalize reply) failed: %v", err)
+	}
+	waitClosed(t, finalized, "the finalize reply to be reported")
+
+	if err := manager.ForceEndSession(context.Background()); err != nil {
+		t.Fatalf("ForceEndSession failed: %v", err)
+	}
+	if id, _ := manager.ActiveSession(); id != "" {
+		t.Fatalf("session %q still active after it ended", id)
+	}
+	if _, ended := recorder.counts(); ended != 1 {
+		t.Fatalf("recorder ended %d sessions, want 1", ended)
+	}
+	if text := segmentText(t, store, sessionID); !strings.Contains(text, "last words") {
+		t.Fatalf("finalize reply not saved to the session, segments: %q", text)
+	}
+}
+
+// A Finalize reply with no words (nothing was buffered) still reports.
+func TestManager_AwaitFinalizeReportsAnEmptyReply(t *testing.T) {
+	manager := NewManager(newStoreMock(), &recorderMock{}, nil, &hubMock{}, NewDetector(time.Hour), 0)
+
+	finalized := manager.AwaitFinalize()
+	if err := manager.Message(buildMsg(t, `{"is_final": true, "from_finalize": true, "channel": {"alternatives": [{"transcript": ""}]}}`)); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+	waitClosed(t, finalized, "the empty finalize reply to be reported")
+}
+
+// PauseCapture only blocks new sessions: it does not wait for a session start
+// already under way, since the capture gate stays open until it returns.
+// WaitForSessionStarts waits for that start, so the session end that follows a
+// pause cannot run while the session is half created.
+func TestManager_PauseCaptureDoesNotWaitForASessionStartInFlight(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	recorder.startHook = func() {
+		close(entered)
+		<-release
+	}
+	manager := NewManager(store, recorder, nil, &hubMock{}, NewDetector(time.Hour), 0)
+
+	messageErr := make(chan error, 1)
+	go func() { messageErr <- manager.Message(buildMsg(t, pausedCaptureSpeechFinal)) }()
+	waitClosed(t, entered, "the session start to reach the recorder")
+
+	paused := make(chan struct{})
+	go func() {
+		manager.PauseCapture()
+		close(paused)
+	}()
+	waitClosed(t, paused, "PauseCapture while a session start was in flight")
+
+	waited := make(chan struct{})
+	go func() {
+		manager.WaitForSessionStarts()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("WaitForSessionStarts returned while a session start was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	waitClosed(t, waited, "WaitForSessionStarts after the session start finished")
+	if err := <-messageErr; err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+
+	if err := manager.ForceEndSession(context.Background()); err != nil {
+		t.Fatalf("ForceEndSession failed: %v", err)
+	}
+	if started, ended := recorder.counts(); started != 1 || ended != 1 {
+		t.Fatalf("recorder started %d and ended %d sessions, want 1 and 1", started, ended)
+	}
+}
+
+// blockFirstEnd makes the recorder's first EndSession wait until release is
+// closed, as a long encode does, and closes entered when it starts.
+func blockFirstEnd(recorder *recorderMock) (entered, release chan struct{}) {
+	entered = make(chan struct{})
+	release = make(chan struct{})
+	var first atomic.Bool
+	recorder.endHook = func() {
+		if first.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	return entered, release
+}
+
+// Two ends of one session at once (the silence timer and a pause) end it once:
+// the second waits for the first, then finds no session. It must not end the
+// session again and overwrite its saved audio path.
+func TestManager_ConcurrentEndsEndTheSessionOnce(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	entered, release := blockFirstEnd(recorder)
+	manager := NewManager(store, recorder, nil, &hubMock{}, NewDetector(time.Hour), 0)
+	if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+	sessionID, _ := manager.ActiveSession()
+
+	firstErr := make(chan error, 1)
+	go func() { firstErr <- manager.ForceEndSession(context.Background()) }()
+	waitClosed(t, entered, "the first end to reach the recorder")
+
+	secondErr := make(chan error, 1)
+	go func() { secondErr <- manager.ForceEndSession(context.Background()) }()
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second end returned %v while the first was still running", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-firstErr; err != nil {
+		t.Fatalf("first end failed: %v", err)
+	}
+	if err := <-secondErr; !errors.Is(err, ErrNoActiveSession) {
+		t.Fatalf("second end after the first finished: got %v, want ErrNoActiveSession", err)
+	}
+
+	store.mu.Lock()
+	calls, audioPath := store.endSessionCalls, store.audio[sessionID]
+	store.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("store ended the session %d times, want 1", calls)
+	}
+	if want := "data/audio/" + sessionID + ".mp3"; audioPath != want {
+		t.Fatalf("saved audio path = %q, want %q", audioPath, want)
+	}
+}
+
+// A session that starts in the same second as the one before it (a short
+// session ended by a pause, then a resume) gets its own ID. With the same ID
+// its words and recording would be filed under the earlier session.
+func TestManager_SessionsStartedInTheSameSecondGetDistinctIDs(t *testing.T) {
+	store := newStoreMock()
+	manager := NewManager(store, &recorderMock{}, nil, &hubMock{}, NewDetector(time.Hour), 0)
+
+	var ids []string
+	for range 3 {
+		if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+			t.Fatalf("Message failed: %v", err)
+		}
+		id, _ := manager.ActiveSession()
+		ids = append(ids, id)
+		if err := manager.ForceEndSession(context.Background()); err != nil {
+			t.Fatalf("ForceEndSession failed: %v", err)
+		}
+	}
+	id, err := manager.ManualStartSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ManualStartSession failed: %v", err)
+	}
+	ids = append(ids, id)
+
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			t.Fatalf("session IDs %v repeat %s", ids, id)
+		}
+		seen[id] = true
+	}
+}
+
+// A pause that lands while another end of the session (the silence timer's) is
+// still encoding waits for that end. Otherwise the pause ends nothing, resume
+// follows, and speech after the resume is filed into the session from before
+// the pause.
+func TestManager_PauseDuringSessionEndKeepsPostResumeSpeechOut(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	entered, release := blockFirstEnd(recorder)
+	manager := NewManager(store, recorder, nil, &hubMock{}, NewDetector(time.Hour), 0)
+	if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+	before, _ := manager.ActiveSession()
+
+	timerEnd := make(chan error, 1)
+	go func() { timerEnd <- manager.ForceEndSession(context.Background()) }()
+	waitClosed(t, entered, "the silence timer's end to reach the recorder")
+
+	// The capture pause: block starts, end the session, then the resume and
+	// the first words after it.
+	afterResume := buildMsg(t, `{
+		"is_final": true,
+		"speech_final": true,
+		"channel": {"alternatives": [{
+			"transcript": "after resume",
+			"words": [{"speaker": 0, "punctuated_word": "after", "start": 0, "end": 0.3},
+			           {"speaker": 0, "punctuated_word": "resume", "start": 0.3, "end": 0.7}]
+		}]}}`)
+	pauseThenResume := make(chan error, 1)
+	go func() {
+		manager.PauseCapture()
+		if err := manager.ForceEndSession(context.Background()); err != nil && !errors.Is(err, ErrNoActiveSession) {
+			pauseThenResume <- err
+			return
+		}
+		manager.ResumeCapture()
+		pauseThenResume <- manager.Message(afterResume)
+	}()
+	// Give a pause that does not wait time to run all the way through first.
+	var pauseErr error
+	pauseDone := false
+	select {
+	case pauseErr = <-pauseThenResume:
+		pauseDone = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-timerEnd; err != nil {
+		t.Fatalf("silence timer's end failed: %v", err)
+	}
+	if !pauseDone {
+		select {
+		case pauseErr = <-pauseThenResume:
+		case <-time.After(5 * time.Second):
+			t.Fatal("pause did not finish after the session end it waited for")
+		}
+	}
+	if pauseErr != nil {
+		t.Fatalf("pause, resume and message failed: %v", pauseErr)
+	}
+
+	if text := segmentText(t, store, before); strings.Contains(text, "after resume") {
+		t.Fatalf("post-resume words landed in the pre-pause session %s: %q", before, text)
+	}
+	after, _ := manager.ActiveSession()
+	if after == "" || after == before {
+		t.Fatalf("active session after resume = %q, want a new session (pre-pause was %q)", after, before)
+	}
+}
+
+// An end that has to wait for another end of the session gives up at its own
+// deadline: POST /api/sessions/{id}/stop allows 5 s, not another end's encode.
+func TestManager_EndWaitingOnAnotherEndHonorsItsDeadline(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	entered, release := blockFirstEnd(recorder)
+	manager := NewManager(store, recorder, nil, &hubMock{}, NewDetector(time.Hour), 0)
+	if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+	sessionID, _ := manager.ActiveSession()
+
+	firstErr := make(chan error, 1)
+	go func() { firstErr <- manager.ForceEndSession(context.Background()) }()
+	waitClosed(t, entered, "the first end to reach the recorder")
+	defer func() {
+		close(release)
+		if err := <-firstErr; err != nil {
+			t.Errorf("first end failed: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- manager.StopSession(ctx, sessionID) }()
+	select {
+	case err := <-stopErr:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("StopSession past its deadline: got %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopSession ignored its deadline while another end was running")
+	}
+}
+
+// Words that a flush took before a pause stay with the session they were
+// taken for, even when the whole pause and resume happen while that flush is
+// still saving them. They must not open the first session after the resume.
+func TestManager_FlushTakenBeforePauseDoesNotOpenAPostResumeSession(t *testing.T) {
+	store := newStoreMock()
+	manager := NewManager(store, &recorderMock{}, nil, &hubMock{}, NewDetector(time.Hour), 0)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var first atomic.Bool
+	store.appendHook = func() {
+		if first.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	twoSpeakers := buildMsg(t, `{
+		"is_final": true,
+		"speech_final": true,
+		"channel": {"alternatives": [{
+			"transcript": "alpha bravo",
+			"words": [{"speaker": 0, "punctuated_word": "alpha", "start": 0, "end": 0.4},
+			           {"speaker": 1, "punctuated_word": "bravo", "start": 0.5, "end": 0.9}]
+		}]}}`)
+	flushed := make(chan error, 1)
+	go func() { flushed <- manager.Message(twoSpeakers) }()
+	waitClosed(t, entered, "the first segment to reach the store")
+	before, _ := manager.ActiveSession()
+
+	manager.PauseCapture()
+	if err := manager.ForceEndSession(context.Background()); err != nil {
+		t.Fatalf("ForceEndSession failed: %v", err)
+	}
+	manager.ResumeCapture()
+	close(release)
+	if err := <-flushed; err != nil {
+		t.Fatalf("Message failed: %v", err)
+	}
+
+	if id, _ := manager.ActiveSession(); id != "" {
+		t.Fatalf("a pre-pause word opened post-resume session %s", id)
+	}
+	if text := segmentText(t, store, before); !strings.Contains(text, "bravo") {
+		t.Fatalf("pre-pause session %s lost the flushed word, segments: %q", before, text)
+	}
+}
+
+func TestManager_ManualStartSessionRefusedWhilePaused(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	manager := NewManager(store, recorder, nil, &hubMock{}, NewDetector(time.Hour), 0)
+
+	manager.PauseCapture()
+	id, err := manager.ManualStartSession(context.Background(), "")
+	if !errors.Is(err, ErrCapturePaused) {
+		t.Fatalf("ManualStartSession while paused: got (%q, %v), want ErrCapturePaused", id, err)
+	}
+	if got := len(store.sessions); got != 0 {
+		t.Fatalf("store has %d sessions after a refused start, want 0", got)
+	}
+	if started, _ := recorder.counts(); started != 0 {
+		t.Fatalf("recorder started %d sessions while paused, want 0", started)
+	}
+
+	manager.ResumeCapture()
+	if _, err := manager.ManualStartSession(context.Background(), ""); err != nil {
+		t.Fatalf("ManualStartSession after resume failed: %v", err)
+	}
+}
+
+// Words Deepgram finalizes during a pause with no utterance end stay in the
+// word buffer. Resume drops them, so they do not open the first session after
+// the pause.
+func TestManager_ResumeCaptureDropsWordsBufferedWhilePaused(t *testing.T) {
+	store := newStoreMock()
+	manager := NewManager(store, &recorderMock{}, nil, &hubMock{}, NewDetector(time.Hour), 0)
+
+	manager.PauseCapture()
+	if err := manager.Message(buildMsg(t, `{
+		"is_final": true,
+		"speech_final": false,
+		"channel": {"alternatives": [{
+			"transcript": "stale words",
+			"words": [{"speaker": 0, "punctuated_word": "stale", "start": 0, "end": 0.3},
+			           {"speaker": 0, "punctuated_word": "words", "start": 0.3, "end": 0.6}]
+		}]}}`)); err != nil {
+		t.Fatalf("Message while paused failed: %v", err)
+	}
+
+	manager.ResumeCapture()
+	if err := manager.Message(buildMsg(t, pausedCaptureSpeechFinal)); err != nil {
+		t.Fatalf("Message after resume failed: %v", err)
+	}
+	sessionID, _ := manager.ActiveSession()
+	if sessionID == "" {
+		t.Fatal("no active session after a transcript following resume")
+	}
+	if text := segmentText(t, store, sessionID); strings.Contains(text, "stale") {
+		t.Fatalf("session after resume has words from before the pause: %q", text)
 	}
 }

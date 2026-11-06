@@ -41,4 +41,7 @@ const (
 	ComponentStatusOK           = "ok"
 	ComponentStatusOpen         = "open"
 	ComponentStatusClosed       = "closed"
+	ComponentStatusPaused       = "paused"
+	ComponentStatusResuming     = "resuming"
+	ComponentStatusStalled      = "stalled"
 )

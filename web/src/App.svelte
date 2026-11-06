@@ -11,6 +11,7 @@
   import {
     appState,
     setDates,
+    setCapturing,
     setPaused,
     setPresets,
     setSessionDetail,
@@ -62,12 +63,15 @@
   async function togglePause(): Promise<void> {
     if (appState.paused) {
       await resumeRecording()
+      // The microphone comes back a moment later; its mic status event, or the
+      // next status poll, sets capturing.
       setPaused(false)
       return
     }
 
     await pauseRecording()
     setPaused(true)
+    setCapturing(false)
   }
 
   async function handleStartSession(): Promise<void> {
@@ -125,6 +129,7 @@
         }
 
         setPaused(status.paused)
+        setCapturing(status.capturing)
         setWarnings(status.warnings)
         setDates(dates)
         setPresets(presets)
@@ -165,6 +170,7 @@
       void fetchStatus()
         .then((status) => {
           setPaused(status.paused)
+          setCapturing(status.capturing)
           setWarnings(status.warnings)
         })
         .catch((error) => {
@@ -196,6 +202,7 @@
       <Controls
         connected={appState.connected}
         paused={appState.paused}
+        capturing={appState.capturing}
         activeSessionId={appState.activeSessionId}
         onToggle={togglePause}
         onEndSession={endSession}

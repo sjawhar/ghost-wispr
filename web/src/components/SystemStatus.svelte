@@ -24,6 +24,8 @@
       case ComponentStatus.Reconnecting:
       case ComponentStatus.Draining:
         return 'var(--warning)'
+      case ComponentStatus.Paused:
+        return 'var(--muted)'
       default:
         return 'var(--muted)'
     }
@@ -55,6 +57,7 @@
           s === ComponentStatus.Synced ||
           s === ComponentStatus.Open ||
           s === ComponentStatus.Ok ||
+          s === ComponentStatus.Paused ||
           !s,
       )
     )

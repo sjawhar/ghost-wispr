@@ -110,9 +110,11 @@ func (m *Mic) Stream(w io.Writer) error {
 	}
 }
 
-// IsOpen returns true if the mic stream is currently active.
+// IsOpen returns true if the mic stream is currently active. It reads only the
+// atomic flag, so HTTP handlers may call it while the mic loop reopens the
+// stream; the flag is set only while a started stream exists.
 func (m *Mic) IsOpen() bool {
-	return m.stream != nil && m.active.Load()
+	return m != nil && m.active.Load()
 }
 
 func (m *Mic) SampleRate() int {

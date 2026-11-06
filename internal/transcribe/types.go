@@ -95,4 +95,8 @@ type ResilientClient struct {
 
 	// reconnectDelay tracks the current exponential backoff delay.
 	reconnectDelay time.Duration
+
+	// drainMu is held across each chunk drainBuffer reads and writes, and by
+	// Finalize, so a finalize never overtakes buffered audio already in flight.
+	drainMu sync.Mutex
 }

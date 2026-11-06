@@ -21,6 +21,8 @@ type ControlHooks struct {
 	Pause                   func()
 	Resume                  func()
 	IsPaused                func() bool
+	IsCapturing             func() bool
+	CaptureState            func() string
 	OnStatusChanged         func(paused bool)
 	Warnings                func() []string
 	ActiveSession           func() (string, time.Time)
