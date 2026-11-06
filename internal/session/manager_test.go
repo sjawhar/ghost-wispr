@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -179,9 +180,10 @@ func (s *storeMock) GetCanonicalTranscript(sessionID string) (string, string, er
 }
 
 type recorderMock struct {
-	mu      sync.Mutex
-	started []string
-	ended   int
+	mu       sync.Mutex
+	started  []string
+	ended    int
+	endedIDs []string // the session each EndSession was asked to end
 
 	startErr error
 	// endErr, when set, fails every EndSession; unsavedPath is the raw file
@@ -208,20 +210,24 @@ func (r *recorderMock) StartSession(id string) error {
 	return nil
 }
 
-func (r *recorderMock) EndSession() (string, error) {
+// EndSession saves the recording of the session it is given, as the real
+// recorder does: a session it never started has nothing to save, so a manager
+// that ends the wrong session gets no recording back.
+func (r *recorderMock) EndSession(sessionID string) (string, error) {
 	if r.endHook != nil {
 		r.endHook()
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ended++
+	r.endedIDs = append(r.endedIDs, sessionID)
 	if r.endErr != nil {
 		return "", r.endErr
 	}
-	if len(r.started) == 0 {
+	if sessionID == "" || !slices.Contains(r.started, sessionID) {
 		return "", nil
 	}
-	return "data/audio/" + r.started[len(r.started)-1] + ".mp3", nil
+	return "data/audio/" + sessionID + ".mp3", nil
 }
 
 func (r *recorderMock) DiscardUnsaved() string {
@@ -604,6 +610,39 @@ func TestManager_RetriedEndKeepsTheRecordingAFailedEndSaved(t *testing.T) {
 	defer store.mu.Unlock()
 	if got, want := store.audio[id], "data/audio/"+id+".mp3"; got != want {
 		t.Errorf("session ended with recording %q, want %q", got, want)
+	}
+}
+
+// Ending a session asks the recorder for that session's recording, by ID, and
+// files what it gets back under that session: one session after another,
+// each ends with its own recording.
+func TestManager_EndingASessionEndsItsOwnRecording(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{}
+	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour), 0)
+	var ids []string
+	for range 2 {
+		if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+			t.Fatalf("ensureSessionStarted failed: %v", err)
+		}
+		ids = append(ids, manager.currentSession())
+		if err := manager.ForceEndSession(context.Background()); err != nil {
+			t.Fatalf("ForceEndSession failed: %v", err)
+		}
+	}
+
+	recorder.mu.Lock()
+	endedIDs := slices.Clone(recorder.endedIDs)
+	recorder.mu.Unlock()
+	if !slices.Equal(endedIDs, ids) {
+		t.Errorf("recorder asked to end %q, want the sessions ended, %q", endedIDs, ids)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, id := range ids {
+		if got, want := store.audio[id], "data/audio/"+id+".mp3"; got != want {
+			t.Errorf("session %s ended with recording %q, want %q", id, got, want)
+		}
 	}
 }
 

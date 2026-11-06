@@ -1,7 +1,13 @@
 import { fireEvent, render, screen } from '@testing-library/svelte'
 import { describe, expect, it, vi } from 'vitest'
 import SessionCard from '../SessionCard.svelte'
-import { SessionStatus, SummaryStatus, type SessionSummary } from '../../lib/types'
+import sessionCardSource from '../SessionCard.svelte?raw'
+import {
+  RefinementStatus,
+  SessionStatus,
+  SummaryStatus,
+  type SessionSummary,
+} from '../../lib/types'
 
 const baseSession: SessionSummary = {
   id: 's1',
@@ -68,5 +74,71 @@ describe('SessionCard', () => {
     })
 
     expect(screen.getByRole('button', { name: 'Resummarize ▾' })).toBeTruthy()
+  })
+
+  it('says a session with no saved recording cannot be refined, and offers no retry', () => {
+    render(SessionCard, {
+      session: { ...baseSession, audio_path: '', refinement_status: RefinementStatus.NoAudio },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    const badge = screen.getByTestId('refinement-badge')
+    expect(badge.textContent?.trim()).toBe('Refine: no recording')
+    expect(badge.getAttribute('title')).toBe(
+      'No recording was saved for this session, so it cannot be refined',
+    )
+    expect(screen.queryByTestId('retry-refinement-btn')).toBeNull()
+    expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
+  })
+
+  it('marks a session whose audio was removed to free space, refined or not', () => {
+    for (const refinementStatus of [RefinementStatus.Completed, RefinementStatus.NoAudio]) {
+      const { unmount } = render(SessionCard, {
+        session: {
+          ...baseSession,
+          audio_path: '',
+          audio_removed_at: '2026-11-07T09:30:00Z',
+          refinement_status: refinementStatus,
+        },
+        detail: undefined,
+        expanded: false,
+        presets: {},
+        onToggle: vi.fn(),
+        onLoadDetail: vi.fn(),
+        onResummarize: vi.fn(),
+        onDelete: vi.fn(),
+      })
+
+      const marker = screen.getByTestId('audio-removed-badge')
+      expect(marker.textContent?.trim()).toBe('Audio removed to free space')
+      expect(marker.getAttribute('title')).toBe(
+        'The audio was removed to keep the audio directory under its size limit. The transcript and summary are kept.',
+      )
+      if (refinementStatus === RefinementStatus.NoAudio) {
+        expect(screen.getByTestId('refinement-badge').getAttribute('title')).toBe(
+          'The audio was removed to free space, so it cannot be refined',
+        )
+      }
+      expect(screen.queryByTestId('retry-refinement-btn')).toBeNull()
+      unmount()
+    }
+  })
+
+  it('styles the audio-removed marker', () => {
+    expect(sessionCardSource).toMatch(/\.status-badge\.audio-removed\b/)
+  })
+
+  it('gives every refinement status its own badge style', () => {
+    for (const status of Object.values(RefinementStatus)) {
+      expect(sessionCardSource, `no badge style for refinement status "${status}"`).toMatch(
+        new RegExp(`\\.status-badge\\.${status}\\b`),
+      )
+    }
   })
 })

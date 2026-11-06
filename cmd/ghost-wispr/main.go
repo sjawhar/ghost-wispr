@@ -233,6 +233,12 @@ func retryMicStartup(
 		if onRetry != nil {
 			onRetry()
 		}
+		// Shutdown can be ready together with the tick (select picks either) or
+		// land just after it: start re-initializes PortAudio and starts a device,
+		// so it must not run once shutdown has begun.
+		if ctx.Err() != nil {
+			return
+		}
 
 		err := start()
 		if err != nil {
@@ -338,6 +344,33 @@ func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
 		return true
 	case <-timer.C:
 		return false
+	}
+}
+
+// keptRawRefreshEvery is how often the count of raw recordings kept because
+// they could not be saved is refreshed for GET /api/status.
+const keptRawRefreshEvery = time.Minute
+
+// refreshKeptRawRecordings keeps cache up to date with the raw recordings the
+// recorder keeps because they could not be saved, every interval until ctx
+// ends. GET /api/status reads the cache, so a stuck disk or a hung recording
+// write cannot hang the status. The status warns once they take more than a
+// tenth of the audio budget, which they are not counted against.
+func refreshKeptRawRecordings(ctx context.Context, recorder *audio.Recorder, budgetMB func() int, cache *atomic.Pointer[server.KeptRawRecordings], interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		count, size := recorder.KeptRawRecordings()
+		cache.Store(&server.KeptRawRecordings{
+			Count:     count,
+			Bytes:     size,
+			WarnBytes: int64(budgetMB()) * 1024 * 1024 / 10,
+		})
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -724,6 +757,9 @@ func main() {
 		return result, nil
 	}
 
+	var keptRaw atomic.Pointer[server.KeptRawRecordings]
+	go refreshKeptRawRecordings(ctx, audioRecorder, func() int { return cfgStore.Get().GCMaxAudioSizeMB }, &keptRaw, keptRawRefreshEvery)
+
 	controlHooks := &server.ControlHooks{
 		Pause:         capture.Pause,
 		Resume:        capture.Resume,
@@ -735,7 +771,13 @@ func main() {
 			hub.BroadcastStatusChanged(paused)
 		},
 		Warnings: func() []string { return warnings },
-		GetLogs:  logSink.GetLogs,
+		KeptRawRecordings: func() server.KeptRawRecordings {
+			if kept := keptRaw.Load(); kept != nil {
+				return *kept
+			}
+			return server.KeptRawRecordings{}
+		},
+		GetLogs: logSink.GetLogs,
 		RetrySync: func(ctx context.Context, sessionID string) error {
 			if syncOrchestrator == nil {
 				return fmt.Errorf("gdrive sync not configured")

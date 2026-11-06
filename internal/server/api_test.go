@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -891,6 +892,66 @@ func TestAPIStatusReportsAStalledCapture(t *testing.T) {
 	}
 	if len(resp.Warnings) != 2 || resp.Warnings[0] != "existing warning" || !strings.Contains(resp.Warnings[1], "not resumed") {
 		t.Fatalf("warnings = %q, want the existing one and a capture warning", resp.Warnings)
+	}
+}
+
+// Raw recordings kept because they could not be saved are reported in the
+// status, with a warning the UI shows once they take more than the warning
+// size, so the user recovers or deletes them by hand: nothing removes them.
+func TestAPIStatusReportsKeptRawRecordings(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		kept    KeptRawRecordings
+		warning string // "" for no warning
+	}{
+		{name: "none", kept: KeptRawRecordings{WarnBytes: 1000}},
+		{name: "under the warning size", kept: KeptRawRecordings{Count: 1, Bytes: 1000, WarnBytes: 1000}},
+		{
+			name:    "one over the warning size",
+			kept:    KeptRawRecordings{Count: 1, Bytes: 1001, WarnBytes: 1000},
+			warning: "1 recording could not be saved: its raw audio (0.0 MB) is kept in the audio directory. Recover or delete it by hand.",
+		},
+		{
+			name:    "several over the warning size",
+			kept:    KeptRawRecordings{Count: 3, Bytes: 432537600, WarnBytes: 107374182},
+			warning: "3 recordings could not be saved: their raw audio (412.5 MB) is kept in the audio directory. Recover or delete them by hand.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kept := tc.kept
+			h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+				sessionsByDate: map[string][]storage.Session{},
+				sessions:       map[string]storage.Session{},
+				segments:       map[string][]transcribe.Segment{},
+			}, &ControlHooks{
+				KeptRawRecordings: func() KeptRawRecordings { return kept },
+			}, "", nil)
+			if err != nil {
+				t.Fatalf("Handler failed: %v", err)
+			}
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+
+			var resp struct {
+				KeptRawRecordings int      `json:"kept_raw_recordings"`
+				KeptRawBytes      int64    `json:"kept_raw_bytes"`
+				Warnings          []string `json:"warnings"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode status: %v (body=%s)", err, rr.Body.String())
+			}
+			if resp.KeptRawRecordings != kept.Count || resp.KeptRawBytes != kept.Bytes {
+				t.Errorf("kept_raw_recordings=%d kept_raw_bytes=%d, want %d and %d", resp.KeptRawRecordings, resp.KeptRawBytes, kept.Count, kept.Bytes)
+			}
+			var want []string
+			if tc.warning != "" {
+				want = []string{tc.warning}
+			}
+			if !slices.Equal(resp.Warnings, want) {
+				t.Errorf("warnings = %q, want %q", resp.Warnings, want)
+			}
+		})
 	}
 }
 

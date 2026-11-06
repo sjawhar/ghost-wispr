@@ -1180,6 +1180,13 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			// Clip first: the hook may hand out a slice it keeps.
 			warnings = append(slices.Clip(warnings), "Microphone capture has not resumed: the paused session is still being saved")
 		}
+		var kept KeptRawRecordings
+		if controls.KeptRawRecordings != nil {
+			kept = controls.KeptRawRecordings()
+		}
+		if kept.Count > 0 && kept.Bytes > kept.WarnBytes {
+			warnings = append(slices.Clip(warnings), keptRawWarning(kept))
+		}
 		if warnings == nil {
 			warnings = []string{}
 		}
@@ -1197,6 +1204,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"capturing":                 capturing,
 			"capture_state":             captureState,
 			"warnings":                  warnings,
+			"kept_raw_recordings":       kept.Count,
+			"kept_raw_bytes":            kept.Bytes,
 			"active_session_id":         activeSessionID,
 			"active_session_started_at": activeSessionStartedAt,
 		})
@@ -1291,6 +1300,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		if controls.RetryRefinement == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "refinement not configured")
+			return
+		}
+
+		// Refinement transcribes the saved recording; without one it can only fail.
+		if sess, err := store.GetSession(sessionID); err == nil && sess.AudioPath == "" {
+			writeJSONError(w, http.StatusConflict, "session has no saved recording to refine")
 			return
 		}
 

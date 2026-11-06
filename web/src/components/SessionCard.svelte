@@ -245,8 +245,15 @@
             <span
               class={`status-badge ${session.refinement_status}`}
               data-testid="refinement-badge"
+              title={session.refinement_status === RefinementStatus.NoAudio
+                ? session.audio_removed_at
+                  ? 'The audio was removed to free space, so it cannot be refined'
+                  : 'No recording was saved for this session, so it cannot be refined'
+                : undefined}
             >
-              Refine: {session.refinement_status}
+              Refine: {session.refinement_status === RefinementStatus.NoAudio
+                ? 'no recording'
+                : session.refinement_status}
             </span>
             {#if session.refinement_status === RefinementStatus.Failed}
               <button
@@ -259,6 +266,16 @@
               </button>
             {/if}
           </div>
+        {/if}
+
+        {#if session.audio_removed_at}
+          <span
+            class="status-badge audio-removed"
+            data-testid="audio-removed-badge"
+            title="The audio was removed to keep the audio directory under its size limit. The transcript and summary are kept."
+          >
+            Audio removed to free space
+          </span>
         {/if}
 
         {#if session.transcript_source}
@@ -419,6 +436,15 @@
   .status-badge.info {
     background: var(--accent-soft);
     color: var(--accent);
+  }
+
+  /* Terminal, not a fault: the session has no recording to refine, or its
+     audio was removed to free space. */
+  .status-badge.no_audio,
+  .status-badge.audio-removed {
+    background: transparent;
+    border: 1px dashed var(--line-strong);
+    color: var(--muted);
   }
 
   .retry-btn {

@@ -645,6 +645,9 @@ func OpenAPISpec() map[string]any {
 						"200": map[string]any{
 							"description": "Retry triggered",
 						},
+						"409": map[string]any{
+							"description": "The session has no saved recording to refine (refinement_status no_audio)",
+						},
 					},
 				},
 			},
@@ -709,7 +712,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), and the active session",
+					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

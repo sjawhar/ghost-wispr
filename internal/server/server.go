@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,24 @@ import (
 
 var ErrDeepgramNotConfigured = errors.New("deepgram not configured")
 
+// KeptRawRecordings are the raw recordings kept in the audio directory because
+// they could not be saved, for recovery or deletion by hand.
+type KeptRawRecordings struct {
+	Count     int
+	Bytes     int64
+	WarnBytes int64 // GET /api/status warns once Bytes exceeds this
+}
+
+// keptRawWarning tells the user in GET /api/status that recordings could not
+// be saved and their raw audio is waiting in the audio directory.
+func keptRawWarning(kept KeptRawRecordings) string {
+	mb := float64(kept.Bytes) / (1024 * 1024)
+	if kept.Count == 1 {
+		return fmt.Sprintf("1 recording could not be saved: its raw audio (%.1f MB) is kept in the audio directory. Recover or delete it by hand.", mb)
+	}
+	return fmt.Sprintf("%d recordings could not be saved: their raw audio (%.1f MB) is kept in the audio directory. Recover or delete them by hand.", kept.Count, mb)
+}
+
 type ControlHooks struct {
 	Pause                   func()
 	Resume                  func()
@@ -25,6 +44,7 @@ type ControlHooks struct {
 	CaptureState            func() string
 	OnStatusChanged         func(paused bool)
 	Warnings                func() []string
+	KeptRawRecordings       func() KeptRawRecordings
 	ActiveSession           func() (string, time.Time)
 	Presets                 func() map[string]config.Preset
 	Resummarize             func(ctx context.Context, sessionID, preset string) error

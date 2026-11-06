@@ -127,6 +127,12 @@ func (s *Speaker) Play(audioData []byte, format AudioFormat) (result *PlaybackRe
 	framesPerBuffer := sampleRate / 4 // 250ms buffer
 	outputBuf := make([]int16, framesPerBuffer*channels)
 
+	// PortAudio must not be torn down while the stream is open: hold the output
+	// guard from before it opens until after it closes (deferred first, so it
+	// is released last). A teardown stops this playback and waits for it.
+	outputs.begin(s)
+	defer outputs.end(s)
+
 	stream, actualRate, err := s.openStreamWithFallback(sampleRate, channels, framesPerBuffer, outputBuf)
 	if err != nil {
 		return nil, fmt.Errorf("open output stream: %w", err)

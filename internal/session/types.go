@@ -27,7 +27,7 @@ type Store interface {
 
 type Recorder interface {
 	StartSession(sessionID string) error
-	EndSession() (string, error)
+	EndSession(sessionID string) (string, error)
 	DiscardUnsaved() string
 }
 

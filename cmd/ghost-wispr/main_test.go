@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -288,6 +291,30 @@ func TestRetryMicStartupStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// Shutdown that arrives as the retry interval ends (both are ready together, or
+// shutdown lands just after the tick) stops the retry before it starts the
+// microphone: start re-initializes PortAudio and opens and starts a device,
+// which must not happen once shutdown has begun.
+func TestRetryMicStartupDoesNotStartTheMicAfterShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := false
+	retryMicStartup(
+		ctx,
+		time.Second,
+		oneShotAfter(),
+		cancel, // shutdown begins as the retry fires
+		func() error {
+			started = true
+			return nil
+		},
+		nil,
+		nil,
+	)
+	if started {
+		t.Fatal("the microphone was started after shutdown began")
+	}
+}
+
 func TestStartMicMonitoringUsesRecorderWhenDownstreamMissing(t *testing.T) {
 	recorder := audio.NewRecorder(t.TempDir())
 	streamer := &fakeStreamer{}
@@ -337,6 +364,50 @@ func TestMicLoopRunsInTheShutdownGroup(t *testing.T) {
 	close(mic.chunks)
 	if !joinMicLoops(&loops, testWait) {
 		t.Fatal("mic loop not joined after shutdown")
+	}
+}
+
+// GET /api/status reports the raw recordings kept because they could not be
+// saved from a cache refreshed in the background, so a stuck disk or a hung
+// recording write cannot hang the status. The warning size is a tenth of the
+// audio budget.
+func TestRefreshKeptRawRecordings(t *testing.T) {
+	dir := t.TempDir()
+	keep := func(id string, size int) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, id+".pcm"), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keep("20261106100000", 3000)
+	var cache atomic.Pointer[server.KeptRawRecordings]
+	ctx, cancel := context.WithCancel(context.Background())
+	refreshed := goDone(func() {
+		refreshKeptRawRecordings(ctx, audio.NewRecorder(dir), func() int { return 10 }, &cache, 10*time.Millisecond)
+	})
+	t.Cleanup(func() {
+		cancel()
+		<-refreshed
+	})
+	waitCached := func(want server.KeptRawRecordings) {
+		t.Helper()
+		for deadline := time.Now().Add(testWait); ; time.Sleep(time.Millisecond) {
+			if got := cache.Load(); got != nil && *got == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("cached kept raw recordings = %+v, want %+v", cache.Load(), want)
+			}
+		}
+	}
+
+	waitCached(server.KeptRawRecordings{Count: 1, Bytes: 3000, WarnBytes: 10 * 1024 * 1024 / 10})
+	keep("20261106110000", 1000)
+	waitCached(server.KeptRawRecordings{Count: 2, Bytes: 4000, WarnBytes: 10 * 1024 * 1024 / 10})
+
+	cancel()
+	if !returnedWithin(refreshed, testWait) {
+		t.Fatal("refresh still running after shutdown")
 	}
 }
 

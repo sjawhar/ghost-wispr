@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 func TestGetLogs(t *testing.T) {
@@ -125,6 +127,40 @@ func TestRetryEndpoints(t *testing.T) {
 
 			if !tt.check() {
 				t.Errorf("expected %s to be called", tt.name)
+			}
+		})
+	}
+}
+
+// Retry refinement on a session with no saved recording (refinement status
+// no_audio, or audio that disk pressure removed) is refused with the reason,
+// instead of reporting a retry that can only fail.
+func TestRetryRefinementRefusesASessionWithNoRecording(t *testing.T) {
+	cases := map[string]storage.Session{
+		"no recording saved": {ID: "20261106140930", Status: storage.SessionEnded, RefinementStatus: storage.RefinementNoAudio},
+		"audio removed to free space": {ID: "20261106140930", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted,
+			AudioRemovedAt: "2026-11-07T09:30:00Z"},
+	}
+	for name := range cases {
+		sess := cases[name]
+		t.Run(name, func(t *testing.T) {
+			var called atomic.Bool
+			controls := &ControlHooks{RetryRefinement: func(context.Context, string) error {
+				called.Store(true)
+				return nil
+			}}
+			store := &apiStoreStub{sessions: map[string]storage.Session{sess.ID: sess}}
+			mux := http.NewServeMux()
+			registerAPIRoutes(mux, store, controls, nil, nil, nil)
+
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/sessions/20261106140930/retry-refinement", nil))
+			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "no saved recording") {
+				t.Fatalf("retry refinement with no recording = %d %s, want 409 saying there is no saved recording", rr.Code, rr.Body.String())
+			}
+			time.Sleep(10 * time.Millisecond)
+			if called.Load() {
+				t.Fatal("refinement retried for a session with no recording")
 			}
 		})
 	}

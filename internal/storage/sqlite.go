@@ -31,6 +31,7 @@ const (
 	RefinementRunning   = gwstatus.RefinementRunning
 	RefinementCompleted = gwstatus.RefinementCompleted
 	RefinementFailed    = gwstatus.RefinementFailed
+	RefinementNoAudio   = gwstatus.RefinementNoAudio
 
 	SessionActive    = gwstatus.SessionActive
 	SessionEnded     = gwstatus.SessionEnded
@@ -80,6 +81,7 @@ type Session struct {
 	RefinedTranscript   string     `json:"refined_transcript"`
 	RefinementStatus    string     `json:"refinement_status"`
 	AudioPath           string     `json:"audio_path"`
+	AudioRemovedAt      string     `json:"audio_removed_at"` // when disk pressure removed the audio (RFC 3339), "" if never; the session is kept
 	SyncStatus          string     `json:"sync_status"`
 	EnvoyPublishStatus  string     `json:"envoy_publish_status"`
 	SyncState           string     `json:"sync_state"`
@@ -310,10 +312,20 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'PENDING'`,
 		`ALTER TABLE sessions ADD COLUMN canonical_transcript TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN transcript_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN audio_removed_at TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
 		}
+	}
+
+	// Sessions that ended without a saved recording before no_audio existed
+	// can never be refined either: move them off pending.
+	if _, err := s.db.Exec(
+		`UPDATE sessions SET refinement_status = ? WHERE status = 'ended' AND audio_path = '' AND refinement_status = ?`,
+		RefinementNoAudio, RefinementPending,
+	); err != nil {
+		return fmt.Errorf("mark sessions without a recording no_audio: %w", err)
 	}
 
 	for _, stmt := range []string{
@@ -436,11 +448,18 @@ func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 	return nil
 }
 
+// EndSession ends a session with its saved recording. A session that ends
+// without one (it could not be saved, or none was made) can never be refined,
+// so its refinement status becomes the terminal no_audio in the same write.
 func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET ended_at = ?, status = 'ended', audio_path = ? WHERE id = ?`,
+		`UPDATE sessions SET ended_at = ?, status = 'ended', audio_path = ?,
+			refinement_status = CASE WHEN ? = '' THEN ? ELSE refinement_status END
+		 WHERE id = ?`,
 		endedAt.UTC().Format(time.RFC3339Nano),
 		audioPath,
+		audioPath,
+		RefinementNoAudio,
 		id,
 	)
 	if err != nil {
@@ -582,7 +601,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -626,7 +645,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -639,7 +658,7 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -647,7 +666,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -1010,7 +1029,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -1070,8 +1089,9 @@ func (s *SQLiteStore) RecoverStaleSessions() ([]string, error) {
 
 	for _, id := range ids {
 		_, err := s.db.Exec(
-			`UPDATE sessions SET ended_at = ?, status = 'ended' WHERE id = ? AND status = 'active'`,
-			now, id,
+			// Ended with no saved recording, so it can never be refined.
+			`UPDATE sessions SET ended_at = ?, status = 'ended', refinement_status = ? WHERE id = ? AND status = 'active'`,
+			now, RefinementNoAudio, id,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("end stale session %s: %w", id, err)
@@ -1183,7 +1203,7 @@ func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -1197,18 +1217,11 @@ func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error
 	return scanSessions(rows)
 }
 
-// GetGCEligibleSessions returns session IDs eligible for garbage collection.
-// Sessions must be ended. For normal GC, summary must be completed.
-// For disk-pressure GC (diskPressure=true), failed/pending summaries are also eligible
-// as long as the session has been synced (if syncGated) — this is the last line of defense.
-// If maxAgeDays > 0, only sessions older than that are returned.
-// If maxAgeDays == 0, all eligible sessions are returned.
-// Results are ordered oldest first (for disk-pressure GC to delete oldest).
-func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool, diskPressure bool) ([]string, error) {
-	query := `SELECT id FROM sessions WHERE status = 'ended'`
-	if !diskPressure {
-		query += ` AND summary_status = 'completed'`
-	}
+// GetGCEligibleSessions returns the sessions age-based GC deletes: ended, with
+// a completed summary, synced if syncGated, and, if maxAgeDays > 0, started
+// more than that many days ago. Results are ordered oldest first.
+func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+	query := `SELECT id FROM sessions WHERE status = 'ended' AND summary_status = 'completed'`
 	var args []any
 	if maxAgeDays > 0 {
 		cutoff := time.Now().UTC().Add(-time.Duration(maxAgeDays) * 24 * time.Hour).Format(time.RFC3339Nano)
@@ -1238,6 +1251,71 @@ func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool, disk
 		return nil, fmt.Errorf("iterate sessions: %w", err)
 	}
 	return ids, nil
+}
+
+// SessionRecording is a session's saved recording: its audio path, which may
+// name several files (a merged session).
+type SessionRecording struct {
+	ID        string
+	AudioPath string
+}
+
+// RemovableRecordings lists, oldest first, the sessions whose saved recording
+// disk pressure may remove: ended, with a recording, not being refined (the
+// refinement reads the file), and synced when syncGated. Any other sync state,
+// a failure included, keeps the recording.
+func (s *SQLiteStore) RemovableRecordings(syncGated bool) ([]SessionRecording, error) {
+	query := `SELECT id, audio_path FROM sessions
+		WHERE status = 'ended' AND audio_path != '' AND refinement_status != ?`
+	if syncGated {
+		query += ` AND sync_status = 'synced'`
+	}
+	query += ` ORDER BY started_at ASC`
+
+	rows, err := s.db.Query(query, RefinementRunning)
+	if err != nil {
+		return nil, fmt.Errorf("query removable recordings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var recordings []SessionRecording
+	for rows.Next() {
+		var rec SessionRecording
+		if err := rows.Scan(&rec.ID, &rec.AudioPath); err != nil {
+			return nil, fmt.Errorf("scan removable recording: %w", err)
+		}
+		recordings = append(recordings, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate removable recordings: %w", err)
+	}
+	return recordings, nil
+}
+
+// MarkAudioRemoved records that disk pressure removed session id's audio at
+// removedAt, keeping the session: its audio path becomes audioPath, what is
+// left of it, and the marker the UI shows is set. With no audio left, a
+// refinement that can no longer run (pending or failed) becomes no_audio.
+func (s *SQLiteStore) MarkAudioRemoved(id, audioPath string, removedAt time.Time) error {
+	res, err := s.db.Exec(
+		`UPDATE sessions SET audio_path = ?, audio_removed_at = ?,
+			refinement_status = CASE WHEN ? = '' AND refinement_status IN (?, ?) THEN ? ELSE refinement_status END
+		 WHERE id = ?`,
+		audioPath, removedAt.UTC().Format(time.RFC3339Nano),
+		audioPath, RefinementPending, RefinementFailed, RefinementNoAudio,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("mark audio removed for session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark audio removed rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("mark audio removed for session %s: %w", id, sql.ErrNoRows)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) DeleteSession(id string) error {
