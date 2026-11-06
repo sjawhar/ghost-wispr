@@ -43,7 +43,8 @@ type Recorder struct {
 	sampleRate int
 	preroll    *transcribe.RingBuf
 	// unsavedID and unsavedPath name a recording EndSession closed but could
-	// not save; the next EndSession with no session open saves it.
+	// not save; the next EndSession with no session open saves it, unless
+	// DiscardUnsaved gave up on it first.
 	unsavedID   string
 	unsavedPath string
 
@@ -174,6 +175,23 @@ func (r *Recorder) writePCM(data []byte) error {
 		return fmt.Errorf("write raw pcm bytes: %w", err)
 	}
 	return nil
+}
+
+// DiscardUnsaved gives up on a recording EndSession closed but could not save:
+// later EndSession calls no longer try to save it. Its raw audio stays on disk
+// for recovery by hand; DiscardUnsaved returns its path, or "" if it is gone.
+func (r *Recorder) DiscardUnsaved() string {
+	r.mu.Lock()
+	rawPath := r.unsavedPath
+	r.unsavedID, r.unsavedPath = "", ""
+	r.mu.Unlock()
+	if rawPath == "" {
+		return ""
+	}
+	if _, err := os.Stat(rawPath); err != nil {
+		return ""
+	}
+	return rawPath
 }
 
 // DiscardPreroll drops the audio buffered for the next session's start. A

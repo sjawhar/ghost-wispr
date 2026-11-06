@@ -64,3 +64,10 @@ func (d *Detector) SetTimeout(timeout time.Duration) {
 		d.timeout = timeout
 	}
 }
+
+// Timeout returns the silence timeout duration.
+func (d *Detector) Timeout() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.timeout
+}

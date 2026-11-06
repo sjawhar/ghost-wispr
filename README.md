@@ -120,7 +120,7 @@ PI_HOST=pi@raspberrypi ./deploy.sh
 | `GET` | `/api/sessions/{id}` | Get session details with transcript segments |
 | `GET` | `/api/sessions/{id}/audio` | Stream session audio (supports range requests) |
 | `POST` | `/api/pause` | Pause capture: microphone stopped, active session ended, nothing recorded or sent to Deepgram until resume |
-| `POST` | `/api/resume` | Resume capture. Returns at once; audio flows again once the paused session is saved and the microphone restarts |
+| `POST` | `/api/resume` | Resume capture. Returns at once; audio flows again once the paused session has ended (with its recording, or without it if five attempts to save it failed) and the microphone restarts |
 | `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `resuming`, `stalled`, `mic_unavailable` or `capturing`; `stalled` when a resume has not brought the microphone back within 30 s, also reported as a warning and by `/healthz/ready`), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |
 

@@ -744,7 +744,7 @@ func TestSleepUnlessPausedEndsWhenTheGateCloses(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	slept := make(chan struct{})
 	go func() {
-		capture.sleepUnlessPaused(time.Hour)
+		capture.sleepUnlessPaused(context.Background(), time.Hour)
 		close(slept)
 	}()
 	select {
@@ -759,7 +759,68 @@ func TestSleepUnlessPausedEndsWhenTheGateCloses(t *testing.T) {
 	case <-time.After(testWait):
 		t.Fatal("sleep did not end when the gate closed")
 	}
-	returnsAtOnce(t, "a sleep with the gate already closed", func() { capture.sleepUnlessPaused(time.Hour) })
+	returnsAtOnce(t, "a sleep with the gate already closed", func() { capture.sleepUnlessPaused(context.Background(), time.Hour) })
+}
+
+// The mic loop's backoff and overflow waits end at shutdown, so the loop ends
+// before shutdown stops the device and terminates PortAudio.
+func TestSleepUnlessPausedEndsAtShutdown(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	slept := goDone(func() { capture.sleepUnlessPaused(ctx, time.Hour) })
+	if returnedWithin(slept, 50*time.Millisecond) {
+		t.Fatal("sleep ended with the gate open and no shutdown")
+	}
+	cancel()
+	if !returnedWithin(slept, testWait) {
+		t.Fatal("sleep did not end at shutdown")
+	}
+}
+
+// At shutdown a streaming mic loop ends at the device's next buffer, which
+// goes nowhere. Shutdown waits for the loop before it stops the device and
+// terminates PortAudio: doing either under a read in progress crashes inside
+// PortAudio.
+func TestMicLoopEndsAtShutdownWhileStreaming(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	mic := newScriptedMic()
+	recorded := &lockedBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	ended := goDone(func() {
+		streamMicWithRetry(ctx, capture, mic, recorded, func(time.Duration) {}, func(string, ...any) {}, nil)
+	})
+	t.Cleanup(func() {
+		cancel()
+		close(mic.chunks)
+		<-ended
+	})
+	mic.expectEvents(t, "stream")
+	mic.capture(t, make([]byte, 100))
+
+	cancel()
+	mic.capture(t, make([]byte, 100))
+	if !returnedWithin(ended, testWait) {
+		t.Fatal("mic loop still streaming after shutdown")
+	}
+	if got := recorded.Len(); got != 100 {
+		t.Fatalf("recorded %d bytes, want only the 100 captured before shutdown", got)
+	}
+}
+
+// joinMicLoops waits for the mic loops, but not for good: a loop stuck in a
+// read (a device that stopped delivering audio) is reported, so shutdown
+// leaves the device and PortAudio to the process exit.
+func TestJoinMicLoopsReportsALoopStillRunning(t *testing.T) {
+	var loops sync.WaitGroup
+	release := make(chan struct{})
+	loops.Go(func() { <-release })
+	if joinMicLoops(&loops, 50*time.Millisecond) {
+		t.Fatal("joined a mic loop that is still running")
+	}
+	close(release)
+	if !joinMicLoops(&loops, testWait) {
+		t.Fatal("mic loops not joined after they ended")
+	}
 }
 
 type fakeMicState bool
@@ -823,6 +884,7 @@ type fakeSessions struct {
 	mu        sync.Mutex
 	active    string
 	finalized chan struct{}
+	endErr    error // when set, every ForceEndSession fails with it
 }
 
 func (f *fakeSessions) PauseCapture()         { f.log.add("pause-capture") }
@@ -854,6 +916,9 @@ func (f *fakeSessions) ForceEndSession(context.Context) error {
 	f.log.add("end-session")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.endErr != nil {
+		return f.endErr
+	}
 	if f.active == "" {
 		return session.ErrNoActiveSession
 	}
@@ -887,7 +952,7 @@ func TestPauseEndsSessionAfterDeepgramsLastWords(t *testing.T) {
 	log := newCallLog()
 	sessions := &fakeSessions{log: log, active: "s1"}
 	dg := &fakeDeepgram{log: log, onReply: sessions.finalizeReply}
-	capture := newSessionCaptureGate(sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, time.Hour, testEndRetry, nopLogf)
+	capture := newSessionCaptureGate(context.Background(), sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, time.Hour, testEndRetry, nopLogf)
 
 	capture.Pause()
 	if got := log.get(); len(got) == 0 || got[0] != "pause-capture" {
@@ -905,7 +970,7 @@ func TestPauseEndsSessionWhenDeepgramDoesNotReply(t *testing.T) {
 	log := newCallLog()
 	sessions := &fakeSessions{log: log, active: "s1"}
 	dg := &fakeDeepgram{log: log}
-	capture := newSessionCaptureGate(sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, 20*time.Millisecond, testEndRetry, nopLogf)
+	capture := newSessionCaptureGate(context.Background(), sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, 20*time.Millisecond, testEndRetry, nopLogf)
 
 	capture.Pause()
 	log.waitFor(t, "end-session")
@@ -916,7 +981,7 @@ func TestPauseEndsSessionWhenDeepgramDoesNotReply(t *testing.T) {
 func TestPauseWithoutDeepgramEndsSessionAtOnce(t *testing.T) {
 	log := newCallLog()
 	sessions := &fakeSessions{log: log, active: "s1"}
-	capture := newSessionCaptureGate(sessions, fakePreroll{log}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+	capture := newSessionCaptureGate(context.Background(), sessions, fakePreroll{log}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
 
 	capture.Pause()
 	log.waitFor(t, "end-session")
@@ -931,7 +996,7 @@ func TestPauseWithNoSessionStillFinalizesDeepgram(t *testing.T) {
 	log := newCallLog()
 	sessions := &fakeSessions{log: log}
 	dg := &fakeDeepgram{log: log}
-	capture := newSessionCaptureGate(sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, time.Hour, testEndRetry, nopLogf)
+	capture := newSessionCaptureGate(context.Background(), sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, time.Hour, testEndRetry, nopLogf)
 
 	capture.Pause()
 	log.waitFor(t, "end-session")
@@ -952,7 +1017,7 @@ func TestResumeDropsPrerollAndAllowsSessionsBeforeAudioFlows(t *testing.T) {
 		closedAtDiscard.Store(capture.isClosed())
 		log.add("discard-preroll")
 	})
-	capture = newSessionCaptureGate(sessions, preroll, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+	capture = newSessionCaptureGate(context.Background(), sessions, preroll, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
 
 	capture.Pause()
 	capture.Resume()
@@ -972,7 +1037,7 @@ func TestResumeWaitsForDeepgramFinalizeCall(t *testing.T) {
 	sessions := &fakeSessions{log: log}
 	release := make(chan struct{})
 	dg := &fakeDeepgram{log: log, onReply: func() { <-release }}
-	capture := newSessionCaptureGate(sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, time.Hour, testEndRetry, nopLogf)
+	capture := newSessionCaptureGate(context.Background(), sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, time.Hour, testEndRetry, nopLogf)
 
 	capture.Pause()
 	returnsAtOnce(t, "Resume", capture.Resume)
@@ -991,7 +1056,7 @@ func TestWedgedDeepgramFinalizeDoesNotKeepTheMicOff(t *testing.T) {
 	wedged := make(chan struct{})
 	t.Cleanup(func() { close(wedged) })
 	dg := &fakeDeepgram{log: log, onReply: func() { <-wedged }}
-	capture := newSessionCaptureGate(sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, 20*time.Millisecond, testEndRetry, nopLogf)
+	capture := newSessionCaptureGate(context.Background(), sessions, fakePreroll{log}, func() deepgramFinalizer { return dg }, 20*time.Millisecond, testEndRetry, nopLogf)
 
 	capture.Pause()
 	capture.Resume()
@@ -1143,7 +1208,7 @@ func expectOnlySessionEnded(t *testing.T, store *storage.SQLiteStore, manager *s
 // no other session opens.
 func TestPauseShutsTheGateWhileASessionStartWaits(t *testing.T) {
 	store, manager := storeSessions(t)
-	capture := newSessionCaptureGate(manager, fakePreroll{newCallLog()}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+	capture := newSessionCaptureGate(context.Background(), manager, fakePreroll{newCallLog()}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
 	recorded := &lockedBuffer{}
 	mic := capture.Writer(recorded)
 
@@ -1192,7 +1257,7 @@ func TestStuckDatabaseKeepsTheGateClosedAndReportsStalled(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store, manager := storeSessions(t)
-			capture := newSessionCaptureGate(manager, fakePreroll{newCallLog()}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+			capture := newSessionCaptureGate(context.Background(), manager, fakePreroll{newCallLog()}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
 			capture.stallAfter = 50 * time.Millisecond
 
 			var id string
@@ -1317,7 +1382,10 @@ func TestFailedSessionEndKeepsTheGateClosedUntilItSucceeds(t *testing.T) {
 			audioDir := t.TempDir()
 			recorder := audio.NewRecorder(audioDir)
 			manager := session.NewManager(store, recorder, nil, nil, session.NewDetector(time.Hour), 0)
-			capture := newSessionCaptureGate(manager, recorder, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+			// Retries 50 ms apart, then 100, 200 and 400 ms: the failure clears
+			// (about 100 ms in) well before the fifth attempt, after which the
+			// recorder's failures give the recording up.
+			capture := newSessionCaptureGate(context.Background(), manager, recorder, func() deepgramFinalizer { return nil }, time.Hour, 50*time.Millisecond, nopLogf)
 			capture.stallAfter = 50 * time.Millisecond
 			mic := capture.Writer(recorder.Writer(io.Discard))
 
@@ -1360,6 +1428,87 @@ func TestFailedSessionEndKeepsTheGateClosedUntilItSucceeds(t *testing.T) {
 				t.Errorf("pre-pause session %s recording: %v", before, err)
 			}
 		})
+	}
+}
+
+// A recording that can never be saved does not keep the microphone off for
+// good. After the recorder has failed to save it five times, the pause ends
+// the session without it, leaving the raw audio on disk for recovery by hand,
+// and the gate opens onto no session: speech after the resume starts a new
+// one, never the session from before the pause.
+func TestPauseEndsASessionWhoseRecordingCannotBeSaved(t *testing.T) {
+	db, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	audioDir := t.TempDir()
+	recorder := audio.NewRecorder(audioDir)
+	manager := session.NewManager(db, recorder, nil, nil, session.NewDetector(time.Hour), 0)
+	capture := newSessionCaptureGate(context.Background(), manager, recorder, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+	mic := capture.Writer(recorder.Writer(io.Discard))
+
+	before, err := manager.ManualStartSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if _, err := mic.Write(make([]byte, 3200)); err != nil {
+		t.Fatalf("record audio: %v", err)
+	}
+	blockRecordingFiles(t, audioDir, before) // for good
+
+	capture.Pause()
+	capture.Resume()
+	waitOpen(t, capture)
+
+	got, err := db.GetSession(before)
+	if err != nil {
+		t.Fatalf("read session %s: %v", before, err)
+	}
+	if got.Status != "ended" || got.AudioPath != "" {
+		t.Errorf("pre-pause session %s is %q with recording %q, want ended with none", before, got.Status, got.AudioPath)
+	}
+	if size := fileSize(t, filepath.Join(audioDir, before+".pcm")); size != 3200 {
+		t.Errorf("raw recording kept for recovery has %d bytes, want the 3200 recorded", size)
+	}
+	if err := manager.Message(speechFinal(t, "said after the resume")); err != nil {
+		t.Fatalf("Message after the resume: %v", err)
+	}
+	if after, _ := manager.ActiveSession(); after == "" || after == before {
+		t.Errorf("speech from after the resume went to session %q, want a new session, not the pre-pause session %s", after, before)
+	}
+}
+
+// At shutdown a pause stops retrying a session end that keeps failing,
+// instead of calling a closed database until the process exits.
+func TestPauseStopsRetryingTheSessionEndAtShutdown(t *testing.T) {
+	log := newCallLog()
+	sessions := &fakeSessions{log: log, active: "s1", endErr: errors.New("sql: database is closed")}
+	ctx, cancel := context.WithCancel(context.Background())
+	capture := newSessionCaptureGate(ctx, sessions, fakePreroll{log}, func() deepgramFinalizer { return nil }, time.Hour, testEndRetry, nopLogf)
+
+	capture.Pause()
+	ends := func() int {
+		return len(slices.DeleteFunc(log.get(), func(call string) bool { return call != "end-session" }))
+	}
+	for deadline := time.Now().Add(testWait); ends() < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the failed session end was not retried")
+		}
+	}
+	cancel()
+	capture.mu.Lock()
+	settled := capture.settled
+	capture.mu.Unlock()
+	select {
+	case <-settled:
+	case <-time.After(testWait):
+		t.Fatal("pause still retrying the session end after shutdown")
+	}
+	n := ends()
+	time.Sleep(100 * time.Millisecond)
+	if got := ends(); got != n {
+		t.Fatalf("session end tried %d more times after the pause stopped at shutdown", got-n)
 	}
 }
 

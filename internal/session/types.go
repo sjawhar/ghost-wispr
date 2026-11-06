@@ -28,6 +28,7 @@ type Store interface {
 type Recorder interface {
 	StartSession(sessionID string) error
 	EndSession() (string, error)
+	DiscardUnsaved() string
 }
 
 type Summarizer interface {
