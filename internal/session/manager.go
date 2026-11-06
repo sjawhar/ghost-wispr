@@ -51,11 +51,18 @@ type Manager struct {
 // sessionEnd is how far an end of a session got. An end that fails leaves it
 // behind, so retrying the end finishes it with the same end time and recording.
 type sessionEnd struct {
-	sessionID string
-	endedAt   time.Time // when the session's recording ended
-	audioPath string    // the saved recording, once saved
-	saved     bool      // the recorder has saved the recording
+	sessionID    string
+	endedAt      time.Time // when the session's recording ended
+	audioPath    string    // the saved recording, once saved
+	saved        bool      // the recorder has saved the recording, or the end gave it up
+	saveFailures int       // attempts to save the recording that failed
 }
+
+// maxRecordingSaveAttempts is how many times ending a session tries to save
+// its recording. One that still cannot be saved (its raw file was deleted, or
+// the card stays full) is given up and the session ends without it, so a
+// capture pause waiting for the end does not keep the microphone off for good.
+const maxRecordingSaveAttempts = 5
 
 func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int, logger ...*slog.Logger) *Manager {
 	if detector == nil {
@@ -243,7 +250,7 @@ func (m *Manager) ForceEndSession(ctx context.Context) error {
 		// Log flush failure but don't block session end.
 		m.logger.Warn("flush buffer failed", "error", err)
 	}
-	return m.endCurrentSessionAndRestore(ctx)
+	return m.endCurrentSession(ctx)
 }
 
 // newSessionIDLocked returns the ID of a session starting at now: its start
@@ -358,7 +365,15 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	if !end.saved && m.recorder != nil {
 		path, err := m.recorder.EndSession()
 		if err != nil {
-			return fmt.Errorf("end audio recorder session: %w", err)
+			end.saveFailures++
+			if end.saveFailures < maxRecordingSaveAttempts {
+				return fmt.Errorf("end audio recorder session: %w", err)
+			}
+			if rawPath := m.recorder.DiscardUnsaved(); rawPath != "" {
+				m.logger.Error("recording could not be saved; ending the session without it and keeping its raw audio for recovery by hand", "operation", "end_session", "session_id", sessionID, "attempts", end.saveFailures, "raw_audio", rawPath, "error", err)
+			} else {
+				m.logger.Error("recording could not be saved and its raw audio is gone; ending the session without it", "operation", "end_session", "session_id", sessionID, "attempts", end.saveFailures, "error", err)
+			}
 		}
 		end.audioPath, end.saved = path, true
 	}
@@ -371,6 +386,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	m.currentSessionID = ""
 	m.currentStartedAt = time.Time{}
 	m.failedEnd = sessionEnd{}
+	m.endManualLocked()
 	m.endingSession = false
 	m.endsDone.Broadcast()
 	ended = true
@@ -751,6 +767,13 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	m.currentSessionID = sessionID
 	m.currentStartedAt = now
 	m.manualSession = true
+	// Manual sessions use a 5-minute silence timeout instead of the default,
+	// set in the same hold that claims the session, so no end of an earlier
+	// session can restore over it.
+	if m.detector != nil {
+		m.prevTimeout = m.detector.Timeout()
+		m.detector.SetTimeout(5 * time.Minute)
+	}
 	m.sessionStarts++
 	m.mu.Unlock()
 	defer m.finishSessionStart()
@@ -759,7 +782,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 		m.mu.Lock()
 		m.currentSessionID = ""
 		m.currentStartedAt = time.Time{}
-		m.manualSession = false
+		m.endManualLocked()
 		m.mu.Unlock()
 		return "", fmt.Errorf("create session: %w", err)
 	}
@@ -776,22 +799,11 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 			m.mu.Lock()
 			m.currentSessionID = ""
 			m.currentStartedAt = time.Time{}
-			m.manualSession = false
+			m.endManualLocked()
 			m.mu.Unlock()
 			_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
 			return "", fmt.Errorf("start audio recorder session: %w", err)
 		}
-	}
-
-	// Extend silence timeout for manual sessions (5 min vs default 30s).
-	m.mu.Lock()
-	detector := m.detector
-	m.mu.Unlock()
-	if detector != nil {
-		m.mu.Lock()
-		m.prevTimeout = detector.timeout
-		m.mu.Unlock()
-		detector.SetTimeout(5 * time.Minute)
 	}
 
 	if m.hub != nil {
@@ -812,32 +824,21 @@ func (m *Manager) StopSession(ctx context.Context, sessionID string) error {
 	}
 	m.mu.Unlock()
 
-	return m.endCurrentSessionAndRestore(ctx)
+	return m.endCurrentSession(ctx)
 }
 
-// endCurrentSessionAndRestore ends the current session and restores the
-// silence timeout if it was changed for a manual session.
-func (m *Manager) endCurrentSessionAndRestore(ctx context.Context) error {
-	m.mu.Lock()
-	wasManual := m.manualSession
-	prevTimeout := m.prevTimeout
-	m.mu.Unlock()
-
-	err := m.endCurrentSession(ctx)
-
-	// Restore previous silence timeout if this was a manual session.
-	if wasManual && prevTimeout > 0 {
-		m.mu.Lock()
-		detector := m.detector
-		m.manualSession = false
-		m.prevTimeout = 0
-		m.mu.Unlock()
-		if detector != nil {
-			detector.SetTimeout(prevTimeout)
-		}
+// endManualLocked ends a manual session's longer silence timeout, restoring
+// the one it replaced. It runs with m.mu held, in the same hold that ends the
+// session or undoes its start, so a manual session started right after keeps
+// its own timeout, and a session whose end failed (still current) keeps its
+// timeout. It takes the detector's lock inside m.mu; the detector never takes
+// m.mu.
+func (m *Manager) endManualLocked() {
+	if m.manualSession && m.prevTimeout > 0 && m.detector != nil {
+		m.detector.SetTimeout(m.prevTimeout)
 	}
-
-	return err
+	m.manualSession = false
+	m.prevTimeout = 0
 }
 
 // PauseCapture stops new sessions from starting until ResumeCapture. It only

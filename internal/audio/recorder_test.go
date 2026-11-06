@@ -274,3 +274,57 @@ func TestRecorderEndSessionRetriesARecordingItCouldNotSave(t *testing.T) {
 		t.Fatalf("EndSession with nothing left to save = (%q, %v), want nothing", path, err)
 	}
 }
+
+// When the session end gives up on a recording it cannot save, the recorder
+// stops retrying it and leaves its raw audio on disk for recovery by hand,
+// reporting where; with the raw file already gone, it reports none.
+func TestRecorderDiscardUnsavedKeepsTheRawAudio(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		rawRemoved bool
+	}{
+		{name: "raw audio on disk"},
+		{name: "raw audio deleted", rawRemoved: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			recorder := NewRecorder(dir)
+			encodes := 0
+			recorder.encode = func(string, string) (string, error) {
+				encodes++
+				return "", errors.New("no space left on device")
+			}
+			if err := recorder.StartSession("meeting"); err != nil {
+				t.Fatalf("StartSession failed: %v", err)
+			}
+			if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write([]byte{1, 2, 3, 4}); err != nil {
+				t.Fatalf("Write failed: %v", err)
+			}
+			if _, err := recorder.EndSession(); err == nil {
+				t.Fatal("EndSession saved a recording no encoder could write")
+			}
+			rawPath := filepath.Join(dir, "meeting.pcm")
+			if tc.rawRemoved {
+				if err := os.Remove(rawPath); err != nil {
+					t.Fatalf("remove raw audio: %v", err)
+				}
+			}
+
+			want := rawPath
+			if tc.rawRemoved {
+				want = ""
+			}
+			if got := recorder.DiscardUnsaved(); got != want {
+				t.Fatalf("DiscardUnsaved = %q, want %q", got, want)
+			}
+			if path, err := recorder.EndSession(); path != "" || err != nil || encodes != 1 {
+				t.Fatalf("EndSession after giving up = (%q, %v) after %d encodes, want nothing and no retry", path, err, encodes)
+			}
+			if !tc.rawRemoved {
+				if data, err := os.ReadFile(rawPath); err != nil || !bytes.Equal(data, []byte{1, 2, 3, 4}) {
+					t.Fatalf("raw audio after giving up = %v (%v), want it kept", data, err)
+				}
+			}
+		})
+	}
+}

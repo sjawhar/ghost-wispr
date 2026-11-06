@@ -1,9 +1,12 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,6 +184,11 @@ type recorderMock struct {
 	ended   int
 
 	startErr error
+	// endErr, when set, fails every EndSession; unsavedPath is the raw file
+	// DiscardUnsaved then reports, and discards counts its calls.
+	endErr      error
+	unsavedPath string
+	discards    int
 	// startHook and endHook, when set, run first in StartSession and
 	// EndSession, outside the mock's lock, so a test can hold a call open.
 	startHook func()
@@ -207,10 +215,20 @@ func (r *recorderMock) EndSession() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ended++
+	if r.endErr != nil {
+		return "", r.endErr
+	}
 	if len(r.started) == 0 {
 		return "", nil
 	}
 	return "data/audio/" + r.started[len(r.started)-1] + ".mp3", nil
+}
+
+func (r *recorderMock) DiscardUnsaved() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.discards++
+	return r.unsavedPath
 }
 
 func (r *recorderMock) counts() (started, ended int) {
@@ -327,6 +345,9 @@ type hubMock struct {
 	latestPreset      string
 	interimCount      int
 	componentStatuses []componentStatusEvent
+	// endedHook, when set, runs first in BroadcastSessionEnded, outside the
+	// mock's lock: after the session has ended, before the end returns.
+	endedHook func(sessionID string)
 }
 
 func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
@@ -349,6 +370,9 @@ func (h *hubMock) BroadcastSessionStarted(sessionID string) {
 }
 
 func (h *hubMock) BroadcastSessionEnded(sessionID string, _ time.Duration) {
+	if h.endedHook != nil {
+		h.endedHook(sessionID)
+	}
 	h.mu.Lock()
 	h.endedCount++
 	h.latestSession = sessionID
@@ -580,6 +604,165 @@ func TestManager_RetriedEndKeepsTheRecordingAFailedEndSaved(t *testing.T) {
 	defer store.mu.Unlock()
 	if got, want := store.audio[id], "data/audio/"+id+".mp3"; got != want {
 		t.Errorf("session ended with recording %q, want %q", got, want)
+	}
+}
+
+// A recording that can never be saved (every save fails, as when its raw file
+// was deleted) does not keep the session current for good: the end that fails
+// to save it for the fifth time ends the session without it, tells the
+// recorder to stop retrying it, and logs where its raw audio was left.
+func TestManager_EndGivesUpOnARecordingThatCannotBeSaved(t *testing.T) {
+	store := newStoreMock()
+	recorder := &recorderMock{endErr: errors.New("encode wav fallback: no space left on device"), unsavedPath: "data/audio/raw.pcm"}
+	var logs bytes.Buffer
+	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour), 0, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted failed: %v", err)
+	}
+	id := manager.currentSession()
+
+	for attempt := 1; attempt < 5; attempt++ {
+		if err := manager.ForceEndSession(context.Background()); err == nil {
+			t.Fatalf("end %d succeeded with the recording unsaved", attempt)
+		}
+	}
+	if err := manager.ForceEndSession(context.Background()); err != nil {
+		t.Fatalf("end 5 failed: %v; want the session ended without its recording", err)
+	}
+	if got := manager.currentSession(); got != "" {
+		t.Fatalf("session %s still current after the recorder gave up", got)
+	}
+	store.mu.Lock()
+	status, audioPath := store.status[id], store.audio[id]
+	store.mu.Unlock()
+	if status != "ended" || audioPath != "" {
+		t.Errorf("session %s is %q with recording %q, want ended with none", id, status, audioPath)
+	}
+	recorder.mu.Lock()
+	discards := recorder.discards
+	recorder.mu.Unlock()
+	if discards != 1 {
+		t.Errorf("recorder told to give up the recording %d times, want once", discards)
+	}
+	if !strings.Contains(logs.String(), "data/audio/raw.pcm") || !strings.Contains(logs.String(), id) {
+		t.Errorf("log does not say where session %s's raw audio is: %s", id, logs.String())
+	}
+}
+
+// Pressing Record while a Stop of a manual session is still restoring the
+// silence timeout reads the detector's timeout under its own lock, so the
+// two presses do not race (this test fails under go test -race otherwise).
+func TestManager_ManualStartWhileAStopRestoresTheSilenceTimeout(t *testing.T) {
+	manager := NewManager(newStoreMock(), &recorderMock{}, nil, &hubMock{}, NewDetector(time.Hour), 0)
+	ctx := context.Background()
+	id, err := manager.ManualStartSession(ctx, "")
+	if err != nil {
+		t.Fatalf("ManualStartSession failed: %v", err)
+	}
+	for range 100 {
+		stopped := make(chan error, 1)
+		go func(id string) { stopped <- manager.StopSession(ctx, id) }(id)
+		for {
+			if id, err = manager.ManualStartSession(ctx, ""); err == nil {
+				break
+			}
+			if !errors.Is(err, ErrSessionAlreadyActive) {
+				t.Fatalf("ManualStartSession failed: %v", err)
+			}
+			runtime.Gosched()
+		}
+		if err := <-stopped; err != nil {
+			t.Fatalf("StopSession failed: %v", err)
+		}
+	}
+}
+
+// Record pressed while a manual session's Stop is finishing (the session has
+// ended, the Stop has not returned) starts a manual session that keeps its own
+// 5-minute silence timeout: the earlier Stop must not reset the detector or
+// clear what the new session needs to restore. The new session's own Stop then
+// restores the default.
+func TestManager_RecordDuringAStopKeepsTheNewManualTimeout(t *testing.T) {
+	detector := NewDetector(30 * time.Second)
+	hub := &hubMock{}
+	manager := NewManager(newStoreMock(), &recorderMock{}, nil, hub, detector, 0)
+	ctx := context.Background()
+	first, err := manager.ManualStartSession(ctx, "")
+	if err != nil {
+		t.Fatalf("ManualStartSession failed: %v", err)
+	}
+
+	var second string
+	var secondErr error
+	var once sync.Once
+	hub.endedHook = func(string) {
+		once.Do(func() { second, secondErr = manager.ManualStartSession(ctx, "") })
+	}
+	if err := manager.StopSession(ctx, first); err != nil {
+		t.Fatalf("StopSession(%s) failed: %v", first, err)
+	}
+	if secondErr != nil {
+		t.Fatalf("Record pressed after the first session ended: %v", secondErr)
+	}
+	if got := detector.Timeout(); got != 5*time.Minute {
+		t.Errorf("silence timeout during the second manual session = %v, want 5m", got)
+	}
+
+	if err := manager.StopSession(ctx, second); err != nil {
+		t.Fatalf("StopSession(%s) failed: %v", second, err)
+	}
+	if got := detector.Timeout(); got != 30*time.Second {
+		t.Errorf("silence timeout after the second manual session = %v, want the default 30s", got)
+	}
+}
+
+// A Stop of a manual session that fails leaves the session current, so it
+// keeps its 5-minute silence timeout until an end of it succeeds.
+func TestManager_FailedStopKeepsTheManualTimeout(t *testing.T) {
+	detector := NewDetector(30 * time.Second)
+	store := newStoreMock()
+	manager := NewManager(store, &recorderMock{}, nil, &hubMock{}, detector, 0)
+	ctx := context.Background()
+	id, err := manager.ManualStartSession(ctx, "")
+	if err != nil {
+		t.Fatalf("ManualStartSession failed: %v", err)
+	}
+
+	store.mu.Lock()
+	store.endSessionErr = errors.New("disk I/O error")
+	store.mu.Unlock()
+	if err := manager.StopSession(ctx, id); err == nil {
+		t.Fatal("StopSession succeeded while the database refused the end")
+	}
+	if got := detector.Timeout(); got != 5*time.Minute {
+		t.Errorf("silence timeout after a failed Stop, with the session still current = %v, want 5m", got)
+	}
+
+	store.mu.Lock()
+	store.endSessionErr = nil
+	store.mu.Unlock()
+	if err := manager.StopSession(ctx, id); err != nil {
+		t.Fatalf("retried StopSession failed: %v", err)
+	}
+	if got := detector.Timeout(); got != 30*time.Second {
+		t.Errorf("silence timeout after the manual session ended = %v, want the default 30s", got)
+	}
+}
+
+// A manual session the silence timer ends gets the default timeout back too,
+// as one ended by Stop does.
+func TestManager_SilenceEndOfAManualSessionRestoresTheTimeout(t *testing.T) {
+	detector := NewDetector(30 * time.Second)
+	manager := NewManager(newStoreMock(), &recorderMock{}, nil, &hubMock{}, detector, 0)
+	if _, err := manager.ManualStartSession(context.Background(), ""); err != nil {
+		t.Fatalf("ManualStartSession failed: %v", err)
+	}
+	// What the silence timer calls.
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("endCurrentSession failed: %v", err)
+	}
+	if got := detector.Timeout(); got != 30*time.Second {
+		t.Errorf("silence timeout after the silence timer ended a manual session = %v, want the default 30s", got)
 	}
 }
 
