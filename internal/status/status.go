@@ -30,6 +30,9 @@ const (
 	RefinementRunning   = "running"
 	RefinementCompleted = "completed"
 	RefinementFailed    = "failed"
+	// RefinementNoAudio: the session ended without a saved recording, so it
+	// can never be refined. Terminal.
+	RefinementNoAudio = "no_audio"
 
 	TranscriptSourceStreaming = "streaming"
 	TranscriptSourceRefined   = "refined"

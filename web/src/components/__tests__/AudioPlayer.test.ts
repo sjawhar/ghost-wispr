@@ -201,4 +201,42 @@ describe('AudioPlayer', () => {
       'Canonical refined output.',
     )
   })
+
+  it('says no recording was saved instead of loading audio or showing refinement', () => {
+    render(AudioPlayer, {
+      sessionId: 's1',
+      segments: [],
+      session: makeSession({ audio_path: '', refinement_status: RefinementStatus.NoAudio }),
+    })
+
+    expect(
+      screen.getByText(
+        'No recording was saved for this session, so it cannot be played or refined.',
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Play Audio' })).toBeNull()
+    expect(screen.queryByText('Loading audio...')).toBeNull()
+    expect(screen.queryByTestId('refining-indicator')).toBeNull()
+  })
+
+  it('says the audio was removed to free space instead of loading it, and keeps the transcript', () => {
+    render(AudioPlayer, {
+      sessionId: 's1',
+      segments: [],
+      session: makeSession({
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.Completed,
+        refined_transcript: 'The refined words.',
+        transcript_source: 'refined',
+      }),
+    })
+
+    expect(
+      screen.getByText('The audio was removed to free space. The transcript and summary are kept.'),
+    ).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Play Audio' })).toBeNull()
+    expect(screen.queryByText('Loading audio...')).toBeNull()
+    expect(screen.getByTestId('transcript-refined').textContent).toContain('The refined words.')
+  })
 })

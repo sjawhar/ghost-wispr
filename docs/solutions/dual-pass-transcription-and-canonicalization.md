@@ -80,3 +80,5 @@ FTS5 indexes `canonical_transcript`, not segments. Triggers keep it in sync. Whe
 3. **30-second timeout is hardcoded**: The wait for batch refinement before summarizing is 30 seconds. For very long recordings (>1 hour), batch refinement may take longer. The summarizer will use the streaming transcript, and re-canonicalization will happen later when batch completes.
 
 4. **Re-canonicalization doesn't re-summarize by default**: When batch refinement completes late, `Canonicalize()` is called again, but the summary is NOT re-generated automatically. A user would need to click the retry-summary button to get a summary based on the refined transcript.
+
+5. **No recording, no refinement**: A session that ends without a saved recording (its recording could not be saved after five attempts, or the app stopped mid-session and recovered it at startup) gets `refinement_status = 'no_audio'`, a terminal status. Sessions that ended this way before the status existed are moved to it when the store opens. Summarization does not wait for refinement on it, `POST /api/sessions/{id}/retry-refinement` answers 409, and the web UI says no recording was saved.

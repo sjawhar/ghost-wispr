@@ -95,20 +95,24 @@ Sessions start as `pending`. On successful upload of all three files, marked `sy
 
 ### What gets deleted
 
-When a session qualifies for GC, both are removed in the same pass:
-- The local audio file (MP3/WAV)
+GC has two independent rules.
+
+**Age (`gc_max_age_days`, the user's retention policy):** a session older than this is deleted in one pass:
+- The local audio file (MP3/WAV), and a raw `.pcm` beside it only when the saved recording is on disk
 - The SQLite rows (session record, transcript segments, summary)
 
 This is a clean "this session lives on Drive now" model. The web UI shows empty state for GC'd dates. Restore from Drive brings everything back.
 
+**Audio budget (`gc_max_audio_size_mb`):** a budget for the audio GC may remove, not for the whole `audio_dir`. It removes audio files only, never a session, transcript or summary. The removable audio is the saved recordings of ended sessions (synced ones only, when Drive sync gates GC; a session whose sync failed, permanently or not, keeps its file; not while a refinement reads it), plus a raw `.pcm` beside a saved recording. When those files together exceed the budget, GC removes them oldest session first until they fit or none are left. A session whose audio it removed keeps its row, with its audio path cleared, `audio_removed_at` set (the UI shows "Audio removed to free space"), and a pending or failed refinement marked `no_audio`. A file whose removal frees nothing (missing, empty, or refused) is skipped and logged.
+
+Not counted against the budget, and never removed by GC: a raw `.pcm` that is the only copy of a session's audio (a recording that could not be saved, or a session the app stopped inside), the recording under way, unsynced audio when sync gates GC, and files no session names. `GET /api/status` reports the kept raw recordings (`kept_raw_recordings`, `kept_raw_bytes`, and a warning once they exceed a tenth of the budget); unsynced audio is reported by the sync status. Neither is bounded by the budget, so the card can still fill with them.
+
 ### Deletion criteria
 
-A session is eligible for GC when **both conditions are true**:
+A session is eligible for age-based GC when **both conditions are true**:
 
 1. **Sync-gated:** `sync_status = 'synced'` (confirmed backed up to Drive)
-2. **Threshold exceeded (either one):**
-   - Session is older than `gc_max_age_days` (default: 30)
-   - Total `audio_dir` disk usage exceeds `gc_max_audio_size_mb` (default: 1024). Oldest synced sessions are deleted first until under the limit.
+2. **Age:** the session is older than `gc_max_age_days` (default: 30) and its summary is complete.
 
 ### When GDrive sync is not configured
 
@@ -133,7 +137,7 @@ gdrive_sync_enabled: false          # new — master toggle for sync
 # Garbage collection
 gc_enabled: false                   # new — master toggle for GC
 gc_max_age_days: 30                 # new — delete synced sessions older than this
-gc_max_audio_size_mb: 1024          # new — delete oldest synced sessions when audio dir exceeds this
+gc_max_audio_size_mb: 1024          # new — budget for removable audio: past it, remove the oldest sessions' audio files (sessions kept)
 ```
 
 ### Web UI changes
