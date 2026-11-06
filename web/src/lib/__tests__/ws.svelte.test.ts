@@ -83,4 +83,29 @@ describe('ws manager', () => {
     expect(appState.componentStatuses.mic?.status).toBe('unavailable')
     expect(appState.componentStatuses.mic?.message).toBe('Microphone unavailable')
   })
+
+  it('tracks whether the microphone is capturing from mic status events', () => {
+    // MockSocket implements only what the ws manager calls.
+    vi.stubGlobal('WebSocket', MockSocket as unknown as typeof WebSocket)
+    const micEvent = (status: string) => ({
+      data: JSON.stringify({
+        type: 'component_status',
+        version: 1,
+        timestamp: new Date().toISOString(),
+        component: 'mic',
+        status,
+        message: '',
+      }),
+    })
+
+    connect()
+    MockSocket.instances[0].emit('message', micEvent('connected'))
+    expect(appState.capturing).toBe(true)
+    MockSocket.instances[0].emit('message', micEvent('paused'))
+    expect(appState.capturing).toBe(false)
+    MockSocket.instances[0].emit('message', micEvent('connected'))
+    expect(appState.capturing).toBe(true)
+    MockSocket.instances[0].emit('message', micEvent('error'))
+    expect(appState.capturing).toBe(false)
+  })
 })

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -17,8 +18,14 @@ type HealthChecker interface {
 	IsDeepgramConnected() bool
 	IsDBHealthy(ctx context.Context) bool
 	IsMicOpen() bool
+	MicHold() string
 	IsLLMHealthy() string
 }
+
+// readyDBPingTimeout is how long readiness waits for the database. The store
+// has one connection, so a long query holds the ping; past this the database
+// is reported as the fault instead of the check waiting with it.
+const readyDBPingTimeout = 2 * time.Second
 
 const llmStatusUnchecked = "unchecked"
 
@@ -90,7 +97,7 @@ func handleHealthzLive(w http.ResponseWriter, r *http.Request, checker HealthChe
 }
 
 // handleHealthzReady handles the /healthz/ready endpoint
-// Returns 200 only if all components are healthy (Deepgram connected, DB accessible, mic open)
+// Returns 200 only if all components are healthy (Deepgram connected, DB accessible, mic open, paused on purpose, or resuming)
 // Returns 503 with component breakdown if any component is unhealthy
 func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthChecker) {
 	logger := logging.FromContext(r.Context(), slog.Default())
@@ -105,12 +112,20 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 	}
 
 	dbStatus := storage.ComponentStatusError
-	if checker.IsDBHealthy(r.Context()) {
+	pingCtx, cancelPing := context.WithTimeout(r.Context(), readyDBPingTimeout)
+	dbHealthy := checker.IsDBHealthy(pingCtx)
+	cancelPing()
+	if dbHealthy {
 		dbStatus = storage.ComponentStatusOK
 	}
 
+	// A paused capture stops the mic on purpose, and a resume takes a moment to
+	// save the paused session first; neither is an outage. A resume that has
+	// not brought the mic back past its stall limit is.
 	micStatus := storage.ComponentStatusClosed
-	if checker.IsMicOpen() {
+	if hold := checker.MicHold(); hold != "" {
+		micStatus = hold
+	} else if checker.IsMicOpen() {
 		micStatus = storage.ComponentStatusOpen
 	}
 
@@ -124,7 +139,8 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 	}
 
 	// Determine overall health
-	allHealthy := deepgramStatus == storage.ComponentStatusConnected && dbStatus == storage.ComponentStatusOK && micStatus == storage.ComponentStatusOpen && llmStatus != storage.ComponentStatusError
+	micReady := micStatus == storage.ComponentStatusOpen || micStatus == storage.ComponentStatusPaused || micStatus == storage.ComponentStatusResuming
+	allHealthy := deepgramStatus == storage.ComponentStatusConnected && dbStatus == storage.ComponentStatusOK && micReady && llmStatus != storage.ComponentStatusError
 
 	if allHealthy {
 		w.WriteHeader(http.StatusOK)
@@ -150,6 +166,9 @@ type DefaultHealthChecker struct {
 	mic interface {
 		IsOpen() bool
 	}
+	capture interface {
+		MicHold() string
+	}
 	llmTracker interface {
 		Status() string
 	}
@@ -158,13 +177,23 @@ type DefaultHealthChecker struct {
 // NewDefaultHealthChecker creates a new DefaultHealthChecker
 func NewDefaultHealthChecker(resilientClient interface{ IsConnected() bool }, store interface {
 	Ping(ctx context.Context) error
-}, mic interface{ IsOpen() bool }, llmTracker interface{ Status() string }) *DefaultHealthChecker {
+}, mic interface{ IsOpen() bool }, capture interface{ MicHold() string }, llmTracker interface{ Status() string }) *DefaultHealthChecker {
 	return &DefaultHealthChecker{
 		resilientClient: resilientClient,
 		store:           store,
 		mic:             mic,
+		capture:         capture,
 		llmTracker:      llmTracker,
 	}
+}
+
+// MicHold reports why capture holds the mic off on purpose ("paused",
+// "resuming" or "stalled"), or "" when it does not.
+func (d *DefaultHealthChecker) MicHold() string {
+	if isNilInterfaceValue(d.capture) {
+		return ""
+	}
+	return d.capture.MicHold()
 }
 
 func isNilInterfaceValue(v any) bool {

@@ -2,6 +2,7 @@ package audio
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -20,6 +22,17 @@ const (
 	pcmBitDepth       = 16
 )
 
+// encodeTimeout is how long the MP3 encoders (ffmpeg, then lame) together may
+// take for a recording of pcmBytes at sampleRate before the recording is kept
+// as WAV instead: a minute plus a tenth of the recording's length, far slower
+// than either encoder runs. A wedged encoder then cannot hold a session end,
+// or a capture pause waiting on it, open for good.
+var encodeTimeout = func(pcmBytes int64, sampleRate int) time.Duration {
+	bytesPerSecond := int64(sampleRate * pcmChannels * pcmBitDepth / 8)
+	length := time.Duration(pcmBytes/bytesPerSecond) * time.Second
+	return time.Minute + length/10
+}
+
 type Recorder struct {
 	audioDir string
 
@@ -29,6 +42,10 @@ type Recorder struct {
 	rawFile    *os.File
 	sampleRate int
 	preroll    *transcribe.RingBuf
+	// unsavedID and unsavedPath name a recording EndSession closed but could
+	// not save; the next EndSession with no session open saves it.
+	unsavedID   string
+	unsavedPath string
 
 	encode func(rawPath, sessionID string) (string, error)
 }
@@ -95,16 +112,21 @@ func (r *Recorder) StartSession(sessionID string) error {
 	return nil
 }
 
+// EndSession closes the session's recording and saves it, returning the saved
+// file. With no session open, it saves a recording an earlier EndSession closed
+// but could not save, if there is one, so a session end that is retried keeps
+// its recording.
 func (r *Recorder) EndSession() (string, error) {
 	r.mu.Lock()
-	if r.sessionID == "" || r.rawFile == nil {
+	sessionID, rawPath, rawFile := r.sessionID, r.rawPath, r.rawFile
+	if sessionID == "" || rawFile == nil {
+		sessionID, rawPath = r.unsavedID, r.unsavedPath
 		r.mu.Unlock()
-		return "", nil
+		if sessionID == "" {
+			return "", nil
+		}
+		return r.save(sessionID, rawPath)
 	}
-
-	sessionID := r.sessionID
-	rawPath := r.rawPath
-	rawFile := r.rawFile
 
 	r.sessionID = ""
 	r.rawPath = ""
@@ -112,10 +134,25 @@ func (r *Recorder) EndSession() (string, error) {
 	r.mu.Unlock()
 
 	if err := rawFile.Close(); err != nil {
+		r.mu.Lock()
+		r.unsavedID, r.unsavedPath = sessionID, rawPath
+		r.mu.Unlock()
 		return "", fmt.Errorf("close raw pcm file: %w", err)
 	}
+	return r.save(sessionID, rawPath)
+}
 
+// save encodes the closed recording of sessionID and removes its raw file. If
+// it cannot, the recording is kept for the next EndSession to save.
+func (r *Recorder) save(sessionID, rawPath string) (string, error) {
 	audioPath, err := r.encode(rawPath, sessionID)
+	r.mu.Lock()
+	if err != nil {
+		r.unsavedID, r.unsavedPath = sessionID, rawPath
+	} else if r.unsavedID == sessionID {
+		r.unsavedID, r.unsavedPath = "", ""
+	}
+	r.mu.Unlock()
 	if err != nil {
 		return "", err
 	}
@@ -139,6 +176,15 @@ func (r *Recorder) writePCM(data []byte) error {
 	return nil
 }
 
+// DiscardPreroll drops the audio buffered for the next session's start. A
+// capture resume calls it, so a session after the pause does not open with
+// audio from before it.
+func (r *Recorder) DiscardPreroll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.preroll.Reset()
+}
+
 func (r *Recorder) defaultEncode(rawPath, sessionID string) (string, error) {
 	r.mu.Lock()
 	sampleRate := r.sampleRate
@@ -149,13 +195,21 @@ func (r *Recorder) defaultEncode(rawPath, sessionID string) (string, error) {
 
 	mp3Path := filepath.Join(r.audioDir, sessionID+".mp3")
 
-	if err := encodeWithFFmpeg(rawPath, mp3Path, sampleRate); err == nil {
+	var pcmBytes int64
+	if info, err := os.Stat(rawPath); err == nil {
+		pcmBytes = info.Size()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), encodeTimeout(pcmBytes, sampleRate))
+	defer cancel()
+
+	if err := encodeWithFFmpeg(ctx, rawPath, mp3Path, sampleRate); err == nil {
 		return mp3Path, nil
 	}
 
-	if err := encodeWithLame(rawPath, mp3Path, sampleRate); err == nil {
+	if err := encodeWithLame(ctx, rawPath, mp3Path, sampleRate); err == nil {
 		return mp3Path, nil
 	}
+	_ = os.Remove(mp3Path) // a partial file from an encoder that failed or ran out of time
 
 	wavPath := filepath.Join(r.audioDir, sessionID+".wav")
 	if err := pcmToWav(rawPath, wavPath, sampleRate); err != nil {
@@ -165,8 +219,9 @@ func (r *Recorder) defaultEncode(rawPath, sessionID string) (string, error) {
 	return wavPath, nil
 }
 
-func encodeWithFFmpeg(rawPath, outputPath string, sampleRate int) error {
-	cmd := exec.Command(
+func encodeWithFFmpeg(ctx context.Context, rawPath, outputPath string, sampleRate int) error {
+	cmd := exec.CommandContext(
+		ctx,
 		"ffmpeg",
 		"-y",
 		"-f", "s16le",
@@ -181,10 +236,11 @@ func encodeWithFFmpeg(rawPath, outputPath string, sampleRate int) error {
 	return nil
 }
 
-func encodeWithLame(rawPath, outputPath string, sampleRate int) error {
+func encodeWithLame(ctx context.Context, rawPath, outputPath string, sampleRate int) error {
 	khz := float64(sampleRate) / 1000.0
 	formatted := strconv.FormatFloat(khz, 'f', -1, 64)
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		ctx,
 		"lame",
 		"-r",
 		"-s", formatted,

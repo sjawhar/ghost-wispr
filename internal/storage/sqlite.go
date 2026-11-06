@@ -62,6 +62,9 @@ const (
 	ComponentStatusOK           = gwstatus.ComponentStatusOK
 	ComponentStatusOpen         = gwstatus.ComponentStatusOpen
 	ComponentStatusClosed       = gwstatus.ComponentStatusClosed
+	ComponentStatusPaused       = gwstatus.ComponentStatusPaused
+	ComponentStatusResuming     = gwstatus.ComponentStatusResuming
+	ComponentStatusStalled      = gwstatus.ComponentStatusStalled
 )
 
 type Session struct {

@@ -38,6 +38,23 @@ type Manager struct {
 	currentStartedAt time.Time
 	manualSession    bool
 	prevTimeout      time.Duration
+	capturePaused    bool          // no session may start while true
+	sessionStarts    int           // session starts under way
+	startsDone       *sync.Cond    // signalled (with mu) when a session start finishes
+	endingSession    bool          // an end of the current session is under way
+	endsDone         *sync.Cond    // signalled (with mu) when an end of the session finishes
+	failedEnd        sessionEnd    // how far an end of the current session that failed got
+	finalizeWaiter   chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
+	lastIDTime       time.Time     // the start second the latest session ID names
+}
+
+// sessionEnd is how far an end of a session got. An end that fails leaves it
+// behind, so retrying the end finishes it with the same end time and recording.
+type sessionEnd struct {
+	sessionID string
+	endedAt   time.Time // when the session's recording ended
+	audioPath string    // the saved recording, once saved
+	saved     bool      // the recorder has saved the recording
 }
 
 func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int, logger ...*slog.Logger) *Manager {
@@ -65,7 +82,8 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 		batchLogger:        logging.WithModule(l, "transcribe"),
 		refinementWait:     30 * time.Second,
 	}
-
+	m.startsDone = sync.NewCond(&m.mu)
+	m.endsDone = sync.NewCond(&m.mu)
 	detector.OnSessionEnd(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -76,6 +94,11 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 }
 
 func (m *Manager) Message(mr *api.MessageResponse) error {
+	if mr.FromFinalize {
+		// After the words below are buffered or saved, so a waiter ending the
+		// session on this signal saves them too.
+		defer m.finalizeReplied()
+	}
 	if len(mr.Channel.Alternatives) == 0 {
 		return nil
 	}
@@ -179,23 +202,30 @@ func (m *Manager) UtteranceEnd(_ *api.UtteranceEndResponse) error {
 }
 
 func (m *Manager) flushBuffer() error {
+	// Take the words and pick their session in one step under m.mu, which
+	// PauseCapture and ResumeCapture also hold: words taken before a pause go
+	// to the session they were spoken in, or are dropped while paused, and can
+	// never open a session after the resume.
+	m.mu.Lock()
 	words := m.buffer.Flush()
-	if len(words) == 0 {
-		return nil
-	}
-
 	segments := transcribe.GroupWordsBySpeaker(words)
 	if len(segments) == 0 {
+		m.mu.Unlock()
 		return nil
+	}
+	sessionID, err := m.claimSessionLocked(time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, ErrCapturePaused) {
+			// Late results for audio sent before the pause: no session may
+			// start while paused, so they are dropped.
+			m.logger.Info("dropped transcript received while capture is paused", "operation", "flush_buffer", "segments", len(segments))
+			return nil
+		}
+		return err
 	}
 
 	for i := range segments {
 		segments[i].Timestamp = time.Now().UTC()
-		if err := m.ensureSessionStarted(segments[i].Timestamp); err != nil {
-			return err
-		}
-
-		sessionID := m.currentSession()
 		if err := m.store.AppendSegment(sessionID, segments[i]); err != nil {
 			return fmt.Errorf("append segment: %w", err)
 		}
@@ -216,28 +246,47 @@ func (m *Manager) ForceEndSession(ctx context.Context) error {
 	return m.endCurrentSessionAndRestore(ctx)
 }
 
-func (m *Manager) ensureSessionStarted(now time.Time) error {
-	m.mu.Lock()
+// newSessionIDLocked returns the ID of a session starting at now: its start
+// time to the second, moved past the latest ID so two sessions started in the
+// same second (a short session ended by a pause, then a resume) never share
+// one. Must be called with m.mu held.
+func (m *Manager) newSessionIDLocked(now time.Time) string {
+	idTime := now.UTC().Truncate(time.Second)
+	if !idTime.After(m.lastIDTime) {
+		idTime = m.lastIDTime.Add(time.Second)
+	}
+	m.lastIDTime = idTime
+	return idTime.Format("20060102150405")
+}
+
+// claimSessionLocked returns the current session, starting one at now when
+// there is none, or ErrCapturePaused while capture is paused. It must be called
+// with m.mu held and returns with it released.
+func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	if m.currentSessionID != "" {
+		sessionID := m.currentSessionID
 		m.mu.Unlock()
-		return nil
+		return sessionID, nil
+	}
+	if m.capturePaused {
+		m.mu.Unlock()
+		return "", ErrCapturePaused
 	}
 
-	sessionID := now.UTC().Format("20060102150405")
-	if m.currentStartedAt.Format("20060102150405") == sessionID {
-		sessionID = now.UTC().Add(time.Second).Format("20060102150405")
-	}
+	sessionID := m.newSessionIDLocked(now)
 	startedAt := now.UTC()
 	m.currentSessionID = sessionID
 	m.currentStartedAt = startedAt
+	m.sessionStarts++
 	m.mu.Unlock()
+	defer m.finishSessionStart()
 
 	if err := m.store.CreateSession(sessionID, startedAt); err != nil {
 		m.mu.Lock()
 		m.currentSessionID = ""
 		m.currentStartedAt = time.Time{}
 		m.mu.Unlock()
-		return fmt.Errorf("create session: %w", err)
+		return "", fmt.Errorf("create session: %w", err)
 	}
 
 	if m.recorder != nil {
@@ -247,7 +296,7 @@ func (m *Manager) ensureSessionStarted(now time.Time) error {
 			m.currentStartedAt = time.Time{}
 			m.mu.Unlock()
 			_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
-			return fmt.Errorf("start audio recorder session: %w", err)
+			return "", fmt.Errorf("start audio recorder session: %w", err)
 		}
 	}
 
@@ -255,37 +304,76 @@ func (m *Manager) ensureSessionStarted(now time.Time) error {
 		m.hub.BroadcastSessionStarted(sessionID)
 	}
 
-	return nil
+	return sessionID, nil
 }
 
 func (m *Manager) endCurrentSession(ctx context.Context) error {
 	m.mu.Lock()
+	// Another end of the session (silence timer, pause, stop) is under way: wait
+	// for it, up to ctx's deadline, instead of reporting no session while one
+	// still holds the recorder. Then this end finds the session gone, or
+	// retries one that failed.
+	if m.endingSession {
+		stop := context.AfterFunc(ctx, func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			m.endsDone.Broadcast()
+		})
+		defer stop()
+		for m.endingSession {
+			if err := ctx.Err(); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+			m.endsDone.Wait()
+		}
+	}
 	sessionID := m.currentSessionID
 	startedAt := m.currentStartedAt
 	if sessionID == "" {
 		m.mu.Unlock()
 		return ErrNoActiveSession
 	}
-
+	// An earlier end of this session failed: finish that end, with its end
+	// time and the recording it saved, instead of starting another.
+	end := m.failedEnd
+	if end.sessionID != sessionID {
+		end = sessionEnd{sessionID: sessionID, endedAt: time.Now().UTC()}
+	}
+	// Claim the end, so a second caller cannot end the same session again and
+	// overwrite its saved audio path.
+	m.endingSession = true
 	m.mu.Unlock()
-
-	endedAt := time.Now().UTC()
-	audioPath := ""
-	if m.recorder != nil {
+	ended := false
+	defer func() {
+		if !ended {
+			m.mu.Lock()
+			m.failedEnd = end
+			m.endingSession = false
+			m.endsDone.Broadcast()
+			m.mu.Unlock()
+		}
+	}()
+	endedAt := end.endedAt
+	if !end.saved && m.recorder != nil {
 		path, err := m.recorder.EndSession()
 		if err != nil {
 			return fmt.Errorf("end audio recorder session: %w", err)
 		}
-		audioPath = path
+		end.audioPath, end.saved = path, true
 	}
 
-	if err := m.store.EndSession(sessionID, endedAt, audioPath); err != nil {
+	if err := m.store.EndSession(sessionID, endedAt, end.audioPath); err != nil {
 		return fmt.Errorf("end session: %w", err)
 	}
 
 	m.mu.Lock()
 	m.currentSessionID = ""
 	m.currentStartedAt = time.Time{}
+	m.failedEnd = sessionEnd{}
+	m.endingSession = false
+	m.endsDone.Broadcast()
+	ended = true
 	minSegs := m.minSessionSegments
 	m.mu.Unlock()
 
@@ -313,8 +401,8 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	batchTranscriber := m.batchTranscriber
 	m.mu.Unlock()
 
-	if batchTranscriber != nil && strings.TrimSpace(audioPath) != "" {
-		go m.runBatchRefinement(context.Background(), sessionID, audioPath)
+	if batchTranscriber != nil && strings.TrimSpace(end.audioPath) != "" {
+		go m.runBatchRefinement(context.Background(), sessionID, end.audioPath)
 	}
 
 	go m.generateSummary(context.Background(), sessionID, startedAt)
@@ -510,12 +598,6 @@ func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, pres
 	}
 }
 
-func (m *Manager) currentSession() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.currentSessionID
-}
-
 func (m *Manager) ActiveSession() (string, time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -637,8 +719,8 @@ func (m *Manager) OnTranscriptionDisconnect() {
 	detector := m.detector
 	m.mu.Unlock()
 
-	// Persist buffered words — flushBuffer handles its own locking
-	// via ensureSessionStarted/currentSession, so m.mu must NOT be held.
+	// Persist buffered words — flushBuffer takes m.mu itself, so it must NOT
+	// be held here.
 	if err := m.flushBuffer(); err != nil {
 		m.logger.Error("failed to persist buffered words on disconnect", "operation", "flush_buffer", "error", err)
 	}
@@ -649,7 +731,8 @@ func (m *Manager) OnTranscriptionDisconnect() {
 }
 
 // ManualStartSession starts a new session manually. Returns the session ID.
-// If a session is already active, returns ErrSessionAlreadyActive.
+// If a session is already active, returns ErrSessionAlreadyActive; while
+// capture is paused, returns ErrCapturePaused.
 // Manual sessions use a 5-minute silence timeout instead of the default 30s.
 func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (string, error) {
 	now := time.Now().UTC()
@@ -659,15 +742,18 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 		m.mu.Unlock()
 		return "", ErrSessionAlreadyActive
 	}
-
-	sessionID := now.Format("20060102150405")
-	if m.currentStartedAt.Format("20060102150405") == sessionID {
-		sessionID = now.Add(time.Second).Format("20060102150405")
+	if m.capturePaused {
+		m.mu.Unlock()
+		return "", ErrCapturePaused
 	}
+
+	sessionID := m.newSessionIDLocked(now)
 	m.currentSessionID = sessionID
 	m.currentStartedAt = now
 	m.manualSession = true
+	m.sessionStarts++
 	m.mu.Unlock()
+	defer m.finishSessionStart()
 
 	if err := m.store.CreateSession(sessionID, now); err != nil {
 		m.mu.Lock()
@@ -752,4 +838,62 @@ func (m *Manager) endCurrentSessionAndRestore(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// PauseCapture stops new sessions from starting until ResumeCapture. It only
+// sets a flag and waits for nothing, so the capture gate can close at once; a
+// session start already under way still finishes, and WaitForSessionStarts
+// waits for it. It does not end the active session; the capture pause does
+// that once Deepgram's last words are in.
+func (m *Manager) PauseCapture() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.capturePaused = true
+}
+
+// WaitForSessionStarts waits until no session start is under way, so a session
+// end that follows a pause never runs on a half-created session. A start
+// writes to the database, so this waits as long as the database does.
+func (m *Manager) WaitForSessionStarts() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for m.sessionStarts > 0 {
+		m.startsDone.Wait()
+	}
+}
+
+func (m *Manager) finishSessionStart() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionStarts--
+	m.startsDone.Broadcast()
+}
+
+// AwaitFinalize returns a channel that is closed once Deepgram's reply to a
+// Finalize request (a result marked from_finalize) has been handled. Call it
+// before sending Finalize. A later call replaces the earlier wait.
+func (m *Manager) AwaitFinalize() <-chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.finalizeWaiter = make(chan struct{})
+	return m.finalizeWaiter
+}
+
+func (m *Manager) finalizeReplied() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.finalizeWaiter != nil {
+		close(m.finalizeWaiter)
+		m.finalizeWaiter = nil
+	}
+}
+
+// ResumeCapture lets sessions start again after PauseCapture. It drops words
+// Deepgram finalized during the pause that no utterance end flushed: they are
+// from audio before the pause and must not open the first session after it.
+func (m *Manager) ResumeCapture() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.buffer.Flush()
+	m.capturePaused = false
 }

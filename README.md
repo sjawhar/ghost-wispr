@@ -81,19 +81,19 @@ The web UI is available at `http://localhost:8080`.
 
 ## Configuration
 
-All configuration is via environment variables. See `.env.example` for the full list.
+Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environment variables with the `GHOST_WISPR_` prefix override them, and API keys are read only from the environment. See `.env.example` for the full list.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DEEPGRAM_API_KEY` | Yes | — | Deepgram API key for transcription |
-| `OPENAI_API_KEY` | No | — | OpenAI key for session summaries |
-| `OPENAI_MODEL` | No | `gpt-4o-mini` | Model to use for summaries |
-| `DB_PATH` | No | `data/ghost-wispr.db` | SQLite database path |
-| `AUDIO_DIR` | No | `data/audio` | Directory for audio files |
-| `SILENCE_TIMEOUT` | No | `30s` | Silence duration to end a session |
-| `MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
-| `MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
-| `GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
+| `GHOST_WISPR_DEEPGRAM_API_KEY` | Yes | — | Deepgram API key for transcription |
+| `GHOST_WISPR_OPENAI_API_KEY` | No | — | OpenAI key for session summaries |
+| `GHOST_WISPR_SUMMARIZATION_MODEL` | No | `openai/gpt-4o-mini` | Summary model, as `provider/model` |
+| `GHOST_WISPR_DB_PATH` | No | `data/ghost-wispr.db` | SQLite database path |
+| `GHOST_WISPR_AUDIO_DIR` | No | `data/audio` | Directory for audio files |
+| `GHOST_WISPR_SILENCE_TIMEOUT` | No | `30s` | Silence duration to end a session |
+| `GHOST_WISPR_MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
+| `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
+| `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
 | `GOOGLE_APPLICATION_CREDENTIALS` | No | — | Path to service account JSON |
 
 ## Deployment
@@ -119,8 +119,9 @@ PI_HOST=pi@raspberrypi ./deploy.sh
 | `GET` | `/api/sessions?date=YYYY-MM-DD` | List sessions for a date (defaults to today) |
 | `GET` | `/api/sessions/{id}` | Get session details with transcript segments |
 | `GET` | `/api/sessions/{id}/audio` | Stream session audio (supports range requests) |
-| `POST` | `/api/pause` | Pause transcription |
-| `POST` | `/api/resume` | Resume transcription |
+| `POST` | `/api/pause` | Pause capture: microphone stopped, active session ended, nothing recorded or sent to Deepgram until resume |
+| `POST` | `/api/resume` | Resume capture. Returns at once; audio flows again once the paused session is saved and the microphone restarts |
+| `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `resuming`, `stalled`, `mic_unavailable` or `capturing`; `stalled` when a resume has not brought the microphone back within 30 s, also reported as a warning and by `/healthz/ready`), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |
 
 ## Development

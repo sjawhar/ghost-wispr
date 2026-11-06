@@ -10,6 +10,7 @@ export enum ComponentStatus {
   Synced = 'synced',
   Ok = 'ok',
   Draining = 'draining',
+  Paused = 'paused',
 }
 
 export enum SessionStatus {
@@ -154,6 +155,8 @@ export interface SessionDetailResponse {
 
 export interface StatusResponse {
   paused: boolean
+  capturing: boolean
+  capture_state: string
   warnings: string[]
   active_session_id: string
   active_session_started_at: string

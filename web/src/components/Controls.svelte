@@ -4,6 +4,7 @@
   let {
     connected,
     paused,
+    capturing,
     activeSessionId,
     onToggle,
     onEndSession,
@@ -12,6 +13,7 @@
   }: {
     connected: boolean
     paused: boolean
+    capturing: boolean
     activeSessionId: string
     onToggle: () => Promise<void>
     onEndSession: () => Promise<void>
@@ -22,8 +24,27 @@
   let busy = $state(false)
   let endBusy = $state(false)
   let recordBusy = $state(false)
+  let recordError = $state('')
 
   const isRecording = $derived(!!activeSessionId)
+  // A session can only start while the microphone is capturing: not while
+  // paused, and not after a resume until the microphone is back.
+  const recordBlocked = $derived(!isRecording && (paused || !capturing))
+  const captureLabel = $derived(paused ? 'Paused' : capturing ? 'Listening' : 'Not capturing')
+
+  // The API answers errors as {"error": "..."}; show that message.
+  function errorText(err: unknown): string {
+    const text = err instanceof Error ? err.message : String(err)
+    try {
+      const body: unknown = JSON.parse(text)
+      if (body && typeof body === 'object' && 'error' in body && typeof body.error === 'string') {
+        return body.error
+      }
+    } catch {
+      // not JSON: show the text as it is
+    }
+    return text
+  }
 
   async function handleToggle() {
     if (busy) return
@@ -50,8 +71,9 @@
   }
 
   async function handleRecordToggle() {
-    if (recordBusy) return
+    if (recordBusy || recordBlocked) return
     recordBusy = true
+    recordError = ''
     try {
       if (isRecording) {
         await onStopSession()
@@ -59,7 +81,7 @@
         await onStartSession()
       }
     } catch (err) {
-      console.error('Failed to toggle recording session:', err)
+      recordError = errorText(err)
     } finally {
       recordBusy = false
     }
@@ -81,7 +103,7 @@
   <div class="status-wrap">
     <span class:connected class="status-dot"></span>
     <span class="status-text">{connected ? 'Connected' : 'Disconnected'}</span>
-    <span class="state-pill">{paused ? 'Paused' : 'Listening'}</span>
+    <span class="state-pill" class:not-capturing={!paused && !capturing}>{captureLabel}</span>
   </div>
 
   <button
@@ -89,8 +111,14 @@
     class:recording={isRecording}
     type="button"
     onclick={handleRecordToggle}
-    disabled={recordBusy}
-    title={isRecording ? 'Stop Recording (Ctrl+Shift+R)' : 'Start Recording (Ctrl+Shift+R)'}
+    disabled={recordBusy || recordBlocked}
+    title={recordBlocked
+      ? paused
+        ? 'Resume capture to record'
+        : 'The microphone is not capturing yet'
+      : isRecording
+        ? 'Stop Recording (Ctrl+Shift+R)'
+        : 'Start Recording (Ctrl+Shift+R)'}
     data-testid="record-toggle"
   >
     <span class="record-indicator" class:pulsing={isRecording}></span>
@@ -110,9 +138,23 @@
       End Session
     </button>
   {/if}
+
+  {#if recordError}
+    <span class="record-error" role="alert">{recordError}</span>
+  {/if}
 </div>
 
 <style>
+  .state-pill.not-capturing {
+    border-color: var(--warning);
+    color: var(--warning);
+  }
+
+  .record-error {
+    color: var(--danger);
+    font-size: 0.8rem;
+  }
+
   .record-btn {
     display: inline-flex;
     align-items: center;

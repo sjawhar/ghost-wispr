@@ -2,10 +2,67 @@ package audio
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
+
+// An encoder that never finishes (a wedged ffmpeg, then lame) must not hold a
+// session end open: past its time limit the recording is kept as WAV. A
+// capture pause waits for that end before the microphone comes back.
+func TestRecorderEndSessionBoundsAWedgedEncoder(t *testing.T) {
+	bin := t.TempDir()
+	for _, name := range []string{"ffmpeg", "lame"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nexec /bin/sleep 3600\n"), 0o755); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", bin)
+	original := encodeTimeout
+	t.Cleanup(func() { encodeTimeout = original })
+	encodeTimeout = func(int64, int) time.Duration { return 100 * time.Millisecond }
+
+	dir := t.TempDir()
+	recorder := NewRecorder(dir)
+	if err := recorder.StartSession("wedged"); err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 3200)); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	type result struct {
+		path string
+		err  error
+	}
+	ended := make(chan result, 1)
+	go func() {
+		path, err := recorder.EndSession()
+		ended <- result{path, err}
+	}()
+	var got result
+	select {
+	case got = <-ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("EndSession still waiting on a wedged encoder")
+	}
+	if got.err != nil {
+		t.Fatalf("EndSession failed: %v", got.err)
+	}
+	if !strings.HasSuffix(got.path, ".wav") {
+		t.Fatalf("audio path = %q, want the WAV fallback", got.path)
+	}
+	info, err := os.Stat(got.path)
+	if err != nil || info.Size() < 3200 {
+		t.Fatalf("WAV fallback missing or short: %v, %v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "wedged.mp3")); !os.IsNotExist(err) {
+		t.Fatalf("partial MP3 left behind: %v", err)
+	}
+}
 
 func TestRecorderProducesOutputFile(t *testing.T) {
 	dir := t.TempDir()
@@ -128,5 +185,92 @@ func TestRecorderPrerollCapturesBeforeSessionStart(t *testing.T) {
 	expected = append(expected, sessionData...)
 	if !bytes.Equal(got, expected) {
 		t.Errorf("got %v, expected %v", got, expected)
+	}
+}
+
+// Audio held in the preroll buffer before a capture pause must not open the
+// first session recorded after resume.
+func TestRecorderDiscardPrerollDropsBufferedAudio(t *testing.T) {
+	dir := t.TempDir()
+	recorder := NewRecorder(dir)
+	recorder.encode = func(rawPath, sessionID string) (string, error) {
+		data, err := os.ReadFile(rawPath)
+		if err != nil {
+			return "", err
+		}
+		out := filepath.Join(dir, sessionID+".raw")
+		return out, os.WriteFile(out, data, 0o644)
+	}
+
+	writer := recorder.Writer(bytes.NewBuffer(nil))
+	if _, err := writer.Write([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatalf("Write before discard failed: %v", err)
+	}
+	recorder.DiscardPreroll()
+	if _, err := writer.Write([]byte{9, 8}); err != nil {
+		t.Fatalf("Write after discard failed: %v", err)
+	}
+
+	if err := recorder.StartSession("after-resume"); err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	path, err := recorder.EndSession()
+	if err != nil {
+		t.Fatalf("EndSession failed: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if want := []byte{9, 8}; !bytes.Equal(got, want) {
+		t.Fatalf("session audio = %v, want only the audio written after the discard %v", got, want)
+	}
+}
+
+// A recording EndSession could not save (every encoder and the WAV fallback
+// failed, as on a full SD card) is not dropped: the next EndSession saves it,
+// so a session end that is retried keeps its recording.
+func TestRecorderEndSessionRetriesARecordingItCouldNotSave(t *testing.T) {
+	dir := t.TempDir()
+	recorder := NewRecorder(dir)
+	full := true
+	recorder.encode = func(rawPath, sessionID string) (string, error) {
+		if full {
+			return "", errors.New("no space left on device")
+		}
+		data, err := os.ReadFile(rawPath)
+		if err != nil {
+			return "", err
+		}
+		out := filepath.Join(dir, sessionID+".wav")
+		return out, os.WriteFile(out, data, 0o644)
+	}
+
+	if err := recorder.StartSession("meeting"); err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if path, err := recorder.EndSession(); err == nil {
+		t.Fatalf("EndSession = %q with no encoder able to save the recording, want an error", path)
+	}
+
+	full = false
+	path, err := recorder.EndSession()
+	if err != nil {
+		t.Fatalf("retried EndSession failed: %v", err)
+	}
+	if want := filepath.Join(dir, "meeting.wav"); path != want {
+		t.Fatalf("retried EndSession = %q, want the recording saved at %q", path, want)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, []byte{1, 2, 3, 4}) {
+		t.Fatalf("saved recording = %v (%v), want [1 2 3 4]", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "meeting.pcm")); !os.IsNotExist(err) {
+		t.Fatalf("raw recording still on disk after it was saved (stat: %v)", err)
+	}
+	if path, err := recorder.EndSession(); path != "" || err != nil {
+		t.Fatalf("EndSession with nothing left to save = (%q, %v), want nothing", path, err)
 	}
 }

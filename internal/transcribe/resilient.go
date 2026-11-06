@@ -165,26 +165,32 @@ func (rc *ResilientClient) reconnect() {
 }
 
 // drainBuffer writes all buffered audio to the current client.
-// Does NOT hold the mutex during external writes to avoid deadlock.
+// Does NOT hold rc.Mu during external writes to avoid deadlock; drainMu covers
+// the read and the write of each chunk, so Finalize waits for a chunk already
+// read and no chunk is read after it.
 func (rc *ResilientClient) drainBuffer() {
-	for {
-		rc.Mu.Lock()
-		if rc.Buffer.Len() == 0 {
-			rc.Mu.Unlock()
-			break
-		}
-		buf := make([]byte, 4096)
-		n, _ := rc.Buffer.Read(buf)
-		client := rc.Client
-		rc.Mu.Unlock()
-
-		if n == 0 || client == nil {
-			break
-		}
-		if _, err := client.Write(buf[:n]); err != nil {
-			rc.log("failed to drain buffered audio: %v", err)
-		}
+	buf := make([]byte, 4096)
+	for rc.drainChunk(buf) {
 	}
+}
+
+// drainChunk writes one buffered chunk and reports whether to drain another.
+func (rc *ResilientClient) drainChunk(buf []byte) bool {
+	rc.drainMu.Lock()
+	defer rc.drainMu.Unlock()
+
+	rc.Mu.Lock()
+	n, _ := rc.Buffer.Read(buf)
+	client := rc.Client
+	rc.Mu.Unlock()
+
+	if n == 0 || client == nil {
+		return false
+	}
+	if _, err := client.Write(buf[:n]); err != nil {
+		rc.log("failed to drain buffered audio: %v", err)
+	}
+	return true
 }
 
 // IsConnected returns true if the Deepgram connection is currently connected.
@@ -192,4 +198,35 @@ func (rc *ResilientClient) IsConnected() bool {
 	rc.Mu.Lock()
 	defer rc.Mu.Unlock()
 	return rc.State == StateConnected
+}
+
+// Finalize ends the current stretch of audio. It drops the audio buffered
+// during a disconnect, which a reconnect would otherwise send, waits for a
+// buffered chunk the reconnect is already writing, then asks Deepgram to
+// return final results for the audio the live socket has. A capture pause
+// calls it, so no audio reaches Deepgram while paused and audio from before
+// the pause comes back before the pause ends, not after it.
+func (rc *ResilientClient) Finalize() error {
+	rc.Mu.Lock()
+	rc.Buffer.Reset()
+	rc.Mu.Unlock()
+
+	rc.drainMu.Lock()
+	defer rc.drainMu.Unlock()
+	rc.Mu.Lock()
+	state := rc.State
+	client := rc.Client
+	rc.Mu.Unlock()
+
+	// Connected or draining, Client is the live socket. Disconnected or
+	// reconnecting, it is the one that failed, which the SDK would redial; the
+	// reset above already keeps its audio from the next socket.
+	if state != StateConnected && state != StateDraining {
+		return nil
+	}
+	finalizer, ok := client.(interface{ Finalize() error })
+	if !ok {
+		return nil
+	}
+	return finalizer.Finalize()
 }

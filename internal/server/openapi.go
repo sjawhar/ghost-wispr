@@ -231,6 +231,9 @@ func OpenAPISpec() map[string]any {
 						"200": map[string]any{
 							"description": "Session started",
 						},
+						"409": map[string]any{
+							"description": "A session is already active, or capture is paused",
+						},
 					},
 				},
 			},
@@ -665,7 +668,7 @@ func OpenAPISpec() map[string]any {
 			"/api/pause": map[string]any{
 				"post": map[string]any{
 					"summary":     "Pause recording",
-					"description": "Pause the recording system",
+					"description": "Stop microphone capture: no audio reaches the recording or Deepgram, the microphone stops, the active session ends, and no session starts until resume",
 					"tags":        []string{"control"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{
@@ -678,7 +681,7 @@ func OpenAPISpec() map[string]any {
 			"/api/resume": map[string]any{
 				"post": map[string]any{
 					"summary":     "Resume recording",
-					"description": "Resume the recording system",
+					"description": "Restart microphone capture after a pause. Returns at once; audio flows again once the paused session is saved and the microphone restarts",
 					"tags":        []string{"control"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{
@@ -706,7 +709,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status including pause state and active session",
+					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{
