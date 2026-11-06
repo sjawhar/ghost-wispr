@@ -14,7 +14,7 @@ Each completed session produces three files uploaded to Google Drive:
 |------|----------------|---------|
 | `summary.md` | Google Doc (converted on upload) | YAML frontmatter + AI-generated title and summary |
 | `transcript.md` | Google Doc (converted on upload) | YAML frontmatter + full timestamped, speaker-labeled transcript |
-| `audio.mp3` | MP3 (as-is) | Session audio recording |
+| `audio-<recording file name>` | MP3 or WAV (as-is) | Session audio recording, one file per recording (a merged session has several); folders synced before this naming have `audio.mp3` |
 
 ### Folder structure
 
@@ -23,11 +23,11 @@ Each completed session produces three files uploaded to Google Drive:
   2026-03-18-weekly-standup/
     summary.md
     transcript.md
-    audio.mp3
+    audio-20260318100000.mp3
   2026-03-18-design-review/
     summary.md
     transcript.md
-    audio.mp3
+    audio-20260318140000.mp3
 ```
 
 Each session gets its own folder. The folder name is `<date>-<slugified-title>`. Date prefix keeps them chronologically sortable when scrolling.
@@ -89,7 +89,7 @@ New columns on the `sessions` table:
 - `sync_status` — `pending` | `synced` | `failed`
 - `gdrive_folder_id` — the Drive folder ID for this session's folder (for future restore/management)
 
-Sessions start as `pending`. On successful upload of all three files, marked `synced`. On failure, marked `failed` (retry on next sweep).
+Sessions start as `pending`. On successful upload of all its files, marked `synced`. On failure, retried with backoff by the sweep; once the retries run out, `failed`, and a manual retry (`POST /api/sessions/{id}/retry-sync`, the UI's retry button) starts again from there. The sweep runs whether sync is on or not: it syncs nothing while sync is off and picks up a syncer turned on in the settings.
 
 ## Garbage Collection
 
@@ -98,25 +98,39 @@ Sessions start as `pending`. On successful upload of all three files, marked `sy
 GC has two independent rules.
 
 **Age (`gc_max_age_days`, the user's retention policy):** a session older than this is deleted in one pass:
-- The local audio file (MP3/WAV), and a raw `.pcm` beside it only when the saved recording is on disk
+- The local audio file (MP3/WAV), unless another session names it, and a raw `.pcm` beside it only once the saved recording is removed and no session names the `.pcm`
 - The SQLite rows (session record, transcript segments, summary)
 
-This is a clean "this session lives on Drive now" model. The web UI shows empty state for GC'd dates. Restore from Drive brings everything back.
+This is a clean "this session lives on Drive now" model. The web UI shows empty state for GC'd dates. Restore from Drive brings everything back, and a restored session's age runs from its restore (`restored_at`), so the next pass does not delete it again; it is deleted `gc_max_age_days` after the restore.
 
-**Audio budget (`gc_max_audio_size_mb`):** a budget for the audio GC may remove, not for the whole `audio_dir`. It removes audio files only, never a session, transcript or summary. The removable audio is the saved recordings of ended sessions (synced ones only, when Drive sync gates GC; a session whose sync failed, permanently or not, keeps its file; not while a refinement reads it), plus a raw `.pcm` beside a saved recording. When those files together exceed the budget, GC removes them oldest session first until they fit or none are left. A session whose audio it removed keeps its row, with its audio path cleared, `audio_removed_at` set (the UI shows "Audio removed to free space"), and a pending or failed refinement marked `no_audio`. A file whose removal frees nothing (missing, empty, or refused) is skipped and logged.
+**Audio budget (`gc_max_audio_size_mb`):** a budget for the audio GC may remove, not for the whole `audio_dir`. It removes audio files only, never a session, transcript or summary. The removable audio is the saved recordings of ended sessions (synced ones only, when Drive sync gates GC; a session whose sync failed, permanently or not, keeps its file; not while a refinement reads it), plus a raw `.pcm` beside a saved recording. When those files together exceed the budget, GC removes them oldest session first until they fit or none are left. A file whose removal frees nothing (missing, empty, or refused) is skipped and logged.
 
-Not counted against the budget, and never removed by GC: a raw `.pcm` that is the only copy of a session's audio (a recording that could not be saved, or a session the app stopped inside), the recording under way, unsynced audio when sync gates GC, and files no session names. `GET /api/status` reports the kept raw recordings (`kept_raw_recordings`, `kept_raw_bytes`, and a warning once they exceed a tenth of the budget); unsynced audio is reported by the sync status. Neither is bounded by the budget, so the card can still fill with them.
+GC records a removal before it removes anything, so a session never names a file GC removed. In one transaction it checks that the session still has the audio path it listed and may still have it removed (ended, no refinement running, synced when sync gates GC), then takes out of the audio path the files it will remove, sets `audio_removed_at` (the UI shows "Audio removed to free space"), and marks a pending or failed refinement `no_audio` when no recording is left on disk. It takes out nothing else: an entry whose file it cannot see stays named, since that file may be on a disk not mounted for the moment, and a name dropped cannot be recovered. Only then does it remove the files. One that does not go is named in the row again (all of them: the row is as it was). If the transaction fails or the session changed, nothing is removed. When only part of a merged session's audio goes, the session names what is left and the UI says "Some audio removed to free space" and how many recordings are left. A refinement marks itself running only while the session still names the recording it will read (`ClaimRefinement`), so it never reads a file GC is removing and does not start on one GC removed.
+
+Not counted against the budget, and never removed by GC: a raw `.pcm` that is the only copy of a session's audio (a recording that could not be saved, or a session the app stopped inside), the recording under way, unsynced audio when sync gates GC, files no session names, and a file another session names too (a merge gives its sources' recordings to the merged session, so only an imported or hand-edited row makes one). `GET /api/status` reports the kept raw recordings (`kept_raw_recordings`, `kept_raw_bytes`, and a warning once they exceed a tenth of the budget, or as soon as there is one with no budget); unsynced audio is reported by the sync status. Neither is bounded by the budget, so the card can still fill with them.
+
+**No limit.** Each limit's "no limit" is 0: `gc_max_age_days: 0` deletes no session for its age, `gc_max_audio_size_mb: 0` removes no audio to free space. A negative value in the config file is a mistake and becomes the default (30 days, 1024 MB) with a startup warning; `PATCH /api/config` refuses one. No value can wrap: the age cutoff is computed in days (a limit reaching back past year 1 matches no session), and the budget in bytes saturates at the largest `int64`.
+
+**Refinements and missing files.** GC removes nothing a refinement is reading: the age policy skips a session whose refinement is running, and disk pressure refuses it in its transaction. A refinement left running by a stop of the app is marked `failed` when the app starts (it offers a retry), so it does not hold GC off for good. GC changes an audio path only for a file it removes itself: a session whose recordings are all missing from disk is left as it is, and an entry whose file it cannot see stays named beside one it removes, because a missing file may sit on a disk that is not mounted. An entry counts as naming no file (for `no_audio`) only when neither its path in `audio_dir` nor its own stored path has one.
+
+**Drive sync of several recordings.** A merged session's audio path names several recordings; sync uploads each, named `audio-` and its own file name (`audio-20261106100000.mp3`), a single recording too. A name in the folder therefore identifies one recording, whatever the audio path names before or after: named by position (`audio-1`, `audio-2`, an earlier version of this change), a recording took another's name once the audio path shrank, and a re-sync took it as uploaded. Folders synced before keep their `audio.mp3` (a synced session is not synced again, and a restore finds audio by its MIME type, not its name); only the merged sessions the migration below re-syncs get audio again, under the new names, which for a merge target that `main` had synced with one recording means that recording a second time. Earlier versions stat'ed the joined path, uploaded no audio and still marked the session synced, so with sync gating GC could remove audio Drive never had. The first time the store opens with this version (recorded in the `migrations` table), synced merged sessions go back to pending sync: those naming several recordings, and merge targets disk pressure had cut down to one. A session synced before keeps its Drive folder (`gdrive_folder_id`), and so does one whose first sync created its folder and then failed; syncing it again brings the folder up to date instead of creating a second one: a recording goes up unless the folder has a file of its name, and `summary.md` or `transcript.md` is updated in place when its content changed (below). A session is marked synced only when every recording it names was in the upload: one missing from disk when the upload's file list was built (its disk not mounted) fails the sync, even if it comes back during the upload, and a retry uploads it once it is back.
+
+**Sync and GC changing a row at once.** A session is marked synced only while it is still exactly what the sync read and uploaded (`MarkSynced`, a compare-and-set read in the same transaction as the update): its audio path, and its summary and transcript as rendered. If GC changed the row during the upload (put back a recording it could not remove), or the summary or transcript changed (made again, refined, perhaps by a second sync running at the same time, whose older content may then have been written over the newer on Drive), the sync is not done and is retried, and the retry uploads the session as it is now. A sync that ran from start to end while GC had the row marked was marked synced with the row as it then was; when GC then puts back a recording, it reopens the sync (pending, folder kept), so the retry uploads it.
+
+**Nothing on Drive is ever deleted or trashed.** A re-sync creates what a folder lacks and updates `summary.md` and `transcript.md` in place (`Files.Update` with new media on the existing file): the same file id, comments and share links, and Drive's revision history keeps the earlier text, any edit made on Drive included. Each document keeps the hash of the content this app last wrote in its `appProperties`; a document whose newest copy holds the same hash is left alone, and one with no hash (uploaded by an earlier version) is updated once. A folder an earlier version left with two copies of a document is read (by restore) and updated (by a re-sync) through its most recently modified copy. A test fails if any code calls `Files.Delete`, `Files.EmptyTrash` or sets `Trashed`.
 
 ### Deletion criteria
 
 A session is eligible for age-based GC when **both conditions are true**:
 
 1. **Sync-gated:** `sync_status = 'synced'` (confirmed backed up to Drive)
-2. **Age:** the session is older than `gc_max_age_days` (default: 30) and its summary is complete.
+2. **Age:** the session is older than `gc_max_age_days` (default: 30; 0 means never), counted from when it started or, if restored from Drive, from its restore, and its summary is complete.
 
 ### When GDrive sync is not configured
 
 GC still runs but **skips the sync-gate check**. A prominent warning banner is displayed in the web UI: "Garbage collection is deleting files without a Google Drive backup configured."
+
+The gate follows the setting, not whether the syncer started: with `gdrive_sync_enabled` on, GC is sync-gated even when sync failed to start (unreadable credentials, no folder ID), so it deletes and removes only what earlier syncs put on Drive. Settings changes apply to the running app one at a time, each from the latest saved config (Drive sync, summarizer, batch transcriber, log level, Envoy, silence timeout), so two saved together (sync on, then off) cannot leave sync running while the config says off.
 
 ### GC schedule
 
@@ -136,8 +150,8 @@ gdrive_sync_enabled: false          # new — master toggle for sync
 
 # Garbage collection
 gc_enabled: false                   # new — master toggle for GC
-gc_max_age_days: 30                 # new — delete synced sessions older than this
-gc_max_audio_size_mb: 1024          # new — budget for removable audio: past it, remove the oldest sessions' audio files (sessions kept)
+gc_max_age_days: 30                 # new — delete synced sessions older than this; 0 = never
+gc_max_audio_size_mb: 1024          # new — budget for removable audio: past it, remove the oldest sessions' audio files (sessions kept); 0 = no budget
 ```
 
 ### Web UI changes
@@ -148,8 +162,8 @@ gc_max_audio_size_mb: 1024          # new — budget for removable audio: past i
 
 **New GC section in settings:**
 - Enable/disable toggle
-- Max age (days) input
-- Max disk size (MB) input
+- Max age (days) input, 0 = never
+- Audio budget (MB) input, 0 = no budget
 - Warning banner when GC is enabled but GDrive sync is not configured
 
 ## Restore (future, not in this pass)

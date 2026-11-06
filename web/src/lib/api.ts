@@ -20,6 +20,21 @@ async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise
   return (await response.json()) as T
 }
 
+// The reason a failed request gives: the "error" of the JSON error body the
+// API answers with, or the error's text.
+export function requestErrorMessage(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  try {
+    const body: unknown = JSON.parse(text)
+    if (body && typeof body === 'object' && 'error' in body && typeof body.error === 'string') {
+      return body.error
+    }
+  } catch {
+    // not a JSON error body
+  }
+  return text
+}
+
 export function fetchDates(): Promise<string[]> {
   return request<string[]>('/api/dates')
 }

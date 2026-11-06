@@ -74,7 +74,7 @@ func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive
 	for {
 		call := s.service.Files.List().
 			Q(q).
-			Fields("nextPageToken, files(id, name, mimeType)").
+			Fields("nextPageToken, files(id, name, mimeType, appProperties, modifiedTime)").
 			SupportsAllDrives(true).
 			IncludeItemsFromAllDrives(true).
 			PageSize(100).
@@ -192,19 +192,27 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 		return nil, err
 	}
 
-	var transcriptFileID, summaryFileID string
+	// A folder holds one copy of each document, which a re-sync updates in
+	// place; one left with two copies is read through the newest, as a
+	// re-sync updates it.
+	docs := map[string][]driveFile{}
 	hasAudio := false
 	for _, f := range files {
 		switch f.Name {
-		case "transcript.md":
-			transcriptFileID = f.Id
-		case "summary.md":
-			summaryFileID = f.Id
+		case "transcript.md", "summary.md":
+			docs[f.Name] = append(docs[f.Name], toDriveFile(f))
 		default:
 			if strings.HasPrefix(f.MimeType, "audio/") {
 				hasAudio = true
 			}
 		}
+	}
+	var transcriptFileID, summaryFileID string
+	if copies := docs["transcript.md"]; len(copies) > 0 {
+		transcriptFileID = newestFile(copies).ID
+	}
+	if copies := docs["summary.md"]; len(copies) > 0 {
+		summaryFileID = newestFile(copies).ID
 	}
 
 	if transcriptFileID == "" {

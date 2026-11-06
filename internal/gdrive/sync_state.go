@@ -53,8 +53,11 @@ func ValidateSyncStateTransition(from, to SyncState) error {
 			SyncStateFailed:        {},
 			SyncStateRemoteDeleted: {},
 		},
+		// A manual retry (retry-sync) starts again once the automatic
+		// retries ran out; the sweep syncs only PENDING and RETRY_SCHEDULED.
 		SyncStateFailed: {
 			SyncStateRetryScheduled: {},
+			SyncStateSyncing:        {},
 		},
 		SyncStateRetryScheduled: {
 			SyncStateSyncing: {},

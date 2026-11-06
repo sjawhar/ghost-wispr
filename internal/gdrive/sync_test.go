@@ -1,8 +1,10 @@
 package gdrive
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -53,8 +55,8 @@ func TestBuildSyncFiles(t *testing.T) {
 	if names["transcript.md"] != "application/vnd.google-apps.document" {
 		t.Error("transcript.md should convert to Google Doc")
 	}
-	if _, ok := names["audio.mp3"]; !ok {
-		t.Error("missing audio.mp3")
+	if _, ok := names["audio-test.mp3"]; !ok {
+		t.Error("missing audio-test.mp3")
 	}
 }
 
@@ -115,6 +117,112 @@ func TestBuildSyncFilesNoSummary(t *testing.T) {
 		if f.Name == "summary.md" {
 			t.Error("should not include summary.md when summary is empty")
 		}
+	}
+}
+
+// Every recording a session's audio path names is uploaded, as "audio-" and
+// its own file name: a name in the folder identifies one recording, whatever
+// the audio path names before or after, so a re-sync that skips a file by
+// name can only skip the recording it uploaded before. (Named by position,
+// audio-1, audio-2, a recording took another's name once the audio path
+// shrank, and was taken as uploaded.) Before, the whole joined path was
+// stat'ed, failed, and the session synced with no audio, so GC gated on sync
+// could remove audio that never reached Drive.
+func TestBuildSyncFilesUploadsEveryRecording(t *testing.T) {
+	started := time.Date(2026, 3, 21, 14, 30, 22, 0, time.UTC)
+	sess := SyncSession{ID: "20260321143022-merged", Title: "Merged", StartedAt: started}
+	dir := t.TempDir()
+	first := filepath.Join(dir, "20260321143022.mp3")
+	second := filepath.Join(dir, "20260321150000.wav")
+	for _, path := range []string{first, second} {
+		if err := os.WriteFile(path, []byte("audio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	audio := func(audioPath string) map[string]string {
+		t.Helper()
+		files, _, err := BuildSyncFiles(&sess, nil, audioPath)
+		if err != nil {
+			t.Fatalf("build sync files: %v", err)
+		}
+		names := map[string]string{}
+		for _, f := range files {
+			if f.LocalPath != "" {
+				names[f.Name] = f.LocalPath
+			}
+		}
+		return names
+	}
+
+	want := map[string]string{"audio-20260321143022.mp3": first, "audio-20260321150000.wav": second}
+	if got := audio(first + ", " + second); !maps.Equal(got, want) {
+		t.Errorf("uploaded audio %v, want %v", got, want)
+	}
+	// The same recording keeps its name with the other gone, and alone.
+	if got := audio(second); !maps.Equal(got, map[string]string{"audio-20260321150000.wav": second}) {
+		t.Errorf("with the other recording gone, uploaded audio %v, want audio-20260321150000.wav from %s", got, second)
+	}
+}
+
+// A re-sync into a session's folder creates a recording only if the folder
+// has no file of its name, creates a document the folder lacks, and updates
+// in place a document whose content changed since it was uploaded (or that
+// was uploaded before documents carried their content's hash); one with the
+// same content stays. Nothing is ever deleted. Of two copies of a document,
+// the newest decides and is the one updated.
+func TestPlanUpload(t *testing.T) {
+	summary := SyncFile{Name: "summary.md", Content: []byte("the summary, re-summarized")}
+	transcript := SyncFile{Name: "transcript.md", Content: []byte("the transcript")}
+	audio := SyncFile{Name: "audio-20261106100000.mp3", LocalPath: "/audio/20261106100000.mp3"}
+	other := SyncFile{Name: "audio-20261106101000.mp3", LocalPath: "/mnt/20261106101000.mp3"}
+	at := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	names := func(files []SyncFile) []string {
+		var names []string
+		for i := range files {
+			names = append(names, files[i].Name)
+		}
+		return names
+	}
+	updated := func(update []docUpdate) []string {
+		var ids []string
+		for i := range update {
+			ids = append(ids, update[i].ID+"="+update[i].File.Name)
+		}
+		return ids
+	}
+
+	create, update := planUpload([]driveFile{
+		{ID: "old-summary", Name: "summary.md", ContentHash: contentHash(&SyncFile{Content: []byte("the summary")})},
+		{ID: "transcript", Name: "transcript.md", ContentHash: contentHash(&transcript)},
+		{ID: "audio", Name: "audio-20261106100000.mp3"},
+	}, []SyncFile{summary, transcript, audio, other})
+	if want := []string{"audio-20261106101000.mp3"}; !slices.Equal(names(create), want) {
+		t.Errorf("creates %v, want %v", names(create), want)
+	}
+	if want := []string{"old-summary=summary.md"}; !slices.Equal(updated(update), want) {
+		t.Errorf("updates %v, want %v", updated(update), want)
+	}
+
+	// A document uploaded before hashes were kept has no hash: updated.
+	create, update = planUpload([]driveFile{{ID: "unhashed", Name: "transcript.md"}}, []SyncFile{transcript, summary})
+	if !slices.Equal(names(create), []string{"summary.md"}) || !slices.Equal(updated(update), []string{"unhashed=transcript.md"}) {
+		t.Errorf("for a document with no hash: creates %v, updates %v; want [summary.md] and [unhashed=transcript.md]", names(create), updated(update))
+	}
+
+	// Two copies: the newest decides, and is the one updated.
+	create, update = planUpload([]driveFile{
+		{ID: "older", Name: "transcript.md", ContentHash: contentHash(&transcript), ModifiedTime: at},
+		{ID: "newer", Name: "transcript.md", ModifiedTime: at.Add(time.Hour)},
+	}, []SyncFile{transcript})
+	if len(create) != 0 || !slices.Equal(updated(update), []string{"newer=transcript.md"}) {
+		t.Errorf("with an older current and a newer stale copy: creates %v, updates %v; want none and [newer=transcript.md]", names(create), updated(update))
+	}
+	create, update = planUpload([]driveFile{
+		{ID: "older", Name: "transcript.md", ModifiedTime: at},
+		{ID: "newer", Name: "transcript.md", ContentHash: contentHash(&transcript), ModifiedTime: at.Add(time.Hour)},
+	}, []SyncFile{transcript})
+	if len(create) != 0 || len(update) != 0 {
+		t.Errorf("with a newer current copy: creates %v, updates %v; want nothing", names(create), updated(update))
 	}
 }
 

@@ -347,6 +347,19 @@ func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
 	}
 }
 
+// gcConfig is the GC configuration for one pass. With Drive sync on in the
+// config, GC is sync-gated whether or not the syncer is running: if it failed
+// to start, GC still deletes and removes only what is on Drive (sessions
+// synced before), instead of everything never backed up.
+func gcConfig(cfg *config.Config) gc.Config {
+	return gc.Config{
+		MaxAgeDays:     cfg.GCMaxAgeDays,
+		MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
+		SyncGated:      cfg.GDriveSyncEnabled,
+		AudioDir:       cfg.AudioDir,
+	}
+}
+
 // keptRawRefreshEvery is how often the count of raw recordings kept because
 // they could not be saved is refreshed for GET /api/status.
 const keptRawRefreshEvery = time.Minute
@@ -355,16 +368,21 @@ const keptRawRefreshEvery = time.Minute
 // recorder keeps because they could not be saved, every interval until ctx
 // ends. GET /api/status reads the cache, so a stuck disk or a hung recording
 // write cannot hang the status. The status warns once they take more than a
-// tenth of the audio budget, which they are not counted against.
+// tenth of the audio budget, which they are not counted against, or as soon
+// as there is one when there is no budget (0): nothing removes them.
 func refreshKeptRawRecordings(ctx context.Context, recorder *audio.Recorder, budgetMB func() int, cache *atomic.Pointer[server.KeptRawRecordings], interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		count, size := recorder.KeptRawRecordings()
+		var warnBytes int64
+		if budget, limited := gc.AudioBudgetBytes(budgetMB()); limited {
+			warnBytes = budget / 10
+		}
 		cache.Store(&server.KeptRawRecordings{
 			Count:     count,
 			Bytes:     size,
-			WarnBytes: int64(budgetMB()) * 1024 * 1024 / 10,
+			WarnBytes: warnBytes,
 		})
 		select {
 		case <-ctx.Done():
@@ -435,6 +453,10 @@ func main() {
 		log.Printf("warning: failed to recover stale sessions: %v", err)
 	} else if len(recoveredIDs) > 0 {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
+	}
+	// A refinement left running by the previous run stopped with it.
+	if err := store.RecoverStaleRefinements(); err != nil {
+		log.Printf("warning: failed to recover stale refinements: %v", err)
 	}
 
 	// Backfill sessions with empty titles.
@@ -593,7 +615,7 @@ func main() {
 	authToken := os.Getenv("GHOST_WISPR_AUTH_TOKEN")
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
-	var syncOrchestrator *gdrive.Orchestrator
+	drive := &driveSync{}
 	var summaryPublisher *envoy.Publisher
 	publishSummaryReady := func(sessionID string) {
 		pub := summaryPublisher
@@ -778,11 +800,23 @@ func main() {
 			return server.KeptRawRecordings{}
 		},
 		GetLogs: logSink.GetLogs,
-		RetrySync: func(ctx context.Context, sessionID string) error {
-			if syncOrchestrator == nil {
-				return fmt.Errorf("gdrive sync not configured")
+		// RetrySync starts a sync of the session in the background and says
+		// at once if none can start, so the API does not report a retry that
+		// does nothing.
+		RetrySync: func(_ context.Context, sessionID string) error {
+			syncer := drive.Get()
+			if syncer == nil {
+				return server.ErrSyncNotConfigured
 			}
-			return syncOrchestrator.SyncSession(ctx, sessionID)
+			if err := syncer.CanSync(sessionID); err != nil {
+				return err
+			}
+			go func() {
+				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+					log.Printf("gdrive retry: session %s: %v", sessionID, err)
+				}
+			}()
+			return nil
 		},
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
 			sess, err := store.GetSession(sessionID)
@@ -1182,7 +1216,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	// Register config change callback.
-	cfgStore.OnChange(func(newCfg config.Config) {
+	onConfigChange(cfgStore, func(newCfg *config.Config) {
 		appLogger = logging.New(os.Stdout, newCfg.LogLevel)
 		slog.SetDefault(appLogger)
 
@@ -1196,13 +1230,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			"anthropic": newCfg.AnthropicAPIKey,
 			"gemini":    newCfg.GeminiAPIKey,
 		}
-		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && (provider != "gemini" && newAPIKeys[provider] != "" || provider == "gemini" && providerConfigured(&newCfg, provider)) {
+		if provider, _, err := llm.ParseModel(newCfg.Summarization.Model); err == nil && (provider != "gemini" && newAPIKeys[provider] != "" || provider == "gemini" && providerConfigured(newCfg, provider)) {
 			newSummarizer := summary.New(newCfg.Summarization, clientFactory)
 			manager.SetSummarizer(newSummarizer)
 			log.Printf("config: summarizer updated for provider %s", provider)
 		}
 
-		if batchTranscriber, err := makeBatchTranscriber(&newCfg); err != nil {
+		if batchTranscriber, err := makeBatchTranscriber(newCfg); err != nil {
 			manager.SetBatchTranscriber(nil)
 			log.Printf("config: batch transcriber disabled: %v", err)
 		} else {
@@ -1210,20 +1244,23 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("config: batch transcriber updated for provider %s", newCfg.BatchTranscription.Provider)
 		}
 
-		if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
-			if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID, appLogger); err == nil {
-				syncOrchestrator = gdrive.NewOrchestrator(syncer, store, appLogger)
-				manager.SetSyncer(syncOrchestrator)
-				log.Printf("config: gdrive sync enabled")
-			}
-		} else if !newCfg.GDriveSyncEnabled && syncOrchestrator != nil {
-			manager.SetSyncer(nil)
-			syncOrchestrator = nil
-			log.Printf("config: gdrive sync disabled")
-		}
-
-		configureEnvoyPublisher(newCfg)
+		configureEnvoyPublisher(*newCfg)
 	})
+	watchDriveSyncSettings(cfgStore, drive,
+		func(cfg *config.Config) (sessionSyncer, error) {
+			syncer, err := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID, appLogger)
+			if err != nil {
+				return nil, err
+			}
+			return gdrive.NewOrchestrator(syncer, store, appLogger), nil
+		},
+		func(syncer sessionSyncer) {
+			if syncer == nil {
+				manager.SetSyncer(nil)
+				return
+			}
+			manager.SetSyncer(syncer)
+		})
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	if startupSummarizer != nil {
@@ -1308,57 +1345,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
 			warnings = append(warnings, "Google Drive sync failed to initialize — backups are disabled")
 		} else {
-			syncOrchestrator = gdrive.NewOrchestrator(syncer, store, appLogger)
-			manager.SetSyncer(syncOrchestrator)
-
-			go func() {
-				ticker := time.NewTicker(5 * time.Minute)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						ids, err := store.GetSessionsNeedingSync()
-						if err != nil {
-							log.Printf("gdrive sweep error: %v", err)
-							continue
-						}
-
-						retryScheduled, err := store.GetSessionsBySyncState(storage.SyncStateRetryScheduled)
-						if err != nil {
-							log.Printf("gdrive retry sweep error: %v", err)
-							continue
-						}
-
-						now := time.Now().UTC()
-						seen := make(map[string]struct{}, len(ids)+len(retryScheduled))
-						for _, id := range ids {
-							seen[id] = struct{}{}
-						}
-
-						for i := range retryScheduled {
-							sess := &retryScheduled[i]
-							if !gdrive.IsRetryReady(now, sess.RetryCount, sess.LastSyncAttempt) {
-								continue
-							}
-							if _, ok := seen[sess.ID]; ok {
-								continue
-							}
-							ids = append(ids, sess.ID)
-							seen[sess.ID] = struct{}{}
-						}
-
-						for _, id := range ids {
-							if err := syncOrchestrator.SyncSession(ctx, id); err != nil {
-								log.Printf("gdrive sweep: session %s: %v", id, err)
-							}
-						}
-					}
-				}
-			}()
+			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
+			drive.Set(orchestrator)
+			manager.SetSyncer(orchestrator)
 		}
 	}
+	// The Drive sync sweep runs whether sync is on or not: it syncs nothing
+	// while sync is off, and picks up a syncer turned on in the settings.
+	go sweepDriveSync(ctx, store, drive, 5*time.Minute)
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -1386,13 +1380,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					if !latestCfg.GCEnabled {
 						continue
 					}
-					syncGated := latestCfg.GDriveSyncEnabled && syncOrchestrator != nil
-					collector := gc.New(store, gc.Config{
-						MaxAgeDays:     latestCfg.GCMaxAgeDays,
-						MaxAudioSizeMB: latestCfg.GCMaxAudioSizeMB,
-						SyncGated:      syncGated,
-						AudioDir:       latestCfg.AudioDir,
-					}, appLogger)
+					collector := gc.New(store, gcConfig(&latestCfg), appLogger)
 					deleted, err := collector.Run()
 					if err != nil {
 						log.Printf("gc error: %v", err)

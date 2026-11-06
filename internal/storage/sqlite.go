@@ -81,7 +81,7 @@ type Session struct {
 	RefinedTranscript   string     `json:"refined_transcript"`
 	RefinementStatus    string     `json:"refinement_status"`
 	AudioPath           string     `json:"audio_path"`
-	AudioRemovedAt      string     `json:"audio_removed_at"` // when disk pressure removed the audio (RFC 3339), "" if never; the session is kept
+	AudioRemovedAt      string     `json:"audio_removed_at"` // when disk pressure removed audio (RFC 3339), "" if never: all of it, or part when AudioPath names what is left; the session is kept
 	SyncStatus          string     `json:"sync_status"`
 	EnvoyPublishStatus  string     `json:"envoy_publish_status"`
 	SyncState           string     `json:"sync_state"`
@@ -313,6 +313,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN canonical_transcript TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN transcript_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN audio_removed_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN restored_at TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -326,6 +327,25 @@ func (s *SQLiteStore) init(dbPath string) error {
 		RefinementNoAudio, RefinementPending,
 	); err != nil {
 		return fmt.Errorf("mark sessions without a recording no_audio: %w", err)
+	}
+
+	// A merge used to leave its sources naming the recordings it gave the
+	// merged session; the merged session alone names them now.
+	if _, err := s.db.Exec(`UPDATE sessions SET audio_path = '' WHERE status = 'merged' AND audio_path != ''`); err != nil {
+		return fmt.Errorf("move recordings off merged sources: %w", err)
+	}
+
+	if err := s.runOnce("resync-merged-session-audio",
+		// Drive sync uploaded no audio for a merged session (it stat'ed the
+		// joined path of its recordings), yet marked it synced. Sync those
+		// sessions again: every session naming several recordings, and every
+		// merge target, including one disk pressure had cut down to a single
+		// recording. They keep their Drive folder; the sync adds what it lacks.
+		`UPDATE sessions SET sync_status = 'pending', sync_state = 'PENDING', retry_count = 0, error_message = ''
+		 WHERE status = 'ended' AND sync_status = 'synced' AND audio_path != ''
+		   AND (audio_path LIKE '%,%' OR id IN (SELECT merged_into FROM sessions WHERE status = 'merged'))`,
+	); err != nil {
+		return err
 	}
 
 	for _, stmt := range []string{
@@ -428,6 +448,35 @@ func (s *SQLiteStore) Close() error {
 
 func (s *SQLiteStore) DB() *sql.DB {
 	return s.db
+}
+
+// runOnce runs a data migration the first time a database is opened by a
+// version that has it, and records it in the migrations table, in one
+// transaction: a migration that must not repeat (one that sends sessions to
+// sync again) runs once per database.
+func (s *SQLiteStore) runOnce(name, stmt string) error {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		return fmt.Errorf("create migrations table: %w", err)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin migration %s: %w", name, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`INSERT OR IGNORE INTO migrations(name, applied_at) VALUES(?, ?)`, name, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("record migration %s: %w", name, err)
+	}
+	if added, err := res.RowsAffected(); err != nil || added == 0 {
+		return err
+	}
+	if _, err := tx.Exec(stmt); err != nil {
+		return fmt.Errorf("migration %s: %w", name, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration %s: %w", name, err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
@@ -586,8 +635,11 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		}
 	}
 
+	// The merged session now has the sources' recordings: one session names
+	// each file, so removing the merged session's audio leaves no source
+	// naming a file that is gone.
 	markQuery := fmt.Sprintf(
-		`UPDATE sessions SET status = 'merged', merged_into = ? WHERE id IN (%s)`,
+		`UPDATE sessions SET status = 'merged', merged_into = ?, audio_path = '' WHERE id IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 	markArgs := make([]any, 0, len(sourceIDs)+1)
@@ -656,8 +708,18 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	return scanSessions(rows)
 }
 
+// querier is what reading a session needs: the database, or a transaction.
+type querier interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
 func (s *SQLiteStore) GetSession(id string) (Session, error) {
-	row := s.db.QueryRow(
+	return getSession(s.db, id)
+}
+
+func getSession(q querier, id string) (Session, error) {
+	row := q.QueryRow(
 		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at FROM sessions WHERE id = ?`,
 		id,
 	)
@@ -696,7 +758,11 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 }
 
 func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error) {
-	rows, err := s.db.Query(
+	return getSegments(s.db, sessionID)
+}
+
+func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
+	rows, err := q.Query(
 		`SELECT speaker, text, start_time, end_time, timestamp
 		 FROM segments
 		 WHERE session_id = ?
@@ -848,6 +914,27 @@ func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) err
 	return nil
 }
 
+// ClaimRefinement marks session id's refinement running, dropping any earlier
+// refined transcript, only while the session still names audioPath, the
+// recording the refinement will read. Disk pressure changes the audio path
+// before it removes a file (MarkAudioRemoved), so once GC has taken the
+// recording this reports false and the refinement must not start; and GC
+// takes nothing from a session whose refinement is running.
+func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ? WHERE id = ? AND audio_path = ? AND audio_path != ''`,
+		RefinementRunning, id, audioPath,
+	)
+	if err != nil {
+		return false, fmt.Errorf("claim refinement of session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim refinement rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
 func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {
 	var transcript, status string
 	if err := s.db.QueryRow(`SELECT refined_transcript, refinement_status FROM sessions WHERE id = ?`, sessionID).Scan(&transcript, &status); err != nil {
@@ -989,6 +1076,47 @@ func (s *SQLiteStore) UpdateSyncState(sessionID, state, driveFolderID string, re
 	return nil
 }
 
+// MarkSynced marks session id synced to Drive folder driveFolderID, only while
+// unchanged reports true for the session and its segments as they are now,
+// read in the same transaction as the update, and reports whether it did. A
+// sync passes a check that the session is still what it uploaded: its audio
+// path (GC may have put back a recording it could not remove) and its
+// documents (a summary made again, a refined transcript). A session that
+// changed during the upload is not synced, and the next sync uploads what it
+// is now. unchanged runs inside the transaction: it must not use the store.
+func (s *SQLiteStore) MarkSynced(id, driveFolderID string, unchanged func(Session, []transcribe.Segment) bool) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin marking session %s synced: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	sess, err := getSession(tx, id)
+	if err != nil {
+		return false, err
+	}
+	segments, err := getSegments(tx, id)
+	if err != nil {
+		return false, err
+	}
+	if !unchanged(sess, segments) {
+		return false, nil
+	}
+	if _, err := tx.Exec(
+		`UPDATE sessions
+		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
+		     retry_count = 0, last_sync_attempt = NULL, error_message = ''
+		 WHERE id = ?`,
+		SyncStateSynced, SyncSynced, driveFolderID, driveFolderID, id,
+	); err != nil {
+		return false, fmt.Errorf("mark session %s synced: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit marking session %s synced: %w", id, err)
+	}
+	return true, nil
+}
+
 func (s *SQLiteStore) UpdateEnvoyPublishStatus(sessionID, status string) error {
 	res, err := s.db.Exec(`UPDATE sessions SET envoy_publish_status = ? WHERE id = ?`, status, sessionID)
 	if err != nil {
@@ -1062,6 +1190,17 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 	}
 
 	return sessions, nil
+}
+
+// RecoverStaleRefinements marks failed every refinement left running by an
+// earlier run of the app, which stopped inside it: nothing is running when the
+// app starts. Failed offers a retry, and GC, which leaves a running
+// refinement's session and audio alone, is not held off for good.
+func (s *SQLiteStore) RecoverStaleRefinements() error {
+	if _, err := s.db.Exec(`UPDATE sessions SET refinement_status = ? WHERE refinement_status = ?`, RefinementFailed, RefinementRunning); err != nil {
+		return fmt.Errorf("recover stale refinements: %w", err)
+	}
+	return nil
 }
 
 // RecoverStaleSessions ends any sessions still marked as 'active' and returns their IDs.
@@ -1217,23 +1356,39 @@ func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error
 	return scanSessions(rows)
 }
 
-// GetGCEligibleSessions returns the sessions age-based GC deletes: ended, with
-// a completed summary, synced if syncGated, and, if maxAgeDays > 0, started
-// more than that many days ago. Results are ordered oldest first.
-func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
-	query := `SELECT id FROM sessions WHERE status = 'ended' AND summary_status = 'completed'`
-	var args []any
-	if maxAgeDays > 0 {
-		cutoff := time.Now().UTC().Add(-time.Duration(maxAgeDays) * 24 * time.Hour).Format(time.RFC3339Nano)
-		query += ` AND started_at < ?`
-		args = append(args, cutoff)
+// ageCutoff returns the time before which a session started (or was restored)
+// is older than maxAgeDays days at now, and false when no session can be:
+// with no limit (maxAgeDays <= 0), or a limit reaching back past year 1.
+// Counting in days, not in a time.Duration (which overflows past 106,751
+// days), keeps any limit from wrapping round into the future.
+func ageCutoff(now time.Time, maxAgeDays int) (time.Time, bool) {
+	daysSinceYear1 := (now.Unix() - time.Time{}.Unix()) / (24 * 60 * 60)
+	if maxAgeDays <= 0 || int64(maxAgeDays) >= daysSinceYear1 {
+		return time.Time{}, false
 	}
+	return now.AddDate(0, 0, -maxAgeDays), true
+}
+
+// GetGCEligibleSessions returns the sessions age-based GC deletes, oldest
+// first: ended, with a completed summary, synced if syncGated, and older than
+// maxAgeDays days. A session's age runs from when it started or, if it was
+// restored from Drive, from its restore, so the pass after a restore keeps
+// it. maxAgeDays <= 0 is no age limit: it returns none.
+func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+	cutoff, ok := ageCutoff(time.Now().UTC(), maxAgeDays)
+	if !ok {
+		return nil, nil
+	}
+	at := cutoff.Format(time.RFC3339Nano)
+	// restored_at is '' for a session recorded here, which is before any time.
+	query := `SELECT id FROM sessions WHERE status = 'ended' AND summary_status = 'completed'
+		AND started_at < ? AND restored_at < ? AND refinement_status != 'running'`
 	if syncGated {
 		query += ` AND sync_status = 'synced'`
 	}
 	query += ` ORDER BY started_at ASC`
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(query, at, at)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible sessions: %w", err)
 	}
@@ -1254,66 +1409,139 @@ func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]s
 }
 
 // SessionRecording is a session's saved recording: its audio path, which may
-// name several files (a merged session).
+// name several files (a merged session), and whether disk pressure may remove
+// it.
 type SessionRecording struct {
 	ID        string
 	AudioPath string
+	Removable bool
 }
 
-// RemovableRecordings lists, oldest first, the sessions whose saved recording
-// disk pressure may remove: ended, with a recording, not being refined (the
-// refinement reads the file), and synced when syncGated. Any other sync state,
-// a failure included, keeps the recording.
-func (s *SQLiteStore) RemovableRecordings(syncGated bool) ([]SessionRecording, error) {
-	query := `SELECT id, audio_path FROM sessions
-		WHERE status = 'ended' AND audio_path != '' AND refinement_status != ?`
+// removable is the condition under which disk pressure may remove a session's
+// recording, and its arguments: the session ended, no refinement is reading
+// the file, and, when syncGated, it is synced. Any other sync state, a
+// failure included, keeps the recording.
+func removable(syncGated bool) (string, []any) {
+	cond := `status = 'ended' AND refinement_status != ?`
 	if syncGated {
-		query += ` AND sync_status = 'synced'`
+		cond += ` AND sync_status = ?`
+		return cond, []any{RefinementRunning, SyncSynced}
 	}
-	query += ` ORDER BY started_at ASC`
+	return cond, []any{RefinementRunning}
+}
 
-	rows, err := s.db.Query(query, RefinementRunning)
+// Recordings lists, oldest first, every session that names audio, and whether
+// disk pressure may remove its recording (see removable).
+func (s *SQLiteStore) Recordings(syncGated bool) ([]SessionRecording, error) {
+	cond, args := removable(syncGated)
+	rows, err := s.db.Query(`SELECT id, audio_path, (`+cond+`) FROM sessions
+		WHERE audio_path != '' ORDER BY started_at ASC`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query removable recordings: %w", err)
+		return nil, fmt.Errorf("query recordings: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var recordings []SessionRecording
 	for rows.Next() {
 		var rec SessionRecording
-		if err := rows.Scan(&rec.ID, &rec.AudioPath); err != nil {
-			return nil, fmt.Errorf("scan removable recording: %w", err)
+		if err := rows.Scan(&rec.ID, &rec.AudioPath, &rec.Removable); err != nil {
+			return nil, fmt.Errorf("scan recording: %w", err)
 		}
 		recordings = append(recordings, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate removable recordings: %w", err)
+		return nil, fmt.Errorf("iterate recordings: %w", err)
 	}
 	return recordings, nil
 }
 
-// MarkAudioRemoved records that disk pressure removed session id's audio at
-// removedAt, keeping the session: its audio path becomes audioPath, what is
-// left of it, and the marker the UI shows is set. With no audio left, a
-// refinement that can no longer run (pending or failed) becomes no_audio.
-func (s *SQLiteStore) MarkAudioRemoved(id, audioPath string, removedAt time.Time) error {
-	res, err := s.db.Exec(
+// AudioRemoval is what MarkAudioRemoved changed in a session's row: its audio
+// path before and after, and its marker, refinement status and sync state
+// before, so RestoreAudio can put back the part whose files stayed on disk.
+type AudioRemoval struct {
+	ID               string
+	Before, Left     string
+	RemovedAtBefore  string
+	RefinementBefore string
+	SyncStateBefore  string
+}
+
+// MarkAudioRemoved records that disk pressure is about to remove part or all
+// of session id's audio, before it removes any file, so the session never
+// names a file GC has removed. The audio path becomes left, what will be left
+// of before; the marker the UI shows is set to removedAt; and a refinement
+// that can no longer run (pending or failed) becomes no_audio when no
+// recording is left on disk (audioLeft false; left may still name a file GC
+// could not see, on a disk not mounted for the moment). It does this only
+// while the session's audio path is still before and disk pressure may still
+// remove it (see removable), so a refinement that started reading the file
+// since GC listed it keeps it. It reports whether it did, and returns the row
+// as it was, for RestoreAudio.
+func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncGated bool, removedAt time.Time) (AudioRemoval, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AudioRemoval{}, false, fmt.Errorf("begin marking audio removed for session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	removal := AudioRemoval{ID: id, Before: before, Left: left}
+	cond, args := removable(syncGated)
+	err = tx.QueryRow(`SELECT audio_removed_at, refinement_status, sync_state FROM sessions WHERE id = ? AND audio_path = ? AND `+cond,
+		append([]any{id, before}, args...)...).Scan(&removal.RemovedAtBefore, &removal.RefinementBefore, &removal.SyncStateBefore)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AudioRemoval{}, false, nil
+	}
+	if err != nil {
+		return AudioRemoval{}, false, fmt.Errorf("read session %s to mark its audio removed: %w", id, err)
+	}
+	if _, err := tx.Exec(
 		`UPDATE sessions SET audio_path = ?, audio_removed_at = ?,
-			refinement_status = CASE WHEN ? = '' AND refinement_status IN (?, ?) THEN ? ELSE refinement_status END
+			refinement_status = CASE WHEN ? AND refinement_status IN (?, ?) THEN ? ELSE refinement_status END
 		 WHERE id = ?`,
-		audioPath, removedAt.UTC().Format(time.RFC3339Nano),
-		audioPath, RefinementPending, RefinementFailed, RefinementNoAudio,
+		left, removedAt.UTC().Format(time.RFC3339Nano),
+		!audioLeft, RefinementPending, RefinementFailed, RefinementNoAudio,
 		id,
+	); err != nil {
+		return AudioRemoval{}, false, fmt.Errorf("mark audio removed for session %s: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return AudioRemoval{}, false, fmt.Errorf("commit marking audio removed for session %s: %w", id, err)
+	}
+	return removal, true, nil
+}
+
+// RestoreAudio puts back the part of removal whose files GC could not remove
+// after all: the session's audio path becomes restored, what is still on disk
+// of removal.Before. With all of it back, the marker and refinement status
+// are as they were before the mark; with part of it, the marker stays and a
+// refinement the mark moved to no_audio goes back. A sync that finished
+// since the mark uploaded the row as marked, so the recordings put back may
+// not be on Drive: the session goes back to pending sync, keeping its folder.
+// It refuses a row whose audio path is no longer what the mark left.
+func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error {
+	res, err := s.db.Exec(
+		`UPDATE sessions SET audio_path = ?,
+			audio_removed_at = CASE WHEN ? = ? THEN ? ELSE audio_removed_at END,
+			refinement_status = CASE WHEN ? != '' AND refinement_status = ? THEN ? ELSE refinement_status END,
+			sync_status = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_status END,
+			sync_state = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_state END
+		 WHERE id = ? AND audio_path = ? AND status = 'ended'`,
+		restored,
+		restored, removal.Before, removal.RemovedAtBefore,
+		restored, RefinementNoAudio, removal.RefinementBefore,
+		SyncStateSynced, removal.SyncStateBefore, SyncPending,
+		SyncStateSynced, removal.SyncStateBefore, SyncStatePending,
+		removal.ID, removal.Left,
 	)
 	if err != nil {
-		return fmt.Errorf("mark audio removed for session %s: %w", id, err)
+		return fmt.Errorf("restore audio of session %s: %w", removal.ID, err)
 	}
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("mark audio removed rows affected: %w", err)
+		return fmt.Errorf("restore audio rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("mark audio removed for session %s: %w", id, sql.ErrNoRows)
+		return fmt.Errorf("restore audio of session %s: its audio path is no longer %q", removal.ID, removal.Left)
 	}
 	return nil
 }
@@ -1333,7 +1561,26 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 	return nil
 }
 
-// ImportSession inserts a fully-formed session and its segments in a single transaction.
+// DeleteEndedSession deletes session id for the age policy only while it is as
+// GC read it: ended, and naming audioPath. It reports whether it did. A
+// session merged since GC read it gave its recording to the merged session,
+// so deleting it, and removing that recording with it, would leave the merged
+// session naming a file that is gone.
+func (s *SQLiteStore) DeleteEndedSession(id, audioPath string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND status = 'ended' AND audio_path = ? AND refinement_status != ?`, id, audioPath, RefinementRunning)
+	if err != nil {
+		return false, fmt.Errorf("delete session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete session rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
+// ImportSession inserts a fully-formed session restored from a backup, and its
+// segments, in a single transaction. The session keeps the time it started,
+// but its age for the retention policy runs from now, its restore.
 // Returns an error containing "already exists" if the session ID is already present.
 func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment) error {
 	// Check for existing session first.
@@ -1357,8 +1604,8 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 	}
 
 	_, err = tx.Exec(
-		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, canonical_transcript, transcript_source)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions(id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, canonical_transcript, transcript_source, restored_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ID,
 		sess.Title,
 		sess.StartedAt.UTC().Format(time.RFC3339Nano),
@@ -1385,6 +1632,7 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		sess.GDriveFolderID,
 		sess.CanonicalTranscript,
 		sess.TranscriptSource,
+		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("insert session %s: %w", sess.ID, err)
