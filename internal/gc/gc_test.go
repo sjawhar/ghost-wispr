@@ -430,9 +430,7 @@ func TestGCDiskPressureNeverCountsAudioItMayNotRemove(t *testing.T) {
 		hold      func(t *testing.T, store *storage.SQLiteStore, id string)
 	}{
 		{name: "Drive sync failed for good", syncGated: true, hold: func(t *testing.T, store *storage.SQLiteStore, id string) {
-			if err := store.UpdateSyncStatus(id, storage.SyncFailed, ""); err != nil {
-				t.Fatalf("fail sync of %s: %v", id, err)
-			}
+			syncTo(t, store, id, storage.SyncStateFailed, "", 0, "")
 		}},
 		{name: "discarded sessions", hold: func(t *testing.T, store *storage.SQLiteStore, id string) {
 			if err := store.DiscardSession(id); err != nil {
@@ -452,9 +450,7 @@ func TestGCDiskPressureNeverCountsAudioItMayNotRemove(t *testing.T) {
 			healthy := map[string]string{}
 			for i, id := range []string{"20261106101000", "20261106102000", "20261106103000"} {
 				healthy[id] = endWithRecording(t, store, dir, id, started.Add(time.Duration(i+1)*10*time.Minute), 128*1024)
-				if err := store.UpdateSyncStatus(id, storage.SyncSynced, "folder"); err != nil {
-					t.Fatalf("sync %s: %v", id, err)
-				}
+				syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
 			}
 
 			if deleted := runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, SyncGated: tc.syncGated, AudioDir: dir}, 3); len(deleted) != 0 {
@@ -599,9 +595,7 @@ func summarized(t *testing.T, store *storage.SQLiteStore, id string, startedAt t
 	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("summarize %s: %v", id, err)
 	}
-	if err := store.UpdateSyncStatus(id, storage.SyncSynced, "folder"); err != nil {
-		t.Fatalf("sync %s: %v", id, err)
-	}
+	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
 }
 
 // expectNoSessionNamesAMissingFile fails the test unless every file the
@@ -767,16 +761,12 @@ func TestGCNeverRemovesAFileAnotherSessionNames(t *testing.T) {
 			if err := store.EndSession("20261106101000", started.Add(11*time.Minute), saved); err != nil {
 				t.Fatalf("end session: %v", err)
 			}
-			if err := store.UpdateSyncStatus("20261106100000", storage.SyncSynced, "folder"); err != nil {
-				t.Fatalf("sync: %v", err)
-			}
-			other := storage.SyncFailed
+			syncTo(t, store, "20261106100000", storage.SyncStateSynced, "folder", 0, "")
+			other := storage.SyncStateFailed
 			if tc.otherSynced {
-				other = storage.SyncSynced
+				other = storage.SyncStateSynced
 			}
-			if err := store.UpdateSyncStatus("20261106101000", other, "folder"); err != nil {
-				t.Fatalf("sync: %v", err)
-			}
+			syncTo(t, store, "20261106101000", other, "folder", 0, "")
 
 			runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir}, 2)
 			expectAudioKept(t, store, "20261106100000", saved)

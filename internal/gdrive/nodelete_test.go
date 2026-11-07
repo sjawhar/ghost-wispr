@@ -64,9 +64,7 @@ func TestResyncOfAMainEraFolderUpdatesTheDocumentsInPlace(t *testing.T) {
 		t.Fatalf("summarize: %v", err)
 	}
 	// As the re-sync migration leaves it: pending, its folder kept.
-	if err := store.UpdateSyncState(id, storage.SyncStatePending, folder, 0, nil, ""); err != nil {
-		t.Fatalf("pending: %v", err)
-	}
+	syncTo(t, store, id, storage.SyncStatePending, folder, 0, "")
 
 	if err := NewOrchestrator(syncer, store).SyncSession(context.Background(), id); err != nil {
 		t.Fatalf("re-sync: %v", err)

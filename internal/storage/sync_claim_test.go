@@ -121,17 +121,15 @@ func TestEndSync(t *testing.T) {
 // FAILED. Sessions in any other state are left alone.
 func TestRecoverInterruptedSyncs(t *testing.T) {
 	store := newTestSQLiteStore(t)
-	before := time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC)
 	for id, retries := range map[string]int{"20261106140000": 0, "20261106140100": 5} {
 		endedWith(t, store, id, "/audio/"+id+".mp3", RefinementPending)
-		if err := store.UpdateSyncState(id, SyncStateSyncing, "folder-"+id, retries, &before, ""); err != nil {
-			t.Fatalf("UpdateSyncState %s: %v", id, err)
-		}
+		// As an earlier run left it: claimed by a sync that never ended,
+		// with the retries it had already had.
+		syncTo(t, store, id, SyncStateRetryScheduled, "folder-"+id, retries, "")
+		syncTo(t, store, id, SyncStateSyncing, "", 0, "")
 	}
 	endedWith(t, store, "20261106140200", "/audio/c.mp3", RefinementPending)
-	if err := store.UpdateSyncStatus("20261106140200", SyncSynced, "folder-c"); err != nil {
-		t.Fatalf("UpdateSyncStatus: %v", err)
-	}
+	syncTo(t, store, "20261106140200", SyncStateSynced, "folder-c", 0, "")
 
 	at := time.Date(2026, 11, 6, 15, 0, 0, 0, time.UTC)
 	recovered, err := store.RecoverInterruptedSyncs(5, at)

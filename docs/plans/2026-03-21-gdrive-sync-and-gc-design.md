@@ -89,13 +89,16 @@ New columns on the `sessions` table:
 - `sync_status` — `pending` | `synced` | `failed`
 - `sync_state` — `PENDING` | `SYNCING` | `SYNCED` | `RETRY_SCHEDULED` | `FAILED` | `REMOTE_DELETED`, with `retry_count` and `last_sync_attempt` for the backoff
 - `sync_claim` — the claim of the sync that holds the session while it is `SYNCING`
+- `documents_unverified` — 1 while Drive may lack the session's current summary and transcript though it is synced (below); the age policy never deletes such a session
 - `gdrive_folder_id` — the Drive folder ID for this session's folder (for future restore/management)
 
 Sessions start as `pending`. On successful upload of all its files, marked `synced`. On failure, retried with backoff by the sweep; once the retries run out, `failed`, and a manual retry (`POST /api/sessions/{id}/retry-sync`, the UI's retry button) starts again from there. The sweep runs whether sync is on or not: it syncs nothing while sync is off and picks up a syncer turned on in the settings.
 
 **One sync of a session at a time.** A sync first claims its session: in one statement it moves it to `SYNCING` under a claim of its own (`sync_claim`), only from the state it read and never from `SYNCING` (`ClaimSync`). A second sync of the session (retry-sync, the sync after a summary, the sweep) finds it claimed and starts nothing, and retry-sync answers 409, so two syncs never create two folders. Every state the sync writes afterwards (`MarkSynced`, and `EndSync` for a change during the upload, a retry, a failure or a deleted folder) applies only while the session is still `SYNCING` under its claim, so a sync that no longer holds its session never replaces what the session is now. A failure ends in one write (`SYNCING` to `RETRY_SCHEDULED`, or `FAILED` once the retries ran out), and so does an error while marking a session synced: the session goes to a retry with its folder kept, instead of staying `SYNCING`. A sync cut off by the app stopping, or one whose closing write fails too, leaves its session `SYNCING`; when the app starts, every such session goes to a retry (`RecoverInterruptedSyncs`), its folder kept, the cut-off sync counted as a failed attempt.
 
-**A change after a sync goes to Drive.** A synced session's documents are its summary and transcript as a sync renders them, from its title, times, summary, preset and canonical transcript. A write that changes one of these (a summary made again, a title edited, a refinement retried) sends a synced session back to `pending` in the same statement (the `sessions_documents_changed` trigger), keeping its folder, so the sweep updates its documents there in place. A change during a sync sends the session back to `pending` too: its sync sees the change when it marks the session (below), ends in `PENDING` with its retry count, and the next sweep uploads it as it is now. So from this version on, `synced` means Drive has the session's current documents, which is what GC's sync gate relies on. A session an earlier version left `synced` after its documents changed is not found by this: it goes back to sync the next time its documents change.
+**A change after a sync goes to Drive.** A synced session's documents are its summary and transcript as a sync renders them, from its title, times, summary, preset and canonical transcript. A write that changes one of these (a summary made again, a title edited, a refinement retried) sends a synced session back to `pending` in the same statement (the `sessions_documents_changed` trigger), keeping its folder, so the sweep updates its documents there in place. A change during a sync sends the session back to `pending` too: its sync sees the change when it marks the session (below), ends in `PENDING` with its retry count, and the next sweep uploads it as it is now. So from this version on, `synced` means Drive has the session's current documents, which is what GC's sync gate relies on.
+
+**Sessions synced by an earlier version.** An earlier version left a session `synced` when its documents changed after its sync (it synced while its summary was running, or was summarized again, refined again or retitled), and nothing records what it uploaded. So the first time this version opens a database (the `mark-synced-documents-unverified` migration, run once and recorded in the `migrations` table), every `synced` session gets `documents_unverified = 1`; its sync state and folder stay as they are, and nothing is uploaded for it. The age policy never deletes a session so marked, with sync gating it or not; disk pressure still removes its audio, which Drive has. The mark goes when a sync of the session completes: the next time its documents change, the trigger above sends it to sync, and marking it synced clears the mark. A session whose documents never change again stays marked, and kept, until a re-sync of its documents alone verifies it, which this version does not have.
 
 ## Garbage Collection
 
@@ -127,10 +130,11 @@ Not counted against the budget, and never removed by GC: a raw `.pcm` that is th
 
 ### Deletion criteria
 
-A session is eligible for age-based GC when **both conditions are true**:
+A session is eligible for age-based GC when **all these conditions are true**:
 
 1. **Sync-gated:** `sync_status = 'synced'` (confirmed backed up to Drive, with its current summary and transcript), checked again in the statement that deletes it, so a session whose documents changed after GC listed it is kept until they are on Drive
-2. **Age:** the session is older than `gc_max_age_days` (default: 30; 0 means never), counted from when it started or, if restored from Drive, from its restore, and its summary is complete.
+2. **Documents verified:** `documents_unverified = 0`, also checked again in the deleting statement, gated or not (sessions synced by an earlier version, above)
+3. **Age:** the session is older than `gc_max_age_days` (default: 30; 0 means never), counted from when it started or, if restored from Drive, from its restore, and its summary is complete.
 
 ### When GDrive sync is not configured
 

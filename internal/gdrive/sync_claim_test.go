@@ -110,10 +110,12 @@ func TestASyncMarksSyncedOnlyASessionItStillHolds(t *testing.T) {
 	summarizedSession(t, store, t.TempDir(), id, time.Now().UTC().Add(-time.Hour), "A summary.")
 	drive := newFakeDrive()
 	onFirstUpload(drive, func() {
-		now := time.Now().UTC()
-		if err := store.UpdateSyncState(id, storage.SyncStateRemoteDeleted, "", 0, &now, "the Drive folder was deleted by hand"); err != nil {
-			t.Errorf("set remote deleted: %v", err)
+		// The app restarted, so the session is no longer this sync's, and
+		// the sync that took it found its Drive folder deleted by hand.
+		if _, err := store.RecoverInterruptedSyncs(MaxSyncRetries, time.Now().UTC()); err != nil {
+			t.Errorf("recover interrupted syncs: %v", err)
 		}
+		syncTo(t, store, id, storage.SyncStateRemoteDeleted, "", 0, "the Drive folder was deleted by hand")
 	})
 
 	syncErr := NewOrchestratorWithUploader(drive, store).SyncSession(context.Background(), id)
@@ -133,10 +135,12 @@ func TestAFailedSyncNeverReplacesTheStateItNoLongerHolds(t *testing.T) {
 	drive := newFakeDrive()
 	drive.failAfter = 1
 	onFirstUpload(drive, func() {
-		// Another sync finished meanwhile and marked the session synced.
-		if err := store.UpdateSyncStatus(id, storage.SyncSynced, "folder-of-the-other-sync"); err != nil {
-			t.Errorf("mark synced: %v", err)
+		// The app restarted and another sync, which found the session no
+		// longer held, finished and marked it synced.
+		if _, err := store.RecoverInterruptedSyncs(MaxSyncRetries, time.Now().UTC()); err != nil {
+			t.Errorf("recover interrupted syncs: %v", err)
 		}
+		syncTo(t, store, id, storage.SyncStateSynced, "folder-of-the-other-sync", 0, "")
 	})
 
 	syncErr := NewOrchestratorWithUploader(drive, store).SyncSession(context.Background(), id)

@@ -315,6 +315,11 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN audio_removed_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN restored_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN sync_claim TEXT NOT NULL DEFAULT ''`,
+		// 1 while Drive may lack the session's current summary and
+		// transcript though it is synced (mark-synced-documents-unverified,
+		// below); a sync of it that completes sets 0 (MarkSynced). The age
+		// policy never deletes a session marked 1.
+		`ALTER TABLE sessions ADD COLUMN documents_unverified INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -345,6 +350,20 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`UPDATE sessions SET sync_status = 'pending', sync_state = 'PENDING', retry_count = 0, error_message = ''
 		 WHERE status = 'ended' AND sync_status = 'synced' AND audio_path != ''
 		   AND (audio_path LIKE '%,%' OR id IN (SELECT merged_into FROM sessions WHERE status = 'merged'))`,
+	); err != nil {
+		return err
+	}
+
+	if err := s.runOnce("mark-synced-documents-unverified",
+		// Earlier versions left a session synced when its summary or
+		// transcript changed after its sync (it synced while its summary was
+		// running, or was summarized again, refined again or retitled), and
+		// nothing records what they uploaded. So every session synced when
+		// this version first opens the database is marked as having
+		// documents not verified on Drive, which keeps it from the age
+		// policy until a sync of it completes. Its sync state and folder stay
+		// as they are: nothing is uploaded for it until its documents change.
+		`UPDATE sessions SET documents_unverified = 1 WHERE sync_status = 'synced'`,
 	); err != nil {
 		return err
 	}
@@ -391,7 +410,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// when a merge moves them off it, in the transaction that marks it
 		// merged: the sweep and GC take only ended sessions, and the merged
 		// session that now holds them is new, so not synced.
-		`CREATE TRIGGER IF NOT EXISTS sessions_documents_changed
+		`DROP TRIGGER IF EXISTS sessions_documents_changed`,
+		`CREATE TRIGGER sessions_documents_changed
 		AFTER UPDATE OF title, started_at, ended_at, summary, summary_preset, canonical_transcript ON sessions
 		WHEN new.sync_status = 'synced' AND (
 			new.title IS NOT old.title OR new.started_at IS NOT old.started_at OR new.ended_at IS NOT old.ended_at OR
@@ -1055,67 +1075,6 @@ func (s *SQLiteStore) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
-func (s *SQLiteStore) UpdateSyncStatus(sessionID, status, driveFolderID string) error {
-	syncState := SyncStatePending
-	switch status {
-	case SyncSynced:
-		syncState = SyncStateSynced
-	case SyncFailed:
-		syncState = SyncStateFailed
-	}
-
-	res, err := s.db.Exec(
-		`UPDATE sessions SET sync_status = ?, sync_state = ?, gdrive_folder_id = ? WHERE id = ?`,
-		status, syncState, driveFolderID, sessionID,
-	)
-	if err != nil {
-		return fmt.Errorf("update sync status for session %s: %w", sessionID, err)
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("update sync status rows affected: %w", err)
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
-func (s *SQLiteStore) UpdateSyncState(sessionID, state, driveFolderID string, retryCount int, lastSyncAttempt *time.Time, errorMessage string) error {
-	var lastAttempt any
-	if lastSyncAttempt != nil {
-		lastAttempt = lastSyncAttempt.UTC().Format(time.RFC3339Nano)
-	}
-
-	res, err := s.db.Exec(
-		`UPDATE sessions
-		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
-		     retry_count = ?, last_sync_attempt = ?, error_message = ?
-		 WHERE id = ?`,
-		state,
-		syncStatusFromState(state),
-		driveFolderID,
-		driveFolderID,
-		retryCount,
-		lastAttempt,
-		errorMessage,
-		sessionID,
-	)
-	if err != nil {
-		return fmt.Errorf("update sync state for session %s: %w", sessionID, err)
-	}
-
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("update sync state rows affected: %w", err)
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-
-	return nil
-}
-
 // ClaimSync claims session id for one sync, which claim names: it moves the
 // session to SYNCING only while its sync state is still from (the state the
 // sync read) and no sync holds it (from is not SYNCING), and returns the
@@ -1165,8 +1124,10 @@ func (s *SQLiteStore) ClaimSync(id, from, claim string, at time.Time) (Session, 
 // have put back a recording it could not remove) and its documents (a
 // summary made again, a refined transcript). A session that changed during
 // the upload is not synced, and the next sync uploads what it is now; one
-// the sync no longer holds is left as it is. unchanged runs inside the
-// transaction: it must not use the store.
+// the sync no longer holds is left as it is. Marked synced, Drive has the
+// session's documents as they are, so they are verified (documents_unverified
+// is cleared). unchanged runs inside the transaction: it must not use the
+// store.
 func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func(Session, []transcribe.Segment) bool) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1188,7 +1149,7 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
-		     retry_count = 0, last_sync_attempt = NULL, error_message = '', sync_claim = ''
+		     retry_count = 0, last_sync_attempt = NULL, error_message = '', sync_claim = '', documents_unverified = 0
 		 WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
 		SyncStateSynced, SyncSynced, driveFolderID, driveFolderID,
 		id, SyncStateSyncing, claim,
@@ -1538,7 +1499,8 @@ func ageCutoff(now time.Time, maxAgeDays int) (time.Time, bool) {
 }
 
 // GetGCEligibleSessions returns the sessions age-based GC deletes, oldest
-// first: ended, with a completed summary, synced if syncGated, and older than
+// first: ended, with a completed summary, synced if syncGated, with documents
+// not marked unverified on Drive (documents_unverified), and older than
 // maxAgeDays days. A session's age runs from when it started or, if it was
 // restored from Drive, from its restore, so the pass after a restore keeps
 // it. maxAgeDays <= 0 is no age limit: it returns none.
@@ -1550,7 +1512,7 @@ func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]s
 	at := cutoff.Format(time.RFC3339Nano)
 	// restored_at is '' for a session recorded here, which is before any time.
 	query := `SELECT id FROM sessions WHERE status = 'ended' AND summary_status = 'completed'
-		AND started_at < ? AND restored_at < ? AND refinement_status != 'running'`
+		AND started_at < ? AND restored_at < ? AND refinement_status != 'running' AND documents_unverified = 0`
 	if syncGated {
 		query += ` AND sync_status = 'synced'`
 	}
@@ -1730,16 +1692,17 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 }
 
 // DeleteEndedSession deletes session id for the age policy only while it is as
-// GC read it: ended, naming audioPath, and, when syncGated, synced. It
-// reports whether it did. A session merged since GC read it gave its
-// recording to the merged session, so deleting it, and removing that
-// recording with it, would leave the merged session naming a file that is
-// gone. One whose summary or transcript changed since GC read it is waiting
-// to sync them (see the sessions_documents_changed trigger): until it does,
-// the newest text is only on the device.
+// GC read it: ended, naming audioPath, with documents not marked unverified
+// on Drive, and, when syncGated, synced. It reports whether it did. A
+// session merged since GC read it gave its recording to the merged session,
+// so deleting it, and removing that recording with it, would leave the
+// merged session naming a file that is gone. One whose summary or transcript
+// changed since GC read it is waiting to sync them (see the
+// sessions_documents_changed trigger): until it does, the newest text is
+// only on the device.
 func (s *SQLiteStore) DeleteEndedSession(id, audioPath string, syncGated bool) (bool, error) {
 	cond, args := removable(syncGated)
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND `+cond, append([]any{id, audioPath}, args...)...)
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND documents_unverified = 0 AND `+cond, append([]any{id, audioPath}, args...)...)
 	if err != nil {
 		return false, fmt.Errorf("delete session %s: %w", id, err)
 	}

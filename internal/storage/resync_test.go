@@ -7,10 +7,10 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
-// syncedWith ends a new session id with a streamed transcript, its transcript
-// canonicalized and summary as its summary, and marks it synced to Drive
-// folder folder.
-func syncedWith(t *testing.T, store *SQLiteStore, id, summary, folder string) {
+// documentedSession ends a new session id with a streamed transcript, its
+// transcript canonicalized and summary as its summary, ready for its first
+// sync.
+func documentedSession(t *testing.T, store *SQLiteStore, id, summary string) {
 	t.Helper()
 	endedWith(t, store, id, "/audio/"+id+".mp3", RefinementPending)
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "said", EndTime: 1, Timestamp: time.Now().UTC()}); err != nil {
@@ -22,9 +22,14 @@ func syncedWith(t *testing.T, store *SQLiteStore, id, summary, folder string) {
 	if err := store.UpdateSummary(id, "Standup", summary, SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("UpdateSummary %s: %v", id, err)
 	}
-	if err := store.UpdateSyncStatus(id, SyncSynced, folder); err != nil {
-		t.Fatalf("UpdateSyncStatus %s: %v", id, err)
-	}
+}
+
+// syncedWith documents a new session id (documentedSession) and marks it
+// synced to Drive folder folder.
+func syncedWith(t *testing.T, store *SQLiteStore, id, summary, folder string) {
+	t.Helper()
+	documentedSession(t, store, id, summary)
+	syncTo(t, store, id, SyncStateSynced, folder, 0, "")
 }
 
 // Review of #37, round 5, note 1 (on main too): a change to a synced
@@ -144,11 +149,8 @@ func TestADocumentChangeLeavesASessionNotSyncedAsItIs(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			store := newTestSQLiteStore(t)
 			const id = "20261106140000"
-			syncedWith(t, store, id, "The first summary.", "folder-1")
-			now := time.Now().UTC()
-			if err := store.UpdateSyncState(id, state, "", 1, &now, "an earlier sync"); err != nil {
-				t.Fatalf("UpdateSyncState: %v", err)
-			}
+			documentedSession(t, store, id, "The first summary.")
+			syncTo(t, store, id, state, "folder-1", 1, "an earlier sync")
 			if err := store.UpdateTitle(id, "Planning"); err != nil {
 				t.Fatalf("UpdateTitle: %v", err)
 			}
