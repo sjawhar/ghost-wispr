@@ -16,7 +16,7 @@ import (
 type Store interface {
 	GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error)
 	GetSession(id string) (storage.Session, error)
-	DeleteEndedSession(id, audioPath string) (bool, error)
+	DeleteEndedSession(id, audioPath string, syncGated bool) (bool, error)
 	PurgeOldEvents(maxAge time.Duration) error
 	Recordings(syncGated bool) ([]storage.SessionRecording, error)
 	MarkAudioRemoved(id, before, left string, audioLeft, syncGated bool, removedAt time.Time) (storage.AudioRemoval, bool, error)
@@ -184,10 +184,11 @@ func (n names) forget(id string) {
 // deleteSession deletes session id under the age policy, with the files of
 // its saved recording that no other session names, as long as the session is
 // still as GC read it (a session merged meanwhile gave its recording to the
-// merged session). It removes the session's raw .pcm only once a saved
-// recording with audio in it is gone, so the raw file was a redundant copy,
-// and only when no session names it; otherwise the raw file may be the only
-// copy of the audio and stays: GC never removes one.
+// merged session; one whose summary or transcript changed meanwhile, under a
+// sync gate, is waiting to sync them). It removes the session's raw .pcm only
+// once a saved recording with audio in it is gone, so the raw file was a
+// redundant copy, and only when no session names it; otherwise the raw file
+// may be the only copy of the audio and stays: GC never removes one.
 func (c *Collector) deleteSession(id string, names names) error {
 	sess, err := c.store.GetSession(id)
 	if err != nil {
@@ -208,12 +209,12 @@ func (c *Collector) deleteSession(id string, names names) error {
 
 	// Delete DB record first — if this fails, audio files remain (recoverable).
 	// Reverse order (delete files first) risks permanent audio loss on DB failure.
-	deleted, err := c.store.DeleteEndedSession(id, sess.AudioPath)
+	deleted, err := c.store.DeleteEndedSession(id, sess.AudioPath, c.config.SyncGated)
 	if err != nil {
 		return fmt.Errorf("delete from db: %w", err)
 	}
 	if !deleted {
-		return fmt.Errorf("session changed since GC read it (merged, or no longer ended); kept with its audio")
+		return fmt.Errorf("session changed since GC read it (merged, no longer ended, or waiting to sync a change); kept with its audio")
 	}
 	names.forget(id)
 

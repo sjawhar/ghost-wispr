@@ -137,9 +137,7 @@ func TestGCStaysSyncGatedWhenDriveSyncIsOnButNotRunning(t *testing.T) {
 			t.Fatalf("summarize %s: %v", id, err)
 		}
 	}
-	if err := store.UpdateSyncStatus("20261001130000", storage.SyncSynced, "folder"); err != nil {
-		t.Fatalf("sync: %v", err)
-	}
+	syncTo(t, store, "20261001130000", storage.SyncStateSynced, "folder", 0, "")
 
 	cfg := config.Config{GCEnabled: true, GCMaxAgeDays: 30, GCMaxAudioSizeMB: 1024, GDriveSyncEnabled: true, AudioDir: t.TempDir()}
 	gcCfg := gcConfig(&cfg) // no syncer: it failed to start
