@@ -19,6 +19,9 @@ type Store interface {
 	UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error
 	UpdateSummaryError(sessionID, errMsg string) error
 	UpdateRefinement(sessionID, transcript, status string) error
+	// ClaimRefinement marks the refinement running while the session still
+	// names audioPath, the recording it will read, and reports whether it did.
+	ClaimRefinement(sessionID, audioPath string) (bool, error)
 	GetRefinement(sessionID string) (transcript, status string, err error)
 	UpdateTitle(sessionID, title string) error
 	Canonicalize(sessionID string) error

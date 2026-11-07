@@ -239,4 +239,44 @@ describe('AudioPlayer', () => {
     expect(screen.queryByText('Loading audio...')).toBeNull()
     expect(screen.getByTestId('transcript-refined').textContent).toContain('The refined words.')
   })
+
+  it('says what is left when only part of the audio was removed, and still offers to play it', () => {
+    render(AudioPlayer, {
+      sessionId: 's1',
+      segments: [],
+      session: makeSession({
+        audio_path: 'data/audio/b.mp3',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.Pending,
+      }),
+    })
+
+    expect(
+      screen.getByText('Part of the audio was removed to free space; 1 recording is left.'),
+    ).toBeTruthy()
+    expect(
+      screen.queryByText(
+        'The audio was removed to free space. The transcript and summary are kept.',
+      ),
+    ).toBeNull()
+    expect(screen.getByRole('button', { name: 'Play Audio' })).toBeTruthy()
+  })
+
+  it('says the recording left was not found on disk when GC found none, as the card does', () => {
+    render(AudioPlayer, {
+      sessionId: 's1',
+      segments: [],
+      session: makeSession({
+        audio_path: 'mnt/b.mp3',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+      }),
+    })
+
+    expect(
+      screen.getByText(
+        'Part of the audio was removed to free space; 1 recording is left, but it was not on disk when the rest was removed.',
+      ),
+    ).toBeTruthy()
+  })
 })

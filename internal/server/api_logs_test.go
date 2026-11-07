@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,6 +130,45 @@ func TestRetryEndpoints(t *testing.T) {
 
 			if !tt.check() {
 				t.Errorf("expected %s to be called", tt.name)
+			}
+		})
+	}
+}
+
+// Retry sync answers with the truth: when no sync can start for the session
+// (sync is off, or its state refuses one, such as a Drive folder deleted by
+// hand), it says so instead of 200 {"triggered":true} for a retry that did
+// nothing.
+func TestRetrySyncSaysWhenNoSyncCanStart(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantCode  int
+		wantError string // "" for none
+	}{
+		{name: "started", wantCode: http.StatusOK},
+		{name: "state refuses a sync", err: errors.New("cannot sync session test-session now: invalid sync state transition: REMOTE_DELETED -> SYNCING"),
+			wantCode: http.StatusConflict, wantError: "REMOTE_DELETED -> SYNCING"},
+		{name: "sync off", err: ErrSyncNotConfigured, wantCode: http.StatusServiceUnavailable, wantError: ErrSyncNotConfigured.Error()},
+		{name: "no such session", err: fmt.Errorf("get session test-session: query session test-session: %w", sql.ErrNoRows),
+			wantCode: http.StatusNotFound, wantError: "no rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controls := &ControlHooks{RetrySync: func(context.Context, string) error { return tc.err }}
+			mux := http.NewServeMux()
+			registerAPIRoutes(mux, &apiStoreStub{}, controls, nil, nil, nil)
+
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/sessions/test-session/retry-sync", nil))
+			var body struct {
+				Triggered bool   `json:"triggered"`
+				Error     string `json:"error"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode %s: %v", rr.Body.String(), err)
+			}
+			if rr.Code != tc.wantCode || body.Triggered != (tc.err == nil) || !strings.Contains(body.Error, tc.wantError) {
+				t.Errorf("retry sync = %d %s, want %d saying %q", rr.Code, rr.Body.String(), tc.wantCode, tc.wantError)
 			}
 		})
 	}

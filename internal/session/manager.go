@@ -433,8 +433,16 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinement(sessionID, "", storage.RefinementRunning); err != nil {
+	// Claim the refinement only while the session still names the recording:
+	// disk pressure may have removed it since the session ended, and it
+	// removes nothing while the refinement runs.
+	claimed, err := m.store.ClaimRefinement(sessionID, audioPath)
+	if err != nil {
 		m.batchLogger.Error("failed to mark refinement running", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		return
+	}
+	if !claimed {
+		m.batchLogger.Info("batch refinement not started: the session no longer has this recording (removed to free space)", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
 		return
 	}
 

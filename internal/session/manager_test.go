@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -142,6 +144,19 @@ func (s *storeMock) UpdateRefinement(sessionID, transcript, status string) error
 		s.refinedTranscript[sessionID] = transcript
 	}
 	return nil
+}
+
+// ClaimRefinement claims the refinement only while the session still names
+// audioPath, as the real store does.
+func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if audioPath == "" || s.audio[sessionID] != audioPath {
+		return false, nil
+	}
+	s.refinementStatus[sessionID] = "running"
+	delete(s.refinedTranscript, sessionID)
+	return true, nil
 }
 
 func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
@@ -1398,6 +1413,9 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	if err := store.CreateSession("sess-refine", time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
+	if err := store.EndSession("sess-refine", time.Now().UTC(), "data/audio/sess-refine.mp3"); err != nil {
+		t.Fatalf("EndSession failed: %v", err)
+	}
 	hub := &hubMock{}
 	summaryCalled := make(chan string, 1)
 	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, hub, NewDetector(time.Hour), 0)
@@ -1441,6 +1459,65 @@ func TestManager_RefineSession_ErrorsWithoutAudio(t *testing.T) {
 	err := manager.RefineSession(context.Background(), "sess-x", "  ", time.Time{})
 	if err == nil {
 		t.Fatal("expected error when session has no audio")
+	}
+}
+
+// fileTranscriber reads the recording it is asked to transcribe, as a real
+// batch transcriber does, and counts its calls.
+type fileTranscriber struct{ calls atomic.Int32 }
+
+func (f *fileTranscriber) Transcribe(_ context.Context, audioPath string) (string, error) {
+	f.calls.Add(1)
+	if _, err := os.ReadFile(audioPath); err != nil {
+		return "", err
+	}
+	return "refined", nil
+}
+
+// Review note 5: a session's end saves its audio path, then its refinement
+// marks itself running, and GC can remove the audio in between (it removes
+// only what is not being refined). A refinement that starts on audio GC has
+// removed does not run: there is no file to read, and marking it failed
+// would offer a retry that can only fail.
+func TestManager_RefinementDoesNotStartOnAudioGCRemoved(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	const id = "20261106100000"
+	started := time.Now().UTC().Add(-time.Hour)
+	saved := filepath.Join(t.TempDir(), id+".mp3")
+	if err := os.WriteFile(saved, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := store.EndSession(id, started.Add(time.Minute), saved); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	// GC removes the recording to free space and records it.
+	if err := os.Remove(saved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = '', audio_removed_at = ?, refinement_status = ? WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano), storage.RefinementNoAudio, id); err != nil {
+		t.Fatalf("record the removal: %v", err)
+	}
+
+	transcriber := &fileTranscriber{}
+	manager := NewManager(store, nil, nil, &hubMock{}, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(transcriber)
+	if err := manager.RefineSession(context.Background(), id, saved, started); err != nil {
+		t.Fatalf("RefineSession: %v", err)
+	}
+
+	if n := transcriber.calls.Load(); n != 0 {
+		t.Errorf("refinement transcribed audio GC had removed (%d calls)", n)
+	}
+	if _, status, err := store.GetRefinement(id); err != nil || status != storage.RefinementNoAudio {
+		t.Errorf("refinement_status %q (%v), want %q: there is no audio to refine", status, err, storage.RefinementNoAudio)
 	}
 }
 

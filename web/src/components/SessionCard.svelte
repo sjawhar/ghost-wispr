@@ -10,7 +10,14 @@
     type SessionSummary,
   } from '../lib/types'
   import { copyText } from '../lib/clipboard'
-  import { updateSessionTitle, retrySummary, retrySync, retryRefinement } from '../lib/api'
+  import { audioLeftNote, recordingsNamed } from '../lib/audio'
+  import {
+    updateSessionTitle,
+    retrySummary,
+    retrySync,
+    retryRefinement,
+    requestErrorMessage,
+  } from '../lib/api'
 
   let {
     session,
@@ -42,6 +49,8 @@
   let titleDraft = $state('')
   let retryingSummary = $state(false)
   let retryingSync = $state(false)
+  // Why the last sync retry was refused, if it was.
+  let retrySyncError = $state('')
   let retryingRefinement = $state(false)
 
   async function copySummary() {
@@ -125,8 +134,11 @@
   async function handleRetrySync(e: Event) {
     e.stopPropagation()
     retryingSync = true
+    retrySyncError = ''
     try {
       await retrySync(session.id)
+    } catch (error) {
+      retrySyncError = requestErrorMessage(error)
     } finally {
       setTimeout(() => (retryingSync = false), 1000)
     }
@@ -237,6 +249,9 @@
                 {retryingSync ? '...' : '↻'}
               </button>
             {/if}
+            {#if retrySyncError}
+              <span class="retry-error" data-testid="retry-sync-error">{retrySyncError}</span>
+            {/if}
           </div>
         {/if}
 
@@ -247,7 +262,9 @@
               data-testid="refinement-badge"
               title={session.refinement_status === RefinementStatus.NoAudio
                 ? session.audio_removed_at
-                  ? 'The audio was removed to free space, so it cannot be refined'
+                  ? recordingsNamed(session.audio_path) > 0
+                    ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
+                    : 'The audio was removed to free space, so it cannot be refined'
                   : 'No recording was saved for this session, so it cannot be refined'
                 : undefined}
             >
@@ -269,12 +286,15 @@
         {/if}
 
         {#if session.audio_removed_at}
+          {@const partly = recordingsNamed(session.audio_path) > 0}
           <span
             class="status-badge audio-removed"
             data-testid="audio-removed-badge"
-            title="The audio was removed to keep the audio directory under its size limit. The transcript and summary are kept."
+            title={partly
+              ? `Part of the audio was removed to keep the audio directory under its size limit; ${audioLeftNote(session)}. The transcript and summary are kept.`
+              : 'The audio was removed to keep the audio directory under its size limit. The transcript and summary are kept.'}
           >
-            Audio removed to free space
+            {partly ? 'Some audio removed to free space' : 'Audio removed to free space'}
           </span>
         {/if}
 
@@ -465,6 +485,11 @@
   .retry-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  .retry-error {
+    font-size: 0.75rem;
+    color: var(--danger);
   }
 
   .recording-dot {

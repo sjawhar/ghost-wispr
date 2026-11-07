@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1564,6 +1566,148 @@ func TestAPI_PatchConfig_UpdatesGDriveSyncAndGC(t *testing.T) {
 	}
 	if resp.GC.MaxAudioSizeMB != 256 {
 		t.Fatalf("expected gc.max_audio_size_mb 256, got %d", resp.GC.MaxAudioSizeMB)
+	}
+}
+
+// A refused PATCH /api/config changes nothing: not the config, not its file,
+// and no change is announced. The settings page sends all three GC fields in
+// one body; a negative budget among them used to leave GC enabled with the new
+// age limit saved, while the page reported the save as failed.
+func TestAPI_PatchConfig_RefusedPatchChangesNothing(t *testing.T) {
+	newTestConfigStore(t) // clears the environment
+	path := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
+	if err := os.WriteFile(path, []byte("gc_enabled: false\ngc_max_age_days: 30\ngc_max_audio_size_mb: 1024\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgStore, _, err := config.NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var announced atomic.Int32
+	cfgStore.OnChange(func(config.Config) { announced.Add(1) })
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", nil, cfgStore)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	body := `{"gc":{"enabled":true,"max_age_days":1,"max_audio_size_mb":-1}}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH %s: %d %s, want 400", body, rr.Code, rr.Body.String())
+	}
+	if cfg := cfgStore.Get(); cfg.GCEnabled || cfg.GCMaxAgeDays != 30 || cfg.GCMaxAudioSizeMB != 1024 {
+		t.Errorf("a refused PATCH changed the config: gc_enabled %v, gc_max_age_days %d, gc_max_audio_size_mb %d; want false, 30, 1024",
+			cfg.GCEnabled, cfg.GCMaxAgeDays, cfg.GCMaxAudioSizeMB)
+	}
+	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
+		t.Errorf("a refused PATCH rewrote the config file (%v):\n%s", err, after)
+	}
+	if n := announced.Load(); n != 0 {
+		t.Errorf("a refused PATCH announced %d config changes", n)
+	}
+}
+
+// 0 is each GC limit's "no limit", so PATCH /api/config accepts it. A
+// negative limit is refused.
+func TestAPI_PatchConfig_AcceptsNoGCLimit(t *testing.T) {
+	cfgStore := newTestConfigStore(t)
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{},
+		segments:       map[string][]transcribe.Segment{},
+	}, &ControlHooks{}, "", nil, cfgStore)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+	patch := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+
+	rr := patch(`{"gc":{"max_age_days":0,"max_audio_size_mb":0}}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("no limit: %d %s, want 200", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		GC struct {
+			MaxAgeDays     *int `json:"max_age_days"`
+			MaxAudioSizeMB *int `json:"max_audio_size_mb"`
+		} `json:"gc"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.GC.MaxAgeDays == nil || *resp.GC.MaxAgeDays != 0 || resp.GC.MaxAudioSizeMB == nil || *resp.GC.MaxAudioSizeMB != 0 {
+		t.Errorf("response gc = %+v, want max_age_days 0 and max_audio_size_mb 0", resp.GC)
+	}
+	if cfg := cfgStore.Get(); cfg.GCMaxAgeDays != 0 || cfg.GCMaxAudioSizeMB != 0 {
+		t.Errorf("config gc_max_age_days %d, gc_max_audio_size_mb %d; want 0 and 0", cfg.GCMaxAgeDays, cfg.GCMaxAudioSizeMB)
+	}
+
+	for _, body := range []string{`{"gc":{"max_age_days":-1}}`, `{"gc":{"max_audio_size_mb":-1}}`} {
+		if rr := patch(body); rr.Code != http.StatusBadRequest {
+			t.Errorf("PATCH %s: %d %s, want 400", body, rr.Code, rr.Body.String())
+		}
+	}
+	if cfg := cfgStore.Get(); cfg.GCMaxAgeDays != 0 || cfg.GCMaxAudioSizeMB != 0 {
+		t.Errorf("a refused patch changed the config: gc_max_age_days %d, gc_max_audio_size_mb %d", cfg.GCMaxAgeDays, cfg.GCMaxAudioSizeMB)
+	}
+}
+
+// dig returns the value at keys in a decoded JSON object.
+func dig(t *testing.T, v any, keys ...string) any {
+	t.Helper()
+	for i, key := range keys {
+		m, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("%v is not an object", keys[:i])
+		}
+		if v, ok = m[key]; !ok {
+			t.Fatalf("no %v", keys[:i+1])
+		}
+	}
+	return v
+}
+
+// The OpenAPI spec documents both GC limits in GET and PATCH /api/config,
+// with 0 as "no limit".
+func TestOpenAPISpecDocumentsTheGCLimits(t *testing.T) {
+	raw, err := OpenAPISpecJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, schema := range [][]string{
+		{"paths", "/api/config", "get", "responses", "200", "content", "application/json", "schema"},
+		{"paths", "/api/config", "patch", "requestBody", "content", "application/json", "schema"},
+	} {
+		gc := dig(t, spec, append(schema, "properties", "gc", "properties")...)
+		for _, limit := range []string{"max_age_days", "max_audio_size_mb"} {
+			if minimum := dig(t, gc, limit, "minimum"); minimum != float64(0) {
+				t.Errorf("%v gc.%s minimum %v, want 0", schema[:3], limit, minimum)
+			}
+			if description, _ := dig(t, gc, limit, "description").(string); !strings.Contains(description, "0 means no limit") {
+				t.Errorf("%v gc.%s description %q does not say 0 means no limit", schema[:3], limit, description)
+			}
+		}
 	}
 }
 

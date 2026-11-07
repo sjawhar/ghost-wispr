@@ -2,6 +2,33 @@ package server
 
 import "encoding/json"
 
+// configSchema documents the GC settings of GET and PATCH /api/config (a
+// JSON merge patch has the same shape); the other settings are untyped.
+var configSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"gc": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"enabled": map[string]any{
+					"type":        "boolean",
+					"description": "Run garbage collection every hour",
+				},
+				"max_age_days": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"description": "Age policy: delete ended sessions with a completed summary (synced ones only while Drive sync is on) older than this many days, counted from when they started or, for a session restored from Drive, from its restore. 0 means no limit: no session is deleted for its age.",
+				},
+				"max_audio_size_mb": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"description": "Audio budget: past it, GC removes the oldest sessions' audio files and keeps the sessions. 0 means no limit: no audio is removed to free space.",
+				},
+			},
+		},
+	},
+}
+
 // OpenAPISpec returns the OpenAPI 3.1.0 specification for the Ghost Wispr API.
 func OpenAPISpec() map[string]any {
 	return map[string]any{
@@ -607,7 +634,7 @@ func OpenAPISpec() map[string]any {
 			"/api/sessions/{id}/retry-sync": map[string]any{
 				"post": map[string]any{
 					"summary":     "Retry sync",
-					"description": "Retry syncing session to external storage",
+					"description": "Start syncing the session to Google Drive again, in the background: a session waiting for its retry, or whose retries ran out (failed). A session synced before keeps its Drive folder.",
 					"tags":        []string{"sessions"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{
@@ -621,7 +648,16 @@ func OpenAPISpec() map[string]any {
 					},
 					"responses": map[string]any{
 						"200": map[string]any{
-							"description": "Retry triggered",
+							"description": "Sync started",
+						},
+						"404": map[string]any{
+							"description": "No such session",
+						},
+						"409": map[string]any{
+							"description": "No sync can start for this session (already synced, or its Drive folder was deleted); the error says why",
+						},
+						"503": map[string]any{
+							"description": "Google Drive sync is off",
 						},
 					},
 				},
@@ -712,7 +748,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget), and the active session",
+					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{
@@ -748,6 +784,9 @@ func OpenAPISpec() map[string]any {
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Configuration",
+							"content": map[string]any{
+								"application/json": map[string]any{"schema": configSchema},
+							},
 						},
 					},
 				},
@@ -758,16 +797,18 @@ func OpenAPISpec() map[string]any {
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"requestBody": map[string]any{
 						"content": map[string]any{
-							"application/json": map[string]any{
-								"schema": map[string]any{
-									"type": "object",
-								},
-							},
+							"application/json": map[string]any{"schema": configSchema},
 						},
 					},
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Updated configuration",
+							"content": map[string]any{
+								"application/json": map[string]any{"schema": configSchema},
+							},
+						},
+						"400": map[string]any{
+							"description": "An invalid setting, such as a negative GC limit; nothing is changed",
 						},
 					},
 				},
