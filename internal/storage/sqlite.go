@@ -314,6 +314,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN transcript_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN audio_removed_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN restored_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN sync_claim TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -348,6 +349,13 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return err
 	}
 
+	// The triggers are made in one transaction, so another connection to the
+	// database sees the old sessions_au or the new one, never neither.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin creating sessions triggers: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, stmt := range []string{
 		`CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
 			INSERT INTO sessions_fts(rowid, title, summary, canonical_transcript)
@@ -357,16 +365,48 @@ func (s *SQLiteStore) init(dbPath string) error {
 			INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, canonical_transcript)
 			VALUES('delete', old.rowid, old.title, old.summary, old.canonical_transcript);
 		END;`,
-		`CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+		// The index follows only the columns it holds, so the update of other
+		// columns that sessions_documents_changed (below) makes inside its
+		// own run never reaches it. Earlier versions fired on every update:
+		// that nested update could then run this trigger before its run for
+		// the outer update of the row (the order SQLite runs a table's
+		// triggers in is not defined), and delete from the index text it did
+		// not hold yet (SQLITE_CORRUPT_VTAB).
+		`DROP TRIGGER IF EXISTS sessions_au`,
+		`CREATE TRIGGER sessions_au AFTER UPDATE OF title, summary, canonical_transcript ON sessions BEGIN
 			INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, canonical_transcript)
 			VALUES('delete', old.rowid, old.title, old.summary, old.canonical_transcript);
 			INSERT INTO sessions_fts(rowid, title, summary, canonical_transcript)
 			VALUES (new.rowid, new.title, new.summary, new.canonical_transcript);
 		END;`,
+		// A synced session's documents on Drive are its summary and
+		// transcript as a sync renders them, from its title, times, summary,
+		// preset and canonical transcript. A write that changes one of these
+		// (a summary made again, a title edited, a refinement retried) sends
+		// the session back to pending sync in the same statement, keeping its
+		// Drive folder, so the sweep updates its documents there in place and
+		// GC, gated on sync, does not delete it until they are. Its segments,
+		// from which a transcript is rendered when it has no canonical one,
+		// change only while it is recorded, when a restore imports them, and
+		// when a merge moves them off it, in the transaction that marks it
+		// merged: the sweep and GC take only ended sessions, and the merged
+		// session that now holds them is new, so not synced.
+		`CREATE TRIGGER IF NOT EXISTS sessions_documents_changed
+		AFTER UPDATE OF title, started_at, ended_at, summary, summary_preset, canonical_transcript ON sessions
+		WHEN new.sync_status = 'synced' AND (
+			new.title IS NOT old.title OR new.started_at IS NOT old.started_at OR new.ended_at IS NOT old.ended_at OR
+			new.summary IS NOT old.summary OR new.summary_preset IS NOT old.summary_preset OR
+			new.canonical_transcript IS NOT old.canonical_transcript)
+		BEGIN
+			UPDATE sessions SET sync_status = 'pending', sync_state = 'PENDING' WHERE id = new.id;
+		END;`,
 	} {
-		if _, err := s.db.Exec(stmt); err != nil {
-			return fmt.Errorf("create sessions_fts trigger: %w", err)
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("create sessions trigger: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sessions triggers: %w", err)
 	}
 
 	if _, err := s.db.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
@@ -1076,15 +1116,58 @@ func (s *SQLiteStore) UpdateSyncState(sessionID, state, driveFolderID string, re
 	return nil
 }
 
+// ClaimSync claims session id for one sync, which claim names: it moves the
+// session to SYNCING only while its sync state is still from (the state the
+// sync read) and no sync holds it (from is not SYNCING), and returns the
+// session as claimed. So two syncs of one session (retry-sync, the sync after
+// a summary, the sweep) never run at once: the second finds it claimed and
+// starts nothing. The session stays the sync's until MarkSynced or EndSync,
+// under the same claim, ends it, or the app restarts
+// (RecoverInterruptedSyncs).
+func (s *SQLiteStore) ClaimSync(id, from, claim string, at time.Time) (Session, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Session{}, false, fmt.Errorf("begin claiming the sync of session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Exec(
+		`UPDATE sessions SET sync_state = ?, sync_status = ?, sync_claim = ?, last_sync_attempt = ?, error_message = ''
+		 WHERE id = ? AND sync_state = ? AND sync_state != ?`,
+		SyncStateSyncing, syncStatusFromState(SyncStateSyncing), claim, at.UTC().Format(time.RFC3339Nano),
+		id, from, SyncStateSyncing,
+	)
+	if err != nil {
+		return Session{}, false, fmt.Errorf("claim the sync of session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return Session{}, false, fmt.Errorf("claim sync rows affected: %w", err)
+	}
+	if rows == 0 {
+		return Session{}, false, nil
+	}
+	sess, err := getSession(tx, id)
+	if err != nil {
+		return Session{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Session{}, false, fmt.Errorf("commit claiming the sync of session %s: %w", id, err)
+	}
+	return sess, true, nil
+}
+
 // MarkSynced marks session id synced to Drive folder driveFolderID, only while
-// unchanged reports true for the session and its segments as they are now,
-// read in the same transaction as the update, and reports whether it did. A
-// sync passes a check that the session is still what it uploaded: its audio
-// path (GC may have put back a recording it could not remove) and its
-// documents (a summary made again, a refined transcript). A session that
-// changed during the upload is not synced, and the next sync uploads what it
-// is now. unchanged runs inside the transaction: it must not use the store.
-func (s *SQLiteStore) MarkSynced(id, driveFolderID string, unchanged func(Session, []transcribe.Segment) bool) (bool, error) {
+// the sync claim names still holds it (ClaimSync) and unchanged reports true
+// for the session and its segments as they are now, read in the same
+// transaction as the update, and reports whether it did. A sync passes a
+// check that the session is still what it uploaded: its audio path (GC may
+// have put back a recording it could not remove) and its documents (a
+// summary made again, a refined transcript). A session that changed during
+// the upload is not synced, and the next sync uploads what it is now; one
+// the sync no longer holds is left as it is. unchanged runs inside the
+// transaction: it must not use the store.
+func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func(Session, []transcribe.Segment) bool) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, fmt.Errorf("begin marking session %s synced: %w", id, err)
@@ -1102,19 +1185,104 @@ func (s *SQLiteStore) MarkSynced(id, driveFolderID string, unchanged func(Sessio
 	if !unchanged(sess, segments) {
 		return false, nil
 	}
-	if _, err := tx.Exec(
+	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
-		     retry_count = 0, last_sync_attempt = NULL, error_message = ''
-		 WHERE id = ?`,
-		SyncStateSynced, SyncSynced, driveFolderID, driveFolderID, id,
-	); err != nil {
+		     retry_count = 0, last_sync_attempt = NULL, error_message = '', sync_claim = ''
+		 WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
+		SyncStateSynced, SyncSynced, driveFolderID, driveFolderID,
+		id, SyncStateSyncing, claim,
+	)
+	if err != nil {
 		return false, fmt.Errorf("mark session %s synced: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark synced rows affected: %w", err)
+	}
+	if rows == 0 {
+		return false, nil
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit marking session %s synced: %w", id, err)
 	}
 	return true, nil
+}
+
+// EndSync records the end of the sync claim names, which did not mark
+// session id synced: its sync state becomes state (back to pending when the
+// session changed during the upload, a retry, a failure, or its Drive folder
+// gone), with its retry count, the time it was tried and why it did not
+// finish, and the Drive folder the sync made, if it made one (one the session
+// had stays). It does this only while that sync still holds the session, so
+// a sync that no longer does never replaces what the session is now, and
+// reports whether it did. Any other state is an error and changes nothing:
+// SYNCED would skip MarkSynced's check that Drive has the session as it is
+// now, and SYNCING would leave the session held by no sync.
+func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount int, at time.Time, errorMessage string) (bool, error) {
+	switch state {
+	case SyncStatePending, SyncStateRetryScheduled, SyncStateFailed, SyncStateRemoteDeleted:
+	default:
+		return false, fmt.Errorf("end the sync of session %s: %q is not a state a sync ends in unsynced", id, state)
+	}
+	res, err := s.db.Exec(
+		`UPDATE sessions
+		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
+		     retry_count = ?, last_sync_attempt = ?, error_message = ?, sync_claim = ''
+		 WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
+		state, syncStatusFromState(state), driveFolderID, driveFolderID,
+		retryCount, at.UTC().Format(time.RFC3339Nano), errorMessage,
+		id, SyncStateSyncing, claim,
+	)
+	if err != nil {
+		return false, fmt.Errorf("end the sync of session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("end sync rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
+// RecoverInterruptedSyncs moves every session an earlier run of the app left
+// SYNCING (it stopped during the sync, so no sync holds the session now) back
+// to a retry, keeping its Drive folder, and returns their ids. The app calls
+// it as it starts, before any sync. The cut-off sync counts as a failed
+// attempt, as in gdrive.BuildRetryPlan: the session is RETRY_SCHEDULED with
+// one retry more, or FAILED once it has had maxRetries, so a sync that stops
+// the app every time it runs is not retried for ever.
+func (s *SQLiteStore) RecoverInterruptedSyncs(maxRetries int, at time.Time) ([]string, error) {
+	rows, err := s.db.Query(
+		`UPDATE sessions
+		 SET sync_state = CASE WHEN retry_count >= ? THEN ? ELSE ? END,
+		     sync_status = ?,
+		     retry_count = CASE WHEN retry_count >= ? THEN retry_count ELSE retry_count + 1 END,
+		     last_sync_attempt = ?, error_message = ?, sync_claim = ''
+		 WHERE sync_state = ?
+		 RETURNING id`,
+		maxRetries, SyncStateFailed, SyncStateRetryScheduled,
+		SyncFailed,
+		maxRetries,
+		at.UTC().Format(time.RFC3339Nano), "the sync was cut off: the app stopped during it",
+		SyncStateSyncing,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("recover interrupted syncs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan recovered sync: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recover interrupted syncs: %w", err)
+	}
+	return ids, nil
 }
 
 func (s *SQLiteStore) UpdateEnvoyPublishStatus(sessionID, status string) error {
@@ -1417,10 +1585,10 @@ type SessionRecording struct {
 	Removable bool
 }
 
-// removable is the condition under which disk pressure may remove a session's
-// recording, and its arguments: the session ended, no refinement is reading
-// the file, and, when syncGated, it is synced. Any other sync state, a
-// failure included, keeps the recording.
+// removable is the condition under which GC may remove a session's recording
+// (disk pressure) or the session with it (the age policy), and its arguments:
+// the session ended, no refinement is reading the file, and, when syncGated,
+// it is synced. Any other sync state, a failure included, keeps the recording.
 func removable(syncGated bool) (string, []any) {
 	cond := `status = 'ended' AND refinement_status != ?`
 	if syncGated {
@@ -1562,12 +1730,16 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 }
 
 // DeleteEndedSession deletes session id for the age policy only while it is as
-// GC read it: ended, and naming audioPath. It reports whether it did. A
-// session merged since GC read it gave its recording to the merged session,
-// so deleting it, and removing that recording with it, would leave the merged
-// session naming a file that is gone.
-func (s *SQLiteStore) DeleteEndedSession(id, audioPath string) (bool, error) {
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND status = 'ended' AND audio_path = ? AND refinement_status != ?`, id, audioPath, RefinementRunning)
+// GC read it: ended, naming audioPath, and, when syncGated, synced. It
+// reports whether it did. A session merged since GC read it gave its
+// recording to the merged session, so deleting it, and removing that
+// recording with it, would leave the merged session naming a file that is
+// gone. One whose summary or transcript changed since GC read it is waiting
+// to sync them (see the sessions_documents_changed trigger): until it does,
+// the newest text is only on the device.
+func (s *SQLiteStore) DeleteEndedSession(id, audioPath string, syncGated bool) (bool, error) {
+	cond, args := removable(syncGated)
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND `+cond, append([]any{id, audioPath}, args...)...)
 	if err != nil {
 		return false, fmt.Errorf("delete session %s: %w", id, err)
 	}

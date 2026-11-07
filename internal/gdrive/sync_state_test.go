@@ -17,6 +17,8 @@ func TestSyncStateMachineTransitions(t *testing.T) {
 		{name: "pending to syncing", from: SyncStatePending, to: SyncStateSyncing},
 		{name: "syncing to synced", from: SyncStateSyncing, to: SyncStateSynced},
 		{name: "syncing to failed", from: SyncStateSyncing, to: SyncStateFailed},
+		{name: "syncing to retry scheduled", from: SyncStateSyncing, to: SyncStateRetryScheduled},
+		{name: "syncing back to pending", from: SyncStateSyncing, to: SyncStatePending},
 		{name: "failed to retry scheduled", from: SyncStateFailed, to: SyncStateRetryScheduled},
 		{name: "retry scheduled to syncing", from: SyncStateRetryScheduled, to: SyncStateSyncing},
 		{name: "syncing to remote deleted", from: SyncStateSyncing, to: SyncStateRemoteDeleted},

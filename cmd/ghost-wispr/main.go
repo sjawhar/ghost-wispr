@@ -458,6 +458,12 @@ func main() {
 	if err := store.RecoverStaleRefinements(); err != nil {
 		log.Printf("warning: failed to recover stale refinements: %v", err)
 	}
+	// So did a Drive sync: retry it in the folder it had.
+	if ids, err := store.RecoverInterruptedSyncs(gdrive.MaxSyncRetries, time.Now().UTC()); err != nil {
+		log.Printf("warning: failed to recover interrupted Drive syncs: %v", err)
+	} else if len(ids) > 0 {
+		log.Printf("recovered %d interrupted Drive sync(s): %v", len(ids), ids)
+	}
 
 	// Backfill sessions with empty titles.
 	emptyTitleSessions, err := store.GetSessionsWithEmptyTitles()

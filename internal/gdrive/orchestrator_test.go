@@ -3,6 +3,7 @@ package gdrive
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -68,6 +69,7 @@ type fakeOrchestratorStore struct {
 
 	segments []transcribe.Segment
 	updates  []syncStateUpdate
+	claim    string
 }
 
 func (f *fakeOrchestratorStore) GetSession(id string) (storage.Session, error) {
@@ -81,11 +83,46 @@ func (f *fakeOrchestratorStore) GetSegments(_ string) ([]transcribe.Segment, err
 	return f.segments, nil
 }
 
-func (f *fakeOrchestratorStore) UpdateSyncStatus(_, _, _ string) error {
-	return nil
+// ClaimSync records a SYNCING update while the session is still in the state
+// the sync read, and not SYNCING, as the real store does.
+func (f *fakeOrchestratorStore) ClaimSync(_, from, claim string, at time.Time) (storage.Session, bool, error) {
+	if f.session.SyncState != from || from == storage.SyncStateSyncing {
+		return storage.Session{}, false, nil
+	}
+	f.claim = claim
+	f.record(storage.SyncStateSyncing, "", f.session.RetryCount, &at, "")
+	return f.session, true, nil
 }
 
-func (f *fakeOrchestratorStore) UpdateSyncState(_ string, state, driveFolderID string, retryCount int, lastSyncAttempt *time.Time, errorMessage string) error {
+// MarkSynced records a synced update while the sync holds the session and
+// unchanged reports true for it as it is, as the real store does.
+func (f *fakeOrchestratorStore) MarkSynced(_, claim, driveFolderID string, unchanged func(storage.Session, []transcribe.Segment) bool) (bool, error) {
+	if f.session.SyncState != storage.SyncStateSyncing || claim != f.claim || !unchanged(f.session, f.segments) {
+		return false, nil
+	}
+	f.record(storage.SyncStateSynced, driveFolderID, 0, nil, "")
+	return true, nil
+}
+
+// EndSync records the sync's end while it holds the session, and refuses a
+// state a sync does not end in unsynced, as the real store does.
+func (f *fakeOrchestratorStore) EndSync(_, claim, state, driveFolderID string, retryCount int, at time.Time, errorMessage string) (bool, error) {
+	switch state {
+	case storage.SyncStatePending, storage.SyncStateRetryScheduled, storage.SyncStateFailed, storage.SyncStateRemoteDeleted:
+	default:
+		return false, fmt.Errorf("%q is not a state a sync ends in unsynced", state)
+	}
+	if f.session.SyncState != storage.SyncStateSyncing || claim != f.claim {
+		return false, nil
+	}
+	f.record(state, driveFolderID, retryCount, &at, errorMessage)
+	return true, nil
+}
+
+func (f *fakeOrchestratorStore) record(state, driveFolderID string, retryCount int, lastSyncAttempt *time.Time, errorMessage string) {
+	if driveFolderID == "" {
+		driveFolderID = f.session.GDriveFolderID
+	}
 	f.updates = append(f.updates, syncStateUpdate{
 		state:         state,
 		driveFolderID: driveFolderID,
@@ -98,16 +135,6 @@ func (f *fakeOrchestratorStore) UpdateSyncState(_ string, state, driveFolderID s
 	f.session.ErrorMessage = errorMessage
 	f.session.GDriveFolderID = driveFolderID
 	f.session.LastSyncAttempt = lastSyncAttempt
-	return nil
-}
-
-// MarkSynced records a synced update while unchanged reports true for the
-// session as it is, as the real store does.
-func (f *fakeOrchestratorStore) MarkSynced(_, driveFolderID string, unchanged func(storage.Session, []transcribe.Segment) bool) (bool, error) {
-	if !unchanged(f.session, f.segments) {
-		return false, nil
-	}
-	return true, f.UpdateSyncState("", storage.SyncStateSynced, driveFolderID, 0, nil, "")
 }
 
 func TestOrchestratorSyncSessionSuccessTransitions(t *testing.T) {
@@ -165,16 +192,16 @@ func TestOrchestratorSyncSessionSchedulesRetryOnFailure(t *testing.T) {
 		t.Fatal("expected sync session to return retryable error")
 	}
 
-	if len(store.updates) != 3 {
-		t.Fatalf("expected 3 updates (SYNCING->FAILED->RETRY_SCHEDULED), got %d", len(store.updates))
+	if len(store.updates) != 2 {
+		t.Fatalf("expected 2 updates (SYNCING->RETRY_SCHEDULED), got %d", len(store.updates))
 	}
-	if store.updates[2].state != storage.SyncStateRetryScheduled {
-		t.Fatalf("expected final state %q, got %q", storage.SyncStateRetryScheduled, store.updates[2].state)
+	if store.updates[1].state != storage.SyncStateRetryScheduled {
+		t.Fatalf("expected final state %q, got %q", storage.SyncStateRetryScheduled, store.updates[1].state)
 	}
-	if store.updates[2].retryCount != 1 {
-		t.Fatalf("expected retry_count=1, got %d", store.updates[2].retryCount)
+	if store.updates[1].retryCount != 1 {
+		t.Fatalf("expected retry_count=1, got %d", store.updates[1].retryCount)
 	}
-	if !store.updates[2].hasAttempt {
+	if !store.updates[1].hasAttempt {
 		t.Fatal("expected retry schedule to record last_sync_attempt")
 	}
 }
@@ -352,7 +379,7 @@ func TestOrchestratorManualRetryStartsFromFailed(t *testing.T) {
 		t.Errorf("after the manual retry: %q in folder %q, want %q in folder-1", last.state, last.driveFolderID, storage.SyncStateSynced)
 	}
 
-	for _, state := range []string{storage.SyncStateSynced, storage.SyncStateRemoteDeleted} {
+	for _, state := range []string{storage.SyncStateSynced, storage.SyncStateSyncing, storage.SyncStateRemoteDeleted} {
 		store.session.SyncState = state
 		if err := o.CanSync("session-1"); err == nil {
 			t.Errorf("CanSync of a %s session: no error", state)

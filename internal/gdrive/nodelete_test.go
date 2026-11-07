@@ -1,14 +1,23 @@
 package gdrive
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"go/types"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -131,11 +140,9 @@ func TestRestoreReadsTheNewestCopyOfADocument(t *testing.T) {
 	}
 }
 
-// Nothing in the app deletes or trashes a file on Google Drive: Drive holds
-// the user's backup, and a document there may hold their edits. Every Go
-// file outside tests is checked for Files.Delete, Files.EmptyTrash and a
-// Trashed field.
-func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
+// moduleRoot returns the directory of the module's go.mod.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -143,56 +150,373 @@ func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("module root %s: %v", root, err)
 	}
-	checked := 0
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	return root
+}
+
+// drivePackage is the Drive API package whose deletes driveDeletions finds.
+const drivePackage = "google.golang.org/api/drive/v3"
+
+// goPackage is a package as go list reports it.
+type goPackage struct {
+	ImportPath, Dir, Export  string
+	GoFiles, CompiledGoFiles []string
+	DepOnly                  bool
+	Error                    *struct{ Err string }
+}
+
+// moduleList is go list's report on the module's packages (and the export
+// data of every package they import), made once per test process: it builds
+// them, and overlay files do not change it.
+var moduleList struct {
+	once     sync.Once
+	packages []goPackage
+	exports  map[string]string
+	err      error
+}
+
+// listModule returns the packages of the module at root, and the export data
+// file of every package they import, by import path.
+func listModule(root string) ([]goPackage, map[string]string, error) {
+	moduleList.once.Do(func() {
+		var stderr bytes.Buffer
+		cmd := exec.Command("go", "list", "-e", "-export", "-compiled", "-deps", "-json=ImportPath,Dir,Export,GoFiles,CompiledGoFiles,DepOnly,Error", "./...")
+		cmd.Dir, cmd.Stderr = root, &stderr
+		out, err := cmd.Output()
 		if err != nil {
-			return err
+			moduleList.err = fmt.Errorf("go list: %w\n%s", err, stderr.Bytes())
+			return
 		}
-		if entry.IsDir() {
-			switch entry.Name() {
-			case ".git", "node_modules", "web", "vendor", "testdata":
-				return filepath.SkipDir
+		moduleList.exports = map[string]string{}
+		for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); {
+			var p goPackage
+			if err := dec.Decode(&p); err != nil {
+				moduleList.err = fmt.Errorf("read go list: %w", err)
+				return
 			}
-			return nil
+			// The app embeds the web build (cmd/ghost-wispr/static), which a
+			// checkout has only once the frontend is built; its Go files are
+			// checked all the same.
+			embedOnly := p.Error != nil && !p.DepOnly && strings.Contains(p.Error.Err, "no matching files found")
+			if p.Error != nil && !embedOnly {
+				moduleList.err = fmt.Errorf("go list %s: %s", p.ImportPath, p.Error.Err)
+				return
+			}
+			if len(p.CompiledGoFiles) == 0 {
+				p.CompiledGoFiles = p.GoFiles
+			}
+			moduleList.exports[p.ImportPath] = p.Export
+			if !p.DepOnly {
+				moduleList.packages = append(moduleList.packages, p)
+			}
 		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
+	})
+	return moduleList.packages, moduleList.exports, moduleList.err
+}
+
+// typeCheckModule type-checks each package of the module at root, its code
+// outside tests with overlay's files (path to content) added, and returns its
+// files and the objects each identifier there uses. Imports are read from the
+// export data go list builds, with the standard library's importer, which
+// reads the format of the toolchain running the test.
+func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*token.FileSet, []*ast.File, map[*ast.Ident]types.Object) {
+	t.Helper()
+	modulePackages, exports, err := listModule(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	imports := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		if exports[path] == "" {
+			return nil, fmt.Errorf("no export data for %s", path)
 		}
-		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, nil, 0)
-		if err != nil {
-			return err
+		return os.Open(exports[path])
+	})
+	var all []*ast.File
+	uses := map[*ast.Ident]types.Object{}
+	for _, p := range modulePackages {
+		sources := map[string]any{}
+		for _, name := range p.CompiledGoFiles {
+			if !filepath.IsAbs(name) {
+				name = filepath.Join(p.Dir, name)
+			}
+			sources[name] = nil
 		}
-		checked++
+		for path, src := range overlay {
+			if filepath.Dir(path) == p.Dir {
+				sources[path] = src
+			}
+		}
+		var files []*ast.File
+		for path, src := range sources {
+			file, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parse %s: %v", path, err)
+			}
+			files = append(files, file)
+		}
+		conf := types.Config{Importer: imports, Error: func(err error) {
+			t.Errorf("package %s does not type-check, so the check cannot see it: %v", p.ImportPath, err)
+		}}
+		_, _ = conf.Check(p.ImportPath, fset, files, &types.Info{Uses: uses})
+		all = append(all, files...)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+	if len(all) < 20 {
+		t.Fatalf("type-checked %d Go files under %s; the check missed the code", len(all), root)
+	}
+	return fset, all, uses
+}
+
+// written returns the identifiers in files that a value is written through:
+// the left of an assignment, the key of a composite literal, and an operand
+// whose address is taken (a write may follow through the pointer).
+func written(files []*ast.File) map[*ast.Ident]bool {
+	ids := map[*ast.Ident]bool{}
+	mark := func(e ast.Expr) {
+		switch e := ast.Unparen(e).(type) {
+		case *ast.Ident:
+			ids[e] = true
+		case *ast.SelectorExpr:
+			ids[e.Sel] = true
+		}
+	}
+	for _, file := range files {
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch n := n.(type) {
-			case *ast.SelectorExpr:
-				if inner, ok := n.X.(*ast.SelectorExpr); ok && inner.Sel.Name == "Files" && (n.Sel.Name == "Delete" || n.Sel.Name == "EmptyTrash") {
-					t.Errorf("%s: Files.%s deletes files on Drive", fset.Position(n.Pos()), n.Sel.Name)
+			case *ast.AssignStmt:
+				for _, lhs := range n.Lhs {
+					mark(lhs)
 				}
 			case *ast.KeyValueExpr:
-				if key, ok := n.Key.(*ast.Ident); ok && key.Name == "Trashed" {
-					t.Errorf("%s: sets Trashed on a Drive file", fset.Position(n.Pos()))
+				mark(n.Key)
+			case *ast.UnaryExpr:
+				if n.Op == token.AND {
+					mark(n.X)
 				}
 			}
 			return true
 		})
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	if checked < 20 {
-		t.Fatalf("checked %d Go files under %s; the walk missed the code", checked, root)
+	return ids
+}
+
+// driveDeletions returns each place in the module's Go code outside tests,
+// with overlay's files (path to content) added, that could delete or trash
+// something on Drive through the Drive v3 client the app uses, as
+// "file:line: what". It type-checks the code, so it finds every use of a
+// method of that client that deletes (any Delete, of a file, a revision, a
+// comment or a permission, and EmptyTrash) and of the call such a method
+// returns, and every write of a file's Trashed field, however the code
+// reaches it: directly, through an aliased service, a method value, an
+// interface or an embedded field. A request made without that client (raw
+// HTTP, another API version) is not seen.
+func driveDeletions(t *testing.T, root string, overlay map[string][]byte) []string {
+	t.Helper()
+	fset, files, uses := typeCheckModule(t, root, overlay)
+	writes := written(files)
+	var found []string
+	driveUses := 0
+	for id, obj := range uses {
+		if obj.Pkg() == nil || obj.Pkg().Path() != drivePackage {
+			continue
+		}
+		driveUses++
+		if what := driveDeletion(obj, writes[id]); what != "" {
+			pos := fset.Position(id.Pos())
+			found = append(found, fmt.Sprintf("%s:%d: %s", pos.Filename, pos.Line, what))
+		}
+	}
+	if driveUses == 0 {
+		t.Fatalf("no code under %s uses %s: the check sees none of it", root, drivePackage)
+	}
+	sort.Strings(found)
+	return found
+}
+
+// driveDeletion says how obj, part of the Drive API, deletes or trashes
+// something on Drive, or "" if it does not; written is whether this use of
+// obj writes it.
+func driveDeletion(obj types.Object, written bool) string {
+	switch obj := obj.(type) {
+	case *types.Func:
+		recv := obj.Signature().Recv()
+		if recv == nil {
+			return ""
+		}
+		on := recv.Type()
+		if ptr, ok := on.(*types.Pointer); ok {
+			on = ptr.Elem()
+		}
+		named, ok := types.Unalias(on).(*types.Named)
+		if !ok {
+			return ""
+		}
+		recvName := named.Obj().Name()
+		switch {
+		case obj.Name() == "Delete" || obj.Name() == "EmptyTrash":
+			return fmt.Sprintf("%s.%s deletes on Drive", recvName, obj.Name())
+		case isDriveDeleteCall(recvName):
+			return fmt.Sprintf("%s.%s runs a delete on Drive", recvName, obj.Name())
+		}
+	case *types.TypeName:
+		if isDriveDeleteCall(obj.Name()) {
+			return fmt.Sprintf("%s is a delete on Drive", obj.Name())
+		}
+	case *types.Var:
+		if obj.IsField() && obj.Name() == "Trashed" && written {
+			return "sets a Drive file's Trashed field, which trashes it"
+		}
+	}
+	return ""
+}
+
+// isDriveDeleteCall reports whether name is the Drive API's type for a call
+// that deletes (FilesDeleteCall, FilesEmptyTrashCall, RevisionsDeleteCall).
+func isDriveDeleteCall(name string) bool {
+	return strings.HasSuffix(name, "DeleteCall") || strings.HasSuffix(name, "EmptyTrashCall")
+}
+
+// Nothing in the app deletes or trashes a file on Google Drive: Drive holds
+// the user's backup, and a document there may hold their edits.
+func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
+	for _, f := range driveDeletions(t, moduleRoot(t), nil) {
+		t.Error(f)
 	}
 }
 
-// Review of #37, round 4, blocker 1(b): two syncs of one session can run at
+// deletionProbe is code that deletes or trashes files on Drive in every form
+// driveDeletions must find; each line it must report ends in "// want", and
+// a line without it (reading Trashed) must not be reported.
+const deletionProbe = `package gdrive
+
+import "google.golang.org/api/drive/v3"
+
+func (s *Syncer) probeDeleteThroughAnAlias(id string) error {
+	files := s.service.Files
+	return files.Delete(id).Do() // want
+}
+
+func (s *Syncer) probeDeleteThroughAMethodValue(id string) error {
+	remove := s.service.Files.Delete // want
+	return remove(id).Do() // want
+}
+
+type probeDeleter interface {
+	Delete(fileID string) *drive.FilesDeleteCall // want
+}
+
+func (s *Syncer) probeDeleteThroughAnInterface(id string) error {
+	var d probeDeleter = s.service.Files
+	return d.Delete(id).Do() // want
+}
+
+func (s *Syncer) probeEmptyTrashThroughAnAliasedService() error {
+	svc := s.service
+	return svc.Files.EmptyTrash().Do() // want
+}
+
+func (s *Syncer) probeDeleteARevision(fileID, revisionID string) error {
+	return s.service.Revisions.Delete(fileID, revisionID).Do() // want
+}
+
+func (s *Syncer) probeTrashByAssignment(id string) error {
+	f := &drive.File{}
+	f.Trashed = true // want
+	_, err := s.service.Files.Update(id, f).Do()
+	return err
+}
+
+func (s *Syncer) probeTrashByKey(id string) error {
+	_, err := s.service.Files.Update(id, &drive.File{Trashed: true}).Do() // want
+	return err
+}
+
+func (s *Syncer) probeTrashThroughAPointer(id string) error {
+	f := &drive.File{}
+	trashed := &f.Trashed // want
+	*trashed = true
+	_, err := s.service.Files.Update(id, f).Do()
+	return err
+}
+
+func probeReadTrashed(f *drive.File) bool {
+	return f.Trashed
+}
+`
+
+// storageProbe deletes a file on Drive from another package of the module,
+// through a service it is handed.
+const storageProbe = `package storage
+
+import "google.golang.org/api/drive/v3"
+
+func probeDeleteFromAnotherPackage(s *drive.Service, id string) error {
+	return s.Files.Delete(id).Do() // want
+}
+`
+
+// Review of #37, round 5, note 2 (red-team N1): the check missed Trashed set
+// by an assignment and a delete through an aliased Drive service. It now
+// finds every form in the probes, in any package, and nothing else there.
+func TestTheDriveDeletionCheckFindsEveryForm(t *testing.T) {
+	root := moduleRoot(t)
+	probes := map[string]string{
+		filepath.Join(root, "internal", "gdrive", "zz_deletion_probe.go"):  deletionProbe,
+		filepath.Join(root, "internal", "storage", "zz_deletion_probe.go"): storageProbe,
+	}
+	overlay := map[string][]byte{}
+	want := map[string]bool{} // "path:line"
+	for path, src := range probes {
+		overlay[path] = []byte(src)
+		for i, line := range strings.Split(src, "\n") {
+			if strings.HasSuffix(line, "// want") {
+				want[fmt.Sprintf("%s:%d", path, i+1)] = true
+			}
+		}
+	}
+	found := map[string]bool{}
+	for _, f := range driveDeletions(t, root, overlay) {
+		path, rest, _ := strings.Cut(f, ".go:")
+		lineText, _, _ := strings.Cut(rest, ":")
+		if _, err := strconv.Atoi(lineText); err != nil {
+			t.Fatalf("finding %q: %v", f, err)
+		}
+		at := path + ".go:" + lineText
+		if _, ok := probes[path+".go"]; !ok {
+			t.Errorf("outside the probes: %s", f)
+			continue
+		}
+		found[at] = true
+	}
+	for at := range want {
+		if !found[at] {
+			t.Errorf("missed probe line %s", probeLine(probes, at))
+		}
+		delete(found, at)
+	}
+	for at := range found {
+		t.Errorf("reported probe line %s, which deletes nothing", probeLine(probes, at))
+	}
+}
+
+// probeLine is "path:line: text" for at ("path:line") in probes.
+func probeLine(probes map[string]string, at string) string {
+	i := strings.LastIndex(at, ":")
+	line, _ := strconv.Atoi(at[i+1:])
+	lines := strings.Split(probes[at[:i]], "\n")
+	return fmt.Sprintf("%s: %s", at, strings.TrimSpace(lines[line-1]))
+}
+
+// Review of #37, round 4, blocker 1(b): two syncs of one session could run at
 // once (retry-sync, the sync after a summary, the sweep). The one that read
 // the session first could upload last: it replaced the current summary on
 // Drive with the old one, and the session was marked synced anyway, so no
-// later sync put it right. Now the stale sync either leaves the current
-// summary on Drive or ends in a retry, and the retry converges on it.
+// later sync put it right. Now the sync after the summary finds the session
+// claimed by the running sync and starts nothing; the running sync, which
+// uploaded the old summary, ends in a retry, and the retry converges on the
+// current one.
 func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
@@ -226,7 +550,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 	drive.failAfter = 0
 
 	// The retry reads the session; as it starts uploading, the session is
-	// summarized again and the sync after the summary runs to its end first.
+	// summarized again and the sync after the summary is started.
 	var fired atomic.Bool
 	drive.onUpload = func() {
 		if !fired.CompareAndSwap(false, true) {

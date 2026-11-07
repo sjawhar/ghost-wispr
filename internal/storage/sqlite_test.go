@@ -727,13 +727,13 @@ func TestClaimRefinement(t *testing.T) {
 func TestDeleteEndedSession(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	endedWith(t, store, "20261106140000", "/audio/a.mp3", RefinementCompleted)
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/other.mp3"); err != nil || deleted {
+	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/other.mp3", false); err != nil || deleted {
 		t.Errorf("DeleteEndedSession with another audio path = %v, %v; want kept", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err != nil {
 		t.Fatalf("session deleted: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/a.mp3"); err != nil || !deleted {
+	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/a.mp3", false); err != nil || !deleted {
 		t.Errorf("DeleteEndedSession = %v, %v; want deleted", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err == nil {
@@ -744,10 +744,10 @@ func TestDeleteEndedSession(t *testing.T) {
 	if err := store.MergeSessions("20261106140100-merged", []string{"20261106140100"}, time.Date(2026, 11, 6, 14, 1, 0, 0, time.UTC), time.Date(2026, 11, 6, 14, 2, 0, 0, time.UTC)); err != nil {
 		t.Fatalf("MergeSessions: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140100", "/audio/b.mp3"); err != nil || deleted {
+	if deleted, err := store.DeleteEndedSession("20261106140100", "/audio/b.mp3", false); err != nil || deleted {
 		t.Errorf("DeleteEndedSession of a merged source = %v, %v; want kept", deleted, err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106990000", ""); err != nil || deleted {
+	if deleted, err := store.DeleteEndedSession("20261106990000", "", false); err != nil || deleted {
 		t.Errorf("DeleteEndedSession of a missing session = %v, %v; want nothing", deleted, err)
 	}
 }
@@ -766,12 +766,15 @@ func TestMarkSynced(t *testing.T) {
 	if err := store.AppendSegment("20261106140000", transcribe.Segment{Text: "said", EndTime: 1, Timestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("AppendSegment: %v", err)
 	}
-	if err := store.UpdateSyncState("20261106140000", SyncStateSyncing, "", 2, nil, ""); err != nil {
+	if err := store.UpdateSyncState("20261106140000", SyncStateRetryScheduled, "", 2, nil, ""); err != nil {
 		t.Fatalf("UpdateSyncState: %v", err)
+	}
+	if _, ok, err := store.ClaimSync("20261106140000", SyncStateRetryScheduled, "sync-1", time.Now().UTC()); err != nil || !ok {
+		t.Fatalf("ClaimSync = %v, %v", ok, err)
 	}
 	var seen Session
 	var seenSegments []transcribe.Segment
-	if ok, err := store.MarkSynced("20261106140000", "folder-1", func(now Session, segments []transcribe.Segment) bool {
+	if ok, err := store.MarkSynced("20261106140000", "sync-1", "folder-1", func(now Session, segments []transcribe.Segment) bool {
 		seen, seenSegments = now, segments
 		return false
 	}); err != nil || ok {
@@ -783,7 +786,7 @@ func TestMarkSynced(t *testing.T) {
 	if session, _ := store.GetSession("20261106140000"); session.SyncState != SyncStateSyncing {
 		t.Errorf("refused MarkSynced left sync_state %q, want %q", session.SyncState, SyncStateSyncing)
 	}
-	if ok, err := store.MarkSynced("20261106140000", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err != nil || !ok {
+	if ok, err := store.MarkSynced("20261106140000", "sync-1", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err != nil || !ok {
 		t.Fatalf("MarkSynced = %v, %v; want marked", ok, err)
 	}
 	session, err := store.GetSession("20261106140000")
@@ -793,7 +796,7 @@ func TestMarkSynced(t *testing.T) {
 	if session.SyncState != SyncStateSynced || session.SyncStatus != SyncSynced || session.GDriveFolderID != "folder-1" || session.RetryCount != 0 {
 		t.Errorf("after MarkSynced: %q/%q in %q, retry %d; want synced in folder-1, retry 0", session.SyncState, session.SyncStatus, session.GDriveFolderID, session.RetryCount)
 	}
-	if ok, err := store.MarkSynced("20261106990000", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err == nil || ok {
+	if ok, err := store.MarkSynced("20261106990000", "sync-1", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err == nil || ok {
 		t.Errorf("MarkSynced of a missing session = %v, %v; want an error", ok, err)
 	}
 }
@@ -1098,10 +1101,12 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-eligible", old.Add(time.Minute), "data/audio/gc-eligible.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
+	// Summarized, then synced, as the app does it: a summary changed after
+	// the sync sends the session back to sync.
+	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1121,10 +1126,10 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-recent", now.Add(-30*time.Minute), "data/audio/gc-recent.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
+	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
 		t.Fatal(err)
 	}
 

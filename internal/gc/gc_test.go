@@ -48,7 +48,7 @@ func (m *mockStore) GetSession(id string) (storage.Session, error) {
 	return storage.Session{}, os.ErrNotExist
 }
 
-func (m *mockStore) DeleteEndedSession(id, _ string) (bool, error) {
+func (m *mockStore) DeleteEndedSession(id, _ string, _ bool) (bool, error) {
 	m.deletedIDs = append(m.deletedIDs, id)
 	return true, nil
 }
