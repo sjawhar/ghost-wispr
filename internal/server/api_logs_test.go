@@ -150,6 +150,12 @@ func TestRetrySyncSaysWhenNoSyncCanStart(t *testing.T) {
 		{name: "state refuses a sync", err: errors.New("cannot sync session test-session now: invalid sync state transition: REMOTE_DELETED -> SYNCING"),
 			wantCode: http.StatusConflict, wantError: "REMOTE_DELETED -> SYNCING"},
 		{name: "sync off", err: ErrSyncNotConfigured, wantCode: http.StatusServiceUnavailable, wantError: ErrSyncNotConfigured.Error()},
+		// Review of #39, round 3, note 9: Drive not answering whether a
+		// deleted session's folder is back is no conflict with the session:
+		// the retry may work once Drive answers.
+		{name: "Drive not answering", err: fmt.Errorf("%w: %w", ErrDriveUnavailable,
+			errors.New("cannot sync session test-session now: its Drive folder was deleted, and Drive did not say whether it is back: googleapi: Error 503")),
+			wantCode: http.StatusServiceUnavailable, wantError: "Drive did not say whether it is back"},
 		{name: "no such session", err: fmt.Errorf("get session test-session: query session test-session: %w", sql.ErrNoRows),
 			wantCode: http.StatusNotFound, wantError: "no rows"},
 	} {

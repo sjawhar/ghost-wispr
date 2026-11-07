@@ -114,23 +114,34 @@ func TestGCNeverTouchesTheLiveRecording(t *testing.T) {
 }
 
 // With Drive sync on in the config, GC is sync-gated whether or not the
-// syncer started: when it fails to start (credentials unreadable, say), the
-// age policy still deletes only sessions synced to Drive, and disk pressure
-// removes only their audio. It used to run ungated then, deleting sessions
-// never backed up.
+// syncer started: it deletes, and removes the audio of, only sessions synced
+// to Drive, and only after Drive answers that their folder is there, out of
+// the trash. When the syncer failed to start (credentials unreadable, say),
+// nothing can ask Drive, so GC deletes nothing and removes no audio: a synced
+// session's folder may be in the trash since, which Drive empties after 30
+// days. GC used to run ungated then, deleting sessions never backed up, and
+// later deleted the synced ones without asking Drive.
 func TestGCStaysSyncGatedWhenDriveSyncIsOnButNotRunning(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	audioDir := t.TempDir()
 	old := time.Now().UTC().Add(-40 * 24 * time.Hour)
-	for i, id := range []string{"20261001120000", "20261001130000"} {
+	ids := []string{"20261001120000", "20261001130000"}
+	var recordings []string
+	for i, id := range ids {
 		started := old.Add(time.Duration(i) * time.Hour)
 		if err := store.CreateSession(id, started); err != nil {
 			t.Fatalf("create %s: %v", id, err)
 		}
-		if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+		recording := filepath.Join(audioDir, id+".mp3")
+		if err := os.WriteFile(recording, make([]byte, 2*1024*1024), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		recordings = append(recordings, recording)
+		if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 			t.Fatalf("end %s: %v", id, err)
 		}
 		if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
@@ -139,8 +150,8 @@ func TestGCStaysSyncGatedWhenDriveSyncIsOnButNotRunning(t *testing.T) {
 	}
 	syncTo(t, store, "20261001130000", storage.SyncStateSynced, "folder", 0, "")
 
-	cfg := config.Config{GCEnabled: true, GCMaxAgeDays: 30, GCMaxAudioSizeMB: 1024, GDriveSyncEnabled: true, AudioDir: t.TempDir()}
-	gcCfg := gcConfig(&cfg) // no syncer: it failed to start
+	cfg := config.Config{GCEnabled: true, GCMaxAgeDays: 30, GCMaxAudioSizeMB: 1, GDriveSyncEnabled: true, AudioDir: audioDir}
+	gcCfg := gcConfig(&cfg, nil) // no syncer: it failed to start
 	if !gcCfg.SyncGated {
 		t.Errorf("Drive sync on but not running: GC sync gate off")
 	}
@@ -148,10 +159,17 @@ func TestGCStaysSyncGatedWhenDriveSyncIsOnButNotRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
-	if len(deleted) != 1 || deleted[0] != "20261001130000" {
-		t.Errorf("deleted %v, want only the session synced to Drive, [20261001130000]", deleted)
+	if len(deleted) != 0 {
+		t.Errorf("deleted %v, want none: nothing can check that Drive still has them", deleted)
 	}
-	if _, err := store.GetSession("20261001120000"); err != nil {
-		t.Errorf("the session never backed up was deleted: %v", err)
+	for _, id := range ids {
+		if _, err := store.GetSession(id); err != nil {
+			t.Errorf("session %s deleted: %v", id, err)
+		}
+	}
+	for _, recording := range recordings {
+		if _, err := os.Stat(recording); err != nil {
+			t.Errorf("recording removed: %v", err)
+		}
 	}
 }

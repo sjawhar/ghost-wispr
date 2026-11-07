@@ -1045,7 +1045,7 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 	}
 }
 
-func TestUpdateSummaryRunningResetsEnvoyPublishStatus(t *testing.T) {
+func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	sessionID := "envoy-reset-1"
 	started := time.Date(2026, 3, 21, 10, 0, 0, 0, time.UTC)
@@ -1063,8 +1063,8 @@ func TestUpdateSummaryRunningResetsEnvoyPublishStatus(t *testing.T) {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "", "", SummaryRunning, "", "{}"); err != nil {
-		t.Fatalf("update summary running: %v", err)
+	if err := store.StartSummary(sessionID); err != nil {
+		t.Fatalf("start summary: %v", err)
 	}
 
 	sess, err := store.GetSession(sessionID)

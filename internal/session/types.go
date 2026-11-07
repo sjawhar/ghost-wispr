@@ -6,6 +6,7 @@ import (
 
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -17,7 +18,12 @@ type Store interface {
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	CountSegments(sessionID string) (int, error)
 	UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error
-	UpdateSummaryError(sessionID, errMsg string) error
+	// StartSummary marks the summary running; the session keeps its title
+	// and its last good summary until a new one is stored.
+	StartSummary(sessionID string) error
+	// FailSummary records that the summary failed, and why, keeping the
+	// session's title and last good summary, and returns the session.
+	FailSummary(sessionID, errMsg string) (storage.Session, error)
 	UpdateRefinement(sessionID, transcript, status string) error
 	// ClaimRefinement marks the refinement running while the session still
 	// names audioPath, the recording it will read, and reports whether it did.

@@ -48,9 +48,16 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 		{"summary made again", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return store.UpdateSummary(id, "Standup", "The summary, made again.", SummaryCompleted, "default", "{}")
 		}, true},
-		{"summary cleared to be made again", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateSummary(id, "", "", SummaryRunning, "", "{}")
-		}, true},
+		{"summary started again", func(_ *testing.T, store *SQLiteStore, id string) error {
+			return store.StartSummary(id)
+		}, false},
+		{"summary made again failed", func(t *testing.T, store *SQLiteStore, id string) error {
+			if err := store.StartSummary(id); err != nil {
+				t.Fatalf("StartSummary: %v", err)
+			}
+			_, err := store.FailSummary(id, "summarization failed")
+			return err
+		}, false},
 		{"title edited", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return store.UpdateTitle(id, "Planning")
 		}, true},

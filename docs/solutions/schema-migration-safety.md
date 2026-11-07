@@ -52,19 +52,9 @@ The most likely explanation involves FTS5 interaction: the virtual table referen
 
 ## What MUST Be Done
 
-### 1. Pre-Migration Backup (NOT YET IMPLEMENTED)
+### 1. Pre-Migration Backup
 
-Before `init()` runs any schema changes, copy the DB file:
-
-```go
-func (s *SQLiteStore) init() error {
-    // BACKUP FIRST
-    if err := backupDB(s.dbPath); err != nil {
-        return fmt.Errorf("pre-migration backup: %w", err)
-    }
-    // ... then run migrations
-}
-```
+Before `init()` runs any schema changes, `createPreMigrationBackup` (`internal/storage/sqlite.go`) writes `<db>.pre-migrate.bak` on every start. It copies with `VACUUM INTO` through the store's own connection, writes the copy beside the backup, flushes it and renames it over the old backup, so a backup cut off part way leaves the last one.
 
 This is the most important safety net. If migrations corrupt data, you can restore.
 
@@ -93,4 +83,4 @@ Consider making the rebuild conditional — only run if the index is empty or a 
 
 2. **Backup location matters.** The backup at `ghost-wispr.db.bak` existed because a previous deploy created it. There's no automated backup rotation. If the backup itself is corrupted or too old, you're out of luck.
 
-3. **SQLite WAL mode complicates backups.** If the DB is in WAL mode (it is), you need to copy both `ghost-wispr.db` and `ghost-wispr.db-wal` for a consistent backup, or run `PRAGMA wal_checkpoint(TRUNCATE)` first.
+3. **SQLite WAL mode complicates backups: copy through SQLite, never by opening the database file.** Use `VACUUM INTO`, the online backup API or the `sqlite3` command's `.backup`; each reads one consistent snapshot, the `-wal` file included. Never open the database file itself from the app's process (`os.Open`, `io.Copy`): closing that second descriptor drops every POSIX lock the process holds on the file, the locks SQLite took. The next SQLite process that opens and closes the database (the `sqlite3` command, a backup script) then takes itself for the last user and deletes the `-wal` file, and every later write of the app goes to a deleted file, lost on a crash or power cut.
