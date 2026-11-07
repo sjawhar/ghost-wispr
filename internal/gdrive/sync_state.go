@@ -1,7 +1,9 @@
 package gdrive
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -67,6 +69,12 @@ func ValidateSyncStateTransition(from, to SyncState) error {
 		SyncStateRetryScheduled: {
 			SyncStateSyncing: {},
 		},
+		// A retry asks Drive again: the folder may be back from the trash.
+		// The sync checks it before it writes anything, and ends
+		// REMOTE_DELETED again while it is not.
+		SyncStateRemoteDeleted: {
+			SyncStateSyncing: {},
+		},
 	}
 
 	if _, ok := allowed[from][to]; ok {
@@ -118,17 +126,19 @@ func IsRetryReady(now time.Time, retryCount int, lastSyncAttempt *time.Time) boo
 	return !now.UTC().Before(readyAt)
 }
 
+// IsRemoteDeletedError reports whether err is, or wraps, Drive answering that
+// a file is not found (404), or ErrFolderTrashed: a session folder in the
+// trash is treated as one deleted.
 func IsRemoteDeletedError(err error) bool {
-	if err == nil {
+	if errors.Is(err, ErrFolderTrashed) {
+		return true
+	}
+	var gErr *googleapi.Error
+	if !errors.As(err, &gErr) {
 		return false
 	}
 
-	gErr, ok := err.(*googleapi.Error)
-	if !ok {
-		return false
-	}
-
-	if gErr.Code == 404 {
+	if gErr.Code == http.StatusNotFound {
 		return true
 	}
 

@@ -1187,6 +1187,25 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if kept.Count > 0 && kept.Bytes > kept.WarnBytes {
 			warnings = append(slices.Clip(warnings), keptRawWarning(kept))
 		}
+		var gcHold any
+		if controls.GCHold != nil {
+			if hold := controls.GCHold(); hold != nil {
+				warnings = append(slices.Clip(warnings), gcHoldWarning(hold))
+				gcHold = map[string]any{
+					"reason":           hold.Reason,
+					"since":            hold.Since.UTC().Format(time.RFC3339),
+					"disk_used_bytes":  hold.DiskUsedBytes,
+					"disk_total_bytes": hold.DiskTotalBytes,
+				}
+			}
+		}
+		unverified := 0
+		if controls.UnverifiedSessions != nil {
+			unverified = controls.UnverifiedSessions()
+		}
+		if unverified > 0 {
+			warnings = append(slices.Clip(warnings), unverifiedWarning(unverified))
+		}
 		if warnings == nil {
 			warnings = []string{}
 		}
@@ -1206,6 +1225,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"warnings":                  warnings,
 			"kept_raw_recordings":       kept.Count,
 			"kept_raw_bytes":            kept.Bytes,
+			"gc_hold":                   gcHold,
+			"unverified_sessions":       unverified,
 			"active_session_id":         activeSessionID,
 			"active_session_started_at": activeSessionStartedAt,
 		})
@@ -1289,7 +1310,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if err := controls.RetrySync(r.Context(), sessionID); err != nil {
 			status := http.StatusConflict
 			switch {
-			case errors.Is(err, ErrSyncNotConfigured):
+			case errors.Is(err, ErrSyncNotConfigured), errors.Is(err, ErrDriveUnavailable):
 				status = http.StatusServiceUnavailable
 			case errors.Is(err, sql.ErrNoRows), errors.Is(err, os.ErrNotExist):
 				status = http.StatusNotFound

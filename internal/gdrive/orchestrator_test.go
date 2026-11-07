@@ -34,6 +34,9 @@ func (f *fakeUploader) UploadInto(_ context.Context, folderID string, _ []SyncFi
 	return f.err
 }
 
+// FolderOnDrive reports every folder as on Drive.
+func (f *fakeUploader) FolderOnDrive(context.Context, string) (bool, error) { return true, nil }
+
 // A session synced before has its Drive folder: syncing it again (after the
 // store reopened it to upload a merged session's audio) adds the missing
 // files to that folder instead of creating a second one.
@@ -239,19 +242,22 @@ func TestOrchestratorSyncSessionFailsPermanentlyAfterRetryExhaustion(t *testing.
 	}
 }
 
+// A 404 while syncing into the session's own Drive folder: the folder was
+// deleted on Drive.
 func TestOrchestratorSyncSessionSoftDeletesRemoteDeletion(t *testing.T) {
 	started := time.Date(2026, 3, 23, 10, 0, 0, 0, time.UTC)
 	store := &fakeOrchestratorStore{
 		session: storage.Session{
-			ID:        "session-4",
-			Title:     "Remote deleted session",
-			StartedAt: started,
-			Summary:   "summary",
-			SyncState: storage.SyncStatePending,
+			ID:             "session-4",
+			Title:          "Remote deleted session",
+			StartedAt:      started,
+			Summary:        "summary",
+			SyncState:      storage.SyncStatePending,
+			GDriveFolderID: "folder-4",
 		},
 		segments: []transcribe.Segment{{Speaker: 0, Text: "hello", Timestamp: started}},
 	}
-	uploader := &fakeUploader{err: &googleapi.Error{Code: 404}}
+	uploader := &fakeUploader{err: fmt.Errorf("list folder folder-4: %w", &googleapi.Error{Code: 404})}
 
 	o := NewOrchestratorWithUploader(uploader, store)
 	err := o.SyncSession(context.Background(), "session-4")
@@ -369,7 +375,7 @@ func TestOrchestratorManualRetryStartsFromFailed(t *testing.T) {
 	uploader := &fakeUploader{folderID: "folder-new"}
 	o := NewOrchestratorWithUploader(uploader, store)
 
-	if err := o.CanSync("session-1"); err != nil {
+	if err := o.CanSync(context.Background(), "session-1"); err != nil {
 		t.Errorf("CanSync of a FAILED session: %v", err)
 	}
 	if err := o.SyncSession(context.Background(), "session-1"); err != nil {
@@ -379,13 +385,23 @@ func TestOrchestratorManualRetryStartsFromFailed(t *testing.T) {
 		t.Errorf("after the manual retry: %q in folder %q, want %q in folder-1", last.state, last.driveFolderID, storage.SyncStateSynced)
 	}
 
-	for _, state := range []string{storage.SyncStateSynced, storage.SyncStateSyncing, storage.SyncStateRemoteDeleted} {
+	for _, state := range []string{storage.SyncStateSynced, storage.SyncStateSyncing} {
 		store.session.SyncState = state
-		if err := o.CanSync("session-1"); err == nil {
+		if err := o.CanSync(context.Background(), "session-1"); err == nil {
 			t.Errorf("CanSync of a %s session: no error", state)
 		}
 	}
-	if err := o.CanSync("no-such-session"); err == nil {
+	// A session whose Drive folder was deleted: a retry asks Drive again for
+	// its folder, and with none recorded there is nothing to ask about.
+	store.session.SyncState = storage.SyncStateRemoteDeleted
+	if err := o.CanSync(context.Background(), "session-1"); err != nil {
+		t.Errorf("CanSync of a REMOTE_DELETED session with its folder: %v", err)
+	}
+	store.session.GDriveFolderID = ""
+	if err := o.CanSync(context.Background(), "session-1"); err == nil {
+		t.Error("CanSync of a REMOTE_DELETED session with no folder: no error")
+	}
+	if err := o.CanSync(context.Background(), "no-such-session"); err == nil {
 		t.Error("CanSync of a missing session: no error")
 	}
 }

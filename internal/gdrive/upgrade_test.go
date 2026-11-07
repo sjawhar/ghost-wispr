@@ -1,6 +1,7 @@
 package gdrive
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -51,8 +52,14 @@ func openCopy(t *testing.T, src string) (*storage.SQLiteStore, string) {
 }
 
 func ageGC(store *storage.SQLiteStore, syncGated bool) *gc.Collector {
-	return gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: syncGated}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: syncGated, Drive: allFoldersOnDrive{}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
+
+// allFoldersOnDrive is a Drive that has every session folder, so what these
+// tests check is kept or deleted for its own reason.
+type allFoldersOnDrive struct{}
+
+func (allFoldersOnDrive) FolderOnDrive(context.Context, string) (bool, error) { return true, nil }
 
 // Review of #38, round 1, blocker 1: a session the version before left
 // synced after its documents changed (synced while its summary was running,

@@ -529,7 +529,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		return
 	}
 
-	_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "", "{}")
+	_ = m.store.StartSummary(sessionID)
 
 	// Wait for batch refinement if configured, then canonicalize.
 	m.mu.Lock()
@@ -546,9 +546,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
 	if err != nil {
-		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, "", "{}")
-		_ = m.store.UpdateSummaryError(sessionID, fmt.Sprintf("failed to get canonical transcript: %v", err))
-		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, "")
+		m.failSummary(sessionID, fmt.Sprintf("failed to get canonical transcript: %v", err))
 		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to retrieve transcript for session %s", sessionID))
@@ -569,9 +567,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset, "{}")
-		_ = m.store.UpdateSummaryError(sessionID, fmt.Sprintf("summarization failed: %v", err))
-		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
 		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
@@ -581,9 +577,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		_ = m.store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset, "{}")
-		_ = m.store.UpdateSummaryError(sessionID, fmt.Sprintf("failed to store summary: %v", err))
-		m.broadcastSummaryStatus(sessionID, "", "", storage.SummaryFailed, preset)
+		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", err))
 		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
@@ -620,6 +614,18 @@ func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, pres
 	if m.hub != nil {
 		m.hub.BroadcastSummaryReady(sessionID, title, summary, status, preset)
 	}
+}
+
+// failSummary records that making session sessionID's summary failed, and why
+// (reason), and announces the title and summary the session keeps: its last
+// good ones, if it has them.
+func (m *Manager) failSummary(sessionID, reason string) {
+	kept, err := m.store.FailSummary(sessionID, reason)
+	if err != nil {
+		m.logger.Error("failed to record the failed summary", "operation", "generate_summary", "session_id", sessionID, "reason", reason, "error", err)
+		return
+	}
+	m.broadcastSummaryStatus(sessionID, kept.Title, kept.Summary, storage.SummaryFailed, kept.SummaryPreset)
 }
 
 func (m *Manager) ActiveSession() (string, time.Time) {

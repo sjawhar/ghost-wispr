@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,24 @@ type wireDrive struct {
 	files []*wireFile // in listing order
 	next  int
 	clock time.Time
+	// gone holds the folders deleted by hand, for good: Drive answers 404
+	// for each, as for any file it does not have.
+	gone map[string]bool
+	// trashed holds the folders in the trash. A file in one is in the trash
+	// too, as on Drive: a list of what is not trashed leaves it out.
+	trashed map[string]bool
+	// onUpload, when set, runs before each file upload into a folder, with
+	// the folder, while the server holds its lock.
+	onUpload func(folder string)
+	// unavailable makes Drive answer 503 to every request for a file.
+	unavailable bool
+	// onGet, when set, runs as Drive is asked for a file (Files.Get), with
+	// its id, while the server holds its lock.
+	onGet func(id string)
+	// onList, when set, runs after Drive lists a folder's files, with the
+	// folder, while the server holds its lock: what changes on Drive
+	// between the list and the uploads.
+	onList func(folder string)
 }
 
 var parentQuery = regexp.MustCompile(`'([^']+)' in parents`)
@@ -96,6 +115,65 @@ func (d *wireDrive) find(id string) *wireFile {
 	return nil
 }
 
+// deleteByHand deletes folder id and every file in it for good, as a user can
+// on Drive (deleting it, then emptying the trash).
+func (d *wireDrive) deleteByHand(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.gone == nil {
+		d.gone = map[string]bool{}
+	}
+	d.gone[id] = true
+	d.files = slices.DeleteFunc(d.files, func(f *wireFile) bool { return f.ID == id || f.Parent == id })
+}
+
+// trash moves folder id, and every file in it with it, to the trash, as a
+// user deleting it in the Drive UI does.
+func (d *wireDrive) trash(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.trashLocked(id)
+}
+
+// trashLocked is trash for a caller holding the lock (onUpload).
+func (d *wireDrive) trashLocked(id string) {
+	if d.trashed == nil {
+		d.trashed = map[string]bool{}
+	}
+	d.trashed[id] = true
+}
+
+// inTrash reports whether file f is in the trash: itself, or a folder above
+// it, as Drive reports trashed.
+func (d *wireDrive) inTrash(f *wireFile) bool {
+	for id, parent := f.ID, f.Parent; ; {
+		if d.trashed[id] {
+			return true
+		}
+		if parent == "" {
+			return false
+		}
+		id, parent = parent, ""
+		if p := d.find(id); p != nil {
+			parent = p.Parent
+		}
+	}
+}
+
+// notFound answers as Drive does for a file it does not have.
+func notFound(w http.ResponseWriter, id string) {
+	message := "File not found: " + id + "."
+	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"errors": []map[string]string{{
+			"domain": "global", "reason": "notFound", "message": message, "locationType": "parameter", "location": "fileId",
+		}},
+		"code":    http.StatusNotFound,
+		"message": message,
+	}})
+}
+
 func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -111,14 +189,22 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad query", http.StatusBadRequest)
 			return
 		}
+		if d.gone[m[1]] {
+			notFound(w, m[1])
+			return
+		}
+		notTrashed := strings.Contains(r.URL.Query().Get("q"), "trashed = false")
 		list := &drive.FileList{}
 		for _, f := range d.files {
-			if f.Parent == m[1] {
+			if f.Parent == m[1] && (!notTrashed || !d.inTrash(f)) {
 				list.Files = append(list.Files, &drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType,
 					AppProperties: f.AppProperties, ModifiedTime: f.ModifiedTime.Format(time.RFC3339Nano)})
 			}
 		}
 		_ = json.NewEncoder(w).Encode(list)
+		if d.onList != nil {
+			d.onList(m[1])
+		}
 	case r.Method == http.MethodGet && strings.HasSuffix(path, "/export"):
 		f := d.find(strings.TrimSuffix(strings.TrimPrefix(path, "/drive/v3/files/"), "/export"))
 		if f == nil {
@@ -126,10 +212,34 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, _ = w.Write(f.Content)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/drive/v3/files/"):
+		id := strings.TrimPrefix(path, "/drive/v3/files/")
+		if d.onGet != nil {
+			d.onGet(id)
+		}
+		if d.unavailable {
+			http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		if id == "root" && !d.gone[id] {
+			// The folder the Syncer syncs into.
+			_ = json.NewEncoder(w).Encode(&drive.File{Id: id, Trashed: d.trashed[id], ExplicitlyTrashed: d.trashed[id]})
+			return
+		}
+		f := d.find(id)
+		if f == nil {
+			notFound(w, id)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType, Trashed: d.inTrash(f), ExplicitlyTrashed: d.trashed[f.ID]})
 	case r.Method == http.MethodPost && path == "/drive/v3/files":
 		var meta drive.File
 		if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if parent := firstParent(meta.Parents); d.gone[parent] {
+			notFound(w, parent)
 			return
 		}
 		f := d.create(&wireFile{Name: meta.Name, MimeType: meta.MimeType, Parent: firstParent(meta.Parents)})
@@ -139,6 +249,14 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 		if meta == nil {
 			return
 		}
+		parent := firstParent(meta.Parents)
+		if d.gone[parent] {
+			notFound(w, parent)
+			return
+		}
+		if d.onUpload != nil {
+			d.onUpload(parent)
+		}
 		f := d.create(&wireFile{Name: meta.Name, MimeType: meta.MimeType, Parent: firstParent(meta.Parents), AppProperties: meta.AppProperties, Content: content})
 		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID})
 	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/upload/drive/v3/files/"):
@@ -146,6 +264,9 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 		if f == nil {
 			http.Error(w, "no such file", http.StatusNotFound)
 			return
+		}
+		if d.onUpload != nil {
+			d.onUpload(f.Parent)
 		}
 		meta, content := d.multipart(w, r)
 		if meta == nil {

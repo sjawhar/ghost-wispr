@@ -578,7 +578,7 @@ func OpenAPISpec() map[string]any {
 			"/api/sessions/{id}/resummarize": map[string]any{
 				"post": map[string]any{
 					"summary":     "Resummarize session",
-					"description": "Generate a new summary for a session with optional preset",
+					"description": "Generate a new summary for a session with optional preset. The session keeps its title and current summary until the new one is stored; if making it fails, it keeps them, and summary_status becomes failed with summary_error saying why (error_message keeps the last sync's error); a completed summary clears summary_error",
 					"tags":        []string{"sessions"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{
@@ -634,7 +634,7 @@ func OpenAPISpec() map[string]any {
 			"/api/sessions/{id}/retry-sync": map[string]any{
 				"post": map[string]any{
 					"summary":     "Retry sync",
-					"description": "Start syncing the session to Google Drive again, in the background: a session waiting for its retry, or whose retries ran out (failed). A session synced before keeps its Drive folder.",
+					"description": "Start syncing the session to Google Drive again, in the background: a session waiting for its retry, or whose retries ran out (failed), or whose Drive folder was deleted (REMOTE_DELETED) once Drive shows the folder restored. A session synced before keeps its Drive folder.",
 					"tags":        []string{"sessions"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{
@@ -654,10 +654,10 @@ func OpenAPISpec() map[string]any {
 							"description": "No such session",
 						},
 						"409": map[string]any{
-							"description": "No sync can start for this session (already synced, being synced now, or its Drive folder was deleted); the error says why",
+							"description": "No sync can start for this session (already synced, being synced now, or its Drive folder is still in the trash or gone); the error says why",
 						},
 						"503": map[string]any{
-							"description": "Google Drive sync is off",
+							"description": "Google Drive sync is off, or Drive did not answer whether a deleted session's folder is back; the error says which",
 						},
 					},
 				},
@@ -748,7 +748,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), and the active session",
+					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

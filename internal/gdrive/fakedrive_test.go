@@ -118,6 +118,14 @@ func (d *fakeDrive) UploadInto(_ context.Context, folderID string, files []SyncF
 	return nil
 }
 
+// FolderOnDrive reports whether the fake holds folder folderID.
+func (d *fakeDrive) FolderOnDrive(_ context.Context, folderID string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.folders[folderID]
+	return ok, nil
+}
+
 // has reports whether folder folderID holds a file with this content.
 func (d *fakeDrive) has(folderID string, content []byte) bool {
 	d.mu.Lock()

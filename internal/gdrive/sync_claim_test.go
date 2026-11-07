@@ -45,7 +45,7 @@ func TestASecondSyncOfASessionStartsNothingWhileOneRuns(t *testing.T) {
 
 	var canSync, second error
 	onFirstUpload(drive, func() {
-		canSync = o.CanSync(id)
+		canSync = o.CanSync(ctx, id)
 		second = o.SyncSession(ctx, id)
 	})
 	if err := o.SyncSession(ctx, id); err != nil {

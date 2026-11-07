@@ -32,6 +32,8 @@ export enum SyncState {
   Synced = 'SYNCED',
   Failed = 'FAILED',
   RetryScheduled = 'RETRY_SCHEDULED',
+  // The session's Drive folder is in the trash or gone; the device keeps it.
+  RemoteDeleted = 'REMOTE_DELETED',
 }
 
 export enum SyncStatus {
@@ -148,6 +150,9 @@ export interface SessionSummary {
   // still names what is left. The session itself is kept.
   audio_removed_at?: string
   sync_status?: SyncStatus
+  sync_state?: SyncState
+  // Why the last summary attempt failed, when it did.
+  summary_error?: string
   refinement_status?: RefinementStatus
   transcript_source?: string
   refined_transcript?: string

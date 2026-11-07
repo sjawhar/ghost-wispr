@@ -21,6 +21,11 @@ var ErrDeepgramNotConfigured = errors.New("deepgram not configured")
 // ErrSyncNotConfigured is what RetrySync returns when Google Drive sync is off.
 var ErrSyncNotConfigured = errors.New("google drive sync is not configured")
 
+// ErrDriveUnavailable is what RetrySync wraps when Google Drive did not
+// answer a question the retry needs answered first: the retry may work once
+// Drive answers.
+var ErrDriveUnavailable = errors.New("google drive did not answer")
+
 // KeptRawRecordings are the raw recordings kept in the audio directory because
 // they could not be saved, for recovery or deletion by hand.
 type KeptRawRecordings struct {
@@ -39,15 +44,53 @@ func keptRawWarning(kept KeptRawRecordings) string {
 	return fmt.Sprintf("%d recordings could not be saved: their raw audio (%.1f MB) is kept in the audio directory. Recover or delete them by hand.", kept.Count, mb)
 }
 
+// GCHold is a GC pass that held back, deleting and removing nothing more,
+// because it could not check that Drive still has the sessions (Drive sync on
+// but not running, or Drive not answering), and the disk use of the audio
+// directory's filesystem at that pass.
+type GCHold struct {
+	Reason         string
+	Since          time.Time // the first pass of this hold
+	DiskUsedBytes  int64
+	DiskTotalBytes int64
+}
+
+// gcHoldWarning tells the user in GET /api/status that GC is on hold and the
+// disk fills, so a broken sync is noticed before the disk is full.
+func gcHoldWarning(hold *GCHold) string {
+	const gb = 1024 * 1024 * 1024
+	disk := "disk use unknown"
+	if hold.DiskTotalBytes > 0 {
+		disk = fmt.Sprintf("the disk is %d%% full (%.1f of %.1f GB)", hold.DiskUsedBytes*100/hold.DiskTotalBytes,
+			float64(hold.DiskUsedBytes)/gb, float64(hold.DiskTotalBytes)/gb)
+	}
+	return fmt.Sprintf("Garbage collection is on hold since %s: %s. No session is deleted and no audio removed, so the disk fills; %s. Fix Google Drive sync.",
+		hold.Since.UTC().Format("2006-01-02 15:04 UTC"), hold.Reason, disk)
+}
+
+// unverifiedWarning tells the user in GET /api/status how many older sessions
+// GC keeps until a sync re-checks their documents on Drive.
+func unverifiedWarning(n int) string {
+	if n == 1 {
+		return "1 older session is kept until its Drive documents are re-checked, the next time it is synced (when its title or summary changes)."
+	}
+	return fmt.Sprintf("%d older sessions are kept until their Drive documents are re-checked, each the next time it is synced (when its title or summary changes).", n)
+}
+
 type ControlHooks struct {
-	Pause                   func()
-	Resume                  func()
-	IsPaused                func() bool
-	IsCapturing             func() bool
-	CaptureState            func() string
-	OnStatusChanged         func(paused bool)
-	Warnings                func() []string
-	KeptRawRecordings       func() KeptRawRecordings
+	Pause             func()
+	Resume            func()
+	IsPaused          func() bool
+	IsCapturing       func() bool
+	CaptureState      func() string
+	OnStatusChanged   func(paused bool)
+	Warnings          func() []string
+	KeptRawRecordings func() KeptRawRecordings
+	// GCHold is the hold of the last GC pass, nil when it did not hold back.
+	GCHold func() *GCHold
+	// UnverifiedSessions is how many sessions GC keeps until a sync verifies
+	// their documents on Drive.
+	UnverifiedSessions      func() int
 	ActiveSession           func() (string, time.Time)
 	Presets                 func() map[string]config.Preset
 	Resummarize             func(ctx context.Context, sessionID, preset string) error

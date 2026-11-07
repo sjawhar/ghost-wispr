@@ -90,7 +90,7 @@ func TestASyncThatCannotRecordItsEndIsRetriedAfterARestart(t *testing.T) {
 	if state, _ := sessionState(t, store, id); state != storage.SyncStateSyncing {
 		t.Fatalf("after the retry: %q, want the session left SYNCING", state)
 	}
-	if err := o.CanSync(id); err == nil {
+	if err := o.CanSync(context.Background(), id); err == nil {
 		t.Error("CanSync of a session a sync still holds reported nothing")
 	}
 

@@ -39,10 +39,12 @@ func TestOpeningTheStoreReplacesAnEarlierDocumentsTrigger(t *testing.T) {
 
 // A session whose documents are not verified on Drive (synced by an earlier
 // version, see the mark-synced-documents-unverified migration) is never
-// deleted by the age policy, with sync gating it or not. Disk pressure still
-// removes its audio, as for any synced session: Drive has the recording. A
-// sync of it that completes verifies it.
-func TestUnverifiedDocumentsHoldOffOnlyTheAgePolicy(t *testing.T) {
+// deleted by the age policy, sync gate or not. Its audio is on Drive: under
+// the sync gate disk pressure may remove it (GC asks Drive first that the
+// folder is there); with no sync gate there is no Drive to ask, so it is
+// kept. A sync of it that completes verifies it, and the store counts the
+// sessions still unverified.
+func TestUnverifiedDocumentsHoldOffTheAgePolicy(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	const id, audio = "20261001100000", "/audio/20261001100000.mp3"
 	started := time.Now().UTC().AddDate(0, 0, -40)
@@ -81,12 +83,17 @@ func TestUnverifiedDocumentsHoldOffOnlyTheAgePolicy(t *testing.T) {
 			t.Errorf("DeleteEndedSession(gated %v) = %v, %v; want kept", gated, deleted, err)
 		}
 	}
-	recordings, err := store.Recordings(true)
-	if err != nil {
-		t.Fatalf("Recordings: %v", err)
+	for gated, want := range map[bool]bool{true: true, false: false} {
+		recordings, err := store.Recordings(gated)
+		if err != nil {
+			t.Fatalf("Recordings: %v", err)
+		}
+		if len(recordings) != 1 || recordings[0].Removable != want {
+			t.Errorf("Recordings(gated %v) = %+v, want removable %v", gated, recordings, want)
+		}
 	}
-	if len(recordings) != 1 || !recordings[0].Removable {
-		t.Errorf("Recordings(gated) = %+v, want its recording removable under disk pressure", recordings)
+	if n, err := store.CountUnverifiedSessions(); err != nil || n != 1 {
+		t.Errorf("CountUnverifiedSessions = %d, %v; want 1", n, err)
 	}
 
 	// Its title changes, and the sync of the change completes.
@@ -96,5 +103,8 @@ func TestUnverifiedDocumentsHoldOffOnlyTheAgePolicy(t *testing.T) {
 	sync("sync-2")
 	if ids, err := store.GetGCEligibleSessions(30, true); err != nil || !slices.Equal(ids, []string{id}) {
 		t.Errorf("GetGCEligibleSessions after a completed sync = %v, %v; want [%s]", ids, err, id)
+	}
+	if n, err := store.CountUnverifiedSessions(); err != nil || n != 0 {
+		t.Errorf("CountUnverifiedSessions after a completed sync = %d, %v; want 0", n, err)
 	}
 }

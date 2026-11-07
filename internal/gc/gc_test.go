@@ -2,6 +2,7 @@ package gc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,9 +20,10 @@ import (
 )
 
 type mockStore struct {
-	sessions   map[string]storage.Session
-	gcEligible map[int][]string
-	deletedIDs []string
+	sessions      map[string]storage.Session
+	gcEligible    map[int][]string
+	deletedIDs    []string
+	remoteDeleted []string
 }
 
 // The mock serves age-based retention only; disk pressure runs against the
@@ -57,6 +59,27 @@ func (m *mockStore) PurgeOldEvents(maxAge time.Duration) error {
 	return nil
 }
 
+func (m *mockStore) MarkRemoteDeleted(id, _, _ string) (bool, error) {
+	m.remoteDeleted = append(m.remoteDeleted, id)
+	return true, nil
+}
+
+// driveFolders is Drive as GC asks it: every folder is on it, out of the
+// trash, except those in gone; err, when set, is Drive not answering.
+type driveFolders struct {
+	gone  map[string]bool
+	err   error
+	asked []string
+}
+
+func (d *driveFolders) FolderOnDrive(_ context.Context, id string) (bool, error) {
+	d.asked = append(d.asked, id)
+	if d.err != nil {
+		return false, d.err
+	}
+	return !d.gone[id], nil
+}
+
 func TestGCDeletesSyncedOldSessions(t *testing.T) {
 	dir := t.TempDir()
 	audioPath := filepath.Join(dir, "test.mp3")
@@ -66,7 +89,7 @@ func TestGCDeletesSyncedOldSessions(t *testing.T) {
 
 	store := &mockStore{
 		sessions: map[string]storage.Session{
-			"s1": {ID: "s1", AudioPath: audioPath},
+			"s1": {ID: "s1", AudioPath: audioPath, GDriveFolderID: "folder-s1"},
 		},
 		gcEligible: map[int][]string{
 			30: {"s1"},
@@ -77,6 +100,7 @@ func TestGCDeletesSyncedOldSessions(t *testing.T) {
 		MaxAgeDays:     30,
 		MaxAudioSizeMB: 1024,
 		SyncGated:      true,
+		Drive:          &driveFolders{},
 	})
 
 	deleted, err := collector.Run()
@@ -97,7 +121,7 @@ func TestGCDeletesSyncedOldSessions(t *testing.T) {
 func TestGCSkipsSessionWithNoAudio(t *testing.T) {
 	store := &mockStore{
 		sessions: map[string]storage.Session{
-			"s1": {ID: "s1", AudioPath: ""},
+			"s1": {ID: "s1", AudioPath: "", GDriveFolderID: "folder-s1"},
 		},
 		gcEligible: map[int][]string{
 			30: {"s1"},
@@ -108,6 +132,7 @@ func TestGCSkipsSessionWithNoAudio(t *testing.T) {
 		MaxAgeDays:     30,
 		MaxAudioSizeMB: 1024,
 		SyncGated:      true,
+		Drive:          &driveFolders{},
 	})
 
 	deleted, err := collector.Run()
@@ -128,7 +153,7 @@ func TestGCResolvesRelativePath(t *testing.T) {
 
 	store := &mockStore{
 		sessions: map[string]storage.Session{
-			"s1": {ID: "s1", AudioPath: "session.mp3"},
+			"s1": {ID: "s1", AudioPath: "session.mp3", GDriveFolderID: "folder-s1"},
 		},
 		gcEligible: map[int][]string{
 			30: {"s1"},
@@ -139,6 +164,7 @@ func TestGCResolvesRelativePath(t *testing.T) {
 		MaxAgeDays:     30,
 		MaxAudioSizeMB: 1024,
 		SyncGated:      true,
+		Drive:          &driveFolders{},
 		AudioDir:       dir,
 	})
 
@@ -284,9 +310,14 @@ func crashRecovered(t *testing.T, store *storage.SQLiteStore, dir, id string, st
 }
 
 // runGC runs GC passes times, as its hourly schedule does, and returns the
-// sessions the passes deleted.
+// sessions the passes deleted. A sync-gated config with no Drive gets one
+// that has every folder: what a test checks is then kept or removed for its
+// own reason, not because GC could not ask Drive.
 func runGC(t *testing.T, store *storage.SQLiteStore, config Config, passes int) []string {
 	t.Helper()
+	if config.SyncGated && config.Drive == nil {
+		config.Drive = &driveFolders{}
+	}
 	var deleted []string
 	for range passes {
 		ids, err := New(store, config).Run()
