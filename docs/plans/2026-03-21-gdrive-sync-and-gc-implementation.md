@@ -8,6 +8,8 @@
 
 **Tech Stack:** Go (backend), SQLite (storage), Google Drive API v3 (`google.golang.org/api/drive/v3`), Svelte 5 (frontend)
 
+> **Historical (2026-03-21).** This is the plan as written then. `UpdateSyncStatus` and `UpdateSyncState` no longer exist: a sync claims its session (`ClaimSync`) and ends it with `MarkSynced` or `EndSync` under that claim (PR #38). `UpdateSummaryError` is gone too: a failed summary is `FailSummary`. The design doc, `2026-03-21-gdrive-sync-and-gc-design.md`, describes the code as it is.
+
 ---
 
 ### Task 1: Add sync tracking columns to SQLite schema
