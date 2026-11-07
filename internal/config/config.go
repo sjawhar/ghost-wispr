@@ -290,12 +290,12 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
 	if v := os.Getenv(EnvPrefix + "GC_MAX_AGE_DAYS"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			cfg.GCMaxAgeDays = n
 		}
 	}
 	if v := os.Getenv(EnvPrefix + "GC_MAX_AUDIO_SIZE_MB"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			cfg.GCMaxAudioSizeMB = n
 		}
 	}
@@ -465,12 +465,13 @@ func validate(cfg *Config) []string {
 		cfg.BatchTranscription.Provider = "deepgram"
 	}
 
-	if cfg.GCMaxAgeDays <= 0 {
-		warnings = append(warnings, "gc_max_age_days must be positive — using default 30.")
+	// 0 is each GC limit's "no limit"; a negative limit is a mistake.
+	if cfg.GCMaxAgeDays < 0 {
+		warnings = append(warnings, "gc_max_age_days must be 0 (no age limit) or positive — using default 30.")
 		cfg.GCMaxAgeDays = 30
 	}
-	if cfg.GCMaxAudioSizeMB <= 0 {
-		warnings = append(warnings, "gc_max_audio_size_mb must be positive — using default 1024.")
+	if cfg.GCMaxAudioSizeMB < 0 {
+		warnings = append(warnings, "gc_max_audio_size_mb must be 0 (no audio budget) or positive — using default 1024.")
 		cfg.GCMaxAudioSizeMB = 1024
 	}
 

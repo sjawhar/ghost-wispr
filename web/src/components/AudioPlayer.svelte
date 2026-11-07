@@ -2,6 +2,7 @@
   import { appState, setActiveAudioSession } from '../lib/state.svelte'
   import { RefinementStatus, type Segment, type SessionSummary } from '../lib/types'
   import { copyText } from '../lib/clipboard'
+  import { audioLeftNote, recordingsNamed } from '../lib/audio'
 
   let {
     sessionId,
@@ -44,8 +45,10 @@
       session?.refinement_status === RefinementStatus.Running,
   )
 
-  // Disk pressure removed the session's audio to free space: nothing to play.
+  // Disk pressure removed the session's audio to free space: all of it, or
+  // part of it, when the audio path still names what is left.
   const audioRemoved = $derived(Boolean(session?.audio_removed_at))
+  const audioLeft = $derived(audioRemoved && recordingsNamed(session?.audio_path) > 0)
   // The session ended without a saved recording: nothing to play or refine.
   const noRecording = $derived(session?.refinement_status === RefinementStatus.NoAudio)
 
@@ -147,15 +150,20 @@
 </script>
 
 <div class="audio-player" data-testid="audio-player">
-  {#if audioRemoved}
+  {#if audioRemoved && !audioLeft}
     <p class="audio-note">
       The audio was removed to free space. The transcript and summary are kept.
     </p>
-  {:else if noRecording}
+  {:else if noRecording && !audioLeft}
     <p class="audio-note">
       No recording was saved for this session, so it cannot be played or refined.
     </p>
   {:else}
+    {#if audioLeft && session}
+      <p class="audio-note">
+        Part of the audio was removed to free space; {audioLeftNote(session)}.
+      </p>
+    {/if}
     <audio
       bind:this={audioEl}
       src={`/api/sessions/${encodeURIComponent(sessionId)}/audio`}

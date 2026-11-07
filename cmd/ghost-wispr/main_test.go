@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -408,6 +410,42 @@ func TestRefreshKeptRawRecordings(t *testing.T) {
 	cancel()
 	if !returnedWithin(refreshed, testWait) {
 		t.Fatal("refresh still running after shutdown")
+	}
+}
+
+// The kept raw recordings warning starts at a tenth of the audio budget. No
+// budget wraps it: from 2^43 MB the budget in bytes went negative, so any
+// kept recording raised the warning. With no budget (0) it warns at once:
+// nothing removes kept recordings.
+func TestKeptRawWarningSizeNeverWraps(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("budgets past 2^31 MB need a 64-bit int")
+	}
+	for _, tc := range []struct {
+		budgetMB int64
+		want     int64
+	}{
+		{budgetMB: 10, want: 10 * 1024 * 1024 / 10},
+		{budgetMB: 1 << 40, want: (1 << 60) / 10},
+		{budgetMB: 1 << 43, want: math.MaxInt64 / 10},
+		{budgetMB: math.MaxInt64, want: math.MaxInt64 / 10},
+		{budgetMB: 0, want: 0},
+	} {
+		var cache atomic.Pointer[server.KeptRawRecordings]
+		ctx, cancel := context.WithCancel(context.Background())
+		refreshed := goDone(func() {
+			refreshKeptRawRecordings(ctx, audio.NewRecorder(t.TempDir()), func() int { return int(tc.budgetMB) }, &cache, time.Hour)
+		})
+		for deadline := time.Now().Add(testWait); cache.Load() == nil; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("kept raw recordings never cached")
+			}
+		}
+		cancel()
+		<-refreshed
+		if got := cache.Load().WarnBytes; got != tc.want {
+			t.Errorf("a %d MB budget warns from %d bytes, want %d", tc.budgetMB, got, tc.want)
+		}
 	}
 }
 

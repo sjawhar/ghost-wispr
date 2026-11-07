@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -91,6 +93,122 @@ func TestSyncAndGCEnvOverrides(t *testing.T) {
 	}
 	if cfg.GCMaxAudioSizeMB != 512 {
 		t.Errorf("expected gc_max_audio_size_mb 512, got %d", cfg.GCMaxAudioSizeMB)
+	}
+}
+
+// writeConfig writes a YAML config file and returns its path.
+func writeConfig(t *testing.T, yaml string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// gcWarnings returns the warnings about the GC limits.
+func gcWarnings(warnings []string) []string {
+	var gc []string
+	for _, w := range warnings {
+		if strings.Contains(w, "gc_max_") {
+			gc = append(gc, w)
+		}
+	}
+	return gc
+}
+
+// Each GC limit has a value that means "no limit": 0. Before it did not,
+// so stopping the age policy took a large number, and one past 106,751
+// days deleted every summarized session. A negative limit is a mistake:
+// the default, with a warning.
+func TestGCLimitsZeroMeansNoLimit(t *testing.T) {
+	clearEnv(t)
+	cfg, warnings, err := Load(writeConfig(t, "gc_max_age_days: 0\ngc_max_audio_size_mb: 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GCMaxAgeDays != 0 || cfg.GCMaxAudioSizeMB != 0 {
+		t.Errorf("gc_max_age_days %d, gc_max_audio_size_mb %d; want 0 and 0, no limit", cfg.GCMaxAgeDays, cfg.GCMaxAudioSizeMB)
+	}
+	if w := gcWarnings(warnings); len(w) != 0 {
+		t.Errorf("no limit warned %q", w)
+	}
+
+	cfg, warnings, err = Load(writeConfig(t, "gc_max_age_days: -5\ngc_max_audio_size_mb: -1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GCMaxAgeDays != 30 || cfg.GCMaxAudioSizeMB != 1024 {
+		t.Errorf("negative limits gave gc_max_age_days %d, gc_max_audio_size_mb %d; want the defaults, 30 and 1024", cfg.GCMaxAgeDays, cfg.GCMaxAudioSizeMB)
+	}
+	if w := gcWarnings(warnings); len(w) != 2 {
+		t.Errorf("negative limits warned %q, want a warning for each", w)
+	}
+
+	t.Setenv(EnvPrefix+"GC_MAX_AGE_DAYS", "0")
+	t.Setenv(EnvPrefix+"GC_MAX_AUDIO_SIZE_MB", "0")
+	cfg, _, err = Load(writeConfig(t, "gc_max_age_days: 10\ngc_max_audio_size_mb: 20\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GCMaxAgeDays != 0 || cfg.GCMaxAudioSizeMB != 0 {
+		t.Errorf("environment 0 gave gc_max_age_days %d, gc_max_audio_size_mb %d; want 0 and 0", cfg.GCMaxAgeDays, cfg.GCMaxAudioSizeMB)
+	}
+}
+
+// "No limit" set in the settings page survives a restart: the config file
+// it writes reads back as 0, not as the default.
+func TestGCNoLimitSurvivesARestart(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "gc_max_age_days: 30\n")
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) { c.GCMaxAgeDays, c.GCMaxAudioSizeMB = 0, 0 }); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	restarted, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg := restarted.Get(); cfg.GCMaxAgeDays != 0 || cfg.GCMaxAudioSizeMB != 0 {
+		t.Errorf("after a restart gc_max_age_days %d, gc_max_audio_size_mb %d; want 0 and 0", cfg.GCMaxAgeDays, cfg.GCMaxAudioSizeMB)
+	}
+}
+
+// A mutation TryUpdate refuses is rolled back whole: nothing written, no
+// callback, even for the fields set before it refused.
+func TestTryUpdateRollsBackARefusedMutation(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "gc_max_age_days: 30\n")
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	store.OnChange(func(Config) { called = true })
+
+	err = store.TryUpdate(func(c *Config) error {
+		c.GCEnabled, c.GCMaxAgeDays = true, 1
+		return errors.New("gc.max_audio_size_mb must be 0 (no audio budget) or positive")
+	})
+	if err == nil {
+		t.Fatal("TryUpdate accepted a refused mutation")
+	}
+	if cfg := store.Get(); cfg.GCEnabled || cfg.GCMaxAgeDays != 30 {
+		t.Errorf("refused mutation kept: gc_enabled %v, gc_max_age_days %d", cfg.GCEnabled, cfg.GCMaxAgeDays)
+	}
+	if after, _ := os.ReadFile(path); !bytes.Equal(after, before) {
+		t.Errorf("refused mutation rewrote the config file:\n%s", after)
+	}
+	if called {
+		t.Error("refused mutation fired a change callback")
 	}
 }
 

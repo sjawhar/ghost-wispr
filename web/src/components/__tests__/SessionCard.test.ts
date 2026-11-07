@@ -6,6 +6,7 @@ import {
   RefinementStatus,
   SessionStatus,
   SummaryStatus,
+  SyncStatus,
   type SessionSummary,
 } from '../../lib/types'
 
@@ -127,6 +128,90 @@ describe('SessionCard', () => {
       }
       expect(screen.queryByTestId('retry-refinement-btn')).toBeNull()
       unmount()
+    }
+  })
+
+  it('says only part of the audio was removed, and how much is left', () => {
+    render(SessionCard, {
+      session: {
+        ...baseSession,
+        audio_path: 'data/audio/b.mp3, data/audio/c.mp3',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.Pending,
+      },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    const marker = screen.getByTestId('audio-removed-badge')
+    expect(marker.textContent?.trim()).toBe('Some audio removed to free space')
+    expect(marker.getAttribute('title')).toBe(
+      'Part of the audio was removed to keep the audio directory under its size limit; 2 recordings are left. The transcript and summary are kept.',
+    )
+  })
+
+  it('says the recording left was not on disk when GC found none, in the marker and the refinement badge', () => {
+    render(SessionCard, {
+      session: {
+        ...baseSession,
+        audio_path: 'mnt/b.mp3',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+      },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('audio-removed-badge').getAttribute('title')).toBe(
+      'Part of the audio was removed to keep the audio directory under its size limit; 1 recording is left, but it was not on disk when the rest was removed. The transcript and summary are kept.',
+    )
+    expect(screen.getByTestId('refinement-badge').getAttribute('title')).toBe(
+      'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined',
+    )
+  })
+
+  it('shows why a sync retry was refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error:
+              'cannot sync session s1 now: invalid sync state transition: REMOTE_DELETED -> SYNCING',
+          }),
+          { status: 409 },
+        ),
+      ),
+    )
+    try {
+      render(SessionCard, {
+        session: { ...baseSession, sync_status: SyncStatus.Failed },
+        detail: undefined,
+        expanded: false,
+        presets: {},
+        onToggle: vi.fn(),
+        onLoadDetail: vi.fn(),
+        onResummarize: vi.fn(),
+        onDelete: vi.fn(),
+      })
+
+      await fireEvent.click(screen.getByTestId('retry-sync-btn'))
+      const reason = await screen.findByTestId('retry-sync-error')
+      expect(reason.textContent).toBe(
+        'cannot sync session s1 now: invalid sync state transition: REMOTE_DELETED -> SYNCING',
+      )
+    } finally {
+      vi.unstubAllGlobals()
     }
   })
 

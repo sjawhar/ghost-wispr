@@ -61,10 +61,24 @@ func (s *Store) Get() Config {
 // writes back to YAML if a path is configured, and fires onChange callbacks.
 // If validation fails, the mutation is rolled back.
 func (s *Store) Update(fn func(*Config)) error {
+	return s.TryUpdate(func(c *Config) error {
+		fn(c)
+		return nil
+	})
+}
+
+// TryUpdate is Update with a mutation that can refuse: when fn returns an
+// error, the mutation is rolled back, nothing is written and no callback
+// fires, and TryUpdate returns that error.
+func (s *Store) TryUpdate(fn func(*Config) error) error {
 	s.mu.Lock()
 
 	prev := s.copyConfig()
-	fn(&s.cfg)
+	if err := fn(&s.cfg); err != nil {
+		s.cfg = prev
+		s.mu.Unlock()
+		return err
+	}
 
 	if err := s.validateForUpdate(); err != nil {
 		s.cfg = prev

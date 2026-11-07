@@ -84,7 +84,7 @@ The Ghost Wispr web UI has four usability issues:
 - Validation: all sessions must exist, be ended, and belong to the same date.
 - Creates a new session spanning earliest `started_at` to latest `ended_at`.
 - Reassigns all segments from source sessions to the merged session: `UPDATE segments SET session_id = ? WHERE session_id IN (...)`, preserving timestamp order.
-- Stores a comma-separated list of source audio paths on the merged session (no audio concatenation — avoids ffmpeg dependency).
+- Stores a comma-separated list of source audio paths on the merged session (no audio concatenation — avoids ffmpeg dependency). The sources give their audio paths up to it, so one session names each file and GC never leaves a source naming a file it removed with the merged session's audio; when the store opens, sources merged before this keep no audio path either.
 - Marks original sessions with `status = 'merged'` and a new `merged_into` column referencing the new session ID.
 - Triggers summary generation on the merged session.
 

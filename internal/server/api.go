@@ -1284,9 +1284,19 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		go func() {
-			_ = controls.RetrySync(context.Background(), sessionID)
-		}()
+		// RetrySync starts the sync in the background and says at once if
+		// none can start.
+		if err := controls.RetrySync(r.Context(), sessionID); err != nil {
+			status := http.StatusConflict
+			switch {
+			case errors.Is(err, ErrSyncNotConfigured):
+				status = http.StatusServiceUnavailable
+			case errors.Is(err, sql.ErrNoRows), errors.Is(err, os.ErrNotExist):
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
 	})
@@ -1566,15 +1576,10 @@ func handlePatchConfig(cfgStore *config.Store) http.HandlerFunc {
 			return
 		}
 
-		var patchErr error
-		err := cfgStore.Update(func(c *config.Config) {
-			patchErr = applyConfigPatch(c, &patch)
-		})
-		if patchErr != nil {
-			writeJSONError(w, http.StatusBadRequest, patchErr.Error())
-			return
-		}
-		if err != nil {
+		// A patch it refuses changes nothing: not the config, not its file.
+		if err := cfgStore.TryUpdate(func(c *config.Config) error {
+			return applyConfigPatch(c, &patch)
+		}); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -1671,15 +1676,16 @@ func applyConfigPatch(c *config.Config, p *configPatch) error {
 		if p.GC.Enabled != nil {
 			c.GCEnabled = *p.GC.Enabled
 		}
+		// 0 is each limit's "no limit".
 		if p.GC.MaxAgeDays != nil {
-			if *p.GC.MaxAgeDays <= 0 {
-				return fmt.Errorf("gc.max_age_days must be positive")
+			if *p.GC.MaxAgeDays < 0 {
+				return fmt.Errorf("gc.max_age_days must be 0 (no age limit) or positive")
 			}
 			c.GCMaxAgeDays = *p.GC.MaxAgeDays
 		}
 		if p.GC.MaxAudioSizeMB != nil {
-			if *p.GC.MaxAudioSizeMB <= 0 {
-				return fmt.Errorf("gc.max_audio_size_mb must be positive")
+			if *p.GC.MaxAudioSizeMB < 0 {
+				return fmt.Errorf("gc.max_audio_size_mb must be 0 (no audio budget) or positive")
 			}
 			c.GCMaxAudioSizeMB = *p.GC.MaxAudioSizeMB
 		}
