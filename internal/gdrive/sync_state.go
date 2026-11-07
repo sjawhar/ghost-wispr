@@ -48,10 +48,15 @@ func ValidateSyncStateTransition(from, to SyncState) error {
 		SyncStatePending: {
 			SyncStateSyncing: {},
 		},
+		// A sync ends in one write, under its claim: synced, back to pending
+		// (the session changed during the upload), a retry, a failure once
+		// the retries ran out, or its Drive folder gone.
 		SyncStateSyncing: {
-			SyncStateSynced:        {},
-			SyncStateFailed:        {},
-			SyncStateRemoteDeleted: {},
+			SyncStateSynced:         {},
+			SyncStatePending:        {},
+			SyncStateRetryScheduled: {},
+			SyncStateFailed:         {},
+			SyncStateRemoteDeleted:  {},
 		},
 		// A manual retry (retry-sync) starts again once the automatic
 		// retries ran out; the sweep syncs only PENDING and RETRY_SCHEDULED.

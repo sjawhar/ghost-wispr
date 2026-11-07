@@ -654,7 +654,7 @@ func OpenAPISpec() map[string]any {
 							"description": "No such session",
 						},
 						"409": map[string]any{
-							"description": "No sync can start for this session (already synced, or its Drive folder was deleted); the error says why",
+							"description": "No sync can start for this session (already synced, being synced now, or its Drive folder was deleted); the error says why",
 						},
 						"503": map[string]any{
 							"description": "Google Drive sync is off",

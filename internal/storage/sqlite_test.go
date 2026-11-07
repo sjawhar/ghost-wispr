@@ -462,7 +462,7 @@ func newStoreAt(t *testing.T, path string) *SQLiteStore {
 func TestRecordings(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	started := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
-	end := func(id string, at time.Duration, audioPath, syncStatus string) {
+	end := func(id string, at time.Duration, audioPath, syncState string) {
 		t.Helper()
 		if err := store.CreateSession(id, started.Add(at)); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
@@ -470,22 +470,20 @@ func TestRecordings(t *testing.T) {
 		if err := store.EndSession(id, started.Add(at+time.Minute), audioPath); err != nil {
 			t.Fatalf("EndSession %s: %v", id, err)
 		}
-		if syncStatus != "" {
-			if err := store.UpdateSyncStatus(id, syncStatus, "folder"); err != nil {
-				t.Fatalf("UpdateSyncStatus %s: %v", id, err)
-			}
+		if syncState != "" {
+			syncTo(t, store, id, syncState, "folder", 0, "")
 		}
 	}
-	end("20261106140300", 3*time.Minute, "/audio/c.mp3", SyncSynced)
-	end("20261106140000", 0, "/audio/a.mp3,/audio/b.mp3", SyncSynced) // merged recordings
+	end("20261106140300", 3*time.Minute, "/audio/c.mp3", SyncStateSynced)
+	end("20261106140000", 0, "/audio/a.mp3,/audio/b.mp3", SyncStateSynced) // merged recordings
 	end("20261106140100", time.Minute, "/audio/pending.mp3", "")
-	end("20261106140200", 2*time.Minute, "/audio/failed.mp3", SyncFailed)
-	end("20261106140400", 4*time.Minute, "", SyncSynced) // no recording
-	end("20261106140500", 5*time.Minute, "/audio/discarded.mp3", SyncSynced)
+	end("20261106140200", 2*time.Minute, "/audio/failed.mp3", SyncStateFailed)
+	end("20261106140400", 4*time.Minute, "", SyncStateSynced) // no recording
+	end("20261106140500", 5*time.Minute, "/audio/discarded.mp3", SyncStateSynced)
 	if err := store.DiscardSession("20261106140500"); err != nil {
 		t.Fatalf("DiscardSession: %v", err)
 	}
-	end("20261106140600", 6*time.Minute, "/audio/refining.mp3", SyncSynced)
+	end("20261106140600", 6*time.Minute, "/audio/refining.mp3", SyncStateSynced)
 	if err := store.UpdateRefinement("20261106140600", "", RefinementRunning); err != nil {
 		t.Fatalf("UpdateRefinement: %v", err)
 	}
@@ -727,13 +725,13 @@ func TestClaimRefinement(t *testing.T) {
 func TestDeleteEndedSession(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	endedWith(t, store, "20261106140000", "/audio/a.mp3", RefinementCompleted)
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/other.mp3"); err != nil || deleted {
+	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/other.mp3", false); err != nil || deleted {
 		t.Errorf("DeleteEndedSession with another audio path = %v, %v; want kept", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err != nil {
 		t.Fatalf("session deleted: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/a.mp3"); err != nil || !deleted {
+	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/a.mp3", false); err != nil || !deleted {
 		t.Errorf("DeleteEndedSession = %v, %v; want deleted", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err == nil {
@@ -744,10 +742,10 @@ func TestDeleteEndedSession(t *testing.T) {
 	if err := store.MergeSessions("20261106140100-merged", []string{"20261106140100"}, time.Date(2026, 11, 6, 14, 1, 0, 0, time.UTC), time.Date(2026, 11, 6, 14, 2, 0, 0, time.UTC)); err != nil {
 		t.Fatalf("MergeSessions: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140100", "/audio/b.mp3"); err != nil || deleted {
+	if deleted, err := store.DeleteEndedSession("20261106140100", "/audio/b.mp3", false); err != nil || deleted {
 		t.Errorf("DeleteEndedSession of a merged source = %v, %v; want kept", deleted, err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106990000", ""); err != nil || deleted {
+	if deleted, err := store.DeleteEndedSession("20261106990000", "", false); err != nil || deleted {
 		t.Errorf("DeleteEndedSession of a missing session = %v, %v; want nothing", deleted, err)
 	}
 }
@@ -766,12 +764,13 @@ func TestMarkSynced(t *testing.T) {
 	if err := store.AppendSegment("20261106140000", transcribe.Segment{Text: "said", EndTime: 1, Timestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("AppendSegment: %v", err)
 	}
-	if err := store.UpdateSyncState("20261106140000", SyncStateSyncing, "", 2, nil, ""); err != nil {
-		t.Fatalf("UpdateSyncState: %v", err)
+	syncTo(t, store, "20261106140000", SyncStateRetryScheduled, "", 2, "")
+	if _, ok, err := store.ClaimSync("20261106140000", SyncStateRetryScheduled, "sync-1", time.Now().UTC()); err != nil || !ok {
+		t.Fatalf("ClaimSync = %v, %v", ok, err)
 	}
 	var seen Session
 	var seenSegments []transcribe.Segment
-	if ok, err := store.MarkSynced("20261106140000", "folder-1", func(now Session, segments []transcribe.Segment) bool {
+	if ok, err := store.MarkSynced("20261106140000", "sync-1", "folder-1", func(now Session, segments []transcribe.Segment) bool {
 		seen, seenSegments = now, segments
 		return false
 	}); err != nil || ok {
@@ -783,7 +782,7 @@ func TestMarkSynced(t *testing.T) {
 	if session, _ := store.GetSession("20261106140000"); session.SyncState != SyncStateSyncing {
 		t.Errorf("refused MarkSynced left sync_state %q, want %q", session.SyncState, SyncStateSyncing)
 	}
-	if ok, err := store.MarkSynced("20261106140000", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err != nil || !ok {
+	if ok, err := store.MarkSynced("20261106140000", "sync-1", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err != nil || !ok {
 		t.Fatalf("MarkSynced = %v, %v; want marked", ok, err)
 	}
 	session, err := store.GetSession("20261106140000")
@@ -793,7 +792,7 @@ func TestMarkSynced(t *testing.T) {
 	if session.SyncState != SyncStateSynced || session.SyncStatus != SyncSynced || session.GDriveFolderID != "folder-1" || session.RetryCount != 0 {
 		t.Errorf("after MarkSynced: %q/%q in %q, retry %d; want synced in folder-1, retry 0", session.SyncState, session.SyncStatus, session.GDriveFolderID, session.RetryCount)
 	}
-	if ok, err := store.MarkSynced("20261106990000", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err == nil || ok {
+	if ok, err := store.MarkSynced("20261106990000", "sync-1", "folder-1", func(Session, []transcribe.Segment) bool { return true }); err == nil || ok {
 		t.Errorf("MarkSynced of a missing session = %v, %v; want an error", ok, err)
 	}
 }
@@ -817,9 +816,7 @@ func TestRestoreAudioReopensASyncThatRanMeanwhile(t *testing.T) {
 
 	endedWith(t, store, "20261106140000", "/audio/20261106140000.mp3,/mnt/20261106140000.mp3", RefinementPending)
 	removal := mark("20261106140000")
-	if err := store.UpdateSyncStatus("20261106140000", SyncSynced, "folder-1"); err != nil { // a sync ran meanwhile
-		t.Fatalf("UpdateSyncStatus: %v", err)
-	}
+	syncTo(t, store, "20261106140000", SyncStateSynced, "folder-1", 0, "") // a sync ran meanwhile
 	if err := store.RestoreAudio(removal, "/mnt/20261106140000.mp3"); err != nil {
 		t.Fatalf("RestoreAudio: %v", err)
 	}
@@ -828,9 +825,7 @@ func TestRestoreAudioReopensASyncThatRanMeanwhile(t *testing.T) {
 	}
 
 	endedWith(t, store, "20261106140100", "/audio/20261106140100.mp3,/mnt/20261106140100.mp3", RefinementPending)
-	if err := store.UpdateSyncStatus("20261106140100", SyncSynced, "folder-2"); err != nil { // synced before the mark
-		t.Fatalf("UpdateSyncStatus: %v", err)
-	}
+	syncTo(t, store, "20261106140100", SyncStateSynced, "folder-2", 0, "") // synced before the mark
 	if err := store.RestoreAudio(mark("20261106140100"), "/mnt/20261106140100.mp3"); err != nil {
 		t.Fatalf("RestoreAudio: %v", err)
 	}
@@ -904,9 +899,7 @@ func TestOpeningTheStoreResyncsMergedSessionsOnce(t *testing.T) {
 		t.Fatalf("remove part of the merged audio: %v", err)
 	}
 	for id, folder := range map[string]string{"20261106140000-merged": "folder-1", "20261106140100": "folder-2", "20261106150000-merged": "folder-3"} {
-		if err := store.UpdateSyncStatus(id, SyncSynced, folder); err != nil {
-			t.Fatalf("UpdateSyncStatus %s: %v", id, err)
-		}
+		syncTo(t, store, id, SyncStateSynced, folder, 0, "")
 	}
 	// As a database from before per-recording uploads: the migration has not run.
 	if _, err := store.DB().Exec(`DELETE FROM migrations WHERE name = ?`, "resync-merged-session-audio"); err != nil {
@@ -936,9 +929,7 @@ func TestOpeningTheStoreResyncsMergedSessionsOnce(t *testing.T) {
 	expectSync("20261106140100", SyncSynced, SyncStateSynced, "folder-2")
 
 	for id, folder := range map[string]string{"20261106140000-merged": "folder-1", "20261106150000-merged": "folder-3"} {
-		if err := store.UpdateSyncStatus(id, SyncSynced, folder); err != nil {
-			t.Fatalf("UpdateSyncStatus %s: %v", id, err)
-		}
+		syncTo(t, store, id, SyncStateSynced, folder, 0, "")
 	}
 	reopen()
 	expectSync("20261106140000-merged", SyncSynced, SyncStateSynced, "folder-1")
@@ -988,9 +979,7 @@ func TestSyncStatusTracking(t *testing.T) {
 		t.Fatalf("expected [%s], got %v", sessionID, ids)
 	}
 
-	if err := store.UpdateSyncStatus(sessionID, SyncSynced, "drive-folder-id-123"); err != nil {
-		t.Fatalf("update sync status: %v", err)
-	}
+	syncTo(t, store, sessionID, SyncStateSynced, "drive-folder-id-123", 0, "")
 
 	ids, err = store.GetSessionsNeedingSync()
 	if err != nil {
@@ -1098,12 +1087,12 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-eligible", old.Add(time.Minute), "data/audio/gc-eligible.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSyncStatus("gc-eligible", SyncSynced, "folder-1"); err != nil {
-		t.Fatal(err)
-	}
+	// Summarized, then synced, as the app does it: a summary changed after
+	// the sync sends the session back to sync.
 	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
+	syncTo(t, store, "gc-eligible", SyncStateSynced, "folder-1", 0, "")
 
 	if err := store.CreateSession("gc-unsynced", old); err != nil {
 		t.Fatal(err)
@@ -1121,12 +1110,10 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-recent", now.Add(-30*time.Minute), "data/audio/gc-recent.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSyncStatus("gc-recent", SyncSynced, "folder-2"); err != nil {
-		t.Fatal(err)
-	}
 	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default", "{}"); err != nil {
 		t.Fatal(err)
 	}
+	syncTo(t, store, "gc-recent", SyncStateSynced, "folder-2", 0, "")
 
 	ids, err := store.GetGCEligibleSessions(30, true)
 	if err != nil {
@@ -1159,9 +1146,7 @@ func summarizedSession(t *testing.T, store *SQLiteStore, id string, startedAt ti
 	if err := store.UpdateSummary(id, "", "A summary.", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("UpdateSummary %s: %v", id, err)
 	}
-	if err := store.UpdateSyncStatus(id, SyncSynced, "folder"); err != nil {
-		t.Fatalf("UpdateSyncStatus %s: %v", id, err)
-	}
+	syncTo(t, store, id, SyncStateSynced, "folder", 0, "")
 }
 
 // No age limit can wrap the cutoff round into the future. Past the longest
@@ -1523,9 +1508,7 @@ func TestSyncStateMetadataAndRetryQuery(t *testing.T) {
 	}
 
 	attempt := started.Add(10 * time.Minute)
-	if err := store.UpdateSyncState(sessionID, SyncStateRetryScheduled, "", 2, &attempt, "temporary upload failure"); err != nil {
-		t.Fatalf("update sync state: %v", err)
-	}
+	syncToAt(t, store, sessionID, SyncStateRetryScheduled, "", 2, "temporary upload failure", attempt)
 
 	sess, err := store.GetSession(sessionID)
 	if err != nil {
@@ -1566,9 +1549,7 @@ func TestRemoteDeletedIsSoftDelete(t *testing.T) {
 	}
 
 	attempt := started.Add(5 * time.Minute)
-	if err := store.UpdateSyncState(sessionID, SyncStateRemoteDeleted, "", 0, &attempt, "remote folder deleted"); err != nil {
-		t.Fatalf("update sync state remote deleted: %v", err)
-	}
+	syncToAt(t, store, sessionID, SyncStateRemoteDeleted, "", 0, "remote folder deleted", attempt)
 
 	sess, err := store.GetSession(sessionID)
 	if err != nil {
