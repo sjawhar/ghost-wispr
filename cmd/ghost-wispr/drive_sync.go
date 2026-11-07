@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
+	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -15,8 +18,11 @@ import (
 type sessionSyncer interface {
 	// CanSync reports, at once, why a sync of the session cannot start, if
 	// it cannot.
-	CanSync(sessionID string) error
+	CanSync(ctx context.Context, sessionID string) error
 	SyncSession(ctx context.Context, sessionID string) error
+	// FolderOnDrive reports whether Drive has a session folder out of the
+	// trash; GC asks it before it deletes a session or removes its audio.
+	FolderOnDrive(ctx context.Context, folderID string) (bool, error)
 }
 
 // driveSync is the Drive syncer the app uses, nil while sync is off. Turning
@@ -37,6 +43,30 @@ func (d *driveSync) Get() sessionSyncer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.syncer
+}
+
+// retrySync starts a sync of session sessionID in the background with
+// syncer, the running Drive syncer (nil while sync is off), and says at once
+// if none can start (for a session whose Drive folder was deleted, while
+// Drive says it is not back), so the API does not report a retry that does
+// nothing. Drive not answering whether such a folder is back is
+// server.ErrDriveUnavailable: the retry may work once Drive answers.
+func retrySync(ctx context.Context, syncer sessionSyncer, sessionID string) error {
+	if syncer == nil {
+		return server.ErrSyncNotConfigured
+	}
+	if err := syncer.CanSync(ctx, sessionID); err != nil {
+		if errors.Is(err, gdrive.ErrDriveDidNotAnswer) {
+			return fmt.Errorf("%w: %w", server.ErrDriveUnavailable, err)
+		}
+		return err
+	}
+	go func() {
+		if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+			log.Printf("gdrive retry: session %s: %v", sessionID, err)
+		}
+	}()
+	return nil
 }
 
 // watchDriveSyncSettings keeps the running Drive syncer in line with the sync

@@ -347,16 +347,20 @@ func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
 	}
 }
 
-// gcConfig is the GC configuration for one pass. With Drive sync on in the
-// config, GC is sync-gated whether or not the syncer is running: if it failed
-// to start, GC still deletes and removes only what is on Drive (sessions
-// synced before), instead of everything never backed up.
-func gcConfig(cfg *config.Config) gc.Config {
+// gcConfig is the GC configuration for one pass, with drive the running Drive
+// syncer (nil when none runs). With Drive sync on in the config, GC is
+// sync-gated whether or not the syncer is running: it deletes, and removes
+// the audio of, only sessions synced before, and only once the syncer says
+// Drive still has their folder out of the trash; with no syncer running it
+// deletes nothing.
+func gcConfig(cfg *config.Config, drive sessionSyncer) gc.Config {
 	return gc.Config{
 		MaxAgeDays:     cfg.GCMaxAgeDays,
 		MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
 		SyncGated:      cfg.GDriveSyncEnabled,
 		AudioDir:       cfg.AudioDir,
+		// A nil sessionSyncer is a nil DriveFolders.
+		Drive: drive,
 	}
 }
 
@@ -758,7 +762,7 @@ func main() {
 				if br.Error != nil {
 					failed++
 					if br.SessionID != "" {
-						_ = store.UpdateSummary(br.SessionID, "", "", storage.SummaryFailed, br.PresetName, "{}")
+						failSummary(store, nil, br.SessionID, br.Error)
 					}
 					continue
 				}
@@ -787,6 +791,8 @@ func main() {
 
 	var keptRaw atomic.Pointer[server.KeptRawRecordings]
 	go refreshKeptRawRecordings(ctx, audioRecorder, func() int { return cfgStore.Get().GCMaxAudioSizeMB }, &keptRaw, keptRawRefreshEvery)
+	gcHealthState := &gcHealth{}
+	gcHealthState.countUnverified(store)
 
 	controlHooks := &server.ControlHooks{
 		Pause:         capture.Pause,
@@ -798,7 +804,9 @@ func main() {
 		OnStatusChanged: func(paused bool) {
 			hub.BroadcastStatusChanged(paused)
 		},
-		Warnings: func() []string { return warnings },
+		Warnings:           func() []string { return warnings },
+		GCHold:             gcHealthState.Hold,
+		UnverifiedSessions: gcHealthState.Unverified,
 		KeptRawRecordings: func() server.KeptRawRecordings {
 			if kept := keptRaw.Load(); kept != nil {
 				return *kept
@@ -807,22 +815,11 @@ func main() {
 		},
 		GetLogs: logSink.GetLogs,
 		// RetrySync starts a sync of the session in the background and says
-		// at once if none can start, so the API does not report a retry that
-		// does nothing.
-		RetrySync: func(_ context.Context, sessionID string) error {
-			syncer := drive.Get()
-			if syncer == nil {
-				return server.ErrSyncNotConfigured
-			}
-			if err := syncer.CanSync(sessionID); err != nil {
-				return err
-			}
-			go func() {
-				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-					log.Printf("gdrive retry: session %s: %v", sessionID, err)
-				}
-			}()
-			return nil
+		// at once if none can start (for a session whose Drive folder was
+		// deleted, while Drive says it is not back), so the API does not
+		// report a retry that does nothing.
+		RetrySync: func(ctx context.Context, sessionID string) error {
+			return retrySync(ctx, drive.Get(), sessionID)
 		},
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
 			sess, err := store.GetSession(sessionID)
@@ -892,41 +889,7 @@ func main() {
 			if summarizer == nil {
 				return fmt.Errorf("summarization not configured")
 			}
-
-			segments, err := store.GetSegments(sessionID)
-			if err != nil {
-				return err
-			}
-
-			transcript := buildCanonicalTranscript(store, sessionID, segments)
-
-			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "", "{}")
-			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
-
-			var title string
-			var summaryText string
-			var presetUsed string
-			var speakerNames string
-			if preset != "" {
-				presetUsed = preset
-				title, summaryText, speakerNames, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
-			} else {
-				title, summaryText, presetUsed, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
-			}
-
-			status := storage.SummaryCompleted
-			if err != nil {
-				status = storage.SummaryFailed
-			}
-			if status == storage.SummaryFailed {
-				speakerNames = "{}"
-			}
-			_ = store.UpdateSummary(sessionID, title, summaryText, status, presetUsed, speakerNames)
-			hub.BroadcastSummaryReady(sessionID, title, summaryText, status, presetUsed)
-			if status == storage.SummaryCompleted {
-				publishSummaryReady(sessionID)
-			}
-			return err
+			return resummarize(ctx, store, summarizer, hub, publishSummaryReady, sessionID, preset)
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
 			if summarizer == nil {
@@ -945,14 +908,13 @@ func main() {
 				return
 			}
 
-			_ = store.UpdateSummary(sessionID, "", "", storage.SummaryRunning, "", "{}")
+			_ = store.StartSummary(sessionID)
 			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
 			title, summaryText, preset, speakerNames, err := summarizer.Summarize(ctx, sessionID, transcript)
 			if err != nil {
 				log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
-				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryFailed, preset, "{}")
-				hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryFailed, preset)
+				failSummary(store, hub, sessionID, err)
 				return
 			}
 
@@ -1330,11 +1292,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
 					continue
 				}
-				_ = store.UpdateSummary(id, "", "", storage.SummaryRunning, "", "{}")
+				_ = store.StartSummary(id)
 				title, summaryText, preset, speakerNames, err := startupSummarizer.Summarize(ctx, id, transcript)
 				if err != nil {
 					log.Printf("warning: summarization failed for %s: %v", id, err)
-					_ = store.UpdateSummary(id, "", "", storage.SummaryFailed, preset, "{}")
+					failSummary(store, nil, id, err)
 					continue
 				}
 				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
@@ -1384,10 +1346,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				case <-ticker.C:
 					latestCfg := cfgStore.Get()
 					if !latestCfg.GCEnabled {
+						// GC off holds nothing back.
+						gcHealthState.record(nil, latestCfg.AudioDir, time.Now())
 						continue
 					}
-					collector := gc.New(store, gcConfig(&latestCfg), appLogger)
-					deleted, err := collector.Run()
+					deleted, err := runGCPass(store, &latestCfg, drive.Get(), gcHealthState, appLogger)
 					if err != nil {
 						log.Printf("gc error: %v", err)
 					} else if len(deleted) > 0 {

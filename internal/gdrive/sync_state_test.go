@@ -22,6 +22,7 @@ func TestSyncStateMachineTransitions(t *testing.T) {
 		{name: "failed to retry scheduled", from: SyncStateFailed, to: SyncStateRetryScheduled},
 		{name: "retry scheduled to syncing", from: SyncStateRetryScheduled, to: SyncStateSyncing},
 		{name: "syncing to remote deleted", from: SyncStateSyncing, to: SyncStateRemoteDeleted},
+		{name: "remote deleted to syncing (a retry asks Drive again)", from: SyncStateRemoteDeleted, to: SyncStateSyncing},
 		{name: "invalid pending to synced", from: SyncStatePending, to: SyncStateSynced, wantErr: true},
 		{name: "invalid failed to synced", from: SyncStateFailed, to: SyncStateSynced, wantErr: true},
 		{name: "invalid synced to syncing", from: SyncStateSynced, to: SyncStateSyncing, wantErr: true},

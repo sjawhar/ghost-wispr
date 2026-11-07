@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -165,6 +166,10 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// A folder made inside a root in the trash would be in the trash too.
+	if root, err := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id, trashed").Context(ctx).Do(); err == nil && root.Trashed {
+		return "", errRootTrashed(s.folderID)
+	}
 	folder, err := s.service.Files.Create(&drive.File{
 		Name:     folderName,
 		MimeType: "application/vnd.google-apps.folder",
@@ -179,8 +184,75 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 			return folder.Id, err
 		}
 	}
+	// The folder may have gone to the trash during the upload.
+	if err := s.checkFolder(ctx, folder.Id); err != nil {
+		return folder.Id, err
+	}
 
 	return folder.Id, nil
+}
+
+// ErrFolderTrashed is the error syncing into a session folder that is in the
+// Drive trash returns: deleted in the Drive UI, it still exists until the
+// trash empties (after 30 days), so Drive does not answer 404 for it.
+var ErrFolderTrashed = errors.New("the session's Drive folder is in the trash")
+
+// ErrDriveDidNotAnswer is wrapped in the error of a retry of a
+// REMOTE_DELETED session refused because Drive did not say whether the
+// session's folder is back: nothing is wrong with the session, and the retry
+// may work once Drive answers.
+var ErrDriveDidNotAnswer = errors.New("drive did not answer")
+
+// checkFolder returns an error unless Drive has session folder folderID out
+// of the trash: Drive's 404 for a folder gone (wrapped), ErrFolderTrashed
+// for one in the trash, or why Drive could not say. Drive answers 404 for a
+// file the app cannot read as well as for one that is gone, so a 404 counts
+// as the folder gone only while the folder the app syncs into still reads:
+// otherwise the app's access to Drive is lost (credentials, sharing), which
+// says nothing about the session, and the error is not a 404.
+func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
+	folder, err := s.service.Files.Get(folderID).SupportsAllDrives(true).Fields("id, trashed, explicitlyTrashed").Context(ctx).Do()
+	if err != nil {
+		if !IsRemoteDeletedError(err) {
+			return fmt.Errorf("get folder %s: %w", folderID, err)
+		}
+		if _, rootErr := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do(); rootErr != nil {
+			return fmt.Errorf("get folder %s: not found, and the folder the app syncs into (%s) cannot be read either, so access to Drive may be lost: %v", folderID, s.folderID, rootErr)
+		}
+		return fmt.Errorf("get folder %s: %w", folderID, err)
+	}
+	if folder.Trashed && !folder.ExplicitlyTrashed {
+		// In the trash with a folder above it, most likely the folder the
+		// app syncs into: restoring that brings the session back, so this
+		// says nothing about the session.
+		return fmt.Errorf("folder %s: %w", folderID, errRootTrashed(s.folderID))
+	}
+	if folder.Trashed {
+		return fmt.Errorf("folder %s: %w", folderID, ErrFolderTrashed)
+	}
+	return nil
+}
+
+// errRootTrashed is the error for a session folder in the trash with a folder
+// above it, or a sync into a root in the trash: not a deleted session, so a
+// sync retries and GC holds back until the folder is restored.
+func errRootTrashed(root string) error {
+	return fmt.Errorf("a folder above it is in the Drive trash (the folder the app syncs into is %s): restore it from the trash", root)
+}
+
+// FolderOnDrive reports whether Drive has session folder folderID out of the
+// trash, and an error when Drive cannot say (it is unreachable, say). GC asks
+// it before it deletes a synced session or removes its audio.
+func (s *Syncer) FolderOnDrive(ctx context.Context, folderID string) (bool, error) {
+	err := s.checkFolder(ctx, folderID)
+	switch {
+	case err == nil:
+		return true, nil
+	case IsRemoteDeletedError(err):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // driveFile is a file in a session's Drive folder.
@@ -265,11 +337,17 @@ func planUpload(existing []driveFile, files []SyncFile) (create []SyncFile, upda
 
 // UploadInto brings an existing session folder up to date (see planUpload):
 // a session synced before, or whose first sync created its folder and then
-// failed, keeps its one folder when it is synced again.
+// failed, keeps its one folder when it is synced again. It uploads nothing
+// into a folder in the trash or gone, and fails if the folder went to the
+// trash during the upload (checkFolder), so such a session is never marked
+// synced.
 func (s *Syncer) UploadInto(ctx context.Context, folderID string, files []SyncFile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.checkFolder(ctx, folderID); err != nil {
+		return err
+	}
 	var existing []driveFile
 	query := fmt.Sprintf("'%s' in parents and trashed = false", strings.ReplaceAll(folderID, "'", `\'`))
 	err := s.service.Files.List().Q(query).SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
@@ -281,20 +359,36 @@ func (s *Syncer) UploadInto(ctx context.Context, folderID string, files []SyncFi
 			return nil
 		})
 	if err != nil {
-		return fmt.Errorf("list folder %s: %w", folderID, err)
+		return s.folderOr(ctx, folderID, fmt.Errorf("list folder %s: %w", folderID, err))
 	}
 	create, update := planUpload(existing, files)
 	for i := range create {
 		if err := s.uploadFile(ctx, folderID, &create[i]); err != nil {
-			return err
+			return s.folderOr(ctx, folderID, err)
 		}
 	}
 	for i := range update {
 		if err := s.updateDocument(ctx, &update[i]); err != nil {
-			return err
+			return s.folderOr(ctx, folderID, err)
 		}
 	}
-	return nil
+	return s.checkFolder(ctx, folderID)
+}
+
+// folderOr returns err, a failure while syncing into session folder
+// folderID, unless it is Drive's 404: then a file (or the folder, or access
+// to the folder the app syncs into) went since the sync checked the folder,
+// and checkFolder, asked again, says which. With the folder still there, the
+// 404 was about a file alone: the error is kept but is no 404, so the sync is
+// retried rather than the folder taken for deleted.
+func (s *Syncer) folderOr(ctx context.Context, folderID string, err error) error {
+	if !IsRemoteDeletedError(err) {
+		return err
+	}
+	if folderErr := s.checkFolder(ctx, folderID); folderErr != nil {
+		return folderErr
+	}
+	return fmt.Errorf("%v (the session's folder %s is still on Drive)", err, folderID)
 }
 
 // updateDocument replaces a document's content in place, and its content

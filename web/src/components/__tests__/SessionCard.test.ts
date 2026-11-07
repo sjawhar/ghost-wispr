@@ -6,6 +6,7 @@ import {
   RefinementStatus,
   SessionStatus,
   SummaryStatus,
+  SyncState,
   SyncStatus,
   type SessionSummary,
 } from '../../lib/types'
@@ -75,6 +76,42 @@ describe('SessionCard', () => {
     })
 
     expect(screen.getByRole('button', { name: 'Resummarize ▾' })).toBeTruthy()
+  })
+
+  it('shows the summary a session keeps when making it again failed', () => {
+    render(SessionCard, {
+      session: {
+        ...baseSession,
+        summary_status: SummaryStatus.Failed,
+        summary: 'The last good summary.',
+      },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByText('The last good summary.')).toBeTruthy()
+    expect(screen.getByText('The last attempt failed; this is the previous summary.')).toBeTruthy()
+    expect(screen.queryByText('Summary unavailable')).toBeNull()
+  })
+
+  it('says the summary is unavailable when one failed and there is none from before', () => {
+    render(SessionCard, {
+      session: { ...baseSession, summary_status: SummaryStatus.Failed, summary: '' },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByText('Summary unavailable')).toBeTruthy()
   })
 
   it('says a session with no saved recording cannot be refined, and offers no retry', () => {
@@ -225,5 +262,29 @@ describe('SessionCard', () => {
         new RegExp(`\\.status-badge\\.${status}\\b`),
       )
     }
+  })
+
+  it('says a session whose Drive folder was deleted is kept on the device, and offers a retry for a restored folder', () => {
+    render(SessionCard, {
+      session: {
+        ...baseSession,
+        sync_status: SyncStatus.Failed,
+        sync_state: SyncState.RemoteDeleted,
+      },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    const badge = screen.getByTestId('sync-badge')
+    expect(badge.textContent).toContain('Sync: deleted on Drive')
+    expect(badge.getAttribute('title')).toBe(
+      'Its Drive folder is in the trash or gone, so this device keeps the only copy. Restore the folder on Drive, then retry to sync it again.',
+    )
+    expect(screen.getByTestId('retry-sync-btn')).toBeTruthy()
   })
 })

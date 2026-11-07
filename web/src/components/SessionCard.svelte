@@ -4,6 +4,7 @@
   import {
     RefinementStatus,
     SummaryStatus,
+    SyncState,
     SyncStatus,
     type PresetMap,
     type SessionDetailResponse,
@@ -219,7 +220,13 @@
         {/if}
 
         <div class="badge-group">
-          <span class={`status-badge ${session.summary_status}`} data-testid="summary-badge">
+          <span
+            class={`status-badge ${session.summary_status}`}
+            data-testid="summary-badge"
+            title={session.summary_status === SummaryStatus.Failed && session.summary_error
+              ? session.summary_error
+              : undefined}
+          >
             Summary: {session.summary_status}
           </span>
           {#if session.summary_status === SummaryStatus.Failed}
@@ -236,8 +243,16 @@
 
         {#if session.sync_status}
           <div class="badge-group">
-            <span class={`status-badge ${session.sync_status}`} data-testid="sync-badge">
-              Sync: {session.sync_status}
+            <span
+              class={`status-badge ${session.sync_status}`}
+              data-testid="sync-badge"
+              title={session.sync_state === SyncState.RemoteDeleted
+                ? 'Its Drive folder is in the trash or gone, so this device keeps the only copy. Restore the folder on Drive, then retry to sync it again.'
+                : undefined}
+            >
+              Sync: {session.sync_state === SyncState.RemoteDeleted
+                ? 'deleted on Drive'
+                : session.sync_status}
             </span>
             {#if session.sync_status === SyncStatus.Failed}
               <button
@@ -326,6 +341,11 @@
     </div>
   {:else if session.summary_status === SummaryStatus.Running || session.summary_status === SummaryStatus.Pending}
     <p class="summary-preview">Summarizing...</p>
+  {:else if session.summary_status === SummaryStatus.Failed && session.summary}
+    <p class="summary-preview">The last attempt failed; this is the previous summary.</p>
+    <div class="summary-preview-md prose">
+      <Markdown source={session.summary} />
+    </div>
   {:else if session.summary_status === SummaryStatus.Failed}
     <p class="summary-preview">Summary unavailable</p>
   {/if}
@@ -371,7 +391,7 @@
       {#if detail}
         <AudioPlayer sessionId={session.id} segments={detail.segments} {session} />
 
-        {#if session.summary_status === SummaryStatus.Completed && session.summary}
+        {#if (session.summary_status === SummaryStatus.Completed || session.summary_status === SummaryStatus.Failed) && session.summary}
           <div class="summary-section">
             <div class="section-header">
               <span class="section-label">Summary</span>
@@ -379,6 +399,9 @@
                 {summaryCopied ? 'Copied!' : 'Copy summary'}
               </button>
             </div>
+            {#if session.summary_status === SummaryStatus.Failed}
+              <p class="summary-preview">The last attempt failed; this is the previous summary.</p>
+            {/if}
             <div class="summary-markdown prose">
               <Markdown source={session.summary} />
             </div>

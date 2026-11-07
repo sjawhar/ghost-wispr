@@ -55,11 +55,11 @@ func summarizedSession(t *testing.T, store *storage.SQLiteStore, audioDir, id st
 	}
 }
 
-// resummarize makes session id's summary again, as the app does: the summary
-// is cleared while it runs, then stored.
+// resummarize makes session id's summary again, as the app does: its summary
+// is running, the last one kept, then the new one is stored.
 func resummarize(t *testing.T, store *storage.SQLiteStore, id, summary string) {
 	t.Helper()
-	if err := store.UpdateSummary(id, "", "", storage.SummaryRunning, "", "{}"); err != nil {
+	if err := store.StartSummary(id); err != nil {
 		t.Fatalf("start summary: %v", err)
 	}
 	if err := store.UpdateSummary(id, "Standup", summary, storage.SummaryCompleted, "default", "{}"); err != nil {
@@ -243,7 +243,7 @@ func TestAgeGCKeepsASessionUntilItsCurrentDocumentsAreOnDrive(t *testing.T) {
 	drive := newFakeDrive()
 	o := NewOrchestratorWithUploader(drive, store)
 	folder := syncedSession(t, store, o, id)
-	collector := gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	collector := gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	resummarize(t, store, id, "The summary, made again.")
 	deleted, err := collector.Run()
@@ -287,10 +287,11 @@ func TestAgeGCKeepsASessionThatChangesAfterGCListsIt(t *testing.T) {
 	audioDir := t.TempDir()
 	const id = "20260901100000"
 	summarizedSession(t, store, audioDir, id, time.Now().UTC().AddDate(0, 0, -40), "The first summary.")
-	syncedSession(t, store, NewOrchestratorWithUploader(newFakeDrive(), store), id)
+	o := NewOrchestratorWithUploader(newFakeDrive(), store)
+	syncedSession(t, store, o, id)
 
 	changing := &changingStore{SQLiteStore: store, change: func() { resummarize(t, store, id, "The summary, made again.") }}
-	deleted, err := gc.New(changing, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
+	deleted, err := gc.New(changing, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}

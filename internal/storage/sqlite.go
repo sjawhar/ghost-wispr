@@ -82,6 +82,7 @@ type Session struct {
 	RefinementStatus    string     `json:"refinement_status"`
 	AudioPath           string     `json:"audio_path"`
 	AudioRemovedAt      string     `json:"audio_removed_at"` // when disk pressure removed audio (RFC 3339), "" if never: all of it, or part when AudioPath names what is left; the session is kept
+	SummaryError        string     `json:"summary_error"`    // why the last summary attempt failed, "" once one completes; sync errors are in ErrorMessage
 	SyncStatus          string     `json:"sync_status"`
 	EnvoyPublishStatus  string     `json:"envoy_publish_status"`
 	SyncState           string     `json:"sync_state"`
@@ -196,12 +197,22 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	return store, nil
 }
 
-// createPreMigrationBackup copies the database file to a backup before migrations run.
+// createPreMigrationBackup writes a copy of the database to dbPath +
+// ".pre-migrate.bak" before migrations run. It copies through db, the store's
+// own connection, with VACUUM INTO, and never opens the database file itself:
+// closing a second descriptor of that file drops every POSIX lock this
+// process holds on it, the locks SQLite took. Another SQLite process (the
+// sqlite3 command, a backup script) that opens and closes the database after
+// that takes itself for its last user and deletes the write-ahead log, and
+// every later write of the app then goes to a deleted file, lost on a crash.
+// The copy is written beside the backup, flushed to disk and renamed over it,
+// so a backup cut off part way leaves the last one as it was; a backup that
+// fails removes its unfinished copy.
 // If the DB file doesn't exist (fresh install), the backup is skipped.
 // If backup fails, a warning is logged but startup continues (degraded is better than dead).
-func createPreMigrationBackup(db *sql.DB, dbPath string) error {
+func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 	// Check if DB file exists (skip backup for fresh installs)
-	_, err := os.Stat(dbPath)
+	_, err = os.Stat(dbPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Fresh install, no backup needed
@@ -210,33 +221,50 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) error {
 		return fmt.Errorf("stat db file: %w", err)
 	}
 
-	// Flush WAL to main DB file to ensure consistent backup
-	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		return fmt.Errorf("wal checkpoint: %w", err)
-	}
-
-	// Open source DB file
-	src, err := os.Open(dbPath)
-	if err != nil {
-		return fmt.Errorf("open source db: %w", err)
-	}
-	defer func() { _ = src.Close() }()
-
-	// Create/overwrite backup file
 	backupPath := dbPath + ".pre-migrate.bak"
-	dst, err := os.Create(backupPath)
-	if err != nil {
-		return fmt.Errorf("create backup file: %w", err)
+	partPath := backupPath + ".part"
+	// VACUUM INTO writes only a file that does not exist yet: remove the
+	// copy a backup cut off part way left.
+	if err := os.Remove(partPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove unfinished backup: %w", err)
 	}
-	defer func() { _ = dst.Close() }()
-
-	// Copy file content
-	if _, err := io.Copy(dst, src); err != nil {
+	defer func() {
+		if err != nil {
+			_ = os.Remove(partPath)
+		}
+	}()
+	// VACUUM INTO reads one consistent snapshot of the database, the
+	// write-ahead log included.
+	if _, err := db.Exec(`VACUUM INTO ?`, partPath); err != nil {
 		return fmt.Errorf("copy db to backup: %w", err)
+	}
+	// SQLite does not flush the copy VACUUM INTO writes.
+	if err := syncFile(partPath); err != nil {
+		return fmt.Errorf("flush backup: %w", err)
+	}
+	if err := os.Rename(partPath, backupPath); err != nil {
+		return fmt.Errorf("replace backup: %w", err)
+	}
+	// The rename lasts only once the directory naming it is on disk.
+	if err := syncFile(filepath.Dir(backupPath)); err != nil {
+		return fmt.Errorf("flush backup directory: %w", err)
 	}
 
 	slog.Info("pre-migration backup created", "path", backupPath)
 	return nil
+}
+
+// syncFile flushes the file at path to disk.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (s *SQLiteStore) init(dbPath string) error {
@@ -320,6 +348,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// below); a sync of it that completes sets 0 (MarkSynced). The age
 		// policy never deletes a session marked 1.
 		`ALTER TABLE sessions ADD COLUMN documents_unverified INTEGER NOT NULL DEFAULT 0`,
+		// Why the last summary attempt failed, apart from error_message, which
+		// says why the last sync did.
+		`ALTER TABLE sessions ADD COLUMN summary_error TEXT NOT NULL DEFAULT ''`,
+		// The sync state a sync's claim came from, while it holds the session:
+		// startup recovery puts a sync claimed from REMOTE_DELETED back.
+		`ALTER TABLE sessions ADD COLUMN sync_claimed_from TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -364,6 +398,34 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// policy until a sync of it completes. Its sync state and folder stay
 		// as they are: nothing is uploaded for it until its documents change.
 		`UPDATE sessions SET documents_unverified = 1 WHERE sync_status = 'synced'`,
+	); err != nil {
+		return err
+	}
+
+	// An earlier build of this change ran a first form of this move as
+	// "move-summary-failures-out-of-error-message"; its row in migrations
+	// stays, and nothing reads it.
+	if err := s.runOnce("move-summary-failures-to-summary-error",
+		// Earlier versions wrote why a summary failed into error_message,
+		// which says why the last sync failed. Those messages, which no sync
+		// writes, move to summary_error unless a summary has since completed
+		// (then they go) or summary_error already says why a later attempt
+		// failed (then that stays). A summary left running or pending keeps
+		// its old reason until its next attempt.
+		`UPDATE sessions
+		 SET summary_error = CASE WHEN summary_status != 'completed' AND summary_error = '' THEN error_message ELSE summary_error END,
+		     error_message = ''
+		 WHERE error_message LIKE 'summarization failed: %'
+		    OR error_message LIKE 'failed to get canonical transcript: %'
+		    OR error_message LIKE 'failed to store summary: %'`,
+	); err != nil {
+		return err
+	}
+
+	if err := s.runOnce("restored-sessions-synced",
+		// Earlier versions stored a session restored from Drive synced with no
+		// sync state; it is SYNCED, as ImportSession now stores it.
+		`UPDATE sessions SET sync_state = 'SYNCED' WHERE sync_state = '' AND sync_status = 'synced'`,
 	); err != nil {
 		return err
 	}
@@ -713,7 +775,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -757,7 +819,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -780,7 +842,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 
 func getSession(q querier, id string) (Session, error) {
 	row := q.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -788,7 +850,7 @@ func getSession(q querier, id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -895,25 +957,28 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	return segments, nil
 }
 
+// UpdateSummary stores session id's summary, its status, preset and speaker
+// names, and its title unless title is "". An empty summary never replaces
+// the one the session has: its summary, preset and speaker names stay (a
+// session with none keeps none). A completed summary clears the error of the
+// attempt before. Starting a summary and recording one that failed are
+// StartSummary and FailSummary, which keep the last good summary.
 func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions
 		 SET title = CASE WHEN ? != '' THEN ? ELSE title END,
-		     summary = ?,
+		     summary_preset = CASE WHEN ? != '' THEN ? ELSE summary_preset END,
+		     speaker_names = CASE WHEN ? != '' THEN ? ELSE speaker_names END,
+		     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
 		     summary_status = ?,
-		     summary_preset = ?,
-		     speaker_names = ?,
-		     envoy_publish_status = CASE WHEN ? = ? THEN ? ELSE envoy_publish_status END
+		     summary_error = CASE WHEN ? = ? THEN '' ELSE summary_error END
 		 WHERE id = ?`,
-		title,
-		title,
-		summary,
+		title, title,
+		summary, preset,
+		summary, speakerNames,
+		summary, summary,
 		status,
-		preset,
-		speakerNames,
-		status,
-		SummaryRunning,
-		EnvoyPublishPending,
+		status, SummaryCompleted,
 		sessionID,
 	)
 	if err != nil {
@@ -931,25 +996,56 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 	return nil
 }
 
-func (s *SQLiteStore) UpdateSummaryError(sessionID, errMsg string) error {
-	res, err := s.db.Exec(
-		`UPDATE sessions SET error_message = ? WHERE id = ?`,
-		errMsg,
-		sessionID,
-	)
+// StartSummary marks session id's summary running, and not yet published to
+// Envoy. Its title and summary stay as they are until a new summary is
+// stored (UpdateSummary): a summary that fails, or never ends, takes nothing
+// away.
+func (s *SQLiteStore) StartSummary(id string) error {
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ? WHERE id = ?`,
+		SummaryRunning, EnvoyPublishPending, id)
 	if err != nil {
-		return fmt.Errorf("update summary error for session %s: %w", sessionID, err)
+		return fmt.Errorf("start summary of session %s: %w", id, err)
 	}
-
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("update summary error rows affected: %w", err)
+		return fmt.Errorf("start summary rows affected: %w", err)
 	}
 	if rows == 0 {
 		return sql.ErrNoRows
 	}
-
 	return nil
+}
+
+// FailSummary records that making session id's summary failed, and why
+// (errMsg, in summary_error: error_message keeps the last sync's error), and
+// returns the session as it then is. The session keeps its title and its last
+// good summary (with its preset and speaker names), the ones Drive holds: a
+// failed summary takes nothing away.
+func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ?`, SummaryFailed, errMsg, id)
+	if err != nil {
+		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return Session{}, fmt.Errorf("fail summary rows affected: %w", err)
+	}
+	if rows == 0 {
+		return Session{}, sql.ErrNoRows
+	}
+	sess, err := getSession(tx, id)
+	if err != nil {
+		return Session{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
+	}
+	return sess, nil
 }
 
 func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
@@ -1082,7 +1178,7 @@ func (s *SQLiteStore) UpdateTitle(sessionID, title string) error {
 // a summary, the sweep) never run at once: the second finds it claimed and
 // starts nothing. The session stays the sync's until MarkSynced or EndSync,
 // under the same claim, ends it, or the app restarts
-// (RecoverInterruptedSyncs).
+// (RecoverInterruptedSyncs), which reads from (sync_claimed_from).
 func (s *SQLiteStore) ClaimSync(id, from, claim string, at time.Time) (Session, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1091,9 +1187,9 @@ func (s *SQLiteStore) ClaimSync(id, from, claim string, at time.Time) (Session, 
 	defer func() { _ = tx.Rollback() }()
 
 	res, err := tx.Exec(
-		`UPDATE sessions SET sync_state = ?, sync_status = ?, sync_claim = ?, last_sync_attempt = ?, error_message = ''
+		`UPDATE sessions SET sync_state = ?, sync_status = ?, sync_claim = ?, sync_claimed_from = ?, last_sync_attempt = ?, error_message = ''
 		 WHERE id = ? AND sync_state = ? AND sync_state != ?`,
-		SyncStateSyncing, syncStatusFromState(SyncStateSyncing), claim, at.UTC().Format(time.RFC3339Nano),
+		SyncStateSyncing, syncStatusFromState(SyncStateSyncing), claim, from, at.UTC().Format(time.RFC3339Nano),
 		id, from, SyncStateSyncing,
 	)
 	if err != nil {
@@ -1149,7 +1245,7 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
-		     retry_count = 0, last_sync_attempt = NULL, error_message = '', sync_claim = '', documents_unverified = 0
+		     retry_count = 0, last_sync_attempt = NULL, error_message = '', sync_claim = '', sync_claimed_from = '', documents_unverified = 0
 		 WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
 		SyncStateSynced, SyncSynced, driveFolderID, driveFolderID,
 		id, SyncStateSyncing, claim,
@@ -1189,7 +1285,7 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 	res, err := s.db.Exec(
 		`UPDATE sessions
 		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
-		     retry_count = ?, last_sync_attempt = ?, error_message = ?, sync_claim = ''
+		     retry_count = ?, last_sync_attempt = ?, error_message = ?, sync_claim = '', sync_claimed_from = ''
 		 WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
 		state, syncStatusFromState(state), driveFolderID, driveFolderID,
 		retryCount, at.UTC().Format(time.RFC3339Nano), errorMessage,
@@ -1211,20 +1307,27 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 // it as it starts, before any sync. The cut-off sync counts as a failed
 // attempt, as in gdrive.BuildRetryPlan: the session is RETRY_SCHEDULED with
 // one retry more, or FAILED once it has had maxRetries, so a sync that stops
-// the app every time it runs is not retried for ever.
+// the app every time it runs is not retried for ever. A sync claimed from
+// REMOTE_DELETED (a retry that found the session's Drive folder back) goes
+// back to REMOTE_DELETED, its retry count as it was: Drive may have lost the
+// folder again since, and only the next retry, asking Drive again, takes the
+// session out of it.
 func (s *SQLiteStore) RecoverInterruptedSyncs(maxRetries int, at time.Time) ([]string, error) {
 	rows, err := s.db.Query(
 		`UPDATE sessions
-		 SET sync_state = CASE WHEN retry_count >= ? THEN ? ELSE ? END,
+		 SET sync_state = CASE WHEN sync_claimed_from = ? THEN ? WHEN retry_count >= ? THEN ? ELSE ? END,
 		     sync_status = ?,
-		     retry_count = CASE WHEN retry_count >= ? THEN retry_count ELSE retry_count + 1 END,
-		     last_sync_attempt = ?, error_message = ?, sync_claim = ''
+		     retry_count = CASE WHEN sync_claimed_from = ? OR retry_count >= ? THEN retry_count ELSE retry_count + 1 END,
+		     last_sync_attempt = ?,
+		     error_message = CASE WHEN sync_claimed_from = ? THEN ? ELSE ? END,
+		     sync_claim = '', sync_claimed_from = ''
 		 WHERE sync_state = ?
 		 RETURNING id`,
-		maxRetries, SyncStateFailed, SyncStateRetryScheduled,
+		SyncStateRemoteDeleted, SyncStateRemoteDeleted, maxRetries, SyncStateFailed, SyncStateRetryScheduled,
 		SyncFailed,
-		maxRetries,
-		at.UTC().Format(time.RFC3339Nano), "the sync was cut off: the app stopped during it",
+		SyncStateRemoteDeleted, maxRetries,
+		at.UTC().Format(time.RFC3339Nano),
+		SyncStateRemoteDeleted, "a retry after the Drive folder was deleted was cut off: the app stopped during it", "the sync was cut off: the app stopped during it",
 		SyncStateSyncing,
 	)
 	if err != nil {
@@ -1286,7 +1389,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -1471,7 +1574,7 @@ func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at
+		`SELECT id, title, started_at, ended_at, status, summary, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -1500,7 +1603,8 @@ func ageCutoff(now time.Time, maxAgeDays int) (time.Time, bool) {
 
 // GetGCEligibleSessions returns the sessions age-based GC deletes, oldest
 // first: ended, with a completed summary, synced if syncGated, with documents
-// not marked unverified on Drive (documents_unverified), and older than
+// not marked unverified on Drive (documents_unverified), never one whose
+// Drive folder is in the trash or gone (REMOTE_DELETED), and older than
 // maxAgeDays days. A session's age runs from when it started or, if it was
 // restored from Drive, from its restore, so the pass after a restore keeps
 // it. maxAgeDays <= 0 is no age limit: it returns none.
@@ -1511,14 +1615,12 @@ func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]s
 	}
 	at := cutoff.Format(time.RFC3339Nano)
 	// restored_at is '' for a session recorded here, which is before any time.
-	query := `SELECT id FROM sessions WHERE status = 'ended' AND summary_status = 'completed'
-		AND started_at < ? AND restored_at < ? AND refinement_status != 'running' AND documents_unverified = 0`
-	if syncGated {
-		query += ` AND sync_status = 'synced'`
-	}
-	query += ` ORDER BY started_at ASC`
+	cond, args := removable(syncGated)
+	// A session whose documents are unverified on Drive is never deleted.
+	query := `SELECT id FROM sessions WHERE summary_status = 'completed' AND started_at < ? AND restored_at < ? AND documents_unverified = 0 AND ` + cond +
+		` ORDER BY started_at ASC`
 
-	rows, err := s.db.Query(query, at, at)
+	rows, err := s.db.Query(query, append([]any{at, at}, args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible sessions: %w", err)
 	}
@@ -1548,16 +1650,37 @@ type SessionRecording struct {
 }
 
 // removable is the condition under which GC may remove a session's recording
-// (disk pressure) or the session with it (the age policy), and its arguments:
-// the session ended, no refinement is reading the file, and, when syncGated,
-// it is synced. Any other sync state, a failure included, keeps the recording.
+// (disk pressure) or the session with it (the age policy, which also needs
+// documents_unverified = 0), and its arguments: the session ended, no
+// refinement is reading the file, its Drive folder is not in the trash or
+// gone (REMOTE_DELETED: the device then holds its only lasting copy, sync
+// gate or not), and, when syncGated, it is synced. A session whose documents
+// are unverified on Drive (documents_unverified: synced by an earlier
+// version) has its audio on Drive: under the sync gate GC removes it once
+// Drive answers that the session's folder is there; with no sync gate there
+// is no Drive to ask, so it is kept. Any other sync state, a failure
+// included, keeps the recording.
 func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ?`
+	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?`
 	if syncGated {
 		cond += ` AND sync_status = ?`
-		return cond, []any{RefinementRunning, SyncSynced}
+		return cond, []any{RefinementRunning, SyncStateRemoteDeleted, SyncSynced}
 	}
-	return cond, []any{RefinementRunning}
+	cond += ` AND documents_unverified = 0`
+	return cond, []any{RefinementRunning, SyncStateRemoteDeleted}
+}
+
+// CountUnverifiedSessions returns how many sessions GC keeps until a sync
+// verifies their documents on Drive (documents_unverified), for the status
+// the app reports.
+func (s *SQLiteStore) CountUnverifiedSessions() (int, error) {
+	var n int
+	// A REMOTE_DELETED session is never synced again, so it is not waiting
+	// for a re-check.
+	if err := s.db.QueryRow(`SELECT count(*) FROM sessions WHERE documents_unverified = 1 AND sync_state != ?`, SyncStateRemoteDeleted).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count unverified sessions: %w", err)
+	}
+	return n, nil
 }
 
 // Recordings lists, oldest first, every session that names audio, and whether
@@ -1713,6 +1836,30 @@ func (s *SQLiteStore) DeleteEndedSession(id, audioPath string, syncGated bool) (
 	return rows == 1, nil
 }
 
+// MarkRemoteDeleted records that synced session id's Drive folder, folderID,
+// is in the trash or gone, as GC found before deleting it or removing its
+// audio: the session becomes REMOTE_DELETED, keeping its folder, so no GC
+// path deletes it (the device then holds its only lasting copy) and no sync
+// uploads it again. It does this only while the session is still synced in
+// that folder (a session restored from Drive is synced with no sync state),
+// so a sync that started since is left as it is, and reports whether it did.
+func (s *SQLiteStore) MarkRemoteDeleted(id, folderID, errorMessage string) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE sessions SET sync_state = ?, sync_status = ?, error_message = ?
+		 WHERE id = ? AND sync_status = ? AND gdrive_folder_id = ?`,
+		SyncStateRemoteDeleted, syncStatusFromState(SyncStateRemoteDeleted), errorMessage,
+		id, SyncSynced, folderID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark session %s remote deleted: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark remote deleted rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
 // ImportSession inserts a fully-formed session restored from a backup, and its
 // segments, in a single transaction. The session keeps the time it started,
 // but its age for the retention policy runs from now, its restore.
@@ -1755,7 +1902,13 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		sess.AudioPath,
 		sess.SyncStatus,
 		sess.EnvoyPublishStatus,
-		sess.SyncState,
+		func() string {
+			// A session restored synced, with no sync state given, is SYNCED.
+			if sess.SyncState == "" && sess.SyncStatus == SyncSynced {
+				return SyncStateSynced
+			}
+			return sess.SyncState
+		}(),
 		sess.RetryCount,
 		func() any {
 			if sess.LastSyncAttempt == nil {

@@ -109,11 +109,22 @@ func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ s
 	return nil
 }
 
-func (s *storeMock) UpdateSummaryError(sessionID, errMsg string) error {
+// StartSummary keeps the title and summary, as the store does.
+func (s *storeMock) StartSummary(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.errorMessage[sessionID] = errMsg
+	s.status[sessionID] = storage.SummaryRunning
 	return nil
+}
+
+// FailSummary keeps the title and summary, as the store does.
+func (s *storeMock) FailSummary(sessionID, errMsg string) (storage.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status[sessionID] = storage.SummaryFailed
+	s.errorMessage[sessionID] = errMsg
+	return storage.Session{ID: sessionID, Title: s.title[sessionID], Summary: s.summary[sessionID],
+		SummaryStatus: storage.SummaryFailed, SummaryPreset: s.preset[sessionID], SummaryError: errMsg}, nil
 }
 
 func (s *storeMock) UpdateTitle(sessionID, title string) error {

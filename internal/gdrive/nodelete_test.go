@@ -43,7 +43,7 @@ func TestResyncOfAMainEraFolderUpdatesTheDocumentsInPlace(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	const folder = "folder-main-era"
+	folder := wire.add("root", "2026-11-06 Merged", "application/vnd.google-apps.folder", nil, nil)
 	summaryID := wire.add(folder, "summary.md", "application/vnd.google-apps.document", []byte("the summary main uploaded, edited by hand"), nil)
 	transcriptID := wire.add(folder, "transcript.md", "application/vnd.google-apps.document", []byte("the transcript main uploaded"), nil)
 	audioID := wire.add(folder, "audio.mp3", "audio/mpeg", []byte("audio"), nil)

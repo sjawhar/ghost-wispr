@@ -39,6 +39,7 @@ type OrchestratorStore interface {
 type uploader interface {
 	Upload(ctx context.Context, folderName string, files []SyncFile) (string, error)
 	UploadInto(ctx context.Context, folderID string, files []SyncFile) error
+	FolderOnDrive(ctx context.Context, folderID string) (bool, error)
 }
 
 type Orchestrator struct {
@@ -65,11 +66,21 @@ func NewOrchestratorWithUploader(u uploader, store OrchestratorStore, logger ...
 	return &Orchestrator{uploader: u, store: store, logger: l}
 }
 
+// FolderOnDrive reports whether Drive has session folder folderID out of the
+// trash, and an error when Drive cannot say. GC asks it before it deletes a
+// synced session or removes its audio.
+func (o *Orchestrator) FolderOnDrive(ctx context.Context, folderID string) (bool, error) {
+	return o.uploader.FolderOnDrive(ctx, folderID)
+}
+
 // CanSync reports why a sync of the session cannot start, if it cannot: the
 // session is missing, already synced, being synced now, or in a state no sync
-// starts from (its Drive folder was deleted by hand). A manual retry checks it
-// first, so the API can say so instead of starting a sync that does nothing.
-func (o *Orchestrator) CanSync(sessionID string) error {
+// starts from. For a session whose Drive folder was deleted (REMOTE_DELETED)
+// it asks Drive, as the sync would, and says so while the folder is still in
+// the trash or gone, or Drive does not answer. A manual retry checks it
+// first, so the API answers with why instead of starting a sync that does
+// nothing.
+func (o *Orchestrator) CanSync(ctx context.Context, sessionID string) error {
 	sess, err := o.store.GetSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("get session %s: %w", sessionID, err)
@@ -80,9 +91,23 @@ func (o *Orchestrator) CanSync(sessionID string) error {
 	case storage.SyncStateSyncing:
 		return fmt.Errorf("session %s is being synced now", sessionID)
 	default:
-		if err := ValidateSyncStateTransition(SyncState(state), SyncStateSyncing); err != nil {
-			return fmt.Errorf("cannot sync session %s now: %w", sessionID, err)
+		if err := syncableFrom(&sess); err != nil {
+			return err
 		}
+		return o.folderBack(ctx, &sess)
+	}
+}
+
+// syncableFrom returns why no sync starts from sess's sync state, or nil. A
+// REMOTE_DELETED session needs its folder: a sync into a new one would make
+// again what the user deleted.
+func syncableFrom(sess *storage.Session) error {
+	state := syncStateOf(sess)
+	if err := ValidateSyncStateTransition(SyncState(state), SyncStateSyncing); err != nil {
+		return fmt.Errorf("cannot sync session %s now: %w", sess.ID, err)
+	}
+	if state == storage.SyncStateRemoteDeleted && sess.GDriveFolderID == "" {
+		return fmt.Errorf("cannot sync session %s now: its Drive folder was deleted and no folder is recorded to look for", sess.ID)
 	}
 	return nil
 }
@@ -114,9 +139,19 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 		o.logger.Info("gdrive session is being synced by another sync, skipping", "operation", "sync_session", "session_id", sessionID, "sync_state", state)
 		return nil
 	default:
-		if err := ValidateSyncStateTransition(SyncState(state), SyncStateSyncing); err != nil {
-			return fmt.Errorf("sync session %s: %w", sessionID, err)
+		if err := syncableFrom(&read); err != nil {
+			return err
 		}
+	}
+	// A session whose Drive folder was deleted stays REMOTE_DELETED until
+	// Drive shows the folder back: the sync holds it only then. Held first,
+	// a Drive that did not answer would end the hold in a retry, and nothing
+	// would then keep GC from the session while its folder is still in the
+	// trash. (The app stopping while the sync holds it puts it back:
+	// storage.RecoverInterruptedSyncs.)
+	if err := o.folderBack(ctx, &read); err != nil {
+		o.logger.Info("gdrive session stays as it is: its Drive folder is not back", "operation", "sync_session", "session_id", sessionID, "drive_folder_id", read.GDriveFolderID, "error", err)
+		return err
 	}
 
 	segments, err := o.store.GetSegments(sessionID)
@@ -192,7 +227,13 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	}
 
 	attemptedAt := time.Now().UTC()
-	if IsRemoteDeletedError(err) {
+	// A 404 while syncing into the session's own folder, or that folder in
+	// the trash, means it (or a file in it) was deleted on Drive: no sync
+	// uploads into it again, and no GC path deletes the session. A 404 while
+	// creating the folder is about the folder the app syncs into (its root),
+	// which is not this session's to give up on: that sync retries as any
+	// failure does, and its retry into the folder it made finds out.
+	if sess.GDriveFolderID != "" && IsRemoteDeletedError(err) {
 		if o.endSync(sessionID, claim, storage.SyncStateRemoteDeleted, driveFolderID, sess.RetryCount, attemptedAt, err) {
 			o.logger.Warn("gdrive remote deletion soft-deleted session", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateRemoteDeleted, "error", err.Error())
 		}
@@ -208,6 +249,23 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	}
 	o.logger.Error("gdrive sync permanently failed", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateFailed, "retry_count", sess.RetryCount, "error", err.Error())
 	return fmt.Errorf("upload %s: %w", sessionID, err)
+}
+
+// folderBack returns nil unless sess is REMOTE_DELETED and Drive does not
+// show its folder back out of the trash: then why (still in the trash or
+// gone, or Drive did not say).
+func (o *Orchestrator) folderBack(ctx context.Context, sess *storage.Session) error {
+	if sess.SyncState != storage.SyncStateRemoteDeleted {
+		return nil
+	}
+	back, err := o.uploader.FolderOnDrive(ctx, sess.GDriveFolderID)
+	switch {
+	case err != nil:
+		return fmt.Errorf("cannot sync session %s now: its Drive folder was deleted, and Drive did not say whether it is back: %w: %w", sess.ID, ErrDriveDidNotAnswer, err)
+	case !back:
+		return fmt.Errorf("cannot sync session %s now: its Drive folder %s is still in the trash or gone; restore it on Drive, then retry", sess.ID, sess.GDriveFolderID)
+	}
+	return nil
 }
 
 // endSync ends the sync of session sessionID under claim, which did not mark

@@ -39,6 +39,11 @@ func (u *remountingUploader) UploadInto(ctx context.Context, _ string, files []S
 	return err
 }
 
+// FolderOnDrive reports the one folder the uploader makes as on Drive.
+func (u *remountingUploader) FolderOnDrive(_ context.Context, folderID string) (bool, error) {
+	return folderID == "folder-1", nil
+}
+
 // Review of #37, round 2, blocker 1: a recording missing when the sync built
 // its file list, and back on disk by the end of the upload, was never
 // uploaded, yet the session was marked synced, so GC gated on sync removed a
@@ -64,8 +69,9 @@ func TestOrchestratorDoesNotMarkSyncedARecordingThatCameBackDuringTheUpload(t *t
 		t.Fatalf("summarize: %v", err)
 	}
 	uploader := &remountingUploader{recording: recording}
+	o := NewOrchestratorWithUploader(uploader, store)
 
-	if err := NewOrchestratorWithUploader(uploader, store).SyncSession(context.Background(), id); err == nil {
+	if err := o.SyncSession(context.Background(), id); err == nil {
 		t.Errorf("sync succeeded; Drive got only %v", uploader.uploaded)
 	}
 	sess, err := store.GetSession(id)
@@ -76,7 +82,7 @@ func TestOrchestratorDoesNotMarkSyncedARecordingThatCameBackDuringTheUpload(t *t
 		t.Errorf("marked synced, but Drive got only %v: %s was never uploaded", uploader.uploaded, recording)
 	}
 
-	gcConfig := gc.Config{MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir}
+	gcConfig := gc.Config{MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir, Drive: o}
 	if _, err := gc.New(store, gcConfig, slog.New(slog.NewTextHandler(io.Discard, nil))).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
@@ -175,7 +181,7 @@ func TestGCNeverRemovesARecordingDriveSkippedOnARetry(t *testing.T) {
 	}
 
 	// 4. A pass of GC gated on sync.
-	if _, err := gc.New(store, gc.Config{MaxAudioSizeMB: 1, SyncGated: true, AudioDir: audioDir}, logger).Run(); err != nil {
+	if _, err := gc.New(store, gc.Config{MaxAudioSizeMB: 1, SyncGated: true, AudioDir: audioDir, Drive: o}, logger).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	for _, path := range paths {
