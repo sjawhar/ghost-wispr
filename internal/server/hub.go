@@ -18,8 +18,10 @@ type EventStore interface {
 
 type Hub struct {
 	mu                sync.RWMutex
+	statusMu          sync.Mutex
 	clients           map[chan []byte]struct{}
 	componentStatuses map[string]ComponentStatusEvent
+	statusChanged     *StatusChangedEvent
 	logger            *slog.Logger
 	eventStore        EventStore
 }
@@ -65,6 +67,15 @@ func (h *Hub) SnapshotComponentStatuses() []ComponentStatusEvent {
 		snapshot = append(snapshot, h.componentStatuses[key])
 	}
 	return snapshot
+}
+
+func (h *Hub) SnapshotStatusChanged() (StatusChangedEvent, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.statusChanged == nil {
+		return StatusChangedEvent{}, false
+	}
+	return *h.statusChanged, true
 }
 
 func (h *Hub) Unsubscribe(ch chan []byte) {
@@ -132,10 +143,16 @@ func (h *Hub) BroadcastSummaryReady(sessionID, title, summary, status, preset st
 }
 
 func (h *Hub) BroadcastStatusChanged(paused bool) {
-	h.broadcastEvent(StatusChangedEvent{
+	h.statusMu.Lock()
+	defer h.statusMu.Unlock()
+	event := StatusChangedEvent{
 		Event:  newEvent("status_changed", time.Now().UTC()),
 		Paused: paused,
-	})
+	}
+	h.mu.Lock()
+	h.statusChanged = &event
+	h.mu.Unlock()
+	h.broadcastEvent(event)
 }
 
 func (h *Hub) BroadcastComponentStatus(component, status, message string) {

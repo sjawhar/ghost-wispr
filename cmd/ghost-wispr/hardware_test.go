@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -95,9 +96,9 @@ func TestLightStateSubcommand(t *testing.T) {
 	}
 }
 
-type openMicFake struct{ open bool }
+type openMicFake struct{ open atomic.Bool }
 
-func (m *openMicFake) IsOpen() bool { return m.open }
+func (m *openMicFake) IsOpen() bool { return m.open.Load() }
 
 // TestLightFollowsTheGateAndTheMic fails if the indicator is red while
 // capture is paused or the microphone is not actually capturing.
@@ -107,7 +108,7 @@ func TestLightFollowsTheGateAndTheMic(t *testing.T) {
 	if recordingSignal(capture, mic) {
 		t.Fatal("closed microphone was reported as recording")
 	}
-	mic.open = true
+	mic.open.Store(true)
 	if !recordingSignal(capture, mic) {
 		t.Fatal("open microphone and open gate were not reported as recording")
 	}
@@ -126,7 +127,8 @@ func TestTapTogglesAndPersists(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	capture := newCaptureGate(nil, nil, nil)
-	pause, resume := persistingControls(store, capture.Pause, capture.Resume)
+	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	pause, resume := controls.Pause, controls.Resume
 	var statuses []bool
 	if err := toggleCapture(capture.IsPaused, pause, resume, func(paused bool) { statuses = append(statuses, paused) }); err != nil {
 		t.Fatalf("pause tap: %v", err)
@@ -463,7 +465,7 @@ func TestWireLightConsentRequiresRedBeforeStartOrResume(t *testing.T) {
 		light: &reconnectingLight{light: &staleReadLight{}, warnings: newWarningsRegistry()},
 	}
 	capture := newCaptureGate(nil, nil, nil)
-	wireLightConsent(capture, hardware, store, &openMicFake{}, newWarningsRegistry(), nil)
+	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	started := false
 	if err := startMicIfUnpaused(capture, func() error {
 		started = true
@@ -535,12 +537,15 @@ func TestResumeRequiresRedBeforeOpeningCapture(t *testing.T) {
 		confirmations.Add(1)
 		return errors.New("light is off")
 	}
-	guardResumeWithLight(capture, store, &openMicFake{}, newWarningsRegistry(), nil)
+	guardResumeWithLight(capture, newWarningsRegistry(), nil)
+	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
 	capture.Pause()
-	capture.Resume()
-	waitForHardware(t, "failed red confirmation to keep capture paused", func() bool {
-		return confirmations.Load() == 1 && capture.IsPaused()
-	})
+	if err := controls.Resume(); err == nil {
+		t.Fatal("resume succeeded after red confirmation failed")
+	}
+	if confirmations.Load() != 1 || !capture.IsPaused() {
+		t.Fatalf("confirmation calls=%d paused=%t, want (1, true)", confirmations.Load(), capture.IsPaused())
+	}
 	if !capture.IsPaused() {
 		t.Fatal("capture resumed after red confirmation failed")
 	}
@@ -561,7 +566,7 @@ func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
 		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
 	}
 	hardware.light.holdRed = hardware.holdsRed
-	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Hour)
+	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -584,12 +589,13 @@ func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
 	release := sync.OnceFunc(func() { close(releaseClear) })
 	t.Cleanup(release)
 	capture.beforeMicStart = hardware.EnsureRed
+	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = func() {
 		close(clearStarted)
 		<-releaseClear
 		hardware.ReleaseRedHold()
 	}
-	guardResumeWithLight(capture, store, &openMicFake{}, newWarningsRegistry(), nil)
+	guardResumeWithLight(capture, newWarningsRegistry(), nil)
 	capture.Pause()
 	capture.Resume()
 	select {
@@ -604,7 +610,7 @@ func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
 	release()
 	waitForHardware(t, "light to turn off without a microphone", func() bool {
 		colour, _ := device.snapshot()
-		return colour == [3]uint8{}
+		return !hardware.holdsRed() && colour == [3]uint8{}
 	})
 	if hardware.holdsRed() {
 		t.Fatal("forced red remained set without a microphone")
@@ -676,7 +682,8 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 	device := &operationLightFake{}
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
-	mic := &openMicFake{open: true}
+	mic := &openMicFake{}
+	mic.open.Store(true)
 	hardware := &hardwareControl{
 		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
 	}
@@ -700,13 +707,13 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	wireLightConsent(capture, hardware, store, mic, newWarningsRegistry(), nil)
+	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	capture.Resume()
 	waitForHardware(t, "gate-open red hold release", func() bool {
 		colour, _ := device.snapshot()
 		return !hardware.holdsRed() && colour == [3]uint8{255, 0, 0}
 	})
-	mic.open = false
+	mic.open.Store(false)
 	hardware.Wake()
 	waitForHardware(t, "light off after microphone loss", func() bool {
 		colour, _ := device.snapshot()
@@ -729,8 +736,7 @@ func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	mic := &openMicFake{}
-	wireLightConsent(capture, hardware, store, mic, newWarningsRegistry(), nil)
+	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	capture.Resume()
 	waitForHardware(t, "resume to confirm red and release exactly one hold", func() bool {
 		colour, _ := device.snapshot()
@@ -738,5 +744,155 @@ func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
 	})
 	if got := hardware.redHolds.Load(); got != 1 {
 		t.Fatalf("red holds after resume = %d, want 1", got)
+	}
+}
+
+// TestReconnectingLightWarnsWhenPresentDeviceFails fails if a present light is
+// described as missing after its own write fails.
+func TestReconnectingLightWarnsWhenPresentDeviceFails(t *testing.T) {
+	warnings := newWarningsRegistry()
+	light := &reconnectingLight{
+		light:    &reconnectLightFake{setErr: errors.New("USB write failed")},
+		warnings: warnings,
+	}
+	if err := light.SetRGB(255, 0, 0); err == nil {
+		t.Fatal("set red succeeded despite the device error")
+	}
+	if got, want := warnings.List(), []string{"Recording light failed; the unit may be recording without its light"}; !slices.Equal(got, want) {
+		t.Fatalf("warnings = %v, want %v", got, want)
+	}
+}
+
+// TestUnknownLightCommandPrintsUsage fails if an unrecognised command has an
+// ambiguous success-looking exit code or omits its usage.
+func TestUnknownLightCommandPrintsUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if got := runLightCommand([]string{"unexpected"}, &stdout, &stderr); got != 2 {
+		t.Fatalf("unknown command exit code = %d, want 2", got)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("unknown command wrote stdout = %q, want empty", stdout.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, `unknown subcommand "unexpected"`) || !strings.Contains(got, "usage: ghost-wispr") {
+		t.Fatalf("unknown command stderr = %q, want reason and usage", got)
+	}
+}
+
+// TestLightCommandRejectsExtraArgument fails if a light command ignores an
+// extra argument instead of printing usage with exit code 2.
+func TestLightCommandRejectsExtraArgument(t *testing.T) {
+	for _, args := range [][]string{{"light-off", "extra"}, {"light-state", "extra"}} {
+		var stdout, stderr bytes.Buffer
+		if got := runLightCommand(args, &stdout, &stderr); got != 2 {
+			t.Fatalf("%v exit code = %d, want 2", args, got)
+		}
+		if !strings.Contains(stderr.String(), "usage: ghost-wispr") {
+			t.Fatalf("%v stderr = %q, want usage", args, stderr.String())
+		}
+	}
+}
+
+// TestResumeDoesNotLightBeforeGateOpens fails if the request-time confirmation
+// leaves its red hold set while a paused session is still settling.
+func TestResumeDoesNotLightBeforeGateOpens(t *testing.T) {
+	settled := make(chan struct{})
+	capture := newCaptureGate(nil, func() { <-settled }, nil)
+	device := &operationLightFake{}
+	mic := &openMicFake{}
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
+	}
+	hardware.light.holdRed = hardware.holdsRed
+	hardware.controller = indicator.NewController(hardware.light, func() bool {
+		return hardware.holdsRed() || recordingSignal(capture, mic)
+	}, time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		hardware.controller.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		close(settled)
+		cancel()
+		<-done
+	})
+
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
+	capture.Pause()
+	if err := controls.Resume(); err != nil {
+		t.Fatalf("resume request: %v", err)
+	}
+	waitForHardware(t, "light off while resume settles", func() bool {
+		colour, _ := device.snapshot()
+		return !hardware.holdsRed() && colour == [3]uint8{}
+	})
+}
+
+type redThenOffLight struct{ reads int }
+
+func (*redThenOffLight) SetRGB(uint8, uint8, uint8) error { return nil }
+func (l *redThenOffLight) ReadRGB() (uint8, uint8, uint8, error) {
+	l.reads++
+	if l.reads == 1 {
+		return 255, 0, 0, nil
+	}
+	return 0, 0, 0, nil
+}
+func (*redThenOffLight) ServerDown(time.Duration) error { return nil }
+func (*redThenOffLight) BlackPattern() error            { return nil }
+func (*redThenOffLight) Close() error                   { return nil }
+
+// TestResumeKeepsGateClosedWhenLightFailsDuringSettle fails if a later light
+// failure opens the gate onto an active microphone.
+func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
+	settled := make(chan struct{})
+	capture := newCaptureGate(nil, func() { <-settled }, nil)
+	mic := &openMicFake{}
+	mic.open.Store(true)
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: &redThenOffLight{}, warnings: newWarningsRegistry()},
+	}
+	var (
+		statuses   []bool
+		statusesMu sync.Mutex
+	)
+	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, func(paused bool) {
+		statusesMu.Lock()
+		defer statusesMu.Unlock()
+		statuses = append(statuses, paused)
+	})
+	wireLightConsent(capture, hardware, newWarningsRegistry(), func(error) {
+		if err := controls.RefuseResume(); err != nil {
+			t.Errorf("persist refused resume: %v", err)
+		}
+	})
+	capture.Pause()
+	if err := controls.Resume(); err != nil {
+		t.Fatalf("resume request: %v", err)
+	}
+	close(settled)
+	waitForHardware(t, "light failure to re-pause capture", func() bool {
+		return capture.IsPaused() && capture.isClosed() && !recordingSignal(capture, mic)
+	})
+	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
+	if err != nil || !ok || value != "1" {
+		t.Fatalf("persisted pause after gate-open refusal = (%q, %t, %v), want (1, true, nil)", value, ok, err)
+	}
+	statusesMu.Lock()
+	defer statusesMu.Unlock()
+	if got, want := statuses, []bool{false, true}; !slices.Equal(got, want) {
+		t.Fatalf("status broadcasts = %v, want %v", got, want)
 	}
 }

@@ -465,26 +465,8 @@ func main() {
 		return
 	}
 	if len(os.Args) > 1 {
-		var err error
-		switch os.Args[1] {
-		case "light-off":
-			if len(os.Args) != 2 {
-				err = fmt.Errorf("usage: ghost-wispr light-off")
-			} else {
-				err = runLightOff(os.Stderr)
-			}
-		case "light-state":
-			if len(os.Args) != 2 {
-				err = fmt.Errorf("usage: ghost-wispr light-state")
-			} else {
-				err = runLightState(os.Stdout)
-			}
-		default:
-			err = fmt.Errorf("unknown subcommand %q", os.Args[1])
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+		if exitCode := runLightCommand(os.Args[1:], os.Stdout, os.Stderr); exitCode != 0 {
+			os.Exit(exitCode)
 		}
 		return
 	}
@@ -698,7 +680,6 @@ func main() {
 		capture.Pause()
 		restoredPause = true
 	}
-	pauseCapture, resumeCapture := persistingControls(store, capture.Pause, capture.Resume)
 	warningRegistry := newWarningsRegistry()
 	for i, warning := range cfgWarnings {
 		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
@@ -895,15 +876,10 @@ func main() {
 	gcHealthState.countUnverified(store)
 
 	controlHooks := &server.ControlHooks{
-		Pause:         pauseCapture,
-		Resume:        resumeCapture,
-		IsPaused:      capture.IsPaused,
-		IsCapturing:   func() bool { return capture.capturing(micStatus) },
-		CaptureState:  func() string { return capture.captureState(micStatus) },
-		ActiveSession: manager.ActiveSession,
-		OnStatusChanged: func(paused bool) {
-			hub.BroadcastStatusChanged(paused)
-		},
+		IsPaused:           capture.IsPaused,
+		IsCapturing:        func() bool { return capture.capturing(micStatus) },
+		CaptureState:       func() string { return capture.captureState(micStatus) },
+		ActiveSession:      manager.ActiveSession,
 		Warnings:           warningRegistry.List,
 		GCHold:             gcHealthState.Hold,
 		UnverifiedSessions: gcHealthState.Unverified,
@@ -1243,17 +1219,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 
-	hardware := startHardware(ctx, &cfg, capture, micStatus, controlHooks, warningRegistry, hub)
-	pauseCapture, resumeCapture = persistingControls(
+	hardware := startHardware(ctx, &cfg, capture, micStatus, warningRegistry, hub)
+	pauseControls := newPersistentControls(
 		store,
 		func() {
 			capture.Pause()
 			hardware.CaptureStopped()
 		},
-		capture.Resume,
+		capture.RequestResume,
+		hub.BroadcastStatusChanged,
 	)
 	controlHooks.Pause = func() error {
-		err := pauseCapture()
+		err := pauseControls.Pause()
 		if err != nil {
 			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
 		} else {
@@ -1262,17 +1239,25 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		return err
 	}
 	controlHooks.Resume = func() error {
-		err := resumeCapture()
-		if err == nil {
+		err := pauseControls.Resume()
+		if err != nil {
+			if errors.Is(err, errRefusedResumeNotPersisted) {
+				warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+			}
+		} else {
 			warningRegistry.Clear("capture-state")
 		}
 		return err
 	}
-	wireLightConsent(capture, hardware, store, micStatus, warningRegistry, hub)
-	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
+	wireLightConsent(capture, hardware, warningRegistry, func(error) {
+		if err := pauseControls.RefuseResume(); err != nil {
+			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+		}
+	})
 	if restoredPause {
 		hub.BroadcastStatusChanged(true)
 	}
+	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 
 	setSummaryPublisher := func(next *envoy.Publisher) {
 		summaryPublisher.Store(next)

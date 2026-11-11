@@ -16,7 +16,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/indicator"
 	"github.com/sjawhar/ghost-wispr/internal/powerbutton"
 	"github.com/sjawhar/ghost-wispr/internal/server"
-	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 const (
@@ -27,6 +26,18 @@ const (
 	hardwareRetry     = 10 * time.Second
 	lightShutdownWait = 2 * time.Second
 )
+
+const (
+	recordingLightMissingWarning = "Recording light not found; the unit records without its light"
+	recordingLightFailedWarning  = "Recording light failed; the unit may be recording without its light"
+)
+
+func recordingLightWarning(err error) string {
+	if errors.Is(err, indicator.ErrNoBlink1) {
+		return recordingLightMissingWarning
+	}
+	return recordingLightFailedWarning
+}
 
 func listenAddress(address string) string {
 	if address == "" {
@@ -78,6 +89,30 @@ func runLightState(stdout io.Writer) error {
 		return err
 	}
 	return errLightOther
+}
+
+func runLightCommand(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		_, _ = fmt.Fprintln(stderr, "usage: ghost-wispr <light-off|light-state>")
+		return 2
+	}
+
+	var err error
+	switch args[0] {
+	case "light-off":
+		err = runLightOff(stderr)
+	case "light-state":
+		err = runLightState(stdout)
+	default:
+		_, _ = fmt.Fprintf(stderr, "unknown subcommand %q\n", args[0])
+		_, _ = fmt.Fprintln(stderr, "usage: ghost-wispr <light-off|light-state>")
+		return 2
+	}
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }
 
 func recordingSignal(capture *captureGate, mic interface{ IsOpen() bool }) bool {
@@ -173,46 +208,39 @@ func (h *hardwareControl) EnsureRed() error {
 	return nil
 }
 
-// guardResumeWithLight keeps capture paused when its indicator cannot confirm
-// red.
-func guardResumeWithLight(
-	capture *captureGate,
-	store pauseStore,
-	mic interface{ IsOpen() bool },
-	warnings *warningsRegistry,
-	hub *server.Hub,
-) {
-	beforeResume := capture.beforeResume
-	capture.beforeResume = func() {
+// guardResumeWithLight checks red both when a resume is requested, so callers
+// can receive a synchronous refusal, and again immediately before the gate
+// opens. The first hold is released while the paused session settles; the
+// second is released after the gate opens.
+func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, onResumeRefused func(error)) {
+	capture.beforeResumeRequest = func() error {
 		if err := capture.confirmMicStart(); err != nil {
 			warnings.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
-			if err := store.SetAppState(storage.AppStateCapturePaused, "1"); err != nil {
-				warnings.Set("capture-state", "Pause not saved; a restart will resume recording")
-			}
-			capture.mu.Lock()
-			capture.switchOff = true
-			capture.mu.Unlock()
-			if hub != nil {
-				hub.BroadcastStatusChanged(true)
-			}
-			return
+			return err
 		}
-		if beforeResume != nil {
-			beforeResume()
-		}
+		capture.finishMicStart()
+		return nil
 	}
+	capture.beforeGateOpen = func() error {
+		if err := capture.confirmMicStart(); err != nil {
+			warnings.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
+			return err
+		}
+		return nil
+	}
+	capture.onResumeRefused = onResumeRefused
 }
 
-func wireLightConsent(capture *captureGate, hardware *hardwareControl, store pauseStore, mic interface{ IsOpen() bool }, warnings *warningsRegistry, hub *server.Hub) {
+func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry, onResumeRefused func(error)) {
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
-	guardResumeWithLight(capture, store, mic, warnings, hub)
+	guardResumeWithLight(capture, warnings, onResumeRefused)
 }
 
 // startHardware starts the configured recording light. The button starts only
 // after its durable controls are completely wired.
-func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate, mic interface{ IsOpen() bool }, _ *server.ControlHooks, warnings *warningsRegistry, hub *server.Hub) *hardwareControl {
+func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate, mic interface{ IsOpen() bool }, warnings *warningsRegistry, hub *server.Hub) *hardwareControl {
 	done := make(chan struct{})
 	hardware := &hardwareControl{done: done}
 	if cfg.IndicatorLight == config.IndicatorLightBlink1 {
@@ -304,14 +332,14 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 	if err != nil {
 		l.lastErr = err
 		l.nextAttempt = time.Now().Add(hardwareRetry)
-		l.warnings.Set("recording-light", "Recording light not found; the unit records without its light")
+		l.warnings.Set("recording-light", recordingLightWarning(err))
 		return nil, err
 	}
 	if err := light.BlackPattern(); err != nil {
 		_ = light.Close()
 		l.lastErr = err
 		l.nextAttempt = time.Now().Add(hardwareRetry)
-		l.warnings.Set("recording-light", "Recording light not found; the unit records without its light")
+		l.warnings.Set("recording-light", recordingLightWarning(err))
 		return nil, err
 	}
 	l.light = light
@@ -329,7 +357,7 @@ func (l *reconnectingLight) failed(err error) error {
 	}
 	l.lastErr = err
 	l.nextAttempt = time.Time{}
-	l.warnings.Set("recording-light", "Recording light not found; the unit records without its light")
+	l.warnings.Set("recording-light", recordingLightWarning(err))
 	return err
 }
 
