@@ -43,7 +43,8 @@ func TestR4DeleteDuringRecoveryRefineIs409(t *testing.T) {
 	}()
 	<-entered
 	errc := make(chan error, 1)
-	go func() { errc <- r4Runner(store, recording).Delete(context.Background(), "session", ids[0]) }()
+	runner := r4Runner(store, recording)
+	go func() { errc <- runner.Delete(context.Background(), "session", ids[0]) }()
 	select {
 	case err := <-errc:
 		t.Logf("delete during refine: %v", err)
@@ -59,13 +60,15 @@ func TestR4DeleteDuringRecoveryRefineIs409(t *testing.T) {
 
 func TestR4RecoveryFlagClearedAfterRefineError(t *testing.T) {
 	store, recording, ids := r4PendingStore(t)
-	refine := func(context.Context, string, string, time.Time) error { return errors.New("batch transcription not configured") }
+	refine := func(context.Context, string, string, time.Time) error {
+		return errors.New("batch transcription not configured")
+	}
 	_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, refine, func(e error) { t.Logf("warn: %v", e) })
 	pending, _ := store.HasPendingSplice("session")
-	err := r4Runner(store, recording).Delete(context.Background(), "session", ids[0])
+	runner := r4Runner(store, recording)
+	err := runner.Delete(context.Background(), "session", ids[0])
 	t.Logf("pending row=%v; later delete err=%v", pending, err)
 	if !pending && errors.Is(err, storage.ErrSegmentSplicePending) {
 		t.Fatal("PROOF: no splice is pending, but the session refuses deletes as pending until restart (recovering flag leaked)")
 	}
 }
-

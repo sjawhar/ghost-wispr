@@ -59,7 +59,9 @@ func TestR4RealIndexerRefusesWriteAfterDelete(t *testing.T) {
 	idx := NewIndexer(client, store, 500)
 	entered := client.entered
 	errc := make(chan error, 1)
-	go func() { errc <- idx.IndexSessionAtGeneration(context.Background(), "s", "before bridge private deletion token after bridge "+transcript, generation) }()
+	go func() {
+		errc <- idx.IndexSessionAtGeneration(context.Background(), "s", "before bridge private deletion token after bridge "+transcript, generation)
+	}()
 	<-entered
 	if err := store.DeleteSegment("s", id, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatal(err)

@@ -85,7 +85,6 @@ func SplitIntoChunks(text string, chunkSize int) []string {
 	return chunks
 }
 
-
 // IndexSessionAtGeneration indexes only while generation still names the
 // transcript the caller read.
 func (i *Indexer) IndexSessionAtGeneration(ctx context.Context, sessionID, transcript string, generation int) error {
@@ -159,7 +158,6 @@ func (i *Indexer) BackfillMissing(ctx context.Context) error {
 	if len(ids) == 0 {
 		return nil
 	}
-
 
 	sem := make(chan struct{}, 2)
 	var wg sync.WaitGroup

@@ -157,7 +157,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 	return set, nil
 }
 
-func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segmentID int64) error {
+func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segmentID int64) error {
 	if d.store == nil {
 		return fmt.Errorf("segment deletion storage is not configured")
 	}
@@ -294,8 +294,8 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	// A neighbour in another recording has no words on this recording's side
 	// of the cut, so it cannot have been over-cut here. Validate only sides
 	// for which the selected recording supplied pre-cut words.
-	beforeCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, true)
-	afterCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, false)
+	beforeCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, before, true)
+	afterCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, after, false)
 	if beforeCheck {
 		if beforeMissing := missingNeighbourTokens(wordsAfter, start, before, true); len(beforeMissing) > 1 {
 			return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(beforeMissing, ", "))
@@ -339,15 +339,24 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	return nil
 }
 
-// recordingHasWordsOnSide reports whether the selected recording itself has
-// words that could have belonged to this neighbour side of the cut.
-func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool) bool {
+// recordingHasWordsOnSide reports whether the selected recording holds a token
+// from this neighbour on the corresponding side of the cut.
+func recordingHasWordsOnSide(words []audio.Word, start, end float64, neighbour string, before bool) bool {
+	neighbourTokens := make(map[string]struct{})
+	for _, token := range deletionTokens(neighbour) {
+		neighbourTokens[token] = struct{}{}
+	}
 	for _, word := range words {
-		if before && word.Start < end {
-			return true
-		}
-		if !before && word.End > start {
-			return true
+		for _, token := range deletionTokens(word.Text) {
+			if _, ok := neighbourTokens[token]; !ok {
+				continue
+			}
+			if before && word.Start < end {
+				return true
+			}
+			if !before && word.End > start {
+				return true
+			}
 		}
 	}
 	return false
@@ -365,15 +374,15 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 		return 0, err
 	}
 	recovered := 0
-	for _, span := range spans {
-		if recoverPendingSplice(ctx, store, audioDir, source, splice, refine, warn, span) {
+	for i := range spans {
+		if recoverPendingSplice(ctx, store, audioDir, source, splice, refine, warn, &spans[i]) {
 			recovered++
 		}
 	}
 	return recovered, nil
 }
 
-func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(error), span storage.DeletedSpan) bool {
+func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(error), span *storage.DeletedSpan) bool {
 	deleteLocks.setRecovering(span.SessionID, true)
 	defer deleteLocks.setRecovering(span.SessionID, false)
 
@@ -414,7 +423,7 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 		return false
 	}
 	if hash == span.SHA256After {
-		if err := store.MarkSpliceComplete(&span); err != nil {
+		if err := store.MarkSpliceComplete(span); err != nil {
 			warn(err)
 		}
 		return false
@@ -446,7 +455,7 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 		warn(fmt.Errorf("replace recovered recording %s: %w", recording, err))
 		return false
 	}
-	if err := store.MarkSpliceComplete(&span); err != nil {
+	if err := store.MarkSpliceComplete(span); err != nil {
 		warn(err)
 		return false
 	}

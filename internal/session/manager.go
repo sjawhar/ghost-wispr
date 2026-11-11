@@ -50,7 +50,6 @@ type Manager struct {
 	lifecycleStartPublishesStopped bool
 }
 
-
 // sessionEnd is how far an end of a session got. An end that fails leaves it
 // behind, so retrying the end finishes it with the same end time and recording.
 type sessionEnd struct {
