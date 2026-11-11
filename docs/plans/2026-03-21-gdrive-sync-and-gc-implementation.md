@@ -802,8 +802,9 @@ In `ghost-wispr.yaml.example`, add after the existing gdrive section:
 
 ```yaml
 # Google Drive sync
+# google_credentials_file is authoritative; Google Application Default Credentials are the fallback.
 # gdrive_folder_id:
-# google_credentials_file: ./service-account.json
+# google_credentials_file: /opt/ghost-wispr/google-credentials.json
 # gdrive_sync_enabled: false
 
 # Garbage collection
@@ -1187,7 +1188,13 @@ Replace the existing gdrive ticker block (lines 489-511) with:
 // Google Drive sync.
 var syncOrchestrator *gdrive.Orchestrator
 if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
-	syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
+	syncer, syncErr := func() (*gdrive.Syncer, error) {
+		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, "https://www.googleapis.com/auth/drive.file")
+		if err != nil {
+			return nil, err
+		}
+		return gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID)
+	}()
 	if syncErr != nil {
 		log.Printf("warning: gdrive sync disabled: %v", syncErr)
 		warnings = append(warnings, "Google Drive sync failed to initialize \u2014 backups are disabled")
@@ -1260,10 +1267,13 @@ In the existing `cfgStore.OnChange` callback, add:
 ```go
 // Recreate sync orchestrator if gdrive config changed.
 if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
-	if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID); err == nil {
-		syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
-		manager.SetSyncer(syncOrchestrator)
-		log.Printf("config: gdrive sync enabled")
+	credentials, err := googleauth.Detect(ctx, newCfg.GoogleCredentialsFile, "https://www.googleapis.com/auth/drive.file")
+	if err == nil {
+		if syncer, err := gdrive.NewSyncer(ctx, credentials, newCfg.GDriveFolderID); err == nil {
+			syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			manager.SetSyncer(syncOrchestrator)
+			log.Printf("config: gdrive sync enabled")
+		}
 	}
 } else if !newCfg.GDriveSyncEnabled && syncOrchestrator != nil {
 	manager.SetSyncer(nil)
@@ -1588,6 +1598,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -1599,7 +1610,11 @@ func TestSyncToRealDrive(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	syncer, err := NewSyncer(ctx, credPath, folderID)
+	credentials, err := googleauth.Detect(ctx, credPath, "https://www.googleapis.com/auth/drive.file")
+	if err != nil {
+		t.Fatalf("detect credentials: %v", err)
+	}
+	syncer, err := NewSyncer(ctx, credentials, folderID)
 	if err != nil {
 		t.Fatalf("create syncer: %v", err)
 	}

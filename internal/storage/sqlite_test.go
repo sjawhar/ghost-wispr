@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 	"math"
 	"os"
@@ -27,6 +28,21 @@ func newTestSQLiteStore(t *testing.T) *SQLiteStore {
 	})
 
 	return store
+}
+
+func setEnvoyPublishStatus(store *SQLiteStore, sessionID, status string) error {
+	session, err := store.GetSession(sessionID)
+	if err != nil {
+		return err
+	}
+	updated, err := store.UpdateEnvoyPublishStatusAtVersion(sessionID, session.SummaryVersion, status)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("session %s changed before envoy publish status update", sessionID)
+	}
+	return nil
 }
 
 func TestPreMigrationBackupCreated(t *testing.T) {
@@ -269,6 +285,211 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 
 	if session.SummaryPreset != "concise" {
 		t.Fatalf("expected summary_preset %q, got %q", "concise", session.SummaryPreset)
+	}
+}
+
+func TestSummaryVersionIncrements(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "summary-version"
+	if err := store.CreateSession(sessionID, time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession(sessionID, time.Date(2026, 11, 10, 12, 31, 45, 0, time.UTC), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	version := func(step string) int {
+		t.Helper()
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			t.Fatalf("GetSession %s: %v", step, err)
+		}
+		return sess.SummaryVersion
+	}
+	if got := version("before summary"); got != 1 {
+		t.Fatalf("initial summary version = %d, want 1", got)
+	}
+
+	// The first summary keeps version 1.
+	if err := store.StartSummary(sessionID); err != nil {
+		t.Fatalf("StartSummary first: %v", err)
+	}
+	if err := store.UpdateSummary(sessionID, "First", "First summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("UpdateSummary first: %v", err)
+	}
+	if got := version("after first summary"); got != 1 {
+		t.Fatalf("first summary version = %d, want 1", got)
+	}
+
+	// A regeneration through StartSummary bumps it once.
+	if err := store.StartSummary(sessionID); err != nil {
+		t.Fatalf("StartSummary regenerated: %v", err)
+	}
+	if err := store.UpdateSummary(sessionID, "Corrected", "Corrected summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("UpdateSummary regenerated: %v", err)
+	}
+	if got := version("after regenerated summary"); got != 2 {
+		t.Fatalf("regenerated summary version = %d, want 2", got)
+	}
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
+		t.Fatalf("mark regenerated summary published: %v", err)
+	}
+
+	// A completed summary rewritten without StartSummary (the batch path) bumps it too.
+	if err := store.UpdateSummary(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("UpdateSummary batched: %v", err)
+	}
+	if got := version("after batched summary"); got != 3 {
+		t.Fatalf("batched summary version = %d, want 3", got)
+	}
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession after batched summary: %v", err)
+	}
+	if sess.EnvoyPublishStatus != EnvoyPublishPending {
+		t.Fatalf("batched summary publish status = %q, want %q", sess.EnvoyPublishStatus, EnvoyPublishPending)
+	}
+	ids, err := store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("GetSessionsNeedingEnvoyPublish after batched summary: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("sessions needing Envoy publish = %v, want [%s]", ids, sessionID)
+	}
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
+		t.Fatalf("mark batched summary published: %v", err)
+	}
+
+	// Re-reading the completed batch result is not a regeneration.
+	if err := store.UpdateSummary(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("UpdateSummary repeated batch result: %v", err)
+	}
+	if got := version("after repeated batch result"); got != 3 {
+		t.Fatalf("repeated batch summary version = %d, want 3", got)
+	}
+	sess, err = store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession after repeated batch result: %v", err)
+	}
+	if sess.EnvoyPublishStatus != EnvoyPublishPublished {
+		t.Fatalf("repeated batch publish status = %q, want %q", sess.EnvoyPublishStatus, EnvoyPublishPublished)
+	}
+
+	for _, change := range []struct {
+		name  string
+		apply func(*Session, *string, *string, *string)
+	}{
+		{"summary", func(_ *Session, summary, _ *string, _ *string) { *summary = "Summary text changed" }},
+		{"preset", func(_ *Session, _ *string, preset, _ *string) { *preset = "detailed" }},
+		{"speaker names", func(_ *Session, _ *string, _ *string, speakers *string) { *speakers = `{"0":{"name":"Sam"}}` }},
+	} {
+		t.Run("same title "+change.name, func(t *testing.T) {
+			current, err := store.GetSession(sessionID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
+				t.Fatalf("mark summary published: %v", err)
+			}
+			summary, preset, speakers := current.Summary, current.SummaryPreset, current.SpeakerNames
+			change.apply(&current, &summary, &preset, &speakers)
+			if err := store.UpdateSummary(sessionID, current.Title, summary, SummaryCompleted, preset, speakers); err != nil {
+				t.Fatalf("UpdateSummary: %v", err)
+			}
+			updated, err := store.GetSession(sessionID)
+			if err != nil {
+				t.Fatalf("GetSession updated: %v", err)
+			}
+			if updated.SummaryVersion != current.SummaryVersion+1 {
+				t.Fatalf("summary version = %d, want %d", updated.SummaryVersion, current.SummaryVersion+1)
+			}
+			if updated.EnvoyPublishStatus != EnvoyPublishPending {
+				t.Fatalf("envoy publish status = %q, want %q", updated.EnvoyPublishStatus, EnvoyPublishPending)
+			}
+		})
+	}
+}
+
+func TestSummaryVersionMigratesExistingSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "summary-version.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	startedAt := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
+	if err := store.CreateSession("existing", startedAt); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession("existing", startedAt.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := store.UpdateSummary("existing", "Existing", "Existing summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("UpdateSummary: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacy.Exec(`ALTER TABLE sessions DROP COLUMN summary_version`); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("remove summary_version from legacy database: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	migrated, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("migrate legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = migrated.Close() })
+
+	sess, err := migrated.GetSession("existing")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.SummaryVersion != 1 {
+		t.Fatalf("migrated summary version = %d, want 1", sess.SummaryVersion)
+	}
+	sessions, err := migrated.GetSessionsByDate("2026-11-10", false)
+	if err != nil {
+		t.Fatalf("GetSessionsByDate: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].SummaryVersion != 1 {
+		t.Fatalf("migrated date query = %#v, want one session at version 1", sessions)
+	}
+}
+
+func TestOpeningStoreMovesRejectedEnvoyPublishToPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	if err := store.CreateSession("session-1", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET envoy_publish_status = 'rejected' WHERE id = ?`, "session-1"); err != nil {
+		t.Fatalf("mark rejected: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	session, err := reopened.GetSession("session-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.EnvoyPublishStatus != EnvoyPublishPending {
+		t.Fatalf("envoy publish status = %q, want %q", session.EnvoyPublishStatus, EnvoyPublishPending)
 	}
 }
 
@@ -1024,7 +1245,7 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 		t.Fatalf("expected [%s], got %v", sessionID, ids)
 	}
 
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 
@@ -1043,6 +1264,47 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 	if sess.EnvoyPublishStatus != EnvoyPublishPublished {
 		t.Fatalf("expected envoy_publish_status %q, got %q", EnvoyPublishPublished, sess.EnvoyPublishStatus)
 	}
+
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishFailed); err != nil {
+		t.Fatalf("mark envoy publish failed: %v", err)
+	}
+	ids, err = store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("get sessions needing envoy publish after failure: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("failed summary should be swept again, got %v", ids)
+	}
+}
+
+func TestEnvoyPublishStatusIsVersionAware(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "envoy-version"
+	started := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := store.UpdateSummary(sessionID, "Title", "Summary", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("UpdateSummary: %v", err)
+	}
+
+	updated, err := store.UpdateEnvoyPublishStatusAtVersion(sessionID, 2, EnvoyPublishPublished)
+	if err != nil {
+		t.Fatalf("UpdateEnvoyPublishStatusAtVersion stale: %v", err)
+	}
+	if updated {
+		t.Fatal("stale summary version updated the delivery status")
+	}
+	updated, err = store.UpdateEnvoyPublishStatusAtVersion(sessionID, 1, EnvoyPublishFailed)
+	if err != nil {
+		t.Fatalf("UpdateEnvoyPublishStatusAtVersion current: %v", err)
+	}
+	if !updated {
+		t.Fatal("current summary version did not update the delivery status")
+	}
 }
 
 func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
@@ -1059,7 +1321,7 @@ func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
 	if err := store.UpdateSummary(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary completed: %v", err)
 	}
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 

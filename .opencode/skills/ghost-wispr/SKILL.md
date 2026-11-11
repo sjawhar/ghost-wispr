@@ -205,5 +205,5 @@ curl -s "$GHOST_WISPR_HOST/api/sessions/{id}" | jq '{title: .session.title, refi
 - Speaker filter accepts names (`Ben`, case-insensitive) or indices (`0`, `1`)
 - Semantic search returns HTTP 501 if no embedding provider configured — fall back to keyword search
 - Event polling uses cursor-based pagination: pass `next_cursor` from previous response
-- Ghost Wispr publishes `summary_ready` events to Envoy/NATS on topic `notifications.ghost-wispr.summary-ready` when a session summary completes. Subscribe via the meeting-actions skill.
+- Ghost Wispr sends `session_started`, `session_ended` and `summary_ready` events to Envoy's webhook when it is configured. Envoy publishes them under `notifications.ghostwispr.<session>.{session.started,session.ended,summary.ready}`.
 - Auth is disabled by default. If `GHOST_WISPR_AUTH_TOKEN` is set on the server, add `-u "ghost-wispr:$GHOST_WISPR_AUTH_TOKEN"` to requests.

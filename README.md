@@ -94,23 +94,20 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
 | `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
-| `GOOGLE_APPLICATION_CREDENTIALS` | No | — | Path to service account JSON |
+| `google_credentials_file` | No | — | Authoritative Google credential file; when empty, Application Default Credentials are used |
 
+## Consent rule
+
+Record only while the light is on. Anyone may pause it at any time without a reason.
+Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
+
+`ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
 ## Deployment
 
-A systemd service file is included for running on a headless device:
-
-```bash
-# Edit ghost-wispr.service with your paths and user
-sudo cp ghost-wispr.service /etc/systemd/system/
-sudo systemctl enable --now ghost-wispr
-```
-
-A `deploy.sh` script handles cross-compilation and deployment to a Raspberry Pi:
-
-```bash
-PI_HOST=pi@raspberrypi ./deploy.sh
-```
+The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is
+provisioned from `deploy/pi/` and is managed through its user services and nightly updater.
+Follow the [office recorder Pi runbook](docs/pi-setup.md) for the required infrastructure
+outputs, credential bundle, provisioning command, tailnet join, and acceptance checks.
 
 ## API
 
@@ -119,8 +116,8 @@ PI_HOST=pi@raspberrypi ./deploy.sh
 | `GET` | `/api/sessions?date=YYYY-MM-DD` | List sessions for a date (defaults to today) |
 | `GET` | `/api/sessions/{id}` | Get session details with transcript segments |
 | `GET` | `/api/sessions/{id}/audio` | Stream session audio (supports range requests) |
-| `POST` | `/api/pause` | Pause capture: microphone stopped, active session ended, nothing recorded or sent to Deepgram until resume |
-| `POST` | `/api/resume` | Resume capture. Returns at once; audio flows again once the paused session has ended (with its recording, or without it if five attempts to save it failed) and the microphone restarts |
+| `POST` | `/api/pause` | Pause capture. The pause persists through restarts; the active session ends and nothing is recorded or sent to Deepgram until resume. When enabled, the Pi power button toggles the same control. |
+| `POST` | `/api/resume` | Resume a persisted pause. When a configured light is present, it confirms red before returning. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone restarts. |
 | `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `resuming`, `stalled`, `mic_unavailable` or `capturing`; `stalled` when a resume has not brought the microphone back within 30 s, also reported as a warning and by `/healthz/ready`), `kept_raw_recordings` and `kept_raw_bytes` (raw `.pcm` recordings in the audio directory that could not be saved; nothing deletes them, so recover or delete them by hand; a warning once they take more than a tenth of `gc_max_audio_size_mb`, or as soon as there is one when it is 0, no budget; refreshed every minute), `gc_hold` (null, or the last GC pass held back because it could not check that Drive still has the sessions: Drive sync on but not running, or Drive not answering; its reason, since when, and the disk use of the audio directory's filesystem, also reported as a warning), `unverified_sessions` (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive, with a warning while there are any), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |
 

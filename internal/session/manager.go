@@ -33,19 +33,21 @@ type Manager struct {
 	batchTranscriber   transcribe.BatchTranscriber
 	refinementWait     time.Duration
 
-	mu               sync.Mutex
-	currentSessionID string
-	currentStartedAt time.Time
-	manualSession    bool
-	prevTimeout      time.Duration
-	capturePaused    bool          // no session may start while true
-	sessionStarts    int           // session starts under way
-	startsDone       *sync.Cond    // signalled (with mu) when a session start finishes
-	endingSession    bool          // an end of the current session is under way
-	endsDone         *sync.Cond    // signalled (with mu) when an end of the session finishes
-	failedEnd        sessionEnd    // how far an end of the current session that failed got
-	finalizeWaiter   chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
-	lastIDTime       time.Time     // the start second the latest session ID names
+	mu                             sync.Mutex
+	currentSessionID               string
+	currentStartedAt               time.Time
+	manualSession                  bool
+	prevTimeout                    time.Duration
+	capturePaused                  bool          // no session may start while true
+	sessionStarts                  int           // session starts under way
+	startsDone                     *sync.Cond    // signalled (with mu) when a session start finishes
+	endingSession                  bool          // an end of the current session is under way
+	endsDone                       *sync.Cond    // signalled (with mu) when an end of the session finishes
+	failedEnd                      sessionEnd    // how far an end of the current session that failed got
+	finalizeWaiter                 chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
+	lastIDTime                     time.Time     // the start second the latest session ID names
+	lifecyclePublishes             sync.WaitGroup
+	lifecycleStartPublishesStopped bool
 }
 
 // sessionEnd is how far an end of a session got. An end that fails leaves it
@@ -310,8 +312,65 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	if m.hub != nil {
 		m.hub.BroadcastSessionStarted(sessionID)
 	}
+	m.publishSessionStarted(sessionID)
 
 	return sessionID, nil
+}
+
+// StopSessionStartPublishes prevents a shutdown from registering a new
+// session-started send while WaitForLifecyclePublishes is waiting.
+func (m *Manager) StopSessionStartPublishes() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lifecycleStartPublishesStopped = true
+}
+
+func (m *Manager) publishSessionStarted(sessionID string) {
+	m.publishLifecycle(sessionID, "session_started", true, EventPublisher.PublishSessionStarted)
+}
+
+func (m *Manager) publishSessionEnded(sessionID string) {
+	m.publishLifecycle(sessionID, "session_ended", false, EventPublisher.PublishSessionEnded)
+}
+
+func (m *Manager) publishLifecycle(sessionID, eventType string, isStart bool, send func(EventPublisher, context.Context, string) error) {
+	m.mu.Lock()
+	if isStart && m.lifecycleStartPublishesStopped {
+		m.mu.Unlock()
+		return
+	}
+	publisher := m.publisher
+	if publisher == nil {
+		m.mu.Unlock()
+		return
+	}
+	// Shutdown first prevents new start sends, then waits. Register the send
+	// while holding mu so that sequence cannot race with this Add.
+	m.lifecyclePublishes.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.lifecyclePublishes.Done()
+		if err := send(publisher, context.Background(), sessionID); err != nil {
+			m.logger.Error("envoy lifecycle publish failed", "operation", "publish_"+eventType, "session_id", sessionID, "error", err)
+		}
+	}()
+}
+
+// WaitForLifecyclePublishes waits for in-flight session-started and
+// session-ended sends, stopping when ctx is cancelled.
+func (m *Manager) WaitForLifecyclePublishes(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		m.lifecyclePublishes.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
 }
 
 func (m *Manager) endCurrentSession(ctx context.Context) error {
@@ -400,6 +459,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 			if m.hub != nil {
 				m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 			}
+			m.publishSessionEnded(sessionID)
 			if discardErr := m.store.DiscardSession(sessionID); discardErr != nil {
 				m.logger.Warn("failed to discard short session", "operation", "discard_short_session", "session_id", sessionID, "error", discardErr)
 			} else {
@@ -412,6 +472,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	if m.hub != nil {
 		m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 	}
+	m.publishSessionEnded(sessionID)
 
 	m.mu.Lock()
 	batchTranscriber := m.batchTranscriber
@@ -823,6 +884,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	if m.hub != nil {
 		m.hub.BroadcastSessionStarted(sessionID)
 	}
+	m.publishSessionStarted(sessionID)
 
 	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint", titleHint)
 	return sessionID, nil

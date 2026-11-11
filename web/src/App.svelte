@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
+  import ConsentRule from './components/ConsentRule.svelte'
   import Controls from './components/Controls.svelte'
   import SettingsPage from './components/SettingsPage.svelte'
   import LivePanel from './components/LivePanel.svelte'
@@ -199,6 +200,7 @@
       <p class="subtitle">Live capture first, session memory second.</p>
     </div>
     <div class="header-actions">
+      <ConsentRule />
       <Controls
         connected={appState.connected}
         paused={appState.paused}

@@ -634,6 +634,21 @@ func TestCaptureGateControlsDoNotWaitForSettle(t *testing.T) {
 	}
 }
 
+func TestCaptureGateStaysClosedWhenBeforeResumeRepause(t *testing.T) {
+	var capture *captureGate
+	capture = newCaptureGate(nil, nil, func() {
+		capture.mu.Lock()
+		capture.switchOff = true
+		capture.mu.Unlock()
+	})
+	capture.Pause()
+	capture.Resume()
+	expectStaysClosed(t, capture, "resume was rejected")
+	if !capture.IsPaused() {
+		t.Fatal("rejected resume cleared the paused switch")
+	}
+}
+
 // A Pause before the pause settled cancels a pending Resume.
 func TestCaptureGatePauseCancelsPendingResume(t *testing.T) {
 	release := make(chan struct{})
@@ -1518,3 +1533,68 @@ func TestPauseStopsRetryingTheSessionEndAtShutdown(t *testing.T) {
 type prerollFunc func()
 
 func (f prerollFunc) DiscardPreroll() { f() }
+
+// TestGateOpenRefusalDoesNotDeadlockConcurrentResume fails within its timeout
+// if the refusal callback runs while openAfter still holds g.control.
+func TestGateOpenRefusalDoesNotDeadlockConcurrentResume(t *testing.T) {
+	settled := make(chan struct{})
+	capture := newCaptureGate(nil, func() { <-settled }, nil)
+	store := &pauseStoreFake{}
+	var resumeCalls atomic.Int32
+	secondRequest := make(chan struct{})
+	controls := newPersistentControls(store, capture.Pause, func() error {
+		if resumeCalls.Add(1) == 2 {
+			close(secondRequest)
+		}
+		return capture.RequestResume()
+	}, nil)
+	gateCheckEntered := make(chan struct{})
+	releaseGateCheck := make(chan struct{})
+	var gateCheckRan atomic.Bool
+	capture.beforeGateOpen = func() error {
+		if !gateCheckRan.Swap(true) {
+			close(gateCheckEntered)
+			<-releaseGateCheck
+			return errors.New("recording light stayed off")
+		}
+		return nil
+	}
+	refused := make(chan struct{})
+	capture.onResumeRefused = func(error) {
+		defer close(refused)
+		if err := controls.RefuseResume(); err != nil {
+			t.Errorf("persist refusal: %v", err)
+		}
+	}
+	capture.Pause()
+	if err := controls.Resume(); err != nil {
+		t.Fatalf("first resume: %v", err)
+	}
+	close(settled)
+	select {
+	case <-gateCheckEntered:
+	case <-time.After(testWait):
+		t.Fatal("gate-open check did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- controls.Resume() }()
+	select {
+	case <-secondRequest:
+	case <-time.After(testWait):
+		t.Fatal("second resume did not enter RequestResume")
+	}
+	close(releaseGateCheck)
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second resume: %v", err)
+		}
+	case <-time.After(testWait):
+		t.Fatal("second resume deadlocked with gate-open refusal")
+	}
+	select {
+	case <-refused:
+	case <-time.After(testWait):
+		t.Fatal("gate-open refusal callback deadlocked")
+	}
+}
