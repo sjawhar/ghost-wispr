@@ -320,13 +320,48 @@ func (s syncerMock) SyncSession(_ context.Context, sessionID string) error {
 }
 
 type publisherMock struct {
-	called chan string
+	called  chan string
+	started chan string
+	ended   chan string
 }
 
 func (p publisherMock) PublishSummaryReady(_ context.Context, sessionID string) error {
 	if p.called != nil {
 		p.called <- sessionID
 	}
+	return nil
+}
+
+func (p publisherMock) PublishSessionStarted(_ context.Context, sessionID string) error {
+	if p.started != nil {
+		p.started <- sessionID
+	}
+	return nil
+}
+
+func (p publisherMock) PublishSessionEnded(_ context.Context, sessionID string) error {
+	if p.ended != nil {
+		p.ended <- sessionID
+	}
+	return nil
+}
+
+type blockingPublisher struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (p blockingPublisher) PublishSessionStarted(_ context.Context, _ string) error {
+	p.entered <- struct{}{}
+	<-p.release
+	return nil
+}
+
+func (blockingPublisher) PublishSessionEnded(context.Context, string) error {
+	return nil
+}
+
+func (blockingPublisher) PublishSummaryReady(context.Context, string) error {
 	return nil
 }
 
@@ -1113,11 +1148,18 @@ func TestManager_GenerateSummary_TriggersPublisherAfterSummaryCompleted(t *testi
 	}
 }
 
-func TestManager_DiscardedShortSession_DoesNotTriggerPublisher(t *testing.T) {
+// A short session is discarded. Its session_started and session_ended still
+// go to Envoy, as they go to the hub, so a consumer that saw it start sees it
+// end; no summary_ready follows, since nothing is summarized.
+func TestManager_DiscardedShortSession_SendsLifecycleEventsButNoSummary(t *testing.T) {
 	store := newStoreMock()
-	publishCalled := make(chan string, 1)
+	publisher := publisherMock{
+		called:  make(chan string, 1),
+		started: make(chan string, 1),
+		ended:   make(chan string, 1),
+	}
 	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 2)
-	manager.SetEventPublisher(publisherMock{called: publishCalled})
+	manager.SetEventPublisher(publisher)
 
 	startedAt := time.Now().UTC()
 	if err := manager.ensureSessionStarted(startedAt); err != nil {
@@ -1132,9 +1174,19 @@ func TestManager_DiscardedShortSession_DoesNotTriggerPublisher(t *testing.T) {
 		t.Fatalf("endCurrentSession failed: %v", err)
 	}
 
+	for name, events := range map[string]chan string{"session_started": publisher.started, "session_ended": publisher.ended} {
+		select {
+		case got := <-events:
+			if got != sessionID {
+				t.Fatalf("%s session ID = %q, want %q", name, got, sessionID)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected %s event for the discarded session", name)
+		}
+	}
 	select {
-	case got := <-publishCalled:
-		t.Fatalf("expected no publish for discarded session, got %q", got)
+	case got := <-publisher.called:
+		t.Fatalf("expected no summary_ready publish for discarded session, got %q", got)
 	case <-time.After(200 * time.Millisecond):
 	}
 
@@ -1142,6 +1194,108 @@ func TestManager_DiscardedShortSession_DoesNotTriggerPublisher(t *testing.T) {
 	defer store.mu.Unlock()
 	if got := store.status[sessionID]; got != storage.SessionDiscarded {
 		t.Fatalf("expected discarded session status, got %q", got)
+	}
+}
+
+func TestSessionStartAndEndAreSent(t *testing.T) {
+	store := newStoreMock()
+	publisher := publisherMock{
+		started: make(chan string, 1),
+		ended:   make(chan string, 1),
+	}
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(publisher)
+
+	startedAt := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
+	if err := manager.ensureSessionStarted(startedAt); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if sessionID == "" {
+		t.Fatal("expected session ID")
+	}
+
+	select {
+	case got := <-publisher.started:
+		if got != sessionID {
+			t.Fatalf("started event session ID = %q, want %q", got, sessionID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected session_started event")
+	}
+
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	select {
+	case got := <-publisher.ended:
+		if got != sessionID {
+			t.Fatalf("ended event session ID = %q, want %q", got, sessionID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected session_ended event")
+	}
+}
+
+func TestManualSessionStartIsSent(t *testing.T) {
+	publisher := publisherMock{started: make(chan string, 1)}
+	manager := NewManager(newStoreMock(), nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(publisher)
+
+	sessionID, err := manager.ManualStartSession(context.Background(), "Manual topic")
+	if err != nil {
+		t.Fatalf("ManualStartSession: %v", err)
+	}
+	select {
+	case got := <-publisher.started:
+		if got != sessionID {
+			t.Fatalf("started event session ID = %q, want %q", got, sessionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected session_started event")
+	}
+}
+
+func TestStopSessionStartPublishesSuppressesNewStartEvents(t *testing.T) {
+	publisher := publisherMock{started: make(chan string, 1)}
+	manager := NewManager(newStoreMock(), nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(publisher)
+	manager.StopSessionStartPublishes()
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	select {
+	case got := <-publisher.started:
+		t.Fatalf("unexpected session_started event for %q after shutdown began", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWaitForLifecyclePublishesHonorsContext(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	manager := NewManager(newStoreMock(), nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(blockingPublisher{entered: entered, release: release})
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected session_started publish")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := manager.WaitForLifecyclePublishes(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForLifecyclePublishes error = %v, want deadline exceeded", err)
+	}
+
+	close(release)
+	if err := manager.WaitForLifecyclePublishes(context.Background()); err != nil {
+		t.Fatalf("WaitForLifecyclePublishes after release: %v", err)
 	}
 }
 
