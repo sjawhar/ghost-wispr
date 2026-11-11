@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for command in curl jq openssl ssh; do
+for command in curl jq ssh; do
   command -v "$command" >/dev/null || fail "missing required command: $command"
 done
 [[ -f "$baseline_file" ]] || fail "missing baseline file: $baseline_file"
@@ -101,6 +101,75 @@ check_sshd_loopback() {
     [[ "$listener" =~ 127\.0\.0\.1:22([[:space:]]|$) ]] \
       || fail "sshd listens outside 127.0.0.1: $listener"
   done <<<"$listeners"
+}
+
+wait_for_light() {
+  local expected=$1 attempts=$2
+  for _ in $(seq 1 "$attempts"); do
+    if [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == "$expected" ]]; then
+      return
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+boot_id() {
+  remote_run 'cat /proc/sys/kernel/random/boot_id'
+}
+
+assert_new_boot() {
+  local before=$1 after
+  after=$(boot_id)
+  [[ "$after" != "$before" ]] || fail "boot ID did not change after the power cycle"
+}
+
+assert_listener_boundary() {
+  local tailscale_ips listeners listener local_address allowed ip
+  tailscale_ips=$(remote_run 'tailscale ip -4; tailscale ip -6') || fail "could not read Tailscale addresses"
+  listeners=$(remote_run 'sudo ss -ltnH; sudo ss -lunH') || fail "could not read listening sockets"
+  [[ -n "$listeners" ]] || unknown "listener inventory is empty"
+  while IFS= read -r listener; do
+    local_address=$(awk '{print $4}' <<<"$listener")
+    [[ -n "$local_address" ]] || unknown "listener address is missing"
+    allowed=false
+    case "$local_address" in
+      127.0.0.1:*|'[::1]:'*) allowed=true ;;
+    esac
+    while IFS= read -r ip; do
+      [[ -n "$ip" ]] || continue
+      if [[ "$local_address" == "$ip":* || "$local_address" == "$ip"%*:* ]]; then
+        allowed=true
+      fi
+    done <<<"$tailscale_ips"
+    [[ "$allowed" == true ]] || fail "listener is outside loopback and Tailscale: $local_address"
+  done <<<"$listeners"
+}
+
+hmac_signature() {
+  local body=$1 helper="$scratch_dir/ghost-wispr-hmac.go"
+  cat >"$helper" <<'EOF'
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"os"
+)
+
+func main() {
+	secret, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		panic(err)
+	}
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(os.Args[1]))
+	fmt.Printf("%x", mac.Sum(nil))
+}
+EOF
+  printf '%s' "$GHOST_WISPR_ENVOY_WEBHOOK_SECRET" | go run "$helper" "$body"
 }
 
 assert_set_subset() {
@@ -202,74 +271,102 @@ if [[ "$self_test" == true ]]; then
   exit 0
 fi
 
-printf 'A4: check the tagged tailnet identity and automatic service.\n'
+printf 'A4 RAN: check the tagged tailnet identity and automatic service.\n'
 self_status=$(remote_run 'tailscale status --self --json')
 jq -e --arg host "${host}." '
   .Self.Tags == ["tag:ghost-wispr"] and .Self.DNSName == $host
-' >/dev/null <<<"$self_status" || fail "the Pi is not tag:ghost-wispr at the expected hostname"
+' >/dev/null <<<"$self_status" || fail "A4 FAILED: the Pi is not tag:ghost-wispr at the expected hostname"
 remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user is-active --quiet ghost-wispr.service" \
-  || fail "ghost-wispr.service is not active"
+  || fail "A4 FAILED: ghost-wispr.service is not active"
 assert_capturing
-printf '  pass\n'
+a4_boot_before=$(boot_id)
+printf 'A4 NEEDS-PERSON: leave the recorder capturing, pull power, reconnect it, then press Enter. '
+read -r _
+wait_for_recorder
+assert_new_boot "$a4_boot_before"
+assert_capturing
+printf 'A4 RAN: a new boot ID came back capturing.\n'
+printf 'Light power-cycle NEEDS-PERSON: confirm the light stayed dark until Ghost Wispr began capturing.\n'
 
-printf 'A1: check the red light and pause button.\n'
-[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == red ]] || fail "light is not red while capturing"
+printf 'A1 RAN: check the red light, Deepgram control, and pause button.\n'
+[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == red ]] || fail "A1 FAILED: light is not red while capturing"
 recording_bytes_before=$(deepgram_bytes_sent)
 readonly deepgram_control_seconds=5
 sleep "$deepgram_control_seconds"
 recording_bytes_after=$(deepgram_bytes_sent)
 assert_minimum_growth "$recording_bytes_before" "$recording_bytes_after" "$deepgram_control_seconds" \
-  || fail "Deepgram recording control grew by less than 32 kB/s"
+  || fail "A1 FAILED: Deepgram recording control grew by less than 32 kB/s"
 audio_before=$(remote_run 'du -sb /opt/ghost-wispr/data/audio 2>/dev/null | cut -f1 || printf 0')
-printf 'Tap the Pi power button once to pause, then press Enter. '
+printf 'A1 NEEDS-PERSON: tap the Pi power button once to pause, then press Enter. '
 read -r _
 assert_paused
-[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == off ]] || fail "light stays on after pause"
+[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == off ]] || fail "A1 FAILED: light stays on after pause"
 paused_bytes_before=$(deepgram_bytes_sent)
 sleep 60
 paused_bytes_after=$(deepgram_bytes_sent)
 readonly deepgram_paused_max_bytes=4096
 assert_maximum_growth "$paused_bytes_before" "$paused_bytes_after" "$deepgram_paused_max_bytes" \
-  || fail "Deepgram bytes_sent grew by more than ${deepgram_paused_max_bytes} bytes while paused"
+  || fail "A1 FAILED: Deepgram bytes_sent grew by more than ${deepgram_paused_max_bytes} bytes while paused"
 audio_after=$(remote_run 'du -sb /opt/ghost-wispr/data/audio 2>/dev/null | cut -f1 || printf 0')
-[[ "$audio_before" == "$audio_after" ]] || fail "audio grew while paused ($audio_before to $audio_after bytes)"
-printf 'Tap the Pi power button once to resume, then press Enter. '
+[[ "$audio_before" == "$audio_after" ]] || fail "A1 FAILED: audio grew while paused ($audio_before to $audio_after bytes)"
+printf 'A1 NEEDS-PERSON: tap the Pi power button once to resume, then press Enter. '
 read -r _
 assert_capturing
-[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == red ]] || fail "light is not red after resume"
-printf '  pass\n'
+[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == red ]] || fail "A1 FAILED: light is not red after resume"
+printf 'A1 RAN: pause stopped audio and Deepgram growth, then resume restored capture.\n'
 
-printf 'A3: pause persists through a power cycle.\n'
-printf 'Tap once to pause, pull power, reconnect it, then press Enter. '
+printf 'Light hang RAN: stop the recorder process and require darkness within 3 seconds.\n'
+main_pid=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user show --property=MainPID --value ghost-wispr.service")
+[[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "Light hang FAILED: no Ghost Wispr main PID"
+remote_run "kill -STOP $main_pid"
+if ! wait_for_light off 6; then
+  remote_run "kill -CONT $main_pid"
+  fail "Light hang FAILED: light did not turn off within 3 seconds"
+fi
+remote_run "kill -CONT $main_pid"
+wait_for_light red 4 || fail "Light hang FAILED: light did not turn red after continue"
+printf 'Light hang RAN: dark within 3 seconds and red after continue.\n'
+
+printf 'Light correction RAN: force the light off and require correction while capturing.\n'
+remote_run '/opt/ghost-wispr/ghost-wispr light-off'
+wait_for_light red 4 || fail "Light correction FAILED: recorder did not restore red within 2 seconds"
+printf 'Light correction RAN: recorder restored red within 2 seconds.\n'
+
+printf 'A3 RAN: pause persists through a power cycle.\n'
+a3_boot_before=$(boot_id)
+printf 'A3 NEEDS-PERSON: tap once to pause, pull power, reconnect it, then press Enter. '
 read -r _
 wait_for_recorder
+assert_new_boot "$a3_boot_before"
 assert_paused
-[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == off ]] || fail "light is not off after paused reboot"
-printf 'Tap once to resume, then press Enter. '
+[[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == off ]] || fail "A3 FAILED: light is not off after paused reboot"
+printf 'A3 NEEDS-PERSON: tap once to resume, then press Enter. '
 read -r _
 assert_capturing
-printf '  pass\n'
+printf 'A3 RAN: a new boot ID retained pause and resumed only after a tap.\n'
 
-printf 'A5: confirm the service only listens on loopback and Tailscale serves HTTPS.\n'
-remote_run 'sudo ss -ltnpH' | tee "$scratch_dir/listeners.txt"
-app_listeners=$(awk '$4 ~ /:8080$/ && /users:\(\("ghost-wispr"/ { print $4 }' "$scratch_dir/listeners.txt")
-[[ -n "$app_listeners" ]] || fail "Ghost Wispr has no observable listener on port 8080"
+printf 'A5 RAN: confirm the service only listens on loopback or Tailscale.\n'
+remote_run 'sudo ss -ltnpH' >"$scratch_dir/tcp-listeners-with-process.txt"
+app_listeners=$(awk '$4 ~ /:8080$/ && /users:\(\("ghost-wispr"/ { print $4 }' "$scratch_dir/tcp-listeners-with-process.txt")
+[[ -n "$app_listeners" ]] || fail "A5 FAILED: Ghost Wispr has no observable listener on port 8080"
 while IFS= read -r app_listener; do
   [[ "$app_listener" == 127.0.0.1:8080 ]] \
-    || fail "Ghost Wispr listens on a non-loopback address: $app_listener"
+    || fail "A5 FAILED: Ghost Wispr listens on a non-loopback address: $app_listener"
 done <<<"$app_listeners"
+assert_listener_boundary
 status >/dev/null
 check_sshd_loopback
-printf '  pass from this tailnet member. Test a phone on mobile data and a tag:envoy-host separately: both must fail to connect.\n'
+printf 'A5 RAN: local listener boundary passed. A5 NEEDS-PERSON: test a phone off-tailnet and tag:envoy-host; both must fail.\n'
 
 if [[ -n "$relay_url" ]]; then
-  printf 'Envoy: check a signed probe and an unsigned Pi request.\n'
-  [[ "$relay_url" =~ ^https://[A-Za-z0-9.-]+/webhook/ghostwispr$ ]] || fail "invalid relay URL"
+  printf 'Envoy RAN: check a signed probe and an unsigned Pi request.\n'
+  [[ "$relay_url" =~ ^https://[A-Za-z0-9.-]+/webhook/ghostwispr$ ]] || fail "Envoy FAILED: invalid relay URL"
   if [[ -n ${GHOST_WISPR_ENVOY_WEBHOOK_SECRET:-} ]]; then
+    command -v go >/dev/null || fail "Envoy FAILED: Go is required to sign the probe without exposing its secret"
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     delivery="acceptance-probe.session_ended.$(date +%s)"
     body="{\"event_type\":\"session_ended\",\"created_at\":\"$now\",\"payload\":{\"session_id\":\"acceptance-probe\",\"type\":\"session_ended\",\"title\":\"Acceptance probe\",\"summary\":\"\",\"duration\":0}}"
-    signature=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$GHOST_WISPR_ENVOY_WEBHOOK_SECRET" -hex | cut -d' ' -f2)
+    signature=$(hmac_signature "$body")
     signed_code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
       --request POST "$relay_url" \
       --header 'Content-Type: application/json' \
@@ -277,24 +374,24 @@ if [[ -n "$relay_url" ]]; then
       --header "X-GhostWispr-Delivery: $delivery" \
       --header "X-GhostWispr-Signature: sha256=$signature" \
       --data "$body")
-    [[ "$signed_code" =~ ^2 ]] || fail "signed Envoy probe returned HTTP $signed_code"
-    printf '  signed probe accepted; verify its notification with nats sub '\''notifications.ghostwispr.>'\''.\n'
+    [[ "$signed_code" =~ ^2 ]] || fail "Envoy FAILED: signed probe returned HTTP $signed_code"
+    printf 'Envoy RAN: signed probe accepted; verify its notification with nats sub '\''notifications.ghostwispr.>'\''.\n'
   else
-    printf '  skipped signed probe: set GHOST_WISPR_ENVOY_WEBHOOK_SECRET through secrets to run it.\n'
+    printf 'Envoy NEEDS-PERSON: set GHOST_WISPR_ENVOY_WEBHOOK_SECRET through secrets to run the signed probe.\n'
   fi
   unsigned_code=$(remote_run "curl --silent --output /dev/null --write-out '%{http_code}' --request POST '$relay_url' --header 'X-GhostWispr-Delivery: unsigned-probe' --header 'X-GhostWispr-Event: session.ended' --data '{}'")
-  [[ "$unsigned_code" == 401 ]] || fail "unsigned Pi request returned HTTP $unsigned_code, expected 401"
-  printf '  pass\n'
+  [[ "$unsigned_code" == 401 ]] || fail "Envoy FAILED: unsigned Pi request returned HTTP $unsigned_code, expected 401"
+  printf 'Envoy RAN: unsigned Pi request was refused.\n'
 else
-  printf 'Envoy: skipped; rerun with --relay-url from envoy-cluster Pulumi output.\n'
+  printf 'Envoy NEEDS-PERSON: rerun with --relay-url from envoy-cluster Pulumi output.\n'
 fi
 
-printf 'A2: open %s and choose Recording rules. The four rules must appear verbatim.\n' "$unit_url"
-printf 'A7: compare the Pi inventory with deploy/pi/baseline.txt.\n'
+printf 'A2 NEEDS-PERSON: open %s and choose Recording rules; the four rules must appear verbatim.\n' "$unit_url"
+printf 'A7 RAN: compare the Pi inventory with deploy/pi/baseline.txt.\n'
 readonly expected_package_roots=(libportaudio2 ffmpeg lame jq)
 {
   printf '%s\n' "${expected_package_roots[@]}"
-  remote_run 'apt-cache depends --recurse --no-suggests --no-conflicts --no-breaks --no-replaces libportaudio2 ffmpeg lame jq'
+  remote_run 'apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces libportaudio2 ffmpeg lame jq'
 } | dependency_packages_from_apt_cache >"$scratch_dir/allowed-packages.txt"
 remote_run "dpkg-query -W -f='\${Package}\\n' | LC_ALL=C sort -u" >"$scratch_dir/current-packages.txt"
 awk '/^---$/{exit} NF {print}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-packages.txt"
@@ -303,13 +400,13 @@ awk '/^---$/{exit} NF {print}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_di
   cat "$scratch_dir/allowed-packages.txt"
 } | LC_ALL=C sort -u >"$scratch_dir/permitted-packages.txt"
 assert_set_subset package "$scratch_dir/baseline-packages.txt" "$scratch_dir/current-packages.txt" "$scratch_dir/permitted-packages.txt" \
-  || fail "unexpected installed package"
+  || fail "A7 FAILED: unexpected installed package"
 
 readonly expected_service_additions=(ghost-wispr.service ghost-wispr-update.service)
 system_services=$(remote_run "systemctl list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'") \
-  || fail "could not read running system services"
+  || fail "A7 FAILED: could not read running system services"
 user_services=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'") \
-  || fail "could not read running user services"
+  || fail "A7 FAILED: could not read running user services"
 [[ -n "$system_services" ]] || unknown "system service inventory is empty"
 [[ -n "$user_services" ]] || unknown "user service inventory is empty"
 printf '%s\n%s\n' "$system_services" "$user_services" | LC_ALL=C sort -u >"$scratch_dir/current-services.txt"
@@ -319,8 +416,8 @@ awk 'seen && NF {print} /^---$/ {seen=1}' "$baseline_file" | LC_ALL=C sort -u >"
   printf '%s\n' "${expected_service_additions[@]}"
 } | LC_ALL=C sort -u >"$scratch_dir/permitted-services.txt"
 assert_set_subset service "$scratch_dir/baseline-services.txt" "$scratch_dir/current-services.txt" "$scratch_dir/permitted-services.txt" \
-  || fail "unexpected running service"
+  || fail "A7 FAILED: unexpected running service"
 timer_state=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user is-enabled ghost-wispr-update.timer" || true)
-[[ "$timer_state" == enabled ]] || fail "ghost-wispr-update.timer is not enabled"
-printf '  pass\n'
-printf 'slice 1 acceptance checks completed.\n'
+[[ "$timer_state" == enabled ]] || fail "A7 FAILED: ghost-wispr-update.timer is not enabled"
+printf 'A7 RAN: package and service inventories match the allowed sets.\n'
+printf 'Slice 1 driver RAN automated rows; record every NEEDS-PERSON observation before acceptance.\n'

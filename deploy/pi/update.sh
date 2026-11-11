@@ -2,12 +2,12 @@
 # Install the newest verified Ghost Wispr release unless a session is active.
 set -euo pipefail
 
-readonly DEPLOY_DIR=/opt/ghost-wispr
+readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly BINARY="$DEPLOY_DIR/ghost-wispr"
 readonly PREVIOUS_BINARY="$DEPLOY_DIR/ghost-wispr.prev"
-readonly RELEASE_API=https://api.github.com/repos/sjawhar/ghost-wispr/releases/latest
-readonly STATUS_URL=http://127.0.0.1:8080/api/status
-readonly VERSION_URL=http://127.0.0.1:8080/api/version
+readonly RELEASE_API="${GHOST_WISPR_RELEASE_API:-https://api.github.com/repos/sjawhar/ghost-wispr/releases/latest}"
+readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}"
+readonly VERSION_URL="${GHOST_WISPR_VERSION_URL:-http://127.0.0.1:8080/api/version}"
 
 fail() {
   printf 'ghost-wispr update: %s\n' "$*" >&2
@@ -16,26 +16,19 @@ fail() {
 
 rollback() {
   [[ -f "$PREVIOUS_BINARY" ]] || fail "no previous binary is available for rollback"
-  mv "$PREVIOUS_BINARY" "$BINARY"
+  cp --preserve=mode "$PREVIOUS_BINARY" "$BINARY"
   if ! systemctl --user restart ghost-wispr.service; then
     fail "restored the previous binary but could not restart ghost-wispr.service"
   fi
 }
 
-status_json=$(curl --fail --silent --show-error "$STATUS_URL" 2>/dev/null || true)
-if [[ -n "$status_json" ]]; then
-  if ! jq -e . >/dev/null <<<"$status_json"; then
-    fail "the running service returned invalid status JSON"
-  fi
-  if jq -e '.active_session_id != null and .active_session_id != ""' >/dev/null <<<"$status_json"; then
-    printf 'ghost-wispr update: active session; leaving the current binary in place\n'
-    exit 0
-  fi
-elif [[ -x "$BINARY" ]]; then
-  fail "cannot reach the running service to confirm that no session is active"
+status_json=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$STATUS_URL" 2>/dev/null || true)
+if [[ -n "$status_json" ]] && jq -e '.active_session_id != null and .active_session_id != ""' >/dev/null <<<"$status_json"; then
+  printf 'ghost-wispr update: active session; leaving the current binary in place\n'
+  exit 0
 fi
 
-release_json=$(curl --fail --silent --show-error "$RELEASE_API")
+release_json=$(curl --connect-timeout 5 --max-time 30 --fail --silent --show-error "$RELEASE_API")
 release_commit=$(jq -r '.target_commitish // empty' <<<"$release_json")
 [[ "$release_commit" =~ ^[0-9a-f]{40}$ ]] || fail "latest release has no immutable target commit"
 binary_url=$(jq -r '.assets[] | select(.name == "ghost-wispr-linux-arm64") | .browser_download_url' <<<"$release_json")
@@ -43,10 +36,17 @@ checksum_url=$(jq -r '.assets[] | select(.name == "ghost-wispr-linux-arm64.sha25
 [[ -n "$binary_url" && "$binary_url" != null ]] || fail "latest release has no arm64 binary"
 [[ -n "$checksum_url" && "$checksum_url" != null ]] || fail "latest release has no arm64 checksum"
 
+current_commit=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$VERSION_URL" 2>/dev/null \
+  | jq -r '.commit // empty' 2>/dev/null || true)
+if [[ "$current_commit" == "$release_commit" ]]; then
+  printf 'ghost-wispr update: already on commit %s\n' "$current_commit"
+  exit 0
+fi
+
 staging_dir=$(mktemp -d -p "$DEPLOY_DIR" .ghost-wispr-update.XXXXXX)
 trap 'rm -rf -- "$staging_dir"' EXIT
-curl --fail --silent --show-error --location "$binary_url" --output "$staging_dir/ghost-wispr-linux-arm64"
-curl --fail --silent --show-error --location "$checksum_url" --output "$staging_dir/ghost-wispr-linux-arm64.sha256"
+curl --connect-timeout 5 --max-time 60 --fail --silent --show-error --location "$binary_url" --output "$staging_dir/ghost-wispr-linux-arm64"
+curl --connect-timeout 5 --max-time 60 --fail --silent --show-error --location "$checksum_url" --output "$staging_dir/ghost-wispr-linux-arm64.sha256"
 (
   cd "$staging_dir"
   sha256sum --check --status ghost-wispr-linux-arm64.sha256
@@ -66,7 +66,7 @@ fi
 installed_commit=
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
-  version_json=$(curl --fail --silent --show-error "$VERSION_URL" 2>/dev/null || true)
+  version_json=$(curl --connect-timeout 5 --max-time 10 --fail --silent --show-error "$VERSION_URL" 2>/dev/null || true)
   if [[ -n "$version_json" ]]; then
     installed_commit=$(jq -r '.commit // empty' <<<"$version_json" 2>/dev/null || true)
     if [[ "$installed_commit" == "$release_commit" ]]; then

@@ -130,8 +130,9 @@ Create a mode-0700 directory on the operator machine. It exists only long enough
 tar stream.
 
 ```bash
-bundle_dir=$(mktemp -d)
-chmod 700 "$bundle_dir"
+bundle_root="$HOME/.local/share/ghost-wispr-provision"
+mkdir -p -m 700 "$bundle_root"
+bundle_dir=$(mktemp -d "$bundle_root/bundle.XXXXXX")
 trap 'rm -rf -- "$bundle_dir"' EXIT
 ```
 
@@ -150,6 +151,8 @@ Put these files in it:
 ```bash
 (cd ~/src/agent-infra/bootstrap && pulumi stack output --stack prod ghostWisprCertificates --json | jq -r '."ghost-wispr"') >"$bundle_dir/device.crt"
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$bundle_dir/"
+(cd ~/src/agent-infra/root && pulumi stack output tailscaleIds --stack prod --json | jq -r '."ghost-wispr-x509"') >"$bundle_dir/tailscale-client-id"
+(cd ~/src/agent-infra/envoy-cluster && printf '%s/webhook/ghostwispr' "$(pulumi stack output relayUrl --stack prod)") >"$bundle_dir/envoy-webhook-url"
 gcloud secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra >"$bundle_dir/envoy-webhook-secret"
 gcloud iam service-accounts describe ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com --format='value(uniqueId)' >"$bundle_dir/tailscale-subject"
 rm -rf -- "$d"
@@ -175,7 +178,7 @@ removed after provisioning, so the card keeps no source checkout.
 
 ```bash
 remote_dir=$(ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
-  'umask 077; mktemp -d -p /run/user/$(id -u) ghost-wispr-bootstrap.XXXXXX')
+  'umask 077; mkdir -p ~/.local/share/ghost-wispr-provision; chmod 700 ~/.local/share/ghost-wispr-provision; mktemp -d ~/.local/share/ghost-wispr-provision/sources.XXXXXX')
 tar -C . -cf - deploy/pi wait-for-network.sh \
   | ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "tar -xf - -C '$remote_dir'"
 tar -C "$bundle_dir" -cf - \

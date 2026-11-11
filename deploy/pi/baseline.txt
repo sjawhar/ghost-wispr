@@ -643,6 +643,7 @@ bluetooth.service
 cron.service
 dbus.service
 getty@tty1.service
+mpris-proxy.service
 polkit.service
 serial-getty@ttyAMA10.service
 ssh.service

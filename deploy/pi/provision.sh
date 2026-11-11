@@ -84,7 +84,7 @@ readonly webhook_secret
 [[ "$tailscale_subject" =~ ^[0-9]+$ ]] || fail "tailscale-subject must be the service account unique ID"
 
 sudo apt-get update
-sudo apt-get install -y libportaudio2 ffmpeg lame jq curl
+sudo apt-get install -y --no-install-recommends libportaudio2 ffmpeg lame jq curl
 if ! certificate_config_location=$(jq -r '.credential_source.certificate.certificate_config_location // empty' "$staging_dir/google-credentials.json"); then
   fail "google-credentials.json is not valid JSON"
 fi
