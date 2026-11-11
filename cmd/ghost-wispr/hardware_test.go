@@ -738,10 +738,13 @@ func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	capture.Resume()
-	waitForHardware(t, "resume to confirm red and release exactly one hold", func() bool {
-		colour, _ := device.snapshot()
-		return colour == [3]uint8{255, 0, 0} && hardware.redHolds.Load() <= 1
+	waitForHardware(t, "gate to open after resume", func() bool {
+		return !capture.isClosed()
 	})
+	colour, _ := device.snapshot()
+	if colour != [3]uint8{255, 0, 0} {
+		t.Fatalf("light after resume = %v, want red", colour)
+	}
 	if got := hardware.redHolds.Load(); got != 1 {
 		t.Fatalf("red holds after resume = %d, want 1", got)
 	}
