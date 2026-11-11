@@ -9,6 +9,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // TestEveryDriveCallSetsSupportsAllDrives keeps every Drive API request that
@@ -39,25 +42,77 @@ func TestUploadIntoASharedDriveRoot(t *testing.T) {
 	}
 }
 
+func TestRestoreFromDriveListsSharedDriveFolders(t *testing.T) {
+	wire, syncer := newWireDrive(t)
+	const sharedDriveID = "shared-drive-root"
+	wire.rootID = sharedDriveID
+	syncer.folderID = sharedDriveID
+
+	started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	folderID := wire.add(sharedDriveID, "2026-11-10-standup", "application/vnd.google-apps.folder", nil, nil)
+	transcript := RenderTranscriptMarkdown(&SyncSession{ID: "20261110090000", StartedAt: started}, []transcribe.Segment{{
+		Speaker:   0,
+		Text:      "shared drive listing",
+		Timestamp: started,
+	}})
+	wire.add(folderID, "transcript.md", "application/vnd.google-apps.document", []byte(transcript), nil)
+
+	result, err := syncer.RestoreFromDrive(context.Background(), func(RestoredSession) error { return nil })
+	if err != nil {
+		t.Fatalf("restore from shared drive: %v", err)
+	}
+	if result.Restored != 1 || len(result.Errors) != 0 {
+		t.Fatalf("restore result: %+v, want one restored session and no errors", result)
+	}
+}
+
 const sharedDriveParameterProbe = `package gdrive
 
+import "google.golang.org/api/drive/v3"
+
 func (s *Syncer) probeGetWithoutSupportsAllDrives(id string) error {
-	_, err := s.service.Files.Get(id).Do() // want
+	_, err := s.service.Files.Get(id).Do() // want SupportsAllDrives
 	return err
 }
 
 func (s *Syncer) probeGetWithSupportsAllDrivesFalse(id string) error {
-	_, err := s.service.Files.Get(id).SupportsAllDrives(false).Do() // want
+	_, err := s.service.Files.Get(id).SupportsAllDrives(false).Do() // want SupportsAllDrives
 	return err
 }
 
 func (s *Syncer) probeListWithoutIncludeItemsFromAllDrives() error {
-	_, err := s.service.Files.List().SupportsAllDrives(true).Do() // want
+	_, err := s.service.Files.List().SupportsAllDrives(true).Do() // want IncludeItemsFromAllDrives
 	return err
 }
 
 func (s *Syncer) probeListWithIncludeItemsFromAllDrivesFalse() error {
-	_, err := s.service.Files.List().SupportsAllDrives(true).IncludeItemsFromAllDrives(false).Do() // want
+	_, err := s.service.Files.List().SupportsAllDrives(true).IncludeItemsFromAllDrives(false).Do() // want IncludeItemsFromAllDrives
+	return err
+}
+
+func (s *Syncer) probeGetThroughAMethodValue(id string) error {
+	get := s.service.Files.Get
+	_, err := get(id).Do() // want SupportsAllDrives
+	return err
+}
+
+type sharedDriveProbeGetter interface {
+	Get(fileID string) *drive.FilesGetCall
+}
+
+func (s *Syncer) probeGetThroughAnInterface(id string) error {
+	var getter sharedDriveProbeGetter = s.service.Files
+	_, err := getter.Get(id).Do() // want SupportsAllDrives
+	return err
+}
+
+func (s *Syncer) probeChangesListWithoutSharedDriveParameters() error {
+	_, err := s.service.Changes.List("token").Do() // want SupportsAllDrives IncludeItemsFromAllDrives
+	return err
+}
+
+func (s *Syncer) probePermissionsCreateWithoutSupportsAllDrives(id string) error {
+	_, err := s.service.Permissions.Create(id, &drive.Permission{Type: "user", Role: "reader"}).Do() // want SupportsAllDrives
 	return err
 }
 
@@ -75,69 +130,91 @@ func (s *Syncer) probeExport(id string) error {
 }
 `
 
+const sharedDriveParameterStorageProbe = `package storage
+
+import "google.golang.org/api/drive/v3"
+
+func probeDriveCallOutsideGDrive(s *drive.Service, id string) error {
+	_, err := s.Files.Get(id).Do() // want SupportsAllDrives
+	return err
+}
+`
+
 // TestTheSharedDriveParameterCheckFindsEveryForm is a planted-probe control:
-// it proves that the static guard reports each missing or false shared-drive
-// parameter while leaving a valid list and Files.Export (which has no
-// SupportsAllDrives option) alone.
+// it proves that the static guard finds omitted and false shared-drive
+// parameters on every Drive call-chain form while leaving valid calls and
+// Files.Export (which has no SupportsAllDrives option) alone.
 func TestTheSharedDriveParameterCheckFindsEveryForm(t *testing.T) {
 	root := moduleRoot(t)
-	path := filepath.Join(root, "internal", "gdrive", "zz_shared_drive_probe.go")
-	want := map[string]bool{}
-	for i, line := range strings.Split(sharedDriveParameterProbe, "\n") {
-		if strings.HasSuffix(line, "// want") {
-			want[fmt.Sprintf("%s:%d", path, i+1)] = true
+	probes := map[string]string{
+		filepath.Join(root, "internal", "gdrive", "zz_shared_drive_probe.go"):  sharedDriveParameterProbe,
+		filepath.Join(root, "internal", "storage", "zz_shared_drive_probe.go"): sharedDriveParameterStorageProbe,
+	}
+	overlay := map[string][]byte{}
+	want := map[string]bool{} // "path:line:parameter"
+	for path, source := range probes {
+		overlay[path] = []byte(source)
+		for i, line := range strings.Split(source, "\n") {
+			_, parameters, ok := strings.Cut(line, "// want ")
+			if !ok {
+				continue
+			}
+			for _, parameter := range strings.Fields(parameters) {
+				want[fmt.Sprintf("%s:%d:%s", path, i+1, parameter)] = true
+			}
 		}
 	}
 
 	found := map[string]bool{}
-	for _, finding := range driveSharedParameterFailures(t, root, map[string][]byte{path: []byte(sharedDriveParameterProbe)}) {
-		at, _, ok := strings.Cut(finding, ": ")
+	for _, finding := range driveSharedParameterFailures(t, root, overlay) {
+		key, _, ok := strings.Cut(finding, ": missing ")
 		if !ok {
-			t.Errorf("finding has no location: %q", finding)
+			t.Errorf("finding has no path:line:parameter: %q", finding)
 			continue
 		}
-		if !want[at] {
+		if !want[key] {
 			t.Errorf("reported valid code: %s", finding)
 			continue
 		}
-		found[at] = true
+		found[key] = true
 	}
-	for at := range want {
-		if !found[at] {
-			t.Errorf("missed probe line %s", probeLine(map[string]string{path: sharedDriveParameterProbe}, at))
+	for key := range want {
+		if !found[key] {
+			t.Errorf("missed probe %s", key)
 		}
 	}
 }
 
 func driveSharedParameterFailures(t *testing.T, root string, overlay map[string][]byte) []string {
 	t.Helper()
-	fset, files, uses := typeCheckGDrive(t, root, overlay)
+	fset, files, info := typeCheckModule(t, root, overlay)
 	parents := astParents(files)
 	var findings []string
+	driveCalls := 0
 	for _, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
-			method, ok := driveFilesServiceCall(call, uses)
-			if !ok {
+			callType, ok := driveCallType(info.Types[call].Type)
+			if !ok || continuesDriveCall(call, callType, info.Uses) {
 				return true
 			}
 
-			required := []string{"SupportsAllDrives"}
-			if method == "List" {
-				required = append(required, "IncludeItemsFromAllDrives")
-			}
-			for _, parameter := range required {
+			driveCalls++
+			for _, parameter := range sharedDriveParameters(callType) {
 				if sharedDriveParameterIsTrue(call, parents, parameter) {
 					continue
 				}
 				pos := fset.Position(call.Pos())
-				findings = append(findings, fmt.Sprintf("%s:%d: Files.%s call is missing %s(true)", pos.Filename, pos.Line, method, parameter))
+				findings = append(findings, fmt.Sprintf("%s:%d:%s: missing %s(true)", pos.Filename, pos.Line, parameter, parameter))
 			}
 			return true
 		})
+	}
+	if driveCalls == 0 {
+		t.Fatalf("no code under %s makes a Drive call with SupportsAllDrives: the check sees none of it", root)
 	}
 	sort.Strings(findings)
 	return findings
@@ -162,28 +239,36 @@ func astParents(files []*ast.File) map[ast.Node]ast.Node {
 	return parents
 }
 
-func driveFilesServiceCall(call *ast.CallExpr, uses map[*ast.Ident]types.Object) (string, bool) {
+func driveCallType(typ types.Type) (types.Type, bool) {
+	if typ == nil || !hasMethod(typ, "SupportsAllDrives") {
+		return nil, false
+	}
+	named := namedType(typ)
+	if named == nil || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() != drivePackage {
+		return nil, false
+	}
+	return typ, true
+}
+
+func continuesDriveCall(call *ast.CallExpr, callType types.Type, uses map[*ast.Ident]types.Object) bool {
 	selector, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
 	if !ok {
-		return "", false
+		return false
 	}
 	method, ok := uses[selector.Sel].(*types.Func)
-	if !ok || method.Pkg() == nil || method.Pkg().Path() != drivePackage {
-		return "", false
+	if !ok {
+		return false
 	}
-	signature := method.Signature()
-	recv := signature.Recv()
-	if recv == nil {
-		return "", false
+	recv := method.Signature().Recv()
+	return recv != nil && types.Identical(recv.Type(), callType)
+}
+
+func sharedDriveParameters(callType types.Type) []string {
+	parameters := []string{"SupportsAllDrives"}
+	if hasMethod(callType, "IncludeItemsFromAllDrives") {
+		parameters = append(parameters, "IncludeItemsFromAllDrives")
 	}
-	receiver := namedType(recv.Type())
-	if receiver == nil || receiver.Obj().Name() != "FilesService" {
-		return "", false
-	}
-	if signature.Results().Len() == 0 || !hasMethod(signature.Results().At(0).Type(), "SupportsAllDrives") {
-		return "", false
-	}
-	return method.Name(), true
+	return parameters
 }
 
 func namedType(typ types.Type) *types.Named {

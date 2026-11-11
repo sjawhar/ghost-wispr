@@ -216,32 +216,15 @@ func listPackages(root, pattern string) ([]goPackage, map[string]string, error) 
 
 // typeCheckModule type-checks each package of the module at root, its code
 // outside tests with overlay's files (path to content) added, and returns its
-// files and the objects each identifier there uses. Imports are read from the
-// export data go list builds, with the standard library's importer, which
-// reads the format of the toolchain running the test.
-func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*token.FileSet, []*ast.File, map[*ast.Ident]types.Object) {
+// files and type information. Imports are read from the export data go list
+// builds, with the standard library's importer, which reads the format of the
+// toolchain running the test.
+func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*token.FileSet, []*ast.File, *types.Info) {
 	t.Helper()
 	modulePackages, exports, err := listModule(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return typeCheckPackages(t, root, modulePackages, exports, overlay, 20)
-}
-
-// typeCheckGDrive type-checks production code in internal/gdrive. Unlike the
-// whole-module deletion guard, this scoped guard does not need CGO-only
-// packages such as the recorder's PortAudio dependency.
-func typeCheckGDrive(t *testing.T, root string, overlay map[string][]byte) (*token.FileSet, []*ast.File, map[*ast.Ident]types.Object) {
-	t.Helper()
-	packages, exports, err := listPackages(root, "./internal/gdrive")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return typeCheckPackages(t, root, packages, exports, overlay, 1)
-}
-
-func typeCheckPackages(t *testing.T, root string, modulePackages []goPackage, exports map[string]string, overlay map[string][]byte, minimumFiles int) (*token.FileSet, []*ast.File, map[*ast.Ident]types.Object) {
-	t.Helper()
 	fset := token.NewFileSet()
 	imports := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
 		if exports[path] == "" {
@@ -250,7 +233,10 @@ func typeCheckPackages(t *testing.T, root string, modulePackages []goPackage, ex
 		return os.Open(exports[path])
 	})
 	var all []*ast.File
-	uses := map[*ast.Ident]types.Object{}
+	info := &types.Info{
+		Uses:  map[*ast.Ident]types.Object{},
+		Types: map[ast.Expr]types.TypeAndValue{},
+	}
 	for _, p := range modulePackages {
 		sources := map[string]any{}
 		for _, name := range p.CompiledGoFiles {
@@ -275,16 +261,16 @@ func typeCheckPackages(t *testing.T, root string, modulePackages []goPackage, ex
 		conf := types.Config{Importer: imports, Error: func(err error) {
 			t.Errorf("package %s does not type-check, so the check cannot see it: %v", p.ImportPath, err)
 		}}
-		_, _ = conf.Check(p.ImportPath, fset, files, &types.Info{Uses: uses})
+		_, _ = conf.Check(p.ImportPath, fset, files, info)
 		all = append(all, files...)
 	}
 	if t.Failed() {
 		t.FailNow()
 	}
-	if len(all) < minimumFiles {
+	if len(all) < 20 {
 		t.Fatalf("type-checked %d Go files under %s; the check missed the code", len(all), root)
 	}
-	return fset, all, uses
+	return fset, all, info
 }
 
 // written returns the identifiers in files that a value is written through:
@@ -332,11 +318,11 @@ func written(files []*ast.File) map[*ast.Ident]bool {
 // HTTP, another API version) is not seen.
 func driveDeletions(t *testing.T, root string, overlay map[string][]byte) []string {
 	t.Helper()
-	fset, files, uses := typeCheckModule(t, root, overlay)
+	fset, files, info := typeCheckModule(t, root, overlay)
 	writes := written(files)
 	var found []string
 	driveUses := 0
-	for id, obj := range uses {
+	for id, obj := range info.Uses {
 		if obj.Pkg() == nil || obj.Pkg().Path() != drivePackage {
 			continue
 		}
