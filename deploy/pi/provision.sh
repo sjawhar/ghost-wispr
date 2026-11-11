@@ -104,7 +104,6 @@ sed "s|__ENVOY_WEBHOOK_URL__|$escaped_relay_url|" "$repo_root/deploy/pi/files/gh
   | sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 /dev/stdin "$DEPLOY_DIR/ghost-wispr.yaml"
 {
   printf '%s\n' 'GHOST_WISPR_ADDR=127.0.0.1:8080'
-  printf '%s\n' 'GOOGLE_APPLICATION_CREDENTIALS=/opt/ghost-wispr/google-credentials.json'
   printf '%s\n' 'GOOGLE_API_USE_CLIENT_CERTIFICATE=false'
   printf 'GHOST_WISPR_DEEPGRAM_API_KEY=%s\n' "$deepgram_key"
   printf 'GHOST_WISPR_ENVOY_WEBHOOK_SECRET=%s\n' "$webhook_secret"
@@ -156,9 +155,8 @@ fi
 
 readonly token_audience="api.tailscale.com/$tailscale_client_id"
 id_token=$(env \
-  GOOGLE_APPLICATION_CREDENTIALS="$DEPLOY_DIR/google-credentials.json" \
   GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
-  "$DEPLOY_DIR/ghost-wispr" google-id-token --audience "$token_audience")
+  "$DEPLOY_DIR/ghost-wispr" google-id-token --credentials "$DEPLOY_DIR/google-credentials.json" --audience "$token_audience")
 [[ "$id_token" != *$'\n'* && "$id_token" == *.*.* ]] || fail "google-id-token did not return a JWT"
 jwt_payload=${id_token#*.}
 jwt_payload=${jwt_payload%%.*}

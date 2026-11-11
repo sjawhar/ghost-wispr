@@ -7,6 +7,7 @@ batch_transcription:
   model: nova-3
 speaker_enabled: true
 speaker_device: Jabra
+google_credentials_file: /opt/ghost-wispr/google-credentials.json
 indicator_light: blink1
 power_button: true
 envoy_enabled: true

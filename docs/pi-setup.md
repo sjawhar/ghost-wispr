@@ -101,6 +101,11 @@ mv "$d/google-credentials.json.tmp" "$d/google-credentials.json"
 private key stays at `/home/ghost-wispr/.config/ghost-wispr-identity/key.pem`. Do not set
 `GOOGLE_API_CERTIFICATE_CONFIG`: the certificate is for the Security Token Service exchange,
 not Google API mTLS.
+Ghost Wispr reads this credential through
+`google_credentials_file: /opt/ghost-wispr/google-credentials.json` in its YAML. The tailnet
+join passes the same path with `ghost-wispr google-id-token --credentials`; it does not set
+`GOOGLE_APPLICATION_CREDENTIALS`.
+
 
 ## Renew the X.509 certificate
 
