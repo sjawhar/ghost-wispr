@@ -96,9 +96,9 @@ func TestLightStateSubcommand(t *testing.T) {
 	}
 }
 
-type openMicFake struct{ open bool }
+type openMicFake struct{ open atomic.Bool }
 
-func (m *openMicFake) IsOpen() bool { return m.open }
+func (m *openMicFake) IsOpen() bool { return m.open.Load() }
 
 // TestLightFollowsTheGateAndTheMic fails if the indicator is red while
 // capture is paused or the microphone is not actually capturing.
@@ -108,7 +108,7 @@ func TestLightFollowsTheGateAndTheMic(t *testing.T) {
 	if recordingSignal(capture, mic) {
 		t.Fatal("closed microphone was reported as recording")
 	}
-	mic.open = true
+	mic.open.Store(true)
 	if !recordingSignal(capture, mic) {
 		t.Fatal("open microphone and open gate were not reported as recording")
 	}
@@ -682,7 +682,8 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 	device := &operationLightFake{}
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
-	mic := &openMicFake{open: true}
+	mic := &openMicFake{}
+	mic.open.Store(true)
 	hardware := &hardwareControl{
 		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
 	}
@@ -712,7 +713,7 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 		colour, _ := device.snapshot()
 		return !hardware.holdsRed() && colour == [3]uint8{255, 0, 0}
 	})
-	mic.open = false
+	mic.open.Store(false)
 	hardware.Wake()
 	waitForHardware(t, "light off after microphone loss", func() bool {
 		colour, _ := device.snapshot()
@@ -853,7 +854,8 @@ func (*redThenOffLight) Close() error                   { return nil }
 func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
 	settled := make(chan struct{})
 	capture := newCaptureGate(nil, func() { <-settled }, nil)
-	mic := &openMicFake{open: true}
+	mic := &openMicFake{}
+	mic.open.Store(true)
 	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
 	if err != nil {
 		t.Fatal(err)
@@ -862,7 +864,15 @@ func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
 	hardware := &hardwareControl{
 		light: &reconnectingLight{light: &redThenOffLight{}, warnings: newWarningsRegistry()},
 	}
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	var (
+		statuses   []bool
+		statusesMu sync.Mutex
+	)
+	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, func(paused bool) {
+		statusesMu.Lock()
+		defer statusesMu.Unlock()
+		statuses = append(statuses, paused)
+	})
 	wireLightConsent(capture, hardware, newWarningsRegistry(), func(error) {
 		if err := controls.RefuseResume(); err != nil {
 			t.Errorf("persist refused resume: %v", err)
@@ -879,5 +889,10 @@ func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
 	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
 	if err != nil || !ok || value != "1" {
 		t.Fatalf("persisted pause after gate-open refusal = (%q, %t, %v), want (1, true, nil)", value, ok, err)
+	}
+	statusesMu.Lock()
+	defer statusesMu.Unlock()
+	if got, want := statuses, []bool{false, true}; !slices.Equal(got, want) {
+		t.Fatalf("status broadcasts = %v, want %v", got, want)
 	}
 }
