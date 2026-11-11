@@ -92,5 +92,69 @@ func TestReview3ReadySessionWithOpenSpliceUploadsNothing(t *testing.T) {
 			}
 			_ = os.Remove(recording)
 		})
+	}
 }
+
+type spliceHookStore struct {
+	*storage.SQLiteStore
+	hook func()
+}
+
+func (s *spliceHookStore) HasPendingSplice(sessionID string) (bool, error) {
+	open, err := s.SQLiteStore.HasPendingSplice(sessionID)
+	if s.hook != nil {
+		hook := s.hook
+		s.hook = nil
+		hook()
+	}
+	return open, err
+}
+
+// TestReview3NoFolderBranchDoesNotClearANewerDeletion proves a no-folder
+// replacement cannot clear a deletion that commits while it checks readiness.
+func TestReview3NoFolderBranchDoesNotClearANewerDeletion(t *testing.T) {
+	store := openStore(t)
+	const id = "20261106180000"
+	recording, segments := round2Session(t, store, id, []string{"alpha stays.", "bravo secret.", "charlie secret."})
+	wire, syncer := newWireDrive(t)
+	span1 := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b1", SHA256After: "a1"}
+	if err := store.DeleteSegment(id, segments[1].ID, span1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recording, []byte("audio still holding CHARLIE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkSpliceComplete(&span1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ?, summary_status = ? WHERE id = ?`,
+		storage.RefinementCompleted, storage.SummaryCompleted, id); err != nil {
+		t.Fatal(err)
+	}
+	hooked := &spliceHookStore{SQLiteStore: store}
+	hooked.hook = func() {
+		span2 := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 2, End: 3, SHA256Before: "b2", SHA256After: "a2"}
+		if err := store.DeleteSegment(id, segments[2].ID, span2); err != nil {
+			t.Errorf("delete charlie: %v", err)
+		}
+	}
+	o := NewOrchestrator(syncer, hooked)
+	_ = o.SyncSession(context.Background(), id)
+	sess, err := store.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var audio string
+	if sess.GDriveFolderID != "" {
+		for name, copies := range wire.in(sess.GDriveFolderID) {
+			if strings.HasPrefix(name, "audio-") {
+				for _, copy := range copies {
+					audio += string(copy.Content) + "|"
+				}
+			}
+		}
+	}
+	if strings.Contains(audio, "CHARLIE") || !sess.DriveReplacePending {
+		t.Errorf("a newer deletion's marker was cleared and its unspliced audio synced: pending=%v audio=%q", sess.DriveReplacePending, audio)
+	}
 }

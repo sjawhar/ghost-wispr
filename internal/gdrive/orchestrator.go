@@ -155,6 +155,15 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 			return replacementErr
 		}
 		if pending {
+			// Read the generation before the snapshot the checks below use, so
+			// a deletion committing during them makes the clear refuse.
+			generation, err := replacements.DeletionGeneration(sessionID)
+			if err != nil {
+				return fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+			}
+			if read, err = o.store.GetSession(sessionID); err != nil {
+				return fmt.Errorf("get session %s: %w", sessionID, err)
+			}
 			if spliceOpen, err := replacements.HasPendingSplice(sessionID); err != nil {
 				return err
 			} else if spliceOpen {
@@ -166,10 +175,6 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				return nil
 			}
 			if read.GDriveFolderID == "" {
-				generation, err := replacements.DeletionGeneration(sessionID)
-				if err != nil {
-					return fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
-				}
 				if err := replacements.ClearDriveReplacementPending(sessionID, generation); err != nil {
 					return err
 				}
