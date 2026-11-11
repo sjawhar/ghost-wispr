@@ -53,6 +53,7 @@ func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
 	hold := health.Hold()
 	if hold == nil {
 		t.Fatal("a pass with Drive sync on and no syncer running left no hold")
+		return
 	}
 	if !strings.Contains(hold.Reason, "not running") || hold.DiskTotalBytes <= 0 || hold.DiskUsedBytes <= 0 || hold.DiskUsedBytes > hold.DiskTotalBytes {
 		t.Errorf("hold = %+v, want why and the disk use", *hold)
