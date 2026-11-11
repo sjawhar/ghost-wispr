@@ -19,11 +19,12 @@ type geminiClient struct {
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
 	ctx := context.Background()
 	config, err := genaiconfig.BuildClientConfig(&genaiconfig.Options{
-		Backend:  opts.genai.Backend,
-		Project:  opts.genai.Project,
-		Location: opts.genai.Location,
-		APIKey:   apiKey,
-		BaseURL:  opts.baseURL,
+		Backend:     opts.genai.Backend,
+		Project:     opts.genai.Project,
+		Location:    opts.genai.Location,
+		APIKey:      apiKey,
+		BaseURL:     opts.baseURL,
+		Credentials: opts.genai.Credentials,
 	})
 	if err != nil {
 		return nil, err

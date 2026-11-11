@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	driveapi "google.golang.org/api/drive/v3"
+
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -19,7 +22,11 @@ func TestSyncToRealDrive(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	syncer, err := NewSyncer(ctx, credPath, folderID)
+	credentials, err := googleauth.Detect(ctx, credPath, driveapi.DriveFileScope)
+	if err != nil {
+		t.Fatalf("detect credentials: %v", err)
+	}
+	syncer, err := NewSyncer(ctx, credentials, folderID)
 	if err != nil {
 		t.Fatalf("create syncer: %v", err)
 	}
