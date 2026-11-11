@@ -1169,12 +1169,27 @@ func (s *SQLiteStore) StartSummary(id string) error {
 // good summary (with its preset and speaker names), the ones Drive holds: a
 // failed summary takes nothing away.
 func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
+	return s.failSummary(id, errMsg, -1)
+}
+
+// FailSummaryAtGeneration records a failed summary only while generation still
+// identifies the transcript the batch request used.
+func (s *SQLiteStore) FailSummaryAtGeneration(id, errMsg string, generation int) (Session, error) {
+	return s.failSummary(id, errMsg, generation)
+}
+
+func (s *SQLiteStore) failSummary(id, errMsg string, generation int) (Session, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation`, SummaryFailed, errMsg, id)
+	if generation < 0 {
+		if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, id).Scan(&generation); err != nil {
+			return Session{}, fmt.Errorf("read summary generation for session %s: %w", id, err)
+		}
+	}
+	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ?`, SummaryFailed, errMsg, id, generation)
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}

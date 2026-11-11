@@ -4,6 +4,13 @@ import (
 	"fmt"
 )
 
+// SummaryBatchSession records the submitted transcript generation and whether
+// a terminal batch poll has handled that session.
+type SummaryBatchSession struct {
+	Generation int
+	State      string
+}
+
 // RecordSummaryBatch persists the transcript generation each batch request read.
 func (s *SQLiteStore) RecordSummaryBatch(batchName string, generations map[string]int) error {
 	tx, err := s.db.Begin()
@@ -43,6 +50,30 @@ func (s *SQLiteStore) SummaryBatchGenerations(batchName string) (map[string]int,
 		return nil, fmt.Errorf("iterate summary batch %s: %w", batchName, err)
 	}
 	return generations, nil
+}
+
+// SummaryBatchSessions returns every submitted session's generation and
+// processing state, including after an application restart.
+func (s *SQLiteStore) SummaryBatchSessions(batchName string) (map[string]SummaryBatchSession, error) {
+	rows, err := s.db.Query(`SELECT session_id, generation, state FROM summary_batches WHERE batch_name = ?`, batchName)
+	if err != nil {
+		return nil, fmt.Errorf("query summary batch %s sessions: %w", batchName, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	sessions := map[string]SummaryBatchSession{}
+	for rows.Next() {
+		var sessionID string
+		var session SummaryBatchSession
+		if err := rows.Scan(&sessionID, &session.Generation, &session.State); err != nil {
+			return nil, fmt.Errorf("scan summary batch %s session: %w", batchName, err)
+		}
+		sessions[sessionID] = session
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate summary batch %s sessions: %w", batchName, err)
+	}
+	return sessions, nil
 }
 
 // MarkSummaryBatchSessionDone records one consumed response.

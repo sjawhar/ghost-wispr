@@ -728,22 +728,6 @@ func main() {
 		}
 		return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
 	}
-	buildBatchSessions := func(sessionIDs []string) ([]summary.BatchSession, []string) {
-		sessions := make([]summary.BatchSession, 0, len(sessionIDs))
-		emptyTranscriptIDs := make([]string, 0)
-		for _, id := range sessionIDs {
-			transcript, ok := loadSessionTranscript(id)
-			if !ok {
-				continue
-			}
-			if transcript == "" {
-				emptyTranscriptIDs = append(emptyTranscriptIDs, id)
-				continue
-			}
-			sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
-		}
-		return sessions, emptyTranscriptIDs
-	}
 	markEmptySummariesCompleted := func(sessionIDs []string) {
 		for _, id := range sessionIDs {
 			_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
@@ -763,18 +747,15 @@ func main() {
 			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
 
-		sessions, emptyTranscriptIDs := buildBatchSessions(sessionIDs)
+		sessions, generations, emptyTranscriptIDs, err := readBatchSummarySessions(store, sessionIDs)
+		if err != nil {
+			return "", 0, err
+		}
 		markEmptySummariesCompleted(emptyTranscriptIDs)
 		if len(sessions) == 0 {
 			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
 		}
-		generations := make(map[string]int, len(sessions))
 		for _, session := range sessions {
-			generation, err := store.DeletionGeneration(session.ID)
-			if err != nil {
-				return "", 0, fmt.Errorf("read batch summary generation for %s: %w", session.ID, err)
-			}
-			generations[session.ID] = generation
 			if err := store.StartSummary(session.ID); err != nil {
 				return "", 0, fmt.Errorf("start batch summary for %s: %w", session.ID, err)
 			}
@@ -850,42 +831,14 @@ func main() {
 					sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
 				}
 			}
-
 			batchResults := summarizer.ProcessBatchResults(job, sessions)
-			var succeeded, failed int
-			generations, err := store.SummaryBatchGenerations(batchName)
+			succeeded, failed, err := applySummaryBatchResults(store, hub, publishSummaryReady, batchName, batchResults, true)
 			if err != nil {
 				return nil, err
 			}
-			for _, br := range batchResults {
-				if br.Error != nil {
-					failed++
-					if br.SessionID != "" {
-						failSummary(store, nil, br.SessionID, br.Error)
-					}
-					continue
-				}
-				if br.SessionID != "" {
-					generation, ok := generations[br.SessionID]
-					if !ok {
-						log.Printf("warning: discarded batch summary for untracked session %s", br.SessionID)
-						failed++
-						continue
-					}
-					if err := store.UpdateSummaryAtGeneration(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames, generation); err != nil {
-						log.Printf("warning: discarded stale batch summary for session %s: %v", br.SessionID, err)
-						failed++
-						continue
-					}
-					hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
-					publishSummaryReady(br.SessionID)
-				}
-				succeeded++
-			}
 			result["succeeded"] = succeeded
 			result["failed"] = failed
-			result["total"] = len(batchResults)
-			// Persisted rows survive restart and record that each request was submitted.
+			result["total"] = succeeded + failed
 		}
 
 		if job.State == genai.JobStateFailed {
@@ -893,6 +846,12 @@ func main() {
 			if job.Error != nil {
 				errMsg = job.Error.Message
 			}
+			_, failed, err := applySummaryBatchResults(store, hub, nil, batchName, nil, true)
+			if err != nil {
+				return nil, err
+			}
+			result["failed"] = failed
+			result["total"] = failed
 			result["error"] = errMsg
 		}
 
