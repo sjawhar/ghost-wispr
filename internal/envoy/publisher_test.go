@@ -453,6 +453,46 @@ func TestLifecycleEventsSurviveRestart(t *testing.T) {
 	}
 }
 
+func TestPendingLifecycleEventsContinueAfterFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	startedAt := time.Date(2026, 11, 11, 7, 20, 0, 0, time.UTC)
+	if err := store.CreateSession("session-1", startedAt); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := store.EnqueueEnvoyLifecycleEvent(string(eventSessionStarted), "session-1"); err != nil {
+		t.Fatalf("enqueue start: %v", err)
+	}
+	if err := store.EnqueueEnvoyLifecycleEvent(string(eventSessionEnded), "session-1"); err != nil {
+		t.Fatalf("enqueue end: %v", err)
+	}
+
+	server, requests := newListenerTestServer(t, "shared-secret", http.StatusServiceUnavailable, http.StatusOK)
+	defer server.Close()
+	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher.client.retryDelays = nil
+	if err := publisher.PublishPendingLifecycleEvents(context.Background()); err == nil {
+		t.Fatal("PublishPendingLifecycleEvents succeeded, want the first event error")
+	}
+	if got := len(requests()); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+	pending, err := store.PendingEnvoyLifecycleEvents()
+	if err != nil {
+		t.Fatalf("PendingEnvoyLifecycleEvents: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Type != string(eventSessionStarted) {
+		t.Fatalf("pending events = %#v, want the failed start only", pending)
+	}
+}
+
 func TestSummaryReadyRetries429(t *testing.T) {
 	server, requests := newListenerTestServer(t, "shared-secret", http.StatusTooManyRequests, http.StatusOK)
 	defer server.Close()

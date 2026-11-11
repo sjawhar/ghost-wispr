@@ -373,6 +373,40 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	if sess.EnvoyPublishStatus != EnvoyPublishPublished {
 		t.Fatalf("repeated batch publish status = %q, want %q", sess.EnvoyPublishStatus, EnvoyPublishPublished)
 	}
+
+	for _, change := range []struct {
+		name  string
+		apply func(*Session, *string, *string, *string)
+	}{
+		{"summary", func(_ *Session, summary, _ *string, _ *string) { *summary = "Summary text changed" }},
+		{"preset", func(_ *Session, _ *string, preset, _ *string) { *preset = "detailed" }},
+		{"speaker names", func(_ *Session, _ *string, _ *string, speakers *string) { *speakers = `{"0":{"name":"Sam"}}` }},
+	} {
+		t.Run("same title "+change.name, func(t *testing.T) {
+			current, err := store.GetSession(sessionID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
+				t.Fatalf("mark summary published: %v", err)
+			}
+			summary, preset, speakers := current.Summary, current.SummaryPreset, current.SpeakerNames
+			change.apply(&current, &summary, &preset, &speakers)
+			if err := store.UpdateSummary(sessionID, current.Title, summary, SummaryCompleted, preset, speakers); err != nil {
+				t.Fatalf("UpdateSummary: %v", err)
+			}
+			updated, err := store.GetSession(sessionID)
+			if err != nil {
+				t.Fatalf("GetSession updated: %v", err)
+			}
+			if updated.SummaryVersion != current.SummaryVersion+1 {
+				t.Fatalf("summary version = %d, want %d", updated.SummaryVersion, current.SummaryVersion+1)
+			}
+			if updated.EnvoyPublishStatus != EnvoyPublishPending {
+				t.Fatalf("envoy publish status = %q, want %q", updated.EnvoyPublishStatus, EnvoyPublishPending)
+			}
+		})
+	}
 }
 
 func TestSummaryVersionMigratesExistingSessions(t *testing.T) {
@@ -426,6 +460,36 @@ func TestSummaryVersionMigratesExistingSessions(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].SummaryVersion != 1 {
 		t.Fatalf("migrated date query = %#v, want one session at version 1", sessions)
+	}
+}
+
+func TestOpeningStoreMovesRejectedEnvoyPublishToPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	if err := store.CreateSession("session-1", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET envoy_publish_status = 'rejected' WHERE id = ?`, "session-1"); err != nil {
+		t.Fatalf("mark rejected: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	session, err := reopened.GetSession("session-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.EnvoyPublishStatus != EnvoyPublishPending {
+		t.Fatalf("envoy publish status = %q, want %q", session.EnvoyPublishStatus, EnvoyPublishPending)
 	}
 }
 

@@ -282,21 +282,23 @@ func (p *Publisher) PublishPendingLifecycleEvents(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	var firstErr error
 	for _, event := range events {
+		var publishErr error
 		switch EventType(event.Type) {
 		case eventSessionStarted:
-			if err := p.PublishSessionStarted(ctx, event.SessionID); err != nil {
-				return err
-			}
+			publishErr = p.PublishSessionStarted(ctx, event.SessionID)
 		case eventSessionEnded:
-			if err := p.PublishSessionEnded(ctx, event.SessionID); err != nil {
-				return err
-			}
+			publishErr = p.PublishSessionEnded(ctx, event.SessionID)
 		default:
-			return fmt.Errorf("unknown pending Envoy lifecycle event type %q", event.Type)
+			publishErr = fmt.Errorf("unknown pending Envoy lifecycle event type %q", event.Type)
+		}
+		if publishErr != nil && firstErr == nil {
+			firstErr = publishErr
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *storage.Session) error {
