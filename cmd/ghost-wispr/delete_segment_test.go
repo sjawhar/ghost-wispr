@@ -223,7 +223,7 @@ func TestStartupRecoveryContinuesPastBadSplice(t *testing.T) {
 	var warnings []error
 	count, err := recoverPendingSplices(context.Background(), store, audioDir, nil, fakeSplice, nil, func(_ storage.DeletedSpan, err error) {
 		warnings = append(warnings, err)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("recover splices: %v", err)
 	}
@@ -729,7 +729,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 		}
 		refined = true
 		return nil
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("recover pending splice: %v", err)
 	}

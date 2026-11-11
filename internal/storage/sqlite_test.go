@@ -1853,11 +1853,11 @@ func TestCanonicalize_FromRefinedTranscript(t *testing.T) {
 	}
 
 	// Canonicalize should use refined transcript.
-	if _, err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
-	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	transcript, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}
@@ -1901,11 +1901,11 @@ func TestCanonicalize_FallbackToStreaming(t *testing.T) {
 	}
 
 	// Refinement pending (default) — should fall back to streaming.
-	if _, err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
-	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	transcript, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}
@@ -1938,11 +1938,11 @@ func TestCanonicalize_RefinementFailed_FallsBackToStreaming(t *testing.T) {
 		t.Fatalf("update refinement: %v", err)
 	}
 
-	if _, err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
-	_, source, err := store.GetCanonicalTranscript(sessionID)
+	_, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}
@@ -1968,10 +1968,10 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	}
 
 	// First canonicalization — streaming (refinement pending).
-	if _, err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("first canonicalize: %v", err)
 	}
-	_, source, _ := store.GetCanonicalTranscript(sessionID)
+	_, source, _, _ := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if source != "streaming" {
 		t.Fatalf("expected initial source 'streaming', got %q", source)
 	}
@@ -1982,11 +1982,11 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	}
 
 	// Re-canonicalize — should now use refined.
-	if _, err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("re-canonicalize: %v", err)
 	}
 
-	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	transcript, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}

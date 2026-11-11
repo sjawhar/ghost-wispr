@@ -12,16 +12,16 @@ func TestR6CanonicalizePairsItsTranscriptWithItsGeneration(t *testing.T) {
 	if err := store.DeleteSegment("s", segs[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatal(err)
 	}
-	generation, err := store.Canonicalize("s")
+	transcript, generation, err := store.Canonicalize("s")
 	if err != nil {
 		t.Fatal(err)
 	}
-	transcript, _, readGeneration, err := store.GetCanonicalTranscriptWithGeneration("s")
+	storedTranscript, _, readGeneration, err := store.GetCanonicalTranscriptWithGeneration("s")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if generation != readGeneration || strings.Contains(transcript, "private deletion token") {
-		t.Fatalf("canonical transcript=%q canonical generation=%d read generation=%d, want deleted text absent at the written generation", transcript, generation, readGeneration)
+	if transcript != storedTranscript || generation != readGeneration || strings.Contains(transcript, "private deletion token") {
+		t.Fatalf("canonicalize = (%q, generation %d); stored = (%q, generation %d); want deleted text absent at the written generation", transcript, generation, storedTranscript, readGeneration)
 	}
 	if err := store.StartSummary("s"); err != nil {
 		t.Fatal(err)

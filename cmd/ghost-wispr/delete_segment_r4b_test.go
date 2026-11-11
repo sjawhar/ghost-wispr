@@ -20,7 +20,7 @@ func TestR4RecoveryKeepsRecordingWhenResplicedHashDiffers(t *testing.T) {
 		return hashBytesForDeleteTest([]byte("different-cut")), nil
 	}
 	var warnings []error
-	count, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, wrongSplice, nil, func(_ storage.DeletedSpan, e error) { warnings = append(warnings, e) })
+	count, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, wrongSplice, nil, func(_ storage.DeletedSpan, e error) { warnings = append(warnings, e) }, nil)
 	if err != nil || count != 0 || len(warnings) == 0 {
 		t.Fatalf("recovered=%d err=%v warnings=%v, want a warned, unrecovered row", count, err, warnings)
 	}

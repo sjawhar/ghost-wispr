@@ -38,7 +38,7 @@ func TestR4DeleteDuringRecoveryRefineIs409(t *testing.T) {
 	refine := func(context.Context, string, string, time.Time) error { close(entered); <-release; return nil }
 	done := make(chan struct{})
 	go func() {
-		_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, refine, nil)
+		_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, refine, nil, nil)
 		close(done)
 	}()
 	<-entered
@@ -63,7 +63,7 @@ func TestR4RecoveryFlagClearedAfterRefineError(t *testing.T) {
 	refine := func(context.Context, string, string, time.Time) error {
 		return errors.New("batch transcription not configured")
 	}
-	_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, refine, func(_ storage.DeletedSpan, e error) { t.Logf("warn: %v", e) })
+	_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, refine, func(_ storage.DeletedSpan, e error) { t.Logf("warn: %v", e) }, nil)
 	pending, _ := store.HasPendingSplice("session")
 	runner := r4Runner(store, recording)
 	err := runner.Delete(context.Background(), "session", ids[0])

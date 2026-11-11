@@ -137,7 +137,7 @@ func TestBackfillMissing(t *testing.T) {
 		if err := store.AppendSegment(id, transcribe.Segment{Text: "hello world from " + id, Timestamp: time.Now().UTC()}); err != nil {
 			t.Fatalf("append segment %s: %v", id, err)
 		}
-		if _, err := store.Canonicalize(id); err != nil {
+		if _, _, err := store.Canonicalize(id); err != nil {
 			t.Fatalf("canonicalize %s: %v", id, err)
 		}
 	}

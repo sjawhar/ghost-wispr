@@ -88,6 +88,15 @@ func deleteR3Session(t *testing.T, store *storage.SQLiteStore, id int64) {
 	}
 }
 
+func waitR3(t *testing.T, done <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal(description)
+	}
+}
+
 func TestR3StaleSummaryIsRefusedAndNotIndexed(t *testing.T) {
 	store, id := r3SessionStore(t)
 	summary := &r3GateSummarizer{entered: make(chan struct{}), release: make(chan struct{})}
@@ -96,10 +105,10 @@ func TestR3StaleSummaryIsRefusedAndNotIndexed(t *testing.T) {
 	manager.SetIndexer(indexer)
 	done := make(chan struct{})
 	go func() { manager.generateSummary(context.Background(), "r3", time.Now()); close(done) }()
-	<-summary.entered
+	waitR3(t, summary.entered, "summarizer did not start")
 	deleteR3Session(t, store, id)
 	close(summary.release)
-	<-done
+	waitR3(t, done, "summary did not finish")
 	time.Sleep(300 * time.Millisecond)
 	session, _ := store.GetSession("r3")
 	embeddings, _ := store.GetEmbeddings("r3")
@@ -114,10 +123,10 @@ func TestR3EmbeddingAfterSuccessfulSummaryRacesTheDelete(t *testing.T) {
 	manager := NewManager(store, nil, &r3GateSummarizer{}, nil, nil, 0)
 	manager.SetIndexer(indexer)
 	manager.generateSummary(context.Background(), "r3", time.Now())
-	<-indexer.entered
+	waitR3(t, indexer.entered, "indexer did not start before delete")
 	deleteR3Session(t, store, id)
 	close(indexer.release)
-	<-indexer.done
+	waitR3(t, indexer.done, "indexer did not finish")
 	embeddings, _ := store.GetEmbeddings("r3")
 	if len(embeddings) != 0 {
 		t.Fatalf("%d embedding(s) of the pre-delete transcript stored after the deletion", len(embeddings))

@@ -368,10 +368,14 @@ func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool
 
 // recoverPendingSplices completes recordings whose deletion transaction
 // committed before its replacement file reached disk. One bad row is reported
-// through warn and never prevents later rows from recovering.
-func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(storage.DeletedSpan, error)) (int, error) {
+// through warn and never prevents later rows from recovering. A successful
+// recovery clears the warning for that session and recording only.
+func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(storage.DeletedSpan, error), clear func(string, string)) (int, error) {
 	if warn == nil {
 		warn = func(storage.DeletedSpan, error) {}
+	}
+	if clear == nil {
+		clear = func(string, string) {}
 	}
 	spans, err := store.PendingSplices()
 	if err != nil {
@@ -379,8 +383,10 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	}
 	recovered := 0
 	for i := range spans {
-		if recoverPendingSplice(ctx, store, audioDir, source, splice, refine, func(err error) { warn(spans[i], err) }, &spans[i]) {
+		span := spans[i]
+		if recoverPendingSplice(ctx, store, audioDir, source, splice, refine, func(err error) { warn(span, err) }, &span) {
 			recovered++
+			clear(span.SessionID, span.AudioPath)
 		}
 	}
 	return recovered, nil

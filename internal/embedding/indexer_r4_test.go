@@ -42,7 +42,7 @@ func r4Store(t *testing.T) (*storage.SQLiteStore, int64) {
 		_ = store.AppendSegment("s", transcribe.Segment{Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second)})
 	}
 	_ = store.EndSession("s", started.Add(3*time.Second), "recording.mp3")
-	if _, err := store.Canonicalize("s"); err != nil {
+	if _, _, err := store.Canonicalize("s"); err != nil {
 		t.Fatal(err)
 	}
 	segs, _ := store.GetSegments("s")
