@@ -45,8 +45,9 @@ type deletionRecordingSource interface {
 }
 
 type sessionDeletionLocks struct {
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	mu         sync.Mutex
+	locks      map[string]*sync.Mutex
+	recovering map[string]bool
 }
 
 func (l *sessionDeletionLocks) lock(sessionID string) func() {
@@ -62,6 +63,25 @@ func (l *sessionDeletionLocks) lock(sessionID string) func() {
 	l.mu.Unlock()
 	lock.Lock()
 	return lock.Unlock
+}
+
+func (l *sessionDeletionLocks) setRecovering(sessionID string, recovering bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.recovering == nil {
+		l.recovering = make(map[string]bool)
+	}
+	if recovering {
+		l.recovering[sessionID] = true
+	} else {
+		delete(l.recovering, sessionID)
+	}
+}
+
+func (l *sessionDeletionLocks) isRecovering(sessionID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.recovering[sessionID]
 }
 
 var deleteLocks sessionDeletionLocks
@@ -142,6 +162,9 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	}
 	unlock := deleteLocks.lock(sessionID)
 	defer unlock()
+	if deleteLocks.isRecovering(sessionID) {
+		return storage.ErrSegmentSplicePending
+	}
 	session, err := d.store.GetSession(sessionID)
 	if err != nil {
 		return err
@@ -335,6 +358,7 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	}
 	recovered := 0
 	for _, span := range spans {
+		deleteLocks.setRecovering(span.SessionID, true)
 		unlock := deleteLocks.lock(span.SessionID)
 		session, err := store.GetSession(span.SessionID)
 		if err != nil {
@@ -371,6 +395,8 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 		if hash == span.SHA256After {
 			if err := store.MarkSpliceComplete(&span); err != nil {
 				warn(err)
+			} else {
+				deleteLocks.setRecovering(span.SessionID, false)
 			}
 			unlock()
 			continue
@@ -412,15 +438,15 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 			unlock()
 			continue
 		}
+		unlock()
 		if refine != nil {
 			if err := refine(ctx, span.SessionID, session.AudioPath, session.StartedAt); err != nil {
 				warn(fmt.Errorf("refine re-spliced session %s: %w", span.SessionID, err))
-				unlock()
 				continue
 			}
 		}
+		deleteLocks.setRecovering(span.SessionID, false)
 		recovered++
-		unlock()
 	}
 	return recovered, nil
 }
