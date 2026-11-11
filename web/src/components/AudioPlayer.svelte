@@ -55,8 +55,6 @@
       session?.refinement_status === RefinementStatus.Running,
   )
 
-  const hasDeletableSegments = $derived(visibleSegments.some((segment) => segment.id !== undefined))
-
   // Disk pressure removed the session's audio to free space: all of it, or
   // part of it, when the audio path still names what is left.
   const audioRemoved = $derived(Boolean(session?.audio_removed_at))
@@ -65,8 +63,8 @@
   const noRecording = $derived(session?.refinement_status === RefinementStatus.NoAudio)
 
   type View = 'refined' | 'segments'
-  // Default to refined view whenever a refined transcript is available.
-  let view = $derived<View>(refinementCompleted && !hasDeletableSegments ? 'refined' : 'segments')
+  // Refined is the default when it exists; deletion is available in Segments.
+  let view = $derived<View>(refinementCompleted ? 'refined' : 'segments')
 
   function segmentsAsText(): string {
     return visibleSegments
@@ -117,11 +115,17 @@
       try {
         await deleteSessionSegment(sessionId, segmentID)
       } catch (error) {
-        if (!(error instanceof RequestError && error.status === 404)) {
-          segmentDeleteError = requestErrorMessage(error)
+        const message = requestErrorMessage(error)
+        if (error instanceof RequestError && [403, 409, 422, 503].includes(error.status)) {
+          segmentDeleteError = message
           return
         }
-        await onNotFound(segmentID)
+        segmentDeleteError = message
+        try {
+          await onNotFound(segmentID)
+        } catch {
+          // Keep the delete response visible when the reconciliation request fails.
+        }
         return
       }
       visibleSegments = visibleSegments.filter((segment) => segment.id !== segmentID)

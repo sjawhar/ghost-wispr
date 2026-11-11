@@ -18,7 +18,7 @@ describe('ConsentRule', () => {
     expect(within(dialog).getByText(consentRule)).toBeTruthy()
     expect(
       within(dialog).getByText(
-        'Tap the button on the recorder to pause or resume. To delete a segment, open the conversation and choose Delete on that segment.',
+        'Tap the button on the recorder to pause or resume. To delete a segment, open the conversation, switch to segments, and choose Delete on that segment.',
       ),
     ).toBeTruthy()
 

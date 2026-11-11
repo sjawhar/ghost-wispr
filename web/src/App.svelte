@@ -174,6 +174,7 @@
                   type: 'live_transcript' as const,
                   version: 1,
                   timestamp: seg.timestamp,
+                  session_id: status.active_session_id,
                   speaker: seg.speaker,
                   text: seg.text,
                   start_time: seg.start_time,

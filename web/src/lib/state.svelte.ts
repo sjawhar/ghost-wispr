@@ -183,8 +183,11 @@ export function setActiveAudioSession(sessionId: string): void {
 }
 
 export function appendLiveSegment(event: LiveTranscriptEvent): void {
-  if (!appState.liveSegmentsSessionId) {
-    return
+  if (appState.liveSegmentsSessionId !== event.session_id) {
+    if (appState.activeSessionId && appState.activeSessionId !== event.session_id) {
+      return
+    }
+    setLiveSegmentsForSession(event.session_id, [])
   }
   appState.liveSegments.push(event)
   if (appState.liveSegments.length > 400) {

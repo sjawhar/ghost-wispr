@@ -170,6 +170,7 @@ describe('deletion state fences', () => {
       type: 'live_transcript',
       version: 1,
       timestamp: '2026-11-11T10:00:01Z',
+      session_id: 's1',
       speaker: 0,
       text: 'Live words',
       start_time: 0,
@@ -192,5 +193,21 @@ describe('deletion state fences', () => {
 
     expect(appState.liveSegments).toEqual([])
     expect(appState.liveSegmentsSessionId).toBe('')
+  })
+
+  it('restores the live pane from a session-identified event after bootstrap misses its start', () => {
+    applyEvent({
+      type: 'live_transcript',
+      version: 1,
+      timestamp: '2026-11-11T10:00:01Z',
+      session_id: 's1',
+      speaker: 0,
+      text: 'Recovered live words',
+      start_time: 0,
+      end_time: 2,
+    })
+
+    expect(appState.liveSegmentsSessionId).toBe('s1')
+    expect(appState.liveSegments).toHaveLength(1)
   })
 })

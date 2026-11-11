@@ -503,7 +503,7 @@ describe('AudioPlayer', () => {
     )
   })
 
-  it('refreshes the session list when the server no longer knows the session', async () => {
+  it('keeps the not-found message and refreshes stale session state', async () => {
     const onDeleted = vi.fn()
     const onNotFound = vi.fn().mockResolvedValue(undefined)
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 404 })))
@@ -530,10 +530,53 @@ describe('AudioPlayer', () => {
       expect(onNotFound).toHaveBeenCalledTimes(1)
     })
     expect(onDeleted).not.toHaveBeenCalled()
-    expect(screen.queryByRole('alert')).toBeNull()
+    expect((await screen.findByRole('alert')).textContent).toBe('request failed: 404')
+    expect(screen.getByText('Stale segment')).toBeTruthy()
   })
 
-  it('shows deletion controls for stored segments when a refined transcript is available', () => {
+  it.each([
+    [
+      'a 500 response',
+      () => new Response(JSON.stringify({ error: 'rename failed' }), { status: 500 }),
+      'rename failed',
+    ],
+    [
+      'a network error',
+      () => Promise.reject(new Error('connection dropped')),
+      'connection dropped',
+    ],
+  ])('keeps the message and refreshes after %s', async (_, response, message) => {
+    const onDeleted = vi.fn()
+    const onNotFound = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(response))
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Possibly deleted segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      onDeleted,
+      onNotFound,
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    await waitFor(() => {
+      expect(onNotFound).toHaveBeenCalledTimes(1)
+    })
+    expect(onDeleted).not.toHaveBeenCalled()
+    expect((await screen.findByRole('alert')).textContent).toBe(message)
+    expect(screen.getByText('Possibly deleted segment')).toBeTruthy()
+  })
+
+  it('keeps the refined transcript as the default and exposes deletion in segments', async () => {
     render({
       sessionId: 's1',
       segments: [
@@ -552,6 +595,11 @@ describe('AudioPlayer', () => {
         transcript_source: 'refined',
       }),
     })
+
+    expect(screen.getByTestId('transcript-refined')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Delete segment' })).toBeNull()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Segments' }))
 
     expect(screen.getByRole('button', { name: 'Delete segment' })).toBeTruthy()
   })
