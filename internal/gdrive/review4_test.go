@@ -70,7 +70,9 @@ func TestReview4ReplacementCutOffByARestartIsStillSwept(t *testing.T) {
 
 // TestPendingReplacementInAnyUnsweptStateIsSwept fails if a session that
 // still owes Drive a replacement can sit in a sync state the sweep never
-// reads, so that only a manual retry would remove the deleted words.
+// reads, so that only a manual retry would remove the deleted words, or if
+// the finished replacement leaves the session in that state rather than
+// PENDING, where the next sync marks it synced.
 func TestPendingReplacementInAnyUnsweptStateIsSwept(t *testing.T) {
 	for _, state := range []string{storage.SyncStateFailed, storage.SyncStateRemoteDeleted} {
 		t.Run(state, func(t *testing.T) {
@@ -90,6 +92,13 @@ func TestPendingReplacementInAnyUnsweptStateIsSwept(t *testing.T) {
 			sweepOnce(t, fixture.store, fixture.orchestrator)
 			if !sameIDs(fixture.wire.deletedIDs, fixture.oldIDs) {
 				t.Errorf("a %s session owing a replacement was not replaced by the sweep: deleted %v, want %v", state, fixture.wire.deletedIDs, fixture.oldIDs)
+			}
+			sess, err := fixture.store.GetSession(fixture.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sess.SyncState != storage.SyncStatePending || sess.DriveReplacePending {
+				t.Errorf("after the replacement of a %s session: state=%q pending=%v, want %q with nothing owed", state, sess.SyncState, sess.DriveReplacePending, storage.SyncStatePending)
 			}
 		})
 	}
