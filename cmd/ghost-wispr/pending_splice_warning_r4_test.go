@@ -15,3 +15,12 @@ func TestR4PendingSpliceWarningsKeepEachRecording(t *testing.T) {
 		t.Fatalf("pending warnings = %v, want both recording paths", warnings)
 	}
 }
+
+func TestPendingSpliceWarningKeyIgnoresErrorText(t *testing.T) {
+	registry := newWarningsRegistry()
+	setPendingSpliceWarning(registry, errors.New("re-splice /recordings/first.mp3 timed out"))
+	setPendingSpliceWarning(registry, errors.New("replace recovered recording /recordings/first.mp3 failed"))
+	if warnings := registry.List(); len(warnings) != 1 || !strings.Contains(warnings[0], "failed") {
+		t.Fatalf("warnings = %v, want one current warning for the recording", warnings)
+	}
+}
