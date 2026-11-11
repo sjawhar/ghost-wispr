@@ -380,7 +380,8 @@ func isDriveDeleteCall(name string) bool {
 }
 
 // No app code deletes or trashes a Drive file except ReplaceSessionFiles,
-// which removes the three old files only after their replacements are stored.
+// which removes recorded old files and duplicate app-created replacement
+// uploads only after it stores the replacement to retain.
 func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
 	root := moduleRoot(t)
 	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")

@@ -79,11 +79,7 @@ func (s *SQLiteStore) ClearDriveReplacementPending(sessionID string, generation 
 	}
 	return nil
 }
-func (s *SQLiteStore) DriveReplacements(sessionID string, generations ...int) ([]DriveReplacement, error) {
-	generation := 0
-	if len(generations) > 0 {
-		generation = generations[0]
-	}
+func (s *SQLiteStore) DriveReplacements(sessionID string, generation int) ([]DriveReplacement, error) {
 	rows, err := s.db.Query(`SELECT session_id, generation, name, old_id, new_id, state
 		FROM drive_replacements WHERE session_id = ? AND generation = ? ORDER BY name, old_id`, sessionID, generation)
 	if err != nil {

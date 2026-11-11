@@ -228,6 +228,26 @@ func (s *SQLiteStore) HasPendingSplice(sessionID string) (bool, error) {
 	return count > 0, nil
 }
 
+// OldestPendingSplice reports when the oldest committed deletion for sessionID
+// started waiting for its recording splice.
+func (s *SQLiteStore) OldestPendingSplice(sessionID string) (time.Time, bool, error) {
+	var deletedAt string
+	err := s.db.QueryRow(`SELECT deleted_at FROM deleted_segments
+		WHERE session_id = ? AND splice_complete = 0
+		ORDER BY deleted_at ASC, rowid ASC LIMIT 1`, sessionID).Scan(&deletedAt)
+	if err == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("read oldest pending splice for %s: %w", sessionID, err)
+	}
+	at, err := time.Parse(time.RFC3339Nano, deletedAt)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse oldest pending splice for %s: %w", sessionID, err)
+	}
+	return at, true, nil
+}
+
 func rewriteDeletedTextEvents(tx *sql.Tx, sessionID, deletedText string, span *DeletedSpan) error {
 	rows, err := tx.Query(`SELECT id, event_type, payload FROM mcp_events`)
 	if err != nil {

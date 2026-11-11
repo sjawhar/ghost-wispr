@@ -67,7 +67,7 @@ func TestReplaceCreatesRecordsThenDeletes(t *testing.T) {
 	if !sameIDs(fixture.wire.deletedIDs, fixture.oldIDs) {
 		t.Errorf("deleted %v, want exactly old ids %v", fixture.wire.deletedIDs, fixture.oldIDs)
 	}
-	rows, err := fixture.store.DriveReplacements(fixture.id)
+	rows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestReplaceResumesWithoutDeletingANewFile(t *testing.T) {
 	if len(fixture.wire.deletedIDs) != 0 {
 		t.Fatalf("failed replacement deleted %v before every new file was recorded", fixture.wire.deletedIDs)
 	}
-	rows, err := fixture.store.DriveReplacements(fixture.id)
+	rows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements after failed upload: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestReplaceResumesWithoutDeletingANewFile(t *testing.T) {
 	if !sameIDs(fixture.wire.deletedIDs, fixture.oldIDs) {
 		t.Errorf("resume deleted %v, want old ids %v", fixture.wire.deletedIDs, fixture.oldIDs)
 	}
-	rows, err = fixture.store.DriveReplacements(fixture.id)
+	rows, err = fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements after resume: %v", err)
 	}
@@ -202,6 +202,113 @@ func TestReplaceResumesWithoutDeletingANewFile(t *testing.T) {
 	}
 }
 
+// TestReplaceDeletesExtraAppCreatedUpload fails if a lost upload response
+// leaves a second app-created copy with this replacement key on Drive, or if
+// the cleanup deletes the kept replacement or a file without the key.
+func TestReplaceDeletesExtraAppCreatedUpload(t *testing.T) {
+	fixture := newReplacementFixture(t)
+	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
+	const name = "transcript.md"
+	old := fixture.wire.in(fixture.folder)[name][0]
+	generation, err := fixture.store.DeletionGeneration(fixture.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.StartDriveReplacement(fixture.id, name, generation, []string{old.ID}); err != nil {
+		t.Fatal(err)
+	}
+	key := replacementUploadKey(fixture.id, name, []storage.DriveReplacement{{OldID: old.ID}})
+	session, err := fixture.store.GetSession(fixture.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, _, err := replacementFiles(&session, []string{fixture.recording})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var content []byte
+	for _, file := range files {
+		if file.Name == name {
+			content = file.Content
+			break
+		}
+	}
+	if content == nil {
+		t.Fatalf("replacement files do not include %s", name)
+	}
+	properties := map[string]string{
+		replacementKeyProperty: key,
+		contentHashProperty:    contentHash(&SyncFile{Name: name, Content: content}),
+	}
+	orphanID := fixture.wire.add(fixture.folder, name, "application/vnd.google-apps.document", content, properties)
+	keptID := fixture.wire.add(fixture.folder, name, "application/vnd.google-apps.document", content, properties)
+	foreignID := fixture.wire.add(fixture.folder, name, "application/vnd.google-apps.document", []byte("foreign"), nil)
+
+	fixture.wire.allowDeletes = true
+	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
+		t.Fatalf("replace session files: %v", err)
+	}
+
+	if !slices.Contains(fixture.wire.deletedIDs, orphanID) {
+		t.Errorf("deleted ids %v do not include extra app-created upload %s", fixture.wire.deletedIDs, orphanID)
+	}
+	if slices.Contains(fixture.wire.deletedIDs, keptID) {
+		t.Errorf("deleted chosen replacement %s", keptID)
+	}
+	if slices.Contains(fixture.wire.deletedIDs, foreignID) {
+		t.Errorf("deleted foreign file %s", foreignID)
+	}
+	if fixture.wire.find(orphanID) != nil {
+		t.Errorf("extra app-created upload %s remains on Drive", orphanID)
+	}
+	if fixture.wire.find(keptID) == nil {
+		t.Errorf("chosen replacement %s is gone", keptID)
+	}
+	if fixture.wire.find(foreignID) == nil {
+		t.Errorf("foreign file %s is gone", foreignID)
+	}
+}
+
+// TestReplaceClaimsSessionDuringDriveReplacement fails if a replacement runs
+// without the session's sync claim, or does not release it to the state it
+// was claimed from.
+func TestReplaceClaimsSessionDuringDriveReplacement(t *testing.T) {
+	fixture := newReplacementFixture(t)
+	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
+	claimed := make(chan storage.Session, 1)
+	fixture.wire.onUpload = func(string) {
+		session, err := fixture.store.GetSession(fixture.id)
+		if err != nil {
+			return
+		}
+		select {
+		case claimed <- session:
+		default:
+		}
+	}
+	fixture.wire.allowDeletes = true
+
+	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
+		t.Fatalf("replace session files: %v", err)
+	}
+
+	select {
+	case session := <-claimed:
+		if session.SyncState != storage.SyncStateSyncing {
+			t.Errorf("replacement upload had state=%q, want claimed sync", session.SyncState)
+		}
+	default:
+		t.Fatal("replacement did not upload a file")
+	}
+	session, err := fixture.store.GetSession(fixture.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SyncState != storage.SyncStatePending {
+		t.Errorf("replacement ended state=%q, want the claim released to PENDING", session.SyncState)
+	}
+}
+
 type replacementFixture struct {
 	store        *storage.SQLiteStore
 	wire         *wireDrive
@@ -211,6 +318,15 @@ type replacementFixture struct {
 	recording    string
 	folder       string
 	oldIDs       []string
+}
+
+func (f *replacementFixture) deletionGeneration(t *testing.T) int {
+	t.Helper()
+	generation, err := f.store.DeletionGeneration(f.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return generation
 }
 
 func newReplacementFixture(t *testing.T) *replacementFixture {
@@ -266,7 +382,7 @@ func TestReplaceWaitsForRefinementAndSummary(t *testing.T) {
 	if len(fixture.wire.deletedIDs) != 0 {
 		t.Errorf("pending summary deleted %v", fixture.wire.deletedIDs)
 	}
-	rows, err := fixture.store.DriveReplacements(fixture.id)
+	rows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements while summary is pending: %v", err)
 	}
@@ -333,7 +449,7 @@ func TestTheNewFilesHoldNoDeletedText(t *testing.T) {
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
 		t.Fatalf("replace session files: %v", err)
 	}
-	rows, err := fixture.store.DriveReplacements(fixture.id)
+	rows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements: %v", err)
 	}
@@ -400,7 +516,7 @@ func TestReplaceRecoversAnUploadedFileBeforeItsRowIsUpdated(t *testing.T) {
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err == nil {
 		t.Fatal("replacement succeeded though Drive did not verify the uploaded file")
 	}
-	rows, err := fixture.store.DriveReplacements(fixture.id)
+	rows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements after failed verification: %v", err)
 	}
@@ -431,7 +547,7 @@ func TestReplaceStartsANewCycleAfterAnotherDeletion(t *testing.T) {
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
 		t.Fatalf("first replacement: %v", err)
 	}
-	firstRows, err := fixture.store.DriveReplacements(fixture.id)
+	firstRows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("first DriveReplacements: %v", err)
 	}
@@ -450,7 +566,7 @@ func TestReplaceStartsANewCycleAfterAnotherDeletion(t *testing.T) {
 	if !sameIDs(fixture.wire.deletedIDs[3:], firstNewIDs) {
 		t.Errorf("second replacement deleted %v, want first new ids %v", fixture.wire.deletedIDs[3:], firstNewIDs)
 	}
-	rows, err := fixture.store.DriveReplacements(fixture.id)
+	rows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("second DriveReplacements: %v", err)
 	}
@@ -499,7 +615,7 @@ func TestReplaceMarksAnAlreadyGoneOldFileDeleted(t *testing.T) {
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err == nil {
 		t.Fatal("replacement succeeded though its first delete failed")
 	}
-	rows, err := fixture.store.DriveReplacements(fixture.id)
+	rows, err := fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements after delete failure: %v", err)
 	}
@@ -511,7 +627,7 @@ func TestReplaceMarksAnAlreadyGoneOldFileDeleted(t *testing.T) {
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
 		t.Fatalf("resume after old file vanished: %v", err)
 	}
-	rows, err = fixture.store.DriveReplacements(fixture.id)
+	rows, err = fixture.store.DriveReplacements(fixture.id, fixture.deletionGeneration(t))
 	if err != nil {
 		t.Fatalf("DriveReplacements after resume: %v", err)
 	}

@@ -16,7 +16,7 @@ import (
 
 type replacementStore interface {
 	GetSession(id string) (storage.Session, error)
-	DriveReplacements(sessionID string, generation ...int) ([]storage.DriveReplacement, error)
+	DriveReplacements(sessionID string, generation int) ([]storage.DriveReplacement, error)
 	PendingDriveReplacementRecordings(sessionID string) ([]string, error)
 	StartDriveReplacement(sessionID, name string, generation int, oldIDs []string) error
 	MarkDriveReplacementUploaded(sessionID, name string, generation int, newID string) error
@@ -30,9 +30,9 @@ func (s *Syncer) setReplacementStore(store replacementStore) {
 }
 
 // ReplaceSessionFiles replaces exactly three files: transcript.md, summary.md
-// and the one recording that was spliced. It records every new id before it
-// deletes an old id, so a retry resumes from the rows and never deletes a new
-// file or uploads an already recorded replacement.
+// and the one recording that was spliced. It records each selected new id
+// before deleting an old id, so a retry resumes from the rows and never
+// deletes the replacement it chose.
 //
 //nolint:gocritic // The approved API accepts storage.Session by value.
 func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, splicedRecording string) error {
@@ -86,6 +86,7 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	if err != nil {
 		return fmt.Errorf("list replacements for session %s: %w", sess.ID, err)
 	}
+	var orphanUploadIDs []string
 	oldByName := make(map[string][]*drive.File, len(files))
 	for _, file := range existing {
 		for i := range files {
@@ -135,6 +136,7 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		if err := s.replacements.MarkDriveReplacementUploaded(sess.ID, file.Name, generation, newID); err != nil {
 			return err
 		}
+		orphanUploadIDs = append(orphanUploadIDs, extraReplacementFileIDs(existing, file.Name, key, newID)...)
 		replacements, err = s.replacements.DriveReplacements(sess.ID, generation)
 		if err != nil {
 			return err
@@ -147,6 +149,19 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	}
 	if !hasReplacementForEveryFile(replacements, files) {
 		return fmt.Errorf("replace session files %s: replacements are incomplete", sess.ID)
+	}
+
+	deleteFile := func(fileID string) error {
+		err := s.service.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
+		if err != nil && !IsRemoteDeletedError(err) {
+			return err
+		}
+		return nil
+	}
+	for _, orphanID := range orphanUploadIDs {
+		if err := deleteFile(orphanID); err != nil {
+			return fmt.Errorf("delete duplicate replacement upload %s: %w", orphanID, err)
+		}
 	}
 	for _, replacement := range replacements {
 		switch replacement.State {
@@ -161,8 +176,7 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 				return fmt.Errorf("replace session files %s: deletion generation changed from %d to %d", sess.ID, generation, currentGeneration)
 			}
 			if replacement.OldID != "" {
-				err := s.service.Files.Delete(replacement.OldID).SupportsAllDrives(true).Context(ctx).Do()
-				if err != nil && !IsRemoteDeletedError(err) {
+				if err := deleteFile(replacement.OldID); err != nil {
 					return fmt.Errorf("delete old %s: %w", replacement.Name, err)
 				}
 			}
@@ -318,4 +332,14 @@ func replacementFileForKey(files []*drive.File, name, key string) (*drive.File, 
 		}
 	}
 	return found, nil
+}
+
+func extraReplacementFileIDs(files []*drive.File, name, key, keepID string) []string {
+	var ids []string
+	for _, file := range files {
+		if file.Name == name && file.Id != keepID && file.AppProperties[replacementKeyProperty] == key {
+			ids = append(ids, file.Id)
+		}
+	}
+	return ids
 }

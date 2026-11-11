@@ -69,6 +69,21 @@ func newSyncerWithLogger(ctx context.Context, credentials *auth.Credentials, fol
 	}, nil
 }
 
+// BuildSyncFiles returns the files a sync uploads, or an error when a
+// recording could not be read. The orchestrator uses buildSyncFiles so it can
+// upload the readable files while it leaves a session pending for that
+// recording.
+func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
+	files, folderName, unreadable, err := buildSyncFiles(sess, segments, audioPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(unreadable) != 0 {
+		return nil, "", fmt.Errorf("read recordings: %s", strings.Join(unreadable, ", "))
+	}
+	return files, folderName, nil
+}
+
 // renderDocuments returns the documents a sync uploads for s: its summary
 // ("" when it has none) and its transcript, from the canonical transcript if
 // it has one, else from its segments.
@@ -82,12 +97,13 @@ func renderDocuments(s *SyncSession, segments []transcribe.Segment) (summary, tr
 	return summary, RenderTranscriptMarkdown(s, segments)
 }
 
-func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
+func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, []string, error) {
 	date := sess.StartedAt.UTC().Format("2006-01-02")
 	slug := slugify(sess.Title)
 	folderName := date + "-" + slug
 
 	var files []SyncFile
+	var unreadable []string
 
 	summaryMD, transcriptMD := renderDocuments(sess, segments)
 	if summaryMD != "" {
@@ -118,7 +134,8 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		}
 		hash, err := fileSHA256(recording)
 		if err != nil {
-			return nil, "", fmt.Errorf("hash recording %s: %w", recording, err)
+			unreadable = append(unreadable, recording)
+			continue
 		}
 		ext := filepath.Ext(recording)
 		mimeType := "audio/mpeg"
@@ -135,7 +152,7 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		})
 	}
 
-	return files, folderName, nil
+	return files, folderName, unreadable, nil
 }
 
 // recordingEntries returns the recordings an audio path names: a merged
