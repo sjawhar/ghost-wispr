@@ -21,7 +21,7 @@ func summarizedSyncedSession(t *testing.T, store *SQLiteStore, id string) {
 	if err := store.UpdateSummary(id, "Launch planning", "The last good summary.", SummaryCompleted, "default", `{"0":{"name":"Sam"}}`); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
-	if err := store.UpdateEnvoyPublishStatus(id, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, id, EnvoyPublishPublished); err != nil {
 		t.Fatalf("published: %v", err)
 	}
 	syncTo(t, store, id, SyncStateSynced, "folder-1", 0, "")

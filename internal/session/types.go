@@ -49,6 +49,8 @@ type SessionSyncer interface {
 }
 
 type EventPublisher interface {
+	PublishSessionStarted(ctx context.Context, sessionID string) error
+	PublishSessionEnded(ctx context.Context, sessionID string) error
 	PublishSummaryReady(ctx context.Context, sessionID string) error
 }
 
