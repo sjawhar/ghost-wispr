@@ -572,19 +572,20 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.mu.Unlock()
 
 	if summarizer == nil {
-		// Still canonicalize for GDrive sync even without a summarizer.
+		// Without a summarizer the summary completes empty. StartSummary binds
+		// it to the current deletion generation, so that completion passes
+		// the generation fence after a segment deletion.
 		if err := m.store.StartSummary(sessionID); err != nil {
 			m.logger.Error("failed to start empty summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
-			return
 		}
 		generation, err := m.store.Canonicalize(sessionID)
 		if err != nil {
+			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 			return
 		}
 		if err := m.store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", generation); err != nil {
 			m.logger.Error("failed to mark empty summary complete", "operation", "generate_summary", "session_id", sessionID, "error", err)
-			return
 		}
 		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
 			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)

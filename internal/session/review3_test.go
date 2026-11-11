@@ -58,6 +58,8 @@ func (emptySummarySummarizer) Summarize(context.Context, string, string) (string
 	return "Auto title", "", "default", "{}", nil
 }
 
+// TestGenerateSummaryDoesNotPublishEmptySummaryReady fails if Envoy receives
+// summary_ready for a session that has no summary text.
 func TestGenerateSummaryDoesNotPublishEmptySummaryReady(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "empty-summary.db"))
 	if err != nil {
@@ -80,5 +82,75 @@ func TestGenerateSummaryDoesNotPublishEmptySummaryReady(t *testing.T) {
 	case sessionID := <-published:
 		t.Fatalf("published summary_ready for empty summary from session %q", sessionID)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// noSummarizerStore opens a real store holding one ended session with two
+// segments.
+func noSummarizerStore(t *testing.T) *storage.SQLiteStore {
+	t.Helper()
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "no-summarizer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 11, 11, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("s", started); err != nil {
+		t.Fatal(err)
+	}
+	for i, text := range []string{"kept words", "deleted words"} {
+		if err := store.AppendSegment("s", transcribe.Segment{Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession("s", started.Add(2*time.Second), "recording.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+// TestNoSummarizerCanonicalizeFailureEndsTheSummary fails if a canonicalize
+// error leaves the summary running, which holds the Drive replacement forever.
+func TestNoSummarizerCanonicalizeFailureEndsTheSummary(t *testing.T) {
+	store := noSummarizerStore(t)
+	if _, err := store.DB().Exec(`CREATE TRIGGER refuse_canonical BEFORE UPDATE OF canonical_transcript ON sessions
+		BEGIN SELECT RAISE(ABORT, 'canonical transcript refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(store, nil, nil, nil, nil, 0)
+
+	manager.generateSummary(context.Background(), "s", time.Now().UTC())
+
+	session, err := store.GetSession("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SummaryStatus != storage.SummaryFailed {
+		t.Errorf("summary_status after canonicalize failure = %q, want %q", session.SummaryStatus, storage.SummaryFailed)
+	}
+}
+
+// TestNoSummarizerRefusedCompletionStillSyncs fails if a refused empty-summary
+// write skips the Drive sync that the no-summarizer path owes.
+func TestNoSummarizerRefusedCompletionStillSyncs(t *testing.T) {
+	store := noSummarizerStore(t)
+	if _, err := store.DB().Exec(`CREATE TRIGGER refuse_completion BEFORE UPDATE OF summary_status ON sessions
+		WHEN NEW.summary_status = 'completed'
+		BEGIN SELECT RAISE(ABORT, 'summary completion refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	synced := make(chan string, 1)
+	manager := NewManager(store, nil, nil, nil, nil, 0)
+	manager.SetSyncer(syncerMock{called: synced})
+
+	manager.generateSummary(context.Background(), "s", time.Now().UTC())
+
+	select {
+	case sessionID := <-synced:
+		if sessionID != "s" {
+			t.Errorf("synced session %q, want s", sessionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a refused empty-summary write skipped the Drive sync")
 	}
 }
