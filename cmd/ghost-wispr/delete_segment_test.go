@@ -506,10 +506,10 @@ func TestNeighbourCheckCountsRepeatedLostWords(t *testing.T) {
 
 func TestBoundaryCutSkipsOnlyCrossRecordingNeighbour(t *testing.T) {
 	secondRecording := []audio.Word{{Text: "deleted", Start: 0.1, End: 0.2}, {Text: "after", Start: 1.2, End: 1.3}}
-	if recordingHasWordsOnSide(secondRecording, 0, 1, "before", true) {
+	if recordingHasWordsOnSide(secondRecording, 0, 1, true) {
 		t.Fatal("selected recording unexpectedly has a before-side neighbour")
 	}
-	if !recordingHasWordsOnSide(secondRecording, 0, 1, "after", false) {
+	if !recordingHasWordsOnSide(secondRecording, 0, 1, false) {
 		t.Fatal("selected recording should validate its after-side neighbour")
 	}
 }

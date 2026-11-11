@@ -29,29 +29,6 @@ func (s *SQLiteStore) RecordSummaryBatch(batchName string, generations map[strin
 	return nil
 }
 
-// SummaryBatchGenerations returns the persisted generation for every request
-// in batchName, including after an application restart.
-func (s *SQLiteStore) SummaryBatchGenerations(batchName string) (map[string]int, error) {
-	rows, err := s.db.Query(`SELECT session_id, generation FROM summary_batches WHERE batch_name = ?`, batchName)
-	if err != nil {
-		return nil, fmt.Errorf("query summary batch %s: %w", batchName, err)
-	}
-	defer func() { _ = rows.Close() }()
-	generations := map[string]int{}
-	for rows.Next() {
-		var sessionID string
-		var generation int
-		if err := rows.Scan(&sessionID, &generation); err != nil {
-			return nil, fmt.Errorf("scan summary batch %s: %w", batchName, err)
-		}
-		generations[sessionID] = generation
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate summary batch %s: %w", batchName, err)
-	}
-	return generations, nil
-}
-
 // SummaryBatchSessions returns every submitted session's generation and
 // processing state, including after an application restart.
 func (s *SQLiteStore) SummaryBatchSessions(batchName string) (map[string]SummaryBatchSession, error) {

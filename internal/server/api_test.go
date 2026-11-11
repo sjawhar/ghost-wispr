@@ -1919,8 +1919,8 @@ func TestFaultInjectionNoHandler(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 when Deepgram is not configured, got %d", rr.Code)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when Deepgram is not configured, got %d", rr.Code)
 	}
 }
 

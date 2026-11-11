@@ -66,7 +66,7 @@ func r4BatchState(t *testing.T, store *storage.SQLiteStore, batchName, sessionID
 
 func TestR4FailedBatchMarksEverySessionFailed(t *testing.T) {
 	store, _, batchName, _ := r4BatchStore(t, "a", "b")
-	_, failed, err := applySummaryBatchResults(store, nil, nil, batchName, nil, true)
+	_, failed, err := applySummaryBatchResults(store, nil, nil, batchName, nil)
 	if err != nil || failed != 2 {
 		t.Fatalf("apply failed batch = failed:%d err:%v, want 2 nil", failed, err)
 	}
@@ -80,7 +80,7 @@ func TestR4FailedBatchMarksEverySessionFailed(t *testing.T) {
 
 func TestR4PartialBatchMarksUnreturnedSessionFailed(t *testing.T) {
 	store, _, batchName, _ := r4BatchStore(t, "a", "b")
-	succeeded, failed, err := applySummaryBatchResults(store, nil, nil, batchName, []summary.BatchResult{{SessionID: "a", Title: "A", Summary: "A summary", PresetName: "default", SpeakerNames: "{}"}}, true)
+	succeeded, failed, err := applySummaryBatchResults(store, nil, nil, batchName, []summary.BatchResult{{SessionID: "a", Title: "A", Summary: "A summary", PresetName: "default", SpeakerNames: "{}"}})
 	if err != nil || succeeded != 1 || failed != 1 {
 		t.Fatalf("apply partial batch = succeeded:%d failed:%d err:%v, want 1 1 nil", succeeded, failed, err)
 	}
@@ -102,7 +102,7 @@ func TestR4BatchStatesSurviveRestartBeforePoll(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	if _, failed, err := applySummaryBatchResults(store, nil, nil, batchName, nil, true); err != nil || failed != 1 {
+	if _, failed, err := applySummaryBatchResults(store, nil, nil, batchName, nil); err != nil || failed != 1 {
 		t.Fatalf("apply after restart = failed:%d err:%v, want 1 nil", failed, err)
 	}
 	if state := r4BatchState(t, store, batchName, "a"); state != storage.SummaryFailed {
@@ -145,7 +145,7 @@ func TestR4StaleBatchResultIsNotBroadcast(t *testing.T) {
 	}
 	hub := &r4BatchHub{}
 	published := 0
-	_, failed, err := applySummaryBatchResults(store, hub, func(string) { published++ }, batchName, []summary.BatchResult{{SessionID: "a", Title: "stale", Summary: "private", PresetName: "default", SpeakerNames: "{}"}}, true)
+	_, failed, err := applySummaryBatchResults(store, hub, func(string) { published++ }, batchName, []summary.BatchResult{{SessionID: "a", Title: "stale", Summary: "private", PresetName: "default", SpeakerNames: "{}"}})
 	if err != nil || failed != 1 {
 		t.Fatalf("apply stale batch = failed:%d err:%v, want 1 nil", failed, err)
 	}

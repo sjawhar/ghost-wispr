@@ -35,6 +35,19 @@ type segmentDeleteRunner struct {
 	deleteSegment    func(sessionID string, segmentID int64, span storage.DeletedSpan) error
 }
 
+func requireSegmentForDeletion(store *storage.SQLiteStore, sessionID string, segmentID int64) error {
+	segments, err := store.GetSegments(sessionID)
+	if err != nil {
+		return err
+	}
+	for _, segment := range segments {
+		if segment.ID == segmentID {
+			return nil
+		}
+	}
+	return storage.ErrSegmentNotFound
+}
+
 type deletionRecordingSet struct {
 	Paths      []string
 	Downloaded []string
@@ -294,8 +307,8 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 	// A neighbour in another recording has no words on this recording's side
 	// of the cut, so it cannot have been over-cut here. Validate only sides
 	// for which the selected recording supplied pre-cut words.
-	beforeCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, before, true)
-	afterCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, after, false)
+	beforeCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, true)
+	afterCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, false)
 	if beforeCheck {
 		if beforeMissing := missingNeighbourTokens(wordsAfter, start, before, true); len(beforeMissing) > 1 {
 			return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(beforeMissing, ", "))
@@ -339,24 +352,15 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 	return nil
 }
 
-// recordingHasWordsOnSide reports whether the selected recording holds a token
-// from this neighbour on the corresponding side of the cut.
-func recordingHasWordsOnSide(words []audio.Word, start, end float64, neighbour string, before bool) bool {
-	neighbourTokens := make(map[string]struct{})
-	for _, token := range deletionTokens(neighbour) {
-		neighbourTokens[token] = struct{}{}
-	}
+// recordingHasWordsOnSide reports whether the selected recording has words on
+// the corresponding side of the cut.
+func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool) bool {
 	for _, word := range words {
-		for _, token := range deletionTokens(word.Text) {
-			if _, ok := neighbourTokens[token]; !ok {
-				continue
-			}
-			if before && word.Start < end {
-				return true
-			}
-			if !before && word.End > start {
-				return true
-			}
+		if before && word.Start < start {
+			return true
+		}
+		if !before && word.End > end {
+			return true
 		}
 	}
 	return false

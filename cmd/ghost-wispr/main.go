@@ -832,7 +832,10 @@ func main() {
 				}
 			}
 			batchResults := summarizer.ProcessBatchResults(job, sessions)
-			succeeded, failed, err := applySummaryBatchResults(store, hub, publishSummaryReady, batchName, batchResults, true)
+			if len(batchResults) == 0 {
+				log.Printf("warning: summary batch %s completed without inline results; marking submitted sessions failed", batchName)
+			}
+			succeeded, failed, err := applySummaryBatchResults(store, hub, publishSummaryReady, batchName, batchResults)
 			if err != nil {
 				return nil, err
 			}
@@ -846,7 +849,7 @@ func main() {
 			if job.Error != nil {
 				errMsg = job.Error.Message
 			}
-			_, failed, err := applySummaryBatchResults(store, hub, nil, batchName, nil, true)
+			_, failed, err := applySummaryBatchResults(store, hub, nil, batchName, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -893,19 +896,8 @@ func main() {
 			return manager.RefineSession(ctx, sessionID, sess.AudioPath, sess.StartedAt)
 		},
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
-			segments, err := store.GetSegments(sessionID)
-			if err != nil {
+			if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {
 				return err
-			}
-			found := false
-			for _, segment := range segments {
-				if segment.ID == segmentID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return storage.ErrSegmentNotFound
 			}
 			latestCfg := cfgStore.Get()
 			batch, err := makeBatchTranscriber(&latestCfg)

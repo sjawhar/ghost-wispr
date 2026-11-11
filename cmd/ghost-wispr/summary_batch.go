@@ -20,6 +20,9 @@ func readBatchSummarySessions(store *storage.SQLiteStore, sessionIDs []string) (
 	generations := make(map[string]int, len(sessionIDs))
 	emptyTranscriptIDs := make([]string, 0)
 	for _, sessionID := range sessionIDs {
+		if err := store.Canonicalize(sessionID); err != nil {
+			return nil, nil, nil, fmt.Errorf("canonicalize batch summary input for %s: %w", sessionID, err)
+		}
 		transcript, _, generation, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("read batch summary input for %s: %w", sessionID, err)
@@ -37,7 +40,7 @@ func readBatchSummarySessions(store *storage.SQLiteStore, sessionIDs []string) (
 // applySummaryBatchResults stores each terminal response only at its submitted
 // generation. Missing responses are failures; already-handled sessions are
 // skipped so a repeated poll cannot publish a result twice.
-func applySummaryBatchResults(store *storage.SQLiteStore, hub summaryBroadcaster, publish func(string), batchName string, results []summary.BatchResult, terminal bool) (succeeded, failed int, err error) {
+func applySummaryBatchResults(store *storage.SQLiteStore, hub summaryBroadcaster, publish func(string), batchName string, results []summary.BatchResult) (succeeded, failed int, err error) {
 	sessions, err := store.SummaryBatchSessions(batchName)
 	if err != nil {
 		return 0, 0, err
@@ -76,9 +79,6 @@ func applySummaryBatchResults(store *storage.SQLiteStore, hub summaryBroadcaster
 			publish(result.SessionID)
 		}
 		succeeded++
-	}
-	if !terminal {
-		return succeeded, failed, nil
 	}
 	for sessionID, batchSession := range sessions {
 		if batchSession.State != "pending" {

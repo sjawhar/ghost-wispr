@@ -26,11 +26,11 @@ func TestSummaryBatchGenerationsSurviveRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	generations, err := store.SummaryBatchGenerations("batches/one")
+	sessions, err := store.SummaryBatchSessions("batches/one")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if generations["s"] != 7 {
-		t.Fatalf("persisted generations = %v, want session s at 7", generations)
+	if sessions["s"].Generation != 7 || sessions["s"].State != "pending" {
+		t.Fatalf("persisted sessions = %v, want session s at generation 7 and pending", sessions)
 	}
 }

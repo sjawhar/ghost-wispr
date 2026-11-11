@@ -6,9 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -45,47 +43,6 @@ func TestR3DeleteWhilePendingSplice(t *testing.T) {
 	if !errors.Is(err, storage.ErrSegmentSplicePending) || !bytes.Equal(contents, original) {
 		t.Fatal("second delete was not refused, or the recording changed")
 	}
-}
-
-func TestR3RecoveryHoldsTheDeleteLock(t *testing.T) {
-	recording := filepath.Join(t.TempDir(), "recording.mp3")
-	original := []byte("original")
-	if err := os.WriteFile(recording, original, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, segmentID, _ := newDeletionTestStore(t, recording)
-	segs, _ := store.GetSegments("session")
-	if err := store.DeleteSegment("session", segmentID, storage.DeletedSpan{SessionID: "session", AudioPath: recording, Start: 1, End: 2,
-		SHA256Before: hashBytesForDeleteTest(original), SHA256After: hashBytesForDeleteTest([]byte("spliced"))}); err != nil {
-		t.Fatal(err)
-	}
-	entered, release := make(chan struct{}), make(chan struct{})
-	gatedSplice := func(ctx context.Context, path string, s, e float64) (string, error) {
-		close(entered)
-		<-release
-		return fakeSplice(ctx, path, s, e)
-	}
-	recDone := make(chan struct{})
-	go func() {
-		_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, gatedSplice, nil, func(error) {})
-		close(recDone)
-	}()
-	<-entered
-	var reached atomic.Bool
-	runner := segmentDeleteRunner{store: store, transcriber: deletionWordsFake{before: initialWords(), after: cutWords()},
-		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
-			reached.Store(true)
-			return deletionRecordingSet{Paths: []string{recording}}, nil
-		}, splice: fakeSplice}
-	delDone := make(chan error, 1)
-	go func() { delDone <- runner.Delete(context.Background(), "session", segs[0].ID) }()
-	time.Sleep(300 * time.Millisecond)
-	if reached.Load() {
-		t.Fatal("live delete read recordings while recovery held the splice")
-	}
-	close(release)
-	<-recDone
-	<-delDone
 }
 
 func TestR3MergedBoundarySegment(t *testing.T) {

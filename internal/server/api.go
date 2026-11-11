@@ -136,7 +136,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		if controls.FaultDeepgramDisconnect == nil {
-			writeJSONError(w, http.StatusNotFound, "deepgram not configured")
+			writeJSONError(w, http.StatusServiceUnavailable, "deepgram not configured")
 			return
 		}
 		if err := controls.FaultDeepgramDisconnect(); err != nil {
