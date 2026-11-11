@@ -120,7 +120,7 @@ func TestReviewStaleSnapshotClearsNewerDeletion(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Canonicalize(id); err != nil {
+	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateSummary(id, "Standup", "summary", storage.SummaryCompleted, "default", "{}"); err != nil {

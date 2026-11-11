@@ -586,7 +586,7 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 	if err := store.StartSummary("session-1"); err != nil {
 		t.Fatalf("StartSummary: %v", err)
 	}
-	generation, err := store.Canonicalize("session-1")
+	_, generation, err := store.Canonicalize("session-1")
 	if err != nil {
 		t.Fatalf("Canonicalize: %v", err)
 	}

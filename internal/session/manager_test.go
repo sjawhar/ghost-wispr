@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -32,32 +33,36 @@ type storeMock struct {
 	preset   map[string]string
 	audio    map[string]string
 
-	refinementStatus    map[string]string
-	refinedTranscript   map[string]string
-	canonicalTranscript map[string]string
-	transcriptSource    map[string]string
-	errorMessage        map[string]string
+	refinementStatus        map[string]string
+	refinedTranscript       map[string]string
+	canonicalTranscript     map[string]string
+	transcriptSource        map[string]string
+	errorMessage            map[string]string
+	canonicalizeGeneration  map[string]int
+	summaryWriteGenerations []int
 
 	endSessionErr   error
 	endSessionCalls int
+	canonicalizeErr error
 	// appendHook, when set, runs first in AppendSegment, outside the lock.
 	appendHook func()
 }
 
 func newStoreMock() *storeMock {
 	return &storeMock{
-		sessions:            map[string]time.Time{},
-		segments:            map[string][]transcribe.Segment{},
-		title:               map[string]string{},
-		summary:             map[string]string{},
-		status:              map[string]string{},
-		preset:              map[string]string{},
-		audio:               map[string]string{},
-		refinementStatus:    map[string]string{},
-		refinedTranscript:   map[string]string{},
-		canonicalTranscript: map[string]string{},
-		transcriptSource:    map[string]string{},
-		errorMessage:        map[string]string{},
+		sessions:               map[string]time.Time{},
+		segments:               map[string][]transcribe.Segment{},
+		title:                  map[string]string{},
+		summary:                map[string]string{},
+		status:                 map[string]string{},
+		preset:                 map[string]string{},
+		audio:                  map[string]string{},
+		refinementStatus:       map[string]string{},
+		refinedTranscript:      map[string]string{},
+		canonicalTranscript:    map[string]string{},
+		transcriptSource:       map[string]string{},
+		errorMessage:           map[string]string{},
+		canonicalizeGeneration: map[string]int{},
 	}
 }
 
@@ -109,8 +114,18 @@ func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ s
 	return nil
 }
 
-func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, _ int) error {
-	return s.UpdateSummary(sessionID, title, summary, status, preset, speakerNames)
+func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, _ string, generation int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.summaryWriteGenerations = append(s.summaryWriteGenerations, generation)
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return sql.ErrNoRows
+	}
+	s.title[sessionID] = title
+	s.summary[sessionID] = summary
+	s.status[sessionID] = status
+	s.preset[sessionID] = preset
+	return nil
 }
 
 // StartSummary keeps the title and summary, as the store does.
@@ -180,12 +195,15 @@ func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
 	return s.refinedTranscript[sessionID], s.refinementStatus[sessionID], nil
 }
 
-func (s *storeMock) Canonicalize(sessionID string) (int, error) {
+func (s *storeMock) Canonicalize(sessionID string) (string, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.canonicalizeErr != nil {
+		return "", 0, s.canonicalizeErr
+	}
 	status := s.refinementStatus[sessionID]
 	if status == "completed" && strings.TrimSpace(s.refinedTranscript[sessionID]) != "" {
-		s.canonicalTranscript[sessionID] = s.refinedTranscript[sessionID]
+		s.canonicalTranscript[sessionID] = strings.TrimSpace(s.refinedTranscript[sessionID])
 		s.transcriptSource[sessionID] = "refined"
 	} else {
 		var b strings.Builder
@@ -200,18 +218,7 @@ func (s *storeMock) Canonicalize(sessionID string) (int, error) {
 		s.canonicalTranscript[sessionID] = b.String()
 		s.transcriptSource[sessionID] = "streaming"
 	}
-	return 0, nil
-}
-
-func (s *storeMock) GetCanonicalTranscript(sessionID string) (string, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.canonicalTranscript[sessionID], s.transcriptSource[sessionID], nil
-}
-
-func (s *storeMock) GetCanonicalTranscriptWithGeneration(sessionID string) (string, string, int, error) {
-	transcript, source, err := s.GetCanonicalTranscript(sessionID)
-	return transcript, source, 0, err
+	return s.canonicalTranscript[sessionID], s.canonicalizeGeneration[sessionID], nil
 }
 
 type recorderMock struct {

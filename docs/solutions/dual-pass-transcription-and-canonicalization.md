@@ -63,6 +63,12 @@ Only Deepgram is implemented. Config supports `batch_transcription.provider` (de
 - If `completed` and refined transcript is non-empty: use refined, set `transcript_source = 'refined'`
 - Otherwise: assemble streaming segments, set `transcript_source = 'streaming'`
 
+It returns that chosen text with the deletion generation from the same
+transaction that writes it. The store has one SQLite connection, so segment
+deletion waits for the transaction; canonicalization does not retry after a
+deletion. Callers use the returned text and generation together rather than
+reading the canonical transcript again.
+
 ### FTS5 Index
 
 FTS5 indexes `canonical_transcript`, not segments. Triggers keep it in sync. When canonicalization updates the canonical transcript, the UPDATE trigger automatically re-indexes.

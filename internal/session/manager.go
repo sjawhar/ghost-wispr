@@ -537,7 +537,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 
 	// Re-canonicalize now that refined transcript is available.
-	if _, err := m.store.Canonicalize(sessionID); err != nil {
+	if _, _, err := m.store.Canonicalize(sessionID); err != nil {
 		m.batchLogger.Error("failed to re-canonicalize after batch refinement", "operation", "batch_refinement", "session_id", sessionID, "error", err)
 	}
 }
@@ -578,32 +578,21 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		if err := m.store.StartSummary(sessionID); err != nil {
 			m.logger.Error("failed to start empty summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
-		generation, err := m.store.Canonicalize(sessionID)
+		transcript, generation, err := m.store.Canonicalize(sessionID)
 		if err != nil {
+			// Terminal, so a Drive replacement waiting for this session's
+			// summary stops waiting; the sync still runs, with the canonical
+			// transcript the session already has.
 			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+			m.triggerDriveSync(syncer, sessionID)
 			return
 		}
 		if err := m.store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", generation); err != nil {
 			m.logger.Error("failed to mark empty summary complete", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
-		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
-			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		} else {
-			m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
-		}
-		if syncer != nil {
-			go func() {
-				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-					m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
-					if m.hub != nil {
-						m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
-					}
-				} else if m.hub != nil {
-					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
-				}
-			}()
-		}
+		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
+		m.triggerDriveSync(syncer, sessionID)
 		return
 	}
 
@@ -618,20 +607,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	// Canonicalize the transcript (picks refined if available, else assembles streaming).
-	generation, err := m.store.Canonicalize(sessionID)
+	transcript, generation, err := m.store.Canonicalize(sessionID)
 	if err != nil {
 		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		return
-	}
-
-	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
-	if err != nil {
-		m.failSummary(sessionID, fmt.Sprintf("failed to get canonical transcript: %v", err))
-		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to retrieve transcript for session %s", sessionID))
-		}
 		return
 	}
 
@@ -669,18 +648,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 	m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 
-	if syncer != nil {
-		go func() {
-			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-				m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
-				if m.hub != nil {
-					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
-				}
-			} else if m.hub != nil {
-				m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
-			}
-		}()
-	}
+	m.triggerDriveSync(syncer, sessionID)
 
 	if publisher != nil {
 		go func() {
@@ -689,6 +657,22 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 			}
 		}()
 	}
+}
+
+func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
+	if syncer == nil {
+		return
+	}
+	go func() {
+		if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+			m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
+			if m.hub != nil {
+				m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+			}
+		} else if m.hub != nil {
+			m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
+		}
+	}()
 }
 
 func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {

@@ -30,7 +30,7 @@ func round2Session(t *testing.T, store *storage.SQLiteStore, id string, texts []
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Canonicalize(id); err != nil {
+	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateSummary(id, "Standup", "summary", storage.SummaryCompleted, "default", "{}"); err != nil {
