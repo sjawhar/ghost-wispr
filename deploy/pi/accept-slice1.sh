@@ -103,15 +103,24 @@ check_sshd_loopback() {
   done <<<"$listeners"
 }
 
+monotonic_milliseconds() {
+  awk '{printf "%.0f\n", $1 * 1000}' /proc/uptime
+}
+
 wait_for_light() {
-  local expected=$1 attempts=$2
-  for _ in $(seq 1 "$attempts"); do
-    if [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == "$expected" ]]; then
-      return
-    fi
-    sleep 0.5
+  local expected=$1 maximum_ms=$2 started now light_state
+  started=$(monotonic_milliseconds)
+  while :; do
+    light_state=$(remote_run '/opt/ghost-wispr/ghost-wispr light-state')
+    case "$light_state" in
+      red|off) ;;
+      *) fail "light reported an unexpected colour: $light_state" ;;
+    esac
+    [[ "$light_state" == "$expected" ]] && return
+    now=$(monotonic_milliseconds)
+    (( now - started < maximum_ms )) || return 1
+    sleep 0.1
   done
-  return 1
 }
 
 assert_dark_until_capturing() {
@@ -120,6 +129,10 @@ assert_dark_until_capturing() {
     if current_status=$(status 2>/dev/null); then
       capture_state=$(jq -r '.capture_state // empty' <<<"$current_status")
       light_state=$(remote_run '/opt/ghost-wispr/ghost-wispr light-state')
+      case "$light_state" in
+        red|off) ;;
+        *) fail "Light power-cycle FAILED: unexpected colour $light_state" ;;
+      esac
       if [[ "$capture_state" == capturing ]]; then
         [[ "$light_state" == red ]] || fail "Light power-cycle FAILED: light is not red while capturing"
         return
@@ -135,32 +148,46 @@ boot_id() {
   remote_run 'cat /proc/sys/kernel/random/boot_id'
 }
 
-assert_new_boot() {
-  local before=$1 after
-  after=$(boot_id)
-  [[ "$after" != "$before" ]] || fail "boot ID did not change after the power cycle"
+boot_id_changed() {
+  [[ $1 != "$2" ]]
 }
 
-assert_listener_boundary() {
-  local tailscale_ips listeners listener local_address allowed ip
-  tailscale_ips=$(remote_run 'tailscale ip -4; tailscale ip -6') || fail "could not read Tailscale addresses"
-  listeners=$(remote_run 'sudo ss -ltnH; sudo ss -lunH') || fail "could not read listening sockets"
-  [[ -n "$listeners" ]] || unknown "listener inventory is empty"
+wait_for_new_boot() {
+  local before=$1 after
+  for _ in $(seq 1 240); do
+    if after=$(boot_id 2>/dev/null) && boot_id_changed "$before" "$after"; then
+      return
+    fi
+    sleep 0.5
+  done
+  fail "boot ID did not change after the power cycle"
+}
+
+assert_listener_boundary_from() {
+  local tailscale_ips=$1 listeners=$2 listener local_address allowed ip
+  [[ -n "$listeners" ]] || unknown "TCP listener inventory is empty"
   while IFS= read -r listener; do
     local_address=$(awk '{print $4}' <<<"$listener")
-    [[ -n "$local_address" ]] || unknown "listener address is missing"
+    [[ -n "$local_address" ]] || unknown "TCP listener address is missing"
     allowed=false
     case "$local_address" in
-      127.0.0.1:*|'[::1]:'*) allowed=true ;;
+      127.*:*|'[::1]:'*) allowed=true ;;
     esac
     while IFS= read -r ip; do
       [[ -n "$ip" ]] || continue
-      if [[ "$local_address" == "$ip":* || "$local_address" == "$ip"%*:* ]]; then
+      if [[ "$local_address" == "$ip":* || "$local_address" == "$ip"%*:* || "$local_address" == "[$ip]"* ]]; then
         allowed=true
       fi
     done <<<"$tailscale_ips"
-    [[ "$allowed" == true ]] || fail "listener is outside loopback and Tailscale: $local_address"
+    [[ "$allowed" == true ]] || fail "TCP listener is outside loopback and Tailscale: $local_address"
   done <<<"$listeners"
+}
+
+assert_listener_boundary() {
+  local tailscale_ips listeners
+  tailscale_ips=$(remote_run 'tailscale ip -4; tailscale ip -6') || fail "could not read Tailscale addresses"
+  listeners=$(remote_run 'sudo ss -ltnH') || fail "could not read TCP listening sockets"
+  assert_listener_boundary_from "$tailscale_ips" "$listeners"
 }
 
 hmac_signature() {
@@ -281,6 +308,20 @@ run_control_tests() {
     fail "self-test expected the Deepgram recording control to reject low growth"
   fi
   printf 'self-test: Deepgram recording control rejected low growth\n'
+
+  if boot_id_changed old-boot old-boot; then
+    fail "self-test expected unchanged boot ID to be rejected"
+  fi
+  boot_id_changed old-boot new-boot || fail "self-test expected a new boot ID to be accepted"
+  printf 'self-test: boot control rejected an old still-capturing boot ID\n'
+
+  tailscale_fixture=$'100.100.134.41\nfd7a:115c:a1e0::836:862b'
+  listener_fixture=$'LISTEN 0 4096 100.100.134.41%tailscale0:40271 0.0.0.0:*\nLISTEN 0 4096 [fd7a:115c:a1e0::836:862b]%tailscale0:34493 [::]:*\nLISTEN 0 128 127.0.0.1:22 0.0.0.0:*'
+  assert_listener_boundary_from "$tailscale_fixture" "$listener_fixture"
+  if (assert_listener_boundary_from "$tailscale_fixture" "$listener_fixture"$'\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*'); then
+    fail "self-test expected a public TCP listener to be rejected"
+  fi
+  printf 'self-test: TCP listener fixture accepted tailnet IPv6 and rejected 0.0.0.0:22\n'
 }
 
 if [[ "$self_test" == true ]]; then
@@ -289,6 +330,7 @@ if [[ "$self_test" == true ]]; then
 fi
 
 printf 'A4 RAN: check the tagged tailnet identity and automatic service.\n'
+
 self_status=$(remote_run 'tailscale status --self --json')
 jq -e --arg host "${host}." '
   .Self.Tags == ["tag:ghost-wispr"] and .Self.DNSName == $host
@@ -299,8 +341,8 @@ assert_capturing
 a4_boot_before=$(boot_id)
 printf 'A4 NEEDS-PERSON: press Enter, then leave the recorder capturing, pull power, and reconnect it. '
 read -r _
+wait_for_new_boot "$a4_boot_before"
 assert_dark_until_capturing
-assert_new_boot "$a4_boot_before"
 assert_capturing
 printf 'A4 RAN: a new boot ID came back capturing.\n'
 printf 'Light power-cycle NEEDS-PERSON: confirm the light stayed dark until Ghost Wispr began capturing.\n'
@@ -336,25 +378,25 @@ printf 'Light hang RAN: stop the recorder process and require darkness within 3 
 main_pid=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user show --property=MainPID --value ghost-wispr.service")
 [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "Light hang FAILED: no Ghost Wispr main PID"
 remote_run "kill -STOP $main_pid"
-if ! wait_for_light off 6; then
+if ! wait_for_light off 3000; then
   remote_run "kill -CONT $main_pid"
   fail "Light hang FAILED: light did not turn off within 3 seconds"
 fi
 remote_run "kill -CONT $main_pid"
-wait_for_light red 4 || fail "Light hang FAILED: light did not turn red after continue"
+wait_for_light red 2000 || fail "Light hang FAILED: light did not turn red after continue"
 printf 'Light hang RAN: dark within 3 seconds and red after continue.\n'
 
 printf 'Light correction RAN: force the light off and require correction while capturing.\n'
 remote_run '/opt/ghost-wispr/ghost-wispr light-off'
-wait_for_light red 4 || fail "Light correction FAILED: recorder did not restore red within 2 seconds"
+wait_for_light red 2000 || fail "Light correction FAILED: recorder did not restore red within 2 seconds"
 printf 'Light correction RAN: recorder restored red within 2 seconds.\n'
 
 printf 'A3 RAN: pause persists through a power cycle.\n'
 a3_boot_before=$(boot_id)
 printf 'A3 NEEDS-PERSON: tap once to pause, pull power, reconnect it, then press Enter. '
 read -r _
+wait_for_new_boot "$a3_boot_before"
 wait_for_recorder
-assert_new_boot "$a3_boot_before"
 assert_paused
 [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == off ]] || fail "A3 FAILED: light is not off after paused reboot"
 printf 'A3 NEEDS-PERSON: tap once to resume, then press Enter. '

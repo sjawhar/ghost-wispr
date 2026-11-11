@@ -151,7 +151,7 @@ Put these files in it:
 ```bash
 (cd ~/src/agent-infra/bootstrap && pulumi stack output --stack prod ghostWisprCertificates --json | jq -r '."ghost-wispr"') >"$bundle_dir/device.crt"
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$bundle_dir/"
-(cd ~/src/agent-infra/root && pulumi stack output tailscaleIds --stack prod --json | jq -r '."ghost-wispr-x509"') >"$bundle_dir/tailscale-client-id"
+(cd ~/src/agent-infra/root && pulumi config get --stack prod --path 'tailscaleIds["ghost-wispr-x509"]') >"$bundle_dir/tailscale-client-id"
 (cd ~/src/agent-infra/envoy-cluster && printf '%s/webhook/ghostwispr' "$(pulumi stack output relayUrl --stack prod)") >"$bundle_dir/envoy-webhook-url"
 gcloud secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra >"$bundle_dir/envoy-webhook-secret"
 gcloud iam service-accounts describe ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com --format='value(uniqueId)' >"$bundle_dir/tailscale-subject"

@@ -13,10 +13,10 @@ mkdir -p "$HOME/src/agent-infra/bootstrap" "$HOME/src/agent-infra/root" "$HOME/s
 
 cat >"$work_dir/bin/pulumi" <<'EOF'
 #!/usr/bin/env bash
-case "$PWD" in
-  */bootstrap) printf '{"ghost-wispr":"CERTIFICATE"}\n' ;;
-  */root) printf '{"ghost-wispr-x509":"tailscale-client-id"}\n' ;;
-  */envoy-cluster) printf 'https://relay.example.test\n' ;;
+case "$PWD:$*" in
+  */bootstrap:'stack output --stack prod ghostWisprCertificates --json') printf '{"ghost-wispr":"CERTIFICATE"}\n' ;;
+  */root:'config get --stack prod --path tailscaleIds["ghost-wispr-x509"]') printf 'tailscale-client-id\n' ;;
+  */envoy-cluster:'stack output relayUrl --stack prod') printf 'https://relay.example.test\n' ;;
   *) exit 1 ;;
 esac
 EOF
@@ -93,7 +93,7 @@ chmod 700 "$bundle_root"
 bundle_dir=$(mktemp -d "$bundle_root/bundle.XXXXXX")
 (cd ~/src/agent-infra/bootstrap && pulumi stack output --stack prod ghostWisprCertificates --json | jq -r '."ghost-wispr"') >"$bundle_dir/device.crt"
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$bundle_dir/"
-(cd ~/src/agent-infra/root && pulumi stack output tailscaleIds --stack prod --json | jq -r '."ghost-wispr-x509"') >"$bundle_dir/tailscale-client-id"
+(cd ~/src/agent-infra/root && pulumi config get --stack prod --path 'tailscaleIds["ghost-wispr-x509"]') >"$bundle_dir/tailscale-client-id"
 (cd ~/src/agent-infra/envoy-cluster && printf '%s/webhook/ghostwispr' "$(pulumi stack output relayUrl --stack prod)") >"$bundle_dir/envoy-webhook-url"
 gcloud secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra >"$bundle_dir/envoy-webhook-secret"
 gcloud iam service-accounts describe ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com --format='value(uniqueId)' >"$bundle_dir/tailscale-subject"
@@ -115,6 +115,12 @@ tar -C "$bundle_dir" -cf - \
 # shellcheck disable=SC2029 # The stub intentionally receives the locally expanded path.
 ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
 
+[[ $(<"$bundle_dir/device.crt") == CERTIFICATE ]] || exit 1
+[[ $(<"$bundle_dir/tailscale-client-id") == tailscale-client-id ]] || exit 1
+[[ $(<"$bundle_dir/envoy-webhook-url") == https://relay.example.test/webhook/ghostwispr ]] || exit 1
+[[ $(<"$bundle_dir/envoy-webhook-secret") == envoy-secret ]] || exit 1
+[[ $(<"$bundle_dir/tailscale-subject") == 1234567890 ]] || exit 1
+jq -e '.credential_source.certificate.certificate_config_location == "/opt/ghost-wispr/certificate_config.json"' "$bundle_dir/google-credentials.json" >/dev/null
 printf '%s\n' device.crt google-credentials.json certificate_config.json tailscale-client-id tailscale-subject envoy-webhook-url envoy-webhook-secret deepgram-key \
   | LC_ALL=C sort >"$work_dir/expected.list"
 cmp "$work_dir/expected.list" "$TEST_BUNDLE_LIST"

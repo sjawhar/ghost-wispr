@@ -81,6 +81,7 @@ jobs:
       - name: Publish release
         env:
           BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v$(date -u +%Y.%m.%d)-${BUILD_SHA:0:7}"
