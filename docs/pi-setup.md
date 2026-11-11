@@ -342,13 +342,13 @@ The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
   field without a key body (the `ghost-wispr` binary's Go struct tags) is printed as a note.
   The configured credential must be an external-account X.509 credential.
 - A6 requires `/api/config` to show Drive sync on, a folder ID, credentials present, and GC
-  enabled with no age limit and the 20000 MB audio budget.
+  enabled with no age limit and the 20000 MB audio budget. After the real session ends, it
+  requires `summary.ready`, a synced Drive folder, and a keyword-search result for that session.
 - A8 requires `/api/status` to report no warnings, then starts one real session and calls
   summary, semantic search, speech, and batch refinement. It compares the summary's
   `summary_model`, semantic-search `model`, speech response headers and status model/voice,
-  and refinement `refinement_model` with the configured roles. Those fields come from the
-  providers' responses; Vertex falls back to the resolved request model only when its API
-  omits a model version.
+  and refinement `refinement_model` with the configured roles. A provider that does not report
+  its model produces `not reported by provider`; A8 marks that role PRECHECK and does not pass it.
 - A10 checks the member list: the only organizers are the service account and Sami, and the
   approved readers group is the only reader.
 

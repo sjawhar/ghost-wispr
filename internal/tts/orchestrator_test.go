@@ -20,6 +20,8 @@ type mockProvider struct {
 	audio       []byte
 	format      audio.AudioFormat
 	durationMs  int64
+	model       string
+	voice       string
 	err         error
 	calls       int
 	synthesized []SpeechRequest
@@ -49,6 +51,8 @@ func (m *mockProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Spee
 		Audio:      m.audio,
 		Format:     m.format,
 		DurationMs: m.durationMs,
+		Model:      m.model,
+		Voice:      m.voice,
 	}, nil
 }
 
@@ -149,6 +153,29 @@ func TestOrchestrator_SpeakAndStatus(t *testing.T) {
 			t.Fatalf("timeout waiting for completion, current status: %s", status.Status)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *testing.T) {
+	provider := &mockProvider{
+		audio:  []byte{0x01, 0x00},
+		format: audio.AudioFormat{SampleRate: 16000, Channels: 1, Encoding: audio.EncodingPCM16},
+		model:  "provider-tts-model",
+		voice:  "provider-tts-voice",
+	}
+	o := NewOrchestrator(provider, newTestSpeaker(), OrchestratorOpts{MaxRequestsPerMin: 100})
+	defer o.Stop()
+
+	id, err := o.Speak("model acceptance", "", "gemini")
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	status, err := o.WaitForSynthesis(context.Background(), id)
+	if err != nil {
+		t.Fatalf("WaitForSynthesis: %v", err)
+	}
+	if status.Model != provider.model || status.Voice != provider.voice {
+		t.Fatalf("provider report = %q/%q, want %q/%q", status.Model, status.Voice, provider.model, provider.voice)
 	}
 }
 

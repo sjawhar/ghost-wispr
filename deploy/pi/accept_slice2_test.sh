@@ -47,4 +47,17 @@ fi
 assert_source_contains 'assert_provider_model'
 assert_source_contains 'provider model mismatch'
 
+mutation_dir=$(mktemp -d)
+trap 'rm -rf -- "$mutation_dir"' EXIT
+mutated_driver="$mutation_dir/accept-slice2.sh"
+source_text=$(<"$driver")
+needle=$'printf \'%s provider model mismatch: got %q, want %q\\n\' "$role" "$actual" "$expected" >&2\n    return 1'
+replacement=$'printf \'%s provider model mismatch: got %q, want %q\\n\' "$role" "$actual" "$expected" >&2\n    return 0'
+[[ "$source_text" == *"$needle"* ]] || fail 'could not plant the provider-model checker mutation'
+source_text=${source_text/"$needle"/"$replacement"}
+printf '%s' "$source_text" >"$mutated_driver"
+if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
+  fail 'self-test accepted a provider-model checker that accepts planted mismatches'
+fi
+
 printf 'slice 2 acceptance test passed\n'

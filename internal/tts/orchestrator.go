@@ -208,10 +208,9 @@ func (o *Orchestrator) processRequest(req *speakRequest) {
 		if r := recover(); r != nil {
 			slog.Error("tts orchestrator panic recovered", "request_id", req.id, "panic", r)
 			o.updateStatus(req.id, StatusFailed, 0, 0, fmt.Sprintf("internal error: %v", r))
+			o.finishSynthesis(req.id)
 		}
 	}()
-	defer o.finishSynthesis(req.id)
-
 	o.updateStatus(req.id, StatusPlaying, 0, 0, "")
 
 	// Synthesize with timeout.
@@ -226,10 +225,12 @@ func (o *Orchestrator) processRequest(req *speakRequest) {
 	resp, err := o.ttsProvider.Synthesize(synthCtx, speechReq)
 	if err != nil {
 		o.updateStatus(req.id, StatusFailed, 0, 0, fmt.Sprintf("synthesis failed: %v", err))
+		o.finishSynthesis(req.id)
 		return
 	}
 
 	o.updateSpeechReport(req.id, resp.Model, resp.Voice)
+	o.finishSynthesis(req.id)
 	slog.Info("tts synthesized", "request_id", req.id, "provider", o.ttsProvider.Name(), "model", resp.Model, "voice", resp.Voice)
 
 	// Play through speaker.
