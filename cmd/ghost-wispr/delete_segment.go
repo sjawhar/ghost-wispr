@@ -276,7 +276,6 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 		}
 	}
 
-
 	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordings, ","), Start: start, End: end, StreamStart: segments[index].StartTime, StreamEnd: segments[index].EndTime, SHA256Before: beforeHash, SHA256After: afterHash}
 	maintenanceErr := d.store.DeleteSegment(sessionID, segmentID, span)
 	if maintenanceErr != nil && !errors.Is(maintenanceErr, storage.ErrSegmentPostCommitMaintenance) {
