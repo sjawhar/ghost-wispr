@@ -501,6 +501,17 @@ func TestNeighbourCheckCountsRepeatedLostWords(t *testing.T) {
 	}
 }
 
+func TestBoundaryCutSkipsOnlyCrossRecordingNeighbour(t *testing.T) {
+	before, after := neighbourChecksForRecording(1, 2, 0.1, 1, 5)
+	if before || !after {
+		t.Fatalf("boundary checks before=%v after=%v, want skip-before only", before, after)
+	}
+	before, after = neighbourChecksForRecording(0, 2, 1, 4.9, 5)
+	if !before || after {
+		t.Fatalf("boundary checks before=%v after=%v, want skip-after only", before, after)
+	}
+}
+
 func TestSegmentDeleteRunnerRefusesSurvivingWordsWithoutChangingRecording(t *testing.T) {
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("original")
