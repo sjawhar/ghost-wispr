@@ -1211,6 +1211,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	capture.beforeResume = func() {
 		if err := hardware.EnsureRed(); err != nil {
 			warningRegistry.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
+			if err := store.SetAppState(storage.AppStateCapturePaused, "1"); err != nil {
+				warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+			}
 			capture.mu.Lock()
 			capture.switchOff = true
 			capture.mu.Unlock()

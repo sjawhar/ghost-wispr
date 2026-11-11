@@ -211,6 +211,9 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if !g.closed || g.switchOff || g.closings != closing {
+		return
+	}
 	g.closed = false
 	close(g.resumed)
 	g.closing = make(chan struct{})
