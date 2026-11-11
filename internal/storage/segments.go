@@ -108,6 +108,9 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			sync_status = ?,
 			sync_state = ?,
 			drive_replace_pending = 1,
+			drive_replace_since = CASE WHEN drive_replace_pending = 1 AND drive_replace_since != '' THEN drive_replace_since ELSE ? END,
+			drive_replace_failures = 0,
+			drive_replace_error = '',
 			audio_path = ?,
 			audio_removed_at = ''
 		WHERE id = ?`,
@@ -118,6 +121,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		EnvoyPublishPending,
 		SyncPending,
 		SyncStatePending,
+		time.Now().UTC().Format(time.RFC3339Nano),
 		fullAudioPath,
 		sessionID,
 	); err != nil {

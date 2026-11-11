@@ -162,37 +162,34 @@ func TestReplacementOfAFolderGoneForGoodOwesNothing(t *testing.T) {
 	}
 }
 
-// TestAFailingReplacementWarnsAndTheWarningClears fails if a replacement that
-// keeps failing raises no warning naming its session, warns on a single
-// failure, or leaves the warning up once the replacement finishes.
-func TestAFailingReplacementWarnsAndTheWarningClears(t *testing.T) {
+// TestAFailingReplacementRecordsItsFailures fails if replacement attempts that
+// keep failing are not counted in the store, with the last error, which the
+// app's status warning is read from, or if the session is still listed as
+// owing a replacement once it finishes.
+func TestAFailingReplacementRecordsItsFailures(t *testing.T) {
 	fixture := newReplacementFixture(t)
 	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
-	warnings := map[string]string{}
-	fixture.orchestrator.SetReplacementWarnings(
-		func(sessionID, message string) { warnings[sessionID] = message },
-		func(sessionID string) { delete(warnings, sessionID) },
-	)
 	fixture.wire.allowDeletes = true
 	fixture.wire.unavailable = true
-	for attempt := 1; attempt <= replacementWarningAfterFailures; attempt++ {
+	for attempt := 1; attempt <= 3; attempt++ {
 		if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err == nil {
 			t.Fatalf("attempt %d succeeded while Drive was unavailable", attempt)
 		}
-		if _, warned := warnings[fixture.id]; warned != (attempt == replacementWarningAfterFailures) {
-			t.Fatalf("after %d failed attempts, warned = %v; want a warning only from attempt %d", attempt, warned, replacementWarningAfterFailures)
-		}
 	}
-	if !strings.Contains(warnings[fixture.id], fixture.id) {
-		t.Errorf("warning %q does not name session %s", warnings[fixture.id], fixture.id)
+	owed, err := fixture.store.OwedDriveReplacements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owed) != 1 || owed[0].SessionID != fixture.id || owed[0].Failures != 3 || !strings.Contains(owed[0].LastError, "503") {
+		t.Fatalf("owed replacements after three failed attempts = %+v, want %s with 3 failures and the last error", owed, fixture.id)
 	}
 
 	fixture.wire.unavailable = false
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
 		t.Fatalf("replacement once Drive was back: %v", err)
 	}
-	if message, warned := warnings[fixture.id]; warned {
-		t.Errorf("the warning %q stayed up after the replacement finished", message)
+	if owed, err = fixture.store.OwedDriveReplacements(); err != nil || len(owed) != 0 {
+		t.Errorf("owed replacements after the replacement finished = %+v, %v; want none", owed, err)
 	}
 }
 

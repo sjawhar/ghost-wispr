@@ -318,7 +318,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 			drive_replace_pending INTEGER NOT NULL DEFAULT 0,
 			deletion_generation INTEGER NOT NULL DEFAULT 0,
 			refinement_generation INTEGER NOT NULL DEFAULT 0,
-			summary_generation INTEGER NOT NULL DEFAULT 0
+			summary_generation INTEGER NOT NULL DEFAULT 0,
+			drive_replace_since TEXT NOT NULL DEFAULT '',
+			drive_replace_failures INTEGER NOT NULL DEFAULT 0,
+			drive_replace_error TEXT NOT NULL DEFAULT ''
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
@@ -405,6 +408,9 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN deletion_generation INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN refinement_generation INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN summary_generation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_since TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_failures INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_error TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)

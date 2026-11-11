@@ -26,6 +26,10 @@ func (sweepStoreStub) GetSessionsNeedingSync() ([]string, error) {
 
 func (sweepStoreStub) GetSessionsBySyncState(string) ([]storage.Session, error) { return nil, nil }
 
+func (sweepStoreStub) OwedDriveReplacements() ([]storage.OwedDriveReplacement, error) {
+	return nil, nil
+}
+
 // countingSyncer counts the syncs it is asked for.
 type countingSyncer struct{ calls atomic.Int64 }
 
@@ -48,7 +52,7 @@ func TestDriveSyncSweepSurvivesSyncTurnedOffAndOn(t *testing.T) {
 	syncer := &countingSyncer{}
 	drive.Set(syncer)
 	ctx, cancel := context.WithCancel(context.Background())
-	swept := goDone(func() { sweepDriveSync(ctx, sweepStoreStub{}, drive, time.Millisecond) })
+	swept := goDone(func() { sweepDriveSync(ctx, sweepStoreStub{}, drive, newWarningsRegistry(), time.Millisecond) })
 	t.Cleanup(func() {
 		cancel()
 		<-swept

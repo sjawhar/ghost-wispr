@@ -1397,7 +1397,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if err != nil {
 				return nil, err
 			}
-			return newDriveOrchestrator(syncer, store, appLogger, warningRegistry), nil
+			return gdrive.NewOrchestrator(syncer, store, appLogger), nil
 		},
 		func(syncer sessionSyncer) {
 			if syncer == nil {
@@ -1496,14 +1496,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
 		} else {
 			deletionDrive = syncer
-			orchestrator := newDriveOrchestrator(syncer, store, appLogger, warningRegistry)
+			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
 			drive.Set(orchestrator)
 			manager.SetSyncer(orchestrator)
 		}
 	}
 	// The Drive sync sweep runs whether sync is on or not: it syncs nothing
 	// while sync is off, and picks up a syncer turned on in the settings.
-	go sweepDriveSync(ctx, store, drive, 5*time.Minute)
+	go sweepDriveSync(ctx, store, drive, warningRegistry, 5*time.Minute)
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)

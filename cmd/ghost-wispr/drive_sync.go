@@ -94,16 +94,26 @@ func watchDriveSyncSettings(cfgStore *config.Store, drive *driveSync, start func
 	})
 }
 
-// syncSweepStore lists the sessions the sweep syncs.
+// syncSweepStore lists the sessions the sweep syncs, and those that owe
+// Drive a replacement.
 type syncSweepStore interface {
 	GetSessionsNeedingSync() ([]string, error)
 	GetSessionsBySyncState(syncState string) ([]storage.Session, error)
+	owedReplacementStore
 }
 
 // sweepDriveSync syncs, every interval until ctx ends, the sessions waiting
 // for their first sync and those whose retry is due. While sync is off it
-// syncs nothing, and a sweep under way stops when sync is turned off.
-func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync, every time.Duration) {
+// syncs nothing, and a sweep under way stops when sync is turned off. As it
+// starts, and after every pass, sync on or off, it brings the status warnings
+// of owed Drive replacements up to date from the store.
+func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync, warnings *warningsRegistry, every time.Duration) {
+	refreshWarnings := func() {
+		if err := refreshDriveReplacementWarnings(store, warnings, time.Now().UTC()); err != nil {
+			log.Printf("gdrive replacement warnings: %v", err)
+		}
+	}
+	refreshWarnings()
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -111,48 +121,54 @@ func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync,
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if drive.Get() == nil {
-				continue
-			}
-			ids, err := store.GetSessionsNeedingSync()
-			if err != nil {
-				log.Printf("gdrive sweep error: %v", err)
-				continue
-			}
+			syncSweep(ctx, store, drive)
+			refreshWarnings()
+		}
+	}
+}
 
-			retryScheduled, err := store.GetSessionsBySyncState(storage.SyncStateRetryScheduled)
-			if err != nil {
-				log.Printf("gdrive retry sweep error: %v", err)
-				continue
-			}
+// syncSweep is one pass of sweepDriveSync.
+func syncSweep(ctx context.Context, store syncSweepStore, drive *driveSync) {
+	if drive.Get() == nil {
+		return
+	}
+	ids, err := store.GetSessionsNeedingSync()
+	if err != nil {
+		log.Printf("gdrive sweep error: %v", err)
+		return
+	}
 
-			now := time.Now().UTC()
-			seen := make(map[string]struct{}, len(ids)+len(retryScheduled))
-			for _, id := range ids {
-				seen[id] = struct{}{}
-			}
+	retryScheduled, err := store.GetSessionsBySyncState(storage.SyncStateRetryScheduled)
+	if err != nil {
+		log.Printf("gdrive retry sweep error: %v", err)
+		return
+	}
 
-			for i := range retryScheduled {
-				sess := &retryScheduled[i]
-				if !gdrive.IsRetryReady(now, sess.RetryCount, sess.LastSyncAttempt) {
-					continue
-				}
-				if _, ok := seen[sess.ID]; ok {
-					continue
-				}
-				ids = append(ids, sess.ID)
-				seen[sess.ID] = struct{}{}
-			}
+	now := time.Now().UTC()
+	seen := make(map[string]struct{}, len(ids)+len(retryScheduled))
+	for _, id := range ids {
+		seen[id] = struct{}{}
+	}
 
-			for _, id := range ids {
-				syncer := drive.Get()
-				if syncer == nil {
-					break
-				}
-				if err := syncer.SyncSession(ctx, id); err != nil {
-					log.Printf("gdrive sweep: session %s: %v", id, err)
-				}
-			}
+	for i := range retryScheduled {
+		sess := &retryScheduled[i]
+		if !gdrive.IsRetryReady(now, sess.RetryCount, sess.LastSyncAttempt) {
+			continue
+		}
+		if _, ok := seen[sess.ID]; ok {
+			continue
+		}
+		ids = append(ids, sess.ID)
+		seen[sess.ID] = struct{}{}
+	}
+
+	for _, id := range ids {
+		syncer := drive.Get()
+		if syncer == nil {
+			break
+		}
+		if err := syncer.SyncSession(ctx, id); err != nil {
+			log.Printf("gdrive sweep: session %s: %v", id, err)
 		}
 	}
 }

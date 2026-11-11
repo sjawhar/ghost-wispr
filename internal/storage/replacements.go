@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 const (
@@ -66,7 +67,7 @@ func (s *SQLiteStore) PendingDriveReplacementRecordings(sessionID string) ([]str
 }
 
 func (s *SQLiteStore) ClearDriveReplacementPending(sessionID string, generation int) error {
-	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0
+	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0, drive_replace_since = '', drive_replace_failures = 0, drive_replace_error = ''
 		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, sessionID, generation)
 	if err != nil {
 		return fmt.Errorf("clear drive replacement for session %s: %w", sessionID, err)
@@ -79,6 +80,56 @@ func (s *SQLiteStore) ClearDriveReplacementPending(sessionID string, generation 
 		return fmt.Errorf("clear drive replacement for session %s: %w", sessionID, sql.ErrNoRows)
 	}
 	return nil
+}
+
+// OwedDriveReplacement is a session that still owes Google Drive a
+// replacement after a segment deletion: since when (its first deletion not
+// yet replaced), and how many replacement attempts failed in a row since.
+type OwedDriveReplacement struct {
+	SessionID string
+	Since     time.Time
+	Failures  int
+	LastError string
+}
+
+// RecordDriveReplacementFailure counts a failed replacement attempt of
+// sessionID's deletion generation, with why it failed. An attempt for an
+// earlier generation, or a session that no longer owes one, records nothing.
+func (s *SQLiteStore) RecordDriveReplacementFailure(sessionID string, generation int, message string) error {
+	if _, err := s.db.Exec(`UPDATE sessions SET drive_replace_failures = drive_replace_failures + 1, drive_replace_error = ?
+		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, message, sessionID, generation); err != nil {
+		return fmt.Errorf("record drive replacement failure for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+// OwedDriveReplacements returns every session that still owes Drive a
+// replacement, as the store holds it, so it survives a restart.
+func (s *SQLiteStore) OwedDriveReplacements() ([]OwedDriveReplacement, error) {
+	rows, err := s.db.Query(`SELECT id, drive_replace_since, drive_replace_failures, drive_replace_error
+		FROM sessions WHERE drive_replace_pending = 1 ORDER BY started_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list owed drive replacements: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var owed []OwedDriveReplacement
+	for rows.Next() {
+		var replacement OwedDriveReplacement
+		var since string
+		if err := rows.Scan(&replacement.SessionID, &since, &replacement.Failures, &replacement.LastError); err != nil {
+			return nil, fmt.Errorf("scan owed drive replacement: %w", err)
+		}
+		if since != "" {
+			if replacement.Since, err = time.Parse(time.RFC3339Nano, since); err != nil {
+				return nil, fmt.Errorf("parse owed drive replacement time of session %s: %w", replacement.SessionID, err)
+			}
+		}
+		owed = append(owed, replacement)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate owed drive replacements: %w", err)
+	}
+	return owed, nil
 }
 func (s *SQLiteStore) DriveReplacements(sessionID string, generation int) ([]DriveReplacement, error) {
 	rows, err := s.db.Query(`SELECT session_id, generation, name, old_id, new_id, state
@@ -203,7 +254,7 @@ func (s *SQLiteStore) FinishDriveReplacement(sessionID string, generation int, f
 	if incomplete != 0 {
 		return fmt.Errorf("finish drive replacement for session %s: %d rows not deleted", sessionID, incomplete)
 	}
-	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0
+	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0, drive_replace_since = '', drive_replace_failures = 0, drive_replace_error = ''
 		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, sessionID, generation)
 	if err != nil {
 		return fmt.Errorf("finish drive replacement for session %s: %w", sessionID, err)
