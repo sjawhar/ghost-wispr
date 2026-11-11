@@ -35,7 +35,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Install audio build dependencies
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg portaudio19-dev
+        timeout-minutes: 10
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg portaudio19-dev
 
       - name: Build web assets
         working-directory: web
