@@ -700,6 +700,7 @@ func main() {
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	drive := &driveSync{}
 	var summaryPublisher atomic.Pointer[envoy.Publisher]
+	var batchGenerations sync.Map // map[string]map[string]int, keyed by batch job name
 	publishSummaryReady := func(sessionID string) {
 		pub := summaryPublisher.Load()
 		if pub == nil {
@@ -768,7 +769,13 @@ func main() {
 		if len(sessions) == 0 {
 			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
 		}
+		generations := make(map[string]int, len(sessions))
 		for _, session := range sessions {
+			generation, err := store.DeletionGeneration(session.ID)
+			if err != nil {
+				return "", 0, fmt.Errorf("read batch summary generation for %s: %w", session.ID, err)
+			}
+			generations[session.ID] = generation
 			if err := store.StartSummary(session.ID); err != nil {
 				return "", 0, fmt.Errorf("start batch summary for %s: %w", session.ID, err)
 			}
@@ -795,6 +802,7 @@ func main() {
 		if err != nil {
 			return "", 0, fmt.Errorf("create batch job: %w", err)
 		}
+		batchGenerations.Store(job.Name, generations)
 
 		return job.Name, len(sessions), nil
 	}
@@ -844,6 +852,14 @@ func main() {
 
 			batchResults := summarizer.ProcessBatchResults(job, sessions)
 			var succeeded, failed int
+			storedGenerations, ok := batchGenerations.Load(batchName)
+			if !ok {
+				return nil, fmt.Errorf("batch summary %s has no captured deletion generations", batchName)
+			}
+			generations, ok := storedGenerations.(map[string]int)
+			if !ok {
+				return nil, fmt.Errorf("batch summary %s has invalid captured generations", batchName)
+			}
 			for _, br := range batchResults {
 				if br.Error != nil {
 					failed++
@@ -853,7 +869,13 @@ func main() {
 					continue
 				}
 				if br.SessionID != "" {
-					if err := store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames); err != nil {
+					generation, ok := generations[br.SessionID]
+					if !ok {
+						log.Printf("warning: discarded batch summary for untracked session %s", br.SessionID)
+						failed++
+						continue
+					}
+					if err := store.UpdateSummaryAtGeneration(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames, generation); err != nil {
 						log.Printf("warning: discarded stale batch summary for session %s: %v", br.SessionID, err)
 						failed++
 						continue
@@ -866,6 +888,7 @@ func main() {
 			result["succeeded"] = succeeded
 			result["failed"] = failed
 			result["total"] = len(batchResults)
+			batchGenerations.Delete(batchName)
 		}
 
 		if job.State == genai.JobStateFailed {
