@@ -1,8 +1,11 @@
 package gdrive
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,4 +42,55 @@ func TestReview3StaleRowsDoNotFinishANewerGeneration(t *testing.T) {
 	if !sess.DriveReplacePending {
 		t.Errorf("stale generation-1 rows cleared the generation-2 marker")
 	}
+}
+
+// TestReview3ReadySessionWithOpenSpliceUploadsNothing proves a replacement
+// cannot put the unspliced recording on Drive before its splice completes.
+func TestReview3ReadySessionWithOpenSpliceUploadsNothing(t *testing.T) {
+	for _, withFolder := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no folder", true: "synced folder"}[withFolder], func(t *testing.T) {
+			store := openStore(t)
+			const id = "20261106170000"
+			recording, segments := round2Session(t, store, id, []string{"alpha stays.", "bravo secret."})
+			wire, syncer := newWireDrive(t)
+			o := NewOrchestrator(syncer, store)
+			folder := ""
+			if withFolder {
+				folder = syncedSession(t, store, o, id)
+			}
+			span := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
+			if err := store.DeleteSegment(id, segments[1].ID, span); err != nil {
+				t.Fatalf("DeleteSegment: %v", err)
+			}
+			if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ?, summary_status = ?, summary = 'clean', title = 'Clean' WHERE id = ?`,
+				storage.RefinementCompleted, storage.SummaryCompleted, id); err != nil {
+				t.Fatal(err)
+			}
+			wire.allowDeletes = true
+			if err := o.SyncSession(context.Background(), id); err != nil {
+				t.Errorf("SyncSession: %v", err)
+			}
+			sess, _ := store.GetSession(id)
+			if sess.GDriveFolderID != "" {
+				folder = sess.GDriveFolderID
+			}
+			var audio string
+			if folder != "" {
+				for name, copies := range wire.in(folder) {
+					if strings.HasPrefix(name, "audio-") {
+						for _, copy := range copies {
+							audio += string(copy.Content) + "|"
+						}
+					}
+				}
+			}
+			if len(wire.deletedIDs) != 0 || !sess.DriveReplacePending {
+				t.Errorf("an open splice still replaced or cleared: deleted=%v pending=%v", wire.deletedIDs, sess.DriveReplacePending)
+			}
+			if !withFolder && strings.Contains(audio, "UNSPLICED") {
+				t.Errorf("the unspliced recording reached Drive")
+			}
+			_ = os.Remove(recording)
+		})
+}
 }
