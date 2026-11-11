@@ -417,13 +417,13 @@ type hubMock struct {
 	endedHook func(sessionID string)
 }
 
-func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
+func (h *hubMock) BroadcastLiveTranscript(_ string, _ transcribe.Segment) {
 	h.mu.Lock()
 	h.liveCount++
 	h.mu.Unlock()
 }
 
-func (h *hubMock) BroadcastLiveTranscriptInterim(_ int, _ string, _ float64) {
+func (h *hubMock) BroadcastLiveTranscriptInterim(_ string, _ int, _ string, _ float64) {
 	h.mu.Lock()
 	h.interimCount++
 	h.mu.Unlock()

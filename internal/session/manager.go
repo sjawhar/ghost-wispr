@@ -102,6 +102,12 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 	return m
 }
 
+func (m *Manager) sessionIDForBroadcast() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentSessionID
+}
+
 func (m *Manager) Message(mr *api.MessageResponse) error {
 	if mr.FromFinalize {
 		// After the words below are buffered or saved, so a waiter ending the
@@ -159,7 +165,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 				}
 				startTime = words[0].Start
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, broadcastText, startTime)
+			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, broadcastText, startTime)
 		}
 		return nil
 	}
@@ -190,7 +196,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 					startTime = w.Start
 				}
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, b.String(), startTime)
+			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, b.String(), startTime)
 		}
 	}
 
@@ -240,7 +246,7 @@ func (m *Manager) flushBuffer() error {
 		}
 
 		if m.hub != nil {
-			m.hub.BroadcastLiveTranscript(segments[i])
+			m.hub.BroadcastLiveTranscript(sessionID, segments[i])
 		}
 	}
 	return nil

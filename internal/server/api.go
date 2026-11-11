@@ -674,6 +674,54 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		writeJSON(w, http.StatusOK, segments)
 	})
 
+	mux.HandleFunc("DELETE /api/sessions/{id}/segments/{segmentID}", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+		segmentID, err := strconv.ParseInt(r.PathValue("segmentID"), 10, 64)
+		if err != nil || segmentID <= 0 {
+			writeJSONError(w, http.StatusNotFound, "segment not found")
+			return
+		}
+		sessionData, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+		if sessionData.Status == storage.SessionActive {
+			writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
+			return
+		}
+		if controls.DeleteSegment == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "segment deletion is not configured")
+			return
+		}
+		if err := controls.DeleteSegment(r.Context(), sessionID, segmentID); err != nil {
+			switch {
+			case errors.Is(err, storage.ErrSegmentNotFound):
+				writeJSONError(w, http.StatusNotFound, "segment not found")
+			case errors.Is(err, storage.ErrSegmentSessionActive):
+				writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
+			case errors.Is(err, ErrSegmentNotFoundInRecording):
+				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be found in the recording; nothing was deleted")
+			case errors.Is(err, ErrSegmentNotRemovedCleanly):
+				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be removed cleanly; nothing was deleted")
+			case errors.Is(err, ErrSegmentRawAudioKept):
+				writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			default:
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete segment: %v", err))
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	mux.HandleFunc("PATCH /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
 		if !validSessionID(sessionID) {

@@ -537,6 +537,36 @@ func OpenAPISpec() map[string]any {
 					},
 				},
 			},
+			"/api/sessions/{id}/segments/{segmentID}": map[string]any{
+				"delete": map[string]any{
+					"summary":     "Delete one session segment",
+					"description": "Permanently remove one ended session segment from the transcript and recording.",
+					"tags":        []string{"sessions"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "id",
+							"in":          "path",
+							"description": "Session ID",
+							"required":    true,
+							"schema":      map[string]any{"type": "string"},
+						},
+						{
+							"name":        "segmentID",
+							"in":          "path",
+							"description": "Segment ID",
+							"required":    true,
+							"schema":      map[string]any{"type": "integer", "format": "int64"},
+						},
+					},
+					"responses": map[string]any{
+						"204": map[string]any{"description": "Segment deleted"},
+						"404": map[string]any{"description": "Session or segment not found"},
+						"409": map[string]any{"description": "Session is still recording"},
+						"422": map[string]any{"description": "Segment could not be found or removed cleanly"},
+					},
+				},
+			},
 			"/api/sessions/{id}/context": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get context window",

@@ -34,8 +34,8 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: Install PortAudio headers
-        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+      - name: Install audio build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg portaudio19-dev
 
       - name: Build web assets
         working-directory: web

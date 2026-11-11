@@ -14,6 +14,7 @@ type Word struct {
 }
 
 type Segment struct {
+	ID        int64     `json:"id,omitempty"`
 	Speaker   int       `json:"speaker"`
 	Text      string    `json:"text"`
 	StartTime float64   `json:"start_time"`

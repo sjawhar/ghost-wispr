@@ -417,6 +417,36 @@ func TestAPISessionDetail(t *testing.T) {
 	}
 }
 
+func TestAPISessionDetailCarriesStoredSegmentIDs(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {{ID: 42, Text: "stored segment"}},
+		},
+	}
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/s1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Segments []transcribe.Segment `json:"segments"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode session detail: %v", err)
+	}
+	if len(payload.Segments) != 1 || payload.Segments[0].ID != 42 {
+		t.Fatalf("segment IDs = %+v, want stored ID 42", payload.Segments)
+	}
+}
+
 func TestDeleteSession_Success(t *testing.T) {
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
@@ -482,6 +512,98 @@ func TestDeleteSession_InvalidID(t *testing.T) {
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected status 403, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteSegmentAPI(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		session   storage.Session
+		hook      func(context.Context, string, int64) error
+		wantCode  int
+		wantError string
+	}{
+		{
+			name:    "deleted",
+			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook: func(_ context.Context, sessionID string, segmentID int64) error {
+				if sessionID != "s1" || segmentID != 42 {
+					t.Fatalf("delete hook received session=%q segment=%d", sessionID, segmentID)
+				}
+				return nil
+			},
+			wantCode: http.StatusNoContent,
+		},
+		{
+			name:     "unknown segment",
+			session:  storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook:     func(context.Context, string, int64) error { return storage.ErrSegmentNotFound },
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name:      "not found in recording",
+			session:   storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook:      func(context.Context, string, int64) error { return ErrSegmentNotFoundInRecording },
+			wantCode:  http.StatusUnprocessableEntity,
+			wantError: "The segment could not be found in the recording; nothing was deleted",
+		},
+		{
+			name:      "not removed cleanly",
+			session:   storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook:      func(context.Context, string, int64) error { return ErrSegmentNotRemovedCleanly },
+			wantCode:  http.StatusUnprocessableEntity,
+			wantError: "The segment could not be removed cleanly; nothing was deleted",
+		},
+		{
+			name:    "kept raw recording",
+			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook: func(context.Context, string, int64) error {
+				return fmt.Errorf("%w: /audio/s1.pcm", ErrSegmentRawAudioKept)
+			},
+			wantCode:  http.StatusUnprocessableEntity,
+			wantError: "s1.pcm",
+		},
+		{
+			name:    "active",
+			session: storage.Session{ID: "s1", Status: storage.SessionActive},
+			hook: func(context.Context, string, int64) error {
+				t.Fatal("delete hook called for active session")
+				return nil
+			},
+			wantCode:  http.StatusConflict,
+			wantError: "This conversation is still being recorded. Delete the segment after it ends.",
+		},
+		{
+			name:    "unknown session",
+			session: storage.Session{},
+			hook: func(context.Context, string, int64) error {
+				t.Fatal("delete hook called for unknown session")
+				return nil
+			},
+			wantCode:  http.StatusNotFound,
+			wantError: "get session",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sessions := map[string]storage.Session{}
+			if tc.session.ID != "" {
+				sessions[tc.session.ID] = tc.session
+			}
+			store := &apiStoreStub{sessionsByDate: map[string][]storage.Session{}, sessions: sessions, segments: map[string][]transcribe.Segment{}}
+			handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{DeleteSegment: tc.hook}, "", nil)
+			if err != nil {
+				t.Fatalf("handler: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42", nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != tc.wantCode {
+				t.Fatalf("status = %d body=%s, want %d", response.Code, response.Body.String(), tc.wantCode)
+			}
+			if tc.wantError != "" && !strings.Contains(response.Body.String(), tc.wantError) {
+				t.Fatalf("body = %q, want %q", response.Body.String(), tc.wantError)
+			}
+		})
 	}
 }
 
@@ -2821,6 +2943,7 @@ func TestOpenAPISpec(t *testing.T) {
 		"/api/sessions/aggregate",
 		"/api/sessions/{id}",
 		"/api/sessions/{id}/segments",
+		"/api/sessions/{id}/segments/{segmentID}",
 		"/api/sessions/{id}/context",
 	}
 	for _, path := range expectedPaths {

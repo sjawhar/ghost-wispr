@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -93,6 +95,66 @@ func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive
 		pageToken = resp.NextPageToken
 	}
 	return files, nil
+}
+
+// DownloadRecording finds name in folderID and atomically writes it to destination.
+func (s *Syncer) DownloadRecording(ctx context.Context, folderID, name, destination string) error {
+	files, err := s.ListFolderFiles(ctx, folderID)
+	if err != nil {
+		return err
+	}
+	var recording *drive.File
+	for _, file := range files {
+		if file.Name == name && strings.HasPrefix(file.MimeType, "audio/") {
+			recording = file
+			break
+		}
+	}
+	if recording == nil {
+		return fmt.Errorf("%w: recording %s in folder %s", os.ErrNotExist, name, folderID)
+	}
+
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".download-*"+filepath.Ext(destination))
+	if err != nil {
+		return fmt.Errorf("create recording download beside %s: %w", destination, err)
+	}
+	tempPath := temp.Name()
+	keepTemp := false
+	defer func() {
+		if !keepTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	response, err := s.service.Files.Get(recording.Id).SupportsAllDrives(true).Context(ctx).Download()
+	if err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("download recording %s: %w", name, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if _, err := io.Copy(temp, response.Body); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write downloaded recording %s: %w", destination, err)
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("flush downloaded recording %s: %w", destination, err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close downloaded recording %s: %w", destination, err)
+	}
+	if err := os.Rename(tempPath, destination); err != nil {
+		return fmt.Errorf("replace recording %s: %w", destination, err)
+	}
+	keepTemp = true
+	directory, err := os.Open(filepath.Dir(destination))
+	if err != nil {
+		return fmt.Errorf("open recording directory %s: %w", filepath.Dir(destination), err)
+	}
+	defer func() { _ = directory.Close() }()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("flush recording directory %s: %w", filepath.Dir(destination), err)
+	}
+	return nil
 }
 
 // ExportGoogleDoc exports a Google Docs file as plain text.

@@ -94,6 +94,7 @@ type Session struct {
 	MergedInto          string     `json:"merged_into"`
 	CanonicalTranscript string     `json:"canonical_transcript"`
 	TranscriptSource    string     `json:"transcript_source"`
+	DriveReplacePending bool       `json:"drive_replace_pending"`
 }
 
 type SearchResult struct {
@@ -271,6 +272,7 @@ func syncFile(path string) error {
 func (s *SQLiteStore) init(dbPath string) error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
+		"PRAGMA secure_delete = ON",
 		"PRAGMA busy_timeout = 5000",
 		"PRAGMA foreign_keys = ON",
 	}
@@ -309,7 +311,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 			error_message TEXT NOT NULL DEFAULT '',
 			sync_state TEXT NOT NULL DEFAULT 'PENDING',
 			canonical_transcript TEXT NOT NULL DEFAULT '',
-			transcript_source TEXT NOT NULL DEFAULT ''
+			transcript_source TEXT NOT NULL DEFAULT '',
+			drive_replace_pending INTEGER NOT NULL DEFAULT 0
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
@@ -377,6 +380,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// The sync state a sync's claim came from, while it holds the session:
 		// startup recovery puts a sync claimed from REMOTE_DELETED back.
 		`ALTER TABLE sessions ADD COLUMN sync_claimed_from TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_pending INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -542,6 +546,25 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS deleted_segments (
+			session_id TEXT NOT NULL,
+			audio_path TEXT NOT NULL,
+			start REAL NOT NULL,
+			end REAL NOT NULL,
+			sha256_before TEXT NOT NULL,
+			sha256_after TEXT NOT NULL,
+			splice_complete INTEGER NOT NULL DEFAULT 0,
+			deleted_at TEXT NOT NULL,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create deleted_segments table: %w", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN splice_complete INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate deleted_segments splice completion: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS summary_requests (
 			session_id TEXT NOT NULL,
 			prompt_hash TEXT NOT NULL,
@@ -573,6 +596,9 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_segments_session_id ON segments(session_id, timestamp)"); err != nil {
 		return fmt.Errorf("create segments index: %w", err)
 	}
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_deleted_segments_session_audio ON deleted_segments(session_id, audio_path)"); err != nil {
+		return fmt.Errorf("create deleted segments index: %w", err)
+	}
 
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS mcp_events (
@@ -583,6 +609,17 @@ func (s *SQLiteStore) init(dbPath string) error {
 		);
 	`); err != nil {
 		return fmt.Errorf("create mcp_events table: %w", err)
+	}
+
+	if err := s.runOnce("discard-unattributable-live-events", `
+		DELETE FROM mcp_events
+		WHERE event_type = 'live_transcript'
+		  AND CASE
+			WHEN json_valid(payload) THEN COALESCE(json_extract(payload, '$.session_id'), '') = ''
+			ELSE 1
+		  END
+	`); err != nil {
+		return fmt.Errorf("discard unattributable live events: %w", err)
 	}
 
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_mcp_events_created_at ON mcp_events(created_at)"); err != nil {
@@ -806,7 +843,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -850,7 +887,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -873,7 +910,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 
 func getSession(q querier, id string) (Session, error) {
 	row := q.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -881,7 +918,7 @@ func getSession(q querier, id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -916,7 +953,7 @@ func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error
 
 func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	rows, err := q.Query(
-		`SELECT speaker, text, start_time, end_time, timestamp
+		`SELECT id, speaker, text, start_time, end_time, timestamp
 		 FROM segments
 		 WHERE session_id = ?
 		 ORDER BY id ASC`,
@@ -931,7 +968,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	for rows.Next() {
 		var seg transcribe.Segment
 		var ts string
-		if err := rows.Scan(&seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
 			return nil, fmt.Errorf("scan segment for session %s: %w", sessionID, err)
 		}
 
@@ -953,7 +990,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 
 func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
 	rows, err := s.db.Query(
-		`SELECT speaker, text, start_time, end_time, timestamp
+		`SELECT id, speaker, text, start_time, end_time, timestamp
 		 FROM segments
 		 WHERE session_id = ? AND start_time >= ? AND end_time <= ?
 		 ORDER BY start_time`,
@@ -968,7 +1005,7 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	for rows.Next() {
 		var seg transcribe.Segment
 		var ts string
-		if err := rows.Scan(&seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
 			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
 		}
 
@@ -1510,7 +1547,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -1695,7 +1732,7 @@ func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -1782,7 +1819,8 @@ type SessionRecording struct {
 // is no Drive to ask, so it is kept. Any other sync state, a failure
 // included, keeps the recording.
 func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?`
+	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?
+		AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)`
 	if syncGated {
 		cond += ` AND sync_status = ?`
 		return cond, []any{RefinementRunning, SyncStateRemoteDeleted, SyncSynced}

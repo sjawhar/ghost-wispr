@@ -904,6 +904,45 @@ func main() {
 			}
 			return manager.RefineSession(ctx, sessionID, sess.AudioPath, sess.StartedAt)
 		},
+		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
+			latestCfg := cfgStore.Get()
+			batch, err := makeBatchTranscriber(&latestCfg)
+			if err != nil {
+				return fmt.Errorf("configure batch transcription for deletion: %w", err)
+			}
+			wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
+			if !ok {
+				return fmt.Errorf("configured batch transcription does not return word timestamps")
+			}
+			runner := segmentDeleteRunner{
+				store:       store,
+				transcriber: audio.WordsTranscriber{Batch: wordTranscriber},
+				audioDir:    latestCfg.AudioDir,
+				ensureRecordings: func(ctx context.Context, session storage.Session) ([]string, error) {
+					var source deletionRecordingSource
+					if session.GDriveFolderID != "" {
+						if latestCfg.GDriveFolderID == "" {
+							return nil, fmt.Errorf("google Drive root folder is not configured")
+						}
+						credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+						if err != nil {
+							return nil, fmt.Errorf("detect Google credentials: %w", err)
+						}
+						syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID, appLogger)
+						if err != nil {
+							return nil, fmt.Errorf("create Drive syncer: %w", err)
+						}
+						source = syncer
+					}
+					return restoreDeletionRecordings(ctx, &session, latestCfg.AudioDir, source)
+				},
+				splice: audio.Splice,
+				refine: func(ctx context.Context, sessionID, recording string, startedAt time.Time) error {
+					return manager.RefineSession(ctx, sessionID, recording, startedAt)
+				},
+			}
+			return runner.Delete(ctx, sessionID, segmentID)
+		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			dates, err := store.GetDates()
 			if err != nil {
@@ -1451,6 +1490,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	defer func() { _ = store.Close() }()
 
+	var deletionDrive *gdrive.Syncer
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
 		credentials, syncErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
 		var syncer *gdrive.Syncer
@@ -1461,10 +1501,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
 			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
 		} else {
+			deletionDrive = syncer
 			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
 			drive.Set(orchestrator)
 			manager.SetSyncer(orchestrator)
 		}
+	}
+	if count, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession); err != nil {
+		log.Printf("warning: failed to recover pending segment splices: %v", err)
+		warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", err))
+	} else if count > 0 {
+		log.Printf("recovered %d pending segment splices", count)
 	}
 	// The Drive sync sweep runs whether sync is on or not: it syncs nothing
 	// while sync is off, and picks up a syncer turned on in the settings.

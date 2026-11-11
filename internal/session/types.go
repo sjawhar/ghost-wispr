@@ -59,11 +59,11 @@ type EmbeddingIndexer interface {
 }
 
 type EventBroadcaster interface {
-	BroadcastLiveTranscript(seg transcribe.Segment)
+	BroadcastLiveTranscript(sessionID string, seg transcribe.Segment)
 	BroadcastSessionStarted(sessionID string)
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
 	BroadcastSummaryReady(sessionID, title, summary, status, preset string)
-	BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64)
+	BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64)
 	BroadcastComponentStatus(component, status, message string)
 }
 

@@ -15,6 +15,7 @@ func (e Event) eventType() string { return e.Type }
 
 type LiveTranscriptEvent struct {
 	Event
+	SessionID string  `json:"session_id"`
 	Speaker   int     `json:"speaker"`
 	Text      string  `json:"text"`
 	StartTime float64 `json:"start_time"`
@@ -23,6 +24,7 @@ type LiveTranscriptEvent struct {
 
 type LiveTranscriptInterimEvent struct {
 	Event
+	SessionID string  `json:"session_id,omitempty"`
 	Speaker   int     `json:"speaker"`
 	Text      string  `json:"text"`
 	StartTime float64 `json:"start_time"`
