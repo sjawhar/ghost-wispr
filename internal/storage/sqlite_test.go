@@ -1853,7 +1853,7 @@ func TestCanonicalize_FromRefinedTranscript(t *testing.T) {
 	}
 
 	// Canonicalize should use refined transcript.
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
@@ -1901,7 +1901,7 @@ func TestCanonicalize_FallbackToStreaming(t *testing.T) {
 	}
 
 	// Refinement pending (default) — should fall back to streaming.
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
@@ -1938,7 +1938,7 @@ func TestCanonicalize_RefinementFailed_FallsBackToStreaming(t *testing.T) {
 		t.Fatalf("update refinement: %v", err)
 	}
 
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
@@ -1968,7 +1968,7 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	}
 
 	// First canonicalization — streaming (refinement pending).
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("first canonicalize: %v", err)
 	}
 	_, source, _ := store.GetCanonicalTranscript(sessionID)
@@ -1982,7 +1982,7 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	}
 
 	// Re-canonicalize — should now use refined.
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("re-canonicalize: %v", err)
 	}
 

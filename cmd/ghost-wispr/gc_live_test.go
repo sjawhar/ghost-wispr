@@ -25,6 +25,10 @@ import (
 // recording on disk or the marker saying GC removed it, never a path to a
 // file that is gone.
 func TestGCNeverTouchesTheLiveRecording(t *testing.T) {
+	// This test exercises GC under a fixed, uncompressed 5 MB recording load;
+	// external encoders would make the same zero-valued PCM compress below its
+	// 1 MB budget and turn its pressure assertion into a no-op.
+	t.Setenv("PATH", t.TempDir())
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -56,6 +60,9 @@ func TestGCNeverTouchesTheLiveRecording(t *testing.T) {
 	defer stopSweeping()
 
 	chunk := make([]byte, 4096)
+	for i := range chunk {
+		chunk[i] = byte(i*31 + i/7)
+	}
 	var ids []string
 	for range 20 {
 		id, err := manager.ManualStartSession(context.Background(), "")

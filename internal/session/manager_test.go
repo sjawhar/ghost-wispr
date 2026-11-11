@@ -109,6 +109,10 @@ func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ s
 	return nil
 }
 
+func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, _ int) error {
+	return s.UpdateSummary(sessionID, title, summary, status, preset, speakerNames)
+}
+
 // StartSummary keeps the title and summary, as the store does.
 func (s *storeMock) StartSummary(sessionID string) error {
 	s.mu.Lock()
@@ -176,7 +180,7 @@ func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
 	return s.refinedTranscript[sessionID], s.refinementStatus[sessionID], nil
 }
 
-func (s *storeMock) Canonicalize(sessionID string) error {
+func (s *storeMock) Canonicalize(sessionID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	status := s.refinementStatus[sessionID]
@@ -196,13 +200,18 @@ func (s *storeMock) Canonicalize(sessionID string) error {
 		s.canonicalTranscript[sessionID] = b.String()
 		s.transcriptSource[sessionID] = "streaming"
 	}
-	return nil
+	return 0, nil
 }
 
 func (s *storeMock) GetCanonicalTranscript(sessionID string) (string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.canonicalTranscript[sessionID], s.transcriptSource[sessionID], nil
+}
+
+func (s *storeMock) GetCanonicalTranscriptWithGeneration(sessionID string) (string, string, int, error) {
+	transcript, source, err := s.GetCanonicalTranscript(sessionID)
+	return transcript, source, 0, err
 }
 
 type recorderMock struct {
@@ -417,13 +426,13 @@ type hubMock struct {
 	endedHook func(sessionID string)
 }
 
-func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
+func (h *hubMock) BroadcastLiveTranscript(_ string, _ transcribe.Segment) {
 	h.mu.Lock()
 	h.liveCount++
 	h.mu.Unlock()
 }
 
-func (h *hubMock) BroadcastLiveTranscriptInterim(_ int, _ string, _ float64) {
+func (h *hubMock) BroadcastLiveTranscriptInterim(_ string, _ int, _ string, _ float64) {
 	h.mu.Lock()
 	h.interimCount++
 	h.mu.Unlock()

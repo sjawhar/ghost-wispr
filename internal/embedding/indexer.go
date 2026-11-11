@@ -23,13 +23,11 @@ const (
 type StoredEmbedding = storage.StoredEmbedding
 
 type EmbeddingStore interface {
-	StoreEmbedding(sessionID string, chunkIndex int, vector []float32, textHash, model string) error
+	StoreEmbeddingAtGeneration(sessionID string, chunkIndex int, vector []float32, textHash, model string, generation int) error
+	DeleteEmbeddingChunksAtOrAfterGeneration(sessionID string, chunkIndex, generation int) error
 	GetAllEmbeddings() ([]StoredEmbedding, error)
 	GetSessionsWithoutEmbeddings() ([]string, error)
-}
-
-type canonicalTranscriptStore interface {
-	GetCanonicalTranscript(sessionID string) (transcript, source string, err error)
+	GetCanonicalTranscriptWithGeneration(sessionID string) (transcript, source string, generation int, err error)
 }
 
 type Indexer struct {
@@ -87,7 +85,13 @@ func SplitIntoChunks(text string, chunkSize int) []string {
 	return chunks
 }
 
-func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string) error {
+// IndexSessionAtGeneration indexes only while generation still names the
+// transcript the caller read.
+func (i *Indexer) IndexSessionAtGeneration(ctx context.Context, sessionID, transcript string, generation int) error {
+	return i.indexSession(ctx, sessionID, transcript, generation)
+}
+
+func (i *Indexer) indexSession(ctx context.Context, sessionID, transcript string, generation int) error {
 	chunks := SplitIntoChunks(transcript, i.chunkSize)
 	if len(chunks) == 0 {
 		return nil
@@ -120,7 +124,7 @@ func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string
 	}
 
 	if len(texts) == 0 {
-		return nil
+		return i.store.DeleteEmbeddingChunksAtOrAfterGeneration(sessionID, len(chunks), generation)
 	}
 
 	var vectors [][]float32
@@ -136,11 +140,13 @@ func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string
 	}
 
 	for idx := range indexes {
-		if err := i.store.StoreEmbedding(sessionID, indexes[idx], vectors[idx], hashes[idx], i.model); err != nil {
+		if err := i.store.StoreEmbeddingAtGeneration(sessionID, indexes[idx], vectors[idx], hashes[idx], i.model, generation); err != nil {
 			return fmt.Errorf("store embedding chunk %d: %w", indexes[idx], err)
 		}
 	}
-
+	if err := i.store.DeleteEmbeddingChunksAtOrAfterGeneration(sessionID, len(chunks), generation); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -151,11 +157,6 @@ func (i *Indexer) BackfillMissing(ctx context.Context) error {
 	}
 	if len(ids) == 0 {
 		return nil
-	}
-
-	transcripts, ok := i.store.(canonicalTranscriptStore)
-	if !ok {
-		return fmt.Errorf("store does not support canonical transcript reads")
 	}
 
 	sem := make(chan struct{}, 2)
@@ -180,14 +181,14 @@ func (i *Indexer) BackfillMissing(ctx context.Context) error {
 			}
 			defer func() { <-sem }()
 
-			transcript, _, err := transcripts.GetCanonicalTranscript(sessionID)
+			transcript, _, generation, err := i.store.GetCanonicalTranscriptWithGeneration(sessionID)
 			if err != nil {
 				slog.Error("embedding backfill failed to load canonical transcript", "session_id", sessionID, "error", err)
 				setFirstErr(&firstErr, fmt.Errorf("get canonical transcript for %s: %w", sessionID, err))
 				return
 			}
 
-			if err := i.IndexSession(ctx, sessionID, transcript); err != nil {
+			if err := i.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {
 				slog.Error("embedding backfill failed", "session_id", sessionID, "error", err)
 				setFirstErr(&firstErr, fmt.Errorf("index session %s: %w", sessionID, err))
 			}
