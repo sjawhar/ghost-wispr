@@ -1,0 +1,26 @@
+{
+  "metadata": {
+    "request_id": "recorded-fixture",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "duration": 1.62,
+    "channels": 1,
+    "models": ["nova-3"]
+  },
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "Hello, office recorder.",
+            "confidence": 0.999,
+            "words": [
+              {"word": "hello", "start": 0.12, "end": 0.48, "confidence": 0.999, "punctuated_word": "Hello,"},
+              {"word": "office", "start": 0.53, "end": 0.91, "confidence": 0.998, "punctuated_word": "office"},
+              {"word": "recorder", "start": 0.96, "end": 1.62, "confidence": 0.997, "punctuated_word": "recorder."}
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
