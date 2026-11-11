@@ -421,6 +421,10 @@ EOF
     || fail 'A8 self-test rejected the provider speech model'
   assert_provider_model refinement "$batch_refinement_model" "$batch_refinement_model" \
     || fail 'A8 self-test rejected the provider refinement model'
+  assert_provider_model search "$model_not_reported" "$embedding_model" >/dev/null
+  if [[ $? -ne 2 ]]; then
+    fail 'A8 self-test did not classify an unreported provider model as PRECHECK'
+  fi
   printf 'A8 self-test RAN: planted failure rejected\n'
 
   if assert_drive_members $'sami@theorem.dev|organizer\nreaders@theorem.dev|reader' readers@theorem.dev 2>/dev/null; then

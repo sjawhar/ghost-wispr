@@ -164,8 +164,8 @@ func (o *Orchestrator) Status(id string) (SpeakStatus, bool) {
 	return val.(*SpeakStatus).Snapshot(), true
 }
 
-// WaitForSynthesis waits until the provider call and playback finish, then
-// returns the provider-reported model and voice in the final request status.
+// WaitForSynthesis returns after the provider call reports its model and
+// voice, before asynchronous speaker playback finishes.
 func (o *Orchestrator) WaitForSynthesis(ctx context.Context, id string) (SpeakStatus, error) {
 	val, ok := o.statuses.Load(id)
 	if !ok {
