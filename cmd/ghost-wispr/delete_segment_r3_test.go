@@ -96,12 +96,14 @@ func TestR3MergedBoundarySegment(t *testing.T) {
 	_ = os.WriteFile(r2, []byte("r2"), 0o600)
 	store, segmentID, _ := newDeletionTestStore(t, r1+","+r2)
 	words := byContentWords{
-		"r1": {{Text: "before", Start: 0.1, End: 0.2}, {Text: "bridge", Start: 0.3, End: 0.4}},
-		"r2": {{Text: "private", Start: 0.1, End: 0.2}, {Text: "deletion", Start: 0.3, End: 0.4}, {Text: "token", Start: 0.5, End: 0.6}, {Text: "after", Start: 1.1, End: 1.2}, {Text: "bridge", Start: 1.3, End: 1.4}},
+		"r1":      {{Text: "before", Start: 0.1, End: 0.2}, {Text: "bridge", Start: 0.3, End: 0.4}},
+		"r2":      {{Text: "private", Start: 0.1, End: 0.2}, {Text: "deletion", Start: 0.3, End: 0.4}, {Text: "token", Start: 0.5, End: 0.6}, {Text: "after", Start: 1.1, End: 1.2}, {Text: "bridge", Start: 1.3, End: 1.4}},
 		"spliced": {{Text: "after", Start: 0.3, End: 0.4}, {Text: "bridge", Start: 0.5, End: 0.6}},
 	}
 	runner := segmentDeleteRunner{store: store, transcriber: words,
-		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) { return deletionRecordingSet{Paths: []string{r1, r2}}, nil }, splice: fakeSplice}
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{r1, r2}}, nil
+		}, splice: fakeSplice}
 	if err := runner.Delete(context.Background(), "session", segmentID); err != nil {
 		t.Fatalf("boundary delete refused: %v", err)
 	}
@@ -121,12 +123,14 @@ func TestR3MergedBoundaryOverCutStillRefused(t *testing.T) {
 	_ = os.WriteFile(r2, []byte("r2"), 0o600)
 	store, segmentID, _ := newDeletionTestStore(t, r1+","+r2)
 	words := byContentWords{
-		"r1": {{Text: "before", Start: 0.1, End: 0.2}, {Text: "bridge", Start: 0.3, End: 0.4}},
-		"r2": {{Text: "private", Start: 0.1, End: 0.2}, {Text: "deletion", Start: 0.3, End: 0.4}, {Text: "token", Start: 0.5, End: 0.6}, {Text: "after", Start: 1.1, End: 1.2}, {Text: "bridge", Start: 1.3, End: 1.4}},
+		"r1":      {{Text: "before", Start: 0.1, End: 0.2}, {Text: "bridge", Start: 0.3, End: 0.4}},
+		"r2":      {{Text: "private", Start: 0.1, End: 0.2}, {Text: "deletion", Start: 0.3, End: 0.4}, {Text: "token", Start: 0.5, End: 0.6}, {Text: "after", Start: 1.1, End: 1.2}, {Text: "bridge", Start: 1.3, End: 1.4}},
 		"spliced": {},
 	}
 	runner := segmentDeleteRunner{store: store, transcriber: words,
-		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) { return deletionRecordingSet{Paths: []string{r1, r2}}, nil }, splice: fakeSplice}
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{r1, r2}}, nil
+		}, splice: fakeSplice}
 	if err := runner.Delete(context.Background(), "session", segmentID); err == nil {
 		t.Fatal("over-cut of the after-neighbour accepted")
 	}
