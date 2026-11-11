@@ -19,7 +19,7 @@ import (
 const EnvPrefix = "GHOST_WISPR_"
 
 const (
-	IndicatorLightBlink1     = "blink1"
+	IndicatorLightBlink1      = "blink1"
 	envoyWebhookSecretWarning = "Envoy enabled but webhook secret not configured — set " + EnvPrefix + "ENVOY_WEBHOOK_SECRET; Envoy rejects unsigned events."
 )
 
