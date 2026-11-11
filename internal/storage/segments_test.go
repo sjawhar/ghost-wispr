@@ -323,6 +323,32 @@ func TestDeleteSegmentRestoresTheFullAudioPath(t *testing.T) {
 		t.Fatalf("audio path=%q removed_at=%q, want restored full path and no marker", session.AudioPath, session.AudioRemovedAt)
 	}
 }
+
+func TestDeleteSegmentRejectsStaleRefinementAndSummaryWrites(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	_, _ = segmentTestSession(t, store, "generation-fence")
+	segments, err := store.GetSegments("generation-fence")
+	if err != nil {
+		t.Fatalf("get segments: %v", err)
+	}
+	claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
+	if err != nil || !claimed {
+		t.Fatalf("claim refinement = %v, %v", claimed, err)
+	}
+	if err := store.DeleteSegment("generation-fence", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	if err := store.UpdateRefinement("generation-fence", "stale private deletion token", RefinementCompleted); err == nil {
+		t.Fatal("stale refinement write succeeded after deletion")
+	}
+	if err := store.UpdateSummary("generation-fence", "stale private deletion token", "stale private deletion token", SummaryCompleted, "default", "{}"); err == nil {
+		t.Fatal("stale summary write succeeded after deletion")
+	}
+	session := storeSession(t, store, "generation-fence")
+	if strings.Contains(session.RefinedTranscript, "private") || strings.Contains(session.Summary, "private") {
+		t.Fatalf("stale words returned to session: %+v", session)
+	}
+}
 func TestDeleteSegmentSecurelyErasesDeletedText(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "delete.db")
 	store, err := NewSQLiteStore(path)

@@ -312,7 +312,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 			sync_state TEXT NOT NULL DEFAULT 'PENDING',
 			canonical_transcript TEXT NOT NULL DEFAULT '',
 			transcript_source TEXT NOT NULL DEFAULT '',
-			drive_replace_pending INTEGER NOT NULL DEFAULT 0
+			drive_replace_pending INTEGER NOT NULL DEFAULT 0,
+			deletion_generation INTEGER NOT NULL DEFAULT 0,
+			refinement_generation INTEGER NOT NULL DEFAULT 0,
+			summary_generation INTEGER NOT NULL DEFAULT 0
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
@@ -381,6 +384,9 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// startup recovery puts a sync claimed from REMOTE_DELETED back.
 		`ALTER TABLE sessions ADD COLUMN sync_claimed_from TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN drive_replace_pending INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN deletion_generation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN refinement_generation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN summary_generation INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -1057,7 +1063,7 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
 		     summary_error = CASE WHEN ? = ? THEN '' ELSE summary_error END
-		 WHERE id = ?`,
+		 WHERE id = ? AND summary_generation = deletion_generation`,
 		title, title,
 		summary, preset,
 		summary, speakerNames,
@@ -1104,7 +1110,7 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 // already have been sent to Envoy: it is or was completed, or Envoy publishing
 // of it was attempted.
 func (s *SQLiteStore) StartSummary(id string) error {
-	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ?`,
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_generation = deletion_generation, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ?`,
 		SummaryRunning, EnvoyPublishPending, SummaryCompleted, EnvoyPublishPending, id)
 	if err != nil {
 		return fmt.Errorf("start summary of session %s: %w", id, err)
@@ -1130,7 +1136,7 @@ func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ?`, SummaryFailed, errMsg, id)
+	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation`, SummaryFailed, errMsg, id)
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
@@ -1153,7 +1159,7 @@ func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
 
 func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = ?`,
+		`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = ? AND refinement_generation = deletion_generation`,
 		transcript,
 		status,
 		sessionID,
@@ -1181,7 +1187,7 @@ func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) err
 // takes nothing from a session whose refinement is running.
 func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ? WHERE id = ? AND audio_path = ? AND audio_path != ''`,
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != ''`,
 		RefinementRunning, id, audioPath,
 	)
 	if err != nil {

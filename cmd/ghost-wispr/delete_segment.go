@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -40,6 +41,28 @@ type deletionRecordingSource interface {
 	ListFolderFiles(ctx context.Context, folderID string) ([]*drive.File, error)
 	DownloadRecording(ctx context.Context, folderID, name, destination string) error
 }
+
+type sessionDeletionLocks struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func (l *sessionDeletionLocks) lock(sessionID string) func() {
+	l.mu.Lock()
+	if l.locks == nil {
+		l.locks = make(map[string]*sync.Mutex)
+	}
+	lock := l.locks[sessionID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		l.locks[sessionID] = lock
+	}
+	l.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+var deleteLocks sessionDeletionLocks
 
 // restoreDeletionRecordings combines the session's locally known recordings
 // with every audio file Drive has for it, restoring only missing local files.
@@ -104,9 +127,11 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 }
 
 func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segmentID int64) error {
-	if d.store == nil || d.transcriber == nil || d.ensureRecordings == nil || d.splice == nil {
-		return fmt.Errorf("segment deletion is not configured")
+	if d.store == nil {
+		return fmt.Errorf("segment deletion storage is not configured")
 	}
+	unlock := deleteLocks.lock(sessionID)
+	defer unlock()
 	session, err := d.store.GetSession(sessionID)
 	if err != nil {
 		return err
@@ -127,6 +152,9 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	}
 	if index == -1 {
 		return storage.ErrSegmentNotFound
+	}
+	if d.transcriber == nil || d.ensureRecordings == nil || d.splice == nil {
+		return fmt.Errorf("segment deletion is not configured")
 	}
 	if strings.TrimSpace(d.audioDir) != "" {
 		rawPath := filepath.Join(d.audioDir, sessionID+".pcm")

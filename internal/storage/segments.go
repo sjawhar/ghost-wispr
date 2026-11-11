@@ -93,6 +93,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			canonical_transcript = ?,
 			transcript_source = ?,
 			summary_version = summary_version + 1,
+			deletion_generation = deletion_generation + 1,
 			envoy_publish_status = ?,
 			sync_status = ?,
 			sync_state = ?,

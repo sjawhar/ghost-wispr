@@ -918,19 +918,19 @@ func main() {
 				store:       store,
 				transcriber: audio.WordsTranscriber{Batch: wordTranscriber},
 				audioDir:    latestCfg.AudioDir,
-				ensureRecordings: func(ctx context.Context, session storage.Session) ([]string, error) {
+				ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
 					var source deletionRecordingSource
 					if session.GDriveFolderID != "" {
 						if latestCfg.GDriveFolderID == "" {
-							return nil, fmt.Errorf("google Drive root folder is not configured")
+							return deletionRecordingSet{}, fmt.Errorf("google Drive root folder is not configured")
 						}
 						credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
 						if err != nil {
-							return nil, fmt.Errorf("detect Google credentials: %w", err)
+							return deletionRecordingSet{}, fmt.Errorf("detect Google credentials: %w", err)
 						}
 						syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID, appLogger)
 						if err != nil {
-							return nil, fmt.Errorf("create Drive syncer: %w", err)
+							return deletionRecordingSet{}, fmt.Errorf("create Drive syncer: %w", err)
 						}
 						source = syncer
 					}
@@ -1036,7 +1036,10 @@ func main() {
 				return
 			}
 
-			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
+			if err := store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
+				log.Printf("warning: discarded stale merged summary for session %s: %v", sessionID, err)
+				return
+			}
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 			publishSummaryReady(sessionID)
 		},

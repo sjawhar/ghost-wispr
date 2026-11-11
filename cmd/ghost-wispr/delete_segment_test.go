@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -229,6 +231,18 @@ func TestDeleteSegmentRemovesDownloadedAudioOnRefusal(t *testing.T) {
 	}
 }
 
+func TestSegmentDeleteRunnerFindsUnknownSegmentBeforeNeedingTranscriber(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("recording"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	store, _, _ := newDeletionTestStore(t, recording)
+	runner := segmentDeleteRunner{store: store}
+	if err := runner.Delete(context.Background(), "session", 999999); !errors.Is(err, storage.ErrSegmentNotFound) {
+		t.Fatalf("Delete error = %v, want segment not found", err)
+	}
+}
+
 func storeSessionForDelete(t *testing.T, store *storage.SQLiteStore, id string) storage.Session {
 	t.Helper()
 	session, err := store.GetSession(id)
@@ -236,6 +250,105 @@ func storeSessionForDelete(t *testing.T, store *storage.SQLiteStore, id string) 
 		t.Fatalf("get session %s: %v", id, err)
 	}
 	return session
+}
+
+type sequenceDeletionWordsFake struct{}
+
+func (sequenceDeletionWordsFake) Words(_ context.Context, path string) ([]audio.Word, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	switch string(contents) {
+	case "original":
+		return []audio.Word{
+			{Text: "before", Start: 0.1, End: 0.2},
+			{Text: "bridge", Start: 0.3, End: 0.4},
+			{Text: "private", Start: 1.1, End: 1.2},
+			{Text: "deletion", Start: 1.3, End: 1.4},
+			{Text: "token", Start: 1.5, End: 1.6},
+			{Text: "after", Start: 2.1, End: 2.2},
+			{Text: "bridge", Start: 2.3, End: 2.4},
+		}, nil
+	case "spliced-one":
+		return []audio.Word{
+			{Text: "before", Start: 0.1, End: 0.2},
+			{Text: "bridge", Start: 0.3, End: 0.4},
+			{Text: "after", Start: 1.1, End: 1.2},
+			{Text: "bridge", Start: 1.3, End: 1.4},
+		}, nil
+	case "spliced-two":
+		return []audio.Word{{Text: "before", Start: 0.1, End: 0.2}, {Text: "bridge", Start: 0.3, End: 0.4}}, nil
+	default:
+		return nil, fmt.Errorf("unknown recording state %q", contents)
+	}
+}
+
+
+func TestSegmentDeleteRunnerSerializesConcurrentDeletes(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	store, firstID, _ := newDeletionTestStore(t, recording)
+	segments, err := store.GetSegments("session")
+	if err != nil {
+		t.Fatalf("get segments: %v", err)
+	}
+	secondID := segments[2].ID
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var spliceCalls atomic.Int32
+	controlledSplice := func(_ context.Context, path string, _, _ float64) (string, error) {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		if spliceCalls.Add(1) == 1 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		next := []byte("spliced-one")
+		if bytes.Equal(contents, []byte("spliced-one")) {
+			next = []byte("spliced-two")
+		}
+		if err := os.WriteFile(path, next, 0o600); err != nil {
+			return "", err
+		}
+		return hashBytesForDeleteTest(next), nil
+	}
+	runner := segmentDeleteRunner{
+		store:       store,
+		transcriber: sequenceDeletionWordsFake{},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		splice: controlledSplice,
+	}
+	errs := make(chan error, 2)
+	go func() { errs <- runner.Delete(context.Background(), "session", firstID) }()
+	<-firstEntered
+	go func() { errs <- runner.Delete(context.Background(), "session", secondID) }()
+	close(releaseFirst)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent delete: %v", err)
+		}
+	}
+	remaining, err := store.GetSegments("session")
+	if err != nil {
+		t.Fatalf("get remaining segments: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Text != "before bridge" {
+		t.Fatalf("remaining segments = %+v, want only the first", remaining)
+	}
+	contents, err := os.ReadFile(recording)
+	if err != nil {
+		t.Fatalf("read recording: %v", err)
+	}
+	if !bytes.Equal(contents, []byte("spliced-two")) {
+		t.Fatalf("recording = %q, want both cuts", contents)
+	}
 }
 
 func TestSegmentDeleteRunnerRefusesSurvivingWordsWithoutChangingRecording(t *testing.T) {
