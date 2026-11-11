@@ -64,7 +64,7 @@ func TestAFailedResummarizeKeepsTheLastGoodSummaryAndTitle(t *testing.T) {
 			if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
 				t.Fatalf("end session: %v", err)
 			}
-			if _, err := store.Canonicalize(id); err != nil {
+			if _, _, err := store.Canonicalize(id); err != nil {
 				t.Fatalf("canonicalize: %v", err)
 			}
 			const speakers = `{"0":{"name":"Sam","confidence":"high"}}`

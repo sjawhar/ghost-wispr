@@ -89,7 +89,7 @@ func TestR5DeleteDuringRecoverySpliceIs409(t *testing.T) {
 	}
 	recovered := make(chan struct{})
 	go func() {
-		_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, gatedSplice, nil, nil)
+		_, _ = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, gatedSplice, nil)
 		close(recovered)
 	}()
 	<-entered
