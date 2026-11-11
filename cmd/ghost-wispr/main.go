@@ -1244,6 +1244,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	hardware := startHardware(ctx, &cfg, capture, micStatus, controlHooks, warningRegistry, hub)
 	capture.beforeMicStart = hardware.EnsureRed
+	capture.afterMicStart = hardware.CaptureStopped
 	pauseCapture, resumeCapture = persistingControls(
 		store,
 		func() {
@@ -1942,7 +1943,9 @@ func streamMicWithRetry(
 				wait(backoff)
 				continue
 			}
-			if err = streamer.Start(); err == nil {
+			err = streamer.Start()
+			capture.finishMicStart()
+			if err == nil {
 				logf("microphone restarted: capture resumed")
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone capture resumed")
@@ -1981,7 +1984,9 @@ func streamMicWithRetry(
 				logf("recording light unavailable before microphone reconnect: %v", err)
 				continue
 			}
-			if reopenErr := streamer.Reopen(); reopenErr != nil {
+			reopenErr := streamer.Reopen()
+			capture.finishMicStart()
+			if reopenErr != nil {
 				logf("mic reopen failed: %v", reopenErr)
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
@@ -2015,7 +2020,9 @@ func streamMicWithRetry(
 			logf("recording light unavailable before microphone reconnect: %v", err)
 			continue
 		}
-		if reopenErr := streamer.Reopen(); reopenErr != nil {
+		reopenErr := streamer.Reopen()
+		capture.finishMicStart()
+		if reopenErr != nil {
 			logf("mic reopen failed: %v", reopenErr)
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())

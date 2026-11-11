@@ -66,20 +66,20 @@ type captureGate struct {
 	settle         func()
 	beforeResume   func()
 	beforeMicStart func() error
+	afterMicStart  func()
 	stallAfter     time.Duration // see captureStallAfter
 	writeWait      time.Duration // see captureWriteWait
-
-	control    sync.Mutex    // serializes closing and opening the gate, with their steps
-	mu         sync.Mutex    // guards the fields below
-	switchOff  bool          // Pause was called and Resume has not been since
-	resumedAt  time.Time     // when Resume last moved the switch on
-	closed     bool          // no audio passes the gate
-	closings   int           // counts closings, so a Resume left from an earlier one does nothing
-	resumed    chan struct{} // closed while the gate is open
-	closing    chan struct{} // closed while the gate is closed
-	settled    chan struct{} // closed once the latest closing has settled
-	writing    int           // writes that passed the gate and are still running
-	writesDone *sync.Cond    // signalled (with mu) when a write finishes
+	control        sync.Mutex    // serializes closing and opening the gate, with their steps
+	mu             sync.Mutex    // guards the fields below
+	switchOff      bool          // Pause was called and Resume has not been since
+	resumedAt      time.Time     // when Resume last moved the switch on
+	closed         bool          // no audio passes the gate
+	closings       int           // counts closings, so a Resume left from an earlier one does nothing
+	resumed        chan struct{} // closed while the gate is open
+	closing        chan struct{} // closed while the gate is closed
+	settled        chan struct{} // closed once the latest closing has settled
+	writing        int           // writes that passed the gate and are still running
+	writesDone     *sync.Cond    // signalled (with mu) when a write finishes
 }
 
 func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
@@ -225,6 +225,12 @@ func (g *captureGate) confirmMicStart() error {
 		return nil
 	}
 	return g.beforeMicStart()
+}
+
+func (g *captureGate) finishMicStart() {
+	if g.afterMicStart != nil {
+		g.afterMicStart()
+	}
 }
 
 // waitForInflightWrites waits, up to writeWait, until no write that passed the
