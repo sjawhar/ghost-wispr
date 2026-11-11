@@ -62,6 +62,18 @@ type BatchTranscriber interface {
 	Transcribe(ctx context.Context, audioPath string) (string, error)
 }
 
+// TimestampedWord is a word in a batch transcription with its recording span in seconds.
+type TimestampedWord struct {
+	Text       string
+	Start, End float64
+}
+
+// BatchWordsTranscriber transcribes a recording as text and timestamped words.
+type BatchWordsTranscriber interface {
+	BatchTranscriber
+	Words(ctx context.Context, audioPath string) ([]TimestampedWord, error)
+}
+
 // ResilientClient wraps an io.WriteCloser (Deepgram client) and buffers audio during disconnects.
 // All fields are exported for testing purposes.
 type ResilientClient struct {
