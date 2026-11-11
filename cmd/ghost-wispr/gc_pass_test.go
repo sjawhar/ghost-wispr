@@ -192,6 +192,38 @@ func TestGCPassReportsAndClearsRecordingChecksumMismatchThroughStatus(t *testing
 	expectRecordingMismatchWarning(t, warnings, id, false, "the checksum matched and the session was deleted")
 }
 
+func TestGCPassClearsRecordingChecksumMismatchWhenDriveMatchesAndKeepsSession(t *testing.T) {
+	const id = "20261001130100"
+	store, cfg := recordingMismatchSession(t, id)
+	syncer := &recordingMismatchSyncer{}
+	warnings := newWarningsRegistry()
+	health := &gcHealth{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if _, err := runGCPass(store, &cfg, syncer, health, warnings, logger); err != nil {
+		t.Fatalf("GC pass with mismatch: %v", err)
+	}
+	expectRecordingMismatchWarning(t, warnings, id, true, "a pass with a mismatch")
+
+	session, err := store.GetSession(id)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if err := os.WriteFile(session.AudioPath, make([]byte, 2*1024*1024), 0o600); err != nil {
+		t.Fatalf("enlarge recording: %v", err)
+	}
+	cfg.GCMaxAgeDays = 0
+	cfg.GCMaxAudioSizeMB = 1
+	syncer.matches = true
+	if _, err := runGCPass(store, &cfg, syncer, health, warnings, logger); err != nil {
+		t.Fatalf("GC pass after checksum match under audio budget: %v", err)
+	}
+	expectRecordingMismatchWarning(t, warnings, id, false, "the checksum matched and disk pressure kept the session")
+	if _, err := store.GetSession(id); err != nil {
+		t.Fatalf("disk pressure deleted the session: %v", err)
+	}
+}
+
 // A mismatched recording's warning becomes stale when Drive later says its
 // folder is gone: the session is retained locally as REMOTE_DELETED, so there
 // is no Drive recording left to compare.
