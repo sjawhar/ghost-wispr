@@ -50,14 +50,6 @@ type Manager struct {
 	lifecycleStartPublishesStopped bool
 }
 
-type summaryGenerationStore interface {
-	GetCanonicalTranscriptWithGeneration(sessionID string) (transcript, source string, generation int, err error)
-	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error
-}
-
-type generationEmbeddingIndexer interface {
-	IndexSessionAtGeneration(ctx context.Context, sessionID, transcript string, generation int) error
-}
 
 // sessionEnd is how far an end of a session got. An end that fails leaves it
 // behind, so retrying the end finishes it with the same end time and recording.
@@ -585,10 +577,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		if err := m.store.Canonicalize(sessionID); err != nil {
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
-		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
+		if transcript, _, generation, err := m.store.GetCanonicalTranscriptWithGeneration(sessionID); err != nil {
 			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		} else {
-			m.triggerEmbeddingIndex(sessionID, transcript)
+			m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		}
 		if syncer != nil {
 			go func() {
@@ -620,15 +612,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 	}
 
-	generationStore, generationAware := m.store.(summaryGenerationStore)
 	var transcript string
 	var generation int
 	var err error
-	if generationAware {
-		transcript, _, generation, err = generationStore.GetCanonicalTranscriptWithGeneration(sessionID)
-	} else {
-		transcript, _, err = m.store.GetCanonicalTranscript(sessionID)
-	}
+	transcript, _, generation, err = m.store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		m.failSummary(sessionID, fmt.Sprintf("failed to get canonical transcript: %v", err))
 		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
@@ -652,23 +639,14 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
-		if generationAware {
-			m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
-		} else {
-			m.triggerEmbeddingIndex(sessionID, transcript)
-		}
+		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
 		return
 	}
 
-	var storeErr error
-	if generationAware {
-		storeErr = generationStore.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, generation)
-	} else {
-		storeErr = m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
-	}
+	storeErr := m.store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, generation)
 	if storeErr != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
 		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr))
@@ -815,10 +793,6 @@ func (m *Manager) waitForRefinedTranscript(ctx context.Context, sessionID string
 	}
 }
 
-func (m *Manager) triggerEmbeddingIndex(sessionID, transcript string) {
-	m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, -1)
-}
-
 func (m *Manager) triggerEmbeddingIndexAtGeneration(sessionID, transcript string, generation int) {
 	m.mu.Lock()
 	indexer := m.indexer
@@ -831,13 +805,7 @@ func (m *Manager) triggerEmbeddingIndexAtGeneration(sessionID, transcript string
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
-		if generationIndexer, ok := indexer.(generationEmbeddingIndexer); ok && generation >= 0 {
-			if err := generationIndexer.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {
-				m.logger.Error("embedding index failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
-			}
-			return
-		}
-		if err := indexer.IndexSession(ctx, sessionID, transcript); err != nil {
+		if err := indexer.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {
 			m.logger.Error("embedding index failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
 	}()

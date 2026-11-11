@@ -91,12 +91,16 @@ func TestIndexerOnSessionEnd(t *testing.T) {
 	}
 
 	transcript := makeTranscript(700)
-	if err := indexer.IndexSession(context.Background(), sessionID, transcript); err != nil {
-		t.Fatalf("IndexSession: %v", err)
+	generation, err := store.DeletionGeneration(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := indexer.IndexSessionAtGeneration(context.Background(), sessionID, transcript, generation); err != nil {
+		t.Fatalf("IndexSessionAtGeneration: %v", err)
 	}
 
-	if err := indexer.IndexSession(context.Background(), sessionID, transcript); err != nil {
-		t.Fatalf("IndexSession idempotent re-run: %v", err)
+	if err := indexer.IndexSessionAtGeneration(context.Background(), sessionID, transcript, generation); err != nil {
+		t.Fatalf("IndexSessionAtGeneration idempotent re-run: %v", err)
 	}
 
 	embeddings, err := store.GetEmbeddings(sessionID)
@@ -138,7 +142,11 @@ func TestBackfillMissing(t *testing.T) {
 		}
 	}
 
-	if err := indexer.IndexSession(context.Background(), indexedID, "hello world from "+indexedID); err != nil {
+	generation, err := store.DeletionGeneration(indexedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := indexer.IndexSessionAtGeneration(context.Background(), indexedID, "hello world from "+indexedID, generation); err != nil {
 		t.Fatalf("pre-index indexed session: %v", err)
 	}
 
@@ -188,13 +196,17 @@ func TestIndexerReembedsWhenModelChanges(t *testing.T) {
 	}
 
 	transcript := makeTranscript(100)
+	generation, err := store.DeletionGeneration(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	indexer.SetModel("gemini/gemini-embedding-001")
-	if err := indexer.IndexSession(context.Background(), sessionID, transcript); err != nil {
-		t.Fatalf("initial IndexSession: %v", err)
+	if err := indexer.IndexSessionAtGeneration(context.Background(), sessionID, transcript, generation); err != nil {
+		t.Fatalf("initial IndexSessionAtGeneration: %v", err)
 	}
 
 	indexer.SetModel("gemini/gemini-embedding-2")
-	if err := indexer.IndexSession(context.Background(), sessionID, transcript); err != nil {
+	if err := indexer.IndexSessionAtGeneration(context.Background(), sessionID, transcript, generation); err != nil {
 		t.Fatalf("reindex after model change: %v", err)
 	}
 

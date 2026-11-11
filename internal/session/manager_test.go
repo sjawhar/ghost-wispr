@@ -109,6 +109,10 @@ func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ s
 	return nil
 }
 
+func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, _ int) error {
+	return s.UpdateSummary(sessionID, title, summary, status, preset, speakerNames)
+}
+
 // StartSummary keeps the title and summary, as the store does.
 func (s *storeMock) StartSummary(sessionID string) error {
 	s.mu.Lock()
@@ -203,6 +207,11 @@ func (s *storeMock) GetCanonicalTranscript(sessionID string) (string, string, er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.canonicalTranscript[sessionID], s.transcriptSource[sessionID], nil
+}
+
+func (s *storeMock) GetCanonicalTranscriptWithGeneration(sessionID string) (string, string, int, error) {
+	transcript, source, err := s.GetCanonicalTranscript(sessionID)
+	return transcript, source, 0, err
 }
 
 type recorderMock struct {

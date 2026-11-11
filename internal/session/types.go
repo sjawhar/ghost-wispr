@@ -18,6 +18,7 @@ type Store interface {
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	CountSegments(sessionID string) (int, error)
 	UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error
+	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error
 	// StartSummary marks the summary running; the session keeps its title
 	// and its last good summary until a new one is stored.
 	StartSummary(sessionID string) error
@@ -32,6 +33,7 @@ type Store interface {
 	UpdateTitle(sessionID, title string) error
 	Canonicalize(sessionID string) error
 	GetCanonicalTranscript(sessionID string) (transcript, source string, err error)
+	GetCanonicalTranscriptWithGeneration(sessionID string) (transcript, source string, generation int, err error)
 }
 
 type Recorder interface {
@@ -55,7 +57,7 @@ type EventPublisher interface {
 }
 
 type EmbeddingIndexer interface {
-	IndexSession(ctx context.Context, sessionID, transcript string) error
+	IndexSessionAtGeneration(ctx context.Context, sessionID, transcript string, generation int) error
 }
 
 type EventBroadcaster interface {
