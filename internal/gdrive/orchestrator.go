@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,6 +55,56 @@ type Orchestrator struct {
 	uploader uploader
 	store    OrchestratorStore
 	logger   *slog.Logger
+
+	// warnings tracks the Drive replacements that keep failing, for
+	// SetReplacementWarnings.
+	warnings replacementWarnings
+}
+
+// replacementWarningAfterFailures is how many replacement attempts in a row
+// fail before the app warns that Drive still holds deleted words.
+const replacementWarningAfterFailures = 3
+
+// replacementWarnings counts each session's failed replacement attempts in a
+// row and reports them through set once they reach
+// replacementWarningAfterFailures, and through clear once the session no
+// longer owes Drive a replacement.
+type replacementWarnings struct {
+	mu       sync.Mutex
+	set      func(sessionID, message string)
+	clear    func(sessionID string)
+	failures map[string]int
+}
+
+func (w *replacementWarnings) failed(sessionID string, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.failures == nil {
+		w.failures = map[string]int{}
+	}
+	w.failures[sessionID]++
+	if n := w.failures[sessionID]; n >= replacementWarningAfterFailures && w.set != nil {
+		w.set(sessionID, fmt.Sprintf("Google Drive still holds the words of a deleted segment of session %s: replacing its files failed %d times in a row (last: %v). The sync sweep keeps retrying.", sessionID, n, err))
+	}
+}
+
+func (w *replacementWarnings) done(sessionID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.failures, sessionID)
+	if w.clear != nil {
+		w.clear(sessionID)
+	}
+}
+
+// SetReplacementWarnings has the orchestrator call set, with a message naming
+// the session, once replacing a session's Drive files after a segment
+// deletion has failed replacementWarningAfterFailures times in a row, and
+// clear once the session no longer owes Drive a replacement.
+func (o *Orchestrator) SetReplacementWarnings(set func(sessionID, message string), clear func(sessionID string)) {
+	o.warnings.mu.Lock()
+	defer o.warnings.mu.Unlock()
+	o.warnings.set, o.warnings.clear = set, clear
 }
 
 func NewOrchestrator(syncer *Syncer, store OrchestratorStore, logger ...*slog.Logger) *Orchestrator {
@@ -189,6 +240,7 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				if err := replacements.ClearDriveReplacementPending(sessionID, generation); err != nil {
 					return err
 				}
+				o.warnings.done(sessionID)
 				o.logger.Info("gdrive replacement falls through to first sync", "operation", "replace_session_files", "session_id", sessionID)
 				return o.SyncSession(ctx, sessionID)
 			}
@@ -196,45 +248,9 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 			if !ok {
 				return fmt.Errorf("replace session files %s: the Drive uploader cannot replace files", sessionID)
 			}
-			// Hold the session's sync claim while replacing, so retry-sync, the
-			// sync after a summary and the sweep do not start a second
-			// replacement. Release it to the state it was claimed from: the
-			// replacement does not prove that every other recording of the
-			// session is on Drive, so it never marks the session synced.
-			releaseState := syncStateOf(&read)
-			if releaseState == storage.SyncStateSynced {
-				releaseState = storage.SyncStatePending
-			}
-			claim := uuid.NewString()
-			claimedSession, claimed, err := o.store.ClaimSync(sessionID, read.SyncState, claim, time.Now().UTC())
-			if err != nil {
-				return fmt.Errorf("claim replacement sync of %s: %w", sessionID, err)
-			}
-			if !claimed {
-				o.logger.Info("gdrive replacement was claimed by another sync first, skipping", "operation", "replace_session_files", "session_id", sessionID)
-				return nil
-			}
-			replaceErr := syncer.ReplaceSessionFiles(ctx, claimedSession, splicedRecording)
-			message := ""
-			if replaceErr != nil {
-				message = replaceErr.Error()
-			}
-			released, releaseErr := o.store.EndSync(sessionID, claim, releaseState, claimedSession.GDriveFolderID, claimedSession.RetryCount, time.Now().UTC(), message)
-			switch {
-			case releaseErr != nil:
-				o.logger.Error("gdrive replacement could not release its sync claim; the session stays mid-sync until the app restarts", "operation", "replace_session_files", "session_id", sessionID, "error", releaseErr)
-				if replaceErr == nil {
-					replaceErr = fmt.Errorf("release replacement sync claim: %w", releaseErr)
-				}
-			case !released:
-				o.logger.Warn("gdrive replacement no longer holds its session; its state is left as it is", "operation", "replace_session_files", "session_id", sessionID)
-			}
-			if replaceErr != nil {
-				return fmt.Errorf("replace session files %s: %w", sessionID, replaceErr)
-			}
-			o.logger.Info("gdrive session files replaced", "operation", "replace_session_files", "session_id", sessionID, "drive_folder_id", claimedSession.GDriveFolderID, "sync_state", releaseState)
-			return nil
+			return o.replaceSessionFiles(ctx, syncer, replacements, &read, generation, splicedRecording)
 		}
+		o.warnings.done(sessionID)
 	}
 	switch state := syncStateOf(&read); state {
 	case storage.SyncStateSynced:
@@ -363,6 +379,90 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	}
 	o.logger.Error("gdrive sync permanently failed", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStateFailed, "retry_count", sess.RetryCount, "error", err.Error())
 	return fmt.Errorf("upload %s: %w", sessionID, err)
+}
+
+// replaceSessionFiles replaces sess's Drive files after the segment deletion
+// of generation, holding the session's sync claim. It asks Drive about the
+// session's folder first, as a sync does. A folder in the trash moves the
+// session to REMOTE_DELETED with the replacement still owed, and the sweep
+// asks again until the folder is back. A folder gone for good took the old
+// files with it, so nothing is owed any more. A Drive that cannot say leaves
+// the session as it is, for the next sweep.
+func (o *Orchestrator) replaceSessionFiles(ctx context.Context, syncer *Syncer, replacements replacementInputStore, sess *storage.Session, generation int, splicedRecording string) error {
+	sessionID := sess.ID
+	if err := syncer.checkFolder(ctx, sess.GDriveFolderID); err != nil {
+		switch {
+		case errors.Is(err, ErrFolderTrashed):
+			o.endReplacementAs(sess, storage.SyncStateRemoteDeleted, err)
+			o.warnings.failed(sessionID, err)
+			return fmt.Errorf("replace session files %s: its Drive folder is in the trash, and the replacement runs once it is restored: %w", sessionID, err)
+		case IsRemoteDeletedError(err):
+			if clearErr := replacements.ClearDriveReplacementPending(sessionID, generation); clearErr != nil {
+				o.warnings.failed(sessionID, clearErr)
+				return clearErr
+			}
+			o.endReplacementAs(sess, storage.SyncStateRemoteDeleted, err)
+			o.warnings.done(sessionID)
+			return fmt.Errorf("remote folder deleted for %s: %w", sessionID, err)
+		default:
+			o.warnings.failed(sessionID, err)
+			return fmt.Errorf("replace session files %s: %w", sessionID, err)
+		}
+	}
+
+	// Hold the session's sync claim while replacing, so retry-sync, the sync
+	// after a summary and the sweep do not start a second replacement.
+	claim := uuid.NewString()
+	claimed, ok, err := o.store.ClaimSync(sessionID, sess.SyncState, claim, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("claim replacement sync of %s: %w", sessionID, err)
+	}
+	if !ok {
+		o.logger.Info("gdrive replacement was claimed by another sync first, skipping", "operation", "replace_session_files", "session_id", sessionID)
+		return nil
+	}
+	replaceErr := syncer.ReplaceSessionFiles(ctx, claimed, splicedRecording)
+	message := ""
+	if replaceErr != nil {
+		message = replaceErr.Error()
+	}
+	// Released PENDING, its retry count kept, either way. A replacement does
+	// not prove that every other recording of the session is on Drive, so it
+	// never marks the session synced: the next sync does. A replacement that
+	// failed is owed still, and the sweep reads PENDING every time it runs.
+	released, releaseErr := o.store.EndSync(sessionID, claim, storage.SyncStatePending, claimed.GDriveFolderID, claimed.RetryCount, time.Now().UTC(), message)
+	switch {
+	case releaseErr != nil:
+		o.logger.Error("gdrive replacement could not release its sync claim; the session stays mid-sync until the app restarts", "operation", "replace_session_files", "session_id", sessionID, "error", releaseErr)
+		if replaceErr == nil {
+			replaceErr = fmt.Errorf("release replacement sync claim: %w", releaseErr)
+		}
+	case !released:
+		o.logger.Warn("gdrive replacement no longer holds its session; its state is left as it is", "operation", "replace_session_files", "session_id", sessionID)
+	}
+	if replaceErr != nil {
+		o.warnings.failed(sessionID, replaceErr)
+		return fmt.Errorf("replace session files %s: %w", sessionID, replaceErr)
+	}
+	o.warnings.done(sessionID)
+	o.logger.Info("gdrive session files replaced", "operation", "replace_session_files", "session_id", sessionID, "drive_folder_id", claimed.GDriveFolderID)
+	return nil
+}
+
+// endReplacementAs moves sess to sync state state, its retry count kept,
+// unless it is in that state already, recording why (cause). It claims the
+// session for the write, so it changes nothing that another sync holds.
+func (o *Orchestrator) endReplacementAs(sess *storage.Session, state string, cause error) {
+	if syncStateOf(sess) == state {
+		return
+	}
+	claim := uuid.NewString()
+	claimed, ok, err := o.store.ClaimSync(sess.ID, sess.SyncState, claim, time.Now().UTC())
+	if err != nil || !ok {
+		o.logger.Warn("gdrive replacement could not record its session's Drive folder state", "operation", "replace_session_files", "session_id", sess.ID, "sync_state", state, "claimed", ok, "error", err)
+		return
+	}
+	o.endSync(sess.ID, claim, state, claimed.GDriveFolderID, claimed.RetryCount, time.Now().UTC(), cause)
 }
 
 // folderBack returns nil unless sess is REMOTE_DELETED and Drive does not

@@ -1502,22 +1502,31 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 // REMOTE_DELETED (a retry that found the session's Drive folder back) goes
 // back to REMOTE_DELETED, its retry count as it was: Drive may have lost the
 // folder again since, and only the next retry, asking Drive again, takes the
-// session out of it.
+// session out of it. A session that still owes Drive a replacement
+// (drive_replace_pending) goes back to the state its claim came from, its
+// retry count as it was: a deletion is never left FAILED, where only a manual
+// retry would remove the deleted words from Drive.
 func (s *SQLiteStore) RecoverInterruptedSyncs(maxRetries int, at time.Time) ([]string, error) {
+	// The state a cut-off replacement goes back to: the one its claim came
+	// from, PENDING when that was SYNCED or is not recorded.
+	const replacementBack = `CASE WHEN sync_claimed_from IN ('', ?) THEN ? ELSE sync_claimed_from END`
 	rows, err := s.db.Query(
 		`UPDATE sessions
-		 SET sync_state = CASE WHEN sync_claimed_from = ? THEN ? WHEN retry_count >= ? THEN ? ELSE ? END,
-		     sync_status = ?,
-		     retry_count = CASE WHEN sync_claimed_from = ? OR retry_count >= ? THEN retry_count ELSE retry_count + 1 END,
+		 SET sync_state = CASE WHEN drive_replace_pending = 1 THEN `+replacementBack+`
+		                       WHEN sync_claimed_from = ? THEN ? WHEN retry_count >= ? THEN ? ELSE ? END,
+		     sync_status = CASE WHEN drive_replace_pending = 1 AND `+replacementBack+` = ? THEN ? ELSE ? END,
+		     retry_count = CASE WHEN drive_replace_pending = 1 OR sync_claimed_from = ? OR retry_count >= ? THEN retry_count ELSE retry_count + 1 END,
 		     last_sync_attempt = ?,
-		     error_message = CASE WHEN sync_claimed_from = ? THEN ? ELSE ? END,
+		     error_message = CASE WHEN drive_replace_pending = 1 THEN ? WHEN sync_claimed_from = ? THEN ? ELSE ? END,
 		     sync_claim = '', sync_claimed_from = ''
 		 WHERE sync_state = ?
 		 RETURNING id`,
+		SyncStateSynced, SyncStatePending,
 		SyncStateRemoteDeleted, SyncStateRemoteDeleted, maxRetries, SyncStateFailed, SyncStateRetryScheduled,
-		SyncFailed,
+		SyncStateSynced, SyncStatePending, SyncStatePending, SyncPending, SyncFailed,
 		SyncStateRemoteDeleted, maxRetries,
 		at.UTC().Format(time.RFC3339Nano),
+		"a Drive replacement after a segment deletion was cut off: the app stopped during it",
 		SyncStateRemoteDeleted, "a retry after the Drive folder was deleted was cut off: the app stopped during it", "the sync was cut off: the app stopped during it",
 		SyncStateSyncing,
 	)
@@ -1769,10 +1778,17 @@ func (s *SQLiteStore) GetSessionsForBackfill() ([]string, error) {
 	return ids, nil
 }
 
+// GetSessionsNeedingSync returns the ended sessions the sync sweep syncs now:
+// those waiting for a sync, and those that still owe Drive a replacement after
+// a segment deletion while FAILED or REMOTE_DELETED, which an ordinary sync
+// leaves to a manual retry. A replacement asks Drive whether a deleted folder
+// is back each time, so a deletion never waits on a click. (A scheduled retry
+// is read separately, by GetSessionsBySyncState, when it is due.)
 func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended' AND sync_state = ?`,
-		SyncStatePending,
+		`SELECT id FROM sessions WHERE status = 'ended'
+		 AND (sync_state = ? OR (drive_replace_pending = 1 AND sync_state IN (?, ?)))`,
+		SyncStatePending, SyncStateFailed, SyncStateRemoteDeleted,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing sync: %w", err)

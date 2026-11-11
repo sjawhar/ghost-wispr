@@ -511,7 +511,9 @@ func TestReplaceRecoversAnUploadedFileBeforeItsRowIsUpdated(t *testing.T) {
 	fixture := newReplacementFixture(t)
 	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
 	fixture.wire.allowDeletes = true
-	fixture.wire.failGetAt = fixture.wire.gets + 1
+	// The replacement first reads the session folder (checkFolder); the
+	// read after it is the first upload's verification.
+	fixture.wire.failGetAt = fixture.wire.gets + 2
 
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err == nil {
 		t.Fatal("replacement succeeded though Drive did not verify the uploaded file")
