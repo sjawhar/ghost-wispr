@@ -252,8 +252,12 @@ deploy/pi/accept-slice1.sh
 ```
 
 The driver pauses and resumes the recorder, asks the operator to power-cycle it, checks the
-light state, verifies the tagged identity and loopback listeners, tests the signed and unsigned
-webhook paths, and compares the Pi's package inventory against `deploy/pi/baseline.txt`. While
-it runs, a member device must also subscribe with
-`nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222` and
-confirm the signed probe plus a real `session.started` and `session.ended` notification.
+light state, verifies the tagged identity and loopback listeners, and tests the signed and
+unsigned webhook paths. Before the pause it requires the Ghost Wispr Deepgram socket to grow by
+at least 32 kB/s; during the 60-second pause it permits at most 4096 bytes. It compares package
+and running-service inventories against `deploy/pi/baseline.txt`, allowing only
+`libportaudio2`, `ffmpeg`, `lame`, `jq`, their package dependencies, and Ghost Wispr's user
+services. An empty inventory is UNKNOWN, not a pass. While it runs, a member device must also
+subscribe with `nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222`
+and confirm the signed probe plus a real
+`session.started` and `session.ended` notification.

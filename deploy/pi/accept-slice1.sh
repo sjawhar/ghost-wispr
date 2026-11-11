@@ -108,7 +108,7 @@ assert_set_subset() {
   [[ -s "$baseline" ]] || unknown "$subject baseline is empty"
   [[ -s "$current" ]] || unknown "$subject inventory is empty"
   unexpected="$scratch_dir/${subject// /-}-unexpected.txt"
-  comm -13 "$allowed" "$current" >"$unexpected"
+  LC_ALL=C comm -13 "$allowed" "$current" >"$unexpected"
   if [[ -s "$unexpected" ]]; then
     printf 'unexpected %s:\n' "$subject" >&2
     cat "$unexpected" >&2
@@ -116,9 +116,13 @@ assert_set_subset() {
   fi
 }
 
+dependency_packages_from_apt_cache() {
+  sed -nE '/^[^[:space:]<]/p' | sed -E 's/:[[:alnum:]]+$//' | LC_ALL=C sort -u
+}
+
 deepgram_bytes_from_ss() {
   awk '
-    /^[A-Z-]+[[:space:]]/ { held_by_ghost_wispr = /users:\(\("ghost-wispr"/ }
+    /^[A-Z][A-Z0-9-]*[[:space:]]/ { held_by_ghost_wispr = /users:\(\("ghost-wispr"/ }
     held_by_ghost_wispr && match($0, /bytes_sent:[0-9]+/) {
       total += substr($0, RSTART + 11, RLENGTH - 11)
       found = 1
@@ -165,6 +169,11 @@ run_control_tests() {
   fi
   printf 'self-test: package control rejected a doctored baseline\n'
 
+  dependency_packages=$(printf '%s\n' 'libportaudio2' ' |Depends: libjack-jackd2-0' 'libjack-jackd2-0:arm64' | dependency_packages_from_apt_cache)
+  [[ "$dependency_packages" == $'libjack-jackd2-0\nlibportaudio2' ]] \
+    || fail "self-test expected the dependency parser to keep first-choice packages"
+  printf 'self-test: dependency parser retained first-choice packages\n'
+
   printf 'base.service\n' >"$controls_dir/baseline-services.txt"
   printf 'base.service\nunexpected.service\n' >"$controls_dir/current-services.txt"
   printf 'base.service\nghost-wispr.service\n' >"$controls_dir/allowed-services.txt"
@@ -177,6 +186,10 @@ run_control_tests() {
     fail "self-test expected the Deepgram socket control to reject fake ss output without bytes_sent"
   fi
   printf 'self-test: Deepgram socket control rejected fake ss output\n'
+
+  parsed_bytes=$(printf '%s\n' 'ESTAB 0 0 10.0.0.2:12345 34.120.1.2:443 users:(("ghost-wispr",pid=7,fd=9))' ' bbr bytes_sent:160000' | deepgram_bytes_from_ss)
+  [[ "$parsed_bytes" == 160000 ]] || fail "self-test expected the Deepgram parser to accept a ghost-wispr socket"
+  printf 'self-test: Deepgram socket control accepted valid fake ss output\n'
 
   if assert_minimum_growth 100 101 5; then
     fail "self-test expected the Deepgram recording control to reject low growth"
@@ -281,8 +294,8 @@ printf 'A7: compare the Pi inventory with deploy/pi/baseline.txt.\n'
 readonly expected_package_roots=(libportaudio2 ffmpeg lame jq)
 {
   printf '%s\n' "${expected_package_roots[@]}"
-  remote_run 'apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces libportaudio2 ffmpeg lame jq | sed -nE "s/^[[:space:]]*(Pre)?Depends:[[:space:]]*//p" | grep -v "^<" | LC_ALL=C sort -u'
-} | LC_ALL=C sort -u >"$scratch_dir/allowed-packages.txt"
+  remote_run 'apt-cache depends --recurse --no-suggests --no-conflicts --no-breaks --no-replaces libportaudio2 ffmpeg lame jq'
+} | dependency_packages_from_apt_cache >"$scratch_dir/allowed-packages.txt"
 remote_run "dpkg-query -W -f='\${Package}\\n' | LC_ALL=C sort -u" >"$scratch_dir/current-packages.txt"
 awk '/^---$/{exit} NF {print}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-packages.txt"
 {
@@ -293,8 +306,13 @@ assert_set_subset package "$scratch_dir/baseline-packages.txt" "$scratch_dir/cur
   || fail "unexpected installed package"
 
 readonly expected_service_additions=(ghost-wispr.service ghost-wispr-update.service)
-remote_run "systemctl list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'; XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user list-units --type=service --all --plain --no-legend | awk '{print \$1}'" \
-  | LC_ALL=C sort -u >"$scratch_dir/current-services.txt"
+system_services=$(remote_run "systemctl list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'") \
+  || fail "could not read running system services"
+user_services=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'") \
+  || fail "could not read running user services"
+[[ -n "$system_services" ]] || unknown "system service inventory is empty"
+[[ -n "$user_services" ]] || unknown "user service inventory is empty"
+printf '%s\n%s\n' "$system_services" "$user_services" | LC_ALL=C sort -u >"$scratch_dir/current-services.txt"
 awk 'seen && NF {print} /^---$/ {seen=1}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-services.txt"
 {
   cat "$scratch_dir/baseline-services.txt"
@@ -302,7 +320,7 @@ awk 'seen && NF {print} /^---$/ {seen=1}' "$baseline_file" | LC_ALL=C sort -u >"
 } | LC_ALL=C sort -u >"$scratch_dir/permitted-services.txt"
 assert_set_subset service "$scratch_dir/baseline-services.txt" "$scratch_dir/current-services.txt" "$scratch_dir/permitted-services.txt" \
   || fail "unexpected running service"
-timer_state=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user is-enabled ghost-wispr-update.timer")
+timer_state=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user is-enabled ghost-wispr-update.timer" || true)
 [[ "$timer_state" == enabled ]] || fail "ghost-wispr-update.timer is not enabled"
 printf '  pass\n'
 printf 'slice 1 acceptance checks completed.\n'
