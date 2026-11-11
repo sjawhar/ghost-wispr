@@ -1818,7 +1818,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	lightOff := hardware.Done()
 	if err := cleanupSpliceTempCopies(cfg.AudioDir); err != nil {
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
-		warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", err))
+		setPendingSpliceWarning(warningRegistry, err)
 	}
 
 	// Create health checker with actual component references
@@ -1839,11 +1839,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	go func() {
 		count, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession, func(recoveryErr error) {
 			log.Printf("warning: pending segment splice: %v", recoveryErr)
-			warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", recoveryErr))
+			setPendingSpliceWarning(warningRegistry, recoveryErr)
 		})
 		if err != nil {
 			log.Printf("warning: failed to recover pending segment splices: %v", err)
-			warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", err))
+			setPendingSpliceWarning(warningRegistry, err)
 		} else if count > 0 {
 			log.Printf("recovered %d pending segment splices", count)
 		}

@@ -245,7 +245,7 @@ ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user
 
 ## Recover a pending segment deletion
 
-If `/api/status` names a session with a pending segment deletion, do not issue another
+If `/api/status` names a recording with a pending segment deletion, do not issue another
 delete for that conversation. First restore Drive connectivity and confirm the session
 folder still contains its recordings. Then restart Ghost Wispr:
 
