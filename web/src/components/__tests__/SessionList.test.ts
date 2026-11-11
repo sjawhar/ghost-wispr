@@ -148,4 +148,60 @@ describe('SessionList', () => {
     expect(calls).toEqual(deletedCalls === 1 ? ['scrub', 'refresh'] : ['refresh'])
     expect(screen.queryByTestId('search-results')).toBeNull()
   })
+
+  it('clears the segment locally when uncertain deletion refresh fails', async () => {
+    const session: SessionSummary = {
+      id: 's1',
+      title: 'Fixture session',
+      started_at: '2026-11-11T10:00:00Z',
+      ended_at: '2026-11-11T10:10:00Z',
+      status: SessionStatus.Ended,
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: 'default',
+      audio_path: 'fixture.mp3',
+    }
+    const onSegmentDeleted = vi.fn()
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 500 })))
+    render({
+      dates: ['2026-11-11'],
+      sessionsByDate: new Map([['2026-11-11', [session]]]),
+      sessionDetails: new Map([
+        [
+          's1',
+          {
+            session,
+            segments: [
+              {
+                id: 42,
+                speaker: 0,
+                text: 'Possibly deleted phrase',
+                start_time: 0,
+                end_time: 2,
+                timestamp: '2026-11-11T10:00:00Z',
+              },
+            ],
+          },
+        ],
+      ]),
+      presets: {},
+      expandedSessionId: 's1',
+      onToggleSession: vi.fn(),
+      onLoadDate: vi.fn().mockResolvedValue(undefined),
+      onLoadDetail: vi.fn().mockResolvedValue(undefined),
+      onResummarize: vi.fn().mockResolvedValue(undefined),
+      onDelete: vi.fn().mockResolvedValue(undefined),
+      onMerge: vi.fn().mockResolvedValue(undefined),
+      onSegmentDeleted,
+      onRefreshSession: vi.fn().mockRejectedValue(new Error('refresh unavailable')),
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    await waitFor(() => {
+      expect(onSegmentDeleted).toHaveBeenCalledWith('s1', 42)
+      expect(screen.queryByText('Possibly deleted phrase')).toBeNull()
+    })
+  })
 })
