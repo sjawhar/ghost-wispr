@@ -366,33 +366,40 @@ func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool
 	return false
 }
 
-// recoverPendingSplices completes recordings whose deletion transaction
-// committed before its replacement file reached disk. One bad row is reported
-// through warn and never prevents later rows from recovering. A successful
-// recovery clears the warning for that session and recording only.
-func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(storage.DeletedSpan, error), clear func(string, string)) (int, error) {
-	if warn == nil {
-		warn = func(storage.DeletedSpan, error) {}
-	}
-	if clear == nil {
-		clear = func(string, string) {}
-	}
-	spans, err := store.PendingSplices()
-	if err != nil {
-		return 0, err
-	}
-	recovered := 0
-	for i := range spans {
-		span := spans[i]
-		if recoverPendingSplice(ctx, store, audioDir, source, splice, refine, func(err error) { warn(span, err) }, &span) {
-			recovered++
-			clear(span.SessionID, span.AudioPath)
-		}
-	}
-	return recovered, nil
+type pendingSpliceFailure struct {
+	Span storage.DeletedSpan
+	Err  error
 }
 
-func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(error), span *storage.DeletedSpan) bool {
+type refinementAfterSegmentDeletionError struct{ err error }
+
+func (e refinementAfterSegmentDeletionError) Error() string { return e.err.Error() }
+
+func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
+
+// recoverPendingSplices completes recordings whose deletion transaction
+// committed before its replacement file reached disk. It returns the spans
+// whose audio recovered and the spans that still need operator attention, so
+// the caller owns the lifetime of their status warnings.
+func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (recovered []storage.DeletedSpan, failed []pendingSpliceFailure, err error) {
+	spans, err := store.PendingSplices()
+	if err != nil {
+		return nil, nil, err
+	}
+	for i := range spans {
+		span := spans[i]
+		didRecover, recoveryErr := recoverPendingSplice(ctx, store, audioDir, source, splice, refine, &span)
+		if didRecover {
+			recovered = append(recovered, span)
+		}
+		if recoveryErr != nil {
+			failed = append(failed, pendingSpliceFailure{Span: span, Err: recoveryErr})
+		}
+	}
+	return recovered, failed, nil
+}
+
+func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, span *storage.DeletedSpan) (bool, error) {
 	deleteLocks.setRecovering(span.SessionID, true)
 	defer deleteLocks.setRecovering(span.SessionID, false)
 
@@ -406,13 +413,11 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 
 	session, err := store.GetSession(span.SessionID)
 	if err != nil {
-		warn(fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err))
-		return false
+		return false, fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err)
 	}
 	recordingSet, err := restoreDeletionRecordings(ctx, &session, audioDir, source)
 	if err != nil {
-		warn(fmt.Errorf("restore pending splice %s: %w", span.AudioPath, err))
-		return false
+		return false, fmt.Errorf("restore pending splice %s: %w", span.AudioPath, err)
 	}
 	recording := ""
 	for _, candidate := range recordingSet.Paths {
@@ -423,61 +428,52 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	}
 	if recording == "" {
 		removeFiles(recordingSet.Downloaded)
-		warn(fmt.Errorf("pending splice recording %s is unavailable", span.AudioPath))
-		return false
+		return false, fmt.Errorf("pending splice recording %s is unavailable", span.AudioPath)
 	}
 	hash, err := fileSHA256(recording)
 	if err != nil {
 		removeFiles(recordingSet.Downloaded)
-		warn(fmt.Errorf("hash pending splice recording %s: %w", recording, err))
-		return false
+		return false, fmt.Errorf("hash pending splice recording %s: %w", recording, err)
 	}
 	if hash == span.SHA256After {
 		if err := store.MarkSpliceComplete(span); err != nil {
-			warn(err)
+			return false, err
 		}
-		return false
+		return false, nil
 	}
 	if hash != span.SHA256Before {
 		removeFiles(recordingSet.Downloaded)
-		warn(fmt.Errorf("pending splice recording %s has SHA-256 %s, want %s", recording, hash, span.SHA256Before))
-		return false
+		return false, fmt.Errorf("pending splice recording %s has SHA-256 %s, want %s", recording, hash, span.SHA256Before)
 	}
 	tempPath, err := copyForSplice(recording)
 	if err != nil {
 		removeFiles(recordingSet.Downloaded)
-		warn(fmt.Errorf("copy pending splice %s: %w", recording, err))
-		return false
+		return false, fmt.Errorf("copy pending splice %s: %w", recording, err)
 	}
 	afterHash, err := splice(ctx, tempPath, span.Start, span.End)
 	if err != nil {
 		_ = os.Remove(tempPath)
 		removeFiles(recordingSet.Downloaded)
-		warn(fmt.Errorf("re-splice %s: %w", recording, err))
-		return false
+		return false, fmt.Errorf("re-splice %s: %w", recording, err)
 	}
 	if afterHash != span.SHA256After {
 		_ = os.Remove(tempPath)
-		warn(fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After))
-		return false
+		return false, fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After)
 	}
 	if err := os.Rename(tempPath, recording); err != nil {
-		warn(fmt.Errorf("replace recovered recording %s: %w", recording, err))
-		return false
+		return false, fmt.Errorf("replace recovered recording %s: %w", recording, err)
 	}
 	if err := store.MarkSpliceComplete(span); err != nil {
-		warn(err)
-		return false
+		return false, err
 	}
 	unlock()
 	locked = false
 	if refine != nil {
 		if err := refine(ctx, span.SessionID, session.AudioPath, session.StartedAt); err != nil {
-			warn(fmt.Errorf("refine re-spliced session %s: %w", span.SessionID, err))
-			return false
+			return true, refinementAfterSegmentDeletionError{err: fmt.Errorf("refinement after segment deletion failed for session %s: %w", span.SessionID, err)}
 		}
 	}
-	return true
+	return true, nil
 }
 
 func removeFiles(paths []string) {

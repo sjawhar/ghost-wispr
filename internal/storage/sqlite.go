@@ -186,6 +186,8 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
 
+	// One connection keeps DeleteSegment out of Canonicalize's transaction.
+	// TestR7OpenTransactionExcludesDeleteSegment guards this invariant.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 

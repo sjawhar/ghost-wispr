@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
@@ -8,9 +9,10 @@ import (
 )
 
 const (
-	pendingSpliceWarningKeyPrefix   = "pending-segment-splices:"
-	pendingSpliceCleanupWarningKey  = pendingSpliceWarningKeyPrefix + "startup-cleanup"
-	pendingSpliceRecoveryWarningKey = pendingSpliceWarningKeyPrefix + "startup-recovery"
+	pendingSpliceWarningKeyPrefix    = "pending-segment-splices:"
+	pendingSpliceRefinementKeyPrefix = "segment-deletion-refinement:"
+	pendingSpliceCleanupWarningKey   = pendingSpliceWarningKeyPrefix + "startup-cleanup"
+	pendingSpliceRecoveryWarningKey  = pendingSpliceWarningKeyPrefix + "startup-recovery"
 )
 
 // pendingSpliceWarningKey identifies one recording of one session, so a
@@ -31,13 +33,25 @@ func clearPendingSpliceWarning(registry *warningsRegistry, sessionID, recording 
 	registry.Clear(pendingSpliceWarningKey(sessionID, recording))
 }
 
-func pendingSpliceWarningCallbacks(registry *warningsRegistry) (func(storage.DeletedSpan, error), func(string, string)) {
-	return func(span storage.DeletedSpan, recoveryErr error) {
-			log.Printf("warning: pending segment splice session=%s recording=%s: %v", span.SessionID, span.AudioPath, recoveryErr)
-			setPendingSpliceWarning(registry, span.SessionID, span.AudioPath, recoveryErr)
-		}, func(sessionID, recording string) {
-			clearPendingSpliceWarning(registry, sessionID, recording)
+func pendingSpliceRefinementKey(span *storage.DeletedSpan) string {
+	return pendingSpliceRefinementKeyPrefix + span.SessionID + "\x00" + span.AudioPath
+}
+
+func applyPendingSpliceRecoveryWarnings(registry *warningsRegistry, recovered []storage.DeletedSpan, failed []pendingSpliceFailure) {
+	for i := range recovered {
+		clearPendingSpliceWarning(registry, recovered[i].SessionID, recovered[i].AudioPath)
+	}
+	for i := range failed {
+		failure := failed[i]
+		var refinementErr refinementAfterSegmentDeletionError
+		if errors.As(failure.Err, &refinementErr) {
+			log.Printf("warning: %v recording=%s", failure.Err, failure.Span.AudioPath)
+			registry.Set(pendingSpliceRefinementKey(&failure.Span), failure.Err.Error())
+			continue
 		}
+		log.Printf("warning: pending segment splice session=%s recording=%s: %v", failure.Span.SessionID, failure.Span.AudioPath, failure.Err)
+		setPendingSpliceWarning(registry, failure.Span.SessionID, failure.Span.AudioPath, failure.Err)
+	}
 }
 
 func recordPendingSpliceCleanupWarning(registry *warningsRegistry, recoveryErr error) {

@@ -1,19 +1,17 @@
 package storage
 
 import (
-	"runtime"
+	"database/sql"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites holds Canonicalize between
-// its read and write, then gives DeleteSegment the processor. The one-connection
-// transaction must write before the delete can commit; otherwise the stale
-// canonical text would land after the delete.
+// its read and write, then waits for DeleteSegment to block on the only
+// connection. The transaction must write before the delete can commit;
+// otherwise the stale canonical text would land after the delete.
 func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
-	oldProcs := runtime.GOMAXPROCS(1)
-	t.Cleanup(func() { runtime.GOMAXPROCS(oldProcs) })
-
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "s")
 	segments, err := store.GetSegments("s")
@@ -47,7 +45,7 @@ func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
 		})
 	}()
 	<-deleteStarted
-	runtime.Gosched()
+	waitForConnectionWait(t, store.DB())
 	close(allowWrite)
 
 	result := <-canonicalizedResult
@@ -67,5 +65,23 @@ func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
 	}
 	if generation != 1 || strings.Contains(transcript, "private deletion token") {
 		t.Fatalf("canonical transcript=%q at generation %d, want the deleted text absent at generation 1", transcript, generation)
+	}
+}
+
+func waitForConnectionWait(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if db.Stats().WaitCount > 0 {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("DeleteSegment did not block on Canonicalize's transaction")
+		case <-ticker.C:
+		}
 	}
 }

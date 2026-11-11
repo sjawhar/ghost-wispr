@@ -1808,7 +1808,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	lightOff := hardware.Done()
-	pendingSpliceWarn, clearRecoveredSpliceWarning := pendingSpliceWarningCallbacks(warningRegistry)
 	if err := cleanupSpliceTempCopies(cfg.AudioDir); err != nil {
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
@@ -1830,12 +1829,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}()
 
 	go func() {
-		count, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession, pendingSpliceWarn, clearRecoveredSpliceWarning)
+		recovered, failed, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession)
+		applyPendingSpliceRecoveryWarnings(warningRegistry, recovered, failed)
 		if err != nil {
 			log.Printf("warning: failed to recover pending segment splices: %v", err)
 			recordPendingSpliceRecoveryWarning(warningRegistry, err)
-		} else if count > 0 {
-			log.Printf("recovered %d pending segment splices", count)
+		} else if len(recovered) > 0 {
+			log.Printf("recovered %d pending segment splices", len(recovered))
 		}
 	}()
 
