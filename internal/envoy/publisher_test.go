@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -52,6 +53,14 @@ func (s *storeStub) UpdateEnvoyPublishStatusAtVersion(sessionID string, summaryV
 	return true, nil
 }
 
+func (*storeStub) EnqueueEnvoyLifecycleEvent(string, string) error { return nil }
+
+func (*storeStub) PendingEnvoyLifecycleEvents() ([]storage.EnvoyLifecycleEvent, error) {
+	return nil, nil
+}
+
+func (*storeStub) MarkEnvoyLifecycleEventDelivered(string, string) error { return nil }
+
 type webhookBody struct {
 	EventType string         `json:"event_type"`
 	CreatedAt string         `json:"created_at"`
@@ -74,11 +83,9 @@ func TestSendSignsTheBody(t *testing.T) {
 	client.retryDelays = nil
 
 	if err := client.Send(context.Background(), Event{
-		Type:      "summary_ready",
-		SessionID: "session-1",
-		Payload: map[string]any{
-			"version": 1,
-		},
+		Type:           eventSummaryReady,
+		SessionID:      "session-1",
+		SummaryVersion: 1,
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -88,10 +95,10 @@ func TestSendSignsTheBody(t *testing.T) {
 	}
 }
 
-func TestNewClientLeavesRequestDeadlineToCaller(t *testing.T) {
+func TestNewClientSetsRequestTimeout(t *testing.T) {
 	client := NewClient("https://relay.example.test/webhook/ghostwispr", "shared-secret")
-	if client.httpClient.Timeout != 0 {
-		t.Fatalf("default HTTP timeout = %s, want caller-managed deadline", client.httpClient.Timeout)
+	if client.httpClient.Timeout != 10*time.Second {
+		t.Fatalf("default HTTP timeout = %s, want 10s", client.httpClient.Timeout)
 	}
 }
 
@@ -147,14 +154,14 @@ func TestSendCarriesTheHeadersAndBodyTheListenerNeeds(t *testing.T) {
 	client.retryDelays = nil
 
 	if err := client.Send(context.Background(), Event{
-		Type:      "summary_ready",
-		SessionID: "session-1",
+		Type:           eventSummaryReady,
+		SessionID:      "session-1",
+		SummaryVersion: 3,
 		Payload: map[string]any{
 			"title":          "Team sync",
 			"summary":        "Reviewed the webhook cutover.",
 			"duration":       int64(2700),
 			"summary_preset": "default",
-			"version":        3,
 		},
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
@@ -332,7 +339,7 @@ func TestPublishSummaryReadyLeavesANewerSummaryAlone(t *testing.T) {
 	}
 }
 
-func TestPublishSummaryReadyRecordsRejected4xx(t *testing.T) {
+func TestPublishSummaryReadyRecordsFailed4xx(t *testing.T) {
 	server, requests := newListenerTestServer(t, "shared-secret", http.StatusUnauthorized)
 	defer server.Close()
 
@@ -356,8 +363,8 @@ func TestPublishSummaryReadyRecordsRejected4xx(t *testing.T) {
 	if got := len(requests()); got != 1 {
 		t.Fatalf("requests = %d, want 1", got)
 	}
-	if got := store.statuses["session-1"]; got != storage.EnvoyPublishRejected {
-		t.Fatalf("publish status = %q, want %q", got, storage.EnvoyPublishRejected)
+	if got := store.statuses["session-1"]; got != storage.EnvoyPublishFailed {
+		t.Fatalf("publish status = %q, want %q", got, storage.EnvoyPublishFailed)
 	}
 }
 
@@ -387,6 +394,132 @@ func TestPublishSummaryReadyRecordsFailed5xx(t *testing.T) {
 	}
 	if got := store.statuses["session-1"]; got != storage.EnvoyPublishFailed {
 		t.Fatalf("publish status = %q, want %q", got, storage.EnvoyPublishFailed)
+	}
+}
+
+func TestLifecycleEventsSurviveRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	startedAt := time.Date(2026, 11, 11, 7, 20, 0, 0, time.UTC)
+	if err := store.CreateSession("session-1", startedAt); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	down, _ := newListenerTestServer(t, "shared-secret", http.StatusServiceUnavailable, http.StatusServiceUnavailable)
+	publisher := NewPublisher(down.URL, "shared-secret", store)
+	publisher.client.retryDelays = nil
+	if err := publisher.PublishSessionStarted(context.Background(), "session-1"); err == nil {
+		t.Fatal("PublishSessionStarted succeeded while relay was down")
+	}
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := publisher.PublishSessionEnded(context.Background(), "session-1"); err == nil {
+		t.Fatal("PublishSessionEnded succeeded while relay was down")
+	}
+	down.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	up, requests := newListenerTestServer(t, "shared-secret")
+	defer up.Close()
+	publisher = NewPublisher(up.URL, "shared-secret", reopened)
+	publisher.client.retryDelays = nil
+	if err := publisher.PublishPendingLifecycleEvents(context.Background()); err != nil {
+		t.Fatalf("PublishPendingLifecycleEvents: %v", err)
+	}
+	got := requests()
+	if len(got) != 2 {
+		t.Fatalf("requests = %d, want 2", len(got))
+	}
+	if got[0].delivery != "session-1.session_started" || got[1].delivery != "session-1.session_ended" {
+		t.Fatalf("deliveries = %#v, want stable start then end", got)
+	}
+	events, err := reopened.PendingEnvoyLifecycleEvents()
+	if err != nil {
+		t.Fatalf("PendingEnvoyLifecycleEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("pending lifecycle events = %#v, want none", events)
+	}
+}
+
+func TestSummaryReadyRetries429(t *testing.T) {
+	server, requests := newListenerTestServer(t, "shared-secret", http.StatusTooManyRequests, http.StatusOK)
+	defer server.Close()
+	endedAt := time.Date(2026, 11, 11, 7, 20, 0, 0, time.UTC)
+	store := &storeStub{sessions: map[string]storage.Session{
+		"session-1": {
+			ID:             "session-1",
+			StartedAt:      endedAt.Add(-time.Minute),
+			EndedAt:        &endedAt,
+			Status:         storage.SessionEnded,
+			SummaryStatus:  storage.SummaryCompleted,
+			SummaryVersion: 1,
+		},
+	}}
+	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher.client.retryDelays = []time.Duration{0}
+	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
+		t.Fatalf("PublishSummaryReady: %v", err)
+	}
+	if got := len(requests()); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+	if got := store.statuses["session-1"]; got != storage.EnvoyPublishPublished {
+		t.Fatalf("publish status = %q, want %q", got, storage.EnvoyPublishPublished)
+	}
+}
+
+func TestFailedSummaryDeliversAfterSecretIsFixed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := storage.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	startedAt := time.Date(2026, 11, 11, 7, 20, 0, 0, time.UTC)
+	if err := store.CreateSession("session-1", startedAt); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := store.UpdateSummary("session-1", "Title", "Summary", storage.SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("UpdateSummary: %v", err)
+	}
+
+	listener, requests := newListenerTestServer(t, "fixed-secret")
+	defer listener.Close()
+	publisher := NewPublisher(listener.URL, "wrong-secret", store)
+	publisher.client.retryDelays = nil
+	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err == nil {
+		t.Fatal("PublishSummaryReady succeeded with the wrong secret")
+	}
+	ids, err := store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("GetSessionsNeedingEnvoyPublish: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "session-1" {
+		t.Fatalf("failed summary candidates = %v, want [session-1]", ids)
+	}
+
+	publisher = NewPublisher(listener.URL, "fixed-secret", store)
+	publisher.client.retryDelays = nil
+	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
+		t.Fatalf("PublishSummaryReady after secret fix: %v", err)
+	}
+	if got := len(requests()); got != 1 {
+		t.Fatalf("successful requests = %d, want 1", got)
 	}
 }
 

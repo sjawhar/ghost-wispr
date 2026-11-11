@@ -1152,6 +1152,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		if pub == nil {
 			return
 		}
+		if err := pub.PublishPendingLifecycleEvents(ctx); err != nil {
+			log.Printf("envoy lifecycle sweep error: %v", err)
+		}
 		ids, err := store.GetSessionsNeedingEnvoyPublish()
 		if err != nil {
 			log.Printf("envoy sweep error: %v", err)
@@ -1678,9 +1681,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
 		log.Printf("warning: force end session failed: %v", err)
 	}
-	if err := manager.WaitForLifecyclePublishes(shutdownCtx); err != nil {
+	lifecycleCtx, lifecycleCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := manager.WaitForLifecyclePublishes(lifecycleCtx); err != nil {
 		log.Printf("warning: lifecycle event publishing did not finish before shutdown: %v", err)
 	}
+	lifecycleCancel()
 
 	if dgStop != nil {
 		dgStop()

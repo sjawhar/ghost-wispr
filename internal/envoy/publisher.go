@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,10 +20,12 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
+type EventType string
+
 const (
-	eventSessionStarted = "session_started"
-	eventSessionEnded   = "session_ended"
-	eventSummaryReady   = "summary_ready"
+	eventSessionStarted EventType = "session_started"
+	eventSessionEnded   EventType = "session_ended"
+	eventSummaryReady   EventType = "summary_ready"
 )
 
 var defaultRetryDelays = []time.Duration{5 * time.Second, 30 * time.Second, 120 * time.Second}
@@ -32,13 +33,17 @@ var defaultRetryDelays = []time.Duration{5 * time.Second, 30 * time.Second, 120 
 type Store interface {
 	GetSession(id string) (storage.Session, error)
 	UpdateEnvoyPublishStatusAtVersion(sessionID string, summaryVersion int, status string) (bool, error)
+	EnqueueEnvoyLifecycleEvent(eventType, sessionID string) error
+	PendingEnvoyLifecycleEvents() ([]storage.EnvoyLifecycleEvent, error)
+	MarkEnvoyLifecycleEventDelivered(eventType, sessionID string) error
 }
 
 // Event is one Ghost Wispr event sent to Envoy's webhook.
 type Event struct {
-	Type      string
-	SessionID string
-	Payload   map[string]any
+	Type           EventType
+	SessionID      string
+	SummaryVersion int
+	Payload        map[string]any
 }
 
 // Option configures a Client.
@@ -88,6 +93,7 @@ func NewClient(url, secret string, opts ...Option) *Client {
 		url:    strings.TrimSpace(url),
 		secret: []byte(strings.TrimSpace(secret)),
 		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -119,7 +125,7 @@ func (c *Client) Send(ctx context.Context, ev Event) error {
 	if err != nil {
 		return err
 	}
-	body, err := webhookEventBody(eventType, ev.SessionID, ev.Payload, c.now())
+	body, err := webhookEventBody(eventType, ev.SessionID, ev.SummaryVersion, ev.Payload, c.now())
 	if err != nil {
 		return err
 	}
@@ -151,13 +157,13 @@ func (c *Client) Send(ctx context.Context, ev Event) error {
 	}
 }
 
-func (c *Client) sendOnce(ctx context.Context, eventType, delivery string, body []byte, signature string) (retry bool, err error) {
+func (c *Client) sendOnce(ctx context.Context, eventType EventType, delivery string, body []byte, signature string) (retry bool, err error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 	if err != nil {
 		return false, fmt.Errorf("create envoy webhook request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-GhostWispr-Event", strings.ReplaceAll(eventType, "_", "."))
+	request.Header.Set("X-GhostWispr-Event", strings.ReplaceAll(string(eventType), "_", "."))
 	request.Header.Set("X-GhostWispr-Delivery", delivery)
 	request.Header.Set("X-GhostWispr-Signature", signature)
 
@@ -172,6 +178,9 @@ func (c *Client) sendOnce(ctx context.Context, eventType, delivery string, body 
 	}
 
 	err = &webhookStatusError{status: response.StatusCode}
+	if response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooManyRequests {
+		return true, err
+	}
 	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError {
 		c.logger.Warn("envoy webhook request rejected",
 			"event", eventType,
@@ -232,12 +241,7 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		publishStatus := storage.EnvoyPublishFailed
-		var responseErr *webhookStatusError
-		if errors.As(err, &responseErr) && responseErr.status >= http.StatusBadRequest && responseErr.status < http.StatusInternalServerError {
-			publishStatus = storage.EnvoyPublishRejected
-		}
-		if updated, statusErr := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, publishStatus); statusErr != nil {
+		if updated, statusErr := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, storage.EnvoyPublishFailed); statusErr != nil {
 			return fmt.Errorf("publish summary-ready event for session %s: %w (also failed to mark status: %v)", sessionID, err, statusErr)
 		} else if !updated {
 			return nil
@@ -253,9 +257,12 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 	return nil
 }
 
-func (p *Publisher) publishSession(ctx context.Context, eventType, sessionID string) error {
+func (p *Publisher) publishSession(ctx context.Context, eventType EventType, sessionID string) error {
 	if p == nil || p.client == nil || p.store == nil {
 		return nil
+	}
+	if err := p.store.EnqueueEnvoyLifecycleEvent(string(eventType), sessionID); err != nil {
+		return err
 	}
 	sess, err := p.store.GetSession(sessionID)
 	if err != nil {
@@ -264,24 +271,46 @@ func (p *Publisher) publishSession(ctx context.Context, eventType, sessionID str
 	if err := p.sendSession(ctx, eventType, &sess); err != nil {
 		return fmt.Errorf("publish %s event for session %s: %w", eventType, sessionID, err)
 	}
+	if err := p.store.MarkEnvoyLifecycleEventDelivered(string(eventType), sessionID); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (p *Publisher) sendSession(ctx context.Context, eventType string, sess *storage.Session) error {
+func (p *Publisher) PublishPendingLifecycleEvents(ctx context.Context) error {
+	events, err := p.store.PendingEnvoyLifecycleEvents()
+	if err != nil {
+		return err
+	}
+	for _, event := range events {
+		switch EventType(event.Type) {
+		case eventSessionStarted:
+			if err := p.PublishSessionStarted(ctx, event.SessionID); err != nil {
+				return err
+			}
+		case eventSessionEnded:
+			if err := p.PublishSessionEnded(ctx, event.SessionID); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown pending Envoy lifecycle event type %q", event.Type)
+		}
+	}
+	return nil
+}
+
+func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *storage.Session) error {
 	payload := map[string]any{
 		"title":    sess.Title,
 		"summary":  sess.Summary,
 		"duration": sessionDuration(sess),
 	}
+	event := Event{Type: eventType, SessionID: sess.ID, Payload: payload}
 	if eventType == eventSummaryReady {
 		payload["summary_preset"] = sess.SummaryPreset
-		payload["version"] = sess.SummaryVersion
+		event.SummaryVersion = sess.SummaryVersion
 	}
-	return p.client.Send(ctx, Event{
-		Type:      eventType,
-		SessionID: sess.ID,
-		Payload:   payload,
-	})
+	return p.client.Send(ctx, event)
 }
 
 func shouldPublish(sess *storage.Session) bool {
@@ -295,8 +324,8 @@ func sessionDuration(sess *storage.Session) int64 {
 	return int64(sess.EndedAt.Sub(sess.StartedAt).Seconds())
 }
 
-func eventDelivery(ev Event) (eventType, delivery string, err error) {
-	eventType = normalizeEventType(ev.Type)
+func eventDelivery(ev Event) (eventType EventType, delivery string, err error) {
+	eventType = EventType(normalizeEventType(string(ev.Type)))
 	sessionID := strings.TrimSpace(ev.SessionID)
 	if sessionID == "" {
 		return "", "", errors.New("envoy webhook session ID is required")
@@ -304,26 +333,28 @@ func eventDelivery(ev Event) (eventType, delivery string, err error) {
 
 	switch eventType {
 	case eventSessionStarted, eventSessionEnded:
-		return eventType, sessionID + "." + eventType, nil
+		return eventType, sessionID + "." + string(eventType), nil
 	case eventSummaryReady:
-		version, ok := summaryVersion(ev.Payload["version"])
-		if !ok {
+		if ev.SummaryVersion <= 0 {
 			return "", "", errors.New("envoy webhook summary version must be a positive integer")
 		}
-		return eventType, sessionID + "." + eventType + "." + strconv.FormatInt(version, 10), nil
+		return eventType, sessionID + "." + string(eventType) + "." + strconv.Itoa(ev.SummaryVersion), nil
 	default:
 		return "", "", fmt.Errorf("unsupported envoy webhook event type %q", ev.Type)
 	}
 }
 
-func webhookEventBody(eventType, sessionID string, payload map[string]any, createdAt time.Time) ([]byte, error) {
-	bodyPayload := make(map[string]any, len(payload)+2)
+func webhookEventBody(eventType EventType, sessionID string, summaryVersion int, payload map[string]any, createdAt time.Time) ([]byte, error) {
+	bodyPayload := make(map[string]any, len(payload)+3)
 	maps.Copy(bodyPayload, payload)
 	bodyPayload["session_id"] = strings.TrimSpace(sessionID)
 	bodyPayload["type"] = eventType
+	if eventType == eventSummaryReady {
+		bodyPayload["version"] = summaryVersion
+	}
 
 	return json.Marshal(struct {
-		EventType string         `json:"event_type"`
+		EventType EventType      `json:"event_type"`
 		CreatedAt string         `json:"created_at"`
 		Payload   map[string]any `json:"payload"`
 	}{
@@ -337,48 +368,6 @@ func webhookSignature(secret, body []byte) string {
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write(body)
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
-}
-
-func summaryVersion(value any) (int64, bool) {
-	switch version := value.(type) {
-	case int:
-		return int64(version), version > 0
-	case int8:
-		return int64(version), version > 0
-	case int16:
-		return int64(version), version > 0
-	case int32:
-		return int64(version), version > 0
-	case int64:
-		return version, version > 0
-	case uint:
-		if uint64(version) > math.MaxInt64 {
-			return 0, false
-		}
-		return int64(version), version > 0
-	case uint8:
-		return int64(version), version > 0
-	case uint16:
-		return int64(version), version > 0
-	case uint32:
-		return int64(version), version > 0
-	case uint64:
-		if version > math.MaxInt64 {
-			return 0, false
-		}
-		return int64(version), version > 0
-	case float64:
-		// float64(math.MaxInt64) rounds up to 2^63, which int64 cannot hold.
-		if version <= 0 || version != math.Trunc(version) || version >= math.MaxInt64 {
-			return 0, false
-		}
-		return int64(version), true
-	case json.Number:
-		parsed, err := version.Int64()
-		return parsed, err == nil && parsed > 0
-	default:
-		return 0, false
-	}
 }
 
 func normalizeEventType(event string) string {

@@ -30,6 +30,21 @@ func newTestSQLiteStore(t *testing.T) *SQLiteStore {
 	return store
 }
 
+func setEnvoyPublishStatus(store *SQLiteStore, sessionID, status string) error {
+	session, err := store.GetSession(sessionID)
+	if err != nil {
+		return err
+	}
+	updated, err := store.UpdateEnvoyPublishStatusAtVersion(sessionID, session.SummaryVersion, status)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("session %s changed before envoy publish status update", sessionID)
+	}
+	return nil
+}
+
 func TestPreMigrationBackupCreated(t *testing.T) {
 	t.Helper()
 
@@ -315,7 +330,7 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	if got := version("after regenerated summary"); got != 2 {
 		t.Fatalf("regenerated summary version = %d, want 2", got)
 	}
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("mark regenerated summary published: %v", err)
 	}
 
@@ -340,7 +355,7 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	if len(ids) != 1 || ids[0] != sessionID {
 		t.Fatalf("sessions needing Envoy publish = %v, want [%s]", ids, sessionID)
 	}
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("mark batched summary published: %v", err)
 	}
 
@@ -1166,7 +1181,7 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 		t.Fatalf("expected [%s], got %v", sessionID, ids)
 	}
 
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 
@@ -1186,15 +1201,15 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 		t.Fatalf("expected envoy_publish_status %q, got %q", EnvoyPublishPublished, sess.EnvoyPublishStatus)
 	}
 
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishRejected); err != nil {
-		t.Fatalf("mark envoy publish rejected: %v", err)
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishFailed); err != nil {
+		t.Fatalf("mark envoy publish failed: %v", err)
 	}
 	ids, err = store.GetSessionsNeedingEnvoyPublish()
 	if err != nil {
-		t.Fatalf("get sessions needing envoy publish after rejection: %v", err)
+		t.Fatalf("get sessions needing envoy publish after failure: %v", err)
 	}
-	if len(ids) != 0 {
-		t.Fatalf("rejected summary should not be swept again, got %v", ids)
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("failed summary should be swept again, got %v", ids)
 	}
 }
 
@@ -1219,7 +1234,7 @@ func TestEnvoyPublishStatusIsVersionAware(t *testing.T) {
 	if updated {
 		t.Fatal("stale summary version updated the delivery status")
 	}
-	updated, err = store.UpdateEnvoyPublishStatusAtVersion(sessionID, 1, EnvoyPublishRejected)
+	updated, err = store.UpdateEnvoyPublishStatusAtVersion(sessionID, 1, EnvoyPublishFailed)
 	if err != nil {
 		t.Fatalf("UpdateEnvoyPublishStatusAtVersion current: %v", err)
 	}
@@ -1242,7 +1257,7 @@ func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
 	if err := store.UpdateSummary(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("update summary completed: %v", err)
 	}
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 

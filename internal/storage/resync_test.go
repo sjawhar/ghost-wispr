@@ -74,7 +74,7 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			return store.UpdateRefinement(id, "The refined transcript.", RefinementCompleted)
 		}, false},
 		{"published to Envoy", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateEnvoyPublishStatus(id, EnvoyPublishPublished)
+			return setEnvoyPublishStatus(store, id, EnvoyPublishPublished)
 		}, false},
 		// Every other input of the documents, written directly: the app
 		// changes none of these on a synced session today.
