@@ -154,15 +154,3 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 
 	return results
 }
-
-func (s *Summarizer) resolvedModel(presetName string) string {
-	model := s.cfg.Model
-	if preset, ok := s.cfg.Presets[presetName]; ok && preset.Model != "" {
-		model = preset.Model
-	}
-	_, name, err := llm.ParseModel(model)
-	if err != nil {
-		return ""
-	}
-	return name
-}
