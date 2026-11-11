@@ -23,6 +23,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"github.com/sjawhar/ghost-wispr/internal/tts"
 )
 
 type apiStoreStub struct {
@@ -3665,5 +3666,27 @@ func TestSessionDetailReportsProviderModels(t *testing.T) {
 	}
 	if payload.Session.RefinementModel != "provider-refinement-model" {
 		t.Fatalf("refinement_model = %q", payload.Session.RefinementModel)
+	}
+}
+
+func TestTTSSpeakReturnsBadGatewayAfterSynthesisFailure(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
+		TTSSpeak: func(string, string, string) (string, error) { return "failed-request", nil },
+		TTSWaitForSynthesis: func(context.Context, string) (map[string]any, error) {
+			return map[string]any{"status": tts.StatusFailed, "error": "provider refused synthesis"}, nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/tts/speak", strings.NewReader(`{"text":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("POST /api/tts/speak = %d, want 502: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "provider refused synthesis") {
+		t.Fatalf("failure response %q omits synthesis error", rr.Body.String())
 	}
 }

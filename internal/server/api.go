@@ -1434,6 +1434,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			} else if controls.TTSStatus != nil {
 				speechStatus, _ = controls.TTSStatus(id)
 			}
+			if state, _ := speechStatus["status"].(string); state == tts.StatusFailed {
+				message, _ := speechStatus["error"].(string)
+				writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("TTS synthesis failed: %s", message))
+				return
+			}
 			if model, ok := speechStatus["model"].(string); ok && model != "" {
 				w.Header().Set("X-Ghost-Wispr-TTS-Model", model)
 			}
