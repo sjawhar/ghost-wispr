@@ -176,39 +176,42 @@ var moduleList struct {
 // file of every package they import, by import path.
 func listModule(root string) ([]goPackage, map[string]string, error) {
 	moduleList.once.Do(func() {
-		var stderr bytes.Buffer
-		cmd := exec.Command("go", "list", "-e", "-export", "-compiled", "-deps", "-json=ImportPath,Dir,Export,GoFiles,CompiledGoFiles,DepOnly,Error", "./...")
-		cmd.Dir, cmd.Stderr = root, &stderr
-		out, err := cmd.Output()
-		if err != nil {
-			moduleList.err = fmt.Errorf("go list: %w\n%s", err, stderr.Bytes())
-			return
-		}
-		moduleList.exports = map[string]string{}
-		for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); {
-			var p goPackage
-			if err := dec.Decode(&p); err != nil {
-				moduleList.err = fmt.Errorf("read go list: %w", err)
-				return
-			}
-			// The app embeds the web build (cmd/ghost-wispr/static), which a
-			// checkout has only once the frontend is built; its Go files are
-			// checked all the same.
-			embedOnly := p.Error != nil && !p.DepOnly && strings.Contains(p.Error.Err, "no matching files found")
-			if p.Error != nil && !embedOnly {
-				moduleList.err = fmt.Errorf("go list %s: %s", p.ImportPath, p.Error.Err)
-				return
-			}
-			if len(p.CompiledGoFiles) == 0 {
-				p.CompiledGoFiles = p.GoFiles
-			}
-			moduleList.exports[p.ImportPath] = p.Export
-			if !p.DepOnly {
-				moduleList.packages = append(moduleList.packages, p)
-			}
-		}
+		moduleList.packages, moduleList.exports, moduleList.err = listPackages(root, "./...")
 	})
 	return moduleList.packages, moduleList.exports, moduleList.err
+}
+
+func listPackages(root, pattern string) ([]goPackage, map[string]string, error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command("go", "list", "-e", "-export", "-compiled", "-deps", "-json=ImportPath,Dir,Export,GoFiles,CompiledGoFiles,DepOnly,Error", pattern)
+	cmd.Dir, cmd.Stderr = root, &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, nil, fmt.Errorf("go list: %w\n%s", err, stderr.Bytes())
+	}
+	exports := map[string]string{}
+	var packages []goPackage
+	for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); {
+		var p goPackage
+		if err := dec.Decode(&p); err != nil {
+			return nil, nil, fmt.Errorf("read go list: %w", err)
+		}
+		// The app embeds the web build (cmd/ghost-wispr/static), which a
+		// checkout has only once the frontend is built; its Go files are
+		// checked all the same.
+		embedOnly := p.Error != nil && !p.DepOnly && strings.Contains(p.Error.Err, "no matching files found")
+		if p.Error != nil && !embedOnly {
+			return nil, nil, fmt.Errorf("go list %s: %s", p.ImportPath, p.Error.Err)
+		}
+		if len(p.CompiledGoFiles) == 0 {
+			p.CompiledGoFiles = p.GoFiles
+		}
+		exports[p.ImportPath] = p.Export
+		if !p.DepOnly {
+			packages = append(packages, p)
+		}
+	}
+	return packages, exports, nil
 }
 
 // typeCheckModule type-checks each package of the module at root, its code
@@ -222,6 +225,23 @@ func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*tok
 	if err != nil {
 		t.Fatal(err)
 	}
+	return typeCheckPackages(t, root, modulePackages, exports, overlay, 20)
+}
+
+// typeCheckGDrive type-checks production code in internal/gdrive. Unlike the
+// whole-module deletion guard, this scoped guard does not need CGO-only
+// packages such as the recorder's PortAudio dependency.
+func typeCheckGDrive(t *testing.T, root string, overlay map[string][]byte) (*token.FileSet, []*ast.File, map[*ast.Ident]types.Object) {
+	t.Helper()
+	packages, exports, err := listPackages(root, "./internal/gdrive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return typeCheckPackages(t, root, packages, exports, overlay, 1)
+}
+
+func typeCheckPackages(t *testing.T, root string, modulePackages []goPackage, exports map[string]string, overlay map[string][]byte, minimumFiles int) (*token.FileSet, []*ast.File, map[*ast.Ident]types.Object) {
+	t.Helper()
 	fset := token.NewFileSet()
 	imports := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
 		if exports[path] == "" {
@@ -261,7 +281,7 @@ func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*tok
 	if t.Failed() {
 		t.FailNow()
 	}
-	if len(all) < 20 {
+	if len(all) < minimumFiles {
 		t.Fatalf("type-checked %d Go files under %s; the check missed the code", len(all), root)
 	}
 	return fset, all, uses
