@@ -315,8 +315,12 @@ func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *
 	return p.client.Send(ctx, event)
 }
 
+// shouldPublish reports whether sess has a summary to announce: an ended
+// session whose summary completed with text. A session with no summarizer
+// completes its summary empty, and Envoy gets no summary_ready for it.
 func shouldPublish(sess *storage.Session) bool {
-	return sess.Status == storage.SessionEnded && sess.SummaryStatus == storage.SummaryCompleted && sess.EndedAt != nil
+	return sess.Status == storage.SessionEnded && sess.SummaryStatus == storage.SummaryCompleted && sess.EndedAt != nil &&
+		strings.TrimSpace(sess.Summary) != ""
 }
 
 func sessionDuration(sess *storage.Session) int64 {

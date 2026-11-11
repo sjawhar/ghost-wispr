@@ -682,7 +682,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		}()
 	}
 
-	if publisher != nil && strings.TrimSpace(summaryText) != "" {
+	if publisher != nil {
 		go func() {
 			if err := publisher.PublishSummaryReady(context.Background(), sessionID); err != nil {
 				m.logger.Error("envoy publish failed", "operation", "publish_summary_ready", "session_id", sessionID, "error", err)

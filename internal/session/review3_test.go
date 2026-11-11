@@ -52,39 +52,6 @@ func TestReview3NoSummarizerCompletesSummaryAfterDelete(t *testing.T) {
 	}
 }
 
-type emptySummarySummarizer struct{}
-
-func (emptySummarySummarizer) Summarize(context.Context, string, string) (string, string, string, string, error) {
-	return "Auto title", "", "default", "{}", nil
-}
-
-// TestGenerateSummaryDoesNotPublishEmptySummaryReady fails if Envoy receives
-// summary_ready for a session that has no summary text.
-func TestGenerateSummaryDoesNotPublishEmptySummaryReady(t *testing.T) {
-	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "empty-summary.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	if err := store.CreateSession("empty", time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.AppendSegment("empty", transcribe.Segment{Text: "transcript"}); err != nil {
-		t.Fatal(err)
-	}
-	published := make(chan string, 1)
-	manager := NewManager(store, nil, emptySummarySummarizer{}, nil, NewDetector(time.Hour), 0)
-	manager.SetEventPublisher(publisherMock{called: published})
-
-	manager.generateSummary(context.Background(), "empty", time.Now().UTC())
-
-	select {
-	case sessionID := <-published:
-		t.Fatalf("published summary_ready for empty summary from session %q", sessionID)
-	case <-time.After(100 * time.Millisecond):
-	}
-}
-
 // noSummarizerStore opens a real store holding one ended session with two
 // segments.
 func noSummarizerStore(t *testing.T) *storage.SQLiteStore {

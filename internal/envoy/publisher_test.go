@@ -313,6 +313,7 @@ func TestPublishSummaryReadyLeavesANewerSummaryAlone(t *testing.T) {
 			EndedAt:        &endedAt,
 			Status:         storage.SessionEnded,
 			SummaryStatus:  storage.SummaryCompleted,
+			Summary:        "A completed summary.",
 			SummaryVersion: 1,
 		},
 	}}
@@ -351,6 +352,7 @@ func TestPublishSummaryReadyRecordsFailed4xx(t *testing.T) {
 			EndedAt:        &endedAt,
 			Status:         storage.SessionEnded,
 			SummaryStatus:  storage.SummaryCompleted,
+			Summary:        "A completed summary.",
 			SummaryVersion: 1,
 		},
 	}}
@@ -380,6 +382,7 @@ func TestPublishSummaryReadyRecordsFailed5xx(t *testing.T) {
 			EndedAt:        &endedAt,
 			Status:         storage.SessionEnded,
 			SummaryStatus:  storage.SummaryCompleted,
+			Summary:        "A completed summary.",
 			SummaryVersion: 1,
 		},
 	}}
@@ -504,6 +507,7 @@ func TestSummaryReadyRetries429(t *testing.T) {
 			EndedAt:        &endedAt,
 			Status:         storage.SessionEnded,
 			SummaryStatus:  storage.SummaryCompleted,
+			Summary:        "A completed summary.",
 			SummaryVersion: 1,
 		},
 	}}
@@ -560,6 +564,51 @@ func TestFailedSummaryDeliversAfterSecretIsFixed(t *testing.T) {
 	}
 	if got := len(requests()); got != 1 {
 		t.Fatalf("successful requests = %d, want 1", got)
+	}
+}
+
+// TestEmptySummaryIsNotPublished fails if the summary-ready path, which the
+// startup sweep also uses, sends Envoy a completed summary with no text: the
+// one a session gets when no summarizer is configured.
+func TestEmptySummaryIsNotPublished(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	startedAt := time.Date(2026, 11, 11, 7, 20, 0, 0, time.UTC)
+	if err := store.CreateSession("session-1", startedAt); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := store.StartSummary("session-1"); err != nil {
+		t.Fatalf("StartSummary: %v", err)
+	}
+	generation, err := store.Canonicalize("session-1")
+	if err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration("session-1", "", "", storage.SummaryCompleted, "", "{}", generation); err != nil {
+		t.Fatalf("complete empty summary: %v", err)
+	}
+
+	listener, requests := newListenerTestServer(t, "shared-secret")
+	defer listener.Close()
+	publisher := NewPublisher(listener.URL, "shared-secret", store)
+	publisher.client.retryDelays = nil
+	ids, err := store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("GetSessionsNeedingEnvoyPublish: %v", err)
+	}
+	for _, id := range ids {
+		if err := publisher.PublishSummaryReady(context.Background(), id); err != nil {
+			t.Fatalf("PublishSummaryReady(%s): %v", id, err)
+		}
+	}
+	if got := requests(); len(got) != 0 {
+		t.Fatalf("summary_ready requests for an empty summary = %d, want none", len(got))
 	}
 }
 
