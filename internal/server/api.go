@@ -846,6 +846,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		newID := earliest.UTC().Format("20060102150405") + "-merged"
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
+			if errors.Is(err, storage.ErrMergeReplacementPending) {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("merge sessions: %v", err))
 			return
 		}

@@ -709,6 +709,46 @@ func TestMergeSession_SessionNotFound(t *testing.T) {
 	}
 }
 
+// TestMergeSession_RefusesASessionThatOwesADriveReplacement fails if the
+// merge route merges, or answers anything but 409 with the reason, while a
+// session to merge still has a deleted segment on Google Drive.
+func TestMergeSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"20261106100000", "20261106110000"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = '20261106110000'`); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/merge", strings.NewReader(`{"session_ids":["20261106100000","20261106110000"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "deleted segment on Google Drive") {
+		t.Fatalf("merge of a session owing a Drive replacement = %d %s, want 409 with the reason", rr.Code, rr.Body.String())
+	}
+	if sess, err := store.GetSession("20261106100000"); err != nil || sess.Status != storage.SessionEnded {
+		t.Fatalf("after the refused merge the other session is %q (%v), want it ended", sess.Status, err)
+	}
+}
+
 func TestAPIAudioRange(t *testing.T) {
 	root := t.TempDir()
 	audioFile := "audio.mp3"

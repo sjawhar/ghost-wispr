@@ -795,6 +795,12 @@ func (s *SQLiteStore) AppendSegment(sessionID string, seg transcribe.Segment) er
 	return nil
 }
 
+// ErrMergeReplacementPending is the error MergeSessions returns, changing
+// nothing, when a source session still owes Google Drive a replacement after
+// a segment deletion: merged, it would leave the sync sweep before Drive lost
+// the deleted words.
+var ErrMergeReplacementPending = errors.New("a session to merge still has a deleted segment on Google Drive; merge it after its Drive files are replaced")
+
 func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	if strings.TrimSpace(newID) == "" {
 		return errors.New("new session id is required")
@@ -809,6 +815,23 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	placeholders := make([]string, len(sourceIDs))
+	args := make([]any, 0, len(sourceIDs)+1)
+	args = append(args, newID)
+	for i, id := range sourceIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+
+	var owing string
+	err = tx.QueryRow(fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND drive_replace_pending = 1 LIMIT 1`, strings.Join(placeholders, ",")), args[1:]...).Scan(&owing)
+	switch {
+	case err == nil:
+		return fmt.Errorf("merge session %s: %w", owing, ErrMergeReplacementPending)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("check sources for owed Drive replacements: %w", err)
+	}
+
 	_, err = tx.Exec(
 		`INSERT INTO sessions(id, started_at, ended_at, status, summary_status) VALUES(?, ?, ?, 'ended', 'pending')`,
 		newID,
@@ -818,15 +841,6 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	if err != nil {
 		return fmt.Errorf("create merged session: %w", err)
 	}
-
-	placeholders := make([]string, len(sourceIDs))
-	args := make([]any, 0, len(sourceIDs)+1)
-	args = append(args, newID)
-	for i, id := range sourceIDs {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-
 	segQuery := fmt.Sprintf(
 		`UPDATE segments SET session_id = ? WHERE session_id IN (%s)`,
 		strings.Join(placeholders, ","),
@@ -1800,17 +1814,18 @@ func (s *SQLiteStore) GetSessionsForBackfill() ([]string, error) {
 	return ids, nil
 }
 
-// GetSessionsNeedingSync returns the ended sessions the sync sweep syncs now:
-// those waiting for a sync, and those that still owe Drive a replacement after
-// a segment deletion while FAILED or REMOTE_DELETED, which an ordinary sync
-// leaves to a manual retry. A replacement asks Drive whether a deleted folder
-// is back each time, so a deletion never waits on a click. (A scheduled retry
-// is read separately, by GetSessionsBySyncState, when it is due.)
+// GetSessionsNeedingSync returns the sessions the sync sweep syncs now: the
+// ended sessions waiting for a sync, and every session, ended or merged, that
+// still owes Drive a replacement after a segment deletion and that no sync
+// holds. An ordinary sync leaves a FAILED or REMOTE_DELETED session to a
+// manual retry, and syncs no merged one; a replacement asks Drive whether a
+// deleted folder is back each time, so a deletion never waits on a click. (A
+// scheduled retry is read separately, by GetSessionsBySyncState, when due.)
 func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended'
-		 AND (sync_state = ? OR (drive_replace_pending = 1 AND sync_state IN (?, ?)))`,
-		SyncStatePending, SyncStateFailed, SyncStateRemoteDeleted,
+		`SELECT id FROM sessions WHERE (status = 'ended' AND sync_state = ?)
+		 OR (drive_replace_pending = 1 AND status IN ('ended', 'merged') AND sync_state != ?)`,
+		SyncStatePending, SyncStateSyncing,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing sync: %w", err)
