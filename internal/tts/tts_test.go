@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/googleauthtest"
 )
 
 // ---------------------------------------------------------------------------
@@ -284,6 +286,29 @@ func TestElevenLabs_Name(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Google Cloud TTS
 // ---------------------------------------------------------------------------
+
+func TestTTSUsesAuthCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer fake-tts-token" {
+			t.Errorf("Authorization = %q, want fake-tts-token", got)
+		}
+		_ = json.NewEncoder(w).Encode(googleTTSResponse{AudioContent: base64.StdEncoding.EncodeToString(fakeMP3())})
+	}))
+	t.Cleanup(server.Close)
+
+	credentialPath := googleauthtest.X509CredentialFile(t, "fake-tts-token")
+	credentials, err := googleauth.Detect(context.Background(), credentialPath, googleauth.CloudPlatformScope)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	provider, err := NewGoogleProvider("", "en-US-Chirp3-HD-Charon", WithAuthCredentials(credentials), WithGoogleBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("NewGoogleProvider: %v", err)
+	}
+	if _, err := provider.Synthesize(context.Background(), SpeechRequest{Text: "Hello"}); err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+}
 
 func TestGoogle_Synthesize_Success(t *testing.T) {
 	mp3 := fakeMP3()

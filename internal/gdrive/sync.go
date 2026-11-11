@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/oauth2/google"
+	"cloud.google.com/go/auth"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
@@ -41,31 +41,28 @@ type SyncFile struct {
 	ContentType string
 }
 
-func NewSyncer(ctx context.Context, credPath, folderID string, logger ...*slog.Logger) (*Syncer, error) {
-	creds, err := os.ReadFile(credPath)
-	if err != nil {
-		return nil, fmt.Errorf("read credentials: %w", err)
-	}
-
-	config, err := google.CredentialsFromJSONWithTypeAndParams(ctx, creds, google.ServiceAccount, google.CredentialsParams{Scopes: []string{drive.DriveFileScope}})
-	if err != nil {
-		return nil, fmt.Errorf("parse credentials: %w", err)
-	}
-
-	svc, err := drive.NewService(ctx, option.WithCredentials(config))
-	if err != nil {
-		return nil, fmt.Errorf("create drive service: %w", err)
-	}
-
+func NewSyncer(ctx context.Context, credentials *auth.Credentials, folderID string, logger ...*slog.Logger) (*Syncer, error) {
 	l := logging.WithModule(slog.Default(), "gdrive")
 	if len(logger) > 0 && logger[0] != nil {
 		l = logging.WithModule(logger[0], "gdrive")
+	}
+	return newSyncerWithLogger(ctx, credentials, folderID, l)
+}
+
+func newSyncerWithLogger(ctx context.Context, credentials *auth.Credentials, folderID string, logger *slog.Logger, options ...option.ClientOption) (*Syncer, error) {
+	if credentials == nil {
+		return nil, fmt.Errorf("google Drive credentials are required")
+	}
+	options = append([]option.ClientOption{option.WithAuthCredentials(credentials)}, options...)
+	svc, err := drive.NewService(ctx, options...)
+	if err != nil {
+		return nil, fmt.Errorf("create drive service: %w", err)
 	}
 
 	return &Syncer{
 		service:  svc,
 		folderID: folderID,
-		logger:   l,
+		logger:   logger,
 	}, nil
 }
 

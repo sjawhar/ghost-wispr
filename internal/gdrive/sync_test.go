@@ -1,15 +1,49 @@
 package gdrive
 
 import (
+	"context"
+	"log/slog"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 
+	driveapi "google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
+
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/googleauthtest"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
+
+func TestDriveUsesAuthCredentials(t *testing.T) {
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"id":"root"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	credentialPath := googleauthtest.X509CredentialFile(t, "fake-drive-token")
+	credentials, err := googleauth.Detect(context.Background(), credentialPath, driveapi.DriveFileScope)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	syncer, err := newSyncerWithLogger(context.Background(), credentials, "root", slog.Default(), option.WithEndpoint(server.URL+"/drive/v3/"))
+	if err != nil {
+		t.Fatalf("new syncer: %v", err)
+	}
+	if _, err := syncer.service.Files.Get("root").Do(); err != nil {
+		t.Fatalf("get Drive root: %v", err)
+	}
+	if authorization != "Bearer fake-drive-token" {
+		t.Fatalf("Authorization = %q, want fake-drive-token", authorization)
+	}
+}
 
 func TestBuildSyncFiles(t *testing.T) {
 	started := time.Date(2026, 3, 21, 14, 30, 22, 0, time.UTC)
