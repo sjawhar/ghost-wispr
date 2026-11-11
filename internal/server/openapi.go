@@ -562,7 +562,7 @@ func OpenAPISpec() map[string]any {
 					"responses": map[string]any{
 						"204": map[string]any{"description": "Segment deleted"},
 						"404": map[string]any{"description": "Session or segment not found"},
-						"409": map[string]any{"description": "Session is still recording"},
+						"409": map[string]any{"description": "Session is still recording or an earlier segment deletion is recovering"},
 						"422": map[string]any{"description": "Segment could not be found or removed cleanly"},
 					},
 				},

@@ -652,6 +652,11 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
+		if generationAware {
+			m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
+		} else {
+			m.triggerEmbeddingIndex(sessionID, transcript)
+		}
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
