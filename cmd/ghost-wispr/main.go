@@ -1397,7 +1397,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if err != nil {
 				return nil, err
 			}
-			return gdrive.NewOrchestrator(syncer, store, appLogger), nil
+			return newDriveOrchestrator(syncer, store, appLogger, warningRegistry), nil
 		},
 		func(syncer sessionSyncer) {
 			if syncer == nil {
@@ -1496,7 +1496,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
 		} else {
 			deletionDrive = syncer
-			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
+			orchestrator := newDriveOrchestrator(syncer, store, appLogger, warningRegistry)
 			drive.Set(orchestrator)
 			manager.SetSyncer(orchestrator)
 		}
