@@ -32,6 +32,7 @@ type segmentDeleteRunner struct {
 	duration         func(context.Context, string) (float64, error)
 	splice           func(context.Context, string, float64, float64) (string, error)
 	refine           func(context.Context, string, string, time.Time) error
+	deleteSegment    func(sessionID string, segmentID int64, span storage.DeletedSpan) error
 }
 
 type deletionRecordingSet struct {
@@ -307,7 +308,11 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	}
 
 	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordings, ","), Start: start, End: end, StreamStart: segments[index].StartTime, StreamEnd: segments[index].EndTime, SHA256Before: beforeHash, SHA256After: afterHash}
-	maintenanceErr := d.store.DeleteSegment(sessionID, segmentID, span)
+	deleteSegment := d.store.DeleteSegment
+	if d.deleteSegment != nil {
+		deleteSegment = d.deleteSegment
+	}
+	maintenanceErr := deleteSegment(sessionID, segmentID, span)
 	if maintenanceErr != nil && !errors.Is(maintenanceErr, storage.ErrSegmentPostCommitMaintenance) {
 		return maintenanceErr
 	}
