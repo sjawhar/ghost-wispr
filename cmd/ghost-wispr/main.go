@@ -489,7 +489,6 @@ func main() {
 		return
 	}
 
-
 	log.Println("ghost-wispr: starting")
 
 	envPath := filepath.Join(filepath.Dir(configPath), ".env")
