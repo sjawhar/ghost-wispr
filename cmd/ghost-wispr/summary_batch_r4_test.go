@@ -123,6 +123,9 @@ func TestR4BatchSubmitReadRefusesDeleteBetweenReadAndSubmit(t *testing.T) {
 	if err := store.DeleteSegment("a", segments[0].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.StartSummary("a"); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.UpdateSummaryAtGeneration("a", "stale", sessions[0].Transcript, storage.SummaryCompleted, "default", "{}", generations["a"]); err == nil {
 		t.Fatal("batch submit retained a transcript after its generation changed")
 	}
@@ -135,6 +138,9 @@ func TestR4StaleBatchResultIsNotBroadcast(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.DeleteSegment("a", segments[0].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StartSummary("a"); err != nil {
 		t.Fatal(err)
 	}
 	hub := &r4BatchHub{}
