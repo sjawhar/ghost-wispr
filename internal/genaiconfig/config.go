@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"cloud.google.com/go/auth"
+
 	"google.golang.org/genai"
 )
 
@@ -14,11 +16,12 @@ const (
 )
 
 type Options struct {
-	Backend  string
-	Project  string
-	Location string
-	APIKey   string
-	BaseURL  string
+	Backend     string
+	Project     string
+	Location    string
+	APIKey      string
+	BaseURL     string
+	Credentials *auth.Credentials
 }
 
 func NormalizeBackend(raw string) string {
@@ -76,9 +79,10 @@ func BuildClientConfig(opts *Options) (*genai.ClientConfig, error) {
 			return nil, fmt.Errorf("vertex ai backend requires a GCP project")
 		}
 		cfg = &genai.ClientConfig{
-			Backend:  genai.BackendVertexAI,
-			Project:  project,
-			Location: location,
+			Backend:     genai.BackendVertexAI,
+			Project:     project,
+			Location:    location,
+			Credentials: opts.Credentials,
 		}
 	case BackendGemini:
 		if apiKey == "" {

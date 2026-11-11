@@ -156,12 +156,12 @@
     </div>
 
     <div class="field">
-      <label for="gdrive-creds">Service Account Credentials</label>
+      <label for="gdrive-creds">Google Credentials</label>
       <p class="hint">
         {#if config.gdrive.has_credentials}
-          Credentials uploaded ✓
+          Credentials configured ✓
         {:else}
-          Credential upload coming soon — set <code>GOOGLE_CREDENTIALS_FILE</code> env var for now.
+          Set <code>google_credentials_file</code> in <code>ghost-wispr.yaml</code>.
         {/if}
       </p>
     </div>
