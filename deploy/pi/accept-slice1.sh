@@ -7,10 +7,11 @@ readonly script_dir
 readonly baseline_file="$script_dir/baseline.txt"
 host=${GHOST_WISPR_HOST:-ghost-wispr.tail12ec1c.ts.net}
 relay_url=${GHOST_WISPR_RELAY_URL:-}
+self_test=false
 
 usage() {
   cat <<'EOF'
-Usage: deploy/pi/accept-slice1.sh [--host HOST] [--relay-url URL]
+Usage: deploy/pi/accept-slice1.sh [--host HOST] [--relay-url URL] [--self-test]
 
 GHOST_WISPR_ENVOY_WEBHOOK_SECRET is optional. When present, the driver sends
 an authenticated Envoy probe before it checks that an unsigned Pi request is refused.
@@ -20,6 +21,11 @@ EOF
 fail() {
   printf 'slice 1 acceptance: %s\n' "$*" >&2
   exit 1
+}
+
+unknown() {
+  printf 'slice 1 acceptance: UNKNOWN: %s\n' "$*" >&2
+  exit 2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -33,6 +39,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || fail "--relay-url needs a value"
       relay_url=$2
       shift 2
+      ;;
+    --self-test)
+      self_test=true
+      shift
       ;;
     --help)
       usage
@@ -93,6 +103,92 @@ check_sshd_loopback() {
   done <<<"$listeners"
 }
 
+assert_set_subset() {
+  local subject=$1 baseline=$2 current=$3 allowed=$4 unexpected
+  [[ -s "$baseline" ]] || unknown "$subject baseline is empty"
+  [[ -s "$current" ]] || unknown "$subject inventory is empty"
+  unexpected="$scratch_dir/${subject// /-}-unexpected.txt"
+  comm -13 "$allowed" "$current" >"$unexpected"
+  if [[ -s "$unexpected" ]]; then
+    printf 'unexpected %s:\n' "$subject" >&2
+    cat "$unexpected" >&2
+    return 1
+  fi
+}
+
+deepgram_bytes_from_ss() {
+  awk '
+    /^[A-Z-]+[[:space:]]/ { held_by_ghost_wispr = /users:\(\("ghost-wispr"/ }
+    held_by_ghost_wispr && match($0, /bytes_sent:[0-9]+/) {
+      total += substr($0, RSTART + 11, RLENGTH - 11)
+      found = 1
+    }
+    END {
+      if (!found) exit 1
+      print total
+    }
+  '
+}
+
+deepgram_bytes_sent() {
+  local socket_state bytes
+  socket_state=$(remote_run 'ss -tinpH dst api.deepgram.com') \
+    || fail "could not read the Deepgram socket"
+  if ! bytes=$(printf '%s\n' "$socket_state" | deepgram_bytes_from_ss); then
+    fail "no Deepgram socket held by ghost-wispr with bytes_sent was found"
+  fi
+  [[ "$bytes" =~ ^[0-9]+$ ]] || fail "Deepgram bytes_sent is not numeric"
+  printf '%s\n' "$bytes"
+}
+
+assert_minimum_growth() {
+  local start=$1 end=$2 seconds=$3
+  local minimum=$((32000 * seconds))
+  (( end >= start && end - start >= minimum ))
+}
+
+assert_maximum_growth() {
+  local start=$1 end=$2 maximum=$3
+  (( end >= start && end - start <= maximum ))
+}
+
+run_control_tests() {
+  local controls_dir
+  controls_dir=$(mktemp -d)
+  trap 'rm -rf -- "$controls_dir"' RETURN
+
+  printf 'base-package\n' >"$controls_dir/baseline-packages.txt"
+  printf 'base-package\nunexpected-package\n' >"$controls_dir/current-packages.txt"
+  printf 'base-package\nexpected-package\n' >"$controls_dir/allowed-packages.txt"
+  if assert_set_subset package "$controls_dir/baseline-packages.txt" "$controls_dir/current-packages.txt" "$controls_dir/allowed-packages.txt"; then
+    fail "self-test expected the package control to reject a doctored baseline"
+  fi
+  printf 'self-test: package control rejected a doctored baseline\n'
+
+  printf 'base.service\n' >"$controls_dir/baseline-services.txt"
+  printf 'base.service\nunexpected.service\n' >"$controls_dir/current-services.txt"
+  printf 'base.service\nghost-wispr.service\n' >"$controls_dir/allowed-services.txt"
+  if assert_set_subset service "$controls_dir/baseline-services.txt" "$controls_dir/current-services.txt" "$controls_dir/allowed-services.txt"; then
+    fail "self-test expected the service control to reject an unexpected service"
+  fi
+  printf 'self-test: service control rejected an unexpected service\n'
+
+  if printf '%s\n' 'ESTAB 0 0 10.0.0.2:12345 34.120.1.2:443 users:(("ghost-wispr",pid=7,fd=9))' | deepgram_bytes_from_ss; then
+    fail "self-test expected the Deepgram socket control to reject fake ss output without bytes_sent"
+  fi
+  printf 'self-test: Deepgram socket control rejected fake ss output\n'
+
+  if assert_minimum_growth 100 101 5; then
+    fail "self-test expected the Deepgram recording control to reject low growth"
+  fi
+  printf 'self-test: Deepgram recording control rejected low growth\n'
+}
+
+if [[ "$self_test" == true ]]; then
+  run_control_tests
+  exit 0
+fi
+
 printf 'A4: check the tagged tailnet identity and automatic service.\n'
 self_status=$(remote_run 'tailscale status --self --json')
 jq -e --arg host "${host}." '
@@ -105,14 +201,23 @@ printf '  pass\n'
 
 printf 'A1: check the red light and pause button.\n'
 [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == red ]] || fail "light is not red while capturing"
+recording_bytes_before=$(deepgram_bytes_sent)
+readonly deepgram_control_seconds=5
+sleep "$deepgram_control_seconds"
+recording_bytes_after=$(deepgram_bytes_sent)
+assert_minimum_growth "$recording_bytes_before" "$recording_bytes_after" "$deepgram_control_seconds" \
+  || fail "Deepgram recording control grew by less than 32 kB/s"
 audio_before=$(remote_run 'du -sb /opt/ghost-wispr/data/audio 2>/dev/null | cut -f1 || printf 0')
 printf 'Tap the Pi power button once to pause, then press Enter. '
 read -r _
 assert_paused
 [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == off ]] || fail "light stays on after pause"
-printf 'Observe ss -tin on the Pi now; it must show no audio flow beyond Deepgram keep-alives for 60 seconds.\n'
-remote_run 'ss -tin'
+paused_bytes_before=$(deepgram_bytes_sent)
 sleep 60
+paused_bytes_after=$(deepgram_bytes_sent)
+readonly deepgram_paused_max_bytes=4096
+assert_maximum_growth "$paused_bytes_before" "$paused_bytes_after" "$deepgram_paused_max_bytes" \
+  || fail "Deepgram bytes_sent grew by more than ${deepgram_paused_max_bytes} bytes while paused"
 audio_after=$(remote_run 'du -sb /opt/ghost-wispr/data/audio 2>/dev/null | cut -f1 || printf 0')
 [[ "$audio_before" == "$audio_after" ]] || fail "audio grew while paused ($audio_before to $audio_after bytes)"
 printf 'Tap the Pi power button once to resume, then press Enter. '
@@ -172,11 +277,32 @@ else
 fi
 
 printf 'A2: open %s and choose Recording rules. The four rules must appear verbatim.\n' "$unit_url"
-printf 'A7: compare the package inventory below with deploy/pi/baseline.txt; only libportaudio2, ffmpeg, lame, jq, and their dependencies may be new.\n'
-# shellcheck disable=SC2016 # ${Package} expands in the remote shell.
-remote_run 'dpkg-query -W -f="${Package}\n" | LC_ALL=C sort' >"$scratch_dir/current-packages.txt"
-sed '/^---$/,$d' "$baseline_file" | LC_ALL=C sort >"$scratch_dir/baseline-packages.txt"
-comm -13 "$scratch_dir/baseline-packages.txt" "$scratch_dir/current-packages.txt"
-printf 'A7: running services (only Ghost Wispr units are new):\n'
-remote_run "systemctl list-units --type=service --state=running; XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user list-units --type=service"
+printf 'A7: compare the Pi inventory with deploy/pi/baseline.txt.\n'
+readonly expected_package_roots=(libportaudio2 ffmpeg lame jq)
+{
+  printf '%s\n' "${expected_package_roots[@]}"
+  remote_run 'apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces libportaudio2 ffmpeg lame jq | sed -nE "s/^[[:space:]]*(Pre)?Depends:[[:space:]]*//p" | grep -v "^<" | LC_ALL=C sort -u'
+} | LC_ALL=C sort -u >"$scratch_dir/allowed-packages.txt"
+remote_run "dpkg-query -W -f='\${Package}\\n' | LC_ALL=C sort -u" >"$scratch_dir/current-packages.txt"
+awk '/^---$/{exit} NF {print}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-packages.txt"
+{
+  cat "$scratch_dir/baseline-packages.txt"
+  cat "$scratch_dir/allowed-packages.txt"
+} | LC_ALL=C sort -u >"$scratch_dir/permitted-packages.txt"
+assert_set_subset package "$scratch_dir/baseline-packages.txt" "$scratch_dir/current-packages.txt" "$scratch_dir/permitted-packages.txt" \
+  || fail "unexpected installed package"
+
+readonly expected_service_additions=(ghost-wispr.service ghost-wispr-update.service)
+remote_run "systemctl list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'; XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user list-units --type=service --all --plain --no-legend | awk '{print \$1}'" \
+  | LC_ALL=C sort -u >"$scratch_dir/current-services.txt"
+awk 'seen && NF {print} /^---$/ {seen=1}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-services.txt"
+{
+  cat "$scratch_dir/baseline-services.txt"
+  printf '%s\n' "${expected_service_additions[@]}"
+} | LC_ALL=C sort -u >"$scratch_dir/permitted-services.txt"
+assert_set_subset service "$scratch_dir/baseline-services.txt" "$scratch_dir/current-services.txt" "$scratch_dir/permitted-services.txt" \
+  || fail "unexpected running service"
+timer_state=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user is-enabled ghost-wispr-update.timer")
+[[ "$timer_state" == enabled ]] || fail "ghost-wispr-update.timer is not enabled"
+printf '  pass\n'
 printf 'slice 1 acceptance checks completed.\n'
