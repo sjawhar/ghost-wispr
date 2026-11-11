@@ -21,13 +21,6 @@ type Provider interface {
 	Name() string
 }
 
-// ModelVoiceReporter resolves the model and voice a provider will send before
-// asynchronous synthesis begins. Synthesize returns the same values after the
-// provider call so the status and log reflect the actual call.
-type ModelVoiceReporter interface {
-	ReportedSpeech(req SpeechRequest) (model, voice string)
-}
-
 // SpeechRequest carries the parameters for a single synthesis call.
 type SpeechRequest struct {
 	Text     string

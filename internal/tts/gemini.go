@@ -219,7 +219,7 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 	}
 	model := strings.TrimSpace(ttsResponse.ModelVersion)
 	if model == "" {
-		model = p.model
+		model = "not reported by provider"
 	}
 	for _, candidate := range ttsResponse.Candidates {
 		for _, part := range candidate.Content.Parts {

@@ -1441,7 +1441,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				w.Header().Set("X-Ghost-Wispr-TTS-Voice", voice)
 			}
 
-			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "queued"})
+			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "synthesized"})
 		})
 
 		mux.HandleFunc("GET /api/tts/status/{id}", func(w http.ResponseWriter, r *http.Request) {

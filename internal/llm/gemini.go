@@ -80,11 +80,11 @@ func (c *geminiClient) Complete(ctx context.Context, messages []Message) (string
 		return "", fmt.Errorf("gemini completion: %w", err)
 	}
 
-	c.recordReportedModel(result.ModelVersion)
 	text := strings.TrimSpace(result.Text())
 	if text == "" {
 		return "", fmt.Errorf("gemini: empty response text")
 	}
+	c.recordReportedModel(result.ModelVersion)
 	return text, nil
 }
 
@@ -112,11 +112,11 @@ func (c *geminiClient) CompleteJSON(ctx context.Context, messages []Message, sch
 		return nil, fmt.Errorf("gemini json completion: %w", err)
 	}
 
-	c.recordReportedModel(result.ModelVersion)
 	text := strings.TrimSpace(result.Text())
 	if text == "" {
 		return nil, fmt.Errorf("gemini: empty response text")
 	}
+	c.recordReportedModel(result.ModelVersion)
 	return json.RawMessage(text), nil
 }
 
@@ -132,7 +132,7 @@ func (c *geminiClient) ReportedModel() string {
 func (c *geminiClient) recordReportedModel(modelVersion string) {
 	model := strings.TrimSpace(modelVersion)
 	if model == "" {
-		model = c.model
+		model = ModelNotReportedByProvider
 	}
 	c.mu.Lock()
 	c.reportedModel = model

@@ -617,6 +617,13 @@ wait_for_drive_sync() {
   return 1
 }
 
+session_search_word() {
+  jq -r '.segments[]?.text // ""' <<<"$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -cs '[:alpha:]' '\n' \
+    | awk 'length >= 6 && $0 !~ /^(acceptance|about|after|before|conversation|could|drive|ghost|google|recording|search|session|should|summary|through|their|there|these|topic|which|would)$/ { print; exit }'
+}
+
 wait_for_tts() {
   local request_id=$1 speech_status model voice
   for _ in {1..60}; do
@@ -691,7 +698,7 @@ run_a9() {
 }
 
 run_a6() {
-  local current_config start_response stop_response
+  local current_config start_response stop_response detail search_word search_response
   printf 'A6 PRECHECK: read the running Drive and GC configuration.\n'
   current_config=$(running_config) || {
     printf 'A6 FAILED: could not read /api/config\n' >&2
@@ -725,19 +732,28 @@ run_a6() {
   }
   wait_for_summary_ready "$acceptance_session_id" || return 1
   wait_for_drive_sync "$acceptance_session_id" || return 1
-  search_response=$(curl --fail --silent --show-error --get --data-urlencode 'q=Slice 2 acceptance' "$unit_url/api/search") || {
+  detail=$(session_detail "$acceptance_session_id") || {
+    printf 'A6: could not read session %s for transcript search\n' "$acceptance_session_id" >&2
+    return 1
+  }
+  search_word=$(session_search_word "$detail")
+  [[ -n "$search_word" ]] || {
+    printf 'A6: session %s has no distinctive transcript word to search\n' "$acceptance_session_id" >&2
+    return 1
+  }
+  search_response=$(curl --fail --silent --show-error --get --data-urlencode "q=$search_word" "$unit_url/api/search") || {
     printf 'A6: keyword search did not answer\n' >&2
     return 1
   }
   jq -e --arg id "$acceptance_session_id" 'any(.[]; .session_id == $id)' >/dev/null <<<"$search_response" || {
-    printf 'A6: keyword search did not return session %s\n' "$acceptance_session_id" >&2
+    printf 'A6: keyword search for %q did not return session %s\n' "$search_word" "$acceptance_session_id" >&2
     return 1
   }
   printf 'A6 RAN: real session %s produced summary.ready, synced to Drive, and was found by keyword search. Verify its dated Drive folder contains transcript, summary, and audio-*.mp3.\n' "$acceptance_session_id"
 }
 
 run_a8() {
-  local current_status current_config deployed_yaml environment_names embedding_location before_summary_version
+  local current_status current_config deployed_yaml environment_names embedding_location before_summary_version a8_precheck=false
   local summary_response semantic_response semantic_model speech_response speech_headers speech_model speech_voice speech_request_id refinement_response
   printf 'A8 PRECHECK: read status, running configuration, deployed YAML, and service environment before provider calls.\n'
   current_status=$(status) || {
@@ -815,8 +831,11 @@ run_a8() {
     :
   else
     result=$?
-    [[ $result -eq 2 ]] && return 2
-    return 1
+    if [[ $result -eq 2 ]]; then
+      a8_precheck=true
+    else
+      return 1
+    fi
   fi
 
   speech_headers="$scratch_dir/a8-tts.headers"
@@ -851,6 +870,7 @@ run_a8() {
   wait_for_refinement "$acceptance_session_id" || return 1
   printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with provider-reported models: %s, %s, %s, and %s/%s.\n' \
     "$acceptance_session_id" "$batch_refinement_model" "$summarization_model" "$embedding_model" "$tts_model" "$tts_voice"
+  [[ "$a8_precheck" == true ]] && return 2
 }
 
 run_a10() {

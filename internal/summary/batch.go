@@ -120,9 +120,7 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 
 		result.Model = strings.TrimSpace(resp.Response.ModelVersion)
 		if result.Model == "" {
-			// Vertex batch responses may omit ModelVersion. In that documented
-			// case, report the model resolved into this request.
-			result.Model = s.resolvedModel(result.PresetName)
+			result.Model = llm.ModelNotReportedByProvider
 		}
 
 		text := strings.TrimSpace(resp.Response.Text())

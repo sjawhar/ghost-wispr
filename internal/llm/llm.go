@@ -12,6 +12,8 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 )
 
+const ModelNotReportedByProvider = "not reported by provider"
+
 type Message struct {
 	Role    string
 	Content string
