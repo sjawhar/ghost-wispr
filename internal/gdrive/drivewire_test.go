@@ -2,6 +2,7 @@ package gdrive
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -248,8 +249,13 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 		list := &drive.FileList{}
 		for _, f := range d.files {
 			if f.Parent == m[1] && (!notTrashed || !d.inTrash(f)) {
-				list.Files = append(list.Files, &drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType,
-					AppProperties: f.AppProperties, ModifiedTime: f.ModifiedTime.Format(time.RFC3339Nano)})
+				file := &drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType,
+					AppProperties: f.AppProperties, ModifiedTime: f.ModifiedTime.Format(time.RFC3339Nano)}
+				if strings.Contains(r.URL.Query().Get("fields"), "md5Checksum") {
+					sum := md5.Sum(f.Content)
+					file.Md5Checksum = fmt.Sprintf("%x", sum)
+				}
+				list.Files = append(list.Files, file)
 			}
 		}
 		_ = json.NewEncoder(w).Encode(list)

@@ -54,22 +54,57 @@ func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
 	}
 }
 
+// SummaryResult holds a completed summary and the model reported by the
+// provider that generated it.
+type SummaryResult struct {
+	Title        string
+	Summary      string
+	Preset       string
+	SpeakerNames string
+	Model        string
+}
+
 func (s *Summarizer) Summarize(ctx context.Context, sessionID, transcript string) (title, summaryText, presetName, speakerNames string, err error) {
+	result, err := s.SummarizeResult(ctx, sessionID, transcript)
+	return result.Title, result.Summary, result.Preset, result.SpeakerNames, err
+}
+
+// SummarizeReported returns the provider model beside the summary, so callers
+// can persist the exact result without a shared mutable result cache.
+func (s *Summarizer) SummarizeReported(ctx context.Context, sessionID, transcript string) (title, summaryText, presetName, speakerNames, model string, err error) {
+	result, err := s.SummarizeResult(ctx, sessionID, transcript)
+	return result.Title, result.Summary, result.Preset, result.SpeakerNames, result.Model, err
+}
+
+func (s *Summarizer) SummarizeResult(ctx context.Context, sessionID, transcript string) (result SummaryResult, err error) {
 	defer func() {
 		if s.OnResult != nil {
 			s.OnResult(err)
 		}
 	}()
 
-	presetName, err = s.selectPreset(ctx, transcript)
+	presetName, err := s.selectPreset(ctx, transcript)
 	if err != nil {
-		return "", "", "", "{}", fmt.Errorf("select preset: %w", err)
+		return SummaryResult{}, fmt.Errorf("select preset: %w", err)
 	}
-	title, summaryText, speakerNames, err = s.SummarizeWithPreset(ctx, sessionID, transcript, presetName)
-	return title, summaryText, presetName, speakerNames, err
+	result, err = s.SummarizeWithPresetResult(ctx, sessionID, transcript, presetName)
+	result.Preset = presetName
+	return result, err
 }
 
-func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcript, presetName string) (title, summaryText, speakerNames string, err error) {
+func (s *Summarizer) SummarizeWithPreset(ctx context.Context, sessionID, transcript, presetName string) (title, summaryText, speakerNames string, err error) {
+	result, err := s.SummarizeWithPresetResult(ctx, sessionID, transcript, presetName)
+	return result.Title, result.Summary, result.SpeakerNames, err
+}
+
+// SummarizeWithPresetReported returns the provider model with a preset
+// summary. It is the direct counterpart to SummarizeWithPreset.
+func (s *Summarizer) SummarizeWithPresetReported(ctx context.Context, sessionID, transcript, presetName string) (title, summaryText, speakerNames, model string, err error) {
+	result, err := s.SummarizeWithPresetResult(ctx, sessionID, transcript, presetName)
+	return result.Title, result.Summary, result.SpeakerNames, result.Model, err
+}
+
+func (s *Summarizer) SummarizeWithPresetResult(ctx context.Context, _ string, transcript, presetName string) (result SummaryResult, err error) {
 	defer func() {
 		if s.OnResult != nil {
 			s.OnResult(err)
@@ -81,14 +116,12 @@ func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcri
 		minWords = defaultMinSummaryWords
 	}
 	if len(strings.Fields(transcript)) < minWords {
-		return guaranteedTitle(transcript), "", "{}", nil
+		return SummaryResult{Title: guaranteedTitle(transcript), SpeakerNames: "{}"}, nil
 	}
 
-	var preset config.Preset
-	var ok bool
-	preset, ok = s.cfg.Presets[presetName]
+	preset, ok := s.cfg.Presets[presetName]
 	if !ok {
-		return "", "", "{}", fmt.Errorf("unknown preset %q", presetName)
+		return SummaryResult{}, fmt.Errorf("unknown preset %q", presetName)
 	}
 
 	modelStr := preset.Model
@@ -96,54 +129,67 @@ func (s *Summarizer) SummarizeWithPreset(ctx context.Context, _ string, transcri
 		modelStr = s.cfg.Model
 	}
 
-	provider, model, err := llm.ParseModel(modelStr)
+	provider, modelName, err := llm.ParseModel(modelStr)
 	if err != nil {
-		return "", "", "{}", err
+		return SummaryResult{}, err
 	}
 
-	client, err := s.factory(provider, model)
+	client, err := s.factory(provider, modelName)
 	if err != nil {
-		return "", "", "{}", fmt.Errorf("create llm client: %w", err)
+		return SummaryResult{}, fmt.Errorf("create llm client: %w", err)
 	}
 
 	logger := logging.WithModule(logging.FromContext(ctx, nil), "summary")
 	if s.shouldChunk(transcript) {
-		title, summary, speakerNames, err := s.summarizeChunked(ctx, client, preset, transcript, logger)
+		title, summaryText, speakerNames, err := s.summarizeChunked(ctx, client, preset, transcript, logger)
 		if err != nil {
-			return guaranteedTitle(transcript), "", "{}", err
+			return SummaryResult{}, err
 		}
 		if strings.TrimSpace(title) == "" {
 			title = guaranteedTitle(transcript)
 		}
-		return title, strings.TrimSpace(summary), speakerNames, nil
+		return SummaryResult{Title: title, Summary: strings.TrimSpace(summaryText), Preset: presetName, SpeakerNames: speakerNames, Model: reportedModel(client)}, nil
 	}
 
 	messages := s.BuildPromptMessages(preset, transcript)
-	schema := StructuredSchema()
-	raw, err := s.completeJSONWithRetry(ctx, client, messages, schema, logger)
+	raw, err := s.completeJSONWithRetry(ctx, client, messages, StructuredSchema(), logger)
 	if err != nil {
 		if isContextOverflow(err) {
-			title, summary, speakerNames, chunkErr := s.summarizeChunked(ctx, client, preset, transcript, logger)
+			title, summaryText, speakerNames, chunkErr := s.summarizeChunked(ctx, client, preset, transcript, logger)
 			if chunkErr == nil {
 				if strings.TrimSpace(title) == "" {
 					title = guaranteedTitle(transcript)
 				}
-				return title, strings.TrimSpace(summary), speakerNames, nil
+				return SummaryResult{Title: title, Summary: strings.TrimSpace(summaryText), Preset: presetName, SpeakerNames: speakerNames, Model: reportedModel(client)}, nil
 			}
-			return guaranteedTitle(transcript), "", "{}", fmt.Errorf("summarize chunked after overflow: %w", chunkErr)
+			return SummaryResult{}, fmt.Errorf("summarize chunked after overflow: %w", chunkErr)
 		}
-		return guaranteedTitle(transcript), "", "{}", err
+		return SummaryResult{}, err
 	}
 
+	providerModel := reportedModel(client)
 	parsed, parseErr := parseStructuredSummary(raw)
 	if parseErr != nil {
-		return guaranteedTitle(transcript), strings.TrimSpace(string(raw)), "{}", nil
+		return SummaryResult{Title: guaranteedTitle(transcript), Summary: strings.TrimSpace(string(raw)), Preset: presetName, SpeakerNames: "{}", Model: providerModel}, nil
 	}
 	if strings.TrimSpace(parsed.Title) == "" {
 		parsed.Title = guaranteedTitle(transcript)
 	}
+	return SummaryResult{
+		Title:        strings.TrimSpace(parsed.Title),
+		Summary:      strings.TrimSpace(parsed.Summary),
+		Preset:       presetName,
+		SpeakerNames: parsed.speakerNamesJSON(),
+		Model:        providerModel,
+	}, nil
+}
 
-	return strings.TrimSpace(parsed.Title), strings.TrimSpace(parsed.Summary), parsed.speakerNamesJSON(), nil
+func reportedModel(client llm.Client) string {
+	reporter, ok := client.(interface{ ReportedModel() string })
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(reporter.ReportedModel())
 }
 
 type parsedSummary struct {

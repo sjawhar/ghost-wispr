@@ -23,6 +23,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"github.com/sjawhar/ghost-wispr/internal/tts"
 )
 
 type apiStoreStub struct {
@@ -42,9 +43,10 @@ type apiStoreStub struct {
 }
 
 type embeddingClientStub struct {
-	vectors   [][]float32
-	err       error
-	taskTypes []embedding.TaskType
+	vectors       [][]float32
+	err           error
+	taskTypes     []embedding.TaskType
+	reportedModel string
 }
 
 func (s *embeddingClientStub) Embed(ctx context.Context, texts []string, taskType embedding.TaskType) ([][]float32, error) {
@@ -53,6 +55,10 @@ func (s *embeddingClientStub) Embed(ctx context.Context, texts []string, taskTyp
 	}
 	s.taskTypes = append(s.taskTypes, taskType)
 	return s.vectors, nil
+}
+
+func (s *embeddingClientStub) ReportedModel() string {
+	return s.reportedModel
 }
 
 var _ embedding.Client = (*embeddingClientStub)(nil)
@@ -2363,7 +2369,7 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 
 	cfgStore := newTestConfigStore(t)
-	client := &embeddingClientStub{vectors: [][]float32{{1, 0}}}
+	client := &embeddingClientStub{vectors: [][]float32{{1, 0}}, reportedModel: "provider-embedding-model"}
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, client)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/search/semantic?q=planning&limit=1", nil)
@@ -2375,6 +2381,7 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 
 	var payload struct {
+		Model   string `json:"model"`
 		Results []struct {
 			SessionID  string  `json:"session_id"`
 			Title      string  `json:"title"`
@@ -2394,6 +2401,9 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 	if payload.Results[0].Title != "Top Session" {
 		t.Fatalf("expected title Top Session, got %q", payload.Results[0].Title)
+	}
+	if payload.Model != client.reportedModel {
+		t.Fatalf("response model = %q, want provider value %q", payload.Model, client.reportedModel)
 	}
 	if len(client.taskTypes) != 1 || client.taskTypes[0] != embedding.TaskTypeQuery {
 		t.Fatalf("expected query task type, got %#v", client.taskTypes)
@@ -3574,5 +3584,109 @@ func TestRepairSummariesEndpointUnavailableWithoutHook(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestTTSSpeakReportsProviderModelAndVoiceInHeaders(t *testing.T) {
+	const (
+		configuredModel = "configured-tts-model"
+		providerModel   = "provider-tts-model"
+		providerVoice   = "provider-tts-voice"
+	)
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
+		TTSSpeak: func(text, voice, provider string) (string, error) {
+			if text == "" || voice != providerVoice || provider != "gemini" {
+				return "", errors.New("unexpected speech request")
+			}
+			return "speech-request", nil
+		},
+		TTSStatus: func(id string) (map[string]any, bool) {
+			if id != "speech-request" {
+				return nil, false
+			}
+			return map[string]any{
+				"id":     id,
+				"status": "queued",
+				"model":  providerModel,
+				"voice":  providerVoice,
+			}, true
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tts/speak", strings.NewReader(`{"text":"model acceptance","voice":"provider-tts-voice","provider":"gemini"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/tts/speak = %d, want 202: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("X-Ghost-Wispr-TTS-Model"); got != providerModel {
+		t.Fatalf("TTS model header = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
+	}
+	if got := rr.Header().Get("X-Ghost-Wispr-TTS-Voice"); got != providerVoice {
+		t.Fatalf("TTS voice header = %q, want provider value %q", got, providerVoice)
+	}
+}
+
+func TestSessionDetailReportsProviderModels(t *testing.T) {
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{
+			"provider-models": {
+				ID:              "provider-models",
+				SummaryModel:    "provider-summary-model",
+				RefinementModel: "provider-refinement-model",
+			},
+		},
+		segments: map[string][]transcribe.Segment{"provider-models": {}},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/provider-models", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET session = %d: %s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		Session struct {
+			SummaryModel    string `json:"summary_model"`
+			RefinementModel string `json:"refinement_model"`
+		} `json:"session"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.Session.SummaryModel != "provider-summary-model" {
+		t.Fatalf("summary_model = %q", payload.Session.SummaryModel)
+	}
+	if payload.Session.RefinementModel != "provider-refinement-model" {
+		t.Fatalf("refinement_model = %q", payload.Session.RefinementModel)
+	}
+}
+
+func TestTTSSpeakReturnsBadGatewayAfterSynthesisFailure(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
+		TTSSpeak: func(string, string, string) (string, error) { return "failed-request", nil },
+		TTSWaitForSynthesis: func(context.Context, string) (map[string]any, error) {
+			return map[string]any{"status": tts.StatusFailed, "error": "provider refused synthesis"}, nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/tts/speak", strings.NewReader(`{"text":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("POST /api/tts/speak = %d, want 502: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "provider refused synthesis") {
+		t.Fatalf("failure response %q omits synthesis error", rr.Body.String())
 	}
 }

@@ -44,6 +44,10 @@ func (u *remountingUploader) FolderOnDrive(_ context.Context, folderID string) (
 	return folderID == "folder-1", nil
 }
 
+func (*remountingUploader) RecordingsMatch(context.Context, string, map[string]string) (bool, error) {
+	return true, nil
+}
+
 // Review of #37, round 2, blocker 1: a recording missing when the sync built
 // its file list, and back on disk by the end of the upload, was never
 // uploaded, yet the session was marked synced, so GC gated on sync removed a

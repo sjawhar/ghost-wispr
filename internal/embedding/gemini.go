@@ -3,6 +3,7 @@ package embedding
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"google.golang.org/genai"
 
@@ -12,6 +13,9 @@ import (
 type geminiClient struct {
 	client *genai.Client
 	model  string
+
+	mu            sync.RWMutex
+	reportedModel string
 }
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
@@ -57,7 +61,24 @@ func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskT
 			return nil, fmt.Errorf("gemini: no embedding in response")
 		}
 		result = append(result, resp.Embeddings[0].Values)
+		// Vertex EmbedContent does not echo a model version. Preserve that
+		// absence rather than presenting the configured request as a report.
+		c.recordReportedModel()
 	}
 
 	return result, nil
+}
+
+// ReportedModel returns the latest provider model identity. Vertex
+// EmbedContent does not return one, so successful calls report that absence.
+func (c *geminiClient) ReportedModel() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.reportedModel
+}
+
+func (c *geminiClient) recordReportedModel() {
+	c.mu.Lock()
+	c.reportedModel = ModelNotReportedByProvider
+	c.mu.Unlock()
 }

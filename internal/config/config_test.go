@@ -22,6 +22,7 @@ func clearEnv(t *testing.T) {
 		"BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL",
 		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
 		"INDICATOR_LIGHT", "POWER_BUTTON",
+		"TTS_PROVIDER", "TTS_MODEL", "TTS_VOICE", "TTS_MAX_LENGTH",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
@@ -390,6 +391,63 @@ summarization:
 	}
 	if cfg.GenAIBackend != "vertex" {
 		t.Fatalf("expected env override for genai_backend, got %q", cfg.GenAIBackend)
+	}
+}
+
+func TestGeminiTTSConfigurationLoadsModelAndVoice(t *testing.T) {
+	clearEnv(t)
+	configPath := writeConfig(t, `
+gcp_project: theorem-agent-infra
+tts_provider: gemini
+tts_model: gemini-3.8-flash-tts
+tts_voice: Kore
+`)
+
+	cfg, _, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.TTSProvider != "gemini" {
+		t.Fatalf("tts_provider = %q, want gemini", cfg.TTSProvider)
+	}
+	if cfg.TTSModel != "gemini-3.8-flash-tts" {
+		t.Fatalf("tts_model = %q, want gemini-3.8-flash-tts", cfg.TTSModel)
+	}
+	if cfg.TTSVoice != "Kore" {
+		t.Fatalf("tts_voice = %q, want Kore", cfg.TTSVoice)
+	}
+}
+
+func TestTTSModelEnvironmentOverride(t *testing.T) {
+	clearEnv(t)
+	configPath := writeConfig(t, "tts_model: gemini-3.1-flash-tts-preview\n")
+	t.Setenv(EnvPrefix+"TTS_MODEL", "gemini-3.8-flash-tts")
+
+	cfg, _, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.TTSModel != "gemini-3.8-flash-tts" {
+		t.Fatalf("tts_model = %q, want environment override", cfg.TTSModel)
+	}
+}
+
+func TestGoogleTTSProviderRemainsValidForChirpFallback(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvPrefix+"TTS_PROVIDER", "google")
+	t.Setenv(EnvPrefix+"TTS_VOICE", "en-US-Chirp3-HD-Charon")
+
+	cfg, warnings, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.TTSProvider != "google" || cfg.TTSVoice != "en-US-Chirp3-HD-Charon" {
+		t.Fatalf("Chirp fallback config = %#v", cfg)
+	}
+	for _, warning := range warnings {
+		if strings.Contains(warning, "Invalid tts_provider") || strings.Contains(warning, "TTS provider configured but API key") {
+			t.Fatalf("unexpected Chirp fallback warning: %q", warning)
+		}
 	}
 }
 

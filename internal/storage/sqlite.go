@@ -75,12 +75,14 @@ type Session struct {
 	EndedAt             *time.Time `json:"ended_at,omitempty"`
 	Status              string     `json:"status"`
 	Summary             string     `json:"summary"`
+	SummaryModel        string     `json:"summary_model"`
 	SummaryVersion      int        `json:"summary_version"`
 	SummaryStatus       string     `json:"summary_status"`
 	SummaryPreset       string     `json:"summary_preset"`
 	SpeakerNames        string     `json:"speaker_names"`
 	RefinedTranscript   string     `json:"refined_transcript"`
 	RefinementStatus    string     `json:"refinement_status"`
+	RefinementModel     string     `json:"refinement_model"`
 	AudioPath           string     `json:"audio_path"`
 	AudioRemovedAt      string     `json:"audio_removed_at"` // when disk pressure removed audio (RFC 3339), "" if never: all of it, or part when AudioPath names what is left; the session is kept
 	SummaryError        string     `json:"summary_error"`    // why the last summary attempt failed, "" once one completes; sync errors are in ErrorMessage
@@ -293,12 +295,14 @@ func (s *SQLiteStore) init(dbPath string) error {
 			ended_at TEXT,
 			status TEXT NOT NULL,
 			summary TEXT NOT NULL DEFAULT '',
+			summary_model TEXT NOT NULL DEFAULT '',
 			summary_version INTEGER NOT NULL DEFAULT 1,
 			summary_status TEXT NOT NULL DEFAULT 'pending',
 			summary_preset TEXT NOT NULL DEFAULT '',
 			speaker_names TEXT NOT NULL DEFAULT '{}',
 			refined_transcript TEXT NOT NULL DEFAULT '',
 			refinement_status TEXT NOT NULL DEFAULT 'pending',
+			refinement_model TEXT NOT NULL DEFAULT '',
 			audio_path TEXT NOT NULL DEFAULT '',
 			sync_status TEXT NOT NULL DEFAULT 'pending',
 			envoy_publish_status TEXT NOT NULL DEFAULT 'pending',
@@ -377,6 +381,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// The sync state a sync's claim came from, while it holds the session:
 		// startup recovery puts a sync claimed from REMOTE_DELETED back.
 		`ALTER TABLE sessions ADD COLUMN sync_claimed_from TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN summary_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN refinement_model TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -806,7 +812,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -850,7 +856,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -873,7 +879,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 
 func getSession(q querier, id string) (Session, error) {
 	row := q.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -881,7 +887,7 @@ func getSession(q querier, id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryModel, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.RefinementModel, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -998,7 +1004,15 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 // A changed completed summary not started by StartSummary (a batch result)
 // gets a new summary version when the session's current version may already
 // have been sent to Envoy, so Envoy does not drop it as a duplicate delivery.
+// UpdateSummary stores a summary when its producer has no provider model to
+// report, such as a restored or repaired legacy record.
 func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
+	return s.UpdateSummaryWithModel(sessionID, title, summary, status, preset, speakerNames, "")
+}
+
+// UpdateSummaryWithModel atomically stores a summary and the model reported by
+// the provider that generated it.
+func (s *SQLiteStore) UpdateSummaryWithModel(sessionID, title, summary, status, preset, speakerNames, model string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin summary update for session %s: %w", sessionID, err)
@@ -1009,13 +1023,14 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 	if err != nil {
 		return err
 	}
-	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames)
+	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames, model)
 	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET title = CASE WHEN ? != '' THEN ? ELSE title END,
 		     summary_preset = CASE WHEN ? != '' THEN ? ELSE summary_preset END,
 		     speaker_names = CASE WHEN ? != '' THEN ? ELSE speaker_names END,
 		     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
+		     summary_model = CASE WHEN ? != '' THEN ? ELSE summary_model END,
 		     summary_version = CASE WHEN ? THEN summary_version + 1 ELSE summary_version END,
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
@@ -1025,6 +1040,7 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		summary, preset,
 		summary, speakerNames,
 		summary, summary,
+		model, model,
 		bumpVersion,
 		bumpVersion, EnvoyPublishPending,
 		status,
@@ -1047,7 +1063,7 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 	return nil
 }
 
-func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames string) bool {
+func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames, model string) bool {
 	if status != SummaryCompleted || current.SummaryStatus == SummaryRunning {
 		return false
 	}
@@ -1055,6 +1071,9 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 		return false
 	}
 	if title != "" && title != current.Title {
+		return true
+	}
+	if model != "" && model != current.SummaryModel {
 		return true
 	}
 	return summary != "" && (summary != current.Summary || preset != current.SummaryPreset || speakerNames != current.SpeakerNames)
@@ -1114,11 +1133,23 @@ func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
 	return sess, nil
 }
 
+// UpdateRefinement stores a refinement when its producer did not expose a
+// model identity.
 func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
+	return s.UpdateRefinementWithModel(sessionID, transcript, status, "")
+}
+
+// UpdateRefinementWithModel atomically stores a refinement and the model
+// reported by its provider.
+func (s *SQLiteStore) UpdateRefinementWithModel(sessionID, transcript, status, model string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = ?`,
+		`UPDATE sessions
+		 SET refined_transcript = ?, refinement_status = ?,
+		     refinement_model = CASE WHEN ? != '' THEN ? ELSE refinement_model END
+		 WHERE id = ?`,
 		transcript,
 		status,
+		model, model,
 		sessionID,
 	)
 	if err != nil {
@@ -1144,7 +1175,7 @@ func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) err
 // takes nothing from a session whose refinement is running.
 func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ? WHERE id = ? AND audio_path = ? AND audio_path != ''`,
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '' WHERE id = ? AND audio_path = ? AND audio_path != ''`,
 		RefinementRunning, id, audioPath,
 	)
 	if err != nil {
@@ -1510,7 +1541,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryModel, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.RefinementModel, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -1695,7 +1726,7 @@ func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,

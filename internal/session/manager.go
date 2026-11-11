@@ -508,7 +508,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 
 	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
-	transcript, err := batchTranscriber.Transcribe(ctx, audioPath)
+	result, err := batchTranscriber.Transcribe(ctx, audioPath)
 	if err != nil {
 		if updateErr := m.store.UpdateRefinement(sessionID, "", storage.RefinementFailed); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
@@ -520,12 +520,12 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinement(sessionID, transcript, storage.RefinementCompleted); err != nil {
+	if err := m.store.UpdateRefinementWithModel(sessionID, result.Transcript, storage.RefinementCompleted, result.Model); err != nil {
 		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}
 
-	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID)
+	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID, "model", result.Model)
 	if m.hub != nil {
 		m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
 	}
@@ -621,7 +621,12 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Warn("failed to get segments for title fallback", "operation", "generate_summary", "session_id", sessionID, "error", err)
 	}
 
-	title, summaryText, preset, speakerNames, err := summarizer.Summarize(ctx, sessionID, transcript)
+	var title, summaryText, preset, speakerNames, summaryModel string
+	if reporter, ok := summarizer.(ReportedSummarizer); ok {
+		title, summaryText, preset, speakerNames, summaryModel, err = reporter.SummarizeReported(ctx, sessionID, transcript)
+	} else {
+		title, summaryText, preset, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
+	}
 	// Safety net: ensure title is never empty using fallback chain.
 	if strings.TrimSpace(title) == "" {
 		title = summary.GenerateTitle("", transcript, segments, startedAt)
@@ -636,7 +641,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		return
 	}
 
-	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
+	if err := m.store.UpdateSummaryWithModel(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, summaryModel); err != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", err))
 		m.triggerEmbeddingIndex(sessionID, transcript)

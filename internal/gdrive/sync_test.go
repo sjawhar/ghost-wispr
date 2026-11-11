@@ -2,6 +2,8 @@ package gdrive
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -42,6 +44,42 @@ func TestDriveUsesAuthCredentials(t *testing.T) {
 	}
 	if authorization != "Bearer fake-drive-token" {
 		t.Fatalf("Authorization = %q, want fake-drive-token", authorization)
+	}
+}
+
+// RecordingsMatch reads Drive's md5Checksum rather than trusting a folder's
+// presence or an audio file's name.
+func TestSyncerRecordingsMatchDriveMD5Checksums(t *testing.T) {
+	wire, syncer := newWireDrive(t)
+	folder := wire.add("root", "2026-11-06 Standup", "application/vnd.google-apps.folder", nil, nil)
+	recording := []byte("recording bytes")
+	wire.add(folder, "audio-recording.mp3", "audio/mpeg", recording, nil)
+	sum := md5.Sum(recording)
+	checksums := map[string]string{"audio-recording.mp3": hex.EncodeToString(sum[:])}
+
+	matches, err := syncer.RecordingsMatch(context.Background(), folder, checksums)
+	if err != nil {
+		t.Fatalf("match recordings: %v", err)
+	}
+	if !matches {
+		t.Error("Drive's matching md5Checksum did not verify the recording")
+	}
+
+	checksums["audio-recording.mp3"] = "00000000000000000000000000000000"
+	matches, err = syncer.RecordingsMatch(context.Background(), folder, checksums)
+	if err != nil {
+		t.Fatalf("compare different checksum: %v", err)
+	}
+	if matches {
+		t.Error("Drive verified a recording with a different md5Checksum")
+	}
+
+	matches, err = syncer.RecordingsMatch(context.Background(), folder, map[string]string{"audio-absent.mp3": checksums["audio-recording.mp3"]})
+	if err != nil {
+		t.Fatalf("compare absent recording: %v", err)
+	}
+	if matches {
+		t.Error("Drive verified an absent recording")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -28,6 +29,24 @@ func restorePause(store pauseStore, gate interface{ Pause() }) (bool, error) {
 	}
 	gate.Pause()
 	return true, nil
+}
+
+// seedPausedState writes the durable pause before a test instance starts, so
+// its microphone never starts without a recording light.
+func seedPausedState(configPath string) error {
+	cfg, _, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	store, err := storage.NewSQLiteStore(cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.SetAppState(storage.AppStateCapturePaused, "1"); err != nil {
+		return fmt.Errorf("set capture pause: %w", err)
+	}
+	return nil
 }
 
 // persistentControls serializes pause and resume state transitions with the

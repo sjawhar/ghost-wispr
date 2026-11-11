@@ -28,11 +28,14 @@ type SpeechRequest struct {
 	Language string
 }
 
-// SpeechResponse carries the synthesised audio and its format metadata.
+// SpeechResponse carries the synthesised audio, provider-reported model and
+// voice, and format metadata.
 type SpeechResponse struct {
 	Audio      []byte
 	Format     audio.AudioFormat
 	DurationMs int64
+	Model      string
+	Voice      string
 }
 
 // ErrTextTooLong is returned when the input text exceeds maxTextLength.

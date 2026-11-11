@@ -110,16 +110,17 @@ type ControlHooks struct {
 	// RetrySync starts a sync of the session in the background and returns
 	// at once: ErrSyncNotConfigured when sync is off, or why no sync can
 	// start for the session.
-	RetrySync       func(ctx context.Context, sessionID string) error
-	RetryRefinement func(ctx context.Context, sessionID string) error
-	RepairSummaries func(ctx context.Context) (int, error)
-	DiagnoseMic     func(ctx context.Context) (map[string]any, error)
-	BatchBackfill   func(ctx context.Context) (batchName string, sessionCount int, err error)
-	BatchPoll       func(ctx context.Context, batchName string) (map[string]any, error)
-	TTSSpeak        func(text, voice, provider string) (string, error)
-	TTSStatus       func(id string) (map[string]any, bool)
-	TTSHasProvider  func() bool
-	TTSHasSpeaker   func() bool
+	RetrySync           func(ctx context.Context, sessionID string) error
+	RetryRefinement     func(ctx context.Context, sessionID string) error
+	RepairSummaries     func(ctx context.Context) (int, error)
+	DiagnoseMic         func(ctx context.Context) (map[string]any, error)
+	BatchBackfill       func(ctx context.Context) (batchName string, sessionCount int, err error)
+	BatchPoll           func(ctx context.Context, batchName string) (map[string]any, error)
+	TTSSpeak            func(text, voice, provider string) (string, error)
+	TTSStatus           func(id string) (map[string]any, bool)
+	TTSWaitForSynthesis func(ctx context.Context, id string) (map[string]any, error)
+	TTSHasProvider      func() bool
+	TTSHasSpeaker       func() bool
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {

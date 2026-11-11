@@ -61,6 +61,10 @@ type allFoldersOnDrive struct{}
 
 func (allFoldersOnDrive) FolderOnDrive(context.Context, string) (bool, error) { return true, nil }
 
+func (allFoldersOnDrive) RecordingsMatch(context.Context, string, map[string]string) (bool, error) {
+	return true, nil
+}
+
 // Review of #38, round 1, blocker 1: a session the version before left
 // synced after its documents changed (synced while its summary was running,
 // summarized again, its refinement retried, its title edited) held text Drive

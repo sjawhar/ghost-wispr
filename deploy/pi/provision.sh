@@ -12,6 +12,8 @@ readonly script_dir
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 readonly repo_root
 readonly TAILSCALE_HOSTNAME=ghost-wispr.tail12ec1c.ts.net.
+readonly CONFIG_TEMPLATE="$repo_root/deploy/pi/files/ghost-wispr.yaml"
+readonly EMBEDDING_LOCATION_SETTING=GHOST_WISPR_EMBEDDING_LOCATION=global
 
 fail() {
   printf 'ghost-wispr provision: %s\n' "$*" >&2
@@ -25,6 +27,113 @@ require_single_line_file() {
   [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || fail "$name must contain one non-empty line"
   printf '%s' "$value"
 }
+valid_drive_id() {
+  [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+valid_relay_url() {
+  [[ $1 =~ ^https://[^[:space:]]+/webhook/ghostwispr$ ]]
+}
+
+# render_base_config writes the template with the Envoy webhook URL: Drive sync and GC stay off.
+render_base_config() {
+  local template=$1 relay_url=$2 escaped_relay_url
+  valid_relay_url "$relay_url" || return 1
+  escaped_relay_url=${relay_url//\\/\\\\}
+  escaped_relay_url=${escaped_relay_url//&/\\&}
+  escaped_relay_url=${escaped_relay_url//|/\\|}
+  sed "s|__ENVOY_WEBHOOK_URL__|$escaped_relay_url|" "$template"
+}
+
+# render_models_config also syncs to the shared drive and turns GC on. GC goes on only with
+# sync, because an ungated GC removes local audio that Drive does not hold.
+render_models_config() {
+  local template=$1 relay_url=$2 drive_id=$3
+  valid_drive_id "$drive_id" || return 1
+  render_base_config "$template" "$relay_url" \
+    | awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' || return 1
+  printf 'gdrive_folder_id: "%s"\n' "$drive_id"
+  printf '%s\n' 'gdrive_sync_enabled: true' 'gc_enabled: true'
+}
+
+# deployed_drive_id reads the shared-drive ID written by render_models_config
+# or yaml.v3. It prints nothing when the configuration has none, including the
+# gdrive_folder_id: "" that every config API save writes without a folder, and
+# fails on any other gdrive_folder_id line.
+deployed_drive_id() {
+  local config=$1 line status=0
+  local quoted_pattern='^gdrive_folder_id: "([A-Za-z0-9_-]+)"$'
+  local unquoted_pattern='^gdrive_folder_id: ([A-Za-z0-9_-]+)$'
+  line=$(grep '^gdrive_folder_id:' "$config") || status=$?
+  (( status != 1 )) || return 0
+  (( status == 0 )) || return 1
+  [[ $line != 'gdrive_folder_id: ""' ]] || return 0
+  if [[ $line =~ $quoted_pattern || $line =~ $unquoted_pattern ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return
+  fi
+  return 1
+}
+
+deployed_relay_url() {
+  local config=$1 line url pattern='^envoy_webhook_url: (.+)$'
+  line=$(grep '^envoy_webhook_url:' "$config") || return 1
+  [[ $line =~ $pattern ]] || return 1
+  url=${BASH_REMATCH[1]}
+  valid_relay_url "$url" || return 1
+  printf '%s' "$url"
+}
+
+render_models_env() {
+  local env_file=$1
+  awk '!/^GHOST_WISPR_EMBEDDING_LOCATION=/' "$env_file" || return 1
+  printf '%s\n' "$EMBEDDING_LOCATION_SETTING"
+}
+
+# run_user_systemctl reads runtime_dir from its caller: the global, or provision_models' local.
+run_user_systemctl() {
+  sudo -u "$SERVICE_USER" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user "$@"
+}
+
+provision_models() {
+  [[ $# -eq 1 ]] || fail "usage: deploy/pi/provision.sh --models <shared-drive-id>"
+  local drive_id=$1
+  valid_drive_id "$drive_id" \
+    || fail "shared-drive ID must be non-empty and contain only letters, numbers, hyphens, and underscores"
+  if [[ $(id -un) != "$SERVICE_USER" ]]; then
+    fail "run as $SERVICE_USER"
+  fi
+
+  local service_uid runtime_dir relay_url
+  service_uid=$(id -u "$SERVICE_USER")
+  runtime_dir="/run/user/$service_uid"
+  [[ -d "$runtime_dir" ]] || fail "$runtime_dir is unavailable; log in as $SERVICE_USER before provisioning"
+  [[ -f "$DEPLOY_DIR/ghost-wispr.yaml" && -f "$DEPLOY_DIR/.env" ]] \
+    || fail "missing $DEPLOY_DIR/ghost-wispr.yaml or $DEPLOY_DIR/.env; run the full provisioner first"
+  relay_url=$(deployed_relay_url "$DEPLOY_DIR/ghost-wispr.yaml") \
+    || fail "$DEPLOY_DIR/ghost-wispr.yaml has no valid envoy_webhook_url; run the full provisioner first"
+
+  # Global, not local: the EXIT trap runs after this function returns.
+  staging_dir=$(mktemp -d -p "$runtime_dir" ghost-wispr-models.XXXXXX)
+  chmod 0700 "$staging_dir"
+  trap 'rm -rf -- "$staging_dir"' EXIT
+  render_models_config "$CONFIG_TEMPLATE" "$relay_url" "$drive_id" >"$staging_dir/ghost-wispr.yaml" \
+    || fail "could not render the models configuration from $CONFIG_TEMPLATE"
+  render_models_env "$DEPLOY_DIR/.env" >"$staging_dir/env" || fail "could not read $DEPLOY_DIR/.env"
+  sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 "$staging_dir/env" "$DEPLOY_DIR/.env"
+  sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-wispr.yaml" "$DEPLOY_DIR/ghost-wispr.yaml"
+  run_user_systemctl restart ghost-wispr.service
+  printf 'ghost-wispr provision: installed models configuration and restarted ghost-wispr.service\n'
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+if [[ ${1:-} == --models ]]; then
+  shift
+  provision_models "$@"
+  exit
+fi
 
 if [[ $(id -un) != "$SERVICE_USER" ]]; then
   fail "run as $SERVICE_USER"
@@ -79,7 +188,7 @@ deepgram_key=$(require_single_line_file deepgram-key)
 readonly deepgram_key
 webhook_secret=$(require_single_line_file envoy-webhook-secret)
 readonly webhook_secret
-[[ "$relay_url" =~ ^https://[^[:space:]]+/webhook/ghostwispr$ ]] || fail "envoy-webhook-url must be an HTTPS Ghost Wispr webhook URL"
+valid_relay_url "$relay_url" || fail "envoy-webhook-url must be an HTTPS Ghost Wispr webhook URL"
 [[ -n "$tailscale_client_id" && "$tailscale_client_id" != null && "$tailscale_client_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "tailscale-client-id is empty or invalid"
 [[ "$tailscale_subject" =~ ^[0-9]+$ ]] || fail "tailscale-subject must be the service account unique ID"
 
@@ -97,14 +206,25 @@ sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0644 "$staging_dir/google-
 sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0644 "$staging_dir/certificate_config.json" "$DEPLOY_DIR/certificate_config.json"
 sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0644 "$staging_dir/tailscale-client-id" "$DEPLOY_DIR/tailscale-client-id"
 
-escaped_relay_url=${relay_url//\\/\\\\}
-escaped_relay_url=${escaped_relay_url//&/\\&}
-escaped_relay_url=${escaped_relay_url//|/\\|}
-sed "s|__ENVOY_WEBHOOK_URL__|$escaped_relay_url|" "$repo_root/deploy/pi/files/ghost-wispr.yaml" \
-  | sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 /dev/stdin "$DEPLOY_DIR/ghost-wispr.yaml"
+deployed_drive=""
+if [[ -f "$DEPLOY_DIR/ghost-wispr.yaml" ]]; then
+  deployed_drive=$(deployed_drive_id "$DEPLOY_DIR/ghost-wispr.yaml") \
+    || fail "$DEPLOY_DIR/ghost-wispr.yaml has an invalid gdrive_folder_id; run provision.sh --models <shared-drive-id> after fixing it"
+fi
+readonly deployed_drive
+# A rerun keeps the shared drive provision.sh --models configured, and with it sync and GC.
+if [[ -n "$deployed_drive" ]]; then
+  render_models_config "$CONFIG_TEMPLATE" "$relay_url" "$deployed_drive" >"$staging_dir/ghost-wispr.yaml" \
+    || fail "could not render $CONFIG_TEMPLATE"
+else
+  render_base_config "$CONFIG_TEMPLATE" "$relay_url" >"$staging_dir/ghost-wispr.yaml" \
+    || fail "could not render $CONFIG_TEMPLATE"
+fi
+sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-wispr.yaml" "$DEPLOY_DIR/ghost-wispr.yaml"
 {
   printf '%s\n' 'GHOST_WISPR_ADDR=127.0.0.1:8080'
   printf '%s\n' 'GOOGLE_API_USE_CLIENT_CERTIFICATE=false'
+  printf '%s\n' "$EMBEDDING_LOCATION_SETTING"
   printf 'GHOST_WISPR_DEEPGRAM_API_KEY=%s\n' "$deepgram_key"
   printf 'GHOST_WISPR_ENVOY_WEBHOOK_SECRET=%s\n' "$webhook_secret"
 } | sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 /dev/stdin "$DEPLOY_DIR/.env"
@@ -136,9 +256,6 @@ if [[ ${groups_changed:-false} == true ]]; then
 fi
 sudo loginctl enable-linger "$SERVICE_USER"
 sudo systemctl start "user@$service_uid.service"
-run_user_systemctl() {
-  sudo -u "$SERVICE_USER" XDG_RUNTIME_DIR="$runtime_dir" systemctl --user "$@"
-}
 run_user_systemctl daemon-reload
 run_user_systemctl enable ghost-wispr.service
 run_user_systemctl enable --now ghost-wispr-update.timer

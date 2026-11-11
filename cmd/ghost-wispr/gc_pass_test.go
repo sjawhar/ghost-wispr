@@ -5,12 +5,17 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -44,7 +49,7 @@ func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder-1", 0, "")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{GCEnabled: true, GCMaxAgeDays: 30, GDriveSyncEnabled: true, AudioDir: t.TempDir()}
+	cfg := config.Config{GCEnabled: true, GCMaxAgeDays: 30, GDriveFolderID: "folder-1", GDriveSyncEnabled: true, AudioDir: t.TempDir()}
 	health := &gcHealth{}
 
 	if _, err := runGCPass(store, &cfg, nil, health, logger); err != nil {
@@ -83,5 +88,108 @@ func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
 	}
 	if n := health.Unverified(); n != 1 {
 		t.Errorf("Unverified() = %d, want 1", n)
+	}
+}
+
+// Each GC pass reads the current config: a config API change that turns Drive
+// sync off or removes the Drive folder makes the next pass hold every
+// recording, even while a syncer still runs (the settings watcher stops none
+// when only the folder is removed), and undoing it lets the next pass remove
+// the audio Drive verifies again.
+func TestGCPassHoldsAudioWhenConfigAPIStopsDriveSync(t *testing.T) {
+	for _, tc := range []struct {
+		name, stop, resume string
+	}{
+		{"sync disabled", `{"gdrive":{"sync_enabled":false}}`, `{"gdrive":{"sync_enabled":true}}`},
+		{"folder removed", `{"gdrive":{"folder_id":""}}`, `{"gdrive":{"folder_id":"folder-1"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			audioDir := t.TempDir()
+			addRecording := func(id string) string {
+				t.Helper()
+				started := time.Now().UTC().Add(-time.Hour)
+				path := filepath.Join(audioDir, id+".mp3")
+				if err := os.WriteFile(path, make([]byte, 2*1024*1024), 0o600); err != nil {
+					t.Fatalf("write recording: %v", err)
+				}
+				if err := store.CreateSession(id, started); err != nil {
+					t.Fatalf("create session: %v", err)
+				}
+				if err := store.EndSession(id, started.Add(time.Minute), path); err != nil {
+					t.Fatalf("end session: %v", err)
+				}
+				return path
+			}
+			unsyncedAudio := addRecording("20261101120000")
+			syncedAudio := addRecording("20261101130000")
+			syncTo(t, store, "20261101130000", storage.SyncStateSynced, "folder-1", 0, "")
+
+			cfgStore, _, err := config.NewStore("")
+			if err != nil {
+				t.Fatalf("config store: %v", err)
+			}
+			if err := cfgStore.Update(func(cfg *config.Config) {
+				cfg.GDriveFolderID = "folder-1"
+				cfg.GDriveSyncEnabled = true
+				cfg.GCEnabled = true
+				cfg.GCMaxAgeDays = 0
+				cfg.GCMaxAudioSizeMB = 1
+				cfg.AudioDir = audioDir
+			}); err != nil {
+				t.Fatalf("configure GC: %v", err)
+			}
+			handler, err := server.Handler(fstest.MapFS{"index.html": {Data: []byte("ok")}}, server.NewHub(), store, &server.ControlHooks{}, "", nil, cfgStore)
+			if err != nil {
+				t.Fatalf("handler: %v", err)
+			}
+			patch := func(body string) {
+				t.Helper()
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "/api/config", strings.NewReader(body)))
+				if response.Code != http.StatusOK {
+					t.Fatalf("PATCH /api/config %s: %d %s", body, response.Code, response.Body.String())
+				}
+			}
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			// The syncer still runs in both passes: only the config differs.
+			syncer := &countingSyncer{}
+
+			patch(tc.stop)
+			stopped := cfgStore.Get()
+			health := &gcHealth{}
+			if _, err := runGCPass(store, &stopped, syncer, health, logger); err != nil {
+				t.Fatalf("GC pass after %s: %v", tc.stop, err)
+			}
+			for _, path := range []string{unsyncedAudio, syncedAudio} {
+				if _, err := os.Stat(path); err != nil {
+					t.Errorf("GC after %s removed %s: %v", tc.stop, path, err)
+				}
+			}
+			if hold := health.Hold(); hold == nil {
+				t.Errorf("GC after %s held every recording but recorded no hold", tc.stop)
+			} else if hold.Reason != "Google Drive sync is off, so recordings are kept on the unit" {
+				t.Errorf("GC after %s hold reason = %q", tc.stop, hold.Reason)
+			}
+
+			patch(tc.resume)
+			resumed := cfgStore.Get()
+			if _, err := runGCPass(store, &resumed, syncer, health, logger); err != nil {
+				t.Fatalf("GC pass after %s: %v", tc.resume, err)
+			}
+			if _, err := os.Stat(unsyncedAudio); err != nil {
+				t.Errorf("GC after %s removed unsynced audio: %v", tc.resume, err)
+			}
+			if _, err := os.Stat(syncedAudio); !os.IsNotExist(err) {
+				t.Errorf("GC after %s kept synced audio: %v", tc.resume, err)
+			}
+			if hold := health.Hold(); hold != nil {
+				t.Errorf("GC after %s still holds: %+v", tc.resume, *hold)
+			}
+		})
 	}
 }

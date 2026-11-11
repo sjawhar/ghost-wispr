@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +80,11 @@ func renderDocuments(s *SyncSession, segments []transcribe.Segment) (summary, tr
 	return summary, RenderTranscriptMarkdown(s, segments)
 }
 
+// RecordingFileName is the stable Drive name for one saved recording.
+func RecordingFileName(recording string) string {
+	return "audio-" + filepath.Base(recording)
+}
+
 func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
 	date := sess.StartedAt.UTC().Format("2006-01-02")
 	slug := slugify(sess.Title)
@@ -118,7 +124,7 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		if ext == ".wav" {
 			mimeType = "audio/wav"
 		}
-		name := "audio-" + filepath.Base(recording)
+		name := RecordingFileName(recording)
 		files = append(files, SyncFile{
 			Name:        name,
 			MimeType:    mimeType,
@@ -250,6 +256,32 @@ func (s *Syncer) FolderOnDrive(ctx context.Context, folderID string) (bool, erro
 	default:
 		return false, err
 	}
+}
+
+// RecordingsMatch reports whether folderID has every requested recording
+// name with the specified Google Drive md5Checksum. Callers confirm the
+// folder itself separately: an empty or inaccessible listing does not prove
+// whether the folder was removed, but it never verifies a recording.
+func (s *Syncer) RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error) {
+	if len(checksums) == 0 {
+		return true, nil
+	}
+	remaining := maps.Clone(checksums)
+	query := fmt.Sprintf("'%s' in parents and trashed = false", strings.ReplaceAll(folderID, "'", `\'`))
+	err := s.service.Files.List().Q(query).SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+		Fields("nextPageToken, files(name, md5Checksum)").Context(ctx).
+		Pages(ctx, func(page *drive.FileList) error {
+			for _, file := range page.Files {
+				if checksum, wanted := remaining[file.Name]; wanted && file.Md5Checksum == checksum {
+					delete(remaining, file.Name)
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return false, fmt.Errorf("list recordings in folder %s: %w", folderID, err)
+	}
+	return len(remaining) == 0, nil
 }
 
 // driveFile is a file in a session's Drive folder.

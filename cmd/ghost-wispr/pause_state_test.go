@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -399,4 +401,27 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 			t.Fatalf("power button status broadcasts = %v, want %v", got, want)
 		}
 	})
+}
+
+func TestSeedPausedStatePersistsBeforeTestInstanceStarts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	configPath := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
+	if err := os.WriteFile(configPath, []byte("db_path: "+dbPath+"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := seedPausedState(configPath); err != nil {
+		t.Fatalf("seed paused state: %v", err)
+	}
+	store, err := storage.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("open seeded database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
+	if err != nil {
+		t.Fatalf("read pause state: %v", err)
+	}
+	if !ok || value != "1" {
+		t.Errorf("capture pause = %q, found %v; want 1, true", value, ok)
+	}
 }
