@@ -40,8 +40,8 @@ func TestDriveReplacementWarningsComeFromTheStore(t *testing.T) {
 		}
 	}
 	owe("20261106100000", now.Add(-5*time.Minute), driveReplacementWarnFailures) // keeps failing
-	owe("20261106110000", now.Add(-2*time.Hour), 0)                               // only waits
-	owe("20261106120000", now.Add(-5*time.Minute), 1)                             // owed briefly
+	owe("20261106110000", now.Add(-2*time.Hour), 0)                              // only waits
+	owe("20261106120000", now.Add(-5*time.Minute), 1)                            // owed briefly
 
 	for _, registry := range []*warningsRegistry{newWarningsRegistry(), newWarningsRegistry()} { // the second is after a restart
 		if err := refreshDriveReplacementWarnings(store, registry, now); err != nil {

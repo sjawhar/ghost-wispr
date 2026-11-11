@@ -2,9 +2,9 @@ package gdrive
 
 import (
 	"context"
-	"errors"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -132,8 +132,10 @@ func (s *Syncer) replacementTargets(ctx context.Context, sess *storage.Session, 
 	if err != nil {
 		return nil, fmt.Errorf("list merged sources of session %s: %w", sess.ID, err)
 	}
+	folders := append([]storage.Session{*sess}, sources...)
 	var candidates []storage.Session
-	for _, folder := range append([]storage.Session{*sess}, sources...) {
+	for i := range folders {
+		folder := &folders[i]
 		if folder.GDriveFolderID == "" {
 			continue
 		}
@@ -143,7 +145,7 @@ func (s *Syncer) replacementTargets(ctx context.Context, sess *storage.Session, 
 			}
 			return nil, fmt.Errorf("check the Drive folder of session %s: %w", folder.ID, err)
 		}
-		candidates = append(candidates, folder)
+		candidates = append(candidates, *folder)
 	}
 
 	targets := make([]*replacementTarget, 0, len(candidates))
