@@ -264,11 +264,22 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	if survivors := audio.Survivors(wordsAfter, start, segments[index].Text, before, after); len(survivors) > 0 {
 		return fmt.Errorf("%w: surviving words: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(survivors, ", "))
 	}
-	if beforeMissing := missingNeighbourTokens(wordsAfter, start, before, true); len(beforeMissing) > 1 {
-		return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(beforeMissing, ", "))
+	// A cut within this distance of a recording boundary may have its
+	// neighbour in the adjacent recording. That neighbour's stream words are
+	// not comparable with this recording's post-splice words, so skip only
+	// that cross-recording side.
+	const recordingBoundarySeconds = 0.5
+	beforeCrossesRecording := recordIndex > 0 && start <= recordingBoundarySeconds
+	afterCrossesRecording := recordIndex+1 < len(candidates) && end >= candidates[recordIndex].Duration-recordingBoundarySeconds
+	if !beforeCrossesRecording {
+		if beforeMissing := missingNeighbourTokens(wordsAfter, start, before, true); len(beforeMissing) > 1 {
+			return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(beforeMissing, ", "))
+		}
 	}
-	if afterMissing := missingNeighbourTokens(wordsAfter, start, after, false); len(afterMissing) > 1 {
-		return fmt.Errorf("%w: after-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(afterMissing, ", "))
+	if !afterCrossesRecording {
+		if afterMissing := missingNeighbourTokens(wordsAfter, start, after, false); len(afterMissing) > 1 {
+			return fmt.Errorf("%w: after-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(afterMissing, ", "))
+		}
 	}
 
 	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordings, ","), Start: start, End: end, StreamStart: segments[index].StartTime, StreamEnd: segments[index].EndTime, SHA256Before: beforeHash, SHA256After: afterHash}
