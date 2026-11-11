@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 func TestR8RecoveryResultsClearPendingWarningThroughStatus(t *testing.T) {
@@ -50,5 +52,26 @@ func TestR8RefinementFailureUsesItsOwnStatusWarning(t *testing.T) {
 	warnings := statusWarnings(t, registry)
 	if len(warnings) != 1 || strings.Contains(warnings[0], "needs audio recovery") || !strings.Contains(warnings[0], "refinement after segment deletion failed for session session") || !strings.Contains(warnings[0], refinementErr.Error()) {
 		t.Fatalf("status warnings after refinement failure = %q, want the refinement warning without an audio-recovery claim", warnings)
+	}
+}
+
+func TestR8SuccessfulRefinementRetryClearsItsStatusWarning(t *testing.T) {
+	registry := newWarningsRegistry()
+	span := storage.DeletedSpan{SessionID: "session", AudioPath: "/recordings/session.mp3"}
+	applyPendingSpliceRecoveryWarnings(registry, []storage.DeletedSpan{span}, []pendingSpliceFailure{{
+		Span: span,
+		Err:  refinementAfterSegmentDeletionError{err: errors.New("batch transcription not configured")},
+	}})
+	if warnings := statusWarnings(t, registry); len(warnings) != 1 {
+		t.Fatalf("status warnings before refinement retry = %q, want one", warnings)
+	}
+
+	if err := retryRefinementWithWarningClear(context.Background(), registry, span.SessionID, span.AudioPath, time.Time{}, func(context.Context, string, string, time.Time) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("retry refinement: %v", err)
+	}
+	if warnings := statusWarnings(t, registry); len(warnings) != 0 {
+		t.Fatalf("status warnings after successful refinement retry = %q, want none", warnings)
 	}
 }

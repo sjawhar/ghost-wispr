@@ -893,7 +893,7 @@ func main() {
 			if err != nil {
 				return fmt.Errorf("get session %s: %w", sessionID, err)
 			}
-			return manager.RefineSession(ctx, sessionID, sess.AudioPath, sess.StartedAt)
+			return retryRefinementWithWarningClear(ctx, warningRegistry, sessionID, sess.AudioPath, sess.StartedAt, manager.RefineSession)
 		},
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
 			if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {

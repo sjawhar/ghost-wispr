@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
@@ -34,7 +36,11 @@ func clearPendingSpliceWarning(registry *warningsRegistry, sessionID, recording 
 }
 
 func pendingSpliceRefinementKey(span *storage.DeletedSpan) string {
-	return pendingSpliceRefinementKeyPrefix + span.SessionID + "\x00" + span.AudioPath
+	return pendingSpliceRefinementKeyFor(span.SessionID, span.AudioPath)
+}
+
+func pendingSpliceRefinementKeyFor(sessionID, recording string) string {
+	return pendingSpliceRefinementKeyPrefix + sessionID + "\x00" + recording
 }
 
 func applyPendingSpliceRecoveryWarnings(registry *warningsRegistry, recovered []storage.DeletedSpan, failed []pendingSpliceFailure) {
@@ -52,6 +58,14 @@ func applyPendingSpliceRecoveryWarnings(registry *warningsRegistry, recovered []
 		log.Printf("warning: pending segment splice session=%s recording=%s: %v", failure.Span.SessionID, failure.Span.AudioPath, failure.Err)
 		setPendingSpliceWarning(registry, failure.Span.SessionID, failure.Span.AudioPath, failure.Err)
 	}
+}
+
+func retryRefinementWithWarningClear(ctx context.Context, registry *warningsRegistry, sessionID, audioPath string, startedAt time.Time, refine func(context.Context, string, string, time.Time) error) error {
+	if err := refine(ctx, sessionID, audioPath, startedAt); err != nil {
+		return err
+	}
+	registry.Clear(pendingSpliceRefinementKeyFor(sessionID, audioPath))
+	return nil
 }
 
 func recordPendingSpliceCleanupWarning(registry *warningsRegistry, recoveryErr error) {
