@@ -50,14 +50,14 @@ summarization:
 # Garbage collection
 # gc_enabled: false
 # Delete ended sessions that have a summary (rows, transcripts, audio) older
-# than this many days; synced ones only when Drive sync is on. A session
-# restored from Drive counts from its restore. 0 = never.
+# than this many days. GC is always Drive-gated: if Drive sync is off, lacks a
+# folder, or cannot verify a session, it removes no audio and reports a hold.
+# A session restored from Drive counts from its restore. 0 = never.
 # gc_max_age_days: 30
-# Budget for the audio GC may remove: saved recordings of ended sessions,
-# synced ones only when Drive sync is on. Past it, GC removes the oldest
+# Budget for audio GC. Past it, GC removes the oldest verified Drive-backed
 # sessions' audio files and keeps the sessions ("Audio removed to free space").
-# Raw recordings kept because they could not be saved, and unsynced audio, are
-# not counted or removed: GET /api/status reports kept raw recordings.
+# Raw recordings kept because they could not be saved, and unverified audio,
+# are not counted or removed: GET /api/status reports kept raw recordings.
 # 0 = no budget: GC removes no audio to free space.
 # A negative value for either is a mistake: the default is used, with a warning.
 # gc_max_audio_size_mb: 1024
