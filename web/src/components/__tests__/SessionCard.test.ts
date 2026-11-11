@@ -1,5 +1,6 @@
-import { fireEvent, render, screen } from '@testing-library/svelte'
-import { describe, expect, it, vi } from 'vitest'
+import { fireEvent, render as renderSvelte, screen, waitFor } from '@testing-library/svelte'
+import type { ComponentProps } from 'svelte'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import SessionCard from '../SessionCard.svelte'
 import sessionCardSource from '../SessionCard.svelte?raw'
 import {
@@ -23,9 +24,26 @@ const baseSession: SessionSummary = {
   audio_path: 'data/audio/s1.mp3',
 }
 
+type SessionCardProps = ComponentProps<typeof SessionCard>
+
+function render(
+  props: Omit<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted'> &
+    Partial<Pick<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted'>>,
+) {
+  return renderSvelte(SessionCard, {
+    onRefreshSession: vi.fn().mockResolvedValue(undefined),
+    onSegmentDeleted: vi.fn(),
+    ...props,
+  })
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
 describe('SessionCard', () => {
   it('shows summary status', () => {
-    render(SessionCard, {
+    render({
       session: baseSession,
       detail: undefined,
       expanded: false,
@@ -46,7 +64,7 @@ describe('SessionCard', () => {
       sync_status: SyncStatus.Synced,
       sync_state: SyncState.Synced,
     }
-    render(SessionCard, {
+    render({
       session: synced,
       detail: { session: synced, segments: [] },
       expanded: true,
@@ -71,7 +89,7 @@ describe('SessionCard', () => {
     ['deleted on Drive', { sync_status: SyncStatus.Failed, sync_state: SyncState.RemoteDeleted }],
   ])('says this unit holds the only copy when the session is %s', (_, sync) => {
     const session = { ...baseSession, ...sync }
-    render(SessionCard, {
+    render({
       session,
       detail: { session, segments: [] },
       expanded: true,
@@ -97,7 +115,7 @@ describe('SessionCard', () => {
   it('loads details when opened', async () => {
     const onToggle = vi.fn()
     const onLoadDetail = vi.fn().mockResolvedValue(undefined)
-    render(SessionCard, {
+    render({
       session: baseSession,
       detail: undefined,
       expanded: false,
@@ -114,7 +132,7 @@ describe('SessionCard', () => {
   })
 
   it('shows resummarize trigger when completed and presets exist', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         summary_status: SummaryStatus.Completed,
@@ -133,7 +151,7 @@ describe('SessionCard', () => {
   })
 
   it('shows the summary a session keeps when making it again failed', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         summary_status: SummaryStatus.Failed,
@@ -154,7 +172,7 @@ describe('SessionCard', () => {
   })
 
   it('says the summary is unavailable when one failed and there is none from before', () => {
-    render(SessionCard, {
+    render({
       session: { ...baseSession, summary_status: SummaryStatus.Failed, summary: '' },
       detail: undefined,
       expanded: false,
@@ -169,7 +187,7 @@ describe('SessionCard', () => {
   })
 
   it('says a session with no saved recording cannot be refined, and offers no retry', () => {
-    render(SessionCard, {
+    render({
       session: { ...baseSession, audio_path: '', refinement_status: RefinementStatus.NoAudio },
       detail: undefined,
       expanded: false,
@@ -191,7 +209,7 @@ describe('SessionCard', () => {
 
   it('marks a session whose audio was removed to free space, refined or not', () => {
     for (const refinementStatus of [RefinementStatus.Completed, RefinementStatus.NoAudio]) {
-      const { unmount } = render(SessionCard, {
+      const { unmount } = render({
         session: {
           ...baseSession,
           audio_path: '',
@@ -223,7 +241,7 @@ describe('SessionCard', () => {
   })
 
   it('says only part of the audio was removed, and how much is left', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         audio_path: 'data/audio/b.mp3, data/audio/c.mp3',
@@ -247,7 +265,7 @@ describe('SessionCard', () => {
   })
 
   it('says the recording left was not on disk when GC found none, in the marker and the refinement badge', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         audio_path: 'mnt/b.mp3',
@@ -285,7 +303,7 @@ describe('SessionCard', () => {
       ),
     )
     try {
-      render(SessionCard, {
+      render({
         session: { ...baseSession, sync_status: SyncStatus.Failed },
         detail: undefined,
         expanded: false,
@@ -319,7 +337,7 @@ describe('SessionCard', () => {
   })
 
   it('says a session whose Drive folder was deleted is kept on the device, and offers a retry for a restored folder', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         sync_status: SyncStatus.Failed,
@@ -340,5 +358,49 @@ describe('SessionCard', () => {
       'Its Drive folder is in the trash or gone, so this device keeps the only copy. Restore the folder on Drive, then retry to sync it again.',
     )
     expect(screen.getByTestId('retry-sync-btn')).toBeTruthy()
+  })
+
+  it.each([
+    ['updates state and refreshes once after a successful deletion', 204, 1],
+    ['scrubs state and refreshes once when a segment is already gone', 404, 1],
+  ])('%s', async (_, status, deletedCalls) => {
+    const onSegmentDeleted = vi.fn()
+    const onRefreshSession = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status })))
+    render({
+      session: baseSession,
+      detail: {
+        session: baseSession,
+        segments: [
+          {
+            id: 42,
+            speaker: 0,
+            text: 'A stored segment',
+            start_time: 0,
+            end_time: 2,
+            timestamp: '2026-11-11T10:00:00Z',
+          },
+        ],
+      },
+      expanded: true,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+      onSegmentDeleted,
+      onRefreshSession,
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    await waitFor(() => {
+      expect(onRefreshSession).toHaveBeenCalledExactlyOnceWith('s1')
+    })
+    expect(onSegmentDeleted).toHaveBeenCalledTimes(deletedCalls)
+    if (deletedCalls === 1) {
+      expect(onSegmentDeleted).toHaveBeenCalledWith('s1', 42)
+    }
   })
 })

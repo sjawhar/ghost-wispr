@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { tick } from 'svelte'
   import { appState, setActiveAudioSession } from '../lib/state.svelte'
+  import { RequestError, deleteSessionSegment, requestErrorMessage } from '../lib/api'
   import { RefinementStatus, type Segment, type SessionSummary } from '../lib/types'
   import { copyText } from '../lib/clipboard'
   import { audioLeftNote, recordingsNamed } from '../lib/audio'
@@ -8,10 +10,14 @@
     sessionId,
     segments,
     session,
+    onDeleted,
+    onNotFound,
   }: {
     sessionId: string
     segments: Segment[]
     session?: SessionSummary
+    onDeleted: (segmentID: number) => void | Promise<void>
+    onNotFound: (segmentID: number) => void | Promise<void>
   } = $props()
 
   let audioEl: HTMLAudioElement | null = $state(null)
@@ -22,6 +28,10 @@
   let error = $state('')
 
   let transcriptCopied = $state(false)
+  let visibleSegments = $derived(segments)
+  const audioVersion = $derived(visibleSegments.map((segment) => segment.id ?? '').join('.'))
+  let segmentDeleteError = $state('')
+  let deletingSegmentID = $state<number | null>(null)
 
   // Refined transcript: prefer the explicit refined_transcript, fall back to
   // canonical_transcript when the source is 'refined' (covers historical sessions
@@ -45,6 +55,8 @@
       session?.refinement_status === RefinementStatus.Running,
   )
 
+  const hasDeletableSegments = $derived(visibleSegments.some((segment) => segment.id !== undefined))
+
   // Disk pressure removed the session's audio to free space: all of it, or
   // part of it, when the audio path still names what is left.
   const audioRemoved = $derived(Boolean(session?.audio_removed_at))
@@ -54,17 +66,10 @@
 
   type View = 'refined' | 'segments'
   // Default to refined view whenever a refined transcript is available.
-  let view = $state<View>('segments')
-  $effect(() => {
-    if (refinementCompleted) {
-      view = 'refined'
-    } else {
-      view = 'segments'
-    }
-  })
+  let view = $derived<View>(refinementCompleted && !hasDeletableSegments ? 'refined' : 'segments')
 
   function segmentsAsText(): string {
-    return segments
+    return visibleSegments
       .map((s) => `[${prettyTime(s.start_time)}] Speaker ${s.speaker}: ${s.text}`)
       .join('\n')
   }
@@ -78,16 +83,67 @@
     }
   }
 
+  async function reloadAudio(): Promise<void> {
+    currentTime = 0
+    duration = 0
+    loading = true
+    playing = false
+    error = ''
+
+    if (!audioEl) {
+      return
+    }
+
+    audioEl.pause()
+    audioEl.currentTime = 0
+    await tick()
+    audioEl?.load()
+  }
+
+  async function handleDeleteSegment(
+    event: MouseEvent,
+    segmentID: number | undefined,
+  ): Promise<void> {
+    if (segmentID === undefined || deletingSegmentID !== null) {
+      return
+    }
+    if (!confirm('Delete this segment? This cannot be undone.')) {
+      return
+    }
+
+    deletingSegmentID = segmentID
+    segmentDeleteError = ''
+    try {
+      try {
+        await deleteSessionSegment(sessionId, segmentID)
+      } catch (error) {
+        if (!(error instanceof RequestError && error.status === 404)) {
+          segmentDeleteError = requestErrorMessage(error)
+          return
+        }
+        await onNotFound(segmentID)
+        return
+      }
+      visibleSegments = visibleSegments.filter((segment) => segment.id !== segmentID)
+      await reloadAudio()
+      await onDeleted(segmentID)
+    } catch (error) {
+      segmentDeleteError = `The session could not be reloaded: ${requestErrorMessage(error)}`
+    } finally {
+      deletingSegmentID = null
+    }
+  }
+
   const activeSegmentIndex = $derived.by(() => {
-    if (segments.length === 0) {
+    if (visibleSegments.length === 0) {
       return -1
     }
 
     let lo = 0
-    let hi = segments.length - 1
+    let hi = visibleSegments.length - 1
     while (lo <= hi) {
       const mid = Math.floor((lo + hi) / 2)
-      const segment = segments[mid]
+      const segment = visibleSegments[mid]
       if (currentTime < segment.start_time) {
         hi = mid - 1
       } else if (currentTime >= segment.end_time) {
@@ -166,7 +222,7 @@
     {/if}
     <audio
       bind:this={audioEl}
-      src={`/api/sessions/${encodeURIComponent(sessionId)}/audio`}
+      src={`/api/sessions/${encodeURIComponent(sessionId)}/audio?v=${audioVersion}`}
       preload="metadata"
       onloadedmetadata={onLoadedMetadata}
       ontimeupdate={onTimeUpdate}
@@ -228,21 +284,40 @@
     </div>
   </div>
 
+  {#if segmentDeleteError}
+    <p class="segment-delete-error" role="alert">{segmentDeleteError}</p>
+  {/if}
+
   {#if view === 'refined' && refinedText}
     <div class="transcript-refined" data-testid="transcript-refined">
       {refinedText}
     </div>
   {:else}
     <div class="transcript-sync">
-      {#each segments as segment, index (segment.timestamp + segment.text + index)}
-        <button
-          type="button"
-          class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
-          onclick={() => seekTo(segment.start_time)}
-        >
-          <span class="line-time">{prettyTime(segment.start_time)}</span>
-          <span class="line-text">{segment.text}</span>
-        </button>
+      {#each visibleSegments as segment, index (segment.id ?? segment.timestamp + segment.text + index)}
+        <div class="transcript-line">
+          <button
+            type="button"
+            class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
+            onclick={() => seekTo(segment.start_time)}
+          >
+            <span class="line-time">{prettyTime(segment.start_time)}</span>
+            <span class="line-text" id={`segment-${segment.id ?? index}`}>{segment.text}</span>
+          </button>
+          {#if segment.id !== undefined}
+            <button
+              type="button"
+              class="segment-delete-btn"
+              aria-label="Delete segment"
+              aria-describedby={`segment-${segment.id ?? index}`}
+              title="Delete segment"
+              disabled={deletingSegmentID !== null}
+              onclick={(event) => void handleDeleteSegment(event, segment.id)}
+            >
+              {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
+            </button>
+          {/if}
+        </div>
       {/each}
     </div>
   {/if}

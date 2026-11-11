@@ -38,7 +38,10 @@
       Record only while the light is on. Anyone may pause it at any time without a reason.
       Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
     </p>
-    <p>Tap the button on the recorder to pause or resume. To delete a segment, ask Sami.</p>
+    <p>
+      Tap the button on the recorder to pause or resume. To delete a segment, open the conversation
+      and choose Delete on that segment.
+    </p>
   </dialog>
 {/if}
 

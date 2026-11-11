@@ -24,6 +24,8 @@
     onResummarize,
     onDelete,
     onMerge,
+    onRefreshSession,
+    onSegmentDeleted,
   }: {
     dates: string[]
     sessionsByDate: Map<string, SessionSummary[]>
@@ -36,6 +38,8 @@
     onResummarize: (sessionId: string, preset: string) => Promise<void>
     onDelete: (id: string) => Promise<void>
     onMerge: (sessionIds: string[]) => Promise<void>
+    onRefreshSession: (id: string) => Promise<void>
+    onSegmentDeleted: (sessionID: string, segmentID: number) => void
   } = $props()
 
   let loadedDates = $state(3)
@@ -69,6 +73,15 @@
     if (selectedIds.size < 2) return
     await onMerge([...selectedIds])
     exitSelectMode()
+  }
+
+  function handleSegmentDeleted(sessionID: string, segmentID: number): void {
+    onSegmentDeleted(sessionID, segmentID)
+    searchRequestID++
+    searchQuery = ''
+    searchResults = []
+    searchError = ''
+    isSearching = false
   }
 
   function isShortSession(session: SessionSummary): boolean {
@@ -282,6 +295,8 @@
                 {onLoadDetail}
                 {onResummarize}
                 {onDelete}
+                {onRefreshSession}
+                onSegmentDeleted={handleSegmentDeleted}
               />
             {/each}
           </div>

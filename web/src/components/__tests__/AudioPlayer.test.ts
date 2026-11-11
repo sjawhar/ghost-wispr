@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from '@testing-library/svelte'
+import { fireEvent, render as renderSvelte, screen, waitFor } from '@testing-library/svelte'
+import type { ComponentProps } from 'svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import AudioPlayer from '../AudioPlayer.svelte'
 import { appState, resetState } from '../../lib/state.svelte'
@@ -20,6 +21,19 @@ function makeSession(overrides: Partial<SessionSummary> = {}): SessionSummary {
   }
 }
 
+type AudioPlayerProps = ComponentProps<typeof AudioPlayer>
+
+function render(
+  props: Omit<AudioPlayerProps, 'onDeleted' | 'onNotFound'> &
+    Partial<Pick<AudioPlayerProps, 'onDeleted' | 'onNotFound'>>,
+) {
+  return renderSvelte(AudioPlayer, {
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(undefined),
+    ...props,
+  })
+}
+
 describe('AudioPlayer', () => {
   beforeEach(() => {
     Object.defineProperty(HTMLMediaElement.prototype, 'play', {
@@ -38,16 +52,17 @@ describe('AudioPlayer', () => {
   })
 
   afterEach(() => {
+    vi.unstubAllGlobals()
     resetState()
   })
 
   it('renders audio controls', () => {
-    render(AudioPlayer, { sessionId: 's1', segments: [] })
+    render({ sessionId: 's1', segments: [] })
     expect(screen.getByRole('button', { name: 'Play Audio' })).toBeTruthy()
   })
 
   it('sets active audio session when transcript line is clicked', async () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [
         {
@@ -65,7 +80,7 @@ describe('AudioPlayer', () => {
   })
 
   it('shows refined transcript and view toggle when refinement completed', () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [
         {
@@ -93,7 +108,7 @@ describe('AudioPlayer', () => {
   })
 
   it('switches to segments view when toggle clicked', async () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [
         {
@@ -117,7 +132,7 @@ describe('AudioPlayer', () => {
   })
 
   it('falls back to segments view when refinement not completed', () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [
         {
@@ -139,7 +154,7 @@ describe('AudioPlayer', () => {
   })
 
   it('copies refined transcript when refined view active', async () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [
         {
@@ -162,7 +177,7 @@ describe('AudioPlayer', () => {
   })
 
   it('copies segment-formatted transcript when in segments view', async () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [
         {
@@ -186,7 +201,7 @@ describe('AudioPlayer', () => {
   })
 
   it('uses canonical_transcript when source is refined and refined_transcript empty', () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [],
       session: makeSession({
@@ -203,7 +218,7 @@ describe('AudioPlayer', () => {
   })
 
   it('says no recording was saved instead of loading audio or showing refinement', () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [],
       session: makeSession({ audio_path: '', refinement_status: RefinementStatus.NoAudio }),
@@ -220,7 +235,7 @@ describe('AudioPlayer', () => {
   })
 
   it('says the audio was removed to free space instead of loading it, and keeps the transcript', () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [],
       session: makeSession({
@@ -241,7 +256,7 @@ describe('AudioPlayer', () => {
   })
 
   it('says what is left when only part of the audio was removed, and still offers to play it', () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [],
       session: makeSession({
@@ -263,7 +278,7 @@ describe('AudioPlayer', () => {
   })
 
   it('says the recording left was not found on disk when GC found none, as the card does', () => {
-    render(AudioPlayer, {
+    render({
       sessionId: 's1',
       segments: [],
       session: makeSession({
@@ -278,5 +293,282 @@ describe('AudioPlayer', () => {
         'Part of the audio was removed to free space; 1 recording is left, but it was not on disk when the rest was removed.',
       ),
     ).toBeTruthy()
+  })
+
+  it('deletes a confirmed stored segment and removes it from the transcript', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    const onDeleted = vi.fn()
+    const confirm = vi.fn().mockReturnValue(true)
+    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('confirm', confirm)
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Delete this segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+        {
+          id: 43,
+          speaker: 1,
+          text: 'Keep this segment',
+          start_time: 2,
+          end_time: 4,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      onDeleted,
+    })
+
+    await fireEvent.click(screen.getAllByRole('button', { name: 'Delete segment' })[0])
+
+    await waitFor(() => {
+      expect(screen.queryByText('Delete this segment')).toBeNull()
+    })
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(fetch).toHaveBeenCalledWith('/api/sessions/s1/segments/42', { method: 'DELETE' })
+    expect(onDeleted).toHaveBeenCalledTimes(1)
+    expect(onDeleted).toHaveBeenCalledWith(42)
+    expect(screen.getByText('Keep this segment')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('reloads audio from a cache-busting URL after a successful deletion', async () => {
+    const pause = vi.fn()
+    const load = vi.fn()
+    Object.defineProperty(HTMLMediaElement.prototype, 'pause', {
+      configurable: true,
+      value: pause,
+    })
+    Object.defineProperty(HTMLMediaElement.prototype, 'load', {
+      configurable: true,
+      value: load,
+    })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })))
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+
+    const { container } = render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Spliced segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: '2026-11-11T10:00:00Z',
+        },
+      ],
+    })
+    const audio = container.querySelector('audio')
+
+    expect(audio?.getAttribute('src')).toBe('/api/sessions/s1/audio?v=42')
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    await waitFor(() => {
+      expect(audio?.getAttribute('src')).toBe('/api/sessions/s1/audio?v=')
+    })
+    expect(pause).toHaveBeenCalledExactlyOnceWith()
+    expect(load).toHaveBeenCalledExactlyOnceWith()
+  })
+
+  it('disables the control and shows progress while the deletion is in flight', async () => {
+    let finishRequest!: (response: Response) => void
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockReturnValue(new Promise<Response>((resolve) => (finishRequest = resolve))),
+    )
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Slow segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+        {
+          id: 43,
+          speaker: 1,
+          text: 'Other segment',
+          start_time: 2,
+          end_time: 4,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    })
+    const deleteButtons = screen.getAllByRole('button', { name: 'Delete segment' })
+    const deleteButton = deleteButtons[0]
+
+    await fireEvent.click(deleteButton)
+
+    await waitFor(() => {
+      expect(deleteButton.textContent).toContain('Deleting…')
+    })
+    expect(deleteButtons.every((button) => button.hasAttribute('disabled'))).toBe(true)
+    expect(screen.getByText('Slow segment')).toBeTruthy()
+    expect(screen.getByText('Other segment')).toBeTruthy()
+
+    finishRequest(new Response(null, { status: 204 }))
+
+    await waitFor(() => {
+      expect(screen.queryByText('Slow segment')).toBeNull()
+    })
+    expect(screen.getByText('Other segment')).toBeTruthy()
+  })
+
+  it('does not request deletion when the confirmation is cancelled', async () => {
+    const fetch = vi.fn()
+    const onDeleted = vi.fn()
+    const confirm = vi.fn().mockReturnValue(false)
+    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('confirm', confirm)
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Do not delete this segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      onDeleted,
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(fetch).not.toHaveBeenCalled()
+    expect(onDeleted).not.toHaveBeenCalled()
+    expect(screen.getByText('Do not delete this segment')).toBeTruthy()
+  })
+
+  it.each([
+    [
+      'explains that an active conversation cannot delete a segment',
+      409,
+      'This conversation is still being recorded. Delete the segment after it ends.',
+      'Active segment',
+    ],
+    [
+      'shows the server message when a segment cannot be removed cleanly',
+      422,
+      'The segment could not be removed cleanly; nothing was deleted',
+      'Unchanged segment',
+    ],
+  ])('%s', async (_, status, message, text) => {
+    const onDeleted = vi.fn()
+    const onNotFound = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: message }), { status })),
+    )
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text,
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      onDeleted,
+      onNotFound,
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    expect((await screen.findByRole('alert')).textContent).toBe(message)
+    expect(screen.getByText(text)).toBeTruthy()
+    expect(onDeleted).not.toHaveBeenCalled()
+    expect(onNotFound).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Delete segment' }).hasAttribute('disabled')).toBe(
+      false,
+    )
+  })
+
+  it('refreshes the session list when the server no longer knows the session', async () => {
+    const onDeleted = vi.fn()
+    const onNotFound = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 404 })))
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Stale segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      onDeleted,
+      onNotFound,
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    await waitFor(() => {
+      expect(onNotFound).toHaveBeenCalledTimes(1)
+    })
+    expect(onDeleted).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('shows deletion controls for stored segments when a refined transcript is available', () => {
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Stored segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      session: makeSession({
+        refinement_status: RefinementStatus.Completed,
+        refined_transcript: 'Refined transcript with the stored segment.',
+        transcript_source: 'refined',
+      }),
+    })
+
+    expect(screen.getByRole('button', { name: 'Delete segment' })).toBeTruthy()
+  })
+  it('does not offer deletion for a segment that is not stored yet', () => {
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          speaker: 0,
+          text: 'Live segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    })
+
+    expect(screen.queryByRole('button', { name: 'Delete segment' })).toBeNull()
   })
 })

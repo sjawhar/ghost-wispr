@@ -128,6 +128,8 @@ export type WebSocketEvent =
   | ComponentStatusEvent
 
 export interface Segment {
+  // Set only after the recorder persists the segment. Live segments cannot be deleted.
+  id?: number
   speaker: number
   text: string
   start_time: number
