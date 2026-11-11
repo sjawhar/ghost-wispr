@@ -28,15 +28,15 @@ type mockStore struct {
 
 // The mock serves age-based retention only; disk pressure runs against the
 // real store.
-func (m *mockStore) Recordings(bool) ([]storage.SessionRecording, error) { return nil, nil }
+func (m *mockStore) Recordings() ([]storage.SessionRecording, error) { return nil, nil }
 
-func (m *mockStore) MarkAudioRemoved(string, string, string, bool, bool, time.Time) (storage.AudioRemoval, bool, error) {
+func (m *mockStore) MarkAudioRemoved(string, string, string, bool, time.Time) (storage.AudioRemoval, bool, error) {
 	return storage.AudioRemoval{}, false, nil
 }
 
 func (m *mockStore) RestoreAudio(*storage.AudioRemoval, string) error { return nil }
 
-func (m *mockStore) GetGCEligibleSessions(maxAgeDays int, _ bool) ([]string, error) {
+func (m *mockStore) GetGCEligibleSessions(maxAgeDays int) ([]string, error) {
 	if ids, ok := m.gcEligible[maxAgeDays]; ok {
 		return ids, nil
 	}
@@ -50,7 +50,7 @@ func (m *mockStore) GetSession(id string) (storage.Session, error) {
 	return storage.Session{}, os.ErrNotExist
 }
 
-func (m *mockStore) DeleteEndedSession(id, _ string, _ bool) (bool, error) {
+func (m *mockStore) DeleteEndedSession(id, _ string) (bool, error) {
 	m.deletedIDs = append(m.deletedIDs, id)
 	return true, nil
 }
@@ -119,7 +119,6 @@ func TestGCDeletesSyncedOldSessions(t *testing.T) {
 	collector := New(store, Config{
 		MaxAgeDays:     30,
 		MaxAudioSizeMB: 1024,
-		SyncGated:      true,
 		Drive:          &driveFolders{},
 	})
 
@@ -151,7 +150,6 @@ func TestGCSkipsSessionWithNoAudio(t *testing.T) {
 	collector := New(store, Config{
 		MaxAgeDays:     30,
 		MaxAudioSizeMB: 1024,
-		SyncGated:      true,
 		Drive:          &driveFolders{},
 	})
 
@@ -183,7 +181,6 @@ func TestGCResolvesRelativePath(t *testing.T) {
 	collector := New(store, Config{
 		MaxAgeDays:     30,
 		MaxAudioSizeMB: 1024,
-		SyncGated:      true,
 		Drive:          &driveFolders{},
 		AudioDir:       dir,
 	})
@@ -243,11 +240,11 @@ func TestGCRemovesALeftoverRawRecordingOfASavedSession(t *testing.T) {
 	}
 	raw := writeRaw(t, dir, "20261106140930", 1024, time.Now())
 	store := &mockStore{
-		sessions:   map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: saved}},
+		sessions:   map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: saved, GDriveFolderID: "folder"}},
 		gcEligible: map[int][]string{30: {"20261106140930"}},
 	}
 
-	if _, err := New(store, Config{MaxAgeDays: 30, AudioDir: dir}).Run(); err != nil {
+	if _, err := New(store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	expectRemoved(t, raw)
@@ -260,11 +257,11 @@ func TestGCKeepsTheRawRecordingWhenTheSavedRecordingIsGone(t *testing.T) {
 	dir := t.TempDir()
 	raw := writeRaw(t, dir, "20261106140930", 1024, time.Now())
 	store := &mockStore{
-		sessions:   map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: filepath.Join(dir, "20261106140930.wav")}},
+		sessions:   map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: filepath.Join(dir, "20261106140930.wav"), GDriveFolderID: "folder"}},
 		gcEligible: map[int][]string{30: {"20261106140930"}},
 	}
 
-	deleted, err := New(store, Config{MaxAgeDays: 30, AudioDir: dir}).Run()
+	deleted, err := New(store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
@@ -330,12 +327,24 @@ func crashRecovered(t *testing.T, store *storage.SQLiteStore, dir, id string, st
 }
 
 // runGC runs GC passes times, as its hourly schedule does, and returns the
-// sessions the passes deleted. A sync-gated config with no Drive gets one
-// that has every folder: what a test checks is then kept or removed for its
-// own reason, not because GC could not ask Drive.
+// sessions the passes deleted. It makes pending fixture sessions look as
+// though a Drive sync already verified them, so each test can isolate its own
+// GC condition. Explicit failed or remotely deleted states stay untouched.
 func runGC(t *testing.T, store *storage.SQLiteStore, config Config, passes int) []string {
 	t.Helper()
-	if config.SyncGated && config.Drive == nil {
+	if _, err := store.DB().Exec(
+		`UPDATE sessions
+		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = ?
+		 WHERE status = ? AND sync_state = ?`,
+		storage.SyncStateSynced,
+		storage.SyncSynced,
+		"gc-test-folder",
+		storage.SessionEnded,
+		storage.SyncStatePending,
+	); err != nil {
+		t.Fatalf("mark fixtures synced: %v", err)
+	}
+	if config.Drive == nil {
 		config.Drive = &driveFolders{}
 	}
 	var deleted []string
@@ -470,17 +479,16 @@ func TestGCDiskPressureCountsOnlyRemovableAudio(t *testing.T) {
 	expectKept(t, crashed)
 }
 
-// Round-3 review, blocking finding 1: audio disk pressure may not remove
-// (a recording whose Drive sync failed for good, while sync gates GC, or a
-// discarded session's) does not count against the budget, so it cannot make
-// GC remove the healthy sessions' audio, let alone their rows.
+// Round-3 review, blocking finding 1: audio disk pressure may not remove a
+// recording whose Drive sync failed for good, or a discarded session's audio.
+// That audio does not count against the budget, so it cannot make GC remove
+// the healthy sessions' audio, let alone their rows.
 func TestGCDiskPressureNeverCountsAudioItMayNotRemove(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		syncGated bool
-		hold      func(t *testing.T, store *storage.SQLiteStore, id string)
+		name string
+		hold func(t *testing.T, store *storage.SQLiteStore, id string)
 	}{
-		{name: "Drive sync failed for good", syncGated: true, hold: func(t *testing.T, store *storage.SQLiteStore, id string) {
+		{name: "Drive sync failed for good", hold: func(t *testing.T, store *storage.SQLiteStore, id string) {
 			syncTo(t, store, id, storage.SyncStateFailed, "", 0, "")
 		}},
 		{name: "discarded sessions", hold: func(t *testing.T, store *storage.SQLiteStore, id string) {
@@ -504,7 +512,7 @@ func TestGCDiskPressureNeverCountsAudioItMayNotRemove(t *testing.T) {
 				syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
 			}
 
-			if deleted := runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, SyncGated: tc.syncGated, AudioDir: dir}, 3); len(deleted) != 0 {
+			if deleted := runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir}, 3); len(deleted) != 0 {
 				t.Errorf("disk pressure deleted sessions %v", deleted)
 			}
 			expectEveryRowAndTranscript(t, store, "20261106100000", "20261106100500", "20261106101000", "20261106102000", "20261106103000")
@@ -621,9 +629,10 @@ func TestGCNeverRemovesARawRecordingThatIsTheOnlyCopy(t *testing.T) {
 		if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = 'completed' WHERE id = ?`, "20261001120000"); err != nil {
 			t.Fatalf("mark summarized: %v", err)
 		}
+		syncTo(t, store, "20261001120000", storage.SyncStateSynced, "folder", 0, "")
 		raw := writeRaw(t, dir, "20261001120000", 1024, daysAgo(40))
 
-		deleted, err := New(store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1024, AudioDir: dir}).Run()
+		deleted, err := New(store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1024, AudioDir: dir, Drive: &driveFolders{}}).Run()
 		if err != nil {
 			t.Fatalf("gc run: %v", err)
 		}
@@ -681,12 +690,12 @@ func TestGCAgeLimitNeverWraps(t *testing.T) {
 		return store
 	}
 	// The age policy runs: a 3,000-day limit deletes the ten-year-old session.
-	if deleted := runGC(t, setup(t), Config{MaxAgeDays: 3000, SyncGated: true}, 1); !slices.Equal(deleted, []string{old}) {
+	if deleted := runGC(t, setup(t), Config{MaxAgeDays: 3000}, 1); !slices.Equal(deleted, []string{old}) {
 		t.Fatalf("a 3000-day limit deleted %v, want [%s]", deleted, old)
 	}
 	for _, days := range []int{106751, 106752, 999999, 1000000, math.MaxInt} {
 		store := setup(t)
-		if deleted := runGC(t, store, Config{MaxAgeDays: days, SyncGated: true}, 1); len(deleted) != 0 {
+		if deleted := runGC(t, store, Config{MaxAgeDays: days}, 1); len(deleted) != 0 {
 			t.Errorf("gc_max_age_days %d deleted %v; no session is that old", days, deleted)
 		}
 		expectEveryRowAndTranscript(t, store, recent, old)
@@ -699,7 +708,7 @@ func TestGCNoAgeLimitDeletesNothing(t *testing.T) {
 	store := newStore(t)
 	summarized(t, store, "20161106090000", daysAgo(3650))
 
-	if deleted := runGC(t, store, Config{MaxAgeDays: 0, SyncGated: true}, 1); len(deleted) != 0 {
+	if deleted := runGC(t, store, Config{MaxAgeDays: 0}, 1); len(deleted) != 0 {
 		t.Errorf("no age limit deleted %v", deleted)
 	}
 	expectEveryRowAndTranscript(t, store, "20161106090000")
@@ -748,7 +757,7 @@ func TestGCNoAudioBudgetRemovesNothing(t *testing.T) {
 // fail, as a locked or full database's do.
 type markFailsStore struct{ *storage.SQLiteStore }
 
-func (markFailsStore) MarkAudioRemoved(string, string, string, bool, bool, time.Time) (storage.AudioRemoval, bool, error) {
+func (markFailsStore) MarkAudioRemoved(string, string, string, bool, time.Time) (storage.AudioRemoval, bool, error) {
 	return storage.AudioRemoval{}, false, errors.New("database is locked")
 }
 
@@ -819,7 +828,7 @@ func TestGCNeverRemovesAFileAnotherSessionNames(t *testing.T) {
 			}
 			syncTo(t, store, "20261106101000", other, "folder", 0, "")
 
-			runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir}, 2)
+			runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir}, 2)
 			expectAudioKept(t, store, "20261106100000", saved)
 			expectAudioKept(t, store, "20261106101000", saved)
 		})
@@ -938,10 +947,11 @@ func TestGCSaysWhatIsLeftOfAPartlyRemovedRecording(t *testing.T) {
 	if err := store.EndSession(id, time.Now().UTC(), gone+","+stuck); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
+	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
 	readOnly(t, stuckDir)
 
 	var logs bytes.Buffer
-	if _, err := New(store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir}, slog.New(slog.NewJSONHandler(&logs, nil))).Run(); err != nil {
+	if _, err := New(store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir, Drive: &driveFolders{}}, slog.New(slog.NewJSONHandler(&logs, nil))).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 
@@ -979,8 +989,8 @@ type refinementStartsStore struct {
 	id string
 }
 
-func (s refinementStartsStore) Recordings(syncGated bool) ([]storage.SessionRecording, error) {
-	recordings, err := s.SQLiteStore.Recordings(syncGated)
+func (s refinementStartsStore) Recordings() ([]storage.SessionRecording, error) {
+	recordings, err := s.SQLiteStore.Recordings()
 	if err == nil {
 		err = s.UpdateRefinement(s.id, "", storage.RefinementRunning)
 	}
@@ -996,8 +1006,9 @@ func TestGCRemovesNoFileARefinementIsReading(t *testing.T) {
 	store := newStore(t)
 	const id = "20261106100000"
 	saved := endWithRecording(t, store, dir, id, time.Now().UTC().Add(-time.Hour), 2*1024*1024)
+	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
 
-	if _, err := New(refinementStartsStore{store, id}, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir}).Run(); err != nil {
+	if _, err := New(refinementStartsStore{store, id}, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir, Drive: &driveFolders{}}).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	expectAudioKept(t, store, id, saved)
@@ -1063,7 +1074,7 @@ func TestGCKeepsSessionsJustRestoredFromDrive(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 
-	if deleted := runGC(t, store, Config{MaxAgeDays: 30, SyncGated: true}, 1); len(deleted) != 0 {
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30}, 1); len(deleted) != 0 {
 		t.Errorf("the pass after a restore deleted %v", deleted)
 	}
 	expectEveryRowAndTranscript(t, store, id)
@@ -1120,8 +1131,9 @@ func TestGCAgeKeepsARecordingMergedAwayMeanwhile(t *testing.T) {
 	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
+	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
 
-	if _, err := New(mergedMeanwhileStore{store, id, merged}, Config{MaxAgeDays: 30, AudioDir: dir}).Run(); err != nil {
+	if _, err := New(mergedMeanwhileStore{store, id, merged}, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	expectKept(t, saved)
@@ -1140,9 +1152,11 @@ func TestGCLogsARawCopyItRemovesAndNoNilError(t *testing.T) {
 	writeRaw(t, dir, "20261106100000", 1024*1024, started)
 	endWithRecording(t, store, dir, "20261106101000", started.Add(10*time.Minute), 1024*1024)
 	raw := writeRaw(t, dir, "20261106101000", 2*1024*1024, started)
+	syncTo(t, store, "20261106100000", storage.SyncStateSynced, "folder-1", 0, "")
+	syncTo(t, store, "20261106101000", storage.SyncStateSynced, "folder-2", 0, "")
 
 	var logs bytes.Buffer
-	if _, err := New(store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 2, AudioDir: dir}, slog.New(slog.NewJSONHandler(&logs, nil))).Run(); err != nil {
+	if _, err := New(store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 2, AudioDir: dir, Drive: &driveFolders{}}, slog.New(slog.NewJSONHandler(&logs, nil))).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	expectRemoved(t, raw)
@@ -1163,7 +1177,7 @@ func TestGCLogsARawCopyItRemovesAndNoNilError(t *testing.T) {
 // recordingsFailStore is the real store whose listing of recordings fails.
 type recordingsFailStore struct{ *storage.SQLiteStore }
 
-func (recordingsFailStore) Recordings(bool) ([]storage.SessionRecording, error) {
+func (recordingsFailStore) Recordings() ([]storage.SessionRecording, error) {
 	return nil, errors.New("database is locked")
 }
 
@@ -1178,8 +1192,10 @@ func TestGCChangesNothingWhenItCannotListRecordings(t *testing.T) {
 		t.Fatalf("summarize: %v", err)
 	}
 	healthy := endWithRecording(t, store, dir, "20261106100000", time.Now().UTC().Add(-time.Hour), 2*1024*1024)
+	syncTo(t, store, "20261001120000", storage.SyncStateSynced, "folder-1", 0, "")
+	syncTo(t, store, "20261106100000", storage.SyncStateSynced, "folder-2", 0, "")
 
-	deleted, err := New(recordingsFailStore{store}, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir}).Run()
+	deleted, err := New(recordingsFailStore{store}, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir, Drive: &driveFolders{}}).Run()
 	if err == nil || len(deleted) != 0 {
 		t.Errorf("Run = %v, %v; want an error and nothing deleted", deleted, err)
 	}

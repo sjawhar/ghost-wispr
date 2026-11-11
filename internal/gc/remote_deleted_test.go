@@ -20,16 +20,17 @@ func remoteDeleted(t *testing.T, store *storage.SQLiteStore, id string) {
 
 // A session whose Drive folder is in the trash or gone has its only lasting
 // copy on the device (Drive empties its trash after 30 days): no GC path
-// deletes it or removes its audio, sync gate or not.
+// deletes it or removes its audio.
 func TestGCNeverDeletesASessionWhoseDriveFolderIsGone(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		config Config
+		name    string
+		config  Config
+		syncOff bool
 	}{
-		{"age policy, sync off", Config{MaxAgeDays: 30}},
-		{"audio budget, sync off", Config{MaxAudioSizeMB: 1}},
-		{"age policy, sync on", Config{MaxAgeDays: 30, SyncGated: true}},
-		{"audio budget, sync on", Config{MaxAudioSizeMB: 1, SyncGated: true}},
+		{"age policy, sync off", Config{MaxAgeDays: 30}, true},
+		{"audio budget, sync off", Config{MaxAudioSizeMB: 1}, true},
+		{"age policy, sync on", Config{MaxAgeDays: 30}, false},
+		{"audio budget, sync on", Config{MaxAudioSizeMB: 1}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newStore(t)
@@ -39,7 +40,12 @@ func TestGCNeverDeletesASessionWhoseDriveFolderIsGone(t *testing.T) {
 			remoteDeleted(t, store, id)
 
 			tc.config.AudioDir = dir
-			deleted := runGC(t, store, tc.config, 2)
+			var deleted []string
+			if tc.syncOff {
+				deleted = runGCWithSyncOff(t, store, tc.config, 2)
+			} else {
+				deleted = runGC(t, store, tc.config, 2)
+			}
 
 			if len(deleted) != 0 {
 				t.Errorf("GC deleted %v", deleted)
@@ -50,10 +56,31 @@ func TestGCNeverDeletesASessionWhoseDriveFolderIsGone(t *testing.T) {
 	}
 }
 
-// A sync-gated pass that cannot check Drive deletes nothing and removes no
-// audio, and says why (Held): no syncer runs, or Drive does not answer, which
-// stops the whole pass at the first session it asks about.
-func TestASyncGatedPassThatCannotCheckDriveHoldsBack(t *testing.T) {
+// runGCWithSyncOff runs passes as the app does with Drive sync off: no Drive
+// to ask, so every pass must hold with ErrDriveSyncOff.
+func runGCWithSyncOff(t *testing.T, store *storage.SQLiteStore, config Config, passes int) []string {
+	t.Helper()
+	config.Drive = nil
+	config.HoldReason = ErrDriveSyncOff
+	var deleted []string
+	for range passes {
+		collector := New(store, config)
+		ids, err := collector.Run()
+		if err != nil {
+			t.Fatalf("gc run: %v", err)
+		}
+		if !errors.Is(collector.Held(), ErrDriveSyncOff) {
+			t.Errorf("sync-off pass held %v, want %v", collector.Held(), ErrDriveSyncOff)
+		}
+		deleted = append(deleted, ids...)
+	}
+	return deleted
+}
+
+// A GC pass that cannot check Drive deletes nothing and removes no audio, and
+// says why (Held): no syncer runs, or Drive does not answer, which stops the
+// whole pass at the first session it asks about.
+func TestAGCPassThatCannotCheckDriveHoldsBack(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		drive *driveFolders
@@ -74,7 +101,7 @@ func TestASyncGatedPassThatCannotCheckDriveHoldsBack(t *testing.T) {
 				}
 				syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")
 			}
-			config := Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir}
+			config := Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir}
 			if tc.drive != nil {
 				config.Drive = tc.drive
 			}
@@ -116,7 +143,7 @@ func TestAKeptSessionsAudioStopsCountingAgainstTheBudget(t *testing.T) {
 	}
 	drive := &driveFolders{gone: map[string]bool{"folder-" + gone: true}}
 
-	runGC(t, store, Config{MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir, Drive: drive}, 1)
+	runGC(t, store, Config{MaxAudioSizeMB: 1, AudioDir: dir, Drive: drive}, 1)
 
 	expectAudioKept(t, store, gone, goneSaved)
 	expectAudioKept(t, store, present, presentSaved)
@@ -135,7 +162,7 @@ func TestGCKeepsASyncedSessionWithNoDriveFolder(t *testing.T) {
 	syncTo(t, store, id, storage.SyncStateSynced, "", 0, "")
 	drive := &driveFolders{}
 
-	if deleted := runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir, Drive: drive}, 1); len(deleted) != 0 {
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir, Drive: drive}, 1); len(deleted) != 0 {
 		t.Errorf("GC deleted %v", deleted)
 	}
 	expectAudioKept(t, store, id, saved)
@@ -145,20 +172,19 @@ func TestGCKeepsASyncedSessionWithNoDriveFolder(t *testing.T) {
 }
 
 // A session synced by an earlier version, its documents unverified on Drive,
-// is never deleted for its age. Its audio is on Drive: under the sync gate
-// the audio budget removes it once Drive answers that the folder is there,
-// and keeps it when the folder is in the trash or gone; with sync off there
-// is no Drive to ask, so it is kept.
+// is never deleted for its age. Its audio is on Drive: the audio budget
+// removes it once Drive answers that the folder is there, and keeps it when
+// the folder is in the trash or gone.
 func TestAnUnverifiedSessionsAudioGoesOnlyOnceDriveHasItsFolder(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		gated   bool
 		gone    bool
+		syncOff bool
 		removed bool
 	}{
-		{"sync on and folder on Drive", true, false, true},
-		{"sync on and folder gone", true, true, false},
-		{"sync off", false, false, false},
+		{"folder on Drive", false, false, true},
+		{"folder gone", true, false, false},
+		{"sync off", false, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newStore(t)
@@ -172,12 +198,20 @@ func TestAnUnverifiedSessionsAudioGoesOnlyOnceDriveHasItsFolder(t *testing.T) {
 			if _, err := store.DB().Exec(`UPDATE sessions SET documents_unverified = 1 WHERE id = ?`, id); err != nil {
 				t.Fatalf("mark unverified: %v", err)
 			}
-			config := Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, SyncGated: tc.gated, AudioDir: dir}
-			if tc.gated {
-				config.Drive = &driveFolders{gone: map[string]bool{"folder-" + id: tc.gone}}
+			config := Config{
+				MaxAgeDays:     30,
+				MaxAudioSizeMB: 1,
+				AudioDir:       dir,
+				Drive:          &driveFolders{gone: map[string]bool{"folder-" + id: tc.gone}},
 			}
 
-			if deleted := runGC(t, store, config, 1); len(deleted) != 0 {
+			var deleted []string
+			if tc.syncOff {
+				deleted = runGCWithSyncOff(t, store, config, 1)
+			} else {
+				deleted = runGC(t, store, config, 1)
+			}
+			if len(deleted) != 0 {
 				t.Errorf("GC deleted %v: the documents are unverified", deleted)
 			}
 			expectEveryRowAndTranscript(t, store, id)

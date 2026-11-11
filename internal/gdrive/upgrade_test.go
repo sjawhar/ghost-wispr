@@ -2,6 +2,7 @@ package gdrive
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -51,8 +52,8 @@ func openCopy(t *testing.T, src string) (*storage.SQLiteStore, string) {
 	return store, path
 }
 
-func ageGC(store *storage.SQLiteStore, syncGated bool) *gc.Collector {
-	return gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: syncGated, Drive: allFoldersOnDrive{}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+func ageGC(store *storage.SQLiteStore) *gc.Collector {
+	return gc.New(store, gc.Config{MaxAgeDays: 30, Drive: allFoldersOnDrive{}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // allFoldersOnDrive is a Drive that has every session folder, so what these
@@ -75,7 +76,7 @@ func (allFoldersOnDrive) RecordingsMatch(context.Context, string, map[string]str
 func TestTheAgePolicyKeepsSessionsSyncedBeforeTheUpgrade(t *testing.T) {
 	store, _ := openCopy(t, mainEraDB)
 
-	deleted, err := ageGC(store, true).Run()
+	deleted, err := ageGC(store).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
@@ -96,13 +97,20 @@ func TestTheAgePolicyKeepsSessionsSyncedBeforeTheUpgrade(t *testing.T) {
 		t.Errorf("20260901100000 after GC: summary %q, transcript %q; want the text only the device has", sess.Summary, sess.CanonicalTranscript)
 	}
 
-	// With sync off, the age policy deletes what was never synced, as
-	// before, and still none of the sessions it cannot know Drive has.
-	if deleted, err = ageGC(store, false).Run(); err != nil {
+	// With sync off there is no Drive to confirm any copy, so the age policy
+	// now deletes nothing, the never-synced 20260901130000 included (the old
+	// ungated pass deleted it).
+	syncOff := gc.New(store, gc.Config{MaxAgeDays: 30, HoldReason: gc.ErrDriveSyncOff}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if deleted, err = syncOff.Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
-	if !slices.Equal(deleted, []string{"20260901130000"}) {
-		t.Errorf("ungated age GC deleted %v, want only the never-synced 20260901130000", deleted)
+	if len(deleted) != 0 || !errors.Is(syncOff.Held(), gc.ErrDriveSyncOff) {
+		t.Errorf("sync-off age GC deleted %v and held %v; want nothing deleted, held by %v", deleted, syncOff.Held(), gc.ErrDriveSyncOff)
+	}
+	for _, id := range append(slices.Clone(mainEraSynced), "20260901130000") {
+		if _, err := store.GetSession(id); err != nil {
+			t.Errorf("%s after sync-off GC: %v", id, err)
+		}
 	}
 }
 
@@ -136,7 +144,7 @@ func TestASessionSyncedAfterTheUpgradeIsVerified(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	deleted, err := ageGC(store, true).Run()
+	deleted, err := ageGC(store).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}

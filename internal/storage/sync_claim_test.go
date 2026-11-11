@@ -164,20 +164,23 @@ func TestRecoverInterruptedSyncs(t *testing.T) {
 	}
 }
 
-// Under a sync gate, the age policy deletes a session only while it is
-// synced, so a change after GC listed it (which sends it back to sync) keeps
-// it.
-func TestDeleteEndedSessionGatedOnSync(t *testing.T) {
+// The age policy deletes a session only while it is synced, so a change after
+// GC listed it (which sends it back to sync) keeps it.
+func TestDeleteEndedSessionRequiresSync(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	const id = "20261106140000"
 	syncedWith(t, store, id, "The first summary.", "folder-1")
 	if err := store.UpdateTitle(id, "Planning"); err != nil {
 		t.Fatalf("UpdateTitle: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession(id, "/audio/"+id+".mp3", true); err != nil || deleted {
-		t.Errorf("gated DeleteEndedSession of a session waiting to sync = %v, %v; want kept", deleted, err)
+	if deleted, err := store.DeleteEndedSession(id, "/audio/"+id+".mp3"); err != nil || deleted {
+		t.Errorf("DeleteEndedSession of a session waiting to sync = %v, %v; want kept", deleted, err)
 	}
-	if deleted, err := store.DeleteEndedSession(id, "/audio/"+id+".mp3", false); err != nil || !deleted {
-		t.Errorf("ungated DeleteEndedSession = %v, %v; want deleted", deleted, err)
+	syncTo(t, store, id, SyncStateSynced, "folder-1", 0, "")
+	if deleted, err := store.DeleteEndedSession(id, "/audio/"+id+".mp3"); err != nil || !deleted {
+		t.Fatalf("DeleteEndedSession after sync = %v, %v; want deleted", deleted, err)
+	}
+	if _, err := store.GetSession(id); err == nil {
+		t.Error("session remains after a synced age-policy delete")
 	}
 }

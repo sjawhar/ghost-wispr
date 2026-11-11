@@ -203,12 +203,12 @@ the stale Tailscale device and provision again.
 ## Enable models and Drive sync
 
 Run the models step after the shared drive exists and its members are added. It takes the
-shared-drive ID and rejects an absent or malformed one. It renders
-`deploy/pi/files/ghost-wispr.yaml` with that ID, `gdrive_sync_enabled: true` and
-`gc_enabled: true`, keeps the deployed `envoy_webhook_url`, installs the result over
-`/opt/ghost-wispr/ghost-wispr.yaml`, and restarts Ghost Wispr. The credential files from
-the full provisioner stay as they are. A later full-provisioner run keeps the drive ID and
-both enablements.
+shared-drive ID and rejects an absent or malformed one. It replaces settings saved in the UI
+with `deploy/pi/files/ghost-wispr.yaml` rendered with that ID,
+`gdrive_sync_enabled: true` and `gc_enabled: true`, keeps the deployed
+`envoy_webhook_url`, installs the result over `/opt/ghost-wispr/ghost-wispr.yaml`, and
+restarts Ghost Wispr. The credential files from the full provisioner stay as they are. A later
+full-provisioner run keeps the drive ID and both enablements.
 
 ```bash
 (
@@ -332,6 +332,11 @@ GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
 GHOST_WISPR_ADDR=127.0.0.1:8081 \
 /opt/ghost-wispr/ghost-wispr
 ```
+
+`seed-paused-state` resolves the config and its `db_path` exactly as the recorder does
+(`GHOST_WISPR_CONFIG`, else `ghost-wispr.yaml` in the working directory; a relative `db_path`
+against the working directory) and prints the absolute database path it wrote. Check that the
+path is the copy's database, not the production one under `/opt/ghost-wispr`.
 
 Then run the driver with `--cert-test`. Without that flag, the row prints `NEEDS-PERSON`.
 

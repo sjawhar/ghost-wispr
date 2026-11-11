@@ -70,29 +70,42 @@ func TestMarkRemoteDeletedOnlyMarksASessionStillSyncedInThatFolder(t *testing.T)
 	})
 }
 
-// The age policy lists no session whose Drive folder is in the trash or gone,
-// sync gate or not.
+// The age policy lists no session whose Drive folder is in the trash or gone.
 func TestGetGCEligibleSessionsSkipsARemoteDeletedSession(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	const id = "20261106090000"
 	syncedSessionInFolder(t, store, id)
-	if _, err := store.DB().Exec(`UPDATE sessions SET documents_unverified = 1 WHERE id = ?`, id); err != nil {
-		t.Fatalf("mark unverified: %v", err)
-	}
 	if _, err := store.MarkRemoteDeleted(id, "folder-1", "the folder is in the trash"); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
-	// Never synced again, it is not counted as waiting for a re-check.
-	if n, err := store.CountUnverifiedSessions(); err != nil || n != 0 {
-		t.Errorf("CountUnverifiedSessions = %d, %v; want 0", n, err)
+	// MarkRemoteDeleted also sets sync_status failed. Restore it so the
+	// REMOTE_DELETED condition itself keeps the session from age-based GC.
+	if _, err := store.DB().Exec(`UPDATE sessions SET sync_status = ? WHERE id = ?`, SyncSynced, id); err != nil {
+		t.Fatalf("restore synced status: %v", err)
 	}
-	for _, gated := range []bool{false, true} {
-		ids, err := store.GetGCEligibleSessions(30, gated)
-		if err != nil {
-			t.Fatalf("eligible: %v", err)
-		}
-		if len(ids) != 0 {
-			t.Errorf("sync gate %v: eligible %v, want none", gated, ids)
-		}
+	ids, err := store.GetGCEligibleSessions(30)
+	if err != nil {
+		t.Fatalf("eligible: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("eligible %v, want none", ids)
+	}
+}
+
+func TestCountUnverifiedSessionsSkipsARemoteDeletedSession(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	const id = "20261106090100"
+	syncedSessionInFolder(t, store, id)
+	if _, err := store.DB().Exec(`UPDATE sessions SET documents_unverified = 1 WHERE id = ?`, id); err != nil {
+		t.Fatalf("mark unverified: %v", err)
+	}
+	if n, err := store.CountUnverifiedSessions(); err != nil || n != 1 {
+		t.Fatalf("CountUnverifiedSessions before remote deletion = %d, %v; want 1", n, err)
+	}
+	if _, err := store.MarkRemoteDeleted(id, "folder-1", "the folder is in the trash"); err != nil {
+		t.Fatalf("mark remote deleted: %v", err)
+	}
+	if n, err := store.CountUnverifiedSessions(); err != nil || n != 0 {
+		t.Errorf("CountUnverifiedSessions after remote deletion = %d, %v; want 0", n, err)
 	}
 }

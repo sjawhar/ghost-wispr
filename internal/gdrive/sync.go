@@ -22,6 +22,7 @@ import (
 	"google.golang.org/api/option"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -80,11 +81,6 @@ func renderDocuments(s *SyncSession, segments []transcribe.Segment) (summary, tr
 	return summary, RenderTranscriptMarkdown(s, segments)
 }
 
-// RecordingFileName is the stable Drive name for one saved recording.
-func RecordingFileName(recording string) string {
-	return "audio-" + filepath.Base(recording)
-}
-
 func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
 	date := sess.StartedAt.UTC().Format("2006-01-02")
 	slug := slugify(sess.Title)
@@ -124,7 +120,7 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		if ext == ".wav" {
 			mimeType = "audio/wav"
 		}
-		name := RecordingFileName(recording)
+		name := recordingname.FileName(recording)
 		files = append(files, SyncFile{
 			Name:        name,
 			MimeType:    mimeType,

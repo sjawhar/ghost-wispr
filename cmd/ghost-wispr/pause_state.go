@@ -3,9 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
-	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -32,21 +32,30 @@ func restorePause(store pauseStore, gate interface{ Pause() }) (bool, error) {
 }
 
 // seedPausedState writes the durable pause before a test instance starts, so
-// its microphone never starts without a recording light.
-func seedPausedState(configPath string) error {
-	cfg, _, err := config.Load(configPath)
+// its microphone never starts without a recording light. It resolves the
+// configuration and database exactly as the recorder does, prints the
+// absolute database path it wrote, and returns that path.
+func seedPausedState(configPath string, out io.Writer) (string, error) {
+	cfgStore, _, err := loadRuntimeConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return "", fmt.Errorf("load config: %w", err)
 	}
-	store, err := storage.NewSQLiteStore(cfg.DBPath)
+	dbPath, err := databasePath(cfgStore.Get().DBPath)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return "", err
+	}
+	store, err := storage.NewSQLiteStore(dbPath)
+	if err != nil {
+		return "", fmt.Errorf("open database: %w", err)
 	}
 	defer func() { _ = store.Close() }()
 	if err := store.SetAppState(storage.AppStateCapturePaused, "1"); err != nil {
-		return fmt.Errorf("set capture pause: %w", err)
+		return "", fmt.Errorf("set capture pause: %w", err)
 	}
-	return nil
+	if _, err := fmt.Fprintf(out, "seed-paused-state: capture pause written to %s\n", dbPath); err != nil {
+		return "", fmt.Errorf("report database path: %w", err)
+	}
+	return dbPath, nil
 }
 
 // persistentControls serializes pause and resume state transitions with the

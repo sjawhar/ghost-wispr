@@ -1754,25 +1754,24 @@ func ageCutoff(now time.Time, maxAgeDays int) (time.Time, bool) {
 }
 
 // GetGCEligibleSessions returns the sessions age-based GC deletes, oldest
-// first: ended, with a completed summary, synced if syncGated, with documents
-// not marked unverified on Drive (documents_unverified), never one whose
-// Drive folder is in the trash or gone (REMOTE_DELETED), and older than
-// maxAgeDays days. A session's age runs from when it started or, if it was
-// restored from Drive, from its restore, so the pass after a restore keeps
-// it. maxAgeDays <= 0 is no age limit: it returns none.
-func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+// first: ended, with a completed summary, synced, with documents not marked
+// unverified on Drive (documents_unverified), never one whose Drive folder is
+// in the trash or gone (REMOTE_DELETED), and older than maxAgeDays days. A
+// session's age runs from when it started or, if it was restored from Drive,
+// from its restore, so the pass after a restore keeps it. maxAgeDays <= 0 is
+// no age limit: it returns none.
+func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int) ([]string, error) {
 	cutoff, ok := ageCutoff(time.Now().UTC(), maxAgeDays)
 	if !ok {
 		return nil, nil
 	}
 	at := cutoff.Format(time.RFC3339Nano)
 	// restored_at is '' for a session recorded here, which is before any time.
-	cond, args := removable(syncGated)
 	// A session whose documents are unverified on Drive is never deleted.
-	query := `SELECT id FROM sessions WHERE summary_status = 'completed' AND started_at < ? AND restored_at < ? AND documents_unverified = 0 AND ` + cond +
-		` ORDER BY started_at ASC`
-
-	rows, err := s.db.Query(query, append([]any{at, at}, args...)...)
+	rows, err := s.db.Query(
+		`SELECT id FROM sessions WHERE summary_status = 'completed' AND started_at < ? AND restored_at < ? AND documents_unverified = 0 AND `+removableCondition+` ORDER BY started_at ASC`,
+		at, at,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible sessions: %w", err)
 	}
@@ -1801,26 +1800,18 @@ type SessionRecording struct {
 	Removable bool
 }
 
-// removable is the condition under which GC may remove a session's recording
-// (disk pressure) or the session with it (the age policy, which also needs
-// documents_unverified = 0), and its arguments: the session ended, no
-// refinement is reading the file, its Drive folder is not in the trash or
-// gone (REMOTE_DELETED: the device then holds its only lasting copy, sync
-// gate or not), and, when syncGated, it is synced. A session whose documents
-// are unverified on Drive (documents_unverified: synced by an earlier
-// version) has its audio on Drive: under the sync gate GC removes it once
-// Drive answers that the session's folder is there; with no sync gate there
-// is no Drive to ask, so it is kept. Any other sync state, a failure
-// included, keeps the recording.
-func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?`
-	if syncGated {
-		cond += ` AND sync_status = ?`
-		return cond, []any{RefinementRunning, SyncStateRemoteDeleted, SyncSynced}
-	}
-	cond += ` AND documents_unverified = 0`
-	return cond, []any{RefinementRunning, SyncStateRemoteDeleted}
-}
+// removableCondition identifies a session whose recording GC may remove under
+// disk pressure or with the session under the age policy (which also requires
+// documents_unverified = 0): it ended, no refinement is reading the file, its
+// Drive folder is not in the trash or gone (REMOTE_DELETED: the device then
+// holds its only lasting copy), and it is synced. A session whose documents
+// are unverified on Drive (synced by an earlier version) has its audio on
+// Drive: GC removes it once Drive answers that the session's folder is there.
+// Any other sync state, a failure included, keeps the recording.
+const removableCondition = `status = 'ended'` +
+	` AND refinement_status != '` + RefinementRunning + `'` +
+	` AND sync_state != '` + SyncStateRemoteDeleted + `'` +
+	` AND sync_status = '` + SyncSynced + `'`
 
 // CountUnverifiedSessions returns how many sessions GC keeps until a sync
 // verifies their documents on Drive (documents_unverified), for the status
@@ -1836,11 +1827,9 @@ func (s *SQLiteStore) CountUnverifiedSessions() (int, error) {
 }
 
 // Recordings lists, oldest first, every session that names audio, and whether
-// disk pressure may remove its recording (see removable).
-func (s *SQLiteStore) Recordings(syncGated bool) ([]SessionRecording, error) {
-	cond, args := removable(syncGated)
-	rows, err := s.db.Query(`SELECT id, audio_path, (`+cond+`) FROM sessions
-		WHERE audio_path != '' ORDER BY started_at ASC`, args...)
+// disk pressure may remove its recording (see removableCondition).
+func (s *SQLiteStore) Recordings() ([]SessionRecording, error) {
+	rows, err := s.db.Query(`SELECT id, audio_path, (` + removableCondition + `) FROM sessions WHERE audio_path != '' ORDER BY started_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query recordings: %w", err)
 	}
@@ -1861,28 +1850,26 @@ func (s *SQLiteStore) Recordings(syncGated bool) ([]SessionRecording, error) {
 }
 
 // AudioRemoval is what MarkAudioRemoved changed in a session's row: its audio
-// path before and after, and its marker, refinement status and sync state
-// before, so RestoreAudio can put back the part whose files stayed on disk.
+// path before and after, and its marker and refinement status before, so
+// RestoreAudio can put back the part whose files stayed on disk.
 type AudioRemoval struct {
 	ID               string
 	Before, Left     string
 	RemovedAtBefore  string
 	RefinementBefore string
-	SyncStateBefore  string
 }
 
 // MarkAudioRemoved records that disk pressure is about to remove part or all
 // of session id's audio, before it removes any file, so the session never
 // names a file GC has removed. The audio path becomes left, what will be left
-// of before; the marker the UI shows is set to removedAt; and a refinement
-// that can no longer run (pending or failed) becomes no_audio when no
-// recording is left on disk (audioLeft false; left may still name a file GC
-// could not see, on a disk not mounted for the moment). It does this only
-// while the session's audio path is still before and disk pressure may still
-// remove it (see removable), so a refinement that started reading the file
-// since GC listed it keeps it. It reports whether it did, and returns the row
-// as it was, for RestoreAudio.
-func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncGated bool, removedAt time.Time) (AudioRemoval, bool, error) {
+// of before; the marker the UI shows is set to removedAt; and a pending or
+// failed refinement becomes no_audio when no recording is left on disk
+// (audioLeft false; left may still name a file GC could not see, on a disk not
+// mounted for the moment). It does this only while the session's audio path is
+// still before and disk pressure may still remove it (see removableCondition),
+// so a refinement that started reading the file since GC listed it keeps it.
+// It reports whether it did, and returns the row as it was, for RestoreAudio.
+func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft bool, removedAt time.Time) (AudioRemoval, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return AudioRemoval{}, false, fmt.Errorf("begin marking audio removed for session %s: %w", id, err)
@@ -1890,9 +1877,10 @@ func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncG
 	defer func() { _ = tx.Rollback() }()
 
 	removal := AudioRemoval{ID: id, Before: before, Left: left}
-	cond, args := removable(syncGated)
-	err = tx.QueryRow(`SELECT audio_removed_at, refinement_status, sync_state FROM sessions WHERE id = ? AND audio_path = ? AND `+cond,
-		append([]any{id, before}, args...)...).Scan(&removal.RemovedAtBefore, &removal.RefinementBefore, &removal.SyncStateBefore)
+	err = tx.QueryRow(
+		`SELECT audio_removed_at, refinement_status FROM sessions WHERE id = ? AND audio_path = ? AND `+removableCondition,
+		id, before,
+	).Scan(&removal.RemovedAtBefore, &removal.RefinementBefore)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AudioRemoval{}, false, nil
 	}
@@ -1919,23 +1907,25 @@ func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncG
 // after all: the session's audio path becomes restored, what is still on disk
 // of removal.Before. With all of it back, the marker and refinement status
 // are as they were before the mark; with part of it, the marker stays and a
-// refinement the mark moved to no_audio goes back. A sync that finished
-// since the mark uploaded the row as marked, so the recordings put back may
-// not be on Drive: the session goes back to pending sync, keeping its folder.
-// It refuses a row whose audio path is no longer what the mark left.
+// refinement the mark moved to no_audio goes back. A sync may have finished
+// since the mark and uploaded the row as marked, so the recordings put back
+// may not be on Drive: a synced session goes back to pending sync, keeping its
+// folder. GC marks only synced sessions, so the state before the mark cannot
+// tell whether a sync ran since. It refuses a row whose audio path is no
+// longer what the mark left.
 func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions SET audio_path = ?,
 			audio_removed_at = CASE WHEN ? = ? THEN ? ELSE audio_removed_at END,
 			refinement_status = CASE WHEN ? != '' AND refinement_status = ? THEN ? ELSE refinement_status END,
-			sync_status = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_status END,
-			sync_state = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_state END
+			sync_status = CASE WHEN sync_state = ? THEN ? ELSE sync_status END,
+			sync_state = CASE WHEN sync_state = ? THEN ? ELSE sync_state END
 		 WHERE id = ? AND audio_path = ? AND status = 'ended'`,
 		restored,
 		restored, removal.Before, removal.RemovedAtBefore,
 		restored, RefinementNoAudio, removal.RefinementBefore,
-		SyncStateSynced, removal.SyncStateBefore, SyncPending,
-		SyncStateSynced, removal.SyncStateBefore, SyncStatePending,
+		SyncStateSynced, SyncPending,
+		SyncStateSynced, SyncStatePending,
 		removal.ID, removal.Left,
 	)
 	if err != nil {
@@ -1967,17 +1957,18 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 }
 
 // DeleteEndedSession deletes session id for the age policy only while it is as
-// GC read it: ended, naming audioPath, with documents not marked unverified
-// on Drive, and, when syncGated, synced. It reports whether it did. A
-// session merged since GC read it gave its recording to the merged session,
-// so deleting it, and removing that recording with it, would leave the
-// merged session naming a file that is gone. One whose summary or transcript
-// changed since GC read it is waiting to sync them (see the
-// sessions_documents_changed trigger): until it does, the newest text is
-// only on the device.
-func (s *SQLiteStore) DeleteEndedSession(id, audioPath string, syncGated bool) (bool, error) {
-	cond, args := removable(syncGated)
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND documents_unverified = 0 AND `+cond, append([]any{id, audioPath}, args...)...)
+// GC read it: ended, synced, naming audioPath, with documents not marked
+// unverified on Drive. It reports whether it did. A session merged since GC
+// read it gave its recording to the merged session, so deleting it, and
+// removing that recording with it, would leave the merged session naming a
+// file that is gone. One whose summary or transcript changed since GC read it
+// is waiting to sync them (see the sessions_documents_changed trigger): until
+// it does, the newest text is only on the device.
+func (s *SQLiteStore) DeleteEndedSession(id, audioPath string) (bool, error) {
+	res, err := s.db.Exec(
+		`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND documents_unverified = 0 AND `+removableCondition,
+		id, audioPath,
+	)
 	if err != nil {
 		return false, fmt.Errorf("delete session %s: %w", id, err)
 	}

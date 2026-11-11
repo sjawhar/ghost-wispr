@@ -69,7 +69,6 @@ func TestGCRemovesRecordingsOnlyAfterDriveContentVerification(t *testing.T) {
 
 				config := policy.config
 				config.AudioDir = dir
-				config.SyncGated = true
 				config.Drive = &driveFolders{recordingChecksums: check.checksums}
 				deleted, err := New(store, config).Run()
 				if err != nil {

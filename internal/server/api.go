@@ -749,6 +749,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 			return
 		}
+		if controls.OnSessionDeleted != nil {
+			controls.OnSessionDeleted(sessionID)
+		}
 
 		// Clean up audio files after successful DB deletion.
 		if sessionData.AudioPath != "" {
@@ -803,6 +806,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("merge sessions: %v", err))
 			return
+		}
+		if controls.OnSessionsMerged != nil {
+			controls.OnSessionsMerged(body.SessionIDs)
 		}
 
 		if controls.OnSessionMerged != nil {
@@ -900,6 +906,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				continue
 			}
 			mergedIDs = append(mergedIDs, newID)
+			if controls.OnSessionsMerged != nil {
+				controls.OnSessionsMerged(group)
+			}
 			if controls.OnSessionMerged != nil {
 				go controls.OnSessionMerged(context.Background(), newID)
 			}

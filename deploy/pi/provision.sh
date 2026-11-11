@@ -45,8 +45,8 @@ render_base_config() {
   sed "s|__ENVOY_WEBHOOK_URL__|$escaped_relay_url|" "$template"
 }
 
-# render_models_config also syncs to the shared drive and turns GC on. GC goes on only with
-# sync, because an ungated GC removes local audio that Drive does not hold.
+# render_models_config also syncs to the shared drive and turns GC on. GC
+# removes audio only after Drive confirms a durable copy.
 render_models_config() {
   local template=$1 relay_url=$2 drive_id=$3
   valid_drive_id "$drive_id" || return 1
@@ -120,6 +120,7 @@ provision_models() {
   render_models_config "$CONFIG_TEMPLATE" "$relay_url" "$drive_id" >"$staging_dir/ghost-wispr.yaml" \
     || fail "could not render the models configuration from $CONFIG_TEMPLATE"
   render_models_env "$DEPLOY_DIR/.env" >"$staging_dir/env" || fail "could not read $DEPLOY_DIR/.env"
+  printf 'ghost-wispr provision: --models replaces settings saved in the UI with the approved models configuration.\n'
   sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 "$staging_dir/env" "$DEPLOY_DIR/.env"
   sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-wispr.yaml" "$DEPLOY_DIR/ghost-wispr.yaml"
   run_user_systemctl restart ghost-wispr.service

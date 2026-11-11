@@ -288,168 +288,6 @@ run_key_sweep_locally() {
   bash -s <<<"$(key_sweep_script "$1" "$1" '')"
 }
 
-# run_self_test runs in a subshell so that its EXIT trap removes the controls
-# even when fail exits.
-run_self_test() (
-  local controls_dir key_root nested_dev_key report good_config marshaled_config swapped_config
-  controls_dir=$(mktemp -d)
-  trap 'rm -rf -- "$controls_dir"' EXIT
-
-  key_root="$controls_dir/key-root"
-  mkdir -p "$key_root/nested/dev"
-  printf 'benign\n' >"$key_root/notes.txt"
-  printf 'ELF\000json:"private_key_id"\n' >"$key_root/binary-with-field-name"
-  report=$(run_key_sweep_locally "$key_root") || fail 'A9 self-test could not run the key sweep'
-  grep -Fqx "binary-field-name"$'\t'"$key_root/binary-with-field-name" <<<"$report" \
-    || fail 'A9 self-test sweep did not report the binary file that names a key field'
-  key_sweep_passes "$report" >/dev/null || fail 'A9 self-test rejected a tree whose only match is a binary field name'
-  nested_dev_key="$key_root/nested/dev/planted-key.json"
-  printf '{"type": "service_account", "private_key_id": "planted"}\n' >"$nested_dev_key"
-  report=$(run_key_sweep_locally "$key_root") || fail 'A9 self-test could not run the key sweep'
-  if key_sweep_passes "$report" >/dev/null 2>&1; then
-    fail 'A9 self-test accepted a service-account key below a nested dev directory'
-  fi
-  rm -- "$nested_dev_key"
-  {
-    printf 'PK\000{"type": "service_account", "private_key_id": "planted", "private_key": "--'
-    printf '%s\n' '---BEGIN PRIVATE KEY-----"}'
-  } >"$key_root/archive.bin"
-  report=$(run_key_sweep_locally "$key_root") || fail 'A9 self-test could not run the key sweep'
-  if key_sweep_passes "$report" >/dev/null 2>&1; then
-    fail 'A9 self-test accepted a key body inside binary data'
-  fi
-  if key_sweep_passes '' >/dev/null 2>&1; then
-    fail 'A9 self-test accepted a sweep that did not find its planted control'
-  fi
-  if key_sweep_passes $'grep-error\t2\ncontrol-found\t/tmp/control' >/dev/null 2>&1; then
-    fail 'A9 self-test accepted a sweep that grep could not finish'
-  fi
-  printf '%s\n' '{"type":"service_account","private_key_id":"planted"}' >"$controls_dir/service-account.json"
-  if assert_external_account_credential "$(<"$controls_dir/service-account.json")"; then
-    fail 'A9 self-test accepted a planted service-account credential'
-  fi
-  assert_external_account_credential '{"type":"external_account","credential_source":{"certificate":{"certificate_config_location":"/opt/ghost-wispr/certificate_config.json"}}}' \
-    || fail 'A9 self-test rejected a valid external-account credential'
-  printf 'A9 self-test RAN: planted failure rejected\n'
-
-  if assert_drive_config '{"gdrive":{"folder_id":"0AExample","has_credentials":true,"sync_enabled":false},"gc":{"enabled":true,"max_age_days":0,"max_audio_size_mb":20000}}'; then
-    fail 'A6 self-test accepted a configuration with Drive sync disabled'
-  fi
-  if assert_drive_config '{"gdrive":{"folder_id":"","has_credentials":true,"sync_enabled":true},"gc":{"enabled":true,"max_age_days":0,"max_audio_size_mb":20000}}'; then
-    fail 'A6 self-test accepted a configuration without a Drive folder'
-  fi
-  assert_drive_config '{"gdrive":{"folder_id":"0AExample","has_credentials":true,"sync_enabled":true},"gc":{"enabled":true,"max_age_days":0,"max_audio_size_mb":20000}}' \
-    || fail 'A6 self-test rejected the provisioned Drive configuration'
-  printf 'A6 self-test RAN: planted failure rejected\n'
-
-  if assert_no_warnings '{"warnings":["Vertex unavailable"]}'; then
-    fail 'A8 self-test accepted an application warning'
-  fi
-  if assert_no_warnings '{"capture_state":"capturing"}'; then
-    fail 'A8 self-test accepted a status without a warnings field'
-  fi
-  if assert_no_warnings '{"warnings":null}'; then
-    fail 'A8 self-test accepted warnings that are not an array'
-  fi
-  assert_no_warnings '{"warnings":[]}' || fail 'A8 self-test rejected a warning-free status'
-  good_config=$(cat <<'EOF'
-deepgram_model: nova-3
-batch_transcription:
-  provider: deepgram
-  model: nova-3
-summarization:
-  model: gemini/gemini-4-carbon
-embedding_model: gemini/gemini-embedding-2
-genai_backend: vertex
-gcp_project: theorem-agent-infra
-gcp_location: global
-tts_provider: gemini
-tts_model: gemini-3.8-flash-tts
-tts_voice: Kore
-EOF
-)
-  assert_expected_config "$good_config" || fail 'A8 self-test rejected the accepted model configuration'
-  marshaled_config=${good_config//$'\n  '/$'\n    '}
-  assert_expected_config "$marshaled_config" || fail 'A8 self-test rejected yaml.v3 indentation'
-  if assert_expected_config "${good_config/deepgram_model: nova-3/deepgram_model: nova-2}" 2>/dev/null; then
-    fail 'A8 self-test accepted a superseded transcription model'
-  fi
-  swapped_config=${good_config/  model: nova-3/  model: swapped}
-  swapped_config=${swapped_config/  model: gemini\/gemini-4-carbon/  model: nova-3}
-  swapped_config=${swapped_config/  model: swapped/  model: gemini/gemini-4-carbon}
-  if assert_expected_config "$swapped_config" 2>/dev/null; then
-    fail 'A8 self-test accepted swapped batch and summarization models'
-  fi
-  if assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-2.5-flash"}}'; then
-    fail 'A8 self-test accepted a running summarization model that differs from the YAML'
-  fi
-  assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-4-carbon"}}' \
-    || fail 'A8 self-test rejected the running summarization model'
-  if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_TTS_VOICE' 2>/dev/null; then
-    fail 'A8 self-test accepted an environment override of the TTS voice'
-  fi
-  if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_GOOGLE_CREDENTIALS_FILE' 2>/dev/null; then
-    fail 'A8 self-test accepted a Google credential override'
-  fi
-  if assert_no_config_overrides '' 2>/dev/null; then
-    fail 'A8 self-test accepted an unread service environment'
-  fi
-  assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION' \
-    || fail 'A8 self-test rejected an environment without overrides'
-  if assert_embedding_location 'GHOST_WISPR_EMBEDDING_LOCATION=us' 2>/dev/null; then
-    fail 'A8 self-test accepted an embedding location outside global'
-  fi
-  assert_embedding_location 'GHOST_WISPR_EMBEDDING_LOCATION=global' \
-    || fail 'A8 self-test rejected the required embedding location'
-  if assert_provider_model summary configured-summary-model "$summary_provider_model" 2>/dev/null; then
-    fail 'A8 self-test accepted a provider model mismatch for summary'
-  fi
-  if assert_provider_model search configured-embedding-model "$embedding_model" 2>/dev/null; then
-    fail 'A8 self-test accepted a provider model mismatch for search'
-  fi
-  if assert_provider_model speech configured-tts-model "$tts_model" 2>/dev/null; then
-    fail 'A8 self-test accepted a provider model mismatch for speech'
-  fi
-  if assert_provider_model refinement configured-refinement-model "$batch_refinement_model" 2>/dev/null; then
-    fail 'A8 self-test accepted a provider model mismatch for refinement'
-  fi
-  assert_provider_model summary "$summary_provider_model" "$summary_provider_model" \
-    || fail 'A8 self-test rejected the provider summary model'
-  assert_provider_model search "$embedding_model" "$embedding_model" \
-    || fail 'A8 self-test rejected the provider embedding model'
-  assert_provider_model speech "$tts_model" "$tts_model" \
-    || fail 'A8 self-test rejected the provider speech model'
-  assert_provider_model refinement "$batch_refinement_model" "$batch_refinement_model" \
-    || fail 'A8 self-test rejected the provider refinement model'
-  assert_provider_model search "$model_not_reported" "$embedding_model" >/dev/null
-  if [[ $? -ne 2 ]]; then
-    fail 'A8 self-test did not classify an unreported provider model as PRECHECK'
-  fi
-  printf 'A8 self-test RAN: planted failure rejected\n'
-
-  if assert_drive_members $'sami@theorem.dev|organizer\nreaders@theorem.dev|reader' readers@theorem.dev 2>/dev/null; then
-    fail 'A10 self-test accepted a member list without the service account as organizer'
-  fi
-  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer\nreaders@theorem.dev|reader\nextra@theorem.dev|writer' readers@theorem.dev 2>/dev/null; then
-    fail 'A10 self-test accepted an unapproved writer'
-  fi
-  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer\noutside@example.com|reader' readers@theorem.dev 2>/dev/null; then
-    fail 'A10 self-test accepted a reader other than the approved group'
-  fi
-  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer' readers@theorem.dev 2>/dev/null; then
-    fail 'A10 self-test accepted a member list without a reader'
-  fi
-  assert_drive_members $'# Task 2.4 members\nghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nSami@theorem.dev | organizer\nreaders@theorem.dev|reader' readers@theorem.dev \
-    || fail 'A10 self-test rejected the expected member roles'
-  printf 'A10 self-test RAN: planted failure rejected\n'
-
-  if assert_certificate_warning '{"warnings":["Vertex unavailable"]}'; then
-    fail 'Cert-warning self-test accepted a status with no certificate warning'
-  fi
-  assert_certificate_warning '{"warnings":["Google credential certificate expires on 2026-11-21; renew it with the runbook in docs/pi-setup.md."]}' \
-    || fail 'Cert-warning self-test rejected a certificate-expiry warning'
-  printf 'Cert-warning self-test RAN: planted failure rejected\n'
-)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -488,38 +326,36 @@ if [[ "$self_test" == true ]]; then
   for command in awk bash find grep jq mktemp sort tr; do
     command -v "$command" >/dev/null || fail "self-test requires $command"
   done
-  run_self_test || exit 1
-  exit 0
-fi
-
-for command in awk curl find grep jq mktemp nats ssh sort tr; do
-  command -v "$command" >/dev/null || fail "missing required command: $command"
-done
-if [[ -n "$drive_members_file" ]]; then
-  [[ -r "$drive_members_file" ]] || fail "cannot read --drive-members file: $drive_members_file"
-fi
-if [[ -n "$drive_members_file" || -n "$readers_group" ]]; then
-  [[ -n "$drive_members_file" && -n "$readers_group" ]] || fail '--drive-members and --readers-group must be used together'
-fi
-readonly remote="ghost-wispr@$host"
-readonly unit_url="https://$host"
-scratch_dir=$(mktemp -d)
-nats_pid=
-nats_log="$scratch_dir/nats.log"
-acceptance_session_id=
-row_failures=0
-
-cleanup() {
-  local result=$?
-  trap - EXIT
-  if [[ -n "$nats_pid" ]]; then
-    kill "$nats_pid" >/dev/null 2>&1 || true
-    wait "$nats_pid" 2>/dev/null || true
+else
+  for command in awk curl find grep jq mktemp nats ssh sort tr; do
+    command -v "$command" >/dev/null || fail "missing required command: $command"
+  done
+  if [[ -n "$drive_members_file" ]]; then
+    [[ -r "$drive_members_file" ]] || fail "cannot read --drive-members file: $drive_members_file"
   fi
-  rm -rf -- "$scratch_dir"
-  exit "$result"
-}
-trap cleanup EXIT
+  if [[ -n "$drive_members_file" || -n "$readers_group" ]]; then
+    [[ -n "$drive_members_file" && -n "$readers_group" ]] || fail '--drive-members and --readers-group must be used together'
+  fi
+  readonly remote="ghost-wispr@$host"
+  readonly unit_url="https://$host"
+  scratch_dir=$(mktemp -d)
+  nats_pid=
+  nats_log="$scratch_dir/nats.log"
+  acceptance_session_id=
+  row_failures=0
+
+  cleanup() {
+    local result=$?
+    trap - EXIT
+    if [[ -n "$nats_pid" ]]; then
+      kill "$nats_pid" >/dev/null 2>&1 || true
+      wait "$nats_pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$scratch_dir"
+    exit "$result"
+  }
+  trap cleanup EXIT
+fi
 
 remote_run() {
   ssh -o BatchMode=yes "$remote" "$@"
@@ -541,6 +377,20 @@ post_json() {
   local path=$1 body=$2
   curl --fail --silent --show-error --request POST \
     --header 'Content-Type: application/json' --data "$body" "$unit_url$path"
+}
+
+semantic_search() {
+  curl --fail --silent --show-error --get \
+    --data-urlencode "q=Slice 2 acceptance ${acceptance_session_id}" --data-urlencode 'limit=1' \
+    "$unit_url/api/search/semantic"
+}
+
+speak() {
+  local headers=$1
+  curl --fail --silent --show-error --dump-header "$headers" \
+    --request POST --header 'Content-Type: application/json' \
+    --data '{"text":"Slice two model acceptance speech test.","provider":"gemini"}' \
+    "$unit_url/api/tts/speak"
 }
 
 response_header() {
@@ -583,7 +433,7 @@ wait_for_summary_ready() {
 }
 
 wait_for_summary() {
-  local session_id=$1 before_version=$2 detail model version
+  local session_id=$1 before_version=$2 detail model version model_status
   for _ in {1..120}; do
     if detail=$(session_detail "$session_id"); then
       if jq -e '.session.summary_status == "completed" and (.session.summary | type == "string" and length > 0)' \
@@ -591,7 +441,11 @@ wait_for_summary() {
         version=$(jq -r '.session.summary_version // 0' <<<"$detail")
         if (( version > before_version )); then
           model=$(jq -r '.session.summary_model // ""' <<<"$detail")
-          assert_provider_model summary "$model" "$summary_provider_model" || return 1
+          assert_provider_model summary "$model" "$summary_provider_model"
+          model_status=$?
+          if (( model_status != 0 )); then
+            return "$model_status"
+          fi
           return 0
         fi
       fi
@@ -622,20 +476,24 @@ wait_for_drive_sync() {
 }
 
 session_search_word() {
-  jq -r '.segments[]?.text // ""' <<<"$1" \
+  jq -r '.session.canonical_transcript // ""' <<<"$1" \
     | tr '[:upper:]' '[:lower:]' \
     | tr -cs '[:alpha:]' '\n' \
     | awk 'length >= 6 && $0 !~ /^(acceptance|about|after|before|conversation|could|drive|ghost|google|recording|search|session|should|summary|through|their|there|these|topic|which|would)$/ { print; exit }'
 }
 
 wait_for_tts() {
-  local request_id=$1 speech_status model voice
+  local request_id=$1 speech_status model voice model_status
   for _ in {1..60}; do
     if speech_status=$(curl --fail --silent --show-error "$unit_url/api/tts/status/$request_id"); then
       if jq -e '.status == "completed" and (.bytes_written | type == "number" and . > 0)' >/dev/null <<<"$speech_status"; then
         model=$(jq -r '.model // ""' <<<"$speech_status")
         voice=$(jq -r '.voice // ""' <<<"$speech_status")
-        assert_provider_model speech "$model" "$tts_model" || return 1
+        assert_provider_model speech "$model" "$tts_model"
+        model_status=$?
+        if (( model_status != 0 )); then
+          return "$model_status"
+        fi
         [[ "$voice" == "$tts_voice" ]] || {
           printf 'speech provider voice mismatch: got %q, want %q\n' "$voice" "$tts_voice" >&2
           return 1
@@ -654,7 +512,7 @@ wait_for_tts() {
 }
 
 wait_for_refinement() {
-  local session_id=$1 detail saw_running=false model
+  local session_id=$1 detail saw_running=false model model_status
   for _ in {1..120}; do
     if detail=$(session_detail "$session_id"); then
       case "$(jq -r '.session.refinement_status' <<<"$detail")" in
@@ -662,7 +520,11 @@ wait_for_refinement() {
         completed)
           if [[ "$saw_running" == true ]]; then
             model=$(jq -r '.session.refinement_model // ""' <<<"$detail")
-            assert_provider_model refinement "$model" "$batch_refinement_model" || return 1
+            assert_provider_model refinement "$model" "$batch_refinement_model"
+            model_status=$?
+            if (( model_status != 0 )); then
+              return "$model_status"
+            fi
             return 0
           fi
           ;;
@@ -818,11 +680,18 @@ run_a8() {
     printf 'A8 FAILED: summary route returned an unexpected body\n' >&2
     return 1
   }
-  wait_for_summary "$acceptance_session_id" "$before_summary_version" || return 1
+  if wait_for_summary "$acceptance_session_id" "$before_summary_version"; then
+    :
+  else
+    result=$?
+    if (( result == 2 )); then
+      a8_precheck=true
+    else
+      return 1
+    fi
+  fi
 
-  semantic_response=$(curl --fail --silent --show-error --get \
-    --data-urlencode "q=Slice 2 acceptance ${acceptance_session_id}" --data-urlencode 'limit=1' \
-    "$unit_url/api/search/semantic") || {
+  semantic_response=$(semantic_search) || {
     printf 'A8 FAILED: semantic-search route did not answer\n' >&2
     return 1
   }
@@ -843,16 +712,22 @@ run_a8() {
   fi
 
   speech_headers="$scratch_dir/a8-tts.headers"
-  speech_response=$(curl --fail --silent --show-error --dump-header "$speech_headers" \
-    --request POST --header 'Content-Type: application/json' \
-    --data '{"text":"Slice two model acceptance speech test.","provider":"gemini"}' \
-    "$unit_url/api/tts/speak") || {
+  speech_response=$(speak "$speech_headers") || {
     printf 'A8 FAILED: speech route did not accept the Gemini TTS request\n' >&2
     return 1
   }
   speech_model=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Model)
   speech_voice=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Voice)
-  assert_provider_model speech "$speech_model" "$tts_model" || return 1
+  if assert_provider_model speech "$speech_model" "$tts_model"; then
+    :
+  else
+    result=$?
+    if (( result == 2 )); then
+      a8_precheck=true
+    else
+      return 1
+    fi
+  fi
   [[ "$speech_voice" == "$tts_voice" ]] || {
     printf 'speech provider voice mismatch: got %q, want %q\n' "$speech_voice" "$tts_voice" >&2
     return 1
@@ -861,7 +736,16 @@ run_a8() {
     printf 'A8 FAILED: speech route did not return a request ID\n' >&2
     return 1
   }
-  wait_for_tts "$speech_request_id" || return 1
+  if wait_for_tts "$speech_request_id"; then
+    :
+  else
+    result=$?
+    if (( result == 2 )); then
+      a8_precheck=true
+    else
+      return 1
+    fi
+  fi
 
   refinement_response=$(post_json "/api/sessions/${acceptance_session_id}/retry-refinement" '{}') || {
     printf 'A8 FAILED: batch-refinement route did not accept real session %s\n' "$acceptance_session_id" >&2
@@ -871,10 +755,22 @@ run_a8() {
     printf 'A8 FAILED: batch-refinement route did not confirm its request\n' >&2
     return 1
   }
-  wait_for_refinement "$acceptance_session_id" || return 1
+  if wait_for_refinement "$acceptance_session_id"; then
+    :
+  else
+    result=$?
+    if (( result == 2 )); then
+      a8_precheck=true
+    else
+      return 1
+    fi
+  fi
   printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with provider-reported models: %s, %s, %s, and %s/%s.\n' \
     "$acceptance_session_id" "$batch_refinement_model" "$summarization_model" "$embedding_model" "$tts_model" "$tts_voice"
-  [[ "$a8_precheck" == true ]] && return 2
+  if [[ "$a8_precheck" == true ]]; then
+    return 2
+  fi
+  return 0
 }
 
 run_a10() {
@@ -924,6 +820,284 @@ run_row() {
     row_failures=$((row_failures + 1))
   fi
 }
+
+run_self_test() (
+  local controls_dir key_root nested_dev_key report good_config marshaled_config swapped_config
+  controls_dir=$(mktemp -d)
+  trap 'rm -rf -- "$controls_dir"' EXIT
+
+  key_root="$controls_dir/key-root"
+  mkdir -p "$key_root/nested/dev"
+  printf 'benign\n' >"$key_root/notes.txt"
+  printf 'ELF\000json:"private_key_id"\n' >"$key_root/binary-with-field-name"
+  report=$(run_key_sweep_locally "$key_root") || fail 'A9 self-test could not run the key sweep'
+  grep -Fqx "binary-field-name"$'\t'"$key_root/binary-with-field-name" <<<"$report" \
+    || fail 'A9 self-test sweep did not report the binary file that names a key field'
+  key_sweep_passes "$report" >/dev/null || fail 'A9 self-test rejected a tree whose only match is a binary field name'
+  nested_dev_key="$key_root/nested/dev/planted-key.json"
+  printf '{"type": "service_account", "private_key_id": "planted"}\n' >"$nested_dev_key"
+  report=$(run_key_sweep_locally "$key_root") || fail 'A9 self-test could not run the key sweep'
+  if key_sweep_passes "$report" >/dev/null 2>&1; then
+    fail 'A9 self-test accepted a service-account key below a nested dev directory'
+  fi
+  rm -- "$nested_dev_key"
+  {
+    printf 'PK\000{"type": "service_account", "private_key_id": "planted", "private_key": "--'
+    printf '%s\n' '---BEGIN PRIVATE KEY-----"}'
+  } >"$key_root/archive.bin"
+  report=$(run_key_sweep_locally "$key_root") || fail 'A9 self-test could not run the key sweep'
+  if key_sweep_passes "$report" >/dev/null 2>&1; then
+    fail 'A9 self-test accepted a key body inside binary data'
+  fi
+  if key_sweep_passes '' >/dev/null 2>&1; then
+    fail 'A9 self-test accepted a sweep that did not find its planted control'
+  fi
+  if key_sweep_passes $'grep-error\t2\ncontrol-found\t/tmp/control' >/dev/null 2>&1; then
+    fail 'A9 self-test accepted a sweep that grep could not finish'
+  fi
+  printf '%s\n' '{"type":"service_account","private_key_id":"planted"}' >"$controls_dir/service-account.json"
+  if assert_external_account_credential "$(<"$controls_dir/service-account.json")"; then
+    fail 'A9 self-test accepted a planted service-account credential'
+  fi
+  assert_external_account_credential '{"type":"external_account","credential_source":{"certificate":{"certificate_config_location":"/opt/ghost-wispr/certificate_config.json"}}}' \
+    || fail 'A9 self-test rejected a valid external-account credential'
+  printf 'A9 self-test RAN: planted failure rejected\n'
+
+  if assert_drive_config '{"gdrive":{"folder_id":"0AExample","has_credentials":true,"sync_enabled":false},"gc":{"enabled":true,"max_age_days":0,"max_audio_size_mb":20000}}'; then
+    fail 'A6 self-test accepted a configuration with Drive sync disabled'
+  fi
+  if assert_drive_config '{"gdrive":{"folder_id":"","has_credentials":true,"sync_enabled":true},"gc":{"enabled":true,"max_age_days":0,"max_audio_size_mb":20000}}'; then
+    fail 'A6 self-test accepted a configuration without a Drive folder'
+  fi
+  assert_drive_config '{"gdrive":{"folder_id":"0AExample","has_credentials":true,"sync_enabled":true},"gc":{"enabled":true,"max_age_days":0,"max_audio_size_mb":20000}}' \
+    || fail 'A6 self-test rejected the provisioned Drive configuration'
+  printf 'A6 self-test RAN: planted failure rejected\n'
+
+  if assert_no_warnings '{"warnings":["Vertex unavailable"]}'; then
+    fail 'A8 self-test accepted an application warning'
+  fi
+  if assert_no_warnings '{"capture_state":"capturing"}'; then
+    fail 'A8 self-test accepted a status without a warnings field'
+  fi
+  if assert_no_warnings '{"warnings":null}'; then
+    fail 'A8 self-test accepted warnings that are not an array'
+  fi
+  assert_no_warnings '{"warnings":[]}' || fail 'A8 self-test rejected a warning-free status'
+  good_config=$(cat <<'EOF'
+deepgram_model: nova-3
+batch_transcription:
+  provider: deepgram
+  model: nova-3
+summarization:
+  model: gemini/gemini-4-carbon
+embedding_model: gemini/gemini-embedding-2
+genai_backend: vertex
+gcp_project: theorem-agent-infra
+gcp_location: global
+tts_provider: gemini
+tts_model: gemini-3.8-flash-tts
+tts_voice: Kore
+EOF
+)
+  assert_expected_config "$good_config" || fail 'A8 self-test rejected the accepted model configuration'
+  marshaled_config=${good_config//$'\n  '/$'\n    '}
+  assert_expected_config "$marshaled_config" || fail 'A8 self-test rejected yaml.v3 indentation'
+  if assert_expected_config "${good_config/deepgram_model: nova-3/deepgram_model: nova-2}" 2>/dev/null; then
+    fail 'A8 self-test accepted a superseded transcription model'
+  fi
+  swapped_config=${good_config/  model: nova-3/  model: swapped}
+  swapped_config=${swapped_config/  model: gemini\/gemini-4-carbon/  model: nova-3}
+  swapped_config=${swapped_config/  model: swapped/  model: gemini/gemini-4-carbon}
+  if assert_expected_config "$swapped_config" 2>/dev/null; then
+    fail 'A8 self-test accepted swapped batch and summarization models'
+  fi
+  if assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-2.5-flash"}}'; then
+    fail 'A8 self-test accepted a running summarization model that differs from the YAML'
+  fi
+  assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-4-carbon"}}' \
+    || fail 'A8 self-test rejected the running summarization model'
+  if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_TTS_VOICE' 2>/dev/null; then
+    fail 'A8 self-test accepted an environment override of the TTS voice'
+  fi
+  if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_GOOGLE_CREDENTIALS_FILE' 2>/dev/null; then
+    fail 'A8 self-test accepted a Google credential override'
+  fi
+  if assert_no_config_overrides '' 2>/dev/null; then
+    fail 'A8 self-test accepted an unread service environment'
+  fi
+  assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION' \
+    || fail 'A8 self-test rejected an environment without overrides'
+  if assert_embedding_location 'GHOST_WISPR_EMBEDDING_LOCATION=us' 2>/dev/null; then
+    fail 'A8 self-test accepted an embedding location outside global'
+  fi
+  assert_embedding_location 'GHOST_WISPR_EMBEDDING_LOCATION=global' \
+    || fail 'A8 self-test rejected the required embedding location'
+  if assert_provider_model summary configured-summary-model "$summary_provider_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for summary'
+  fi
+  if assert_provider_model search configured-embedding-model "$embedding_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for search'
+  fi
+  if assert_provider_model speech configured-tts-model "$tts_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for speech'
+  fi
+  if assert_provider_model refinement configured-refinement-model "$batch_refinement_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for refinement'
+  fi
+  assert_provider_model summary "$summary_provider_model" "$summary_provider_model" \
+    || fail 'A8 self-test rejected the provider summary model'
+  assert_provider_model search "$embedding_model" "$embedding_model" \
+    || fail 'A8 self-test rejected the provider embedding model'
+  assert_provider_model speech "$tts_model" "$tts_model" \
+    || fail 'A8 self-test rejected the provider speech model'
+  assert_provider_model refinement "$batch_refinement_model" "$batch_refinement_model" \
+    || fail 'A8 self-test rejected the provider refinement model'
+  assert_provider_model search "$model_not_reported" "$embedding_model" >/dev/null
+  if [[ $? -ne 2 ]]; then
+    fail 'A8 self-test did not classify an unreported provider model as PRECHECK'
+  fi
+  printf 'A8 self-test RAN: planted failure rejected\n'
+
+  local search_word model_result scratch_dir acceptance_session_id unit_url=http://self-test
+  search_word=$(session_search_word '{"session":{"canonical_transcript":"canonicaltoken"},"segments":[{"text":"segmenttoken"}]}')
+  [[ "$search_word" == canonicaltoken ]] || fail 'A6 self-test did not use canonical_transcript for the search word'
+  printf 'A6 self-test RAN: canonical transcript supplied the search word\n'
+
+  session_detail() {
+    printf '%s\n' '{"session":{"summary_status":"completed","summary":"summary","summary_version":1,"summary_model":"not reported by provider"}}'
+  }
+  if wait_for_summary self-test 0; then
+    fail 'A8 self-test accepted an unreported summary model'
+  else
+    model_result=$?
+  fi
+  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported summary model as PRECHECK'
+
+  curl() {
+    printf '%s\n' '{"status":"completed","bytes_written":1,"model":"not reported by provider","voice":"Kore"}'
+  }
+  if wait_for_tts self-test; then
+    fail 'A8 self-test accepted an unreported speech model'
+  else
+    model_result=$?
+  fi
+  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported speech model as PRECHECK'
+
+  local refinement_marker="$controls_dir/refinement-running"
+  session_detail() {
+    if [[ ! -e "$refinement_marker" ]]; then
+      : >"$refinement_marker"
+      printf '%s\n' '{"session":{"refinement_status":"running"}}'
+      return
+    fi
+    printf '%s\n' '{"session":{"refinement_status":"completed","refinement_model":"not reported by provider"}}'
+  }
+  if wait_for_refinement self-test; then
+    fail 'A8 self-test accepted an unreported refinement model'
+  else
+    model_result=$?
+  fi
+  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported refinement model as PRECHECK'
+
+  scratch_dir="$controls_dir/a8"
+  mkdir "$scratch_dir"
+  acceptance_session_id=self-test
+  local summary_called="$controls_dir/summary-called"
+  local speech_called="$controls_dir/speech-called"
+  local refinement_called="$controls_dir/refinement-called"
+  local summary_requested="$controls_dir/summary-requested"
+  local refinement_requested="$controls_dir/refinement-requested"
+  local refinement_seen_running="$controls_dir/refinement-seen-running"
+  status() { printf '%s\n' '{"warnings":[]}'; }
+  running_config() { printf '%s\n' '{"summarization":{"model":"gemini/gemini-4-carbon"}}'; }
+  remote_run() { printf '%s\n' "$good_config"; }
+  service_environment_names() { printf '%s\n' $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION'; }
+  service_embedding_location() { printf '%s\n' 'GHOST_WISPR_EMBEDDING_LOCATION=global'; }
+  session_detail() {
+    if [[ -e "$refinement_requested" ]]; then
+      if [[ ! -e "$refinement_seen_running" ]]; then
+        : >"$refinement_seen_running"
+        printf '%s\n' '{"session":{"refinement_status":"running"}}'
+        return
+      fi
+      : >"$refinement_called"
+      printf '%s\n' "{\"session\":{\"refinement_status\":\"completed\",\"refinement_model\":\"$batch_refinement_model\"}}"
+      return
+    fi
+    if [[ -e "$summary_requested" ]]; then
+      : >"$summary_called"
+      printf '%s\n' "{\"session\":{\"summary_status\":\"completed\",\"summary\":\"summary\",\"summary_version\":2,\"summary_model\":\"$summary_provider_model\"}}"
+      return
+    fi
+    printf '%s\n' '{"session":{"summary_version":1}}'
+  }
+  post_json() {
+    case "$1" in
+      */resummarize) : >"$summary_requested" ;;
+      */retry-refinement)
+        : >"$refinement_requested"
+        printf '%s\n' '{"triggered":true}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  semantic_search() { printf '%s\n' '{"results":[{}],"model":"gemini-embedding-2"}'; }
+  speak() {
+    printf '%s\n' "X-Ghost-Wispr-TTS-Model: $tts_model" "X-Ghost-Wispr-TTS-Voice: $tts_voice" >"$1"
+    printf '%s\n' '{"id":"self-test"}'
+  }
+  curl() {
+    : >"$speech_called"
+    printf '%s\n' "{\"status\":\"completed\",\"bytes_written\":1,\"model\":\"$tts_model\",\"voice\":\"$tts_voice\"}"
+  }
+  if ! run_a8; then
+    fail 'A8 self-test did not pass when every role reported its model'
+  fi
+  [[ -e "$summary_called" && -e "$speech_called" && -e "$refinement_called" ]] \
+    || fail 'A8 self-test did not run every provider role'
+  printf 'A8 self-test RAN: every reported model returns PASS\n'
+
+  rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
+  speak() {
+    printf '%s\n' "X-Ghost-Wispr-TTS-Model: $model_not_reported" "X-Ghost-Wispr-TTS-Voice: $tts_voice" >"$1"
+    printf '%s\n' '{"id":"self-test"}'
+  }
+  if run_a8; then
+    fail 'A8 self-test accepted an unreported speech-header model'
+  else
+    model_result=$?
+  fi
+  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported speech-header model as PRECHECK'
+  [[ -e "$refinement_called" ]] || fail 'A8 self-test stopped before batch refinement after a speech-header PRECHECK'
+  printf 'A8 self-test RAN: unreported speech header is PRECHECK and later roles still run\n'
+
+  if assert_drive_members $'sami@theorem.dev|organizer\nreaders@theorem.dev|reader' readers@theorem.dev 2>/dev/null; then
+    fail 'A10 self-test accepted a member list without the service account as organizer'
+  fi
+  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer\nreaders@theorem.dev|reader\nextra@theorem.dev|writer' readers@theorem.dev 2>/dev/null; then
+    fail 'A10 self-test accepted an unapproved writer'
+  fi
+  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer\noutside@example.com|reader' readers@theorem.dev 2>/dev/null; then
+    fail 'A10 self-test accepted a reader other than the approved group'
+  fi
+  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer' readers@theorem.dev 2>/dev/null; then
+    fail 'A10 self-test accepted a member list without a reader'
+  fi
+  assert_drive_members $'# Task 2.4 members\nghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nSami@theorem.dev | organizer\nreaders@theorem.dev|reader' readers@theorem.dev \
+    || fail 'A10 self-test rejected the expected member roles'
+  printf 'A10 self-test RAN: planted failure rejected\n'
+
+  if assert_certificate_warning '{"warnings":["Vertex unavailable"]}'; then
+    fail 'Cert-warning self-test accepted a status with no certificate warning'
+  fi
+  assert_certificate_warning '{"warnings":["Google credential certificate expires on 2026-11-21; renew it with the runbook in docs/pi-setup.md."]}' \
+    || fail 'Cert-warning self-test rejected a certificate-expiry warning'
+  printf 'Cert-warning self-test RAN: planted failure rejected\n'
+)
+if [[ "$self_test" == true ]]; then
+  run_self_test
+  exit
+fi
 
 run_row A9 run_a9
 run_row A6 run_a6
