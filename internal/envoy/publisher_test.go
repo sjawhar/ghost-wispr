@@ -568,8 +568,10 @@ func TestFailedSummaryDeliversAfterSecretIsFixed(t *testing.T) {
 }
 
 // TestEmptySummaryIsNotPublished fails if the summary-ready path, which the
-// startup sweep also uses, sends Envoy a completed summary with no text: the
-// one a session gets when no summarizer is configured.
+// startup sweep also uses, sends Envoy a completed summary with no text (the
+// one a session gets when no summarizer is configured), or if the sweep then
+// selects that session again on every run instead of recording it as
+// skipped. A summary made later is still published.
 func TestEmptySummaryIsNotPublished(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
@@ -609,6 +611,28 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 	}
 	if got := requests(); len(got) != 0 {
 		t.Fatalf("summary_ready requests for an empty summary = %d, want none", len(got))
+	}
+	if ids, err = store.GetSessionsNeedingEnvoyPublish(); err != nil || len(ids) != 0 {
+		t.Fatalf("sessions needing an Envoy publish after the skip = %v, %v; want none", ids, err)
+	}
+	if sess, err := store.GetSession("session-1"); err != nil || sess.EnvoyPublishStatus != storage.EnvoyPublishSkipped {
+		t.Fatalf("envoy_publish_status after the skip = %q, %v; want %q", sess.EnvoyPublishStatus, err, storage.EnvoyPublishSkipped)
+	}
+
+	if err := store.StartSummary("session-1"); err != nil {
+		t.Fatalf("StartSummary: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration("session-1", "Title", "A real summary.", storage.SummaryCompleted, "default", "{}", generation); err != nil {
+		t.Fatalf("store a real summary: %v", err)
+	}
+	if ids, err = store.GetSessionsNeedingEnvoyPublish(); err != nil || len(ids) != 1 {
+		t.Fatalf("sessions needing an Envoy publish after a real summary = %v, %v; want session-1", ids, err)
+	}
+	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
+		t.Fatalf("PublishSummaryReady after a real summary: %v", err)
+	}
+	if got := requests(); len(got) != 1 {
+		t.Fatalf("summary_ready requests after a real summary = %d, want 1", len(got))
 	}
 }
 

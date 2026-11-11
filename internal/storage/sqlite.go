@@ -45,6 +45,7 @@ const (
 	EnvoyPublishPending   = gwstatus.EnvoyPublishPending
 	EnvoyPublishPublished = gwstatus.EnvoyPublishPublished
 	EnvoyPublishFailed    = gwstatus.EnvoyPublishFailed
+	EnvoyPublishSkipped   = gwstatus.EnvoyPublishSkipped
 
 	SyncStatePending        = gwstatus.SyncStatePending
 	SyncStateSyncing        = gwstatus.SyncStateSyncing
@@ -1809,11 +1810,15 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	return ids, nil
 }
 
+// GetSessionsNeedingEnvoyPublish returns the ended sessions with a completed
+// summary that Envoy has not had: neither published nor skipped (a summary
+// with no text, which is not announced).
 func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended' AND summary_status = ? AND envoy_publish_status != ? ORDER BY started_at ASC`,
+		`SELECT id FROM sessions WHERE status = 'ended' AND summary_status = ? AND envoy_publish_status NOT IN (?, ?) ORDER BY started_at ASC`,
 		SummaryCompleted,
 		EnvoyPublishPublished,
+		EnvoyPublishSkipped,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing envoy publish: %w", err)
