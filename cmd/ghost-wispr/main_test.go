@@ -24,10 +24,15 @@ type fakeStreamer struct {
 	reopenErrs []error
 	calls      int
 	reopens    int
+	stops      int
+	stopped    bool
 }
 
 func (f *fakeStreamer) Stream(_ io.Writer) error {
 	f.calls++
+	if f.stopped {
+		return errors.New("microphone stopped")
+	}
 	if len(f.errs) == 0 {
 		return nil
 	}
@@ -48,7 +53,11 @@ func (f *fakeStreamer) Reopen() error {
 
 func (f *fakeStreamer) Start() error { return nil }
 
-func (f *fakeStreamer) Stop() error { return nil }
+func (f *fakeStreamer) Stop() error {
+	f.stops++
+	f.stopped = true
+	return nil
+}
 
 func TestStreamMicWithRetryRetriesOverflow(t *testing.T) {
 	streamer := &fakeStreamer{errs: []error{errors.New("Input overflowed"), nil}}
@@ -80,6 +89,55 @@ func TestStreamMicWithRetryOverflowReopens(t *testing.T) {
 
 	if streamer.reopens != 1 {
 		t.Fatalf("expected 1 reopen call for overflow, got %d", streamer.reopens)
+	}
+}
+
+// TestStreamMicWithRetryRequiresRedBeforeEachReopen fails if either reconnect
+// path starts microphone capture after the light refuses confirmation, or
+// retries a stopped device without another confirmation.
+func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "overflow", err: errors.New("Input overflowed")},
+		{name: "device error", err: errors.New("device disconnected")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			capture := newCaptureGate(nil, nil, nil)
+			var confirmations int
+			capture.beforeMicStart = func() error {
+				confirmations++
+				if confirmations == 2 {
+					cancel()
+				}
+				return errors.New("recording light stayed off")
+			}
+			streamer := &fakeStreamer{errs: []error{tc.err}}
+			streamMicWithRetry(
+				ctx,
+				capture,
+				streamer,
+				bytes.NewBuffer(nil),
+				func(time.Duration) {},
+				func(string, ...any) {},
+				nil,
+			)
+			if streamer.reopens != 0 {
+				t.Fatalf("microphone reopened %d times after red confirmation failed", streamer.reopens)
+			}
+			if confirmations != 2 {
+				t.Fatalf("red confirmations = %d, want 2", confirmations)
+			}
+			if streamer.stops != 2 {
+				t.Fatalf("microphone stops after red confirmation failed = %d, want 2", streamer.stops)
+			}
+			if streamer.calls != 2 {
+				t.Fatalf("stream calls = %d, want first error and stopped retry", streamer.calls)
+			}
+		})
 	}
 }
 

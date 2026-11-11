@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"testing/fstest"
 
@@ -170,4 +171,42 @@ func TestRestoredPauseOpensNoMicrophone(t *testing.T) {
 		t.Fatalf("start after resume: %v", err)
 	}
 	mic.expectEvents(t, "start")
+}
+
+// TestStartMicIfUnpausedConfirmsRedBeforeStarting fails if boot can start
+// capture before the indicator has confirmed red.
+func TestStartMicIfUnpausedConfirmsRedBeforeStarting(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	var calls []string
+	capture.beforeMicStart = func() error {
+		calls = append(calls, "confirm-red")
+		return nil
+	}
+	capture.afterMicStart = func() { calls = append(calls, "finish-start") }
+	if err := startMicIfUnpaused(capture, func() error {
+		calls = append(calls, "start")
+		return nil
+	}); err != nil {
+		t.Fatalf("start microphone: %v", err)
+	}
+	if got, want := calls, []string{"confirm-red", "start", "finish-start"}; !slices.Equal(got, want) {
+		t.Fatalf("microphone startup calls = %v, want %v", got, want)
+	}
+}
+
+// TestStartMicIfUnpausedRefusesAnUnconfirmedLight fails if boot starts capture
+// after the red check reports an error.
+func TestStartMicIfUnpausedRefusesAnUnconfirmedLight(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	capture.beforeMicStart = func() error { return errors.New("light stayed off") }
+	started := false
+	if err := startMicIfUnpaused(capture, func() error {
+		started = true
+		return nil
+	}); err == nil {
+		t.Fatal("microphone start succeeded without a confirmed red light")
+	}
+	if started {
+		t.Fatal("microphone start ran without a confirmed red light")
+	}
 }

@@ -57,10 +57,15 @@ func persistingControls(store pauseStore, pause, resume func()) (p, r func() err
 }
 
 // startMicIfUnpaused leaves a restored pause with an open device handle but
-// without starting microphone capture. The mic loop starts it on resume.
+// without starting microphone capture. The mic loop starts it on resume. Each
+// start attempt confirms red first and clears any forced-red hold afterward.
 func startMicIfUnpaused(capture *captureGate, start func() error) error {
 	if capture.IsPaused() {
 		return nil
 	}
+	if err := capture.confirmMicStart(); err != nil {
+		return err
+	}
+	defer capture.finishMicStart()
 	return start()
 }

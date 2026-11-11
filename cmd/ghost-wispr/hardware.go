@@ -16,6 +16,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/indicator"
 	"github.com/sjawhar/ghost-wispr/internal/powerbutton"
 	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 const (
@@ -106,7 +107,7 @@ type hardwareControl struct {
 	light      *reconnectingLight
 	controller *indicator.Controller
 	done       <-chan struct{}
-	forceRed   atomic.Bool
+	redHolds   atomic.Int32
 	stopped    atomic.Bool
 }
 
@@ -120,14 +121,27 @@ func (h *hardwareControl) Wake() {
 	}
 }
 
+func (h *hardwareControl) holdsRed() bool {
+	return h.redHolds.Load() > 0
+}
+
 func (h *hardwareControl) CaptureStarted() {
-	h.forceRed.Store(false)
 	h.Wake()
 }
 
 func (h *hardwareControl) CaptureStopped() {
-	h.forceRed.Store(false)
+	h.redHolds.Store(0)
 	h.Wake()
+}
+
+func (h *hardwareControl) ReleaseRedHold() {
+	for {
+		holds := h.redHolds.Load()
+		if holds == 0 || h.redHolds.CompareAndSwap(holds, holds-1) {
+			h.Wake()
+			return
+		}
+	}
 }
 
 func (h *hardwareControl) Stop() {
@@ -135,8 +149,9 @@ func (h *hardwareControl) Stop() {
 }
 
 // EnsureRed confirms the configured and connected indicator is red before a
-// microphone starts. A missing light preserves the approved warning-and-record
-// behavior; an available light must show red.
+// microphone starts. Each successful check owns a temporary red hold until
+// that start attempt ends. A missing light preserves the approved
+// warning-and-record behavior.
 func (h *hardwareControl) EnsureRed() error {
 	if h.stopped.Load() {
 		return fmt.Errorf("recording light stopped")
@@ -144,15 +159,57 @@ func (h *hardwareControl) EnsureRed() error {
 	if h.light == nil {
 		return nil
 	}
+	// Hold red before the write: reconnectingLight.SetRGB then refuses an off
+	// write the controller decided before this confirmation.
+	h.redHolds.Add(1)
 	if err := h.light.ConfirmRed(); err != nil {
 		if errors.Is(err, indicator.ErrNoBlink1) {
 			return nil
 		}
+		h.ReleaseRedHold()
 		return err
 	}
-	h.forceRed.Store(true)
 	h.light.warnings.Clear("recording-light")
 	return nil
+}
+
+// guardResumeWithLight keeps capture paused when its indicator cannot confirm
+// red and clears the short-lived red hold when no microphone can start.
+func guardResumeWithLight(
+	capture *captureGate,
+	store pauseStore,
+	mic interface{ IsOpen() bool },
+	warnings *warningsRegistry,
+	hub *server.Hub,
+) {
+	beforeResume := capture.beforeResume
+	capture.beforeResume = func() {
+		if err := capture.confirmMicStart(); err != nil {
+			warnings.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
+			if err := store.SetAppState(storage.AppStateCapturePaused, "1"); err != nil {
+				warnings.Set("capture-state", "Pause not saved; a restart will resume recording")
+			}
+			capture.mu.Lock()
+			capture.switchOff = true
+			capture.mu.Unlock()
+			if hub != nil {
+				hub.BroadcastStatusChanged(true)
+			}
+			return
+		}
+		if beforeResume != nil {
+			beforeResume()
+		}
+		if !mic.IsOpen() {
+			capture.finishMicStart()
+		}
+	}
+}
+
+func wireLightConsent(capture *captureGate, hardware *hardwareControl, store pauseStore, mic interface{ IsOpen() bool }, warnings *warningsRegistry, hub *server.Hub) {
+	capture.beforeMicStart = hardware.EnsureRed
+	capture.afterMicStart = hardware.ReleaseRedHold
+	guardResumeWithLight(capture, store, mic, warnings, hub)
 }
 
 // startHardware starts the configured recording light. The button starts only
@@ -161,10 +218,14 @@ func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate
 	done := make(chan struct{})
 	hardware := &hardwareControl{done: done}
 	if cfg.IndicatorLight == config.IndicatorLightBlink1 {
-		hardware.light = &reconnectingLight{warnings: warnings}
-		hardware.controller = indicator.NewController(hardware.light, func() bool {
-			return hardware.forceRed.Load() || recordingSignal(capture, mic)
-		}, time.Second)
+		wantRed := func() bool {
+			return hardware.holdsRed() || recordingSignal(capture, mic)
+		}
+		hardware.light = &reconnectingLight{
+			warnings: warnings,
+			holdRed:  func() bool { return !hardware.stopped.Load() && wantRed() },
+		}
+		hardware.controller = indicator.NewController(hardware.light, wantRed, time.Second)
 		go func() {
 			defer close(done)
 			hardware.controller.Run(ctx)
@@ -193,19 +254,21 @@ func wakeLightOnCaptureEvents(ctx context.Context, hub *server.Hub, hardware *ha
 			if !ok {
 				return
 			}
-			var event struct {
-				Type      string `json:"type"`
-				Component string `json:"component"`
-			}
-			if json.Unmarshal(raw, &event) != nil {
-				continue
-			}
-			if event.Type == "status_changed" {
-				hardware.Wake()
-			} else if event.Type == "component_status" && event.Component == "mic" {
-				hardware.CaptureStarted()
-			}
+			wakeLightOnCaptureEvent(raw, hardware)
 		}
+	}
+}
+
+func wakeLightOnCaptureEvent(raw []byte, hardware *hardwareControl) {
+	var event struct {
+		Type      string `json:"type"`
+		Component string `json:"component"`
+	}
+	if json.Unmarshal(raw, &event) != nil {
+		return
+	}
+	if event.Type == "status_changed" || (event.Type == "component_status" && event.Component == "mic") {
+		hardware.Wake()
 	}
 }
 
@@ -216,15 +279,27 @@ type reconnectingLight struct {
 	nextAttempt time.Time
 	lastErr     error
 	warnings    *warningsRegistry
+	// holdRed reports that the light must stay red. SetRGB checks it under
+	// deviceMu, so an off write decided before a red confirmation cannot land
+	// after it.
+	holdRed func() bool
 }
 
 func (l *reconnectingLight) current() (indicator.Light, error) {
+	return l.currentWithRetry(false)
+}
+
+func (l *reconnectingLight) currentForConfirmation() (indicator.Light, error) {
+	return l.currentWithRetry(true)
+}
+
+func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.light != nil {
 		return l.light, nil
 	}
-	if time.Now().Before(l.nextAttempt) {
+	if !force && time.Now().Before(l.nextAttempt) {
 		return nil, l.lastErr
 	}
 	light, err := openBlink1(blinkSysfsRoot, blinkDevRoot)
@@ -263,6 +338,9 @@ func (l *reconnectingLight) failed(err error) error {
 func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
 	l.deviceMu.Lock()
 	defer l.deviceMu.Unlock()
+	if (r != 255 || g != 0 || b != 0) && l.holdRed != nil && l.holdRed() {
+		return nil
+	}
 	light, err := l.current()
 	if err != nil {
 		return err
@@ -316,7 +394,7 @@ func (l *reconnectingLight) BlackPattern() error {
 func (l *reconnectingLight) ConfirmRed() error {
 	l.deviceMu.Lock()
 	defer l.deviceMu.Unlock()
-	light, err := l.current()
+	light, err := l.currentForConfirmation()
 	if err != nil {
 		return err
 	}
@@ -334,6 +412,8 @@ func (l *reconnectingLight) ConfirmRed() error {
 }
 
 func (l *reconnectingLight) Close() error {
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.light == nil {

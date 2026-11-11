@@ -33,6 +33,7 @@ func (l *fakeLight) SetRGB(r, g, b uint8) error {
 func (l *fakeLight) ReadRGB() (uint8, uint8, uint8, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.calls = append(l.calls, "read")
 	return l.colour[0], l.colour[1], l.colour[2], nil
 }
 
@@ -62,6 +63,16 @@ func (l *fakeLight) snapshot() ([]string, []time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]string(nil), l.calls...), append([]time.Duration(nil), l.serverDowns...)
+}
+
+func countCalls(calls []string, want string) int {
+	count := 0
+	for _, call := range calls {
+		if call == want {
+			count++
+		}
+	}
+	return count
 }
 
 func waitFor(t *testing.T, description string, predicate func() bool) {
@@ -182,20 +193,24 @@ func TestBlink1BlackPatternAndWatchdogReports(t *testing.T) {
 	light := &blink1{file: file, patternLines: 32}
 	original := featureIOCTL
 	var reports [][8]byte
-	patternIsBlack := false
+	patterns := make(map[byte][8]byte)
+	var patternReads []byte
 	featureIOCTL = func(_ uintptr, request uintptr, report *[8]byte) error {
 		if request == hidIOCSetFeature {
 			reports = append(reports, *report)
 			if report[1] == 'P' {
-				patternIsBlack = true
+				patterns[report[7]] = *report
 			}
 			return nil
 		}
 		if report[1] == 'R' {
-			if !patternIsBlack {
+			line := report[7]
+			patternReads = append(patternReads, line)
+			pattern, ok := patterns[line]
+			if !ok || pattern[2] != 0 || pattern[3] != 0 || pattern[4] != 0 || (pattern[5] == 0 && pattern[6] == 0) {
 				report[2] = 1
 			} else {
-				report[6] = 10
+				report[6] = pattern[6]
 			}
 		}
 		return nil
@@ -211,18 +226,35 @@ func TestBlink1BlackPatternAndWatchdogReports(t *testing.T) {
 	if got, want := reports[1], Blink1Report('l', [6]byte{}); got != want {
 		t.Fatalf("all-LED report = %v, want %v", got, want)
 	}
-	var patterns [][8]byte
-	for _, report := range reports {
-		if report[1] == 'P' {
-			patterns = append(patterns, report)
+	var patternsWritten [][8]byte
+	lastPattern := -1
+	saveIndex := -1
+	for i, report := range reports {
+		switch report[1] {
+		case 'P':
+			patternsWritten = append(patternsWritten, report)
+			lastPattern = i
+		case 'W':
+			saveIndex = i
 		}
 	}
-	if got, want := len(patterns), 32; got != want {
+	if got, want := len(patternsWritten), 32; got != want {
 		t.Fatalf("saved pattern lines = %d, want %d", got, want)
 	}
 	for line := range 32 {
-		if got, want := patterns[line], Blink1Report('P', [6]byte{0, 0, 0, 0, 10, byte(line)}); got != want {
+		if got, want := patternsWritten[line], Blink1Report('P', [6]byte{0, 0, 0, 0, 10, byte(line)}); got != want {
 			t.Fatalf("pattern line %d = %v, want %v", line, got, want)
+		}
+	}
+	if saveIndex != lastPattern+1 || reports[saveIndex] != Blink1Report('W', [6]byte{0xbe, 0xef, 0xca, 0xfe}) {
+		t.Fatalf("save report at %d after final pattern %d = %v, want immediate save", saveIndex, lastPattern, reports[saveIndex])
+	}
+	if got, want := len(patternReads), 33; got != want || patternReads[0] != 0 {
+		t.Fatalf("pattern reads = %v, want initial line 0 then 32 verification reads", patternReads)
+	}
+	for line := range 32 {
+		if got := patternReads[line+1]; got != byte(line) {
+			t.Fatalf("verification read %d = line %d, want line %d", line, got, line)
 		}
 	}
 	if got, want := reports[len(reports)-1], Blink1Report('D', [6]byte{1, 0x01, 0x2c, 1, 0, 31}); got != want {
@@ -255,6 +287,10 @@ func TestControllerRedOnlyWhileRecording(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 	waitFor(t, "controller startup", func() bool {
 		calls, _ := light.snapshot()
 		return len(calls) >= 2
@@ -266,6 +302,21 @@ func TestControllerRedOnlyWhileRecording(t *testing.T) {
 		defer light.mu.Unlock()
 		return light.colour == [3]uint8{255, 0, 0}
 	})
+	calls, _ := light.snapshot()
+	setCalls := countCalls(calls, "set")
+	readCalls := countCalls(calls, "read")
+	for range 2 {
+		controller.Wake()
+		readCalls++
+		waitFor(t, "same-state controller update", func() bool {
+			calls, _ := light.snapshot()
+			return countCalls(calls, "read") >= readCalls
+		})
+	}
+	calls, _ = light.snapshot()
+	if gotSetCalls := countCalls(calls, "set"); gotSetCalls != setCalls {
+		t.Fatalf("colour writes while already red = %d, want %d", gotSetCalls, setCalls)
+	}
 	recording.Store(false)
 	controller.Wake()
 	waitFor(t, "recording off", func() bool {
@@ -273,16 +324,18 @@ func TestControllerRedOnlyWhileRecording(t *testing.T) {
 		defer light.mu.Unlock()
 		return light.colour == [3]uint8{}
 	})
-	cancel()
-	<-done
 }
 
 func TestControllerRewritesAWrongColour(t *testing.T) {
 	light := &fakeLight{}
-	controller := NewController(light, func() bool { return true }, time.Hour)
+	controller := NewController(light, func() bool { return true }, time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 	waitFor(t, "initial red", func() bool {
 		light.mu.Lock()
 		defer light.mu.Unlock()
@@ -291,14 +344,11 @@ func TestControllerRewritesAWrongColour(t *testing.T) {
 	light.mu.Lock()
 	light.colour = [3]uint8{}
 	light.mu.Unlock()
-	controller.Wake()
-	waitFor(t, "red restored", func() bool {
+	waitFor(t, "red restored by tick", func() bool {
 		light.mu.Lock()
 		defer light.mu.Unlock()
 		return light.colour == [3]uint8{255, 0, 0}
 	})
-	cancel()
-	<-done
 }
 
 func TestControllerTicklesBeforeTheTimeout(t *testing.T) {

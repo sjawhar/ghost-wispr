@@ -1243,8 +1243,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	hardware := startHardware(ctx, &cfg, capture, micStatus, controlHooks, warningRegistry, hub)
-	capture.beforeMicStart = hardware.EnsureRed
-	capture.afterMicStart = hardware.CaptureStopped
 	pauseCapture, resumeCapture = persistingControls(
 		store,
 		func() {
@@ -1269,21 +1267,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		return err
 	}
-	beforeResume := capture.beforeResume
-	capture.beforeResume = func() {
-		if err := hardware.EnsureRed(); err != nil {
-			warningRegistry.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
-			if err := store.SetAppState(storage.AppStateCapturePaused, "1"); err != nil {
-				warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
-			}
-			capture.mu.Lock()
-			capture.switchOff = true
-			capture.mu.Unlock()
-			hub.BroadcastStatusChanged(true)
-			return
-		}
-		beforeResume()
-	}
+	wireLightConsent(capture, hardware, store, micStatus, warningRegistry, hub)
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	if restoredPause {
 		hub.BroadcastStatusChanged(true)
@@ -1599,14 +1583,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		audioRecorder.SetSampleRate(sampleRate)
-		if !capture.IsPaused() {
-			if err := hardware.EnsureRed(); err != nil {
-				warningRegistry.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
-				return fmt.Errorf("confirm recording light before microphone start: %w", err)
-			}
-		}
+		// micRef is published before the start so the controller, woken when
+		// the start clears the forced-red hold, already sees the open mic.
+		micRef.Store(mic)
 		if err := startMicIfUnpaused(capture, mic.Start); err != nil {
-			hardware.CaptureStopped()
 			micRef.Store(nil)
 			if updateStartupState {
 				warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
@@ -1615,7 +1595,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
 		}
 
-		micRef.Store(mic)
 		hardware.CaptureStarted()
 		warningRegistry.Clear("microphone")
 		log.Printf("microphone started at %d Hz", sampleRate)
@@ -1982,6 +1961,7 @@ func streamMicWithRetry(
 			}
 			if err := capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone reconnect: %v", err)
+				stopMicWithoutRed(streamer, logf)
 				continue
 			}
 			reopenErr := streamer.Reopen()
@@ -2018,6 +1998,7 @@ func streamMicWithRetry(
 
 		if err := capture.confirmMicStart(); err != nil {
 			logf("recording light unavailable before microphone reconnect: %v", err)
+			stopMicWithoutRed(streamer, logf)
 			continue
 		}
 		reopenErr := streamer.Reopen()
@@ -2036,6 +2017,17 @@ func streamMicWithRetry(
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
 		}
 		backoff = baseBackoff
+	}
+}
+
+// stopMicWithoutRed stops a device the reconnect could not confirm red for.
+// An overflow, or a transient read error, leaves the device capturing with
+// IsOpen false, so the light goes dark while audio still flows. The next
+// Stream then fails on the stopped device, and the error path backs off and
+// confirms red again before it reopens.
+func stopMicWithoutRed(streamer micStreamer, logf func(string, ...any)) {
+	if err := streamer.Stop(); err != nil {
+		logf("warning: stop microphone without a red recording light: %v", err)
 	}
 }
 

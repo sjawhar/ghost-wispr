@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -270,5 +271,401 @@ func TestReconnectingLightRetainsAccessFailureDuringRetry(t *testing.T) {
 	}
 	if _, err := light.current(); !errors.Is(err, accessErr) {
 		t.Fatalf("retry-window error = %v, want %v", err, accessErr)
+	}
+}
+
+type operationLightFake struct {
+	mu         sync.Mutex
+	colour     [3]uint8
+	offStarted chan struct{}
+	releaseOff chan struct{}
+	offOnce    sync.Once
+	reads      [][3]uint8
+}
+
+func (l *operationLightFake) SetRGB(r, g, b uint8) error {
+	if r == 0 && g == 0 && b == 0 && l.offStarted != nil {
+		l.offOnce.Do(func() {
+			close(l.offStarted)
+			<-l.releaseOff
+		})
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.colour = [3]uint8{r, g, b}
+	return nil
+}
+
+func (l *operationLightFake) ReadRGB() (uint8, uint8, uint8, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reads = append(l.reads, l.colour)
+	return l.colour[0], l.colour[1], l.colour[2], nil
+}
+
+func (*operationLightFake) ServerDown(time.Duration) error { return nil }
+func (*operationLightFake) BlackPattern() error            { return nil }
+func (*operationLightFake) Close() error                   { return nil }
+
+func (l *operationLightFake) snapshot() ([3]uint8, [][3]uint8) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.colour, append([][3]uint8(nil), l.reads...)
+}
+
+func waitForHardware(t *testing.T, description string, predicate func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if predicate() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
+}
+
+// TestEnsureRedSerializesControllerUpdate fails if the controller can turn the
+// light off after a successful red confirmation.
+func TestEnsureRedSerializesControllerUpdate(t *testing.T) {
+	device := &operationLightFake{
+		colour:     [3]uint8{255, 0, 0},
+		offStarted: make(chan struct{}),
+		releaseOff: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() { close(device.releaseOff) })
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
+	}
+	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		hardware.controller.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		release()
+		cancel()
+		<-done
+	})
+
+	select {
+	case <-device.offStarted:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not begin its off update")
+	}
+	confirmed := make(chan error, 1)
+	go func() { confirmed <- hardware.EnsureRed() }()
+	select {
+	case err := <-confirmed:
+		t.Fatalf("EnsureRed returned before the controller update completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-confirmed; err != nil {
+		t.Fatalf("EnsureRed: %v", err)
+	}
+	colour, reads := device.snapshot()
+	if colour != [3]uint8{255, 0, 0} {
+		t.Fatalf("colour after confirmed red = %v, want red", colour)
+	}
+	if got, want := len(reads), 2; got != want || reads[0] != [3]uint8{255, 0, 0} || reads[1] != [3]uint8{255, 0, 0} {
+		t.Fatalf("read replies = %v, want each operation's red reply", reads)
+	}
+}
+
+type closeRaceLight struct {
+	setStarted chan struct{}
+	releaseSet chan struct{}
+	closeCalls atomic.Int32
+}
+
+func (l *closeRaceLight) SetRGB(uint8, uint8, uint8) error {
+	close(l.setStarted)
+	<-l.releaseSet
+	return nil
+}
+func (*closeRaceLight) ReadRGB() (uint8, uint8, uint8, error) { return 0, 0, 0, nil }
+func (*closeRaceLight) ServerDown(time.Duration) error        { return nil }
+func (*closeRaceLight) BlackPattern() error                   { return nil }
+func (l *closeRaceLight) Close() error {
+	l.closeCalls.Add(1)
+	return nil
+}
+
+// TestReconnectingLightDoesNotCloseDuringAnOperation fails if Close can
+// invalidate a feature report still in flight.
+func TestReconnectingLightDoesNotCloseDuringAnOperation(t *testing.T) {
+	device := &closeRaceLight{setStarted: make(chan struct{}), releaseSet: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(device.releaseSet) })
+	t.Cleanup(release)
+	light := &reconnectingLight{light: device, warnings: newWarningsRegistry()}
+	setDone := make(chan error, 1)
+	go func() { setDone <- light.SetRGB(255, 0, 0) }()
+	select {
+	case <-device.setStarted:
+	case <-time.After(time.Second):
+		t.Fatal("feature report did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- light.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the in-flight feature report completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-setDone; err != nil {
+		t.Fatalf("set red: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := device.closeCalls.Load(); got != 1 {
+		t.Fatalf("close calls = %d, want 1", got)
+	}
+}
+
+type staleReadLight struct{}
+
+func (*staleReadLight) SetRGB(uint8, uint8, uint8) error { return nil }
+func (*staleReadLight) ReadRGB() (uint8, uint8, uint8, error) {
+	return 0, 0, 0, nil
+}
+func (*staleReadLight) ServerDown(time.Duration) error { return nil }
+func (*staleReadLight) BlackPattern() error            { return nil }
+func (*staleReadLight) Close() error                   { return nil }
+
+// TestEnsureRedRequiresReadback fails if a write is trusted without confirming
+// that the light is actually red.
+func TestEnsureRedRequiresReadback(t *testing.T) {
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: &staleReadLight{}, warnings: newWarningsRegistry()},
+	}
+	if err := hardware.EnsureRed(); err == nil {
+		t.Fatal("EnsureRed succeeded with an off readback")
+	}
+	if hardware.holdsRed() {
+		t.Fatal("EnsureRed held the light red after a failed readback")
+	}
+}
+
+// TestWireLightConsentRequiresRedBeforeStartOrResume fails if recorder wiring
+// bypasses the configured indicator's red confirmation.
+func TestWireLightConsentRequiresRedBeforeStartOrResume(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: &staleReadLight{}, warnings: newWarningsRegistry()},
+	}
+	capture := newCaptureGate(nil, nil, nil)
+	wireLightConsent(capture, hardware, store, &openMicFake{}, newWarningsRegistry(), nil)
+	started := false
+	if err := startMicIfUnpaused(capture, func() error {
+		started = true
+		return nil
+	}); err == nil {
+		t.Fatal("microphone started after red confirmation failed")
+	}
+	if started {
+		t.Fatal("microphone start ran after red confirmation failed")
+	}
+	capture.Pause()
+	capture.Resume()
+	waitForHardware(t, "failed red confirmation to keep wired resume paused", capture.IsPaused)
+}
+
+// TestConfirmRedRetriesDiscoveryBeforeRecording fails if a cached missing-light
+// result lets capture begin after the blink(1) appears.
+func TestConfirmRedRetriesDiscoveryBeforeRecording(t *testing.T) {
+	device := &operationLightFake{}
+	original := openBlink1
+	var opens int
+	openBlink1 = func(string, string) (indicator.Light, error) {
+		opens++
+		if opens == 1 {
+			return nil, indicator.ErrNoBlink1
+		}
+		return device, nil
+	}
+	t.Cleanup(func() { openBlink1 = original })
+	light := &reconnectingLight{warnings: newWarningsRegistry()}
+	if _, err := light.current(); !errors.Is(err, indicator.ErrNoBlink1) {
+		t.Fatalf("initial discovery error = %v, want ErrNoBlink1", err)
+	}
+	if err := light.ConfirmRed(); err != nil {
+		t.Fatalf("confirm red after light appears: %v", err)
+	}
+	if opens != 2 {
+		t.Fatalf("blink(1) discoveries = %d, want 2", opens)
+	}
+	if colour, _ := device.snapshot(); colour != [3]uint8{255, 0, 0} {
+		t.Fatalf("colour after rediscovery = %v, want red", colour)
+	}
+}
+
+// TestMicStatusEventKeepsRedHold fails if a delayed reconnect event can clear
+// the confirmation that protects another start attempt.
+func TestMicStatusEventKeepsRedHold(t *testing.T) {
+	hardware := &hardwareControl{}
+	hardware.redHolds.Store(1)
+	wakeLightOnCaptureEvent([]byte(`{"type":"component_status","component":"mic"}`), hardware)
+	if !hardware.holdsRed() {
+		t.Fatal("mic status event cleared a pending red hold")
+	}
+}
+
+// TestResumeRequiresRedBeforeOpeningCapture fails if a resume can open capture
+// after the light refuses its red confirmation.
+func TestResumeRequiresRedBeforeOpeningCapture(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	capture := newCaptureGate(nil, nil, nil)
+	var beforeResume atomic.Bool
+	capture.beforeResume = func() { beforeResume.Store(true) }
+	var confirmations atomic.Int32
+	capture.beforeMicStart = func() error {
+		confirmations.Add(1)
+		return errors.New("light is off")
+	}
+	guardResumeWithLight(capture, store, &openMicFake{}, newWarningsRegistry(), nil)
+	capture.Pause()
+	capture.Resume()
+	waitForHardware(t, "failed red confirmation to keep capture paused", func() bool {
+		return confirmations.Load() == 1 && capture.IsPaused()
+	})
+	if !capture.IsPaused() {
+		t.Fatal("capture resumed after red confirmation failed")
+	}
+	if beforeResume.Load() {
+		t.Fatal("capture's normal resume work ran after red confirmation failed")
+	}
+	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
+	if err != nil || !ok || value != "1" {
+		t.Fatalf("persisted pause after red confirmation failure = (%q, %t, %v), want (1, true, nil)", value, ok, err)
+	}
+}
+
+// TestResumeClearsForcedRedWhenMicUnavailable fails if resuming with no
+// microphone leaves the indicator red while no audio can flow.
+func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
+	device := &operationLightFake{}
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
+	}
+	hardware.light.holdRed = hardware.holdsRed
+	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		hardware.controller.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	capture := newCaptureGate(nil, nil, nil)
+	clearStarted := make(chan struct{})
+	releaseClear := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseClear) })
+	t.Cleanup(release)
+	capture.beforeMicStart = hardware.EnsureRed
+	capture.afterMicStart = func() {
+		close(clearStarted)
+		<-releaseClear
+		hardware.ReleaseRedHold()
+	}
+	guardResumeWithLight(capture, store, &openMicFake{}, newWarningsRegistry(), nil)
+	capture.Pause()
+	capture.Resume()
+	select {
+	case <-clearStarted:
+	case <-time.After(time.Second):
+		t.Fatal("resume did not clear forced red without a microphone")
+	}
+	colour, _ := device.snapshot()
+	if colour != [3]uint8{255, 0, 0} || !hardware.holdsRed() {
+		t.Fatalf("light before clearing forced red = (%v, forced=%t), want (red, true)", colour, hardware.holdsRed())
+	}
+	release()
+	waitForHardware(t, "light to turn off without a microphone", func() bool {
+		colour, _ := device.snapshot()
+		return colour == [3]uint8{}
+	})
+	if hardware.holdsRed() {
+		t.Fatal("forced red remained set without a microphone")
+	}
+}
+
+// TestEnsureRedOutlastsAStaleOffDecision fails if the controller, having
+// decided "off" before a red confirmation, can still turn the light off after
+// EnsureRed has returned.
+func TestEnsureRedOutlastsAStaleOffDecision(t *testing.T) {
+	device := &operationLightFake{
+		colour:     [3]uint8{255, 0, 0},
+		offStarted: make(chan struct{}),
+		releaseOff: make(chan struct{}),
+	}
+	releaseOff := sync.OnceFunc(func() { close(device.releaseOff) })
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
+	}
+	hardware.light.holdRed = hardware.holdsRed
+	decided := make(chan struct{})
+	releaseDecision := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseDecision) })
+	var decisions atomic.Int32
+	hardware.controller = indicator.NewController(hardware.light, func() bool {
+		want := hardware.holdsRed()
+		if decisions.Add(1) == 1 {
+			close(decided)
+			<-releaseDecision
+		}
+		return want
+	}, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		hardware.controller.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		release()
+		releaseOff()
+		cancel()
+		<-done
+	})
+
+	select {
+	case <-decided:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not decide its first update")
+	}
+	if err := hardware.EnsureRed(); err != nil {
+		t.Fatalf("EnsureRed: %v", err)
+	}
+	release()
+	waitForHardware(t, "controller read after its stale decision", func() bool {
+		_, reads := device.snapshot()
+		return len(reads) >= 2
+	})
+	select {
+	case <-device.offStarted:
+		t.Fatal("controller wrote off after EnsureRed returned")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
