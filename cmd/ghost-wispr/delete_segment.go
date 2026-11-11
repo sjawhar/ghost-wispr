@@ -454,23 +454,25 @@ func orderedMissing(expected, actual []string) []string {
 	}
 	for i := len(expected) - 1; i >= 0; i-- {
 		for j := len(actual) - 1; j >= 0; j-- {
-			if expected[i] == actual[j] {
+			switch {
+			case expected[i] == actual[j]:
 				rows[i][j] = rows[i+1][j+1] + 1
-			} else if rows[i+1][j] >= rows[i][j+1] {
+			case rows[i+1][j] >= rows[i][j+1]:
 				rows[i][j] = rows[i+1][j]
-			} else {
+			default:
 				rows[i][j] = rows[i][j+1]
 			}
 		}
 	}
 	missing := make([]string, 0, len(expected)-rows[0][0])
 	for i, j := 0, 0; i < len(expected); {
-		if j < len(actual) && expected[i] == actual[j] {
+		switch {
+		case j < len(actual) && expected[i] == actual[j]:
 			i++
 			j++
-		} else if j < len(actual) && rows[i][j+1] > rows[i+1][j] {
+		case j < len(actual) && rows[i][j+1] > rows[i+1][j]:
 			j++
-		} else {
+		default:
 			missing = append(missing, expected[i])
 			i++
 		}

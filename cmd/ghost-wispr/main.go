@@ -937,7 +937,7 @@ func main() {
 					return restoreDeletionRecordings(ctx, &session, latestCfg.AudioDir, source)
 				},
 				duration: audio.Duration,
-				splice: audio.Splice,
+				splice:   audio.Splice,
 				refine: func(ctx context.Context, sessionID, recording string, startedAt time.Time) error {
 					return manager.RefineSession(ctx, sessionID, recording, startedAt)
 				},

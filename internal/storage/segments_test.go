@@ -178,11 +178,11 @@ func TestDeleteSegmentClearsOverlappingLiveEvents(t *testing.T) {
 	}
 
 	if err := store.DeleteSegment("event-clear", segments[1].ID, DeletedSpan{
-		AudioPath:   "recording.mp3",
-		Start:       20,
-		End:         22,
-		StreamStart: 2,
-		StreamEnd:   4,
+		AudioPath:    "recording.mp3",
+		Start:        20,
+		End:          22,
+		StreamStart:  2,
+		StreamEnd:    4,
 		SHA256Before: "before",
 		SHA256After:  "after",
 	}); err != nil {
@@ -330,7 +330,6 @@ func TestRecordingsSkipPendingSegmentSplice(t *testing.T) {
 	}
 }
 
-
 func TestDeleteSegmentRestoresTheFullAudioPath(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "restored-audio")
@@ -344,12 +343,12 @@ func TestDeleteSegmentRestoresTheFullAudioPath(t *testing.T) {
 		t.Fatalf("mark audio removed: %v", err)
 	}
 	if err := store.DeleteSegment("restored-audio", segments[1].ID, DeletedSpan{
-		AudioPath:       second,
+		AudioPath:        second,
 		SessionAudioPath: first + "," + second,
-		Start:           2,
-		End:             4,
-		SHA256Before:    "before",
-		SHA256After:     "after",
+		Start:            2,
+		End:              4,
+		SHA256Before:     "before",
+		SHA256After:      "after",
 	}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}

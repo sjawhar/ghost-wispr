@@ -383,7 +383,6 @@ func (sequenceDeletionWordsFake) Words(_ context.Context, path string) ([]audio.
 	}
 }
 
-
 func TestSegmentDeleteRunnerSerializesConcurrentDeletes(t *testing.T) {
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
