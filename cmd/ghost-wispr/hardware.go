@@ -174,7 +174,7 @@ func (h *hardwareControl) EnsureRed() error {
 }
 
 // guardResumeWithLight keeps capture paused when its indicator cannot confirm
-// red and clears the short-lived red hold when no microphone can start.
+// red.
 func guardResumeWithLight(
 	capture *captureGate,
 	store pauseStore,
@@ -199,9 +199,6 @@ func guardResumeWithLight(
 		}
 		if beforeResume != nil {
 			beforeResume()
-		}
-		if !mic.IsOpen() {
-			capture.finishMicStart()
 		}
 	}
 }

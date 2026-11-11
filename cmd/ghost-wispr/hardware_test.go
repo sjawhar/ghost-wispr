@@ -584,7 +584,7 @@ func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
 	release := sync.OnceFunc(func() { close(releaseClear) })
 	t.Cleanup(release)
 	capture.beforeMicStart = hardware.EnsureRed
-	capture.afterMicStart = func() {
+	capture.afterGateOpen = func() {
 		close(clearStarted)
 		<-releaseClear
 		hardware.ReleaseRedHold()
@@ -712,4 +712,31 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 		colour, _ := device.snapshot()
 		return !hardware.holdsRed() && colour == [3]uint8{}
 	})
+}
+
+// TestResumeReleasesOnlyItsOwnRedHold fails if opening the gate consumes a
+// second start attempt's red hold.
+func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
+	device := &operationLightFake{}
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
+	}
+	capture := newCaptureGate(nil, nil, nil)
+	capture.Pause()
+	hardware.redHolds.Store(1)
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	mic := &openMicFake{}
+	wireLightConsent(capture, hardware, store, mic, newWarningsRegistry(), nil)
+	capture.Resume()
+	waitForHardware(t, "resume to confirm red and release exactly one hold", func() bool {
+		colour, _ := device.snapshot()
+		return colour == [3]uint8{255, 0, 0} && hardware.redHolds.Load() <= 1
+	})
+	if got := hardware.redHolds.Load(); got != 1 {
+		t.Fatalf("red holds after resume = %d, want 1", got)
+	}
 }
