@@ -1042,6 +1042,16 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 // gets a new summary version when the session's current version may already
 // have been sent to Envoy, so Envoy does not drop it as a duplicate delivery.
 func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, -1)
+}
+
+// UpdateSummaryAtGeneration stores a summary only if the transcript generation
+// the writer read remains current.
+func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, generation)
+}
+
+func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, speakerNames string, generation int) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin summary update for session %s: %w", sessionID, err)
@@ -1051,6 +1061,11 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 	current, err := getSession(tx, sessionID)
 	if err != nil {
 		return err
+	}
+	if generation < 0 {
+		if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&generation); err != nil {
+			return fmt.Errorf("read summary generation for session %s: %w", sessionID, err)
+		}
 	}
 	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames)
 	res, err := tx.Exec(
@@ -1063,7 +1078,7 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
 		     summary_error = CASE WHEN ? = ? THEN '' ELSE summary_error END
-		 WHERE id = ? AND summary_generation = deletion_generation`,
+		 WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ?`,
 		title, title,
 		summary, preset,
 		summary, speakerNames,
@@ -1073,6 +1088,7 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		status,
 		status, SummaryCompleted,
 		sessionID,
+		generation,
 	)
 	if err != nil {
 		return fmt.Errorf("update summary for session %s: %w", sessionID, err)
@@ -1088,6 +1104,15 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		return fmt.Errorf("commit summary update for session %s: %w", sessionID, err)
 	}
 	return nil
+}
+
+// DeletionGeneration returns the current transcript generation for sessionID.
+func (s *SQLiteStore) DeletionGeneration(sessionID string) (int, error) {
+	var generation int
+	if err := s.db.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&generation); err != nil {
+		return 0, fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+	}
+	return generation, nil
 }
 
 func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames string) bool {
@@ -1261,6 +1286,18 @@ func (s *SQLiteStore) GetCanonicalTranscript(sessionID string) (string, string, 
 		return "", "", fmt.Errorf("query canonical transcript for session %s: %w", sessionID, err)
 	}
 	return transcript, source, nil
+}
+
+// GetCanonicalTranscriptWithGeneration reads the canonical transcript and the
+// deletion generation atomically, so asynchronous writers can fence updates
+// against the exact text they consumed.
+func (s *SQLiteStore) GetCanonicalTranscriptWithGeneration(sessionID string) (string, string, int, error) {
+	var transcript, source string
+	var generation int
+	if err := s.db.QueryRow(`SELECT canonical_transcript, transcript_source, deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&transcript, &source, &generation); err != nil {
+		return "", "", 0, fmt.Errorf("query canonical transcript generation for session %s: %w", sessionID, err)
+	}
+	return transcript, source, generation, nil
 }
 
 func (s *SQLiteStore) UpdateTitle(sessionID, title string) error {

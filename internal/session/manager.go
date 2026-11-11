@@ -50,6 +50,11 @@ type Manager struct {
 	lifecycleStartPublishesStopped bool
 }
 
+type summaryGenerationStore interface {
+	GetCanonicalTranscriptWithGeneration(sessionID string) (transcript, source string, generation int, err error)
+	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error
+}
+
 // sessionEnd is how far an end of a session got. An end that fails leaves it
 // behind, so retrying the end finishes it with the same end time and recording.
 type sessionEnd struct {
@@ -611,7 +616,15 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 	}
 
-	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
+	generationStore, generationAware := m.store.(summaryGenerationStore)
+	var transcript string
+	var generation int
+	var err error
+	if generationAware {
+		transcript, _, generation, err = generationStore.GetCanonicalTranscriptWithGeneration(sessionID)
+	} else {
+		transcript, _, err = m.store.GetCanonicalTranscript(sessionID)
+	}
 	if err != nil {
 		m.failSummary(sessionID, fmt.Sprintf("failed to get canonical transcript: %v", err))
 		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
@@ -635,16 +648,21 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
-		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
 		return
 	}
 
-	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
-		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", err))
+	var storeErr error
+	if generationAware {
+		storeErr = generationStore.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, generation)
+	} else {
+		storeErr = m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
+	}
+	if storeErr != nil {
+		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
+		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr))
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
