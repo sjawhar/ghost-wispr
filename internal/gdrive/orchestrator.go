@@ -49,6 +49,7 @@ type replacementInputStore interface {
 	ClearDriveReplacementPending(sessionID string, generation int) error
 	HasPendingSplice(sessionID string) (bool, error)
 	OldestPendingSplice(sessionID string) (time.Time, bool, error)
+	MergedSources(sessionID string) ([]storage.Session, error)
 }
 
 type Orchestrator struct {
@@ -236,7 +237,15 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				o.logger.Warn("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
 				return nil
 			}
-			if read.GDriveFolderID == "" {
+			sources, err := replacements.MergedSources(sessionID)
+			if err != nil {
+				return fmt.Errorf("list merged sources of session %s: %w", sessionID, err)
+			}
+			sourceFolders := false
+			for i := range sources {
+				sourceFolders = sourceFolders || sources[i].GDriveFolderID != ""
+			}
+			if read.GDriveFolderID == "" && !sourceFolders {
 				if err := replacements.ClearDriveReplacementPending(sessionID, generation); err != nil {
 					return err
 				}
@@ -248,7 +257,7 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 			if !ok {
 				return fmt.Errorf("replace session files %s: the Drive uploader cannot replace files", sessionID)
 			}
-			return o.replaceSessionFiles(ctx, syncer, replacements, &read, generation, splicedRecording)
+			return o.replaceSessionFiles(ctx, syncer, replacements, &read, generation, splicedRecording, sourceFolders)
 		}
 		o.warnings.done(sessionID)
 	}
@@ -383,25 +392,36 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 // asks again until the folder is back. A folder gone for good took the old
 // files with it, so nothing is owed any more. A Drive that cannot say leaves
 // the session as it is, for the next sweep.
-func (o *Orchestrator) replaceSessionFiles(ctx context.Context, syncer *Syncer, replacements replacementInputStore, sess *storage.Session, generation int, splicedRecording string) error {
+func (o *Orchestrator) replaceSessionFiles(ctx context.Context, syncer *Syncer, replacements replacementInputStore, sess *storage.Session, generation int, splicedRecording string, sourceFolders bool) error {
 	sessionID := sess.ID
-	if err := syncer.checkFolder(ctx, sess.GDriveFolderID); err != nil {
-		switch {
-		case errors.Is(err, ErrFolderTrashed):
-			o.endReplacementAs(sess, storage.SyncStateRemoteDeleted, err)
-			o.warnings.failed(sessionID, err)
-			return fmt.Errorf("replace session files %s: its Drive folder is in the trash, and the replacement runs once it is restored: %w", sessionID, err)
-		case IsRemoteDeletedError(err):
-			if clearErr := replacements.ClearDriveReplacementPending(sessionID, generation); clearErr != nil {
-				o.warnings.failed(sessionID, clearErr)
-				return clearErr
+	if sess.GDriveFolderID != "" {
+		if err := syncer.checkFolder(ctx, sess.GDriveFolderID); err != nil {
+			switch {
+			case errors.Is(err, ErrFolderTrashed):
+				o.endReplacementAs(sess, storage.SyncStateRemoteDeleted, err)
+				o.warnings.failed(sessionID, err)
+				return fmt.Errorf("replace session files %s: its Drive folder is in the trash, and the replacement runs once it is restored: %w", sessionID, err)
+			case IsRemoteDeletedError(err):
+				o.endReplacementAs(sess, storage.SyncStateRemoteDeleted, err)
+				if !sourceFolders {
+					if clearErr := replacements.ClearDriveReplacementPending(sessionID, generation); clearErr != nil {
+						o.warnings.failed(sessionID, clearErr)
+						return clearErr
+					}
+					o.warnings.done(sessionID)
+					return fmt.Errorf("remote folder deleted for %s: %w", sessionID, err)
+				}
+				// The folders of the sessions merged into this one still
+				// hold the words: the replacement goes on without its own.
+				current, getErr := o.store.GetSession(sessionID)
+				if getErr != nil {
+					return fmt.Errorf("get session %s: %w", sessionID, getErr)
+				}
+				*sess = current
+			default:
+				o.warnings.failed(sessionID, err)
+				return fmt.Errorf("replace session files %s: %w", sessionID, err)
 			}
-			o.endReplacementAs(sess, storage.SyncStateRemoteDeleted, err)
-			o.warnings.done(sessionID)
-			return fmt.Errorf("remote folder deleted for %s: %w", sessionID, err)
-		default:
-			o.warnings.failed(sessionID, err)
-			return fmt.Errorf("replace session files %s: %w", sessionID, err)
 		}
 	}
 

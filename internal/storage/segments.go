@@ -191,27 +191,10 @@ var postDeleteMaintenance = func(db *sql.DB) error {
 // which cannot be rebuilt without the words, are cleared. The full-text
 // index is rebuilt from these rows in the same transaction.
 func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Segment) ([]string, error) {
-	rows, err := tx.Query(`WITH RECURSIVE source(id) AS (
-			SELECT id FROM sessions WHERE merged_into = ?
-			UNION SELECT sessions.id FROM sessions JOIN source ON sessions.merged_into = source.id
-		) SELECT id FROM source`, sessionID)
+	sources, err := mergedSourceIDs(tx, sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("list merged sources of session %s: %w", sessionID, err)
+		return nil, err
 	}
-	var sources []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("scan merged source of session %s: %w", sessionID, err)
-		}
-		sources = append(sources, id)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, fmt.Errorf("iterate merged sources of session %s: %w", sessionID, err)
-	}
-	_ = rows.Close()
 
 	for _, id := range sources {
 		source, err := getSession(tx, id)
@@ -278,6 +261,50 @@ func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 		return nil, fmt.Errorf("iterate merged sources for %s: %w", mergedID, err)
 	}
 	return ids, nil
+}
+
+// mergedSourceIDs returns the sessions merged, directly or through another
+// merge, into sessionID, in session time order.
+func mergedSourceIDs(q querier, sessionID string) ([]string, error) {
+	rows, err := q.Query(`WITH RECURSIVE source(id) AS (
+			SELECT id FROM sessions WHERE merged_into = ?
+			UNION SELECT sessions.id FROM sessions JOIN source ON sessions.merged_into = source.id
+		) SELECT sessions.id FROM sessions JOIN source ON sessions.id = source.id ORDER BY sessions.started_at ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list merged sources of session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var sources []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan merged source of session %s: %w", sessionID, err)
+		}
+		sources = append(sources, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate merged sources of session %s: %w", sessionID, err)
+	}
+	return sources, nil
+}
+
+// MergedSources returns the sessions merged, directly or through another
+// merge, into sessionID. Each keeps its own Drive folder, which a deletion in
+// sessionID must also reach.
+func (s *SQLiteStore) MergedSources(sessionID string) ([]Session, error) {
+	ids, err := mergedSourceIDs(s.db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	sources := make([]Session, 0, len(ids))
+	for _, id := range ids {
+		source, err := getSession(s.db, id)
+		if err != nil {
+			return nil, fmt.Errorf("get merged source %s: %w", id, err)
+		}
+		sources = append(sources, source)
+	}
+	return sources, nil
 }
 
 // HasPendingSplice reports whether a committed deletion for sessionID still

@@ -554,9 +554,15 @@ func TestReplaceRecoversAnUploadedFileBeforeItsRowIsUpdated(t *testing.T) {
 	fixture := newReplacementFixture(t)
 	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
 	fixture.wire.allowDeletes = true
-	// The replacement first reads the session folder (checkFolder); the
-	// read after it is the first upload's verification.
-	fixture.wire.failGetAt = fixture.wire.gets + 2
+	// Fail the first read of a file that is not the session folder or the
+	// root: the first upload's verification. (Folder checks come before it.)
+	failed := false
+	fixture.wire.onGet = func(id string) {
+		if !failed && id != fixture.folder && id != fixture.wire.rootID {
+			failed = true
+			fixture.wire.failGetAt = fixture.wire.gets + 1
+		}
+	}
 
 	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err == nil {
 		t.Fatal("replacement succeeded though Drive did not verify the uploaded file")
@@ -701,7 +707,7 @@ func TestFinishDriveReplacementKeepsANewerDeletionPending(t *testing.T) {
 			t.Fatalf("seed replacement row %s: %v", name, err)
 		}
 	}
-	if err := store.FinishDriveReplacement(id, 1); !errors.Is(err, sql.ErrNoRows) {
+	if err := store.FinishDriveReplacement(id, 1, []string{id}); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("FinishDriveReplacement = %v, want generation refusal", err)
 	}
 	var pending int

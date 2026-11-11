@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 const (
@@ -178,12 +179,22 @@ func (s *SQLiteStore) MarkDriveReplacementDeleted(sessionID, name, oldID string,
 	return nil
 }
 
-// FinishDriveReplacement clears the pending marker only once every old file
-// recorded for this generation is gone.
-func (s *SQLiteStore) FinishDriveReplacement(sessionID string, generation int) error {
+// FinishDriveReplacement clears sessionID's pending marker only once every
+// old file recorded for this generation, in each folder the replacement
+// covered (folderSessionIDs: sessionID's own and its merged sources'), is
+// gone.
+func (s *SQLiteStore) FinishDriveReplacement(sessionID string, generation int, folderSessionIDs []string) error {
+	if len(folderSessionIDs) == 0 {
+		return fmt.Errorf("finish drive replacement for session %s: no folder was replaced: %w", sessionID, sql.ErrNoRows)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(folderSessionIDs)), ",")
+	args := []any{DriveReplacementDeleted, generation}
+	for _, id := range folderSessionIDs {
+		args = append(args, id)
+	}
 	var count, incomplete int
 	if err := s.db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE state != ?)
-		FROM drive_replacements WHERE session_id = ? AND generation = ?`, DriveReplacementDeleted, sessionID, generation).Scan(&count, &incomplete); err != nil {
+		FROM drive_replacements WHERE generation = ? AND session_id IN (`+placeholders+`)`, args...).Scan(&count, &incomplete); err != nil {
 		return fmt.Errorf("check drive replacement for session %s: %w", sessionID, err)
 	}
 	if count == 0 {
