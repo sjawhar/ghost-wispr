@@ -96,22 +96,18 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
 | `google_credentials_file` | No | — | Authoritative Google credential file; when empty, Application Default Credentials are used |
 
+## Consent rule
+
+Record only while the light is on. Anyone may pause it at any time without a reason.
+Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
+
 `ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
 ## Deployment
 
-A systemd service file is included for running on a headless device:
-
-```bash
-# Edit ghost-wispr.service with your paths and user
-sudo cp ghost-wispr.service /etc/systemd/system/
-sudo systemctl enable --now ghost-wispr
-```
-
-A `deploy.sh` script handles cross-compilation and deployment to a Raspberry Pi:
-
-```bash
-PI_HOST=pi@raspberrypi ./deploy.sh
-```
+The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is
+provisioned from `deploy/pi/` and is managed through its user services and nightly updater.
+Follow the [office recorder Pi runbook](docs/pi-setup.md) for the required infrastructure
+outputs, credential bundle, provisioning command, tailnet join, and acceptance checks.
 
 ## API
 
