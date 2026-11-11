@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -76,5 +77,46 @@ func TestR4NoSummarizerRefusesEmbeddingAfterDelete(t *testing.T) {
 	}
 	if len(embeddings) != 0 {
 		t.Fatalf("no-summarizer path stored %d pre-delete embedding(s)", len(embeddings))
+	}
+}
+
+func TestR4RealIndexerRunsAfterSummaryFailure(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "failed-summary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("s", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSegment("s", transcribe.Segment{Text: "failure fallback transcript", StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("s", started.Add(time.Second), "recording.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	client := &r4GateEmbeddingClient{entered: make(chan struct{}), release: make(chan struct{})}
+	indexer := &r4NotifyingIndexer{indexer: embedding.NewIndexer(client, store, 500), done: make(chan struct{})}
+	manager := NewManager(store, nil, &r3GateSummarizer{err: errors.New("summary backend failed")}, nil, nil, 0)
+	manager.SetIndexer(indexer)
+	manager.generateSummary(context.Background(), "s", started)
+	select {
+	case <-client.entered:
+	case <-time.After(time.Second):
+		t.Fatal("failed summary did not start real-indexer fallback")
+	}
+	close(client.release)
+	<-indexer.done
+	session, err := store.GetSession("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeddings, err := store.GetEmbeddings("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SummaryStatus != storage.SummaryFailed || len(embeddings) != 1 {
+		t.Fatalf("failed summary status=%q embeddings=%d, want failed and one real-indexer chunk", session.SummaryStatus, len(embeddings))
 	}
 }
