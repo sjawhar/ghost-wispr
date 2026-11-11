@@ -277,7 +277,7 @@ func TestPendingSplicesReturnsOnlyRecordingsAtTheirBeforeHash(t *testing.T) {
 func TestDeleteSegmentClearsPriorDriveReplacementCycle(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "replacement-cycle")
-	if _, err := store.DB().Exec(`INSERT INTO drive_replacements VALUES('replacement-cycle', 'transcript.md', 'old', 'new', 'deleted')`); err != nil {
+	if _, err := store.DB().Exec(`INSERT INTO drive_replacements(session_id, generation, name, old_id, new_id, state) VALUES('replacement-cycle', 0, 'transcript.md', 'old', 'new', 'deleted')`); err != nil {
 		t.Fatalf("seed replacement: %v", err)
 	}
 	segments, err := store.GetSegments("replacement-cycle")

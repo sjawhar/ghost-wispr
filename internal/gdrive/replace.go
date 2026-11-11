@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -14,10 +15,12 @@ import (
 )
 
 type replacementStore interface {
-	DriveReplacements(sessionID string) ([]storage.DriveReplacement, error)
-	StartDriveReplacement(sessionID, name string, oldIDs []string) error
-	MarkDriveReplacementUploaded(sessionID, name, newID string) error
-	MarkDriveReplacementDeleted(sessionID, name, oldID string) error
+	GetSession(id string) (storage.Session, error)
+	DriveReplacements(sessionID string, generation ...int) ([]storage.DriveReplacement, error)
+	PendingDriveReplacementRecordings(sessionID string) ([]string, error)
+	StartDriveReplacement(sessionID, name string, generation int, oldIDs []string) error
+	MarkDriveReplacementUploaded(sessionID, name string, generation int, newID string) error
+	MarkDriveReplacementDeleted(sessionID, name, oldID string, generation int) error
 	DeletionGeneration(sessionID string) (int, error)
 	FinishDriveReplacement(sessionID string, generation int) error
 }
@@ -39,6 +42,14 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	if s.replacements == nil {
 		return fmt.Errorf("replace session files %s: replacement store is required", sess.ID)
 	}
+	current, err := s.replacements.GetSession(sess.ID)
+	if err != nil {
+		return fmt.Errorf("read replacement session %s: %w", sess.ID, err)
+	}
+	sess = current
+	if !sess.DriveReplacePending || !replacementReady(&sess) {
+		return nil
+	}
 	if sess.GDriveFolderID == "" {
 		return fmt.Errorf("replace session files %s: session has no Drive folder", sess.ID)
 	}
@@ -48,7 +59,7 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		return fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
 	}
 
-	replacements, err := s.replacements.DriveReplacements(sess.ID)
+	replacements, err := s.replacements.DriveReplacements(sess.ID, generation)
 	if err != nil {
 		return err
 	}
@@ -60,7 +71,14 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		return s.replacements.FinishDriveReplacement(sess.ID, generation)
 	}
 
-	files, folderName, err := replacementFiles(&sess, splicedRecording)
+	recordings, err := s.replacements.PendingDriveReplacementRecordings(sess.ID)
+	if err != nil {
+		return fmt.Errorf("list replacement recordings for session %s: %w", sess.ID, err)
+	}
+	if len(recordings) == 0 {
+		recordings = []string{splicedRecording}
+	}
+	files, folderName, err := replacementFiles(&sess, recordings)
 	if err != nil {
 		return fmt.Errorf("build replacements for session %s: %w", sess.ID, err)
 	}
@@ -81,13 +99,10 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		rows := driveReplacementsNamed(replacements, file.Name)
 		if len(rows) == 0 {
 			oldFiles := oldByName[file.Name]
-			if len(oldFiles) == 0 {
-				return fmt.Errorf("replace session files %s: no old %s in Drive folder", sess.ID, file.Name)
-			}
-			if err := s.replacements.StartDriveReplacement(sess.ID, file.Name, driveFileIDs(oldFiles)); err != nil {
+			if err := s.replacements.StartDriveReplacement(sess.ID, file.Name, generation, driveFileIDs(oldFiles)); err != nil {
 				return err
 			}
-			replacements, err = s.replacements.DriveReplacements(sess.ID)
+			replacements, err = s.replacements.DriveReplacements(sess.ID, generation)
 			if err != nil {
 				return err
 			}
@@ -114,19 +129,19 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		} else {
 			newID = newFile.Id
 		}
-		if err := s.verifyFileHash(ctx, newID, file.SHA256); err != nil {
+		if err := s.verifyFile(ctx, newID, file); err != nil {
 			return fmt.Errorf("verify replacement %s: %w", file.Name, err)
 		}
-		if err := s.replacements.MarkDriveReplacementUploaded(sess.ID, file.Name, newID); err != nil {
+		if err := s.replacements.MarkDriveReplacementUploaded(sess.ID, file.Name, generation, newID); err != nil {
 			return err
 		}
-		replacements, err = s.replacements.DriveReplacements(sess.ID)
+		replacements, err = s.replacements.DriveReplacements(sess.ID, generation)
 		if err != nil {
 			return err
 		}
 	}
 
-	replacements, err = s.replacements.DriveReplacements(sess.ID)
+	replacements, err = s.replacements.DriveReplacements(sess.ID, generation)
 	if err != nil {
 		return err
 	}
@@ -138,11 +153,20 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		case storage.DriveReplacementDeleted:
 			continue
 		case storage.DriveReplacementUploaded:
-			err := s.service.Files.Delete(replacement.OldID).SupportsAllDrives(true).Context(ctx).Do()
-			if err != nil && !IsRemoteDeletedError(err) {
-				return fmt.Errorf("delete old %s: %w", replacement.Name, err)
+			currentGeneration, err := s.replacements.DeletionGeneration(sess.ID)
+			if err != nil {
+				return fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
 			}
-			if err := s.replacements.MarkDriveReplacementDeleted(sess.ID, replacement.Name, replacement.OldID); err != nil {
+			if currentGeneration != generation {
+				return fmt.Errorf("replace session files %s: deletion generation changed from %d to %d", sess.ID, generation, currentGeneration)
+			}
+			if replacement.OldID != "" {
+				err := s.service.Files.Delete(replacement.OldID).SupportsAllDrives(true).Context(ctx).Do()
+				if err != nil && !IsRemoteDeletedError(err) {
+					return fmt.Errorf("delete old %s: %w", replacement.Name, err)
+				}
+			}
+			if err := s.replacements.MarkDriveReplacementDeleted(sess.ID, replacement.Name, replacement.OldID, generation); err != nil {
 				return err
 			}
 		default:
@@ -158,8 +182,8 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	return nil
 }
 
-func replacementFiles(sess *storage.Session, splicedRecording string) ([]SyncFile, string, error) {
-	if splicedRecording == "" {
+func replacementFiles(sess *storage.Session, recordings []string) ([]SyncFile, string, error) {
+	if len(recordings) == 0 {
 		return nil, "", fmt.Errorf("spliced recording is required")
 	}
 	syncSession := toSyncSession(sess)
@@ -167,28 +191,43 @@ func replacementFiles(sess *storage.Session, splicedRecording string) ([]SyncFil
 	if sess.SummaryStatus != storage.SummaryCompleted {
 		summary = ""
 	}
-	hash, err := fileSHA256(splicedRecording)
-	if err != nil {
-		return nil, "", fmt.Errorf("hash spliced recording %s: %w", splicedRecording, err)
-	}
-	mimeType := "audio/mpeg"
-	if filepath.Ext(splicedRecording) == ".wav" {
-		mimeType = "audio/wav"
-	}
-	return []SyncFile{
+	files := []SyncFile{
 		{Name: "summary.md", MimeType: "application/vnd.google-apps.document", Content: []byte(summary), ContentType: "text/plain"},
 		{Name: "transcript.md", MimeType: "application/vnd.google-apps.document", Content: []byte(transcript), ContentType: "text/plain"},
-		{Name: "audio-" + filepath.Base(splicedRecording), MimeType: mimeType, LocalPath: splicedRecording, ContentType: mimeType, SHA256: hash},
-	}, sess.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(sess.Title), nil
+	}
+	for _, recording := range recordings {
+		hash, err := fileSHA256(recording)
+		if err != nil {
+			return nil, "", fmt.Errorf("hash spliced recording %s: %w", recording, err)
+		}
+		mimeType := "audio/mpeg"
+		if filepath.Ext(recording) == ".wav" {
+			mimeType = "audio/wav"
+		}
+		files = append(files, SyncFile{Name: "audio-" + filepath.Base(recording), MimeType: mimeType, LocalPath: recording, ContentType: mimeType, SHA256: hash})
+	}
+	return files, sess.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(sess.Title), nil
 }
 
-func (s *Syncer) verifyFileHash(ctx context.Context, fileID, want string) error {
-	file, err := s.service.Files.Get(fileID).SupportsAllDrives(true).Context(ctx).Fields("id, appProperties").Do()
+func (s *Syncer) verifyFile(ctx context.Context, fileID string, expected *SyncFile) error {
+	file, err := s.service.Files.Get(fileID).SupportsAllDrives(true).Context(ctx).
+		Fields("id, appProperties, sha256Checksum, size").Do()
 	if err != nil {
 		return fmt.Errorf("read uploaded file %s: %w", fileID, err)
 	}
-	if got := file.AppProperties[contentHashProperty]; got != want {
+	if got, want := file.AppProperties[contentHashProperty], expected.SHA256; got != want {
 		return fmt.Errorf("uploaded file %s hash = %q, want %q", fileID, got, want)
+	}
+	if expected.LocalPath == "" {
+		return nil
+	}
+	info, err := os.Stat(expected.LocalPath)
+	if err != nil {
+		return fmt.Errorf("stat uploaded source %s: %w", expected.LocalPath, err)
+	}
+	if file.Sha256Checksum != expected.SHA256 || file.Size != info.Size() {
+		return fmt.Errorf("uploaded file %s content differs: sha256=%q size=%d, want sha256=%q size=%d",
+			fileID, file.Sha256Checksum, file.Size, expected.SHA256, info.Size())
 	}
 	return nil
 }
@@ -274,10 +313,9 @@ func replacementFileForKey(files []*drive.File, name, key string) (*drive.File, 
 		if file.Name != name || file.AppProperties[replacementKeyProperty] != key {
 			continue
 		}
-		if found != nil {
-			return nil, fmt.Errorf("replacement %s has more than one uploaded file", name)
+		if found == nil || file.ModifiedTime > found.ModifiedTime {
+			found = file
 		}
-		found = file
 	}
 	return found, nil
 }

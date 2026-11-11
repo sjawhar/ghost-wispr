@@ -333,11 +333,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS drive_replacements (
 			session_id TEXT NOT NULL,
+			generation INTEGER NOT NULL DEFAULT 0,
 			name TEXT NOT NULL,
 			old_id TEXT NOT NULL,
 			new_id TEXT NOT NULL,
 			state TEXT NOT NULL,
-			PRIMARY KEY (session_id, name, old_id),
+			PRIMARY KEY (session_id, generation, name, old_id),
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
@@ -405,6 +406,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
 		}
+	}
+
+	if _, err := s.db.Exec(`ALTER TABLE drive_replacements ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate drive replacements generation: %w", err)
 	}
 
 	if _, err := s.db.Exec(

@@ -14,11 +14,12 @@ const (
 // DriveReplacement records one old Drive file and the replacement uploaded for
 // it. A duplicate filename can have several rows so every copy is removed.
 type DriveReplacement struct {
-	SessionID string
-	Name      string
-	OldID     string
-	NewID     string
-	State     string
+	SessionID  string
+	Generation int
+	Name       string
+	OldID      string
+	NewID      string
+	State      string
 }
 
 // DriveReplacementInput reports whether sessionID needs a Drive replacement
@@ -42,8 +43,49 @@ func (s *SQLiteStore) DriveReplacementInput(sessionID string) (bool, string, err
 	return true, audioPath, nil
 }
 
-func (s *SQLiteStore) DriveReplacements(sessionID string) ([]DriveReplacement, error) {
-	rows, err := s.db.Query(`SELECT session_id, name, old_id, new_id, state FROM drive_replacements WHERE session_id = ? ORDER BY name, old_id`, sessionID)
+func (s *SQLiteStore) PendingDriveReplacementRecordings(sessionID string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT audio_path FROM deleted_segments WHERE session_id = ? ORDER BY audio_path`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list spliced recordings for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var recordings []string
+	for rows.Next() {
+		var recording string
+		if err := rows.Scan(&recording); err != nil {
+			return nil, fmt.Errorf("scan spliced recording for session %s: %w", sessionID, err)
+		}
+		recordings = append(recordings, recording)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate spliced recordings for session %s: %w", sessionID, err)
+	}
+	return recordings, nil
+}
+
+func (s *SQLiteStore) ClearDriveReplacementPending(sessionID string, generation int) error {
+	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0
+		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, sessionID, generation)
+	if err != nil {
+		return fmt.Errorf("clear drive replacement for session %s: %w", sessionID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count cleared drive replacement for session %s: %w", sessionID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("clear drive replacement for session %s: %w", sessionID, sql.ErrNoRows)
+	}
+	return nil
+}
+func (s *SQLiteStore) DriveReplacements(sessionID string, generations ...int) ([]DriveReplacement, error) {
+	generation := 0
+	if len(generations) > 0 {
+		generation = generations[0]
+	}
+	rows, err := s.db.Query(`SELECT session_id, generation, name, old_id, new_id, state
+		FROM drive_replacements WHERE session_id = ? AND generation = ? ORDER BY name, old_id`, sessionID, generation)
 	if err != nil {
 		return nil, fmt.Errorf("list drive replacements for session %s: %w", sessionID, err)
 	}
@@ -52,7 +94,7 @@ func (s *SQLiteStore) DriveReplacements(sessionID string) ([]DriveReplacement, e
 	var replacements []DriveReplacement
 	for rows.Next() {
 		var replacement DriveReplacement
-		if err := rows.Scan(&replacement.SessionID, &replacement.Name, &replacement.OldID, &replacement.NewID, &replacement.State); err != nil {
+		if err := rows.Scan(&replacement.SessionID, &replacement.Generation, &replacement.Name, &replacement.OldID, &replacement.NewID, &replacement.State); err != nil {
 			return nil, fmt.Errorf("scan drive replacement for session %s: %w", sessionID, err)
 		}
 		replacements = append(replacements, replacement)
@@ -64,11 +106,14 @@ func (s *SQLiteStore) DriveReplacements(sessionID string) ([]DriveReplacement, e
 }
 
 // StartDriveReplacement writes every old id before uploading its replacement.
-// The one transaction lets a retry recover the new file after a stop between
-// Drive's upload response and the later uploaded-state write.
-func (s *SQLiteStore) StartDriveReplacement(sessionID, name string, oldIDs []string) error {
-	if sessionID == "" || name == "" || len(oldIDs) == 0 {
-		return fmt.Errorf("start drive replacement: session, name and old ids are required")
+// An empty old id represents a missing Drive file that must be uploaded but
+// has nothing to delete.
+func (s *SQLiteStore) StartDriveReplacement(sessionID, name string, generation int, oldIDs []string) error {
+	if sessionID == "" || name == "" {
+		return fmt.Errorf("start drive replacement: session and name are required")
+	}
+	if len(oldIDs) == 0 {
+		oldIDs = []string{""}
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -77,7 +122,7 @@ func (s *SQLiteStore) StartDriveReplacement(sessionID, name string, oldIDs []str
 	defer func() { _ = tx.Rollback() }()
 
 	var existing int
-	if err := tx.QueryRow(`SELECT count(*) FROM drive_replacements WHERE session_id = ? AND name = ?`, sessionID, name).Scan(&existing); err != nil {
+	if err := tx.QueryRow(`SELECT count(*) FROM drive_replacements WHERE session_id = ? AND generation = ? AND name = ?`, sessionID, generation, name).Scan(&existing); err != nil {
 		return fmt.Errorf("check drive replacement %s/%s: %w", sessionID, name, err)
 	}
 	if existing != 0 {
@@ -85,12 +130,12 @@ func (s *SQLiteStore) StartDriveReplacement(sessionID, name string, oldIDs []str
 	}
 	seen := make(map[string]bool, len(oldIDs))
 	for _, oldID := range oldIDs {
-		if oldID == "" || seen[oldID] {
-			return fmt.Errorf("start drive replacement %s/%s: old ids must be non-empty and unique", sessionID, name)
+		if seen[oldID] {
+			return fmt.Errorf("start drive replacement %s/%s: old ids must be unique", sessionID, name)
 		}
 		seen[oldID] = true
-		if _, err := tx.Exec(`INSERT INTO drive_replacements(session_id, name, old_id, new_id, state) VALUES(?, ?, ?, '', ?)`,
-			sessionID, name, oldID, DriveReplacementUploading); err != nil {
+		if _, err := tx.Exec(`INSERT INTO drive_replacements(session_id, generation, name, old_id, new_id, state) VALUES(?, ?, ?, ?, '', ?)`,
+			sessionID, generation, name, oldID, DriveReplacementUploading); err != nil {
 			return fmt.Errorf("record drive replacement %s/%s: %w", sessionID, name, err)
 		}
 	}
@@ -100,12 +145,13 @@ func (s *SQLiteStore) StartDriveReplacement(sessionID, name string, oldIDs []str
 	return nil
 }
 
-func (s *SQLiteStore) MarkDriveReplacementUploaded(sessionID, name, newID string) error {
+func (s *SQLiteStore) MarkDriveReplacementUploaded(sessionID, name string, generation int, newID string) error {
 	if newID == "" {
 		return fmt.Errorf("mark drive replacement uploaded %s/%s: new id is required", sessionID, name)
 	}
-	result, err := s.db.Exec(`UPDATE drive_replacements SET new_id = ?, state = ? WHERE session_id = ? AND name = ? AND state = ?`,
-		newID, DriveReplacementUploaded, sessionID, name, DriveReplacementUploading)
+	result, err := s.db.Exec(`UPDATE drive_replacements SET new_id = ?, state = ?
+		WHERE session_id = ? AND name = ? AND generation = ? AND state = ?`,
+		newID, DriveReplacementUploaded, sessionID, name, generation, DriveReplacementUploading)
 	if err != nil {
 		return fmt.Errorf("mark drive replacement uploaded %s/%s: %w", sessionID, name, err)
 	}
@@ -119,9 +165,10 @@ func (s *SQLiteStore) MarkDriveReplacementUploaded(sessionID, name, newID string
 	return nil
 }
 
-func (s *SQLiteStore) MarkDriveReplacementDeleted(sessionID, name, oldID string) error {
-	result, err := s.db.Exec(`UPDATE drive_replacements SET state = ? WHERE session_id = ? AND name = ? AND old_id = ? AND state = ?`,
-		DriveReplacementDeleted, sessionID, name, oldID, DriveReplacementUploaded)
+func (s *SQLiteStore) MarkDriveReplacementDeleted(sessionID, name, oldID string, generation int) error {
+	result, err := s.db.Exec(`UPDATE drive_replacements SET state = ?
+		WHERE session_id = ? AND name = ? AND old_id = ? AND generation = ? AND state = ?`,
+		DriveReplacementDeleted, sessionID, name, oldID, generation, DriveReplacementUploaded)
 	if err != nil {
 		return fmt.Errorf("mark drive replacement deleted %s/%s: %w", sessionID, name, err)
 	}
@@ -136,15 +183,18 @@ func (s *SQLiteStore) MarkDriveReplacementDeleted(sessionID, name, oldID string)
 }
 
 // FinishDriveReplacement clears the pending marker only once every old file
-// recorded for the replacement is gone and the deletion generation is still
-// the one that initiated this replacement.
+// recorded for this generation is gone.
 func (s *SQLiteStore) FinishDriveReplacement(sessionID string, generation int) error {
 	var count, incomplete int
-	if err := s.db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE state != ?) FROM drive_replacements WHERE session_id = ?`, DriveReplacementDeleted, sessionID).Scan(&count, &incomplete); err != nil {
+	if err := s.db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE state != ?)
+		FROM drive_replacements WHERE session_id = ? AND generation = ?`, DriveReplacementDeleted, sessionID, generation).Scan(&count, &incomplete); err != nil {
 		return fmt.Errorf("check drive replacement for session %s: %w", sessionID, err)
 	}
-	if count < 3 || incomplete != 0 {
-		return fmt.Errorf("finish drive replacement for session %s: %d rows, %d not deleted", sessionID, count, incomplete)
+	if count == 0 {
+		return fmt.Errorf("finish drive replacement for session %s: %w", sessionID, sql.ErrNoRows)
+	}
+	if incomplete != 0 {
+		return fmt.Errorf("finish drive replacement for session %s: %d rows not deleted", sessionID, incomplete)
 	}
 	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0
 		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, sessionID, generation)

@@ -550,3 +550,16 @@ func TestFinishDriveReplacementKeepsANewerDeletionPending(t *testing.T) {
 		t.Errorf("newer deletion pending marker = %d, want 1", pending)
 	}
 }
+
+func TestReplaceRefusesARecordingWithWrongDriveChecksum(t *testing.T) {
+	fixture := newReplacementFixture(t)
+	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
+	fixture.wire.allowDeletes = true
+	fixture.wire.corruptChecksum = true
+	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err == nil {
+		t.Fatal("replacement succeeded with a wrong Drive checksum")
+	}
+	if len(fixture.wire.deletedIDs) != 0 {
+		t.Fatalf("wrong checksum deleted old files %v", fixture.wire.deletedIDs)
+	}
+}

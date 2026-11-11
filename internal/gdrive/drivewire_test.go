@@ -2,6 +2,8 @@ package gdrive
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,7 +82,8 @@ type wireDrive struct {
 	failDeleteAt int
 	deletedIDs   []string
 	// unavailable makes Drive answer 503 to every request for a file.
-	unavailable bool
+	unavailable     bool
+	corruptChecksum bool
 	// onGet, when set, runs as Drive is asked for a file (Files.Get), with
 	// its id, while the server holds its lock.
 	onGet     func(id string)
@@ -336,7 +339,12 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(f.Content)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType, AppProperties: f.AppProperties, Trashed: d.inTrash(f), ExplicitlyTrashed: d.trashed[f.ID]})
+		sum := sha256.Sum256(f.Content)
+		checksum := hex.EncodeToString(sum[:])
+		if d.corruptChecksum {
+			checksum = "corrupt"
+		}
+		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType, AppProperties: f.AppProperties, Sha256Checksum: checksum, Size: int64(len(f.Content)), Trashed: d.inTrash(f), ExplicitlyTrashed: d.trashed[f.ID]})
 	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/drive/v3/files/"):
 		f := d.find(strings.TrimPrefix(path, "/drive/v3/files/"))
 		if f == nil {

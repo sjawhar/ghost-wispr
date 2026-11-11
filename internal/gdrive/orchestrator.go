@@ -44,6 +44,8 @@ type uploader interface {
 
 type replacementInputStore interface {
 	DriveReplacementInput(sessionID string) (pending bool, splicedRecording string, err error)
+	DeletionGeneration(sessionID string) (int, error)
+	ClearDriveReplacementPending(sessionID string, generation int) error
 }
 
 type Orchestrator struct {
@@ -128,7 +130,9 @@ func syncStateOf(sess *storage.Session) string {
 }
 
 func replacementReady(sess *storage.Session) bool {
-	refinementDone := sess.RefinementStatus == storage.RefinementCompleted || sess.RefinementStatus == storage.RefinementFailed
+	refinementDone := sess.RefinementStatus == storage.RefinementCompleted ||
+		sess.RefinementStatus == storage.RefinementFailed ||
+		sess.RefinementStatus == storage.RefinementNoAudio
 	summaryDone := sess.SummaryStatus == storage.SummaryCompleted || sess.SummaryStatus == storage.SummaryFailed
 	return refinementDone && summaryDone
 }
@@ -150,6 +154,16 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 			return replacementErr
 		}
 		if pending {
+			if read.GDriveFolderID == "" {
+				generation, err := replacements.DeletionGeneration(sessionID)
+				if err != nil {
+					return fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+				}
+				if err := replacements.ClearDriveReplacementPending(sessionID, generation); err != nil {
+					return err
+				}
+				return o.SyncSession(ctx, sessionID)
+			}
 			if !replacementReady(&read) {
 				o.logger.Info("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
 				return nil

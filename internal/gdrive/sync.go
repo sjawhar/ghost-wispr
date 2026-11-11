@@ -263,9 +263,8 @@ func (s *Syncer) FolderOnDrive(ctx context.Context, folderID string) (bool, erro
 // driveFile is a file in a session's Drive folder.
 type driveFile struct {
 	ID, Name string
-	// ContentHash is the hash of a document (summary, transcript) this app
-	// uploaded, kept in the file's appProperties; "" for audio, and for a
-	// document uploaded before hashes were kept.
+	// ContentHash is the hash this app uploaded in the file's appProperties;
+	// it is empty only for a file uploaded before hashes were kept.
 	ContentHash  string
 	ModifiedTime time.Time
 }
