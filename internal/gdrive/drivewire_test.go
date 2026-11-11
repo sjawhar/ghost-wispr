@@ -30,16 +30,35 @@ type wireFile struct {
 	Content            []byte
 }
 
+type wireListRequest struct {
+	Parent, PageToken string
+}
+
+func (d *wireDrive) listed(want wireListRequest) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, got := range d.listRequests {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
 // wireDrive is the part of the Google Drive v3 HTTP API the Syncer uses,
 // served over httptest, so the real Syncer (its requests on the wire) runs
 // against it. It fails the test on any request that deletes or trashes a
-// file, or that it does not know.
+// file, does not configure a shared-drive-capable operation for all drives,
+// or that it does not know.
 type wireDrive struct {
-	t     *testing.T
-	mu    sync.Mutex
-	files []*wireFile // in listing order
-	next  int
-	clock time.Time
+	t            *testing.T
+	mu           sync.Mutex
+	files        []*wireFile // in listing order
+	listPages    map[string]map[string]*drive.FileList
+	listRequests []wireListRequest
+	next         int
+	clock        time.Time
+	rootID       string
 	// gone holds the folders deleted by hand, for good: Drive answers 404
 	// for each, as for any file it does not have.
 	gone map[string]bool
@@ -66,14 +85,14 @@ var parentQuery = regexp.MustCompile(`'([^']+)' in parents`)
 // folder is "root".
 func newWireDrive(t *testing.T) (*wireDrive, *Syncer) {
 	t.Helper()
-	d := &wireDrive{t: t, clock: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)}
+	d := &wireDrive{t: t, rootID: "root", clock: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)}
 	srv := httptest.NewServer(http.HandlerFunc(d.serve))
 	t.Cleanup(srv.Close)
 	svc, err := drive.NewService(context.Background(), option.WithEndpoint(srv.URL+"/drive/v3/"), option.WithHTTPClient(srv.Client()))
 	if err != nil {
 		t.Fatalf("drive service: %v", err)
 	}
-	return d, &Syncer{service: svc, folderID: "root", logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	return d, &Syncer{service: svc, folderID: d.rootID, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 }
 
 // add puts a file in folder parent, as an earlier version of the app left it,
@@ -174,9 +193,26 @@ func notFound(w http.ResponseWriter, id string) {
 	}})
 }
 
+func (d *wireDrive) requireSharedDriveParameters(w http.ResponseWriter, r *http.Request) bool {
+	if !strings.HasSuffix(r.URL.Path, "/export") && r.URL.Query().Get("supportsAllDrives") != "true" {
+		d.t.Errorf("Drive: %s %s is missing supportsAllDrives=true", r.Method, r.URL)
+		http.Error(w, "supportsAllDrives=true is required", http.StatusBadRequest)
+		return false
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/drive/v3/files" && r.URL.Query().Get("includeItemsFromAllDrives") != "true" {
+		d.t.Errorf("Drive: %s %s is missing includeItemsFromAllDrives=true", r.Method, r.URL)
+		http.Error(w, "includeItemsFromAllDrives=true is required", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if !d.requireSharedDriveParameters(w, r) {
+		return
+	}
 	path := r.URL.Path
 	switch {
 	case r.Method == http.MethodDelete:
@@ -191,6 +227,21 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		if d.gone[m[1]] {
 			notFound(w, m[1])
+			return
+		}
+		request := wireListRequest{Parent: m[1], PageToken: r.URL.Query().Get("pageToken")}
+		d.listRequests = append(d.listRequests, request)
+		if pages := d.listPages[request.Parent]; pages != nil {
+			page, ok := pages[request.PageToken]
+			if !ok {
+				d.t.Errorf("Drive: no page for %+v", request)
+				http.Error(w, "unknown page token", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(page)
+			if d.onList != nil {
+				d.onList(request.Parent)
+			}
 			return
 		}
 		notTrashed := strings.Contains(r.URL.Query().Get("q"), "trashed = false")
@@ -221,9 +272,10 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
 			return
 		}
-		if id == "root" && !d.gone[id] {
-			// The folder the Syncer syncs into.
-			_ = json.NewEncoder(w).Encode(&drive.File{Id: id, Trashed: d.trashed[id], ExplicitlyTrashed: d.trashed[id]})
+		if id == d.rootID && !d.gone[id] {
+			// The folder the Syncer syncs into. It is a shared-drive root,
+			// whose ID is also its Drive ID.
+			_ = json.NewEncoder(w).Encode(&drive.File{Id: id, DriveId: d.rootID, Trashed: d.trashed[id], ExplicitlyTrashed: d.trashed[id]})
 			return
 		}
 		f := d.find(id)
