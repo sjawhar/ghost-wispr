@@ -47,7 +47,7 @@ func summarizedSession(t *testing.T, store *storage.SQLiteStore, audioDir, id st
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.Canonicalize(id); err != nil {
+	if _, err := store.Canonicalize(id); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 	if err := store.UpdateSummary(id, "Standup", summary, storage.SummaryCompleted, "default", "{}"); err != nil {
@@ -161,7 +161,7 @@ func TestAChangeAfterASyncReachesDrive(t *testing.T) {
 				if err := store.UpdateRefinement(id, "The refined transcript.", storage.RefinementCompleted); err != nil {
 					t.Fatalf("refine: %v", err)
 				}
-				if err := store.Canonicalize(id); err != nil {
+				if _, err := store.Canonicalize(id); err != nil {
 					t.Fatalf("canonicalize: %v", err)
 				}
 			},

@@ -537,7 +537,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 
 	// Re-canonicalize now that refined transcript is available.
-	if err := m.store.Canonicalize(sessionID); err != nil {
+	if _, err := m.store.Canonicalize(sessionID); err != nil {
 		m.batchLogger.Error("failed to re-canonicalize after batch refinement", "operation", "batch_refinement", "session_id", sessionID, "error", err)
 	}
 }
@@ -573,10 +573,12 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	if summarizer == nil {
 		// Still canonicalize for GDrive sync even without summarizer.
-		if err := m.store.Canonicalize(sessionID); err != nil {
+		generation, err := m.store.Canonicalize(sessionID)
+		if err != nil {
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+			return
 		}
-		if transcript, _, generation, err := m.store.GetCanonicalTranscriptWithGeneration(sessionID); err != nil {
+		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
 			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		} else {
 			m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
@@ -607,14 +609,14 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	// Canonicalize the transcript (picks refined if available, else assembles streaming).
-	if err := m.store.Canonicalize(sessionID); err != nil {
+	generation, err := m.store.Canonicalize(sessionID)
+	if err != nil {
+		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		return
 	}
 
-	var transcript string
-	var generation int
-	var err error
-	transcript, _, generation, err = m.store.GetCanonicalTranscriptWithGeneration(sessionID)
+	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
 	if err != nil {
 		m.failSummary(sessionID, fmt.Sprintf("failed to get canonical transcript: %v", err))
 		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)

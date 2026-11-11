@@ -180,7 +180,7 @@ func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
 	return s.refinedTranscript[sessionID], s.refinementStatus[sessionID], nil
 }
 
-func (s *storeMock) Canonicalize(sessionID string) error {
+func (s *storeMock) Canonicalize(sessionID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	status := s.refinementStatus[sessionID]
@@ -200,7 +200,7 @@ func (s *storeMock) Canonicalize(sessionID string) error {
 		s.canonicalTranscript[sessionID] = b.String()
 		s.transcriptSource[sessionID] = "streaming"
 	}
-	return nil
+	return 0, nil
 }
 
 func (s *storeMock) GetCanonicalTranscript(sessionID string) (string, string, error) {

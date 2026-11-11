@@ -31,7 +31,7 @@ type Store interface {
 	ClaimRefinement(sessionID, audioPath string) (bool, error)
 	GetRefinement(sessionID string) (transcript, status string, err error)
 	UpdateTitle(sessionID, title string) error
-	Canonicalize(sessionID string) error
+	Canonicalize(sessionID string) (generation int, err error)
 	GetCanonicalTranscript(sessionID string) (transcript, source string, err error)
 	GetCanonicalTranscriptWithGeneration(sessionID string) (transcript, source string, generation int, err error)
 }

@@ -221,7 +221,7 @@ func TestStartupRecoveryContinuesPastBadSplice(t *testing.T) {
 		t.Fatalf("insert pending rows: %v", err)
 	}
 	var warnings []error
-	count, err := recoverPendingSplices(context.Background(), store, audioDir, nil, fakeSplice, nil, func(err error) {
+	count, err := recoverPendingSplices(context.Background(), store, audioDir, nil, fakeSplice, nil, func(_ storage.DeletedSpan, err error) {
 		warnings = append(warnings, err)
 	})
 	if err != nil {

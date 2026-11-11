@@ -1262,49 +1262,57 @@ func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {
 	return transcript, status, nil
 }
 
-// Canonicalize sets the canonical_transcript and transcript_source for a session.
-// If refinement is completed, uses the refined transcript; otherwise assembles streaming segments.
-func (s *SQLiteStore) Canonicalize(sessionID string) error {
-	var refinedTranscript, refinementStatus string
-	if err := s.db.QueryRow(`SELECT refined_transcript, refinement_status FROM sessions WHERE id = ?`, sessionID).Scan(&refinedTranscript, &refinementStatus); err != nil {
-		return fmt.Errorf("query refinement for canonicalize %s: %w", sessionID, err)
-	}
-
-	var canonical, source string
-	if refinementStatus == RefinementCompleted && strings.TrimSpace(refinedTranscript) != "" {
-		canonical = strings.TrimSpace(refinedTranscript)
-		source = TranscriptSourceRefined
-	} else {
-		// Assemble from streaming segments.
-		segs, err := s.GetSegments(sessionID)
+// Canonicalize sets the canonical transcript and source for sessionID. It
+// returns the deletion generation whose segments it read and writes only while
+// that generation is still current.
+func (s *SQLiteStore) Canonicalize(sessionID string) (int, error) {
+	for range 2 {
+		tx, err := s.db.Begin()
 		if err != nil {
-			return fmt.Errorf("get segments for canonicalize %s: %w", sessionID, err)
+			return 0, fmt.Errorf("begin canonicalize %s: %w", sessionID, err)
 		}
-		var b strings.Builder
-		for _, seg := range segs {
-			text := strings.TrimSpace(seg.Text)
-			if text == "" {
-				continue
-			}
-			b.WriteString(text)
-			b.WriteByte('\n')
-		}
-		canonical = b.String()
-		source = TranscriptSourceStreaming
-	}
 
-	res, err := s.db.Exec(`UPDATE sessions SET canonical_transcript = ?, transcript_source = ? WHERE id = ?`, canonical, source, sessionID)
-	if err != nil {
-		return fmt.Errorf("update canonical transcript for session %s: %w", sessionID, err)
+		var refinedTranscript, refinementStatus string
+		var generation int
+		if err := tx.QueryRow(`SELECT refined_transcript, refinement_status, deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&refinedTranscript, &refinementStatus, &generation); err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("query refinement for canonicalize %s: %w", sessionID, err)
+		}
+
+		var canonical, source string
+		if refinementStatus == RefinementCompleted && strings.TrimSpace(refinedTranscript) != "" {
+			canonical = strings.TrimSpace(refinedTranscript)
+			source = TranscriptSourceRefined
+		} else {
+			segs, err := getSegments(tx, sessionID)
+			if err != nil {
+				_ = tx.Rollback()
+				return 0, fmt.Errorf("get segments for canonicalize %s: %w", sessionID, err)
+			}
+			canonical = canonicalTranscript(segs)
+			source = TranscriptSourceStreaming
+		}
+
+		res, err := tx.Exec(`UPDATE sessions SET canonical_transcript = ?, transcript_source = ? WHERE id = ? AND deletion_generation = ?`, canonical, source, sessionID, generation)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("update canonical transcript for session %s: %w", sessionID, err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("canonicalize rows affected: %w", err)
+		}
+		if rows == 0 {
+			_ = tx.Rollback()
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("commit canonical transcript for session %s: %w", sessionID, err)
+		}
+		return generation, nil
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("canonicalize rows affected: %w", err)
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return 0, fmt.Errorf("canonicalize %s: %w", sessionID, sql.ErrNoRows)
 }
 
 // GetCanonicalTranscript returns the canonical transcript and its source for a session.

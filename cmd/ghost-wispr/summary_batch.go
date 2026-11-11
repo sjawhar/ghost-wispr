@@ -20,10 +20,11 @@ func readBatchSummarySessions(store *storage.SQLiteStore, sessionIDs []string) (
 	generations := make(map[string]int, len(sessionIDs))
 	emptyTranscriptIDs := make([]string, 0)
 	for _, sessionID := range sessionIDs {
-		if err := store.Canonicalize(sessionID); err != nil {
+		generation, err := store.Canonicalize(sessionID)
+		if err != nil {
 			return nil, nil, nil, fmt.Errorf("canonicalize batch summary input for %s: %w", sessionID, err)
 		}
-		transcript, _, generation, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
+		transcript, _, err := store.GetCanonicalTranscript(sessionID)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("read batch summary input for %s: %w", sessionID, err)
 		}

@@ -369,9 +369,9 @@ func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool
 // recoverPendingSplices completes recordings whose deletion transaction
 // committed before its replacement file reached disk. One bad row is reported
 // through warn and never prevents later rows from recovering.
-func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(error)) (int, error) {
+func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(storage.DeletedSpan, error)) (int, error) {
 	if warn == nil {
-		warn = func(error) {}
+		warn = func(storage.DeletedSpan, error) {}
 	}
 	spans, err := store.PendingSplices()
 	if err != nil {
@@ -379,7 +379,7 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	}
 	recovered := 0
 	for i := range spans {
-		if recoverPendingSplice(ctx, store, audioDir, source, splice, refine, warn, &spans[i]) {
+		if recoverPendingSplice(ctx, store, audioDir, source, splice, refine, func(err error) { warn(spans[i], err) }, &spans[i]) {
 			recovered++
 		}
 	}

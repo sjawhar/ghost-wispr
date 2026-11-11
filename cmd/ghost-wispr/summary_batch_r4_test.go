@@ -36,10 +36,7 @@ func r4BatchStore(t *testing.T, ids ...string) (*storage.SQLiteStore, string, st
 		if err := store.EndSession(id, started.Add(time.Minute), "recording.mp3"); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.Canonicalize(id); err != nil {
-			t.Fatal(err)
-		}
-		generation, err := store.DeletionGeneration(id)
+		generation, err := store.Canonicalize(id)
 		if err != nil {
 			t.Fatal(err)
 		}
