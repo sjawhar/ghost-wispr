@@ -209,5 +209,8 @@ func CertificateExpiryWarning(now, notAfter time.Time, hasCertificate bool) stri
 	if !hasCertificate || notAfter.After(now.AddDate(0, 0, 30)) {
 		return ""
 	}
+	if !notAfter.After(now) {
+		return fmt.Sprintf("Google credential certificate expired on %s; renew it with the runbook in docs/pi-setup.md.", notAfter.UTC().Format("2006-01-02"))
+	}
 	return fmt.Sprintf("Google credential certificate expires on %s; renew it with the runbook in docs/pi-setup.md.", notAfter.UTC().Format("2006-01-02"))
 }
