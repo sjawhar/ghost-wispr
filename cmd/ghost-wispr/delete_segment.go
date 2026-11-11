@@ -324,15 +324,16 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	recovered := 0
 	for _, span := range spans {
 		unlock := deleteLocks.lock(span.SessionID)
-		defer unlock()
 		session, err := store.GetSession(span.SessionID)
 		if err != nil {
 			warn(fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err))
+			unlock()
 			continue
 		}
 		recordingSet, err := restoreDeletionRecordings(ctx, &session, audioDir, source)
 		if err != nil {
 			warn(fmt.Errorf("restore pending splice %s: %w", span.AudioPath, err))
+			unlock()
 			continue
 		}
 		recording := ""
@@ -345,46 +346,55 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 		if recording == "" {
 			removeFiles(recordingSet.Downloaded)
 			warn(fmt.Errorf("pending splice recording %s is unavailable", span.AudioPath))
+			unlock()
 			continue
 		}
 		hash, err := fileSHA256(recording)
 		if err != nil {
 			removeFiles(recordingSet.Downloaded)
 			warn(fmt.Errorf("hash pending splice recording %s: %w", recording, err))
+			unlock()
 			continue
 		}
 		if hash == span.SHA256After {
 			if err := store.MarkSpliceComplete(&span); err != nil {
 				warn(err)
 			}
+			unlock()
 			continue
 		}
 		if hash != span.SHA256Before {
 			removeFiles(recordingSet.Downloaded)
 			warn(fmt.Errorf("pending splice recording %s has SHA-256 %s, want %s", recording, hash, span.SHA256Before))
+			unlock()
 			continue
 		}
 		afterHash, err := splice(ctx, recording, span.Start, span.End)
 		if err != nil {
 			removeFiles(recordingSet.Downloaded)
 			warn(fmt.Errorf("re-splice %s: %w", recording, err))
+			unlock()
 			continue
 		}
 		if afterHash != span.SHA256After {
 			warn(fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After))
+			unlock()
 			continue
 		}
 		if err := store.MarkSpliceComplete(&span); err != nil {
 			warn(err)
+			unlock()
 			continue
 		}
 		if refine != nil {
 			if err := refine(ctx, span.SessionID, session.AudioPath, session.StartedAt); err != nil {
 				warn(fmt.Errorf("refine re-spliced session %s: %w", span.SessionID, err))
+				unlock()
 				continue
 			}
 		}
 		recovered++
+		unlock()
 	}
 	return recovered, nil
 }

@@ -774,7 +774,6 @@ func main() {
 			}
 		}
 
-
 		requests, err := summarizer.BuildBatchRequests(ctx, sessions)
 		if err != nil {
 			return "", 0, fmt.Errorf("build batch requests: %w", err)
@@ -1842,7 +1841,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", err))
 	}
-
 
 	// Create health checker with actual component references
 	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
