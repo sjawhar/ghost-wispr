@@ -233,6 +233,9 @@ func TestStartupRecoveryContinuesPastBadSplice(t *testing.T) {
 	if contents, err := os.ReadFile(good); err != nil || !bytes.Equal(contents, []byte("spliced")) {
 		t.Fatalf("good recovery bytes=%q err=%v", contents, err)
 	}
+	if contents, err := os.ReadFile(bad); err != nil || !bytes.Equal(contents, []byte("unexpected")) {
+		t.Fatalf("bad recovery bytes=%q err=%v, want unchanged recording", contents, err)
+	}
 }
 
 type mergedDeletionWordsFake struct{}
@@ -502,13 +505,12 @@ func TestNeighbourCheckCountsRepeatedLostWords(t *testing.T) {
 }
 
 func TestBoundaryCutSkipsOnlyCrossRecordingNeighbour(t *testing.T) {
-	before, after := neighbourChecksForRecording(1, 2, 0.1, 1, 5)
-	if before || !after {
-		t.Fatalf("boundary checks before=%v after=%v, want skip-before only", before, after)
+	secondRecording := []audio.Word{{Text: "deleted", Start: 0.1, End: 0.2}, {Text: "after", Start: 1.2, End: 1.3}}
+	if recordingHasWordsOnSide(secondRecording, 0, 1, true) {
+		t.Fatal("selected recording unexpectedly has a before-side neighbour")
 	}
-	before, after = neighbourChecksForRecording(0, 2, 1, 4.9, 5)
-	if !before || after {
-		t.Fatalf("boundary checks before=%v after=%v, want skip-after only", before, after)
+	if !recordingHasWordsOnSide(secondRecording, 0, 1, false) {
+		t.Fatal("selected recording should validate its after-side neighbour")
 	}
 }
 

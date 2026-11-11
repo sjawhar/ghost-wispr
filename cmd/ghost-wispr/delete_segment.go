@@ -264,7 +264,11 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	if survivors := audio.Survivors(wordsAfter, start, segments[index].Text, before, after); len(survivors) > 0 {
 		return fmt.Errorf("%w: surviving words: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(survivors, ", "))
 	}
-	beforeCheck, afterCheck := neighbourChecksForRecording(recordIndex, len(candidates), start, end, candidates[recordIndex].Duration)
+	// A neighbour in another recording has no words on this recording's side
+	// of the cut, so it cannot have been over-cut here. Validate only sides
+	// for which the selected recording supplied pre-cut words.
+	beforeCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, true)
+	afterCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, false)
 	if beforeCheck {
 		if beforeMissing := missingNeighbourTokens(wordsAfter, start, before, true); len(beforeMissing) > 1 {
 			return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(beforeMissing, ", "))
@@ -304,13 +308,18 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	return nil
 }
 
-// neighbourChecksForRecording skips only a neighbour that must reside in an
-// adjacent recording: a cut at this recording's leading or trailing boundary.
-func neighbourChecksForRecording(recordIndex, recordings int, start, end, duration float64) (before, after bool) {
-	const recordingBoundarySeconds = 0.5
-	before = !(recordIndex > 0 && start <= recordingBoundarySeconds)
-	after = !(recordIndex+1 < recordings && end >= duration-recordingBoundarySeconds)
-	return before, after
+// recordingHasWordsOnSide reports whether the selected recording itself has
+// words that could have belonged to this neighbour side of the cut.
+func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool) bool {
+	for _, word := range words {
+		if before && word.End <= start {
+			return true
+		}
+		if !before && word.Start >= end {
+			return true
+		}
+	}
+	return false
 }
 
 // recoverPendingSplices completes recordings whose deletion transaction
@@ -372,15 +381,29 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 			unlock()
 			continue
 		}
-		afterHash, err := splice(ctx, recording, span.Start, span.End)
+		tempPath, err := copyForSplice(recording)
 		if err != nil {
+			removeFiles(recordingSet.Downloaded)
+			warn(fmt.Errorf("copy pending splice %s: %w", recording, err))
+			unlock()
+			continue
+		}
+		afterHash, err := splice(ctx, tempPath, span.Start, span.End)
+		if err != nil {
+			_ = os.Remove(tempPath)
 			removeFiles(recordingSet.Downloaded)
 			warn(fmt.Errorf("re-splice %s: %w", recording, err))
 			unlock()
 			continue
 		}
 		if afterHash != span.SHA256After {
+			_ = os.Remove(tempPath)
 			warn(fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After))
+			unlock()
+			continue
+		}
+		if err := os.Rename(tempPath, recording); err != nil {
+			warn(fmt.Errorf("replace recovered recording %s: %w", recording, err))
 			unlock()
 			continue
 		}
