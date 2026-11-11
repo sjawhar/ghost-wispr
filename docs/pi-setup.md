@@ -243,6 +243,21 @@ ssh ghost-wispr@ghost-wispr 'curl -fsS http://127.0.0.1:8080/api/version'
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user list-timers ghost-wispr-update.timer'
 ```
 
+## Recover a pending segment deletion
+
+If `/api/status` names a session with a pending segment deletion, do not issue another
+delete for that conversation. First restore Drive connectivity and confirm the session
+folder still contains its recordings. Then restart Ghost Wispr:
+
+```bash
+ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
+  'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service'
+```
+
+The startup recovery verifies the recording hash, completes the splice, and clears the
+warning. If the warning remains, preserve the named recording and contact the recorder
+operator; do not remove the pending database row or audio file by hand.
+
 ## Accept slice 1
 
 Run the acceptance driver from a tailnet member. Give it the relay URL. To run the signed

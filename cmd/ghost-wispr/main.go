@@ -700,7 +700,6 @@ func main() {
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	drive := &driveSync{}
 	var summaryPublisher atomic.Pointer[envoy.Publisher]
-	var batchGenerations sync.Map // map[string]map[string]int, keyed by batch job name
 	publishSummaryReady := func(sessionID string) {
 		pub := summaryPublisher.Load()
 		if pub == nil {
@@ -802,7 +801,9 @@ func main() {
 		if err != nil {
 			return "", 0, fmt.Errorf("create batch job: %w", err)
 		}
-		batchGenerations.Store(job.Name, generations)
+		if err := store.RecordSummaryBatch(job.Name, generations); err != nil {
+			return "", 0, fmt.Errorf("persist summary batch %s: %w", job.Name, err)
+		}
 
 		return job.Name, len(sessions), nil
 	}
@@ -852,13 +853,9 @@ func main() {
 
 			batchResults := summarizer.ProcessBatchResults(job, sessions)
 			var succeeded, failed int
-			storedGenerations, ok := batchGenerations.Load(batchName)
-			if !ok {
-				return nil, fmt.Errorf("batch summary %s has no captured deletion generations", batchName)
-			}
-			generations, ok := storedGenerations.(map[string]int)
-			if !ok {
-				return nil, fmt.Errorf("batch summary %s has invalid captured generations", batchName)
+			generations, err := store.SummaryBatchGenerations(batchName)
+			if err != nil {
+				return nil, err
 			}
 			for _, br := range batchResults {
 				if br.Error != nil {
@@ -888,7 +885,7 @@ func main() {
 			result["succeeded"] = succeeded
 			result["failed"] = failed
 			result["total"] = len(batchResults)
-			batchGenerations.Delete(batchName)
+			// Persisted rows survive restart and record that each request was submitted.
 		}
 
 		if job.State == genai.JobStateFailed {

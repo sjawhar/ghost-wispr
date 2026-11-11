@@ -582,6 +582,19 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS summary_batches (
+			batch_name TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			state TEXT NOT NULL DEFAULT 'pending',
+			PRIMARY KEY (batch_name, session_id),
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create summary_batches table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS embeddings (
 			session_id TEXT NOT NULL,
 			chunk_index INTEGER NOT NULL,
