@@ -19,7 +19,7 @@ func TestWSBroadcastEventShape(t *testing.T) {
 	ch := hub.Subscribe()
 	defer hub.Unsubscribe(ch)
 
-	hub.BroadcastLiveTranscript(transcribe.Segment{
+	hub.BroadcastLiveTranscript("session-1", transcribe.Segment{
 		Speaker:   2,
 		Text:      "test line",
 		StartTime: 0.5,
@@ -41,6 +41,9 @@ func TestWSBroadcastEventShape(t *testing.T) {
 		}
 		if payload["timestamp"] == nil {
 			t.Fatalf("expected timestamp field in payload: %s", string(msg))
+		}
+		if payload["session_id"] != "session-1" {
+			t.Fatalf("expected session_id in payload, got %#v", payload["session_id"])
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("timeout waiting for websocket broadcast")

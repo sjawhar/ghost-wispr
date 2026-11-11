@@ -79,7 +79,7 @@ type locateCandidate struct {
 // then adds a safety margin and clamps to that recording's duration. Doubled boundary words
 // and equal-cost ties resolved toward a longer cut usually over-cut one neighbour word, but
 // can over-cut more when context is empty or the segment has one or two words. Task 3.2 checks
-// every cut afterwards: it refuses if segment words survive or neighbours lose more than one word.
+// every cut afterwards: it refuses if segment words survive or a given neighbour loses more than one word.
 func Locate(recordings []Recording, segmentText, before, after string) (record int, start, end, score float64, err error) {
 	record = -1
 	segmentTokens := normaliseText(segmentText)

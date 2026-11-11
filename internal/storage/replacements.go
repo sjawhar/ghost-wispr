@@ -136,8 +136,9 @@ func (s *SQLiteStore) MarkDriveReplacementDeleted(sessionID, name, oldID string)
 }
 
 // FinishDriveReplacement clears the pending marker only once every old file
-// recorded for the replacement is gone.
-func (s *SQLiteStore) FinishDriveReplacement(sessionID string) error {
+// recorded for the replacement is gone and the deletion generation is still
+// the one that initiated this replacement.
+func (s *SQLiteStore) FinishDriveReplacement(sessionID string, generation int) error {
 	var count, incomplete int
 	if err := s.db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE state != ?) FROM drive_replacements WHERE session_id = ?`, DriveReplacementDeleted, sessionID).Scan(&count, &incomplete); err != nil {
 		return fmt.Errorf("check drive replacement for session %s: %w", sessionID, err)
@@ -145,7 +146,8 @@ func (s *SQLiteStore) FinishDriveReplacement(sessionID string) error {
 	if count < 3 || incomplete != 0 {
 		return fmt.Errorf("finish drive replacement for session %s: %d rows, %d not deleted", sessionID, count, incomplete)
 	}
-	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0 WHERE id = ? AND drive_replace_pending = 1`, sessionID)
+	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0
+		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, sessionID, generation)
 	if err != nil {
 		return fmt.Errorf("finish drive replacement for session %s: %w", sessionID, err)
 	}

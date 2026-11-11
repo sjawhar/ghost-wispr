@@ -332,6 +332,10 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			notFound(w, id)
 			return
 		}
+		if r.URL.Query().Get("alt") == "media" {
+			_, _ = w.Write(f.Content)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType, AppProperties: f.AppProperties, Trashed: d.inTrash(f), ExplicitlyTrashed: d.trashed[f.ID]})
 	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/drive/v3/files/"):
 		f := d.find(strings.TrimPrefix(path, "/drive/v3/files/"))

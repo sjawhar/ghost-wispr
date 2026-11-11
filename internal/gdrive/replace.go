@@ -18,7 +18,8 @@ type replacementStore interface {
 	StartDriveReplacement(sessionID, name string, oldIDs []string) error
 	MarkDriveReplacementUploaded(sessionID, name, newID string) error
 	MarkDriveReplacementDeleted(sessionID, name, oldID string) error
-	FinishDriveReplacement(sessionID string) error
+	DeletionGeneration(sessionID string) (int, error)
+	FinishDriveReplacement(sessionID string, generation int) error
 }
 
 func (s *Syncer) setReplacementStore(store replacementStore) {
@@ -42,6 +43,11 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		return fmt.Errorf("replace session files %s: session has no Drive folder", sess.ID)
 	}
 
+	generation, err := s.replacements.DeletionGeneration(sess.ID)
+	if err != nil {
+		return fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
+	}
+
 	replacements, err := s.replacements.DriveReplacements(sess.ID)
 	if err != nil {
 		return err
@@ -51,7 +57,7 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		if err := s.renameSessionFolder(ctx, sess.GDriveFolderID, folderName); err != nil {
 			return err
 		}
-		return s.replacements.FinishDriveReplacement(sess.ID)
+		return s.replacements.FinishDriveReplacement(sess.ID, generation)
 	}
 
 	files, folderName, err := replacementFiles(&sess, splicedRecording)
@@ -143,7 +149,7 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	if err := s.renameSessionFolder(ctx, sess.GDriveFolderID, folderName); err != nil {
 		return err
 	}
-	if err := s.replacements.FinishDriveReplacement(sess.ID); err != nil {
+	if err := s.replacements.FinishDriveReplacement(sess.ID, generation); err != nil {
 		return err
 	}
 	return nil

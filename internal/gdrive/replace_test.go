@@ -62,7 +62,6 @@ func TestReplaceCreatesRecordsThenDeletes(t *testing.T) {
 	if _, err := store.DB().Exec(`UPDATE sessions SET title = ?, canonical_transcript = ? WHERE id = ?`, "Purple elephant seventeen", "purple elephant seventeen", id); err != nil {
 		t.Fatalf("seed deleted text: %v", err)
 	}
-	installDriveReplacementInputs(t, store)
 
 	wire, syncer := newWireDrive(t)
 	orchestrator := NewOrchestrator(syncer, store)
@@ -135,27 +134,9 @@ func oldReplacementIDs(t *testing.T, wire *wireDrive, folder, recording string) 
 	return ids
 }
 
-func installDriveReplacementInputs(t *testing.T, store *storage.SQLiteStore) {
-	t.Helper()
-	if _, err := store.DB().Exec(`ALTER TABLE sessions ADD COLUMN drive_replace_pending INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-		t.Fatalf("add drive replacement flag: %v", err)
-	}
-	if _, err := store.DB().Exec(`CREATE TABLE IF NOT EXISTS deleted_segments (
-		session_id TEXT NOT NULL,
-		audio_path TEXT NOT NULL,
-		start REAL NOT NULL,
-		end REAL NOT NULL,
-		sha256_before TEXT NOT NULL,
-		sha256_after TEXT NOT NULL,
-		deleted_at TEXT NOT NULL
-	)`); err != nil {
-		t.Fatalf("create deleted segments: %v", err)
-	}
-}
 
 func setDriveReplacementPending(t *testing.T, store *storage.SQLiteStore, sessionID, audioPath string) {
 	t.Helper()
-	installDriveReplacementInputs(t, store)
 	if _, err := store.DB().Exec(`DELETE FROM drive_replacements WHERE session_id = ?`, sessionID); err != nil {
 		t.Fatalf("clear completed drive replacements: %v", err)
 	}
@@ -264,7 +245,6 @@ func newReplacementFixture(t *testing.T) *replacementFixture {
 	if _, err := store.DB().Exec(`UPDATE sessions SET title = ?, canonical_transcript = ? WHERE id = ?`, "Purple elephant seventeen", "purple elephant seventeen", id); err != nil {
 		t.Fatalf("seed deleted text: %v", err)
 	}
-	installDriveReplacementInputs(t, store)
 	wire, syncer := newWireDrive(t)
 	orchestrator := NewOrchestrator(syncer, store)
 	folder := syncedSession(t, store, orchestrator, id)

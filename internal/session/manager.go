@@ -102,6 +102,12 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 	return m
 }
 
+func (m *Manager) sessionIDForBroadcast() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentSessionID
+}
+
 func (m *Manager) Message(mr *api.MessageResponse) error {
 	if mr.FromFinalize {
 		// After the words below are buffered or saved, so a waiter ending the
@@ -159,7 +165,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 				}
 				startTime = words[0].Start
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, broadcastText, startTime)
+			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, broadcastText, startTime)
 		}
 		return nil
 	}
@@ -190,7 +196,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 					startTime = w.Start
 				}
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, b.String(), startTime)
+			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, b.String(), startTime)
 		}
 	}
 
@@ -240,7 +246,7 @@ func (m *Manager) flushBuffer() error {
 		}
 
 		if m.hub != nil {
-			m.hub.BroadcastLiveTranscript(segments[i])
+			m.hub.BroadcastLiveTranscript(sessionID, segments[i])
 		}
 	}
 	return nil
@@ -531,7 +537,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 
 	// Re-canonicalize now that refined transcript is available.
-	if err := m.store.Canonicalize(sessionID); err != nil {
+	if _, err := m.store.Canonicalize(sessionID); err != nil {
 		m.batchLogger.Error("failed to re-canonicalize after batch refinement", "operation", "batch_refinement", "session_id", sessionID, "error", err)
 	}
 }
@@ -567,13 +573,15 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 
 	if summarizer == nil {
 		// Still canonicalize for GDrive sync even without summarizer.
-		if err := m.store.Canonicalize(sessionID); err != nil {
+		generation, err := m.store.Canonicalize(sessionID)
+		if err != nil {
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+			return
 		}
 		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
 			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		} else {
-			m.triggerEmbeddingIndex(sessionID, transcript)
+			m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		}
 		if syncer != nil {
 			go func() {
@@ -601,8 +609,11 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	// Canonicalize the transcript (picks refined if available, else assembles streaming).
-	if err := m.store.Canonicalize(sessionID); err != nil {
+	generation, err := m.store.Canonicalize(sessionID)
+	if err != nil {
+		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		return
 	}
 
 	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
@@ -629,17 +640,17 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
-		m.triggerEmbeddingIndex(sessionID, transcript)
+		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
 		return
 	}
 
-	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
-		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", err))
-		m.triggerEmbeddingIndex(sessionID, transcript)
+	storeErr := m.store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, generation)
+	if storeErr != nil {
+		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
+		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr))
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
@@ -647,7 +658,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
-	m.triggerEmbeddingIndex(sessionID, transcript)
+	m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 
 	if syncer != nil {
 		go func() {
@@ -783,7 +794,7 @@ func (m *Manager) waitForRefinedTranscript(ctx context.Context, sessionID string
 	}
 }
 
-func (m *Manager) triggerEmbeddingIndex(sessionID, transcript string) {
+func (m *Manager) triggerEmbeddingIndexAtGeneration(sessionID, transcript string, generation int) {
 	m.mu.Lock()
 	indexer := m.indexer
 	m.mu.Unlock()
@@ -795,7 +806,7 @@ func (m *Manager) triggerEmbeddingIndex(sessionID, transcript string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
-		if err := indexer.IndexSession(ctx, sessionID, transcript); err != nil {
+		if err := indexer.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {
 			m.logger.Error("embedding index failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
 	}()

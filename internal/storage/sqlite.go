@@ -94,6 +94,7 @@ type Session struct {
 	MergedInto          string     `json:"merged_into"`
 	CanonicalTranscript string     `json:"canonical_transcript"`
 	TranscriptSource    string     `json:"transcript_source"`
+	DriveReplacePending bool       `json:"drive_replace_pending"`
 }
 
 type SearchResult struct {
@@ -271,6 +272,7 @@ func syncFile(path string) error {
 func (s *SQLiteStore) init(dbPath string) error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
+		"PRAGMA secure_delete = ON",
 		"PRAGMA busy_timeout = 5000",
 		"PRAGMA foreign_keys = ON",
 	}
@@ -309,7 +311,11 @@ func (s *SQLiteStore) init(dbPath string) error {
 			error_message TEXT NOT NULL DEFAULT '',
 			sync_state TEXT NOT NULL DEFAULT 'PENDING',
 			canonical_transcript TEXT NOT NULL DEFAULT '',
-			transcript_source TEXT NOT NULL DEFAULT ''
+			transcript_source TEXT NOT NULL DEFAULT '',
+			drive_replace_pending INTEGER NOT NULL DEFAULT 0,
+			deletion_generation INTEGER NOT NULL DEFAULT 0,
+			refinement_generation INTEGER NOT NULL DEFAULT 0,
+			summary_generation INTEGER NOT NULL DEFAULT 0
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
@@ -391,6 +397,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// The sync state a sync's claim came from, while it holds the session:
 		// startup recovery puts a sync claimed from REMOTE_DELETED back.
 		`ALTER TABLE sessions ADD COLUMN sync_claimed_from TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_pending INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN deletion_generation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN refinement_generation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN summary_generation INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -556,6 +566,25 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS deleted_segments (
+			session_id TEXT NOT NULL,
+			audio_path TEXT NOT NULL,
+			start REAL NOT NULL,
+			end REAL NOT NULL,
+			sha256_before TEXT NOT NULL,
+			sha256_after TEXT NOT NULL,
+			splice_complete INTEGER NOT NULL DEFAULT 0,
+			deleted_at TEXT NOT NULL,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create deleted_segments table: %w", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN splice_complete INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate deleted_segments splice completion: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS summary_requests (
 			session_id TEXT NOT NULL,
 			prompt_hash TEXT NOT NULL,
@@ -564,6 +593,19 @@ func (s *SQLiteStore) init(dbPath string) error {
 		);
 	`); err != nil {
 		return fmt.Errorf("create summary_requests table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS summary_batches (
+			batch_name TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			state TEXT NOT NULL DEFAULT 'pending',
+			PRIMARY KEY (batch_name, session_id),
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create summary_batches table: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -587,6 +629,9 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_segments_session_id ON segments(session_id, timestamp)"); err != nil {
 		return fmt.Errorf("create segments index: %w", err)
 	}
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_deleted_segments_session_audio ON deleted_segments(session_id, audio_path)"); err != nil {
+		return fmt.Errorf("create deleted segments index: %w", err)
+	}
 
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS mcp_events (
@@ -597,6 +642,17 @@ func (s *SQLiteStore) init(dbPath string) error {
 		);
 	`); err != nil {
 		return fmt.Errorf("create mcp_events table: %w", err)
+	}
+
+	if err := s.runOnce("discard-unattributable-live-events", `
+		DELETE FROM mcp_events
+		WHERE event_type = 'live_transcript'
+		  AND CASE
+			WHEN json_valid(payload) THEN COALESCE(json_extract(payload, '$.session_id'), '') = ''
+			ELSE 1
+		  END
+	`); err != nil {
+		return fmt.Errorf("discard unattributable live events: %w", err)
 	}
 
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_mcp_events_created_at ON mcp_events(created_at)"); err != nil {
@@ -820,7 +876,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -864,7 +920,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -887,7 +943,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 
 func getSession(q querier, id string) (Session, error) {
 	row := q.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -895,7 +951,7 @@ func getSession(q querier, id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -930,7 +986,7 @@ func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error
 
 func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	rows, err := q.Query(
-		`SELECT speaker, text, start_time, end_time, timestamp
+		`SELECT id, speaker, text, start_time, end_time, timestamp
 		 FROM segments
 		 WHERE session_id = ?
 		 ORDER BY id ASC`,
@@ -945,7 +1001,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	for rows.Next() {
 		var seg transcribe.Segment
 		var ts string
-		if err := rows.Scan(&seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
 			return nil, fmt.Errorf("scan segment for session %s: %w", sessionID, err)
 		}
 
@@ -967,7 +1023,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 
 func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
 	rows, err := s.db.Query(
-		`SELECT speaker, text, start_time, end_time, timestamp
+		`SELECT id, speaker, text, start_time, end_time, timestamp
 		 FROM segments
 		 WHERE session_id = ? AND start_time >= ? AND end_time <= ?
 		 ORDER BY start_time`,
@@ -982,7 +1038,7 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	for rows.Next() {
 		var seg transcribe.Segment
 		var ts string
-		if err := rows.Scan(&seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
 			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
 		}
 
@@ -1013,6 +1069,16 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 // gets a new summary version when the session's current version may already
 // have been sent to Envoy, so Envoy does not drop it as a duplicate delivery.
 func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, -1)
+}
+
+// UpdateSummaryAtGeneration stores a summary only if the transcript generation
+// the writer read remains current.
+func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, generation)
+}
+
+func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, speakerNames string, generation int) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin summary update for session %s: %w", sessionID, err)
@@ -1022,6 +1088,11 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 	current, err := getSession(tx, sessionID)
 	if err != nil {
 		return err
+	}
+	if generation < 0 {
+		if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&generation); err != nil {
+			return fmt.Errorf("read summary generation for session %s: %w", sessionID, err)
+		}
 	}
 	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames)
 	res, err := tx.Exec(
@@ -1034,7 +1105,7 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
 		     summary_error = CASE WHEN ? = ? THEN '' ELSE summary_error END
-		 WHERE id = ?`,
+		 WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ?`,
 		title, title,
 		summary, preset,
 		summary, speakerNames,
@@ -1044,6 +1115,7 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		status,
 		status, SummaryCompleted,
 		sessionID,
+		generation,
 	)
 	if err != nil {
 		return fmt.Errorf("update summary for session %s: %w", sessionID, err)
@@ -1059,6 +1131,15 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 		return fmt.Errorf("commit summary update for session %s: %w", sessionID, err)
 	}
 	return nil
+}
+
+// DeletionGeneration returns the current transcript generation for sessionID.
+func (s *SQLiteStore) DeletionGeneration(sessionID string) (int, error) {
+	var generation int
+	if err := s.db.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&generation); err != nil {
+		return 0, fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+	}
+	return generation, nil
 }
 
 func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames string) bool {
@@ -1081,7 +1162,7 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 // already have been sent to Envoy: it is or was completed, or Envoy publishing
 // of it was attempted.
 func (s *SQLiteStore) StartSummary(id string) error {
-	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ?`,
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_generation = deletion_generation, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ?`,
 		SummaryRunning, EnvoyPublishPending, SummaryCompleted, EnvoyPublishPending, id)
 	if err != nil {
 		return fmt.Errorf("start summary of session %s: %w", id, err)
@@ -1102,12 +1183,27 @@ func (s *SQLiteStore) StartSummary(id string) error {
 // good summary (with its preset and speaker names), the ones Drive holds: a
 // failed summary takes nothing away.
 func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
+	return s.failSummary(id, errMsg, -1)
+}
+
+// FailSummaryAtGeneration records a failed summary only while generation still
+// identifies the transcript the batch request used.
+func (s *SQLiteStore) FailSummaryAtGeneration(id, errMsg string, generation int) (Session, error) {
+	return s.failSummary(id, errMsg, generation)
+}
+
+func (s *SQLiteStore) failSummary(id, errMsg string, generation int) (Session, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ?`, SummaryFailed, errMsg, id)
+	if generation < 0 {
+		if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, id).Scan(&generation); err != nil {
+			return Session{}, fmt.Errorf("read summary generation for session %s: %w", id, err)
+		}
+	}
+	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ?`, SummaryFailed, errMsg, id, generation)
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
@@ -1130,7 +1226,7 @@ func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
 
 func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = ?`,
+		`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = ? AND refinement_generation = deletion_generation`,
 		transcript,
 		status,
 		sessionID,
@@ -1158,7 +1254,7 @@ func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) err
 // takes nothing from a session whose refinement is running.
 func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ? WHERE id = ? AND audio_path = ? AND audio_path != ''`,
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != ''`,
 		RefinementRunning, id, audioPath,
 	)
 	if err != nil {
@@ -1180,49 +1276,57 @@ func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {
 	return transcript, status, nil
 }
 
-// Canonicalize sets the canonical_transcript and transcript_source for a session.
-// If refinement is completed, uses the refined transcript; otherwise assembles streaming segments.
-func (s *SQLiteStore) Canonicalize(sessionID string) error {
-	var refinedTranscript, refinementStatus string
-	if err := s.db.QueryRow(`SELECT refined_transcript, refinement_status FROM sessions WHERE id = ?`, sessionID).Scan(&refinedTranscript, &refinementStatus); err != nil {
-		return fmt.Errorf("query refinement for canonicalize %s: %w", sessionID, err)
-	}
-
-	var canonical, source string
-	if refinementStatus == RefinementCompleted && strings.TrimSpace(refinedTranscript) != "" {
-		canonical = strings.TrimSpace(refinedTranscript)
-		source = TranscriptSourceRefined
-	} else {
-		// Assemble from streaming segments.
-		segs, err := s.GetSegments(sessionID)
+// Canonicalize sets the canonical transcript and source for sessionID. It
+// returns the deletion generation whose segments it read and writes only while
+// that generation is still current.
+func (s *SQLiteStore) Canonicalize(sessionID string) (int, error) {
+	for range 2 {
+		tx, err := s.db.Begin()
 		if err != nil {
-			return fmt.Errorf("get segments for canonicalize %s: %w", sessionID, err)
+			return 0, fmt.Errorf("begin canonicalize %s: %w", sessionID, err)
 		}
-		var b strings.Builder
-		for _, seg := range segs {
-			text := strings.TrimSpace(seg.Text)
-			if text == "" {
-				continue
-			}
-			b.WriteString(text)
-			b.WriteByte('\n')
-		}
-		canonical = b.String()
-		source = TranscriptSourceStreaming
-	}
 
-	res, err := s.db.Exec(`UPDATE sessions SET canonical_transcript = ?, transcript_source = ? WHERE id = ?`, canonical, source, sessionID)
-	if err != nil {
-		return fmt.Errorf("update canonical transcript for session %s: %w", sessionID, err)
+		var refinedTranscript, refinementStatus string
+		var generation int
+		if err := tx.QueryRow(`SELECT refined_transcript, refinement_status, deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&refinedTranscript, &refinementStatus, &generation); err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("query refinement for canonicalize %s: %w", sessionID, err)
+		}
+
+		var canonical, source string
+		if refinementStatus == RefinementCompleted && strings.TrimSpace(refinedTranscript) != "" {
+			canonical = strings.TrimSpace(refinedTranscript)
+			source = TranscriptSourceRefined
+		} else {
+			segs, err := getSegments(tx, sessionID)
+			if err != nil {
+				_ = tx.Rollback()
+				return 0, fmt.Errorf("get segments for canonicalize %s: %w", sessionID, err)
+			}
+			canonical = canonicalTranscript(segs)
+			source = TranscriptSourceStreaming
+		}
+
+		res, err := tx.Exec(`UPDATE sessions SET canonical_transcript = ?, transcript_source = ? WHERE id = ? AND deletion_generation = ?`, canonical, source, sessionID, generation)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("update canonical transcript for session %s: %w", sessionID, err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("canonicalize rows affected: %w", err)
+		}
+		if rows == 0 {
+			_ = tx.Rollback()
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("commit canonical transcript for session %s: %w", sessionID, err)
+		}
+		return generation, nil
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("canonicalize rows affected: %w", err)
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return 0, fmt.Errorf("canonicalize %s: %w", sessionID, sql.ErrNoRows)
 }
 
 // GetCanonicalTranscript returns the canonical transcript and its source for a session.
@@ -1232,6 +1336,18 @@ func (s *SQLiteStore) GetCanonicalTranscript(sessionID string) (string, string, 
 		return "", "", fmt.Errorf("query canonical transcript for session %s: %w", sessionID, err)
 	}
 	return transcript, source, nil
+}
+
+// GetCanonicalTranscriptWithGeneration reads the canonical transcript and the
+// deletion generation atomically, so asynchronous writers can fence updates
+// against the exact text they consumed.
+func (s *SQLiteStore) GetCanonicalTranscriptWithGeneration(sessionID string) (string, string, int, error) {
+	var transcript, source string
+	var generation int
+	if err := s.db.QueryRow(`SELECT canonical_transcript, transcript_source, deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&transcript, &source, &generation); err != nil {
+		return "", "", 0, fmt.Errorf("query canonical transcript generation for session %s: %w", sessionID, err)
+	}
+	return transcript, source, generation, nil
 }
 
 func (s *SQLiteStore) UpdateTitle(sessionID, title string) error {
@@ -1524,7 +1640,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -1709,7 +1825,7 @@ func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error
+		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -1796,7 +1912,8 @@ type SessionRecording struct {
 // is no Drive to ask, so it is kept. Any other sync state, a failure
 // included, keeps the recording.
 func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?`
+	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?
+		AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)`
 	if syncGated {
 		cond += ` AND sync_status = ?`
 		return cond, []any{RefinementRunning, SyncStateRemoteDeleted, SyncSynced}
@@ -2278,6 +2395,47 @@ func (s *SQLiteStore) StoreEmbedding(sessionID string, chunkIndex int, vector []
 	)
 	if err != nil {
 		return fmt.Errorf("store embedding for session %s chunk %d: %w", sessionID, chunkIndex, err)
+	}
+	return nil
+}
+
+// StoreEmbeddingAtGeneration writes a chunk only while the transcript
+// generation that produced it remains current.
+func (s *SQLiteStore) StoreEmbeddingAtGeneration(sessionID string, chunkIndex int, vector []float32, textHash, model string, generation int) error {
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, vector); err != nil {
+		return fmt.Errorf("serialize embedding vector: %w", err)
+	}
+	res, err := s.db.Exec(`
+		INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model)
+		SELECT ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND deletion_generation = ?)
+		ON CONFLICT(session_id, chunk_index)
+		DO UPDATE SET embedding = excluded.embedding, text_hash = excluded.text_hash, model = excluded.model, created_at = CURRENT_TIMESTAMP`,
+		sessionID, chunkIndex, buf.Bytes(), textHash, model, sessionID, generation)
+	if err != nil {
+		return fmt.Errorf("store embedding for session %s chunk %d: %w", sessionID, chunkIndex, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count embedding write for session %s: %w", sessionID, err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteEmbeddingChunksAtOrAfterGeneration removes stale trailing chunks only
+// while the indexer's transcript generation remains current.
+func (s *SQLiteStore) DeleteEmbeddingChunksAtOrAfterGeneration(sessionID string, chunkIndex, generation int) error {
+	_, err := s.db.Exec(`
+		DELETE FROM embeddings
+		WHERE session_id = ? AND chunk_index >= ?
+		  AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND deletion_generation = ?)`,
+		sessionID, chunkIndex, sessionID, generation)
+	if err != nil {
+		return fmt.Errorf("delete trailing embeddings for session %s: %w", sessionID, err)
 	}
 	return nil
 }
