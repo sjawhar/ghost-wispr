@@ -572,7 +572,11 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.mu.Unlock()
 
 	if summarizer == nil {
-		// Still canonicalize for GDrive sync even without summarizer.
+		// Still canonicalize for GDrive sync even without a summarizer.
+		if err := m.store.StartSummary(sessionID); err != nil {
+			m.logger.Error("failed to start empty summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
+			return
+		}
 		generation, err := m.store.Canonicalize(sessionID)
 		if err != nil {
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
@@ -677,7 +681,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		}()
 	}
 
-	if publisher != nil {
+	if publisher != nil && strings.TrimSpace(summaryText) != "" {
 		go func() {
 			if err := publisher.PublishSummaryReady(context.Background(), sessionID); err != nil {
 				m.logger.Error("envoy publish failed", "operation", "publish_summary_ready", "session_id", sessionID, "error", err)
