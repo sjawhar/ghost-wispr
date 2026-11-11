@@ -166,6 +166,10 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	defer s.mu.Unlock()
 
 	// A folder made inside a root in the trash would be in the trash too.
+	// Only a folder in My Drive can be: a shared drive's root cannot be
+	// trashed, and under the drive.file scope files.get answers 404 for it
+	// (rootReadable), which skips this check as any error does; the create
+	// below then answers for the root.
 	if root, err := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id, trashed").Context(ctx).Do(); err == nil && root.Trashed {
 		return "", errRootTrashed(s.folderID)
 	}
@@ -206,16 +210,17 @@ var ErrDriveDidNotAnswer = errors.New("drive did not answer")
 // of the trash: Drive's 404 for a folder gone (wrapped), ErrFolderTrashed
 // for one in the trash, or why Drive could not say. Drive answers 404 for a
 // file the app cannot read as well as for one that is gone, so a 404 counts
-// as the folder gone only while the folder the app syncs into still reads:
-// otherwise the app's access to Drive is lost (credentials, sharing), which
-// says nothing about the session, and the error is not a 404.
+// as the folder gone only while the folder the app syncs into still reads
+// (rootReadable): otherwise the app's access to Drive is lost (credentials,
+// sharing), which says nothing about the session, and the error is not a
+// 404.
 func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
 	folder, err := s.service.Files.Get(folderID).SupportsAllDrives(true).Fields("id, trashed, explicitlyTrashed").Context(ctx).Do()
 	if err != nil {
 		if !IsRemoteDeletedError(err) {
 			return fmt.Errorf("get folder %s: %w", folderID, err)
 		}
-		if _, rootErr := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do(); rootErr != nil {
+		if rootErr := s.rootReadable(ctx); rootErr != nil {
 			return fmt.Errorf("get folder %s: not found, and the folder the app syncs into (%s) cannot be read either, so access to Drive may be lost: %v", folderID, s.folderID, rootErr)
 		}
 		return fmt.Errorf("get folder %s: %w", folderID, err)
@@ -228,6 +233,35 @@ func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
 	}
 	if folder.Trashed {
 		return fmt.Errorf("folder %s: %w", folderID, ErrFolderTrashed)
+	}
+	return nil
+}
+
+// rootReadable returns nil when Drive answers for the folder the app syncs
+// into, and why not otherwise. files.get reads a folder in My Drive the app
+// can read (under the drive.file scope, one it created). It answers 404 for a
+// shared drive's root, as for an id Drive does not have, since the app did
+// not create the root. A list of the shared drive's files (corpora "drive")
+// tells the two apart: it answers for a shared drive the app is a member of,
+// and 404 "Shared drive not found" for an id Drive does not have. A list
+// without corpora cannot: it answers 200, with no files, for an id Drive does
+// not have too. These three answers for a shared drive's root were measured
+// through the app on the office Pi on 2026-11-11. A shared drive the app is
+// no longer a member of is taken to answer as an id Drive does not have; that
+// was not measured. A shared drive reads through the app's membership, not
+// through the files the app made there: another account made a member would
+// read the drive and get 404 for the folders the first one made.
+func (s *Syncer) rootReadable(ctx context.Context) error {
+	_, err := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do()
+	if err == nil || !IsRemoteDeletedError(err) {
+		return err
+	}
+	query := fmt.Sprintf("'%s' in parents and trashed = false", strings.ReplaceAll(s.folderID, "'", `\'`))
+	_, listErr := s.service.Files.List().Corpora("drive").DriveId(s.folderID).Q(query).PageSize(1).
+		SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+		Fields("files(id)").Context(ctx).Do()
+	if listErr != nil {
+		return fmt.Errorf("%v; nor does Drive list it as a shared drive the app is a member of: %v", err, listErr)
 	}
 	return nil
 }

@@ -36,6 +36,10 @@ type RestoreResult struct {
 }
 
 // ListSessionFolders returns all subfolders in the configured root folder.
+// Drive lists no files, and no error, for a parent it does not have (and,
+// it is taken, for a shared drive the app is not a member of), so when it
+// lists none the root is asked for (rootReadable): a root that does not read
+// is an error, not an empty Drive.
 func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) {
 	var folders []*drive.File
 	pageToken := ""
@@ -62,7 +66,11 @@ func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) 
 		}
 		pageToken = resp.NextPageToken
 	}
-
+	if len(folders) == 0 {
+		if err := s.rootReadable(ctx); err != nil {
+			return nil, fmt.Errorf("list session folders: none found, and the folder the app syncs into (%s) cannot be read, so access to Drive may be lost: %v", s.folderID, err)
+		}
+	}
 	return folders, nil
 }
 

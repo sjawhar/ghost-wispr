@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -24,31 +25,38 @@ func TestEveryDriveCallSetsSupportsAllDrives(t *testing.T) {
 	}
 }
 
-func TestUploadIntoASharedDriveRoot(t *testing.T) {
-	wire, syncer := newWireDrive(t)
-	const sharedDriveID = "shared-drive-root"
-	wire.rootID = sharedDriveID
-	syncer.folderID = sharedDriveID
+// A sync into a shared drive's root, as the drive.file scope sees it:
+// files.get answers 404 for the root, so neither the first sync, which makes
+// the session's folder there, nor a re-sync, which updates that folder in
+// place, may depend on reading the root.
+func TestASyncIntoASharedDriveRoot(t *testing.T) {
+	wire, syncer := newSharedDriveWire(t)
+	store := openStore(t)
+	o := NewOrchestrator(syncer, store)
+	const id = "20261111090000"
+	summarizedSession(t, store, t.TempDir(), id, time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC), "The summary.")
+	folder := syncedSession(t, store, o, id)
 
-	err := syncer.UploadInto(context.Background(), sharedDriveID, []SyncFile{{
-		Name:        "transcript.md",
-		MimeType:    "application/vnd.google-apps.document",
-		Content:     []byte("shared-drive transcript"),
-		ContentType: "text/plain",
-	}})
-	if err != nil {
-		t.Fatalf("upload into shared-drive root: %v", err)
+	if err := store.UpdateTitle(id, "Renamed"); err != nil {
+		t.Fatalf("rename: %v", err)
 	}
-	if got := wire.in(sharedDriveID)["transcript.md"]; len(got) != 1 {
-		t.Fatalf("files in shared-drive root: %d transcript.md files, want 1", len(got))
+	if err := o.SyncSession(context.Background(), id); err != nil {
+		t.Fatalf("re-sync into the shared drive: %v", err)
+	}
+	if state, kept := sessionState(t, store, id); state != storage.SyncStateSynced || kept != folder {
+		t.Errorf("after the re-sync: %q in folder %q, want %q in %q", state, kept, storage.SyncStateSynced, folder)
+	}
+	if folders := wire.in(sharedDriveID); len(folders) != 1 {
+		t.Errorf("shared drive root holds %v, want the session's one folder", keysOf(folders))
+	}
+	summaries := wire.in(folder)["summary.md"]
+	if len(summaries) != 1 || !strings.Contains(string(summaries[0].Content), "Renamed") {
+		t.Errorf("summary.md: %d copies, want one updated in place to the new title", len(summaries))
 	}
 }
 
 func TestRestoreFromDriveListsSharedDriveFolders(t *testing.T) {
-	wire, syncer := newWireDrive(t)
-	const sharedDriveID = "shared-drive-root"
-	wire.rootID = sharedDriveID
-	syncer.folderID = sharedDriveID
+	wire, syncer := newSharedDriveWire(t)
 
 	started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
 	folderID := wire.add(sharedDriveID, "2026-11-10-standup", "application/vnd.google-apps.folder", nil, nil)
@@ -69,10 +77,7 @@ func TestRestoreFromDriveListsSharedDriveFolders(t *testing.T) {
 }
 
 func TestRestoreFromDrivePaginatesSharedDriveLists(t *testing.T) {
-	wire, syncer := newWireDrive(t)
-	const sharedDriveID = "shared-drive-root"
-	wire.rootID = sharedDriveID
-	syncer.folderID = sharedDriveID
+	wire, syncer := newSharedDriveWire(t)
 
 	started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
 	transcript := func(id, text string) []byte {
