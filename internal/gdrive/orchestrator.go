@@ -307,19 +307,14 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 		driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
 	}
 	// A recording the upload left out (missing from disk when the file list
-	// was built: its disk not mounted, say) was not uploaded: the session is
-	// not synced until a retry uploads it. Marked synced, GC (gated on sync)
-	// could remove that recording once it is back, though Drive never had it.
-	// This is decided from the files built for the upload, not from a second
-	// look at the disk, which a recording coming back meanwhile would pass.
+	// was built: its disk not mounted, say; or there but unreadable) was not
+	// uploaded: the session is not synced until a retry, with the sync's
+	// backoff, uploads it. Marked synced, GC (gated on sync) could remove
+	// that recording once it is back, though Drive never had it. This is
+	// decided from the files built for the upload, not from a second look at
+	// the disk, which a recording coming back meanwhile would pass.
 	if err == nil && len(unreadable) != 0 {
 		err = fmt.Errorf("recordings could not be read, not uploaded: %s", strings.Join(unreadable, ", "))
-		attemptedAt := time.Now().UTC()
-		if !o.endSync(sessionID, claim, storage.SyncStatePending, driveFolderID, sess.RetryCount, attemptedAt, err) {
-			return fmt.Errorf("upload %s: %w", sessionID, err)
-		}
-		o.logger.Warn("gdrive session stays pending for unreadable recordings", "operation", "sync_session", "session_id", sessionID, "sync_state", storage.SyncStatePending, "error", err.Error())
-		return fmt.Errorf("upload %s: %w", sessionID, err)
 	}
 	if missing := notUploaded(sess.AudioPath, files); err == nil && len(missing) > 0 {
 		err = fmt.Errorf("recordings not on disk, not uploaded: %s", strings.Join(missing, ", "))

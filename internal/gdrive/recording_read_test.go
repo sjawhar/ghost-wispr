@@ -10,10 +10,11 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// TestSyncKeepsAnUnreadableRecordingPending proves a transient read error on
-// one recording uploads the readable session files and remains pending instead
-// of permanently failing the session.
-func TestSyncKeepsAnUnreadableRecordingPending(t *testing.T) {
+// TestSyncRetriesAnUnreadableRecordingWithBackoff fails if a recording on
+// disk that cannot be read stops the session's other files from reaching
+// Drive, fails the sync for good at once, or is retried on every sweep
+// instead of with the sync's backoff, as a recording missing from disk is.
+func TestSyncRetriesAnUnreadableRecordingWithBackoff(t *testing.T) {
 	store := openStore(t)
 	const id = "20261106190000"
 	audioDir := t.TempDir()
@@ -24,7 +25,7 @@ func TestSyncKeepsAnUnreadableRecordingPending(t *testing.T) {
 	if err := os.Mkdir(unreadable, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ?, retry_count = 100 WHERE id = ?`, good+","+unreadable, id); err != nil {
+	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ? WHERE id = ?`, good+","+unreadable, id); err != nil {
 		t.Fatal(err)
 	}
 	wire, syncer := newWireDrive(t)
@@ -37,8 +38,11 @@ func TestSyncKeepsAnUnreadableRecordingPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.SyncState != storage.SyncStatePending || session.RetryCount != 100 {
-		t.Errorf("after unreadable recording: state=%q retry=%d, want PENDING with no retry consumed", session.SyncState, session.RetryCount)
+	if session.SyncState != storage.SyncStateRetryScheduled || session.RetryCount != 1 {
+		t.Fatalf("after an unreadable recording: state=%q retry=%d, want %q with retry 1", session.SyncState, session.RetryCount, storage.SyncStateRetryScheduled)
+	}
+	if IsRetryReady(time.Now().UTC(), session.RetryCount, session.LastSyncAttempt) {
+		t.Errorf("the retry is due at once; want it after the %s backoff", RetryDelayForCount(session.RetryCount))
 	}
 	if session.GDriveFolderID == "" {
 		t.Fatal("readable session files did not reach Drive")
