@@ -208,26 +208,34 @@ func (h *hardwareControl) EnsureRed() error {
 	return nil
 }
 
-// guardResumeWithLight refuses a resume before it changes the capture switch
-// when its indicator cannot confirm red.
-func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, hub *server.Hub) {
+// guardResumeWithLight checks red both when a resume is requested, so callers
+// can receive a synchronous refusal, and again immediately before the gate
+// opens. The first hold is released while the paused session settles; the
+// second is released after the gate opens.
+func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, onResumeRefused func(error)) {
 	capture.beforeResumeRequest = func() error {
 		if err := capture.confirmMicStart(); err != nil {
 			warnings.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
-			if hub != nil {
-				hub.BroadcastStatusChanged(true)
-			}
+			return err
+		}
+		capture.finishMicStart()
+		return nil
+	}
+	capture.beforeGateOpen = func() error {
+		if err := capture.confirmMicStart(); err != nil {
+			warnings.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
 			return err
 		}
 		return nil
 	}
+	capture.onResumeRefused = onResumeRefused
 }
 
-func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry, hub *server.Hub) {
+func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry, onResumeRefused func(error)) {
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
-	guardResumeWithLight(capture, warnings, hub)
+	guardResumeWithLight(capture, warnings, onResumeRefused)
 }
 
 // startHardware starts the configured recording light. The button starts only

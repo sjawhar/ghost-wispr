@@ -84,6 +84,19 @@ func (c *persistentControls) Resume() error {
 	return nil
 }
 
+func (c *persistentControls) RefuseResume() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err := c.store.SetAppState(storage.AppStateCapturePaused, "1")
+	if c.onStatusChanged != nil {
+		c.onStatusChanged(true)
+	}
+	if err != nil {
+		return fmt.Errorf("persist refused capture resume: %w", err)
+	}
+	return nil
+}
+
 // startMicIfUnpaused leaves a restored pause with an open device handle but
 // without starting microphone capture. The mic loop starts it on resume. Each
 // start attempt confirms red first and clears any forced-red hold afterward.

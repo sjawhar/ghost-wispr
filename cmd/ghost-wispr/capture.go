@@ -66,6 +66,8 @@ type captureGate struct {
 	settle              func()
 	beforeResume        func()
 	beforeResumeRequest func() error
+	beforeGateOpen      func() error
+	onResumeRefused     func(error)
 	beforeMicStart      func() error
 	afterMicStart       func()
 	afterGateOpen       func()
@@ -218,13 +220,28 @@ func (g *captureGate) MicHold() string {
 func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 	<-settled
 	g.control.Lock()
-	defer g.control.Unlock()
 
 	g.mu.Lock()
 	open := g.closed && !g.switchOff && g.closings == closing
 	g.mu.Unlock()
 	if !open {
+		g.control.Unlock()
 		return
+	}
+	if g.beforeGateOpen != nil {
+		if err := g.beforeGateOpen(); err != nil {
+			g.mu.Lock()
+			if g.closed && g.closings == closing {
+				g.switchOff = true
+			}
+			g.mu.Unlock()
+			onResumeRefused := g.onResumeRefused
+			g.control.Unlock()
+			if onResumeRefused != nil {
+				onResumeRefused(err)
+			}
+			return
+		}
 	}
 	if g.beforeResume != nil {
 		g.beforeResume()
@@ -233,12 +250,14 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 	g.mu.Lock()
 	if !g.closed || g.switchOff || g.closings != closing {
 		g.mu.Unlock()
+		g.control.Unlock()
 		return
 	}
 	g.closed = false
 	close(g.resumed)
 	g.closing = make(chan struct{})
 	g.mu.Unlock()
+	g.control.Unlock()
 	if g.afterGateOpen != nil {
 		g.afterGateOpen()
 	}

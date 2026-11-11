@@ -343,3 +343,60 @@ func TestRefusedResumeWriteBackFailureIsReported(t *testing.T) {
 		t.Fatalf("status broadcasts = %v, want %v", got, want)
 	}
 }
+
+// TestPersistentControlsAnnounceHTTPAndPowerTransitions fails if either public
+// pause surface bypasses the controls' serialized status callback.
+func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
+	t.Run("HTTP", func(t *testing.T) {
+		store := &pauseStoreFake{}
+		capture := newCaptureGate(nil, nil, nil)
+		var statuses []bool
+		controls := newPersistentControls(
+			store,
+			capture.Pause,
+			capture.RequestResume,
+			func(paused bool) { statuses = append(statuses, paused) },
+		)
+		handler, err := server.Handler(
+			fstest.MapFS{"index.html": {Data: []byte("ok")}},
+			server.NewHub(),
+			&storage.SQLiteStore{},
+			&server.ControlHooks{Pause: controls.Pause, Resume: controls.Resume},
+			"", nil,
+		)
+		if err != nil {
+			t.Fatalf("build handler: %v", err)
+		}
+		for _, path := range []string{"/api/pause", "/api/resume"} {
+			request := httptest.NewRequest(http.MethodPost, path, nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("%s status = %d, want 204", path, response.Code)
+			}
+		}
+		if got, want := statuses, []bool{true, false}; !slices.Equal(got, want) {
+			t.Fatalf("HTTP status broadcasts = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("power button", func(t *testing.T) {
+		store := &pauseStoreFake{}
+		capture := newCaptureGate(nil, nil, nil)
+		var statuses []bool
+		controls := newPersistentControls(
+			store,
+			capture.Pause,
+			capture.RequestResume,
+			func(paused bool) { statuses = append(statuses, paused) },
+		)
+		for range 2 {
+			if err := toggleCapture(capture.IsPaused, controls.Pause, controls.Resume, nil); err != nil {
+				t.Fatalf("toggle capture: %v", err)
+			}
+		}
+		if got, want := statuses, []bool{true, false}; !slices.Equal(got, want) {
+			t.Fatalf("power button status broadcasts = %v, want %v", got, want)
+		}
+	})
+}

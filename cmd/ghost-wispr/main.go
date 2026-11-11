@@ -1248,7 +1248,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		return err
 	}
-	wireLightConsent(capture, hardware, warningRegistry, hub)
+	wireLightConsent(capture, hardware, warningRegistry, func(error) {
+		if err := pauseControls.RefuseResume(); err != nil {
+			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+		}
+	})
 	if restoredPause {
 		hub.BroadcastStatusChanged(true)
 	}
