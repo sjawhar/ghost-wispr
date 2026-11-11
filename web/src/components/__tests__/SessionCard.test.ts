@@ -362,7 +362,7 @@ describe('SessionCard', () => {
 
   it.each([
     ['updates state and refreshes once after a successful deletion', 204, 1],
-    ['scrubs state and refreshes once when a segment is already gone', 404, 1],
+    ['refreshes first when a segment is already gone', 404, 0],
   ])('%s', async (_, status, deletedCalls) => {
     const onSegmentDeleted = vi.fn()
     const onRefreshSession = vi.fn().mockResolvedValue(undefined)
@@ -391,8 +391,11 @@ describe('SessionCard', () => {
       onDelete: vi.fn(),
       onSegmentDeleted,
       onRefreshSession,
+      onSegmentNotFound: async (sessionID) => {
+        await onRefreshSession(sessionID)
+        return false
+      },
     })
-
     await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
 
     await waitFor(() => {

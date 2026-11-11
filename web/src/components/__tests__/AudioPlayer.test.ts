@@ -29,7 +29,7 @@ function render(
 ) {
   return renderSvelte(AudioPlayer, {
     onDeleted: vi.fn(),
-    onNotFound: vi.fn().mockResolvedValue(undefined),
+    onNotFound: vi.fn().mockResolvedValue(false),
     ...props,
   })
 }
@@ -610,6 +610,7 @@ describe('AudioPlayer', () => {
     const onDeleted = vi.fn()
     const onNotFound = vi.fn(async () => {
       rerender({ ...props, session: { ...session }, onDeleted, onNotFound })
+      return false
     })
     vi.stubGlobal(
       'fetch',

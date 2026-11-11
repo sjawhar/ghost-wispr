@@ -31,6 +31,7 @@
     onDelete,
     onRefreshSession,
     onSegmentDeleted,
+    onSegmentNotFound = async () => false,
     selected = false,
     onToggleSelect = () => {},
   }: {
@@ -45,6 +46,7 @@
     onDelete: (id: string) => Promise<void>
     onRefreshSession: (id: string) => Promise<void>
     onSegmentDeleted: (sessionID: string, segmentID: number) => void
+    onSegmentNotFound?: (sessionID: string, segmentID: number) => Promise<boolean>
     onToggleSelect?: () => void
   } = $props()
 
@@ -418,10 +420,7 @@
             onSegmentDeleted(session.id, segmentID)
             await onRefreshSession(session.id)
           }}
-          onNotFound={async (segmentID) => {
-            onSegmentDeleted(session.id, segmentID)
-            await onRefreshSession(session.id)
-          }}
+          onNotFound={(segmentID) => onSegmentNotFound(session.id, segmentID)}
         />
 
         {#if (session.summary_status === SummaryStatus.Completed || session.summary_status === SummaryStatus.Failed) && session.summary}

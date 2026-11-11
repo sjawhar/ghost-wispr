@@ -71,9 +71,9 @@ describe('SessionList', () => {
   })
 
   it.each([
-    ['after a successful segment deletion', 204],
-    ['when the segment is already gone', 404],
-  ])('clears search results %s before refreshing', async (_, status) => {
+    ['after a successful segment deletion', 204, 1],
+    ['when the segment is already gone', 404, 0],
+  ])('clears search results %s before refreshing', async (_, status, deletedCalls) => {
     const session: SessionSummary = {
       id: 's1',
       title: 'Fixture session',
@@ -141,11 +141,11 @@ describe('SessionList', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
 
     await waitFor(() => {
-      expect(onSegmentDeleted).toHaveBeenCalledWith('s1', 42)
+      expect(onSegmentDeleted).toHaveBeenCalledTimes(deletedCalls)
       expect(onRefreshSession).toHaveBeenCalledExactlyOnceWith('s1')
       expect((search as HTMLInputElement).value).toBe('')
     })
-    expect(calls).toEqual(['scrub', 'refresh'])
+    expect(calls).toEqual(deletedCalls === 1 ? ['scrub', 'refresh'] : ['refresh'])
     expect(screen.queryByTestId('search-results')).toBeNull()
   })
 })

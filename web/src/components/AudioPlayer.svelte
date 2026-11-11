@@ -17,7 +17,7 @@
     segments: Segment[]
     session?: SessionSummary
     onDeleted: (segmentID: number) => void | Promise<void>
-    onNotFound: (segmentID: number) => void | Promise<void>
+    onNotFound: (segmentID: number) => boolean | Promise<boolean>
   } = $props()
 
   let audioEl: HTMLAudioElement | null = $state(null)
@@ -122,7 +122,11 @@
         }
         segmentDeleteError = message
         try {
-          await onNotFound(segmentID)
+          const clearLocally = await onNotFound(segmentID)
+          if (clearLocally) {
+            visibleSegments = visibleSegments.filter((segment) => segment.id !== segmentID)
+            await reloadAudio()
+          }
         } catch {
           // Keep the delete response visible when the reconciliation request fails.
         }

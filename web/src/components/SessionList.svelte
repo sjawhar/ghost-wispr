@@ -84,6 +84,21 @@
     isSearching = false
   }
 
+  async function handleSegmentNotFound(sessionID: string, segmentID: number): Promise<boolean> {
+    searchRequestID++
+    searchQuery = ''
+    searchResults = []
+    searchError = ''
+    isSearching = false
+    try {
+      await onRefreshSession(sessionID)
+      return false
+    } catch {
+      onSegmentDeleted(sessionID, segmentID)
+      return true
+    }
+  }
+
   function isShortSession(session: SessionSummary): boolean {
     if (!session.ended_at) return false
     const durationMs = Date.parse(session.ended_at) - Date.parse(session.started_at)
@@ -297,6 +312,7 @@
                 {onDelete}
                 {onRefreshSession}
                 onSegmentDeleted={handleSegmentDeleted}
+                onSegmentNotFound={handleSegmentNotFound}
               />
             {/each}
           </div>
