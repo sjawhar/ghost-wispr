@@ -123,14 +123,23 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	); err != nil {
 		return fmt.Errorf("clear deleted segment derivatives for session %s: %w", sessionID, err)
 	}
-	if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, sessionID); err != nil {
-		return fmt.Errorf("clear embeddings for session %s: %w", sessionID, err)
+	sources, err := scrubMergedSources(tx, sessionID, remaining)
+	if err != nil {
+		return err
+	}
+	owners := append([]string{sessionID}, sources...)
+	for _, owner := range owners {
+		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
+			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
+		}
 	}
 	if exists, err := tableExists(tx, "drive_replacements"); err != nil {
 		return fmt.Errorf("check prior Drive replacements for session %s: %w", sessionID, err)
 	} else if exists {
-		if _, err := tx.Exec(`DELETE FROM drive_replacements WHERE session_id = ?`, sessionID); err != nil {
-			return fmt.Errorf("clear prior Drive replacements for session %s: %w", sessionID, err)
+		for _, owner := range owners {
+			if _, err := tx.Exec(`DELETE FROM drive_replacements WHERE session_id = ?`, owner); err != nil {
+				return fmt.Errorf("clear prior Drive replacements for session %s: %w", owner, err)
+			}
 		}
 	}
 
@@ -146,7 +155,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	); err != nil {
 		return fmt.Errorf("record deleted span for session %s: %w", sessionID, err)
 	}
-	if err := rewriteDeletedTextEvents(tx, sessionID, deletedText, &span); err != nil {
+	if err := rewriteDeletedTextEvents(tx, owners, deletedText, &span); err != nil {
 		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
@@ -169,6 +178,59 @@ var postDeleteMaintenance = func(db *sql.DB) error {
 		return fmt.Errorf("checkpoint: %w", err)
 	}
 	return nil
+}
+
+// scrubMergedSources removes a deleted segment's words from every session
+// merged, directly or through another merge, into sessionID, and returns
+// their ids. A merge moves its sources' segments to the merged session and
+// leaves each source row (status merged) with the text it had: its title,
+// summary, canonical and refined transcripts, all of which can hold the
+// deleted words. A source's canonical transcript is rebuilt from the merged
+// session's remaining segments in the source's time span, which are its own
+// segments less the deleted one; its title, summary and refined transcript,
+// which cannot be rebuilt without the words, are cleared. The full-text
+// index is rebuilt from these rows in the same transaction.
+func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Segment) ([]string, error) {
+	rows, err := tx.Query(`WITH RECURSIVE source(id) AS (
+			SELECT id FROM sessions WHERE merged_into = ?
+			UNION SELECT sessions.id FROM sessions JOIN source ON sessions.merged_into = source.id
+		) SELECT id FROM source`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list merged sources of session %s: %w", sessionID, err)
+	}
+	var sources []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan merged source of session %s: %w", sessionID, err)
+		}
+		sources = append(sources, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterate merged sources of session %s: %w", sessionID, err)
+	}
+	_ = rows.Close()
+
+	for _, id := range sources {
+		source, err := getSession(tx, id)
+		if err != nil {
+			return nil, fmt.Errorf("get merged source %s: %w", id, err)
+		}
+		var own []transcribe.Segment
+		for _, segment := range remaining {
+			if !segment.Timestamp.Before(source.StartedAt) && (source.EndedAt == nil || !segment.Timestamp.After(*source.EndedAt)) {
+				own = append(own, segment)
+			}
+		}
+		if _, err := tx.Exec(`UPDATE sessions
+			SET title = '', summary = '', refined_transcript = '', canonical_transcript = ?, transcript_source = ?
+			WHERE id = ?`, canonicalTranscript(own), TranscriptSourceStreaming, id); err != nil {
+			return nil, fmt.Errorf("scrub merged source %s: %w", id, err)
+		}
+	}
+	return sources, nil
 }
 
 func canonicalTranscript(segments []transcribe.Segment) string {
@@ -248,7 +310,14 @@ func (s *SQLiteStore) OldestPendingSplice(sessionID string) (time.Time, bool, er
 	return at, true, nil
 }
 
-func rewriteDeletedTextEvents(tx *sql.Tx, sessionID, deletedText string, span *DeletedSpan) error {
+// rewriteDeletedTextEvents removes a deleted segment's words from the stored
+// events of sessionIDs: the session it was deleted from and the sessions
+// merged into it, whose live events recorded the words first.
+func rewriteDeletedTextEvents(tx *sql.Tx, sessionIDs []string, deletedText string, span *DeletedSpan) error {
+	owners := make(map[string]bool, len(sessionIDs))
+	for _, id := range sessionIDs {
+		owners[id] = true
+	}
 	rows, err := tx.Query(`SELECT id, event_type, payload FROM mcp_events`)
 	if err != nil {
 		return err
@@ -271,7 +340,7 @@ func rewriteDeletedTextEvents(tx *sql.Tx, sessionID, deletedText string, span *D
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			continue
 		}
-		if eventSessionID, _ := event["session_id"].(string); eventSessionID != sessionID {
+		if eventSessionID, _ := event["session_id"].(string); !owners[eventSessionID] {
 			continue
 		}
 		if isSummaryReadyEvent(eventType, event) || isLiveTranscriptEvent(eventType, event) && eventOverlapsDeletedSpan(event, span) {
