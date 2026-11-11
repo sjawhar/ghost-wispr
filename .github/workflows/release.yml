@@ -84,6 +84,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          # release-publish-command:start
           tag="v$(date -u +%Y.%m.%d)-${BUILD_SHA:0:7}"
           gh release create "$tag" \
             ghost-wispr-linux-arm64 \
@@ -91,3 +92,4 @@ jobs:
             --target "$BUILD_SHA" \
             --title "$tag" \
             --generate-notes
+          # release-publish-command:end

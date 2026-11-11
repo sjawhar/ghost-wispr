@@ -81,6 +81,7 @@ webhook_secret=$(require_single_line_file envoy-webhook-secret)
 readonly webhook_secret
 [[ "$relay_url" =~ ^https://[^[:space:]]+/webhook/ghostwispr$ ]] || fail "envoy-webhook-url must be an HTTPS Ghost Wispr webhook URL"
 [[ -n "$tailscale_client_id" && "$tailscale_client_id" != null && "$tailscale_client_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "tailscale-client-id is empty or invalid"
+[[ "$tailscale_subject" =~ ^[0-9]+$ ]] || fail "tailscale-subject must be the service account unique ID"
 
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends libportaudio2 ffmpeg lame jq curl

@@ -60,7 +60,25 @@ done
 readonly remote="ghost-wispr@$host"
 readonly unit_url="https://$host"
 scratch_dir=$(mktemp -d)
-trap 'rm -rf -- "$scratch_dir"' EXIT
+stopped_pid=
+
+resume_stopped_process() {
+  if [[ -n ${stopped_pid:-} ]]; then
+    remote_run "kill -CONT $stopped_pid" >/dev/null 2>&1 || true
+    stopped_pid=
+  fi
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT ERR
+  resume_stopped_process
+  rm -rf -- "$scratch_dir"
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap cleanup ERR
 
 remote_run() {
   ssh -o BatchMode=yes "$remote" "$@"
@@ -315,6 +333,18 @@ run_control_tests() {
   boot_id_changed old-boot new-boot || fail "self-test expected a new boot ID to be accepted"
   printf 'self-test: boot control rejected an old still-capturing boot ID\n'
 
+  (
+    stopped_pid=17
+    remote_run() {
+      printf '%s\n' "$*" >"$controls_dir/recovery-command.txt"
+      return 255
+    }
+    resume_stopped_process
+  )
+  grep -qx 'kill -CONT 17' "$controls_dir/recovery-command.txt" \
+    || fail "self-test expected cleanup to resume a stopped process after an SSH failure"
+  printf 'self-test: cleanup attempted kill -CONT after a stubbed SSH failure\n'
+
   tailscale_fixture=$'100.100.134.41\nfd7a:115c:a1e0::836:862b'
   listener_fixture=$'LISTEN 0 4096 100.100.134.41%tailscale0:40271 0.0.0.0:*\nLISTEN 0 4096 [fd7a:115c:a1e0::836:862b]%tailscale0:34493 [::]:*\nLISTEN 0 128 127.0.0.1:22 0.0.0.0:*'
   assert_listener_boundary_from "$tailscale_fixture" "$listener_fixture"
@@ -378,11 +408,12 @@ printf 'Light hang RAN: stop the recorder process and require darkness within 3 
 main_pid=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user show --property=MainPID --value ghost-wispr.service")
 [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "Light hang FAILED: no Ghost Wispr main PID"
 remote_run "kill -STOP $main_pid"
+stopped_pid=$main_pid
 if ! wait_for_light off 3000; then
-  remote_run "kill -CONT $main_pid"
   fail "Light hang FAILED: light did not turn off within 3 seconds"
 fi
 remote_run "kill -CONT $main_pid"
+stopped_pid=
 wait_for_light red 2000 || fail "Light hang FAILED: light did not turn red after continue"
 printf 'Light hang RAN: dark within 3 seconds and red after continue.\n'
 
