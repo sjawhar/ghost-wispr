@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,7 +127,8 @@ func TestTapTogglesAndPersists(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	capture := newCaptureGate(nil, nil, nil)
-	pause, resume := persistingControls(store, capture.Pause, capture.Resume)
+	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	pause, resume := controls.Pause, controls.Resume
 	var statuses []bool
 	if err := toggleCapture(capture.IsPaused, pause, resume, func(paused bool) { statuses = append(statuses, paused) }); err != nil {
 		t.Fatalf("pause tap: %v", err)
@@ -463,7 +465,7 @@ func TestWireLightConsentRequiresRedBeforeStartOrResume(t *testing.T) {
 		light: &reconnectingLight{light: &staleReadLight{}, warnings: newWarningsRegistry()},
 	}
 	capture := newCaptureGate(nil, nil, nil)
-	wireLightConsent(capture, hardware, store, &openMicFake{}, newWarningsRegistry(), nil)
+	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	started := false
 	if err := startMicIfUnpaused(capture, func() error {
 		started = true
@@ -535,12 +537,15 @@ func TestResumeRequiresRedBeforeOpeningCapture(t *testing.T) {
 		confirmations.Add(1)
 		return errors.New("light is off")
 	}
-	guardResumeWithLight(capture, store, &openMicFake{}, newWarningsRegistry(), nil)
+	guardResumeWithLight(capture, newWarningsRegistry(), nil)
+	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
 	capture.Pause()
-	capture.Resume()
-	waitForHardware(t, "failed red confirmation to keep capture paused", func() bool {
-		return confirmations.Load() == 1 && capture.IsPaused()
-	})
+	if err := controls.Resume(); err == nil {
+		t.Fatal("resume succeeded after red confirmation failed")
+	}
+	if confirmations.Load() != 1 || !capture.IsPaused() {
+		t.Fatalf("confirmation calls=%d paused=%t, want (1, true)", confirmations.Load(), capture.IsPaused())
+	}
 	if !capture.IsPaused() {
 		t.Fatal("capture resumed after red confirmation failed")
 	}
@@ -589,7 +594,7 @@ func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
 		<-releaseClear
 		hardware.ReleaseRedHold()
 	}
-	guardResumeWithLight(capture, store, &openMicFake{}, newWarningsRegistry(), nil)
+	guardResumeWithLight(capture, newWarningsRegistry(), nil)
 	capture.Pause()
 	capture.Resume()
 	select {
@@ -700,7 +705,7 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	wireLightConsent(capture, hardware, store, mic, newWarningsRegistry(), nil)
+	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	capture.Resume()
 	waitForHardware(t, "gate-open red hold release", func() bool {
 		colour, _ := device.snapshot()
@@ -729,8 +734,7 @@ func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	mic := &openMicFake{}
-	wireLightConsent(capture, hardware, store, mic, newWarningsRegistry(), nil)
+	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	capture.Resume()
 	waitForHardware(t, "resume to confirm red and release exactly one hold", func() bool {
 		colour, _ := device.snapshot()
@@ -738,5 +742,36 @@ func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
 	})
 	if got := hardware.redHolds.Load(); got != 1 {
 		t.Fatalf("red holds after resume = %d, want 1", got)
+	}
+}
+
+// TestReconnectingLightWarnsWhenPresentDeviceFails fails if a present light is
+// described as missing after its own write fails.
+func TestReconnectingLightWarnsWhenPresentDeviceFails(t *testing.T) {
+	warnings := newWarningsRegistry()
+	light := &reconnectingLight{
+		light:    &reconnectLightFake{setErr: errors.New("USB write failed")},
+		warnings: warnings,
+	}
+	if err := light.SetRGB(255, 0, 0); err == nil {
+		t.Fatal("set red succeeded despite the device error")
+	}
+	if got, want := warnings.List(), []string{"Recording light failed; the unit may be recording without its light"}; !slices.Equal(got, want) {
+		t.Fatalf("warnings = %v, want %v", got, want)
+	}
+}
+
+// TestUnknownLightCommandPrintsUsage fails if an unrecognised command has an
+// ambiguous success-looking exit code or omits its usage.
+func TestUnknownLightCommandPrintsUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if got := runLightCommand([]string{"unexpected"}, &stdout, &stderr); got != 2 {
+		t.Fatalf("unknown command exit code = %d, want 2", got)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("unknown command wrote stdout = %q, want empty", stdout.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, `unknown subcommand "unexpected"`) || !strings.Contains(got, "usage: ghost-wispr") {
+		t.Fatalf("unknown command stderr = %q, want reason and usage", got)
 	}
 }

@@ -723,15 +723,15 @@ func OpenAPISpec() map[string]any {
 			"/api/resume": map[string]any{
 				"post": map[string]any{
 					"summary":     "Resume recording",
-					"description": "Restart microphone capture after a pause. Returns at once; audio flows again once the paused session has ended (with its recording, or without it if five attempts to save it failed) and the microphone restarts",
+					"description": "Resume a persisted pause. A configured, present recording light confirms red before the request returns. Audio flows once the paused session has ended and the microphone restarts.",
 					"tags":        []string{"control"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{
 						"204": map[string]any{
-							"description": "Resumed",
+							"description": "Resume accepted",
 						},
 						"500": map[string]any{
-							"description": "The persistent resume state could not be saved; capture stays paused",
+							"description": "The recording light could not be confirmed or persistent state could not be saved; capture stays paused",
 						},
 					},
 				},

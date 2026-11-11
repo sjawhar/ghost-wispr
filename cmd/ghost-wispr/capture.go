@@ -62,25 +62,26 @@ var errGateClosed = errors.New("microphone capture gate closed")
 // as long as encoding its recording). Resume moves the switch at once; the gate
 // opens once the pause has settled, unless a Pause comes first.
 type captureGate struct {
-	onPause        func()
-	settle         func()
-	beforeResume   func()
-	beforeMicStart func() error
-	afterMicStart  func()
-	afterGateOpen  func()
-	stallAfter     time.Duration // see captureStallAfter
-	writeWait      time.Duration // see captureWriteWait
-	control        sync.Mutex    // serializes closing and opening the gate, with their steps
-	mu             sync.Mutex    // guards the fields below
-	switchOff      bool          // Pause was called and Resume has not been since
-	resumedAt      time.Time     // when Resume last moved the switch on
-	closed         bool          // no audio passes the gate
-	closings       int           // counts closings, so a Resume left from an earlier one does nothing
-	resumed        chan struct{} // closed while the gate is open
-	closing        chan struct{} // closed while the gate is closed
-	settled        chan struct{} // closed once the latest closing has settled
-	writing        int           // writes that passed the gate and are still running
-	writesDone     *sync.Cond    // signalled (with mu) when a write finishes
+	onPause             func()
+	settle              func()
+	beforeResume        func()
+	beforeResumeRequest func() error
+	beforeMicStart      func() error
+	afterMicStart       func()
+	afterGateOpen       func()
+	stallAfter          time.Duration // see captureStallAfter
+	writeWait           time.Duration // see captureWriteWait
+	control             sync.Mutex    // serializes closing and opening the gate, with their steps
+	mu                  sync.Mutex    // guards the fields below
+	switchOff           bool          // Pause was called and Resume has not been since
+	resumedAt           time.Time     // when Resume last moved the switch on
+	closed              bool          // no audio passes the gate
+	closings            int           // counts closings, so a Resume left from an earlier one does nothing
+	resumed             chan struct{} // closed while the gate is open
+	closing             chan struct{} // closed while the gate is closed
+	settled             chan struct{} // closed once the latest closing has settled
+	writing             int           // writes that passed the gate and are still running
+	writesDone          *sync.Cond    // signalled (with mu) when a write finishes
 }
 
 func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
@@ -144,22 +145,40 @@ func (g *captureGate) Pause() {
 	}()
 }
 
-// Resume moves the switch back on and returns without waiting for the pause
-// to settle. The gate opens, after beforeResume, once the pause has settled,
-// unless Pause is called first. It takes the transition lock like Pause, so
-// the two apply in the order they are called.
+// Resume requests an asynchronous gate opening. Call RequestResume when the
+// caller must learn why the request was refused.
 func (g *captureGate) Resume() {
+	_ = g.RequestResume()
+}
+
+// RequestResume checks a requested resume before changing the switch, then
+// returns without waiting for the paused session to settle. The gate opens
+// after beforeResume once settling finishes, unless a Pause comes first.
+func (g *captureGate) RequestResume() error {
 	g.control.Lock()
 	defer g.control.Unlock()
 
 	g.mu.Lock()
+	if !g.switchOff {
+		g.mu.Unlock()
+		return nil
+	}
+	g.mu.Unlock()
+	if g.beforeResumeRequest != nil {
+		if err := g.beforeResumeRequest(); err != nil {
+			return err
+		}
+	}
+
+	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.switchOff {
-		return
+		return nil
 	}
 	g.switchOff = false
 	g.resumedAt = time.Now()
 	go g.openAfter(g.closings, g.settled)
+	return nil
 }
 
 // captureState reports what capture is doing: paused, resuming or stalled
