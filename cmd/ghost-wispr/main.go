@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -386,7 +385,6 @@ func gcConfig(cfg *config.Config, drive sessionSyncer) gc.Config {
 	return gc.Config{
 		MaxAgeDays:     cfg.GCMaxAgeDays,
 		MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
-		SyncGated:      true,
 		AudioDir:       cfg.AudioDir,
 		HoldReason:     holdReason,
 		// A nil sessionSyncer is a nil DriveVerifier.
@@ -453,10 +451,7 @@ func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *int
 }
 
 func main() {
-	configPath := os.Getenv(config.EnvPrefix + "CONFIG")
-	if configPath == "" {
-		configPath = "ghost-wispr.yaml"
-	}
+	configPath := configPathFromEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
 		cfg, _, err := config.Load(configPath)
 		if err != nil {
@@ -472,7 +467,7 @@ func main() {
 		if len(os.Args) != 2 {
 			log.Fatalf("seed-paused-state: expected no arguments")
 		}
-		if err := seedPausedState(configPath); err != nil {
+		if _, err := seedPausedState(configPath, os.Stdout); err != nil {
 			log.Fatalf("seed-paused-state: %v", err)
 		}
 		return
@@ -486,8 +481,7 @@ func main() {
 
 	log.Println("ghost-wispr: starting")
 
-	envPath := filepath.Join(filepath.Dir(configPath), ".env")
-	cfgStore, cfgWarnings, err := config.NewStoreWithEnv(configPath, envPath)
+	cfgStore, cfgWarnings, err := loadRuntimeConfig(configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
@@ -502,7 +496,11 @@ func main() {
 	// Startup validation: check component readiness from config.
 	startupStatus := config.ValidateStartup(&cfg)
 
-	store, err := storage.NewSQLiteStore(cfg.DBPath)
+	dbPath, err := databasePath(cfg.DBPath)
+	if err != nil {
+		log.Fatalf("storage init failed: %v", err)
+	}
+	store, err := storage.NewSQLiteStore(dbPath)
 	if err != nil {
 		log.Fatalf("storage init failed: %v", err)
 	}
@@ -1511,7 +1509,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 						gcHealthState.record(nil, latestCfg.AudioDir, time.Now())
 						continue
 					}
-					deleted, err := runGCPass(store, &latestCfg, drive.Get(), gcHealthState, appLogger)
+					deleted, err := runGCPass(store, &latestCfg, drive.Get(), gcHealthState, warningRegistry, appLogger)
 					if err != nil {
 						log.Printf("gc error: %v", err)
 					} else if len(deleted) > 0 {

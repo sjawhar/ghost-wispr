@@ -203,4 +203,9 @@ env_block=$(awk '/GHOST_WISPR_ADDR=127\.0\.0\.1:8080/,/\/dev\/stdin "\$DEPLOY_DI
 grep -Fqx "  printf '%s\n' \"\$EMBEDDING_LOCATION_SETTING\"" <<<"$env_block" \
   || fail 'the full provisioner does not write the Vertex embedding location into .env'
 
+for file in "$provisioner" "$test_root/docs/pi-setup.md"; do
+  grep -Fq -- 'replaces settings saved in the UI' "$file" \
+    || fail "$file does not say --models replaces settings saved in the UI"
+done
+
 printf 'provision models test passed\n'

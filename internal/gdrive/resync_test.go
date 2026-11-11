@@ -243,7 +243,7 @@ func TestAgeGCKeepsASessionUntilItsCurrentDocumentsAreOnDrive(t *testing.T) {
 	drive := newFakeDrive()
 	o := NewOrchestratorWithUploader(drive, store)
 	folder := syncedSession(t, store, o, id)
-	collector := gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	collector := gc.New(store, gc.Config{MaxAgeDays: 30, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	resummarize(t, store, id, "The summary, made again.")
 	deleted, err := collector.Run()
@@ -291,7 +291,7 @@ func TestAgeGCKeepsASessionThatChangesAfterGCListsIt(t *testing.T) {
 	syncedSession(t, store, o, id)
 
 	changing := &changingStore{SQLiteStore: store, change: func() { resummarize(t, store, id, "The summary, made again.") }}
-	deleted, err := gc.New(changing, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
+	deleted, err := gc.New(changing, gc.Config{MaxAgeDays: 30, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}

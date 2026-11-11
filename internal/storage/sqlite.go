@@ -1919,23 +1919,25 @@ func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncG
 // after all: the session's audio path becomes restored, what is still on disk
 // of removal.Before. With all of it back, the marker and refinement status
 // are as they were before the mark; with part of it, the marker stays and a
-// refinement the mark moved to no_audio goes back. A sync that finished
-// since the mark uploaded the row as marked, so the recordings put back may
-// not be on Drive: the session goes back to pending sync, keeping its folder.
-// It refuses a row whose audio path is no longer what the mark left.
+// refinement the mark moved to no_audio goes back. A sync may have finished
+// since the mark and uploaded the row as marked, so the recordings put back
+// may not be on Drive: a synced session goes back to pending sync, keeping its
+// folder. GC marks only synced sessions, so the state before the mark cannot
+// tell whether a sync ran since. It refuses a row whose audio path is no
+// longer what the mark left.
 func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions SET audio_path = ?,
 			audio_removed_at = CASE WHEN ? = ? THEN ? ELSE audio_removed_at END,
 			refinement_status = CASE WHEN ? != '' AND refinement_status = ? THEN ? ELSE refinement_status END,
-			sync_status = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_status END,
-			sync_state = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_state END
+			sync_status = CASE WHEN sync_state = ? THEN ? ELSE sync_status END,
+			sync_state = CASE WHEN sync_state = ? THEN ? ELSE sync_state END
 		 WHERE id = ? AND audio_path = ? AND status = 'ended'`,
 		restored,
 		restored, removal.Before, removal.RemovedAtBefore,
 		restored, RefinementNoAudio, removal.RefinementBefore,
-		SyncStateSynced, removal.SyncStateBefore, SyncPending,
-		SyncStateSynced, removal.SyncStateBefore, SyncStatePending,
+		SyncStateSynced, SyncPending,
+		SyncStateSynced, SyncStatePending,
 		removal.ID, removal.Left,
 	)
 	if err != nil {

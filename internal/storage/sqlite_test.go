@@ -1050,8 +1050,10 @@ func TestRestoreAudioReopensASyncThatRanMeanwhile(t *testing.T) {
 	if err := store.RestoreAudio(mark("20261106140100"), "/mnt/20261106140100.mp3"); err != nil {
 		t.Fatalf("RestoreAudio: %v", err)
 	}
-	if session, _ := store.GetSession("20261106140100"); session.SyncState != SyncStateSynced {
-		t.Errorf("a session synced before the mark: %q after the put-back, want still synced", session.SyncState)
+	// GC marks only synced sessions, so a session synced before the mark may
+	// also have synced again since; the put-back reopens it either way.
+	if session, _ := store.GetSession("20261106140100"); session.SyncState != SyncStatePending || session.GDriveFolderID != "folder-2" {
+		t.Errorf("a session synced before the mark: %q in %q after the put-back, want pending in folder-2", session.SyncState, session.GDriveFolderID)
 	}
 }
 

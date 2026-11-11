@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"sync"
 	"syscall"
@@ -100,8 +101,19 @@ func diskUse(dir string) (used, total int64, err error) {
 // many sessions it keeps until a sync verifies them. A pass that failed (the
 // store did not answer) says nothing about Drive: the last hold, if any,
 // stays.
-func runGCPass(store gcStore, cfg *config.Config, drive sessionSyncer, health *gcHealth, logger *slog.Logger) ([]string, error) {
-	collector := gc.New(store, gcConfig(cfg, drive), logger)
+func runGCPass(store gcStore, cfg *config.Config, drive sessionSyncer, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger) ([]string, error) {
+	gcConfig := gcConfig(cfg, drive)
+	if warnings != nil {
+		gcConfig.OnRecordingMismatch = func(sessionID string, mismatch bool) {
+			key := "recording-checksum-" + sessionID
+			if mismatch {
+				warnings.Set(key, fmt.Sprintf("Recording for session %s does not match its Google Drive copy; local audio is retained.", sessionID))
+				return
+			}
+			warnings.Clear(key)
+		}
+	}
+	collector := gc.New(store, gcConfig, logger)
 	deleted, err := collector.Run()
 	if err != nil {
 		return nil, err
