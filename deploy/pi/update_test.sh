@@ -66,9 +66,12 @@ case "$url" in
 esac
 EOF
 chmod +x "$work_dir/bin/curl"
-
 cat >"$work_dir/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$*" == '--user is-active --quiet ghost-wispr.service' ]]; then
+  [[ ${TEST_SCENARIO:?} == down ]] && exit 3
+  exit 0
+fi
 printf '%s\n' "$*" >>"$TEST_SYSTEMCTL_LOG"
 EOF
 chmod +x "$work_dir/bin/systemctl"

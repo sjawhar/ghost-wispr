@@ -114,6 +114,23 @@ wait_for_light() {
   return 1
 }
 
+assert_dark_until_capturing() {
+  local current_status capture_state light_state
+  for _ in $(seq 1 240); do
+    if current_status=$(status 2>/dev/null); then
+      capture_state=$(jq -r '.capture_state // empty' <<<"$current_status")
+      light_state=$(remote_run '/opt/ghost-wispr/ghost-wispr light-state')
+      if [[ "$capture_state" == capturing ]]; then
+        [[ "$light_state" == red ]] || fail "Light power-cycle FAILED: light is not red while capturing"
+        return
+      fi
+      [[ "$light_state" == off ]] || fail "Light power-cycle FAILED: light was $light_state before capture began"
+    fi
+    sleep 0.5
+  done
+  fail "Light power-cycle FAILED: recorder did not reach capturing within two minutes"
+}
+
 boot_id() {
   remote_run 'cat /proc/sys/kernel/random/boot_id'
 }
@@ -280,9 +297,9 @@ remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user is-active -
   || fail "A4 FAILED: ghost-wispr.service is not active"
 assert_capturing
 a4_boot_before=$(boot_id)
-printf 'A4 NEEDS-PERSON: leave the recorder capturing, pull power, reconnect it, then press Enter. '
+printf 'A4 NEEDS-PERSON: press Enter, then leave the recorder capturing, pull power, and reconnect it. '
 read -r _
-wait_for_recorder
+assert_dark_until_capturing
 assert_new_boot "$a4_boot_before"
 assert_capturing
 printf 'A4 RAN: a new boot ID came back capturing.\n'
@@ -391,7 +408,7 @@ printf 'A7 RAN: compare the Pi inventory with deploy/pi/baseline.txt.\n'
 readonly expected_package_roots=(libportaudio2 ffmpeg lame jq)
 {
   printf '%s\n' "${expected_package_roots[@]}"
-  remote_run 'apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces libportaudio2 ffmpeg lame jq'
+  remote_run 'apt-cache depends --recurse --no-recommends --no-suggests --no-enhances --no-conflicts --no-breaks --no-replaces libportaudio2 ffmpeg lame jq'
 } | dependency_packages_from_apt_cache >"$scratch_dir/allowed-packages.txt"
 remote_run "dpkg-query -W -f='\${Package}\\n' | LC_ALL=C sort -u" >"$scratch_dir/current-packages.txt"
 awk '/^---$/{exit} NF {print}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-packages.txt"
@@ -402,21 +419,25 @@ awk '/^---$/{exit} NF {print}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_di
 assert_set_subset package "$scratch_dir/baseline-packages.txt" "$scratch_dir/current-packages.txt" "$scratch_dir/permitted-packages.txt" \
   || fail "A7 FAILED: unexpected installed package"
 
-readonly expected_service_additions=(ghost-wispr.service ghost-wispr-update.service)
 system_services=$(remote_run "systemctl list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'") \
   || fail "A7 FAILED: could not read running system services"
 user_services=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user list-units --type=service --state=running --plain --no-legend | awk '{print \$1}'") \
   || fail "A7 FAILED: could not read running user services"
 [[ -n "$system_services" ]] || unknown "system service inventory is empty"
 [[ -n "$user_services" ]] || unknown "user service inventory is empty"
-printf '%s\n%s\n' "$system_services" "$user_services" | LC_ALL=C sort -u >"$scratch_dir/current-services.txt"
-awk 'seen && NF {print} /^---$/ {seen=1}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-services.txt"
+printf '%s\n' "$system_services" | LC_ALL=C sort -u >"$scratch_dir/current-system-services.txt"
+printf '%s\n' "$user_services" | LC_ALL=C sort -u >"$scratch_dir/current-user-services.txt"
+awk 'section == 1 && NF {print} /^---$/ {section += 1}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-system-services.txt"
+awk 'section >= 2 && NF {print} /^---$/ {section += 1}' "$baseline_file" | LC_ALL=C sort -u >"$scratch_dir/baseline-user-services.txt"
+assert_set_subset system-service "$scratch_dir/baseline-system-services.txt" "$scratch_dir/current-system-services.txt" "$scratch_dir/baseline-system-services.txt" \
+  || fail "A7 FAILED: unexpected running system service"
+readonly expected_user_service_additions=(ghost-wispr.service ghost-wispr-update.service)
 {
-  cat "$scratch_dir/baseline-services.txt"
-  printf '%s\n' "${expected_service_additions[@]}"
-} | LC_ALL=C sort -u >"$scratch_dir/permitted-services.txt"
-assert_set_subset service "$scratch_dir/baseline-services.txt" "$scratch_dir/current-services.txt" "$scratch_dir/permitted-services.txt" \
-  || fail "A7 FAILED: unexpected running service"
+  cat "$scratch_dir/baseline-user-services.txt"
+  printf '%s\n' "${expected_user_service_additions[@]}"
+} | LC_ALL=C sort -u >"$scratch_dir/permitted-user-services.txt"
+assert_set_subset user-service "$scratch_dir/baseline-user-services.txt" "$scratch_dir/current-user-services.txt" "$scratch_dir/permitted-user-services.txt" \
+  || fail "A7 FAILED: unexpected running user service"
 timer_state=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user is-enabled ghost-wispr-update.timer" || true)
 [[ "$timer_state" == enabled ]] || fail "A7 FAILED: ghost-wispr-update.timer is not enabled"
 printf 'A7 RAN: package and service inventories match the allowed sets.\n'

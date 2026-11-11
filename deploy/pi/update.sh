@@ -27,6 +27,9 @@ if [[ -n "$status_json" ]] && jq -e '.active_session_id != null and .active_sess
   printf 'ghost-wispr update: active session; leaving the current binary in place\n'
   exit 0
 fi
+if [[ -z "$status_json" ]] && systemctl --user is-active --quiet ghost-wispr.service; then
+  fail "ghost-wispr is active but /api/status did not answer"
+fi
 
 release_json=$(curl --connect-timeout 5 --max-time 30 --fail --silent --show-error "$RELEASE_API")
 release_commit=$(jq -r '.target_commitish // empty' <<<"$release_json")

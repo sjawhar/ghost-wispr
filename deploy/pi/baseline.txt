@@ -643,7 +643,6 @@ bluetooth.service
 cron.service
 dbus.service
 getty@tty1.service
-mpris-proxy.service
 polkit.service
 serial-getty@ttyAMA10.service
 ssh.service
@@ -655,3 +654,6 @@ tailscaled.service
 udisks2.service
 user@1000.service
 wpa_supplicant.service
+---
+dbus.service
+mpris-proxy.service
