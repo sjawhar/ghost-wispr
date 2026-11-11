@@ -314,6 +314,15 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS app_state (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`); err != nil {
+		return fmt.Errorf("create app_state table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
 			title, summary, canonical_transcript,
 			content='sessions', content_rowid='rowid'

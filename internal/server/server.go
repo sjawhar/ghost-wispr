@@ -78,8 +78,11 @@ func unverifiedWarning(n int) string {
 }
 
 type ControlHooks struct {
-	Pause             func()
-	Resume            func()
+	// Pause stops capture. A non-nil error means capture stopped but the
+	// stopped state was not persisted.
+	Pause func() error
+	// Resume restarts capture. A non-nil error means capture stayed paused.
+	Resume            func() error
 	IsPaused          func() bool
 	IsCapturing       func() bool
 	CaptureState      func() string

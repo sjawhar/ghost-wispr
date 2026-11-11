@@ -17,6 +17,8 @@ import (
 // EnvPrefix is the namespace prefix for all Ghost Wispr environment variables.
 const EnvPrefix = "GHOST_WISPR_"
 
+const IndicatorLightBlink1 = "blink1"
+
 // Config holds all application configuration. Secrets (API keys) are loaded
 // exclusively from environment variables and never appear in the config file.
 type Preset struct {
@@ -73,6 +75,8 @@ type Config struct {
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
 	SpeakerDevice                 string             `yaml:"speaker_device"`
+	IndicatorLight                string             `yaml:"indicator_light"`
+	PowerButton                   bool               `yaml:"power_button"`
 	TTSProvider                   string             `yaml:"tts_provider"`
 	TTSVoice                      string             `yaml:"tts_voice"`
 	TTSMaxLength                  int                `yaml:"tts_max_length"`
@@ -305,6 +309,12 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "SPEAKER_DEVICE"); v != "" {
 		cfg.SpeakerDevice = v
 	}
+	if v := os.Getenv(EnvPrefix + "INDICATOR_LIGHT"); v != "" {
+		cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv(EnvPrefix + "POWER_BUTTON"); v != "" {
+		cfg.PowerButton = strings.EqualFold(v, "true") || v == "1"
+	}
 	if v := os.Getenv(EnvPrefix + "TTS_PROVIDER"); v != "" {
 		cfg.TTSProvider = strings.ToLower(strings.TrimSpace(v))
 	}
@@ -373,6 +383,12 @@ func validate(cfg *Config) []string {
 
 	if cfg.DeepgramAPIKey == "" {
 		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+	}
+
+	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
+	if cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
+		warnings = append(warnings, fmt.Sprintf("Invalid indicator_light %q — disabling the recording light.", cfg.IndicatorLight))
+		cfg.IndicatorLight = ""
 	}
 
 	if cfg.GenAIBackend != "" && genaiconfig.NormalizeBackend(cfg.GenAIBackend) == "" {

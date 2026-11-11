@@ -1,0 +1,173 @@
+package main
+
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"testing/fstest"
+
+	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
+)
+
+type pauseStoreFake struct {
+	values map[string]string
+	err    error
+}
+
+func (s *pauseStoreFake) GetAppState(key string) (string, bool, error) {
+	if s.err != nil {
+		return "", false, s.err
+	}
+	value, ok := s.values[key]
+	return value, ok, nil
+}
+
+func (s *pauseStoreFake) SetAppState(key, value string) error {
+	if s.err != nil {
+		return s.err
+	}
+	if s.values == nil {
+		s.values = make(map[string]string)
+	}
+	s.values[key] = value
+	return nil
+}
+
+type pauseGateFake struct{ calls int }
+
+func (g *pauseGateFake) Pause() { g.calls++ }
+
+// TestRestorePausePausesWhenStored fails if a persisted pause is not restored
+// before capture begins.
+func TestRestorePausePausesWhenStored(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		values     map[string]string
+		wantPaused bool
+		wantErr    bool
+	}{
+		{name: "paused", values: map[string]string{storage.AppStateCapturePaused: "1"}, wantPaused: true},
+		{name: "resumed", values: map[string]string{storage.AppStateCapturePaused: "0"}},
+		{name: "missing", values: map[string]string{}},
+		{name: "invalid", values: map[string]string{storage.AppStateCapturePaused: "invalid"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := &pauseGateFake{}
+			paused, err := restorePause(&pauseStoreFake{values: tc.values}, gate)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("restore pause error = %v, want error=%t", err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if paused != tc.wantPaused {
+				t.Fatalf("restore paused = %t, want %t", paused, tc.wantPaused)
+			}
+			if got := gate.calls; got != map[bool]int{true: 1, false: 0}[tc.wantPaused] {
+				t.Fatalf("Pause calls = %d, want %d", got, map[bool]int{true: 1, false: 0}[tc.wantPaused])
+			}
+		})
+	}
+}
+
+// TestPersistingControlsWritesBeforeReturning fails if a control reply can
+// report success before its restart-safe state reaches the store.
+func TestPersistingControlsWritesBeforeReturning(t *testing.T) {
+	store := &pauseStoreFake{}
+	var pauses, resumes int
+	pause, resume := persistingControls(store, func() { pauses++ }, func() { resumes++ })
+
+	if err := pause(); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if got := store.values[storage.AppStateCapturePaused]; got != "1" {
+		t.Fatalf("stored state after pause = %q, want 1", got)
+	}
+	if pauses != 1 {
+		t.Fatalf("pause calls = %d, want 1", pauses)
+	}
+	if err := resume(); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got := store.values[storage.AppStateCapturePaused]; got != "0" {
+		t.Fatalf("stored state after resume = %q, want 0", got)
+	}
+	if resumes != 1 {
+		t.Fatalf("resume calls = %d, want 1", resumes)
+	}
+}
+
+// TestAStoreWriteFailureIsReported fails if a failed resume store write lets
+// capture resume, or a failed pause write leaves capture running.
+func TestAStoreWriteFailureIsReported(t *testing.T) {
+	store := &pauseStoreFake{err: errors.New("disk full")}
+	var pauses, resumes int
+	pause, resume := persistingControls(store, func() { pauses++ }, func() { resumes++ })
+
+	if err := pause(); err == nil {
+		t.Fatal("pause succeeded after storage failure")
+	}
+	if pauses != 1 {
+		t.Fatalf("pause calls = %d, want 1", pauses)
+	}
+	if err := resume(); err == nil {
+		t.Fatal("resume succeeded after storage failure")
+	}
+	if resumes != 0 {
+		t.Fatalf("resume calls = %d, want 0", resumes)
+	}
+}
+
+// TestPauseHTTPPersists fails if the public pause route bypasses the durable
+// controls that the physical button uses.
+func TestPauseHTTPPersists(t *testing.T) {
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	capture := newCaptureGate(nil, nil, nil)
+	pause, resume := persistingControls(store, capture.Pause, capture.Resume)
+	handler, err := server.Handler(
+		fstest.MapFS{"index.html": {Data: []byte("ok")}},
+		server.NewHub(),
+		store,
+		&server.ControlHooks{Pause: pause, Resume: resume, IsPaused: capture.IsPaused},
+		"", nil,
+	)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/pause", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("pause status = %d, want %d: %s", response.Code, http.StatusNoContent, response.Body.String())
+	}
+	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
+	if err != nil || !ok || value != "1" {
+		t.Fatalf("stored pause = (%q, %t, %v), want (1, true, nil)", value, ok, err)
+	}
+}
+
+// TestRestoredPauseOpensNoMicrophone fails if a persisted pause starts audio
+// capture before a person explicitly resumes it.
+func TestRestoredPauseOpensNoMicrophone(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	paused, err := restorePause(&pauseStoreFake{values: map[string]string{storage.AppStateCapturePaused: "1"}}, capture)
+	if err != nil || !paused {
+		t.Fatalf("restore pause = (%t, %v), want (true, nil)", paused, err)
+	}
+	mic := newScriptedMic()
+	if err := startMicIfUnpaused(capture, mic.Start); err != nil {
+		t.Fatalf("start while restored paused: %v", err)
+	}
+	mic.expectNoEvents(t)
+	capture.Resume()
+	if err := startMicIfUnpaused(capture, mic.Start); err != nil {
+		t.Fatalf("start after resume: %v", err)
+	}
+	mic.expectEvents(t, "start")
+}

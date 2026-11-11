@@ -18,6 +18,10 @@ silence_timeout: 30s
 mic_sample_rate: 16000
 mic_sample_rates: [48000, 44100, 32000, 24000]
 
+# Office recorder hardware (both are disabled unless configured)
+# indicator_light: blink1
+# power_button: true
+
 # Summarization — model format is provider/model_name
 summarization:
   model: openai/gpt-4o-mini
