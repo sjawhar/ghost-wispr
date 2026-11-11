@@ -737,10 +737,19 @@ func TestResumeReleasesOnlyItsOwnRedHold(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
+	released := make(chan struct{})
+	afterGateOpen := capture.afterGateOpen
+	capture.afterGateOpen = func() {
+		time.Sleep(50 * time.Millisecond)
+		afterGateOpen()
+		close(released)
+	}
 	capture.Resume()
-	waitForHardware(t, "gate to open after resume", func() bool {
-		return !capture.isClosed()
-	})
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for gate-open red hold release")
+	}
 	colour, _ := device.snapshot()
 	if colour != [3]uint8{255, 0, 0} {
 		t.Fatalf("light after resume = %v, want red", colour)
