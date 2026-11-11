@@ -220,12 +220,21 @@ func TestStartupRecoveryContinuesPastBadSplice(t *testing.T) {
 	); err != nil {
 		t.Fatalf("insert pending rows: %v", err)
 	}
-	recovered, failed, err := recoverPendingSplices(context.Background(), store, audioDir, nil, fakeSplice, nil)
+	outcomes, err := recoverPendingSplices(context.Background(), store, audioDir, nil, fakeSplice, nil)
 	if err != nil {
 		t.Fatalf("recover splices: %v", err)
 	}
-	if len(recovered) != 1 || len(failed) == 0 {
-		t.Fatalf("recovered=%v failed=%v, want good row recovered and bad row failed", recovered, failed)
+	recovered, failed := 0, 0
+	for i := range outcomes {
+		if outcomes[i].Recovered {
+			recovered++
+		}
+		if outcomes[i].Err != nil {
+			failed++
+		}
+	}
+	if recovered != 1 || failed != 1 {
+		t.Fatalf("outcomes=%v, want one recovered and one failed row", outcomes)
 	}
 	if contents, err := os.ReadFile(good); err != nil || !bytes.Equal(contents, []byte("spliced")) {
 		t.Fatalf("good recovery bytes=%q err=%v", contents, err)
@@ -720,7 +729,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 		t.Fatalf("record interrupted delete: %v", err)
 	}
 	var refined bool
-	recovered, failed, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, func(_ context.Context, sessionID, audioPath string, gotStarted time.Time) error {
+	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, func(_ context.Context, sessionID, audioPath string, gotStarted time.Time) error {
 		if sessionID != "session" || audioPath != recording || gotStarted != started {
 			t.Fatalf("refine recovered splice session=%q audio=%q started=%s", sessionID, audioPath, gotStarted)
 		}
@@ -730,8 +739,8 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recover pending splice: %v", err)
 	}
-	if len(recovered) != 1 || len(failed) != 0 || !refined {
-		t.Fatalf("recovered=%v failed=%v refined=%v; want one recovered span and true", recovered, failed, refined)
+	if len(outcomes) != 1 || !outcomes[0].Recovered || outcomes[0].Err != nil || !refined {
+		t.Fatalf("outcomes=%v refined=%v; want one recovered span and true", outcomes, refined)
 	}
 	contents, err := os.ReadFile(recording)
 	if err != nil {

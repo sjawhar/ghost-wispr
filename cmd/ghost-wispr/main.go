@@ -889,11 +889,7 @@ func main() {
 			return retrySync(ctx, drive.Get(), sessionID)
 		},
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
-			sess, err := store.GetSession(sessionID)
-			if err != nil {
-				return fmt.Errorf("get session %s: %w", sessionID, err)
-			}
-			return retryRefinementWithWarningClear(ctx, warningRegistry, sessionID, sess.AudioPath, sess.StartedAt, manager.RefineSession)
+			return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
 		},
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
 			if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {
@@ -1829,13 +1825,21 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}()
 
 	go func() {
-		recovered, failed, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession)
-		applyPendingSpliceRecoveryWarnings(warningRegistry, recovered, failed)
+		outcomes, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession)
+		applyPendingSpliceRecoveryWarnings(warningRegistry, outcomes)
 		if err != nil {
 			log.Printf("warning: failed to recover pending segment splices: %v", err)
 			recordPendingSpliceRecoveryWarning(warningRegistry, err)
-		} else if len(recovered) > 0 {
-			log.Printf("recovered %d pending segment splices", len(recovered))
+		} else {
+			recovered := 0
+			for i := range outcomes {
+				if outcomes[i].Recovered {
+					recovered++
+				}
+			}
+			if recovered > 0 {
+				log.Printf("recovered %d pending segment splices", recovered)
+			}
 		}
 	}()
 

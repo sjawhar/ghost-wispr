@@ -24,12 +24,12 @@ func TestR7PendingSpliceRecoveryUsesEachSpansWarningKeyThroughStatus(t *testing.
 		return "", errors.New("splicer unavailable")
 	}
 
-	recovered, failed, err := recoverPendingSplices(context.Background(), store, filepath.Dir(first), nil, failSplice, nil)
-	if err != nil || len(recovered) != 0 || len(failed) != 2 {
-		t.Fatalf("recovery = recovered:%v failed:%v err:%v, want two failed spans", recovered, failed, err)
+	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(first), nil, failSplice, nil)
+	if err != nil || len(outcomes) != 2 || outcomes[0].Recovered || outcomes[0].Err == nil || outcomes[1].Recovered || outcomes[1].Err == nil {
+		t.Fatalf("outcomes=%v err=%v, want two failed spans", outcomes, err)
 	}
 	registry := newWarningsRegistry()
-	applyPendingSpliceRecoveryWarnings(registry, recovered, failed)
+	applyPendingSpliceRecoveryWarnings(registry, outcomes)
 	warnings := statusWarnings(t, registry)
 	if len(warnings) != 2 || !strings.Contains(strings.Join(warnings, "\n"), filepath.Base(first)) || !strings.Contains(strings.Join(warnings, "\n"), filepath.Base(second)) {
 		t.Fatalf("status warnings = %q, want one warning for each recording", warnings)
@@ -54,7 +54,7 @@ func TestR7PendingSpliceFailureLogsItsSpan(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(previousOutput) })
 
 	span := storage.DeletedSpan{SessionID: "session-42", AudioPath: "/recordings/meeting.mp3"}
-	applyPendingSpliceRecoveryWarnings(registry, nil, []pendingSpliceFailure{{Span: span, Err: errors.New("splicing failed")}})
+	applyPendingSpliceRecoveryWarnings(registry, []pendingSpliceOutcome{{Span: span, Err: errors.New("splicing failed")}})
 
 	if entry := output.String(); !strings.Contains(entry, span.SessionID) || !strings.Contains(entry, span.AudioPath) {
 		t.Fatalf("pending splice log = %q, want session and recording", entry)

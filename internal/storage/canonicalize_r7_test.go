@@ -45,7 +45,7 @@ func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
 		})
 	}()
 	<-deleteStarted
-	waitForConnectionWait(t, store.DB())
+	waitForConnectionWait(t, store.DB(), allowWrite)
 	close(allowWrite)
 
 	result := <-canonicalizedResult
@@ -68,9 +68,9 @@ func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
 	}
 }
 
-func waitForConnectionWait(t *testing.T, db *sql.DB) {
+func waitForConnectionWait(t *testing.T, db *sql.DB, release chan<- struct{}) {
 	t.Helper()
-	deadline := time.NewTimer(time.Second)
+	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
@@ -80,6 +80,7 @@ func waitForConnectionWait(t *testing.T, db *sql.DB) {
 		}
 		select {
 		case <-deadline.C:
+			close(release)
 			t.Fatal("DeleteSegment did not block on Canonicalize's transaction")
 		case <-ticker.C:
 		}

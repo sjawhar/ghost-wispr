@@ -18,20 +18,20 @@ func TestR8RecoveryResultsClearPendingWarningThroughStatus(t *testing.T) {
 		return "", errors.New("splicer unavailable")
 	}
 
-	recovered, failed, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, failSplice, nil)
-	if err != nil || len(recovered) != 0 || len(failed) != 1 {
-		t.Fatalf("failed recovery = recovered:%v failed:%v err:%v, want one failure", recovered, failed, err)
+	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, failSplice, nil)
+	if err != nil || len(outcomes) != 1 || outcomes[0].Recovered || outcomes[0].Err == nil {
+		t.Fatalf("failed recovery = outcomes:%v err:%v, want one failed span", outcomes, err)
 	}
-	applyPendingSpliceRecoveryWarnings(registry, recovered, failed)
+	applyPendingSpliceRecoveryWarnings(registry, outcomes)
 	if warnings := statusWarnings(t, registry); len(warnings) != 1 || !strings.Contains(warnings[0], "splicer unavailable") {
 		t.Fatalf("status warnings after failed recovery = %q, want the pending-splice failure", warnings)
 	}
 
-	recovered, failed, err = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, nil)
-	if err != nil || len(recovered) != 1 || len(failed) != 0 {
-		t.Fatalf("successful recovery = recovered:%v failed:%v err:%v, want one recovery", recovered, failed, err)
+	outcomes, err = recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, nil)
+	if err != nil || len(outcomes) != 1 || !outcomes[0].Recovered || outcomes[0].Err != nil {
+		t.Fatalf("successful recovery = outcomes:%v err:%v, want one recovered span", outcomes, err)
 	}
-	applyPendingSpliceRecoveryWarnings(registry, recovered, failed)
+	applyPendingSpliceRecoveryWarnings(registry, outcomes)
 	if warnings := statusWarnings(t, registry); len(warnings) != 0 {
 		t.Fatalf("status warnings after successful recovery = %q, want none", warnings)
 	}
@@ -40,36 +40,41 @@ func TestR8RecoveryResultsClearPendingWarningThroughStatus(t *testing.T) {
 func TestR8RefinementFailureUsesItsOwnStatusWarning(t *testing.T) {
 	store, recording, _ := r4PendingStore(t)
 	registry := newWarningsRegistry()
-	refinementErr := errors.New("batch transcription not configured")
+	refinementErr := errors.New("batch transcription not configured: upstream failure 123")
 
-	recovered, failed, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, func(context.Context, string, string, time.Time) error {
+	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, func(context.Context, string, string, time.Time) error {
 		return refinementErr
 	})
-	if err != nil || len(recovered) != 1 || len(failed) != 1 {
-		t.Fatalf("refinement failure = recovered:%v failed:%v err:%v, want one recovered and one failed span", recovered, failed, err)
+	if err != nil || len(outcomes) != 1 || !outcomes[0].Recovered || outcomes[0].Err == nil {
+		t.Fatalf("refinement failure = outcomes:%v err:%v, want one recovered, failed span", outcomes, err)
 	}
-	applyPendingSpliceRecoveryWarnings(registry, recovered, failed)
+	applyPendingSpliceRecoveryWarnings(registry, outcomes)
 	warnings := statusWarnings(t, registry)
-	if len(warnings) != 1 || strings.Contains(warnings[0], "needs audio recovery") || !strings.Contains(warnings[0], "refinement after segment deletion failed for session session") || !strings.Contains(warnings[0], refinementErr.Error()) {
-		t.Fatalf("status warnings after refinement failure = %q, want the refinement warning without an audio-recovery claim", warnings)
+	if len(warnings) != 1 || strings.Contains(warnings[0], "needs audio recovery") || strings.Contains(warnings[0], "upstream failure 123") || !strings.Contains(warnings[0], "Refinement after segment deletion failed for session session") || !strings.Contains(warnings[0], "batch transcription not configured") {
+		t.Fatalf("status warnings after refinement failure = %q, want a short refinement warning without an audio-recovery claim", warnings)
 	}
 }
 
 func TestR8SuccessfulRefinementRetryClearsItsStatusWarning(t *testing.T) {
 	registry := newWarningsRegistry()
 	span := storage.DeletedSpan{SessionID: "session", AudioPath: "/recordings/session.mp3"}
-	applyPendingSpliceRecoveryWarnings(registry, []storage.DeletedSpan{span}, []pendingSpliceFailure{{
-		Span: span,
-		Err:  refinementAfterSegmentDeletionError{err: errors.New("batch transcription not configured")},
+	applyPendingSpliceRecoveryWarnings(registry, []pendingSpliceOutcome{{
+		Span:      span,
+		Recovered: true,
+		Err: refinementAfterSegmentDeletionError{
+			sessionID: span.SessionID,
+			err:       errors.New("batch transcription not configured"),
+		},
 	}})
 	if warnings := statusWarnings(t, registry); len(warnings) != 1 {
 		t.Fatalf("status warnings before refinement retry = %q, want one", warnings)
 	}
 
-	if err := retryRefinementWithWarningClear(context.Background(), registry, span.SessionID, span.AudioPath, time.Time{}, func(context.Context, string, string, time.Time) error {
-		return nil
+	store, _, _ := r4PendingStore(t)
+	if err := retryRefinementWithWarningClear(context.Background(), registry, store, "session", func(context.Context, string, string, time.Time) error {
+		return setRefinementStatusForWarningTest(store, storage.RefinementCompleted)
 	}); err != nil {
-		t.Fatalf("retry refinement: %v", err)
+		t.Fatal(err)
 	}
 	if warnings := statusWarnings(t, registry); len(warnings) != 0 {
 		t.Fatalf("status warnings after successful refinement retry = %q, want none", warnings)

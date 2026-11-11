@@ -254,11 +254,13 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
   'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service'
 ```
 
-The startup recovery verifies the recording hash and completes the splice. It then clears
-the audio-recovery warning for that session and recording. If `/api/status` instead names
-failed refinement, audio recovery is complete: repair batch transcription and rerun
-refinement. Otherwise, preserve the named recording and contact the recorder operator; do
-not remove any database row or audio file by hand.
+The startup recovery verifies the recording hash and completes the splice. When it
+succeeds, no audio-recovery warning remains for that recording. If `/api/status` instead
+says refinement after segment deletion failed, audio recovery is complete: repair batch
+transcription, then rerun refinement with `POST /api/sessions/{id}/retry-refinement`. The
+warning clears once the session's refinement completes. If an audio-recovery warning
+remains, preserve the named recording and contact the recorder operator; do not remove any
+database row or audio file by hand.
 
 ## Accept slice 1
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -17,10 +18,8 @@ const (
 	pendingSpliceRecoveryWarningKey  = pendingSpliceWarningKeyPrefix + "startup-recovery"
 )
 
-// pendingSpliceWarningKey identifies one recording of one session, so a
-// successful recovery clears only that recording's warning.
-func pendingSpliceWarningKey(sessionID, recording string) string {
-	return pendingSpliceWarningKeyPrefix + sessionID + "\x00" + recording
+func segmentDeletionWarningKey(prefix, sessionID, recording string) string {
+	return prefix + sessionID + "\x00" + recording
 }
 
 func pendingSpliceWarningText(recoveryErr error) string {
@@ -28,43 +27,60 @@ func pendingSpliceWarningText(recoveryErr error) string {
 }
 
 func setPendingSpliceWarning(registry *warningsRegistry, sessionID, recording string, recoveryErr error) {
-	registry.Set(pendingSpliceWarningKey(sessionID, recording), pendingSpliceWarningText(recoveryErr))
+	registry.Set(segmentDeletionWarningKey(pendingSpliceWarningKeyPrefix, sessionID, recording), pendingSpliceWarningText(recoveryErr))
 }
 
 func clearPendingSpliceWarning(registry *warningsRegistry, sessionID, recording string) {
-	registry.Clear(pendingSpliceWarningKey(sessionID, recording))
+	registry.Clear(segmentDeletionWarningKey(pendingSpliceWarningKeyPrefix, sessionID, recording))
 }
 
-func pendingSpliceRefinementKey(span *storage.DeletedSpan) string {
-	return pendingSpliceRefinementKeyFor(span.SessionID, span.AudioPath)
-}
-
-func pendingSpliceRefinementKeyFor(sessionID, recording string) string {
-	return pendingSpliceRefinementKeyPrefix + sessionID + "\x00" + recording
-}
-
-func applyPendingSpliceRecoveryWarnings(registry *warningsRegistry, recovered []storage.DeletedSpan, failed []pendingSpliceFailure) {
-	for i := range recovered {
-		clearPendingSpliceWarning(registry, recovered[i].SessionID, recovered[i].AudioPath)
+func refinementWarningText(sessionID string, err error) string {
+	reason, _, _ := strings.Cut(strings.TrimSpace(err.Error()), ":")
+	if reason == "" {
+		reason = "unknown error"
 	}
-	for i := range failed {
-		failure := failed[i]
-		var refinementErr refinementAfterSegmentDeletionError
-		if errors.As(failure.Err, &refinementErr) {
-			log.Printf("warning: %v recording=%s", failure.Err, failure.Span.AudioPath)
-			registry.Set(pendingSpliceRefinementKey(&failure.Span), failure.Err.Error())
+	return fmt.Sprintf("Refinement after segment deletion failed for session %s: %s", sessionID, reason)
+}
+
+func applyPendingSpliceRecoveryWarnings(registry *warningsRegistry, outcomes []pendingSpliceOutcome) {
+	for i := range outcomes {
+		outcome := outcomes[i]
+		if outcome.Recovered {
+			clearPendingSpliceWarning(registry, outcome.Span.SessionID, outcome.Span.AudioPath)
+		}
+		if outcome.Err == nil {
 			continue
 		}
-		log.Printf("warning: pending segment splice session=%s recording=%s: %v", failure.Span.SessionID, failure.Span.AudioPath, failure.Err)
-		setPendingSpliceWarning(registry, failure.Span.SessionID, failure.Span.AudioPath, failure.Err)
+		var refinementErr refinementAfterSegmentDeletionError
+		if errors.As(outcome.Err, &refinementErr) {
+			log.Printf("warning: %v recording=%s", outcome.Err, outcome.Span.AudioPath)
+			registry.Set(segmentDeletionWarningKey(pendingSpliceRefinementKeyPrefix, refinementErr.sessionID, ""), refinementWarningText(refinementErr.sessionID, refinementErr.err))
+			continue
+		}
+		log.Printf("warning: pending segment splice session=%s recording=%s: %v", outcome.Span.SessionID, outcome.Span.AudioPath, outcome.Err)
+		setPendingSpliceWarning(registry, outcome.Span.SessionID, outcome.Span.AudioPath, outcome.Err)
 	}
 }
 
-func retryRefinementWithWarningClear(ctx context.Context, registry *warningsRegistry, sessionID, audioPath string, startedAt time.Time, refine func(context.Context, string, string, time.Time) error) error {
-	if err := refine(ctx, sessionID, audioPath, startedAt); err != nil {
+type refinementRetryStore interface {
+	GetSession(id string) (storage.Session, error)
+}
+
+func retryRefinementWithWarningClear(ctx context.Context, registry *warningsRegistry, store refinementRetryStore, sessionID string, refine func(context.Context, string, string, time.Time) error) error {
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("get session %s before retry refinement: %w", sessionID, err)
+	}
+	if err := refine(ctx, sessionID, sess.AudioPath, sess.StartedAt); err != nil {
 		return err
 	}
-	registry.Clear(pendingSpliceRefinementKeyFor(sessionID, audioPath))
+	sess, err = store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("get session %s after retry refinement: %w", sessionID, err)
+	}
+	if sess.RefinementStatus == storage.RefinementCompleted {
+		registry.Clear(segmentDeletionWarningKey(pendingSpliceRefinementKeyPrefix, sessionID, ""))
+	}
 	return nil
 }
 
