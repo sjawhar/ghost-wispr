@@ -1091,6 +1091,13 @@ func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T)
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected sync to trigger when summarizer is nil")
 	}
+
+	store.mu.Lock()
+	status := store.status["session-no-summarizer"]
+	store.mu.Unlock()
+	if status != storage.SummaryCompleted {
+		t.Errorf("summary status = %q, want %q", status, storage.SummaryCompleted)
+	}
 }
 
 func TestManager_GenerateSummary_TriggersSyncAfterSummaryCompleted(t *testing.T) {

@@ -46,6 +46,7 @@ type replacementInputStore interface {
 	DriveReplacementInput(sessionID string) (pending bool, splicedRecording string, err error)
 	DeletionGeneration(sessionID string) (int, error)
 	ClearDriveReplacementPending(sessionID string, generation int) error
+	HasPendingSplice(sessionID string) (bool, error)
 }
 
 type Orchestrator struct {
@@ -154,6 +155,16 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 			return replacementErr
 		}
 		if pending {
+			if spliceOpen, err := replacements.HasPendingSplice(sessionID); err != nil {
+				return err
+			} else if spliceOpen {
+				o.logger.Warn("gdrive replacement waits for the splice", "operation", "replace_session_files", "session_id", sessionID)
+				return nil
+			}
+			if !replacementReady(&read) {
+				o.logger.Warn("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
+				return nil
+			}
 			if read.GDriveFolderID == "" {
 				generation, err := replacements.DeletionGeneration(sessionID)
 				if err != nil {
@@ -162,11 +173,8 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				if err := replacements.ClearDriveReplacementPending(sessionID, generation); err != nil {
 					return err
 				}
+				o.logger.Info("gdrive replacement falls through to first sync", "operation", "replace_session_files", "session_id", sessionID)
 				return o.SyncSession(ctx, sessionID)
-			}
-			if !replacementReady(&read) {
-				o.logger.Info("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
-				return nil
 			}
 			syncer, ok := o.uploader.(*Syncer)
 			if !ok {

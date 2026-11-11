@@ -578,6 +578,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 			return
 		}
+		if err := m.store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", generation); err != nil {
+			m.logger.Error("failed to mark empty summary complete", "operation", "generate_summary", "session_id", sessionID, "error", err)
+			return
+		}
 		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
 			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		} else {

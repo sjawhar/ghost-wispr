@@ -32,8 +32,8 @@ func TestReviewTwoRecordingsDeletedBeforeReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	if _, err := fixture.store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
-		VALUES(?, ?, 1, 2, 'before', 'after', ?)`, fixture.id, other, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := fixture.store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, splice_complete)
+		VALUES(?, ?, 1, 2, 'before', 'after', ?, 1)`, fixture.id, other, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	fixture.wire.allowDeletes = true

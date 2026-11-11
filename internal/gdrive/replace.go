@@ -42,6 +42,11 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	if s.replacements == nil {
 		return fmt.Errorf("replace session files %s: replacement store is required", sess.ID)
 	}
+	generation, err := s.replacements.DeletionGeneration(sess.ID)
+	if err != nil {
+		return fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
+	}
+
 	current, err := s.replacements.GetSession(sess.ID)
 	if err != nil {
 		return fmt.Errorf("read replacement session %s: %w", sess.ID, err)
@@ -52,11 +57,6 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	}
 	if sess.GDriveFolderID == "" {
 		return fmt.Errorf("replace session files %s: session has no Drive folder", sess.ID)
-	}
-
-	generation, err := s.replacements.DeletionGeneration(sess.ID)
-	if err != nil {
-		return fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
 	}
 
 	replacements, err := s.replacements.DriveReplacements(sess.ID, generation)

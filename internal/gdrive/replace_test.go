@@ -120,8 +120,8 @@ func setDriveReplacementPending(t *testing.T, store *storage.SQLiteStore, sessio
 	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = ?`, sessionID); err != nil {
 		t.Fatalf("mark replacement pending: %v", err)
 	}
-	if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
-		VALUES(?, ?, 1, 2, 'before', 'after', ?)`, sessionID, audioPath, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, splice_complete)
+		VALUES(?, ?, 1, 2, 'before', 'after', ?, 1)`, sessionID, audioPath, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatalf("record deleted segment: %v", err)
 	}
 }
@@ -534,7 +534,7 @@ func TestFinishDriveReplacementKeepsANewerDeletionPending(t *testing.T) {
 		t.Fatalf("prepare newer deletion: %v", err)
 	}
 	for _, name := range []string{"summary.md", "transcript.md", "audio-recording.mp3"} {
-		if _, err := store.DB().Exec(`INSERT INTO drive_replacements(session_id, name, old_id, new_id, state) VALUES(?, ?, ?, ?, ?)`,
+		if _, err := store.DB().Exec(`INSERT INTO drive_replacements(session_id, generation, name, old_id, new_id, state) VALUES(?, 1, ?, ?, ?, ?)`,
 			id, name, "old-"+name, "new-"+name, storage.DriveReplacementDeleted); err != nil {
 			t.Fatalf("seed replacement row %s: %v", name, err)
 		}
