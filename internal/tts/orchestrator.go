@@ -143,8 +143,7 @@ func (o *Orchestrator) Speak(text, voice, provider string) (string, error) {
 		provider: provider,
 	}
 
-	model, reportedVoice := reportedSpeech(o.ttsProvider, SpeechRequest{Text: text, Voice: voice})
-	status := &SpeakStatus{ID: id, Status: StatusQueued, Model: model, Voice: reportedVoice, synthesisDone: make(chan struct{})}
+	status := &SpeakStatus{ID: id, Status: StatusQueued, synthesisDone: make(chan struct{})}
 	o.statuses.Store(id, status)
 
 	select {

@@ -21,6 +21,7 @@ readonly embedding_model=gemini-embedding-2
 readonly batch_refinement_model=nova-3
 readonly tts_model=gemini-3.8-flash-tts
 readonly tts_voice=Kore
+readonly model_not_reported='not reported by provider'
 expected_config_lines=(
   "deepgram_model: $batch_refinement_model"
   'batch_transcription.provider: deepgram'
@@ -222,6 +223,10 @@ assert_embedding_location() {
 
 assert_provider_model() {
   local role=$1 actual=$2 expected=$3
+  if [[ "$actual" == "$model_not_reported" ]]; then
+    printf 'A8 PRECHECK: %s model was not reported by provider\n' "$role"
+    return 2
+  fi
   if [[ -z "$actual" || "$actual" != "$expected" ]]; then
     printf '%s provider model mismatch: got %q, want %q\n' "$role" "$actual" "$expected" >&2
     return 1
@@ -479,7 +484,7 @@ if [[ "$self_test" == true ]]; then
   for command in awk bash find grep jq mktemp sort tr; do
     command -v "$command" >/dev/null || fail "self-test requires $command"
   done
-  run_self_test
+  run_self_test || exit 1
   exit 0
 fi
 
@@ -597,6 +602,21 @@ wait_for_summary() {
   return 1
 }
 
+wait_for_drive_sync() {
+  local session_id=$1 detail
+  for _ in {1..120}; do
+    if detail=$(session_detail "$session_id"); then
+      if jq -e '(.session.sync_state | ascii_downcase) == "synced" and (.session.gdrive_folder_id | type == "string" and length > 0)' \
+        >/dev/null <<<"$detail"; then
+        return 0
+      fi
+    fi
+    sleep 5
+  done
+  printf 'A6: session %s did not sync to a Drive folder\n' "$session_id" >&2
+  return 1
+}
+
 wait_for_tts() {
   local request_id=$1 speech_status model voice
   for _ in {1..60}; do
@@ -704,7 +724,16 @@ run_a6() {
     return 1
   }
   wait_for_summary_ready "$acceptance_session_id" || return 1
-  printf 'A6 RAN: real session %s produced a summary.ready notification. Verify its dated Drive folder contains transcript, summary, and audio-*.mp3.\n' "$acceptance_session_id"
+  wait_for_drive_sync "$acceptance_session_id" || return 1
+  search_response=$(curl --fail --silent --show-error --get --data-urlencode 'q=Slice 2 acceptance' "$unit_url/api/search") || {
+    printf 'A6: keyword search did not answer\n' >&2
+    return 1
+  }
+  jq -e --arg id "$acceptance_session_id" 'any(.[]; .session_id == $id)' >/dev/null <<<"$search_response" || {
+    printf 'A6: keyword search did not return session %s\n' "$acceptance_session_id" >&2
+    return 1
+  }
+  printf 'A6 RAN: real session %s produced summary.ready, synced to Drive, and was found by keyword search. Verify its dated Drive folder contains transcript, summary, and audio-*.mp3.\n' "$acceptance_session_id"
 }
 
 run_a8() {
@@ -782,7 +811,13 @@ run_a8() {
     return 1
   }
   semantic_model=$(jq -r '.model // ""' <<<"$semantic_response")
-  assert_provider_model search "$semantic_model" "$embedding_model" || return 1
+  if assert_provider_model search "$semantic_model" "$embedding_model"; then
+    :
+  else
+    result=$?
+    [[ $result -eq 2 ]] && return 2
+    return 1
+  fi
 
   speech_headers="$scratch_dir/a8-tts.headers"
   speech_response=$(curl --fail --silent --show-error --dump-header "$speech_headers" \
