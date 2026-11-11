@@ -638,8 +638,9 @@ func TestReplaceMarksAnAlreadyGoneOldFileDeleted(t *testing.T) {
 	}
 }
 
-// TestFinishDriveReplacementKeepsANewerDeletionPending fails if an older
-// replacement clears the marker a later segment deletion set.
+// TestFinishDriveReplacementKeepsANewerDeletionPending fails if the session
+// fence lets an older generation clear the marker a later segment deletion
+// set. TestReview3StaleRowsDoNotFinishANewerGeneration covers the row filters.
 func TestFinishDriveReplacementKeepsANewerDeletionPending(t *testing.T) {
 	store := openStore(t)
 	const id = "replacement-generation"
