@@ -16,6 +16,7 @@ import (
 	"cloud.google.com/go/auth"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/llm"
 )
 
 const (
@@ -219,7 +220,7 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 	}
 	model := strings.TrimSpace(ttsResponse.ModelVersion)
 	if model == "" {
-		model = "not reported by provider"
+		model = llm.ModelNotReportedByProvider
 	}
 	for _, candidate := range ttsResponse.Candidates {
 		for _, part := range candidate.Content.Parts {

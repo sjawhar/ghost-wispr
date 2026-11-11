@@ -108,3 +108,25 @@ func TestGeminiCompleteReportsProviderModelVersion(t *testing.T) {
 		t.Fatalf("reported model = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
 	}
 }
+
+func TestGeminiCompleteJSONMarksMissingModelVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{{
+				"content": map[string]any{"parts": []map[string]any{{"text": `{"summary":"ok","title":"ok"}`}}},
+			}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client, err := newGeminiClient("test-key", "configured-summary-model", &clientOptions{baseURL: server.URL})
+	if err != nil {
+		t.Fatalf("newGeminiClient: %v", err)
+	}
+	if _, err := client.CompleteJSON(context.Background(), []Message{{Role: "user", Content: "summarize"}}, map[string]any{}); err != nil {
+		t.Fatalf("CompleteJSON: %v", err)
+	}
+	if got := client.ReportedModel(); got != ModelNotReportedByProvider {
+		t.Fatalf("reported model = %q, want %q", got, ModelNotReportedByProvider)
+	}
+}

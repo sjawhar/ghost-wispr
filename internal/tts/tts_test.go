@@ -676,6 +676,36 @@ func TestGemini_Synthesize_SendsConfiguredVertexRequest(t *testing.T) {
 	}
 }
 
+func TestGeminiSynthesizeMarksMissingModelVersion(t *testing.T) {
+	pcm := []byte{0x01, 0x00}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{"parts": []any{map[string]any{
+					"inlineData": map[string]string{"data": base64.StdEncoding.EncodeToString(fakeWAV(pcm))},
+				}}},
+			}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	credentialPath := googleauthtest.X509CredentialFile(t, "token")
+	credentials, err := googleauth.Detect(context.Background(), credentialPath, googleauth.CloudPlatformScope)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	provider, err := NewGeminiProvider("project", "configured-tts-model", "Kore", WithGeminiAuthCredentials(credentials), WithGeminiBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("NewGeminiProvider: %v", err)
+	}
+	response, err := provider.Synthesize(context.Background(), SpeechRequest{Text: "Speak this."})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if got := response.Model; got != "not reported by provider" {
+		t.Fatalf("model = %q, want not reported by provider", got)
+	}
+}
+
 func TestDecodeGeminiWAVRejectsNonPCM16(t *testing.T) {
 	wav := fakeWAV([]byte{0x01, 0x00})
 	binary.LittleEndian.PutUint16(wav[20:22], 3)
