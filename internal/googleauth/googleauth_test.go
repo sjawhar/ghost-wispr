@@ -154,6 +154,14 @@ func TestStatusWarnsWhenTheCertificateExpiresSoon(t *testing.T) {
 	}
 }
 
+func TestCertificateExpiryWarningSaysExpired(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	warning := CertificateExpiryWarning(now, now.AddDate(0, 0, -1), true)
+	if !strings.Contains(warning, "expired on 2026-11-09") {
+		t.Fatalf("expired certificate warning = %q", warning)
+	}
+}
+
 type externalAccountFixture struct {
 	credentialPath string
 	stsServer      *httptest.Server

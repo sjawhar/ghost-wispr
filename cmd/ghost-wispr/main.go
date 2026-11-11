@@ -703,6 +703,7 @@ func main() {
 	for i, warning := range cfgWarnings {
 		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
 	}
+	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
 	if restorePauseErr != nil {
 		warningRegistry.Set("capture-state", "Capture pause state could not be restored; the recorder started paused")
 	}
