@@ -97,6 +97,8 @@ type ControlHooks struct {
 	ActiveSession           func() (string, time.Time)
 	Presets                 func() map[string]config.Preset
 	Resummarize             func(ctx context.Context, sessionID, preset string) error
+	OnSessionDeleted        func(sessionID string)
+	OnSessionsMerged        func(sessionIDs []string)
 	OnSessionMerged         func(ctx context.Context, sessionID string)
 	EndSession              func(ctx context.Context) error
 	StartSession            func(ctx context.Context, titleHint string) (string, error)

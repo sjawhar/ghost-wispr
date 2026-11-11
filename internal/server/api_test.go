@@ -433,7 +433,10 @@ func TestDeleteSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	var deletedSession string
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{OnSessionDeleted: func(sessionID string) {
+		deletedSession = sessionID
+	}}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -444,6 +447,9 @@ func TestDeleteSession_Success(t *testing.T) {
 
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected status 204, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if deletedSession != "s1" {
+		t.Errorf("deleted session callback = %q, want s1", deletedSession)
 	}
 }
 
@@ -507,7 +513,10 @@ func TestMergeSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	var mergedSessions []string
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{OnSessionsMerged: func(sessionIDs []string) {
+		mergedSessions = slices.Clone(sessionIDs)
+	}}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -534,6 +543,9 @@ func TestMergeSession_Success(t *testing.T) {
 	}
 	if merged.SummaryStatus != storage.SummaryPending {
 		t.Fatalf("expected summary status pending, got %q", merged.SummaryStatus)
+	}
+	if !slices.Equal(mergedSessions, []string{"s1", "s2"}) {
+		t.Errorf("merged sessions callback = %v, want [s1 s2]", mergedSessions)
 	}
 }
 

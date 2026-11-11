@@ -887,11 +887,23 @@ func main() {
 	gcHealthState.countUnverified(store)
 
 	controlHooks := &server.ControlHooks{
-		IsPaused:           capture.IsPaused,
-		IsCapturing:        func() bool { return capture.capturing(micStatus) },
-		CaptureState:       func() string { return capture.captureState(micStatus) },
-		ActiveSession:      manager.ActiveSession,
-		Warnings:           warningRegistry.List,
+		IsPaused:      capture.IsPaused,
+		IsCapturing:   func() bool { return capture.capturing(micStatus) },
+		CaptureState:  func() string { return capture.captureState(micStatus) },
+		ActiveSession: manager.ActiveSession,
+		Warnings:      warningRegistry.List,
+		OnSessionDeleted: func(sessionID string) {
+			warningRegistry.WithRecordingMismatch(func() {
+				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
+			})
+		},
+		OnSessionsMerged: func(sessionIDs []string) {
+			warningRegistry.WithRecordingMismatch(func() {
+				for _, sessionID := range sessionIDs {
+					warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
+				}
+			})
+		},
 		GCHold:             gcHealthState.Hold,
 		UnverifiedSessions: gcHealthState.Unverified,
 		KeptRawRecordings: func() server.KeptRawRecordings {

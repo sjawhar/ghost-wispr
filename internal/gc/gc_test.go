@@ -28,15 +28,15 @@ type mockStore struct {
 
 // The mock serves age-based retention only; disk pressure runs against the
 // real store.
-func (m *mockStore) Recordings(bool) ([]storage.SessionRecording, error) { return nil, nil }
+func (m *mockStore) Recordings() ([]storage.SessionRecording, error) { return nil, nil }
 
-func (m *mockStore) MarkAudioRemoved(string, string, string, bool, bool, time.Time) (storage.AudioRemoval, bool, error) {
+func (m *mockStore) MarkAudioRemoved(string, string, string, bool, time.Time) (storage.AudioRemoval, bool, error) {
 	return storage.AudioRemoval{}, false, nil
 }
 
 func (m *mockStore) RestoreAudio(*storage.AudioRemoval, string) error { return nil }
 
-func (m *mockStore) GetGCEligibleSessions(maxAgeDays int, _ bool) ([]string, error) {
+func (m *mockStore) GetGCEligibleSessions(maxAgeDays int) ([]string, error) {
 	if ids, ok := m.gcEligible[maxAgeDays]; ok {
 		return ids, nil
 	}
@@ -50,7 +50,7 @@ func (m *mockStore) GetSession(id string) (storage.Session, error) {
 	return storage.Session{}, os.ErrNotExist
 }
 
-func (m *mockStore) DeleteEndedSession(id, _ string, _ bool) (bool, error) {
+func (m *mockStore) DeleteEndedSession(id, _ string) (bool, error) {
 	m.deletedIDs = append(m.deletedIDs, id)
 	return true, nil
 }
@@ -479,10 +479,10 @@ func TestGCDiskPressureCountsOnlyRemovableAudio(t *testing.T) {
 	expectKept(t, crashed)
 }
 
-// Round-3 review, blocking finding 1: audio disk pressure may not remove
-// (a recording whose Drive sync failed for good, while sync gates GC, or a
-// discarded session's) does not count against the budget, so it cannot make
-// GC remove the healthy sessions' audio, let alone their rows.
+// Round-3 review, blocking finding 1: audio disk pressure may not remove a
+// recording whose Drive sync failed for good, or a discarded session's audio.
+// That audio does not count against the budget, so it cannot make GC remove
+// the healthy sessions' audio, let alone their rows.
 func TestGCDiskPressureNeverCountsAudioItMayNotRemove(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -757,7 +757,7 @@ func TestGCNoAudioBudgetRemovesNothing(t *testing.T) {
 // fail, as a locked or full database's do.
 type markFailsStore struct{ *storage.SQLiteStore }
 
-func (markFailsStore) MarkAudioRemoved(string, string, string, bool, bool, time.Time) (storage.AudioRemoval, bool, error) {
+func (markFailsStore) MarkAudioRemoved(string, string, string, bool, time.Time) (storage.AudioRemoval, bool, error) {
 	return storage.AudioRemoval{}, false, errors.New("database is locked")
 }
 
@@ -989,8 +989,8 @@ type refinementStartsStore struct {
 	id string
 }
 
-func (s refinementStartsStore) Recordings(syncGated bool) ([]storage.SessionRecording, error) {
-	recordings, err := s.SQLiteStore.Recordings(syncGated)
+func (s refinementStartsStore) Recordings() ([]storage.SessionRecording, error) {
+	recordings, err := s.SQLiteStore.Recordings()
 	if err == nil {
 		err = s.UpdateRefinement(s.id, "", storage.RefinementRunning)
 	}
@@ -1177,7 +1177,7 @@ func TestGCLogsARawCopyItRemovesAndNoNilError(t *testing.T) {
 // recordingsFailStore is the real store whose listing of recordings fails.
 type recordingsFailStore struct{ *storage.SQLiteStore }
 
-func (recordingsFailStore) Recordings(bool) ([]storage.SessionRecording, error) {
+func (recordingsFailStore) Recordings() ([]storage.SessionRecording, error) {
 	return nil, errors.New("database is locked")
 }
 

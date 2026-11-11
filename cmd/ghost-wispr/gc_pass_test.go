@@ -35,6 +35,74 @@ func (s *recordingMismatchSyncer) RecordingsMatch(context.Context, string, map[s
 	return s.matches, nil
 }
 
+type folderGoneSyncer struct{ recordingMismatchSyncer }
+
+func (*folderGoneSyncer) FolderOnDrive(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+// warningAfterVerificationStore models another verification reporting a
+// mismatch after this pass has verified the recording, before it deletes the
+// session. A deleted session cannot retain that warning.
+type warningAfterVerificationStore struct {
+	*storage.SQLiteStore
+	warnings *warningsRegistry
+}
+
+func (s warningAfterVerificationStore) DeleteEndedSession(id, audioPath string) (bool, error) {
+	s.warnings.Set("recording-checksum-"+id, "Recording for session "+id+" does not match its Google Drive copy; local audio is retained.")
+	return s.SQLiteStore.DeleteEndedSession(id, audioPath)
+}
+
+func recordingMismatchSession(t *testing.T, id string) (*storage.SQLiteStore, config.Config) {
+	t.Helper()
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	audioPath := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(audioPath, []byte("recording"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+		t.Fatalf("end: %v", err)
+	}
+	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+	syncTo(t, store, id, storage.SyncStateSynced, "folder-1", 0, "")
+	return store, config.Config{
+		GCEnabled:         true,
+		GCMaxAgeDays:      30,
+		GDriveFolderID:    "folder-1",
+		GDriveSyncEnabled: true,
+		AudioDir:          filepath.Dir(audioPath),
+	}
+}
+
+// expectRecordingMismatchWarning fails the test unless the status API's
+// warnings name session id's recording as not matching its Drive copy (want
+// true) or say nothing of either (want false). after says what the GC pass
+// before it did, for the failure message.
+func expectRecordingMismatchWarning(t *testing.T, registry *warningsRegistry, id string, want bool, after string) {
+	t.Helper()
+	warnings := strings.Join(statusWarnings(t, registry), "\n")
+	namesSession := strings.Contains(warnings, id)
+	saysMismatch := strings.Contains(warnings, "does not match its Google Drive copy")
+	if want && (!namesSession || !saysMismatch) {
+		t.Fatalf("status warnings after %s = %q, want the mismatched recording of session %s", after, warnings, id)
+	}
+	if !want && (namesSession || saysMismatch) {
+		t.Fatalf("status warnings after %s = %q, want none for session %s", after, warnings, id)
+	}
+}
+
 // A GC pass that cannot check Drive (sync on but not running, or Drive not
 // answering) is recorded with the disk use, for the status API and the web
 // UI, and a hold that goes on keeps the time it began; a pass that does not
@@ -101,64 +169,89 @@ func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
 }
 
 func TestGCPassReportsAndClearsRecordingChecksumMismatchThroughStatus(t *testing.T) {
-	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-
 	const id = "20261001130000"
-	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
-	audioPath := filepath.Join(t.TempDir(), "recording.mp3")
-	if err := os.WriteFile(audioPath, []byte("recording"), 0o600); err != nil {
-		t.Fatalf("write recording: %v", err)
-	}
-	if err := store.CreateSession(id, started); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
-		t.Fatalf("end: %v", err)
-	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("summarize: %v", err)
-	}
-	syncTo(t, store, id, storage.SyncStateSynced, "folder-1", 0, "")
-
-	cfg := config.Config{GCEnabled: true, GCMaxAgeDays: 30, GDriveFolderID: "folder-1", GDriveSyncEnabled: true, AudioDir: filepath.Dir(audioPath)}
+	store, cfg := recordingMismatchSession(t, id)
 	syncer := &recordingMismatchSyncer{}
 	warnings := newWarningsRegistry()
 	health := &gcHealth{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	statusHandler := func() *httptest.ResponseRecorder {
-		t.Helper()
-		handler, handlerErr := server.Handler(
-			fstest.MapFS{"index.html": {Data: []byte("ok")}},
-			server.NewHub(),
-			store,
-			&server.ControlHooks{Warnings: warnings.List},
-			"", nil,
-		)
-		if handlerErr != nil {
-			t.Fatalf("build handler: %v", handlerErr)
-		}
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/status", nil))
-		return response
-	}
 
 	if _, err := runGCPass(store, &cfg, syncer, health, warnings, logger); err != nil {
 		t.Fatalf("GC pass with mismatch: %v", err)
 	}
-	if body := statusHandler().Body.String(); !strings.Contains(body, id) || !strings.Contains(body, "does not match its Google Drive copy") {
-		t.Fatalf("status warning = %s, want the mismatched recording session", body)
-	}
+	expectRecordingMismatchWarning(t, warnings, id, true, "a pass with a mismatch")
 
 	syncer.matches = true
-	if _, err := runGCPass(store, &cfg, syncer, health, warnings, logger); err != nil {
+	deletingStore := warningAfterVerificationStore{SQLiteStore: store, warnings: warnings}
+	if _, err := runGCPass(deletingStore, &cfg, syncer, health, warnings, logger); err != nil {
 		t.Fatalf("GC pass after checksum match: %v", err)
 	}
-	if body := statusHandler().Body.String(); strings.Contains(body, id) || strings.Contains(body, "does not match its Google Drive copy") {
-		t.Fatalf("status warning remained after checksum matched: %s", body)
+	if _, err := store.GetSession(id); err == nil {
+		t.Fatal("age policy kept a session whose matching recording it deleted")
+	}
+	expectRecordingMismatchWarning(t, warnings, id, false, "the checksum matched and the session was deleted")
+}
+
+// A mismatched recording's warning becomes stale when Drive later says its
+// folder is gone: the session is retained locally as REMOTE_DELETED, so there
+// is no Drive recording left to compare.
+func TestGCPassClearsRecordingChecksumMismatchWhenDriveFolderIsGone(t *testing.T) {
+	const id = "20261001140000"
+	store, cfg := recordingMismatchSession(t, id)
+	warnings := newWarningsRegistry()
+	health := &gcHealth{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := runGCPass(store, &cfg, &recordingMismatchSyncer{}, health, warnings, logger); err != nil {
+		t.Fatalf("GC pass with mismatch: %v", err)
+	}
+	expectRecordingMismatchWarning(t, warnings, id, true, "a pass with a mismatch")
+
+	if _, err := runGCPass(store, &cfg, &folderGoneSyncer{}, health, warnings, logger); err != nil {
+		t.Fatalf("GC pass after Drive folder disappeared: %v", err)
+	}
+	expectRecordingMismatchWarning(t, warnings, id, false, "the Drive folder disappeared")
+	sess, err := store.GetSession(id)
+	if err != nil {
+		t.Fatalf("get retained session: %v", err)
+	}
+	if sess.SyncState != storage.SyncStateRemoteDeleted {
+		t.Errorf("sync state = %q, want %q", sess.SyncState, storage.SyncStateRemoteDeleted)
+	}
+}
+
+func TestGCPassPrunesRecordingMismatchWarningsForSessionsGCWillNeverCheckAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(*storage.SQLiteStore, string) error
+	}{
+		{
+			name: "deleted",
+			end: func(store *storage.SQLiteStore, id string) error {
+				return store.DeleteSession(id)
+			},
+		},
+		{
+			name: "remote deleted",
+			end: func(store *storage.SQLiteStore, id string) error {
+				_, err := store.MarkRemoteDeleted(id, "folder-1", "Drive folder is gone")
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "20261001150000"
+			store, cfg := recordingMismatchSession(t, id)
+			warnings := newWarningsRegistry()
+			warnings.Set("recording-checksum-"+id, "Recording for session "+id+" does not match its Google Drive copy; local audio is retained.")
+			if err := tc.end(store, id); err != nil {
+				t.Fatalf("end session: %v", err)
+			}
+
+			if _, err := runGCPass(store, &cfg, nil, &gcHealth{}, warnings, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+				t.Fatalf("held GC pass: %v", err)
+			}
+			expectRecordingMismatchWarning(t, warnings, id, false, tc.name+" session left GC")
+		})
 	}
 }
 
