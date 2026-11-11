@@ -30,18 +30,35 @@ type wireFile struct {
 	Content            []byte
 }
 
+type wireListRequest struct {
+	Parent, PageToken string
+}
+
+func (d *wireDrive) listed(want wireListRequest) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, got := range d.listRequests {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
 // wireDrive is the part of the Google Drive v3 HTTP API the Syncer uses,
 // served over httptest, so the real Syncer (its requests on the wire) runs
 // against it. It fails the test on any request that deletes or trashes a
 // file, does not configure a shared-drive-capable operation for all drives,
 // or that it does not know.
 type wireDrive struct {
-	t      *testing.T
-	mu     sync.Mutex
-	files  []*wireFile // in listing order
-	next   int
-	clock  time.Time
-	rootID string
+	t            *testing.T
+	mu           sync.Mutex
+	files        []*wireFile // in listing order
+	listPages    map[string]map[string]*drive.FileList
+	listRequests []wireListRequest
+	next         int
+	clock        time.Time
+	rootID       string
 	// gone holds the folders deleted by hand, for good: Drive answers 404
 	// for each, as for any file it does not have.
 	gone map[string]bool
@@ -210,6 +227,21 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		if d.gone[m[1]] {
 			notFound(w, m[1])
+			return
+		}
+		request := wireListRequest{Parent: m[1], PageToken: r.URL.Query().Get("pageToken")}
+		d.listRequests = append(d.listRequests, request)
+		if pages := d.listPages[request.Parent]; pages != nil {
+			page, ok := pages[request.PageToken]
+			if !ok {
+				d.t.Errorf("Drive: no page for %+v", request)
+				http.Error(w, "unknown page token", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(page)
+			if d.onList != nil {
+				d.onList(request.Parent)
+			}
 			return
 		}
 		notTrashed := strings.Contains(r.URL.Query().Get("q"), "trashed = false")

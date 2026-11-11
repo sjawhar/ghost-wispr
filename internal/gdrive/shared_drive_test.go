@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/api/drive/v3"
+
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -66,6 +68,76 @@ func TestRestoreFromDriveListsSharedDriveFolders(t *testing.T) {
 	}
 }
 
+func TestRestoreFromDrivePaginatesSharedDriveLists(t *testing.T) {
+	wire, syncer := newWireDrive(t)
+	const sharedDriveID = "shared-drive-root"
+	wire.rootID = sharedDriveID
+	syncer.folderID = sharedDriveID
+
+	started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	transcript := func(id, text string) []byte {
+		return []byte(RenderTranscriptMarkdown(&SyncSession{ID: id, StartedAt: started}, []transcribe.Segment{{
+			Speaker:   0,
+			Text:      text,
+			Timestamp: started,
+		}}))
+	}
+	file := func(id, name, mimeType string) *drive.File {
+		return &drive.File{Id: id, Name: name, MimeType: mimeType}
+	}
+	folderOne := wire.add(sharedDriveID, "2026-11-10-first", "application/vnd.google-apps.folder", nil, nil)
+	folderTwo := wire.add(sharedDriveID, "2026-11-10-second", "application/vnd.google-apps.folder", nil, nil)
+	transcriptOne := wire.add(folderOne, "transcript.md", "application/vnd.google-apps.document", transcript("20261110090000", "first page"), nil)
+	audioOne := wire.add(folderOne, "audio.mp3", "audio/mpeg", []byte("audio"), nil)
+	transcriptTwo := wire.add(folderTwo, "transcript.md", "application/vnd.google-apps.document", transcript("20261110090100", "second page"), nil)
+	wire.listPages = map[string]map[string]*drive.FileList{
+		sharedDriveID: {
+			"":          {Files: []*drive.File{file(folderOne, "2026-11-10-first", "application/vnd.google-apps.folder")}, NextPageToken: "folders-2"},
+			"folders-2": {Files: []*drive.File{file(folderTwo, "2026-11-10-second", "application/vnd.google-apps.folder")}},
+		},
+		folderOne: {
+			"":        {Files: []*drive.File{file(transcriptOne, "transcript.md", "application/vnd.google-apps.document")}, NextPageToken: "files-2"},
+			"files-2": {Files: []*drive.File{file(audioOne, "audio.mp3", "audio/mpeg")}},
+		},
+		folderTwo: {
+			"": {Files: []*drive.File{file(transcriptTwo, "transcript.md", "application/vnd.google-apps.document")}},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	imported := make(chan RestoredSession, 2)
+	result, err := syncer.RestoreFromDrive(ctx, func(sess RestoredSession) error {
+		imported <- sess
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("restore paginated drive: %v", err)
+	}
+	if result.Restored != 2 || len(result.Errors) != 0 {
+		t.Fatalf("restore result: %+v, want two restored sessions and no errors", result)
+	}
+	sessions := map[string]RestoredSession{}
+	for range 2 {
+		sess := <-imported
+		sessions[sess.ID] = sess
+	}
+	if !sessions["20261110090000"].HasAudio {
+		t.Error("first session lost the audio from its second file page")
+	}
+	for _, request := range []wireListRequest{
+		{Parent: sharedDriveID},
+		{Parent: sharedDriveID, PageToken: "folders-2"},
+		{Parent: folderOne},
+		{Parent: folderOne, PageToken: "files-2"},
+		{Parent: folderTwo},
+	} {
+		if !wire.listed(request) {
+			t.Errorf("Drive did not request page %+v", request)
+		}
+	}
+}
+
 const sharedDriveParameterProbe = `package gdrive
 
 import "google.golang.org/api/drive/v3"
@@ -87,6 +159,20 @@ func (s *Syncer) probeListWithoutIncludeItemsFromAllDrives() error {
 
 func (s *Syncer) probeListWithIncludeItemsFromAllDrivesFalse() error {
 	_, err := s.service.Files.List().SupportsAllDrives(true).IncludeItemsFromAllDrives(false).Do() // want IncludeItemsFromAllDrives
+	return err
+}
+
+func (s *Syncer) probeGetWithLaterSupportsAllDrivesFalse(id string) error {
+	call := s.service.Files.Get(id) // want SupportsAllDrives
+	call = call.SupportsAllDrives(false) // want SupportsAllDrives
+	_, err := call.Do()
+	return err
+}
+
+func (s *Syncer) probeListWithLaterIncludeItemsFromAllDrivesFalse() error {
+	call := s.service.Files.List().SupportsAllDrives(true) // want IncludeItemsFromAllDrives
+	call = call.IncludeItemsFromAllDrives(false) // want IncludeItemsFromAllDrives
+	_, err := call.Do()
 	return err
 }
 
@@ -167,7 +253,7 @@ func TestTheSharedDriveParameterCheckFindsEveryForm(t *testing.T) {
 
 	found := map[string]bool{}
 	for _, finding := range driveSharedParameterFailures(t, root, overlay) {
-		key, _, ok := strings.Cut(finding, ": missing ")
+		key, _, ok := strings.Cut(finding, ": ")
 		if !ok {
 			t.Errorf("finding has no path:line:parameter: %q", finding)
 			continue
@@ -197,6 +283,10 @@ func driveSharedParameterFailures(t *testing.T, root string, overlay map[string]
 			if !ok {
 				return true
 			}
+			if parameter, ok := sharedDriveParameterMethodCall(call, info.Uses); ok && !callHasTrueArgument(call) {
+				pos := fset.Position(call.Pos())
+				findings = append(findings, fmt.Sprintf("%s:%d:%s: non-true argument to %s", pos.Filename, pos.Line, parameter, parameter))
+			}
 			callType, ok := driveCallType(info.Types[call].Type)
 			if !ok || continuesDriveCall(call, callType, info.Uses) {
 				return true
@@ -204,7 +294,7 @@ func driveSharedParameterFailures(t *testing.T, root string, overlay map[string]
 
 			driveCalls++
 			for _, parameter := range sharedDriveParameters(callType) {
-				if sharedDriveParameterIsTrue(call, parents, parameter) {
+				if sharedDriveParameterIsTrue(call, parents, parameter) || sharedDriveParameterIsPresent(call, parents, parameter) {
 					continue
 				}
 				pos := fset.Position(call.Pos())
@@ -263,6 +353,27 @@ func continuesDriveCall(call *ast.CallExpr, callType types.Type, uses map[*ast.I
 	return recv != nil && types.Identical(recv.Type(), callType)
 }
 
+func sharedDriveParameterMethodCall(call *ast.CallExpr, uses map[*ast.Ident]types.Object) (string, bool) {
+	selector, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	parameter := selector.Sel.Name
+	if parameter != "SupportsAllDrives" && parameter != "IncludeItemsFromAllDrives" {
+		return "", false
+	}
+	method, ok := uses[selector.Sel].(*types.Func)
+	if !ok {
+		return "", false
+	}
+	recv := method.Signature().Recv()
+	if recv == nil {
+		return "", false
+	}
+	callType, ok := driveCallType(recv.Type())
+	return parameter, ok && hasMethod(callType, parameter)
+}
+
 func sharedDriveParameters(callType types.Type) []string {
 	parameters := []string{"SupportsAllDrives"}
 	if hasMethod(callType, "IncludeItemsFromAllDrives") {
@@ -290,6 +401,15 @@ func hasMethod(typ types.Type, method string) bool {
 }
 
 func sharedDriveParameterIsTrue(root *ast.CallExpr, parents map[ast.Node]ast.Node, parameter string) bool {
+	call := sharedDriveParameterInChain(root, parents, parameter)
+	return call != nil && callHasTrueArgument(call)
+}
+
+func sharedDriveParameterIsPresent(root *ast.CallExpr, parents map[ast.Node]ast.Node, parameter string) bool {
+	return sharedDriveParameterInChain(root, parents, parameter) != nil
+}
+
+func sharedDriveParameterInChain(root *ast.CallExpr, parents map[ast.Node]ast.Node, parameter string) *ast.CallExpr {
 	var current ast.Node = root
 	for {
 		parent := parents[current]
@@ -299,14 +419,14 @@ func sharedDriveParameterIsTrue(root *ast.CallExpr, parents map[ast.Node]ast.Nod
 		}
 		selector, ok := parent.(*ast.SelectorExpr)
 		if !ok || selector.X != current {
-			return false
+			return nil
 		}
 		call, ok := parents[selector].(*ast.CallExpr)
 		if !ok || call.Fun != selector {
-			return false
+			return nil
 		}
-		if selector.Sel.Name == parameter && callHasTrueArgument(call) {
-			return true
+		if selector.Sel.Name == parameter {
+			return call
 		}
 		current = call
 	}

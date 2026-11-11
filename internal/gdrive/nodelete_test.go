@@ -176,42 +176,39 @@ var moduleList struct {
 // file of every package they import, by import path.
 func listModule(root string) ([]goPackage, map[string]string, error) {
 	moduleList.once.Do(func() {
-		moduleList.packages, moduleList.exports, moduleList.err = listPackages(root, "./...")
+		var stderr bytes.Buffer
+		cmd := exec.Command("go", "list", "-e", "-export", "-compiled", "-deps", "-json=ImportPath,Dir,Export,GoFiles,CompiledGoFiles,DepOnly,Error", "./...")
+		cmd.Dir, cmd.Stderr = root, &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			moduleList.err = fmt.Errorf("go list: %w\n%s", err, stderr.Bytes())
+			return
+		}
+		moduleList.exports = map[string]string{}
+		for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); {
+			var p goPackage
+			if err := dec.Decode(&p); err != nil {
+				moduleList.err = fmt.Errorf("read go list: %w", err)
+				return
+			}
+			// The app embeds the web build (cmd/ghost-wispr/static), which a
+			// checkout has only once the frontend is built; its Go files are
+			// checked all the same.
+			embedOnly := p.Error != nil && !p.DepOnly && strings.Contains(p.Error.Err, "no matching files found")
+			if p.Error != nil && !embedOnly {
+				moduleList.err = fmt.Errorf("go list %s: %s", p.ImportPath, p.Error.Err)
+				return
+			}
+			if len(p.CompiledGoFiles) == 0 {
+				p.CompiledGoFiles = p.GoFiles
+			}
+			moduleList.exports[p.ImportPath] = p.Export
+			if !p.DepOnly {
+				moduleList.packages = append(moduleList.packages, p)
+			}
+		}
 	})
 	return moduleList.packages, moduleList.exports, moduleList.err
-}
-
-func listPackages(root, pattern string) ([]goPackage, map[string]string, error) {
-	var stderr bytes.Buffer
-	cmd := exec.Command("go", "list", "-e", "-export", "-compiled", "-deps", "-json=ImportPath,Dir,Export,GoFiles,CompiledGoFiles,DepOnly,Error", pattern)
-	cmd.Dir, cmd.Stderr = root, &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, nil, fmt.Errorf("go list: %w\n%s", err, stderr.Bytes())
-	}
-	exports := map[string]string{}
-	var packages []goPackage
-	for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); {
-		var p goPackage
-		if err := dec.Decode(&p); err != nil {
-			return nil, nil, fmt.Errorf("read go list: %w", err)
-		}
-		// The app embeds the web build (cmd/ghost-wispr/static), which a
-		// checkout has only once the frontend is built; its Go files are
-		// checked all the same.
-		embedOnly := p.Error != nil && !p.DepOnly && strings.Contains(p.Error.Err, "no matching files found")
-		if p.Error != nil && !embedOnly {
-			return nil, nil, fmt.Errorf("go list %s: %s", p.ImportPath, p.Error.Err)
-		}
-		if len(p.CompiledGoFiles) == 0 {
-			p.CompiledGoFiles = p.GoFiles
-		}
-		exports[p.ImportPath] = p.Export
-		if !p.DepOnly {
-			packages = append(packages, p)
-		}
-	}
-	return packages, exports, nil
 }
 
 // typeCheckModule type-checks each package of the module at root, its code
