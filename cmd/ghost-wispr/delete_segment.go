@@ -338,10 +338,10 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 // words that could have belonged to this neighbour side of the cut.
 func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool) bool {
 	for _, word := range words {
-		if before && word.End <= start {
+		if before && word.Start < end {
 			return true
 		}
-		if !before && word.Start >= end {
+		if !before && word.End > start {
 			return true
 		}
 	}
