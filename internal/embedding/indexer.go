@@ -32,6 +32,11 @@ type canonicalTranscriptStore interface {
 	GetCanonicalTranscript(sessionID string) (transcript, source string, err error)
 }
 
+type generationEmbeddingStore interface {
+	StoreEmbeddingAtGeneration(sessionID string, chunkIndex int, vector []float32, textHash, model string, generation int) error
+	DeleteEmbeddingChunksAtOrAfterGeneration(sessionID string, chunkIndex, generation int) error
+}
+
 type Indexer struct {
 	client    Client
 	store     EmbeddingStore
@@ -88,6 +93,16 @@ func SplitIntoChunks(text string, chunkSize int) []string {
 }
 
 func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string) error {
+	return i.indexSession(ctx, sessionID, transcript, -1)
+}
+
+// IndexSessionAtGeneration indexes only while generation still names the
+// transcript the caller read.
+func (i *Indexer) IndexSessionAtGeneration(ctx context.Context, sessionID, transcript string, generation int) error {
+	return i.indexSession(ctx, sessionID, transcript, generation)
+}
+
+func (i *Indexer) indexSession(ctx context.Context, sessionID, transcript string, generation int) error {
 	chunks := SplitIntoChunks(transcript, i.chunkSize)
 	if len(chunks) == 0 {
 		return nil
@@ -120,6 +135,9 @@ func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string
 	}
 
 	if len(texts) == 0 {
+		if generationStore, ok := i.store.(generationEmbeddingStore); ok && generation >= 0 {
+			return generationStore.DeleteEmbeddingChunksAtOrAfterGeneration(sessionID, len(chunks), generation)
+		}
 		return nil
 	}
 
@@ -136,11 +154,21 @@ func (i *Indexer) IndexSession(ctx context.Context, sessionID, transcript string
 	}
 
 	for idx := range indexes {
+		if generationStore, ok := i.store.(generationEmbeddingStore); ok && generation >= 0 {
+			if err := generationStore.StoreEmbeddingAtGeneration(sessionID, indexes[idx], vectors[idx], hashes[idx], i.model, generation); err != nil {
+				return fmt.Errorf("store embedding chunk %d: %w", indexes[idx], err)
+			}
+			continue
+		}
 		if err := i.store.StoreEmbedding(sessionID, indexes[idx], vectors[idx], hashes[idx], i.model); err != nil {
 			return fmt.Errorf("store embedding chunk %d: %w", indexes[idx], err)
 		}
 	}
-
+	if generationStore, ok := i.store.(generationEmbeddingStore); ok && generation >= 0 {
+		if err := generationStore.DeleteEmbeddingChunksAtOrAfterGeneration(sessionID, len(chunks), generation); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

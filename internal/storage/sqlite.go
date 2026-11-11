@@ -2349,6 +2349,47 @@ func (s *SQLiteStore) StoreEmbedding(sessionID string, chunkIndex int, vector []
 	return nil
 }
 
+// StoreEmbeddingAtGeneration writes a chunk only while the transcript
+// generation that produced it remains current.
+func (s *SQLiteStore) StoreEmbeddingAtGeneration(sessionID string, chunkIndex int, vector []float32, textHash, model string, generation int) error {
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, vector); err != nil {
+		return fmt.Errorf("serialize embedding vector: %w", err)
+	}
+	res, err := s.db.Exec(`
+		INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model)
+		SELECT ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND deletion_generation = ?)
+		ON CONFLICT(session_id, chunk_index)
+		DO UPDATE SET embedding = excluded.embedding, text_hash = excluded.text_hash, model = excluded.model, created_at = CURRENT_TIMESTAMP`,
+		sessionID, chunkIndex, buf.Bytes(), textHash, model, sessionID, generation)
+	if err != nil {
+		return fmt.Errorf("store embedding for session %s chunk %d: %w", sessionID, chunkIndex, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count embedding write for session %s: %w", sessionID, err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteEmbeddingChunksAtOrAfterGeneration removes stale trailing chunks only
+// while the indexer's transcript generation remains current.
+func (s *SQLiteStore) DeleteEmbeddingChunksAtOrAfterGeneration(sessionID string, chunkIndex, generation int) error {
+	_, err := s.db.Exec(`
+		DELETE FROM embeddings
+		WHERE session_id = ? AND chunk_index >= ?
+		  AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND deletion_generation = ?)`,
+		sessionID, chunkIndex, sessionID, generation)
+	if err != nil {
+		return fmt.Errorf("delete trailing embeddings for session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
 // GetEmbeddings retrieves all embeddings for a session.
 func (s *SQLiteStore) GetEmbeddings(sessionID string) ([]StoredEmbedding, error) {
 	rows, err := s.db.Query(
