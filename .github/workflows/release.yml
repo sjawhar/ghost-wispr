@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  pull_request:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install PortAudio headers
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+
+      - name: Build web assets
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Embed web assets
+        run: make --silent embed-assets
+
+      - name: Build arm64 binary
+        env:
+          BUILD_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          go build \
+            -ldflags "-X main.Commit=${BUILD_SHA} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o ghost-wispr-linux-arm64 \
+            ./cmd/ghost-wispr
+          sha256sum ghost-wispr-linux-arm64 > ghost-wispr-linux-arm64.sha256
+
+      - name: Upload pull request artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-wispr-linux-arm64
+          path: |
+            ghost-wispr-linux-arm64
+            ghost-wispr-linux-arm64.sha256
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'workflow_run'
+        env:
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(date -u +%Y.%m.%d)-${BUILD_SHA:0:7}"
+          gh release create "$tag" \
+            ghost-wispr-linux-arm64 \
+            ghost-wispr-linux-arm64.sha256 \
+            --target "$BUILD_SHA" \
+            --title "$tag" \
+            --generate-notes
