@@ -26,6 +26,7 @@ var (
 type DeletedSpan struct {
 	SessionID                 string
 	AudioPath                 string
+	SessionAudioPath          string
 	Start, End                float64
 	SHA256Before, SHA256After string
 }
@@ -60,6 +61,10 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if session.Status == SessionActive {
 		return ErrSegmentSessionActive
 	}
+	fullAudioPath := span.SessionAudioPath
+	if fullAudioPath == "" {
+		fullAudioPath = session.AudioPath
+	}
 
 	var deletedText string
 	if err := tx.QueryRow(`SELECT text FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID).Scan(&deletedText); err != nil {
@@ -92,6 +97,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			sync_status = ?,
 			sync_state = ?,
 			drive_replace_pending = 1,
+			audio_path = ?,
 			audio_removed_at = ''
 		WHERE id = ?`,
 		RefinementPending,
@@ -101,6 +107,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		EnvoyPublishPending,
 		SyncPending,
 		SyncStatePending,
+		fullAudioPath,
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("clear deleted segment derivatives for session %s: %w", sessionID, err)

@@ -295,6 +295,34 @@ func TestRecordingsStayRemovableWithoutPendingSplice(t *testing.T) {
 	}
 }
 
+
+func TestDeleteSegmentRestoresTheFullAudioPath(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	_, _ = segmentTestSession(t, store, "restored-audio")
+	segments, err := store.GetSegments("restored-audio")
+	if err != nil {
+		t.Fatalf("get segments: %v", err)
+	}
+	const first = "/audio/20261111120000.mp3"
+	const second = "/audio/20261111130000.mp3"
+	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ?, audio_removed_at = ? WHERE id = ?`, first, time.Now().UTC().Format(time.RFC3339Nano), "restored-audio"); err != nil {
+		t.Fatalf("mark audio removed: %v", err)
+	}
+	if err := store.DeleteSegment("restored-audio", segments[1].ID, DeletedSpan{
+		AudioPath:       second,
+		SessionAudioPath: first + "," + second,
+		Start:           2,
+		End:             4,
+		SHA256Before:    "before",
+		SHA256After:     "after",
+	}); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	session := storeSession(t, store, "restored-audio")
+	if session.AudioPath != first+","+second || session.AudioRemovedAt != "" {
+		t.Fatalf("audio path=%q removed_at=%q, want restored full path and no marker", session.AudioPath, session.AudioRemovedAt)
+	}
+}
 func TestDeleteSegmentSecurelyErasesDeletedText(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "delete.db")
 	store, err := NewSQLiteStore(path)

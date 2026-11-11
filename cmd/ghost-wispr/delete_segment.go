@@ -26,9 +26,14 @@ type segmentDeleteRunner struct {
 	store            *storage.SQLiteStore
 	transcriber      audio.Transcriber
 	audioDir         string
-	ensureRecordings func(context.Context, storage.Session) ([]string, error)
+	ensureRecordings func(context.Context, storage.Session) (deletionRecordingSet, error)
 	splice           func(context.Context, string, float64, float64) (string, error)
 	refine           func(context.Context, string, string, time.Time) error
+}
+
+type deletionRecordingSet struct {
+	Paths      []string
+	Downloaded []string
 }
 
 type deletionRecordingSource interface {
@@ -38,7 +43,7 @@ type deletionRecordingSource interface {
 
 // restoreDeletionRecordings combines the session's locally known recordings
 // with every audio file Drive has for it, restoring only missing local files.
-func restoreDeletionRecordings(ctx context.Context, session *storage.Session, audioDir string, source deletionRecordingSource) ([]string, error) {
+func restoreDeletionRecordings(ctx context.Context, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
 	byName := make(map[string]string)
 	for _, entry := range strings.Split(session.AudioPath, ",") {
 		entry = strings.TrimSpace(entry)
@@ -54,7 +59,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 	if session.GDriveFolderID != "" && source != nil {
 		files, err := source.ListFolderFiles(ctx, session.GDriveFolderID)
 		if err != nil {
-			return nil, fmt.Errorf("list Drive recordings: %w", err)
+			return deletionRecordingSet{}, fmt.Errorf("list Drive recordings: %w", err)
 		}
 		for _, file := range files {
 			if !strings.HasPrefix(file.MimeType, "audio/") || !strings.HasPrefix(file.Name, "audio-") {
@@ -63,38 +68,39 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 			name := strings.TrimPrefix(file.Name, "audio-")
 			if _, known := byName[name]; !known {
 				if strings.TrimSpace(audioDir) == "" {
-					return nil, fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
+					return deletionRecordingSet{}, fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
 				}
 				byName[name] = filepath.Join(audioDir, name)
 			}
 		}
 	}
 	if len(byName) == 0 {
-		return nil, nil
+		return deletionRecordingSet{}, nil
 	}
 	names := make([]string, 0, len(byName))
 	for name := range byName {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	recordings := make([]string, 0, len(names))
+	set := deletionRecordingSet{Paths: make([]string, 0, len(names))}
 	for _, name := range names {
 		path := byName[name]
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			recordings = append(recordings, path)
+			set.Paths = append(set.Paths, path)
 			continue
 		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("stat recording %s: %w", path, err)
+			return deletionRecordingSet{}, fmt.Errorf("stat recording %s: %w", path, err)
 		}
 		if source == nil || session.GDriveFolderID == "" {
-			return nil, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
+			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
 		if err := source.DownloadRecording(ctx, session.GDriveFolderID, "audio-"+name, path); err != nil {
-			return nil, fmt.Errorf("restore recording %s: %w", name, err)
+			return deletionRecordingSet{}, fmt.Errorf("restore recording %s: %w", name, err)
 		}
-		recordings = append(recordings, path)
+		set.Paths = append(set.Paths, path)
+		set.Downloaded = append(set.Downloaded, path)
 	}
-	return recordings, nil
+	return set, nil
 }
 
 func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segmentID int64) error {
@@ -131,13 +137,23 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 		}
 	}
 
-	recordings, err := d.ensureRecordings(ctx, session)
+	recordingSet, err := d.ensureRecordings(ctx, session)
 	if err != nil {
 		return fmt.Errorf("get recordings: %w", err)
 	}
+	recordings := recordingSet.Paths
 	if len(recordings) == 0 {
 		return fmt.Errorf("session %s has no recording", sessionID)
 	}
+	keepDownloaded := false
+	defer func() {
+		if keepDownloaded {
+			return
+		}
+		for _, downloaded := range recordingSet.Downloaded {
+			_ = os.Remove(downloaded)
+		}
+	}()
 	candidates := make([]audio.Recording, len(recordings))
 	for i, recording := range recordings {
 		words, err := d.transcriber.Words(ctx, recording)
@@ -197,10 +213,11 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 		return fmt.Errorf("%w: after-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(afterMissing, ", "))
 	}
 
-	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, Start: start, End: end, SHA256Before: beforeHash, SHA256After: afterHash}
+	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordings, ","), Start: start, End: end, SHA256Before: beforeHash, SHA256After: afterHash}
 	if err := d.store.DeleteSegment(sessionID, segmentID, span); err != nil {
 		return err
 	}
+	keepDownloaded = true
 	if err := os.Rename(tempPath, recording); err != nil {
 		return fmt.Errorf("replace recording %s: %w", recording, err)
 	}
@@ -209,7 +226,11 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 		return err
 	}
 	if d.refine != nil {
-		if err := d.refine(ctx, sessionID, recording, session.StartedAt); err != nil {
+		updated, err := d.store.GetSession(sessionID)
+		if err != nil {
+			return fmt.Errorf("get spliced session %s: %w", sessionID, err)
+		}
+		if err := d.refine(ctx, sessionID, updated.AudioPath, updated.StartedAt); err != nil {
 			return fmt.Errorf("refine spliced session %s: %w", sessionID, err)
 		}
 	}
@@ -228,10 +249,11 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 		if err != nil {
 			return 0, fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err)
 		}
-		recordings, err := restoreDeletionRecordings(ctx, &session, audioDir, source)
+		recordingSet, err := restoreDeletionRecordings(ctx, &session, audioDir, source)
 		if err != nil {
 			return 0, err
 		}
+		recordings := recordingSet.Paths
 		recording := ""
 		for _, candidate := range recordings {
 			if filepath.Base(candidate) == filepath.Base(span.AudioPath) {
