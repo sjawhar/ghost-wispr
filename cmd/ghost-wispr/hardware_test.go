@@ -257,3 +257,18 @@ func TestDefaultListenAddressIsLoopback(t *testing.T) {
 		t.Fatalf("explicit listen address = %q, want :8081", got)
 	}
 }
+
+func TestReconnectingLightRetainsAccessFailureDuringRetry(t *testing.T) {
+	accessErr := errors.New("permission denied")
+	original := openBlink1
+	openBlink1 = func(string, string) (indicator.Light, error) { return nil, accessErr }
+	t.Cleanup(func() { openBlink1 = original })
+
+	light := &reconnectingLight{warnings: newWarningsRegistry()}
+	if _, err := light.current(); !errors.Is(err, accessErr) {
+		t.Fatalf("first open error = %v, want %v", err, accessErr)
+	}
+	if _, err := light.current(); !errors.Is(err, accessErr) {
+		t.Fatalf("retry-window error = %v, want %v", err, accessErr)
+	}
+}

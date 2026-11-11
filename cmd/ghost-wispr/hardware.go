@@ -224,6 +224,7 @@ type reconnectingLight struct {
 	mu          sync.Mutex
 	light       indicator.Light
 	nextAttempt time.Time
+	lastErr     error
 	warnings    *warningsRegistry
 }
 
@@ -234,21 +235,24 @@ func (l *reconnectingLight) current() (indicator.Light, error) {
 		return l.light, nil
 	}
 	if time.Now().Before(l.nextAttempt) {
-		return nil, indicator.ErrNoBlink1
+		return nil, l.lastErr
 	}
 	light, err := openBlink1(blinkSysfsRoot, blinkDevRoot)
 	if err != nil {
+		l.lastErr = err
 		l.nextAttempt = time.Now().Add(hardwareRetry)
 		l.warnings.Set("recording-light", "Recording light not found; the unit records without its light")
 		return nil, err
 	}
 	if err := light.BlackPattern(); err != nil {
 		_ = light.Close()
+		l.lastErr = err
 		l.nextAttempt = time.Now().Add(hardwareRetry)
 		l.warnings.Set("recording-light", "Recording light not found; the unit records without its light")
 		return nil, err
 	}
 	l.light = light
+	l.lastErr = nil
 	l.warnings.Clear("recording-light")
 	return light, nil
 }
@@ -260,6 +264,7 @@ func (l *reconnectingLight) failed(err error) error {
 		_ = l.light.Close()
 		l.light = nil
 	}
+	l.lastErr = err
 	l.nextAttempt = time.Time{}
 	l.warnings.Set("recording-light", "Recording light not found; the unit records without its light")
 	return err

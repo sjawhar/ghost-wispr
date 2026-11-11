@@ -88,9 +88,7 @@ func (c *Controller) Run(ctx context.Context) {
 }
 
 func (c *Controller) update() {
-	if err := c.light.ServerDown(serverDownTimeout); err != nil && !errors.Is(err, ErrNoBlink1) {
-		slog.Warn("tickle recording light watchdog", "error", err)
-	}
+	_ = c.light.ServerDown(serverDownTimeout)
 
 	var wantRed uint8
 	if c.recording() {
@@ -98,15 +96,10 @@ func (c *Controller) update() {
 	}
 	red, green, blue, err := c.light.ReadRGB()
 	if err != nil {
-		if !errors.Is(err, ErrNoBlink1) {
-			slog.Warn("read recording light state", "error", err)
-		}
 		return
 	}
 	if red == wantRed && green == 0 && blue == 0 {
 		return
 	}
-	if err := c.light.SetRGB(wantRed, 0, 0); err != nil && !errors.Is(err, ErrNoBlink1) {
-		slog.Warn("set recording light state", "error", err)
-	}
+	_ = c.light.SetRGB(wantRed, 0, 0)
 }

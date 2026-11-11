@@ -1206,7 +1206,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		return err
 	}
-	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	beforeResume := capture.beforeResume
 	capture.beforeResume = func() {
 		if err := hardware.EnsureRed(); err != nil {
@@ -1222,6 +1221,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		beforeResume()
 	}
+	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	if restoredPause {
 		hub.BroadcastStatusChanged(true)
 	}
