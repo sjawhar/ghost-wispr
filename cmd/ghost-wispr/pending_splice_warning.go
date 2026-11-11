@@ -34,12 +34,21 @@ func clearPendingSpliceWarning(registry *warningsRegistry, sessionID, recording 
 	registry.Clear(segmentDeletionWarningKey(pendingSpliceWarningKeyPrefix, sessionID, recording))
 }
 
+// refinementWarningText names the innermost cause of err: it follows %w
+// wrapping to the last error, then keeps the final ": "-separated clause of
+// that error's text, which is the innermost cause of a chain flattened by %v.
 func refinementWarningText(sessionID string, err error) string {
-	reason, _, _ := strings.Cut(strings.TrimSpace(err.Error()), ":")
-	if reason == "" {
-		reason = "unknown error"
+	for inner := errors.Unwrap(err); inner != nil; inner = errors.Unwrap(err) {
+		err = inner
 	}
-	return fmt.Sprintf("Refinement after segment deletion failed for session %s: %s", sessionID, reason)
+	text := strings.TrimSpace(err.Error())
+	if i := strings.LastIndex(text, ": "); i >= 0 {
+		text = strings.TrimSpace(text[i+2:])
+	}
+	if text == "" {
+		text = "unknown error"
+	}
+	return fmt.Sprintf("Refinement after segment deletion failed for session %s: %s", sessionID, text)
 }
 
 func applyPendingSpliceRecoveryWarnings(registry *warningsRegistry, outcomes []pendingSpliceOutcome) {

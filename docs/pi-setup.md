@@ -258,9 +258,10 @@ The startup recovery verifies the recording hash and completes the splice. When 
 succeeds, no audio-recovery warning remains for that recording. If `/api/status` instead
 says refinement after segment deletion failed, audio recovery is complete: repair batch
 transcription, then rerun refinement with `POST /api/sessions/{id}/retry-refinement`. The
-warning clears once the session's refinement completes. If an audio-recovery warning
-remains, preserve the named recording and contact the recorder operator; do not remove any
-database row or audio file by hand.
+warning lasts until refinement completes or the service restarts; after a restart, check
+the session's refinement badge. If an audio-recovery warning remains, preserve the named
+recording and contact the recorder operator; do not remove any database row or audio file
+by hand.
 
 ## Accept slice 1
 

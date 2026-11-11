@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -40,7 +41,7 @@ func TestR8RecoveryResultsClearPendingWarningThroughStatus(t *testing.T) {
 func TestR8RefinementFailureUsesItsOwnStatusWarning(t *testing.T) {
 	store, recording, _ := r4PendingStore(t)
 	registry := newWarningsRegistry()
-	refinementErr := errors.New("batch transcription not configured: upstream failure 123")
+	refinementErr := fmt.Errorf("refine recording 123: %w", errors.New("batch transcription not configured"))
 
 	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, func(context.Context, string, string, time.Time) error {
 		return refinementErr
@@ -50,7 +51,7 @@ func TestR8RefinementFailureUsesItsOwnStatusWarning(t *testing.T) {
 	}
 	applyPendingSpliceRecoveryWarnings(registry, outcomes)
 	warnings := statusWarnings(t, registry)
-	if len(warnings) != 1 || strings.Contains(warnings[0], "needs audio recovery") || strings.Contains(warnings[0], "upstream failure 123") || !strings.Contains(warnings[0], "Refinement after segment deletion failed for session session") || !strings.Contains(warnings[0], "batch transcription not configured") {
+	if len(warnings) != 1 || strings.Contains(warnings[0], "needs audio recovery") || strings.Contains(warnings[0], "refine recording 123") || !strings.Contains(warnings[0], "Refinement after segment deletion failed for session session") || !strings.Contains(warnings[0], "batch transcription not configured") {
 		t.Fatalf("status warnings after refinement failure = %q, want a short refinement warning without an audio-recovery claim", warnings)
 	}
 }

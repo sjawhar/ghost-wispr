@@ -3,11 +3,32 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
+
+func TestR9RefinementWarningShowsInnermostCause(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"wrapped twice", fmt.Errorf("refine session: %w", fmt.Errorf("transcribe recording.mp3: %w", errors.New("batch transcription not configured"))), "batch transcription not configured"},
+		{"flattened text", errors.New("refine session: transcribe recording.mp3: upstream timeout"), "upstream timeout"},
+		{"plain", errors.New("batch transcription not configured"), "batch transcription not configured"},
+		{"empty", errors.New("  "), "unknown error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := "Refinement after segment deletion failed for session s: " + tc.want
+			if got := refinementWarningText("s", tc.err); got != want {
+				t.Fatalf("refinementWarningText(%q) = %q, want %q", tc.err, got, want)
+			}
+		})
+	}
+}
 
 func TestR9RetryThatLeavesRefinementFailedKeepsStatusWarning(t *testing.T) {
 	store, recording, _ := r4PendingStore(t)
