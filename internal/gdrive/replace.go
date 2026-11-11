@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"google.golang.org/api/drive/v3"
 
@@ -86,7 +87,6 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 	if err != nil {
 		return fmt.Errorf("list replacements for session %s: %w", sess.ID, err)
 	}
-	var orphanUploadIDs []string
 	oldByName := make(map[string][]*drive.File, len(files))
 	for _, file := range existing {
 		for i := range files {
@@ -136,7 +136,6 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		if err := s.replacements.MarkDriveReplacementUploaded(sess.ID, file.Name, generation, newID); err != nil {
 			return err
 		}
-		orphanUploadIDs = append(orphanUploadIDs, extraReplacementFileIDs(existing, file.Name, key, newID)...)
 		replacements, err = s.replacements.DriveReplacements(sess.ID, generation)
 		if err != nil {
 			return err
@@ -158,9 +157,25 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		}
 		return nil
 	}
-	for _, orphanID := range orphanUploadIDs {
-		if err := deleteFile(orphanID); err != nil {
-			return fmt.Errorf("delete duplicate replacement upload %s: %w", orphanID, err)
+	// Every copy of a replacement this app uploaded, other than the one its
+	// rows record, is a duplicate: an upload Drive carried out twice because
+	// a retried request's first response was lost, in an earlier attempt or
+	// in this one. The folder is listed again after the uploads, so a copy
+	// made in this attempt is found too.
+	uploaded, err := s.ListFolderFiles(ctx, sess.GDriveFolderID)
+	if err != nil {
+		return fmt.Errorf("list replacements for session %s after uploading: %w", sess.ID, err)
+	}
+	for i := range files {
+		rows := driveReplacementsNamed(replacements, files[i].Name)
+		if len(rows) == 0 || rows[0].NewID == "" {
+			continue
+		}
+		key := replacementUploadKey(sess.ID, files[i].Name, rows)
+		for _, duplicateID := range extraReplacementFileIDs(uploaded, files[i].Name, key, rows[0].NewID) {
+			if err := deleteFile(duplicateID); err != nil {
+				return fmt.Errorf("delete duplicate replacement upload %s: %w", duplicateID, err)
+			}
 		}
 	}
 	for _, replacement := range replacements {
@@ -321,14 +336,18 @@ func replacementUploadKey(sessionID, name string, replacements []storage.DriveRe
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
+// replacementFileForKey returns the newest copy of name in files that carries
+// replacement key key, or nil. Drive's modified times are compared as times,
+// not as text, which would order fractional seconds wrongly.
 func replacementFileForKey(files []*drive.File, name, key string) (*drive.File, error) {
 	var found *drive.File
+	var foundAt time.Time
 	for _, file := range files {
 		if file.Name != name || file.AppProperties[replacementKeyProperty] != key {
 			continue
 		}
-		if found == nil || file.ModifiedTime > found.ModifiedTime {
-			found = file
+		if at := toDriveFile(file).ModifiedTime; found == nil || at.After(foundAt) {
+			found, foundAt = file, at
 		}
 	}
 	return found, nil

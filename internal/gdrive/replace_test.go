@@ -269,6 +269,49 @@ func TestReplaceDeletesExtraAppCreatedUpload(t *testing.T) {
 	}
 }
 
+// TestReplaceDeletesADuplicateCreatedInTheSameAttempt fails if an upload that
+// Drive carried out twice in one attempt (a retried request whose first
+// response was lost) leaves the extra copy on Drive.
+func TestReplaceDeletesADuplicateCreatedInTheSameAttempt(t *testing.T) {
+	fixture := newReplacementFixture(t)
+	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
+	fixture.wire.allowDeletes = true
+	fixture.wire.duplicateUploadAt = fixture.wire.uploads + 1
+
+	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
+		t.Fatalf("replace session files: %v", err)
+	}
+	files := fixture.wire.in(fixture.folder)
+	for _, name := range []string{"summary.md", "transcript.md", "audio-" + fixture.id + ".mp3"} {
+		if copies := files[name]; len(copies) != 1 {
+			t.Errorf("after the replacement the folder has %d %s files, want one", len(copies), name)
+		}
+	}
+	if got := len(fixture.wire.deletedIDs); got != len(fixture.oldIDs)+1 {
+		t.Errorf("deleted %v, want the %d old files and the duplicate", fixture.wire.deletedIDs, len(fixture.oldIDs))
+	}
+}
+
+// TestReplacementFileForKeyComparesTimesNotText fails if the newest copy of a
+// replacement is chosen by comparing Drive's modified times as text: a time
+// written with fractional seconds sorts before the same second written
+// without, though it is later.
+func TestReplacementFileForKeyComparesTimesNotText(t *testing.T) {
+	const key = "key"
+	keyed := map[string]string{replacementKeyProperty: key}
+	files := []*drive.File{
+		{Id: "whole-second", Name: "transcript.md", AppProperties: keyed, ModifiedTime: "2026-03-01T00:01:00Z"},
+		{Id: "later", Name: "transcript.md", AppProperties: keyed, ModifiedTime: "2026-03-01T00:01:00.500Z"},
+	}
+	found, err := replacementFileForKey(files, "transcript.md", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found == nil || found.Id != "later" {
+		t.Errorf("newest copy = %v, want the one modified half a second later", found)
+	}
+}
+
 // TestReplaceClaimsSessionDuringDriveReplacement fails if a replacement runs
 // without the session's sync claim, or does not release it to the state it
 // was claimed from.

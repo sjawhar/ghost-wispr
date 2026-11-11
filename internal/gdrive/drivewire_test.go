@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -76,6 +77,10 @@ type wireDrive struct {
 	// failUploadAt makes precisely one upload request fail before Drive creates
 	// its file, so a replacement retry can resume from prior rows.
 	failUploadAt int
+	// duplicateUploadAt makes precisely one upload create its file twice, as
+	// a client retrying a request whose response was lost does; Drive answers
+	// with the second copy.
+	duplicateUploadAt int
 	// allowDeletes permits the replacement-path test to exercise Files.Delete.
 	allowDeletes bool
 	deletes      int
@@ -396,6 +401,9 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			d.onUpload(parent)
 		}
 		f := d.create(&wireFile{Name: meta.Name, MimeType: meta.MimeType, Parent: firstParent(meta.Parents), AppProperties: meta.AppProperties, Content: content})
+		if d.duplicateUploadAt == d.uploads {
+			f = d.create(&wireFile{Name: meta.Name, MimeType: meta.MimeType, Parent: firstParent(meta.Parents), AppProperties: maps.Clone(meta.AppProperties), Content: content})
+		}
 		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID})
 	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/upload/drive/v3/files/"):
 		f := d.find(strings.TrimPrefix(path, "/upload/drive/v3/files/"))
