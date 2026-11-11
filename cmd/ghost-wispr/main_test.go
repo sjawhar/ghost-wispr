@@ -141,6 +141,101 @@ func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
 	}
 }
 
+// TestStreamMicWithRetryDoesNotStartWithoutRed fails if a resumed microphone
+// starts after its red confirmation refuses capture.
+func TestStreamMicWithRetryDoesNotStartWithoutRed(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	capture.Pause()
+	mic := newScriptedMic()
+	confirmed := make(chan struct{})
+	capture.beforeMicStart = func() error {
+		close(confirmed)
+		return errors.New("recording light stayed off")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		streamMicWithRetry(ctx, capture, mic, bytes.NewBuffer(nil), func(time.Duration) {
+			cancel()
+		}, func(string, ...any) {}, nil)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		close(mic.chunks)
+		<-done
+	})
+
+	mic.expectEvents(t, "stop")
+	capture.Resume()
+	select {
+	case <-confirmed:
+	case <-time.After(testWait):
+		t.Fatal("timed out waiting for red confirmation")
+	}
+	select {
+	case <-done:
+	case <-time.After(testWait):
+		t.Fatal("mic loop did not stop after refused red confirmation")
+	}
+	mic.expectNoEvents(t)
+}
+
+// TestStreamMicWithRetryReleasesRedHoldAfterEveryStart fails if successful
+// Start or Reopen paths leave the matching confirmation hold set.
+func TestStreamMicWithRetryReleasesRedHoldAfterEveryStart(t *testing.T) {
+	t.Run("resume start", func(t *testing.T) {
+		capture := newCaptureGate(nil, nil, nil)
+		capture.Pause()
+		mic := newScriptedMic()
+		var afterCalls int
+		ctx, cancel := context.WithCancel(context.Background())
+		var closeChunks sync.Once
+		stop := func() {
+			cancel()
+			closeChunks.Do(func() { close(mic.chunks) })
+		}
+		mic.onStream = stop
+		capture.afterMicStart = func() { afterCalls++ }
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			streamMicWithRetry(ctx, capture, mic, bytes.NewBuffer(nil), func(time.Duration) {}, func(string, ...any) {}, nil)
+		}()
+		t.Cleanup(func() {
+			stop()
+			<-done
+		})
+
+		mic.expectEvents(t, "stop")
+		capture.Resume()
+		mic.expectEvents(t, "start")
+		<-done
+		if afterCalls != 1 {
+			t.Fatalf("red-hold releases after Start = %d, want 1", afterCalls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "overflow reopen", err: errors.New("Input overflowed")},
+		{name: "device-error reopen", err: errors.New("device disconnected")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			var afterCalls int
+			capture.afterMicStart = func() { afterCalls++ }
+			streamer := &fakeStreamer{errs: []error{tc.err, nil}}
+			streamMicWithRetry(context.Background(), capture, streamer, bytes.NewBuffer(nil), func(time.Duration) {}, func(string, ...any) {}, nil)
+			if afterCalls != 1 {
+				t.Fatalf("red-hold releases after Reopen = %d, want 1", afterCalls)
+			}
+		})
+	}
+}
+
 func TestStreamMicWithRetryRetriesDeviceError(t *testing.T) {
 	streamer := &fakeStreamer{errs: []error{errors.New("device disconnected"), nil}}
 	var waits []time.Duration

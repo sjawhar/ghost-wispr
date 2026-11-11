@@ -209,6 +209,7 @@ func guardResumeWithLight(
 func wireLightConsent(capture *captureGate, hardware *hardwareControl, store pauseStore, mic interface{ IsOpen() bool }, warnings *warningsRegistry, hub *server.Hub) {
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
+	capture.afterGateOpen = hardware.ReleaseRedHold
 	guardResumeWithLight(capture, store, mic, warnings, hub)
 }
 

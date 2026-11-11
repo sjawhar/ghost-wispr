@@ -669,3 +669,47 @@ func TestEnsureRedOutlastsAStaleOffDecision(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestResumeReleasesRedHoldAfterGateOpens fails if a short pause leaves the
+// confirmation hold set after the microphone resumes without restarting.
+func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
+	device := &operationLightFake{}
+	capture := newCaptureGate(nil, nil, nil)
+	capture.Pause()
+	mic := &openMicFake{open: true}
+	hardware := &hardwareControl{
+		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
+	}
+	hardware.light.holdRed = hardware.holdsRed
+	hardware.controller = indicator.NewController(hardware.light, func() bool {
+		return hardware.holdsRed() || recordingSignal(capture, mic)
+	}, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		hardware.controller.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	store, err := storage.NewSQLiteStore(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	wireLightConsent(capture, hardware, store, mic, newWarningsRegistry(), nil)
+	capture.Resume()
+	waitForHardware(t, "gate-open red hold release", func() bool {
+		colour, _ := device.snapshot()
+		return !hardware.holdsRed() && colour == [3]uint8{255, 0, 0}
+	})
+	mic.open = false
+	hardware.Wake()
+	waitForHardware(t, "light off after microphone loss", func() bool {
+		colour, _ := device.snapshot()
+		return !hardware.holdsRed() && colour == [3]uint8{}
+	})
+}

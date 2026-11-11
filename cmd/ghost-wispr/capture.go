@@ -67,6 +67,7 @@ type captureGate struct {
 	beforeResume   func()
 	beforeMicStart func() error
 	afterMicStart  func()
+	afterGateOpen  func()
 	stallAfter     time.Duration // see captureStallAfter
 	writeWait      time.Duration // see captureWriteWait
 	control        sync.Mutex    // serializes closing and opening the gate, with their steps
@@ -211,13 +212,17 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 	}
 
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if !g.closed || g.switchOff || g.closings != closing {
+		g.mu.Unlock()
 		return
 	}
 	g.closed = false
 	close(g.resumed)
 	g.closing = make(chan struct{})
+	g.mu.Unlock()
+	if g.afterGateOpen != nil {
+		g.afterGateOpen()
+	}
 }
 
 func (g *captureGate) confirmMicStart() error {
