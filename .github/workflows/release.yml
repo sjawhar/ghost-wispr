@@ -36,7 +36,9 @@ jobs:
 
       - name: Install audio build dependencies
         timeout-minutes: 10
-        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg portaudio19-dev
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg portaudio19-dev
 
       - name: Build web assets
         working-directory: web

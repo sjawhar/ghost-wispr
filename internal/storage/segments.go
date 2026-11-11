@@ -19,6 +19,9 @@ var (
 	ErrSegmentNotFound = errors.New("segment not found")
 	// ErrSegmentSessionActive means a recording session cannot be changed yet.
 	ErrSegmentSessionActive = errors.New("session is still active")
+	// ErrSegmentPostCommitMaintenance means the deletion committed but SQLite
+	// maintenance did not complete.
+	ErrSegmentPostCommitMaintenance = errors.New("segment deletion post-commit maintenance failed")
 )
 
 // DeletedSpan identifies the session recording span removed for a segment and
@@ -28,6 +31,7 @@ type DeletedSpan struct {
 	AudioPath                 string
 	SessionAudioPath          string
 	Start, End                float64
+	StreamStart, StreamEnd    float64
 	SHA256Before, SHA256After string
 }
 
@@ -67,11 +71,15 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	}
 
 	var deletedText string
-	if err := tx.QueryRow(`SELECT text FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID).Scan(&deletedText); err != nil {
+	var segmentStart, segmentEnd float64
+	if err := tx.QueryRow(`SELECT text, start_time, end_time FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID).Scan(&deletedText, &segmentStart, &segmentEnd); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrSegmentNotFound
 		}
 		return fmt.Errorf("get segment %d from session %s: %w", segmentID, sessionID, err)
+	}
+	if span.StreamEnd <= span.StreamStart {
+		span.StreamStart, span.StreamEnd = segmentStart, segmentEnd
 	}
 	if _, err := tx.Exec(`DELETE FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID); err != nil {
 		return fmt.Errorf("delete segment %d from session %s: %w", segmentID, sessionID, err)
@@ -145,11 +153,18 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
 	}
-	if _, err := s.db.Exec(`VACUUM`); err != nil {
-		return fmt.Errorf("vacuum after deleting segment from session %s: %w", sessionID, err)
+	if err := postDeleteMaintenance(s.db); err != nil {
+		return fmt.Errorf("%w: %v", ErrSegmentPostCommitMaintenance, err)
 	}
-	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return fmt.Errorf("checkpoint after deleting segment from session %s: %w", sessionID, err)
+	return nil
+}
+
+var postDeleteMaintenance = func(db *sql.DB) error {
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		return fmt.Errorf("vacuum: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
 	}
 	return nil
 }
@@ -179,6 +194,28 @@ func tableExists(tx *sql.Tx, name string) (bool, error) {
 	return true, nil
 }
 
+// SourceSessionIDs returns the source sessions whose recordings a merged
+// session owns, in session time order.
+func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM sessions WHERE merged_into = ? ORDER BY started_at ASC`, mergedID)
+	if err != nil {
+		return nil, fmt.Errorf("query merged sources for %s: %w", mergedID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan merged source: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate merged sources for %s: %w", mergedID, err)
+	}
+	return ids, nil
+}
+
 func rewriteDeletedTextEvents(tx *sql.Tx, sessionID, deletedText string, span *DeletedSpan) error {
 	rows, err := tx.Query(`SELECT id, event_type, payload FROM mcp_events`)
 	if err != nil {
@@ -205,7 +242,7 @@ func rewriteDeletedTextEvents(tx *sql.Tx, sessionID, deletedText string, span *D
 		if eventSessionID, _ := event["session_id"].(string); eventSessionID != sessionID {
 			continue
 		}
-		if isLiveTranscriptEvent(eventType, event) && eventOverlapsDeletedSpan(event, span) {
+		if isSummaryReadyEvent(eventType, event) || isLiveTranscriptEvent(eventType, event) && eventOverlapsDeletedSpan(event, span) {
 			updates = append(updates, update{id: id, delete: true})
 			continue
 		}
@@ -247,6 +284,14 @@ func isLiveTranscriptEvent(eventType string, event map[string]any) bool {
 	return typeName == "live_transcript" || typeName == "live_transcript_interim"
 }
 
+func isSummaryReadyEvent(eventType string, event map[string]any) bool {
+	if eventType == "summary_ready" {
+		return true
+	}
+	typeName, _ := event["type"].(string)
+	return typeName == "summary_ready"
+}
+
 func eventOverlapsDeletedSpan(event map[string]any, span *DeletedSpan) bool {
 	start, ok := event["start_time"].(float64)
 	if !ok {
@@ -254,9 +299,9 @@ func eventOverlapsDeletedSpan(event map[string]any, span *DeletedSpan) bool {
 	}
 	end, hasEnd := event["end_time"].(float64)
 	if !hasEnd {
-		return start >= span.Start && start < span.End
+		return start >= span.StreamStart && start < span.StreamEnd
 	}
-	return start < span.End && end > span.Start
+	return start < span.StreamEnd && end > span.StreamStart
 }
 
 func redactEventText(value any, deletedText string) (any, bool) {
@@ -312,6 +357,8 @@ func (s *SQLiteStore) PendingSplices() ([]DeletedSpan, error) {
 			return nil, fmt.Errorf("hash deleted recording %s: %w", span.AudioPath, err)
 		case hash == span.SHA256After:
 			complete = append(complete, span)
+		default:
+			pending = append(pending, span)
 		}
 	}
 	if err := rows.Err(); err != nil {

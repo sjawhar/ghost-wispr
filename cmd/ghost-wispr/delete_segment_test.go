@@ -18,6 +18,7 @@ import (
 	"google.golang.org/api/drive/v3"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -133,6 +134,104 @@ func TestSegmentDeleteRunnerSplicesAndRefinesTheRecording(t *testing.T) {
 	}
 	if refinedPath != recording {
 		t.Fatalf("refinement read %q, want spliced %q", refinedPath, recording)
+	}
+}
+
+func TestSegmentDeleteRunnerUsesProbedRecordingDuration(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	store, segmentID, _ := newDeletionTestStore(t, recording)
+	probed := false
+	runner := segmentDeleteRunner{
+		store:       store,
+		transcriber: deletionWordsFake{before: initialWords(), after: cutWords()},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		duration: func(_ context.Context, path string) (float64, error) {
+			if path != recording {
+				t.Fatalf("probed %q, want %q", path, recording)
+			}
+			probed = true
+			return 3, nil
+		},
+		splice: fakeSplice,
+	}
+	if err := runner.Delete(context.Background(), "session", segmentID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if !probed {
+		t.Fatal("runner did not probe recording duration")
+	}
+}
+
+func TestCleanupSpliceTempCopies(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", "recording.mp3"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if err := cleanupSpliceTempCopies(dir); err != nil {
+		t.Fatalf("cleanup splice temp copies: %v", err)
+	}
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("temp copy %s remains: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recording.mp3")); err != nil {
+		t.Fatalf("recording disappeared: %v", err)
+	}
+}
+
+func TestStartupRecoveryContinuesPastBadSplice(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "recovery.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	audioDir := t.TempDir()
+	bad := filepath.Join(audioDir, "bad.mp3")
+	good := filepath.Join(audioDir, "good.mp3")
+	if err := os.WriteFile(bad, []byte("unexpected"), 0o600); err != nil {
+		t.Fatalf("write bad recording: %v", err)
+	}
+	if err := os.WriteFile(good, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write good recording: %v", err)
+	}
+	now := time.Now().UTC()
+	for _, entry := range []struct{ id, path string }{{"bad", bad}, {"good", good}} {
+		if err := store.CreateSession(entry.id, now); err != nil {
+			t.Fatalf("create %s: %v", entry.id, err)
+		}
+		if err := store.EndSession(entry.id, now.Add(time.Second), entry.path); err != nil {
+			t.Fatalf("end %s: %v", entry.id, err)
+		}
+	}
+	goodAfter := hashBytesForDeleteTest([]byte("spliced"))
+	if _, err := store.DB().Exec(`
+		INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
+		VALUES (?, ?, 1, 2, ?, ?, ?), (?, ?, 1, 2, ?, ?, ?)`,
+		"bad", bad, "not-the-current-hash", "ignored", now.Format(time.RFC3339Nano),
+		"good", good, hashBytesForDeleteTest([]byte("original")), goodAfter, now.Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("insert pending rows: %v", err)
+	}
+	var warnings []error
+	count, err := recoverPendingSplices(context.Background(), store, audioDir, nil, fakeSplice, nil, func(err error) {
+		warnings = append(warnings, err)
+	})
+	if err != nil {
+		t.Fatalf("recover splices: %v", err)
+	}
+	if count != 1 || len(warnings) == 0 {
+		t.Fatalf("recovered=%d warnings=%v, want good row recovered and bad row warned", count, warnings)
+	}
+	if contents, err := os.ReadFile(good); err != nil || !bytes.Equal(contents, []byte("spliced")) {
+		t.Fatalf("good recovery bytes=%q err=%v", contents, err)
 	}
 }
 
@@ -351,6 +450,26 @@ func TestSegmentDeleteRunnerSerializesConcurrentDeletes(t *testing.T) {
 	}
 }
 
+func TestNeighbourCheckUsesWordsNearestTheCut(t *testing.T) {
+	var beforeTokens []string
+	var words []audio.Word
+	for i := range 30 {
+		token := fmt.Sprintf("word%d", i)
+		beforeTokens = append(beforeTokens, token)
+		words = append(words, audio.Word{Text: token, Start: float64(i), End: float64(i) + 0.5})
+	}
+	if missing := missingNeighbourTokens(words, 30, strings.Join(beforeTokens, " "), true); len(missing) != 0 {
+		t.Fatalf("missing words = %v, want none from the six words nearest the cut", missing)
+	}
+}
+
+func TestNeighbourCheckCountsRepeatedLostWords(t *testing.T) {
+	words := []audio.Word{{Text: "the", Start: 1, End: 1.2}}
+	if missing := missingNeighbourTokens(words, 0, "so the so", false); len(missing) != 2 {
+		t.Fatalf("missing words = %v, want both lost occurrences of %q", missing, "so")
+	}
+}
+
 func TestSegmentDeleteRunnerRefusesSurvivingWordsWithoutChangingRecording(t *testing.T) {
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("original")
@@ -377,6 +496,38 @@ func TestSegmentDeleteRunnerRefusesSurvivingWordsWithoutChangingRecording(t *tes
 	}
 	if !bytes.Equal(contents, original) {
 		t.Fatalf("refused deletion changed recording: got %q, want %q", contents, original)
+	}
+}
+
+func TestSegmentDeleteRunnerRefusesKeptRawRecordingFromMergedSource(t *testing.T) {
+	audioDir := t.TempDir()
+	recording := filepath.Join(audioDir, "merged.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	store, segmentID, _ := newDeletionTestStore(t, recording)
+	if err := store.CreateSession("source-session", time.Now().UTC()); err != nil {
+		t.Fatalf("create source session: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = 'merged', merged_into = ? WHERE id = ?`, "session", "source-session"); err != nil {
+		t.Fatalf("mark source merged: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(audioDir, "source-session.pcm"), []byte("raw audio"), 0o600); err != nil {
+		t.Fatalf("write source raw audio: %v", err)
+	}
+	runner := segmentDeleteRunner{
+		store:       store,
+		audioDir:    audioDir,
+		transcriber: deletionWordsFake{before: initialWords(), after: cutWords()},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			t.Fatal("recordings checked after kept raw source audio")
+			return deletionRecordingSet{}, nil
+		},
+		splice: fakeSplice,
+	}
+	err := runner.Delete(context.Background(), "session", segmentID)
+	if !errors.Is(err, server.ErrSegmentRawAudioKept) || !strings.Contains(err.Error(), "source-session.pcm") {
+		t.Fatalf("delete error = %v, want named source raw recording", err)
 	}
 }
 
@@ -491,6 +642,17 @@ func TestRestoreDeletionRecordingsDownloadsGCMissingAudioInTimeOrder(t *testing.
 	}
 }
 
+func TestRestoreDeletionRecordingsHandlesTypedNilDriveSource(t *testing.T) {
+	var source deletionRecordingSource = (*gdrive.Syncer)(nil)
+	set, err := restoreDeletionRecordings(context.Background(), &storage.Session{GDriveFolderID: "folder"}, t.TempDir(), source)
+	if err != nil {
+		t.Fatalf("restore with sync off: %v", err)
+	}
+	if len(set.Paths) != 0 {
+		t.Fatalf("restore paths = %v, want no Drive download while sync is off", set.Paths)
+	}
+}
+
 func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("original")
@@ -523,7 +685,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 		}
 		refined = true
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("recover pending splice: %v", err)
 	}

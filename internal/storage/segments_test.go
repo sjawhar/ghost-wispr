@@ -137,8 +137,8 @@ func TestDeleteSegmentRemovesTextEverywhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read events: %v", err)
 	}
-	if len(events) != 1 || strings.Contains(events[0].Payload, "private deletion token") {
-		t.Fatalf("event payload still contains deleted text: %+v", events)
+	if len(events) != 0 {
+		t.Fatalf("summary event remains after deletion: %+v", events)
 	}
 
 	var deleted DeletedSpan
@@ -154,30 +154,46 @@ func TestDeleteSegmentRemovesTextEverywhere(t *testing.T) {
 func TestDeleteSegmentClearsOverlappingLiveEvents(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "event-clear")
+	if err := store.CreateSession("other-session", time.Now().UTC()); err != nil {
+		t.Fatalf("create other session: %v", err)
+	}
 	segments, err := store.GetSegments("event-clear")
 	if err != nil {
 		t.Fatalf("get segments: %v", err)
 	}
-	for _, event := range []string{
-		`{"type":"live_transcript_interim","session_id":"event-clear","start_time":2.1,"text":"private"}`,
-		`{"type":"live_transcript_interim","session_id":"event-clear","start_time":2.4,"text":"private deletion"}`,
-		`{"type":"live_transcript","session_id":"event-clear","start_time":2,"end_time":4,"text":"private deletion token"}`,
-		`{"type":"live_transcript","session_id":"event-clear","start_time":4,"end_time":6,"text":"after bridge"}`,
+	for _, event := range []struct {
+		eventType string
+		payload   string
+	}{
+		{"live_transcript_interim", `{"type":"live_transcript_interim","session_id":"event-clear","start_time":2.1,"text":"private"}`},
+		{"live_transcript_interim", `{"type":"live_transcript_interim","session_id":"event-clear","start_time":2.4,"text":"private deletion"}`},
+		{"live_transcript", `{"type":"live_transcript","session_id":"event-clear","start_time":2,"end_time":4,"text":"private deletion token"}`},
+		{"summary_ready", `{"type":"summary_ready","session_id":"event-clear","title":"Purple elephant seventeen","summary":"A paraphrase without the segment text"}`},
+		{"live_transcript", `{"type":"live_transcript","session_id":"event-clear","start_time":4,"end_time":6,"text":"after bridge"}`},
+		{"live_transcript", `{"type":"live_transcript","session_id":"other-session","start_time":2,"end_time":4,"text":"other session"}`},
 	} {
-		if err := store.StoreEvent("live_transcript", event); err != nil {
-			t.Fatalf("store live event: %v", err)
+		if err := store.StoreEvent(event.eventType, event.payload); err != nil {
+			t.Fatalf("store event: %v", err)
 		}
 	}
 
-	if err := store.DeleteSegment("event-clear", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
+	if err := store.DeleteSegment("event-clear", segments[1].ID, DeletedSpan{
+		AudioPath:   "recording.mp3",
+		Start:       20,
+		End:         22,
+		StreamStart: 2,
+		StreamEnd:   4,
+		SHA256Before: "before",
+		SHA256After:  "after",
+	}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
 	events, err := store.GetEventsSince(0, 10)
 	if err != nil {
 		t.Fatalf("read events: %v", err)
 	}
-	if len(events) != 1 || !strings.Contains(events[0].Payload, "after bridge") {
-		t.Fatalf("remaining live events = %+v, want only the non-overlapping segment", events)
+	if len(events) != 2 || !strings.Contains(events[0].Payload, "after bridge") || !strings.Contains(events[1].Payload, "other session") {
+		t.Fatalf("remaining events = %+v, want the neighbouring and other-session events only", events)
 	}
 }
 
@@ -292,6 +308,25 @@ func TestRecordingsStayRemovableWithoutPendingSplice(t *testing.T) {
 	}
 	if len(recordings) != 1 || !recordings[0].Removable {
 		t.Fatalf("recordings = %+v, want a removable recording", recordings)
+	}
+}
+
+func TestRecordingsSkipPendingSegmentSplice(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	_, _ = segmentTestSession(t, store, "pending-gc")
+	segments, err := store.GetSegments("pending-gc")
+	if err != nil {
+		t.Fatalf("get segments: %v", err)
+	}
+	if err := store.DeleteSegment("pending-gc", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	recordings, err := store.Recordings(false)
+	if err != nil {
+		t.Fatalf("Recordings: %v", err)
+	}
+	if len(recordings) != 1 || recordings[0].Removable {
+		t.Fatalf("recordings = %+v, want pending splice held from GC", recordings)
 	}
 }
 

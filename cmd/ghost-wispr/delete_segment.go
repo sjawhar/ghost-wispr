@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ type segmentDeleteRunner struct {
 	transcriber      audio.Transcriber
 	audioDir         string
 	ensureRecordings func(context.Context, storage.Session) (deletionRecordingSet, error)
+	duration         func(context.Context, string) (float64, error)
 	splice           func(context.Context, string, float64, float64) (string, error)
 	refine           func(context.Context, string, string, time.Time) error
 }
@@ -64,6 +66,14 @@ func (l *sessionDeletionLocks) lock(sessionID string) func() {
 
 var deleteLocks sessionDeletionLocks
 
+func usableRecordingSource(source deletionRecordingSource) bool {
+	if source == nil {
+		return false
+	}
+	value := reflect.ValueOf(source)
+	return value.Kind() != reflect.Ptr || !value.IsNil()
+}
+
 // restoreDeletionRecordings combines the session's locally known recordings
 // with every audio file Drive has for it, restoring only missing local files.
 func restoreDeletionRecordings(ctx context.Context, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
@@ -79,7 +89,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		}
 		byName[filepath.Base(path)] = path
 	}
-	if session.GDriveFolderID != "" && source != nil {
+	if session.GDriveFolderID != "" && usableRecordingSource(source) {
 		files, err := source.ListFolderFiles(ctx, session.GDriveFolderID)
 		if err != nil {
 			return deletionRecordingSet{}, fmt.Errorf("list Drive recordings: %w", err)
@@ -157,11 +167,19 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 		return fmt.Errorf("segment deletion is not configured")
 	}
 	if strings.TrimSpace(d.audioDir) != "" {
-		rawPath := filepath.Join(d.audioDir, sessionID+".pcm")
-		if info, err := os.Stat(rawPath); err == nil && !info.IsDir() {
-			return fmt.Errorf("%w: %s", server.ErrSegmentRawAudioKept, rawPath)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("check raw recording %s: %w", rawPath, err)
+		rawSessionIDs := []string{sessionID}
+		sources, err := d.store.SourceSessionIDs(sessionID)
+		if err != nil {
+			return err
+		}
+		rawSessionIDs = append(rawSessionIDs, sources...)
+		for _, rawSessionID := range rawSessionIDs {
+			rawPath := filepath.Join(d.audioDir, rawSessionID+".pcm")
+			if info, err := os.Stat(rawPath); err == nil && !info.IsDir() {
+				return fmt.Errorf("%w: %s", server.ErrSegmentRawAudioKept, rawPath)
+			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("check raw recording %s: %w", rawPath, err)
+			}
 		}
 	}
 
@@ -188,7 +206,14 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 		if err != nil {
 			return fmt.Errorf("transcribe recording %s: %w", recording, err)
 		}
-		candidates[i] = audio.Recording{Words: words, Duration: wordDuration(words)}
+		duration := wordDuration(words)
+		if d.duration != nil {
+			duration, err = d.duration(ctx, recording)
+			if err != nil {
+				return fmt.Errorf("probe recording %s: %w", recording, err)
+			}
+		}
+		candidates[i] = audio.Recording{Words: words, Duration: duration}
 	}
 	before, after := neighbourText(segments, index)
 	recordIndex, start, end, _, err := audio.Locate(candidates, segments[index].Text, before, after)
@@ -241,9 +266,10 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 		return fmt.Errorf("%w: after-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(afterMissing, ", "))
 	}
 
-	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordings, ","), Start: start, End: end, SHA256Before: beforeHash, SHA256After: afterHash}
-	if err := d.store.DeleteSegment(sessionID, segmentID, span); err != nil {
-		return err
+	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordings, ","), Start: start, End: end, StreamStart: segments[index].StartTime, StreamEnd: segments[index].EndTime, SHA256Before: beforeHash, SHA256After: afterHash}
+	maintenanceErr := d.store.DeleteSegment(sessionID, segmentID, span)
+	if maintenanceErr != nil && !errors.Is(maintenanceErr, storage.ErrSegmentPostCommitMaintenance) {
+		return maintenanceErr
 	}
 	keepDownloaded = true
 	if err := os.Rename(tempPath, recording); err != nil {
@@ -262,53 +288,114 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 			return fmt.Errorf("refine spliced session %s: %w", sessionID, err)
 		}
 	}
+	if maintenanceErr != nil {
+		return maintenanceErr
+	}
 	return nil
 }
 
 // recoverPendingSplices completes recordings whose deletion transaction
-// committed before its replacement file reached disk.
-func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (int, error) {
+// committed before its replacement file reached disk. One bad row is reported
+// through warn and never prevents later rows from recovering.
+func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, warn func(error)) (int, error) {
+	if warn == nil {
+		warn = func(error) {}
+	}
 	spans, err := store.PendingSplices()
 	if err != nil {
 		return 0, err
 	}
+	recovered := 0
 	for _, span := range spans {
 		session, err := store.GetSession(span.SessionID)
 		if err != nil {
-			return 0, fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err)
+			warn(fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err))
+			continue
 		}
 		recordingSet, err := restoreDeletionRecordings(ctx, &session, audioDir, source)
 		if err != nil {
-			return 0, err
+			warn(fmt.Errorf("restore pending splice %s: %w", span.AudioPath, err))
+			continue
 		}
-		recordings := recordingSet.Paths
 		recording := ""
-		for _, candidate := range recordings {
+		for _, candidate := range recordingSet.Paths {
 			if filepath.Base(candidate) == filepath.Base(span.AudioPath) {
 				recording = candidate
 				break
 			}
 		}
 		if recording == "" {
-			return 0, fmt.Errorf("pending splice recording %s is unavailable", span.AudioPath)
+			removeFiles(recordingSet.Downloaded)
+			warn(fmt.Errorf("pending splice recording %s is unavailable", span.AudioPath))
+			continue
+		}
+		hash, err := fileSHA256(recording)
+		if err != nil {
+			removeFiles(recordingSet.Downloaded)
+			warn(fmt.Errorf("hash pending splice recording %s: %w", recording, err))
+			continue
+		}
+		if hash == span.SHA256After {
+			if err := store.MarkSpliceComplete(&span); err != nil {
+				warn(err)
+			}
+			continue
+		}
+		if hash != span.SHA256Before {
+			removeFiles(recordingSet.Downloaded)
+			warn(fmt.Errorf("pending splice recording %s has SHA-256 %s, want %s", recording, hash, span.SHA256Before))
+			continue
 		}
 		afterHash, err := splice(ctx, recording, span.Start, span.End)
 		if err != nil {
-			return 0, fmt.Errorf("re-splice %s: %w", recording, err)
+			removeFiles(recordingSet.Downloaded)
+			warn(fmt.Errorf("re-splice %s: %w", recording, err))
+			continue
 		}
 		if afterHash != span.SHA256After {
-			return 0, fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After)
+			warn(fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After))
+			continue
 		}
 		if err := store.MarkSpliceComplete(&span); err != nil {
-			return 0, err
+			warn(err)
+			continue
 		}
 		if refine != nil {
-			if err := refine(ctx, span.SessionID, recording, session.StartedAt); err != nil {
-				return 0, fmt.Errorf("refine re-spliced session %s: %w", span.SessionID, err)
+			if err := refine(ctx, span.SessionID, session.AudioPath, session.StartedAt); err != nil {
+				warn(fmt.Errorf("refine re-spliced session %s: %w", span.SessionID, err))
+				continue
 			}
 		}
+		recovered++
 	}
-	return len(spans), nil
+	return recovered, nil
+}
+
+func removeFiles(paths []string) {
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+}
+
+func cleanupSpliceTempCopies(audioDir string) error {
+	entries, err := os.ReadDir(audioDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read audio directory %s: %w", audioDir, err)
+	}
+	var cleanupErr error
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, ".delete-segment-") && !strings.HasPrefix(name, ".splice-") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(audioDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
+	return cleanupErr
 }
 
 func neighbourText(segments []transcribe.Segment, index int) (before, after string) {
@@ -331,35 +418,61 @@ func wordDuration(words []audio.Word) float64 {
 	return duration
 }
 
+const neighbourTokenLimit = 6
+
 func missingNeighbourTokens(words []audio.Word, splice float64, neighbour string, before bool) []string {
-	expected := deletionTokens(neighbour)
+	expected := nearestTokens(deletionTokens(neighbour), before)
 	if len(expected) == 0 {
 		return nil
 	}
-	nearby := make(map[string]struct{})
+	var actual []string
 	for _, word := range words {
-		if word.End < splice-10 || word.Start > splice+10 {
-			continue
+		if before && word.End <= splice {
+			actual = append(actual, deletionTokens(word.Text)...)
 		}
-		if before && word.End > splice {
-			continue
-		}
-		if !before && word.Start < splice {
-			continue
-		}
-		for _, token := range deletionTokens(word.Text) {
-			nearby[token] = struct{}{}
+		if !before && word.Start >= splice {
+			actual = append(actual, deletionTokens(word.Text)...)
 		}
 	}
-	missing := make([]string, 0, len(expected))
-	seen := make(map[string]struct{})
-	for _, token := range expected {
-		if _, already := seen[token]; already {
-			continue
+	return orderedMissing(expected, nearestTokens(actual, before))
+}
+
+func nearestTokens(tokens []string, before bool) []string {
+	if len(tokens) <= neighbourTokenLimit {
+		return tokens
+	}
+	if before {
+		return tokens[len(tokens)-neighbourTokenLimit:]
+	}
+	return tokens[:neighbourTokenLimit]
+}
+
+func orderedMissing(expected, actual []string) []string {
+	rows := make([][]int, len(expected)+1)
+	for i := range rows {
+		rows[i] = make([]int, len(actual)+1)
+	}
+	for i := len(expected) - 1; i >= 0; i-- {
+		for j := len(actual) - 1; j >= 0; j-- {
+			if expected[i] == actual[j] {
+				rows[i][j] = rows[i+1][j+1] + 1
+			} else if rows[i+1][j] >= rows[i][j+1] {
+				rows[i][j] = rows[i+1][j]
+			} else {
+				rows[i][j] = rows[i][j+1]
+			}
 		}
-		seen[token] = struct{}{}
-		if _, found := nearby[token]; !found {
-			missing = append(missing, token)
+	}
+	missing := make([]string, 0, len(expected)-rows[0][0])
+	for i, j := 0, 0; i < len(expected); {
+		if j < len(actual) && expected[i] == actual[j] {
+			i++
+			j++
+		} else if j < len(actual) && rows[i][j+1] > rows[i+1][j] {
+			j++
+		} else {
+			missing = append(missing, expected[i])
+			i++
 		}
 	}
 	return missing
