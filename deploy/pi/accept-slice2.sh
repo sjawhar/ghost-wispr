@@ -16,17 +16,23 @@ readonly service_account=ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com
 readonly drive_owner=sami@theorem.dev
 readonly cert_test_port=8081
 readonly summarization_model=gemini/gemini-4-carbon
+readonly summary_provider_model=gemini-4-carbon
+readonly embedding_model=gemini-embedding-2
+readonly batch_refinement_model=nova-3
+readonly tts_model=gemini-3.8-flash-tts
+readonly tts_voice=Kore
 expected_config_lines=(
-  'deepgram_model: nova-3'
+  "deepgram_model: $batch_refinement_model"
   'batch_transcription.provider: deepgram'
-  'batch_transcription.model: nova-3'
+  "batch_transcription.model: $batch_refinement_model"
   "summarization.model: $summarization_model"
-  'embedding_model: gemini/gemini-embedding-2'
+  "embedding_model: gemini/$embedding_model"
   'genai_backend: vertex'
   'gcp_project: theorem-agent-infra'
   'gcp_location: global'
   'tts_provider: gemini'
-  'tts_voice: Kore'
+  "tts_model: $tts_model"
+  "tts_voice: $tts_voice"
 )
 # Environment variables that override the YAML settings above (internal/config/config.go applyEnvOverrides).
 config_override_variables=(
@@ -42,6 +48,7 @@ config_override_variables=(
   GHOST_WISPR_GDRIVE_FOLDER_ID
   GHOST_WISPR_GOOGLE_CREDENTIALS_FILE
   GHOST_WISPR_TTS_PROVIDER
+  GHOST_WISPR_TTS_MODEL
   GHOST_WISPR_TTS_VOICE
 )
 
@@ -213,6 +220,14 @@ assert_embedding_location() {
   [[ $1 == GHOST_WISPR_EMBEDDING_LOCATION=global ]]
 }
 
+assert_provider_model() {
+  local role=$1 actual=$2 expected=$3
+  if [[ -z "$actual" || "$actual" != "$expected" ]]; then
+    printf '%s provider model mismatch: got %q, want %q\n' "$role" "$actual" "$expected" >&2
+    return 1
+  fi
+}
+
 lowercase_trimmed() {
   printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'
 }
@@ -344,6 +359,7 @@ genai_backend: vertex
 gcp_project: theorem-agent-infra
 gcp_location: global
 tts_provider: gemini
+tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
 EOF
 )
@@ -380,6 +396,26 @@ EOF
   fi
   assert_embedding_location 'GHOST_WISPR_EMBEDDING_LOCATION=global' \
     || fail 'A8 self-test rejected the required embedding location'
+  if assert_provider_model summary configured-summary-model "$summary_provider_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for summary'
+  fi
+  if assert_provider_model search configured-embedding-model "$embedding_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for search'
+  fi
+  if assert_provider_model speech configured-tts-model "$tts_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for speech'
+  fi
+  if assert_provider_model refinement configured-refinement-model "$batch_refinement_model" 2>/dev/null; then
+    fail 'A8 self-test accepted a provider model mismatch for refinement'
+  fi
+  assert_provider_model summary "$summary_provider_model" "$summary_provider_model" \
+    || fail 'A8 self-test rejected the provider summary model'
+  assert_provider_model search "$embedding_model" "$embedding_model" \
+    || fail 'A8 self-test rejected the provider embedding model'
+  assert_provider_model speech "$tts_model" "$tts_model" \
+    || fail 'A8 self-test rejected the provider speech model'
+  assert_provider_model refinement "$batch_refinement_model" "$batch_refinement_model" \
+    || fail 'A8 self-test rejected the provider refinement model'
   printf 'A8 self-test RAN: planted failure rejected\n'
 
   if assert_drive_members $'sami@theorem.dev|organizer\nreaders@theorem.dev|reader' readers@theorem.dev 2>/dev/null; then
@@ -498,6 +534,12 @@ post_json() {
     --header 'Content-Type: application/json' --data "$body" "$unit_url$path"
 }
 
+response_header() {
+  local headers=$1 name=$2
+  name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+  awk -v name="$name:" 'tolower($1) == name { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$headers"
+}
+
 service_environment_names() {
   # shellcheck disable=SC2016 # The remote shell expands the service runtime path.
   remote_run 'pid=$(XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show --property=MainPID --value ghost-wispr.service) && [ "$pid" -gt 0 ] && tr "\000" "\n" <"/proc/$pid/environ" | sed "s/=.*//"'
@@ -532,12 +574,17 @@ wait_for_summary_ready() {
 }
 
 wait_for_summary() {
-  local session_id=$1 detail
+  local session_id=$1 before_version=$2 detail model version
   for _ in {1..120}; do
     if detail=$(session_detail "$session_id"); then
       if jq -e '.session.summary_status == "completed" and (.session.summary | type == "string" and length > 0)' \
         >/dev/null <<<"$detail"; then
-        return 0
+        version=$(jq -r '.session.summary_version // 0' <<<"$detail")
+        if (( version > before_version )); then
+          model=$(jq -r '.session.summary_model // ""' <<<"$detail")
+          assert_provider_model summary "$model" "$summary_provider_model" || return 1
+          return 0
+        fi
       fi
       if jq -e '.session.summary_status == "failed"' >/dev/null <<<"$detail"; then
         printf 'A8: summary failed: %s\n' "$(jq -r '.session.summary_error // .session.error_message // "no error detail"' <<<"$detail")" >&2
@@ -551,10 +598,17 @@ wait_for_summary() {
 }
 
 wait_for_tts() {
-  local request_id=$1 speech_status
+  local request_id=$1 speech_status model voice
   for _ in {1..60}; do
     if speech_status=$(curl --fail --silent --show-error "$unit_url/api/tts/status/$request_id"); then
       if jq -e '.status == "completed" and (.bytes_written | type == "number" and . > 0)' >/dev/null <<<"$speech_status"; then
+        model=$(jq -r '.model // ""' <<<"$speech_status")
+        voice=$(jq -r '.voice // ""' <<<"$speech_status")
+        assert_provider_model speech "$model" "$tts_model" || return 1
+        [[ "$voice" == "$tts_voice" ]] || {
+          printf 'speech provider voice mismatch: got %q, want %q\n' "$voice" "$tts_voice" >&2
+          return 1
+        }
         return 0
       fi
       if jq -e '.status == "failed"' >/dev/null <<<"$speech_status"; then
@@ -569,13 +623,17 @@ wait_for_tts() {
 }
 
 wait_for_refinement() {
-  local session_id=$1 detail saw_running=false
+  local session_id=$1 detail saw_running=false model
   for _ in {1..120}; do
     if detail=$(session_detail "$session_id"); then
       case "$(jq -r '.session.refinement_status' <<<"$detail")" in
         running) saw_running=true ;;
         completed)
-          [[ "$saw_running" == true ]] && return 0
+          if [[ "$saw_running" == true ]]; then
+            model=$(jq -r '.session.refinement_model // ""' <<<"$detail")
+            assert_provider_model refinement "$model" "$batch_refinement_model" || return 1
+            return 0
+          fi
           ;;
         failed|no_audio)
           printf 'A8: refinement is %s for session %s\n' \
@@ -650,8 +708,8 @@ run_a6() {
 }
 
 run_a8() {
-  local current_status current_config deployed_yaml environment_names embedding_location
-  local summary_response semantic_response speech_response speech_request_id refinement_response
+  local current_status current_config deployed_yaml environment_names embedding_location before_summary_version
+  local summary_response semantic_response semantic_model speech_response speech_headers speech_model speech_voice speech_request_id refinement_response
   printf 'A8 PRECHECK: read status, running configuration, deployed YAML, and service environment before provider calls.\n'
   current_status=$(status) || {
     printf 'A8 FAILED: could not read /api/status\n' >&2
@@ -698,6 +756,11 @@ run_a8() {
     return 1
   }
 
+  before_summary_version=$(session_detail "$acceptance_session_id" | jq -er '.session.summary_version | numbers') || {
+    printf 'A8 FAILED: could not read the summary version before resummarization\n' >&2
+    return 1
+  }
+
   summary_response=$(post_json "/api/sessions/${acceptance_session_id}/resummarize" '{}') || {
     printf 'A8 FAILED: summary route did not accept real session %s\n' "$acceptance_session_id" >&2
     return 1
@@ -706,7 +769,7 @@ run_a8() {
     printf 'A8 FAILED: summary route returned an unexpected body\n' >&2
     return 1
   }
-  wait_for_summary "$acceptance_session_id" || return 1
+  wait_for_summary "$acceptance_session_id" "$before_summary_version" || return 1
 
   semantic_response=$(curl --fail --silent --show-error --get \
     --data-urlencode "q=Slice 2 acceptance ${acceptance_session_id}" --data-urlencode 'limit=1' \
@@ -718,9 +781,22 @@ run_a8() {
     printf 'A8 FAILED: semantic-search response contained no embedding result\n' >&2
     return 1
   }
+  semantic_model=$(jq -r '.model // ""' <<<"$semantic_response")
+  assert_provider_model search "$semantic_model" "$embedding_model" || return 1
 
-  speech_response=$(post_json '/api/tts/speak' '{"text":"Slice two model acceptance speech test.","voice":"Kore"}') || {
+  speech_headers="$scratch_dir/a8-tts.headers"
+  speech_response=$(curl --fail --silent --show-error --dump-header "$speech_headers" \
+    --request POST --header 'Content-Type: application/json' \
+    --data '{"text":"Slice two model acceptance speech test.","provider":"gemini"}' \
+    "$unit_url/api/tts/speak") || {
     printf 'A8 FAILED: speech route did not accept the Gemini TTS request\n' >&2
+    return 1
+  }
+  speech_model=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Model)
+  speech_voice=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Voice)
+  assert_provider_model speech "$speech_model" "$tts_model" || return 1
+  [[ "$speech_voice" == "$tts_voice" ]] || {
+    printf 'speech provider voice mismatch: got %q, want %q\n' "$speech_voice" "$tts_voice" >&2
     return 1
   }
   speech_request_id=$(jq -er '.id | select(type == "string" and length > 0)' <<<"$speech_response") || {
@@ -738,7 +814,8 @@ run_a8() {
     return 1
   }
   wait_for_refinement "$acceptance_session_id" || return 1
-  printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with the PRECHECKed models: nova-3, gemini-4-carbon, gemini-embedding-2, and gemini-3.8-flash-tts/Kore.\n' "$acceptance_session_id"
+  printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with provider-reported models: %s, %s, %s, and %s/%s.\n' \
+    "$acceptance_session_id" "$batch_refinement_model" "$summarization_model" "$embedding_model" "$tts_model" "$tts_voice"
 }
 
 run_a10() {

@@ -3,6 +3,7 @@ package embedding
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"google.golang.org/genai"
 
@@ -12,6 +13,9 @@ import (
 type geminiClient struct {
 	client *genai.Client
 	model  string
+
+	mu            sync.RWMutex
+	reportedModel string
 }
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
@@ -57,7 +61,25 @@ func (c *geminiClient) Embed(ctx context.Context, texts []string, taskType TaskT
 			return nil, fmt.Errorf("gemini: no embedding in response")
 		}
 		result = append(result, resp.Embeddings[0].Values)
+		// EmbedContent does not return a model version. After a successful
+		// provider call, retain the resolved model sent to Vertex rather than
+		// making the API handler read application configuration.
+		c.recordReportedModel()
 	}
 
 	return result, nil
+}
+
+// ReportedModel returns the model used by the latest successful embedding
+// request. Vertex EmbedContent does not echo a model version.
+func (c *geminiClient) ReportedModel() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.reportedModel
+}
+
+func (c *geminiClient) recordReportedModel() {
+	c.mu.Lock()
+	c.reportedModel = c.model
+	c.mu.Unlock()
 }

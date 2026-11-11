@@ -861,7 +861,7 @@ func main() {
 					continue
 				}
 				if br.SessionID != "" {
-					_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
+					_ = store.UpdateSummaryWithModel(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames, br.Model)
 					hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
 					publishSummaryReady(br.SessionID)
 				}
@@ -959,7 +959,7 @@ func main() {
 						speakerNames = "{}"
 					}
 
-					if err := store.UpdateSummary(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames); err != nil {
+					if err := store.UpdateSummaryWithModel(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames, sessions[i].SummaryModel); err != nil {
 						return repaired, err
 					}
 					if title != sessions[i].Title || summaryText != sessions[i].Summary || speakerNames != sessions[i].SpeakerNames {
@@ -1003,14 +1003,14 @@ func main() {
 			_ = store.StartSummary(sessionID)
 			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
-			title, summaryText, preset, speakerNames, err := summarizer.Summarize(ctx, sessionID, transcript)
+			title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, transcript)
 			if err != nil {
 				log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
 				failSummary(store, hub, sessionID, err)
 				return
 			}
 
-			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
+			_ = store.UpdateSummaryWithModel(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model)
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 			publishSummaryReady(sessionID)
 		},
@@ -1450,13 +1450,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					continue
 				}
 				_ = store.StartSummary(id)
-				title, summaryText, preset, speakerNames, err := startupSummarizer.Summarize(ctx, id, transcript)
+				title, summaryText, preset, speakerNames, model, err := startupSummarizer.SummarizeReported(ctx, id, transcript)
 				if err != nil {
 					log.Printf("warning: summarization failed for %s: %v", id, err)
 					failSummary(store, nil, id, err)
 					continue
 				}
-				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
+				_ = store.UpdateSummaryWithModel(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model)
 				log.Printf("summarized session %s with preset %s", id, preset)
 				publishSummaryReady(id)
 			}
@@ -1741,8 +1741,25 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"status":        status.Status,
 				"bytes_written": status.BytesWritten,
 				"duration_ms":   status.DurationMs,
+				"model":         status.Model,
+				"voice":         status.Voice,
 				"error":         status.Error,
 			}, true
+		}
+		controlHooks.TTSWaitForSynthesis = func(ctx context.Context, id string) (map[string]any, error) {
+			status, err := ttsOrchestrator.WaitForSynthesis(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"id":            status.ID,
+				"status":        status.Status,
+				"bytes_written": status.BytesWritten,
+				"duration_ms":   status.DurationMs,
+				"model":         status.Model,
+				"voice":         status.Voice,
+				"error":         status.Error,
+			}, nil
 		}
 		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker

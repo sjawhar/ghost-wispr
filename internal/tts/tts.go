@@ -21,6 +21,13 @@ type Provider interface {
 	Name() string
 }
 
+// ModelVoiceReporter resolves the model and voice a provider will send before
+// asynchronous synthesis begins. Synthesize returns the same values after the
+// provider call so the status and log reflect the actual call.
+type ModelVoiceReporter interface {
+	ReportedSpeech(req SpeechRequest) (model, voice string)
+}
+
 // SpeechRequest carries the parameters for a single synthesis call.
 type SpeechRequest struct {
 	Text     string
@@ -28,11 +35,14 @@ type SpeechRequest struct {
 	Language string
 }
 
-// SpeechResponse carries the synthesised audio and its format metadata.
+// SpeechResponse carries the synthesised audio, provider-reported model and
+// voice, and format metadata.
 type SpeechResponse struct {
 	Audio      []byte
 	Format     audio.AudioFormat
 	DurationMs int64
+	Model      string
+	Voice      string
 }
 
 // ErrTextTooLong is returned when the input text exceeds maxTextLength.

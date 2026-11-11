@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"google.golang.org/genai"
+
+	"github.com/sjawhar/ghost-wispr/internal/llm"
 )
 
 // BatchSession holds the data needed to build a batch request for one session.
@@ -15,13 +17,13 @@ type BatchSession struct {
 	Transcript string
 }
 
-// BatchResult holds the parsed result for a single session from a batch job.
 type BatchResult struct {
 	SessionID    string
 	Title        string
 	Summary      string
 	SpeakerNames string
 	PresetName   string
+	Model        string
 	Error        error
 }
 
@@ -116,6 +118,13 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 			continue
 		}
 
+		result.Model = strings.TrimSpace(resp.Response.ModelVersion)
+		if result.Model == "" {
+			// Vertex batch responses may omit ModelVersion. In that documented
+			// case, report the model resolved into this request.
+			result.Model = s.resolvedModel(result.PresetName)
+		}
+
 		text := strings.TrimSpace(resp.Response.Text())
 		if text == "" {
 			result.Error = fmt.Errorf("empty response for session %s", result.SessionID)
@@ -146,4 +155,16 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 	}
 
 	return results
+}
+
+func (s *Summarizer) resolvedModel(presetName string) string {
+	model := s.cfg.Model
+	if preset, ok := s.cfg.Presets[presetName]; ok && preset.Model != "" {
+		model = preset.Model
+	}
+	_, name, err := llm.ParseModel(model)
+	if err != nil {
+		return ""
+	}
+	return name
 }

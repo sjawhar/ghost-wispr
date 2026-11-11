@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -13,6 +14,10 @@ import (
 type presetSummarizer interface {
 	Summarize(ctx context.Context, sessionID, transcript string) (title, summary, preset, speakerNames string, err error)
 	SummarizeWithPreset(ctx context.Context, sessionID, transcript, preset string) (title, summary, speakerNames string, err error)
+}
+
+type reportedPresetSummarizer interface {
+	SummarizeWithPresetReported(ctx context.Context, sessionID, transcript, preset string) (title, summary, speakerNames, model string, err error)
 }
 
 // summaryBroadcaster announces the progress of a session's summary.
@@ -35,13 +40,16 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 	_ = store.StartSummary(sessionID)
 	hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
-	var title string
-	var summaryText string
-	var presetUsed string
-	var speakerNames string
+	var title, summaryText, presetUsed, speakerNames, model string
 	if preset != "" {
 		presetUsed = preset
-		title, summaryText, speakerNames, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
+		if reporter, ok := summarizer.(reportedPresetSummarizer); ok {
+			title, summaryText, speakerNames, model, err = reporter.SummarizeWithPresetReported(ctx, sessionID, transcript, preset)
+		} else {
+			title, summaryText, speakerNames, err = summarizer.SummarizeWithPreset(ctx, sessionID, transcript, preset)
+		}
+	} else if reporter, ok := summarizer.(session.ReportedSummarizer); ok {
+		title, summaryText, presetUsed, speakerNames, model, err = reporter.SummarizeReported(ctx, sessionID, transcript)
 	} else {
 		title, summaryText, presetUsed, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
 	}
@@ -50,7 +58,7 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 		return err
 	}
 
-	if err := store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, presetUsed, speakerNames); err != nil {
+	if err := store.UpdateSummaryWithModel(sessionID, title, summaryText, storage.SummaryCompleted, presetUsed, speakerNames, model); err != nil {
 		err = fmt.Errorf("store summary: %w", err)
 		failSummary(store, hub, sessionID, err)
 		return err

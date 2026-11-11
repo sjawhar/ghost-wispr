@@ -72,3 +72,39 @@ func TestGemini_Complete_EmptyResult(t *testing.T) {
 		t.Fatalf("expected 'empty response' in error, got %q", err.Error())
 	}
 }
+
+func TestGeminiCompleteReportsProviderModelVersion(t *testing.T) {
+	const (
+		configuredModel = "configured-summary-model"
+		providerModel   = "provider-summary-model"
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"modelVersion": providerModel,
+			"candidates": []map[string]any{{
+				"content": map[string]any{
+					"parts": []map[string]any{{"text": "summary"}},
+					"role":  "model",
+				},
+			}},
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := newGeminiClient("test-key", configuredModel, &clientOptions{baseURL: server.URL})
+	if err != nil {
+		t.Fatalf("newGeminiClient: %v", err)
+	}
+	if _, err := client.Complete(context.Background(), []Message{{Role: "user", Content: "summarize"}}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	reporter, ok := any(client).(interface{ ReportedModel() string })
+	if !ok {
+		t.Fatal("Gemini client does not report the model returned by the provider")
+	}
+	if got := reporter.ReportedModel(); got != providerModel {
+		t.Fatalf("reported model = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
+	}
+}

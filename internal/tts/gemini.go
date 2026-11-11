@@ -90,6 +90,14 @@ func NewGeminiProvider(project, model, defaultVoice string, opts ...GeminiOption
 
 func (p *GeminiProvider) Name() string { return "gemini" }
 
+func (p *GeminiProvider) ReportedSpeech(req SpeechRequest) (model, voice string) {
+	voice = strings.TrimSpace(req.Voice)
+	if voice == "" {
+		voice = p.defaultVoice
+	}
+	return p.model, voice
+}
+
 type geminiTTSRequest struct {
 	Contents         []geminiTTSContent        `json:"contents"`
 	GenerationConfig geminiTTSGenerationConfig `json:"generationConfig"`
@@ -114,11 +122,16 @@ type geminiTTSSpeechConfig struct {
 }
 
 type geminiTTSVoiceConfig struct {
-	Voice string `json:"voice"`
+	PrebuiltVoiceConfig geminiTTSPrebuiltVoiceConfig `json:"prebuiltVoiceConfig"`
+}
+
+type geminiTTSPrebuiltVoiceConfig struct {
+	VoiceName string `json:"voiceName"`
 }
 
 type geminiTTSResponse struct {
-	Candidates []geminiTTSCandidate `json:"candidates"`
+	Candidates   []geminiTTSCandidate `json:"candidates"`
+	ModelVersion string               `json:"modelVersion"`
 }
 
 type geminiTTSCandidate struct {
@@ -148,10 +161,7 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 		return nil, fmt.Errorf("gemini tts: %w", err)
 	}
 
-	voice := strings.TrimSpace(req.Voice)
-	if voice == "" {
-		voice = p.defaultVoice
-	}
+	_, voice := p.ReportedSpeech(req)
 	bodyJSON, err := json.Marshal(geminiTTSRequest{
 		Contents: []geminiTTSContent{{
 			Role:  "user",
@@ -160,7 +170,7 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 		GenerationConfig: geminiTTSGenerationConfig{
 			ResponseModalities: []string{"AUDIO"},
 			SpeechConfig: geminiTTSSpeechConfig{
-				VoiceConfig: geminiTTSVoiceConfig{Voice: voice},
+				VoiceConfig: geminiTTSVoiceConfig{PrebuiltVoiceConfig: geminiTTSPrebuiltVoiceConfig{VoiceName: voice}},
 			},
 		},
 	})
@@ -207,6 +217,10 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 	if err := json.Unmarshal(responseBody, &ttsResponse); err != nil {
 		return nil, fmt.Errorf("gemini tts: unmarshal response: %w", err)
 	}
+	model := strings.TrimSpace(ttsResponse.ModelVersion)
+	if model == "" {
+		model = p.model
+	}
 	for _, candidate := range ttsResponse.Candidates {
 		for _, part := range candidate.Content.Parts {
 			if part.InlineData.Data == "" {
@@ -220,7 +234,7 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 			if err != nil {
 				return nil, fmt.Errorf("gemini tts: decode WAV audio: %w", err)
 			}
-			return &SpeechResponse{Audio: pcm, Format: format}, nil
+			return &SpeechResponse{Audio: pcm, Format: format, Model: model, Voice: voice}, nil
 		}
 	}
 

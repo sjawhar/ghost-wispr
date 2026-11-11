@@ -2,6 +2,7 @@ package transcribe
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -36,7 +37,7 @@ func TestBatchRefinement_DeepgramSubmissionAndTranscriptExtraction(t *testing.T)
 		if err != nil {
 			t.Fatalf("read request body: %v", err)
 		}
-		_, _ = w.Write([]byte(`{"results":{"channels":[{"alternatives":[{"transcript":"refined transcript"}]}]}}`))
+		_, _ = w.Write([]byte(`{"metadata":{"models":["provider-id"],"model_info":{"provider-id":{"name":"general-nova","arch":"nova-3"}}},"results":{"channels":[{"alternatives":[{"transcript":"refined transcript"}]}]}}`))
 	}))
 	defer server.Close()
 
@@ -50,8 +51,8 @@ func TestBatchRefinement_DeepgramSubmissionAndTranscriptExtraction(t *testing.T)
 	if err != nil {
 		t.Fatalf("Transcribe returned error: %v", err)
 	}
-	if got != "refined transcript" {
-		t.Fatalf("expected refined transcript, got %q", got)
+	if got.Transcript != "refined transcript" {
+		t.Fatalf("expected refined transcript, got %q", got.Transcript)
 	}
 	if gotAuth != "Token test-key" {
 		t.Fatalf("expected authorization header %q, got %q", "Token test-key", gotAuth)
@@ -82,5 +83,41 @@ func TestBatchRefinement_DeepgramNonOKFails(t *testing.T) {
 	_, err := client.Transcribe(context.Background(), audioPath)
 	if err == nil {
 		t.Fatal("expected error when Deepgram returns non-200")
+	}
+}
+
+func TestBatchRefinementReportsDeepgramResponseModel(t *testing.T) {
+	const (
+		configuredModel = "configured-refinement-model"
+		providerModel   = "provider-refinement-model"
+	)
+	audioPath := filepath.Join(t.TempDir(), "session.mp3")
+	if err := os.WriteFile(audioPath, []byte("fake-audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"metadata": map[string]any{
+				"models": []string{"provider-id"},
+				"model_info": map[string]any{
+					"provider-id": map[string]string{"name": "provider-internal-name", "arch": providerModel},
+				},
+			},
+			"results": map[string]any{
+				"channels": []any{map[string]any{
+					"alternatives": []any{map[string]string{"transcript": "refined transcript"}},
+				}},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewDeepgramBatchTranscriber(DeepgramBatchConfig{Model: configuredModel, BaseURL: server.URL})
+	result, err := client.Transcribe(context.Background(), audioPath)
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if result.Model != providerModel {
+		t.Fatalf("reported model = %q, want provider value %q, not configured %q", result.Model, providerModel, configuredModel)
 	}
 }

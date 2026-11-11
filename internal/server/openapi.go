@@ -154,7 +154,7 @@ func OpenAPISpec() map[string]any {
 			"/api/search/semantic": map[string]any{
 				"get": map[string]any{
 					"summary":     "Semantic search",
-					"description": "Search across sessions using semantic similarity (embedding-based)",
+					"description": "Search across sessions using semantic similarity (embedding-based). The response model is the model reported by the embedding provider for that query.",
 					"tags":        []string{"search"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{

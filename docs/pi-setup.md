@@ -225,11 +225,12 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
 ```
 
 That YAML names Deepgram `nova-3` for live and batch transcription, Gemini 4 Carbon for
-summaries, Gemini Embedding 2 for search, and the configured Google voice for speech. Gemini
-calls use Vertex AI in `theorem-agent-infra`, location `global`; embeddings use the documented
-global endpoint through `GHOST_WISPR_EMBEDDING_LOCATION` in
-`/opt/ghost-wispr/.env`. Nothing sets `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection
-keeps every session (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
+summaries, Gemini Embedding 2 for search, and Gemini 3.8 Flash TTS with voice `Kore` for
+speech. Chirp 3: HD remains the Google Cloud Text-to-Speech fallback. Gemini calls use Vertex
+AI in `theorem-agent-infra`, location `global`; embeddings use the documented global endpoint
+through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing sets
+`GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
+(`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
 ships GC off so it never runs before sync is on.
 
@@ -303,9 +304,10 @@ and confirm the signed probe plus a real
 Run both from a tailnet member after the models step. The self-test plants a
 service-account key, a key body inside binary data, a sweep that missed its control, Drive
 sync disabled, a missing Drive folder, a status warning, a superseded model, swapped batch
-and summarization models, a running model that differs from the YAML, an environment
-override of a model setting, an unapproved Drive writer, and a status with no certificate
-warning; each planted condition must be rejected before the live driver runs.
+and summarization models, a provider-model mismatch, a running model that differs from the
+YAML, an environment override of a model setting, an unapproved Drive writer, and a status
+with no certificate warning; each planted condition must be rejected before the live driver
+runs.
 
 ```bash
 deploy/pi/accept-slice2.sh --self-test
@@ -341,9 +343,12 @@ The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
   The configured credential must be an external-account X.509 credential.
 - A6 requires `/api/config` to show Drive sync on, a folder ID, credentials present, and GC
   enabled with no age limit and the 20000 MB audio budget.
-- A8 requires `/api/status` to report no warnings, the deployed YAML and the running
-  summarization model to name the models above, the required embedding location, and the
-  service environment to set no model or Google override.
+- A8 requires `/api/status` to report no warnings, then starts one real session and calls
+  summary, semantic search, speech, and batch refinement. It compares the summary's
+  `summary_model`, semantic-search `model`, speech response headers and status model/voice,
+  and refinement `refinement_model` with the configured roles. Those fields come from the
+  providers' responses; Vertex falls back to the resolved request model only when its API
+  omits a model version.
 - A10 checks the member list: the only organizers are the service account and Sami, and the
   approved readers group is the only reader.
 

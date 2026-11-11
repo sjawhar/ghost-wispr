@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,10 +266,7 @@ func (s *Syncer) RecordingsMatch(ctx context.Context, folderID string, checksums
 	if len(checksums) == 0 {
 		return true, nil
 	}
-	remaining := make(map[string]string, len(checksums))
-	for name, checksum := range checksums {
-		remaining[name] = checksum
-	}
+	remaining := maps.Clone(checksums)
 	query := fmt.Sprintf("'%s' in parents and trashed = false", strings.ReplaceAll(folderID, "'", `\'`))
 	err := s.service.Files.List().Q(query).SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
 		Fields("nextPageToken, files(name, md5Checksum)").Context(ctx).

@@ -13,14 +13,15 @@ import (
 )
 
 type mockLLMClient struct {
-	calls        int
-	failUntil    int // fail until calls reaches this number (default: 0 = never fail)
-	response     string
-	err          error
-	jsonQueue    []mockJSONResult
-	textQueue    []mockTextResult
-	lastMessages []llm.Message
-	lastSchema   map[string]any
+	calls         int
+	failUntil     int // fail until calls reaches this number (default: 0 = never fail)
+	response      string
+	err           error
+	jsonQueue     []mockJSONResult
+	textQueue     []mockTextResult
+	lastMessages  []llm.Message
+	lastSchema    map[string]any
+	reportedModel string
 }
 
 type mockJSONResult struct {
@@ -66,6 +67,10 @@ func (m *mockLLMClient) CompleteJSON(_ context.Context, messages []llm.Message, 
 		return nil, m.err
 	}
 	return json.RawMessage(m.response), nil
+}
+
+func (m *mockLLMClient) ReportedModel() string {
+	return m.reportedModel
 }
 
 func TestSummarizeSinglePreset(t *testing.T) {
@@ -547,4 +552,29 @@ func buildTranscript(wordCount int) string {
 		words = append(words, "word")
 	}
 	return strings.Join(words, " ")
+}
+
+func TestSummarizeReturnsProviderReportedModel(t *testing.T) {
+	const (
+		configuredModel = "gemini/configured-summary-model"
+		providerModel   = "provider-summary-model"
+		sessionID       = "provider-model-session"
+	)
+	client := &mockLLMClient{
+		response:      `{"title":"Provider title","summary":"Provider summary"}`,
+		reportedModel: providerModel,
+	}
+	s := New(config.Summarization{
+		Model: configuredModel,
+		Presets: map[string]config.Preset{
+			"default": {Description: "general", SystemPrompt: "system", UserTemplate: "{{transcript}}"},
+		},
+	}, func(provider, model string) (llm.Client, error) {
+		return client, nil
+	})
+	if _, _, _, _, got, err := s.SummarizeReported(context.Background(), sessionID, buildTranscript(25)); err != nil {
+		t.Fatalf("SummarizeReported: %v", err)
+	} else if got != providerModel {
+		t.Fatalf("summary model = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
+	}
 }

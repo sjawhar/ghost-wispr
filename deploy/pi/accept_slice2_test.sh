@@ -44,5 +44,7 @@ if grep -Fq -- '--exclude-dir=dev' "$driver"; then
   fail 'A9 sweep excludes nested dev directories'
 fi
 
+assert_source_contains 'assert_provider_model'
+assert_source_contains 'provider model mismatch'
 
 printf 'slice 2 acceptance test passed\n'

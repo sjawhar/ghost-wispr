@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/auth"
@@ -83,6 +84,21 @@ func NewGoogleProvider(apiKey, defaultVoice string, opts ...GoogleOption) (*Goog
 
 func (p *GoogleProvider) Name() string { return "google" }
 
+func (p *GoogleProvider) ReportedSpeech(req SpeechRequest) (model, voice string) {
+	voice = strings.TrimSpace(req.Voice)
+	if voice == "" {
+		voice = p.defaultVoice
+	}
+	return googleModelForVoice(voice), voice
+}
+
+func googleModelForVoice(voice string) string {
+	if strings.Contains(strings.ToLower(voice), "chirp3-hd") {
+		return "chirp-3-hd"
+	}
+	return "google-cloud-text-to-speech"
+}
+
 // googleTTSRequest matches the Cloud TTS REST API request body.
 type googleTTSRequest struct {
 	Input       googleTTSInput       `json:"input"`
@@ -122,10 +138,7 @@ func (p *GoogleProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 		return nil, fmt.Errorf("google tts: %w", err)
 	}
 
-	voice := req.Voice
-	if voice == "" {
-		voice = p.defaultVoice
-	}
+	_, voice := p.ReportedSpeech(req)
 	lang := req.Language
 	if lang == "" {
 		lang = p.defaultLang
@@ -173,6 +186,8 @@ func (p *GoogleProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 			Channels:   1,
 			Encoding:   audio.EncodingMP3,
 		},
+		Model: googleModelForVoice(voice),
+		Voice: voice,
 	}, nil
 }
 

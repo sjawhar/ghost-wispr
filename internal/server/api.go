@@ -225,6 +225,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
+		model := ""
+		if reporter, ok := embeddingClient.(interface{ ReportedModel() string }); ok {
+			model = reporter.ReportedModel()
+		}
+
 		allEmbeddings, err := store.GetAllEmbeddings()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load embeddings: %v", err))
@@ -289,7 +294,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			})
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{"results": results})
+		writeJSON(w, http.StatusOK, map[string]any{"model": model, "results": results})
 	})
 
 	// Full-text search endpoint
@@ -1416,6 +1421,24 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 					writeJSONError(w, http.StatusInternalServerError, err.Error())
 				}
 				return
+			}
+
+			var speechStatus map[string]any
+			if controls.TTSWaitForSynthesis != nil {
+				var waitErr error
+				speechStatus, waitErr = controls.TTSWaitForSynthesis(r.Context(), id)
+				if waitErr != nil {
+					writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("TTS synthesis failed: %v", waitErr))
+					return
+				}
+			} else if controls.TTSStatus != nil {
+				speechStatus, _ = controls.TTSStatus(id)
+			}
+			if model, ok := speechStatus["model"].(string); ok && model != "" {
+				w.Header().Set("X-Ghost-Wispr-TTS-Model", model)
+			}
+			if voice, ok := speechStatus["voice"].(string); ok && voice != "" {
+				w.Header().Set("X-Ghost-Wispr-TTS-Voice", voice)
 			}
 
 			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "queued"})

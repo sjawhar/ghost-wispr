@@ -277,6 +277,7 @@ func TestPublishSummaryReadyUsesSummaryVersionAndMarksStatus(t *testing.T) {
 			Status:         storage.SessionEnded,
 			SummaryStatus:  storage.SummaryCompleted,
 			SummaryPreset:  "default",
+			SummaryModel:   "provider-summary-model",
 			SummaryVersion: 3,
 		},
 	}}
@@ -295,6 +296,9 @@ func TestPublishSummaryReadyUsesSummaryVersionAndMarksStatus(t *testing.T) {
 	}
 	if got[0].delivery != "session-1.summary_ready.3" {
 		t.Fatalf("delivery = %q, want session-1.summary_ready.3", got[0].delivery)
+	}
+	if got, _ := got[0].body.Payload["summary_model"].(string); got != "provider-summary-model" {
+		t.Fatalf("summary_model = %q, want provider-summary-model", got)
 	}
 }
 

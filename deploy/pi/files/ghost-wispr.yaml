@@ -21,6 +21,7 @@ gc_max_audio_size_mb: 20000
 speaker_enabled: true
 speaker_device: Jabra
 tts_provider: gemini
+tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
 indicator_light: blink1
 power_button: true

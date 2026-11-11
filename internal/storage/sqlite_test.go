@@ -2727,3 +2727,27 @@ func TestGetEventsSince_Pagination(t *testing.T) {
 		t.Fatalf("expected 0 events past end, got %d", len(events4))
 	}
 }
+
+func TestProviderModelsPersistWithSummaryAndRefinement(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	const id = "provider-models"
+	if err := store.CreateSession(id, time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.UpdateSummaryWithModel(id, "Model report", "Summary", SummaryCompleted, "default", "{}", "provider-summary-model"); err != nil {
+		t.Fatalf("UpdateSummaryWithModel: %v", err)
+	}
+	if err := store.UpdateRefinementWithModel(id, "Refined transcript", RefinementCompleted, "provider-refinement-model"); err != nil {
+		t.Fatalf("UpdateRefinementWithModel: %v", err)
+	}
+	sess, err := store.GetSession(id)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.SummaryModel != "provider-summary-model" {
+		t.Fatalf("summary model = %q", sess.SummaryModel)
+	}
+	if sess.RefinementModel != "provider-refinement-model" {
+		t.Fatalf("refinement model = %q", sess.RefinementModel)
+	}
+}

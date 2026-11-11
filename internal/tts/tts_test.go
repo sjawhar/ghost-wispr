@@ -581,10 +581,11 @@ func TestGoogle_Name(t *testing.T) {
 
 func TestGemini_Synthesize_SendsConfiguredVertexRequest(t *testing.T) {
 	const (
-		project = "theorem-agent-infra"
-		model   = "gemini-3.8-flash-tts"
-		voice   = "Kore"
-		token   = "configured-vertex-token"
+		project       = "theorem-agent-infra"
+		model         = "gemini-3.8-flash-tts"
+		providerModel = "provider-tts-model"
+		voice         = "Kore"
+		token         = "configured-vertex-token"
 	)
 	pcm := []byte{0x01, 0x00, 0x02, 0x00}
 	wav := fakeWAV(pcm)
@@ -610,7 +611,9 @@ func TestGemini_Synthesize_SendsConfiguredVertexRequest(t *testing.T) {
 				ResponseModalities []string `json:"responseModalities"`
 				SpeechConfig       struct {
 					VoiceConfig struct {
-						Voice string `json:"voice"`
+						PrebuiltVoiceConfig struct {
+							VoiceName string `json:"voiceName"`
+						} `json:"prebuiltVoiceConfig"`
 					} `json:"voiceConfig"`
 				} `json:"speechConfig"`
 			} `json:"generationConfig"`
@@ -624,12 +627,13 @@ func TestGemini_Synthesize_SendsConfiguredVertexRequest(t *testing.T) {
 			if len(body.GenerationConfig.ResponseModalities) != 1 || body.GenerationConfig.ResponseModalities[0] != "AUDIO" {
 				t.Errorf("responseModalities = %#v, want [AUDIO]", body.GenerationConfig.ResponseModalities)
 			}
-			if got := body.GenerationConfig.SpeechConfig.VoiceConfig.Voice; got != voice {
+			if got := body.GenerationConfig.SpeechConfig.VoiceConfig.PrebuiltVoiceConfig.VoiceName; got != voice {
 				t.Errorf("voice = %q, want %q", got, voice)
 			}
 		}
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
+			"modelVersion": providerModel,
 			"candidates": []any{map[string]any{
 				"content": map[string]any{
 					"parts": []any{map[string]any{
@@ -663,6 +667,12 @@ func TestGemini_Synthesize_SendsConfiguredVertexRequest(t *testing.T) {
 	}
 	if got, want := response.Format, (audio.AudioFormat{SampleRate: 24000, Channels: 1, Encoding: audio.EncodingPCM16}); got != want {
 		t.Errorf("format = %#v, want %#v", got, want)
+	}
+	if response.Model != providerModel {
+		t.Errorf("model = %q, want provider model %q instead of configured %q", response.Model, providerModel, model)
+	}
+	if response.Voice != voice {
+		t.Errorf("voice = %q, want provider voice %q", response.Voice, voice)
 	}
 }
 

@@ -29,19 +29,23 @@ const (
 
 // SpeakStatus represents the current state of a TTS speak request.
 type SpeakStatus struct {
-	mu           sync.RWMutex `json:"-"`
-	ID           string       `json:"id"`
-	Status       string       `json:"status"`
-	BytesWritten int64        `json:"bytes_written"`
-	DurationMs   int64        `json:"duration_ms"`
-	Error        string       `json:"error,omitempty"`
+	mu            sync.RWMutex `json:"-"`
+	ID            string       `json:"id"`
+	Status        string       `json:"status"`
+	BytesWritten  int64        `json:"bytes_written"`
+	DurationMs    int64        `json:"duration_ms"`
+	Model         string       `json:"model,omitempty"`
+	Voice         string       `json:"voice,omitempty"`
+	Error         string       `json:"error,omitempty"`
+	synthesisDone chan struct{}
+	synthesisOnce sync.Once
 }
 
 // Snapshot returns a copy safe for concurrent read.
 func (s *SpeakStatus) Snapshot() SpeakStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return SpeakStatus{ID: s.ID, Status: s.Status, BytesWritten: s.BytesWritten, DurationMs: s.DurationMs, Error: s.Error}
+	return SpeakStatus{ID: s.ID, Status: s.Status, BytesWritten: s.BytesWritten, DurationMs: s.DurationMs, Model: s.Model, Voice: s.Voice, Error: s.Error}
 }
 
 // OrchestratorOpts configures the TTS orchestrator.
@@ -139,7 +143,8 @@ func (o *Orchestrator) Speak(text, voice, provider string) (string, error) {
 		provider: provider,
 	}
 
-	status := &SpeakStatus{ID: id, Status: StatusQueued}
+	model, reportedVoice := reportedSpeech(o.ttsProvider, SpeechRequest{Text: text, Voice: voice})
+	status := &SpeakStatus{ID: id, Status: StatusQueued, Model: model, Voice: reportedVoice, synthesisDone: make(chan struct{})}
 	o.statuses.Store(id, status)
 
 	select {
@@ -158,6 +163,22 @@ func (o *Orchestrator) Status(id string) (SpeakStatus, bool) {
 		return SpeakStatus{}, false
 	}
 	return val.(*SpeakStatus).Snapshot(), true
+}
+
+// WaitForSynthesis waits until the provider call and playback finish, then
+// returns the provider-reported model and voice in the final request status.
+func (o *Orchestrator) WaitForSynthesis(ctx context.Context, id string) (SpeakStatus, error) {
+	val, ok := o.statuses.Load(id)
+	if !ok {
+		return SpeakStatus{}, fmt.Errorf("unknown request id")
+	}
+	s := val.(*SpeakStatus)
+	select {
+	case <-ctx.Done():
+		return SpeakStatus{}, ctx.Err()
+	case <-s.synthesisDone:
+		return s.Snapshot(), nil
+	}
 }
 
 // HasProvider reports whether a TTS provider is configured.
@@ -190,6 +211,7 @@ func (o *Orchestrator) processRequest(req *speakRequest) {
 			o.updateStatus(req.id, StatusFailed, 0, 0, fmt.Sprintf("internal error: %v", r))
 		}
 	}()
+	defer o.finishSynthesis(req.id)
 
 	o.updateStatus(req.id, StatusPlaying, 0, 0, "")
 
@@ -207,6 +229,9 @@ func (o *Orchestrator) processRequest(req *speakRequest) {
 		o.updateStatus(req.id, StatusFailed, 0, 0, fmt.Sprintf("synthesis failed: %v", err))
 		return
 	}
+
+	o.updateSpeechReport(req.id, resp.Model, resp.Voice)
+	slog.Info("tts synthesized", "request_id", req.id, "provider", o.ttsProvider.Name(), "model", resp.Model, "voice", resp.Voice)
 
 	// Play through speaker.
 	result, err := o.speaker.Play(resp.Audio, resp.Format)
@@ -237,6 +262,39 @@ func (o *Orchestrator) updateStatus(id, status string, bytesWritten, durationMs 
 	s.Error = errMsg
 	s.mu.Unlock()
 
+}
+
+func (o *Orchestrator) updateSpeechReport(id, model, voice string) {
+	val, ok := o.statuses.Load(id)
+	if !ok {
+		return
+	}
+	s := val.(*SpeakStatus)
+	s.mu.Lock()
+	if model != "" {
+		s.Model = model
+	}
+	if voice != "" {
+		s.Voice = voice
+	}
+	s.mu.Unlock()
+}
+
+func (o *Orchestrator) finishSynthesis(id string) {
+	val, ok := o.statuses.Load(id)
+	if !ok {
+		return
+	}
+	s := val.(*SpeakStatus)
+	s.synthesisOnce.Do(func() { close(s.synthesisDone) })
+}
+
+func reportedSpeech(provider Provider, req SpeechRequest) (string, string) {
+	reporter, ok := provider.(ModelVoiceReporter)
+	if !ok {
+		return "", ""
+	}
+	return reporter.ReportedSpeech(req)
 }
 
 // allowRequest checks and records a request against the per-minute rate limit.
