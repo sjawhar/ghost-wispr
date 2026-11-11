@@ -29,7 +29,7 @@ type wireFile struct {
 	AppProperties      map[string]string
 	ModifiedTime       time.Time
 	Content            []byte
-	Revisions          [][]byte
+	RevisionCount      int
 }
 
 type wireListRequest struct {
@@ -121,7 +121,7 @@ func (d *wireDrive) create(f *wireFile) *wireFile {
 	d.clock = d.clock.Add(time.Minute)
 	f.ID = fmt.Sprintf("file-%d", d.next)
 	f.ModifiedTime = d.clock
-	f.Revisions = append(f.Revisions, slices.Clone(f.Content))
+	f.RevisionCount++
 	d.files = append(d.files, f)
 	return f
 }
@@ -299,8 +299,8 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			notFound(w, id)
 			return
 		}
-		revisions := make([]*drive.Revision, 0, len(f.Revisions))
-		for i := range f.Revisions {
+		revisions := make([]*drive.Revision, 0, f.RevisionCount)
+		for i := range f.RevisionCount {
 			revisions = append(revisions, &drive.Revision{Id: strconv.Itoa(i + 1)})
 		}
 		_ = json.NewEncoder(w).Encode(&drive.RevisionList{Revisions: revisions})
@@ -406,7 +406,7 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			d.t.Errorf("Drive: %s %s trashes a file", r.Method, path)
 		}
 		f.Content = content
-		f.Revisions = append(f.Revisions, slices.Clone(content))
+		f.RevisionCount++
 		for k, v := range meta.AppProperties {
 			if f.AppProperties == nil {
 				f.AppProperties = map[string]string{}

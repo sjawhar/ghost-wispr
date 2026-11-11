@@ -2,8 +2,11 @@ package gdrive
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -54,42 +57,17 @@ func syncerFiles(t *testing.T, syncer *Syncer, folder string) []*drive.File {
 // old Drive files in place, or if it deletes anything before its replacements
 // are uploaded.
 func TestReplaceCreatesRecordsThenDeletes(t *testing.T) {
-	store := openStore(t)
-	const id = "20261106100000"
-	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
-	audioDir := t.TempDir()
-	summarizedSession(t, store, audioDir, id, started, "purple elephant seventeen")
-	if _, err := store.DB().Exec(`UPDATE sessions SET title = ?, canonical_transcript = ? WHERE id = ?`, "Purple elephant seventeen", "purple elephant seventeen", id); err != nil {
-		t.Fatalf("seed deleted text: %v", err)
-	}
-
-	wire, syncer := newWireDrive(t)
-	orchestrator := NewOrchestrator(syncer, store)
-	folder := syncedSession(t, store, orchestrator, id)
-	old := oldReplacementIDs(t, wire, folder, "audio-"+id+".mp3")
-	recording := filepath.Join(audioDir, id+".mp3")
-	if err := os.WriteFile(recording, []byte("recording without the deleted phrase"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	setDriveReplacementPending(t, store, id, recording)
-	if _, err := store.DB().Exec(`UPDATE sessions
-		SET title = ?, summary = ?, canonical_transcript = ?, refinement_status = ?, summary_status = ?, sync_state = ?
-		WHERE id = ?`,
-		"Regenerated title", "clean summary", "clean transcript",
-		storage.RefinementCompleted, storage.SummaryCompleted, storage.SyncStatePending, id,
-	); err != nil {
-		t.Fatalf("prepare regenerated session: %v", err)
-	}
-
-	wire.allowDeletes = true
-	if err := orchestrator.SyncSession(context.Background(), id); err != nil {
+	fixture := newReplacementFixture(t)
+	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
+	fixture.wire.allowDeletes = true
+	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err != nil {
 		t.Fatalf("replace session files: %v", err)
 	}
 
-	if !sameIDs(wire.deletedIDs, old) {
-		t.Errorf("deleted %v, want exactly old ids %v", wire.deletedIDs, old)
+	if !sameIDs(fixture.wire.deletedIDs, fixture.oldIDs) {
+		t.Errorf("deleted %v, want exactly old ids %v", fixture.wire.deletedIDs, fixture.oldIDs)
 	}
-	rows, err := store.DriveReplacements(id)
+	rows, err := fixture.store.DriveReplacements(fixture.id)
 	if err != nil {
 		t.Fatalf("DriveReplacements: %v", err)
 	}
@@ -100,12 +78,12 @@ func TestReplaceCreatesRecordsThenDeletes(t *testing.T) {
 		if row.State != storage.DriveReplacementDeleted {
 			t.Errorf("replacement row %+v has state %q, want deleted", row, row.State)
 		}
-		if sameID(row.NewID, old) {
+		if slices.Contains(fixture.oldIDs, row.NewID) {
 			t.Errorf("replacement %s records old id %s as its new id", row.Name, row.NewID)
 		}
 	}
-	files := wire.in(folder)
-	for _, name := range []string{"summary.md", "transcript.md", "audio-" + id + ".mp3"} {
+	files := fixture.wire.in(fixture.folder)
+	for _, name := range []string{"summary.md", "transcript.md", "audio-" + fixture.id + ".mp3"} {
 		copies := files[name]
 		if len(copies) != 1 {
 			t.Errorf("new folder has %d %s files, want one", len(copies), name)
@@ -115,7 +93,7 @@ func TestReplaceCreatesRecordsThenDeletes(t *testing.T) {
 			t.Errorf("new %s retains deleted text", name)
 		}
 	}
-	if got := wire.find(folder).Name; got != "2026-11-06-regenerated-title" {
+	if got := fixture.wire.find(fixture.folder).Name; got != "2026-11-06-regenerated-title" {
 		t.Errorf("folder name = %q, want regenerated title", got)
 	}
 }
@@ -133,7 +111,6 @@ func oldReplacementIDs(t *testing.T, wire *wireDrive, folder, recording string) 
 	}
 	return ids
 }
-
 
 func setDriveReplacementPending(t *testing.T, store *storage.SQLiteStore, sessionID, audioPath string) {
 	t.Helper()
@@ -219,7 +196,7 @@ func TestReplaceResumesWithoutDeletingANewFile(t *testing.T) {
 		if row.State != storage.DriveReplacementDeleted {
 			t.Errorf("row %+v has state %q, want deleted", row, row.State)
 		}
-		if sameID(row.NewID, fixture.wire.deletedIDs) {
+		if slices.Contains(fixture.wire.deletedIDs, row.NewID) {
 			t.Errorf("retry deleted new file %s for %s", row.NewID, row.Name)
 		}
 	}
@@ -232,6 +209,7 @@ type replacementFixture struct {
 	orchestrator *Orchestrator
 	id           string
 	recording    string
+	folder       string
 	oldIDs       []string
 }
 
@@ -255,6 +233,7 @@ func newReplacementFixture(t *testing.T) *replacementFixture {
 		orchestrator: orchestrator,
 		id:           id,
 		recording:    filepath.Join(audioDir, id+".mp3"),
+		folder:       folder,
 		oldIDs:       oldReplacementIDs(t, wire, folder, "audio-"+id+".mp3"),
 	}
 }
@@ -272,15 +251,6 @@ func (f *replacementFixture) queue(t *testing.T, refinement, summary string) {
 	); err != nil {
 		t.Fatalf("prepare regenerated session: %v", err)
 	}
-}
-
-func sameID(id string, ids []string) bool {
-	for _, candidate := range ids {
-		if candidate == id {
-			return true
-		}
-	}
-	return false
 }
 
 // TestReplaceWaitsForRefinementAndSummary fails if an ordinary sync updates
@@ -549,5 +519,34 @@ func TestReplaceMarksAnAlreadyGoneOldFileDeleted(t *testing.T) {
 		if row.State != storage.DriveReplacementDeleted {
 			t.Errorf("row %+v has state %q, want deleted", row, row.State)
 		}
+	}
+}
+
+// TestFinishDriveReplacementKeepsANewerDeletionPending fails if an older
+// replacement clears the marker a later segment deletion set.
+func TestFinishDriveReplacementKeepsANewerDeletionPending(t *testing.T) {
+	store := openStore(t)
+	const id = "replacement-generation"
+	if err := store.CreateSession(id, time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1, deletion_generation = 2 WHERE id = ?`, id); err != nil {
+		t.Fatalf("prepare newer deletion: %v", err)
+	}
+	for _, name := range []string{"summary.md", "transcript.md", "audio-recording.mp3"} {
+		if _, err := store.DB().Exec(`INSERT INTO drive_replacements(session_id, name, old_id, new_id, state) VALUES(?, ?, ?, ?, ?)`,
+			id, name, "old-"+name, "new-"+name, storage.DriveReplacementDeleted); err != nil {
+			t.Fatalf("seed replacement row %s: %v", name, err)
+		}
+	}
+	if err := store.FinishDriveReplacement(id, 1); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("FinishDriveReplacement = %v, want generation refusal", err)
+	}
+	var pending int
+	if err := store.DB().QueryRow(`SELECT drive_replace_pending FROM sessions WHERE id = ?`, id).Scan(&pending); err != nil {
+		t.Fatalf("read pending marker: %v", err)
+	}
+	if pending != 1 {
+		t.Errorf("newer deletion pending marker = %d, want 1", pending)
 	}
 }

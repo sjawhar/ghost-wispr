@@ -101,20 +101,23 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		if err != nil {
 			return err
 		}
+		if file.SHA256 == "" {
+			file.SHA256 = contentHash(file)
+		}
+		newID := ""
 		if newFile == nil {
 			file.AppProperties = map[string]string{replacementKeyProperty: key}
-			newID, err := s.uploadFileID(ctx, sess.GDriveFolderID, file)
+			newID, err = s.uploadFileID(ctx, sess.GDriveFolderID, file)
 			if err != nil {
 				return err
 			}
-			if err := s.verifyFileHash(ctx, newID, contentHash(file)); err != nil {
-				return fmt.Errorf("verify replacement %s: %w", file.Name, err)
-			}
-			newFile = &drive.File{Id: newID}
-		} else if err := s.verifyFileHash(ctx, newFile.Id, contentHash(file)); err != nil {
+		} else {
+			newID = newFile.Id
+		}
+		if err := s.verifyFileHash(ctx, newID, file.SHA256); err != nil {
 			return fmt.Errorf("verify replacement %s: %w", file.Name, err)
 		}
-		if err := s.replacements.MarkDriveReplacementUploaded(sess.ID, file.Name, newFile.Id); err != nil {
+		if err := s.replacements.MarkDriveReplacementUploaded(sess.ID, file.Name, newID); err != nil {
 			return err
 		}
 		replacements, err = s.replacements.DriveReplacements(sess.ID)
