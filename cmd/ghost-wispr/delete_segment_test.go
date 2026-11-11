@@ -253,36 +253,46 @@ func (mergedDeletionWordsFake) Words(_ context.Context, path string) ([]audio.Wo
 
 func TestDeleteSegmentWhenGCRemovedTheLocalAudio(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		audioPath string
+		name          string
+		audioPath     string
+		wantDownloads []string
 	}{
-		{name: "one recording removed", audioPath: "first"},
-		{name: "all recordings removed", audioPath: ""},
+		{name: "one recording removed", audioPath: "first", wantDownloads: []string{"audio-20261111130000.mp3"}},
+		{name: "all recordings removed", wantDownloads: []string{"audio-20261111120000.mp3", "audio-20261111130000.mp3"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			audioDir := t.TempDir()
 			first := filepath.Join(audioDir, "20261111120000.mp3")
 			second := filepath.Join(audioDir, "20261111130000.mp3")
-			if err := os.WriteFile(first, []byte("first"), 0o600); err != nil {
-				t.Fatalf("write first recording: %v", err)
-			}
-			if err := os.WriteFile(second, []byte("second"), 0o600); err != nil {
-				t.Fatalf("write second recording: %v", err)
+			if tc.audioPath != "" {
+				if err := os.WriteFile(first, []byte("first"), 0o600); err != nil {
+					t.Fatalf("write first recording: %v", err)
+				}
 			}
 			store, segmentID, _ := newDeletionTestStore(t, second)
 			path := ""
 			if tc.audioPath != "" {
 				path = first
 			}
-			if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ?, audio_removed_at = ? WHERE id = ?`, path, time.Now().UTC().Format(time.RFC3339Nano), "session"); err != nil {
+			if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ?, audio_removed_at = ?, gdrive_folder_id = ? WHERE id = ?`, path, time.Now().UTC().Format(time.RFC3339Nano), "folder", "session"); err != nil {
 				t.Fatalf("mark local audio removed: %v", err)
+			}
+			drive := &deletionDriveFake{
+				files: []*drive.File{
+					{Name: "audio-20261111120000.mp3", MimeType: "audio/mpeg"},
+					{Name: "audio-20261111130000.mp3", MimeType: "audio/mpeg"},
+				},
+				downloads: map[string][]byte{
+					"audio-20261111120000.mp3": []byte("first"),
+					"audio-20261111130000.mp3": []byte("second"),
+				},
 			}
 			var refinedPath string
 			runner := segmentDeleteRunner{
 				store:       store,
 				transcriber: mergedDeletionWordsFake{},
-				ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
-					return deletionRecordingSet{Paths: []string{first, second}}, nil
+				ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+					return restoreDeletionRecordings(ctx, &session, audioDir, drive)
 				},
 				splice: fakeSplice,
 				refine: func(_ context.Context, _ string, audioPath string, _ time.Time) error {
@@ -303,6 +313,9 @@ func TestDeleteSegmentWhenGCRemovedTheLocalAudio(t *testing.T) {
 			}
 			if contents, err := os.ReadFile(second); err != nil || !bytes.Equal(contents, []byte("spliced")) {
 				t.Fatalf("spliced downloaded recording: bytes=%q err=%v", contents, err)
+			}
+			if !slices.Equal(drive.downloaded, tc.wantDownloads) {
+				t.Fatalf("Drive downloads = %v, want %v", drive.downloaded, tc.wantDownloads)
 			}
 		})
 	}
