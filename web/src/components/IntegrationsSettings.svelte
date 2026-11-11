@@ -200,8 +200,8 @@
         <label for="gc-max-age">Delete sessions older than (days)</label>
         <input id="gc-max-age" type="number" min="0" bind:value={gcMaxAgeDays} />
         <p class="hint">
-          0 = never. Deletes only ended sessions that have a verified copy in Google Drive.
-          A session restored from Drive counts from its restore.
+          0 = never. Deletes only ended sessions that have a verified copy in Google Drive. A
+          session restored from Drive counts from its restore.
         </p>
       </div>
       <div class="field">
