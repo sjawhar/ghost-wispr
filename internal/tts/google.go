@@ -9,10 +9,9 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"time"
 
-	"golang.org/x/oauth2/google"
+	"cloud.google.com/go/auth"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 )
@@ -25,14 +24,13 @@ const (
 
 // GoogleProvider implements Provider using the Google Cloud Text-to-Speech API.
 type GoogleProvider struct {
-	apiKey       string
-	credPath     string
-	tokenSource  func(ctx context.Context) (string, error)
-	defaultVoice string
-	defaultLang  string
-	baseURL      string
-	maxTextLen   int
-	httpClient   *http.Client
+	apiKey          string
+	authCredentials *auth.Credentials
+	defaultVoice    string
+	defaultLang     string
+	baseURL         string
+	maxTextLen      int
+	httpClient      *http.Client
 }
 
 // GoogleOption configures optional GoogleProvider settings.
@@ -53,15 +51,13 @@ func WithGoogleMaxTextLength(n int) GoogleOption {
 	return func(p *GoogleProvider) { p.maxTextLen = n }
 }
 
-// WithGoogleCredentialPath sets the path to a Google service account JSON file.
-func WithGoogleCredentialPath(path string) GoogleOption {
-	return func(p *GoogleProvider) { p.credPath = path }
+// WithAuthCredentials sets the Google credentials used to authorize requests.
+func WithAuthCredentials(credentials *auth.Credentials) GoogleOption {
+	return func(p *GoogleProvider) { p.authCredentials = credentials }
 }
 
 // NewGoogleProvider creates a Google Cloud TTS provider.
-// It accepts EITHER an API key OR a service account credential file path.
-// If credPath is provided (and apiKey is empty), it uses OAuth2 service account auth.
-// If apiKey is provided, it uses API key auth.
+// It accepts either an API key or Google credentials.
 func NewGoogleProvider(apiKey, defaultVoice string, opts ...GoogleOption) (*GoogleProvider, error) {
 	p := &GoogleProvider{
 		apiKey:       apiKey,
@@ -78,28 +74,8 @@ func NewGoogleProvider(apiKey, defaultVoice string, opts ...GoogleOption) (*Goog
 		opt(p)
 	}
 
-	// If no API key, try service account credentials
-	if p.apiKey == "" && p.credPath != "" {
-		creds, err := os.ReadFile(p.credPath)
-		if err != nil {
-			return nil, fmt.Errorf("google tts: read credentials: %w", err)
-		}
-		cfg, err := google.CredentialsFromJSONWithTypeAndParams(
-			context.Background(), creds, google.ServiceAccount,
-			google.CredentialsParams{Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"}},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("google tts: parse credentials: %w", err)
-		}
-		p.tokenSource = func(ctx context.Context) (string, error) {
-			tok, err := cfg.TokenSource.Token()
-			if err != nil {
-				return "", fmt.Errorf("google tts: get token: %w", err)
-			}
-			return tok.AccessToken, nil
-		}
-	} else if p.apiKey == "" {
-		return nil, fmt.Errorf("google tts: either api key or credential path is required")
+	if p.apiKey == "" && p.authCredentials == nil {
+		return nil, fmt.Errorf("google tts: either API key or credentials are required")
 	}
 
 	return p, nil
@@ -210,12 +186,12 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 			return nil, fmt.Errorf("google tts: create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if p.tokenSource != nil {
-			token, err := p.tokenSource(ctx)
+		if p.apiKey == "" {
+			token, err := p.authCredentials.Token(ctx)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("google tts: get token: %w", err)
 			}
-			httpReq.Header.Set("Authorization", "Bearer "+token)
+			httpReq.Header.Set("Authorization", "Bearer "+token.Value)
 		} else {
 			httpReq.Header.Set("X-Goog-Api-Key", p.apiKey)
 		}

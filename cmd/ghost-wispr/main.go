@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/auth"
+
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
@@ -31,6 +33,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -40,6 +43,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 
+	driveapi "google.golang.org/api/drive/v3"
 	"google.golang.org/genai"
 )
 
@@ -50,6 +54,8 @@ var (
 )
 
 const defaultListenAddress = "127.0.0.1:8080"
+
+var vertexCredentialCache sync.Map
 
 //go:embed static/*
 var staticFiles embed.FS
@@ -85,6 +91,24 @@ func genAIOptions(cfg *config.Config, apiKey string) *genaiconfig.Options {
 		Location: cfg.GCPLocation,
 		APIKey:   apiKey,
 	}
+}
+
+func addVertexCredentials(ctx context.Context, cfg *config.Config, options *genaiconfig.Options) error {
+	if genaiconfig.ResolveBackend(options.Backend, options.Project) != genaiconfig.BackendVertex {
+		return nil
+	}
+	credentialPath := cfg.GoogleCredentialsFile
+	if cached, ok := vertexCredentialCache.Load(credentialPath); ok {
+		options.Credentials = cached.(*auth.Credentials)
+		return nil
+	}
+	credentials, err := googleauth.Detect(ctx, credentialPath, googleauth.CloudPlatformScope)
+	if err != nil {
+		return fmt.Errorf("detect Google credentials: %w", err)
+	}
+	cached, _ := vertexCredentialCache.LoadOrStore(credentialPath, credentials)
+	options.Credentials = cached.(*auth.Credentials)
+	return nil
 }
 
 func providerConfigured(cfg *config.Config, provider string) bool {
@@ -425,6 +449,21 @@ func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *int
 }
 
 func main() {
+	configPath := os.Getenv(config.EnvPrefix + "CONFIG")
+	if configPath == "" {
+		configPath = "ghost-wispr.yaml"
+	}
+	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
+		cfg, _, err := config.Load(configPath)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		_, err = runGoogleIDTokenCommand(context.Background(), os.Args[1:], os.Stdout, cfg.GoogleCredentialsFile, googleauth.IDToken)
+		if err != nil {
+			log.Fatalf("google-id-token: %v", err)
+		}
+		return
+	}
 	if len(os.Args) > 1 {
 		var err error
 		switch os.Args[1] {
@@ -450,12 +489,8 @@ func main() {
 		return
 	}
 
-	log.Println("ghost-wispr: starting")
 
-	configPath := os.Getenv(config.EnvPrefix + "CONFIG")
-	if configPath == "" {
-		configPath = "ghost-wispr.yaml"
-	}
+	log.Println("ghost-wispr: starting")
 
 	envPath := filepath.Join(filepath.Dir(configPath), ".env")
 	cfgStore, cfgWarnings, err := config.NewStoreWithEnv(configPath, envPath)
@@ -547,10 +582,15 @@ func main() {
 			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
 		}
 		if provider == "gemini" {
+			genOptions := genAIOptions(&latestCfg, key)
+			if err := addVertexCredentials(context.Background(), &latestCfg, genOptions); err != nil {
+				return nil, err
+			}
 			opts = append(opts, llm.WithGenAIConfig(llm.GenAIConfig{
-				Backend:  latestCfg.GenAIBackend,
-				Project:  latestCfg.GCPProject,
-				Location: latestCfg.GCPLocation,
+				Backend:     genOptions.Backend,
+				Project:     genOptions.Project,
+				Location:    genOptions.Location,
+				Credentials: genOptions.Credentials,
 			}))
 		}
 		return llm.NewClient(provider, key, model, opts...)
@@ -588,15 +628,22 @@ func main() {
 	var embeddingClient embedding.Client
 	var indexer *embedding.Indexer
 	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
-			// Backend left empty — embedding.NewClient reads GHOST_WISPR_EMBEDDING_BACKEND first,
-			// then falls back to GHOST_WISPR_GENAI_BACKEND. This allows Vertex AI for embeddings
-			// while LLM/batch uses Gemini API.
-			Project: cfg.GCPProject,
-			// Location intentionally omitted — let embedding.NewClient read
-			// GHOST_WISPR_EMBEDDING_LOCATION (us-central1), not cfg.GCPLocation (global)
-		}))
-		if err != nil {
+		embeddingOptions := &genaiconfig.Options{
+			Backend:  os.Getenv("GHOST_WISPR_EMBEDDING_BACKEND"),
+			Project:  cfg.GCPProject,
+			Location: os.Getenv("GHOST_WISPR_EMBEDDING_LOCATION"),
+		}
+		if embeddingOptions.Backend == "" {
+			embeddingOptions.Backend = os.Getenv("GHOST_WISPR_GENAI_BACKEND")
+		}
+		if err := addVertexCredentials(context.Background(), &cfg, embeddingOptions); err != nil {
+			log.Printf("warning: embedding indexer disabled: %v", err)
+		} else if embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
+			Backend:     embeddingOptions.Backend,
+			Project:     embeddingOptions.Project,
+			Location:    embeddingOptions.Location,
+			Credentials: embeddingOptions.Credentials,
+		})); err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
 		} else {
 			indexer = embedding.NewIndexer(embeddingClient, store, 500)
@@ -726,7 +773,11 @@ func main() {
 			return "", 0, fmt.Errorf("summarization not configured")
 		}
 		latestCfg := cfgStore.Get()
-		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
+		genOptions := genAIOptions(&latestCfg, latestCfg.GeminiAPIKey)
+		if err := addVertexCredentials(ctx, &latestCfg, genOptions); err != nil {
+			return "", 0, err
+		}
+		clientConfig, err := genaiconfig.BuildClientConfig(genOptions)
 		if err != nil {
 			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
@@ -763,7 +814,11 @@ func main() {
 	}
 	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
 		latestCfg := cfgStore.Get()
-		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
+		genOptions := genAIOptions(&latestCfg, latestCfg.GeminiAPIKey)
+		if err := addVertexCredentials(ctx, &latestCfg, genOptions); err != nil {
+			return nil, err
+		}
+		clientConfig, err := genaiconfig.BuildClientConfig(genOptions)
 		if err != nil {
 			return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
@@ -1134,7 +1189,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if latestCfg.GDriveFolderID == "" {
 				return nil, fmt.Errorf("google drive folder ID not configured")
 			}
-			syncer, err := gdrive.NewSyncer(ctx, latestCfg.GoogleCredentialsFile, latestCfg.GDriveFolderID)
+			credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+			if err != nil {
+				return nil, fmt.Errorf("detect Google credentials: %w", err)
+			}
+			syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID)
 			if err != nil {
 				return nil, fmt.Errorf("create syncer: %w", err)
 			}
@@ -1308,7 +1367,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	})
 	watchDriveSyncSettings(cfgStore, drive,
 		func(cfg *config.Config) (sessionSyncer, error) {
-			syncer, err := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID, appLogger)
+			credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+			if err != nil {
+				return nil, fmt.Errorf("detect Google credentials: %w", err)
+			}
+			syncer, err := gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID, appLogger)
 			if err != nil {
 				return nil, err
 			}
@@ -1400,7 +1463,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	defer func() { _ = store.Close() }()
 
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
-		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID, appLogger)
+		credentials, syncErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+		var syncer *gdrive.Syncer
+		if syncErr == nil {
+			syncer, syncErr = gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID, appLogger)
+		}
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
 			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
@@ -1632,10 +1699,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		case "google":
 			if cfg.TTSAPIKey != "" {
 				ttsProvider, ttsErr = tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
-			} else if credPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credPath != "" {
-				ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithGoogleCredentialPath(credPath))
 			} else {
-				ttsErr = fmt.Errorf("google TTS requires GHOST_WISPR_TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS")
+				credentials, credentialErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+				if credentialErr != nil {
+					ttsErr = fmt.Errorf("detect Google credentials: %w", credentialErr)
+				} else {
+					ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
+				}
 			}
 		default:
 			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
