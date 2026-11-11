@@ -1,143 +1,215 @@
 package envoy
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"math"
+	"net/http"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 const (
-	Source       = "ghost-wispr"
-	DefaultTopic = "notifications.ghost-wispr.summary-ready"
+	eventSessionStarted = "session_started"
+	eventSessionEnded   = "session_ended"
+	eventSummaryReady   = "summary_ready"
 )
 
 var defaultRetryDelays = []time.Duration{5 * time.Second, 30 * time.Second, 120 * time.Second}
 
 type Store interface {
 	GetSession(id string) (storage.Session, error)
-	UpdateEnvoyPublishStatus(sessionID, status string) error
+	UpdateEnvoyPublishStatusAtVersion(sessionID string, summaryVersion int, status string) (bool, error)
 }
 
-type SummaryReadyPayload struct {
-	SessionID       string    `json:"session_id"`
-	Title           string    `json:"title"`
-	SummaryPreset   string    `json:"summary_preset"`
-	StartedAt       time.Time `json:"started_at"`
-	EndedAt         time.Time `json:"ended_at"`
-	DurationSeconds int64     `json:"duration_seconds"`
+// Event is one Ghost Wispr event sent to Envoy's webhook.
+type Event struct {
+	Type      string
+	SessionID string
+	Payload   map[string]any
 }
 
-type Envelope struct {
-	EventID        string `json:"event_id"`
-	Source         string `json:"source"`
-	SourceEventID  string `json:"source_event_id"`
-	Topic          string `json:"topic"`
-	DedupeKey      string `json:"dedupe_key"`
-	IssuedAt       int64  `json:"issued_at"`
-	ExpiresAt      *int64 `json:"expires_at,omitempty"`
-	PayloadSummary string `json:"payload_summary"`
-	PayloadRef     string `json:"payload_ref,omitempty"`
-	TraceID        string `json:"trace_id"`
-}
+// Option configures a Client.
+type Option func(*Client)
 
-func (e *Envelope) Validate() error {
-	if strings.TrimSpace(e.EventID) == "" {
-		return fmt.Errorf("event_id is required")
-	}
-	if strings.TrimSpace(e.Source) == "" {
-		return fmt.Errorf("source is required")
-	}
-	if strings.TrimSpace(e.SourceEventID) == "" {
-		return fmt.Errorf("source_event_id is required")
-	}
-	if strings.TrimSpace(e.Topic) == "" {
-		return fmt.Errorf("topic is required")
-	}
-	if strings.TrimSpace(e.DedupeKey) == "" {
-		return fmt.Errorf("dedupe_key is required")
-	}
-	if e.IssuedAt == 0 {
-		return fmt.Errorf("issued_at must be set")
-	}
-	if strings.TrimSpace(e.PayloadSummary) == "" {
-		return fmt.Errorf("payload_summary is required")
-	}
-	if strings.TrimSpace(e.TraceID) == "" {
-		return fmt.Errorf("trace_id is required")
-	}
-	switch e.Source {
-	case "agent", "github", "ghost-wispr", "slack", "whatsapp":
-		return nil
-	default:
-		return fmt.Errorf("source must be one of: agent, github, ghost-wispr, slack, whatsapp")
+// WithHTTPClient sets the HTTP client used for webhook requests.
+func WithHTTPClient(client *http.Client) Option {
+	return func(c *Client) {
+		if client != nil {
+			c.httpClient = client
+		}
 	}
 }
 
-type busPublisher interface {
-	Publish(item *Envelope) error
-	Close() error
+// WithLogger sets the logger used for webhook request failures and retries.
+func WithLogger(logger *slog.Logger) Option {
+	return func(c *Client) {
+		if logger != nil {
+			c.logger = logging.WithModule(logger, "envoy")
+		}
+	}
 }
 
-type Publisher struct {
-	store       Store
-	client      busPublisher
-	topic       string
+// Client sends Ghost Wispr events to Envoy's webhook.
+type Client struct {
+	url         string
+	secret      []byte
+	httpClient  *http.Client
 	logger      *slog.Logger
 	now         func() time.Time
-	id          func() string
 	sleep       func(context.Context, time.Duration) error
 	retryDelays []time.Duration
 }
-
-func NewPublisher(natsURL, topic string, store Store, logger ...*slog.Logger) (*Publisher, error) {
-	urls := splitURLs(natsURL)
-	if len(urls) == 0 {
-		return nil, fmt.Errorf("nats url is required")
-	}
-	client, err := connectNATS(urls, logger...)
-	if err != nil {
-		return nil, err
-	}
-	return NewPublisherWithClient(store, client, topic, logger...), nil
+type webhookStatusError struct {
+	status int
 }
 
-func NewPublisherWithClient(store Store, client busPublisher, topic string, logger ...*slog.Logger) *Publisher {
-	l := logging.WithModule(slog.Default(), "envoy")
-	if len(logger) > 0 && logger[0] != nil {
-		l = logging.WithModule(logger[0], "envoy")
-	}
-	if strings.TrimSpace(topic) == "" {
-		topic = DefaultTopic
-	}
-	return &Publisher{
-		store:       store,
-		client:      client,
-		topic:       strings.TrimSpace(topic),
-		logger:      l,
+func (err *webhookStatusError) Error() string {
+	return fmt.Sprintf("envoy webhook responded with status %d", err.status)
+}
+
+// NewClient creates a webhook client. It does not contact the relay until Send.
+// It trims the URL and secret as Envoy trims ENVOY_GHOSTWISPR_SIGNING_SECRET,
+// so both sides sign with the same key.
+func NewClient(url, secret string, opts ...Option) *Client {
+	client := &Client{
+		url:    strings.TrimSpace(url),
+		secret: []byte(strings.TrimSpace(secret)),
+		httpClient: &http.Client{
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		logger:      logging.WithModule(slog.Default(), "envoy"),
 		now:         func() time.Time { return time.Now().UTC() },
-		id:          uuid.NewString,
 		sleep:       sleepWithContext,
 		retryDelays: append([]time.Duration(nil), defaultRetryDelays...),
 	}
-}
-
-func (p *Publisher) Close() error {
-	if p == nil || p.client == nil {
-		return nil
+	for _, option := range opts {
+		if option != nil {
+			option(client)
+		}
 	}
-	return p.client.Close()
+	return client
 }
 
+// Send posts ev to Envoy's webhook. It retries transient failures with the
+// event's stable delivery ID and returns immediately for a 4xx response.
+func (c *Client) Send(ctx context.Context, ev Event) error {
+	if c == nil {
+		return errors.New("envoy webhook client is nil")
+	}
+	if strings.TrimSpace(c.url) == "" {
+		return errors.New("envoy webhook URL is required")
+	}
+
+	eventType, delivery, err := eventDelivery(ev)
+	if err != nil {
+		return err
+	}
+	body, err := webhookEventBody(eventType, ev.SessionID, ev.Payload, c.now())
+	if err != nil {
+		return err
+	}
+	signature := webhookSignature(c.secret, body)
+
+	for attempt := 0; ; attempt++ {
+		retry, err := c.sendOnce(ctx, eventType, delivery, body, signature)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !retry || attempt == len(c.retryDelays) {
+			return err
+		}
+
+		delay := c.retryDelays[attempt]
+		c.logger.Warn("envoy webhook retry scheduled",
+			"event", eventType,
+			"session_id", ev.SessionID,
+			"delivery", delivery,
+			"delay", delay.String(),
+			"error", err,
+		)
+		if err := c.sleep(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) sendOnce(ctx context.Context, eventType, delivery string, body []byte, signature string) (retry bool, err error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
+	if err != nil {
+		return false, fmt.Errorf("create envoy webhook request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-GhostWispr-Event", strings.ReplaceAll(eventType, "_", "."))
+	request.Header.Set("X-GhostWispr-Delivery", delivery)
+	request.Header.Set("X-GhostWispr-Signature", signature)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return true, fmt.Errorf("post envoy webhook: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+		return false, nil
+	}
+
+	err = &webhookStatusError{status: response.StatusCode}
+	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError {
+		c.logger.Warn("envoy webhook request rejected",
+			"event", eventType,
+			"delivery", delivery,
+			"status", response.StatusCode,
+		)
+		return false, err
+	}
+	return true, err
+}
+
+// Publisher builds Ghost Wispr event payloads from stored sessions.
+type Publisher struct {
+	store  Store
+	client *Client
+}
+
+// NewPublisher creates a session-aware Envoy webhook publisher.
+func NewPublisher(url, secret string, store Store, opts ...Option) *Publisher {
+	client := NewClient(url, secret, opts...)
+	return &Publisher{
+		store:  store,
+		client: client,
+	}
+}
+
+// PublishSessionStarted sends a session_started event.
+func (p *Publisher) PublishSessionStarted(ctx context.Context, sessionID string) error {
+	return p.publishSession(ctx, eventSessionStarted, sessionID)
+}
+
+// PublishSessionEnded sends a session_ended event.
+func (p *Publisher) PublishSessionEnded(ctx context.Context, sessionID string) error {
+	return p.publishSession(ctx, eventSessionEnded, sessionID)
+}
+
+// PublishSummaryReady sends a summary_ready event and tracks its delivery
+// state so the existing sweep retries a completed summary after an outage.
 func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) error {
 	if p == nil || p.client == nil || p.store == nil {
 		return nil
@@ -150,225 +222,177 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 	if !shouldPublish(&sess) {
 		return nil
 	}
-
-	item, err := p.buildEnvelope(&sess)
-	if err != nil {
-		return fmt.Errorf("build envelope for session %s: %w", sessionID, err)
-	}
-	if err := p.store.UpdateEnvoyPublishStatus(sessionID, storage.EnvoyPublishPending); err != nil {
+	if updated, err := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, storage.EnvoyPublishPending); err != nil {
 		return fmt.Errorf("mark envoy publish pending for session %s: %w", sessionID, err)
+	} else if !updated {
+		return nil
 	}
 
-	p.logger.Info("publishing summary-ready event", "operation", "publish_summary_ready", "session_id", sessionID, "topic", item.Topic)
-	if err := p.publishWithRetry(ctx, &item); err != nil {
+	if err := p.sendSession(ctx, eventSummaryReady, &sess); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if statusErr := p.store.UpdateEnvoyPublishStatus(sessionID, storage.EnvoyPublishFailed); statusErr != nil {
+		publishStatus := storage.EnvoyPublishFailed
+		var responseErr *webhookStatusError
+		if errors.As(err, &responseErr) && responseErr.status >= http.StatusBadRequest && responseErr.status < http.StatusInternalServerError {
+			publishStatus = storage.EnvoyPublishRejected
+		}
+		if updated, statusErr := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, publishStatus); statusErr != nil {
 			return fmt.Errorf("publish summary-ready event for session %s: %w (also failed to mark status: %v)", sessionID, err, statusErr)
+		} else if !updated {
+			return nil
 		}
 		return fmt.Errorf("publish summary-ready event for session %s: %w", sessionID, err)
 	}
 
-	if err := p.store.UpdateEnvoyPublishStatus(sessionID, storage.EnvoyPublishPublished); err != nil {
+	if updated, err := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, storage.EnvoyPublishPublished); err != nil {
 		return fmt.Errorf("mark envoy publish published for session %s: %w", sessionID, err)
+	} else if !updated {
+		return nil
 	}
-	p.logger.Info("summary-ready event published", "operation", "publish_summary_ready", "session_id", sessionID, "topic", item.Topic)
 	return nil
 }
 
-func (p *Publisher) publishWithRetry(ctx context.Context, item *Envelope) error {
-	if err := p.client.Publish(item); err == nil {
+func (p *Publisher) publishSession(ctx context.Context, eventType, sessionID string) error {
+	if p == nil || p.client == nil || p.store == nil {
 		return nil
-	} else {
-		lastErr := err
-		for _, delay := range p.retryDelays {
-			p.logger.Warn("summary-ready publish retry scheduled", "operation", "publish_summary_ready", "topic", item.Topic, "delay", delay.String(), "error", lastErr)
-			if err := p.sleep(ctx, delay); err != nil {
-				return err
-			}
-			if err := p.client.Publish(item); err == nil {
-				return nil
-			} else {
-				lastErr = err
-			}
-		}
-		return lastErr
 	}
+	sess, err := p.store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("get session %s: %w", sessionID, err)
+	}
+	if err := p.sendSession(ctx, eventType, &sess); err != nil {
+		return fmt.Errorf("publish %s event for session %s: %w", eventType, sessionID, err)
+	}
+	return nil
 }
 
-func (p *Publisher) buildEnvelope(sess *storage.Session) (Envelope, error) {
-	if sess.EndedAt == nil {
-		return Envelope{}, fmt.Errorf("ended_at is required")
+func (p *Publisher) sendSession(ctx context.Context, eventType string, sess *storage.Session) error {
+	payload := map[string]any{
+		"title":    sess.Title,
+		"summary":  sess.Summary,
+		"duration": sessionDuration(sess),
 	}
-	payloadBytes, err := json.Marshal(SummaryReadyPayload{
-		SessionID:       sess.ID,
-		Title:           sess.Title,
-		SummaryPreset:   sess.SummaryPreset,
-		StartedAt:       sess.StartedAt.UTC(),
-		EndedAt:         sess.EndedAt.UTC(),
-		DurationSeconds: int64(sess.EndedAt.Sub(sess.StartedAt).Seconds()),
+	if eventType == eventSummaryReady {
+		payload["summary_preset"] = sess.SummaryPreset
+		payload["version"] = sess.SummaryVersion
+	}
+	return p.client.Send(ctx, Event{
+		Type:      eventType,
+		SessionID: sess.ID,
+		Payload:   payload,
 	})
-	if err != nil {
-		return Envelope{}, err
-	}
-
-	item := Envelope{
-		EventID:        p.id(),
-		Source:         Source,
-		SourceEventID:  sess.ID,
-		Topic:          p.topic,
-		DedupeKey:      sess.ID,
-		IssuedAt:       p.now().UnixMilli(),
-		PayloadSummary: string(payloadBytes),
-		TraceID:        p.id(),
-	}
-	if err := item.Validate(); err != nil {
-		return Envelope{}, err
-	}
-	return item, nil
 }
 
 func shouldPublish(sess *storage.Session) bool {
 	return sess.Status == storage.SessionEnded && sess.SummaryStatus == storage.SummaryCompleted && sess.EndedAt != nil
 }
 
-func splitURLs(raw string) []string {
-	parts := strings.Split(raw, ",")
-	urls := make([]string, 0, len(parts))
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			urls = append(urls, trimmed)
-		}
+func sessionDuration(sess *storage.Session) int64 {
+	if sess.EndedAt == nil {
+		return 0
 	}
-	return urls
+	return int64(sess.EndedAt.Sub(sess.StartedAt).Seconds())
+}
+
+func eventDelivery(ev Event) (eventType, delivery string, err error) {
+	eventType = normalizeEventType(ev.Type)
+	sessionID := strings.TrimSpace(ev.SessionID)
+	if sessionID == "" {
+		return "", "", errors.New("envoy webhook session ID is required")
+	}
+
+	switch eventType {
+	case eventSessionStarted, eventSessionEnded:
+		return eventType, sessionID + "." + eventType, nil
+	case eventSummaryReady:
+		version, ok := summaryVersion(ev.Payload["version"])
+		if !ok {
+			return "", "", errors.New("envoy webhook summary version must be a positive integer")
+		}
+		return eventType, sessionID + "." + eventType + "." + strconv.FormatInt(version, 10), nil
+	default:
+		return "", "", fmt.Errorf("unsupported envoy webhook event type %q", ev.Type)
+	}
+}
+
+func webhookEventBody(eventType, sessionID string, payload map[string]any, createdAt time.Time) ([]byte, error) {
+	bodyPayload := make(map[string]any, len(payload)+2)
+	maps.Copy(bodyPayload, payload)
+	bodyPayload["session_id"] = strings.TrimSpace(sessionID)
+	bodyPayload["type"] = eventType
+
+	return json.Marshal(struct {
+		EventType string         `json:"event_type"`
+		CreatedAt string         `json:"created_at"`
+		Payload   map[string]any `json:"payload"`
+	}{
+		EventType: eventType,
+		CreatedAt: createdAt.UTC().Format(time.RFC3339),
+		Payload:   bodyPayload,
+	})
+}
+
+func webhookSignature(secret, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func summaryVersion(value any) (int64, bool) {
+	switch version := value.(type) {
+	case int:
+		return int64(version), version > 0
+	case int8:
+		return int64(version), version > 0
+	case int16:
+		return int64(version), version > 0
+	case int32:
+		return int64(version), version > 0
+	case int64:
+		return version, version > 0
+	case uint:
+		if uint64(version) > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(version), version > 0
+	case uint8:
+		return int64(version), version > 0
+	case uint16:
+		return int64(version), version > 0
+	case uint32:
+		return int64(version), version > 0
+	case uint64:
+		if version > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(version), version > 0
+	case float64:
+		// float64(math.MaxInt64) rounds up to 2^63, which int64 cannot hold.
+		if version <= 0 || version != math.Trunc(version) || version >= math.MaxInt64 {
+			return 0, false
+		}
+		return int64(version), true
+	case json.Number:
+		parsed, err := version.Int64()
+		return parsed, err == nil && parsed > 0
+	default:
+		return 0, false
+	}
+}
+
+func normalizeEventType(event string) string {
+	event = strings.TrimSpace(strings.ToLower(event))
+	return strings.ReplaceAll(event, ".", "_")
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
-	t := time.NewTimer(delay)
-	defer t.Stop()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-t.C:
+	case <-timer.C:
 		return nil
-	}
-}
-
-type natsClient struct {
-	logger *slog.Logger
-	conn   *nats.Conn
-	js     nats.JetStreamContext
-	urls   []string
-	mu     sync.Mutex
-}
-
-func connectNATS(urls []string, logger ...*slog.Logger) (*natsClient, error) {
-	l := logging.WithModule(slog.Default(), "envoy")
-	if len(logger) > 0 && logger[0] != nil {
-		l = logging.WithModule(logger[0], "envoy")
-	}
-	nc, err := connect(urls, l)
-	if err != nil {
-		return nil, err
-	}
-	js, err := nc.JetStream()
-	if err != nil {
-		nc.Close()
-		return nil, err
-	}
-	return &natsClient{logger: l, conn: nc, js: js, urls: urls}, nil
-}
-
-func (c *natsClient) Publish(item *Envelope) error {
-	data, err := json.Marshal(item)
-	if err != nil {
-		return err
-	}
-	if err := c.ensureConn(); err != nil {
-		return err
-	}
-	_, err = c.js.Publish(item.Topic, data)
-	if err == nil {
-		return nil
-	}
-	if err == nats.ErrConnectionClosed {
-		if ensureErr := c.ensureConn(); ensureErr != nil {
-			return ensureErr
-		}
-		_, err = c.js.Publish(item.Topic, data)
-	}
-	return err
-}
-
-func (c *natsClient) Close() error {
-	if c == nil || c.conn == nil {
-		return nil
-	}
-	c.conn.Close()
-	return nil
-}
-
-func (c *natsClient) ensureConn() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != nil && c.conn.Status() != nats.CLOSED {
-		return nil
-	}
-	nc, err := connect(c.urls, c.logger)
-	if err != nil {
-		return err
-	}
-	js, err := nc.JetStream()
-	if err != nil {
-		nc.Close()
-		return err
-	}
-	c.conn = nc
-	c.js = js
-	return nil
-}
-
-func connect(urls []string, logger *slog.Logger) (*nats.Conn, error) {
-	var nc *nats.Conn
-	var err error
-	for range 10 {
-		next := options(urls, logger)
-		nc, err = next.Connect()
-		if err == nil {
-			return nc, nil
-		}
-		time.Sleep(time.Second)
-	}
-	return nil, err
-}
-
-func options(urls []string, logger *slog.Logger) nats.Options {
-	return nats.Options{
-		Servers:       urls,
-		Name:          "ghost-wispr",
-		MaxReconnect:  -1,
-		ReconnectWait: 2 * nats.DefaultReconnectWait,
-		DisconnectedErrCB: func(_ *nats.Conn, err error) {
-			if err != nil {
-				logger.Warn("envoy nats disconnected", "error", err)
-				return
-			}
-			logger.Warn("envoy nats disconnected")
-		},
-		ReconnectedCB: func(nc *nats.Conn) {
-			logger.Info("envoy nats reconnected", "url", nc.ConnectedUrl())
-		},
-		ClosedCB: func(_ *nats.Conn) {
-			logger.Warn("envoy nats connection closed")
-		},
-		AsyncErrorCB: func(_ *nats.Conn, sub *nats.Subscription, err error) {
-			if sub != nil {
-				logger.Warn("envoy nats async error", "subject", sub.Subject, "error", err)
-				return
-			}
-			logger.Warn("envoy nats async error", "error", err)
-		},
 	}
 }

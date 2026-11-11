@@ -6,6 +6,7 @@
 #   GHOST_WISPR_OPENAI_API_KEY      (for OpenAI summarization)
 #   GHOST_WISPR_ANTHROPIC_API_KEY   (for Anthropic summarization)
 #   GHOST_WISPR_GEMINI_API_KEY      (for Gemini summarization)
+#   GHOST_WISPR_ENVOY_WEBHOOK_SECRET (signs posts to Envoy's webhook)
 
 # Database
 db_path: data/ghost-wispr.db
@@ -33,6 +34,10 @@ summarization:
 # gdrive_folder_id:
 # google_credentials_file: ./service-account.json
 # gdrive_sync_enabled: false
+
+# Envoy webhook (optional). Posts are signed with GHOST_WISPR_ENVOY_WEBHOOK_SECRET.
+# envoy_enabled: false
+# envoy_webhook_url: https://relay.example.test/webhook/ghostwispr
 
 # Garbage collection
 # gc_enabled: false

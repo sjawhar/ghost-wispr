@@ -626,9 +626,9 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	drive := &driveSync{}
-	var summaryPublisher *envoy.Publisher
+	var summaryPublisher atomic.Pointer[envoy.Publisher]
 	publishSummaryReady := func(sessionID string) {
-		pub := summaryPublisher
+		pub := summaryPublisher.Load()
 		if pub == nil {
 			return
 		}
@@ -872,6 +872,9 @@ func main() {
 
 					if err := store.UpdateSummary(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames); err != nil {
 						return repaired, err
+					}
+					if title != sessions[i].Title || summaryText != sessions[i].Summary || speakerNames != sessions[i].SpeakerNames {
+						publishSummaryReady(sessions[i].ID)
 					}
 					repaired++
 				}
@@ -1137,10 +1140,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	setSummaryPublisher := func(next *envoy.Publisher) {
-		if summaryPublisher != nil && summaryPublisher != next {
-			_ = summaryPublisher.Close()
+		summaryPublisher.Store(next)
+		if next == nil {
+			// Avoid storing a typed nil *Publisher in EventPublisher.
+			manager.SetEventPublisher(nil)
+			return
 		}
-		summaryPublisher = next
 		manager.SetEventPublisher(next)
 	}
 	sweepEnvoy := func(pub *envoy.Publisher) {
@@ -1159,22 +1164,32 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}
 	configureEnvoyPublisher := func(currentCfg config.Config) {
-		if !currentCfg.EnvoyEnabled {
+		if !currentCfg.EnvoyEnabled || strings.TrimSpace(currentCfg.EnvoyWebhookURL) == "" {
 			setSummaryPublisher(nil)
 			return
 		}
-		pub, err := envoy.NewPublisher(currentCfg.NATSURL, currentCfg.EnvoyTopic, store, appLogger)
-		if err != nil {
-			log.Printf("warning: envoy publishing disabled: %v", err)
-			warnings = append(warnings, "Envoy publishing failed to initialize — summary notifications are disabled")
-			setSummaryPublisher(nil)
-			return
-		}
+
+		pub := envoy.NewPublisher(
+			currentCfg.EnvoyWebhookURL,
+			currentCfg.EnvoyWebhookSecret,
+			store,
+			envoy.WithLogger(appLogger),
+		)
 		setSummaryPublisher(pub)
-		log.Printf("envoy publishing enabled (topic=%s)", currentCfg.EnvoyTopic)
+		log.Printf("envoy webhook publishing enabled")
 		go sweepEnvoy(pub)
 	}
 	configureEnvoyPublisher(cfg)
+	if pub := summaryPublisher.Load(); pub != nil && len(recoveredIDs) > 0 {
+		ids := append([]string(nil), recoveredIDs...)
+		go func() {
+			for _, sessionID := range ids {
+				if err := pub.PublishSessionEnded(context.Background(), sessionID); err != nil {
+					log.Printf("warning: failed to publish recovered session end for %s: %v", sessionID, err)
+				}
+			}
+		}()
+	}
 	if indexer != nil {
 		go func() {
 			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
@@ -1330,7 +1345,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				sweepEnvoy(summaryPublisher)
+				sweepEnvoy(summaryPublisher.Load())
 			}
 		}
 	}()
@@ -1647,6 +1662,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	log.Println("ghost-wispr: shutting down")
 	cancel()
+	manager.StopSessionStartPublishes()
 	// The mic loops end at the device's next buffer. Stopping the device or
 	// terminating PortAudio while one is still inside a read crashes inside
 	// PortAudio, so neither happens before they end, nor at all if one is stuck
@@ -1662,12 +1678,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
 		log.Printf("warning: force end session failed: %v", err)
 	}
+	if err := manager.WaitForLifecyclePublishes(shutdownCtx); err != nil {
+		log.Printf("warning: lifecycle event publishing did not finish before shutdown: %v", err)
+	}
 
 	if dgStop != nil {
 		dgStop()
-	}
-	if summaryPublisher != nil {
-		_ = summaryPublisher.Close()
 	}
 	if mic := micRef.Load(); mic != nil && micLoopsEnded {
 		_ = mic.Stop()

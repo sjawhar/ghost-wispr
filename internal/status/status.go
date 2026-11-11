@@ -18,6 +18,7 @@ const (
 	EnvoyPublishPending   = "pending"
 	EnvoyPublishPublished = "published"
 	EnvoyPublishFailed    = "failed"
+	EnvoyPublishRejected  = "rejected"
 
 	SyncStatePending        = "PENDING"
 	SyncStateSyncing        = "SYNCING"
