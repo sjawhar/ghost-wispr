@@ -3,6 +3,7 @@ package gdrive
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"os"
@@ -124,6 +125,28 @@ func (d *fakeDrive) FolderOnDrive(_ context.Context, folderID string) (bool, err
 	defer d.mu.Unlock()
 	_, ok := d.folders[folderID]
 	return ok, nil
+}
+
+func (d *fakeDrive) RecordingsMatch(_ context.Context, folderID string, checksums map[string]string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for name, checksum := range checksums {
+		matched := false
+		for _, f := range d.folders[folderID] {
+			if f.Name != name {
+				continue
+			}
+			sum := md5.Sum(f.content)
+			if fmt.Sprintf("%x", sum) == checksum {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // has reports whether folder folderID holds a file with this content.

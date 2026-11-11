@@ -23,6 +23,9 @@ type sessionSyncer interface {
 	// FolderOnDrive reports whether Drive has a session folder out of the
 	// trash; GC asks it before it deletes a session or removes its audio.
 	FolderOnDrive(ctx context.Context, folderID string) (bool, error)
+	// RecordingsMatch reports whether Drive has every supplied recording with
+	// the matching MD5 checksum before GC removes local audio.
+	RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error)
 }
 
 // driveSync is the Drive syncer the app uses, nil while sync is off. Turning

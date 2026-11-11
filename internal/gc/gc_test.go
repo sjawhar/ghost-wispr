@@ -65,11 +65,13 @@ func (m *mockStore) MarkRemoteDeleted(id, _, _ string) (bool, error) {
 }
 
 // driveFolders is Drive as GC asks it: every folder is on it, out of the
-// trash, except those in gone; err, when set, is Drive not answering.
+// trash, except those in gone; err, when set, is Drive not answering. When
+// recordingChecksums is set, it is the checksum Drive lists by file name.
 type driveFolders struct {
-	gone  map[string]bool
-	err   error
-	asked []string
+	gone               map[string]bool
+	err                error
+	asked              []string
+	recordingChecksums map[string]string
 }
 
 func (d *driveFolders) FolderOnDrive(_ context.Context, id string) (bool, error) {
@@ -78,6 +80,24 @@ func (d *driveFolders) FolderOnDrive(_ context.Context, id string) (bool, error)
 		return false, d.err
 	}
 	return !d.gone[id], nil
+}
+
+func (d *driveFolders) RecordingsMatch(_ context.Context, _ string, checksums map[string]string) (bool, error) {
+	if d.err != nil {
+		return false, d.err
+	}
+	if d.recordingChecksums == nil {
+		return true, nil
+	}
+	if len(d.recordingChecksums) != len(checksums) {
+		return false, nil
+	}
+	for name, checksum := range checksums {
+		if d.recordingChecksums[name] != checksum {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func TestGCDeletesSyncedOldSessions(t *testing.T) {

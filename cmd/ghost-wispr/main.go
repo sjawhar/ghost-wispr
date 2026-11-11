@@ -373,19 +373,20 @@ func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
 	}
 }
 
-// gcConfig is the GC configuration for one pass, with drive the running Drive
-// syncer (nil when none runs). With Drive sync on in the config, GC is
-// sync-gated whether or not the syncer is running: it deletes, and removes
-// the audio of, only sessions synced before, and only once the syncer says
-// Drive still has their folder out of the trash; with no syncer running it
-// deletes nothing.
+// gcConfig is the GC configuration for one pass. GC is always Drive-gated:
+// it may remove audio only after Drive answers that it still holds the session.
+// The current config decides whether a running syncer is usable. With sync off
+// or no folder, it passes nil so the collector holds every recording.
 func gcConfig(cfg *config.Config, drive sessionSyncer) gc.Config {
+	if !cfg.GDriveSyncEnabled || cfg.GDriveFolderID == "" {
+		drive = nil
+	}
 	return gc.Config{
 		MaxAgeDays:     cfg.GCMaxAgeDays,
 		MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
-		SyncGated:      cfg.GDriveSyncEnabled,
+		SyncGated:      true,
 		AudioDir:       cfg.AudioDir,
-		// A nil sessionSyncer is a nil DriveFolders.
+		// A nil sessionSyncer is a nil DriveVerifier.
 		Drive: drive,
 	}
 }
@@ -461,6 +462,15 @@ func main() {
 		_, err = runGoogleIDTokenCommand(context.Background(), os.Args[1:], os.Stdout, cfg.GoogleCredentialsFile, googleauth.IDToken)
 		if err != nil {
 			log.Fatalf("google-id-token: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "seed-paused-state" {
+		if len(os.Args) != 2 {
+			log.Fatalf("seed-paused-state: expected no arguments")
+		}
+		if err := seedPausedState(configPath); err != nil {
+			log.Fatalf("seed-paused-state: %v", err)
 		}
 		return
 	}

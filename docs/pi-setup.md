@@ -200,6 +200,39 @@ The status must show exactly `Tags: ["tag:ghost-wispr"]` and
 `DNSName: "ghost-wispr.tail12ec1c.ts.net."`. If Tailscale names it `ghost-wispr-1`, remove
 the stale Tailscale device and provision again.
 
+## Enable models and Drive sync
+
+Run the models step after the shared drive exists and its members are added. It takes the
+shared-drive ID and rejects an absent or malformed one. It renders
+`deploy/pi/files/ghost-wispr.yaml` with that ID, `gdrive_sync_enabled: true` and
+`gc_enabled: true`, keeps the deployed `envoy_webhook_url`, installs the result over
+`/opt/ghost-wispr/ghost-wispr.yaml`, and restarts Ghost Wispr. The credential files from
+the full provisioner stay as they are. A later full-provisioner run keeps the drive ID and
+both enablements.
+
+```bash
+(
+read -r -p 'Shared Drive ID: ' drive_id
+[[ "$drive_id" =~ ^[A-Za-z0-9_-]+$ ]] || { printf 'Invalid shared-drive ID\n' >&2; exit 1; }
+remote_dir=$(ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
+  'umask 077; mkdir -p ~/.local/share/ghost-wispr-provision; chmod 700 ~/.local/share/ghost-wispr-provision; mktemp -d ~/.local/share/ghost-wispr-provision/sources.XXXXXX')
+tar -C . -cf - deploy/pi/provision.sh deploy/pi/files/ghost-wispr.yaml \
+  | ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "tar -xf - -C '$remote_dir'"
+ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
+  "$remote_dir/deploy/pi/provision.sh --models '$drive_id'"
+ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
+)
+```
+
+That YAML names Deepgram `nova-3` for live and batch transcription, Gemini 4 Carbon for
+summaries, Gemini Embedding 2 for search, and Cloud Text-to-Speech Chirp 3: HD voice
+`en-US-Chirp3-HD-Charon`. Gemini calls use Vertex AI in `theorem-agent-infra`, location
+`global`; embeddings use `us-central1` through `GHOST_WISPR_EMBEDDING_LOCATION` in
+`/opt/ghost-wispr/.env`. Nothing sets `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection
+keeps every session (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
+(`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the
+template ships GC off so it never runs before sync is on.
+
 ## Restrict OpenSSH to loopback
 
 Only after Tailscale SSH works, restrict OpenSSH. Raspberry Pi OS Trixie can activate OpenSSH
@@ -264,3 +297,56 @@ services. An empty inventory is UNKNOWN, not a pass. While it runs, a member dev
 subscribe with `nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222`
 and confirm the signed probe plus a real
 `session.started` and `session.ended` notification.
+
+## Accept slice 2
+
+Run both from a tailnet member after the models step. The self-test plants a
+service-account key, a key body inside binary data, a sweep that missed its control, Drive
+sync disabled, a missing Drive folder, a status warning, a superseded model, swapped batch
+and summarization models, a running model that differs from the YAML, an environment
+override of a model setting, an unapproved Drive writer, and a status with no certificate
+warning; each planted condition must be rejected before the live driver runs.
+
+```bash
+deploy/pi/accept-slice2.sh --self-test
+deploy/pi/accept-slice2.sh --drive-members "$members_file" --readers-group "$readers_group" --cert-test
+```
+
+`--drive-members FILE` is the shared drive's member list from the Drive owner, one
+`email|role` line each with Drive API role names (`organizer`, `fileOrganizer`, `writer`,
+`commenter`, `reader`). `--readers-group EMAIL` is the approved readers group from Task 2.4.
+`--cert-test` reads `/api/status` from a test instance on the Pi
+at `127.0.0.1:8081`. The binary has no `--config` flag. Put the test credential file and
+its certificate config in a private temporary directory, point the copied certificate config
+at the certificate that expires in 10 days, and use a copied YAML that sets its
+`google_credentials_file`, separate `db_path` and `audio_dir`, and disables Drive sync, GC,
+Envoy, speaker, indicator light, and power button. Before starting it, seed its
+separate database as paused. This prevents the test instance from opening the microphone:
+
+```bash
+GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
+/opt/ghost-wispr/ghost-wispr seed-paused-state
+GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
+GHOST_WISPR_ADDR=127.0.0.1:8081 \
+/opt/ghost-wispr/ghost-wispr
+```
+
+Then run the driver with `--cert-test`. Without that flag, the row prints `NEEDS-PERSON`.
+
+The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
+
+- A9 plants a service-account control in `/tmp`, sweeps the whole root once, and requires
+  the sweep to find that control and no other key material; a binary file that names a key
+  field without a key body (the `ghost-wispr` binary's Go struct tags) is printed as a note.
+  The configured credential must be an external-account X.509 credential.
+- A6 requires `/api/config` to show Drive sync on, a folder ID, credentials present, and GC
+  enabled with no age limit and the 20000 MB audio budget.
+- A8 requires `/api/status` to report no warnings, the deployed YAML and the running
+  summarization model to name the models above, the required embedding location, and the
+  service environment to set no model or Google override.
+- A10 checks the member list: the only organizers are the service account and Sami, and the
+  approved readers group is the only reader.
+
+Record the Drive, search, Envoy, model-call, read-only-member, and (without `--cert-test`)
+expiring-certificate observations requested by its `NEEDS-PERSON` rows before accepting
+the slice.

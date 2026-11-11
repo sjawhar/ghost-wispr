@@ -5,11 +5,24 @@ deepgram_model: nova-3
 batch_transcription:
   provider: deepgram
   model: nova-3
+summarization:
+  model: gemini/gemini-4-carbon
+embedding_model: gemini/gemini-embedding-2
+genai_backend: vertex
+gcp_project: theorem-agent-infra
+gcp_location: global
+google_credentials_file: /opt/ghost-wispr/google-credentials.json
+# provision.sh --models <shared-drive-id> adds gdrive_folder_id and turns gdrive_sync_enabled
+# and gc_enabled on; GC removes only local audio that Drive holds a copy of.
+gdrive_sync_enabled: false
+gc_enabled: false
+gc_max_age_days: 0
+gc_max_audio_size_mb: 20000
 speaker_enabled: true
 speaker_device: Jabra
-google_credentials_file: /opt/ghost-wispr/google-credentials.json
+tts_provider: google
+tts_voice: en-US-Chirp3-HD-Charon
 indicator_light: blink1
 power_button: true
 envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__
-gc_enabled: false
