@@ -714,6 +714,9 @@ func OpenAPISpec() map[string]any {
 						"204": map[string]any{
 							"description": "Paused",
 						},
+						"500": map[string]any{
+							"description": "The pause was applied but its persistent state could not be saved",
+						},
 					},
 				},
 			},
@@ -726,6 +729,9 @@ func OpenAPISpec() map[string]any {
 					"responses": map[string]any{
 						"204": map[string]any{
 							"description": "Resumed",
+						},
+						"500": map[string]any{
+							"description": "The persistent resume state could not be saved; capture stays paused",
 						},
 					},
 				},

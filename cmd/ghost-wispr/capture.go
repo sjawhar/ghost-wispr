@@ -62,23 +62,25 @@ var errGateClosed = errors.New("microphone capture gate closed")
 // as long as encoding its recording). Resume moves the switch at once; the gate
 // opens once the pause has settled, unless a Pause comes first.
 type captureGate struct {
-	onPause      func()
-	settle       func()
-	beforeResume func()
-	stallAfter   time.Duration // see captureStallAfter
-	writeWait    time.Duration // see captureWriteWait
-
-	control    sync.Mutex    // serializes closing and opening the gate, with their steps
-	mu         sync.Mutex    // guards the fields below
-	switchOff  bool          // Pause was called and Resume has not been since
-	resumedAt  time.Time     // when Resume last moved the switch on
-	closed     bool          // no audio passes the gate
-	closings   int           // counts closings, so a Resume left from an earlier one does nothing
-	resumed    chan struct{} // closed while the gate is open
-	closing    chan struct{} // closed while the gate is closed
-	settled    chan struct{} // closed once the latest closing has settled
-	writing    int           // writes that passed the gate and are still running
-	writesDone *sync.Cond    // signalled (with mu) when a write finishes
+	onPause        func()
+	settle         func()
+	beforeResume   func()
+	beforeMicStart func() error
+	afterMicStart  func()
+	afterGateOpen  func()
+	stallAfter     time.Duration // see captureStallAfter
+	writeWait      time.Duration // see captureWriteWait
+	control        sync.Mutex    // serializes closing and opening the gate, with their steps
+	mu             sync.Mutex    // guards the fields below
+	switchOff      bool          // Pause was called and Resume has not been since
+	resumedAt      time.Time     // when Resume last moved the switch on
+	closed         bool          // no audio passes the gate
+	closings       int           // counts closings, so a Resume left from an earlier one does nothing
+	resumed        chan struct{} // closed while the gate is open
+	closing        chan struct{} // closed while the gate is closed
+	settled        chan struct{} // closed once the latest closing has settled
+	writing        int           // writes that passed the gate and are still running
+	writesDone     *sync.Cond    // signalled (with mu) when a write finishes
 }
 
 func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
@@ -210,10 +212,30 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 	}
 
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	if !g.closed || g.switchOff || g.closings != closing {
+		g.mu.Unlock()
+		return
+	}
 	g.closed = false
 	close(g.resumed)
 	g.closing = make(chan struct{})
+	g.mu.Unlock()
+	if g.afterGateOpen != nil {
+		g.afterGateOpen()
+	}
+}
+
+func (g *captureGate) confirmMicStart() error {
+	if g.beforeMicStart == nil {
+		return nil
+	}
+	return g.beforeMicStart()
+}
+
+func (g *captureGate) finishMicStart() {
+	if g.afterMicStart != nil {
+		g.afterMicStart()
+	}
 }
 
 // waitForInflightWrites waits, up to writeWait, until no write that passed the

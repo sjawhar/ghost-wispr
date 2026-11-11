@@ -53,6 +53,8 @@ var (
 	BuildTime = "unknown"
 )
 
+const defaultListenAddress = "127.0.0.1:8080"
+
 var vertexCredentialCache sync.Map
 
 //go:embed static/*
@@ -462,6 +464,30 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 {
+		var err error
+		switch os.Args[1] {
+		case "light-off":
+			if len(os.Args) != 2 {
+				err = fmt.Errorf("usage: ghost-wispr light-off")
+			} else {
+				err = runLightOff(os.Stderr)
+			}
+		case "light-state":
+			if len(os.Args) != 2 {
+				err = fmt.Errorf("usage: ghost-wispr light-state")
+			} else {
+				err = runLightState(os.Stdout)
+			}
+		default:
+			err = fmt.Errorf("unknown subcommand %q", os.Args[1])
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	log.Println("ghost-wispr: starting")
 
@@ -661,10 +687,28 @@ func main() {
 		}
 		return nil
 	}, captureFinalizeWait, captureEndRetry, log.Printf)
-	warnings := append([]string{}, cfgWarnings...)
+
+	restoredPause, err := restorePause(store, capture)
+	var restorePauseErr error
+	if err != nil {
+		// The recorder must not start capturing when it cannot establish the
+		// prior consent state.
+		restorePauseErr = err
+		log.Printf("warning: restore capture pause: %v; starting paused", err)
+		capture.Pause()
+		restoredPause = true
+	}
+	pauseCapture, resumeCapture := persistingControls(store, capture.Pause, capture.Resume)
+	warningRegistry := newWarningsRegistry()
+	for i, warning := range cfgWarnings {
+		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
+	}
+	if restorePauseErr != nil {
+		warningRegistry.Set("capture-state", "Capture pause state could not be restored; the recorder started paused")
+	}
 	if batchTranscriber, err := makeBatchTranscriber(&cfg); err != nil {
 		log.Printf("warning: batch transcription disabled: %v", err)
-		warnings = append(warnings, "Batch transcription unavailable — using streaming transcript fallback")
+		warningRegistry.Set("batch-transcription", "Batch transcription unavailable — using streaming transcript fallback")
 	} else {
 		manager.SetBatchTranscriber(batchTranscriber)
 	}
@@ -850,8 +894,8 @@ func main() {
 	gcHealthState.countUnverified(store)
 
 	controlHooks := &server.ControlHooks{
-		Pause:         capture.Pause,
-		Resume:        capture.Resume,
+		Pause:         pauseCapture,
+		Resume:        resumeCapture,
 		IsPaused:      capture.IsPaused,
 		IsCapturing:   func() bool { return capture.capturing(micStatus) },
 		CaptureState:  func() string { return capture.captureState(micStatus) },
@@ -859,7 +903,7 @@ func main() {
 		OnStatusChanged: func(paused bool) {
 			hub.BroadcastStatusChanged(paused)
 		},
-		Warnings:           func() []string { return warnings },
+		Warnings:           warningRegistry.List,
 		GCHold:             gcHealthState.Hold,
 		UnverifiedSessions: gcHealthState.Unverified,
 		KeptRawRecordings: func() server.KeptRawRecordings {
@@ -1198,6 +1242,37 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 
+	hardware := startHardware(ctx, &cfg, capture, micStatus, controlHooks, warningRegistry, hub)
+	pauseCapture, resumeCapture = persistingControls(
+		store,
+		func() {
+			capture.Pause()
+			hardware.CaptureStopped()
+		},
+		capture.Resume,
+	)
+	controlHooks.Pause = func() error {
+		err := pauseCapture()
+		if err != nil {
+			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+		} else {
+			warningRegistry.Clear("capture-state")
+		}
+		return err
+	}
+	controlHooks.Resume = func() error {
+		err := resumeCapture()
+		if err == nil {
+			warningRegistry.Clear("capture-state")
+		}
+		return err
+	}
+	wireLightConsent(capture, hardware, store, micStatus, warningRegistry, hub)
+	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
+	if restoredPause {
+		hub.BroadcastStatusChanged(true)
+	}
+
 	setSummaryPublisher := func(next *envoy.Publisher) {
 		summaryPublisher.Store(next)
 		if next == nil {
@@ -1227,6 +1302,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	configureEnvoyPublisher := func(currentCfg config.Config) {
 		if !currentCfg.EnvoyEnabled || strings.TrimSpace(currentCfg.EnvoyWebhookURL) == "" {
+			warningRegistry.Clear("envoy")
 			setSummaryPublisher(nil)
 			return
 		}
@@ -1237,6 +1313,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			store,
 			envoy.WithLogger(appLogger),
 		)
+		warningRegistry.Clear("envoy")
 		setSummaryPublisher(pub)
 		log.Printf("envoy webhook publishing enabled")
 		go sweepEnvoy(pub)
@@ -1396,7 +1473,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
-			warnings = append(warnings, "Google Drive sync failed to initialize — backups are disabled")
+			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
 		} else {
 			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
 			drive.Set(orchestrator)
@@ -1499,23 +1576,27 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 		if mic == nil {
 			if updateStartupState {
-				warnings = append(warnings, "Microphone unavailable — recording and live transcription are disabled")
+				warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 			}
 			return fmt.Errorf("microphone unavailable")
 		}
 
 		audioRecorder.SetSampleRate(sampleRate)
-		if err := mic.Start(); err != nil {
+		// micRef is published before the start so the controller, woken when
+		// the start clears the forced-red hold, already sees the open mic.
+		micRef.Store(mic)
+		if err := startMicIfUnpaused(capture, mic.Start); err != nil {
 			micRef.Store(nil)
 			if updateStartupState {
-				warnings = append(warnings, "Microphone failed to start — recording and live transcription are disabled")
+				warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
 			}
 			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
 		}
 
-		micRef.Store(mic)
+		hardware.CaptureStarted()
+		warningRegistry.Clear("microphone")
 		log.Printf("microphone started at %d Hz", sampleRate)
 		message := fmt.Sprintf("Microphone open at %d Hz", sampleRate)
 		if updateStartupState {
@@ -1563,7 +1644,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
 			if updateStartupState {
-				warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
+				warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
 			}
 			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
 			return nil
@@ -1586,7 +1667,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	if paInitFailed {
 		slog.Warn("microphone unavailable, running API/UI only")
-		warnings = append(warnings, "Microphone unavailable \u2014 recording and live transcription are disabled")
+		warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 	}
 	// Initialize speaker output device (completely isolated from mic).
@@ -1594,7 +1675,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if cfg.SpeakerEnabled {
 		if paInitFailed {
 			slog.Warn("speaker requested but portaudio init failed — speaker disabled")
-			warnings = append(warnings, "Speaker unavailable — PortAudio initialization failed")
+			warningRegistry.Set("speaker", "Speaker unavailable — PortAudio initialization failed")
 		} else {
 			speaker = audio.NewSpeaker(cfg.SpeakerDevice)
 			log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
@@ -1629,7 +1710,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		if ttsErr != nil {
 			log.Printf("warning: TTS disabled: %v", ttsErr)
-			warnings = append(warnings, fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
+			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
 		} else {
 			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, speaker, tts.OrchestratorOpts{})
 			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
@@ -1701,6 +1782,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		})
 	}
 
+	lightOff := hardware.Done()
+
 	// Create health checker with actual component references
 	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
@@ -1708,10 +1791,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		panic(fmt.Sprintf("build http handler failed: %v", err))
 	}
 
-	addr := os.Getenv("GHOST_WISPR_ADDR")
-	if addr == "" {
-		addr = ":8080"
-	}
+	addr := listenAddress(os.Getenv("GHOST_WISPR_ADDR"))
 	httpServer := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -1722,7 +1802,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// Log structured startup banner.
 	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)
 	slog.Info("deepgram API key", "status", config.MaskAPIKey(cfg.DeepgramAPIKey))
-	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://127.0.0.1%s", Version, Commit, BuildTime, addr)
+	uiAddr := addr
+	if strings.HasPrefix(uiAddr, ":") {
+		uiAddr = "127.0.0.1" + uiAddr
+	}
+	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://%s", Version, Commit, BuildTime, uiAddr)
 
 	// Broadcast initial component status to any connected WebSocket clients.
 	for _, c := range startupStatus.Components() {
@@ -1734,6 +1818,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	<-sig
 
 	log.Println("ghost-wispr: shutting down")
+	hardware.Stop()
 	cancel()
 	manager.StopSessionStartPublishes()
 	// The mic loops end at the device's next buffer. Stopping the device or
@@ -1743,6 +1828,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	micLoopsEnded := joinMicLoops(&micLoops, micShutdownWait)
 	if !micLoopsEnded {
 		log.Printf("warning: microphone still reading %v after shutdown began; leaving the device and PortAudio to the process exit", micShutdownWait)
+	}
+	select {
+	case <-lightOff:
+	case <-time.After(lightShutdownWait):
+		log.Printf("warning: recording light not turned off within %v; leaving it to its watchdog", lightShutdownWait)
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1827,7 +1917,14 @@ func streamMicWithRetry(
 			if !holdMicWhilePaused(ctx, capture, streamer, logf, hub) || ctx.Err() != nil {
 				return
 			}
-			if err = streamer.Start(); err == nil {
+			if err = capture.confirmMicStart(); err != nil {
+				logf("recording light unavailable before microphone restart: %v", err)
+				wait(backoff)
+				continue
+			}
+			err = streamer.Start()
+			capture.finishMicStart()
+			if err == nil {
 				logf("microphone restarted: capture resumed")
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone capture resumed")
@@ -1862,7 +1959,14 @@ func streamMicWithRetry(
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 			}
-			if reopenErr := streamer.Reopen(); reopenErr != nil {
+			if err := capture.confirmMicStart(); err != nil {
+				logf("recording light unavailable before microphone reconnect: %v", err)
+				stopMicWithoutRed(streamer, logf)
+				continue
+			}
+			reopenErr := streamer.Reopen()
+			capture.finishMicStart()
+			if reopenErr != nil {
 				logf("mic reopen failed: %v", reopenErr)
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
@@ -1892,7 +1996,14 @@ func streamMicWithRetry(
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 		}
 
-		if reopenErr := streamer.Reopen(); reopenErr != nil {
+		if err := capture.confirmMicStart(); err != nil {
+			logf("recording light unavailable before microphone reconnect: %v", err)
+			stopMicWithoutRed(streamer, logf)
+			continue
+		}
+		reopenErr := streamer.Reopen()
+		capture.finishMicStart()
+		if reopenErr != nil {
 			logf("mic reopen failed: %v", reopenErr)
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
@@ -1906,6 +2017,17 @@ func streamMicWithRetry(
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
 		}
 		backoff = baseBackoff
+	}
+}
+
+// stopMicWithoutRed stops a device the reconnect could not confirm red for.
+// An overflow, or a transient read error, leaves the device capturing with
+// IsOpen false, so the light goes dark while audio still flows. The next
+// Stream then fails on the stopped device, and the error path backs off and
+// confirms red again before it reopens.
+func stopMicWithoutRed(streamer micStreamer, logf func(string, ...any)) {
+	if err := streamer.Stop(); err != nil {
+		logf("warning: stop microphone without a red recording light: %v", err)
 	}
 }
 

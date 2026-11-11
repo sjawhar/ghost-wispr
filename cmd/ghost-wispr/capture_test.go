@@ -634,6 +634,21 @@ func TestCaptureGateControlsDoNotWaitForSettle(t *testing.T) {
 	}
 }
 
+func TestCaptureGateStaysClosedWhenBeforeResumeRepause(t *testing.T) {
+	var capture *captureGate
+	capture = newCaptureGate(nil, nil, func() {
+		capture.mu.Lock()
+		capture.switchOff = true
+		capture.mu.Unlock()
+	})
+	capture.Pause()
+	capture.Resume()
+	expectStaysClosed(t, capture, "resume was rejected")
+	if !capture.IsPaused() {
+		t.Fatal("rejected resume cleared the paused switch")
+	}
+}
+
 // A Pause before the pause settled cancels a pending Resume.
 func TestCaptureGatePauseCancelsPendingResume(t *testing.T) {
 	release := make(chan struct{})

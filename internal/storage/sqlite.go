@@ -316,6 +316,15 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS app_state (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`); err != nil {
+		return fmt.Errorf("create app_state table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS envoy_lifecycle_events (
 			event_type TEXT NOT NULL,
 			session_id TEXT NOT NULL,
