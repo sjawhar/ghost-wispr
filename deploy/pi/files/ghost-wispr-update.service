@@ -1,0 +1,9 @@
+[Unit]
+Description=Ghost Wispr release updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ghost-wispr
+ExecStart=/opt/ghost-wispr/update.sh

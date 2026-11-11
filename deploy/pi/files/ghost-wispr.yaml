@@ -1,0 +1,14 @@
+db_path: data/ghost-wispr.db
+audio_dir: data/audio
+silence_timeout: 300s
+deepgram_model: nova-3
+batch_transcription:
+  provider: deepgram
+  model: nova-3
+speaker_enabled: true
+speaker_device: Jabra
+indicator_light: blink1
+power_button: true
+envoy_enabled: true
+envoy_webhook_url: __ENVOY_WEBHOOK_URL__
+gc_enabled: false
