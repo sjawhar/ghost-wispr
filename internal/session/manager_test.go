@@ -136,6 +136,11 @@ func (s *storeMock) StartSummary(sessionID string) error {
 	return nil
 }
 
+// StartEmptySummary marks the summary running, as the store does.
+func (s *storeMock) StartEmptySummary(sessionID string) error {
+	return s.StartSummary(sessionID)
+}
+
 // FailSummary keeps the title and summary, as the store does.
 func (s *storeMock) FailSummary(sessionID, errMsg string) (storage.Session, error) {
 	s.mu.Lock()

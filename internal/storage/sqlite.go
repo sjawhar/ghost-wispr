@@ -1185,6 +1185,27 @@ func (s *SQLiteStore) StartSummary(id string) error {
 	return nil
 }
 
+// StartEmptySummary marks session id's summary running for the current
+// transcript generation, as StartSummary does, for an app with no summarizer:
+// the summary it then completes is empty, which keeps the session's summary
+// as it is. So it neither moves the summary version nor queues the session
+// for Envoy again, and a summary Envoy already has is not sent at a new
+// version.
+func (s *SQLiteStore) StartEmptySummary(id string) error {
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, summary_generation = deletion_generation WHERE id = ?`, SummaryRunning, id)
+	if err != nil {
+		return fmt.Errorf("start empty summary of session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("start empty summary rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // FailSummary records that making session id's summary failed, and why
 // (errMsg, in summary_error: error_message keeps the last sync's error), and
 // returns the session as it then is. The session keeps its title and its last

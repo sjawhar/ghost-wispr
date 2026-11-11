@@ -76,6 +76,45 @@ func noSummarizerStore(t *testing.T) *storage.SQLiteStore {
 	return store
 }
 
+// TestNoSummarizerDoesNotRepublishAnOldSummary fails if regenerating the
+// summary of a session whose summary a summarizer made earlier, and Envoy
+// already has, sends that same summary to Envoy again at a new version once
+// no summarizer is configured.
+func TestNoSummarizerDoesNotRepublishAnOldSummary(t *testing.T) {
+	store := noSummarizerStore(t)
+	if err := store.UpdateSummary("s", "Title", "The summary a summarizer made.", storage.SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetSession("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateEnvoyPublishStatusAtVersion("s", before.SummaryVersion, storage.EnvoyPublishPublished); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(store, nil, nil, nil, nil, 0)
+
+	manager.generateSummary(context.Background(), "s", time.Now().UTC())
+
+	after, err := store.GetSession("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SummaryStatus != storage.SummaryCompleted || after.Summary != before.Summary {
+		t.Fatalf("summary after a regeneration with no summarizer = %q (%q), want the earlier one kept, completed", after.Summary, after.SummaryStatus)
+	}
+	if after.SummaryVersion != before.SummaryVersion || after.EnvoyPublishStatus != storage.EnvoyPublishPublished {
+		t.Errorf("summary version %d -> %d, envoy %q: the unchanged summary was queued for Envoy again", before.SummaryVersion, after.SummaryVersion, after.EnvoyPublishStatus)
+	}
+	ids, err := store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("sessions needing an Envoy publish = %v, want none", ids)
+	}
+}
+
 // TestNoSummarizerCanonicalizeFailureEndsTheSummary fails if a canonicalize
 // error leaves the summary running, which holds the Drive replacement forever.
 func TestNoSummarizerCanonicalizeFailureEndsTheSummary(t *testing.T) {

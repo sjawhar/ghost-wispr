@@ -572,10 +572,13 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.mu.Unlock()
 
 	if summarizer == nil {
-		// Without a summarizer the summary completes empty. StartSummary binds
-		// it to the current deletion generation, so that completion passes
-		// the generation fence after a segment deletion.
-		if err := m.store.StartSummary(sessionID); err != nil {
+		// Without a summarizer the summary completes empty, which keeps the
+		// session's summary as it is. StartEmptySummary binds it to the
+		// current deletion generation, so that completion passes the
+		// generation fence after a segment deletion, and leaves the summary
+		// version and Envoy delivery state alone, so a summary Envoy already
+		// has is not sent again.
+		if err := m.store.StartEmptySummary(sessionID); err != nil {
 			m.logger.Error("failed to start empty summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
 		transcript, generation, err := m.store.Canonicalize(sessionID)
