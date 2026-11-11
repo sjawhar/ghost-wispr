@@ -97,9 +97,10 @@ func (h *Hub) Broadcast(msg []byte) {
 	}
 }
 
-func (h *Hub) BroadcastLiveTranscript(seg transcribe.Segment) {
+func (h *Hub) BroadcastLiveTranscript(sessionID string, seg transcribe.Segment) {
 	h.broadcastEvent(LiveTranscriptEvent{
 		Event:     newEvent("live_transcript", seg.Timestamp),
+		SessionID: sessionID,
 		Speaker:   seg.Speaker,
 		Text:      seg.Text,
 		StartTime: seg.StartTime,
@@ -107,9 +108,10 @@ func (h *Hub) BroadcastLiveTranscript(seg transcribe.Segment) {
 	})
 }
 
-func (h *Hub) BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64) {
+func (h *Hub) BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64) {
 	h.broadcastEvent(LiveTranscriptInterimEvent{
 		Event:     newEvent("live_transcript_interim", time.Now().UTC()),
+		SessionID: sessionID,
 		Speaker:   speaker,
 		Text:      text,
 		StartTime: startTime,

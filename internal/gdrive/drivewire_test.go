@@ -283,6 +283,10 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			notFound(w, id)
 			return
 		}
+		if r.URL.Query().Get("alt") == "media" {
+			_, _ = w.Write(f.Content)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType, Trashed: d.inTrash(f), ExplicitlyTrashed: d.trashed[f.ID]})
 	case r.Method == http.MethodPost && path == "/drive/v3/files":
 		var meta drive.File

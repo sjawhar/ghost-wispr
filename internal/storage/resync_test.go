@@ -16,7 +16,7 @@ func documentedSession(t *testing.T, store *SQLiteStore, id, summary string) {
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "said", EndTime: 1, Timestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("AppendSegment %s: %v", id, err)
 	}
-	if err := store.Canonicalize(id); err != nil {
+	if _, err := store.Canonicalize(id); err != nil {
 		t.Fatalf("Canonicalize %s: %v", id, err)
 	}
 	if err := store.UpdateSummary(id, "Standup", summary, SummaryCompleted, "default", "{}"); err != nil {
@@ -65,7 +65,8 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			if err := store.UpdateRefinement(id, "The refined transcript.", RefinementCompleted); err != nil {
 				t.Fatalf("UpdateRefinement: %v", err)
 			}
-			return store.Canonicalize(id)
+			_, err := store.Canonicalize(id)
+			return err
 		}, true},
 		{"same summary stored again", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return store.UpdateSummary(id, "Standup", "The first summary.", SummaryCompleted, "default", "{}")

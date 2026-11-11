@@ -18,6 +18,7 @@ type Store interface {
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	CountSegments(sessionID string) (int, error)
 	UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error
+	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error
 	// StartSummary marks the summary running; the session keeps its title
 	// and its last good summary until a new one is stored.
 	StartSummary(sessionID string) error
@@ -30,8 +31,9 @@ type Store interface {
 	ClaimRefinement(sessionID, audioPath string) (bool, error)
 	GetRefinement(sessionID string) (transcript, status string, err error)
 	UpdateTitle(sessionID, title string) error
-	Canonicalize(sessionID string) error
+	Canonicalize(sessionID string) (generation int, err error)
 	GetCanonicalTranscript(sessionID string) (transcript, source string, err error)
+	GetCanonicalTranscriptWithGeneration(sessionID string) (transcript, source string, generation int, err error)
 }
 
 type Recorder interface {
@@ -55,15 +57,15 @@ type EventPublisher interface {
 }
 
 type EmbeddingIndexer interface {
-	IndexSession(ctx context.Context, sessionID, transcript string) error
+	IndexSessionAtGeneration(ctx context.Context, sessionID, transcript string, generation int) error
 }
 
 type EventBroadcaster interface {
-	BroadcastLiveTranscript(seg transcribe.Segment)
+	BroadcastLiveTranscript(sessionID string, seg transcribe.Segment)
 	BroadcastSessionStarted(sessionID string)
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
 	BroadcastSummaryReady(sessionID, title, summary, status, preset string)
-	BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64)
+	BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64)
 	BroadcastComponentStatus(component, status, message string)
 }
 

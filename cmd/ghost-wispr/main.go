@@ -728,22 +728,6 @@ func main() {
 		}
 		return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
 	}
-	buildBatchSessions := func(sessionIDs []string) ([]summary.BatchSession, []string) {
-		sessions := make([]summary.BatchSession, 0, len(sessionIDs))
-		emptyTranscriptIDs := make([]string, 0)
-		for _, id := range sessionIDs {
-			transcript, ok := loadSessionTranscript(id)
-			if !ok {
-				continue
-			}
-			if transcript == "" {
-				emptyTranscriptIDs = append(emptyTranscriptIDs, id)
-				continue
-			}
-			sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
-		}
-		return sessions, emptyTranscriptIDs
-	}
 	markEmptySummariesCompleted := func(sessionIDs []string) {
 		for _, id := range sessionIDs {
 			_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
@@ -763,10 +747,18 @@ func main() {
 			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
 
-		sessions, emptyTranscriptIDs := buildBatchSessions(sessionIDs)
+		sessions, generations, emptyTranscriptIDs, err := readBatchSummarySessions(store, sessionIDs)
+		if err != nil {
+			return "", 0, err
+		}
 		markEmptySummariesCompleted(emptyTranscriptIDs)
 		if len(sessions) == 0 {
 			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
+		}
+		for _, session := range sessions {
+			if err := store.StartSummary(session.ID); err != nil {
+				return "", 0, fmt.Errorf("start batch summary for %s: %w", session.ID, err)
+			}
 		}
 
 		requests, err := summarizer.BuildBatchRequests(ctx, sessions)
@@ -789,6 +781,9 @@ func main() {
 		}, nil)
 		if err != nil {
 			return "", 0, fmt.Errorf("create batch job: %w", err)
+		}
+		if err := store.RecordSummaryBatch(job.Name, generations); err != nil {
+			return "", 0, fmt.Errorf("persist summary batch %s: %w", job.Name, err)
 		}
 
 		return job.Name, len(sessions), nil
@@ -836,27 +831,17 @@ func main() {
 					sessions = append(sessions, summary.BatchSession{ID: id, Transcript: transcript})
 				}
 			}
-
 			batchResults := summarizer.ProcessBatchResults(job, sessions)
-			var succeeded, failed int
-			for _, br := range batchResults {
-				if br.Error != nil {
-					failed++
-					if br.SessionID != "" {
-						failSummary(store, nil, br.SessionID, br.Error)
-					}
-					continue
-				}
-				if br.SessionID != "" {
-					_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
-					hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
-					publishSummaryReady(br.SessionID)
-				}
-				succeeded++
+			if len(batchResults) == 0 {
+				log.Printf("warning: summary batch %s completed without inline results; marking submitted sessions failed", batchName)
+			}
+			succeeded, failed, err := applySummaryBatchResults(store, hub, publishSummaryReady, batchName, batchResults)
+			if err != nil {
+				return nil, err
 			}
 			result["succeeded"] = succeeded
 			result["failed"] = failed
-			result["total"] = len(batchResults)
+			result["total"] = succeeded + failed
 		}
 
 		if job.State == genai.JobStateFailed {
@@ -864,6 +849,12 @@ func main() {
 			if job.Error != nil {
 				errMsg = job.Error.Message
 			}
+			_, failed, err := applySummaryBatchResults(store, hub, nil, batchName, nil)
+			if err != nil {
+				return nil, err
+			}
+			result["failed"] = failed
+			result["total"] = failed
 			result["error"] = errMsg
 		}
 
@@ -903,6 +894,49 @@ func main() {
 				return fmt.Errorf("get session %s: %w", sessionID, err)
 			}
 			return manager.RefineSession(ctx, sessionID, sess.AudioPath, sess.StartedAt)
+		},
+		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
+			if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {
+				return err
+			}
+			latestCfg := cfgStore.Get()
+			batch, err := makeBatchTranscriber(&latestCfg)
+			if err != nil {
+				return fmt.Errorf("configure batch transcription for deletion: %w", err)
+			}
+			wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
+			if !ok {
+				return fmt.Errorf("configured batch transcription does not return word timestamps")
+			}
+			runner := segmentDeleteRunner{
+				store:       store,
+				transcriber: audio.WordsTranscriber{Batch: wordTranscriber},
+				audioDir:    latestCfg.AudioDir,
+				ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+					var source deletionRecordingSource
+					if session.GDriveFolderID != "" {
+						if latestCfg.GDriveFolderID == "" {
+							return deletionRecordingSet{}, fmt.Errorf("google Drive root folder is not configured")
+						}
+						credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+						if err != nil {
+							return deletionRecordingSet{}, fmt.Errorf("detect Google credentials: %w", err)
+						}
+						syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID, appLogger)
+						if err != nil {
+							return deletionRecordingSet{}, fmt.Errorf("create Drive syncer: %w", err)
+						}
+						source = syncer
+					}
+					return restoreDeletionRecordings(ctx, &session, latestCfg.AudioDir, source)
+				},
+				duration: audio.Duration,
+				splice:   audio.Splice,
+				refine: func(ctx context.Context, sessionID, recording string, startedAt time.Time) error {
+					return manager.RefineSession(ctx, sessionID, recording, startedAt)
+				},
+			}
+			return runner.Delete(ctx, sessionID, segmentID)
 		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			dates, err := store.GetDates()
@@ -997,7 +1031,10 @@ func main() {
 				return
 			}
 
-			_ = store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
+			if err := store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
+				log.Printf("warning: discarded stale merged summary for session %s: %v", sessionID, err)
+				return
+			}
 			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
 			publishSummaryReady(sessionID)
 		},
@@ -1451,6 +1488,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	defer func() { _ = store.Close() }()
 
+	var deletionDrive deletionRecordingSource
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
 		credentials, syncErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
 		var syncer *gdrive.Syncer
@@ -1461,6 +1499,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
 			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
 		} else {
+			deletionDrive = syncer
 			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
 			drive.Set(orchestrator)
 			manager.SetSyncer(orchestrator)
@@ -1769,6 +1808,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	lightOff := hardware.Done()
+	if err := cleanupSpliceTempCopies(cfg.AudioDir); err != nil {
+		log.Printf("warning: failed to clean leftover splice copies: %v", err)
+		setPendingSpliceWarning(warningRegistry, "", "", err)
+	}
 
 	// Create health checker with actual component references
 	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
@@ -1782,6 +1825,19 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("http server error: %v", err)
+		}
+	}()
+
+	go func() {
+		count, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession, func(span storage.DeletedSpan, recoveryErr error) {
+			log.Printf("warning: pending segment splice: %v", recoveryErr)
+			setPendingSpliceWarning(warningRegistry, span.SessionID, span.AudioPath, recoveryErr)
+		})
+		if err != nil {
+			log.Printf("warning: failed to recover pending segment splices: %v", err)
+			setPendingSpliceWarning(warningRegistry, "", "", err)
+		} else if count > 0 {
+			log.Printf("recovered %d pending segment splices", count)
 		}
 	}()
 
