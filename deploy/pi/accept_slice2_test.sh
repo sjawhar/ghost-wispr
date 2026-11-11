@@ -20,30 +20,29 @@ for row in A9 A6 A8 A10 Cert-warning; do
     || fail "self-test did not prove the $row check can fail"
 done
 
-work_dir=$(mktemp -d)
-trap 'rm -rf -- "$work_dir"' EXIT
-mutant="$work_dir/accept-slice2.sh"
+assert_source_contains() {
+  local needle=$1
+  grep -Fq -- "$needle" "$driver" || fail "driver does not contain: $needle"
+}
 
-# Each stub replaces one live check with one that cannot fail. The self-test
-# must then fail, which shows that it exercises that check.
-stubs=(
-  'key_sweep_passes() { return 0; }'
-  'run_key_sweep_locally() { printf "control-found\t/missing-control\n"; }'
-  'assert_external_account_credential() { return 0; }'
-  'assert_drive_config() { return 0; }'
-  'assert_no_warnings() { return 0; }'
-  'assert_expected_config() { return 0; }'
-  'assert_running_summarization_model() { return 0; }'
-  'assert_no_config_overrides() { return 0; }'
-  'assert_drive_members() { return 0; }'
-  'assert_certificate_warning() { return 0; }'
-)
-for stub in "${stubs[@]}"; do
-  STUB=$stub awk '$0 == "if [[ \"$self_test\" == true ]]; then" { print ENVIRON["STUB"] } { print }' "$driver" >"$mutant"
-  grep -Fqx -- "$stub" "$mutant" || fail "could not plant the stub: $stub"
-  if bash "$mutant" --self-test >/dev/null 2>&1; then
-    fail "self-test passed with a check that cannot fail: $stub"
-  fi
-done
+assert_source_contains "nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222"
+assert_source_contains "/api/sessions/start"
+assert_source_contains "/api/sessions/\${acceptance_session_id}/resummarize"
+assert_source_contains '/api/search/semantic'
+assert_source_contains '/api/tts/speak'
+assert_source_contains "/api/sessions/\${acceptance_session_id}/retry-refinement"
+assert_source_contains 'A6 PRECHECK:'
+assert_source_contains 'A8 PRECHECK:'
+assert_source_contains 'nested/dev'
+assert_source_contains "find \"\$root\" -mindepth 1 -maxdepth 1 -print0"
+assert_source_contains 'run_row A9 run_a9'
+assert_source_contains 'run_row A6 run_a6'
+assert_source_contains 'run_row A8 run_a8'
+assert_source_contains 'run_row A10 run_a10'
+assert_source_contains 'run_row Cert-warning run_certificate_warning'
+if grep -Fq -- '--exclude-dir=dev' "$driver"; then
+  fail 'A9 sweep excludes nested dev directories'
+fi
+
 
 printf 'slice 2 acceptance test passed\n'

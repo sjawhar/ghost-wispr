@@ -378,14 +378,17 @@ func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
 // The current config decides whether a running syncer is usable. With sync off
 // or no folder, it passes nil so the collector holds every recording.
 func gcConfig(cfg *config.Config, drive sessionSyncer) gc.Config {
+	var holdReason error
 	if !cfg.GDriveSyncEnabled || cfg.GDriveFolderID == "" {
 		drive = nil
+		holdReason = gc.ErrDriveSyncOff
 	}
 	return gc.Config{
 		MaxAgeDays:     cfg.GCMaxAgeDays,
 		MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
 		SyncGated:      true,
 		AudioDir:       cfg.AudioDir,
+		HoldReason:     holdReason,
 		// A nil sessionSyncer is a nil DriveVerifier.
 		Drive: drive,
 	}
@@ -1700,6 +1703,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				} else {
 					ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
 				}
+			}
+		case "gemini":
+			credentials, credentialErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+			if credentialErr != nil {
+				ttsErr = fmt.Errorf("detect Google credentials: %w", credentialErr)
+			} else {
+				ttsProvider, ttsErr = tts.NewGeminiProvider(
+					cfg.GCPProject,
+					cfg.TTSModel,
+					cfg.TTSVoice,
+					tts.WithGeminiAuthCredentials(credentials),
+				)
 			}
 		default:
 			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)

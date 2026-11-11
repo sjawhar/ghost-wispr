@@ -20,8 +20,8 @@ gc_max_age_days: 0
 gc_max_audio_size_mb: 20000
 speaker_enabled: true
 speaker_device: Jabra
-tts_provider: google
-tts_voice: en-US-Chirp3-HD-Charon
+tts_provider: gemini
+tts_voice: Kore
 indicator_light: blink1
 power_button: true
 envoy_enabled: true

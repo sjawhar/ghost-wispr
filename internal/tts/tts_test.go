@@ -1,8 +1,10 @@
 package tts
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +24,25 @@ import (
 func fakeMP3() []byte {
 	// Minimal bytes to simulate non-empty audio payload.
 	return []byte{0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x01, 0x02}
+}
+
+func fakeWAV(pcm []byte) []byte {
+	wav := make([]byte, 44+len(pcm))
+	copy(wav[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(wav[4:8], uint32(36+len(pcm)))
+	copy(wav[8:12], "WAVE")
+	copy(wav[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(wav[16:20], 16)
+	binary.LittleEndian.PutUint16(wav[20:22], 1)
+	binary.LittleEndian.PutUint16(wav[22:24], 1)
+	binary.LittleEndian.PutUint32(wav[24:28], 24000)
+	binary.LittleEndian.PutUint32(wav[28:32], 48000)
+	binary.LittleEndian.PutUint16(wav[32:34], 2)
+	binary.LittleEndian.PutUint16(wav[34:36], 16)
+	copy(wav[36:40], "data")
+	binary.LittleEndian.PutUint32(wav[40:44], uint32(len(pcm)))
+	copy(wav[44:], pcm)
+	return wav
 }
 
 // ---------------------------------------------------------------------------
@@ -555,8 +576,109 @@ func TestGoogle_Name(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Gemini Vertex TTS
+// ---------------------------------------------------------------------------
+
+func TestGemini_Synthesize_SendsConfiguredVertexRequest(t *testing.T) {
+	const (
+		project = "theorem-agent-infra"
+		model   = "gemini-3.8-flash-tts"
+		voice   = "Kore"
+		token   = "configured-vertex-token"
+	)
+	pcm := []byte{0x01, 0x00, 0x02, 0x00}
+	wav := fakeWAV(pcm)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if got, want := r.URL.Path, "/v1/projects/"+project+"/locations/global/publishers/google/models/"+model+":generateContent"; got != want {
+			t.Errorf("path = %q, want %q", got, want)
+		}
+		if got, want := r.Header.Get("Authorization"), "Bearer "+token; got != want {
+			t.Errorf("Authorization = %q, want %q", got, want)
+		}
+
+		var body struct {
+			Contents []struct {
+				Role  string `json:"role"`
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"contents"`
+			GenerationConfig struct {
+				ResponseModalities []string `json:"responseModalities"`
+				SpeechConfig       struct {
+					VoiceConfig struct {
+						Voice string `json:"voice"`
+					} `json:"voiceConfig"`
+				} `json:"speechConfig"`
+			} `json:"generationConfig"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		} else {
+			if len(body.Contents) != 1 || body.Contents[0].Role != "user" || len(body.Contents[0].Parts) != 1 || body.Contents[0].Parts[0].Text != "Speak this." {
+				t.Errorf("contents = %#v, want the requested text", body.Contents)
+			}
+			if len(body.GenerationConfig.ResponseModalities) != 1 || body.GenerationConfig.ResponseModalities[0] != "AUDIO" {
+				t.Errorf("responseModalities = %#v, want [AUDIO]", body.GenerationConfig.ResponseModalities)
+			}
+			if got := body.GenerationConfig.SpeechConfig.VoiceConfig.Voice; got != voice {
+				t.Errorf("voice = %q, want %q", got, voice)
+			}
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{
+					"parts": []any{map[string]any{
+						"inlineData": map[string]string{
+							"mimeType": "audio/wav",
+							"data":     base64.StdEncoding.EncodeToString(wav),
+						},
+					}},
+				},
+			}},
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	credentialPath := googleauthtest.X509CredentialFile(t, token)
+	credentials, err := googleauth.Detect(context.Background(), credentialPath, googleauth.CloudPlatformScope)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	provider, err := NewGeminiProvider(project, model, voice, WithGeminiAuthCredentials(credentials), WithGeminiBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("NewGeminiProvider: %v", err)
+	}
+
+	response, err := provider.Synthesize(context.Background(), SpeechRequest{Text: "Speak this."})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if !bytes.Equal(response.Audio, pcm) {
+		t.Errorf("audio = %v, want %v", response.Audio, pcm)
+	}
+	if got, want := response.Format, (audio.AudioFormat{SampleRate: 24000, Channels: 1, Encoding: audio.EncodingPCM16}); got != want {
+		t.Errorf("format = %#v, want %#v", got, want)
+	}
+}
+
+func TestDecodeGeminiWAVRejectsNonPCM16(t *testing.T) {
+	wav := fakeWAV([]byte{0x01, 0x00})
+	binary.LittleEndian.PutUint16(wav[20:22], 3)
+
+	if _, _, err := decodeGeminiWAV(wav); err == nil || !strings.Contains(err.Error(), "16-bit PCM") {
+		t.Fatalf("decodeGeminiWAV error = %v, want unsupported audio encoding", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Interface compliance
 // ---------------------------------------------------------------------------
 
 var _ Provider = (*ElevenLabsProvider)(nil)
 var _ Provider = (*GoogleProvider)(nil)
+var _ Provider = (*GeminiProvider)(nil)

@@ -13,7 +13,7 @@ repo_root="$(cd -- "$script_dir/../.." && pwd)"
 readonly repo_root
 readonly TAILSCALE_HOSTNAME=ghost-wispr.tail12ec1c.ts.net.
 readonly CONFIG_TEMPLATE="$repo_root/deploy/pi/files/ghost-wispr.yaml"
-readonly EMBEDDING_LOCATION_SETTING=GHOST_WISPR_EMBEDDING_LOCATION=us-central1
+readonly EMBEDDING_LOCATION_SETTING=GHOST_WISPR_EMBEDDING_LOCATION=global
 
 fail() {
   printf 'ghost-wispr provision: %s\n' "$*" >&2

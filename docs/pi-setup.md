@@ -225,13 +225,13 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
 ```
 
 That YAML names Deepgram `nova-3` for live and batch transcription, Gemini 4 Carbon for
-summaries, Gemini Embedding 2 for search, and Cloud Text-to-Speech Chirp 3: HD voice
-`en-US-Chirp3-HD-Charon`. Gemini calls use Vertex AI in `theorem-agent-infra`, location
-`global`; embeddings use `us-central1` through `GHOST_WISPR_EMBEDDING_LOCATION` in
+summaries, Gemini Embedding 2 for search, and the configured Google voice for speech. Gemini
+calls use Vertex AI in `theorem-agent-infra`, location `global`; embeddings use the documented
+global endpoint through `GHOST_WISPR_EMBEDDING_LOCATION` in
 `/opt/ghost-wispr/.env`. Nothing sets `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection
 keeps every session (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
-(`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the
-template ships GC off so it never runs before sync is on.
+(`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
+ships GC off so it never runs before sync is on.
 
 ## Restrict OpenSSH to loopback
 

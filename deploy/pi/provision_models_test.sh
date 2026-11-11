@@ -63,8 +63,8 @@ for line in \
   '  model: nova-3' \
   '  model: gemini/gemini-4-carbon' \
   'embedding_model: gemini/gemini-embedding-2' \
-  'tts_provider: google' \
-  'tts_voice: en-US-Chirp3-HD-Charon' \
+  'tts_provider: gemini' \
+  'tts_voice: Kore' \
   'genai_backend: vertex' \
   'gcp_project: theorem-agent-infra' \
   'gcp_location: global' \
@@ -97,8 +97,8 @@ for line in \
   '  model: nova-3' \
   '  model: gemini/gemini-4-carbon' \
   'embedding_model: gemini/gemini-embedding-2' \
-  'tts_provider: google' \
-  'tts_voice: en-US-Chirp3-HD-Charon' \
+  'tts_provider: gemini' \
+  'tts_voice: Kore' \
   'genai_backend: vertex' \
   'gcp_project: theorem-agent-infra' \
   'gcp_location: global' \
@@ -191,7 +191,7 @@ provisioner_function render_models_env "$deployed_env" >"$models_env" \
   || fail 'the .env renderer rejected a deployed .env'
 assert_line 'GHOST_WISPR_ADDR=127.0.0.1:8080' "$models_env"
 assert_line 'GHOST_WISPR_DEEPGRAM_API_KEY=test-key' "$models_env"
-assert_line 'GHOST_WISPR_EMBEDDING_LOCATION=us-central1' "$models_env"
+assert_line 'GHOST_WISPR_EMBEDDING_LOCATION=global' "$models_env"
 assert_count '^GHOST_WISPR_EMBEDDING_LOCATION=' 1 "$models_env"
 if provisioner_function render_models_env "$work_dir/missing.env" >/dev/null 2>&1; then
   fail 'the .env renderer succeeded without a deployed .env'

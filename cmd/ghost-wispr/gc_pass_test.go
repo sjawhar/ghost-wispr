@@ -170,8 +170,10 @@ func TestGCPassHoldsAudioWhenConfigAPIStopsDriveSync(t *testing.T) {
 					t.Errorf("GC after %s removed %s: %v", tc.stop, path, err)
 				}
 			}
-			if health.Hold() == nil {
+			if hold := health.Hold(); hold == nil {
 				t.Errorf("GC after %s held every recording but recorded no hold", tc.stop)
+			} else if hold.Reason != "Google Drive sync is off, so recordings are kept on the unit" {
+				t.Errorf("GC after %s hold reason = %q", tc.stop, hold.Reason)
 			}
 
 			patch(tc.resume)

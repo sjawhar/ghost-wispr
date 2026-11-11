@@ -48,12 +48,14 @@ type Config struct {
 	MaxAudioSizeMB int
 	SyncGated      bool
 	AudioDir       string
+	// HoldReason explains why a nil Drive intentionally holds a pass. When
+	// unset, a nil Drive means its configured syncer did not start.
+	HoldReason error
 	// Drive, when GC is sync-gated, confirms that Drive has the session's
 	// folder and every local recording under its recording name with its
 	// matching content. A folder in the trash (which Drive empties after 30
 	// days), a missing recording, or a mismatched checksum leaves the device
-	// with the only lasting copy. Nil when Drive sync is on but not running:
-	// then GC deletes nothing and removes no audio.
+	// with the only lasting copy.
 	Drive DriveVerifier
 }
 
@@ -74,10 +76,16 @@ var (
 	errCannotReadRecording = errors.New("cannot read local recording to verify it on Drive")
 )
 
+const driveSyncOffReason = "Google Drive sync is off, so recordings are kept on the unit"
+
 // The reasons a sync-gated GC pass holds back, deleting and removing nothing
 // more (Held): the app reports them where the user sees its health, so a
 // broken sync is noticed before the disk fills.
 var (
+	// ErrDriveSyncOff: no Drive copy can be verified while sync is disabled
+	// or no shared-drive folder is configured, so GC keeps local recordings.
+	//nolint:staticcheck // Google Drive is a proper name shown to the operator.
+	ErrDriveSyncOff = errors.New(driveSyncOffReason)
 	// ErrDriveNotRunning: Drive sync is on but no syncer runs (it failed to
 	// start), so nothing can confirm a session's durable copy.
 	ErrDriveNotRunning = errors.New("sync to Google Drive is on but not running, so nothing can confirm a session's durable copy")
@@ -132,8 +140,10 @@ func (c *Collector) Run() ([]string, error) {
 	var deleted []string
 	c.held = nil
 	if c.config.SyncGated && c.config.Drive == nil {
-		c.held = ErrDriveNotRunning
-		c.logger.Warn("gc deletes no session and removes no audio", "operation", "run", "error", c.held)
+		c.held = c.config.HoldReason
+		if c.held == nil {
+			c.held = ErrDriveNotRunning
+		}
 	} else {
 		var err error
 		if deleted, err = c.applyAgePolicy(); err != nil {

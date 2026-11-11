@@ -81,6 +81,7 @@ type Config struct {
 	IndicatorLight                string             `yaml:"indicator_light"`
 	PowerButton                   bool               `yaml:"power_button"`
 	TTSProvider                   string             `yaml:"tts_provider"`
+	TTSModel                      string             `yaml:"tts_model"`
 	TTSVoice                      string             `yaml:"tts_voice"`
 	TTSMaxLength                  int                `yaml:"tts_max_length"`
 
@@ -350,6 +351,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "TTS_PROVIDER"); v != "" {
 		cfg.TTSProvider = strings.ToLower(strings.TrimSpace(v))
 	}
+	if v := os.Getenv(EnvPrefix + "TTS_MODEL"); v != "" {
+		cfg.TTSModel = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "TTS_VOICE"); v != "" {
 		cfg.TTSVoice = strings.TrimSpace(v)
 	}
@@ -543,11 +547,14 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 
 	if cfg.TTSProvider != "" {
 		switch cfg.TTSProvider {
-		case "elevenlabs", "google":
+		case "elevenlabs", "google", "gemini":
 		default:
-			warnings = append(warnings, fmt.Sprintf("Invalid tts_provider %q — supported providers are elevenlabs, google.", cfg.TTSProvider))
+			warnings = append(warnings, fmt.Sprintf("Invalid tts_provider %q — supported providers are elevenlabs, gemini, google.", cfg.TTSProvider))
 		}
-		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" {
+		if cfg.TTSProvider == "gemini" && strings.TrimSpace(cfg.GCPProject) == "" {
+			warnings = append(warnings, "Gemini TTS provider requires gcp_project for Vertex AI.")
+		}
+		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" && cfg.TTSProvider != "gemini" {
 			warnings = append(warnings, "TTS provider configured but API key not set — set "+EnvPrefix+"TTS_API_KEY.")
 		}
 		if cfg.TTSMaxLength <= 0 {
