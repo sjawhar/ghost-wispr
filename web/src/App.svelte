@@ -11,16 +11,20 @@
   import { filterVisibleWarnings } from './lib/warnings'
   import {
     appState,
-    setDates,
+    applySegmentDeletion,
+    beginSessionDetailRequest,
+    removeSession,
     setCapturing,
+    setDates,
+    setLiveSegmentsForSession,
     setPaused,
     setPresets,
-    setSessionDetail,
+    setSessionDetailIfCurrent,
     setSessionsForDate,
     setWarnings,
-    removeSession,
   } from './lib/state.svelte'
   import {
+    RequestError,
     endSession,
     fetchDates,
     fetchPresets,
@@ -52,13 +56,18 @@
     setSessionsForDate(date, sessions)
   }
 
+  async function fetchAndStoreSession(id: string): Promise<void> {
+    const requestVersion = beginSessionDetailRequest(id)
+    const detail = await fetchSession(id)
+    setSessionDetailIfCurrent(detail, requestVersion)
+  }
+
   async function loadSession(id: string): Promise<void> {
     if (appState.sessionDetails.has(id)) {
       return
     }
 
-    const detail = await fetchSession(id)
-    setSessionDetail(detail)
+    await fetchAndStoreSession(id)
   }
 
   async function togglePause(): Promise<void> {
@@ -99,19 +108,33 @@
     removeSession(id)
   }
 
-  async function handleMerge(sessionIds: string[]): Promise<void> {
-    await mergeSessions(sessionIds)
-    // Refresh sessions for affected dates
-    const affectedDates = new Set<string>()
+  async function refreshSessionList(sessionIds: readonly string[]): Promise<void> {
     for (const [date, sessions] of appState.sessionsByDate) {
-      if (sessions.some((s) => sessionIds.includes(s.id))) {
-        affectedDates.add(date)
+      if (sessions.some((session) => sessionIds.includes(session.id))) {
+        setSessionsForDate(date, await fetchSessions(date))
       }
     }
-    for (const date of affectedDates) {
-      const sessions = await fetchSessions(date)
-      setSessionsForDate(date, sessions)
+  }
+
+  async function handleRefreshSession(id: string): Promise<void> {
+    await refreshSessionList([id])
+    try {
+      await fetchAndStoreSession(id)
+    } catch (error) {
+      if (!(error instanceof RequestError && error.status === 404)) {
+        throw error
+      }
+      removeSession(id)
     }
+  }
+
+  function handleSegmentDeleted(sessionID: string, segmentID: number): void {
+    applySegmentDeletion(sessionID, segmentID)
+  }
+
+  async function handleMerge(sessionIds: string[]): Promise<void> {
+    await mergeSessions(sessionIds)
+    await refreshSessionList(sessionIds)
   }
 
   onMount(() => {
@@ -139,19 +162,26 @@
         if (status.active_session_id) {
           appState.activeSessionId = status.active_session_id
           appState.activeSessionStartedAt = Date.parse(status.active_session_started_at)
+          setLiveSegmentsForSession(status.active_session_id, [])
 
           try {
+            const requestVersion = beginSessionDetailRequest(status.active_session_id)
             const detail = await fetchSession(status.active_session_id)
-            setSessionDetail(detail)
-            appState.liveSegments = detail.segments.map((seg) => ({
-              type: 'live_transcript' as const,
-              version: 1,
-              timestamp: seg.timestamp,
-              speaker: seg.speaker,
-              text: seg.text,
-              start_time: seg.start_time,
-              end_time: seg.end_time,
-            }))
+            if (setSessionDetailIfCurrent(detail, requestVersion)) {
+              setLiveSegmentsForSession(
+                status.active_session_id,
+                detail.segments.map((seg) => ({
+                  type: 'live_transcript' as const,
+                  version: 1,
+                  timestamp: seg.timestamp,
+                  session_id: status.active_session_id,
+                  speaker: seg.speaker,
+                  text: seg.text,
+                  start_time: seg.start_time,
+                  end_time: seg.end_time,
+                })),
+              )
+            }
           } catch {
             // Session may have ended between status and detail fetch — that's OK
           }
@@ -267,6 +297,8 @@
         onResummarize={handleResummarize}
         onDelete={handleDeleteSession}
         onMerge={handleMerge}
+        onRefreshSession={handleRefreshSession}
+        onSegmentDeleted={handleSegmentDeleted}
       />
     </section>
   {/if}

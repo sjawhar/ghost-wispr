@@ -29,6 +29,9 @@
     onLoadDetail,
     onResummarize,
     onDelete,
+    onRefreshSession,
+    onSegmentDeleted,
+    onSegmentNotFound = async () => false,
     selected = false,
     onToggleSelect = () => {},
   }: {
@@ -41,6 +44,9 @@
     onLoadDetail: (id: string) => Promise<void>
     onResummarize: (sessionId: string, preset: string) => Promise<void>
     onDelete: (id: string) => Promise<void>
+    onRefreshSession: (id: string) => Promise<void>
+    onSegmentDeleted: (sessionID: string, segmentID: number) => void
+    onSegmentNotFound?: (sessionID: string, segmentID: number) => Promise<boolean>
     onToggleSelect?: () => void
   } = $props()
 
@@ -406,7 +412,16 @@
   {#if expanded}
     <div class="session-details">
       {#if detail}
-        <AudioPlayer sessionId={session.id} segments={detail.segments} {session} />
+        <AudioPlayer
+          sessionId={session.id}
+          segments={detail.segments}
+          {session}
+          onDeleted={async (segmentID) => {
+            onSegmentDeleted(session.id, segmentID)
+            await onRefreshSession(session.id)
+          }}
+          onNotFound={(segmentID) => onSegmentNotFound(session.id, segmentID)}
+        />
 
         {#if (session.summary_status === SummaryStatus.Completed || session.summary_status === SummaryStatus.Failed) && session.summary}
           <div class="summary-section">

@@ -1,4 +1,4 @@
-import { ComponentStatus as ComponentStatusValue } from './types'
+import { ComponentStatus as ComponentStatusValue, RefinementStatus, SummaryStatus } from './types'
 import type {
   ComponentStatusEvent,
   LiveTranscriptEvent,
@@ -23,6 +23,7 @@ type AppState = {
   // microphone is back.
   capturing: boolean
   liveSegments: LiveTranscriptEvent[]
+  liveSegmentsSessionId: string
   sessionsByDate: Map<string, SessionSummary[]>
   sessionDetails: Map<string, SessionDetailResponse>
   dates: string[]
@@ -41,6 +42,7 @@ export const appState = $state<AppState>({
   paused: false,
   capturing: false,
   liveSegments: [],
+  liveSegmentsSessionId: '',
   sessionsByDate: new Map(),
   sessionDetails: new Map(),
   dates: [],
@@ -53,6 +55,9 @@ export const appState = $state<AppState>({
   interimSpeaker: -1,
   componentStatuses: {},
 })
+
+const detailRequestVersions = new Map<string, number>()
+const summaryDeletionTimes = new Map<string, number>()
 
 export function getTodaysSessions(): SessionSummary[] {
   const today = new Date().toISOString().slice(0, 10)
@@ -95,11 +100,95 @@ export function setSessionDetail(detail: SessionDetailResponse): void {
   appState.sessionDetails = next
 }
 
+export function beginSessionDetailRequest(sessionID: string): number {
+  return detailRequestVersions.get(sessionID) ?? 0
+}
+
+export function setSessionDetailIfCurrent(
+  detail: SessionDetailResponse,
+  requestVersion: number,
+): boolean {
+  if ((detailRequestVersions.get(detail.session.id) ?? 0) !== requestVersion) {
+    return false
+  }
+  setSessionDetail(detail)
+  return true
+}
+
+function invalidateSessionDetailRequest(sessionID: string): void {
+  detailRequestVersions.set(sessionID, (detailRequestVersions.get(sessionID) ?? 0) + 1)
+}
+
+export function setLiveSegmentsForSession(
+  sessionID: string,
+  segments: LiveTranscriptEvent[],
+): void {
+  appState.liveSegmentsSessionId = sessionID
+  appState.liveSegments = segments
+}
+
+// What the server holds once a segment is deleted: it cleared every field that
+// can quote the segment and queued a new refinement and summary. Applied before
+// the session is fetched again, so the deleted words leave the screen at once.
+function withoutDeletedText(session: SessionSummary): SessionSummary {
+  return {
+    ...session,
+    title: '',
+    summary: '',
+    summary_status: SummaryStatus.Pending,
+    summary_error: '',
+    refinement_status: RefinementStatus.Pending,
+    refined_transcript: '',
+    canonical_transcript: '',
+    transcript_source: 'streaming',
+  }
+}
+
+export function applySegmentDeletion(sessionID: string, segmentID: number): void {
+  invalidateSessionDetailRequest(sessionID)
+  summaryDeletionTimes.set(sessionID, Date.now())
+
+  if (appState.liveSegmentsSessionId === sessionID) {
+    appState.liveSegmentsSessionId = ''
+    appState.liveSegments = []
+  }
+
+  const nextByDate = new Map(appState.sessionsByDate)
+  for (const [date, sessions] of nextByDate) {
+    if (sessions.some((session) => session.id === sessionID)) {
+      nextByDate.set(
+        date,
+        sessions.map((session) =>
+          session.id === sessionID ? withoutDeletedText(session) : session,
+        ),
+      )
+    }
+  }
+  appState.sessionsByDate = nextByDate
+
+  const detail = appState.sessionDetails.get(sessionID)
+  if (!detail) {
+    return
+  }
+  const next = new Map(appState.sessionDetails)
+  next.set(sessionID, {
+    session: withoutDeletedText(detail.session),
+    segments: detail.segments.filter((segment) => segment.id !== segmentID),
+  })
+  appState.sessionDetails = next
+}
+
 export function setActiveAudioSession(sessionId: string): void {
   appState.activeAudioSessionId = sessionId
 }
 
 export function appendLiveSegment(event: LiveTranscriptEvent): void {
+  if (appState.liveSegmentsSessionId !== event.session_id) {
+    if (appState.activeSessionId && appState.activeSessionId !== event.session_id) {
+      return
+    }
+    setLiveSegmentsForSession(event.session_id, [])
+  }
   appState.liveSegments.push(event)
   if (appState.liveSegments.length > 400) {
     appState.liveSegments = appState.liveSegments.slice(-400)
@@ -107,6 +196,11 @@ export function appendLiveSegment(event: LiveTranscriptEvent): void {
 }
 
 export function applySummaryUpdate(event: SummaryReadyEvent): void {
+  const deletedAt = summaryDeletionTimes.get(event.session_id)
+  if (deletedAt !== undefined && Date.parse(event.timestamp) <= deletedAt) {
+    return
+  }
+
   const nextByDate = new Map(appState.sessionsByDate)
 
   for (const date of appState.dates) {
@@ -160,15 +254,17 @@ export function applyEvent(event: WebSocketEvent): void {
     case 'session_started':
       appState.activeSessionId = event.session_id
       appState.activeSessionStartedAt = Date.parse(event.timestamp)
-      appState.liveSegments = []
+      setLiveSegmentsForSession(event.session_id, [])
       appState.interimText = ''
       appState.interimSpeaker = -1
       return
     case 'session_ended':
-      appState.activeSessionId = ''
-      appState.activeSessionStartedAt = 0
-      appState.interimText = ''
-      appState.interimSpeaker = -1
+      if (appState.activeSessionId === event.session_id) {
+        appState.activeSessionId = ''
+        appState.activeSessionStartedAt = 0
+        appState.interimText = ''
+        appState.interimSpeaker = -1
+      }
       return
     case 'summary_ready':
       applySummaryUpdate(event)
@@ -211,6 +307,9 @@ export function resetState(): void {
   appState.paused = false
   appState.capturing = false
   appState.liveSegments = []
+  appState.liveSegmentsSessionId = ''
+  detailRequestVersions.clear()
+  summaryDeletionTimes.clear()
   appState.sessionsByDate = new Map()
   appState.sessionDetails = new Map()
   appState.dates = []
@@ -225,6 +324,11 @@ export function resetState(): void {
 }
 
 export function removeSession(sessionId: string): void {
+  invalidateSessionDetailRequest(sessionId)
+  if (appState.liveSegmentsSessionId === sessionId) {
+    appState.liveSegments = []
+    appState.liveSegmentsSessionId = ''
+  }
   const nextByDate = new Map(appState.sessionsByDate)
   for (const [date, sessions] of nextByDate) {
     const filtered = sessions.filter((s) => s.id !== sessionId)

@@ -67,6 +67,7 @@ export interface BaseEvent {
 
 export interface LiveTranscriptEvent extends BaseEvent {
   type: 'live_transcript'
+  session_id: string
   speaker: number
   text: string
   start_time: number
@@ -75,6 +76,7 @@ export interface LiveTranscriptEvent extends BaseEvent {
 
 export interface LiveTranscriptInterimEvent extends BaseEvent {
   type: 'live_transcript_interim'
+  session_id: string
   speaker: number
   text: string
   start_time: number
@@ -128,6 +130,8 @@ export type WebSocketEvent =
   | ComponentStatusEvent
 
 export interface Segment {
+  // Set only after the recorder persists the segment. Live segments cannot be deleted.
+  id?: number
   speaker: number
   text: string
   start_time: number

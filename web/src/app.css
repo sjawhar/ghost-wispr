@@ -642,6 +642,43 @@ h1 {
   gap: 0.1rem;
 }
 
+.transcript-line {
+  display: flex;
+  align-items: stretch;
+  gap: 0.25rem;
+}
+
+.transcript-line .line {
+  flex: 1;
+}
+
+.segment-delete-btn {
+  border: 1px solid var(--danger);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.7rem;
+  padding: 0.2rem 0.4rem;
+}
+
+.segment-delete-btn:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
+.segment-delete-btn:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.segment-delete-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+  margin: 0;
+}
+
 .line {
   border: 1px solid transparent;
   background: transparent;
