@@ -1229,6 +1229,13 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if unverified > 0 {
 			warnings = append(slices.Clip(warnings), unverifiedWarning(unverified))
 		}
+		unitOnly := 0
+		if controls.UnitOnlySessions != nil {
+			unitOnly = controls.UnitOnlySessions()
+		}
+		if unitOnly > 0 {
+			warnings = append(slices.Clip(warnings), unitOnlyWarning(unitOnly))
+		}
 		if warnings == nil {
 			warnings = []string{}
 		}
@@ -1250,6 +1257,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"kept_raw_bytes":            kept.Bytes,
 			"gc_hold":                   gcHold,
 			"unverified_sessions":       unverified,
+			"unit_only_sessions":        unitOnly,
 			"active_session_id":         activeSessionID,
 			"active_session_started_at": activeSessionStartedAt,
 		})

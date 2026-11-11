@@ -1826,6 +1826,18 @@ func (s *SQLiteStore) CountUnverifiedSessions() (int, error) {
 	return n, nil
 }
 
+// CountUnitOnlySessions returns how many sessions are kept on this unit
+// only: REMOTE_DELETED (their Drive folder is in the trash, gone, or cannot
+// be read) with their audio still named here, for the status the app
+// reports. No GC path deletes such a session or removes its audio.
+func (s *SQLiteStore) CountUnitOnlySessions() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sessions WHERE sync_state = ? AND audio_path != ''`, SyncStateRemoteDeleted).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count sessions kept on this unit only: %w", err)
+	}
+	return n, nil
+}
+
 // Recordings lists, oldest first, every session that names audio, and whether
 // disk pressure may remove its recording (see removableCondition).
 func (s *SQLiteStore) Recordings() ([]SessionRecording, error) {

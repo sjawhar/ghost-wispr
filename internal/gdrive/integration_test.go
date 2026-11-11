@@ -100,8 +100,8 @@ func TestRealDriveTellsTheRootFromALostOne(t *testing.T) {
 	}
 
 	root := syncer(folderID)
-	if err := root.rootReadable(ctx); err != nil {
-		t.Errorf("root %s: %v, want it to read", folderID, err)
+	if shared, err := root.rootReadable(ctx); err != nil || !shared {
+		t.Errorf("root %s: shared drive %v, %v; want a shared drive's root that reads", folderID, shared, err)
 	}
 	if on, err := root.FolderOnDrive(ctx, madeUp); on || err != nil {
 		t.Errorf("session folder %s, which root %s does not have: FolderOnDrive = %v, %v; want false, no error (gone)", madeUp, folderID, on, err)
@@ -144,7 +144,7 @@ func TestRealDriveTellsTheRootFromALostOne(t *testing.T) {
 	})
 
 	lost := syncer(madeUp)
-	if err := lost.rootReadable(ctx); err == nil {
+	if _, err := lost.rootReadable(ctx); err == nil {
 		t.Errorf("root %s, which Drive does not have: it reads", madeUp)
 	}
 	if on, err := lost.FolderOnDrive(ctx, madeUp); on || err == nil || !strings.Contains(err.Error(), "access to Drive may be lost") {

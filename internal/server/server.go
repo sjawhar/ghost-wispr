@@ -77,6 +77,15 @@ func unverifiedWarning(n int) string {
 	return fmt.Sprintf("%d older sessions are kept until their Drive documents are re-checked, each the next time it is synced (when its title or summary changes).", n)
 }
 
+// unitOnlyWarning tells the user in GET /api/status how many sessions are
+// kept on this unit only, their Drive folder gone or unreadable.
+func unitOnlyWarning(n int) string {
+	if n == 1 {
+		return "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back"
+	}
+	return fmt.Sprintf("%d sessions are kept on this unit only, because their Drive folder is gone or unreadable; retry sync once the folder is back", n)
+}
+
 type ControlHooks struct {
 	// Pause stops capture. A non-nil error means capture stopped but the
 	// stopped state was not persisted.
@@ -93,7 +102,10 @@ type ControlHooks struct {
 	GCHold func() *GCHold
 	// UnverifiedSessions is how many sessions GC keeps until a sync verifies
 	// their documents on Drive.
-	UnverifiedSessions      func() int
+	UnverifiedSessions func() int
+	// UnitOnlySessions is how many sessions are kept on this unit only:
+	// REMOTE_DELETED, with their audio still here.
+	UnitOnlySessions        func() int
 	ActiveSession           func() (string, time.Time)
 	Presets                 func() map[string]config.Preset
 	Resummarize             func(ctx context.Context, sessionID, preset string) error

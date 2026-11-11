@@ -93,6 +93,12 @@ type wireDrive struct {
 	// driveUnavailable makes Drive answer 503 to every list of a shared
 	// drive's files (corpora "drive").
 	driveUnavailable bool
+	// unscopedListsMiss makes every list without corpora answer 200 with no
+	// files, while the shared drive's own list (corpora "drive") still holds
+	// the files the app made: Drive not keeping what its documentation says
+	// of a list without corpora (the files the user has accessed, shared
+	// drives' too), which was not measured with files there.
+	unscopedListsMiss bool
 	// onGet, when set, runs as Drive is asked for a file (Files.Get), with
 	// its id, while the server holds its lock.
 	onGet func(id string)
@@ -102,7 +108,13 @@ type wireDrive struct {
 	onList func(folder string)
 }
 
-var parentQuery = regexp.MustCompile(`'([^']+)' in parents`)
+// parentQuery reads the parent a list asks for: the query starts with it,
+// quoted, with a quote or a backslash in it escaped by a backslash, as Drive
+// reads a query.
+var parentQuery = regexp.MustCompile(`^'((?:[^'\\]|\\.)*)' in parents`)
+
+// unquote undoes the escapes parentQuery allows.
+var unquote = strings.NewReplacer(`\'`, `'`, `\\`, `\`)
 
 // newWireDrive starts the server and returns it with a Syncer whose root
 // folder is "root", a folder in My Drive.
@@ -276,10 +288,14 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/drive/v3/files":
 		m := parentQuery.FindStringSubmatch(r.URL.Query().Get("q"))
 		if m == nil {
-			d.t.Errorf("Drive: list without a parent: %q", r.URL.Query().Get("q"))
-			http.Error(w, "bad query", http.StatusBadRequest)
+			if !strings.Contains(r.URL.Query().Get("q"), " in parents") {
+				d.t.Errorf("Drive: list without a parent: %q", r.URL.Query().Get("q"))
+			}
+			// As Drive answers a query it cannot read.
+			http.Error(w, `{"error":{"code":400,"message":"Invalid Value"}}`, http.StatusBadRequest)
 			return
 		}
+		m[1] = unquote.Replace(m[1])
 		if corpora := r.URL.Query().Get("corpora"); corpora != "" {
 			driveID := r.URL.Query().Get("driveId")
 			if corpora != "drive" || driveID == "" {
@@ -295,6 +311,10 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 				sharedDriveNotFound(w, driveID)
 				return
 			}
+		}
+		if r.URL.Query().Get("corpora") == "" && d.unscopedListsMiss {
+			_ = json.NewEncoder(w).Encode(&drive.FileList{})
+			return
 		}
 		request := wireListRequest{Parent: m[1], PageToken: r.URL.Query().Get("pageToken")}
 		d.listRequests = append(d.listRequests, request)

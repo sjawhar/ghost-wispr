@@ -66,6 +66,27 @@ func (h *gcHealth) countUnverified(store gcStore) {
 	h.unverified = n
 }
 
+// unitOnlyCounter returns how many sessions store keeps on this unit only
+// (REMOTE_DELETED, with their audio still here), counted again at each call,
+// so GET /api/status shows a session marked by a sync or a GC pass at once,
+// and stops showing it once a retry syncs it. A count that fails gives the
+// last one.
+func unitOnlyCounter(store interface{ CountUnitOnlySessions() (int, error) }) func() int {
+	var mu sync.Mutex
+	last := 0
+	return func() int {
+		n, err := store.CountUnitOnlySessions()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			slog.Warn("could not count the sessions kept on this unit only", "operation", "status", "error", err)
+			return last
+		}
+		last = n
+		return n
+	}
+}
+
 // record keeps why a pass at now held back (held, nil when it did not), with
 // the disk use of dir's filesystem then. A hold that goes on keeps the time
 // it began.

@@ -906,6 +906,7 @@ func main() {
 		},
 		GCHold:             gcHealthState.Hold,
 		UnverifiedSessions: gcHealthState.Unverified,
+		UnitOnlySessions:   unitOnlyCounter(store),
 		KeptRawRecordings: func() server.KeptRawRecordings {
 			if kept := keptRaw.Load(); kept != nil {
 				return *kept

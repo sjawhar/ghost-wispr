@@ -220,7 +220,7 @@ func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
 		if !IsRemoteDeletedError(err) {
 			return fmt.Errorf("get folder %s: %w", folderID, err)
 		}
-		if rootErr := s.rootReadable(ctx); rootErr != nil {
+		if _, rootErr := s.rootReadable(ctx); rootErr != nil {
 			return fmt.Errorf("get folder %s: not found, and the folder the app syncs into (%s) cannot be read either, so access to Drive may be lost: %v", folderID, s.folderID, rootErr)
 		}
 		return fmt.Errorf("get folder %s: %w", folderID, err)
@@ -238,10 +238,11 @@ func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
 }
 
 // rootReadable returns nil when Drive answers for the folder the app syncs
-// into, and why not otherwise. files.get reads a folder in My Drive the app
-// can read (under the drive.file scope, one it created). It answers 404 for a
-// shared drive's root, as for an id Drive does not have, since the app did
-// not create the root. A list of the shared drive's files (corpora "drive")
+// into, with whether it is a shared drive's root, and why not otherwise.
+// files.get reads a folder in My Drive the app can read (under the drive.file
+// scope, one it created). It answers 404 for a shared drive's root, as for an
+// id Drive does not have, since the app did not create the root. A list of
+// the shared drive's files (corpora "drive")
 // tells the two apart: it answers for a shared drive the app is a member of,
 // and 404 "Shared drive not found" for an id Drive does not have. A list
 // without corpora cannot: it answers 200, with no files, for an id Drive does
@@ -251,19 +252,19 @@ func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
 // was not measured. A shared drive reads through the app's membership, not
 // through the files the app made there: another account made a member would
 // read the drive and get 404 for the folders the first one made.
-func (s *Syncer) rootReadable(ctx context.Context) error {
-	_, err := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do()
+func (s *Syncer) rootReadable(ctx context.Context) (sharedDrive bool, err error) {
+	_, err = s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do()
 	if err == nil || !IsRemoteDeletedError(err) {
-		return err
+		return false, err
 	}
 	query := fmt.Sprintf("'%s' in parents and trashed = false", strings.ReplaceAll(s.folderID, "'", `\'`))
 	_, listErr := s.service.Files.List().Corpora("drive").DriveId(s.folderID).Q(query).PageSize(1).
 		SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
 		Fields("files(id)").Context(ctx).Do()
 	if listErr != nil {
-		return fmt.Errorf("%v; nor does Drive list it as a shared drive the app is a member of: %v", err, listErr)
+		return false, fmt.Errorf("%v; nor does Drive list it as a shared drive the app is a member of: %v", err, listErr)
 	}
-	return nil
+	return true, nil
 }
 
 // errRootTrashed is the error for a session folder in the trash with a folder

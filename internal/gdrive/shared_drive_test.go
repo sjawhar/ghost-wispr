@@ -76,6 +76,53 @@ func TestRestoreFromDriveListsSharedDriveFolders(t *testing.T) {
 	}
 }
 
+// A restore lists a shared drive's session folders without corpora, a list
+// Drive documents as holding the folders the app made there (not measured
+// with folders there). Should it leave them out, a restore that lists none
+// while the drive's own list (corpora "drive") holds one fails, instead of
+// reporting an empty Drive. An empty drive still restores none, with no
+// error.
+func TestRestoreFailsWhenTheListWithoutCorporaMissesTheDrivesFolders(t *testing.T) {
+	wire, syncer := newSharedDriveWire(t)
+	wire.unscopedListsMiss = true
+	importNone := func(RestoredSession) error { return nil }
+
+	result, err := syncer.RestoreFromDrive(context.Background(), importNone)
+	if err != nil || result.Restored != 0 || len(result.Errors) != 0 {
+		t.Errorf("restore from an empty shared drive: %+v, %v; want none restored and no error", result, err)
+	}
+	folder := wire.add(sharedDriveID, "2026-11-10-standup", "application/vnd.google-apps.folder", nil, nil)
+	result, err = syncer.RestoreFromDrive(context.Background(), importNone)
+	if err == nil || !strings.Contains(err.Error(), folder) {
+		t.Errorf("restore with folder %s left out of the list without corpora: %+v, %v; want an error naming it", folder, result, err)
+	}
+}
+
+// The folder the app syncs into is set by hand, so a quote in its id is
+// escaped in the query that lists its session folders, as in the Syncer's
+// other queries: unescaped, Drive cannot read the query (400), and the
+// restore fails.
+func TestRestoreFromARootWhoseIDHasAQuote(t *testing.T) {
+	for _, root := range wireRoots {
+		t.Run(root.name, func(t *testing.T) {
+			wire, syncer := root.newWire(t)
+			const quoted = "root'with-a-quote"
+			wire.rootID, syncer.folderID = quoted, quoted
+			started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+			folder := wire.add(quoted, "2026-11-10-standup", "application/vnd.google-apps.folder", nil, nil)
+			transcript := RenderTranscriptMarkdown(&SyncSession{ID: "20261110090000", StartedAt: started}, []transcribe.Segment{{
+				Speaker: 0, Text: "a quoted root", Timestamp: started,
+			}})
+			wire.add(folder, "transcript.md", "application/vnd.google-apps.document", []byte(transcript), nil)
+
+			result, err := syncer.RestoreFromDrive(context.Background(), func(RestoredSession) error { return nil })
+			if err != nil || result.Restored != 1 || len(result.Errors) != 0 {
+				t.Errorf("restore from root %q: %+v, %v; want one restored session and no errors", quoted, result, err)
+			}
+		})
+	}
+}
+
 func TestRestoreFromDrivePaginatesSharedDriveLists(t *testing.T) {
 	wire, syncer := newSharedDriveWire(t)
 
