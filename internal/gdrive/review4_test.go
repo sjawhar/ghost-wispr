@@ -186,3 +186,32 @@ func TestAFailingReplacementWarnsAndTheWarningClears(t *testing.T) {
 		t.Errorf("the warning %q stayed up after the replacement finished", message)
 	}
 }
+
+// TestAFailedReplacementNeverExhaustsItsRetries fails if a replacement that
+// fails with the session's retries already used up leaves the session FAILED,
+// or anywhere the sweep does not read.
+func TestAFailedReplacementNeverExhaustsItsRetries(t *testing.T) {
+	fixture := newReplacementFixture(t)
+	fixture.queue(t, storage.RefinementCompleted, storage.SummaryCompleted)
+	if _, err := fixture.store.DB().Exec(`UPDATE sessions SET retry_count = ? WHERE id = ?`, MaxSyncRetries, fixture.id); err != nil {
+		t.Fatal(err)
+	}
+	// Drive fails the first upload (after the folder check passes).
+	fixture.wire.failUploadAt = fixture.wire.uploads + 1
+	if err := fixture.orchestrator.SyncSession(context.Background(), fixture.id); err == nil {
+		t.Fatal("the replacement succeeded though its first upload failed")
+	}
+	sess, err := fixture.store.GetSession(fixture.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.SyncState != storage.SyncStatePending || sess.RetryCount != MaxSyncRetries || !sess.DriveReplacePending {
+		t.Errorf("after a failed replacement with retries used up: state=%q retry=%d pending=%v, want %q, retry %d, still owed",
+			sess.SyncState, sess.RetryCount, sess.DriveReplacePending, storage.SyncStatePending, MaxSyncRetries)
+	}
+	fixture.wire.allowDeletes = true
+	sweepOnce(t, fixture.store, fixture.orchestrator)
+	if !sameIDs(fixture.wire.deletedIDs, fixture.oldIDs) {
+		t.Errorf("the next sweep deleted %v, want the old ids %v", fixture.wire.deletedIDs, fixture.oldIDs)
+	}
+}
