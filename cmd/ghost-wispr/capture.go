@@ -62,11 +62,12 @@ var errGateClosed = errors.New("microphone capture gate closed")
 // as long as encoding its recording). Resume moves the switch at once; the gate
 // opens once the pause has settled, unless a Pause comes first.
 type captureGate struct {
-	onPause      func()
-	settle       func()
-	beforeResume func()
-	stallAfter   time.Duration // see captureStallAfter
-	writeWait    time.Duration // see captureWriteWait
+	onPause        func()
+	settle         func()
+	beforeResume   func()
+	beforeMicStart func() error
+	stallAfter     time.Duration // see captureStallAfter
+	writeWait      time.Duration // see captureWriteWait
 
 	control    sync.Mutex    // serializes closing and opening the gate, with their steps
 	mu         sync.Mutex    // guards the fields below
@@ -217,6 +218,13 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 	g.closed = false
 	close(g.resumed)
 	g.closing = make(chan struct{})
+}
+
+func (g *captureGate) confirmMicStart() error {
+	if g.beforeMicStart == nil {
+		return nil
+	}
+	return g.beforeMicStart()
 }
 
 // waitForInflightWrites waits, up to writeWait, until no write that passed the

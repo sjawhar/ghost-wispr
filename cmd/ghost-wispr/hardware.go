@@ -144,22 +144,11 @@ func (h *hardwareControl) EnsureRed() error {
 	if h.light == nil {
 		return nil
 	}
-	light, err := h.light.current()
-	if err != nil {
+	if err := h.light.ConfirmRed(); err != nil {
 		if errors.Is(err, indicator.ErrNoBlink1) {
 			return nil
 		}
 		return err
-	}
-	if err := light.SetRGB(255, 0, 0); err != nil {
-		return h.light.failed(err)
-	}
-	r, g, b, err := light.ReadRGB()
-	if err != nil {
-		return h.light.failed(err)
-	}
-	if r != 255 || g != 0 || b != 0 {
-		return fmt.Errorf("recording light readback is %d,%d,%d, want red", r, g, b)
 	}
 	h.forceRed.Store(true)
 	h.light.warnings.Clear("recording-light")
@@ -222,6 +211,7 @@ func wakeLightOnCaptureEvents(ctx context.Context, hub *server.Hub, hardware *ha
 
 type reconnectingLight struct {
 	mu          sync.Mutex
+	deviceMu    sync.Mutex
 	light       indicator.Light
 	nextAttempt time.Time
 	lastErr     error
@@ -271,6 +261,8 @@ func (l *reconnectingLight) failed(err error) error {
 }
 
 func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
 	light, err := l.current()
 	if err != nil {
 		return err
@@ -282,6 +274,8 @@ func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
 }
 
 func (l *reconnectingLight) ReadRGB() (uint8, uint8, uint8, error) {
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
 	light, err := l.current()
 	if err != nil {
 		return 0, 0, 0, err
@@ -294,6 +288,8 @@ func (l *reconnectingLight) ReadRGB() (uint8, uint8, uint8, error) {
 }
 
 func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
 	light, err := l.current()
 	if err != nil {
 		return err
@@ -305,12 +301,34 @@ func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
 }
 
 func (l *reconnectingLight) BlackPattern() error {
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
 	light, err := l.current()
 	if err != nil {
 		return err
 	}
 	if err := light.BlackPattern(); err != nil {
 		return l.failed(err)
+	}
+	return nil
+}
+
+func (l *reconnectingLight) ConfirmRed() error {
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
+	light, err := l.current()
+	if err != nil {
+		return err
+	}
+	if err := light.SetRGB(255, 0, 0); err != nil {
+		return l.failed(err)
+	}
+	r, g, b, err := light.ReadRGB()
+	if err != nil {
+		return l.failed(err)
+	}
+	if r != 255 || g != 0 || b != 0 {
+		return fmt.Errorf("recording light readback is %d,%d,%d, want red", r, g, b)
 	}
 	return nil
 }
