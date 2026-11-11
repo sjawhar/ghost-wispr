@@ -59,8 +59,7 @@ func (c *Controller) Run(ctx context.Context) {
 	defer func() {
 		if err := c.light.SetRGB(0, 0, 0); err != nil {
 			slog.Warn("turn recording light off", "error", err)
-		}
-		if err := c.light.ServerDown(0); err != nil {
+		} else if err := c.light.ServerDown(0); err != nil {
 			slog.Warn("disable recording light watchdog", "error", err)
 		}
 		if err := c.light.Close(); err != nil {

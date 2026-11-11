@@ -137,7 +137,7 @@ func (b *blink1) BlackPattern() error {
 }
 
 func (b *blink1) flashPatternLines() uint8 {
-	return min(b.patternLines, uint8(16))
+	return b.patternLines
 }
 
 func (b *blink1) patternIsBlack() (bool, error) {

@@ -217,15 +217,15 @@ func TestBlink1BlackPatternAndWatchdogReports(t *testing.T) {
 			patterns = append(patterns, report)
 		}
 	}
-	if got, want := len(patterns), 16; got != want {
+	if got, want := len(patterns), 32; got != want {
 		t.Fatalf("saved pattern lines = %d, want %d", got, want)
 	}
-	for line := range 16 {
+	for line := range 32 {
 		if got, want := patterns[line], Blink1Report('P', [6]byte{0, 0, 0, 0, 10, byte(line)}); got != want {
 			t.Fatalf("pattern line %d = %v, want %v", line, got, want)
 		}
 	}
-	if got, want := reports[len(reports)-1], Blink1Report('D', [6]byte{1, 0x01, 0x2c, 1, 0, 15}); got != want {
+	if got, want := reports[len(reports)-1], Blink1Report('D', [6]byte{1, 0x01, 0x2c, 1, 0, 31}); got != want {
 		t.Fatalf("watchdog report = %v, want %v", got, want)
 	}
 }
