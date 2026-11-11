@@ -40,6 +40,60 @@ describe('SessionCard', () => {
     expect(screen.getByText('Summarizing...')).toBeTruthy()
   })
 
+  it('labels whole-conversation removal as local-only once Drive has the session', () => {
+    const synced = {
+      ...baseSession,
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.Synced,
+    }
+    render(SessionCard, {
+      session: synced,
+      detail: { session: synced, segments: [] },
+      expanded: true,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(
+      screen.getAllByRole('button', {
+        name: 'Remove from this unit; the shared drive keeps its copy',
+      }),
+    ).toHaveLength(2)
+  })
+
+  it.each([
+    ['never synced', {}],
+    ['still pending', { sync_status: SyncStatus.Pending, sync_state: SyncState.Pending }],
+    ['failed', { sync_status: SyncStatus.Failed, sync_state: SyncState.Failed }],
+    ['deleted on Drive', { sync_status: SyncStatus.Failed, sync_state: SyncState.RemoteDeleted }],
+  ])('says this unit holds the only copy when the session is %s', (_, sync) => {
+    const session = { ...baseSession, ...sync }
+    render(SessionCard, {
+      session,
+      detail: { session, segments: [] },
+      expanded: true,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(
+      screen.getAllByRole('button', {
+        name: 'Delete from this unit; this unit holds the only copy',
+      }),
+    ).toHaveLength(2)
+    expect(
+      screen.queryByRole('button', {
+        name: 'Remove from this unit; the shared drive keeps its copy',
+      }),
+    ).toBeNull()
+  })
+
   it('loads details when opened', async () => {
     const onToggle = vi.fn()
     const onLoadDetail = vi.fn().mockResolvedValue(undefined)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ func clearEnv(t *testing.T) {
 		"GCP_PROJECT", "GCP_LOCATION", "GENAI_BACKEND",
 		"BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL",
 		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
+		"INDICATOR_LIGHT", "POWER_BUTTON",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
 	} {
 		t.Setenv(EnvPrefix+key, "")
@@ -395,7 +397,7 @@ func TestGenAIProjectDefaultFromServiceAccount(t *testing.T) {
 	clearEnv(t)
 	dir := t.TempDir()
 	credsPath := filepath.Join(dir, "service-account.json")
-	if err := os.WriteFile(credsPath, []byte(`{"project_id":"sa-project"}`), 0o644); err != nil {
+	if err := os.WriteFile(credsPath, []byte(`{"type":"service_account","project_id":"sa-project"}`), 0o644); err != nil {
 		t.Fatalf("write credentials: %v", err)
 	}
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsPath)
@@ -409,6 +411,34 @@ func TestGenAIProjectDefaultFromServiceAccount(t *testing.T) {
 	}
 	if cfg.GenAIBackend != "vertex" {
 		t.Fatalf("expected Vertex backend when project is discovered, got %q", cfg.GenAIBackend)
+	}
+}
+
+func TestConfigDoesNotNeedProjectIDInAnExternalAccountFile(t *testing.T) {
+	clearEnv(t)
+	credentialsPath := filepath.Join(t.TempDir(), "external-account.json")
+	if err := os.WriteFile(credentialsPath, []byte(`{"type":"external_account","project_id":"must-not-be-used"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credentialsPath)
+	t.Setenv(EnvPrefix+"GENAI_BACKEND", "vertex")
+	t.Setenv(EnvPrefix+"GCP_PROJECT", "theorem-agent-infra")
+
+	_, warnings, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(warnings, "Set gcp_project: an external-account credential file names no project.") {
+		t.Fatalf("unexpected external-account project warning with gcp_project set: %v", warnings)
+	}
+
+	t.Setenv(EnvPrefix+"GCP_PROJECT", "")
+	_, warnings, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(warnings, "Set gcp_project: an external-account credential file names no project.") {
+		t.Fatalf("missing external-account project warning: %v", warnings)
 	}
 }
 

@@ -3239,8 +3239,9 @@ func testNonRegressionPause(t *testing.T) {
 	}
 
 	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
-		Pause: func() {
+		Pause: func() error {
 			called = true
+			return nil
 		},
 	}, "", nil)
 	if err != nil {
@@ -3268,8 +3269,9 @@ func testNonRegressionResume(t *testing.T) {
 	}
 
 	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
-		Resume: func() {
+		Resume: func() error {
 			called = true
+			return nil
 		},
 	}, "", nil)
 	if err != nil {

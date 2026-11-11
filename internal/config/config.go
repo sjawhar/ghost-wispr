@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -16,6 +17,11 @@ import (
 
 // EnvPrefix is the namespace prefix for all Ghost Wispr environment variables.
 const EnvPrefix = "GHOST_WISPR_"
+
+const (
+	IndicatorLightBlink1      = "blink1"
+	envoyWebhookSecretWarning = "Envoy enabled but webhook secret not configured — set " + EnvPrefix + "ENVOY_WEBHOOK_SECRET; Envoy rejects unsigned events."
+)
 
 // Config holds all application configuration. Secrets (API keys) are loaded
 // exclusively from environment variables and never appear in the config file.
@@ -58,8 +64,7 @@ type Config struct {
 	GenAIBackend                  string             `yaml:"genai_backend"`
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
 	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
-	NATSURL                       string             `yaml:"nats_url"`
-	EnvoyTopic                    string             `yaml:"envoy_topic"`
+	EnvoyWebhookURL               string             `yaml:"envoy_webhook_url"`
 	GCEnabled                     bool               `yaml:"gc_enabled"`
 	GCMaxAgeDays                  int                `yaml:"gc_max_age_days"`
 	GCMaxAudioSizeMB              int                `yaml:"gc_max_audio_size_mb"`
@@ -73,16 +78,19 @@ type Config struct {
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
 	SpeakerDevice                 string             `yaml:"speaker_device"`
+	IndicatorLight                string             `yaml:"indicator_light"`
+	PowerButton                   bool               `yaml:"power_button"`
 	TTSProvider                   string             `yaml:"tts_provider"`
 	TTSVoice                      string             `yaml:"tts_voice"`
 	TTSMaxLength                  int                `yaml:"tts_max_length"`
 
 	// Secrets — env vars only, never serialized to YAML.
-	DeepgramAPIKey  string `yaml:"-"`
-	OpenAIAPIKey    string `yaml:"-"`
-	AnthropicAPIKey string `yaml:"-"`
-	GeminiAPIKey    string `yaml:"-"`
-	TTSAPIKey       string `yaml:"-"`
+	DeepgramAPIKey     string `yaml:"-"`
+	OpenAIAPIKey       string `yaml:"-"`
+	AnthropicAPIKey    string `yaml:"-"`
+	GeminiAPIKey       string `yaml:"-"`
+	TTSAPIKey          string `yaml:"-"`
+	EnvoyWebhookSecret string `yaml:"-"`
 }
 
 func defaults() Config {
@@ -94,9 +102,8 @@ func defaults() Config {
 		MinSessionSegments:    0,
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
-		GoogleCredentialsFile: "./service-account.json",
+		GoogleCredentialsFile: "",
 		GCPLocation:           genaiconfig.DefaultLocation,
-		EnvoyTopic:            "notifications.ghost-wispr.summary-ready",
 		GCMaxAgeDays:          30,
 		GCMaxAudioSizeMB:      1024,
 		Summarization: Summarization{
@@ -133,6 +140,7 @@ func defaults() Config {
 // exists but cannot be read or parsed.
 func Load(path string) (Config, []string, error) {
 	cfg := defaults()
+	warnings := deprecatedEnvoyEnvironmentWarnings()
 
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -144,15 +152,46 @@ func Load(path string) (Config, []string, error) {
 			if err := yaml.Unmarshal(data, &cfg); err != nil {
 				return cfg, nil, fmt.Errorf("parse config file: %w", err)
 			}
+			warnings = append(warnings, deprecatedEnvoyConfigWarnings(data)...)
 		}
 	}
 
 	applyEnvOverrides(&cfg)
-	applyGenAIConfigDefaults(&cfg)
+	credentialPath := cfg.GoogleCredentialsFile
+	if credentialPath == "" {
+		credentialPath = os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	}
+	googleCredentialInfo := inspectGoogleCredentialFile(credentialPath)
+	applyGenAIConfigDefaults(&cfg, googleCredentialInfo.serviceAccountProject)
 	loadSecrets(&cfg)
 
-	warnings := validate(&cfg)
+	warnings = append(warnings, validate(&cfg, googleCredentialInfo.hasExternalAccount)...)
 	return cfg, warnings, nil
+}
+
+func deprecatedEnvoyConfigWarnings(data []byte) []string {
+	var values map[string]any
+	if err := yaml.Unmarshal(data, &values); err != nil {
+		return nil
+	}
+
+	var warnings []string
+	for _, key := range []string{"nats_url", "envoy_topic"} {
+		if _, found := values[key]; found {
+			warnings = append(warnings, key+" has been removed; use envoy_webhook_url instead.")
+		}
+	}
+	return warnings
+}
+
+func deprecatedEnvoyEnvironmentWarnings() []string {
+	var warnings []string
+	for _, key := range []string{"NATS_URL", "ENVOY_TOPIC"} {
+		if _, found := os.LookupEnv(EnvPrefix + key); found {
+			warnings = append(warnings, EnvPrefix+key+" has been removed; use "+EnvPrefix+"ENVOY_WEBHOOK_URL instead.")
+		}
+	}
+	return warnings
 }
 
 // ParsedSilenceTimeout returns SilenceTimeout as a time.Duration,
@@ -280,11 +319,8 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "ENVOY_ENABLED"); v != "" {
 		cfg.EnvoyEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
-	if v := os.Getenv(EnvPrefix + "NATS_URL"); v != "" {
-		cfg.NATSURL = strings.TrimSpace(v)
-	}
-	if v := os.Getenv(EnvPrefix + "ENVOY_TOPIC"); v != "" {
-		cfg.EnvoyTopic = strings.TrimSpace(v)
+	if v := os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_URL"); v != "" {
+		cfg.EnvoyWebhookURL = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "GC_ENABLED"); v != "" {
 		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
@@ -305,6 +341,12 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "SPEAKER_DEVICE"); v != "" {
 		cfg.SpeakerDevice = v
 	}
+	if v := os.Getenv(EnvPrefix + "INDICATOR_LIGHT"); v != "" {
+		cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv(EnvPrefix + "POWER_BUTTON"); v != "" {
+		cfg.PowerButton = strings.EqualFold(v, "true") || v == "1"
+	}
 	if v := os.Getenv(EnvPrefix + "TTS_PROVIDER"); v != "" {
 		cfg.TTSProvider = strings.ToLower(strings.TrimSpace(v))
 	}
@@ -318,12 +360,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 }
 
-func applyGenAIConfigDefaults(cfg *Config) {
+func applyGenAIConfigDefaults(cfg *Config, serviceAccountProject string) {
 	if cfg.GCPProject == "" {
-		cfg.GCPProject = discoverServiceAccountProject(
-			os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-			cfg.GoogleCredentialsFile,
-		)
+		cfg.GCPProject = serviceAccountProject
 	}
 	if strings.TrimSpace(cfg.GCPLocation) == "" {
 		cfg.GCPLocation = genaiconfig.DefaultLocation
@@ -340,39 +379,53 @@ func loadSecrets(cfg *Config) {
 	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
 	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
 	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
+	cfg.EnvoyWebhookSecret = strings.TrimSpace(os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_SECRET"))
 }
 
-func discoverServiceAccountProject(paths ...string) string {
-	type serviceAccount struct {
+type googleCredentialInfo struct {
+	serviceAccountProject string
+	hasExternalAccount    bool
+}
+
+func inspectGoogleCredentialFile(path string) googleCredentialInfo {
+	type credentialFile struct {
+		Type      string `json:"type"`
 		ProjectID string `json:"project_id"`
 	}
 
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var creds serviceAccount
-		if err := json.Unmarshal(data, &creds); err != nil {
-			continue
-		}
-		if strings.TrimSpace(creds.ProjectID) != "" {
-			return strings.TrimSpace(creds.ProjectID)
-		}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return googleCredentialInfo{}
 	}
-
-	return ""
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return googleCredentialInfo{}
+	}
+	var credential credentialFile
+	if err := json.Unmarshal(data, &credential); err != nil {
+		return googleCredentialInfo{}
+	}
+	switch credential.Type {
+	case "service_account":
+		return googleCredentialInfo{serviceAccountProject: strings.TrimSpace(credential.ProjectID)}
+	case "external_account":
+		return googleCredentialInfo{hasExternalAccount: true}
+	default:
+		return googleCredentialInfo{}
+	}
 }
 
-func validate(cfg *Config) []string {
+func validate(cfg *Config, hasExternalAccount bool) []string {
 	var warnings []string
 
 	if cfg.DeepgramAPIKey == "" {
 		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+	}
+
+	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
+	if cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
+		warnings = append(warnings, fmt.Sprintf("Invalid indicator_light %q — disabling the recording light.", cfg.IndicatorLight))
+		cfg.IndicatorLight = ""
 	}
 
 	if cfg.GenAIBackend != "" && genaiconfig.NormalizeBackend(cfg.GenAIBackend) == "" {
@@ -381,6 +434,10 @@ func validate(cfg *Config) []string {
 	}
 	if strings.TrimSpace(cfg.GCPLocation) == "" {
 		cfg.GCPLocation = genaiconfig.DefaultLocation
+	}
+
+	if cfg.GCPProject == "" && hasExternalAccount {
+		warnings = append(warnings, "Set gcp_project: an external-account credential file names no project.")
 	}
 
 	providers := make(map[string]struct{})
@@ -449,11 +506,20 @@ func validate(cfg *Config) []string {
 	if cfg.BatchTranscription.Provider == "" {
 		cfg.BatchTranscription.Provider = "deepgram"
 	}
-	if cfg.EnvoyTopic == "" {
-		cfg.EnvoyTopic = "notifications.ghost-wispr.summary-ready"
-	}
-	if cfg.EnvoyEnabled && strings.TrimSpace(cfg.NATSURL) == "" {
-		warnings = append(warnings, "Envoy enabled but NATS URL not configured — set "+EnvPrefix+"NATS_URL or disable Envoy publishing.")
+	if cfg.EnvoyEnabled {
+		webhookURL := strings.TrimSpace(cfg.EnvoyWebhookURL)
+		switch webhookURL {
+		case "":
+			warnings = append(warnings, "Envoy enabled but webhook URL not configured — set "+EnvPrefix+"ENVOY_WEBHOOK_URL or disable Envoy publishing.")
+		default:
+			parsedURL, err := url.Parse(webhookURL)
+			if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" {
+				warnings = append(warnings, "Envoy webhook URL must be an absolute HTTPS URL.")
+			}
+		}
+		if cfg.EnvoyWebhookSecret == "" {
+			warnings = append(warnings, envoyWebhookSecretWarning)
+		}
 	}
 	if cfg.BatchTranscription.Model == "" {
 		cfg.BatchTranscription.Model = cfg.DeepgramModel
@@ -483,8 +549,6 @@ func validate(cfg *Config) []string {
 		}
 		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" {
 			warnings = append(warnings, "TTS provider configured but API key not set — set "+EnvPrefix+"TTS_API_KEY.")
-		} else if cfg.TTSAPIKey == "" && cfg.TTSProvider == "google" && os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
-			warnings = append(warnings, "Google TTS requires "+EnvPrefix+"TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS.")
 		}
 		if cfg.TTSMaxLength <= 0 {
 			cfg.TTSMaxLength = 5000

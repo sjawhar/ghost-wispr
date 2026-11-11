@@ -1122,18 +1122,27 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 	})
 
 	mux.HandleFunc("POST /api/pause", func(w http.ResponseWriter, r *http.Request) {
+		var pauseErr error
 		if controls.Pause != nil {
-			controls.Pause()
+			pauseErr = controls.Pause()
 		}
+		// A Pause error still leaves capture paused, so clients must hear of it.
 		if controls.OnStatusChanged != nil {
 			controls.OnStatusChanged(true)
+		}
+		if pauseErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("pause capture: %v", pauseErr))
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("POST /api/resume", func(w http.ResponseWriter, r *http.Request) {
 		if controls.Resume != nil {
-			controls.Resume()
+			if err := controls.Resume(); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("resume capture: %v", err))
+				return
+			}
 		}
 		if controls.OnStatusChanged != nil {
 			controls.OnStatusChanged(false)

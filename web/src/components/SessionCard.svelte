@@ -154,6 +154,27 @@
       setTimeout(() => (retryingRefinement = false), 1000)
     }
   }
+
+  // Drive holds a copy only once the session synced and its Drive folder was
+  // not deleted since; otherwise this unit holds the only copy.
+  const onDrive = $derived(
+    session.sync_status === SyncStatus.Synced && session.sync_state !== SyncState.RemoteDeleted,
+  )
+  const localRemovalLabel = $derived(
+    onDrive
+      ? 'Remove from this unit; the shared drive keeps its copy'
+      : 'Delete from this unit; this unit holds the only copy',
+  )
+
+  async function handleDelete(event: MouseEvent) {
+    event.stopPropagation()
+    const question = onDrive
+      ? 'Remove this session from this unit? The shared drive keeps its copy.'
+      : 'Delete this session? This unit holds the only copy, so this cannot be undone.'
+    if (confirm(question)) {
+      await onDelete(session.id)
+    }
+  }
 </script>
 
 <article class="session-card" class:selected>
@@ -322,13 +343,9 @@
       <button
         type="button"
         class="quick-delete-btn"
-        title="Delete session"
-        onclick={async (e) => {
-          e.stopPropagation()
-          if (confirm('Delete this session? This cannot be undone.')) {
-            await onDelete(session.id)
-          }
-        }}
+        title={localRemovalLabel}
+        aria-label={localRemovalLabel}
+        onclick={handleDelete}
       >
         ×
       </button>
@@ -408,17 +425,8 @@
           </div>
         {/if}
         <div class="session-actions">
-          <button
-            type="button"
-            class="delete-btn"
-            onclick={async (e) => {
-              e.stopPropagation()
-              if (confirm('Delete this session? This cannot be undone.')) {
-                await onDelete(session.id)
-              }
-            }}
-          >
-            Delete session
+          <button type="button" class="delete-btn" onclick={handleDelete}>
+            {localRemovalLabel}
           </button>
         </div>
       {:else}

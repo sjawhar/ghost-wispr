@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/auth"
+
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
@@ -31,6 +33,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -40,6 +43,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 
+	driveapi "google.golang.org/api/drive/v3"
 	"google.golang.org/genai"
 )
 
@@ -48,6 +52,10 @@ var (
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )
+
+const defaultListenAddress = "127.0.0.1:8080"
+
+var vertexCredentialCache sync.Map
 
 //go:embed static/*
 var staticFiles embed.FS
@@ -83,6 +91,24 @@ func genAIOptions(cfg *config.Config, apiKey string) *genaiconfig.Options {
 		Location: cfg.GCPLocation,
 		APIKey:   apiKey,
 	}
+}
+
+func addVertexCredentials(ctx context.Context, cfg *config.Config, options *genaiconfig.Options) error {
+	if genaiconfig.ResolveBackend(options.Backend, options.Project) != genaiconfig.BackendVertex {
+		return nil
+	}
+	credentialPath := cfg.GoogleCredentialsFile
+	if cached, ok := vertexCredentialCache.Load(credentialPath); ok {
+		options.Credentials = cached.(*auth.Credentials)
+		return nil
+	}
+	credentials, err := googleauth.Detect(ctx, credentialPath, googleauth.CloudPlatformScope)
+	if err != nil {
+		return fmt.Errorf("detect Google credentials: %w", err)
+	}
+	cached, _ := vertexCredentialCache.LoadOrStore(credentialPath, credentials)
+	options.Credentials = cached.(*auth.Credentials)
+	return nil
 }
 
 func providerConfigured(cfg *config.Config, provider string) bool {
@@ -423,12 +449,29 @@ func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *int
 }
 
 func main() {
-	log.Println("ghost-wispr: starting")
-
 	configPath := os.Getenv(config.EnvPrefix + "CONFIG")
 	if configPath == "" {
 		configPath = "ghost-wispr.yaml"
 	}
+	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
+		cfg, _, err := config.Load(configPath)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		_, err = runGoogleIDTokenCommand(context.Background(), os.Args[1:], os.Stdout, cfg.GoogleCredentialsFile, googleauth.IDToken)
+		if err != nil {
+			log.Fatalf("google-id-token: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 {
+		if exitCode := runLightCommand(os.Args[1:], os.Stdout, os.Stderr); exitCode != 0 {
+			os.Exit(exitCode)
+		}
+		return
+	}
+
+	log.Println("ghost-wispr: starting")
 
 	envPath := filepath.Join(filepath.Dir(configPath), ".env")
 	cfgStore, cfgWarnings, err := config.NewStoreWithEnv(configPath, envPath)
@@ -520,10 +563,15 @@ func main() {
 			opts = append(opts, llm.WithBaseURL(latestCfg.Summarization.BaseURL))
 		}
 		if provider == "gemini" {
+			genOptions := genAIOptions(&latestCfg, key)
+			if err := addVertexCredentials(context.Background(), &latestCfg, genOptions); err != nil {
+				return nil, err
+			}
 			opts = append(opts, llm.WithGenAIConfig(llm.GenAIConfig{
-				Backend:  latestCfg.GenAIBackend,
-				Project:  latestCfg.GCPProject,
-				Location: latestCfg.GCPLocation,
+				Backend:     genOptions.Backend,
+				Project:     genOptions.Project,
+				Location:    genOptions.Location,
+				Credentials: genOptions.Credentials,
 			}))
 		}
 		return llm.NewClient(provider, key, model, opts...)
@@ -561,15 +609,22 @@ func main() {
 	var embeddingClient embedding.Client
 	var indexer *embedding.Indexer
 	if strings.TrimSpace(cfg.EmbeddingModel) != "" {
-		embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
-			// Backend left empty — embedding.NewClient reads GHOST_WISPR_EMBEDDING_BACKEND first,
-			// then falls back to GHOST_WISPR_GENAI_BACKEND. This allows Vertex AI for embeddings
-			// while LLM/batch uses Gemini API.
-			Project: cfg.GCPProject,
-			// Location intentionally omitted — let embedding.NewClient read
-			// GHOST_WISPR_EMBEDDING_LOCATION (us-central1), not cfg.GCPLocation (global)
-		}))
-		if err != nil {
+		embeddingOptions := &genaiconfig.Options{
+			Backend:  os.Getenv("GHOST_WISPR_EMBEDDING_BACKEND"),
+			Project:  cfg.GCPProject,
+			Location: os.Getenv("GHOST_WISPR_EMBEDDING_LOCATION"),
+		}
+		if embeddingOptions.Backend == "" {
+			embeddingOptions.Backend = os.Getenv("GHOST_WISPR_GENAI_BACKEND")
+		}
+		if err := addVertexCredentials(context.Background(), &cfg, embeddingOptions); err != nil {
+			log.Printf("warning: embedding indexer disabled: %v", err)
+		} else if embeddingClient, err = embedding.NewClient(cfg.EmbeddingModel, embedding.WithGenAIConfig(embedding.GenAIConfig{
+			Backend:     embeddingOptions.Backend,
+			Project:     embeddingOptions.Project,
+			Location:    embeddingOptions.Location,
+			Credentials: embeddingOptions.Credentials,
+		})); err != nil {
 			log.Printf("warning: embedding indexer disabled: %v", err)
 		} else {
 			indexer = embedding.NewIndexer(embeddingClient, store, 500)
@@ -614,10 +669,28 @@ func main() {
 		}
 		return nil
 	}, captureFinalizeWait, captureEndRetry, log.Printf)
-	warnings := append([]string{}, cfgWarnings...)
+
+	restoredPause, err := restorePause(store, capture)
+	var restorePauseErr error
+	if err != nil {
+		// The recorder must not start capturing when it cannot establish the
+		// prior consent state.
+		restorePauseErr = err
+		log.Printf("warning: restore capture pause: %v; starting paused", err)
+		capture.Pause()
+		restoredPause = true
+	}
+	warningRegistry := newWarningsRegistry()
+	for i, warning := range cfgWarnings {
+		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
+	}
+	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
+	if restorePauseErr != nil {
+		warningRegistry.Set("capture-state", "Capture pause state could not be restored; the recorder started paused")
+	}
 	if batchTranscriber, err := makeBatchTranscriber(&cfg); err != nil {
 		log.Printf("warning: batch transcription disabled: %v", err)
-		warnings = append(warnings, "Batch transcription unavailable — using streaming transcript fallback")
+		warningRegistry.Set("batch-transcription", "Batch transcription unavailable — using streaming transcript fallback")
 	} else {
 		manager.SetBatchTranscriber(batchTranscriber)
 	}
@@ -626,9 +699,9 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	drive := &driveSync{}
-	var summaryPublisher *envoy.Publisher
+	var summaryPublisher atomic.Pointer[envoy.Publisher]
 	publishSummaryReady := func(sessionID string) {
-		pub := summaryPublisher
+		pub := summaryPublisher.Load()
 		if pub == nil {
 			return
 		}
@@ -681,7 +754,11 @@ func main() {
 			return "", 0, fmt.Errorf("summarization not configured")
 		}
 		latestCfg := cfgStore.Get()
-		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
+		genOptions := genAIOptions(&latestCfg, latestCfg.GeminiAPIKey)
+		if err := addVertexCredentials(ctx, &latestCfg, genOptions); err != nil {
+			return "", 0, err
+		}
+		clientConfig, err := genaiconfig.BuildClientConfig(genOptions)
 		if err != nil {
 			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
@@ -718,7 +795,11 @@ func main() {
 	}
 	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
 		latestCfg := cfgStore.Get()
-		clientConfig, err := genaiconfig.BuildClientConfig(genAIOptions(&latestCfg, latestCfg.GeminiAPIKey))
+		genOptions := genAIOptions(&latestCfg, latestCfg.GeminiAPIKey)
+		if err := addVertexCredentials(ctx, &latestCfg, genOptions); err != nil {
+			return nil, err
+		}
+		clientConfig, err := genaiconfig.BuildClientConfig(genOptions)
 		if err != nil {
 			return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
@@ -795,16 +876,11 @@ func main() {
 	gcHealthState.countUnverified(store)
 
 	controlHooks := &server.ControlHooks{
-		Pause:         capture.Pause,
-		Resume:        capture.Resume,
-		IsPaused:      capture.IsPaused,
-		IsCapturing:   func() bool { return capture.capturing(micStatus) },
-		CaptureState:  func() string { return capture.captureState(micStatus) },
-		ActiveSession: manager.ActiveSession,
-		OnStatusChanged: func(paused bool) {
-			hub.BroadcastStatusChanged(paused)
-		},
-		Warnings:           func() []string { return warnings },
+		IsPaused:           capture.IsPaused,
+		IsCapturing:        func() bool { return capture.capturing(micStatus) },
+		CaptureState:       func() string { return capture.captureState(micStatus) },
+		ActiveSession:      manager.ActiveSession,
+		Warnings:           warningRegistry.List,
 		GCHold:             gcHealthState.Hold,
 		UnverifiedSessions: gcHealthState.Unverified,
 		KeptRawRecordings: func() server.KeptRawRecordings {
@@ -872,6 +948,9 @@ func main() {
 
 					if err := store.UpdateSummary(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames); err != nil {
 						return repaired, err
+					}
+					if title != sessions[i].Title || summaryText != sessions[i].Summary || speakerNames != sessions[i].SpeakerNames {
+						publishSummaryReady(sessions[i].ID)
 					}
 					repaired++
 				}
@@ -1089,7 +1168,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if latestCfg.GDriveFolderID == "" {
 				return nil, fmt.Errorf("google drive folder ID not configured")
 			}
-			syncer, err := gdrive.NewSyncer(ctx, latestCfg.GoogleCredentialsFile, latestCfg.GDriveFolderID)
+			credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+			if err != nil {
+				return nil, fmt.Errorf("detect Google credentials: %w", err)
+			}
+			syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID)
 			if err != nil {
 				return nil, fmt.Errorf("create syncer: %w", err)
 			}
@@ -1136,16 +1219,61 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 
-	setSummaryPublisher := func(next *envoy.Publisher) {
-		if summaryPublisher != nil && summaryPublisher != next {
-			_ = summaryPublisher.Close()
+	hardware := startHardware(ctx, &cfg, capture, micStatus, warningRegistry, hub)
+	pauseControls := newPersistentControls(
+		store,
+		func() {
+			capture.Pause()
+			hardware.CaptureStopped()
+		},
+		capture.RequestResume,
+		hub.BroadcastStatusChanged,
+	)
+	controlHooks.Pause = func() error {
+		err := pauseControls.Pause()
+		if err != nil {
+			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+		} else {
+			warningRegistry.Clear("capture-state")
 		}
-		summaryPublisher = next
+		return err
+	}
+	controlHooks.Resume = func() error {
+		err := pauseControls.Resume()
+		if err != nil {
+			if errors.Is(err, errRefusedResumeNotPersisted) {
+				warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+			}
+		} else {
+			warningRegistry.Clear("capture-state")
+		}
+		return err
+	}
+	wireLightConsent(capture, hardware, warningRegistry, func(error) {
+		if err := pauseControls.RefuseResume(); err != nil {
+			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+		}
+	})
+	if restoredPause {
+		hub.BroadcastStatusChanged(true)
+	}
+	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
+
+	setSummaryPublisher := func(next *envoy.Publisher) {
+		summaryPublisher.Store(next)
+		if next == nil {
+			// Avoid storing a typed nil *Publisher in EventPublisher.
+			manager.SetEventPublisher(nil)
+			return
+		}
 		manager.SetEventPublisher(next)
 	}
 	sweepEnvoy := func(pub *envoy.Publisher) {
 		if pub == nil {
 			return
+		}
+		if err := pub.PublishPendingLifecycleEvents(ctx); err != nil {
+			log.Printf("envoy lifecycle sweep error: %v", err)
 		}
 		ids, err := store.GetSessionsNeedingEnvoyPublish()
 		if err != nil {
@@ -1159,22 +1287,34 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}
 	configureEnvoyPublisher := func(currentCfg config.Config) {
-		if !currentCfg.EnvoyEnabled {
+		if !currentCfg.EnvoyEnabled || strings.TrimSpace(currentCfg.EnvoyWebhookURL) == "" {
+			warningRegistry.Clear("envoy")
 			setSummaryPublisher(nil)
 			return
 		}
-		pub, err := envoy.NewPublisher(currentCfg.NATSURL, currentCfg.EnvoyTopic, store, appLogger)
-		if err != nil {
-			log.Printf("warning: envoy publishing disabled: %v", err)
-			warnings = append(warnings, "Envoy publishing failed to initialize — summary notifications are disabled")
-			setSummaryPublisher(nil)
-			return
-		}
+
+		pub := envoy.NewPublisher(
+			currentCfg.EnvoyWebhookURL,
+			currentCfg.EnvoyWebhookSecret,
+			store,
+			envoy.WithLogger(appLogger),
+		)
+		warningRegistry.Clear("envoy")
 		setSummaryPublisher(pub)
-		log.Printf("envoy publishing enabled (topic=%s)", currentCfg.EnvoyTopic)
+		log.Printf("envoy webhook publishing enabled")
 		go sweepEnvoy(pub)
 	}
 	configureEnvoyPublisher(cfg)
+	if pub := summaryPublisher.Load(); pub != nil && len(recoveredIDs) > 0 {
+		ids := append([]string(nil), recoveredIDs...)
+		go func() {
+			for _, sessionID := range ids {
+				if err := pub.PublishSessionEnded(context.Background(), sessionID); err != nil {
+					log.Printf("warning: failed to publish recovered session end for %s: %v", sessionID, err)
+				}
+			}
+		}()
+	}
 	if indexer != nil {
 		go func() {
 			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
@@ -1216,7 +1356,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	})
 	watchDriveSyncSettings(cfgStore, drive,
 		func(cfg *config.Config) (sessionSyncer, error) {
-			syncer, err := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID, appLogger)
+			credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+			if err != nil {
+				return nil, fmt.Errorf("detect Google credentials: %w", err)
+			}
+			syncer, err := gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID, appLogger)
 			if err != nil {
 				return nil, err
 			}
@@ -1308,10 +1452,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	defer func() { _ = store.Close() }()
 
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
-		syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID, appLogger)
+		credentials, syncErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+		var syncer *gdrive.Syncer
+		if syncErr == nil {
+			syncer, syncErr = gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID, appLogger)
+		}
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
-			warnings = append(warnings, "Google Drive sync failed to initialize — backups are disabled")
+			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")
 		} else {
 			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
 			drive.Set(orchestrator)
@@ -1330,7 +1478,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				sweepEnvoy(summaryPublisher)
+				sweepEnvoy(summaryPublisher.Load())
 			}
 		}
 	}()
@@ -1414,23 +1562,27 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 		if mic == nil {
 			if updateStartupState {
-				warnings = append(warnings, "Microphone unavailable — recording and live transcription are disabled")
+				warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 			}
 			return fmt.Errorf("microphone unavailable")
 		}
 
 		audioRecorder.SetSampleRate(sampleRate)
-		if err := mic.Start(); err != nil {
+		// micRef is published before the start so the controller, woken when
+		// the start clears the forced-red hold, already sees the open mic.
+		micRef.Store(mic)
+		if err := startMicIfUnpaused(capture, mic.Start); err != nil {
 			micRef.Store(nil)
 			if updateStartupState {
-				warnings = append(warnings, "Microphone failed to start — recording and live transcription are disabled")
+				warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
 			}
 			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
 		}
 
-		micRef.Store(mic)
+		hardware.CaptureStarted()
+		warningRegistry.Clear("microphone")
 		log.Printf("microphone started at %d Hz", sampleRate)
 		message := fmt.Sprintf("Microphone open at %d Hz", sampleRate)
 		if updateStartupState {
@@ -1478,7 +1630,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
 			if updateStartupState {
-				warnings = append(warnings, "Deepgram initialization failed — live transcription is disabled")
+				warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
 			}
 			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
 			return nil
@@ -1501,7 +1653,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	if paInitFailed {
 		slog.Warn("microphone unavailable, running API/UI only")
-		warnings = append(warnings, "Microphone unavailable \u2014 recording and live transcription are disabled")
+		warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 	}
 	// Initialize speaker output device (completely isolated from mic).
@@ -1509,7 +1661,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if cfg.SpeakerEnabled {
 		if paInitFailed {
 			slog.Warn("speaker requested but portaudio init failed — speaker disabled")
-			warnings = append(warnings, "Speaker unavailable — PortAudio initialization failed")
+			warningRegistry.Set("speaker", "Speaker unavailable — PortAudio initialization failed")
 		} else {
 			speaker = audio.NewSpeaker(cfg.SpeakerDevice)
 			log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
@@ -1531,17 +1683,20 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		case "google":
 			if cfg.TTSAPIKey != "" {
 				ttsProvider, ttsErr = tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
-			} else if credPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credPath != "" {
-				ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithGoogleCredentialPath(credPath))
 			} else {
-				ttsErr = fmt.Errorf("google TTS requires GHOST_WISPR_TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS")
+				credentials, credentialErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+				if credentialErr != nil {
+					ttsErr = fmt.Errorf("detect Google credentials: %w", credentialErr)
+				} else {
+					ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
+				}
 			}
 		default:
 			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
 		}
 		if ttsErr != nil {
 			log.Printf("warning: TTS disabled: %v", ttsErr)
-			warnings = append(warnings, fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
+			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
 		} else {
 			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, speaker, tts.OrchestratorOpts{})
 			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
@@ -1613,6 +1768,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		})
 	}
 
+	lightOff := hardware.Done()
+
 	// Create health checker with actual component references
 	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
@@ -1620,10 +1777,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		panic(fmt.Sprintf("build http handler failed: %v", err))
 	}
 
-	addr := os.Getenv("GHOST_WISPR_ADDR")
-	if addr == "" {
-		addr = ":8080"
-	}
+	addr := listenAddress(os.Getenv("GHOST_WISPR_ADDR"))
 	httpServer := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -1634,7 +1788,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// Log structured startup banner.
 	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)
 	slog.Info("deepgram API key", "status", config.MaskAPIKey(cfg.DeepgramAPIKey))
-	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://127.0.0.1%s", Version, Commit, BuildTime, addr)
+	uiAddr := addr
+	if strings.HasPrefix(uiAddr, ":") {
+		uiAddr = "127.0.0.1" + uiAddr
+	}
+	log.Printf("ghost-wispr %s (commit=%s built=%s): web UI on http://%s", Version, Commit, BuildTime, uiAddr)
 
 	// Broadcast initial component status to any connected WebSocket clients.
 	for _, c := range startupStatus.Components() {
@@ -1646,7 +1804,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	<-sig
 
 	log.Println("ghost-wispr: shutting down")
+	hardware.Stop()
 	cancel()
+	manager.StopSessionStartPublishes()
 	// The mic loops end at the device's next buffer. Stopping the device or
 	// terminating PortAudio while one is still inside a read crashes inside
 	// PortAudio, so neither happens before they end, nor at all if one is stuck
@@ -1655,6 +1815,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if !micLoopsEnded {
 		log.Printf("warning: microphone still reading %v after shutdown began; leaving the device and PortAudio to the process exit", micShutdownWait)
 	}
+	select {
+	case <-lightOff:
+	case <-time.After(lightShutdownWait):
+		log.Printf("warning: recording light not turned off within %v; leaving it to its watchdog", lightShutdownWait)
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -1662,12 +1827,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := manager.ForceEndSession(shutdownCtx); err != nil {
 		log.Printf("warning: force end session failed: %v", err)
 	}
+	lifecycleCtx, lifecycleCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := manager.WaitForLifecyclePublishes(lifecycleCtx); err != nil {
+		log.Printf("warning: lifecycle event publishing did not finish before shutdown: %v", err)
+	}
+	lifecycleCancel()
 
 	if dgStop != nil {
 		dgStop()
-	}
-	if summaryPublisher != nil {
-		_ = summaryPublisher.Close()
 	}
 	if mic := micRef.Load(); mic != nil && micLoopsEnded {
 		_ = mic.Stop()
@@ -1736,7 +1903,14 @@ func streamMicWithRetry(
 			if !holdMicWhilePaused(ctx, capture, streamer, logf, hub) || ctx.Err() != nil {
 				return
 			}
-			if err = streamer.Start(); err == nil {
+			if err = capture.confirmMicStart(); err != nil {
+				logf("recording light unavailable before microphone restart: %v", err)
+				wait(backoff)
+				continue
+			}
+			err = streamer.Start()
+			capture.finishMicStart()
+			if err == nil {
 				logf("microphone restarted: capture resumed")
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone capture resumed")
@@ -1771,7 +1945,14 @@ func streamMicWithRetry(
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 			}
-			if reopenErr := streamer.Reopen(); reopenErr != nil {
+			if err := capture.confirmMicStart(); err != nil {
+				logf("recording light unavailable before microphone reconnect: %v", err)
+				stopMicWithoutRed(streamer, logf)
+				continue
+			}
+			reopenErr := streamer.Reopen()
+			capture.finishMicStart()
+			if reopenErr != nil {
 				logf("mic reopen failed: %v", reopenErr)
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
@@ -1801,7 +1982,14 @@ func streamMicWithRetry(
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 		}
 
-		if reopenErr := streamer.Reopen(); reopenErr != nil {
+		if err := capture.confirmMicStart(); err != nil {
+			logf("recording light unavailable before microphone reconnect: %v", err)
+			stopMicWithoutRed(streamer, logf)
+			continue
+		}
+		reopenErr := streamer.Reopen()
+		capture.finishMicStart()
+		if reopenErr != nil {
 			logf("mic reopen failed: %v", reopenErr)
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
@@ -1815,6 +2003,17 @@ func streamMicWithRetry(
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
 		}
 		backoff = baseBackoff
+	}
+}
+
+// stopMicWithoutRed stops a device the reconnect could not confirm red for.
+// An overflow, or a transient read error, leaves the device capturing with
+// IsOpen false, so the light goes dark while audio still flows. The next
+// Stream then fails on the stopped device, and the error path backs off and
+// confirms red again before it reopens.
+func stopMicWithoutRed(streamer micStreamer, logf func(string, ...any)) {
+	if err := streamer.Stop(); err != nil {
+		logf("warning: stop microphone without a red recording light: %v", err)
 	}
 }
 
