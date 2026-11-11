@@ -188,14 +188,15 @@ func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *test
 	if err != nil {
 		t.Fatalf("Speak: %v", err)
 	}
-	waited := make(chan SpeakStatus, 1)
+	type report struct{ model, voice string }
+	waited := make(chan report, 1)
 	go func() {
 		status, waitErr := o.WaitForSynthesis(context.Background(), id)
 		if waitErr != nil {
 			t.Errorf("WaitForSynthesis: %v", waitErr)
 			return
 		}
-		waited <- status
+		waited <- report{model: status.Model, voice: status.Voice}
 	}()
 	select {
 	case <-playEntered:
@@ -204,8 +205,8 @@ func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *test
 	}
 	select {
 	case status := <-waited:
-		if status.Model != provider.model || status.Voice != provider.voice {
-			t.Fatalf("provider report = %q/%q, want %q/%q", status.Model, status.Voice, provider.model, provider.voice)
+		if status.model != provider.model || status.voice != provider.voice {
+			t.Fatalf("provider report = %q/%q, want %q/%q", status.model, status.voice, provider.model, provider.voice)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("WaitForSynthesis did not return while Play was blocked")
