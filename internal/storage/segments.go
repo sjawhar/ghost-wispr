@@ -22,6 +22,8 @@ var (
 	// ErrSegmentPostCommitMaintenance means the deletion committed but SQLite
 	// maintenance did not complete.
 	ErrSegmentPostCommitMaintenance = errors.New("segment deletion post-commit maintenance failed")
+	// ErrSegmentSplicePending means an earlier deletion still needs recovery.
+	ErrSegmentSplicePending = errors.New("segment splice is pending")
 )
 
 // DeletedSpan identifies the session recording span removed for a segment and
@@ -214,6 +216,16 @@ func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 		return nil, fmt.Errorf("iterate merged sources for %s: %w", mergedID, err)
 	}
 	return ids, nil
+}
+
+// HasPendingSplice reports whether a committed deletion for sessionID still
+// requires its recording replacement to complete.
+func (s *SQLiteStore) HasPendingSplice(sessionID string) (bool, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT count(*) FROM deleted_segments WHERE session_id = ? AND splice_complete = 0`, sessionID).Scan(&count); err != nil {
+		return false, fmt.Errorf("query pending splice for %s: %w", sessionID, err)
+	}
+	return count > 0, nil
 }
 
 func rewriteDeletedTextEvents(tx *sql.Tx, sessionID, deletedText string, span *DeletedSpan) error {

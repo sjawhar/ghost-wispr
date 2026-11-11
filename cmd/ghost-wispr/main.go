@@ -768,6 +768,12 @@ func main() {
 		if len(sessions) == 0 {
 			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
 		}
+		for _, session := range sessions {
+			if err := store.StartSummary(session.ID); err != nil {
+				return "", 0, fmt.Errorf("start batch summary for %s: %w", session.ID, err)
+			}
+		}
+
 
 		requests, err := summarizer.BuildBatchRequests(ctx, sessions)
 		if err != nil {
@@ -848,7 +854,11 @@ func main() {
 					continue
 				}
 				if br.SessionID != "" {
-					_ = store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames)
+					if err := store.UpdateSummary(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName, br.SpeakerNames); err != nil {
+						log.Printf("warning: discarded stale batch summary for session %s: %v", br.SessionID, err)
+						failed++
+						continue
+					}
 					hub.BroadcastSummaryReady(br.SessionID, br.Title, br.Summary, storage.SummaryCompleted, br.PresetName)
 					publishSummaryReady(br.SessionID)
 				}
@@ -905,6 +915,20 @@ func main() {
 			return manager.RefineSession(ctx, sessionID, sess.AudioPath, sess.StartedAt)
 		},
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
+			segments, err := store.GetSegments(sessionID)
+			if err != nil {
+				return err
+			}
+			found := false
+			for _, segment := range segments {
+				if segment.ID == segmentID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return storage.ErrSegmentNotFound
+			}
 			latestCfg := cfgStore.Get()
 			batch, err := makeBatchTranscriber(&latestCfg)
 			if err != nil {
@@ -1814,6 +1838,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	lightOff := hardware.Done()
+	if err := cleanupSpliceTempCopies(cfg.AudioDir); err != nil {
+		log.Printf("warning: failed to clean leftover splice copies: %v", err)
+		warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", err))
+	}
+
 
 	// Create health checker with actual component references
 	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
@@ -1831,10 +1860,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}()
 
 	go func() {
-		if err := cleanupSpliceTempCopies(cfg.AudioDir); err != nil {
-			log.Printf("warning: failed to clean leftover splice copies: %v", err)
-			warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", err))
-		}
 		count, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession, func(recoveryErr error) {
 			log.Printf("warning: pending segment splice: %v", recoveryErr)
 			warningRegistry.Set("pending-segment-splices", fmt.Sprintf("A segment deletion needs audio recovery: %v", recoveryErr))

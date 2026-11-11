@@ -355,6 +355,25 @@ func TestSegmentDeleteRunnerFindsUnknownSegmentBeforeNeedingTranscriber(t *testi
 	}
 }
 
+func TestSegmentDeleteRunnerRefusesSecondDeleteWhileSplicePending(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	store, firstID, _ := newDeletionTestStore(t, recording)
+	segments, err := store.GetSegments("session")
+	if err != nil {
+		t.Fatalf("get segments: %v", err)
+	}
+	if err := store.DeleteSegment("session", firstID, storage.DeletedSpan{AudioPath: recording, Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		t.Fatalf("record pending splice: %v", err)
+	}
+	runner := segmentDeleteRunner{store: store}
+	if err := runner.Delete(context.Background(), "session", segments[2].ID); !errors.Is(err, storage.ErrSegmentSplicePending) {
+		t.Fatalf("second delete error = %v, want pending splice conflict", err)
+	}
+}
+
 func storeSessionForDelete(t *testing.T, store *storage.SQLiteStore, id string) storage.Session {
 	t.Helper()
 	session, err := store.GetSession(id)

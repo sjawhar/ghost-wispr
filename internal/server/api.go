@@ -708,6 +708,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				writeJSONError(w, http.StatusNotFound, "segment not found")
 			case errors.Is(err, storage.ErrSegmentSessionActive):
 				writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
+			case errors.Is(err, storage.ErrSegmentSplicePending):
+				writeJSONError(w, http.StatusConflict, "A previous segment deletion is still being recovered. Try again after it completes.")
 			case errors.Is(err, ErrSegmentNotFoundInRecording):
 				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be found in the recording; nothing was deleted")
 			case errors.Is(err, ErrSegmentNotRemovedCleanly):

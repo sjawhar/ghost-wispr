@@ -645,7 +645,6 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", err))
-		m.triggerEmbeddingIndex(sessionID, transcript)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}

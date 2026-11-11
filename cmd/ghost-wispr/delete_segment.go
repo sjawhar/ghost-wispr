@@ -163,6 +163,11 @@ func (d segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segme
 	if index == -1 {
 		return storage.ErrSegmentNotFound
 	}
+	if pending, err := d.store.HasPendingSplice(sessionID); err != nil {
+		return err
+	} else if pending {
+		return storage.ErrSegmentSplicePending
+	}
 	if d.transcriber == nil || d.ensureRecordings == nil || d.splice == nil {
 		return fmt.Errorf("segment deletion is not configured")
 	}
@@ -307,6 +312,8 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	}
 	recovered := 0
 	for _, span := range spans {
+		unlock := deleteLocks.lock(span.SessionID)
+		defer unlock()
 		session, err := store.GetSession(span.SessionID)
 		if err != nil {
 			warn(fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err))
