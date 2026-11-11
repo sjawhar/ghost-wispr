@@ -210,4 +210,27 @@ describe('deletion state fences', () => {
     expect(appState.liveSegmentsSessionId).toBe('s1')
     expect(appState.liveSegments).toHaveLength(1)
   })
+
+  it('drops a live event from another session while recording', () => {
+    applyEvent({
+      type: 'session_started',
+      version: 1,
+      timestamp: '2026-11-11T10:00:00Z',
+      session_id: 's1',
+    })
+
+    applyEvent({
+      type: 'live_transcript',
+      version: 1,
+      timestamp: '2026-11-11T10:00:01Z',
+      session_id: 's2',
+      speaker: 0,
+      text: 'Other session words',
+      start_time: 0,
+      end_time: 2,
+    })
+
+    expect(appState.liveSegmentsSessionId).toBe('s1')
+    expect(appState.liveSegments).toEqual([])
+  })
 })

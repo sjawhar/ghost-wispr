@@ -576,6 +576,63 @@ describe('AudioPlayer', () => {
     expect(screen.getByText('Possibly deleted segment')).toBeTruthy()
   })
 
+  it('keeps segments open without reloading audio after an uncertain deletion refresh', async () => {
+    const pause = vi.fn()
+    const load = vi.fn()
+    Object.defineProperty(HTMLMediaElement.prototype, 'pause', {
+      configurable: true,
+      value: pause,
+    })
+    Object.defineProperty(HTMLMediaElement.prototype, 'load', {
+      configurable: true,
+      value: load,
+    })
+    const session = makeSession({
+      refinement_status: RefinementStatus.Completed,
+      refined_transcript: 'Refined transcript with the stored segment.',
+      transcript_source: 'refined',
+    })
+    const props = {
+      sessionId: 's1',
+      segments: [
+        {
+          id: 42,
+          speaker: 0,
+          text: 'Possibly deleted segment',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      session,
+    }
+    let rerender: (props: AudioPlayerProps) => void = () => {}
+    const onDeleted = vi.fn()
+    const onNotFound = vi.fn(async () => {
+      rerender({ ...props, session: { ...session }, onDeleted, onNotFound })
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ error: 'rename failed' }), { status: 500 }),
+        ),
+    )
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    const result = render({ ...props, onDeleted, onNotFound })
+    rerender = result.rerender
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Segments' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+
+    await waitFor(() => {
+      expect(onNotFound).toHaveBeenCalledTimes(1)
+    })
+    expect(screen.getByRole('button', { name: 'Delete segment' })).toBeTruthy()
+    expect(pause).not.toHaveBeenCalled()
+    expect(load).not.toHaveBeenCalled()
+  })
   it('keeps the refined transcript as the default and exposes deletion in segments', async () => {
     render({
       sessionId: 's1',
