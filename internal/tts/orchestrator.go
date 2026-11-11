@@ -288,14 +288,6 @@ func (o *Orchestrator) finishSynthesis(id string) {
 	s.synthesisOnce.Do(func() { close(s.synthesisDone) })
 }
 
-func reportedSpeech(provider Provider, req SpeechRequest) (string, string) {
-	reporter, ok := provider.(ModelVoiceReporter)
-	if !ok {
-		return "", ""
-	}
-	return reporter.ReportedSpeech(req)
-}
-
 // allowRequest checks and records a request against the per-minute rate limit.
 func (o *Orchestrator) allowRequest() bool {
 	o.rateMu.Lock()
