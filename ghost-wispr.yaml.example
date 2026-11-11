@@ -1,6 +1,9 @@
 # Ghost Wispr Configuration
 # Copy to ghost-wispr.yaml and customize as needed.
 #
+# Google authentication uses google_credentials_file in this YAML first.
+# GOOGLE_APPLICATION_CREDENTIALS is the fallback when that key is empty.
+# The fallback accepts any Application Default Credential type.
 # API keys are configured ONLY via environment variables:
 #   GHOST_WISPR_DEEPGRAM_API_KEY    (required for live transcription)
 #   GHOST_WISPR_OPENAI_API_KEY      (for OpenAI summarization)
@@ -29,9 +32,10 @@ summarization:
       system_prompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics, decisions made, and action items if any."
       user_template: "{{transcript}}"
 
-# Google Drive sync (optional)
+# Google Drive, Vertex AI, text-to-speech, and ghost-wispr google-id-token use google_credentials_file.
+# When it is empty, Google Application Default Credentials are the fallback.
 # gdrive_folder_id:
-# google_credentials_file: ./service-account.json
+# google_credentials_file: /opt/ghost-wispr/google-credentials.json
 # gdrive_sync_enabled: false
 
 # Garbage collection

@@ -94,7 +94,7 @@ func defaults() Config {
 		MinSessionSegments:    0,
 		MicSampleRate:         16000,
 		MicSampleRates:        []int{48000, 44100, 32000, 24000},
-		GoogleCredentialsFile: "./service-account.json",
+		GoogleCredentialsFile: "",
 		GCPLocation:           genaiconfig.DefaultLocation,
 		EnvoyTopic:            "notifications.ghost-wispr.summary-ready",
 		GCMaxAgeDays:          30,
@@ -148,10 +148,15 @@ func Load(path string) (Config, []string, error) {
 	}
 
 	applyEnvOverrides(&cfg)
-	applyGenAIConfigDefaults(&cfg)
+	credentialPath := cfg.GoogleCredentialsFile
+	if credentialPath == "" {
+		credentialPath = os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	}
+	googleCredentialInfo := inspectGoogleCredentialFile(credentialPath)
+	applyGenAIConfigDefaults(&cfg, googleCredentialInfo.serviceAccountProject)
 	loadSecrets(&cfg)
 
-	warnings := validate(&cfg)
+	warnings := validate(&cfg, googleCredentialInfo.hasExternalAccount)
 	return cfg, warnings, nil
 }
 
@@ -318,12 +323,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 }
 
-func applyGenAIConfigDefaults(cfg *Config) {
+func applyGenAIConfigDefaults(cfg *Config, serviceAccountProject string) {
 	if cfg.GCPProject == "" {
-		cfg.GCPProject = discoverServiceAccountProject(
-			os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-			cfg.GoogleCredentialsFile,
-		)
+		cfg.GCPProject = serviceAccountProject
 	}
 	if strings.TrimSpace(cfg.GCPLocation) == "" {
 		cfg.GCPLocation = genaiconfig.DefaultLocation
@@ -342,33 +344,40 @@ func loadSecrets(cfg *Config) {
 	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
 }
 
-func discoverServiceAccountProject(paths ...string) string {
-	type serviceAccount struct {
+type googleCredentialInfo struct {
+	serviceAccountProject string
+	hasExternalAccount    bool
+}
+
+func inspectGoogleCredentialFile(path string) googleCredentialInfo {
+	type credentialFile struct {
+		Type      string `json:"type"`
 		ProjectID string `json:"project_id"`
 	}
 
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var creds serviceAccount
-		if err := json.Unmarshal(data, &creds); err != nil {
-			continue
-		}
-		if strings.TrimSpace(creds.ProjectID) != "" {
-			return strings.TrimSpace(creds.ProjectID)
-		}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return googleCredentialInfo{}
 	}
-
-	return ""
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return googleCredentialInfo{}
+	}
+	var credential credentialFile
+	if err := json.Unmarshal(data, &credential); err != nil {
+		return googleCredentialInfo{}
+	}
+	switch credential.Type {
+	case "service_account":
+		return googleCredentialInfo{serviceAccountProject: strings.TrimSpace(credential.ProjectID)}
+	case "external_account":
+		return googleCredentialInfo{hasExternalAccount: true}
+	default:
+		return googleCredentialInfo{}
+	}
 }
 
-func validate(cfg *Config) []string {
+func validate(cfg *Config, hasExternalAccount bool) []string {
 	var warnings []string
 
 	if cfg.DeepgramAPIKey == "" {
@@ -381,6 +390,10 @@ func validate(cfg *Config) []string {
 	}
 	if strings.TrimSpace(cfg.GCPLocation) == "" {
 		cfg.GCPLocation = genaiconfig.DefaultLocation
+	}
+
+	if cfg.GCPProject == "" && hasExternalAccount {
+		warnings = append(warnings, "Set gcp_project: an external-account credential file names no project.")
 	}
 
 	providers := make(map[string]struct{})
@@ -483,8 +496,6 @@ func validate(cfg *Config) []string {
 		}
 		if cfg.TTSAPIKey == "" && cfg.TTSProvider != "google" {
 			warnings = append(warnings, "TTS provider configured but API key not set — set "+EnvPrefix+"TTS_API_KEY.")
-		} else if cfg.TTSAPIKey == "" && cfg.TTSProvider == "google" && os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
-			warnings = append(warnings, "Google TTS requires "+EnvPrefix+"TTS_API_KEY or GOOGLE_APPLICATION_CREDENTIALS.")
 		}
 		if cfg.TTSMaxLength <= 0 {
 			cfg.TTSMaxLength = 5000

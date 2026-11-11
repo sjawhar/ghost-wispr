@@ -94,13 +94,14 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
 | `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
-| `GOOGLE_APPLICATION_CREDENTIALS` | No | — | Path to a Google credential JSON file, including external-account credentials |
+| `google_credentials_file` | No | — | Authoritative Google credential file; when empty, Application Default Credentials are used |
 
 ## Consent rule
 
 Record only while the light is on. Anyone may pause it at any time without a reason.
 Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
 
+`ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
 ## Deployment
 
 The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is
