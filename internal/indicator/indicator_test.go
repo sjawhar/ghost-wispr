@@ -339,6 +339,12 @@ func TestControllerTurnsOffOnStop(t *testing.T) {
 	if got := ticks[len(ticks)-1]; got != 0 {
 		t.Fatalf("final watchdog timeout = %v, want disabled", got)
 	}
+	light.mu.Lock()
+	finalColour := light.colour
+	light.mu.Unlock()
+	if finalColour != [3]uint8{} {
+		t.Fatalf("final light colour = %v, want off", finalColour)
+	}
 }
 
 func TestControllerLightErrorsDoNotStopRecording(t *testing.T) {
