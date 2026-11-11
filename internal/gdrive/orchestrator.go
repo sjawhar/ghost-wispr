@@ -42,6 +42,10 @@ type uploader interface {
 	FolderOnDrive(ctx context.Context, folderID string) (bool, error)
 }
 
+type replacementInputStore interface {
+	DriveReplacementInput(sessionID string) (pending bool, splicedRecording string, err error)
+}
+
 type Orchestrator struct {
 	uploader uploader
 	store    OrchestratorStore
@@ -52,6 +56,9 @@ func NewOrchestrator(syncer *Syncer, store OrchestratorStore, logger ...*slog.Lo
 	l := logging.WithModule(slog.Default(), "gdrive")
 	if len(logger) > 0 && logger[0] != nil {
 		l = logging.WithModule(logger[0], "gdrive")
+	}
+	if replacements, ok := store.(replacementStore); ok {
+		syncer.setReplacementStore(replacements)
 	}
 
 	return &Orchestrator{uploader: syncer, store: store, logger: l}
@@ -120,6 +127,12 @@ func syncStateOf(sess *storage.Session) string {
 	return sess.SyncState
 }
 
+func replacementReady(sess *storage.Session) bool {
+	refinementDone := sess.RefinementStatus == storage.RefinementCompleted || sess.RefinementStatus == storage.RefinementFailed
+	summaryDone := sess.SummaryStatus == storage.SummaryCompleted || sess.SummaryStatus == storage.SummaryFailed
+	return refinementDone && summaryDone
+}
+
 // SyncSession uploads the session to Drive and marks it synced. It starts
 // nothing for a session already synced, or one another sync holds: a sync
 // claims its session first (ClaimSync), so retry-sync, the sync after a
@@ -130,6 +143,23 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	read, err := o.store.GetSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("get session %s: %w", sessionID, err)
+	}
+	if replacements, ok := o.store.(replacementInputStore); ok {
+		pending, splicedRecording, replacementErr := replacements.DriveReplacementInput(sessionID)
+		if replacementErr != nil {
+			return replacementErr
+		}
+		if pending {
+			if !replacementReady(&read) {
+				o.logger.Info("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
+				return nil
+			}
+			syncer, ok := o.uploader.(*Syncer)
+			if !ok {
+				return fmt.Errorf("replace session files %s: the Drive uploader cannot replace files", sessionID)
+			}
+			return syncer.ReplaceSessionFiles(ctx, read, splicedRecording)
+		}
 	}
 	switch state := syncStateOf(&read); state {
 	case storage.SyncStateSynced:

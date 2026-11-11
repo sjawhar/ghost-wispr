@@ -325,6 +325,20 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS drive_replacements (
+			session_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			old_id TEXT NOT NULL,
+			new_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			PRIMARY KEY (session_id, name, old_id),
+			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create drive replacements table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS envoy_lifecycle_events (
 			event_type TEXT NOT NULL,
 			session_id TEXT NOT NULL,
