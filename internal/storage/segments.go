@@ -436,8 +436,7 @@ func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
 	if err != nil {
 		return fmt.Errorf("stat erase directory %s: %w", dir, err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO erase_directories(path, device) VALUES(?, ?)
-		ON CONFLICT(path) DO UPDATE SET device = excluded.device`, dir, fileSystemOf(info)); err != nil {
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO erase_directories(path, device) VALUES(?, ?)`, dir, fileSystemOf(info)); err != nil {
 		return fmt.Errorf("record erase directory %s: %w", dir, err)
 	}
 	return nil

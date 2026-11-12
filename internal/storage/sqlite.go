@@ -664,9 +664,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 	// erase cut off by a stop leaves a .erasing-* file there that no row may
 	// lead to any more; the startup cleanup finishes it and then forgets the
 	// directory, once it was there to clean (RecordingDirectories,
-	// ForgetEraseDirectories).
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS erase_directories (path TEXT PRIMARY KEY, device INTEGER NOT NULL)`); err != nil {
-		return fmt.Errorf("create erase_directories table: %w", err)
+	// ForgetEraseDirectories). A row is kept per directory and file system,
+	// so an erase on one file system does not replace the row of an erase
+	// owed on another (a disk not mounted, its mount point showing the file
+	// system below).
+	if err := migrateEraseDirectories(s.db); err != nil {
+		return err
 	}
 
 	if _, err := s.db.Exec(`
@@ -1050,6 +1053,45 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	defer func() { _ = rows.Close() }()
 
 	return scanSessions(rows)
+}
+
+// migrateEraseDirectories creates erase_directories keyed on the directory
+// and its file system, and rebuilds, keeping its rows, one an earlier build
+// keyed on the directory alone. Every erase_directories table has the device
+// column: none was published without it (no release holds the table at all,
+// and main does not have it), so no ALTER adds it.
+func migrateEraseDirectories(db *sql.DB) error {
+	var keyColumns int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('erase_directories') WHERE pk > 0`).Scan(&keyColumns); err != nil {
+		return fmt.Errorf("read the erase_directories key: %w", err)
+	}
+	if keyColumns == 2 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin keying erase_directories on the file system: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	const create = `CREATE TABLE %s (path TEXT NOT NULL, device INTEGER NOT NULL, PRIMARY KEY (path, device))`
+	statements := []string{fmt.Sprintf(create, "erase_directories")}
+	if keyColumns == 1 {
+		statements = []string{
+			fmt.Sprintf(create, "erase_directories_keyed"),
+			`INSERT INTO erase_directories_keyed(path, device) SELECT path, device FROM erase_directories`,
+			`DROP TABLE erase_directories`,
+			`ALTER TABLE erase_directories_keyed RENAME TO erase_directories`,
+		}
+	}
+	for _, stmt := range statements {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("key erase_directories on the file system: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit keying erase_directories on the file system: %w", err)
+	}
+	return nil
 }
 
 // querier is what reading a session needs: the database, or a transaction.
