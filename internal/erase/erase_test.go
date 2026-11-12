@@ -127,3 +127,57 @@ func TestLeftoversZeroesOnlyWhatNothingElseLinks(t *testing.T) {
 		t.Errorf("left in the directory: %v (%v), want only the live recording", entries, err)
 	}
 }
+
+// TestLeftoversDoesNotFollowASymlink fails if a .erasing-* name that is a
+// symbolic link (never one Remove or Replace makes) has the file it points to
+// overwritten: anyone able to write the directory could aim it at any file.
+func TestLeftoversDoesNotFollowASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "elsewhere.txt")
+	if err := os.WriteFile(target, []byte("not ours to erase"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, hiddenPrefix+"planted")); err != nil {
+		t.Fatal(err)
+	}
+	for name, finish := range map[string]func(string) error{"Leftovers": Leftovers, "Orphans": Orphans} {
+		if err := finish(dir); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got, err := os.ReadFile(target); err != nil || string(got) != "not ours to erase" {
+			t.Errorf("%s changed the file a planted symlink points to: %q (%v)", name, got, err)
+		}
+	}
+}
+
+// TestOrphansLeavesASecondNameAlone fails if Orphans, which runs while the
+// app runs, unlinks the hidden second name Replace keeps before its rename:
+// the rename would then free the replaced recording without overwriting it.
+// An orphan no other name links is overwritten and removed.
+func TestOrphansLeavesASecondNameAlone(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "recording.mp3")
+	if err := os.WriteFile(live, []byte("the live recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(dir, hiddenPrefix+"second-name")
+	if err := os.Link(live, second); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(dir, hiddenPrefix+"orphan")
+	held := holdOpen(t, orphan, []byte(secret))
+
+	if err := Orphans(dir); err != nil {
+		t.Fatalf("Orphans: %v", err)
+	}
+	if _, err := os.Stat(second); err != nil {
+		t.Errorf("Orphans unlinked the second name of a recording not yet replaced: %v", err)
+	}
+	if got, err := os.ReadFile(live); err != nil || string(got) != "the live recording" {
+		t.Errorf("live recording after Orphans = %q (%v), want it whole", got, err)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the orphan is still there: %v", err)
+	}
+	assertZeroed(t, held, len(secret))
+}

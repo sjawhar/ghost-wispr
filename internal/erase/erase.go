@@ -14,6 +14,11 @@
 // A file being erased is first given a hidden name beside it (.erasing-*), so
 // one cut off by the app stopping is found and finished by Leftovers.
 //
+// Replace needs the file system to support hard links: it keeps the file it
+// replaces under a second name until the rename is done. On one without them
+// (vfat, for example) Replace fails and changes nothing, so a segment deletion
+// fails closed.
+//
 // Limits: the zeros go to the blocks the file system has for the file, which
 // a copy-on-write file system (btrfs, ZFS) would not overwrite in place, and
 // below the block device a flash card's wear levelling may keep an old copy
@@ -105,8 +110,27 @@ func Replace(from, to string) error {
 // app stopped part way (.erasing-*): it overwrites with zeros each one no
 // other name links and removes them all. One that another name still links is
 // a second name Replace made for a file it had not replaced yet: it is only
-// unlinked, and that file stays whole.
+// unlinked, and that file stays whole. Run it only while nothing else erases
+// in dir (as the app starts): an erase under way keeps such a second name
+// until its rename.
 func Leftovers(dir string) error {
+	return finish(dir, true)
+}
+
+// Orphans finishes, while the app runs, the erase of every file in dir that
+// Remove or Replace left gone from its name but not overwritten
+// (ErrLeftover): each .erasing-* file no other name links. A second name
+// another name still links is left alone, since a Replace under way may still
+// need it.
+func Orphans(dir string) error {
+	return finish(dir, false)
+}
+
+// finish erases the .erasing-* regular files in dir, and unlinks those another
+// name still links when unlinkSecondNames is set. Anything else with that
+// prefix (a symbolic link, a directory) is not one Remove or Replace makes and
+// is left alone.
+func finish(dir string, unlinkSecondNames bool) error {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -116,10 +140,26 @@ func Leftovers(dir string) error {
 	}
 	var errs error
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), hiddenPrefix) {
+		if !entry.Type().IsRegular() || !strings.HasPrefix(entry.Name(), hiddenPrefix) {
 			continue
 		}
-		if err := eraseFile(filepath.Join(dir, entry.Name())); err != nil {
+		path := filepath.Join(dir, entry.Name())
+		if !unlinkSecondNames {
+			info, err := os.Lstat(path)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				errs = errors.Join(errs, err)
+				continue
+			}
+			if links(info) > 1 {
+				continue
+			}
+		}
+		// Another erase may finish the same file at once; either one's zeros
+		// do.
+		if err := eraseFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = errors.Join(errs, err)
 		}
 	}
@@ -128,8 +168,9 @@ func Leftovers(dir string) error {
 
 // eraseFile overwrites the file at path with zeros and flushes it, unless
 // another name links it (its content is then still in use), and removes path.
+// It does not follow a symbolic link at path.
 func eraseFile(path string) error {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	f, err := os.OpenFile(path, os.O_RDWR|noFollow, 0)
 	if err != nil {
 		return fmt.Errorf("open %s to erase it: %w", path, err)
 	}
