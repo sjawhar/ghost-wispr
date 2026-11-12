@@ -89,6 +89,11 @@ func (m *scriptedMic) Stop() error {
 	return nil
 }
 
+func (m *scriptedMic) Close() error {
+	m.events <- "close"
+	return nil
+}
+
 func (m *scriptedMic) Reopen() error {
 	m.events <- "reopen"
 	return nil
@@ -413,7 +418,8 @@ func TestPausedMicIsNotReopenedAfterOverflow(t *testing.T) {
 }
 
 // If the device cannot restart on resume (unplugged during the pause), the mic
-// loop falls back to the reconnect path.
+// loop closes it, so it holds no input device through the backoff, and falls
+// back to the reconnect path.
 func TestResumeFallsBackToReopenWhenMicCannotRestart(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
@@ -425,7 +431,7 @@ func TestResumeFallsBackToReopenWhenMicCannotRestart(t *testing.T) {
 	mic.expectEvents(t, "stop")
 
 	capture.Resume()
-	mic.expectEvents(t, "start", "reopen", "stream")
+	mic.expectEvents(t, "start", "close", "reopen", "stream")
 	if got := waits.get(); len(got) != 1 || got[0] != time.Second {
 		t.Fatalf("backoff waits = %v, want [1s]", got)
 	}

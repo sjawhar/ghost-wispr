@@ -227,6 +227,54 @@ func TestStartMicIfUnpausedRefusesAnUnconfirmedLight(t *testing.T) {
 	}
 }
 
+// TestFailedMicStartClosesTheDevice fails if a microphone start that fails,
+// because the light could not be confirmed red or the device did not start,
+// leaves the capture stream it opened open: the input device then stays held
+// with nothing recording, until a later retry happens to close it. A start
+// that succeeds, and one a pause skips, keep the device for the mic loop.
+func TestFailedMicStartClosesTheDevice(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		lightErr  error
+		startErr  error
+		paused    bool
+		wantErr   bool
+		wantCalls []string
+	}{
+		{name: "light refused", lightErr: errors.New("light stayed off"), wantErr: true, wantCalls: []string{"close"}},
+		{name: "start failed", startErr: errors.New("device busy"), wantErr: true, wantCalls: []string{"start", "close"}},
+		{name: "started", wantCalls: []string{"start"}},
+		{name: "paused", paused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			if tc.paused {
+				capture.Pause()
+			}
+			capture.beforeMicStart = func() error { return tc.lightErr }
+			mic := newScriptedMic()
+			if tc.startErr != nil {
+				mic.startErrs = []error{tc.startErr}
+			}
+			withdrawn := false
+			err := startOpenedMic(capture, mic, func() { withdrawn = true }, func(string, ...any) {})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("start = %v, want an error: %t", err, tc.wantErr)
+			}
+			if withdrawn != tc.wantErr {
+				t.Errorf("microphone withdrawn = %t, want %t", withdrawn, tc.wantErr)
+			}
+			var calls []string
+			for len(mic.events) > 0 {
+				calls = append(calls, <-mic.events)
+			}
+			if !slices.Equal(calls, tc.wantCalls) {
+				t.Fatalf("device calls = %v, want %v", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
 // TestRefusedResumeHTTPReturns500 fails if the public resume route reports
 // success after the pre-resume light confirmation refuses it.
 func TestRefusedResumeHTTPReturns500(t *testing.T) {

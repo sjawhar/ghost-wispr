@@ -1661,8 +1661,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
-		if err := startMicIfUnpaused(capture, mic.Start); err != nil {
-			micRef.Store(nil)
+		if err := startOpenedMic(capture, mic, func() { micRef.Store(nil) }, log.Printf); err != nil {
 			warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
 			if updateStartupState {
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
@@ -2017,6 +2016,7 @@ type micStreamer interface {
 	Stream(writer io.Writer) error
 	Start() error
 	Stop() error
+	Close() error
 	Reopen() error
 }
 
@@ -2064,6 +2064,7 @@ func streamMicWithRetry(
 			}
 			if err = capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone restart: %v", err)
+				closeMic(streamer, "without a red recording light", logf)
 				wait(backoff)
 				continue
 			}
@@ -2076,7 +2077,10 @@ func streamMicWithRetry(
 				}
 				continue
 			}
-			// The device did not come back (unplugged during the pause): reconnect below.
+			// The device did not come back (unplugged during the pause): close
+			// it, so it holds no input device through the backoff, and
+			// reconnect below.
+			closeMic(streamer, "that did not restart", logf)
 		} else {
 			err = streamer.Stream(gated)
 			if err == nil || ctx.Err() != nil {
@@ -2106,7 +2110,7 @@ func streamMicWithRetry(
 			}
 			if err := capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone reconnect: %v", err)
-				stopMicWithoutRed(streamer, logf)
+				closeMic(streamer, "without a red recording light", logf)
 				continue
 			}
 			reopenErr := streamer.Reopen()
@@ -2143,7 +2147,7 @@ func streamMicWithRetry(
 
 		if err := capture.confirmMicStart(); err != nil {
 			logf("recording light unavailable before microphone reconnect: %v", err)
-			stopMicWithoutRed(streamer, logf)
+			closeMic(streamer, "without a red recording light", logf)
 			continue
 		}
 		reopenErr := streamer.Reopen()
@@ -2165,14 +2169,15 @@ func streamMicWithRetry(
 	}
 }
 
-// stopMicWithoutRed stops a device the reconnect could not confirm red for.
-// An overflow, or a transient read error, leaves the device capturing with
-// IsOpen false, so the light goes dark while audio still flows. The next
-// Stream then fails on the stopped device, and the error path backs off and
-// confirms red again before it reopens.
-func stopMicWithoutRed(streamer micStreamer, logf func(string, ...any)) {
-	if err := streamer.Stop(); err != nil {
-		logf("warning: stop microphone without a red recording light: %v", err)
+// closeMic closes a device that failed to start, or that the light could not
+// be confirmed red for, so it holds no input device meanwhile. An overflow, or
+// a transient read error, leaves the device capturing with IsOpen false, so
+// the light goes dark while audio still flows; a resume finds the device
+// stopped but open. The next Stream then fails on the closed device, and the
+// error path backs off and confirms red again before it reopens.
+func closeMic(streamer micStreamer, which string, logf func(string, ...any)) {
+	if err := streamer.Close(); err != nil {
+		logf("warning: close microphone %s: %v", which, err)
 	}
 }
 

@@ -140,3 +140,23 @@ func startMicIfUnpaused(capture *captureGate, start func() error) error {
 	defer capture.finishMicStart()
 	return start()
 }
+
+// startOpenedMic starts mic, which the caller has opened and published,
+// unless capture is paused (startMicIfUnpaused). If the start fails, because
+// the light could not be confirmed red or the device did not start, it
+// withdraws mic with withdraw, then closes it, so a failed start holds no
+// input device. A start skipped for a pause keeps the device open and not
+// started, for the mic loop to start on resume.
+func startOpenedMic(capture *captureGate, mic interface {
+	Start() error
+	Close() error
+}, withdraw func(), logf func(string, ...any)) error {
+	if err := startMicIfUnpaused(capture, mic.Start); err != nil {
+		withdraw()
+		if closeErr := mic.Close(); closeErr != nil {
+			logf("warning: close microphone after its start failed: %v", closeErr)
+		}
+		return err
+	}
+	return nil
+}

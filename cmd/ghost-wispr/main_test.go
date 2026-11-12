@@ -25,6 +25,7 @@ type fakeStreamer struct {
 	calls      int
 	reopens    int
 	stops      int
+	closes     int
 	stopped    bool
 }
 
@@ -55,6 +56,12 @@ func (f *fakeStreamer) Start() error { return nil }
 
 func (f *fakeStreamer) Stop() error {
 	f.stops++
+	f.stopped = true
+	return nil
+}
+
+func (f *fakeStreamer) Close() error {
+	f.closes++
 	f.stopped = true
 	return nil
 }
@@ -131,8 +138,8 @@ func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
 			if confirmations != 2 {
 				t.Fatalf("red confirmations = %d, want 2", confirmations)
 			}
-			if streamer.stops != 2 {
-				t.Fatalf("microphone stops after red confirmation failed = %d, want 2", streamer.stops)
+			if streamer.closes != 2 {
+				t.Fatalf("microphone closes after red confirmation failed = %d, want 2: a refused reconnect must release the input device", streamer.closes)
 			}
 			if streamer.calls != 2 {
 				t.Fatalf("stream calls = %d, want first error and stopped retry", streamer.calls)
@@ -178,6 +185,7 @@ func TestStreamMicWithRetryDoesNotStartWithoutRed(t *testing.T) {
 	case <-time.After(testWait):
 		t.Fatal("mic loop did not stop after refused red confirmation")
 	}
+	mic.expectEvents(t, "close")
 	mic.expectNoEvents(t)
 }
 
