@@ -73,6 +73,23 @@ type locateCandidate struct {
 	distance   float64
 }
 
+// LocateWords finds the recording and the words of segmentText as Locate
+// does, with the same refusals, and returns the start of the first matched
+// word and the end of the last, with no safety margin: the segment's aligned
+// word span. "Delete text" records it, and refinement drops every word whose
+// middle is in it, so a margin would drop a neighbour's word as well.
+func LocateWords(recordings []Recording, segmentText, before, after string) (record int, start, end, score float64, err error) {
+	best, words, err := locate(recordings, segmentText, before, after)
+	if err != nil {
+		return -1, 0, 0, best.score, err
+	}
+	start, end = words[best.start].word.Start, words[best.end-1].word.End
+	if !(end > start) {
+		return -1, 0, 0, best.score, fmt.Errorf("%w: matched words at %v-%v seconds have no duration", ErrSegmentNotFound, start, end)
+	}
+	return best.record, start, end, best.score, nil
+}
+
 // Locate finds the recording and span of segmentText. Recordings must be in session time
 // order so context can cross their boundaries. It chooses the window with the closest
 // normalised tokens across every recording, using before and after as lower-weight context,
@@ -81,10 +98,26 @@ type locateCandidate struct {
 // can over-cut more when context is empty or the segment has one or two words. Task 3.2 checks
 // every cut afterwards: it refuses if segment words survive or a given neighbour loses more than one word.
 func Locate(recordings []Recording, segmentText, before, after string) (record int, start, end, score float64, err error) {
-	record = -1
+	best, bestWords, err := locate(recordings, segmentText, before, after)
+	if err != nil {
+		return -1, 0, 0, best.score, err
+	}
+	start = clamp(bestWords[best.start].word.Start-locatePadding, 0, recordings[best.record].Duration)
+	end = clamp(bestWords[best.end-1].word.End+locatePadding, 0, recordings[best.record].Duration)
+	if !(end > start) {
+		return -1, 0, 0, best.score, fmt.Errorf("%w: matched words at %v-%v seconds lie outside the recording's %v-second duration",
+			ErrSegmentNotFound, bestWords[best.start].word.Start, bestWords[best.end-1].word.End, recordings[best.record].Duration)
+	}
+	return best.record, start, end, best.score, nil
+}
+
+// locate is the search Locate and LocateWords share: the best window and the
+// normalised words of its recording, or ErrSegmentNotFound for no match, a
+// weak or ambiguous one, or one whose context matches better inside it.
+func locate(recordings []Recording, segmentText, before, after string) (best locateCandidate, bestWords []locatedWord, err error) {
 	segmentTokens := normaliseText(segmentText)
 	if len(segmentTokens) == 0 {
-		return record, 0, 0, 0, ErrSegmentNotFound
+		return best, nil, ErrSegmentNotFound
 	}
 
 	beforeTokens := normaliseText(before)
@@ -108,8 +141,6 @@ func Locate(recordings []Recording, segmentText, before, after string) (record i
 	afterContext := make([]string, maxContextTokens)
 
 	minWindowSize := max(1, len(segmentTokens)-windowSlack)
-	var best locateCandidate
-	var bestWords []locatedWord
 	found := false
 	ambiguous := false
 	for recordIndex := range recordings {
@@ -170,21 +201,14 @@ func Locate(recordings []Recording, segmentText, before, after string) (record i
 	}
 
 	if !found || ambiguous || best.score < minimumLocateScore {
-		return -1, 0, 0, best.score, ErrSegmentNotFound
+		return best, nil, ErrSegmentNotFound
 	}
 
 	if contextMatchesBetterInside(beforeTokens, recordingTokensByRecord, best, true, beforeContext, previous, current) ||
 		contextMatchesBetterInside(afterTokens, recordingTokensByRecord, best, false, afterContext, previous, current) {
-		return -1, 0, 0, best.score, ErrSegmentNotFound
+		return best, nil, ErrSegmentNotFound
 	}
-
-	start = clamp(bestWords[best.start].word.Start-locatePadding, 0, recordings[best.record].Duration)
-	end = clamp(bestWords[best.end-1].word.End+locatePadding, 0, recordings[best.record].Duration)
-	if !(end > start) {
-		return -1, 0, 0, best.score, fmt.Errorf("%w: matched words at %v-%v seconds lie outside the recording's %v-second duration",
-			ErrSegmentNotFound, bestWords[best.start].word.Start, bestWords[best.end-1].word.End, recordings[best.record].Duration)
-	}
-	return best.record, start, end, best.score, nil
+	return best, bestWords, nil
 }
 
 func normaliseWords(words []Word) []locatedWord {
