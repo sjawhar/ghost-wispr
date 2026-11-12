@@ -57,6 +57,40 @@ func TestRemoveZeroesTheFileBeforeItIsFreed(t *testing.T) {
 	}
 }
 
+// TestBeginLeavesTheFileForFinishOrLeftovers fails if Begin leaves the file
+// at its name, or overwrites it before Finish runs, or if a file Begin hid
+// and no Finish reached (the app stopped) is not finished by Leftovers.
+func TestBeginLeavesTheFileForFinishOrLeftovers(t *testing.T) {
+	for _, stopped := range []bool{false, true} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "recording.mp3")
+		held := holdOpen(t, path, []byte(secret))
+		pending, err := Begin(path)
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the file still has its name after Begin: %v", err)
+		}
+		got := make([]byte, len(secret))
+		if _, err := held.ReadAt(got, 0); err != nil || string(got) != secret {
+			t.Fatalf("Begin overwrote the file before Finish: %q (%v)", got, err)
+		}
+		if stopped {
+			err = Leftovers(dir)
+		} else {
+			err = pending.Finish()
+		}
+		if err != nil {
+			t.Fatalf("finish (stopped %v): %v", stopped, err)
+		}
+		assertZeroed(t, held, len(secret))
+		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+			t.Errorf("left in the directory (stopped %v): %v (%v)", stopped, entries, err)
+		}
+	}
+}
+
 func TestRemoveOfAMissingFileChangesNothing(t *testing.T) {
 	if err := Remove(filepath.Join(t.TempDir(), "missing.mp3")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("Remove of a missing file = %v, want not-exist", err)

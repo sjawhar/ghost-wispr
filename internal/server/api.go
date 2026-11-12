@@ -800,17 +800,30 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		// Erase the audio files after the database deletion: removing a whole
-		// audio file overwrites it with zeros before the file system frees its
-		// blocks (Sami, 2026-11-12, "Zero every audio removal",
+		// Erase the audio files after the database deletion, which records
+		// their directories so that an erase cut off by a stop is finished
+		// as the app starts: removing a whole audio file overwrites it with
+		// zeros before the file system frees its blocks (Sami, 2026-11-12,
+		// "Zero every audio removal",
 		// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
-		if sessionData.AudioPath != "" {
-			for _, p := range strings.Split(sessionData.AudioPath, ",") {
-				p = strings.TrimSpace(p)
-				if p != "" {
-					_ = erase.Remove(p)
-				}
+		// The files leave their names before the answer; the zeros, a write
+		// as large as the recordings, follow it.
+		var pending []erase.Pending
+		for _, p := range strings.Split(sessionData.AudioPath, ",") {
+			if p = strings.TrimSpace(p); p == "" {
+				continue
 			}
+			hidden, err := erase.Begin(p)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					slog.Warn("could not remove a deleted session's recording", "session_id", sessionID, "audio_path", p, "error", err)
+				}
+				continue
+			}
+			pending = append(pending, hidden)
+		}
+		if len(pending) > 0 {
+			go finishErasing(sessionID, pending)
 		}
 
 		w.WriteHeader(http.StatusNoContent)
@@ -1526,6 +1539,18 @@ func cosineSimilarity(a, b []float32) float32 {
 	}
 
 	return float32(dot / (math.Sqrt(normA) * math.Sqrt(normB)))
+}
+
+// finishErasing overwrites with zeros and removes the recordings a session
+// delete moved to hidden names, after the response. One it cannot finish
+// stays under its hidden name for erase.Leftovers as the app starts. Tests
+// replace it to see the response come first.
+var finishErasing = func(sessionID string, pending []erase.Pending) {
+	for _, p := range pending {
+		if err := p.Finish(); err != nil {
+			slog.Warn("could not overwrite a deleted session's recording; it is erased as the app starts", "session_id", sessionID, "error", err)
+		}
+	}
 }
 
 func validSessionID(id string) bool {

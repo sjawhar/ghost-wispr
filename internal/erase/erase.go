@@ -9,17 +9,20 @@
 // (dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81), option
 // "Zero every audio removal", with: "This is really not very important. Do
 // NOT zero entire files if people just want to delete certain segments." So the
-// removal of a whole audio file uses Remove: GC's age and disk-pressure
-// removal and its raw copies, a saved session's raw recording, a partial
-// encoder output, and DELETE /api/sessions/{id}. A segment deletion zeroes no
-// audio file: its splice and the copies it makes are renamed and removed
+// removal of a whole audio file erases it: GC's age and disk-pressure
+// removal and its raw copies, a saved session's raw recording and a partial
+// encoder output use Remove, and DELETE /api/sessions/{id} uses its two
+// halves, Begin before it answers and Finish after. A segment deletion zeroes
+// no audio file: its splice and the copies it makes are renamed and removed
 // plainly, so audio a segment deletion cuts stays recoverable at the block
 // level, which that answer accepts. The database's pre-migration backup,
 // which holds transcript text, is replaced and removed through Replace and
 // Remove.
 //
 // A file being erased is first given a hidden name beside it (.erasing-*), so
-// one cut off by the app stopping is found and finished by Leftovers.
+// one cut off by the app stopping is found and finished by Leftovers. The
+// app runs Leftovers as it starts in every directory it records a recording
+// or an erase in (storage.RecordingDirectories).
 //
 // Replace needs the file system to support hard links: it keeps the file it
 // replaces under a second name until the rename is done. On one without them
@@ -58,23 +61,50 @@ var ErrLeftover = errors.New("the old content is left under a hidden name (.eras
 // directory, a symbolic link) holds no bytes of its own and is removed as
 // os.Remove removes it.
 func Remove(path string) error {
+	pending, err := Begin(path)
+	if err != nil {
+		return err
+	}
+	return pending.Finish()
+}
+
+// Pending is a file Begin moved to a hidden name, for Finish to erase.
+type Pending struct {
+	path, hidden string
+}
+
+// Begin is the first half of Remove: it moves the file at path to a hidden
+// name beside it (.erasing-*), so path no longer names it, and returns it for
+// Finish, which a caller may run later. Until Finish is done, a stop leaves
+// the file under its hidden name for Leftovers. An error means path still
+// names the file, unchanged. A path that is not a regular file is removed as
+// os.Remove removes it, and Finish then has nothing to do.
+func Begin(path string) (Pending, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return err
+		return Pending{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return os.Remove(path)
+		return Pending{}, os.Remove(path)
 	}
-	dir := filepath.Dir(path)
-	hidden, err := hiddenName(dir)
+	hidden, err := hiddenName(filepath.Dir(path))
 	if err != nil {
-		return err
+		return Pending{}, err
 	}
 	if err := os.Rename(path, hidden); err != nil {
-		return err
+		return Pending{}, err
 	}
-	if err := errors.Join(syncDir(dir), eraseFile(hidden)); err != nil {
-		return fmt.Errorf("erase %s: %w: %w", path, ErrLeftover, err)
+	return Pending{path: path, hidden: hidden}, nil
+}
+
+// Finish is the second half of Remove: it overwrites the file Begin hid with
+// zeros, flushes it, and removes it. Its error wraps ErrLeftover.
+func (p Pending) Finish() error {
+	if p.hidden == "" {
+		return nil
+	}
+	if err := errors.Join(syncDir(filepath.Dir(p.hidden)), eraseFile(p.hidden)); err != nil {
+		return fmt.Errorf("erase %s: %w: %w", p.path, ErrLeftover, err)
 	}
 	return nil
 }

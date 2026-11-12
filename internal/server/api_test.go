@@ -20,6 +20,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -471,12 +472,12 @@ func TestDeleteSession_Success(t *testing.T) {
 	}
 }
 
-// TestDeleteSession_ZeroesItsAudio fails if deleting a session removes its
-// recordings without overwriting their bytes before the file system frees
-// them.
-func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
+// deleteSessionWithRecording serves DELETE /api/sessions/s1 for a session
+// whose recording holds audio, with finish in place of finishErasing, and
+// returns the recording's path and a descriptor held on it.
+func deleteSessionWithRecording(t *testing.T, audio []byte, finish func(string, []erase.Pending)) (string, *os.File, <-chan *httptest.ResponseRecorder) {
+	t.Helper()
 	recording := filepath.Join(t.TempDir(), "s1.mp3")
-	audio := []byte("the session's audio")
 	if err := os.WriteFile(recording, audio, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +485,10 @@ func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = held.Close() }()
+	t.Cleanup(func() { _ = held.Close() })
+	original := finishErasing
+	t.Cleanup(func() { finishErasing = original })
+	finishErasing = finish
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: recording}},
@@ -494,14 +498,78 @@ func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
-	if rr.Code != http.StatusNoContent {
+	answered := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+		answered <- rr
+	}()
+	return recording, held, answered
+}
+
+// TestDeleteSession_ZeroesItsAudio fails if deleting a session removes its
+// recordings without overwriting their bytes before the file system frees
+// them.
+func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
+	audio := []byte("the session's audio")
+	finish := finishErasing
+	finished := make(chan struct{})
+	recording, held, answered := deleteSessionWithRecording(t, audio, func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	})
+	if rr := <-answered; rr.Code != http.StatusNoContent {
 		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
 	}
 	if _, err := os.Stat(recording); !os.IsNotExist(err) {
 		t.Fatalf("the recording is still there: %v", err)
 	}
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the removed recording still holds %q", got)
+	}
+}
+
+// TestDeleteSession_AnswersBeforeItZeroesTheAudio fails if deleting a session
+// holds the request until its recordings are overwritten, a write as large as
+// they are, or answers before they have left their names.
+func TestDeleteSession_AnswersBeforeItZeroesTheAudio(t *testing.T) {
+	audio := []byte("the session's audio")
+	finish := finishErasing
+	release, finished := make(chan struct{}), make(chan struct{})
+	recording, held, answered := deleteSessionWithRecording(t, audio, func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		<-release
+		finish(sessionID, pending)
+	})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	select {
+	case rr := <-answered:
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session delete waited for its recordings to be overwritten before it answered")
+	}
+	if _, err := os.Stat(recording); !os.IsNotExist(err) {
+		t.Fatalf("the recording still has its name when the delete answers: %v", err)
+	}
+	close(release)
+	<-finished
 	got := make([]byte, len(audio))
 	if _, err := held.ReadAt(got, 0); err != nil {
 		t.Fatal(err)
