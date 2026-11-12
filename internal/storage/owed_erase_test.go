@@ -476,3 +476,23 @@ func TestARetryKeepsAnEraseOwedSinceItRead(t *testing.T) {
 		t.Errorf("owed erasures after a retry a deletion overtook = %d, want 2", owed)
 	}
 }
+
+// TestARetryWhoseLogOverwriteFailsStaysOwed fails if a retry whose own
+// overwrite of the write-ahead log fails records the erase done: the log's
+// old frames would keep the deleted words with nothing owed.
+func TestARetryWhoseLogOverwriteFailsStaysOwed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	store := openStoreWithBackup(t, path)
+	maintenance := postDeleteMaintenance
+	t.Cleanup(func() { postDeleteMaintenance = maintenance })
+	postDeleteMaintenance = func(*sql.DB, string) error { return errors.New("a reader kept the log from starting over") }
+	deleteSecretOwingTheErase(t, store)
+
+	if err := store.RetryOwedErasure(); err == nil {
+		t.Error("RetryOwedErasure with a failing log overwrite reported no error")
+	}
+	if owed := owedErasures(t, store); owed != 1 {
+		t.Errorf("owed erasures after a retry whose log overwrite failed = %d, want 1", owed)
+	}
+}
