@@ -404,6 +404,51 @@ func TestDeleteSegmentSecurelyErasesDeletedText(t *testing.T) {
 	}
 }
 
+// TestEveryConnectionErasesDeletedText fails if a connection that
+// database/sql opens again, after dropping the first, lacks secure_delete or
+// foreign keys. No VACUUM runs after a deletion, so secure_delete on the
+// connection that commits it is what zeroes the deleted words in the pages it
+// frees.
+func TestEveryConnectionErasesDeletedText(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconnect.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	// Every statement from here on runs on a connection opened for it.
+	store.DB().SetMaxIdleConns(0)
+	var secureDelete, foreignKeys int
+	if err := store.DB().QueryRow(`PRAGMA secure_delete`).Scan(&secureDelete); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		t.Fatal(err)
+	}
+	if secureDelete != 1 || foreignKeys != 1 {
+		t.Errorf("a reopened connection has secure_delete=%d foreign_keys=%d, want both on", secureDelete, foreignKeys)
+	}
+	_, _ = segmentTestSession(t, store, "reconnect")
+	segments, err := store.GetSegments("reconnect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const unique = "reconnected-deletion-phrase-5be1a0"
+	if _, err := store.DB().Exec(`UPDATE segments SET text = ? WHERE id = ?`, unique, segments[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegment("reconnect", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	store.DB().SetMaxIdleConns(1)
+	if _, err := store.DB().Exec(`SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	assertDatabaseFilesLack(t, path, unique, "after bridge")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // assertDatabaseFilesLack fails if secret is in any file of the open SQLite
 // database at path: the database, its write-ahead log and its shared-memory
 // index. It reads them while the store is open, when they all exist (SQLite

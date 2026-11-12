@@ -20,8 +20,8 @@ var (
 	ErrSegmentNotFound = errors.New("segment not found")
 	// ErrSegmentSessionActive means a recording session cannot be changed yet.
 	ErrSegmentSessionActive = errors.New("session is still active")
-	// ErrSegmentPostCommitMaintenance means the deletion committed but SQLite
-	// maintenance did not complete.
+	// ErrSegmentPostCommitMaintenance means the deletion committed but the
+	// write-ahead log checkpoint did not complete.
 	ErrSegmentPostCommitMaintenance = errors.New("segment deletion post-commit maintenance failed")
 	// ErrSegmentSplicePending means an earlier deletion still needs recovery.
 	ErrSegmentSplicePending = errors.New("segment splice is pending")
@@ -186,10 +186,15 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	return nil
 }
 
+// postDeleteMaintenance moves a committed deletion out of the write-ahead log
+// and empties the log: its older frames still hold the deleted words. The
+// database file itself needs nothing more. Every connection has
+// secure_delete on (NewSQLiteStore), which zeroes the deleted content in the
+// pages the deletion rewrites and every page it frees, the freelist included
+// (SQLite's "fast" setting would leave the freelist; ON does not), so a
+// VACUUM would only shrink the file: it rewrote the whole database through
+// the log on every deletion.
 var postDeleteMaintenance = func(db *sql.DB) error {
-	if _, err := db.Exec(`VACUUM`); err != nil {
-		return fmt.Errorf("vacuum: %w", err)
-	}
 	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
 	}

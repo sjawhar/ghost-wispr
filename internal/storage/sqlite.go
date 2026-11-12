@@ -182,7 +182,14 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// The per-connection settings are part of the name every connection opens,
+	// so one that database/sql opens again after dropping the first has them
+	// too: secure_delete (a deleted segment's freed pages are zeroed, the
+	// freelist included, which is what keeps its words out of the database
+	// file; see postDeleteMaintenance), foreign keys (the cascades that remove
+	// a session's rows) and the busy timeout. Set with PRAGMA once, they held
+	// for the first connection only.
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=secure_delete(1)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -275,9 +282,6 @@ func syncFile(path string) error {
 func (s *SQLiteStore) init(dbPath string) error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
-		"PRAGMA secure_delete = ON",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA foreign_keys = ON",
 	}
 	for _, p := range pragmas {
 		if _, err := s.db.Exec(p); err != nil {
