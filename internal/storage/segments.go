@@ -107,7 +107,9 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		UPDATE sessions
 		SET title = '',
 			summary = '',
+			summary_model = '',
 			refined_transcript = '',
+			refinement_model = '',
 			refinement_status = ?,
 			summary_status = ?,
 			summary_error = '',
@@ -316,7 +318,7 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 	}
 	for _, id := range sources {
 		if _, err := tx.Exec(`UPDATE sessions
-			SET title = '', summary = '', refined_transcript = '', canonical_transcript = ?, transcript_source = ?
+			SET title = '', summary = '', summary_model = '', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?
 			WHERE id = ?`, canonicalTranscript(own[id]), TranscriptSourceStreaming, id); err != nil {
 			return nil, nil, fmt.Errorf("scrub merged source %s: %w", id, err)
 		}
