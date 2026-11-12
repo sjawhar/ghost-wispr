@@ -379,23 +379,28 @@ func isDriveDeleteCall(name string) bool {
 	return strings.HasSuffix(name, "DeleteCall") || strings.HasSuffix(name, "EmptyTrashCall")
 }
 
-// No app code deletes or trashes a Drive file except ReplaceSessionFiles,
-// which removes recorded old files and duplicate app-created replacement
-// uploads only after it stores the replacement to retain.
+// replacementDeleteFunction is the one function with a Drive delete call:
+// replaceFolder (replace.go), which a segment deletion's replacement runs for
+// each folder it owes.
+const replacementDeleteFunction = "replaceFolder"
+
+// No app code deletes or trashes a Drive file except replaceFolder, which
+// removes recorded old files and duplicate app-created replacement uploads
+// only after it stores the replacement to retain.
 func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
 	root := moduleRoot(t)
 	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")
 	allowedLocations := map[string]bool{}
 	for _, finding := range driveDeletions(t, root, nil) {
 		path, line, ok := driveDeletionLocation(finding)
-		if ok && path == replacePath && functionAtLine(t, path, line) == "ReplaceSessionFiles" {
+		if ok && path == replacePath && functionAtLine(t, path, line) == replacementDeleteFunction {
 			allowedLocations[fmt.Sprintf("%s:%d", path, line)] = true
 			continue
 		}
 		t.Error(finding)
 	}
 	if len(allowedLocations) != 1 {
-		t.Errorf("found %d allowed Drive delete call sites in ReplaceSessionFiles, want exactly one", len(allowedLocations))
+		t.Errorf("found %d allowed Drive delete call sites in %s, want exactly one", len(allowedLocations), replacementDeleteFunction)
 	}
 }
 
@@ -533,7 +538,7 @@ func TestTheDriveDeletionCheckFindsEveryForm(t *testing.T) {
 		if !ok {
 			t.Fatalf("finding %q has no source location", finding)
 		}
-		if path == replacePath && functionAtLine(t, path, line) == "ReplaceSessionFiles" {
+		if path == replacePath && functionAtLine(t, path, line) == replacementDeleteFunction {
 			continue
 		}
 		at := fmt.Sprintf("%s:%d", path, line)

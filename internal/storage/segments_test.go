@@ -398,20 +398,35 @@ func TestDeleteSegmentSecurelyErasesDeletedText(t *testing.T) {
 	if err := store.DeleteSegment("secure-delete", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
+	assertDatabaseFilesLack(t, path, unique, "after bridge")
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
+}
+
+// assertDatabaseFilesLack fails if secret is in any file of the open SQLite
+// database at path: the database, its write-ahead log and its shared-memory
+// index. It reads them while the store is open, when they all exist (SQLite
+// removes the log and index when the last connection closes, so a read
+// after Close would pass by reading nothing), fails if one is missing, and
+// fails unless kept, text the database still holds, is found in one of them,
+// so the read is shown able to see text at all.
+func assertDatabaseFilesLack(t *testing.T, path, secret, kept string) {
+	t.Helper()
+	seenKept := false
 	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
-		bytes, err := os.ReadFile(candidate)
-		if os.IsNotExist(err) {
-			continue
-		}
+		contents, err := os.ReadFile(candidate)
 		if err != nil {
-			t.Fatalf("read %s: %v", candidate, err)
+			t.Fatalf("read %s while the store is open: %v", candidate, err)
 		}
-		if strings.Contains(string(bytes), unique) {
-			t.Fatalf("deleted text remains in %s", candidate)
+		t.Logf("%s: %d bytes", filepath.Base(candidate), len(contents))
+		if strings.Contains(string(contents), secret) {
+			t.Errorf("the deleted words remain in %s", candidate)
 		}
+		seenKept = seenKept || strings.Contains(string(contents), kept)
+	}
+	if !seenKept {
+		t.Fatalf("no database file holds the kept text %q: the read saw no data", kept)
 	}
 }
 

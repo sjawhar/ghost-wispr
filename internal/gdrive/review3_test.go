@@ -32,7 +32,7 @@ func TestReview3StaleRowsDoNotFinishANewerGeneration(t *testing.T) {
 	if rows, err := store.DriveReplacements(id, 2); err != nil || len(rows) != 0 {
 		t.Errorf("DriveReplacements(gen 2) = %d rows, %v; want none", len(rows), err)
 	}
-	if err := store.FinishDriveReplacement(id, 2, []string{id}); !errors.Is(err, sql.ErrNoRows) {
+	if err := store.FinishDriveReplacement(id, 2); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("FinishDriveReplacement(gen 2) with only gen-1 rows = %v, want a refusal", err)
 	}
 	sess, err := store.GetSession(id)

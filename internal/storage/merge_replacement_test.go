@@ -65,3 +65,27 @@ func TestAMergedSourceOwingADriveReplacementIsSwept(t *testing.T) {
 		t.Errorf("sessions needing sync = %v, want the merged source that owes a replacement", ids)
 	}
 }
+
+// TestEveryOwedSessionThatIsNotRecordingIsSwept fails if a session that owes
+// Drive a replacement is left out of the sync sweep because it was discarded
+// (consent to delete covers discarded sessions too), or if the sweep reads a
+// session still recording.
+func TestEveryOwedSessionThatIsNotRecordingIsSwept(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"discarded", "recording"} {
+		if err := store.CreateSession(id, started.Add(time.Duration(i)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = CASE id WHEN 'discarded' THEN 'discarded' ELSE 'active' END, drive_replace_pending = 1, sync_state = ?`, SyncStateFailed); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := store.GetSessionsNeedingSync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != "discarded" {
+		t.Errorf("sessions needing sync = %v, want only the discarded session that owes a replacement", ids)
+	}
+}

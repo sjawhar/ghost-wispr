@@ -18,7 +18,6 @@ import (
 
 type replacementStore interface {
 	GetSession(id string) (storage.Session, error)
-	MergedSources(sessionID string) ([]storage.Session, error)
 	DriveReplacements(sessionID string, generation int) ([]storage.DriveReplacement, error)
 	PendingDriveReplacementRecordings(sessionID string) ([]string, error)
 	StartDriveReplacement(sessionID, name string, generation int, oldIDs []string) error
@@ -26,7 +25,9 @@ type replacementStore interface {
 	MarkDriveReplacementDeleted(sessionID, name, oldID string, generation int) error
 	DeletionGeneration(sessionID string) (int, error)
 	ClearDriveReplacementPending(sessionID string, generation int) error
-	FinishDriveReplacement(sessionID string, generation int, folderSessionIDs []string) error
+	DriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
+	MarkDriveReplacementFolder(sessionID string, generation int, folderSessionID, state string) error
+	FinishDriveReplacement(sessionID string, generation int) error
 }
 
 // replacementTarget is one Drive folder a replacement covers: the session's
@@ -44,60 +45,144 @@ type replacementTarget struct {
 	rows     []storage.DriveReplacement
 }
 
+// replacementOutcome is what one replacement attempt did to the session's
+// own Drive folder: replaced it, or found it in the trash or gone. All false:
+// the session has no folder of its own, or this attempt did not reach it
+// (an earlier one did).
+type replacementOutcome struct {
+	ownReplaced, ownTrashed, ownGone bool
+}
+
 func (s *Syncer) setReplacementStore(store replacementStore) {
 	s.replacements = store
 }
 
 // ReplaceSessionFiles replaces, in every Drive folder that can hold a deleted
 // segment's words (the session's own, and each folder of a session merged
-// into it), transcript.md, summary.md and each spliced recording that folder
-// has. It uploads and verifies every replacement, in every folder, and
-// records each new id before it deletes any old id, so a retry resumes from
-// the rows and never deletes the replacement it chose.
+// into it, as the deletion recorded them owed), transcript.md, summary.md and
+// each spliced recording that folder has. See replaceSessionFiles.
 //
 //nolint:gocritic // The approved API accepts storage.Session by value.
 func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, splicedRecording string) error {
+	_, err := s.replaceSessionFiles(ctx, &sess, splicedRecording)
+	return err
+}
+
+// replaceSessionFiles replaces every Drive folder sess's segment deletion
+// still owes that Drive can reach now, one folder at a time: it uploads and
+// verifies the folder's replacements, recording each new id before it
+// deletes any old id there (so a retry resumes from the rows and never
+// deletes the replacement it chose), deletes the folder's old files, renames
+// the folder and records it replaced. A folder gone for good is recorded
+// gone, its old files gone with it. A folder in the trash stays owed: the
+// attempt fails, and the sweep comes back until the folder is restored. The
+// folders Drive can reach are replaced meanwhile, so one in the trash does not
+// keep the words in the others. The deletion finishes once no folder is owed.
+func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session, splicedRecording string) (replacementOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var outcome replacementOutcome
 	if s.replacements == nil {
-		return fmt.Errorf("replace session files %s: replacement store is required", sess.ID)
+		return outcome, fmt.Errorf("replace session files %s: replacement store is required", sess.ID)
 	}
 	generation, err := s.replacements.DeletionGeneration(sess.ID)
 	if err != nil {
-		return fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
+		return outcome, fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
 	}
-
 	current, err := s.replacements.GetSession(sess.ID)
 	if err != nil {
-		return fmt.Errorf("read replacement session %s: %w", sess.ID, err)
+		return outcome, fmt.Errorf("read replacement session %s: %w", sess.ID, err)
 	}
-	sess = current
-	if !sess.DriveReplacePending || !replacementReady(&sess) {
-		return nil
+	if !current.DriveReplacePending || !replacementReady(&current) {
+		return outcome, nil
 	}
-	recordings, err := s.replacements.PendingDriveReplacementRecordings(sess.ID)
+	recordings, err := s.replacements.PendingDriveReplacementRecordings(current.ID)
 	if err != nil {
-		return fmt.Errorf("list replacement recordings for session %s: %w", sess.ID, err)
+		return outcome, fmt.Errorf("list replacement recordings for session %s: %w", current.ID, err)
 	}
 	if len(recordings) == 0 {
 		recordings = []string{splicedRecording}
 	}
-	targets, err := s.replacementTargets(ctx, &sess, generation, recordings)
+	folders, err := s.replacements.DriveReplacementFolders(current.ID, generation)
 	if err != nil {
-		return err
+		return outcome, err
 	}
-	if len(targets) == 0 {
-		// No folder holds the session's files: the merged sources' folders
-		// that did are gone for good, and their old files with them.
-		return s.replacements.ClearDriveReplacementPending(sess.ID, generation)
-	}
-	for _, target := range targets {
-		if err := s.uploadReplacements(ctx, target, generation); err != nil {
-			return err
-		}
+	if len(folders) == 0 {
+		// The deletion owes no folder: none held the session's files.
+		return outcome, s.replacements.ClearDriveReplacementPending(current.ID, generation)
 	}
 
+	var failures []error
+	for _, folder := range folders {
+		if folder.State != storage.DriveReplacementFolderOwed {
+			continue
+		}
+		own := folder.FolderSessionID == current.ID
+		folderSession := current
+		if !own {
+			if folderSession, err = s.replacements.GetSession(folder.FolderSessionID); err != nil {
+				failures = append(failures, fmt.Errorf("read merged session %s: %w", folder.FolderSessionID, err))
+				continue
+			}
+		}
+		if err := s.checkFolder(ctx, folderSession.GDriveFolderID); err != nil {
+			switch {
+			case errors.Is(err, ErrFolderTrashed):
+				outcome.ownTrashed = outcome.ownTrashed || own
+				failures = append(failures, fmt.Errorf("the Drive folder of session %s is in the trash, and its replacement runs once it is restored: %w", folderSession.ID, err))
+			case IsRemoteDeletedError(err):
+				if err := s.replacements.MarkDriveReplacementFolder(current.ID, generation, folderSession.ID, storage.DriveReplacementFolderGone); err != nil {
+					failures = append(failures, err)
+					continue
+				}
+				outcome.ownGone = outcome.ownGone || own
+			default:
+				failures = append(failures, fmt.Errorf("check the Drive folder of session %s: %w", folderSession.ID, err))
+			}
+			continue
+		}
+		if err := s.replaceFolder(ctx, current.ID, generation, &folderSession, recordings, own); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		outcome.ownReplaced = outcome.ownReplaced || own
+	}
+	if len(failures) != 0 {
+		return outcome, errors.Join(failures...)
+	}
+	return outcome, s.replacements.FinishDriveReplacement(current.ID, generation)
+}
+
+// replaceFolder replaces the Drive folder of folderSession, which ownerID's
+// segment deletion at generation owes: uploads and verifies its replacements,
+// deletes its old files and duplicates, renames it and records it replaced.
+// A merged source's folder (own false) gets the spliced recordings it holds,
+// under their own names, and its scrubbed transcript and summary.
+func (s *Syncer) replaceFolder(ctx context.Context, ownerID string, generation int, folderSession *storage.Session, recordings []string, own bool) error {
+	target := &replacementTarget{
+		session:    *folderSession,
+		folderName: folderSession.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(folderSession.Title),
+	}
+	var err error
+	if target.rows, err = s.replacements.DriveReplacements(target.session.ID, generation); err != nil {
+		return err
+	}
+	if !allDriveReplacementsDeleted(target.rows) {
+		if target.existing, err = s.ListFolderFiles(ctx, target.session.GDriveFolderID); err != nil {
+			return fmt.Errorf("list replacements for session %s: %w", target.session.ID, err)
+		}
+		folderRecordings := recordings
+		if !own {
+			folderRecordings = recordingsInFolder(recordings, target.existing, target.rows)
+		}
+		if target.files, _, err = replacementFiles(&target.session, folderRecordings); err != nil {
+			return fmt.Errorf("build replacements for session %s: %w", target.session.ID, err)
+		}
+	}
+	if err := s.uploadReplacements(ctx, target, generation); err != nil {
+		return err
+	}
 	deleteFile := func(fileID string) error {
 		err := s.service.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
 		if err != nil && !IsRemoteDeletedError(err) {
@@ -105,72 +190,13 @@ func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, 
 		}
 		return nil
 	}
-	for _, target := range targets {
-		if err := s.deleteReplacedFiles(ctx, sess.ID, target, generation, deleteFile); err != nil {
-			return err
-		}
+	if err := s.deleteReplacedFiles(ctx, ownerID, target, generation, deleteFile); err != nil {
+		return err
 	}
-	folders := make([]string, 0, len(targets))
-	for _, target := range targets {
-		if err := s.renameSessionFolder(ctx, target.session.GDriveFolderID, target.folderName); err != nil {
-			return err
-		}
-		folders = append(folders, target.session.ID)
+	if err := s.renameSessionFolder(ctx, target.session.GDriveFolderID, target.folderName); err != nil {
+		return err
 	}
-	return s.replacements.FinishDriveReplacement(sess.ID, generation, folders)
-}
-
-// replacementTargets returns the folders a replacement of sess's files covers:
-// sess's own, if it has one, and that of each session merged into it. Each
-// folder is checked, as a sync checks a folder. One gone for good took its
-// old files with it and is left out; one in the trash fails the replacement,
-// which the sweep retries until it is restored. A merged source gets the
-// spliced recordings its folder holds, under their own names, and its
-// scrubbed transcript and summary.
-func (s *Syncer) replacementTargets(ctx context.Context, sess *storage.Session, generation int, recordings []string) ([]*replacementTarget, error) {
-	sources, err := s.replacements.MergedSources(sess.ID)
-	if err != nil {
-		return nil, fmt.Errorf("list merged sources of session %s: %w", sess.ID, err)
-	}
-	folders := append([]storage.Session{*sess}, sources...)
-	var candidates []storage.Session
-	for i := range folders {
-		folder := &folders[i]
-		if folder.GDriveFolderID == "" {
-			continue
-		}
-		if err := s.checkFolder(ctx, folder.GDriveFolderID); err != nil {
-			if IsRemoteDeletedError(err) && !errors.Is(err, ErrFolderTrashed) {
-				continue
-			}
-			return nil, fmt.Errorf("check the Drive folder of session %s: %w", folder.ID, err)
-		}
-		candidates = append(candidates, *folder)
-	}
-
-	targets := make([]*replacementTarget, 0, len(candidates))
-	for i := range candidates {
-		target := &replacementTarget{session: candidates[i]}
-		target.folderName = target.session.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(target.session.Title)
-		if target.rows, err = s.replacements.DriveReplacements(target.session.ID, generation); err != nil {
-			return nil, err
-		}
-		targets = append(targets, target)
-		if allDriveReplacementsDeleted(target.rows) {
-			continue
-		}
-		if target.existing, err = s.ListFolderFiles(ctx, target.session.GDriveFolderID); err != nil {
-			return nil, fmt.Errorf("list replacements for session %s: %w", target.session.ID, err)
-		}
-		targetRecordings := recordings
-		if target.session.ID != sess.ID {
-			targetRecordings = recordingsInFolder(recordings, target.existing, target.rows)
-		}
-		if target.files, _, err = replacementFiles(&target.session, targetRecordings); err != nil {
-			return nil, fmt.Errorf("build replacements for session %s: %w", target.session.ID, err)
-		}
-	}
-	return targets, nil
+	return s.replacements.MarkDriveReplacementFolder(ownerID, generation, target.session.ID, storage.DriveReplacementFolderReplaced)
 }
 
 // recordingsInFolder returns the recordings whose Drive copy (audio- and the

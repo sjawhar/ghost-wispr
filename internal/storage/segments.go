@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -83,13 +84,21 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if span.StreamEnd <= span.StreamStart {
 		span.StreamStart, span.StreamEnd = segmentStart, segmentEnd
 	}
+	all, err := getSegments(tx, sessionID)
+	if err != nil {
+		return fmt.Errorf("get segments for session %s: %w", sessionID, err)
+	}
+	var deleted transcribe.Segment
+	remaining := make([]transcribe.Segment, 0, len(all))
+	for _, segment := range all {
+		if segment.ID == segmentID {
+			deleted = segment
+			continue
+		}
+		remaining = append(remaining, segment)
+	}
 	if _, err := tx.Exec(`DELETE FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID); err != nil {
 		return fmt.Errorf("delete segment %d from session %s: %w", segmentID, sessionID, err)
-	}
-
-	remaining, err := getSegments(tx, sessionID)
-	if err != nil {
-		return fmt.Errorf("get remaining segments for session %s: %w", sessionID, err)
 	}
 	canonical := canonicalTranscript(remaining)
 	if _, err := tx.Exec(`
@@ -105,8 +114,8 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			summary_version = summary_version + 1,
 			deletion_generation = deletion_generation + 1,
 			envoy_publish_status = ?,
-			sync_status = ?,
-			sync_state = ?,
+			sync_status = CASE WHEN sync_state = ? THEN sync_status ELSE ? END,
+			sync_state = CASE WHEN sync_state = ? THEN sync_state ELSE ? END,
 			drive_replace_pending = 1,
 			drive_replace_since = CASE WHEN drive_replace_pending = 1 AND drive_replace_since != '' THEN drive_replace_since ELSE ? END,
 			drive_replace_failures = 0,
@@ -119,19 +128,22 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		canonical,
 		TranscriptSourceStreaming,
 		EnvoyPublishPending,
-		SyncPending,
-		SyncStatePending,
+		SyncStateSyncing, SyncPending,
+		SyncStateSyncing, SyncStatePending,
 		time.Now().UTC().Format(time.RFC3339Nano),
 		fullAudioPath,
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("clear deleted segment derivatives for session %s: %w", sessionID, err)
 	}
-	sources, err := scrubMergedSources(tx, sessionID, remaining)
+	sources, holders, err := scrubMergedSources(tx, sessionID, remaining, deleted.Timestamp)
 	if err != nil {
 		return err
 	}
 	owners := append([]string{sessionID}, sources...)
+	if err := recordOwedDriveReplacementFolders(tx, sessionID, owners); err != nil {
+		return err
+	}
 	for _, owner := range owners {
 		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
 			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
@@ -159,7 +171,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	); err != nil {
 		return fmt.Errorf("record deleted span for session %s: %w", sessionID, err)
 	}
-	if err := rewriteDeletedTextEvents(tx, owners, deletedText, &span); err != nil {
+	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, &span); err != nil {
 		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
@@ -186,38 +198,80 @@ var postDeleteMaintenance = func(db *sql.DB) error {
 
 // scrubMergedSources removes a deleted segment's words from every session
 // merged, directly or through another merge, into sessionID, and returns
-// their ids. A merge moves its sources' segments to the merged session and
-// leaves each source row (status merged) with the text it had: its title,
-// summary, canonical and refined transcripts, all of which can hold the
-// deleted words. A source's canonical transcript is rebuilt from the merged
-// session's remaining segments in the source's time span, which are its own
-// segments less the deleted one; its title, summary and refined transcript,
-// which cannot be rebuilt without the words, are cleared. The full-text
-// index is rebuilt from these rows in the same transaction.
-func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Segment) ([]string, error) {
-	sources, err := mergedSourceIDs(tx, sessionID)
+// their ids (sources) and those of them that held the deleted segment
+// (holders: the recorded session it came from, and each merged session
+// between that one and sessionID). A merge moves its sources' segments to
+// the merged session and leaves each source row (status merged) with the
+// text it had: its title, summary, canonical and refined transcripts. A
+// source's canonical transcript is rebuilt from the merged session's
+// remaining segments that came from it; its title, summary and refined
+// transcript, which cannot be rebuilt without the words, are cleared. The
+// full-text index is rebuilt from these rows in the same transaction.
+//
+// A segment does not record the session it was recorded in, so it is
+// assigned by time, without gaps: to the last recorded source (one nothing
+// is merged into) that started at or before the segment, or to the first
+// one if it started before every source. Sessions are recorded one at a
+// time, so a segment cannot fall in another source's time, and one stamped
+// after its session ended (a late final transcript) stays with it. A merged
+// source holds every segment of the sources merged into it.
+func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Segment, deletedAt time.Time) (sources, holders []string, err error) {
+	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
+	if len(sources) == 0 {
+		return nil, nil, nil
+	}
+	parent := make(map[string]string, len(sources))
+	hasChildren := make(map[string]bool, len(sources))
+	var recorded []Session
 	for _, id := range sources {
 		source, err := getSession(tx, id)
 		if err != nil {
-			return nil, fmt.Errorf("get merged source %s: %w", id, err)
+			return nil, nil, fmt.Errorf("get merged source %s: %w", id, err)
 		}
-		var own []transcribe.Segment
-		for _, segment := range remaining {
-			if !segment.Timestamp.Before(source.StartedAt) && (source.EndedAt == nil || !segment.Timestamp.After(*source.EndedAt)) {
-				own = append(own, segment)
-			}
-		}
-		if _, err := tx.Exec(`UPDATE sessions
-			SET title = '', summary = '', refined_transcript = '', canonical_transcript = ?, transcript_source = ?
-			WHERE id = ?`, canonicalTranscript(own), TranscriptSourceStreaming, id); err != nil {
-			return nil, fmt.Errorf("scrub merged source %s: %w", id, err)
+		parent[id] = source.MergedInto
+		hasChildren[source.MergedInto] = true
+		recorded = append(recorded, source)
+	}
+	var leaves []Session
+	for i := range recorded {
+		if !hasChildren[recorded[i].ID] {
+			leaves = append(leaves, recorded[i])
 		}
 	}
-	return sources, nil
+	sort.SliceStable(leaves, func(i, j int) bool { return leaves[i].StartedAt.Before(leaves[j].StartedAt) })
+	// chainOf is the recorded source a segment stamped at came from, and the
+	// merged sources between it and sessionID.
+	chainOf := func(at time.Time) []string {
+		leaf := leaves[0].ID
+		for i := range leaves {
+			if !leaves[i].StartedAt.After(at) {
+				leaf = leaves[i].ID
+			}
+		}
+		var chain []string
+		for id := leaf; id != "" && id != sessionID; id = parent[id] {
+			chain = append(chain, id)
+		}
+		return chain
+	}
+
+	own := make(map[string][]transcribe.Segment, len(sources))
+	for _, segment := range remaining {
+		for _, id := range chainOf(segment.Timestamp) {
+			own[id] = append(own[id], segment)
+		}
+	}
+	for _, id := range sources {
+		if _, err := tx.Exec(`UPDATE sessions
+			SET title = '', summary = '', refined_transcript = '', canonical_transcript = ?, transcript_source = ?
+			WHERE id = ?`, canonicalTranscript(own[id]), TranscriptSourceStreaming, id); err != nil {
+			return nil, nil, fmt.Errorf("scrub merged source %s: %w", id, err)
+		}
+	}
+	return sources, chainOf(deletedAt), nil
 }
 
 func canonicalTranscript(segments []transcribe.Segment) string {
@@ -292,25 +346,6 @@ func mergedSourceIDs(q querier, sessionID string) ([]string, error) {
 	return sources, nil
 }
 
-// MergedSources returns the sessions merged, directly or through another
-// merge, into sessionID. Each keeps its own Drive folder, which a deletion in
-// sessionID must also reach.
-func (s *SQLiteStore) MergedSources(sessionID string) ([]Session, error) {
-	ids, err := mergedSourceIDs(s.db, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	sources := make([]Session, 0, len(ids))
-	for _, id := range ids {
-		source, err := getSession(s.db, id)
-		if err != nil {
-			return nil, fmt.Errorf("get merged source %s: %w", id, err)
-		}
-		sources = append(sources, source)
-	}
-	return sources, nil
-}
-
 // HasPendingSplice reports whether a committed deletion for sessionID still
 // requires its recording replacement to complete.
 func (s *SQLiteStore) HasPendingSplice(sessionID string) (bool, error) {
@@ -341,13 +376,21 @@ func (s *SQLiteStore) OldestPendingSplice(sessionID string) (time.Time, bool, er
 	return at, true, nil
 }
 
-// rewriteDeletedTextEvents removes a deleted segment's words from the stored
-// events of sessionIDs: the session it was deleted from and the sessions
-// merged into it, whose live events recorded the words first.
-func rewriteDeletedTextEvents(tx *sql.Tx, sessionIDs []string, deletedText string, span *DeletedSpan) error {
+// rewriteDeletedTextEvents removes a deleted segment's words from stored
+// events. Every session in sessionIDs (the one it was deleted from and those
+// merged into it, whose summaries are cleared) loses its summary_ready events
+// and every event with the deleted text. Only the sessions in holderIDs (the
+// one it was deleted from and those that held the segment) lose the live
+// transcript events that overlap the deleted span: the span is in the
+// recording's own time, which every other session's live events share.
+func rewriteDeletedTextEvents(tx *sql.Tx, sessionIDs, holderIDs []string, deletedText string, span *DeletedSpan) error {
 	owners := make(map[string]bool, len(sessionIDs))
 	for _, id := range sessionIDs {
 		owners[id] = true
+	}
+	holders := make(map[string]bool, len(holderIDs))
+	for _, id := range holderIDs {
+		holders[id] = true
 	}
 	rows, err := tx.Query(`SELECT id, event_type, payload FROM mcp_events`)
 	if err != nil {
@@ -371,10 +414,11 @@ func rewriteDeletedTextEvents(tx *sql.Tx, sessionIDs []string, deletedText strin
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			continue
 		}
-		if eventSessionID, _ := event["session_id"].(string); !owners[eventSessionID] {
+		eventSessionID, _ := event["session_id"].(string)
+		if !owners[eventSessionID] {
 			continue
 		}
-		if isSummaryReadyEvent(eventType, event) || isLiveTranscriptEvent(eventType, event) && eventOverlapsDeletedSpan(event, span) {
+		if isSummaryReadyEvent(eventType, event) || holders[eventSessionID] && isLiveTranscriptEvent(eventType, event) && eventOverlapsDeletedSpan(event, span) {
 			updates = append(updates, update{id: id, delete: true})
 			continue
 		}

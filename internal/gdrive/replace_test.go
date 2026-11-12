@@ -112,13 +112,23 @@ func oldReplacementIDs(t *testing.T, wire *wireDrive, folder, recording string) 
 	return ids
 }
 
+// setDriveReplacementPending records a segment deletion of sessionID, as
+// DeleteSegment does for Drive: a new deletion generation, the replacement
+// pending, and the session's folder owed in the ledger.
 func setDriveReplacementPending(t *testing.T, store *storage.SQLiteStore, sessionID, audioPath string) {
 	t.Helper()
 	if _, err := store.DB().Exec(`DELETE FROM drive_replacements WHERE session_id = ?`, sessionID); err != nil {
 		t.Fatalf("clear completed drive replacements: %v", err)
 	}
-	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = ?`, sessionID); err != nil {
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1, deletion_generation = deletion_generation + 1 WHERE id = ?`, sessionID); err != nil {
 		t.Fatalf("mark replacement pending: %v", err)
+	}
+	if _, err := store.DB().Exec(`DELETE FROM drive_replacement_folders WHERE session_id = ?`, sessionID); err != nil {
+		t.Fatalf("clear earlier owed folders: %v", err)
+	}
+	if _, err := store.DB().Exec(`INSERT INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
+		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND gdrive_folder_id != ''`, storage.DriveReplacementFolderOwed, sessionID); err != nil {
+		t.Fatalf("owe the session's folder: %v", err)
 	}
 	if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, splice_complete)
 		VALUES(?, ?, 1, 2, 'before', 'after', ?, 1)`, sessionID, audioPath, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
@@ -707,7 +717,13 @@ func TestFinishDriveReplacementKeepsANewerDeletionPending(t *testing.T) {
 			t.Fatalf("seed replacement row %s: %v", name, err)
 		}
 	}
-	if err := store.FinishDriveReplacement(id, 1, []string{id}); !errors.Is(err, sql.ErrNoRows) {
+	// Gen 1's ledger is finished too, so only the session's generation fence
+	// can refuse.
+	if _, err := store.DB().Exec(`INSERT INTO drive_replacement_folders(session_id, generation, folder_session_id, state) VALUES(?, 1, ?, ?)`,
+		id, id, storage.DriveReplacementFolderReplaced); err != nil {
+		t.Fatalf("seed finished ledger: %v", err)
+	}
+	if err := store.FinishDriveReplacement(id, 1); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("FinishDriveReplacement = %v, want generation refusal", err)
 	}
 	var pending int

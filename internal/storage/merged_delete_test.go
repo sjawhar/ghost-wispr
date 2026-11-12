@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -102,19 +101,8 @@ func TestDeleteSegmentScrubsMergedSources(t *testing.T) {
 	if indexed != 0 || embeddings != 0 {
 		t.Errorf("after the deletion: %d search index matches, %d source embeddings; want none", indexed, embeddings)
 	}
+	assertDatabaseFilesLack(t, path, mergedSourceSecret, "alpha stays")
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
-	}
-	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
-		contents, err := os.ReadFile(candidate)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(contents), mergedSourceSecret) {
-			t.Errorf("the deleted words remain in %s", candidate)
-		}
 	}
 }
