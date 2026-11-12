@@ -555,10 +555,11 @@ type recordingDirectoryLister interface {
 
 // cleanupRecordingDirectories runs cleanupSpliceTempCopies, as the app
 // starts, in audioDir and in every directory a session keeps a recording in
-// or a whole-file erase was started in after its row went
-// (storage.RecordingDirectories): splice copies, downloads and cut-off
-// erasures are made beside the recording they copy or erase. It then forgets
-// the erase directories it cleaned.
+// or a whole-file erase was started in (storage.RecordingDirectories):
+// splice copies, downloads and cut-off erasures are made beside the
+// recording they copy or erase. It then hands the directories it cleaned
+// without an error to ForgetEraseDirectories, which forgets those that were
+// there to clean.
 func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string) error {
 	dirs := []string{filepath.Clean(audioDir)}
 	others, err := store.RecordingDirectories()
