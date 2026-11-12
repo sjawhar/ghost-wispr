@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"strings"
@@ -16,6 +18,44 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
+
+// gcEvery is how often GC runs after its first pass, as the app starts.
+const gcEvery = time.Hour
+
+// collectGarbage runs a GC pass at once, so GET /api/status shows a hold as
+// the app starts and not an hour later, then every interval until ctx ends.
+// Each pass runs under the configuration and the Drive syncer current then.
+// A pass with GC turned off in the settings since removes nothing and clears
+// the hold: GC off holds nothing back. The app starts it only after the
+// start-up cleanup of the recording directories (cleanupRecordingDirectories),
+// since a pass erases audio files.
+func collectGarbage(ctx context.Context, cfgStore *config.Store, store gcStore, drive *driveSync, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger, every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		scheduledGCPass(cfgStore, store, drive, health, warnings, logger)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// scheduledGCPass is one pass of collectGarbage.
+func scheduledGCPass(cfgStore *config.Store, store gcStore, drive *driveSync, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger) {
+	latestCfg := cfgStore.Get()
+	if !latestCfg.GCEnabled {
+		health.record(nil, latestCfg.AudioDir, time.Now())
+		return
+	}
+	deleted, err := runGCPass(store, &latestCfg, drive.Get(), health, warnings, logger)
+	if err != nil {
+		log.Printf("gc error: %v", err)
+	} else if len(deleted) > 0 {
+		log.Printf("gc: deleted %d sessions", len(deleted))
+	}
+}
 
 // gcHealth is whether the last GC pass held back, and how many sessions GC
 // keeps until a sync verifies their documents on Drive, for GET /api/status

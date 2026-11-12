@@ -170,7 +170,7 @@ The hold's reason follows the setting and the syncer: with `gdrive_sync_enabled`
 
 ### GC schedule
 
-Runs on a periodic sweep (e.g., every hour). Not triggered on session end.
+Runs once as the app starts, after the start-up cleanup of the recording directories, then every hour, so `GET /api/status` shows a hold from the start. Not triggered on session end.
 
 ## Configuration
 

@@ -1561,32 +1561,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}()
 
-	if cfg.GCEnabled {
-		go func() {
-			ticker := time.NewTicker(1 * time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					latestCfg := cfgStore.Get()
-					if !latestCfg.GCEnabled {
-						// GC off holds nothing back.
-						gcHealthState.record(nil, latestCfg.AudioDir, time.Now())
-						continue
-					}
-					deleted, err := runGCPass(store, &latestCfg, drive.Get(), gcHealthState, warningRegistry, appLogger)
-					if err != nil {
-						log.Printf("gc error: %v", err)
-					} else if len(deleted) > 0 {
-						log.Printf("gc: deleted %d sessions", len(deleted))
-					}
-				}
-			}
-		}()
-	}
-
 	var dgStop func()
 	if cfg.DeepgramAPIKey != "" {
 		controlHooks.FaultDeepgramDisconnect = func() error {
@@ -1878,8 +1852,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	lightOff := hardware.Done()
 	// This cleanup must run before anything else splices or erases in these
 	// directories: before the HTTP listener below (segment and session
-	// deletions), before recoverPendingSplices, and before the first Drive
-	// sweep (5 minutes) and GC pass (an hour), whose tickers start above.
+	// deletions), before recoverPendingSplices, before the first Drive sweep
+	// (5 minutes), whose ticker starts above, and before GC, which starts
+	// below with a pass at once.
 	// erase.Leftovers unlinks the second name an erase.Replace under way still
 	// needs, cleanupSpliceTempCopies removes the copies a running deletion
 	// splices, and ForgetEraseDirectories forgets directories no erase is
@@ -1890,6 +1865,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := cleanupRecordingDirectories(store, cfg.AudioDir); err != nil {
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
+	}
+	if cfg.GCEnabled {
+		go collectGarbage(ctx, cfgStore, store, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
 
 	// Create health checker with actual component references
