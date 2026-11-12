@@ -473,6 +473,11 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN drive_replace_since TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN drive_replace_failures INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN drive_replace_error TEXT NOT NULL DEFAULT ''`,
+		// 1 while a merged source's own Drive folder holds documents that
+		// "Delete text" in the session it was merged into changed
+		// (DeleteSegmentText): the next sync of either updates them in place
+		// (DriveDocumentsOwed, ClearDriveDocumentsPending).
+		`ALTER TABLE sessions ADD COLUMN drive_documents_pending INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -658,6 +663,23 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN splice_complete INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("migrate deleted_segments splice completion: %w", err)
+	}
+	// deleted_text_spans: where, in a recording that keeps them, the words of
+	// a segment "Delete text" deleted are (DeleteSegmentText): the recording's
+	// file name, the span's times in it and the recording's SHA-256, never
+	// the words. Refinement drops the words it finds in a span.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS deleted_text_spans (
+			session_id TEXT NOT NULL,
+			recording TEXT NOT NULL,
+			start REAL NOT NULL,
+			end REAL NOT NULL,
+			sha256 TEXT NOT NULL,
+			deleted_at TEXT NOT NULL,
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create deleted_text_spans table: %w", err)
 	}
 	// erase_directories: a directory a whole-file audio erase was started in
 	// (RecordEraseDirectory), and the file system it was on (device). An
@@ -1974,19 +1996,22 @@ func (s *SQLiteStore) GetSessionsForBackfill() ([]string, error) {
 }
 
 // GetSessionsNeedingSync returns the sessions the sync sweep syncs now: the
-// ended sessions waiting for a sync, and every session that still owes Drive
+// ended sessions waiting for a sync, every session that still owes Drive
 // a replacement after a segment deletion and that no sync holds, whatever its
 // status (ended, merged, or discarded: the consent to delete covers them all)
-// once it is no longer recording. An ordinary sync leaves a FAILED or
-// REMOTE_DELETED session to a manual retry, and syncs no merged or discarded
-// one; a replacement asks Drive whether a deleted folder is back each time,
-// so a deletion never waits on a click. (A scheduled retry is read
-// separately, by GetSessionsBySyncState, when due.)
+// once it is no longer recording, and every merged source whose own Drive
+// folder still holds documents "Delete text" changed (DriveDocumentsOwed).
+// An ordinary sync leaves a FAILED or REMOTE_DELETED session to a manual
+// retry, and syncs no merged or discarded one; a replacement asks Drive
+// whether a deleted folder is back each time, so a deletion never waits on a
+// click. (A scheduled retry is read separately, by GetSessionsBySyncState,
+// when due.)
 func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	rows, err := s.db.Query(
 		`SELECT id FROM sessions WHERE (status = 'ended' AND sync_state = ?)
-		 OR (drive_replace_pending = 1 AND status != ? AND sync_state != ?)`,
-		SyncStatePending, SessionActive, SyncStateSyncing,
+		 OR (drive_replace_pending = 1 AND status != ? AND sync_state != ?)
+		 OR (status = ? AND drive_documents_pending = 1 AND gdrive_folder_id != '')`,
+		SyncStatePending, SessionActive, SyncStateSyncing, SessionMerged,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing sync: %w", err)
