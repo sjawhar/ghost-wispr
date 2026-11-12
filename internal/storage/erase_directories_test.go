@@ -209,3 +209,71 @@ func TestEraseDirectoriesOfAnEarlierSchemaAreKeptAndKeyedByFileSystem(t *testing
 		t.Errorf("after an erase on this file system, %d rows of the directory, want the earlier one and this one", n)
 	}
 }
+
+// TestEraseDirectoriesAreRecordedAsAbsolutePaths fails if a directory named
+// relative to the working directory (a relative audio_dir) is recorded as
+// named: its row then means another directory from another working
+// directory, and it is not the row an absolute spelling of the same
+// directory forgets.
+func TestEraseDirectoriesAreRecordedAsAbsolutePaths(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	store := newTestSQLiteStore(t)
+	if err := os.Mkdir("audio", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordEraseDirectory("audio"); err != nil {
+		t.Fatal(err)
+	}
+	absolute := filepath.Join(root, "audio")
+	if n := eraseDirectoryRows(t, store, absolute); n != 1 {
+		t.Errorf("%d rows of %s after recording \"audio\", want 1 under its absolute path", n, absolute)
+	}
+	if err := store.ForgetEraseDirectories([]string{"audio"}); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := store.DB().QueryRow(`SELECT count(*) FROM erase_directories`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("%d erase directories left after forgetting \"audio\", want none", n)
+	}
+}
+
+// TestAnEarlierBuildsRelativeEraseDirectoryIsMadeAbsolute fails if an erase
+// directory an earlier build recorded relative to the working directory (the
+// session delete named a relative audio_dir so) keeps its relative name after
+// the upgrade: the cleanup, which forgets absolute paths, never forgets it.
+func TestAnEarlierBuildsRelativeEraseDirectoryIsMadeAbsolute(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.Mkdir("audio", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "erase.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP TABLE erase_directories`,
+		`CREATE TABLE erase_directories (path TEXT PRIMARY KEY, device INTEGER NOT NULL)`,
+		`INSERT INTO erase_directories(path, device) VALUES('audio', 1)`,
+	} {
+		if _, err := store.DB().Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if n := eraseDirectoryRows(t, store, filepath.Join(root, "audio")); n != 1 {
+		t.Errorf("%d rows of the absolute directory after the upgrade, want the relative row made absolute", n)
+	}
+}

@@ -372,6 +372,26 @@ func TestStartupCleanupForgetsNoDirectoryItFailedToClean(t *testing.T) {
 	}
 }
 
+// TestStartupCleanupNamesTheAudioDirectoryAsAnAbsolutePath fails if the
+// startup cleanup hands on a relative audio_dir as named, beside the absolute
+// spelling the store lists for the same directory: it cleans that directory
+// twice and forgets it under two names.
+func TestStartupCleanupNamesTheAudioDirectoryAsAnAbsolutePath(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.Mkdir("audio", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	absolute := filepath.Join(root, "audio")
+	lister := &eraseDirectoryLister{dirs: []string{absolute}}
+	if err := cleanupRecordingDirectories(lister, "audio"); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if !slices.Equal(lister.forgotten, []string{absolute}) {
+		t.Errorf("forgotten %v, want the audio directory once, as %s", lister.forgotten, absolute)
+	}
+}
+
 // TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere fails if an erase
 // directory that is not there as the app starts (a disk not mounted) is
 // forgotten: a cut-off erase in it is finished at a later start, once it is

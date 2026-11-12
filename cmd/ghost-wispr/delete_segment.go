@@ -603,17 +603,25 @@ type recordingDirectoryLister interface {
 // starts, in audioDir and in every directory a session keeps a recording in
 // or a whole-file erase was started in (storage.RecordingDirectories):
 // splice copies, downloads and cut-off erasures are made beside the
-// recording they copy or erase. It then hands the directories it cleaned
-// without an error to ForgetEraseDirectories, which forgets those that were
-// there to clean.
+// recording they copy or erase. Each directory is named by its absolute path,
+// as the store lists it, so a relative audio_dir is cleaned once. It then
+// hands the directories it cleaned without an error to
+// ForgetEraseDirectories, which forgets those that were there to clean.
 func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string) error {
-	dirs := []string{filepath.Clean(audioDir)}
+	audioDir, err := filepath.Abs(audioDir)
+	if err != nil {
+		return fmt.Errorf("find the audio directory: %w", err)
+	}
+	dirs := []string{audioDir}
 	others, err := store.RecordingDirectories()
 	if err != nil {
 		return errors.Join(err, cleanupSpliceTempCopies(audioDir))
 	}
 	for _, dir := range others {
-		if dir = filepath.Clean(dir); !slices.Contains(dirs, dir) {
+		if dir, err = filepath.Abs(dir); err != nil {
+			return fmt.Errorf("find the recording directory: %w", err)
+		}
+		if !slices.Contains(dirs, dir) {
 			dirs = append(dirs, dir)
 		}
 	}

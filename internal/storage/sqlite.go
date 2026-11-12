@@ -1057,9 +1057,12 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 
 // migrateEraseDirectories creates erase_directories keyed on the directory
 // and its file system, and rebuilds, keeping its rows, one an earlier build
-// keyed on the directory alone. Every erase_directories table has the device
-// column: none was published without it (no release holds the table at all,
-// and main does not have it), so no ALTER adds it.
+// keyed on the directory alone. That build recorded a directory as the
+// caller named it, so a relative one (a relative audio_dir) is made absolute
+// from the working directory, which the service fixes; RecordEraseDirectory
+// now records only absolute paths. Every erase_directories table has the
+// device column: none was published without it (no release holds the table
+// at all, and main does not have it), so no ALTER adds it.
 func migrateEraseDirectories(db *sql.DB) error {
 	var keyColumns int
 	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('erase_directories') WHERE pk > 0`).Scan(&keyColumns); err != nil {
@@ -1073,19 +1076,41 @@ func migrateEraseDirectories(db *sql.DB) error {
 		return fmt.Errorf("begin keying erase_directories on the file system: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	const create = `CREATE TABLE %s (path TEXT NOT NULL, device INTEGER NOT NULL, PRIMARY KEY (path, device))`
-	statements := []string{fmt.Sprintf(create, "erase_directories")}
+	type eraseDirectory struct {
+		path   string
+		device int64
+	}
+	var earlier []eraseDirectory
 	if keyColumns == 1 {
-		statements = []string{
-			fmt.Sprintf(create, "erase_directories_keyed"),
-			`INSERT INTO erase_directories_keyed(path, device) SELECT path, device FROM erase_directories`,
-			`DROP TABLE erase_directories`,
-			`ALTER TABLE erase_directories_keyed RENAME TO erase_directories`,
+		rows, err := tx.Query(`SELECT path, device FROM erase_directories`)
+		if err != nil {
+			return fmt.Errorf("read the earlier erase directories: %w", err)
+		}
+		for rows.Next() {
+			var dir eraseDirectory
+			if err := rows.Scan(&dir.path, &dir.device); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan an earlier erase directory: %w", err)
+			}
+			if dir.path, err = filepath.Abs(dir.path); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("make an earlier erase directory absolute: %w", err)
+			}
+			earlier = append(earlier, dir)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return fmt.Errorf("read the earlier erase directories: %w", err)
+		}
+		if _, err := tx.Exec(`DROP TABLE erase_directories`); err != nil {
+			return fmt.Errorf("drop the earlier erase directories: %w", err)
 		}
 	}
-	for _, stmt := range statements {
-		if _, err := tx.Exec(stmt); err != nil {
-			return fmt.Errorf("key erase_directories on the file system: %w", err)
+	if _, err := tx.Exec(`CREATE TABLE erase_directories (path TEXT NOT NULL, device INTEGER NOT NULL, PRIMARY KEY (path, device))`); err != nil {
+		return fmt.Errorf("create erase_directories table: %w", err)
+	}
+	for _, dir := range earlier {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO erase_directories(path, device) VALUES(?, ?)`, dir.path, dir.device); err != nil {
+			return fmt.Errorf("keep the earlier erase directory %s: %w", dir.path, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

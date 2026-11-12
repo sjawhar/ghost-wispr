@@ -422,13 +422,16 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	return dirs, nil
 }
 
-// RecordEraseDirectory records dir, as the caller names it, before a
-// whole-file erase in it begins (erase_directories), with the file system it
-// is on. An erase cut off by a stop leaves its .erasing-* file there, and the
-// row that named the file may be gone: the startup cleanup still reaches dir.
-// A directory that is not there holds nothing to erase and is not recorded.
+// RecordEraseDirectory records dir, as an absolute path, before a whole-file
+// erase in it begins (erase_directories), with the file system it is on. An
+// erase cut off by a stop leaves its .erasing-* file there, and the row that
+// named the file may be gone: the startup cleanup still reaches dir. A
+// directory that is not there holds nothing to erase and is not recorded.
 func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
-	dir = filepath.Clean(dir)
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("find the erase directory %s: %w", dir, err)
+	}
 	info, err := os.Stat(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -450,11 +453,15 @@ func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
 // recorded since is forgotten.
 func (s *SQLiteStore) ForgetEraseDirectories(dirs []string) error {
 	for _, dir := range dirs {
+		dir, err := filepath.Abs(dir)
+		if err != nil {
+			return fmt.Errorf("find the erase directory %s: %w", dir, err)
+		}
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
 			continue
 		}
-		if _, err := s.db.Exec(`DELETE FROM erase_directories WHERE path = ? AND device = ?`, filepath.Clean(dir), fileSystemOf(info)); err != nil {
+		if _, err := s.db.Exec(`DELETE FROM erase_directories WHERE path = ? AND device = ?`, dir, fileSystemOf(info)); err != nil {
 			return fmt.Errorf("forget erase directory %s: %w", dir, err)
 		}
 	}
