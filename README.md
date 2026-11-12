@@ -124,7 +124,7 @@ outputs, credential bundle, provisioning command, tailnet join, and acceptance c
 ## Development
 
 ```bash
-# Run backend tests
+# Run backend tests (cmd/ghost-wispr embeds the web build, so run `make build` first)
 go test ./...
 
 # Run frontend tests
