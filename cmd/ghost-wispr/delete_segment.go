@@ -461,6 +461,7 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	}
 	if afterHash != span.SHA256After {
 		_ = erase.Remove(tempPath)
+		removeFiles(recordingSet.Downloaded)
 		return false, fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After)
 	}
 	if err := replaceRecording(tempPath, recording); err != nil {
