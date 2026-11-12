@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -637,7 +638,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
+		m.failSummaryAtGeneration(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
 		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
@@ -646,9 +647,15 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	storeErr := m.store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, summaryModel, generation)
+	if errors.Is(storeErr, sql.ErrNoRows) {
+		// The text changed since it was read (a segment deletion): a newer
+		// run owns the summary, so this one records no failure.
+		m.logger.Warn("discarded a stale summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID)
+		return
+	}
 	if storeErr != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
-		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr))
+		m.failSummaryAtGeneration(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr), generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
@@ -691,11 +698,30 @@ func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, pres
 	}
 }
 
-// failSummary records that making session sessionID's summary failed, and why
-// (reason), and announces the title and summary the session keeps: its last
-// good ones, if it has them.
+// failSummary records that making session sessionID's summary failed before
+// its text was read, and why (reason), and announces the title and summary
+// the session keeps: its last good ones, if it has them.
 func (m *Manager) failSummary(sessionID, reason string) {
 	kept, err := m.store.FailSummary(sessionID, reason)
+	m.announceFailedSummary(sessionID, reason, &kept, err)
+}
+
+// failSummaryAtGeneration records, as failSummary does, that making the
+// summary from the text of transcript generation generation failed. Once the
+// text has changed since (a segment deletion), it records nothing: the newer
+// run's status stays.
+func (m *Manager) failSummaryAtGeneration(sessionID, reason string, generation int) {
+	kept, err := m.store.FailSummaryAtGeneration(sessionID, reason, generation)
+	m.announceFailedSummary(sessionID, reason, &kept, err)
+}
+
+// announceFailedSummary announces the summary the session keeps (kept) once
+// its failure is recorded (err is nil), and logs why it is not otherwise.
+func (m *Manager) announceFailedSummary(sessionID, reason string, kept *storage.Session, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		m.logger.Warn("discarded a stale failed summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID, "reason", reason)
+		return
+	}
 	if err != nil {
 		m.logger.Error("failed to record the failed summary", "operation", "generate_summary", "session_id", sessionID, "reason", reason, "error", err)
 		return

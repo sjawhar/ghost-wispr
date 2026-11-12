@@ -146,6 +146,18 @@ func (s *storeMock) FailSummary(sessionID, errMsg string) (storage.Session, erro
 		SummaryStatus: storage.SummaryFailed, SummaryPreset: s.preset[sessionID], SummaryError: errMsg}, nil
 }
 
+// FailSummaryAtGeneration fails the summary only while generation is the
+// session's transcript generation, as the store does.
+func (s *storeMock) FailSummaryAtGeneration(sessionID, errMsg string, generation int) (storage.Session, error) {
+	s.mu.Lock()
+	stale := generation != s.canonicalizeGeneration[sessionID]
+	s.mu.Unlock()
+	if stale {
+		return storage.Session{}, sql.ErrNoRows
+	}
+	return s.FailSummary(sessionID, errMsg)
+}
+
 func (s *storeMock) UpdateTitle(sessionID, title string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

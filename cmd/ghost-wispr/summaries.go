@@ -57,13 +57,19 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 		title, summaryText, presetUsed, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
 	}
 	if err != nil {
-		failSummary(store, hub, sessionID, err)
+		failSummary(store, hub, sessionID, generation, err)
 		return err
 	}
 
 	if err := store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, presetUsed, speakerNames, model, generation); err != nil {
 		err = fmt.Errorf("store summary: %w", err)
-		failSummary(store, hub, sessionID, err)
+		if errors.Is(err, sql.ErrNoRows) {
+			// The text changed since it was read; a newer run owns the
+			// summary, so this one records no failure.
+			log.Printf("warning: discarded stale summary for session %s: %v", sessionID, err)
+			return err
+		}
+		failSummary(store, hub, sessionID, generation, err)
 		return err
 	}
 	hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, presetUsed)
@@ -92,7 +98,7 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, transcript)
 	if err != nil {
 		log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
-		failSummary(store, hub, sessionID, err)
+		failSummary(store, hub, sessionID, generation, err)
 		return
 	}
 
@@ -124,7 +130,7 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 	title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, id, transcript)
 	if err != nil {
 		log.Printf("warning: summarization failed for %s: %v", id, err)
-		failSummary(store, nil, id, err)
+		failSummary(store, nil, id, generation, err)
 		return
 	}
 	if err := store.UpdateSummaryAtGeneration(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model, generation); err != nil {
@@ -236,12 +242,18 @@ func repairStructuredSummaries(ctx context.Context, store summaryRepairStore, pu
 	return repaired, nil
 }
 
-// failSummary records that making session sessionID's summary failed, and
-// why (cause), and announces on hub (when not nil) the title and summary the
-// session keeps: its last good ones, if it has them. A failed summary takes
-// nothing away.
-func failSummary(store *storage.SQLiteStore, hub summaryBroadcaster, sessionID string, cause error) {
-	kept, err := store.FailSummary(sessionID, fmt.Sprintf("summarization failed: %v", cause))
+// failSummary records that making session sessionID's summary from the text
+// of transcript generation generation failed, and why (cause), and announces
+// on hub (when not nil) the title and summary the session keeps: its last
+// good ones, if it has them. A failed summary takes nothing away. Once the
+// text has changed since (a segment deletion), it records nothing: the newer
+// run's status stays.
+func failSummary(store *storage.SQLiteStore, hub summaryBroadcaster, sessionID string, generation int, cause error) {
+	kept, err := store.FailSummaryAtGeneration(sessionID, fmt.Sprintf("summarization failed: %v", cause), generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		log.Printf("warning: discarded a stale failed summary of %s: its transcript changed since it was read: %v", sessionID, cause)
+		return
+	}
 	if err != nil {
 		log.Printf("warning: could not record the failed summary of %s: %v", sessionID, err)
 		return

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -140,5 +141,58 @@ func TestASummaryOfTheTextBeforeADeletionIsNotStored(t *testing.T) {
 				t.Error("the stale summary was published")
 			}
 		})
+	}
+}
+
+// A summary run that read the text from before a segment deletion, and ends
+// after the deletion's own summary started, records nothing: neither a
+// refused summary nor a failed model call marks the newer run failed, which
+// would let a Drive replacement go ahead before the newer summary is stored.
+func TestAStaleSummaryRunLeavesTheNewerRunRunning(t *testing.T) {
+	const id = "session"
+	modelDown := errors.New("summarize: model unavailable (503)")
+	for _, writer := range []struct {
+		name string
+		run  func(store *storage.SQLiteStore, summarizer *racingSummarizer, hub *recordingBroadcaster)
+	}{
+		{"resummarize", func(store *storage.SQLiteStore, summarizer *racingSummarizer, hub *recordingBroadcaster) {
+			_ = resummarize(context.Background(), store, summarizer, hub, func(string) {}, id, "")
+		}},
+		{"merged session", func(store *storage.SQLiteStore, summarizer *racingSummarizer, hub *recordingBroadcaster) {
+			summarizeMergedSession(context.Background(), store, summarizer, hub, func(string) {}, id)
+		}},
+		{"startup", func(store *storage.SQLiteStore, summarizer *racingSummarizer, _ *recordingBroadcaster) {
+			summarizeBackfillSession(context.Background(), store, summarizer, func(string) {}, id)
+		}},
+	} {
+		for _, outcome := range []struct {
+			name string
+			err  error
+		}{
+			{"summary refused", nil},
+			{"model call failed", modelDown},
+		} {
+			t.Run(writer.name+", "+outcome.name, func(t *testing.T) {
+				store, segmentID, _ := newDeletionTestStore(t, "recording.mp3")
+				summarizer := &racingSummarizer{during: func() { deleteAndStartNewerSummary(t, store, id, segmentID) }, err: outcome.err}
+				hub := &recordingBroadcaster{}
+				writer.run(store, summarizer, hub)
+
+				sess, err := store.GetSession(id)
+				if err != nil {
+					t.Fatalf("get session: %v", err)
+				}
+				if sess.SummaryStatus != storage.SummaryRunning || sess.SummaryError != "" {
+					t.Errorf("summary status %q, error %q; want the newer run's: %q, no error", sess.SummaryStatus, sess.SummaryError, storage.SummaryRunning)
+				}
+				hub.mu.Lock()
+				defer hub.mu.Unlock()
+				for _, event := range hub.events {
+					if event.status == storage.SummaryFailed {
+						t.Errorf("announced %+v for the newer run", event)
+					}
+				}
+			})
+		}
 	}
 }
