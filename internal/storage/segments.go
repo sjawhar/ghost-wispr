@@ -739,9 +739,16 @@ var flushRecordingDirectory = func(recording string) error {
 }
 
 // MarkSpliceComplete lets garbage collection proceed after the recording has
-// been atomically replaced with the span's expected post-splice bytes.
+// been atomically replaced with the span's expected post-splice bytes. In the
+// same transaction it clears the session's pending Drive replacement when the
+// deletion owes Drive nothing (settleUnownedDriveReplacement).
 func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
-	result, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin marking deleted span complete: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.Exec(`
 		UPDATE deleted_segments SET splice_complete = 1
 		WHERE session_id = ? AND audio_path = ? AND start = ? AND end = ?
 		  AND sha256_before = ? AND sha256_after = ?`,
@@ -756,6 +763,12 @@ func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 	}
 	if rows == 0 {
 		return fmt.Errorf("mark deleted span complete: %w", sql.ErrNoRows)
+	}
+	if err := settleUnownedDriveReplacement(tx, span.SessionID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit marking deleted span complete: %w", err)
 	}
 	return nil
 }

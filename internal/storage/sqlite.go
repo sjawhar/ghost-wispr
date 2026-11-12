@@ -1677,14 +1677,16 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 // recorded for session id as owed to the session's pending segment deletion,
 // if it has one: a sync that held the session while a segment was deleted
 // (DeleteSegment leaves the claim to it) uploaded the words before the
-// deletion. EndSync and MarkSynced both call it.
+// deletion. A sync that made no folder leaves nothing to owe, and the
+// deletion is then settled as owing Drive nothing once its splices are done
+// (settleUnownedDriveReplacement). EndSync and MarkSynced both call it.
 func oweFolderOfPendingDeletion(tx *sql.Tx, id string) error {
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
 		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND gdrive_folder_id != ''`,
 		DriveReplacementFolderOwed, id); err != nil {
 		return fmt.Errorf("owe the Drive folder of session %s its replacement: %w", id, err)
 	}
-	return nil
+	return settleUnownedDriveReplacement(tx, id)
 }
 
 // RecoverInterruptedSyncs moves every session an earlier run of the app left
