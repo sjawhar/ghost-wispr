@@ -149,6 +149,43 @@ func TestSpliceDoesNotRewriteTheFileItReplaces(t *testing.T) {
 	}
 }
 
+// TestSpliceFlushesItsOutputBeforeTheRename fails if Splice renames its
+// output over the recording before flushing it: after a power loss the
+// recording's name could hold an output whose data never reached the disk,
+// and the live recording would be lost.
+func TestSpliceFlushesItsOutputBeforeTheRename(t *testing.T) {
+	requireFFmpeg(t)
+	path := filepath.Join(t.TempDir(), "tones.mp3")
+	makeThreeToneMP3(t, path)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush := syncFile
+	t.Cleanup(func() { syncFile = flush })
+	var flushed []string
+	syncFile = func(output string) error {
+		flushed = append(flushed, output)
+		if !strings.HasPrefix(filepath.Base(output), ".splice-") {
+			t.Errorf("flushed %s, want the splice output", output)
+		}
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
+			t.Errorf("the output was renamed over the recording before it was flushed (%v)", err)
+		}
+		return flush(output)
+	}
+
+	if _, err := Splice(context.Background(), path, 3, 6); err != nil {
+		t.Fatalf("Splice: %v", err)
+	}
+	if len(flushed) != 1 {
+		t.Fatalf("Splice flushed %v, want its output once", flushed)
+	}
+	if got, err := os.ReadFile(path); err != nil || bytes.Equal(got, original) {
+		t.Fatalf("control: the recording was not spliced (%v)", err)
+	}
+}
+
 func commonPrefix(a, b []byte) int {
 	n := 0
 	for n < len(a) && n < len(b) && a[n] == b[n] {
