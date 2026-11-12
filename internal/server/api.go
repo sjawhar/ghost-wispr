@@ -1089,7 +1089,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		// No browser keeps a copy: a segment deletion splices this file, and
+		// the spliced recording is served at this same URL (noStoreAPI).
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", contentTypeForAudio(cleanPath))
 		http.ServeContent(w, r, filepath.Base(cleanPath), info.ModTime(), f)
 	})

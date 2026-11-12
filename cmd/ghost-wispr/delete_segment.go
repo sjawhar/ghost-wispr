@@ -483,6 +483,11 @@ func removeFiles(paths []string) {
 	}
 }
 
+// cleanupSpliceTempCopies removes, as the app starts and before any deletion
+// or recovery runs, the temporary files a stopped app can leave in audioDir,
+// each a whole copy of a recording, deleted segment included: a splice's copy
+// (.delete-segment-*) and output (.splice-*), and a recording downloaded from
+// Drive for a splice (.download-*, gdrive.Syncer.DownloadRecording).
 func cleanupSpliceTempCopies(audioDir string) error {
 	entries, err := os.ReadDir(audioDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -494,7 +499,7 @@ func cleanupSpliceTempCopies(audioDir string) error {
 	var cleanupErr error
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, ".delete-segment-") && !strings.HasPrefix(name, ".splice-") {
+		if entry.IsDir() || !strings.HasPrefix(name, ".delete-segment-") && !strings.HasPrefix(name, ".splice-") && !strings.HasPrefix(name, ".download-") {
 			continue
 		}
 		if err := os.Remove(filepath.Join(audioDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {

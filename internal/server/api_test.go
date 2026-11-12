@@ -832,6 +832,45 @@ func TestAPIAudioRange(t *testing.T) {
 	}
 }
 
+// TestAPIResponsesAreNotKeptByBrowsers fails if a recording or a session's
+// transcript is served in a way a browser may keep in its disk cache: a
+// segment deleted on the unit would stay there, and a spliced recording is
+// served at the URL the unspliced one had.
+func TestAPIResponsesAreNotKeptByBrowsers(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "audio.mp3"), []byte(strings.Repeat("a", 4096)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: "audio.mp3"}},
+		segments:       map[string][]transcribe.Segment{"s1": {{ID: 1, Text: "words on the unit"}}},
+		dates:          []string{"2026-02-26"},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/sessions/s1/audio", "/api/sessions/s1", "/api/dates"} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code >= 400 {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("GET %s Cache-Control = %q, want no-store", path, got)
+		}
+	}
+}
+
 func TestAPIDates(t *testing.T) {
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},

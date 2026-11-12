@@ -169,7 +169,7 @@ func TestSegmentDeleteRunnerUsesProbedRecordingDuration(t *testing.T) {
 
 func TestCleanupSpliceTempCopies(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", "recording.mp3"} {
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", "recording.mp3"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
@@ -177,7 +177,7 @@ func TestCleanupSpliceTempCopies(t *testing.T) {
 	if err := cleanupSpliceTempCopies(dir); err != nil {
 		t.Fatalf("cleanup splice temp copies: %v", err)
 	}
-	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3"} {
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("temp copy %s remains: %v", name, err)
 		}

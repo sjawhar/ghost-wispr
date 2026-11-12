@@ -153,8 +153,21 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))
 
 	withAuth := BasicAuthMiddleware(authToken)(mux)
-	withRequestID := logging.RequestIDMiddleware(moduleLogger, nil)(withAuth)
+	withRequestID := logging.RequestIDMiddleware(moduleLogger, nil)(noStoreAPI(withAuth))
 	return withRequestID, nil
+}
+
+// noStoreAPI keeps every API response out of the browser's caches
+// (Cache-Control: no-store): transcripts, summaries and recordings. A segment
+// deleted on the unit must not stay in a browser's disk cache, and a spliced
+// recording is served at the URL the unspliced one had.
+func noStoreAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func Serve(addr string, staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) error {
