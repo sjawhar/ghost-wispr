@@ -82,7 +82,7 @@ func noSummarizerStore(t *testing.T) *storage.SQLiteStore {
 // no summarizer is configured.
 func TestNoSummarizerDoesNotRepublishAnOldSummary(t *testing.T) {
 	store := noSummarizerStore(t)
-	if err := store.UpdateSummary("s", "Title", "The summary a summarizer made.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("s", "Title", "The summary a summarizer made.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	before, err := store.GetSession("s")

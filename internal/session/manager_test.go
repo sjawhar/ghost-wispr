@@ -43,9 +43,10 @@ type storeMock struct {
 	canonicalizeGeneration  map[string]int
 	summaryWriteGenerations []int
 
-	endSessionErr   error
-	endSessionCalls int
-	canonicalizeErr error
+	endSessionErr         error
+	endSessionCalls       int
+	canonicalizeErr       error
+	deletionGenerationErr error
 	// appendHook, when set, runs first in AppendSegment, outside the lock.
 	appendHook func()
 }
@@ -136,14 +137,28 @@ func (s *storeMock) StartEmptySummary(sessionID string) error {
 	return s.StartSummary(sessionID)
 }
 
-// FailSummary keeps the title and summary, as the store does.
-func (s *storeMock) FailSummary(sessionID, errMsg string) (storage.Session, error) {
+// FailSummaryAtGeneration keeps the title and summary, and fails the summary
+// only while generation is the session's transcript generation, as the store
+// does.
+func (s *storeMock) FailSummaryAtGeneration(sessionID, errMsg string, generation int) (storage.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return storage.Session{}, sql.ErrNoRows
+	}
 	s.status[sessionID] = storage.SummaryFailed
 	s.errorMessage[sessionID] = errMsg
 	return storage.Session{ID: sessionID, Title: s.title[sessionID], Summary: s.summary[sessionID],
 		SummaryStatus: storage.SummaryFailed, SummaryPreset: s.preset[sessionID], SummaryError: errMsg}, nil
+}
+
+func (s *storeMock) DeletionGeneration(sessionID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deletionGenerationErr != nil {
+		return 0, s.deletionGenerationErr
+	}
+	return s.canonicalizeGeneration[sessionID], nil
 }
 
 func (s *storeMock) UpdateTitle(sessionID, title string) error {
@@ -166,17 +181,7 @@ func (s *storeMock) CountSegments(sessionID string) (int, error) {
 	return len(s.segments[sessionID]), nil
 }
 
-func (s *storeMock) UpdateRefinement(sessionID, transcript, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.refinementStatus[sessionID] = status
-	if transcript != "" {
-		s.refinedTranscript[sessionID] = transcript
-	}
-	return nil
-}
-
-func (s *storeMock) UpdateRefinementWithModel(sessionID, transcript, status, model string) error {
+func (s *storeMock) UpdateRefinementAtGeneration(sessionID, transcript, status, model string, _ int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refinementStatus[sessionID] = status
@@ -189,15 +194,15 @@ func (s *storeMock) UpdateRefinementWithModel(sessionID, transcript, status, mod
 
 // ClaimRefinement claims the refinement only while the session still names
 // audioPath, as the real store does.
-func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (bool, error) {
+func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (int, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if audioPath == "" || s.audio[sessionID] != audioPath {
-		return false, nil
+		return 0, false, nil
 	}
 	s.refinementStatus[sessionID] = "running"
 	delete(s.refinedTranscript, sessionID)
-	return true, nil
+	return s.canonicalizeGeneration[sessionID], true, nil
 }
 
 func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {

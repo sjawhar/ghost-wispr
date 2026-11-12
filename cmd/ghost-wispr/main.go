@@ -722,28 +722,6 @@ func main() {
 			}
 		}()
 	}
-	loadSessionTranscript := func(sessionID string) (string, bool) {
-		sess, err := store.GetSession(sessionID)
-		if err != nil {
-			log.Printf("warning: failed to get session %s: %v", sessionID, err)
-			return "", false
-		}
-		transcript := strings.TrimSpace(sess.CanonicalTranscript)
-		if transcript != "" {
-			return transcript, true
-		}
-		segments, err := store.GetSegments(sessionID)
-		if err != nil {
-			log.Printf("warning: failed to get segments for %s: %v", sessionID, err)
-			return "", false
-		}
-		return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
-	}
-	markEmptySummariesCompleted := func(sessionIDs []string) {
-		for _, id := range sessionIDs {
-			_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
-		}
-	}
 	submitSummaryBatch := func(ctx context.Context, sessionIDs []string) (string, int, error) {
 		if summarizer == nil {
 			return "", 0, fmt.Errorf("summarization not configured")
@@ -758,11 +736,11 @@ func main() {
 			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
 
-		sessions, generations, emptyTranscriptIDs, err := readBatchSummarySessions(store, sessionIDs)
+		sessions, generations, emptyTranscripts, err := readBatchSummarySessions(store, sessionIDs)
 		if err != nil {
 			return "", 0, err
 		}
-		markEmptySummariesCompleted(emptyTranscriptIDs)
+		completeEmptySummaries(store, emptyTranscripts)
 		if len(sessions) == 0 {
 			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
 		}
@@ -835,7 +813,7 @@ func main() {
 					}
 					transcript := ""
 					if id != "" {
-						if loaded, ok := loadSessionTranscript(id); ok {
+						if loaded, ok := loadSessionTranscript(store, id); ok {
 							transcript = loaded
 						}
 					}
@@ -959,58 +937,7 @@ func main() {
 			return runner.Delete(ctx, sessionID, segmentID)
 		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
-			dates, err := store.GetDates()
-			if err != nil {
-				return 0, err
-			}
-
-			repaired := 0
-			seenSessionIDs := make(map[string]struct{})
-			for _, date := range dates {
-				select {
-				case <-ctx.Done():
-					return repaired, ctx.Err()
-				default:
-				}
-
-				sessions, err := store.GetSessionsByDate(date, true)
-				if err != nil {
-					return repaired, err
-				}
-
-				for i := range sessions {
-					if _, exists := seenSessionIDs[sessions[i].ID]; exists {
-						continue
-					}
-					seenSessionIDs[sessions[i].ID] = struct{}{}
-
-					trimmedSummary := strings.TrimSpace(sessions[i].Summary)
-					if !strings.HasPrefix(trimmedSummary, "{") {
-						continue
-					}
-
-					title, summaryText, speakerNames, err := parseStoredStructuredSummary(trimmedSummary)
-					if err != nil {
-						continue
-					}
-					if title == "" {
-						title = sessions[i].Title
-					}
-					if speakerNames == "" {
-						speakerNames = "{}"
-					}
-
-					if err := store.UpdateSummaryWithModel(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames, sessions[i].SummaryModel); err != nil {
-						return repaired, err
-					}
-					if title != sessions[i].Title || summaryText != sessions[i].Summary || speakerNames != sessions[i].SpeakerNames {
-						publishSummaryReady(sessions[i].ID)
-					}
-					repaired++
-				}
-			}
-
-			return repaired, nil
+			return repairStructuredSummaries(ctx, store, publishSummaryReady)
 		},
 		Presets: func() map[string]config.Preset {
 			if summarizer == nil {
@@ -1028,35 +955,7 @@ func main() {
 			if summarizer == nil {
 				return
 			}
-
-			segments, err := store.GetSegments(sessionID)
-			if err != nil {
-				log.Printf("warning: failed to get segments for merged session %s: %v", sessionID, err)
-				return
-			}
-
-			transcript := buildCanonicalTranscript(store, sessionID, segments)
-			if transcript == "" {
-				_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "", "{}")
-				return
-			}
-
-			_ = store.StartSummary(sessionID)
-			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
-
-			title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, transcript)
-			if err != nil {
-				log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
-				failSummary(store, hub, sessionID, err)
-				return
-			}
-
-			if err := store.UpdateSummaryWithModel(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model); err != nil {
-				log.Printf("warning: discarded stale merged summary for session %s: %v", sessionID, err)
-				return
-			}
-			hub.BroadcastSummaryReady(sessionID, title, summaryText, storage.SummaryCompleted, preset)
-			publishSummaryReady(sessionID)
+			summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
 		},
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
@@ -1484,25 +1383,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				log.Printf("warning: startup batch submission failed for %d sessions: %v; falling back to synchronous summarization", len(pendingIDs), err)
 			}
 			for _, id := range pendingIDs {
-				log.Printf("startup: summarizing session %s synchronously", id)
-				transcript, ok := loadSessionTranscript(id)
-				if !ok {
-					continue
-				}
-				if transcript == "" {
-					_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
-					continue
-				}
-				_ = store.StartSummary(id)
-				title, summaryText, preset, speakerNames, model, err := startupSummarizer.SummarizeReported(ctx, id, transcript)
-				if err != nil {
-					log.Printf("warning: summarization failed for %s: %v", id, err)
-					failSummary(store, nil, id, err)
-					continue
-				}
-				_ = store.UpdateSummaryWithModel(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model)
-				log.Printf("summarized session %s with preset %s", id, preset)
-				publishSummaryReady(id)
+				summarizeBackfillSession(ctx, store, startupSummarizer, publishSummaryReady, id)
 			}
 		}()
 	}

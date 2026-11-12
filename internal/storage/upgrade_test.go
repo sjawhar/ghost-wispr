@@ -53,8 +53,8 @@ func TestUnverifiedDocumentsHoldOffTheAgePolicy(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), audio); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Standup", "A summary.", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary: %v", err)
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 	}
 	sync := func(claim string) {
 		t.Helper()

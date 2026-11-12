@@ -67,7 +67,7 @@ func TestStoredSegmentsCarryIDs(t *testing.T) {
 func TestDeleteSegmentRemovesTextEverywhere(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	started, _ := segmentTestSession(t, store, "delete-everywhere")
-	if err := store.UpdateSummary("delete-everywhere", "private deletion token title", "summary names private deletion token", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("delete-everywhere", "private deletion token title", "summary names private deletion token", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("set summary: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refined_transcript = ?, refinement_status = ?, canonical_transcript = ?, envoy_publish_status = ?, sync_status = ?, sync_state = ? WHERE id = ?`,
@@ -373,17 +373,23 @@ func TestDeleteSegmentRejectsStaleRefinementAndSummaryWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get segments: %v", err)
 	}
-	claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
+	claimedAt, claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
 	if err != nil || !claimed {
 		t.Fatalf("claim refinement = %v, %v", claimed, err)
+	}
+	// A summary writer reads the text, and with it the generation, before
+	// the deletion.
+	_, summaryReadAt, err := store.Canonicalize("generation-fence")
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
 	}
 	if err := store.DeleteSegment("generation-fence", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
-	if err := store.UpdateRefinement("generation-fence", "stale private deletion token", RefinementCompleted); err == nil {
+	if err := store.UpdateRefinementAtGeneration("generation-fence", "stale private deletion token", RefinementCompleted, "", claimedAt); err == nil {
 		t.Fatal("stale refinement write succeeded after deletion")
 	}
-	if err := store.UpdateSummary("generation-fence", "stale private deletion token", "stale private deletion token", SummaryCompleted, "default", "{}"); err == nil {
+	if err := store.UpdateSummaryAtGeneration("generation-fence", "stale private deletion token", "stale private deletion token", SummaryCompleted, "default", "{}", "", summaryReadAt); err == nil {
 		t.Fatal("stale summary write succeeded after deletion")
 	}
 	session := storeSession(t, store, "generation-fence")

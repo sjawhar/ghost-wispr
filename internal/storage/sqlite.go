@@ -1179,36 +1179,23 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	return segments, nil
 }
 
-// UpdateSummary stores session id's summary, its status, preset and speaker
-// names, and its title unless title is "". An empty summary never replaces
-// the one the session has: its summary, preset and speaker names stay (a
-// session with none keeps none). A completed summary clears the error of the
-// attempt before. Starting a summary and recording one that failed are
-// StartSummary and FailSummary, which keep the last good summary.
+// UpdateSummaryAtGeneration stores session id's summary, its status, preset,
+// speaker names and the model its provider reported, and its title unless
+// title is "", only while generation, the transcript generation the writer
+// read with the text it summarized, is still the session's and the
+// session's summary run started at it. Otherwise it stores nothing and
+// returns sql.ErrNoRows.
+//
+// An empty summary never replaces the one the session has: its summary,
+// preset, speaker names and model stay (a session with none keeps none). A
+// completed summary clears the error of the attempt before. Starting a
+// summary and recording one that failed are StartSummary and
+// FailSummaryAtGeneration, which keep the last good summary.
 //
 // A changed completed summary not started by StartSummary (a batch result)
 // gets a new summary version when the session's current version may already
 // have been sent to Envoy, so Envoy does not drop it as a duplicate delivery.
-// UpdateSummary stores a summary when its producer has no provider model to
-// report, such as a restored or repaired legacy record.
-func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
-	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, "", -1)
-}
-
-// UpdateSummaryWithModel atomically stores a summary and the model reported by
-// the provider that generated it.
-func (s *SQLiteStore) UpdateSummaryWithModel(sessionID, title, summary, status, preset, speakerNames, model string) error {
-	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, model, -1)
-}
-
-// UpdateSummaryAtGeneration stores a summary, and the model reported by the
-// provider that generated it, only if the transcript generation the writer
-// read remains current.
 func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error {
-	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, model, generation)
-}
-
-func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin summary update for session %s: %w", sessionID, err)
@@ -1219,11 +1206,6 @@ func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, s
 	if err != nil {
 		return err
 	}
-	if generation < 0 {
-		if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, sessionID).Scan(&generation); err != nil {
-			return fmt.Errorf("read summary generation for session %s: %w", sessionID, err)
-		}
-	}
 	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames, model)
 	res, err := tx.Exec(
 		`UPDATE sessions
@@ -1231,7 +1213,7 @@ func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, s
 		     summary_preset = CASE WHEN ? != '' THEN ? ELSE summary_preset END,
 		     speaker_names = CASE WHEN ? != '' THEN ? ELSE speaker_names END,
 		     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
-		     summary_model = CASE WHEN ? != '' THEN ? ELSE summary_model END,
+		     summary_model = CASE WHEN ? != '' AND ? != '' THEN ? ELSE summary_model END,
 		     summary_version = CASE WHEN ? THEN summary_version + 1 ELSE summary_version END,
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
@@ -1241,7 +1223,7 @@ func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, s
 		summary, preset,
 		summary, speakerNames,
 		summary, summary,
-		model, model,
+		summary, model, model,
 		bumpVersion,
 		bumpVersion, EnvoyPublishPending,
 		status,
@@ -1274,6 +1256,27 @@ func (s *SQLiteStore) DeletionGeneration(sessionID string) (int, error) {
 	return generation, nil
 }
 
+// GetSessionWithGeneration reads session id and its transcript generation in
+// one transaction, so a writer that derives a summary from the session can
+// store it only at the generation of the text it read
+// (UpdateSummaryAtGeneration).
+func (s *SQLiteStore) GetSessionWithGeneration(id string) (Session, int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Session{}, 0, fmt.Errorf("begin read of session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	sess, err := getSession(tx, id)
+	if err != nil {
+		return Session{}, 0, err
+	}
+	var generation int
+	if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, id).Scan(&generation); err != nil {
+		return Session{}, 0, fmt.Errorf("read deletion generation for session %s: %w", id, err)
+	}
+	return sess, generation, nil
+}
+
 func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames, model string) bool {
 	if status != SummaryCompleted || current.SummaryStatus == SummaryRunning {
 		return false
@@ -1284,7 +1287,9 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 	if title != "" && title != current.Title {
 		return true
 	}
-	if model != "" && model != current.SummaryModel {
+	// An empty summary keeps the summary the session has, and with it the
+	// model that made it.
+	if summary != "" && model != "" && model != current.SummaryModel {
 		return true
 	}
 	return summary != "" && (summary != current.Summary || preset != current.SummaryPreset || speakerNames != current.SpeakerNames)
@@ -1292,9 +1297,10 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 
 // StartSummary marks session id's summary running, and not yet published to
 // Envoy. Its title and summary stay as they are until a new summary is
-// stored (UpdateSummary): a summary that fails, or never ends, takes nothing
-// away. The session gets a new summary version when its current one may
-// already have been sent to Envoy: it is or was completed, or Envoy publishing
+// stored (UpdateSummaryAtGeneration): a summary that fails, or never ends,
+// takes nothing away. The session gets a new summary version when its
+// current one may already have been sent to Envoy: it is or was completed,
+// or Envoy publishing
 // of it was attempted.
 func (s *SQLiteStore) StartSummary(id string) error {
 	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_generation = deletion_generation, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ?`,
@@ -1333,32 +1339,19 @@ func (s *SQLiteStore) StartEmptySummary(id string) error {
 	return nil
 }
 
-// FailSummary records that making session id's summary failed, and why
-// (errMsg, in summary_error: error_message keeps the last sync's error), and
-// returns the session as it then is. The session keeps its title and its last
-// good summary (with its preset and speaker names), the ones Drive holds: a
-// failed summary takes nothing away.
-func (s *SQLiteStore) FailSummary(id, errMsg string) (Session, error) {
-	return s.failSummary(id, errMsg, -1)
-}
-
-// FailSummaryAtGeneration records a failed summary only while generation still
-// identifies the transcript the batch request used.
+// FailSummaryAtGeneration records that making session id's summary failed,
+// and why (errMsg, in summary_error: error_message keeps the last sync's
+// error), and returns the session as it then is, only while generation, the
+// transcript generation the summary run read, is still the session's and the
+// run started at it; otherwise it records nothing and returns sql.ErrNoRows.
+// The session keeps its title and its last good summary (with its preset and
+// speaker names), the ones Drive holds: a failed summary takes nothing away.
 func (s *SQLiteStore) FailSummaryAtGeneration(id, errMsg string, generation int) (Session, error) {
-	return s.failSummary(id, errMsg, generation)
-}
-
-func (s *SQLiteStore) failSummary(id, errMsg string, generation int) (Session, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if generation < 0 {
-		if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, id).Scan(&generation); err != nil {
-			return Session{}, fmt.Errorf("read summary generation for session %s: %w", id, err)
-		}
-	}
 	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ?`, SummaryFailed, errMsg, id, generation)
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
@@ -1380,24 +1373,22 @@ func (s *SQLiteStore) failSummary(id, errMsg string, generation int) (Session, e
 	return sess, nil
 }
 
-// UpdateRefinement stores a refinement when its producer did not expose a
-// model identity.
-func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
-	return s.UpdateRefinementWithModel(sessionID, transcript, status, "")
-}
-
-// UpdateRefinementWithModel atomically stores a refinement and the model
-// reported by its provider.
-func (s *SQLiteStore) UpdateRefinementWithModel(sessionID, transcript, status, model string) error {
+// UpdateRefinementAtGeneration atomically stores a refinement and the model
+// reported by its provider, only while generation, the transcript generation
+// ClaimRefinement returned, is still the session's. A refinement of the
+// recording from before a segment deletion is refused (sql.ErrNoRows), also
+// once the deletion's own refinement has claimed the session.
+func (s *SQLiteStore) UpdateRefinementAtGeneration(sessionID, transcript, status, model string, generation int) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions
 		 SET refined_transcript = ?, refinement_status = ?,
 		     refinement_model = CASE WHEN ? != '' THEN ? ELSE refinement_model END
-		 WHERE id = ? AND refinement_generation = deletion_generation`,
+		 WHERE id = ? AND refinement_generation = deletion_generation AND deletion_generation = ?`,
 		transcript,
 		status,
 		model, model,
 		sessionID,
+		generation,
 	)
 	if err != nil {
 		return fmt.Errorf("update refinement for session %s: %w", sessionID, err)
@@ -1415,24 +1406,25 @@ func (s *SQLiteStore) UpdateRefinementWithModel(sessionID, transcript, status, m
 }
 
 // ClaimRefinement marks session id's refinement running, dropping any earlier
-// refined transcript, only while the session still names audioPath, the
-// recording the refinement will read. Disk pressure changes the audio path
-// before it removes a file (MarkAudioRemoved), so once GC has taken the
-// recording this reports false and the refinement must not start; and GC
-// takes nothing from a session whose refinement is running.
-func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (bool, error) {
-	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != ''`,
+// refined transcript and its model, only while the session still names
+// audioPath, the recording the refinement will read. Disk pressure changes
+// the audio path before it removes a file (MarkAudioRemoved), so once GC has
+// taken the recording this reports false and the refinement must not start;
+// and GC takes nothing from a session whose refinement is running. It returns
+// the transcript generation it claimed at, the one the refinement stores its
+// result at (UpdateRefinementAtGeneration).
+func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (generation int, claimed bool, err error) {
+	err = s.db.QueryRow(
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != '' RETURNING refinement_generation`,
 		RefinementRunning, id, audioPath,
-	)
-	if err != nil {
-		return false, fmt.Errorf("claim refinement of session %s: %w", id, err)
+	).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
 	}
-	rows, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("claim refinement rows affected: %w", err)
+		return 0, false, fmt.Errorf("claim refinement of session %s: %w", id, err)
 	}
-	return rows == 1, nil
+	return generation, true, nil
 }
 
 func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {

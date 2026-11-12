@@ -123,7 +123,7 @@ func TestReviewStaleSnapshotClearsNewerDeletion(t *testing.T) {
 	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary(id, "Standup", "summary", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	wire, syncer := newWireDrive(t)

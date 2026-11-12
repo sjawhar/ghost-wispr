@@ -18,7 +18,7 @@ func summarizedSyncedSession(t *testing.T, store *SQLiteStore, id string) {
 	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Launch planning", "The last good summary.", SummaryCompleted, "default", `{"0":{"name":"Sam"}}`); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Launch planning", "The last good summary.", SummaryCompleted, "default", `{"0":{"name":"Sam"}}`, "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	if err := setEnvoyPublishStatus(store, id, EnvoyPublishPublished); err != nil {
@@ -65,7 +65,7 @@ func TestStartingASummaryKeepsTheLastOne(t *testing.T) {
 
 // A summary that fails takes nothing away: the session keeps its title and
 // its last good summary, and records the failure as its summary's status and
-// why. FailSummary returns the session as it then is.
+// why. FailSummaryAtGeneration returns the session as it then is.
 func TestAFailedSummaryKeepsTheLastGoodOneAndRecordsWhy(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	const id = "20261106090000"
@@ -74,7 +74,7 @@ func TestAFailedSummaryKeepsTheLastGoodOneAndRecordsWhy(t *testing.T) {
 		t.Fatalf("start summary: %v", err)
 	}
 
-	kept, err := store.FailSummary(id, "summarization failed: model unavailable")
+	kept, err := store.FailSummaryAtGeneration(id, "summarization failed: model unavailable", 0)
 	if err != nil {
 		t.Fatalf("fail summary: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestAFailedSummaryKeepsTheLastGoodOneAndRecordsWhy(t *testing.T) {
 		t.Errorf("summary_status %q, summary_error %q; want %q and why", sess.SummaryStatus, sess.SummaryError, SummaryFailed)
 	}
 	if kept.Title != sess.Title || kept.Summary != sess.Summary || kept.SummaryPreset != sess.SummaryPreset || kept.SummaryStatus != SummaryFailed {
-		t.Errorf("FailSummary returned title %q, summary %q, preset %q, status %q; want the session as it is",
+		t.Errorf("FailSummaryAtGeneration returned title %q, summary %q, preset %q, status %q; want the session as it is",
 			kept.Title, kept.Summary, kept.SummaryPreset, kept.SummaryStatus)
 	}
 }
@@ -98,7 +98,7 @@ func TestStartAndFailSummaryOfAMissingSession(t *testing.T) {
 	if err := store.StartSummary("missing"); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("start summary: %v, want %v", err, sql.ErrNoRows)
 	}
-	if _, err := store.FailSummary("missing", "why"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.FailSummaryAtGeneration("missing", "why", 0); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("fail summary: %v, want %v", err, sql.ErrNoRows)
 	}
 }

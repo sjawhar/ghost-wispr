@@ -73,7 +73,7 @@ func recordingMismatchSession(t *testing.T, id string) (*storage.SQLiteStore, co
 	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
 		t.Fatalf("end: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder-1", 0, "")
@@ -121,7 +121,7 @@ func TestAGCPassThatCannotCheckDriveIsRecordedWithTheDiskUse(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
 		t.Fatalf("end: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder-1", 0, "")
