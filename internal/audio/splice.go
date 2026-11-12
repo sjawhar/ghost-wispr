@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 )
 
 var ffmpegBinary = "ffmpeg"
@@ -36,13 +39,13 @@ func Splice(ctx context.Context, path string, start, end float64) (string, error
 	}
 	tempPath := temp.Name()
 	if err := temp.Close(); err != nil {
-		_ = os.Remove(tempPath)
+		_ = erase.Remove(tempPath)
 		return "", fmt.Errorf("close splice output %s: %w", tempPath, err)
 	}
 	keepTemp := false
 	defer func() {
 		if !keepTemp {
-			_ = os.Remove(tempPath)
+			_ = erase.Remove(tempPath)
 		}
 	}()
 
@@ -64,7 +67,10 @@ func Splice(ctx context.Context, path string, start, end float64) (string, error
 	if err := syncFile(tempPath); err != nil {
 		return "", fmt.Errorf("flush spliced recording %s: %w", tempPath, err)
 	}
-	if err := os.Rename(tempPath, path); err != nil {
+	// The file replaced holds the audio cut out: its bytes are overwritten
+	// before the file system frees them. Left erased part way, it is
+	// finished by erase.Leftovers as the app starts.
+	if err := erase.Replace(tempPath, path); err != nil && !errors.Is(err, erase.ErrLeftover) {
 		return "", fmt.Errorf("replace recording %s: %w", path, err)
 	}
 	keepTemp = true

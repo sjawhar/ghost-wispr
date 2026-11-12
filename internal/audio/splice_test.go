@@ -117,6 +117,46 @@ func TestSpliceCutsTheSpan(t *testing.T) {
 	}
 }
 
+// TestSpliceZeroesTheRecordingItReplaces fails if the recording a splice
+// replaces (it holds the audio cut out) is renamed over without its bytes
+// overwritten: the file system would free blocks still holding that audio.
+// A descriptor held on the original reads its inode after the splice.
+func TestSpliceZeroesTheRecordingItReplaces(t *testing.T) {
+	requireFFmpeg(t)
+	path := filepath.Join(t.TempDir(), "tones.mp3")
+	makeThreeToneMP3(t, path)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+
+	if _, err := Splice(context.Background(), path, 3, 6); err != nil {
+		t.Fatalf("Splice: %v", err)
+	}
+	got, err := io.ReadAll(io.NewSectionReader(held, 0, int64(len(original))+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(original) || !bytes.Equal(got, make([]byte, len(original))) {
+		t.Errorf("the replaced recording still holds %d nonzero bytes of %d (length %d)", nonzero(got), len(original), len(got))
+	}
+}
+
+func nonzero(b []byte) int {
+	n := 0
+	for _, c := range b {
+		if c != 0 {
+			n++
+		}
+	}
+	return n
+}
+
 func TestSpliceIsAtomic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("the original recording bytes")

@@ -105,6 +105,7 @@ func TestSegmentDeleteRunnerSplicesAndRefinesTheRecording(t *testing.T) {
 		t.Fatalf("write recording: %v", err)
 	}
 	store, segmentID, started := newDeletionTestStore(t, recording)
+	held := holdRecording(t, recording)
 	var refinedPath string
 	runner := segmentDeleteRunner{
 		store:       store,
@@ -134,6 +135,33 @@ func TestSegmentDeleteRunnerSplicesAndRefinesTheRecording(t *testing.T) {
 	}
 	if refinedPath != recording {
 		t.Fatalf("refinement read %q, want spliced %q", refinedPath, recording)
+	}
+	assertRecordingZeroed(t, held, len("original"))
+}
+
+// holdRecording opens the recording at path, so the test still reads its
+// inode after a splice has replaced the name.
+func holdRecording(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// assertRecordingZeroed fails unless the recording held reads size zero
+// bytes: the one a splice replaced, which holds the audio cut out, was
+// overwritten before the file system freed its blocks.
+func assertRecordingZeroed(t *testing.T, held *os.File, size int) {
+	t.Helper()
+	got := make([]byte, size)
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatalf("read the replaced recording: %v", err)
+	}
+	if !bytes.Equal(got, make([]byte, size)) {
+		t.Errorf("the replaced recording still holds %q", got)
 	}
 }
 
@@ -167,23 +195,41 @@ func TestSegmentDeleteRunnerUsesProbedRecordingDuration(t *testing.T) {
 	}
 }
 
+// TestCleanupSpliceTempCopies fails if a copy of a recording a stopped app
+// left (a splice's copy or output, a Drive download, an erasure cut off) is
+// still there after the app starts, or was removed without its bytes
+// overwritten, or if a recording is touched.
 func TestCleanupSpliceTempCopies(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", "recording.mp3"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+	held := map[string]*os.File{}
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", ".erasing-cut-off", "recording.mp3"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("audio of "+name), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
+		f, err := os.Open(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		held[name] = f
 	}
 	if err := cleanupSpliceTempCopies(dir); err != nil {
 		t.Fatalf("cleanup splice temp copies: %v", err)
 	}
-	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3"} {
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", ".erasing-cut-off"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("temp copy %s remains: %v", name, err)
 		}
+		got := make([]byte, len("audio of "+name))
+		if _, err := held[name].ReadAt(got, 0); err != nil {
+			t.Fatalf("read the removed %s: %v", name, err)
+		}
+		if !bytes.Equal(got, make([]byte, len(got))) {
+			t.Errorf("temp copy %s was removed still holding %q", name, got)
+		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "recording.mp3")); err != nil {
-		t.Fatalf("recording disappeared: %v", err)
+	if got, err := os.ReadFile(filepath.Join(dir, "recording.mp3")); err != nil || string(got) != "audio of recording.mp3" {
+		t.Fatalf("recording after cleanup = %q (%v), want it whole", got, err)
 	}
 }
 
@@ -710,6 +756,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 		t.Fatalf("write recording: %v", err)
 	}
 	store, segmentID, started := newDeletionTestStore(t, recording)
+	held := holdRecording(t, recording)
 	segments, err := store.GetSegments("session")
 	if err != nil {
 		t.Fatalf("get segments: %v", err)
@@ -756,6 +803,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("pending splices after recovery = %+v", pending)
 	}
+	assertRecordingZeroed(t, held, len(original))
 }
 
 func hashBytesForDeleteTest(value []byte) string {

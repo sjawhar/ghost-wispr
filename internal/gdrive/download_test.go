@@ -16,6 +16,11 @@ func TestDownloadRecordingWritesTheDriveFileAtomically(t *testing.T) {
 	if err := os.WriteFile(destination, []byte("old local recording"), 0o600); err != nil {
 		t.Fatalf("write destination: %v", err)
 	}
+	held, err := os.Open(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
 
 	if err := syncer.DownloadRecording(context.Background(), folder, "audio-20261111120000.mp3", destination); err != nil {
 		t.Fatalf("DownloadRecording: %v", err)
@@ -26,6 +31,14 @@ func TestDownloadRecordingWritesTheDriveFileAtomically(t *testing.T) {
 	}
 	if !bytes.Equal(contents, []byte("recording from Drive")) {
 		t.Fatalf("downloaded recording = %q", contents)
+	}
+	// The recording replaced was overwritten before the file system freed it.
+	old := make([]byte, len("old local recording"))
+	if _, err := held.ReadAt(old, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(old, make([]byte, len(old))) {
+		t.Errorf("the replaced recording still holds %q", old)
 	}
 }
 
