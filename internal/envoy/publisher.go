@@ -228,7 +228,16 @@ func (p *Publisher) PublishSummaryReady(ctx context.Context, sessionID string) e
 	if err != nil {
 		return fmt.Errorf("get session %s: %w", sessionID, err)
 	}
-	if !shouldPublish(&sess) {
+	if !summaryCompleted(&sess) {
+		return nil
+	}
+	if strings.TrimSpace(sess.Summary) == "" {
+		// No summarizer made a summary, so there is nothing to announce.
+		// Recorded as skipped, the publish sweep does not select the session
+		// again; a summary made later moves it back to pending.
+		if _, err := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, storage.EnvoyPublishSkipped); err != nil {
+			return fmt.Errorf("mark envoy publish skipped for session %s: %w", sessionID, err)
+		}
 		return nil
 	}
 	if updated, err := p.store.UpdateEnvoyPublishStatusAtVersion(sessionID, sess.SummaryVersion, storage.EnvoyPublishPending); err != nil {
@@ -315,7 +324,9 @@ func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *
 	return p.client.Send(ctx, event)
 }
 
-func shouldPublish(sess *storage.Session) bool {
+// summaryCompleted reports whether sess is an ended session whose summary
+// completed. Only one with summary text is announced to Envoy.
+func summaryCompleted(sess *storage.Session) bool {
 	return sess.Status == storage.SessionEnded && sess.SummaryStatus == storage.SummaryCompleted && sess.EndedAt != nil
 }
 

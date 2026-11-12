@@ -136,6 +136,11 @@ func (s *storeMock) StartSummary(sessionID string) error {
 	return nil
 }
 
+// StartEmptySummary marks the summary running, as the store does.
+func (s *storeMock) StartEmptySummary(sessionID string) error {
+	return s.StartSummary(sessionID)
+}
+
 // FailSummary keeps the title and summary, as the store does.
 func (s *storeMock) FailSummary(sessionID, errMsg string) (storage.Session, error) {
 	s.mu.Lock()
@@ -1097,6 +1102,13 @@ func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected sync to trigger when summarizer is nil")
+	}
+
+	store.mu.Lock()
+	status := store.status["session-no-summarizer"]
+	store.mu.Unlock()
+	if status != storage.SummaryCompleted {
+		t.Errorf("summary status = %q, want %q", status, storage.SummaryCompleted)
 	}
 }
 

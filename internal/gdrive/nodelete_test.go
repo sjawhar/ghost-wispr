@@ -379,12 +379,66 @@ func isDriveDeleteCall(name string) bool {
 	return strings.HasSuffix(name, "DeleteCall") || strings.HasSuffix(name, "EmptyTrashCall")
 }
 
-// Nothing in the app deletes or trashes a file on Google Drive: Drive holds
-// the user's backup, and a document there may hold their edits.
+// replacementDeleteFunction is the one function with a Drive delete call:
+// replaceFolder (replace.go), which a segment deletion's replacement runs for
+// each folder it owes.
+const replacementDeleteFunction = "replaceFolder"
+
+// No app code deletes or trashes a Drive file except replaceFolder, which
+// removes recorded old files and duplicate app-created replacement uploads
+// only after it stores the replacement to retain.
 func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
-	for _, f := range driveDeletions(t, moduleRoot(t), nil) {
-		t.Error(f)
+	root := moduleRoot(t)
+	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")
+	allowedLocations := map[string]bool{}
+	for _, finding := range driveDeletions(t, root, nil) {
+		path, line, ok := driveDeletionLocation(finding)
+		if ok && path == replacePath && functionAtLine(t, path, line) == replacementDeleteFunction {
+			allowedLocations[fmt.Sprintf("%s:%d", path, line)] = true
+			continue
+		}
+		t.Error(finding)
 	}
+	if len(allowedLocations) != 1 {
+		t.Errorf("found %d allowed Drive delete call sites in %s, want exactly one", len(allowedLocations), replacementDeleteFunction)
+	}
+}
+
+func driveDeletionLocation(finding string) (string, int, bool) {
+	path, rest, ok := strings.Cut(finding, ".go:")
+	if !ok {
+		return "", 0, false
+	}
+	lineText, _, ok := strings.Cut(rest, ":")
+	if !ok {
+		return "", 0, false
+	}
+	line, err := strconv.Atoi(lineText)
+	if err != nil {
+		return "", 0, false
+	}
+	return path + ".go", line, true
+}
+
+func functionAtLine(t *testing.T, path string, line int) string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		start := fset.Position(function.Pos()).Line
+		end := fset.Position(function.End()).Line
+		if start <= line && line <= end {
+			return function.Name.Name
+		}
+	}
+	return ""
 }
 
 // deletionProbe is code that deletes or trashes files on Drive in every form
@@ -478,15 +532,18 @@ func TestTheDriveDeletionCheckFindsEveryForm(t *testing.T) {
 		}
 	}
 	found := map[string]bool{}
-	for _, f := range driveDeletions(t, root, overlay) {
-		path, rest, _ := strings.Cut(f, ".go:")
-		lineText, _, _ := strings.Cut(rest, ":")
-		if _, err := strconv.Atoi(lineText); err != nil {
-			t.Fatalf("finding %q: %v", f, err)
+	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")
+	for _, finding := range driveDeletions(t, root, overlay) {
+		path, line, ok := driveDeletionLocation(finding)
+		if !ok {
+			t.Fatalf("finding %q has no source location", finding)
 		}
-		at := path + ".go:" + lineText
-		if _, ok := probes[path+".go"]; !ok {
-			t.Errorf("outside the probes: %s", f)
+		if path == replacePath && functionAtLine(t, path, line) == replacementDeleteFunction {
+			continue
+		}
+		at := fmt.Sprintf("%s:%d", path, line)
+		if _, ok := probes[path]; !ok {
+			t.Errorf("outside the probes: %s", finding)
 			continue
 		}
 		found[at] = true

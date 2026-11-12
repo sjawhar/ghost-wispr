@@ -74,7 +74,11 @@ func Splice(ctx context.Context, path string, start, end float64) (string, error
 	return fileSHA256(path)
 }
 
-func syncFile(path string) error {
+// syncFile flushes the file at path to disk. Splice flushes its output with
+// it before the rename puts the output in place of the recording: renamed
+// first, a power loss could leave the recording's name on an output whose
+// data never reached the disk. Tests replace it to see the order.
+var syncFile = func(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err

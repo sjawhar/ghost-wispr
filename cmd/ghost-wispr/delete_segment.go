@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/api/drive/v3"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -334,6 +336,9 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 		return fmt.Errorf("replace recording %s: %w", recording, err)
 	}
 	keepTemp = true
+	if err := syncRecordingDirectory(recording); err != nil {
+		return err
+	}
 	if err := d.store.MarkSpliceComplete(&span); err != nil {
 		return err
 	}
@@ -437,6 +442,9 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 		return false, fmt.Errorf("hash pending splice recording %s: %w", recording, err)
 	}
 	if hash == span.SHA256After {
+		if err := syncRecordingDirectory(recording); err != nil {
+			return false, err
+		}
 		if err := store.MarkSpliceComplete(span); err != nil {
 			return false, err
 		}
@@ -459,10 +467,14 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	}
 	if afterHash != span.SHA256After {
 		_ = os.Remove(tempPath)
+		removeFiles(recordingSet.Downloaded)
 		return false, fmt.Errorf("re-splice %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After)
 	}
 	if err := os.Rename(tempPath, recording); err != nil {
 		return false, fmt.Errorf("replace recovered recording %s: %w", recording, err)
+	}
+	if err := syncRecordingDirectory(recording); err != nil {
+		return false, err
 	}
 	if err := store.MarkSpliceComplete(span); err != nil {
 		return false, err
@@ -477,12 +489,41 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	return true, nil
 }
 
+// syncRecordingDirectory flushes the directory holding recording, so the
+// rename that put the spliced recording there is on disk before the splice is
+// marked complete: after a power loss the mark must not stand beside the
+// unspliced recording, which the Drive replacement would then upload as the
+// clean copy.
+var syncRecordingDirectory = func(recording string) error {
+	dir := filepath.Dir(recording)
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open recording directory %s: %w", dir, err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("flush recording directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+// removeFiles removes paths with a plain unlink: a segment deletion zeroes
+// no whole audio file (Sami, 2026-11-12, dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
 func removeFiles(paths []string) {
 	for _, path := range paths {
 		_ = os.Remove(path)
 	}
 }
 
+// cleanupSpliceTempCopies removes, as the app starts and before any deletion
+// or recovery runs, the temporary files a stopped app can leave in audioDir,
+// each a whole copy of a recording: a splice's copy (.delete-segment-*) and
+// output (.splice-*), and a recording downloaded from Drive for a splice
+// (.download-*, gdrive.Syncer.DownloadRecording). It removes them with a
+// plain unlink, since a segment deletion zeroes no whole audio file, and
+// finishes overwriting any file a whole-file removal (GC, the session delete
+// route, a saved session's raw recording) left part way erased
+// (erase.Leftovers).
 func cleanupSpliceTempCopies(audioDir string) error {
 	entries, err := os.ReadDir(audioDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -494,14 +535,52 @@ func cleanupSpliceTempCopies(audioDir string) error {
 	var cleanupErr error
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, ".delete-segment-") && !strings.HasPrefix(name, ".splice-") {
+		if entry.IsDir() || !strings.HasPrefix(name, ".delete-segment-") && !strings.HasPrefix(name, ".splice-") && !strings.HasPrefix(name, ".download-") {
 			continue
 		}
 		if err := os.Remove(filepath.Join(audioDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
-	return cleanupErr
+	return errors.Join(cleanupErr, erase.Leftovers(audioDir))
+}
+
+// recordingDirectoryLister lists the directories recordings are kept or
+// erased in outside the audio directory, and forgets the erase directories
+// the startup cleanup has finished.
+type recordingDirectoryLister interface {
+	RecordingDirectories() ([]string, error)
+	ForgetEraseDirectories(dirs []string) error
+}
+
+// cleanupRecordingDirectories runs cleanupSpliceTempCopies, as the app
+// starts, in audioDir and in every directory a session keeps a recording in
+// or a whole-file erase was started in (storage.RecordingDirectories):
+// splice copies, downloads and cut-off erasures are made beside the
+// recording they copy or erase. It then hands the directories it cleaned
+// without an error to ForgetEraseDirectories, which forgets those that were
+// there to clean.
+func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string) error {
+	dirs := []string{filepath.Clean(audioDir)}
+	others, err := store.RecordingDirectories()
+	if err != nil {
+		return errors.Join(err, cleanupSpliceTempCopies(audioDir))
+	}
+	for _, dir := range others {
+		if dir = filepath.Clean(dir); !slices.Contains(dirs, dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	var cleanupErr error
+	var cleaned []string
+	for _, dir := range dirs {
+		if err := cleanupSpliceTempCopies(dir); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		cleaned = append(cleaned, dir)
+	}
+	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned))
 }
 
 func neighbourText(segments []transcribe.Segment, index int) (before, after string) {

@@ -277,10 +277,7 @@ func TestPendingSplicesReturnsOnlyRecordingsAtTheirBeforeHash(t *testing.T) {
 func TestDeleteSegmentClearsPriorDriveReplacementCycle(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "replacement-cycle")
-	if _, err := store.DB().Exec(`CREATE TABLE drive_replacements(session_id TEXT, name TEXT, old_id TEXT, new_id TEXT, state TEXT)`); err != nil {
-		t.Fatalf("create replacements: %v", err)
-	}
-	if _, err := store.DB().Exec(`INSERT INTO drive_replacements VALUES('replacement-cycle', 'transcript.md', 'old', 'new', 'deleted')`); err != nil {
+	if _, err := store.DB().Exec(`INSERT INTO drive_replacements(session_id, generation, name, old_id, new_id, state) VALUES('replacement-cycle', 0, 'transcript.md', 'old', 'new', 'deleted')`); err != nil {
 		t.Fatalf("seed replacement: %v", err)
 	}
 	segments, err := store.GetSegments("replacement-cycle")
@@ -401,20 +398,83 @@ func TestDeleteSegmentSecurelyErasesDeletedText(t *testing.T) {
 	if err := store.DeleteSegment("secure-delete", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
+	assertDatabaseFilesLack(t, path, unique, "after bridge")
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
+}
+
+// TestEveryConnectionErasesDeletedText fails if a connection that
+// database/sql opens again, after dropping the first, lacks secure_delete or
+// foreign keys. No VACUUM runs after a deletion, so secure_delete on the
+// connection that commits it is what zeroes the deleted words in the pages it
+// frees.
+func TestEveryConnectionErasesDeletedText(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reconnect.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	// Every statement from here on runs on a connection opened for it.
+	store.DB().SetMaxIdleConns(0)
+	var secureDelete, foreignKeys, tempStore int
+	if err := store.DB().QueryRow(`PRAGMA secure_delete`).Scan(&secureDelete); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRow(`PRAGMA temp_store`).Scan(&tempStore); err != nil {
+		t.Fatal(err)
+	}
+	if secureDelete != 1 || foreignKeys != 1 || tempStore != 2 {
+		t.Errorf("a reopened connection has secure_delete=%d foreign_keys=%d temp_store=%d, want 1, 1 and 2 (memory: no temporary file frees blocks holding text)", secureDelete, foreignKeys, tempStore)
+	}
+	_, _ = segmentTestSession(t, store, "reconnect")
+	segments, err := store.GetSegments("reconnect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const unique = "reconnected-deletion-phrase-5be1a0"
+	if _, err := store.DB().Exec(`UPDATE segments SET text = ? WHERE id = ?`, unique, segments[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegment("reconnect", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	store.DB().SetMaxIdleConns(1)
+	if _, err := store.DB().Exec(`SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	assertDatabaseFilesLack(t, path, unique, "after bridge")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertDatabaseFilesLack fails if secret is in any file of the open SQLite
+// database at path: the database, its write-ahead log and its shared-memory
+// index. It reads them while the store is open, when they all exist (SQLite
+// removes the log and index when the last connection closes, so a read
+// after Close would pass by reading nothing), fails if one is missing, and
+// fails unless kept, text the database still holds, is found in one of them,
+// so the read is shown able to see text at all.
+func assertDatabaseFilesLack(t *testing.T, path, secret, kept string) {
+	t.Helper()
+	seenKept := false
 	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
-		bytes, err := os.ReadFile(candidate)
-		if os.IsNotExist(err) {
-			continue
-		}
+		contents, err := os.ReadFile(candidate)
 		if err != nil {
-			t.Fatalf("read %s: %v", candidate, err)
+			t.Fatalf("read %s while the store is open: %v", candidate, err)
 		}
-		if strings.Contains(string(bytes), unique) {
-			t.Fatalf("deleted text remains in %s", candidate)
+		t.Logf("%s: %d bytes", filepath.Base(candidate), len(contents))
+		if strings.Contains(string(contents), secret) {
+			t.Errorf("the deleted words remain in %s", candidate)
 		}
+		seenKept = seenKept || strings.Contains(string(contents), kept)
+	}
+	if !seenKept {
+		t.Fatalf("no database file holds the kept text %q: the read saw no data", kept)
 	}
 }
 

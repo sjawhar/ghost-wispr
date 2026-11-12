@@ -23,6 +23,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -39,7 +40,12 @@ type SessionStore interface {
 	GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
-	DeleteSession(id string) error
+	// DeleteSession deletes the session and returns the audio_path its row
+	// had when it went.
+	DeleteSession(id string) (string, error)
+	// RecordEraseDirectory records a directory before a whole-file erase in
+	// it begins, so the app finishes one a stop cut off as it starts again.
+	RecordEraseDirectory(dir string) error
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
@@ -790,19 +796,44 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		if err := store.DeleteSession(sessionID); err != nil {
+		audioPath, err := store.DeleteSession(sessionID)
+		if err != nil {
+			if errors.Is(err, storage.ErrDeleteReplacementPending) {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 			return
 		}
 
-		// Clean up audio files after successful DB deletion.
-		if sessionData.AudioPath != "" {
-			for _, p := range strings.Split(sessionData.AudioPath, ",") {
-				p = strings.TrimSpace(p)
-				if p != "" {
-					_ = os.Remove(p)
-				}
+		// Erase the recordings the deleted row named, after the database
+		// deletion: removing a whole audio file overwrites it with zeros
+		// before the file system frees its blocks (Sami, 2026-11-12, "Zero
+		// every audio removal",
+		// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
+		// Each one's directory, named as the erase names it, is recorded
+		// first, so an erase cut off by a stop is finished as the app starts.
+		// The files leave their names before the answer; the zeros, a write
+		// as large as the recordings, follow it.
+		var pending []erase.Pending
+		for _, p := range strings.Split(audioPath, ",") {
+			if p = strings.TrimSpace(p); p == "" {
+				continue
 			}
+			if err := store.RecordEraseDirectory(filepath.Dir(p)); err != nil {
+				slog.Warn("could not record where a deleted session's recording is erased; a stop during the erase would leave it", "session_id", sessionID, "audio_path", p, "error", err)
+			}
+			hidden, err := erase.Begin(p)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					slog.Warn("could not remove a deleted session's recording", "session_id", sessionID, "audio_path", p, "error", err)
+				}
+				continue
+			}
+			pending = append(pending, hidden)
+		}
+		if len(pending) > 0 {
+			go finishErasing(sessionID, pending)
 		}
 
 		w.WriteHeader(http.StatusNoContent)
@@ -846,6 +877,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		newID := earliest.UTC().Format("20060102150405") + "-merged"
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
+			if errors.Is(err, storage.ErrMergeReplacementPending) {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("merge sessions: %v", err))
 			return
 		}
@@ -1081,7 +1116,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		// No browser keeps a copy: a segment deletion splices this file, and
+		// the spliced recording is served at this same URL (noStoreAPI).
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", contentTypeForAudio(cleanPath))
 		http.ServeContent(w, r, filepath.Base(cleanPath), info.ModTime(), f)
 	})
@@ -1512,6 +1549,18 @@ func cosineSimilarity(a, b []float32) float32 {
 	}
 
 	return float32(dot / (math.Sqrt(normA) * math.Sqrt(normB)))
+}
+
+// finishErasing overwrites with zeros and removes the recordings a session
+// delete moved to hidden names, after the response. One it cannot finish
+// stays under its hidden name for erase.Leftovers as the app starts. Tests
+// replace it to see the response come first.
+var finishErasing = func(sessionID string, pending []erase.Pending) {
+	for _, p := range pending {
+		if err := p.Finish(); err != nil {
+			slog.Warn("could not overwrite a deleted session's recording; it is erased as the app starts", "session_id", sessionID, "error", err)
+		}
+	}
 }
 
 func validSessionID(id string) bool {

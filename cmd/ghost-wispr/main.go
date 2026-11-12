@@ -1503,7 +1503,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	// The Drive sync sweep runs whether sync is on or not: it syncs nothing
 	// while sync is off, and picks up a syncer turned on in the settings.
-	go sweepDriveSync(ctx, store, drive, 5*time.Minute)
+	go sweepDriveSync(ctx, store, drive, warningRegistry, 5*time.Minute)
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -1804,7 +1804,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	lightOff := hardware.Done()
-	if err := cleanupSpliceTempCopies(cfg.AudioDir); err != nil {
+	// This cleanup must run before anything else splices or erases in these
+	// directories: before the HTTP listener below (segment and session
+	// deletions), before recoverPendingSplices, and before the first Drive
+	// sweep (5 minutes) and GC pass (an hour), whose tickers start above.
+	// erase.Leftovers unlinks the second name an erase.Replace under way still
+	// needs, cleanupSpliceTempCopies removes the copies a running deletion
+	// splices, and ForgetEraseDirectories forgets directories no erase is
+	// using only while none runs. The recorder, started above, may already
+	// erase a saved session's raw recording in the audio directory:
+	// erase.Remove makes no second name, and either erase finishing the file
+	// overwrites it.
+	if err := cleanupRecordingDirectories(store, cfg.AudioDir); err != nil {
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
 	}

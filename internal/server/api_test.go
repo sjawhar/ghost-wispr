@@ -20,6 +20,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -39,6 +40,10 @@ type apiStoreStub struct {
 	allEmbeddings      []storage.StoredEmbedding
 	allEmbeddingsErr   error
 	getEventsSinceFunc func(cursor int64, limit int) ([]storage.StoredEvent, error)
+	// deletedAudioPath, when set, is the audio_path DeleteSession reports the
+	// deleted row had, in place of the one GetSession showed.
+	deletedAudioPath     string
+	recordEraseDirectory func(dir string) error
 }
 
 type embeddingClientStub struct {
@@ -157,11 +162,22 @@ func (s *apiStoreStub) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
-func (s *apiStoreStub) DeleteSession(id string) error {
-	if _, ok := s.sessions[id]; !ok {
-		return os.ErrNotExist
+func (s *apiStoreStub) DeleteSession(id string) (string, error) {
+	sess, ok := s.sessions[id]
+	if !ok {
+		return "", os.ErrNotExist
 	}
 	delete(s.sessions, id)
+	if s.deletedAudioPath != "" {
+		return s.deletedAudioPath, nil
+	}
+	return sess.AudioPath, nil
+}
+
+func (s *apiStoreStub) RecordEraseDirectory(dir string) error {
+	if s.recordEraseDirectory != nil {
+		return s.recordEraseDirectory(dir)
+	}
 	return nil
 }
 
@@ -471,6 +487,172 @@ func TestDeleteSession_Success(t *testing.T) {
 	}
 }
 
+// deleteSessionWithRecording serves DELETE /api/sessions/s1 for a session
+// whose recording holds audio, with finish in place of finishErasing, and
+// returns the recording's path and a descriptor held on it.
+func deleteSessionWithRecording(t *testing.T, audio []byte, finish func(string, []erase.Pending)) (string, *os.File, <-chan *httptest.ResponseRecorder) {
+	t.Helper()
+	recording := filepath.Join(t.TempDir(), "s1.mp3")
+	if err := os.WriteFile(recording, audio, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	original := finishErasing
+	t.Cleanup(func() { finishErasing = original })
+	finishErasing = finish
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: recording}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answered := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+		answered <- rr
+	}()
+	return recording, held, answered
+}
+
+// TestDeleteSession_ErasesWhatTheDeletedRowNamed fails if the session delete
+// erases the recordings it read before the delete rather than those the row
+// named when it went, or begins an erase before recording the recording's
+// directory (an erase a stop cuts off would then not be found as the app
+// starts).
+func TestDeleteSession_ErasesWhatTheDeletedRowNamed(t *testing.T) {
+	dir := t.TempDir()
+	read, deleted := filepath.Join(dir, "read.mp3"), filepath.Join(dir, "deleted.mp3")
+	for _, path := range []string{read, deleted} {
+		if err := os.WriteFile(path, []byte("audio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	var recorded []string
+	store := &apiStoreStub{
+		sessionsByDate:   map[string][]storage.Session{},
+		sessions:         map[string]storage.Session{"s1": {ID: "s1", AudioPath: read}},
+		segments:         map[string][]transcribe.Segment{},
+		deletedAudioPath: deleted,
+		recordEraseDirectory: func(recordedDir string) error {
+			recorded = append(recorded, recordedDir)
+			if _, err := os.Stat(deleted); err != nil {
+				t.Errorf("the recording was moved before its directory was recorded: %v", err)
+			}
+			return nil
+		},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(deleted); !os.IsNotExist(err) {
+		t.Errorf("the recording the deleted row named is still there: %v", err)
+	}
+	if _, err := os.Stat(read); err != nil {
+		t.Errorf("the recording read before the delete was erased: %v", err)
+	}
+	if !slices.Equal(recorded, []string{dir}) {
+		t.Errorf("recorded erase directories %v, want %s", recorded, dir)
+	}
+}
+
+// TestDeleteSession_ZeroesItsAudio fails if deleting a session removes its
+// recordings without overwriting their bytes before the file system frees
+// them.
+func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
+	audio := []byte("the session's audio")
+	finish := finishErasing
+	finished := make(chan struct{})
+	recording, held, answered := deleteSessionWithRecording(t, audio, func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	})
+	if rr := <-answered; rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(recording); !os.IsNotExist(err) {
+		t.Fatalf("the recording is still there: %v", err)
+	}
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the removed recording still holds %q", got)
+	}
+}
+
+// TestDeleteSession_AnswersBeforeItZeroesTheAudio fails if deleting a session
+// holds the request until its recordings are overwritten, a write as large as
+// they are, or answers before they have left their names.
+func TestDeleteSession_AnswersBeforeItZeroesTheAudio(t *testing.T) {
+	audio := []byte("the session's audio")
+	finish := finishErasing
+	release, finished := make(chan struct{}), make(chan struct{})
+	recording, held, answered := deleteSessionWithRecording(t, audio, func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		<-release
+		finish(sessionID, pending)
+	})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	select {
+	case rr := <-answered:
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session delete waited for its recordings to be overwritten before it answered")
+	}
+	if _, err := os.Stat(recording); !os.IsNotExist(err) {
+		t.Fatalf("the recording still has its name when the delete answers: %v", err)
+	}
+	close(release)
+	<-finished
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the removed recording still holds %q", got)
+	}
+}
+
 func TestDeleteSession_NotFound(t *testing.T) {
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
@@ -709,6 +891,83 @@ func TestMergeSession_SessionNotFound(t *testing.T) {
 	}
 }
 
+// TestMergeSession_RefusesASessionThatOwesADriveReplacement fails if the
+// merge route merges, or answers anything but 409 with the reason, while a
+// session to merge still has a deleted segment on Google Drive.
+func TestMergeSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"20261106100000", "20261106110000"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = '20261106110000'`); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/merge", strings.NewReader(`{"session_ids":["20261106100000","20261106110000"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "deleted segment on Google Drive") {
+		t.Fatalf("merge of a session owing a Drive replacement = %d %s, want 409 with the reason", rr.Code, rr.Body.String())
+	}
+	if sess, err := store.GetSession("20261106100000"); err != nil || sess.Status != storage.SessionEnded {
+		t.Fatalf("after the refused merge the other session is %q (%v), want it ended", sess.Status, err)
+	}
+}
+
+// TestDeleteSession_RefusesASessionThatOwesADriveReplacement fails if the
+// delete route removes a session whose deleted segment is still on Google
+// Drive: with its row go its replacement ledger and its status warning, and
+// the Drive folder keeps the words.
+func TestDeleteSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	const id = "20261106100000"
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+id, nil))
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "deleted segment on Google Drive") {
+		t.Fatalf("delete of a session owing a Drive replacement = %d %s, want 409 with the reason", rr.Code, rr.Body.String())
+	}
+	if _, err := store.GetSession(id); err != nil {
+		t.Fatalf("the refused delete removed the session: %v", err)
+	}
+}
+
 func TestAPIAudioRange(t *testing.T) {
 	root := t.TempDir()
 	audioFile := "audio.mp3"
@@ -752,6 +1011,45 @@ func TestAPIAudioRange(t *testing.T) {
 	}
 	if rr.Header().Get("Content-Range") == "" {
 		t.Fatalf("expected Content-Range header")
+	}
+}
+
+// TestAPIResponsesAreNotKeptByBrowsers fails if a recording or a session's
+// transcript is served in a way a browser may keep in its disk cache: a
+// segment deleted on the unit would stay there, and a spliced recording is
+// served at the URL the unspliced one had.
+func TestAPIResponsesAreNotKeptByBrowsers(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "audio.mp3"), []byte(strings.Repeat("a", 4096)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: "audio.mp3"}},
+		segments:       map[string][]transcribe.Segment{"s1": {{ID: 1, Text: "words on the unit"}}},
+		dates:          []string{"2026-02-26"},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/sessions/s1/audio", "/api/sessions/s1", "/api/dates"} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code >= 400 {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("GET %s Cache-Control = %q, want no-store", path, got)
+		}
 	}
 }
 

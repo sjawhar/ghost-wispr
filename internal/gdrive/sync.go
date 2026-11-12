@@ -25,20 +25,23 @@ import (
 )
 
 type Syncer struct {
-	service  *drive.Service
-	folderID string
-	logger   *slog.Logger
-	mu       sync.Mutex
+	service      *drive.Service
+	folderID     string
+	logger       *slog.Logger
+	mu           sync.Mutex
+	replacements replacementStore
 }
 
 const resumableUploadThresholdBytes int64 = 5 * 1024 * 1024
 
 type SyncFile struct {
-	Name        string
-	MimeType    string
-	Content     []byte
-	LocalPath   string
-	ContentType string
+	Name          string
+	MimeType      string
+	Content       []byte
+	LocalPath     string
+	ContentType   string
+	SHA256        string
+	AppProperties map[string]string
 }
 
 func NewSyncer(ctx context.Context, credentials *auth.Credentials, folderID string, logger ...*slog.Logger) (*Syncer, error) {
@@ -66,6 +69,21 @@ func newSyncerWithLogger(ctx context.Context, credentials *auth.Credentials, fol
 	}, nil
 }
 
+// BuildSyncFiles returns the files a sync uploads, or an error when a
+// recording could not be read. The orchestrator uses buildSyncFiles so it can
+// upload the readable files while it leaves a session pending for that
+// recording.
+func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
+	files, folderName, unreadable, err := buildSyncFiles(sess, segments, audioPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(unreadable) != 0 {
+		return nil, "", fmt.Errorf("read recordings: %s", strings.Join(unreadable, ", "))
+	}
+	return files, folderName, nil
+}
+
 // renderDocuments returns the documents a sync uploads for s: its summary
 // ("" when it has none) and its transcript, from the canonical transcript if
 // it has one, else from its segments.
@@ -79,12 +97,13 @@ func renderDocuments(s *SyncSession, segments []transcribe.Segment) (summary, tr
 	return summary, RenderTranscriptMarkdown(s, segments)
 }
 
-func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
+func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, []string, error) {
 	date := sess.StartedAt.UTC().Format("2006-01-02")
 	slug := slugify(sess.Title)
 	folderName := date + "-" + slug
 
 	var files []SyncFile
+	var unreadable []string
 
 	summaryMD, transcriptMD := renderDocuments(sess, segments)
 	if summaryMD != "" {
@@ -113,6 +132,11 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		if _, err := os.Stat(recording); err != nil {
 			continue
 		}
+		hash, err := fileSHA256(recording)
+		if err != nil {
+			unreadable = append(unreadable, recording)
+			continue
+		}
 		ext := filepath.Ext(recording)
 		mimeType := "audio/mpeg"
 		if ext == ".wav" {
@@ -124,10 +148,11 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 			MimeType:    mimeType,
 			LocalPath:   recording,
 			ContentType: mimeType,
+			SHA256:      hash,
 		})
 	}
 
-	return files, folderName, nil
+	return files, folderName, unreadable, nil
 }
 
 // recordingEntries returns the recordings an audio path names: a merged
@@ -255,9 +280,8 @@ func (s *Syncer) FolderOnDrive(ctx context.Context, folderID string) (bool, erro
 // driveFile is a file in a session's Drive folder.
 type driveFile struct {
 	ID, Name string
-	// ContentHash is the hash of a document (summary, transcript) this app
-	// uploaded, kept in the file's appProperties; "" for audio, and for a
-	// document uploaded before hashes were kept.
+	// ContentHash is the hash this app uploaded in the file's appProperties;
+	// it is empty only for a file uploaded before hashes were kept.
 	ContentHash  string
 	ModifiedTime time.Time
 }
@@ -285,14 +309,30 @@ func toDriveFile(f *drive.File) driveFile {
 // contentHashProperty is the appProperties key a document's hash is kept in.
 const contentHashProperty = "ghostWisprSHA256"
 
-// contentHash returns the hash of a document's content, and "" for a
-// recording.
+// contentHash returns the content hash kept on Drive for f.
 func contentHash(f *SyncFile) string {
-	if f.LocalPath != "" || f.Content == nil {
+	if f.SHA256 != "" {
+		return f.SHA256
+	}
+	if f.Content == nil {
 		return ""
 	}
 	sum := sha256.Sum256(f.Content)
 	return hex.EncodeToString(sum[:])
+}
+
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // docUpdate is a document a re-sync updates in place: the file on Drive, and
@@ -404,6 +444,11 @@ func (s *Syncer) updateDocument(ctx context.Context, u *docUpdate) error {
 
 // uploadFile uploads one file into a Drive folder.
 func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) error {
+	_, err := s.uploadFileID(ctx, folderID, f)
+	return err
+}
+
+func (s *Syncer) uploadFileID(ctx context.Context, folderID string, f *SyncFile) (string, error) {
 	var reader io.Reader
 	var file *os.File
 	var fileSize int64
@@ -415,21 +460,21 @@ func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) e
 	case f.LocalPath != "":
 		openedFile, err := os.Open(f.LocalPath)
 		if err != nil {
-			return fmt.Errorf("open %s: %w", f.LocalPath, err)
+			return "", fmt.Errorf("open %s: %w", f.LocalPath, err)
 		}
 		file = openedFile
 		reader = file
 		info, err := file.Stat()
 		if err != nil {
 			_ = file.Close()
-			return fmt.Errorf("stat %s: %w", f.LocalPath, err)
+			return "", fmt.Errorf("stat %s: %w", f.LocalPath, err)
 		}
 		fileSize = info.Size()
 		if shouldUseResumableUpload(fileSize) {
 			useResumable = true
 		}
 	default:
-		return nil
+		return "", fmt.Errorf("upload %s: no content", f.Name)
 	}
 
 	meta := &drive.File{
@@ -437,8 +482,14 @@ func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) e
 		MimeType: f.MimeType,
 		Parents:  []string{folderID},
 	}
-	if hash := contentHash(f); hash != "" {
-		meta.AppProperties = map[string]string{contentHashProperty: hash}
+	if hash, properties := contentHash(f), f.AppProperties; hash != "" || len(properties) != 0 {
+		meta.AppProperties = make(map[string]string, len(properties)+1)
+		for key, value := range properties {
+			meta.AppProperties[key] = value
+		}
+		if hash != "" {
+			meta.AppProperties[contentHashProperty] = hash
+		}
 	}
 	createCall := s.service.Files.Create(meta).SupportsAllDrives(true).Context(ctx).Fields("id")
 
@@ -449,14 +500,17 @@ func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) e
 		createCall = createCall.Media(reader, googleapi.ContentType(f.ContentType))
 	}
 
-	_, err := createCall.Do()
+	created, err := createCall.Do()
 	if file != nil {
 		_ = file.Close()
 	}
 	if err != nil {
-		return fmt.Errorf("upload %s: %w", f.Name, err)
+		return "", fmt.Errorf("upload %s: %w", f.Name, err)
 	}
-	return nil
+	if created.Id == "" {
+		return "", fmt.Errorf("upload %s: Drive returned no file id", f.Name)
+	}
+	return created.Id, nil
 }
 
 func shouldUseResumableUpload(fileSize int64) bool {

@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -45,6 +47,7 @@ const (
 	EnvoyPublishPending   = gwstatus.EnvoyPublishPending
 	EnvoyPublishPublished = gwstatus.EnvoyPublishPublished
 	EnvoyPublishFailed    = gwstatus.EnvoyPublishFailed
+	EnvoyPublishSkipped   = gwstatus.EnvoyPublishSkipped
 
 	SyncStatePending        = gwstatus.SyncStatePending
 	SyncStateSyncing        = gwstatus.SyncStateSyncing
@@ -160,6 +163,13 @@ var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
 	db *sql.DB
+	// path is the database file, beside which createPreMigrationBackup keeps
+	// its backup.
+	path string
+	// eraseMu keeps a deletion's erase from the write-ahead log and the
+	// backup, and a retry of an owed one (RetryOwedErasure), from running at
+	// once: both overwrite the log and take the backup again.
+	eraseMu sync.Mutex
 }
 
 func syncStatusFromState(syncState string) string {
@@ -181,7 +191,16 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// The per-connection settings are part of the name every connection opens,
+	// so one that database/sql opens again after dropping the first has them
+	// too: secure_delete (a deleted segment's freed pages are zeroed, the
+	// freelist included, which is what keeps its words out of the database
+	// file; see postDeleteMaintenance), temporary data in memory (a sort or
+	// index SQLite spills to a temporary file would leave transcript text in
+	// the blocks it frees), foreign keys (the cascades that remove a session's
+	// rows) and the busy timeout. Set with PRAGMA once, they held for the first
+	// connection only.
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -191,7 +210,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	store := &SQLiteStore{db: db}
+	store := &SQLiteStore{db: db, path: dbPath}
 
 	if err := store.init(dbPath); err != nil {
 		_ = db.Close()
@@ -209,9 +228,11 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 // sqlite3 command, a backup script) that opens and closes the database after
 // that takes itself for its last user and deletes the write-ahead log, and
 // every later write of the app then goes to a deleted file, lost on a crash.
-// The copy is written beside the backup, flushed to disk and renamed over it,
-// so a backup cut off part way leaves the last one as it was; a backup that
-// fails removes its unfinished copy.
+// The copy is written beside the backup, flushed to disk and put in its
+// place, so a backup cut off part way leaves the last one as it was; a backup
+// that fails removes its unfinished copy. The backup it replaces, and an
+// unfinished copy it removes, are overwritten with zeros before the file
+// system frees them (erase): they hold transcripts.
 // If the DB file doesn't exist (fresh install), the backup is skipped.
 // If backup fails, a warning is logged but startup continues (degraded is better than dead).
 func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
@@ -225,28 +246,28 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 		return fmt.Errorf("stat db file: %w", err)
 	}
 
-	backupPath := dbPath + ".pre-migrate.bak"
+	backupPath := preMigrationBackupPath(dbPath)
 	partPath := backupPath + ".part"
 	// VACUUM INTO writes only a file that does not exist yet: remove the
 	// copy a backup cut off part way left.
-	if err := os.Remove(partPath); err != nil && !os.IsNotExist(err) {
+	if err := erase.Remove(partPath); err != nil && !os.IsNotExist(err) && !errors.Is(err, erase.ErrLeftover) {
 		return fmt.Errorf("remove unfinished backup: %w", err)
 	}
 	defer func() {
 		if err != nil {
-			_ = os.Remove(partPath)
+			_ = erase.Remove(partPath)
 		}
 	}()
 	// VACUUM INTO reads one consistent snapshot of the database, the
 	// write-ahead log included.
-	if _, err := db.Exec(`VACUUM INTO ?`, partPath); err != nil {
+	if err := vacuumInto(db, partPath); err != nil {
 		return fmt.Errorf("copy db to backup: %w", err)
 	}
 	// SQLite does not flush the copy VACUUM INTO writes.
 	if err := syncFile(partPath); err != nil {
 		return fmt.Errorf("flush backup: %w", err)
 	}
-	if err := os.Rename(partPath, backupPath); err != nil {
+	if err := erase.Replace(partPath, backupPath); err != nil && !errors.Is(err, erase.ErrLeftover) {
 		return fmt.Errorf("replace backup: %w", err)
 	}
 	// The rename lasts only once the directory naming it is on disk.
@@ -256,6 +277,14 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 
 	slog.Info("pre-migration backup created", "path", backupPath)
 	return nil
+}
+
+// vacuumInto writes a copy of db to the file at path, which must not exist.
+// It needs free space about the size of the database. Tests replace it to
+// fail as a full disk does.
+var vacuumInto = func(db *sql.DB, path string) error {
+	_, err := db.Exec(`VACUUM INTO ?`, path)
+	return err
 }
 
 // syncFile flushes the file at path to disk.
@@ -274,18 +303,27 @@ func syncFile(path string) error {
 func (s *SQLiteStore) init(dbPath string) error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
-		"PRAGMA secure_delete = ON",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA foreign_keys = ON",
 	}
 	for _, p := range pragmas {
 		if _, err := s.db.Exec(p); err != nil {
 			return fmt.Errorf("apply pragma %q: %w", p, err)
 		}
 	}
+	// Finish erasing a backup the app stopped part way through replacing.
+	if err := erase.Leftovers(filepath.Dir(dbPath)); err != nil {
+		slog.Warn("failed to erase leftover backups", "path", dbPath, "error", err)
+	}
+	// A scratch table overwriteWriteAheadLog left when the app stopped goes
+	// before the backup is taken, or the backup would carry it and never again
+	// have the database's schema (sameSchema).
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + walScratchTable); err != nil {
+		return fmt.Errorf("drop the write-ahead log scratch table: %w", err)
+	}
 
 	// Create pre-migration backup after pragmas are set (which creates the DB file)
+	backupTaken := true
 	if err := createPreMigrationBackup(s.db, dbPath); err != nil {
+		backupTaken = false
 		slog.Warn("failed to create pre-migration backup", "path", dbPath, "error", err)
 	}
 
@@ -317,7 +355,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 			drive_replace_pending INTEGER NOT NULL DEFAULT 0,
 			deletion_generation INTEGER NOT NULL DEFAULT 0,
 			refinement_generation INTEGER NOT NULL DEFAULT 0,
-			summary_generation INTEGER NOT NULL DEFAULT 0
+			summary_generation INTEGER NOT NULL DEFAULT 0,
+			drive_replace_since TEXT NOT NULL DEFAULT '',
+			drive_replace_failures INTEGER NOT NULL DEFAULT 0,
+			drive_replace_error TEXT NOT NULL DEFAULT ''
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
@@ -330,6 +371,40 @@ func (s *SQLiteStore) init(dbPath string) error {
 		);
 	`); err != nil {
 		return fmt.Errorf("create app_state table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS drive_replacements (
+			session_id TEXT NOT NULL,
+			generation INTEGER NOT NULL DEFAULT 0,
+			name TEXT NOT NULL,
+			old_id TEXT NOT NULL,
+			new_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			PRIMARY KEY (session_id, generation, name, old_id),
+			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create drive replacements table: %w", err)
+	}
+
+	// drive_replacement_folders is the ledger of the Drive folders a segment
+	// deletion (session_id, generation) owes a replacement: the session's own
+	// and each merged source's that had one when the deletion committed.
+	// folder_session_id names the session whose folder it is. A folder stays
+	// owed until it is replaced or found gone, so the deletion is finished
+	// only when none is owed.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS drive_replacement_folders (
+			session_id TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			folder_session_id TEXT NOT NULL,
+			state TEXT NOT NULL DEFAULT '` + DriveReplacementFolderOwed + `',
+			PRIMARY KEY (session_id, generation, folder_session_id),
+			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create drive replacement folders table: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -389,10 +464,17 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN deletion_generation INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN refinement_generation INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN summary_generation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_since TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_failures INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sessions ADD COLUMN drive_replace_error TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
 		}
+	}
+
+	if _, err := s.db.Exec(`ALTER TABLE drive_replacements ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate drive replacements generation: %w", err)
 	}
 
 	if _, err := s.db.Exec(
@@ -571,6 +653,15 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN splice_complete INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("migrate deleted_segments splice completion: %w", err)
 	}
+	// erase_directories: a directory a whole-file audio erase was started in
+	// (RecordEraseDirectory), and the file system it was on (device). An
+	// erase cut off by a stop leaves a .erasing-* file there that no row may
+	// lead to any more; the startup cleanup finishes it and then forgets the
+	// directory, once it was there to clean (RecordingDirectories,
+	// ForgetEraseDirectories).
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS erase_directories (path TEXT PRIMARY KEY, device INTEGER NOT NULL)`); err != nil {
+		return fmt.Errorf("create erase_directories table: %w", err)
+	}
 
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS summary_requests (
@@ -645,6 +736,28 @@ func (s *SQLiteStore) init(dbPath string) error {
 
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_mcp_events_created_at ON mcp_events(created_at)"); err != nil {
 		return fmt.Errorf("create mcp_events index: %w", err)
+	}
+
+	// A session that owed Drive a replacement before the folder ledger
+	// existed owes it for its own folder and each merged source's that has
+	// one, as DeleteSegment records it now.
+	if err := s.runOnce("record-owed-drive-replacement-folders", `
+		WITH RECURSIVE owner(session_id, generation, folder_session_id) AS (
+			SELECT id, deletion_generation, id FROM sessions WHERE drive_replace_pending = 1
+			UNION
+			SELECT owner.session_id, owner.generation, sessions.id FROM sessions JOIN owner ON sessions.merged_into = owner.folder_session_id
+		)
+		INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
+		SELECT owner.session_id, owner.generation, owner.folder_session_id, '`+DriveReplacementFolderOwed+`'
+		FROM owner JOIN sessions ON sessions.id = owner.folder_session_id
+		WHERE sessions.gdrive_folder_id != ''
+	`); err != nil {
+		return fmt.Errorf("record owed drive replacement folders: %w", err)
+	}
+	// Finish the erase of deletions it was owed for when the app stopped. The
+	// backup taken at this start holds none of their words.
+	if err := s.retryOwedErasure(backupTaken); err != nil {
+		slog.Warn("failed to finish an owed erase of deleted segments", "path", dbPath, "error", err)
 	}
 
 	return nil
@@ -775,6 +888,12 @@ func (s *SQLiteStore) AppendSegment(sessionID string, seg transcribe.Segment) er
 	return nil
 }
 
+// ErrMergeReplacementPending is the error MergeSessions returns, changing
+// nothing, when a source session still owes Google Drive a replacement after
+// a segment deletion: merged, it would leave the sync sweep before Drive lost
+// the deleted words.
+var ErrMergeReplacementPending = errors.New("a session to merge still has a deleted segment on Google Drive; merge it after its Drive files are replaced")
+
 func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	if strings.TrimSpace(newID) == "" {
 		return errors.New("new session id is required")
@@ -789,6 +908,23 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	placeholders := make([]string, len(sourceIDs))
+	args := make([]any, 0, len(sourceIDs)+1)
+	args = append(args, newID)
+	for i, id := range sourceIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+
+	var owing string
+	err = tx.QueryRow(fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND NOT (%s) LIMIT 1`, strings.Join(placeholders, ","), noOwedDriveReplacement), args[1:]...).Scan(&owing)
+	switch {
+	case err == nil:
+		return fmt.Errorf("merge session %s: %w", owing, ErrMergeReplacementPending)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("check sources for owed Drive replacements: %w", err)
+	}
+
 	_, err = tx.Exec(
 		`INSERT INTO sessions(id, started_at, ended_at, status, summary_status) VALUES(?, ?, ?, 'ended', 'pending')`,
 		newID,
@@ -798,15 +934,6 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	if err != nil {
 		return fmt.Errorf("create merged session: %w", err)
 	}
-
-	placeholders := make([]string, len(sourceIDs))
-	args := make([]any, 0, len(sourceIDs)+1)
-	args = append(args, newID)
-	for i, id := range sourceIDs {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-
 	segQuery := fmt.Sprintf(
 		`UPDATE segments SET session_id = ? WHERE session_id IN (%s)`,
 		strings.Join(placeholders, ","),
@@ -1165,6 +1292,27 @@ func (s *SQLiteStore) StartSummary(id string) error {
 	return nil
 }
 
+// StartEmptySummary marks session id's summary running for the current
+// transcript generation, as StartSummary does, for an app with no summarizer:
+// the summary it then completes is empty, which keeps the session's summary
+// as it is. So it neither moves the summary version nor queues the session
+// for Envoy again, and a summary Envoy already has is not sent at a new
+// version.
+func (s *SQLiteStore) StartEmptySummary(id string) error {
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, summary_generation = deletion_generation WHERE id = ?`, SummaryRunning, id)
+	if err != nil {
+		return fmt.Errorf("start empty summary of session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("start empty summary rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // FailSummary records that making session id's summary failed, and why
 // (errMsg, in summary_error: error_message keeps the last sync's error), and
 // returns the session as it then is. The session keeps its title and its last
@@ -1432,6 +1580,9 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	if rows == 0 {
 		return false, nil
 	}
+	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit marking session %s synced: %w", id, err)
 	}
@@ -1447,14 +1598,22 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 // a sync that no longer does never replaces what the session is now, and
 // reports whether it did. Any other state is an error and changes nothing:
 // SYNCED would skip MarkSynced's check that Drive has the session as it is
-// now, and SYNCING would leave the session held by no sync.
+// now, and SYNCING would leave the session held by no sync. A sync that held
+// the session while one of its segments was deleted (DeleteSegment leaves the
+// claim to it) uploaded the words before the deletion; the folder it made is
+// recorded as owed to that deletion's replacement in the same transaction.
 func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount int, at time.Time, errorMessage string) (bool, error) {
 	switch state {
 	case SyncStatePending, SyncStateRetryScheduled, SyncStateFailed, SyncStateRemoteDeleted:
 	default:
 		return false, fmt.Errorf("end the sync of session %s: %q is not a state a sync ends in unsynced", id, state)
 	}
-	res, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin ending the sync of session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
 		     retry_count = ?, last_sync_attempt = ?, error_message = ?, sync_claim = '', sync_claimed_from = ''
@@ -1470,7 +1629,30 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 	if err != nil {
 		return false, fmt.Errorf("end sync rows affected: %w", err)
 	}
-	return rows == 1, nil
+	if rows != 1 {
+		return false, nil
+	}
+	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit the end of the sync of session %s: %w", id, err)
+	}
+	return true, nil
+}
+
+// oweFolderOfPendingDeletion records, in tx, the Drive folder a sync just
+// recorded for session id as owed to the session's pending segment deletion,
+// if it has one: a sync that held the session while a segment was deleted
+// (DeleteSegment leaves the claim to it) uploaded the words before the
+// deletion. EndSync and MarkSynced both call it.
+func oweFolderOfPendingDeletion(tx *sql.Tx, id string) error {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
+		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND gdrive_folder_id != ''`,
+		DriveReplacementFolderOwed, id); err != nil {
+		return fmt.Errorf("owe the Drive folder of session %s its replacement: %w", id, err)
+	}
+	return nil
 }
 
 // RecoverInterruptedSyncs moves every session an earlier run of the app left
@@ -1483,22 +1665,31 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 // REMOTE_DELETED (a retry that found the session's Drive folder back) goes
 // back to REMOTE_DELETED, its retry count as it was: Drive may have lost the
 // folder again since, and only the next retry, asking Drive again, takes the
-// session out of it.
+// session out of it. A session that still owes Drive a replacement
+// (drive_replace_pending) goes back to the state its claim came from, its
+// retry count as it was: a deletion is never left FAILED, where only a manual
+// retry would remove the deleted words from Drive.
 func (s *SQLiteStore) RecoverInterruptedSyncs(maxRetries int, at time.Time) ([]string, error) {
+	// The state a cut-off replacement goes back to: the one its claim came
+	// from, PENDING when that was SYNCED or is not recorded.
+	const replacementBack = `CASE WHEN sync_claimed_from IN ('', ?) THEN ? ELSE sync_claimed_from END`
 	rows, err := s.db.Query(
 		`UPDATE sessions
-		 SET sync_state = CASE WHEN sync_claimed_from = ? THEN ? WHEN retry_count >= ? THEN ? ELSE ? END,
-		     sync_status = ?,
-		     retry_count = CASE WHEN sync_claimed_from = ? OR retry_count >= ? THEN retry_count ELSE retry_count + 1 END,
+		 SET sync_state = CASE WHEN drive_replace_pending = 1 THEN `+replacementBack+`
+		                       WHEN sync_claimed_from = ? THEN ? WHEN retry_count >= ? THEN ? ELSE ? END,
+		     sync_status = CASE WHEN drive_replace_pending = 1 AND `+replacementBack+` = ? THEN ? ELSE ? END,
+		     retry_count = CASE WHEN drive_replace_pending = 1 OR sync_claimed_from = ? OR retry_count >= ? THEN retry_count ELSE retry_count + 1 END,
 		     last_sync_attempt = ?,
-		     error_message = CASE WHEN sync_claimed_from = ? THEN ? ELSE ? END,
+		     error_message = CASE WHEN drive_replace_pending = 1 THEN ? WHEN sync_claimed_from = ? THEN ? ELSE ? END,
 		     sync_claim = '', sync_claimed_from = ''
 		 WHERE sync_state = ?
 		 RETURNING id`,
+		SyncStateSynced, SyncStatePending,
 		SyncStateRemoteDeleted, SyncStateRemoteDeleted, maxRetries, SyncStateFailed, SyncStateRetryScheduled,
-		SyncFailed,
+		SyncStateSynced, SyncStatePending, SyncStatePending, SyncPending, SyncFailed,
 		SyncStateRemoteDeleted, maxRetries,
 		at.UTC().Format(time.RFC3339Nano),
+		"a Drive replacement after a segment deletion was cut off: the app stopped during it",
 		SyncStateRemoteDeleted, "a retry after the Drive folder was deleted was cut off: the app stopped during it", "the sync was cut off: the app stopped during it",
 		SyncStateSyncing,
 	)
@@ -1750,10 +1941,20 @@ func (s *SQLiteStore) GetSessionsForBackfill() ([]string, error) {
 	return ids, nil
 }
 
+// GetSessionsNeedingSync returns the sessions the sync sweep syncs now: the
+// ended sessions waiting for a sync, and every session that still owes Drive
+// a replacement after a segment deletion and that no sync holds, whatever its
+// status (ended, merged, or discarded: the consent to delete covers them all)
+// once it is no longer recording. An ordinary sync leaves a FAILED or
+// REMOTE_DELETED session to a manual retry, and syncs no merged or discarded
+// one; a replacement asks Drive whether a deleted folder is back each time,
+// so a deletion never waits on a click. (A scheduled retry is read
+// separately, by GetSessionsBySyncState, when due.)
 func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended' AND sync_state = ?`,
-		SyncStatePending,
+		`SELECT id FROM sessions WHERE (status = 'ended' AND sync_state = ?)
+		 OR (drive_replace_pending = 1 AND status != ? AND sync_state != ?)`,
+		SyncStatePending, SessionActive, SyncStateSyncing,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing sync: %w", err)
@@ -1774,11 +1975,15 @@ func (s *SQLiteStore) GetSessionsNeedingSync() ([]string, error) {
 	return ids, nil
 }
 
+// GetSessionsNeedingEnvoyPublish returns the ended sessions with a completed
+// summary that Envoy has not had: neither published nor skipped (a summary
+// with no text, which is not announced).
 func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM sessions WHERE status = 'ended' AND summary_status = ? AND envoy_publish_status != ? ORDER BY started_at ASC`,
+		`SELECT id FROM sessions WHERE status = 'ended' AND summary_status = ? AND envoy_publish_status NOT IN (?, ?) ORDER BY started_at ASC`,
 		SummaryCompleted,
 		EnvoyPublishPublished,
+		EnvoyPublishSkipped,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query sessions needing envoy publish: %w", err)
@@ -1879,16 +2084,18 @@ type SessionRecording struct {
 // removable is the condition under which GC may remove a session's recording
 // (disk pressure) or the session with it (the age policy, which also needs
 // documents_unverified = 0), and its arguments: the session ended, no
-// refinement is reading the file, its Drive folder is not in the trash or
-// gone (REMOTE_DELETED: the device then holds its only lasting copy, sync
-// gate or not), and, when syncGated, it is synced. A session whose documents
-// are unverified on Drive (documents_unverified: synced by an earlier
-// version) has its audio on Drive: under the sync gate GC removes it once
-// Drive answers that the session's folder is there; with no sync gate there
-// is no Drive to ask, so it is kept. Any other sync state, a failure
+// refinement is reading the file, it owes Drive no replacement after a
+// segment deletion (drive_replace_pending: the replacement needs the row and
+// the spliced recording, sync gate or not), its Drive folder is not in the
+// trash or gone (REMOTE_DELETED: the device then holds its only lasting copy,
+// sync gate or not), and, when syncGated, it is synced. A session whose
+// documents are unverified on Drive (documents_unverified: synced by an
+// earlier version) has its audio on Drive: under the sync gate GC removes it
+// once Drive answers that the session's folder is there; with no sync gate
+// there is no Drive to ask, so it is kept. Any other sync state, a failure
 // included, keeps the recording.
 func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?
+	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ? AND ` + noOwedDriveReplacement + `
 		AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)`
 	if syncGated {
 		cond += ` AND sync_status = ?`
@@ -2027,19 +2234,53 @@ func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error
 	return nil
 }
 
-func (s *SQLiteStore) DeleteSession(id string) error {
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+// ErrDeleteReplacementPending is the error DeleteSession returns, deleting
+// nothing, for a session that still owes Google Drive a replacement after a
+// segment deletion, or whose Drive folder one still owes (a source merged
+// into the session the segment was deleted from): with its row would go the
+// replacement, its warning, or the folder the replacement must reach, and
+// the Drive folder would keep the deleted words.
+var ErrDeleteReplacementPending = errors.New("this session still has a deleted segment on Google Drive; delete it after its Drive files are replaced")
+
+// noOwedDriveReplacement is the condition, on a sessions row, that it owes
+// Google Drive no replacement and its folder is owed none. DeleteSession, GC
+// (removable) and MergeSessions all check it.
+const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXISTS (
+	SELECT 1 FROM drive_replacement_folders
+	WHERE drive_replacement_folders.folder_session_id = sessions.id AND drive_replacement_folders.state = '` + DriveReplacementFolderOwed + `')`
+
+// DeleteSession deletes session id, refusing one that owes Google Drive a
+// replacement (ErrDeleteReplacementPending), and returns the audio_path the
+// deleted row had: the recordings the caller then erases are the ones the
+// row named when it went, not ones it read before.
+func (s *SQLiteStore) DeleteSession(id string) (string, error) {
+	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("delete session %s: %w", id, err)
+		return "", fmt.Errorf("begin deleting session %s: %w", id, err)
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("delete session rows affected: %w", err)
+	defer func() { _ = tx.Rollback() }()
+	var audioPath string
+	switch err := tx.QueryRow(`SELECT audio_path FROM sessions WHERE id = ? AND `+noOwedDriveReplacement, id).Scan(&audioPath); {
+	case errors.Is(err, sql.ErrNoRows):
+		var pending int
+		switch err := tx.QueryRow(`SELECT drive_replace_pending FROM sessions WHERE id = ?`, id).Scan(&pending); {
+		case errors.Is(err, sql.ErrNoRows):
+			return "", sql.ErrNoRows
+		case err != nil:
+			return "", fmt.Errorf("delete session %s: %w", id, err)
+		default:
+			return "", fmt.Errorf("delete session %s: %w", id, ErrDeleteReplacementPending)
+		}
+	case err != nil:
+		return "", fmt.Errorf("read session %s to delete it: %w", id, err)
 	}
-	if rows == 0 {
-		return sql.ErrNoRows
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
+		return "", fmt.Errorf("delete session %s: %w", id, err)
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit deleting session %s: %w", id, err)
+	}
+	return audioPath, nil
 }
 
 // DeleteEndedSession deletes session id for the age policy only while it is as

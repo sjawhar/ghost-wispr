@@ -105,6 +105,7 @@ func TestSegmentDeleteRunnerSplicesAndRefinesTheRecording(t *testing.T) {
 		t.Fatalf("write recording: %v", err)
 	}
 	store, segmentID, started := newDeletionTestStore(t, recording)
+	held := holdRecording(t, recording)
 	var refinedPath string
 	runner := segmentDeleteRunner{
 		store:       store,
@@ -134,6 +135,35 @@ func TestSegmentDeleteRunnerSplicesAndRefinesTheRecording(t *testing.T) {
 	}
 	if refinedPath != recording {
 		t.Fatalf("refinement read %q, want spliced %q", refinedPath, recording)
+	}
+	assertRecordingUnwritten(t, held, "original")
+}
+
+// holdRecording opens the recording at path, so the test still reads its
+// inode after a splice has replaced the name.
+func holdRecording(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// assertRecordingUnwritten fails unless the recording held still reads want:
+// the one a splice replaced is freed by a plain rename, not overwritten
+// first. A segment deletion zeroes no whole audio file, because removing
+// filler words must not set off a write of the whole recording (Sami,
+// 2026-11-12, dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
+func assertRecordingUnwritten(t *testing.T, held *os.File, want string) {
+	t.Helper()
+	got := make([]byte, len(want))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatalf("read the replaced recording: %v", err)
+	}
+	if string(got) != want {
+		t.Errorf("a segment deletion rewrote the recording it replaced: it holds %q, want %q", got, want)
 	}
 }
 
@@ -167,23 +197,210 @@ func TestSegmentDeleteRunnerUsesProbedRecordingDuration(t *testing.T) {
 	}
 }
 
+// TestCleanupSpliceTempCopies fails if a copy of a recording a stopped app
+// left (a splice's copy or output, a Drive download) or a whole-file erase it
+// cut off is still there after the app starts, if a copy is rewritten before
+// it is removed (a segment deletion zeroes no whole audio file), if the
+// cut-off erase is not finished with zeros, or if a recording is touched.
 func TestCleanupSpliceTempCopies(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", "recording.mp3"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+	held := map[string]*os.File{}
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", ".erasing-cut-off", "recording.mp3"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("audio of "+name), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
+		f, err := os.Open(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		held[name] = f
 	}
 	if err := cleanupSpliceTempCopies(dir); err != nil {
 		t.Fatalf("cleanup splice temp copies: %v", err)
 	}
-	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3"} {
+	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", ".erasing-cut-off"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("temp copy %s remains: %v", name, err)
 		}
+		got := make([]byte, len("audio of "+name))
+		if _, err := held[name].ReadAt(got, 0); err != nil {
+			t.Fatalf("read the removed %s: %v", name, err)
+		}
+		zeroed := bytes.Equal(got, make([]byte, len(got)))
+		if name == ".erasing-cut-off" && !zeroed {
+			t.Errorf("the cut-off erase %s was removed still holding %q", name, got)
+		}
+		if name != ".erasing-cut-off" && zeroed {
+			t.Errorf("the splice copy %s was rewritten before it was removed", name)
+		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "recording.mp3")); err != nil {
-		t.Fatalf("recording disappeared: %v", err)
+	if got, err := os.ReadFile(filepath.Join(dir, "recording.mp3")); err != nil || string(got) != "audio of recording.mp3" {
+		t.Fatalf("recording after cleanup = %q (%v), want it whole", got, err)
+	}
+}
+
+// TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory fails if a
+// copy a stopped splice left, or a whole-file erase it cut off, beside a
+// recording kept outside the audio directory (a session's absolute
+// audio_path) is not removed as the app starts, or the cut-off erase is not
+// finished with zeros.
+func TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory(t *testing.T) {
+	audioDir, elsewhere := t.TempDir(), t.TempDir()
+	recording := filepath.Join(elsewhere, "recording.mp3")
+	if err := os.WriteFile(recording, []byte("recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, _, _ := newDeletionTestStore(t, recording)
+	held := map[string]*os.File{}
+	for _, name := range []string{".erasing-cut-off", ".splice-cut-off.mp3"} {
+		path := filepath.Join(elsewhere, name)
+		if err := os.WriteFile(path, []byte("audio of "+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		held[name] = f
+	}
+
+	if err := cleanupRecordingDirectories(store, audioDir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	for name, f := range held {
+		if _, err := os.Stat(filepath.Join(elsewhere, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s beside a recording outside the audio directory remains: %v", name, err)
+		}
+		got := make([]byte, len("audio of "+name))
+		if _, err := f.ReadAt(got, 0); err != nil {
+			t.Fatal(err)
+		}
+		if name == ".erasing-cut-off" && !bytes.Equal(got, make([]byte, len(got))) {
+			t.Errorf("%s was removed still holding %q", name, got)
+		}
+	}
+	if got, err := os.ReadFile(recording); err != nil || string(got) != "recording" {
+		t.Errorf("the recording after cleanup = %q (%v), want it whole", got, err)
+	}
+}
+
+// TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted fails if the
+// erase of a recording kept outside the audio directory, cut off by a stop
+// after DELETE /api/sessions/{id} removed its row, is not finished with zeros
+// as the app starts (no row names the directory any more), or if the
+// directory is still listed once the cleanup has finished it.
+func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
+	audioDir, elsewhere := t.TempDir(), t.TempDir()
+	recording := filepath.Join(elsewhere, "recording.mp3")
+	audio := []byte("the deleted session's audio")
+	if err := os.WriteFile(recording, audio, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, _, _ := newDeletionTestStore(t, recording)
+	if _, err := store.DeleteSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	// The route recorded the recording's directory, moved the recording to
+	// its hidden name, and the app stopped before it overwrote it.
+	if err := store.RecordEraseDirectory(elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	hidden := filepath.Join(elsewhere, ".erasing-cut-off")
+	if err := os.Rename(recording, hidden); err != nil {
+		t.Fatal(err)
+	}
+	held := holdRecording(t, hidden)
+
+	if err := cleanupRecordingDirectories(store, audioDir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := os.Stat(hidden); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the cut-off erase of the deleted session's recording remains: %v", err)
+	}
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the cut-off erase was removed still holding %q", got)
+	}
+	dirs, err := store.RecordingDirectories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(dirs, elsewhere) {
+		t.Error("the directory is still listed after the cleanup finished it")
+	}
+}
+
+// eraseDirectoryLister lists dirs as recording directories and records the
+// ones the cleanup forgets.
+type eraseDirectoryLister struct {
+	dirs      []string
+	forgotten []string
+}
+
+func (l *eraseDirectoryLister) RecordingDirectories() ([]string, error) { return l.dirs, nil }
+
+func (l *eraseDirectoryLister) ForgetEraseDirectories(dirs []string) error {
+	l.forgotten = append(l.forgotten, dirs...)
+	return nil
+}
+
+// TestStartupCleanupForgetsNoDirectoryItFailedToClean fails if the startup
+// cleanup forgets a directory whose cleanup failed: a cut-off erase left
+// there would never be finished. A path that is a file, not a directory,
+// makes the cleanup fail; the directory beside it is cleaned and forgotten.
+func TestStartupCleanupForgetsNoDirectoryItFailedToClean(t *testing.T) {
+	audioDir, good := t.TempDir(), t.TempDir()
+	failing := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(failing, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lister := &eraseDirectoryLister{dirs: []string{failing, good}}
+	if err := cleanupRecordingDirectories(lister, audioDir); err == nil {
+		t.Fatal("control: cleaning a path that is not a directory did not fail")
+	}
+	if slices.Contains(lister.forgotten, failing) {
+		t.Errorf("the directory whose cleanup failed was forgotten: %v", lister.forgotten)
+	}
+	if !slices.Contains(lister.forgotten, good) {
+		t.Errorf("the directory cleaned beside it was not forgotten: %v", lister.forgotten)
+	}
+}
+
+// TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere fails if an erase
+// directory that is not there as the app starts (a disk not mounted) is
+// forgotten: a cut-off erase in it is finished at a later start, once it is
+// back.
+func TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere(t *testing.T) {
+	audioDir := t.TempDir()
+	unplugged := filepath.Join(t.TempDir(), "usb")
+	if err := os.Mkdir(unplugged, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.RecordEraseDirectory(unplugged); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(unplugged); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupRecordingDirectories(store, audioDir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	dirs, err := store.RecordingDirectories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(dirs, unplugged) {
+		t.Error("the erase directory that was not there was forgotten")
 	}
 }
 
@@ -330,12 +547,17 @@ func TestDeleteSegmentWhenGCRemovedTheLocalAudio(t *testing.T) {
 	}
 }
 
+// TestDeleteSegmentRemovesDownloadedAudioOnRefusal fails if a refused
+// deletion leaves a recording it downloaded from Drive, or rewrites it before
+// removing it: a segment deletion zeroes no whole audio file (Sami,
+// 2026-11-12, dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
 func TestDeleteSegmentRemovesDownloadedAudioOnRefusal(t *testing.T) {
 	downloaded := filepath.Join(t.TempDir(), "downloaded.mp3")
 	if err := os.WriteFile(downloaded, []byte("downloaded"), 0o600); err != nil {
 		t.Fatalf("write downloaded recording: %v", err)
 	}
 	store, segmentID, _ := newDeletionTestStore(t, downloaded)
+	held := holdRecording(t, downloaded)
 	runner := segmentDeleteRunner{
 		store:       store,
 		transcriber: deletionWordsFake{before: initialWords(), after: append(cutWords(), audio.Word{Text: "private", Start: 0.9, End: 1})},
@@ -349,6 +571,86 @@ func TestDeleteSegmentRemovesDownloadedAudioOnRefusal(t *testing.T) {
 	}
 	if _, err := os.Stat(downloaded); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("downloaded recording still exists after refusal: %v", err)
+	}
+	assertRecordingUnwritten(t, held, "downloaded")
+}
+
+// TestTheRecordingDirectoryIsFlushedBeforeTheSpliceIsMarkedComplete fails
+// if the runner or the startup recovery marks a splice complete before the
+// directory holding the spliced recording is flushed: after a power loss the
+// mark could stand beside the unspliced recording, which the Drive
+// replacement would then upload as the clean copy.
+func TestTheRecordingDirectoryIsFlushedBeforeTheSpliceIsMarkedComplete(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64)
+	}{
+		{"deletion runner", func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64) {
+			runner := r4Runner(store, recording)
+			if err := runner.Delete(context.Background(), "session", segmentID); err != nil {
+				t.Fatalf("delete segment: %v", err)
+			}
+		}},
+		{"recovery that splices again", func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64) {
+			recoverInterruptedDeletion(t, store, recording, segmentID, nil)
+		}},
+		{"recovery of a spliced recording from Drive", func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64) {
+			if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'folder' WHERE id = 'session'`); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(recording); err != nil {
+				t.Fatal(err)
+			}
+			name := "audio-" + filepath.Base(recording)
+			recoverInterruptedDeletion(t, store, recording, segmentID, &deletionDriveFake{
+				files:     []*drive.File{{Name: name, MimeType: "audio/mpeg"}},
+				downloads: map[string][]byte{name: []byte("spliced")},
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recording := filepath.Join(t.TempDir(), "recording.mp3")
+			if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, segmentID, _ := newDeletionTestStore(t, recording)
+			original := syncRecordingDirectory
+			t.Cleanup(func() { syncRecordingDirectory = original })
+			flushed := 0
+			syncRecordingDirectory = func(path string) error {
+				flushed++
+				if contents, err := os.ReadFile(path); err != nil || string(contents) != "spliced" {
+					t.Errorf("flushed the directory of %s holding %q (%v), want the spliced recording", path, contents, err)
+				}
+				if pending, err := store.HasPendingSplice("session"); err != nil || !pending {
+					t.Errorf("flushed the directory after the splice was marked complete (pending %v, %v)", pending, err)
+				}
+				return original(path)
+			}
+			tc.run(t, store, recording, segmentID)
+			if flushed != 1 {
+				t.Errorf("the recording directory was flushed %d times before the splice was marked complete, want 1", flushed)
+			}
+			if pending, err := store.HasPendingSplice("session"); err != nil || pending {
+				t.Fatalf("control: splice still pending (%v, %v)", pending, err)
+			}
+		})
+	}
+}
+
+// recoverInterruptedDeletion records a deletion of segmentID whose splice did
+// not reach recording, then runs the startup recovery with Drive as source.
+func recoverInterruptedDeletion(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64, source deletionRecordingSource) {
+	t.Helper()
+	if err := store.DeleteSegment("session", segmentID, storage.DeletedSpan{
+		SessionID: "session", AudioPath: recording, Start: 1, End: 2,
+		SHA256Before: hashBytesForDeleteTest([]byte("original")), SHA256After: hashBytesForDeleteTest([]byte("spliced")),
+	}); err != nil {
+		t.Fatalf("record interrupted delete: %v", err)
+	}
+	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), source, fakeSplice, nil)
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+		t.Fatalf("recover pending splice: outcomes=%v err=%v", outcomes, err)
 	}
 }
 
@@ -581,6 +883,45 @@ func TestSegmentDeleteRunnerRefusesKeptRawRecordingFromMergedSource(t *testing.T
 	}
 }
 
+// TestSegmentDeleteRunnerRefusesKeptRawRecordingThroughAChainedMerge fails if
+// a raw recording kept beside a session merged into the deleting one through
+// another merge (A into M1, M1 into this session) lets the deletion go ahead:
+// the raw file would keep the deleted segment's audio as a live file.
+func TestSegmentDeleteRunnerRefusesKeptRawRecordingThroughAChainedMerge(t *testing.T) {
+	audioDir := t.TempDir()
+	recording := filepath.Join(audioDir, "merged.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	store, segmentID, _ := newDeletionTestStore(t, recording)
+	for _, id := range []string{"middle-merge", "recorded-source"} {
+		if err := store.CreateSession(id, time.Now().UTC()); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = 'merged', merged_into = CASE id WHEN 'middle-merge' THEN 'session' ELSE 'middle-merge' END
+		WHERE id IN ('middle-merge', 'recorded-source')`); err != nil {
+		t.Fatalf("chain the merges: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(audioDir, "recorded-source.pcm"), []byte("raw audio"), 0o600); err != nil {
+		t.Fatalf("write source raw audio: %v", err)
+	}
+	runner := segmentDeleteRunner{
+		store:       store,
+		audioDir:    audioDir,
+		transcriber: deletionWordsFake{before: initialWords(), after: cutWords()},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			t.Fatal("recordings checked after kept raw audio of a chained source")
+			return deletionRecordingSet{}, nil
+		},
+		splice: fakeSplice,
+	}
+	err := runner.Delete(context.Background(), "session", segmentID)
+	if !errors.Is(err, server.ErrSegmentRawAudioKept) || !strings.Contains(err.Error(), "recorded-source.pcm") {
+		t.Fatalf("delete error = %v, want the chained source's raw recording named", err)
+	}
+}
+
 func TestSegmentDeleteRunnerRefusesOverCutWithoutChangingRecording(t *testing.T) {
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("original")
@@ -710,6 +1051,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 		t.Fatalf("write recording: %v", err)
 	}
 	store, segmentID, started := newDeletionTestStore(t, recording)
+	held := holdRecording(t, recording)
 	segments, err := store.GetSegments("session")
 	if err != nil {
 		t.Fatalf("get segments: %v", err)
@@ -756,6 +1098,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("pending splices after recovery = %+v", pending)
 	}
+	assertRecordingUnwritten(t, held, string(original))
 }
 
 func hashBytesForDeleteTest(value []byte) string {

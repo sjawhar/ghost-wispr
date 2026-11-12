@@ -572,13 +572,29 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	m.mu.Unlock()
 
 	if summarizer == nil {
-		// Still canonicalize for GDrive sync even without summarizer.
+		// Without a summarizer the summary completes empty, which keeps the
+		// session's summary as it is. StartEmptySummary binds it to the
+		// current deletion generation, so that completion passes the
+		// generation fence after a segment deletion, and leaves the summary
+		// version and Envoy delivery state alone, so a summary Envoy already
+		// has is not sent again.
+		if err := m.store.StartEmptySummary(sessionID); err != nil {
+			m.logger.Error("failed to start empty summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		}
 		transcript, generation, err := m.store.Canonicalize(sessionID)
 		if err != nil {
+			// Terminal, so a Drive replacement waiting for this session's
+			// summary stops waiting; the sync still runs, with the canonical
+			// transcript the session already has.
+			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		} else {
-			m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
+			m.triggerDriveSync(syncer, sessionID)
+			return
 		}
+		if err := m.store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", generation); err != nil {
+			m.logger.Error("failed to mark empty summary complete", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		}
+		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		m.triggerDriveSync(syncer, sessionID)
 		return
 	}

@@ -2,16 +2,20 @@ package gdrive
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +32,7 @@ type wireFile struct {
 	AppProperties      map[string]string
 	ModifiedTime       time.Time
 	Content            []byte
+	RevisionCount      int
 }
 
 type wireListRequest struct {
@@ -68,11 +73,27 @@ type wireDrive struct {
 	// onUpload, when set, runs before each file upload into a folder, with
 	// the folder, while the server holds its lock.
 	onUpload func(folder string)
+	uploads  int
+	// failUploadAt makes precisely one upload request fail before Drive creates
+	// its file, so a replacement retry can resume from prior rows.
+	failUploadAt int
+	// duplicateUploadAt makes precisely one upload create its file twice, as
+	// a client retrying a request whose response was lost does; Drive answers
+	// with the second copy.
+	duplicateUploadAt int
+	// allowDeletes permits the replacement-path test to exercise Files.Delete.
+	allowDeletes bool
+	deletes      int
+	failDeleteAt int
+	deletedIDs   []string
 	// unavailable makes Drive answer 503 to every request for a file.
-	unavailable bool
+	unavailable     bool
+	corruptChecksum bool
 	// onGet, when set, runs as Drive is asked for a file (Files.Get), with
 	// its id, while the server holds its lock.
-	onGet func(id string)
+	onGet     func(id string)
+	gets      int
+	failGetAt int
 	// onList, when set, runs after Drive lists a folder's files, with the
 	// folder, while the server holds its lock: what changes on Drive
 	// between the list and the uploads.
@@ -108,6 +129,7 @@ func (d *wireDrive) create(f *wireFile) *wireFile {
 	d.clock = d.clock.Add(time.Minute)
 	f.ID = fmt.Sprintf("file-%d", d.next)
 	f.ModifiedTime = d.clock
+	f.RevisionCount++
 	d.files = append(d.files, f)
 	return f
 }
@@ -144,6 +166,12 @@ func (d *wireDrive) deleteByHand(id string) {
 	}
 	d.gone[id] = true
 	d.files = slices.DeleteFunc(d.files, func(f *wireFile) bool { return f.ID == id || f.Parent == id })
+}
+
+func (d *wireDrive) deleteFileByHand(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.files = slices.DeleteFunc(d.files, func(f *wireFile) bool { return f.ID == id })
 }
 
 // trash moves folder id, and every file in it with it, to the trash, as a
@@ -194,7 +222,7 @@ func notFound(w http.ResponseWriter, id string) {
 }
 
 func (d *wireDrive) requireSharedDriveParameters(w http.ResponseWriter, r *http.Request) bool {
-	if !strings.HasSuffix(r.URL.Path, "/export") && r.URL.Query().Get("supportsAllDrives") != "true" {
+	if !strings.HasSuffix(r.URL.Path, "/export") && !strings.HasSuffix(r.URL.Path, "/revisions") && r.URL.Query().Get("supportsAllDrives") != "true" {
 		d.t.Errorf("Drive: %s %s is missing supportsAllDrives=true", r.Method, r.URL)
 		http.Error(w, "supportsAllDrives=true is required", http.StatusBadRequest)
 		return false
@@ -216,7 +244,23 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
 	case r.Method == http.MethodDelete:
-		d.t.Errorf("Drive: %s %s deletes a file", r.Method, path)
+		id := strings.TrimPrefix(path, "/drive/v3/files/")
+		if !d.allowDeletes {
+			d.t.Errorf("Drive: %s %s deletes a file", r.Method, path)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		d.deletes++
+		if d.failDeleteAt == d.deletes {
+			http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		if d.find(id) == nil {
+			notFound(w, id)
+			return
+		}
+		d.deletedIDs = append(d.deletedIDs, id)
+		d.files = slices.DeleteFunc(d.files, func(f *wireFile) bool { return f.ID == id })
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodGet && path == "/drive/v3/files":
 		m := parentQuery.FindStringSubmatch(r.URL.Query().Get("q"))
@@ -256,6 +300,18 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 		if d.onList != nil {
 			d.onList(m[1])
 		}
+	case r.Method == http.MethodGet && strings.HasSuffix(path, "/revisions"):
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/drive/v3/files/"), "/revisions")
+		f := d.find(id)
+		if f == nil {
+			notFound(w, id)
+			return
+		}
+		revisions := make([]*drive.Revision, 0, f.RevisionCount)
+		for i := range f.RevisionCount {
+			revisions = append(revisions, &drive.Revision{Id: strconv.Itoa(i + 1)})
+		}
+		_ = json.NewEncoder(w).Encode(&drive.RevisionList{Revisions: revisions})
 	case r.Method == http.MethodGet && strings.HasSuffix(path, "/export"):
 		f := d.find(strings.TrimSuffix(strings.TrimPrefix(path, "/drive/v3/files/"), "/export"))
 		if f == nil {
@@ -268,7 +324,8 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 		if d.onGet != nil {
 			d.onGet(id)
 		}
-		if d.unavailable {
+		d.gets++
+		if d.failGetAt == d.gets || d.unavailable {
 			http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
 			return
 		}
@@ -287,7 +344,32 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(f.Content)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType, Trashed: d.inTrash(f), ExplicitlyTrashed: d.trashed[f.ID]})
+		sum := sha256.Sum256(f.Content)
+		checksum := hex.EncodeToString(sum[:])
+		if d.corruptChecksum {
+			checksum = "corrupt"
+		}
+		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID, Name: f.Name, MimeType: f.MimeType, AppProperties: f.AppProperties, Sha256Checksum: checksum, Size: int64(len(f.Content)), Trashed: d.inTrash(f), ExplicitlyTrashed: d.trashed[f.ID]})
+	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/drive/v3/files/"):
+		f := d.find(strings.TrimPrefix(path, "/drive/v3/files/"))
+		if f == nil {
+			notFound(w, strings.TrimPrefix(path, "/drive/v3/files/"))
+			return
+		}
+		var meta drive.File
+		if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if meta.Trashed {
+			d.t.Errorf("Drive: %s %s trashes a file", r.Method, path)
+		}
+		if meta.Name != "" {
+			f.Name = meta.Name
+		}
+		d.clock = d.clock.Add(time.Minute)
+		f.ModifiedTime = d.clock
+		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID})
 	case r.Method == http.MethodPost && path == "/drive/v3/files":
 		var meta drive.File
 		if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
@@ -310,10 +392,18 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			notFound(w, parent)
 			return
 		}
+		d.uploads++
+		if d.failUploadAt == d.uploads {
+			http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
+			return
+		}
 		if d.onUpload != nil {
 			d.onUpload(parent)
 		}
 		f := d.create(&wireFile{Name: meta.Name, MimeType: meta.MimeType, Parent: firstParent(meta.Parents), AppProperties: meta.AppProperties, Content: content})
+		if d.duplicateUploadAt == d.uploads {
+			f = d.create(&wireFile{Name: meta.Name, MimeType: meta.MimeType, Parent: firstParent(meta.Parents), AppProperties: maps.Clone(meta.AppProperties), Content: content})
+		}
 		_ = json.NewEncoder(w).Encode(&drive.File{Id: f.ID})
 	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/upload/drive/v3/files/"):
 		f := d.find(strings.TrimPrefix(path, "/upload/drive/v3/files/"))
@@ -332,6 +422,7 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			d.t.Errorf("Drive: %s %s trashes a file", r.Method, path)
 		}
 		f.Content = content
+		f.RevisionCount++
 		for k, v := range meta.AppProperties {
 			if f.AppProperties == nil {
 				f.AppProperties = map[string]string{}

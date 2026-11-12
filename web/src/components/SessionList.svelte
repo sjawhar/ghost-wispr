@@ -1,6 +1,6 @@
 <script lang="ts">
   import SessionCard from './SessionCard.svelte'
-  import { fetchSearch } from '../lib/api'
+  import { fetchSearch, requestErrorMessage } from '../lib/api'
   import {
     SessionStatus,
     SummaryStatus,
@@ -45,6 +45,9 @@
   let loadedDates = $state(3)
   let showHidden = $state<Record<string, boolean>>({})
   let selectedIds = $state<Set<string>>(new Set())
+  // Why the last merge was refused (the API's reason), shown until the next
+  // merge or the selection ends.
+  let mergeError = $state('')
   let dateFilter = $state('all')
   let statusFilter = $state('all')
 
@@ -67,11 +70,18 @@
 
   function exitSelectMode() {
     selectedIds = new Set()
+    mergeError = ''
   }
 
   async function handleMerge() {
     if (selectedIds.size < 2) return
-    await onMerge([...selectedIds])
+    mergeError = ''
+    try {
+      await onMerge([...selectedIds])
+    } catch (error) {
+      mergeError = requestErrorMessage(error)
+      return
+    }
     exitSelectMode()
   }
 
@@ -231,6 +241,9 @@
           <button type="button" class="merge-btn" onclick={handleMerge}>Merge</button>
         {/if}
         <button type="button" class="select-action-btn" onclick={exitSelectMode}>Cancel</button>
+        {#if mergeError}
+          <p class="merge-error" role="alert">Merge refused: {mergeError}</p>
+        {/if}
       </div>
     {/if}
   </header>
@@ -427,7 +440,8 @@
     font-size: 0.86rem;
   }
 
-  .search-error {
+  .search-error,
+  .merge-error {
     color: var(--danger, #dc2626);
   }
 </style>

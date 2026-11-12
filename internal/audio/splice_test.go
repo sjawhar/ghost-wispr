@@ -117,6 +117,83 @@ func TestSpliceCutsTheSpan(t *testing.T) {
 	}
 }
 
+// TestSpliceDoesNotRewriteTheFileItReplaces fails if a splice overwrites the
+// file it replaces before freeing it. A segment deletion zeroes no whole
+// audio file (Sami, 2026-11-12: "Do NOT zero entire files if people just want
+// to delete certain segments",
+// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). A
+// descriptor held on the file reads its inode after the splice.
+func TestSpliceDoesNotRewriteTheFileItReplaces(t *testing.T) {
+	requireFFmpeg(t)
+	path := filepath.Join(t.TempDir(), "tones.mp3")
+	makeThreeToneMP3(t, path)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+
+	if _, err := Splice(context.Background(), path, 3, 6); err != nil {
+		t.Fatalf("Splice: %v", err)
+	}
+	got, err := io.ReadAll(io.NewSectionReader(held, 0, int64(len(original))+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Errorf("the splice rewrote the file it replaced (%d of %d bytes still the original)", commonPrefix(got, original), len(original))
+	}
+}
+
+// TestSpliceFlushesItsOutputBeforeTheRename fails if Splice renames its
+// output over the recording before flushing it: after a power loss the
+// recording's name could hold an output whose data never reached the disk,
+// and the live recording would be lost.
+func TestSpliceFlushesItsOutputBeforeTheRename(t *testing.T) {
+	requireFFmpeg(t)
+	path := filepath.Join(t.TempDir(), "tones.mp3")
+	makeThreeToneMP3(t, path)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush := syncFile
+	t.Cleanup(func() { syncFile = flush })
+	var flushed []string
+	syncFile = func(output string) error {
+		flushed = append(flushed, output)
+		if !strings.HasPrefix(filepath.Base(output), ".splice-") {
+			t.Errorf("flushed %s, want the splice output", output)
+		}
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
+			t.Errorf("the output was renamed over the recording before it was flushed (%v)", err)
+		}
+		return flush(output)
+	}
+
+	if _, err := Splice(context.Background(), path, 3, 6); err != nil {
+		t.Fatalf("Splice: %v", err)
+	}
+	if len(flushed) != 1 {
+		t.Fatalf("Splice flushed %v, want its output once", flushed)
+	}
+	if got, err := os.ReadFile(path); err != nil || bytes.Equal(got, original) {
+		t.Fatalf("control: the recording was not spliced (%v)", err)
+	}
+}
+
+func commonPrefix(a, b []byte) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
+}
+
 func TestSpliceIsAtomic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("the original recording bytes")

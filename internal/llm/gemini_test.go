@@ -19,6 +19,7 @@ func TestConvertGeminiMessages(t *testing.T) {
 
 	if systemInstruction == nil {
 		t.Fatalf("expected system instruction, got nil")
+		return
 	}
 	if len(systemInstruction.Parts) != 1 || systemInstruction.Parts[0].Text != "follow policy" {
 		t.Fatalf("unexpected system instruction: %#v", systemInstruction)

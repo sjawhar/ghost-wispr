@@ -22,6 +22,9 @@ type Store interface {
 	// StartSummary marks the summary running; the session keeps its title
 	// and its last good summary until a new one is stored.
 	StartSummary(sessionID string) error
+	// StartEmptySummary marks the summary running, with no summarizer to make
+	// one: the summary version and Envoy delivery state stay as they are.
+	StartEmptySummary(sessionID string) error
 	// FailSummary records that the summary failed, and why, keeping the
 	// session's title and last good summary, and returns the session.
 	FailSummary(sessionID, errMsg string) (storage.Session, error)

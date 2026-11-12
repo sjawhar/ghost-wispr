@@ -24,6 +24,18 @@ type mockStore struct {
 	gcEligible    map[int][]string
 	deletedIDs    []string
 	remoteDeleted []string
+	eraseDirs     []string
+	// onRecordEraseDirectory, when set, runs as an erase directory is
+	// recorded.
+	onRecordEraseDirectory func(dir string)
+}
+
+func (m *mockStore) RecordEraseDirectory(dir string) error {
+	m.eraseDirs = append(m.eraseDirs, dir)
+	if m.onRecordEraseDirectory != nil {
+		m.onRecordEraseDirectory(dir)
+	}
+	return nil
 }
 
 // The mock serves age-based retention only; disk pressure runs against the
@@ -231,6 +243,82 @@ func TestGCRemovesALeftoverRawRecordingOfASavedSession(t *testing.T) {
 		t.Fatalf("gc run: %v", err)
 	}
 	expectRemoved(t, raw)
+}
+
+// TestGCZeroesTheAudioItRemoves fails if GC removes a session's recording or
+// its leftover raw recording without overwriting its bytes: both hold the
+// session's words, a segment deleted later included, and the file system
+// would free blocks still holding them.
+func TestGCZeroesTheAudioItRemoves(t *testing.T) {
+	dir := t.TempDir()
+	held := map[string]*os.File{}
+	for _, name := range []string{"20261106140930.wav", "20261106140930.pcm"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("audio of "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		held[name] = f
+	}
+	store := &mockStore{
+		sessions:   map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: filepath.Join(dir, "20261106140930.wav")}},
+		gcEligible: map[int][]string{30: {"20261106140930"}},
+	}
+	if _, err := New(store, Config{MaxAgeDays: 30, AudioDir: dir}).Run(); err != nil {
+		t.Fatalf("gc run: %v", err)
+	}
+	for name, f := range held {
+		expectRemoved(t, filepath.Join(dir, name))
+		got := make([]byte, len("audio of "+name))
+		if _, err := f.ReadAt(got, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, make([]byte, len(got))) {
+			t.Errorf("GC removed %s still holding %q", name, got)
+		}
+	}
+}
+
+// TestGCRecordsWhereItErasesBeforeItErases fails if GC begins a whole-file
+// erase before recording its directory, or records the directory other than
+// as it resolves the file (a relative entry is in the audio directory): an
+// erase a stop cut off after the row went would then not be found as the app
+// starts.
+func TestGCRecordsWhereItErasesBeforeItErases(t *testing.T) {
+	dir := t.TempDir()
+	recording := filepath.Join(dir, "20261106140930.wav")
+	if err := os.WriteFile(recording, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &mockStore{
+		sessions:   map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: "20261106140930.wav"}},
+		gcEligible: map[int][]string{30: {"20261106140930"}},
+	}
+	store.onRecordEraseDirectory = func(string) {
+		// The first erase is the recording's; the raw copy's follows.
+		if len(store.eraseDirs) != 1 {
+			return
+		}
+		if _, err := os.Stat(recording); err != nil {
+			t.Errorf("the recording was moved before its directory was recorded: %v", err)
+		}
+	}
+	if _, err := New(store, Config{MaxAgeDays: 30, AudioDir: dir}).Run(); err != nil {
+		t.Fatalf("gc run: %v", err)
+	}
+	expectRemoved(t, recording)
+	if len(store.eraseDirs) == 0 {
+		t.Fatal("GC erased the recording with no erase directory recorded")
+	}
+	for _, recorded := range store.eraseDirs {
+		if recorded != dir {
+			t.Errorf("recorded erase directory %s, want the audio directory %s", recorded, dir)
+		}
+	}
 }
 
 // A raw .pcm whose session's saved recording is gone from disk is not a
@@ -566,6 +654,35 @@ func TestGCDiskPressureSkipsAnEmptyRecording(t *testing.T) {
 	expectAudioKept(t, store, "20261106100000", empty)
 	expectKept(t, raw)
 	expectAudioRemoved(t, store, "20261106101000", healthy)
+}
+
+// TestGCDiskPressureZeroesTheRecordingItRemoves fails if disk pressure
+// removes a recording without overwriting its bytes before the file system
+// frees them.
+func TestGCDiskPressureZeroesTheRecordingItRemoves(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	started := time.Now().UTC().Add(-time.Hour)
+	recording := endWithRecording(t, store, dir, "20261106100000", started, 2*1024*1024)
+	audio := bytes.Repeat([]byte{'A'}, 2*1024*1024)
+	if err := os.WriteFile(recording, audio, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+
+	runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir}, 1)
+	expectAudioRemoved(t, store, "20261106100000", recording)
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Error("disk pressure removed a recording still holding its audio")
+	}
 }
 
 // GC never removes the raw .pcm of a session that ended without a saved
