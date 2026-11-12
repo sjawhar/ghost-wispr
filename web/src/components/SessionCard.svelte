@@ -172,13 +172,22 @@
       : 'Delete from this unit; this unit holds the only copy',
   )
 
+  // Why the last delete was refused (the API's reason).
+  let deleteError = $state('')
+
   async function handleDelete(event: MouseEvent) {
     event.stopPropagation()
     const question = onDrive
       ? 'Remove this session from this unit? The shared drive keeps its copy.'
       : 'Delete this session? This unit holds the only copy, so this cannot be undone.'
-    if (confirm(question)) {
+    if (!confirm(question)) {
+      return
+    }
+    deleteError = ''
+    try {
       await onDelete(session.id)
+    } catch (error) {
+      deleteError = requestErrorMessage(error)
     }
   }
 </script>
@@ -357,6 +366,9 @@
       </button>
     </div>
   </div>
+  {#if deleteError}
+    <p class="delete-error" role="alert">Not deleted: {deleteError}</p>
+  {/if}
 
   {#if session.summary_status === SummaryStatus.Completed && session.summary}
     <div class="summary-preview-md prose">
@@ -452,6 +464,12 @@
 </article>
 
 <style>
+  .delete-error {
+    margin: 0.25rem 0 0;
+    color: var(--danger, #dc2626);
+    font-size: 0.85rem;
+  }
+
   .session-card.selected {
     border-color: var(--accent);
     background: var(--accent-soft);

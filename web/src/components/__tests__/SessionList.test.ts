@@ -2,6 +2,7 @@ import { fireEvent, render as renderSvelte, screen, waitFor } from '@testing-lib
 import type { ComponentProps } from 'svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import SessionList from '../SessionList.svelte'
+import { RequestError } from '../../lib/api'
 import {
   SessionStatus,
   SummaryStatus,
@@ -203,5 +204,72 @@ describe('SessionList', () => {
       expect(onSegmentDeleted).toHaveBeenCalledWith('s1', 42)
       expect(screen.queryByText('Possibly deleted phrase')).toBeNull()
     })
+  })
+
+  const refusal =
+    'a session to merge still has a deleted segment on Google Drive; merge it after its Drive files are replaced'
+
+  function endedSession(id: string, title: string): SessionSummary {
+    return {
+      id,
+      title,
+      started_at: '2026-11-11T10:00:00Z',
+      ended_at: '2026-11-11T10:10:00Z',
+      status: SessionStatus.Ended,
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: 'default',
+      audio_path: `${id}.mp3`,
+    }
+  }
+
+  it('shows why a merge was refused and keeps the selection', async () => {
+    const sessions = [endedSession('s1', 'First'), endedSession('s2', 'Second')]
+    const onMerge = vi
+      .fn()
+      .mockRejectedValue(new RequestError(409, JSON.stringify({ error: refusal })))
+    const { container } = render({
+      dates: ['2026-11-11'],
+      sessionsByDate: new Map([['2026-11-11', sessions]]),
+      sessionDetails: new Map(),
+      presets: {},
+      expandedSessionId: '',
+      onToggleSession: vi.fn(),
+      onLoadDate: vi.fn().mockResolvedValue(undefined),
+      onLoadDetail: vi.fn().mockResolvedValue(undefined),
+      onResummarize: vi.fn().mockResolvedValue(undefined),
+      onDelete: vi.fn().mockResolvedValue(undefined),
+      onMerge,
+    })
+    for (const checkbox of container.querySelectorAll<HTMLInputElement>('.session-checkbox')) {
+      await fireEvent.click(checkbox)
+    }
+    await fireEvent.click(screen.getByRole('button', { name: 'Merge' }))
+
+    expect(onMerge).toHaveBeenCalledWith(['s1', 's2'])
+    expect((await screen.findByRole('alert')).textContent).toBe(`Merge refused: ${refusal}`)
+    expect(screen.getByText('2 selected')).toBeTruthy()
+  })
+
+  it('shows why a session delete was refused', async () => {
+    const reason =
+      'this session still has a deleted segment on Google Drive; delete it after its Drive files are replaced'
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    render({
+      dates: ['2026-11-11'],
+      sessionsByDate: new Map([['2026-11-11', [endedSession('s1', 'First')]]]),
+      sessionDetails: new Map(),
+      presets: {},
+      expandedSessionId: '',
+      onToggleSession: vi.fn(),
+      onLoadDate: vi.fn().mockResolvedValue(undefined),
+      onLoadDetail: vi.fn().mockResolvedValue(undefined),
+      onResummarize: vi.fn().mockResolvedValue(undefined),
+      onDelete: vi.fn().mockRejectedValue(new RequestError(409, JSON.stringify({ error: reason }))),
+      onMerge: vi.fn().mockResolvedValue(undefined),
+    })
+    await fireEvent.click(screen.getAllByRole('button', { name: /from this unit/ })[0])
+
+    expect((await screen.findByRole('alert')).textContent).toBe(`Not deleted: ${reason}`)
   })
 })
