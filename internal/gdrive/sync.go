@@ -212,6 +212,9 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	}
 
 	for i := range files {
+		if files[i].UpdateOnly {
+			continue
+		}
 		if err := s.uploadFile(ctx, folder.Id, &files[i]); err != nil {
 			return folder.Id, err
 		}

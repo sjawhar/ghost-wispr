@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -154,6 +155,10 @@ func TestDeleteTextUpdatesMergedSourceFoldersInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = round2Session(t, store, "20261112083000", []string{"charlie stays."})
+	// Source B started after A, so A's segments are attributed to A.
+	if _, err := store.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = '20261112083000'`, time.Date(2026, 11, 6, 15, 30, 0, 0, time.UTC).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 	wire, syncer := newWireDrive(t)
 	o := NewOrchestrator(syncer, store)
 	folderA := syncedSession(t, store, o, "20261112080000")
@@ -241,7 +246,12 @@ func TestASourceFolderTheSyncCouldNotReachIsRefreshedByTheSweep(t *testing.T) {
 
 	wire.trash(folderA)
 	deleteTextFrom(t, store, merged, recA, "merged summary")
-	_ = o.SyncSession(context.Background(), merged)
+	if owed, err := store.DriveDocumentsOwed(merged); err != nil || !slices.Contains(owed, "20261112070000") {
+		t.Fatalf("control: after Delete text the source's folder is not owed its documents: %v (%v)", owed, err)
+	}
+	if err := o.SyncSession(context.Background(), merged); err == nil {
+		t.Error("the sync reported success though a source folder it owed documents is in the trash")
+	}
 	ids, err := store.GetSessionsNeedingSync()
 	if err != nil {
 		t.Fatal(err)

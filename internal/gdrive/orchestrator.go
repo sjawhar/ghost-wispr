@@ -169,8 +169,19 @@ const spliceWaitWarningAfter = 5 * time.Minute
 // claims its session first (ClaimSync), so retry-sync, the sync after a
 // summary and the sweep never sync one session at once. Every state it
 // writes after the claim is under that claim, so a sync that no longer holds
-// its session changes nothing in it.
+// its session changes nothing in it. First it updates in place the Drive
+// documents of the merged sources "Delete text" in the session changed, or of
+// the session itself when it is such a source (refreshOwedDocuments).
 func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error {
+	refreshErr := o.refreshOwedDocuments(ctx, sessionID)
+	err := o.syncSession(ctx, sessionID)
+	if refreshErr == nil {
+		return err
+	}
+	return errors.Join(refreshErr, err)
+}
+
+func (o *Orchestrator) syncSession(ctx context.Context, sessionID string) error {
 	read, err := o.store.GetSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("get session %s: %w", sessionID, err)
@@ -275,10 +286,11 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 
 	// A session synced before keeps its folder, and so does one whose first
 	// sync created its folder and then failed: syncing it again adds what the
-	// folder lacks instead of creating a second folder.
+	// folder lacks instead of creating a second folder. A summary the session
+	// no longer has (a segment deletion cleared it) is emptied there.
 	driveFolderID := sess.GDriveFolderID
 	if driveFolderID != "" {
-		err = o.uploader.UploadInto(ctx, driveFolderID, files)
+		err = o.uploader.UploadInto(ctx, driveFolderID, withEmptiedSummary(files))
 	} else {
 		driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
 	}
