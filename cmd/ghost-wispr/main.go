@@ -722,11 +722,6 @@ func main() {
 			}
 		}()
 	}
-	markEmptySummariesCompleted := func(sessionIDs []string) {
-		for _, id := range sessionIDs {
-			_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
-		}
-	}
 	submitSummaryBatch := func(ctx context.Context, sessionIDs []string) (string, int, error) {
 		if summarizer == nil {
 			return "", 0, fmt.Errorf("summarization not configured")
@@ -741,11 +736,11 @@ func main() {
 			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
 		}
 
-		sessions, generations, emptyTranscriptIDs, err := readBatchSummarySessions(store, sessionIDs)
+		sessions, generations, emptyTranscripts, err := readBatchSummarySessions(store, sessionIDs)
 		if err != nil {
 			return "", 0, err
 		}
-		markEmptySummariesCompleted(emptyTranscriptIDs)
+		completeEmptySummaries(store, emptyTranscripts)
 		if len(sessions) == 0 {
 			return "", 0, fmt.Errorf("no sessions with transcripts found for backfill")
 		}

@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // deletedWords is the text of the segment the tests delete.
@@ -194,5 +197,49 @@ func TestAStaleSummaryRunLeavesTheNewerRunRunning(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A batch summary completes, empty, the summary of a session whose transcript
+// it read empty. Once a segment deletion has changed that session since, and
+// its own summary run started, the empty completion is refused: it would
+// mark the newer run completed before it stored anything.
+func TestAnEmptyBatchSummaryLeavesARunStartedSinceRunning(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "empty.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	const id = "session"
+	started := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for i := range 2 {
+		if err := store.AppendSegment(id, transcribe.Segment{Text: " ", StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second)}); err != nil {
+			t.Fatalf("append segment: %v", err)
+		}
+	}
+	if err := store.EndSession(id, started.Add(2*time.Second), "recording.mp3"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	segments, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatalf("get segments: %v", err)
+	}
+
+	sessions, _, empty, err := readBatchSummarySessions(store, []string{id})
+	if err != nil || len(sessions) != 0 || len(empty) != 1 {
+		t.Fatalf("batch input: sessions %+v, empty %v, %v; want one empty transcript", sessions, empty, err)
+	}
+	deleteAndStartNewerSummary(t, store, id, segments[1].ID)
+	completeEmptySummaries(store, empty)
+
+	sess, err := store.GetSession(id)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if sess.SummaryStatus != storage.SummaryRunning {
+		t.Errorf("summary status %q; want the newer run's: %q", sess.SummaryStatus, storage.SummaryRunning)
 	}
 }
