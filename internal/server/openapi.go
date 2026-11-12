@@ -61,11 +61,14 @@ func OpenAPISpec() map[string]any {
 			"/healthz/ready": map[string]any{
 				"get": map[string]any{
 					"summary":     "Readiness probe",
-					"description": "Check if the service is ready to handle requests",
+					"description": "Check if the service is ready to handle requests. While capture is paused or resuming, a microphone that is closed and a Deepgram connection that is not made yet are reported as paused or resuming, not as faults: a unit that starts paused connects to Deepgram only when it resumes. With no Deepgram API key, Deepgram is a fault whether paused or not.",
 					"tags":        []string{"health"},
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Service is ready",
+						},
+						"503": map[string]any{
+							"description": "A component is not ready; the body names each component's state",
 						},
 					},
 				},

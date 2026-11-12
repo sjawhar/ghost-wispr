@@ -213,6 +213,7 @@ func (s *apiStoreStub) GetSessionsForBackfill() ([]string, error) {
 
 type healthCheckerStub struct{}
 
+func (h *healthCheckerStub) IsDeepgramConfigured() bool           { return true }
 func (h *healthCheckerStub) IsDeepgramConnected() bool            { return true }
 func (h *healthCheckerStub) IsDBHealthy(ctx context.Context) bool { return true }
 func (h *healthCheckerStub) IsMicOpen() bool                      { return true }

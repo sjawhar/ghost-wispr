@@ -1718,12 +1718,19 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
 			warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
+			if !updateStartupState && hub != nil {
+				hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusError, "Deepgram initialization failed")
+			}
 			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
 			return nil
 		}
 
 		candidateResilient.Client = initialClient
 		resilientRef.Store(candidateResilient)
+		if !updateStartupState && hub != nil {
+			// A resilient client starts connected and reports only changes.
+			hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusConnected, "Deepgram connected")
+		}
 
 		startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub)
 		return nil
@@ -1766,6 +1773,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	if startMicrophone(ctx, &micLoops, capture, !paInitFailed, startMic, retryMic) {
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
+		if cfg.DeepgramAPIKey != "" {
+			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
+		}
 	}
 
 	if paInitFailed {
@@ -1909,8 +1919,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		go collectGarbage(ctx, cfgStore, store, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
 
-	// Create health checker with actual component references
-	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
+	// Create health checker with actual component references. With no Deepgram
+	// API key it gets no Deepgram client source, so readiness never excuses
+	// Deepgram, paused or not.
+	var deepgramHealth interface{ IsConnected() bool }
+	if cfg.DeepgramAPIKey != "" {
+		deepgramHealth = &resilientClientProxy{ref: &resilientRef}
+	}
+	healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, capture, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
