@@ -258,10 +258,18 @@ func (p *resilientClientProxy) IsConnected() bool {
 	return client != nil && client.IsConnected()
 }
 
+// micRetryEvery is how long the microphone start-up waits before it tries
+// again, after an attempt failed or PortAudio failed to initialize.
+const micRetryEvery = 15 * time.Second
+
+// retryMicStartup runs start every retryInterval until it succeeds or ctx
+// ends. A paused instance opens no input device: a retry that comes due
+// while capture is paused waits (waitResumed) until capture resumes.
 func retryMicStartup(
 	ctx context.Context,
 	retryInterval time.Duration,
 	after func(time.Duration) <-chan time.Time,
+	waitResumed func(context.Context) bool,
 	onRetry func(),
 	start func() error,
 	onError func(error),
@@ -276,6 +284,9 @@ func retryMicStartup(
 		case <-ctx.Done():
 			return
 		case <-after(retryInterval):
+		}
+		if !waitResumed(ctx) {
+			return
 		}
 
 		if onRetry != nil {
@@ -301,6 +312,32 @@ func retryMicStartup(
 		}
 		return
 	}
+}
+
+// startMicrophone opens the input device and starts capture with start, and
+// runs retry in loops if start fails or PortAudio is not ready. A paused
+// instance opens no input device until it resumes: while the capture gate is
+// closed, start runs in loops once the gate opens, with atBoot false, and
+// startMicrophone returns deferred true. Otherwise start runs at once with
+// atBoot true, so it can write the start-up status.
+func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, portAudioReady bool, start func(atBoot bool) error, retry func()) (deferred bool) {
+	if capture.isClosed() {
+		loops.Go(func() {
+			if !capture.waitResumed(ctx) {
+				return
+			}
+			if portAudioReady && start(false) == nil {
+				return
+			}
+			retry()
+		})
+		return true
+	}
+	if portAudioReady && start(true) == nil {
+		return false
+	}
+	loops.Go(retry)
+	return false
 }
 
 type transcriptCallback struct {
@@ -1613,8 +1650,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if mic == nil {
+			warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 			if updateStartupState {
-				warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 			}
 			return fmt.Errorf("microphone unavailable")
@@ -1626,8 +1663,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		micRef.Store(mic)
 		if err := startMicIfUnpaused(capture, mic.Start); err != nil {
 			micRef.Store(nil)
+			warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
 			if updateStartupState {
-				warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
 			}
 			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
@@ -1681,9 +1718,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		initialClient, err := factory(ctx)
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
-			if updateStartupState {
-				warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
-			}
+			warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
 			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
 			return nil
 		}
@@ -1695,12 +1730,43 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		return nil
 	}
 
-	shouldRetryMicStartup := paInitFailed
-	if !paInitFailed {
-		if err := startMicPipeline(true); err != nil {
+	retryMic := func() {
+		retryMicStartup(
+			ctx,
+			micRetryEvery,
+			time.After,
+			capture.waitResumed,
+			func() {
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
+				}
+			},
+			func() error {
+				if err := audio.ReinitPortAudio(); err != nil {
+					return err
+				}
+				return startMicPipeline(false)
+			},
+			func(err error) {
+				log.Printf("mic startup retry failed: %v", err)
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
+				}
+			},
+			func() {
+				log.Printf("mic startup retry succeeded")
+			},
+		)
+	}
+	startMic := func(atBoot bool) error {
+		err := startMicPipeline(atBoot)
+		if err != nil {
 			slog.Warn("microphone unavailable, running API/UI only", "error", err)
-			shouldRetryMicStartup = true
 		}
+		return err
+	}
+	if startMicrophone(ctx, &micLoops, capture, !paInitFailed, startMic, retryMic) {
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
 	}
 
 	if paInitFailed {
@@ -1804,10 +1870,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
 	}
 
-	// Wire up mic diagnostic hook now that mic is initialized.
+	// Wire up the mic diagnostic hook. A paused instance opens the mic only on
+	// resume, so until then there is none to diagnose.
 	controlHooks.DiagnoseMic = func(ctx context.Context) (map[string]any, error) {
 		mic := micRef.Load()
 		if mic == nil {
+			if capture.IsPaused() {
+				return nil, fmt.Errorf("microphone not opened while capture is paused")
+			}
 			return nil, fmt.Errorf("microphone not available")
 		}
 		sampleRate := mic.SampleRate()
@@ -1817,36 +1887,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			"status":      "operational",
 			"message":     fmt.Sprintf("Microphone open at %d Hz", sampleRate),
 		}, nil
-	}
-
-	if shouldRetryMicStartup {
-		micLoops.Go(func() {
-			retryMicStartup(
-				ctx,
-				15*time.Second,
-				time.After,
-				func() {
-					if hub != nil {
-						hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
-					}
-				},
-				func() error {
-					if err := audio.ReinitPortAudio(); err != nil {
-						return err
-					}
-					return startMicPipeline(false)
-				},
-				func(err error) {
-					log.Printf("mic startup retry failed: %v", err)
-					if hub != nil {
-						hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
-					}
-				},
-				func() {
-					log.Printf("mic startup retry succeeded")
-				},
-			)
-		})
 	}
 
 	lightOff := hardware.Done()

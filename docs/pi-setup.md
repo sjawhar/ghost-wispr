@@ -360,7 +360,10 @@ its certificate config in a private temporary directory, point the copied certif
 at the certificate that expires in 10 days, and use a copied YAML that sets its
 `google_credentials_file`, separate `db_path` and `audio_dir`, and disables Drive sync, GC,
 Envoy, speaker, indicator light, and power button. Before starting it, seed its
-separate database as paused. This prevents the test instance from opening the microphone:
+separate database as paused. A paused instance opens the microphone, and connects to Deepgram,
+only when someone resumes it, so the test instance does not hold the recorder's microphone; do
+not resume it. PortAudio still checks the audio devices once as the app starts. Seed and start
+it like this:
 
 ```bash
 GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \

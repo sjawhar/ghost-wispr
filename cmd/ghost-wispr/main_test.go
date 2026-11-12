@@ -377,6 +377,97 @@ func oneShotAfter() func(time.Duration) <-chan time.Time {
 	}
 }
 
+// neverPaused is a waitResumed for a capture that is never paused.
+func neverPaused(context.Context) bool { return true }
+
+// TestPausedStartOpensNoInputDeviceUntilResume fails if an instance that
+// starts paused opens the input device before someone resumes it: an open
+// capture stream holds the microphone, which a test instance on the Pi would
+// then take from the recorder, although the pause means it must not record.
+func TestPausedStartOpensNoInputDeviceUntilResume(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	capture.Pause()
+	opened := make(chan bool, 4) // each attempt's atBoot
+	var loops sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		if !joinMicLoops(&loops, testWait) {
+			t.Error("microphone start-up still running after shutdown")
+		}
+	})
+
+	deferred := startMicrophone(ctx, &loops, capture, true, func(atBoot bool) error {
+		opened <- atBoot
+		return nil
+	}, func() { t.Error("the start-up retried, but no attempt failed") })
+	select {
+	case atBoot := <-opened:
+		t.Fatalf("an instance started paused opened the input device before resume (atBoot=%t), want none until resume", atBoot)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !deferred {
+		t.Error("startMicrophone did not report that the start waits for resume, so the start-up status would not say the microphone is closed")
+	}
+
+	capture.Resume()
+	select {
+	case atBoot := <-opened:
+		if atBoot {
+			t.Error("the start after resume wrote the start-up status, which only the boot start may write")
+		}
+	case <-time.After(testWait):
+		t.Fatal("resume did not open the input device")
+	}
+}
+
+// TestUnpausedStartOpensTheInputDeviceAtOnce is the control: an instance that
+// starts unpaused opens the input device before startMicrophone returns, and
+// reports into the start-up status.
+func TestUnpausedStartOpensTheInputDeviceAtOnce(t *testing.T) {
+	var loops sync.WaitGroup
+	var attempts []bool
+	deferred := startMicrophone(context.Background(), &loops, newCaptureGate(nil, nil, nil), true, func(atBoot bool) error {
+		attempts = append(attempts, atBoot)
+		return nil
+	}, func() { t.Error("the start-up retried, but no attempt failed") })
+	if deferred || len(attempts) != 1 || !attempts[0] {
+		t.Fatalf("unpaused start: deferred=%t attempts(atBoot)=%v, want deferred=false and one boot attempt", deferred, attempts)
+	}
+	if !joinMicLoops(&loops, testWait) {
+		t.Fatal("a start that succeeded left a start-up goroutine running")
+	}
+}
+
+// TestRetryMicStartupWaitsForResume fails if a microphone start retry that
+// comes due while capture is paused opens the input device before resume.
+func TestRetryMicStartupWaitsForResume(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	capture.Pause()
+	started := make(chan struct{}, 1)
+	done := goDone(func() {
+		retryMicStartup(context.Background(), time.Second, oneShotAfter(), capture.waitResumed, nil, func() error {
+			started <- struct{}{}
+			return nil
+		}, nil, nil)
+	})
+	select {
+	case <-started:
+		t.Fatal("a retry due while capture is paused opened the input device before resume")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	capture.Resume()
+	select {
+	case <-started:
+	case <-time.After(testWait):
+		t.Fatal("resume did not let the retry open the input device")
+	}
+	if !returnedWithin(done, testWait) {
+		t.Fatal("retry still running after a start that succeeded")
+	}
+}
+
 func TestRetryMicStartupRetriesUntilSuccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -391,6 +482,7 @@ func TestRetryMicStartupRetriesUntilSuccess(t *testing.T) {
 		ctx,
 		time.Second,
 		immediateAfter,
+		neverPaused,
 		func() { retries++ },
 		func() error {
 			attempts++
@@ -426,6 +518,7 @@ func TestRetryMicStartupStopsOnContextCancel(t *testing.T) {
 		ctx,
 		time.Second,
 		oneShotAfter(),
+		neverPaused,
 		nil,
 		func() error {
 			attempts++
@@ -457,6 +550,7 @@ func TestRetryMicStartupDoesNotStartTheMicAfterShutdown(t *testing.T) {
 		ctx,
 		time.Second,
 		oneShotAfter(),
+		neverPaused,
 		cancel, // shutdown begins as the retry fires
 		func() error {
 			started = true
