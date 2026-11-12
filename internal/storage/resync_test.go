@@ -19,8 +19,8 @@ func documentedSession(t *testing.T, store *SQLiteStore, id, summary string) {
 	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatalf("Canonicalize %s: %v", id, err)
 	}
-	if err := store.UpdateSummary(id, "Standup", summary, SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary %s: %v", id, err)
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", summary, SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration %s: %v", id, err)
 	}
 }
 
@@ -46,7 +46,7 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 		resync bool
 	}{
 		{"summary made again", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateSummary(id, "Standup", "The summary, made again.", SummaryCompleted, "default", "{}")
+			return store.UpdateSummaryAtGeneration(id, "Standup", "The summary, made again.", SummaryCompleted, "default", "{}", "", 0)
 		}, true},
 		{"summary started again", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return store.StartSummary(id)
@@ -55,7 +55,7 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			if err := store.StartSummary(id); err != nil {
 				t.Fatalf("StartSummary: %v", err)
 			}
-			_, err := store.FailSummary(id, "summarization failed")
+			_, err := store.FailSummaryAtGeneration(id, "summarization failed", 0)
 			return err
 		}, false},
 		{"title edited", func(_ *testing.T, store *SQLiteStore, id string) error {
@@ -69,7 +69,7 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			return err
 		}, true},
 		{"same summary stored again", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateSummary(id, "Standup", "The first summary.", SummaryCompleted, "default", "{}")
+			return store.UpdateSummaryAtGeneration(id, "Standup", "The first summary.", SummaryCompleted, "default", "{}", "", 0)
 		}, false},
 		{"refined, not yet canonicalized", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return store.UpdateRefinementAtGeneration(id, "The refined transcript.", RefinementCompleted, "", 0)

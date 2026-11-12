@@ -769,7 +769,7 @@ func summarized(t *testing.T, store *storage.SQLiteStore, id string, startedAt t
 	if err := store.EndSession(id, startedAt.Add(time.Minute), ""); err != nil {
 		t.Fatalf("end session %s: %v", id, err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize %s: %v", id, err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
@@ -1207,7 +1207,7 @@ func TestGCAgeKeepsTheRawCopyWhenTheRecordingStays(t *testing.T) {
 	store := newStore(t)
 	const id = "20261001120000"
 	saved := endWithRecording(t, store, savedDir, id, daysAgo(40), 1024)
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	raw := writeRaw(t, dir, id, 1024, daysAgo(40))
@@ -1245,7 +1245,7 @@ func TestGCAgeKeepsARecordingMergedAwayMeanwhile(t *testing.T) {
 	store := newStore(t)
 	const id, merged = "20261001120000", "20261001120000-merged"
 	saved := endWithRecording(t, store, dir, id, daysAgo(40), 1024)
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
@@ -1305,7 +1305,7 @@ func TestGCChangesNothingWhenItCannotListRecordings(t *testing.T) {
 	dir := t.TempDir()
 	store := newStore(t)
 	old := endWithRecording(t, store, dir, "20261001120000", daysAgo(40), 1024)
-	if err := store.UpdateSummary("20261001120000", "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("20261001120000", "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	healthy := endWithRecording(t, store, dir, "20261106100000", time.Now().UTC().Add(-time.Hour), 2*1024*1024)
@@ -1352,7 +1352,7 @@ func TestGCAgeKeepsASessionWhileItsRefinementRuns(t *testing.T) {
 	store := newStore(t)
 	const id = "20261001120000"
 	saved := endWithRecording(t, store, dir, id, daysAgo(40), 1024)
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	if err := store.UpdateRefinementAtGeneration(id, "", storage.RefinementRunning, "", 0); err != nil {

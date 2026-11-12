@@ -51,7 +51,7 @@ func nestedMerge(t *testing.T, store *SQLiteStore) int64 {
 	if err := store.MergeSessions("m1", []string{"s1", "s2"}, base, base.Add(31*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("m1", "About "+ledgerSecret, "The summary of "+ledgerSecret+".", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("m1", "About "+ledgerSecret, "The summary of "+ledgerSecret+".", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m2", []string{"m1", "s3"}, base, base.Add(61*time.Minute)); err != nil {

@@ -23,7 +23,7 @@ func TestAnEmptySummaryKeepsTheModelOfTheKeptSummary(t *testing.T) {
 			if err := store.CreateSession(id, time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)); err != nil {
 				t.Fatalf("CreateSession: %v", err)
 			}
-			if err := store.UpdateSummaryWithModel(id, "Launch planning", "The kept summary.", SummaryCompleted, "default", "{}", "model-a"); err != nil {
+			if err := store.UpdateSummaryAtGeneration(id, "Launch planning", "The kept summary.", SummaryCompleted, "default", "{}", "model-a", 0); err != nil {
 				t.Fatalf("store the summary: %v", err)
 			}
 			if err := setEnvoyPublishStatus(store, id, EnvoyPublishPublished); err != nil {
@@ -36,7 +36,7 @@ func TestAnEmptySummaryKeepsTheModelOfTheKeptSummary(t *testing.T) {
 			}
 			before := storeSession(t, store, id)
 
-			if err := store.UpdateSummaryWithModel(id, "", "", SummaryCompleted, "", "{}", "model-b"); err != nil {
+			if err := store.UpdateSummaryAtGeneration(id, "", "", SummaryCompleted, "", "{}", "model-b", 0); err != nil {
 				t.Fatalf("store an empty summary: %v", err)
 			}
 

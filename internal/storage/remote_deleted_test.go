@@ -16,7 +16,7 @@ func syncedSessionInFolder(t *testing.T, store *SQLiteStore, id string) {
 	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
 		t.Fatalf("end: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Standup", "A summary.", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	syncTo(t, store, id, SyncStateSynced, "folder-1", 0, "")

@@ -215,8 +215,8 @@ func TestSQLiteCRUD(t *testing.T) {
 		t.Fatalf("AppendSegment failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary failed: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration failed: %v", err)
 	}
 
 	if err := store.EndSession(sessionID, startedAt.Add(30*time.Second), "data/audio/20260226100000.mp3"); err != nil {
@@ -274,8 +274,8 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise", "{}"); err != nil {
-		t.Fatalf("UpdateSummary failed: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration failed: %v", err)
 	}
 
 	session, err := store.GetSession(sessionID)
@@ -313,8 +313,8 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	if err := store.StartSummary(sessionID); err != nil {
 		t.Fatalf("StartSummary first: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "First", "First summary", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary first: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "First", "First summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration first: %v", err)
 	}
 	if got := version("after first summary"); got != 1 {
 		t.Fatalf("first summary version = %d, want 1", got)
@@ -324,8 +324,8 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	if err := store.StartSummary(sessionID); err != nil {
 		t.Fatalf("StartSummary regenerated: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Corrected", "Corrected summary", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary regenerated: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Corrected", "Corrected summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration regenerated: %v", err)
 	}
 	if got := version("after regenerated summary"); got != 2 {
 		t.Fatalf("regenerated summary version = %d, want 2", got)
@@ -335,8 +335,8 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	}
 
 	// A completed summary rewritten without StartSummary (the batch path) bumps it too.
-	if err := store.UpdateSummary(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary batched: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration batched: %v", err)
 	}
 	if got := version("after batched summary"); got != 3 {
 		t.Fatalf("batched summary version = %d, want 3", got)
@@ -360,8 +360,8 @@ func TestSummaryVersionIncrements(t *testing.T) {
 	}
 
 	// Re-reading the completed batch result is not a regeneration.
-	if err := store.UpdateSummary(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary repeated batch result: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration repeated batch result: %v", err)
 	}
 	if got := version("after repeated batch result"); got != 3 {
 		t.Fatalf("repeated batch summary version = %d, want 3", got)
@@ -392,8 +392,8 @@ func TestSummaryVersionIncrements(t *testing.T) {
 			}
 			summary, preset, speakers := current.Summary, current.SummaryPreset, current.SpeakerNames
 			change.apply(&current, &summary, &preset, &speakers)
-			if err := store.UpdateSummary(sessionID, current.Title, summary, SummaryCompleted, preset, speakers); err != nil {
-				t.Fatalf("UpdateSummary: %v", err)
+			if err := store.UpdateSummaryAtGeneration(sessionID, current.Title, summary, SummaryCompleted, preset, speakers, "", 0); err != nil {
+				t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 			}
 			updated, err := store.GetSession(sessionID)
 			if err != nil {
@@ -422,8 +422,8 @@ func TestSummaryVersionMigratesExistingSessions(t *testing.T) {
 	if err := store.EndSession("existing", startedAt.Add(time.Minute), ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
-	if err := store.UpdateSummary("existing", "Existing", "Existing summary", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary: %v", err)
+	if err := store.UpdateSummaryAtGeneration("existing", "Existing", "Existing summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close current store: %v", err)
@@ -502,10 +502,10 @@ func TestSpeakerNames(t *testing.T) {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 
-	t.Run("UpdateSummary persists speaker_names", func(t *testing.T) {
+	t.Run("UpdateSummaryAtGeneration persists speaker_names", func(t *testing.T) {
 		speakerNames := `{"1":{"name":"Ben","confidence":"mentioned"}}`
-		if err := store.UpdateSummary(sessionID, "Speaker notes", "## Summary\n- discussed", SummaryCompleted, "default", speakerNames); err != nil {
-			t.Fatalf("UpdateSummary failed: %v", err)
+		if err := store.UpdateSummaryAtGeneration(sessionID, "Speaker notes", "## Summary\n- discussed", SummaryCompleted, "default", speakerNames, "", 0); err != nil {
+			t.Fatalf("UpdateSummaryAtGeneration failed: %v", err)
 		}
 
 		session, err := store.GetSession(sessionID)
@@ -1001,8 +1001,8 @@ func TestDeleteEndedSession(t *testing.T) {
 func TestMarkSynced(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	endedWith(t, store, "20261106140000", "/audio/a.mp3,/mnt/b.mp3", RefinementPending)
-	if err := store.UpdateSummary("20261106140000", "", "The current summary.", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary: %v", err)
+	if err := store.UpdateSummaryAtGeneration("20261106140000", "", "The current summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 	}
 	if err := store.AppendSegment("20261106140000", transcribe.Segment{Text: "said", EndTime: 1, Timestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("AppendSegment: %v", err)
@@ -1211,7 +1211,7 @@ func TestSyncStatusTracking(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -1256,7 +1256,7 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-test-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -1310,8 +1310,8 @@ func TestEnvoyPublishStatusIsVersionAware(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(time.Minute), ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Title", "Summary", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Title", "Summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 	}
 
 	updated, err := store.UpdateEnvoyPublishStatusAtVersion(sessionID, 2, EnvoyPublishPublished)
@@ -1341,7 +1341,7 @@ func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-reset-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary completed: %v", err)
 	}
 	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
@@ -1374,7 +1374,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	}
 	// Summarized, then synced, as the app does it: a summary changed after
 	// the sync sends the session back to sync.
-	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("gc-eligible", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	syncTo(t, store, "gc-eligible", SyncStateSynced, "folder-1", 0, "")
@@ -1385,7 +1385,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("gc-unsynced", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1395,7 +1395,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-recent", now.Add(-30*time.Minute), "data/audio/gc-recent.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("gc-recent", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	syncTo(t, store, "gc-recent", SyncStateSynced, "folder-2", 0, "")
@@ -1421,8 +1421,8 @@ func summarizedSession(t *testing.T, store *SQLiteStore, id string, startedAt ti
 	if err := store.EndSession(id, startedAt.Add(time.Minute), ""); err != nil {
 		t.Fatalf("EndSession %s: %v", id, err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary %s: %v", id, err)
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration %s: %v", id, err)
 	}
 	syncTo(t, store, id, SyncStateSynced, "folder", 0, "")
 }
@@ -2048,7 +2048,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-1", started); err != nil {
 		t.Fatalf("create session fts-1: %v", err)
 	}
-	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary fts-1: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha appears once in transcript", "fts-1"); err != nil {
@@ -2058,7 +2058,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-2", started.Add(time.Minute)); err != nil {
 		t.Fatalf("create session fts-2: %v", err)
 	}
-	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary fts-2: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha alpha alpha and alpha again", "fts-2"); err != nil {
@@ -2092,7 +2092,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 	if err := store.CreateSession("fts-sync", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary initial: %v", err)
 	}
 
@@ -2104,7 +2104,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected no matches before update, got %d", len(results))
 	}
 
-	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary delta: %v", err)
 	}
 
@@ -2148,7 +2148,7 @@ func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
 	if err := store.CreateSession("fts-escape", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -2174,7 +2174,7 @@ func TestSearchWithDateFromFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, "default", "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -2204,7 +2204,7 @@ func TestSearchWithDateToFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, "default", "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -2232,7 +2232,7 @@ func TestSearchWithPresetFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, preset, "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -2266,7 +2266,7 @@ func TestSearchWithMultipleFilters(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, preset, "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -2378,7 +2378,7 @@ func TestAggregateSessions(t *testing.T) {
 		if err := store.EndSession(s.id, s.date.Add(30*time.Minute), ""); err != nil {
 			t.Fatalf("end session %s: %v", s.id, err)
 		}
-		if err := store.UpdateSummary(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset, "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset, "{}", "", 0); err != nil {
 			t.Fatalf("update summary %s: %v", s.id, err)
 		}
 	}
@@ -2750,8 +2750,8 @@ func TestProviderModelsPersistWithSummaryAndRefinement(t *testing.T) {
 	if err := store.CreateSession(id, time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := store.UpdateSummaryWithModel(id, "Model report", "Summary", SummaryCompleted, "default", "{}", "provider-summary-model"); err != nil {
-		t.Fatalf("UpdateSummaryWithModel: %v", err)
+	if err := store.UpdateSummaryAtGeneration(id, "Model report", "Summary", SummaryCompleted, "default", "{}", "provider-summary-model", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 	}
 	if err := store.UpdateRefinementAtGeneration(id, "Refined transcript", RefinementCompleted, "provider-refinement-model", 0); err != nil {
 		t.Fatalf("UpdateRefinementAtGeneration: %v", err)

@@ -80,11 +80,6 @@ func (w *writeHookStore) hook() {
 	}
 }
 
-func (w *writeHookStore) UpdateSummaryWithModel(sessionID, title, summary, status, preset, speakerNames, model string) error {
-	w.hook()
-	return w.SQLiteStore.UpdateSummaryWithModel(sessionID, title, summary, status, preset, speakerNames, model)
-}
-
 func (w *writeHookStore) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error {
 	w.hook()
 	return w.SQLiteStore.UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model, generation)
@@ -119,7 +114,7 @@ func TestASummaryOfTheTextBeforeADeletionIsNotStored(t *testing.T) {
 		}},
 		{"repair", func(t *testing.T, store *storage.SQLiteStore, segmentID int64, publish func(string)) {
 			raw := `{"title":"About ` + deletedWords + `","summary":"They said: ` + deletedWords + `"}`
-			if err := store.UpdateSummaryWithModel(id, "", raw, storage.SummaryCompleted, "default", "{}", "model-old-run"); err != nil {
+			if err := store.UpdateSummaryAtGeneration(id, "", raw, storage.SummaryCompleted, "default", "{}", "model-old-run", 0); err != nil {
 				t.Fatalf("store a structured summary: %v", err)
 			}
 			hooked := &writeHookStore{SQLiteStore: store, beforeWrite: func() { deleteAndStartNewerSummary(t, store, id, segmentID) }}
