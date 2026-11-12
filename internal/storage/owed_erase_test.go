@@ -27,9 +27,9 @@ func failVacuumInto(t *testing.T, n int) {
 	}
 }
 
-// owedErasures returns the count of deletions whose erase from the
+// owedErasures returns the number of the last deletion whose erase from the
 // write-ahead log and the backup is still owed (owedEraseKey), 0 when none
-// is.
+// is. In a new store the first deletion is number 1.
 func owedErasures(t *testing.T, store *SQLiteStore) int {
 	t.Helper()
 	var owed int
@@ -451,9 +451,9 @@ func TestALaterDeletionFinishesAnEarlierOwedErase(t *testing.T) {
 }
 
 // TestARetryKeepsAnEraseOwedSinceItRead fails if a retry clears the owed
-// erase although a deletion counted another after the retry read the count
-// (a deletion commits while the retry erases, and waits for eraseMu only for
-// its own erase): that deletion's erase would be lost if its own then failed.
+// erase although a later deletion recorded one after the retry read it (a
+// deletion commits while the retry erases, and waits for eraseMu only for its
+// own erase): that deletion's erase would be lost if its own then failed.
 func TestARetryKeepsAnEraseOwedSinceItRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	openWithSecret(t, path)
@@ -463,7 +463,11 @@ func TestARetryKeepsAnEraseOwedSinceItRead(t *testing.T) {
 	maintenance := postDeleteMaintenance
 	t.Cleanup(func() { postDeleteMaintenance = maintenance })
 	postDeleteMaintenance = func(db *sql.DB, walPath string) error {
-		if _, err := db.Exec(`UPDATE app_state SET value = CAST(value AS INTEGER) + 1 WHERE key = ?`, owedEraseKey); err != nil {
+		// A later deletion commits: it takes the next number and records it.
+		if _, err := db.Exec(`UPDATE app_state SET value = CAST(value AS INTEGER) + 1 WHERE key = ?`, owedEraseSeqKey); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE app_state SET value = (SELECT value FROM app_state WHERE key = ?) WHERE key = ?`, owedEraseSeqKey, owedEraseKey); err != nil {
 			return err
 		}
 		return maintenance(db, walPath)

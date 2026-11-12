@@ -11,13 +11,20 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/erase"
 )
 
-// owedEraseKey is the app_state key that counts the segment deletions whose
-// erase from the write-ahead log and the pre-migration backup is owed: each
-// deletion's transaction adds one, and the erase that covers them all
-// removes it. It is one marker for the store, on no session's row, because
-// that erase is store-wide (one log, one backup), and so that deleting a
-// session does not take an owed erase with it.
+// owedEraseKey is the app_state key whose row says that an erase of segment
+// deletions from the write-ahead log and the pre-migration backup is owed. It
+// holds the number (owedEraseSeqKey) of the last deletion that owes one, and
+// the erase that covers them all removes it. It is one marker for the store,
+// on no session's row, because that erase is store-wide (one log, one
+// backup), and so that deleting a session does not take an owed erase with
+// it.
 const owedEraseKey = "segment_deletion_erase_owed"
+
+// owedEraseSeqKey is the app_state key that numbers the segment deletions.
+// It is never removed, so a number is never used twice: an erase that read an
+// older number never clears the marker a later deletion wrote after the row
+// had gone and come back.
+const owedEraseSeqKey = "segment_deletion_erase_seq"
 
 // RetryOwedErasure finishes the erase of every deletion whose erase from the
 // write-ahead log and the pre-migration backup failed after it committed, or
@@ -68,8 +75,9 @@ func (s *SQLiteStore) eraseEveryOwed(backupTaken bool) error {
 	return s.eraseOrphans()
 }
 
-// recordOwedErase counts a deletion's owed erase, in its transaction
-// (owedEraseKey). It returns the count it left, and whether an earlier
+// recordOwedErase records a deletion's owed erase, in its transaction: it
+// takes the next deletion number (owedEraseSeqKey) and writes it to the owed
+// marker (owedEraseKey). It returns that number, and whether an earlier
 // deletion's erase was owed already.
 func recordOwedErase(tx *sql.Tx) (owed string, earlier bool, err error) {
 	switch err := tx.QueryRow(`SELECT 1 FROM app_state WHERE key = ?`, owedEraseKey).Scan(new(int)); {
@@ -79,17 +87,21 @@ func recordOwedErase(tx *sql.Tx) (owed string, earlier bool, err error) {
 		return "", false, fmt.Errorf("read owed erase: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO app_state(key, value) VALUES(?, '1')
-		ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1`, owedEraseKey); err != nil {
-		return "", false, fmt.Errorf("record owed erase: %w", err)
+		ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1`, owedEraseSeqKey); err != nil {
+		return "", false, fmt.Errorf("number the deletion: %w", err)
 	}
-	if err := tx.QueryRow(`SELECT value FROM app_state WHERE key = ?`, owedEraseKey).Scan(&owed); err != nil {
-		return "", false, fmt.Errorf("read owed erase: %w", err)
+	if err := tx.QueryRow(`SELECT value FROM app_state WHERE key = ?`, owedEraseSeqKey).Scan(&owed); err != nil {
+		return "", false, fmt.Errorf("read the deletion number: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO app_state(key, value) VALUES(?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, owedEraseKey, owed); err != nil {
+		return "", false, fmt.Errorf("record owed erase: %w", err)
 	}
 	return owed, earlier, nil
 }
 
-// clearOwedErase records the owed erase done, unless a deletion has counted
-// one since the erase read the count owed.
+// clearOwedErase records the owed erase done, unless a later deletion has
+// recorded one since the erase read the number owed.
 func clearOwedErase(db *sql.DB, owed string) error {
 	if _, err := db.Exec(`DELETE FROM app_state WHERE key = ? AND value = ?`, owedEraseKey, owed); err != nil {
 		return fmt.Errorf("record the owed erase done: %w", err)

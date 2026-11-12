@@ -193,8 +193,8 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 
 // eraseAfterDeletion erases a committed deletion from the write-ahead log and
 // the pre-migration backup, and clears the owed erase its transaction
-// recorded (owed, the count it left) unless another deletion has counted one
-// since. When an earlier deletion's erase was owed too (earlierOwed), a scrub
+// recorded (owed, its deletion number) unless a later deletion has recorded
+// one since. When an earlier deletion's erase was owed too (earlierOwed), a scrub
 // of the backup would take out only this deletion's words, so it runs the
 // erase a retry runs, which covers both. A failure leaves the erase owed: the
 // deletion's error wraps ErrSegmentPostCommitMaintenance, and
