@@ -546,7 +546,7 @@ func OpenAPISpec() map[string]any {
 			"/api/sessions/{id}/segments/{segmentID}": map[string]any{
 				"delete": map[string]any{
 					"summary":     "Delete one session segment",
-					"description": "Permanently remove one ended session segment from the transcript and recording.",
+					"description": "Permanently remove one ended session segment, by the action mode names. mode=text (\"Delete text\") removes the segment's words from the transcript, the refined transcript, the summary (made again), search, embeddings and stored events, on the session and every session merged into it, and records where the words are in the recording, which it leaves unchanged, so a later refinement leaves them out; the Drive transcript and summary are updated in place by the next sync, so their links stay and their version history keeps the old text. mode=text_and_audio (\"Delete text and audio\") also cuts the segment out of the recording and replaces the session's transcript, summary and recording files in Drive, deleting the old files with their version history, so their links change. Either refuses, changing nothing, a segment whose words cannot be found in the recording.",
 					"tags":        []string{"sessions"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{
@@ -564,9 +564,17 @@ func OpenAPISpec() map[string]any {
 							"required":    true,
 							"schema":      map[string]any{"type": "integer", "format": "int64"},
 						},
+						{
+							"name":        "mode",
+							"in":          "query",
+							"description": "The deletion action: text (\"Delete text\") or text_and_audio (\"Delete text and audio\"). There is no default.",
+							"required":    true,
+							"schema":      map[string]any{"type": "string", "enum": []string{"text", "text_and_audio"}},
+						},
 					},
 					"responses": map[string]any{
 						"204": map[string]any{"description": "Segment deleted"},
+						"400": map[string]any{"description": "No mode, or one that is neither text nor text_and_audio"},
 						"404": map[string]any{"description": "Session or segment not found"},
 						"409": map[string]any{"description": "Session is still recording or an earlier segment deletion is recovering"},
 						"422": map[string]any{"description": "Segment could not be found or removed cleanly"},

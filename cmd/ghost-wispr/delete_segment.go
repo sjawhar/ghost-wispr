@@ -35,6 +35,7 @@ type segmentDeleteRunner struct {
 	splice           func(context.Context, string, float64, float64) (string, error)
 	refine           func(context.Context, string, string, time.Time) error
 	deleteSegment    func(sessionID string, segmentID int64, span storage.DeletedSpan) error
+	summarize        func(context.Context, string, time.Time) error
 }
 
 func requireSegmentForDeletion(store *storage.SQLiteStore, sessionID string, segmentID int64) error {
@@ -172,7 +173,25 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 	return set, nil
 }
 
+// Delete is "Delete text and audio": it removes the segment's words from
+// every text store, cuts its span out of the recording, and owes Google
+// Drive a replacement of the session's files (storage.DeleteSegment).
 func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segmentID int64) error {
+	return d.delete(ctx, sessionID, segmentID, false)
+}
+
+// DeleteText is "Delete text": it removes the segment's words from every
+// text store as Delete does, and records where they are in the recording,
+// which it leaves as it is, so refinement leaves them out
+// (storage.DeleteSegmentText). It splices nothing, keeps no recording it
+// downloads to find the words, and owes Drive no replacement: the ordinary
+// sync updates the session's Drive documents in place. A segment whose words
+// cannot be found in the recording is refused, as Delete refuses it.
+func (d *segmentDeleteRunner) DeleteText(ctx context.Context, sessionID string, segmentID int64) error {
+	return d.delete(ctx, sessionID, segmentID, true)
+}
+
+func (d *segmentDeleteRunner) delete(ctx context.Context, sessionID string, segmentID int64, keepAudio bool) error {
 	if d.store == nil {
 		return fmt.Errorf("segment deletion storage is not configured")
 	}
@@ -210,10 +229,12 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 	} else if pending {
 		return storage.ErrSegmentSplicePending
 	}
-	if d.transcriber == nil || d.ensureRecordings == nil || d.splice == nil {
+	if d.transcriber == nil || d.ensureRecordings == nil || !keepAudio && d.splice == nil {
 		return fmt.Errorf("segment deletion is not configured")
 	}
-	if strings.TrimSpace(d.audioDir) != "" {
+	// A raw recording kept beside the session's would still hold the audio
+	// a splice cuts; "Delete text" cuts none.
+	if !keepAudio && strings.TrimSpace(d.audioDir) != "" {
 		rawSessionIDs := []string{sessionID}
 		sources, err := d.store.SourceSessionIDs(sessionID)
 		if err != nil {
@@ -247,31 +268,35 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 			_ = os.Remove(downloaded)
 		}
 	}()
+	// The words "Delete text" already removed are still in the recordings,
+	// but they are no segment's: they are neither the segment's nor its
+	// neighbours' when it is located and its cut is checked.
 	candidates := make([]audio.Recording, len(recordings))
+	textSpans := make([][]storage.TextDeletionSpan, len(recordings))
 	for i, recording := range recordings {
 		words, err := d.transcriber.Words(ctx, recording)
 		if err != nil {
 			return fmt.Errorf("transcribe recording %s: %w", recording, err)
 		}
 		duration := wordDuration(words)
-		if d.duration != nil {
+		if !keepAudio && d.duration != nil {
 			duration, err = d.duration(ctx, recording)
 			if err != nil {
 				return fmt.Errorf("probe recording %s: %w", recording, err)
 			}
 		}
-		candidates[i] = audio.Recording{Words: words, Duration: duration}
+		if textSpans[i], err = d.deletedTextSpans(recording); err != nil {
+			return err
+		}
+		candidates[i] = audio.Recording{Words: wordsNotDeleted(words, textSpans[i], 0, 0), Duration: duration}
 	}
 	before, after := neighbourText(segments, index)
-	recordIndex, start, end, _, err := audio.Locate(candidates, segments[index].Text, before, after)
-	if err != nil {
-		if errors.Is(err, audio.ErrSegmentNotFound) {
-			return server.ErrSegmentNotFoundInRecording
-		}
-		return fmt.Errorf("locate segment in recording: %w", err)
+	if keepAudio {
+		return d.deleteText(ctx, sessionID, segmentID, segments[index].Text, before, after, &recordingSet, candidates)
 	}
-	if recordIndex < 0 || recordIndex >= len(recordings) {
-		return fmt.Errorf("locator returned recording index %d for %d recordings", recordIndex, len(recordings))
+	recordIndex, start, end, _, err := audio.Locate(candidates, segments[index].Text, before, after)
+	if err := locatedRecording(recordIndex, len(recordings), err); err != nil {
+		return err
 	}
 
 	recording := recordings[recordIndex]
@@ -303,6 +328,7 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 	if err != nil {
 		return fmt.Errorf("transcribe spliced recording %s: %w", recording, err)
 	}
+	wordsAfter = wordsNotDeleted(wordsAfter, textSpans[recordIndex], start, end-start)
 	if survivors := audio.Survivors(wordsAfter, start, segments[index].Text, before, after); len(survivors) > 0 {
 		return fmt.Errorf("%w: surviving words: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(survivors, ", "))
 	}
@@ -355,6 +381,102 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 		return maintenanceErr
 	}
 	return nil
+}
+
+// deletedTextSpans returns the spans "Delete text" recorded in recording that
+// describe its bytes as they are now (storage.TextDeletionSpan.SHA256).
+func (d *segmentDeleteRunner) deletedTextSpans(recording string) ([]storage.TextDeletionSpan, error) {
+	spans, err := d.store.TextDeletionSpans(recording)
+	if err != nil || len(spans) == 0 {
+		return nil, err
+	}
+	hash, err := fileSHA256(recording)
+	if err != nil {
+		return nil, fmt.Errorf("hash recording %s: %w", recording, err)
+	}
+	current := spans[:0]
+	for _, span := range spans {
+		if span.SHA256 == hash {
+			current = append(current, span)
+		}
+	}
+	return current, nil
+}
+
+// wordsNotDeleted returns words without the ones "Delete text" removed from
+// their recording (storage.TextDeleted by spans). For the words of a copy
+// with cutLength seconds cut out at cutStart, a word after the cut is that
+// much later in the recording the spans describe.
+func wordsNotDeleted(words []audio.Word, spans []storage.TextDeletionSpan, cutStart, cutLength float64) []audio.Word {
+	if len(spans) == 0 {
+		return words
+	}
+	kept := make([]audio.Word, 0, len(words))
+	for _, word := range words {
+		start, end := word.Start, word.End
+		if cutLength > 0 && (start+end)/2 >= cutStart {
+			start, end = start+cutLength, end+cutLength
+		}
+		if !storage.TextDeleted(spans, start, end) {
+			kept = append(kept, word)
+		}
+	}
+	return kept
+}
+
+// locatedRecording is the runner's error for a locator's answer: none for a
+// match in one of n recordings, server.ErrSegmentNotFoundInRecording when the
+// segment's words were not found, so the deletion is refused.
+func locatedRecording(record, n int, err error) error {
+	if err != nil {
+		if errors.Is(err, audio.ErrSegmentNotFound) {
+			return server.ErrSegmentNotFoundInRecording
+		}
+		return fmt.Errorf("locate segment in recording: %w", err)
+	}
+	if record < 0 || record >= n {
+		return fmt.Errorf("locator returned recording index %d for %d recordings", record, n)
+	}
+	return nil
+}
+
+// deleteText is DeleteText's work once the recordings are transcribed
+// (candidates, the recordings' words, in session order): it locates the
+// segment's aligned words, records their span with the deletion, removes the
+// recordings it downloaded to find them, and makes the refinement and
+// summary again, without the words: the refinement when the session still
+// has audio, the summary alone when it has none.
+func (d *segmentDeleteRunner) deleteText(ctx context.Context, sessionID string, segmentID int64, text, before, after string, recordings *deletionRecordingSet, candidates []audio.Recording) error {
+	recordIndex, start, end, _, err := audio.LocateWords(candidates, text, before, after)
+	if err := locatedRecording(recordIndex, len(recordings.Paths), err); err != nil {
+		return err
+	}
+	recording := recordings.Paths[recordIndex]
+	hash, err := fileSHA256(recording)
+	if err != nil {
+		return fmt.Errorf("hash recording %s: %w", recording, err)
+	}
+	maintenanceErr := d.store.DeleteSegmentText(sessionID, segmentID, storage.TextDeletionSpan{AudioPath: recording, Start: start, End: end, SHA256: hash})
+	if maintenanceErr != nil && !errors.Is(maintenanceErr, storage.ErrSegmentPostCommitMaintenance) {
+		return maintenanceErr
+	}
+	removeFiles(recordings.Downloaded)
+	updated, err := d.store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("get session %s after deleting text: %w", sessionID, err)
+	}
+	if strings.TrimSpace(updated.AudioPath) != "" {
+		if d.refine != nil {
+			if err := d.refine(ctx, sessionID, updated.AudioPath, updated.StartedAt); err != nil {
+				return fmt.Errorf("refine session %s after deleting text: %w", sessionID, err)
+			}
+		}
+	} else if d.summarize != nil {
+		if err := d.summarize(ctx, sessionID, updated.StartedAt); err != nil {
+			return fmt.Errorf("summarize session %s after deleting text: %w", sessionID, err)
+		}
+	}
+	return maintenanceErr
 }
 
 // recordingHasWordsOnSide reports whether the selected recording has words on
