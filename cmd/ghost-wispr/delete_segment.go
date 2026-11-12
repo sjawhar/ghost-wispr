@@ -467,7 +467,9 @@ func (d *segmentDeleteRunner) deleteText(ctx context.Context, sessionID string, 
 	if err != nil {
 		return fmt.Errorf("get session %s after deleting text: %w", sessionID, err)
 	}
-	if strings.TrimSpace(updated.AudioPath) != "" {
+	// The deletion leaves nothing to refine (no_audio) when the session's
+	// audio, or part of it, was removed to free space.
+	if updated.RefinementStatus != storage.RefinementNoAudio && strings.TrimSpace(updated.AudioPath) != "" {
 		if d.refine != nil {
 			if err := d.refine(ctx, sessionID, updated.AudioPath, updated.StartedAt); err != nil {
 				return fmt.Errorf("refine session %s after deleting text: %w", sessionID, err)

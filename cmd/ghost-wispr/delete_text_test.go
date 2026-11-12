@@ -336,3 +336,41 @@ func TestDeletingTextAndAudioNextToDeletedTextIsNotRefused(t *testing.T) {
 		t.Errorf("segments = %+v, want the two kept", segments)
 	}
 }
+
+// TestDeleteTextWithPartOfTheAudioRemovedSummarizesWithoutRefining fails if
+// "Delete text" of a session whose audio was partly removed to free space
+// refines what is left: that would drop the words of the removed recordings
+// from its transcript.
+func TestDeleteTextWithPartOfTheAudioRemovedSummarizesWithoutRefining(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, segmentID, _ := newDeletionTestStore(t, recording)
+	if _, err := store.DB().Exec(`UPDATE sessions SET audio_removed_at = '2026-11-11T13:00:00Z' WHERE id = 'session'`); err != nil {
+		t.Fatal(err)
+	}
+	summarized := false
+	runner := segmentDeleteRunner{
+		store:       store,
+		transcriber: deletionWordsFake{before: initialWords()},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		splice: refusingSplice(t),
+		refine: func(context.Context, string, string, time.Time) error {
+			t.Error("Delete text refined a session with part of its audio removed")
+			return nil
+		},
+		summarize: func(context.Context, string, time.Time) error {
+			summarized = true
+			return nil
+		},
+	}
+	if err := runner.DeleteText(context.Background(), "session", segmentID); err != nil {
+		t.Fatalf("DeleteText: %v", err)
+	}
+	if !summarized {
+		t.Error("Delete text of a session with part of its audio removed did not make its summary again")
+	}
+}

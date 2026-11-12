@@ -59,19 +59,22 @@ func (s *SQLiteStore) DeleteSegmentText(sessionID string, segmentID int64, span 
 
 // recordTextDeletionSpan records, in tx, the span of sessionID's recording
 // that a "Delete text" deletion's words are in: the recording's file name,
-// the times and the recording's SHA-256, never the words. And each of
-// sources (the sessions merged into sessionID) that has a Drive folder of
-// its own, whose documents the deletion changed, owes that folder a
-// refresh of them in place (DriveDocumentsOwed): no sync of a merged
-// session reaches it otherwise.
+// the times and the recording's SHA-256, never the words. And sessionID and
+// each of sources (the sessions merged into it) that has a Drive folder of
+// its own, whose documents the deletion changed, owes that folder a refresh
+// of them in place (drive_documents_pending): the session's own sync does it
+// and clears the mark (MarkSynced); a merged source, which no sync of its
+// own reaches, is refreshed by every sync of the session it was merged into
+// and by the sweep (DriveDocumentsOwed), also when the session the deletion
+// was made in is merged before its sync ran.
 func recordTextDeletionSpan(tx *sql.Tx, sessionID string, sources []string, span *DeletedSpan) error {
 	if _, err := tx.Exec(`INSERT INTO deleted_text_spans(session_id, recording, start, end, sha256, deleted_at) VALUES(?, ?, ?, ?, ?, ?)`,
 		sessionID, filepath.Base(strings.TrimSpace(span.AudioPath)), span.Start, span.End, span.SHA256Before, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("record deleted text span for session %s: %w", sessionID, err)
 	}
-	for _, source := range sources {
-		if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = ? AND gdrive_folder_id != ''`, source); err != nil {
-			return fmt.Errorf("owe the Drive folder of merged session %s its documents: %w", source, err)
+	for _, id := range append([]string{sessionID}, sources...) {
+		if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = ? AND gdrive_folder_id != ''`, id); err != nil {
+			return fmt.Errorf("owe the Drive folder of session %s its documents: %w", id, err)
 		}
 	}
 	return nil
@@ -108,8 +111,10 @@ func (s *SQLiteStore) DriveDocumentsOwed(sessionID string) ([]string, error) {
 // ClearDriveDocumentsPending records that merged session id's Drive folder
 // has its documents as they are now, only while unchanged reports true for
 // the session as it is now, read in the same transaction, and reports
-// whether it did. unchanged runs inside the transaction: it must not use the
-// store.
+// whether it did. When the session changed, it marks the folder owed again:
+// the refresh that read it before the change may have uploaded after a newer
+// one cleared the mark, so only another refresh puts the current documents
+// back. unchanged runs inside the transaction: it must not use the store.
 func (s *SQLiteStore) ClearDriveDocumentsPending(id string, unchanged func(Session) bool) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -120,16 +125,17 @@ func (s *SQLiteStore) ClearDriveDocumentsPending(id string, unchanged func(Sessi
 	if err != nil {
 		return false, err
 	}
+	pending, cleared := 0, true
 	if !unchanged(sess) {
-		return false, nil
+		pending, cleared = 1, false
 	}
-	if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = 0 WHERE id = ?`, id); err != nil {
-		return false, fmt.Errorf("clear the owed Drive documents of session %s: %w", id, err)
+	if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = ? WHERE id = ?`, pending, id); err != nil {
+		return false, fmt.Errorf("record the owed Drive documents of session %s: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit clearing the owed Drive documents of session %s: %w", id, err)
+		return false, fmt.Errorf("commit the owed Drive documents of session %s: %w", id, err)
 	}
-	return true, nil
+	return cleared, nil
 }
 
 // TextDeletionSpans returns the spans "Delete text" recorded in recording,

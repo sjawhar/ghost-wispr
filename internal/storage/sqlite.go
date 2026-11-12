@@ -668,7 +668,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 	// deleted_text_spans: where, in a recording that keeps them, the words of
 	// a segment "Delete text" deleted are (DeleteSegmentText): the recording's
 	// file name, the span's times in it and the recording's SHA-256, never
-	// the words. Refinement drops the words it finds in a span.
+	// the words. Refinement drops the words it finds in a span. A span
+	// belongs to its recording, not to the session the deletion was made in
+	// (session_id), which a merge can leave as a row of its own that is
+	// deleted while the recording lives on: so no foreign key takes it.
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS deleted_text_spans (
 			session_id TEXT NOT NULL,
@@ -676,8 +679,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			start REAL NOT NULL,
 			end REAL NOT NULL,
 			sha256 TEXT NOT NULL,
-			deleted_at TEXT NOT NULL,
-			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+			deleted_at TEXT NOT NULL
 		);
 	`); err != nil {
 		return fmt.Errorf("create deleted_text_spans table: %w", err)
@@ -1679,7 +1681,7 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET sync_state = ?, sync_status = ?, gdrive_folder_id = CASE WHEN ? != '' THEN ? ELSE gdrive_folder_id END,
-		     retry_count = 0, last_sync_attempt = NULL, error_message = '', sync_claim = '', sync_claimed_from = '', documents_unverified = 0
+		     retry_count = 0, last_sync_attempt = NULL, error_message = '', sync_claim = '', sync_claimed_from = '', documents_unverified = 0, drive_documents_pending = 0
 		 WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
 		SyncStateSynced, SyncSynced, driveFolderID, driveFolderID,
 		id, SyncStateSyncing, claim,

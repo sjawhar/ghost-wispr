@@ -511,8 +511,9 @@ check_mode_required() {
     reason='the 400 carries no JSON error'
     return 1
   }
-  if ! matches "$message" '(^|[^_[:alnum:]])text_and_audio([^_[:alnum:]]|$)' \
-    || ! matches "$message" '(^|[^_[:alnum:]])text([^_[:alnum:]]|$)'; then
+  # The API quotes each mode, so the word "text" in "Delete text and audio"
+  # does not count as naming the text mode.
+  if ! matches "$message" '"text_and_audio"' || ! matches "$message" '"text"'; then
     reason="the error does not name both modes: $message"
     return 1
   fi
@@ -2168,10 +2169,11 @@ $(session_field "$detail" summary)"
   expect 0 'the evidence the Pi-side requests return passes A11' evaluated evaluate_audio_after "$evidence" "$detail" '[]' "$found"
   printf 'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence\n'
 
-  expect 0 'a 400 that names both modes passes' check_mode_required 400 '{"error":"mode must be text or text_and_audio"}'
+  expect 1 'a 400 whose unquoted text names only one mode fails' check_mode_required 400 \
+    '{"error":"mode must be \"text_and_audio\" (Delete text and audio)"}'
   expect 0 "the API's 400 for a deletion without a mode passes" check_mode_required 400 \
     '{"error":"mode must be \"text\" (Delete text: the words only; the recording and the Drive files stay) or \"text_and_audio\" (Delete text and audio: the words, their audio, and the Drive files replaced)"}'
-  expect 1 'a 400 that names one mode fails' check_mode_required 400 '{"error":"mode must be text_and_audio"}'
+  expect 1 'a 400 that names one mode fails' check_mode_required 400 '{"error":"mode must be \"text_and_audio\""}'
   expect 1 'a 400 without a JSON error fails' check_mode_required 400 'bad request'
   expect 1 'a deletion without a mode that answers 204 fails' check_mode_required 204 ''
   expect 1 'a build that reads the session before the mode fails' check_mode_required 404 '{"error":"get session: not found"}'

@@ -113,8 +113,9 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *Del
 		return fmt.Errorf("delete segment %d from session %s: %w", segmentID, sessionID, err)
 	}
 	canonical := canonicalTranscript(remaining)
-	// A session with no recording left to refine ("Delete text" of one whose
-	// audio was removed to free space) has nothing a refinement could run on.
+	// A session with no recording, or only part of it, left to refine
+	// ("Delete text" of one whose audio was removed to free space) has
+	// nothing a refinement could rebuild its whole transcript from.
 	// The session goes back to pending sync, but for two sync states: one
 	// a sync holds (SYNCING) is left to that sync, whose end records the
 	// folder it made as owed (oweFolderOfPendingDeletion); one whose Drive
@@ -129,7 +130,7 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *Del
 			speaker_names = '{}',
 			refined_transcript = '',
 			refinement_model = '',
-			refinement_status = CASE WHEN ? AND audio_path = '' THEN ? ELSE ? END,
+			refinement_status = CASE WHEN ? AND (audio_path = '' OR audio_removed_at != '') THEN ? ELSE ? END,
 			summary_status = ?,
 			summary_error = '',
 			canonical_transcript = ?,
@@ -364,8 +365,11 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 		}
 	}
 	for _, id := range sources {
+		// The source's generation moves too, so a refinement or summary of
+		// it started before the deletion cannot store the words it read.
 		if _, err := tx.Exec(`UPDATE sessions
-			SET title = '', summary = '', summary_model = '', speaker_names = '{}', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?
+			SET title = '', summary = '', summary_model = '', speaker_names = '{}', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?,
+				deletion_generation = deletion_generation + 1
 			WHERE id = ?`, canonicalTranscript(own[id]), TranscriptSourceStreaming, id); err != nil {
 			return nil, nil, fmt.Errorf("scrub merged source %s: %w", id, err)
 		}
