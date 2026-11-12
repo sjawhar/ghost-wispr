@@ -34,25 +34,6 @@ func TestR4RecoveryKeepsRecordingWhenResplicedHashDiffers(t *testing.T) {
 	}
 }
 
-// heldDownloadFake downloads like deletionDriveFake and keeps a descriptor on
-// each file it writes, so a test reads the file's inode after it is removed.
-type heldDownloadFake struct {
-	deletionDriveFake
-	held []*os.File
-}
-
-func (f *heldDownloadFake) DownloadRecording(ctx context.Context, folderID, name, destination string) error {
-	if err := f.deletionDriveFake.DownloadRecording(ctx, folderID, name, destination); err != nil {
-		return err
-	}
-	held, err := os.Open(destination)
-	if err != nil {
-		return err
-	}
-	f.held = append(f.held, held)
-	return nil
-}
-
 // TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers fails if a
 // recovery whose re-splice produces another hash leaves the recording it
 // downloaded from Drive (the unspliced original, deleted segment included) at
@@ -65,15 +46,10 @@ func TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers(t *testing.T) {
 	if err := os.Remove(recording); err != nil {
 		t.Fatal(err)
 	}
-	drive := &heldDownloadFake{deletionDriveFake: deletionDriveFake{
+	drive := &deletionDriveFake{
 		files:     []*drive.File{{Name: "audio-" + filepath.Base(recording), MimeType: "audio/mpeg"}},
 		downloads: map[string][]byte{"audio-" + filepath.Base(recording): []byte("original")},
-	}}
-	t.Cleanup(func() {
-		for _, f := range drive.held {
-			_ = f.Close()
-		}
-	})
+	}
 	wrongSplice := func(_ context.Context, path string, _, _ float64) (string, error) {
 		if err := os.WriteFile(path, []byte("different-cut"), 0o600); err != nil {
 			return "", err
@@ -85,8 +61,8 @@ func TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers(t *testing.T) {
 	if err != nil || len(outcomes) != 1 || outcomes[0].Recovered || outcomes[0].Err == nil {
 		t.Fatalf("outcomes=%v err=%v, want one failed, unrecovered row", outcomes, err)
 	}
-	if len(drive.held) != 1 {
-		t.Fatalf("control: recovery downloaded %d recordings, want the one missing", len(drive.held))
+	if len(drive.downloaded) != 1 {
+		t.Fatalf("control: recovery downloaded %d recordings, want the one missing", len(drive.downloaded))
 	}
 	if _, err := os.Stat(recording); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the recording downloaded for the failed recovery is still at %s (%v)", recording, err)
