@@ -60,8 +60,27 @@ type wireDrive struct {
 	next         int
 	clock        time.Time
 	rootID       string
-	// gone holds the folders deleted by hand, for good: Drive answers 404
-	// for each, as for any file it does not have.
+	// sharedDrive makes rootID a shared drive's root, as Drive answers for
+	// one under the app's drive.file scope (measured through the app on the
+	// office Pi on 2026-11-11): files.get answers 404 for it, as for an id
+	// Drive does not have, since the app did not create it; a list of its
+	// children without corpora answers 200, with none for an id Drive does
+	// not have; and a list with corpora "drive" and its driveId answers 200
+	// while the app is a member, and 404 "Shared drive not found" for an id
+	// Drive does not have. That the list without corpora answers the files
+	// the app made there is Drive's documented corpora "user" (files the
+	// user has accessed, shared drives' too), not measured: it answered no
+	// files for the real drive then. The root deleted by hand (deleteByHand)
+	// is the app no longer a member of the drive, answered as an id Drive
+	// does not have (not measured: only the drive's Manager can remove the
+	// app).
+	// Unset, rootID is a folder in My Drive that files.get reads, as it does
+	// for one the app created.
+	sharedDrive bool
+	// gone holds the folders deleted by hand, for good: as for any id Drive
+	// does not have, files.get answers 404 for each, and a list of its
+	// files without corpora 200 with none (measured for a made-up id on the
+	// office Pi on 2026-11-11).
 	gone map[string]bool
 	// trashed holds the folders in the trash. A file in one is in the trash
 	// too, as on Drive: a list of what is not trashed leaves it out.
@@ -71,6 +90,19 @@ type wireDrive struct {
 	onUpload func(folder string)
 	// unavailable makes Drive answer 503 to every request for a file.
 	unavailable bool
+	// driveUnavailable makes Drive answer 503 to every list of a shared
+	// drive's files (corpora "drive").
+	driveUnavailable bool
+	// driveFolderListUnavailable makes Drive answer 503 only to a list of a
+	// shared drive's folders (corpora "drive", asking for folders), so the
+	// list of any of its files still answers.
+	driveFolderListUnavailable bool
+	// unscopedListsMiss makes every list without corpora answer 200 with no
+	// files, while the shared drive's own list (corpora "drive") still holds
+	// the files the app made: Drive not keeping what its documentation says
+	// of a list without corpora (the files the user has accessed, shared
+	// drives' too), which was not measured with files there.
+	unscopedListsMiss bool
 	// onGet, when set, runs as Drive is asked for a file (Files.Get), with
 	// its id, while the server holds its lock.
 	onGet func(id string)
@@ -80,10 +112,16 @@ type wireDrive struct {
 	onList func(folder string)
 }
 
-var parentQuery = regexp.MustCompile(`'([^']+)' in parents`)
+// parentQuery reads the parent a list asks for: the query starts with it,
+// quoted, with a quote or a backslash in it escaped by a backslash, as Drive
+// reads a query.
+var parentQuery = regexp.MustCompile(`^'((?:[^'\\]|\\.)*)' in parents`)
+
+// unquote undoes the escapes parentQuery allows.
+var unquote = strings.NewReplacer(`\'`, `'`, `\\`, `\`)
 
 // newWireDrive starts the server and returns it with a Syncer whose root
-// folder is "root".
+// folder is "root", a folder in My Drive.
 func newWireDrive(t *testing.T) (*wireDrive, *Syncer) {
 	t.Helper()
 	d := &wireDrive{t: t, rootID: "root", clock: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)}
@@ -94,6 +132,18 @@ func newWireDrive(t *testing.T) (*wireDrive, *Syncer) {
 		t.Fatalf("drive service: %v", err)
 	}
 	return d, &Syncer{service: svc, folderID: d.rootID, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+}
+
+// sharedDriveID is the shared drive newSharedDriveWire's Syncer syncs into.
+const sharedDriveID = "shared-drive-root"
+
+// newSharedDriveWire is newWireDrive with the Syncer syncing into the root of
+// shared drive sharedDriveID, as the drive.file scope sees it (sharedDrive).
+func newSharedDriveWire(t *testing.T) (*wireDrive, *Syncer) {
+	t.Helper()
+	d, s := newWireDrive(t)
+	d.rootID, d.sharedDrive, s.folderID = sharedDriveID, true, sharedDriveID
+	return d, s
 }
 
 // add puts a file in folder parent, as an earlier version of the app left it,
@@ -135,6 +185,13 @@ func (d *wireDrive) find(id string) *wireFile {
 	return nil
 }
 
+// hasParent reports whether Drive has folder id to create a file in: the
+// root, unless deleted by hand, or a folder it holds. A create under any
+// other id, a made-up one included, is answered 404 "File not found".
+func (d *wireDrive) hasParent(id string) bool {
+	return !d.gone[id] && (id == d.rootID || d.find(id) != nil)
+}
+
 // deleteByHand deletes folder id and every file in it for good, as a user can
 // on Drive (deleting it, then emptying the trash).
 func (d *wireDrive) deleteByHand(id string) {
@@ -157,6 +214,9 @@ func (d *wireDrive) trash(id string) {
 
 // trashLocked is trash for a caller holding the lock (onUpload).
 func (d *wireDrive) trashLocked(id string) {
+	if d.sharedDrive && id == d.rootID {
+		d.t.Errorf("Drive: a shared drive's root (%s) cannot be trashed", id)
+	}
 	if d.trashed == nil {
 		d.trashed = map[string]bool{}
 	}
@@ -182,12 +242,22 @@ func (d *wireDrive) inTrash(f *wireFile) bool {
 
 // notFound answers as Drive does for a file it does not have.
 func notFound(w http.ResponseWriter, id string) {
-	message := "File not found: " + id + "."
+	driveNotFound(w, "File not found: "+id+".", "fileId")
+}
+
+// sharedDriveNotFound answers as Drive does for a list of a shared drive it
+// does not have, and, as the fake takes it (not measured), for one whose
+// members the app is not one of.
+func sharedDriveNotFound(w http.ResponseWriter, id string) {
+	driveNotFound(w, "Shared drive not found: "+id, "driveId")
+}
+
+func driveNotFound(w http.ResponseWriter, message, location string) {
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	w.WriteHeader(http.StatusNotFound)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
 		"errors": []map[string]string{{
-			"domain": "global", "reason": "notFound", "message": message, "locationType": "parameter", "location": "fileId",
+			"domain": "global", "reason": "notFound", "message": message, "locationType": "parameter", "location": location,
 		}},
 		"code":    http.StatusNotFound,
 		"message": message,
@@ -222,12 +292,32 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/drive/v3/files":
 		m := parentQuery.FindStringSubmatch(r.URL.Query().Get("q"))
 		if m == nil {
-			d.t.Errorf("Drive: list without a parent: %q", r.URL.Query().Get("q"))
-			http.Error(w, "bad query", http.StatusBadRequest)
+			if !strings.Contains(r.URL.Query().Get("q"), " in parents") {
+				d.t.Errorf("Drive: list without a parent: %q", r.URL.Query().Get("q"))
+			}
+			// As Drive answers a query it cannot read.
+			http.Error(w, `{"error":{"code":400,"message":"Invalid Value"}}`, http.StatusBadRequest)
 			return
 		}
-		if d.gone[m[1]] {
-			notFound(w, m[1])
+		m[1] = unquote.Replace(m[1])
+		if corpora := r.URL.Query().Get("corpora"); corpora != "" {
+			driveID := r.URL.Query().Get("driveId")
+			if corpora != "drive" || driveID == "" {
+				d.t.Errorf("Drive: list with corpora %q and driveId %q", corpora, driveID)
+				http.Error(w, "unexpected corpora", http.StatusBadRequest)
+				return
+			}
+			if d.driveUnavailable || (d.driveFolderListUnavailable && strings.Contains(r.URL.Query().Get("q"), "mimeType = 'application/vnd.google-apps.folder'")) {
+				http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
+				return
+			}
+			if !d.sharedDrive || driveID != d.rootID || d.gone[driveID] {
+				sharedDriveNotFound(w, driveID)
+				return
+			}
+		}
+		if r.URL.Query().Get("corpora") == "" && d.unscopedListsMiss {
+			_ = json.NewEncoder(w).Encode(&drive.FileList{})
 			return
 		}
 		request := wireListRequest{Parent: m[1], PageToken: r.URL.Query().Get("pageToken")}
@@ -278,10 +368,10 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
 			return
 		}
-		if id == d.rootID && !d.gone[id] {
-			// The folder the Syncer syncs into. It is a shared-drive root,
-			// whose ID is also its Drive ID.
-			_ = json.NewEncoder(w).Encode(&drive.File{Id: id, DriveId: d.rootID, Trashed: d.trashed[id], ExplicitlyTrashed: d.trashed[id]})
+		if id == d.rootID && !d.gone[id] && !d.sharedDrive {
+			// The folder the Syncer syncs into, a folder in My Drive. A
+			// shared drive's root is not found, as for the drive.file scope.
+			_ = json.NewEncoder(w).Encode(&drive.File{Id: id, MimeType: "application/vnd.google-apps.folder", Trashed: d.trashed[id], ExplicitlyTrashed: d.trashed[id]})
 			return
 		}
 		f := d.find(id)
@@ -296,7 +386,7 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if parent := firstParent(meta.Parents); d.gone[parent] {
+		if parent := firstParent(meta.Parents); !d.hasParent(parent) {
 			notFound(w, parent)
 			return
 		}
@@ -308,7 +398,7 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		parent := firstParent(meta.Parents)
-		if d.gone[parent] {
+		if !d.hasParent(parent) {
 			notFound(w, parent)
 			return
 		}

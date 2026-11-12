@@ -109,3 +109,30 @@ func TestCountUnverifiedSessionsSkipsARemoteDeletedSession(t *testing.T) {
 		t.Errorf("CountUnverifiedSessions after remote deletion = %d, %v; want 0", n, err)
 	}
 }
+
+// A REMOTE_DELETED session is kept on this unit only while it still names
+// audio here: one whose audio is gone holds no copy GC could free, so it is
+// not counted. A synced session is never counted.
+func TestCountUnitOnlySessionsCountsOnlyRemoteDeletedSessionsWithAudio(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	const noAudio, withAudio, synced = "20261106090200", "20261106090300", "20261106090400"
+	syncedSessionInFolder(t, store, noAudio)
+	for _, id := range []string{withAudio, synced} {
+		started := time.Now().UTC().AddDate(0, 0, -60)
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if err := store.EndSession(id, started.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+			t.Fatalf("end: %v", err)
+		}
+		syncTo(t, store, id, SyncStateSynced, "folder-1", 0, "")
+	}
+	for _, id := range []string{noAudio, withAudio} {
+		if marked, err := store.MarkRemoteDeleted(id, "folder-1", "the folder is gone"); err != nil || !marked {
+			t.Fatalf("mark %s remote deleted: %v, %v", id, marked, err)
+		}
+	}
+	if n, err := store.CountUnitOnlySessions(); err != nil || n != 1 {
+		t.Errorf("CountUnitOnlySessions = %d, %v; want 1, the REMOTE_DELETED session with audio only", n, err)
+	}
+}
