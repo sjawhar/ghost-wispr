@@ -183,7 +183,11 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	if err != nil {
 		return err
 	}
-	if segments["id"] {
+	// rebuildable: the deleted segment was found by its id, so the remaining
+	// segments are the ones the canonical transcript may be rebuilt from.
+	rebuildable := false
+	switch {
+	case segments["id"]:
 		var holder string
 		err := tx.QueryRow(`SELECT session_id FROM segments WHERE id = ?`, segmentID).Scan(&holder)
 		switch {
@@ -195,6 +199,21 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 		}
 		if _, err := tx.Exec(`DELETE FROM segments WHERE id = ?`, segmentID); err != nil {
 			return fmt.Errorf("delete the segment from the backup: %w", err)
+		}
+		rebuildable = true
+	case segments["text"]:
+		// With no id, the segment is found by its text, in the sessions that
+		// can hold it: every segment there with that text goes, an identical
+		// line kept elsewhere in those sessions with it.
+		query, args := `DELETE FROM segments WHERE text = ?`, []any{deletedText}
+		if segments["session_id"] {
+			query += ` AND session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
+			for _, id := range affected {
+				args = append(args, id)
+			}
+		}
+		if _, err := tx.Exec(query, args...); err != nil {
+			return fmt.Errorf("delete the segment from the backup by its text: %w", err)
 		}
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",")
@@ -215,10 +234,16 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	}
 	// Each affected session's canonical transcript is rebuilt from the
 	// backup's own remaining segments, in its order, as this version writes
-	// one; a schema without them has it cleared. Nothing depends on how the
-	// build that made the backup formatted it.
+	// one; it is cleared when the schema has no segments to rebuild it from,
+	// or when the deleted segment could not be found by its id (a rebuild could
+	// write its words back). Nothing depends on how the build that made the
+	// backup formatted it.
 	if sessions["canonical_transcript"] {
-		if err := rebuildBackupCanonical(tx, segments, affected); err != nil {
+		rebuildFrom := segments
+		if !rebuildable {
+			rebuildFrom = nil
+		}
+		if err := rebuildBackupCanonical(tx, rebuildFrom, affected); err != nil {
 			return err
 		}
 	}
