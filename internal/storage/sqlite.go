@@ -1196,7 +1196,8 @@ func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, s
 }
 
 // UpdateSummaryWithModel atomically stores a summary and the model reported by
-// the provider that generated it.
+// the provider that generated it. An empty summary keeps the summary the
+// session has, and the model that made it.
 func (s *SQLiteStore) UpdateSummaryWithModel(sessionID, title, summary, status, preset, speakerNames, model string) error {
 	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, model, -1)
 }
@@ -1231,7 +1232,7 @@ func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, s
 		     summary_preset = CASE WHEN ? != '' THEN ? ELSE summary_preset END,
 		     speaker_names = CASE WHEN ? != '' THEN ? ELSE speaker_names END,
 		     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
-		     summary_model = CASE WHEN ? != '' THEN ? ELSE summary_model END,
+		     summary_model = CASE WHEN ? != '' AND ? != '' THEN ? ELSE summary_model END,
 		     summary_version = CASE WHEN ? THEN summary_version + 1 ELSE summary_version END,
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
@@ -1241,7 +1242,7 @@ func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, s
 		summary, preset,
 		summary, speakerNames,
 		summary, summary,
-		model, model,
+		summary, model, model,
 		bumpVersion,
 		bumpVersion, EnvoyPublishPending,
 		status,
@@ -1305,7 +1306,9 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 	if title != "" && title != current.Title {
 		return true
 	}
-	if model != "" && model != current.SummaryModel {
+	// An empty summary keeps the summary the session has, and with it the
+	// model that made it.
+	if summary != "" && model != "" && model != current.SummaryModel {
 		return true
 	}
 	return summary != "" && (summary != current.Summary || preset != current.SummaryPreset || speakerNames != current.SpeakerNames)
