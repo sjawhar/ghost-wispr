@@ -30,6 +30,39 @@ func (sweepStoreStub) OwedDriveReplacements() ([]storage.OwedDriveReplacement, e
 	return nil, nil
 }
 
+func (sweepStoreStub) RetryOwedErasure() error { return nil }
+
+// erasureRetryStore counts the retries of owed erasures it is asked for.
+type erasureRetryStore struct {
+	sweepStoreStub
+	retries atomic.Int64
+}
+
+func (s *erasureRetryStore) RetryOwedErasure() error {
+	s.retries.Add(1)
+	return nil
+}
+
+// TestTheSyncSweepRetriesOwedErasures fails if the sync sweep does not retry,
+// on each pass and with Drive sync off, the erase a deletion still owes the
+// write-ahead log and the pre-migration backup.
+func TestTheSyncSweepRetriesOwedErasures(t *testing.T) {
+	store := &erasureRetryStore{}
+	ctx, cancel := context.WithCancel(context.Background())
+	swept := goDone(func() { sweepDriveSync(ctx, store, &driveSync{}, newWarningsRegistry(), time.Millisecond) })
+	t.Cleanup(func() {
+		cancel()
+		<-swept
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for store.retries.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := store.retries.Load(); got < 2 {
+		t.Fatalf("the sweep retried owed erasures %d times with sync off, want one per pass", got)
+	}
+}
+
 // countingSyncer counts the syncs it is asked for.
 type countingSyncer struct{ calls atomic.Int64 }
 

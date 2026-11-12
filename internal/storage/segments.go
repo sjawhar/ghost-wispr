@@ -164,12 +164,19 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
 		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
 	}
-	if _, err := tx.Exec(`
-		INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)`,
+	// The erase after the commit is owed until it finishes (erase_owed), so a
+	// failure, or the app stopping, leaves it for RetryOwedErasure.
+	recorded, err := tx.Exec(`
+		INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, erase_owed)
+		VALUES(?, ?, ?, ?, ?, ?, ?, 1)`,
 		sessionID, span.AudioPath, span.Start, span.End, span.SHA256Before, span.SHA256After, time.Now().UTC().Format(time.RFC3339Nano),
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("record deleted span for session %s: %w", sessionID, err)
+	}
+	deletedSpanRow, err := recorded.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("read deleted span row for session %s: %w", sessionID, err)
 	}
 	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, &span); err != nil {
 		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
@@ -180,11 +187,28 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
 	}
+	return s.eraseAfterDeletion(deletedSpanRow, segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span)
+}
+
+// eraseAfterDeletion erases a committed deletion from the write-ahead log and
+// the pre-migration backup, and records the erase done on its deleted-span row
+// (deletedSpanRow). A failure leaves the erase owed: the deletion's error
+// wraps ErrSegmentPostCommitMaintenance, and RetryOwedErasure finishes it at
+// the next start or sweep.
+func (s *SQLiteStore) eraseAfterDeletion(deletedSpanRow, segmentID int64, deletedText string, owners, holders []string, span *DeletedSpan) error {
+	s.eraseMu.Lock()
+	defer s.eraseMu.Unlock()
 	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
 		return fmt.Errorf("%w: %v", ErrSegmentPostCommitMaintenance, err)
 	}
-	if err := s.eraseFromBackup(segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span); err != nil {
+	if err := s.eraseFromBackup(segmentID, deletedText, owners, holders, span); err != nil {
 		return fmt.Errorf("%w: pre-migration backup: %v", ErrSegmentPostCommitMaintenance, err)
+	}
+	if err := s.eraseOrphans(); err != nil {
+		return fmt.Errorf("%w: %v", ErrSegmentPostCommitMaintenance, err)
+	}
+	if _, err := s.db.Exec(`UPDATE deleted_segments SET erase_owed = 0 WHERE rowid = ?`, deletedSpanRow); err != nil {
+		return fmt.Errorf("%w: record the erase done: %v", ErrSegmentPostCommitMaintenance, err)
 	}
 	return nil
 }

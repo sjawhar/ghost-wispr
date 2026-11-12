@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -165,6 +166,10 @@ type SQLiteStore struct {
 	// path is the database file, beside which createPreMigrationBackup keeps
 	// its backup.
 	path string
+	// eraseMu keeps a deletion's erase from the write-ahead log and the
+	// backup, and a retry of an owed one (RetryOwedErasure), from running at
+	// once: both overwrite the log and take the backup again.
+	eraseMu sync.Mutex
 }
 
 func syncStatusFromState(syncState string) string {
@@ -255,7 +260,7 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 	}()
 	// VACUUM INTO reads one consistent snapshot of the database, the
 	// write-ahead log included.
-	if _, err := db.Exec(`VACUUM INTO ?`, partPath); err != nil {
+	if err := vacuumInto(db, partPath); err != nil {
 		return fmt.Errorf("copy db to backup: %w", err)
 	}
 	// SQLite does not flush the copy VACUUM INTO writes.
@@ -272,6 +277,14 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 
 	slog.Info("pre-migration backup created", "path", backupPath)
 	return nil
+}
+
+// vacuumInto writes a copy of db to the file at path, which must not exist.
+// It needs free space about the size of the database. Tests replace it to
+// fail as a full disk does.
+var vacuumInto = func(db *sql.DB, path string) error {
+	_, err := db.Exec(`VACUUM INTO ?`, path)
+	return err
 }
 
 // syncFile flushes the file at path to disk.
@@ -300,9 +313,17 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if err := erase.Leftovers(filepath.Dir(dbPath)); err != nil {
 		slog.Warn("failed to erase leftover backups", "path", dbPath, "error", err)
 	}
+	// A scratch table overwriteWriteAheadLog left when the app stopped goes
+	// before the backup is taken, or the backup would carry it and never again
+	// have the database's schema (sameSchema).
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + walScratchTable); err != nil {
+		return fmt.Errorf("drop the write-ahead log scratch table: %w", err)
+	}
 
 	// Create pre-migration backup after pragmas are set (which creates the DB file)
+	backupTaken := true
 	if err := createPreMigrationBackup(s.db, dbPath); err != nil {
+		backupTaken = false
 		slog.Warn("failed to create pre-migration backup", "path", dbPath, "error", err)
 	}
 
@@ -624,6 +645,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			sha256_after TEXT NOT NULL,
 			splice_complete INTEGER NOT NULL DEFAULT 0,
 			deleted_at TEXT NOT NULL,
+			erase_owed INTEGER NOT NULL DEFAULT 0,
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
@@ -631,6 +653,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN splice_complete INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("migrate deleted_segments splice completion: %w", err)
+	}
+	// erase_owed: the deletion committed, but its erase from the write-ahead
+	// log and the pre-migration backup has not finished (RetryOwedErasure).
+	// The row holds no text of the deleted segment.
+	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN erase_owed INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate deleted_segments owed erase: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -724,9 +752,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 	`); err != nil {
 		return fmt.Errorf("record owed drive replacement folders: %w", err)
 	}
-	// A scratch table overwriteWriteAheadLog left when the app stopped.
-	if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + walScratchTable); err != nil {
-		return fmt.Errorf("drop the write-ahead log scratch table: %w", err)
+	// Finish the erase of deletions it was owed for when the app stopped. The
+	// backup taken at this start holds none of their words.
+	if err := s.retryOwedErasure(backupTaken); err != nil {
+		slog.Warn("failed to finish an owed erase of deleted segments", "path", dbPath, "error", err)
 	}
 
 	return nil

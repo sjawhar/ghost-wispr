@@ -17,6 +17,14 @@ func preMigrationBackupPath(dbPath string) string {
 	return dbPath + ".pre-migrate.bak"
 }
 
+// backupDSN is the name the backup at backupPath is opened with:
+// secure_delete zeroes the pages a scrub frees, and temporary data stays in
+// memory, so a sort or the search index rebuild over the backup's transcripts
+// leaves no text in the blocks a temporary file frees.
+func backupDSN(backupPath string) string {
+	return backupPath + "?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=busy_timeout(5000)"
+}
+
 // eraseFromBackup removes a committed segment deletion from the pre-migration
 // backup (createPreMigrationBackup), which holds the database as this start
 // found it, the deleted words included.
@@ -44,7 +52,7 @@ func (s *SQLiteStore) eraseFromBackup(segmentID int64, deletedText string, sessi
 	} else if err != nil {
 		return fmt.Errorf("stat backup: %w", err)
 	}
-	backup, err := sql.Open("sqlite", backupPath+"?_pragma=secure_delete(1)&_pragma=busy_timeout(5000)")
+	backup, err := sql.Open("sqlite", backupDSN(backupPath))
 	if err != nil {
 		return fmt.Errorf("open backup: %w", err)
 	}
