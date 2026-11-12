@@ -27,19 +27,23 @@ func failVacuumInto(t *testing.T, n int) {
 	}
 }
 
-// owedErasures counts the deletions whose erase from the write-ahead log and
-// the backup is still owed.
+// owedErasures returns the count of deletions whose erase from the
+// write-ahead log and the backup is still owed (owedEraseKey), 0 when none
+// is.
 func owedErasures(t *testing.T, store *SQLiteStore) int {
 	t.Helper()
 	var owed int
-	if err := store.DB().QueryRow(`SELECT count(*) FROM deleted_segments WHERE erase_owed = 1`).Scan(&owed); err != nil {
+	switch err := store.DB().QueryRow(`SELECT CAST(value AS INTEGER) FROM app_state WHERE key = ?`, owedEraseKey).Scan(&owed); {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0
+	case err != nil:
 		t.Fatal(err)
 	}
 	return owed
 }
 
-// assertOwedRowsHoldNoText fails if a row that records an owed erase holds
-// any of the deleted words.
+// assertOwedRowsHoldNoText fails if a deleted-span row, or the owed-erase
+// marker, holds any of the deleted words.
 func assertOwedRowsHoldNoText(t *testing.T, store *SQLiteStore, secret string) {
 	t.Helper()
 	rows, err := store.DB().Query(`SELECT * FROM deleted_segments`)
@@ -63,6 +67,13 @@ func assertOwedRowsHoldNoText(t *testing.T, store *SQLiteStore, secret string) {
 		if row := fmt.Sprint(values...); strings.Contains(row, secret) {
 			t.Errorf("the deleted-span row holds the deleted words: %s", row)
 		}
+	}
+	var marker string
+	if err := store.DB().QueryRow(`SELECT value FROM app_state WHERE key = ?`, owedEraseKey).Scan(&marker); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal(err)
+	}
+	if strings.Contains(marker, secret) {
+		t.Errorf("the owed-erase marker holds the deleted words: %s", marker)
 	}
 }
 
@@ -315,5 +326,154 @@ func TestTheBackupIsOpenedWithTemporaryDataInMemory(t *testing.T) {
 	}
 	if tempStore != 2 || secureDelete != 1 {
 		t.Errorf("backup connection has temp_store=%d secure_delete=%d, want 2 and 1", tempStore, secureDelete)
+	}
+}
+
+// deleteSecretOwingTheErase deletes the segment holding backupSecret while
+// its erase cannot finish, and checks the erase is owed.
+func deleteSecretOwingTheErase(t *testing.T, store *SQLiteStore) {
+	t.Helper()
+	segments, err := store.GetSegments("backed-up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
+		t.Fatalf("DeleteSegment whose erase cannot finish = %v, want %v", err, ErrSegmentPostCommitMaintenance)
+	}
+	if owed := owedErasures(t, store); owed != 1 {
+		t.Fatalf("control: owed erasures after the failed erase = %d, want 1", owed)
+	}
+}
+
+// migrateAfterTheBackup gives the database a table the backup lacks, as a
+// migration at this start does: the backup keeps the schema before it.
+func migrateAfterTheBackup(t *testing.T, store *SQLiteStore, path string) {
+	t.Helper()
+	if _, err := store.DB().Exec(`CREATE TABLE newer_schema (x)`); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := store.backupHasDatabaseSchema(preMigrationBackupPath(path)); err != nil || same {
+		t.Fatalf("control: backup has the database's schema = %v (%v), want false", same, err)
+	}
+}
+
+// TestARetryErasesABackupOfAnOlderSchema fails if a retry keeps, or removes
+// without overwriting, a backup in an older schema than the database's (after
+// a migration at this start). The deleted text is not kept, so the backup
+// cannot be scrubbed, and it holds the deleted words.
+func TestARetryErasesABackupOfAnOlderSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	store := openStoreWithBackup(t, path)
+	held, size := holdFile(t, preMigrationBackupPath(path))
+	failVacuumInto(t, 1)
+	deleteSecretOwingTheErase(t, store)
+	migrateAfterTheBackup(t, store, path)
+
+	if err := store.RetryOwedErasure(); err != nil {
+		t.Fatalf("RetryOwedErasure: %v", err)
+	}
+	if _, err := os.Stat(preMigrationBackupPath(path)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the backup of an older schema is still there (%v)", err)
+	}
+	assertHeldZeroed(t, held, size, "backup of an older schema")
+	if owed := owedErasures(t, store); owed != 0 {
+		t.Errorf("owed erasures after the retry = %d, want 0", owed)
+	}
+}
+
+// TestADeletionFinishesABackupEraseLeftPartWay fails if a deletion's own
+// erase leaves, beside the database, a backup that an earlier erase moved off
+// its name but could not overwrite (erase.ErrLeftover): its bytes, deleted
+// words included, would stay until the next start.
+func TestADeletionFinishesABackupEraseLeftPartWay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	store := openStoreWithBackup(t, path)
+	// What erase.Replace leaves when it cannot overwrite the backup it
+	// replaced: the old backup under a hidden name no other name links.
+	contents, err := os.ReadFile(preMigrationBackupPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftover := filepath.Join(filepath.Dir(path), ".erasing-0123456789abcdef01234567")
+	if err := os.WriteFile(leftover, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, size := holdFile(t, leftover)
+
+	deleteBackedUpSecret(t, store)
+	if _, err := os.Stat(leftover); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the backup erase left part way is still there (%v)", err)
+	}
+	assertHeldZeroed(t, held, size, "backup erase left part way")
+}
+
+// TestALaterDeletionFinishesAnEarlierOwedErase fails if a deletion made
+// while an earlier deletion's erase is owed clears it with an erase of its
+// own words only: a scrub of a backup in an older schema takes out only the
+// later deletion's words, and the earlier one's would stay with nothing owed.
+func TestALaterDeletionFinishesAnEarlierOwedErase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	store := openStoreWithBackup(t, path)
+	migrateAfterTheBackup(t, store, path)
+	maintenance := postDeleteMaintenance
+	t.Cleanup(func() { postDeleteMaintenance = maintenance })
+	postDeleteMaintenance = func(*sql.DB, string) error { return errors.New("a reader kept the log from starting over") }
+	deleteSecretOwingTheErase(t, store)
+	assertBackupHolds(t, path, backupSecret, true)
+	postDeleteMaintenance = maintenance
+
+	segments, err := store.GetSegments("backed-up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegment("backed-up", segments[0].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 2, SHA256Before: "c", SHA256After: "d"}); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	if owed := owedErasures(t, store); owed != 0 {
+		t.Errorf("owed erasures after the later deletion = %d, want 0", owed)
+	}
+	backup := preMigrationBackupPath(path)
+	for _, file := range []string{backup, backup + "-wal"} {
+		contents, err := os.ReadFile(file)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(contents, []byte(backupSecret)) {
+			t.Errorf("%s still holds the earlier deletion's words", filepath.Base(file))
+		}
+	}
+}
+
+// TestARetryKeepsAnEraseOwedSinceItRead fails if a retry clears the owed
+// erase although a deletion counted another after the retry read the count:
+// that deletion's erase would be lost. A deletion in this process waits for
+// the retry (eraseMu); the count is checked again so that one that does not
+// still keeps its erase owed.
+func TestARetryKeepsAnEraseOwedSinceItRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	store := openStoreWithBackup(t, path)
+	failVacuumInto(t, 1)
+	deleteSecretOwingTheErase(t, store)
+	maintenance := postDeleteMaintenance
+	t.Cleanup(func() { postDeleteMaintenance = maintenance })
+	postDeleteMaintenance = func(db *sql.DB, walPath string) error {
+		if _, err := db.Exec(`UPDATE app_state SET value = CAST(value AS INTEGER) + 1 WHERE key = ?`, owedEraseKey); err != nil {
+			return err
+		}
+		return maintenance(db, walPath)
+	}
+
+	if err := store.RetryOwedErasure(); err != nil {
+		t.Fatalf("RetryOwedErasure: %v", err)
+	}
+	if owed := owedErasures(t, store); owed != 2 {
+		t.Errorf("owed erasures after a retry a deletion overtook = %d, want 2", owed)
 	}
 }

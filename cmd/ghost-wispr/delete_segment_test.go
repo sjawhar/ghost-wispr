@@ -286,6 +286,52 @@ func TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory(t *testing.T) {
 	}
 }
 
+// TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted fails if the
+// erase of a recording kept outside the audio directory, cut off by a stop
+// after DELETE /api/sessions/{id} removed its row, is not finished with zeros
+// as the app starts (no row names the directory any more), or if the
+// directory is still listed once the cleanup has finished it.
+func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
+	audioDir, elsewhere := t.TempDir(), t.TempDir()
+	recording := filepath.Join(elsewhere, "recording.mp3")
+	audio := []byte("the deleted session's audio")
+	if err := os.WriteFile(recording, audio, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, _, _ := newDeletionTestStore(t, recording)
+	if err := store.DeleteSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	// The route's erase moved the recording to its hidden name, and the app
+	// stopped before it overwrote it.
+	hidden := filepath.Join(elsewhere, ".erasing-cut-off")
+	if err := os.Rename(recording, hidden); err != nil {
+		t.Fatal(err)
+	}
+	held := holdRecording(t, hidden)
+
+	if err := cleanupRecordingDirectories(store, audioDir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := os.Stat(hidden); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the cut-off erase of the deleted session's recording remains: %v", err)
+	}
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the cut-off erase was removed still holding %q", got)
+	}
+	dirs, err := store.RecordingDirectories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(dirs, elsewhere) {
+		t.Error("the directory is still listed after the cleanup finished it")
+	}
+}
+
 func TestStartupRecoveryContinuesPastBadSplice(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "recovery.db"))
 	if err != nil {

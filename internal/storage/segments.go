@@ -57,6 +57,11 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		return fmt.Errorf("delete segment: invalid deleted span")
 	}
 
+	// eraseMu is held from the transaction to the end of the erase after it,
+	// so no other deletion commits, and no retry runs, between this
+	// deletion's count of owed erases (recordOwedErase) and its erase.
+	s.eraseMu.Lock()
+	defer s.eraseMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin delete segment: %w", err)
@@ -166,19 +171,18 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
 		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
 	}
-	// The erase after the commit is owed until it finishes (erase_owed), so a
-	// failure, or the app stopping, leaves it for RetryOwedErasure.
-	recorded, err := tx.Exec(`
-		INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, erase_owed)
-		VALUES(?, ?, ?, ?, ?, ?, ?, 1)`,
+	if _, err := tx.Exec(`
+		INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		sessionID, span.AudioPath, span.Start, span.End, span.SHA256Before, span.SHA256After, time.Now().UTC().Format(time.RFC3339Nano),
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("record deleted span for session %s: %w", sessionID, err)
 	}
-	deletedSpanRow, err := recorded.LastInsertId()
+	// The erase after the commit is owed until it finishes, so a failure, or
+	// the app stopping, leaves it for RetryOwedErasure.
+	owed, earlierOwed, err := recordOwedErase(tx)
 	if err != nil {
-		return fmt.Errorf("read deleted span row for session %s: %w", sessionID, err)
+		return err
 	}
 	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, &span); err != nil {
 		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
@@ -189,30 +193,43 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
 	}
-	return s.eraseAfterDeletion(deletedSpanRow, segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span)
+	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span)
 }
 
 // eraseAfterDeletion erases a committed deletion from the write-ahead log and
-// the pre-migration backup, and records the erase done on its deleted-span row
-// (deletedSpanRow). A failure leaves the erase owed: the deletion's error
-// wraps ErrSegmentPostCommitMaintenance, and RetryOwedErasure finishes it at
-// the next start or sweep.
-func (s *SQLiteStore) eraseAfterDeletion(deletedSpanRow, segmentID int64, deletedText string, owners, holders []string, span *DeletedSpan) error {
-	s.eraseMu.Lock()
-	defer s.eraseMu.Unlock()
-	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
+// the pre-migration backup, and clears the owed erase its transaction
+// recorded (owed, the count it left). When an earlier deletion's erase was
+// owed too (earlierOwed), a scrub of the backup would take out only this
+// deletion's words, so it runs the erase a retry runs, which covers both. A
+// failure leaves the erase owed: the deletion's error wraps
+// ErrSegmentPostCommitMaintenance, and RetryOwedErasure finishes it at the
+// next start or sweep. The caller holds eraseMu.
+func (s *SQLiteStore) eraseAfterDeletion(owed string, earlierOwed bool, segmentID int64, deletedText string, owners, holders []string, span *DeletedSpan) error {
+	var err error
+	if earlierOwed {
+		err = s.eraseEveryOwed(false)
+	} else {
+		err = s.eraseDeletion(segmentID, deletedText, owners, holders, span)
+	}
+	if err == nil {
+		err = clearOwedErase(s.db, owed)
+	}
+	if err != nil {
 		return fmt.Errorf("%w: %v", ErrSegmentPostCommitMaintenance, err)
-	}
-	if err := s.eraseFromBackup(segmentID, deletedText, owners, holders, span); err != nil {
-		return fmt.Errorf("%w: pre-migration backup: %v", ErrSegmentPostCommitMaintenance, err)
-	}
-	if err := s.eraseOrphans(); err != nil {
-		return fmt.Errorf("%w: %v", ErrSegmentPostCommitMaintenance, err)
-	}
-	if _, err := s.db.Exec(`UPDATE deleted_segments SET erase_owed = 0 WHERE rowid = ?`, deletedSpanRow); err != nil {
-		return fmt.Errorf("%w: record the erase done: %v", ErrSegmentPostCommitMaintenance, err)
 	}
 	return nil
+}
+
+// eraseDeletion erases one deletion's words from the write-ahead log and the
+// pre-migration backup, and finishes any backup erase left part way.
+func (s *SQLiteStore) eraseDeletion(segmentID int64, deletedText string, owners, holders []string, span *DeletedSpan) error {
+	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
+		return err
+	}
+	if err := s.eraseFromBackup(segmentID, deletedText, owners, holders, span); err != nil {
+		return fmt.Errorf("pre-migration backup: %w", err)
+	}
+	return s.eraseOrphans()
 }
 
 // postDeleteMaintenance moves a committed deletion out of the write-ahead log
@@ -343,9 +360,11 @@ func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 }
 
 // RecordingDirectories returns the directories, other than the audio
-// directory, that sessions keep recordings in: those of every absolute path in
-// a session's audio_path or a deleted span's audio_path. A relative path is
-// read from the audio directory.
+// directory, that recordings are kept or erased in: those of every absolute
+// path in a session's audio_path or a deleted span's audio_path, and those a
+// whole-file erase was started in after the row naming its file went
+// (erase_directories), until ForgetEraseDirectories forgets them. A relative
+// path is read from the audio directory.
 func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	rows, err := s.db.Query(`SELECT audio_path FROM sessions WHERE audio_path != ''
 		UNION SELECT audio_path FROM deleted_segments WHERE audio_path != ''`)
@@ -359,12 +378,8 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 		if err := rows.Scan(&paths); err != nil {
 			return nil, fmt.Errorf("scan recording paths: %w", err)
 		}
-		for _, path := range strings.Split(paths, ",") {
-			path = strings.TrimSpace(path)
-			if !filepath.IsAbs(path) {
-				continue
-			}
-			if dir := filepath.Dir(path); !slices.Contains(dirs, dir) {
+		for _, dir := range recordingDirectories(paths) {
+			if !slices.Contains(dirs, dir) {
 				dirs = append(dirs, dir)
 			}
 		}
@@ -372,7 +387,62 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate recording paths: %w", err)
 	}
+	erased, err := s.db.Query(`SELECT path FROM erase_directories`)
+	if err != nil {
+		return nil, fmt.Errorf("list erase directories: %w", err)
+	}
+	defer func() { _ = erased.Close() }()
+	for erased.Next() {
+		var dir string
+		if err := erased.Scan(&dir); err != nil {
+			return nil, fmt.Errorf("scan erase directory: %w", err)
+		}
+		if !slices.Contains(dirs, dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	if err := erased.Err(); err != nil {
+		return nil, fmt.Errorf("iterate erase directories: %w", err)
+	}
 	return dirs, nil
+}
+
+// recordingDirectories returns the directory of each absolute entry in
+// paths, a comma-separated audio_path.
+func recordingDirectories(paths string) []string {
+	var dirs []string
+	for _, path := range strings.Split(paths, ",") {
+		path = strings.TrimSpace(path)
+		if filepath.IsAbs(path) {
+			dirs = append(dirs, filepath.Dir(path))
+		}
+	}
+	return dirs
+}
+
+// recordEraseDirectories records, in tx, the directories of the absolute
+// entries of audioPath (erase_directories), before the row naming them goes
+// and their files are erased. An erase cut off by a stop then leaves its
+// .erasing-* file in a directory the startup cleanup still reaches.
+func recordEraseDirectories(tx *sql.Tx, audioPath string) error {
+	for _, dir := range recordingDirectories(audioPath) {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO erase_directories(path) VALUES(?)`, dir); err != nil {
+			return fmt.Errorf("record erase directory %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// ForgetEraseDirectories forgets the erase directories among dirs, once the
+// startup cleanup has finished every erase left in them. Nothing else erases
+// while it runs, so no erase recorded since is forgotten.
+func (s *SQLiteStore) ForgetEraseDirectories(dirs []string) error {
+	for _, dir := range dirs {
+		if _, err := s.db.Exec(`DELETE FROM erase_directories WHERE path = ?`, dir); err != nil {
+			return fmt.Errorf("forget erase directory %s: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 // mergedSourceIDs returns the sessions merged, directly or through another

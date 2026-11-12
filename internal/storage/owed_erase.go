@@ -7,17 +7,24 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/sjawhar/ghost-wispr/internal/erase"
 )
 
+// owedEraseKey is the app_state key that counts the segment deletions whose
+// erase from the write-ahead log and the pre-migration backup is owed: each
+// deletion's transaction adds one, and the erase that covers them all
+// removes it. It is one marker for the store, on no session's row, because
+// that erase is store-wide (one log, one backup), and so that deleting a
+// session does not take an owed erase with it.
+const owedEraseKey = "segment_deletion_erase_owed"
+
 // RetryOwedErasure finishes the erase of every deletion whose erase from the
 // write-ahead log and the pre-migration backup failed after it committed, or
-// was cut off by the app stopping (deleted_segments.erase_owed): for example
-// VACUUM INTO on a full disk. The segment is gone from the database, so the
-// deletion itself cannot be run again, and its words would otherwise stay in
-// the log's old frames and in the backup for good.
+// was cut off by the app stopping (owedEraseKey): for example VACUUM INTO on
+// a full disk. The segment is gone from the database, so the deletion itself
+// cannot be run again, and its words would otherwise stay in the log's old
+// frames and in the backup for good.
 //
 // The deleted text is not kept, so the backup cannot be scrubbed again: it is
 // taken again from the database when it has the database's schema, and erased
@@ -33,10 +40,23 @@ func (s *SQLiteStore) RetryOwedErasure() error {
 func (s *SQLiteStore) retryOwedErasure(backupTaken bool) error {
 	s.eraseMu.Lock()
 	defer s.eraseMu.Unlock()
-	owed, err := owedErasureRows(s.db)
-	if err != nil || len(owed) == 0 {
+	var owed string
+	switch err := s.db.QueryRow(`SELECT value FROM app_state WHERE key = ?`, owedEraseKey).Scan(&owed); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("read owed erase: %w", err)
+	}
+	if err := s.eraseEveryOwed(backupTaken); err != nil {
 		return err
 	}
+	return clearOwedErase(s.db, owed)
+}
+
+// eraseEveryOwed erases every committed deletion from the write-ahead log and,
+// unless the backup was taken at this start (backupTaken), from the
+// pre-migration backup, and finishes any backup erase left part way.
+func (s *SQLiteStore) eraseEveryOwed(backupTaken bool) error {
 	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
 		return fmt.Errorf("overwrite the write-ahead log: %w", err)
 	}
@@ -45,39 +65,36 @@ func (s *SQLiteStore) retryOwedErasure(backupTaken bool) error {
 			return err
 		}
 	}
-	if err := s.eraseOrphans(); err != nil {
-		return err
+	return s.eraseOrphans()
+}
+
+// recordOwedErase counts a deletion's owed erase, in its transaction
+// (owedEraseKey). It returns the count it left, and whether an earlier
+// deletion's erase was owed already.
+func recordOwedErase(tx *sql.Tx) (owed string, earlier bool, err error) {
+	switch err := tx.QueryRow(`SELECT 1 FROM app_state WHERE key = ?`, owedEraseKey).Scan(new(int)); {
+	case err == nil:
+		earlier = true
+	case !errors.Is(err, sql.ErrNoRows):
+		return "", false, fmt.Errorf("read owed erase: %w", err)
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(owed)), ",")
-	args := make([]any, len(owed))
-	for i, row := range owed {
-		args[i] = row
+	if _, err := tx.Exec(`INSERT INTO app_state(key, value) VALUES(?, '1')
+		ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1`, owedEraseKey); err != nil {
+		return "", false, fmt.Errorf("record owed erase: %w", err)
 	}
-	if _, err := s.db.Exec(`UPDATE deleted_segments SET erase_owed = 0 WHERE rowid IN (`+placeholders+`)`, args...); err != nil {
+	if err := tx.QueryRow(`SELECT value FROM app_state WHERE key = ?`, owedEraseKey).Scan(&owed); err != nil {
+		return "", false, fmt.Errorf("read owed erase: %w", err)
+	}
+	return owed, earlier, nil
+}
+
+// clearOwedErase records the owed erase done, unless a deletion has counted
+// one since the erase read the count owed.
+func clearOwedErase(db *sql.DB, owed string) error {
+	if _, err := db.Exec(`DELETE FROM app_state WHERE key = ? AND value = ?`, owedEraseKey, owed); err != nil {
 		return fmt.Errorf("record the owed erase done: %w", err)
 	}
 	return nil
-}
-
-// owedErasureRows returns the deleted-span rows whose erase is owed.
-func owedErasureRows(db *sql.DB) ([]int64, error) {
-	rows, err := db.Query(`SELECT rowid FROM deleted_segments WHERE erase_owed = 1`)
-	if err != nil {
-		return nil, fmt.Errorf("list owed erasures: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var owed []int64
-	for rows.Next() {
-		var row int64
-		if err := rows.Scan(&row); err != nil {
-			return nil, fmt.Errorf("scan owed erasure: %w", err)
-		}
-		owed = append(owed, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate owed erasures: %w", err)
-	}
-	return owed, nil
 }
 
 // refreshOrRemoveBackup takes the pre-migration backup again from the

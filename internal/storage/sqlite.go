@@ -645,7 +645,6 @@ func (s *SQLiteStore) init(dbPath string) error {
 			sha256_after TEXT NOT NULL,
 			splice_complete INTEGER NOT NULL DEFAULT 0,
 			deleted_at TEXT NOT NULL,
-			erase_owed INTEGER NOT NULL DEFAULT 0,
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
@@ -654,11 +653,14 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN splice_complete INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("migrate deleted_segments splice completion: %w", err)
 	}
-	// erase_owed: the deletion committed, but its erase from the write-ahead
-	// log and the pre-migration backup has not finished (RetryOwedErasure).
-	// The row holds no text of the deleted segment.
-	if _, err := s.db.Exec(`ALTER TABLE deleted_segments ADD COLUMN erase_owed INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
-		return fmt.Errorf("migrate deleted_segments owed erase: %w", err)
+	// erase_directories: the directory of a recording that a whole-file audio
+	// erase is started on after the row naming it went (DeleteSession,
+	// DeleteEndedSession, MarkAudioRemoved). An erase cut off by a stop leaves
+	// a .erasing-* file there that no row leads to; the startup cleanup
+	// finishes it and then forgets the directory (RecordingDirectories,
+	// ForgetEraseDirectories).
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS erase_directories (path TEXT PRIMARY KEY)`); err != nil {
+		return fmt.Errorf("create erase_directories table: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -2180,6 +2182,9 @@ func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncG
 	if err != nil {
 		return AudioRemoval{}, false, fmt.Errorf("read session %s to mark its audio removed: %w", id, err)
 	}
+	if err := recordEraseDirectories(tx, before); err != nil {
+		return AudioRemoval{}, false, err
+	}
 	if _, err := tx.Exec(
 		`UPDATE sessions SET audio_path = ?, audio_removed_at = ?,
 			refinement_status = CASE WHEN ? AND refinement_status IN (?, ?) THEN ? ELSE refinement_status END
@@ -2247,18 +2252,21 @@ const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXIST
 	SELECT 1 FROM drive_replacement_folders
 	WHERE drive_replacement_folders.folder_session_id = sessions.id AND drive_replacement_folders.state = '` + DriveReplacementFolderOwed + `')`
 
+// DeleteSession deletes session id, refusing one that owes Google Drive a
+// replacement (ErrDeleteReplacementPending). With the row it records the
+// directories its recordings are in (recordEraseDirectories): the caller
+// erases the recordings after the row is gone.
 func (s *SQLiteStore) DeleteSession(id string) error {
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND `+noOwedDriveReplacement, id)
+	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("delete session %s: %w", id, err)
+		return fmt.Errorf("begin deleting session %s: %w", id, err)
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("delete session rows affected: %w", err)
-	}
-	if rows == 0 {
+	defer func() { _ = tx.Rollback() }()
+	var audioPath string
+	switch err := tx.QueryRow(`SELECT audio_path FROM sessions WHERE id = ? AND `+noOwedDriveReplacement, id).Scan(&audioPath); {
+	case errors.Is(err, sql.ErrNoRows):
 		var pending int
-		switch err := s.db.QueryRow(`SELECT drive_replace_pending FROM sessions WHERE id = ?`, id).Scan(&pending); {
+		switch err := tx.QueryRow(`SELECT drive_replace_pending FROM sessions WHERE id = ?`, id).Scan(&pending); {
 		case errors.Is(err, sql.ErrNoRows):
 			return sql.ErrNoRows
 		case err != nil:
@@ -2266,6 +2274,17 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 		default:
 			return fmt.Errorf("delete session %s: %w", id, ErrDeleteReplacementPending)
 		}
+	case err != nil:
+		return fmt.Errorf("read session %s to delete it: %w", id, err)
+	}
+	if err := recordEraseDirectories(tx, audioPath); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete session %s: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit deleting session %s: %w", id, err)
 	}
 	return nil
 }
@@ -2278,10 +2297,19 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 // merged session naming a file that is gone. One whose summary or transcript
 // changed since GC read it is waiting to sync them (see the
 // sessions_documents_changed trigger): until it does, the newest text is
-// only on the device.
+// only on the device. With the row it records the directories of audioPath
+// (recordEraseDirectories): GC erases the recordings after the row is gone.
 func (s *SQLiteStore) DeleteEndedSession(id, audioPath string, syncGated bool) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin deleting session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := recordEraseDirectories(tx, audioPath); err != nil {
+		return false, err
+	}
 	cond, args := removable(syncGated)
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND documents_unverified = 0 AND `+cond, append([]any{id, audioPath}, args...)...)
+	res, err := tx.Exec(`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND documents_unverified = 0 AND `+cond, append([]any{id, audioPath}, args...)...)
 	if err != nil {
 		return false, fmt.Errorf("delete session %s: %w", id, err)
 	}
@@ -2289,7 +2317,13 @@ func (s *SQLiteStore) DeleteEndedSession(id, audioPath string, syncGated bool) (
 	if err != nil {
 		return false, fmt.Errorf("delete session rows affected: %w", err)
 	}
-	return rows == 1, nil
+	if rows != 1 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit deleting session %s: %w", id, err)
+	}
+	return true, nil
 }
 
 // MarkRemoteDeleted records that synced session id's Drive folder, folderID,
