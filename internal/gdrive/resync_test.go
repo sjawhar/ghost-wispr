@@ -158,7 +158,7 @@ func TestAChangeAfterASyncReachesDrive(t *testing.T) {
 		{
 			name: "refinement retried",
 			change: func(t *testing.T, store *storage.SQLiteStore, id string) {
-				if err := store.UpdateRefinement(id, "The refined transcript.", storage.RefinementCompleted); err != nil {
+				if err := store.UpdateRefinementAtGeneration(id, "The refined transcript.", storage.RefinementCompleted, "", 0); err != nil {
 					t.Fatalf("refine: %v", err)
 				}
 				if _, _, err := store.Canonicalize(id); err != nil {

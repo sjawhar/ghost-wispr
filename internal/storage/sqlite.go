@@ -1404,36 +1404,22 @@ func (s *SQLiteStore) failSummary(id, errMsg string, generation int) (Session, e
 	return sess, nil
 }
 
-// UpdateRefinement stores a refinement, with no model, while the session's
-// refinement was claimed at its current transcript generation. A refinement
-// that claimed the session stores its result with
-// UpdateRefinementAtGeneration.
-func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
-	return s.updateRefinement(sessionID, transcript, status, "", -1)
-}
-
 // UpdateRefinementAtGeneration atomically stores a refinement and the model
 // reported by its provider, only while generation, the transcript generation
 // ClaimRefinement returned, is still the session's. A refinement of the
 // recording from before a segment deletion is refused (sql.ErrNoRows), also
 // once the deletion's own refinement has claimed the session.
 func (s *SQLiteStore) UpdateRefinementAtGeneration(sessionID, transcript, status, model string, generation int) error {
-	return s.updateRefinement(sessionID, transcript, status, model, generation)
-}
-
-// updateRefinement stores a refinement at generation, or, when generation is
-// negative, at the session's current transcript generation.
-func (s *SQLiteStore) updateRefinement(sessionID, transcript, status, model string, generation int) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions
 		 SET refined_transcript = ?, refinement_status = ?,
 		     refinement_model = CASE WHEN ? != '' THEN ? ELSE refinement_model END
-		 WHERE id = ? AND refinement_generation = deletion_generation AND (? < 0 OR deletion_generation = ?)`,
+		 WHERE id = ? AND refinement_generation = deletion_generation AND deletion_generation = ?`,
 		transcript,
 		status,
 		model, model,
 		sessionID,
-		generation, generation,
+		generation,
 	)
 	if err != nil {
 		return fmt.Errorf("update refinement for session %s: %w", sessionID, err)

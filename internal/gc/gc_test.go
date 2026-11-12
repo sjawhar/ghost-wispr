@@ -1109,7 +1109,7 @@ type refinementStartsStore struct {
 func (s refinementStartsStore) Recordings() ([]storage.SessionRecording, error) {
 	recordings, err := s.SQLiteStore.Recordings()
 	if err == nil {
-		err = s.UpdateRefinement(s.id, "", storage.RefinementRunning)
+		err = s.UpdateRefinementAtGeneration(s.id, "", storage.RefinementRunning, "", 0)
 	}
 	return recordings, err
 }
@@ -1355,7 +1355,7 @@ func TestGCAgeKeepsASessionWhileItsRefinementRuns(t *testing.T) {
 	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
-	if err := store.UpdateRefinement(id, "", storage.RefinementRunning); err != nil {
+	if err := store.UpdateRefinementAtGeneration(id, "", storage.RefinementRunning, "", 0); err != nil {
 		t.Fatalf("start refinement: %v", err)
 	}
 

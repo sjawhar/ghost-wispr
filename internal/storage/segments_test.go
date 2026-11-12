@@ -373,14 +373,14 @@ func TestDeleteSegmentRejectsStaleRefinementAndSummaryWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get segments: %v", err)
 	}
-	_, claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
+	claimedAt, claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
 	if err != nil || !claimed {
 		t.Fatalf("claim refinement = %v, %v", claimed, err)
 	}
 	if err := store.DeleteSegment("generation-fence", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
-	if err := store.UpdateRefinement("generation-fence", "stale private deletion token", RefinementCompleted); err == nil {
+	if err := store.UpdateRefinementAtGeneration("generation-fence", "stale private deletion token", RefinementCompleted, "", claimedAt); err == nil {
 		t.Fatal("stale refinement write succeeded after deletion")
 	}
 	if err := store.UpdateSummary("generation-fence", "stale private deletion token", "stale private deletion token", SummaryCompleted, "default", "{}"); err == nil {

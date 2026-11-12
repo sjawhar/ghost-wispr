@@ -62,8 +62,8 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			return store.UpdateTitle(id, "Planning")
 		}, true},
 		{"refinement retried", func(t *testing.T, store *SQLiteStore, id string) error {
-			if err := store.UpdateRefinement(id, "The refined transcript.", RefinementCompleted); err != nil {
-				t.Fatalf("UpdateRefinement: %v", err)
+			if err := store.UpdateRefinementAtGeneration(id, "The refined transcript.", RefinementCompleted, "", 0); err != nil {
+				t.Fatalf("UpdateRefinementAtGeneration: %v", err)
 			}
 			_, _, err := store.Canonicalize(id)
 			return err
@@ -72,7 +72,7 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			return store.UpdateSummary(id, "Standup", "The first summary.", SummaryCompleted, "default", "{}")
 		}, false},
 		{"refined, not yet canonicalized", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateRefinement(id, "The refined transcript.", RefinementCompleted)
+			return store.UpdateRefinementAtGeneration(id, "The refined transcript.", RefinementCompleted, "", 0)
 		}, false},
 		{"published to Envoy", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return setEnvoyPublishStatus(store, id, EnvoyPublishPublished)

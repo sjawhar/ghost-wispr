@@ -550,12 +550,12 @@ func TestBatchRefinement_StoreStatusAndTranscript(t *testing.T) {
 		t.Fatalf("expected default refinement_status pending, got %q", session.RefinementStatus)
 	}
 
-	if err := store.UpdateRefinement(sessionID, "", "running"); err != nil {
-		t.Fatalf("UpdateRefinement running failed: %v", err)
+	if err := store.UpdateRefinementAtGeneration(sessionID, "", "running", "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration running failed: %v", err)
 	}
 
-	if err := store.UpdateRefinement(sessionID, "refined canonical transcript", "completed"); err != nil {
-		t.Fatalf("UpdateRefinement completed failed: %v", err)
+	if err := store.UpdateRefinementAtGeneration(sessionID, "refined canonical transcript", "completed", "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration completed failed: %v", err)
 	}
 
 	session, err = store.GetSession(sessionID)
@@ -642,8 +642,8 @@ func TestOpeningTheStoreMarksEarlierSessionsWithoutRecordingNoAudio(t *testing.T
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'pending'`); err != nil {
 		t.Fatalf("reset refinement status: %v", err)
 	}
-	if err := store.UpdateRefinement("20261106140200", "refined", RefinementCompleted); err != nil {
-		t.Fatalf("UpdateRefinement: %v", err)
+	if err := store.UpdateRefinementAtGeneration("20261106140200", "refined", RefinementCompleted, "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -704,8 +704,8 @@ func TestRecordings(t *testing.T) {
 		t.Fatalf("DiscardSession: %v", err)
 	}
 	end("20261106140600", 6*time.Minute, "/audio/refining.mp3", SyncStateSynced)
-	if err := store.UpdateRefinement("20261106140600", "", RefinementRunning); err != nil {
-		t.Fatalf("UpdateRefinement: %v", err)
+	if err := store.UpdateRefinementAtGeneration("20261106140600", "", RefinementRunning, "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration: %v", err)
 	}
 	if err := store.CreateSession("20261106140700", started.Add(7*time.Minute)); err != nil { // still recording
 		t.Fatalf("CreateSession: %v", err)
@@ -739,8 +739,8 @@ func endedWith(t *testing.T, store *SQLiteStore, id, audioPath, refinement strin
 	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
 		t.Fatalf("EndSession %s: %v", id, err)
 	}
-	if err := store.UpdateRefinement(id, "", refinement); err != nil {
-		t.Fatalf("UpdateRefinement %s: %v", id, err)
+	if err := store.UpdateRefinementAtGeneration(id, "", refinement, "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration %s: %v", id, err)
 	}
 }
 
@@ -1864,7 +1864,7 @@ func TestCanonicalize_FromRefinedTranscript(t *testing.T) {
 	}
 
 	// Set refined transcript.
-	if err := store.UpdateRefinement(sessionID, "refined hello world. how are you doing?", "completed"); err != nil {
+	if err := store.UpdateRefinementAtGeneration(sessionID, "refined hello world. how are you doing?", "completed", "", 0); err != nil {
 		t.Fatalf("update refinement: %v", err)
 	}
 
@@ -1950,7 +1950,7 @@ func TestCanonicalize_RefinementFailed_FallsBackToStreaming(t *testing.T) {
 	}
 
 	// Mark refinement as failed.
-	if err := store.UpdateRefinement(sessionID, "", "failed"); err != nil {
+	if err := store.UpdateRefinementAtGeneration(sessionID, "", "failed", "", 0); err != nil {
 		t.Fatalf("update refinement: %v", err)
 	}
 
@@ -1993,7 +1993,7 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	}
 
 	// Late refinement completes.
-	if err := store.UpdateRefinement(sessionID, "late refined transcript", "completed"); err != nil {
+	if err := store.UpdateRefinementAtGeneration(sessionID, "late refined transcript", "completed", "", 0); err != nil {
 		t.Fatalf("update refinement: %v", err)
 	}
 
