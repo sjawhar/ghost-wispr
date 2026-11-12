@@ -12,7 +12,7 @@ import (
 // session's Drive folder is in the trash or gone.
 func remoteDeleted(t *testing.T, store *storage.SQLiteStore, id string) {
 	t.Helper()
-	if err := store.UpdateSummary(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize %s: %v", id, err)
 	}
 	syncTo(t, store, id, storage.SyncStateRemoteDeleted, "folder-"+id, 0, "the Drive folder is in the trash")
@@ -96,7 +96,7 @@ func TestAGCPassThatCannotCheckDriveHoldsBack(t *testing.T) {
 			var saved []string
 			for i, id := range ids {
 				saved = append(saved, endWithRecording(t, store, dir, id, daysAgo(60).Add(time.Duration(i)*time.Hour), 2*1024*1024))
-				if err := store.UpdateSummary(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+				if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 					t.Fatalf("summarize: %v", err)
 				}
 				syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")
@@ -136,7 +136,7 @@ func TestAKeptSessionsAudioStopsCountingAgainstTheBudget(t *testing.T) {
 	goneSaved := endWithRecording(t, store, dir, gone, daysAgo(60), 2*1024*1024)
 	presentSaved := endWithRecording(t, store, dir, present, daysAgo(59), 256*1024)
 	for _, id := range []string{gone, present} {
-		if err := store.UpdateSummary(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 			t.Fatalf("summarize: %v", err)
 		}
 		syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")
@@ -156,7 +156,7 @@ func TestGCKeepsASyncedSessionWithNoDriveFolder(t *testing.T) {
 	dir := t.TempDir()
 	const id = "20260901100000"
 	saved := endWithRecording(t, store, dir, id, daysAgo(60), 2*1024*1024)
-	if err := store.UpdateSummary(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "", 0, "")
@@ -191,7 +191,7 @@ func TestAnUnverifiedSessionsAudioGoesOnlyOnceDriveHasItsFolder(t *testing.T) {
 			dir := t.TempDir()
 			const id = "20260901100000"
 			saved := endWithRecording(t, store, dir, id, daysAgo(60), 2*1024*1024)
-			if err := store.UpdateSummary(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+			if err := store.UpdateSummaryAtGeneration(id, "Standup", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 				t.Fatalf("summarize: %v", err)
 			}
 			syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")

@@ -46,7 +46,7 @@ func TestDeleteSegmentScrubsMergedSources(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.UpdateSummary("source-a", "About "+mergedSourceSecret, "The summary of "+mergedSourceSecret+".", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("source-a", "About "+mergedSourceSecret, "The summary of "+mergedSourceSecret+".", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = 'source-a'`, "alpha stays. The "+mergedSourceSecret+" words.", RefinementCompleted); err != nil {

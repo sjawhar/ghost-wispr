@@ -98,7 +98,9 @@ func TestR7SummaryCarriesCanonicalizeGenerationToItsWrite(t *testing.T) {
 	if len(store.summaryWriteGenerations) != 1 || store.summaryWriteGenerations[0] != 7 {
 		t.Fatalf("summary write generations = %v, want [7]", store.summaryWriteGenerations)
 	}
-	if store.status["session"] != storage.SummaryFailed || store.summary["session"] != "" {
-		t.Fatalf("summary after generation changed = status %q, text %q; want failed without storing stale text", store.status["session"], store.summary["session"])
+	// A refused stale write records no failure: whatever changed the
+	// generation (a segment deletion) owns the summary's status now.
+	if store.status["session"] == storage.SummaryFailed || store.summary["session"] != "" {
+		t.Fatalf("summary after generation changed = status %q, text %q; want no failure recorded and no stale text stored", store.status["session"], store.summary["session"])
 	}
 }

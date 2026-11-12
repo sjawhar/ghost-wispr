@@ -51,7 +51,7 @@ func nestedMerge(t *testing.T, store *SQLiteStore) int64 {
 	if err := store.MergeSessions("m1", []string{"s1", "s2"}, base, base.Add(31*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("m1", "About "+ledgerSecret, "The summary of "+ledgerSecret+".", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("m1", "About "+ledgerSecret, "The summary of "+ledgerSecret+".", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MergeSessions("m2", []string{"m1", "s3"}, base, base.Add(61*time.Minute)); err != nil {
@@ -276,10 +276,10 @@ func TestFinishWaitsForEveryOwedFolder(t *testing.T) {
 func TestDeleteSessionRefusesASourceWhoseFolderIsOwed(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	deleteSecret(t, store, nestedMerge(t, store))
-	if _, err := store.DeleteSession("s1"); !errors.Is(err, ErrDeleteReplacementPending) {
+	if _, err := store.DeleteSession("s1", ""); !errors.Is(err, ErrDeleteReplacementPending) {
 		t.Fatalf("DeleteSession of a source with an owed folder = %v, want %v", err, ErrDeleteReplacementPending)
 	}
-	if _, err := store.DeleteSession("s2"); err != nil {
+	if _, err := store.DeleteSession("s2", ""); err != nil {
 		t.Errorf("DeleteSession of a source with no folder: %v", err)
 	}
 }

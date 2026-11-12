@@ -28,6 +28,9 @@ type mockStore struct {
 	// onRecordEraseDirectory, when set, runs as an erase directory is
 	// recorded.
 	onRecordEraseDirectory func(dir string)
+	// recordEraseErr, when set, is the error recording an erase directory
+	// returns.
+	recordEraseErr error
 }
 
 func (m *mockStore) RecordEraseDirectory(dir string) error {
@@ -35,7 +38,7 @@ func (m *mockStore) RecordEraseDirectory(dir string) error {
 	if m.onRecordEraseDirectory != nil {
 		m.onRecordEraseDirectory(dir)
 	}
-	return nil
+	return m.recordEraseErr
 }
 
 // The mock serves age-based retention only; disk pressure runs against the
@@ -336,6 +339,28 @@ func TestGCRecordsWhereItErasesBeforeItErases(t *testing.T) {
 			t.Errorf("recorded erase directory %s, want the audio directory %s", recorded, dir)
 		}
 	}
+}
+
+// TestGCAgeChangesNothingWhenItCannotRecordWhereItErases fails if GC deletes
+// a session by age, or erases its recording, when it could not record the
+// recording's directory first: an erase a stop then cuts off, its row gone,
+// would never be finished as the app starts.
+func TestGCAgeChangesNothingWhenItCannotRecordWhereItErases(t *testing.T) {
+	dir := t.TempDir()
+	recording := filepath.Join(dir, "20261106140930.wav")
+	if err := os.WriteFile(recording, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &mockStore{
+		sessions:       map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: recording, GDriveFolderID: "folder"}},
+		gcEligible:     map[int][]string{30: {"20261106140930"}},
+		recordEraseErr: errors.New("database is locked"),
+	}
+	deleted, _ := New(store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}).Run()
+	if len(deleted) != 0 || len(store.deletedIDs) != 0 {
+		t.Errorf("deleted %v (store: %v) with its erase directory unrecorded, want the session kept", deleted, store.deletedIDs)
+	}
+	expectKept(t, recording)
 }
 
 // A raw .pcm whose session's saved recording is gone from disk is not a
@@ -769,7 +794,7 @@ func summarized(t *testing.T, store *storage.SQLiteStore, id string, startedAt t
 	if err := store.EndSession(id, startedAt.Add(time.Minute), ""); err != nil {
 		t.Fatalf("end session %s: %v", id, err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize %s: %v", id, err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
@@ -894,6 +919,33 @@ func TestGCRemovesNoFileItCannotRecord(t *testing.T) {
 	}
 	expectAudioKept(t, store, "20261106100000", saved)
 	expectNoSessionNamesAMissingFile(t, store, "20261106100000")
+}
+
+// recordFailsStore is the real store whose records of an erase directory
+// fail, as a locked or full database's do.
+type recordFailsStore struct{ *storage.SQLiteStore }
+
+func (recordFailsStore) RecordEraseDirectory(string) error {
+	return errors.New("database is locked")
+}
+
+// TestGCDiskPressureRemovesNoFileWhoseDirectoryItCannotRecord fails if disk
+// pressure takes a recording out of its session's row, or erases it, when it
+// could not record the recording's directory first: an erase a stop then cuts
+// off, no row naming the file, would never be finished as the app starts.
+func TestGCDiskPressureRemovesNoFileWhoseDirectoryItCannotRecord(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	const id = "20261106100000"
+	saved := endWithRecording(t, store, dir, id, time.Now().UTC().Add(-time.Hour), 2*1024*1024)
+	raw := writeRaw(t, dir, id, 1024, time.Now())
+	runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1) // marks the fixture synced; no budget, no removal
+
+	if _, err := New(recordFailsStore{store}, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir, Drive: &driveFolders{}}).Run(); err != nil {
+		t.Fatalf("gc run: %v", err)
+	}
+	expectAudioKept(t, store, id, saved)
+	expectKept(t, raw)
 }
 
 // Review note 2: removing a merged session's audio left its source sessions
@@ -1109,7 +1161,7 @@ type refinementStartsStore struct {
 func (s refinementStartsStore) Recordings() ([]storage.SessionRecording, error) {
 	recordings, err := s.SQLiteStore.Recordings()
 	if err == nil {
-		err = s.UpdateRefinement(s.id, "", storage.RefinementRunning)
+		err = s.UpdateRefinementAtGeneration(s.id, "", storage.RefinementRunning, "", 0)
 	}
 	return recordings, err
 }
@@ -1207,7 +1259,7 @@ func TestGCAgeKeepsTheRawCopyWhenTheRecordingStays(t *testing.T) {
 	store := newStore(t)
 	const id = "20261001120000"
 	saved := endWithRecording(t, store, savedDir, id, daysAgo(40), 1024)
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	raw := writeRaw(t, dir, id, 1024, daysAgo(40))
@@ -1245,7 +1297,7 @@ func TestGCAgeKeepsARecordingMergedAwayMeanwhile(t *testing.T) {
 	store := newStore(t)
 	const id, merged = "20261001120000", "20261001120000-merged"
 	saved := endWithRecording(t, store, dir, id, daysAgo(40), 1024)
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder", 0, "")
@@ -1305,7 +1357,7 @@ func TestGCChangesNothingWhenItCannotListRecordings(t *testing.T) {
 	dir := t.TempDir()
 	store := newStore(t)
 	old := endWithRecording(t, store, dir, "20261001120000", daysAgo(40), 1024)
-	if err := store.UpdateSummary("20261001120000", "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("20261001120000", "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	healthy := endWithRecording(t, store, dir, "20261106100000", time.Now().UTC().Add(-time.Hour), 2*1024*1024)
@@ -1352,10 +1404,10 @@ func TestGCAgeKeepsASessionWhileItsRefinementRuns(t *testing.T) {
 	store := newStore(t)
 	const id = "20261001120000"
 	saved := endWithRecording(t, store, dir, id, daysAgo(40), 1024)
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
-	if err := store.UpdateRefinement(id, "", storage.RefinementRunning); err != nil {
+	if err := store.UpdateRefinementAtGeneration(id, "", storage.RefinementRunning, "", 0); err != nil {
 		t.Fatalf("start refinement: %v", err)
 	}
 
@@ -1392,12 +1444,13 @@ func TestGCLeavesASessionWhoseRecordingIsMissingAlone(t *testing.T) {
 	expectAudioRemoved(t, store, "20261106101000", healthy)
 }
 
-// Review of #37, note 1: after audio_dir changes, a session's relative entry
-// resolves into the new directory, where its file is not, while the file is
-// still where the entry itself points (where the app plays and syncs it). GC
-// drops an entry as naming nothing only when neither path has a file, so the
-// row keeps naming that recording.
-func TestGCKeepsAnEntryWhoseFileIsWhereTheEntryPoints(t *testing.T) {
+// Review of #37, note 1, and of #49: after audio_dir changes, a session's
+// recording left in place is where its entry points (where the app plays,
+// syncs and splices it), not in the new directory. GC reads the entry there
+// too (recording.Resolve), so disk pressure counts that file and removes it
+// with the session's other files, the row then naming neither; GC drops an
+// entry as naming nothing only when neither path has a file.
+func TestGCReadsAnEntryWhereItPointsAfterAnAudioDirChange(t *testing.T) {
 	root := t.TempDir()
 	t.Chdir(root)
 	for _, dir := range []string{"old", "new"} {
@@ -1408,24 +1461,56 @@ func TestGCKeepsAnEntryWhoseFileIsWhereTheEntryPoints(t *testing.T) {
 	store := newStore(t)
 	const id = "20261106100000-merged"
 	createSession(t, store, id, time.Now().UTC().Add(-time.Hour))
-	moved, current := filepath.Join("old", "20261106100000.mp3"), filepath.Join("new", "20261106101000.mp3")
-	for _, path := range []string{moved, current} {
+	leftInPlace, current := filepath.Join("old", "20261106100000.mp3"), filepath.Join("new", "20261106101000.mp3")
+	for _, path := range []string{leftInPlace, current} {
 		if err := os.WriteFile(path, make([]byte, 2*1024*1024), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := store.EndSession(id, time.Now().UTC(), moved+","+current); err != nil {
+	if err := store.EndSession(id, time.Now().UTC(), leftInPlace+","+current); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
 	runGC(t, store, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: "new"}, 1)
 	expectRemoved(t, current)
-	expectKept(t, moved)
+	expectRemoved(t, leftInPlace)
 	sess, err := store.GetSession(id)
 	if err != nil {
 		t.Fatalf("read session: %v", err)
 	}
-	if sess.AudioPath != moved {
-		t.Errorf("audio_path %q, want %q: the recording at old/ is on disk and must stay named", sess.AudioPath, moved)
+	if sess.AudioPath != "" || sess.AudioRemovedAt == "" {
+		t.Errorf("audio_path %q, audio_removed_at %q; want neither recording named, and the marker", sess.AudioPath, sess.AudioRemovedAt)
 	}
+}
+
+// TestGCAgeErasesTheRecordingLeftInPlaceAfterAnAudioDirChange fails if GC,
+// deleting a session by age after audio_dir changed, looks for its recording
+// only in the new audio directory: the row goes and the recording where its
+// entry points stays on the unit, unerased, named by no row.
+func TestGCAgeErasesTheRecordingLeftInPlaceAfterAnAudioDirChange(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	for _, dir := range []string{"old", "new"} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := newStore(t)
+	const id = "20261001120000"
+	createSession(t, store, id, daysAgo(40))
+	leftInPlace := filepath.Join("old", id+".mp3")
+	if err := os.WriteFile(leftInPlace, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(id, daysAgo(40).Add(time.Minute), leftInPlace); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: "new"}, 1); !slices.Equal(deleted, []string{id}) {
+		t.Fatalf("deleted %v, want [%s] by age", deleted, id)
+	}
+	expectRemoved(t, leftInPlace)
 }

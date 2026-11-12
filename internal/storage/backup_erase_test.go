@@ -30,7 +30,7 @@ func openWithSecret(t *testing.T, path string) {
 	if _, _, err := store.Canonicalize("backed-up"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("backed-up", "Title", "The summary of "+backupSecret+".", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("backed-up", "Title", "The summary of "+backupSecret+".", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.StoreEvent("live_transcript", `{"type":"live_transcript","session_id":"backed-up","text":"`+backupSecret+`","start_time":2,"end_time":4}`); err != nil {
@@ -154,4 +154,33 @@ func TestADeletionScrubsABackupOfAnOlderSchemaInPlace(t *testing.T) {
 	if segments != 2 {
 		t.Errorf("the backup keeps %d of the session's segments, want the two not deleted", segments)
 	}
+}
+
+// TestADeletionScrubsTheSpeakerNamesFromABackupOfAnOlderSchema fails if a
+// deletion leaves the session's speaker names in a pre-migration backup it
+// scrubs in place: the database clears them with the summary that named the
+// speakers, and the names can come from the deleted words.
+func TestADeletionScrubsTheSpeakerNamesFromABackupOfAnOlderSchema(t *testing.T) {
+	const speaker = "speaker-named-in-deleted-words-41d9"
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`UPDATE sessions SET speaker_names = ? WHERE id = 'backed-up'`, `{"0":"`+speaker+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	// The previous build's schema lacks a column this version adds.
+	if _, err := old.Exec(`ALTER TABLE sessions DROP COLUMN drive_replace_error`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := openStoreWithBackup(t, path)
+	assertBackupHolds(t, path, speaker, true)
+	deleteBackedUpSecret(t, store)
+	assertBackupHolds(t, path, speaker, false)
 }

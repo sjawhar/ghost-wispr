@@ -14,24 +14,35 @@ const batchResultDiscarded = "discarded"
 
 // readBatchSummarySessions reads every submitted transcript and deletion
 // generation from the same SQLite row, so a delete cannot pair old text with a
-// newer generation.
-func readBatchSummarySessions(store *storage.SQLiteStore, sessionIDs []string) ([]summary.BatchSession, map[string]int, []string, error) {
-	sessions := make([]summary.BatchSession, 0, len(sessionIDs))
-	generations := make(map[string]int, len(sessionIDs))
-	emptyTranscriptIDs := make([]string, 0)
+// newer generation. Sessions whose transcript is empty are not submitted:
+// emptyTranscripts maps each to the generation read with its transcript.
+func readBatchSummarySessions(store *storage.SQLiteStore, sessionIDs []string) (sessions []summary.BatchSession, generations, emptyTranscripts map[string]int, err error) {
+	sessions = make([]summary.BatchSession, 0, len(sessionIDs))
+	generations = make(map[string]int, len(sessionIDs))
+	emptyTranscripts = make(map[string]int)
 	for _, sessionID := range sessionIDs {
 		transcript, generation, err := store.Canonicalize(sessionID)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("canonicalize batch summary input for %s: %w", sessionID, err)
 		}
 		if strings.TrimSpace(transcript) == "" {
-			emptyTranscriptIDs = append(emptyTranscriptIDs, sessionID)
+			emptyTranscripts[sessionID] = generation
 			continue
 		}
 		sessions = append(sessions, summary.BatchSession{ID: sessionID, Transcript: transcript})
 		generations[sessionID] = generation
 	}
-	return sessions, generations, emptyTranscriptIDs, nil
+	return sessions, generations, emptyTranscripts, nil
+}
+
+// completeEmptySummaries completes, empty, the summary of each session whose
+// transcript was empty (emptyTranscripts, with the generation read with it):
+// an empty summary keeps the session's summary. A session whose text changed
+// since is left to the summary run of that change.
+func completeEmptySummaries(store *storage.SQLiteStore, emptyTranscripts map[string]int) {
+	for id, generation := range emptyTranscripts {
+		_ = store.UpdateSummaryAtGeneration(id, "", "", storage.SummaryCompleted, "", "{}", "", generation)
+	}
 }
 
 // applySummaryBatchResults stores each terminal response only at its submitted

@@ -69,7 +69,7 @@ func TestOrchestratorDoesNotMarkSyncedARecordingThatCameBackDuringTheUpload(t *t
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	uploader := &remountingUploader{recording: recording}
@@ -137,7 +137,7 @@ func TestGCNeverRemovesARecordingDriveSkippedOnARetry(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), strings.Join(paths, ",")); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
@@ -217,7 +217,7 @@ func TestOrchestratorRetryReplacesAChangedSummary(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
@@ -227,7 +227,7 @@ func TestOrchestratorRetryReplacesAChangedSummary(t *testing.T) {
 	if err := o.SyncSession(context.Background(), id); err == nil {
 		t.Fatal("the cut-off first sync succeeded")
 	}
-	if err := store.UpdateSummary(id, "", "The summary, made again.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "The summary, made again.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize again: %v", err)
 	}
 	drive.failAfter = 0
@@ -314,7 +314,7 @@ func gcRestoreRace(t *testing.T) (*storage.SQLiteStore, string, string, []byte, 
 	if err := store.EndSession(id, started.Add(time.Minute), removable+","+stuck); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	syncTo(t, store, id, storage.SyncStateSynced, "folder-gc-race", 0, "")

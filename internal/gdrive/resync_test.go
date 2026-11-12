@@ -50,7 +50,7 @@ func summarizedSession(t *testing.T, store *storage.SQLiteStore, audioDir, id st
 	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Standup", summary, storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", summary, storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 }
@@ -62,7 +62,7 @@ func resummarize(t *testing.T, store *storage.SQLiteStore, id, summary string) {
 	if err := store.StartSummary(id); err != nil {
 		t.Fatalf("start summary: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Standup", summary, storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", summary, storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("store summary: %v", err)
 	}
 }
@@ -158,7 +158,7 @@ func TestAChangeAfterASyncReachesDrive(t *testing.T) {
 		{
 			name: "refinement retried",
 			change: func(t *testing.T, store *storage.SQLiteStore, id string) {
-				if err := store.UpdateRefinement(id, "The refined transcript.", storage.RefinementCompleted); err != nil {
+				if err := store.UpdateRefinementAtGeneration(id, "The refined transcript.", storage.RefinementCompleted, "", 0); err != nil {
 					t.Fatalf("refine: %v", err)
 				}
 				if _, _, err := store.Canonicalize(id); err != nil {
