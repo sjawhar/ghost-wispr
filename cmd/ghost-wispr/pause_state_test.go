@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
@@ -399,4 +404,78 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 			t.Fatalf("power button status broadcasts = %v, want %v", got, want)
 		}
 	})
+}
+
+func TestSeedPausedStatePersistsBeforeTestInstanceStarts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	configPath := filepath.Join(t.TempDir(), "ghost-wispr.yaml")
+	if err := os.WriteFile(configPath, []byte("db_path: "+dbPath+"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	var out bytes.Buffer
+	if _, err := seedPausedState(configPath, &out); err != nil {
+		t.Fatalf("seed paused state: %v", err)
+	}
+	store, err := storage.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("open seeded database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
+	if err != nil {
+		t.Fatalf("read pause state: %v", err)
+	}
+	if !ok || value != "1" {
+		t.Errorf("capture pause = %q, found %v; want 1, true", value, ok)
+	}
+}
+
+// seed-paused-state and the recorder resolve the configuration and database
+// with one resolver, so a relative config and a relative db_path from the same
+// working directory name the same database file. The config sits in its own
+// directory, so resolving db_path against the config's directory instead of
+// the working directory names a different file and fails this test.
+func TestSeedPausedStateWritesTheDatabaseTheRecorderOpens(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.Mkdir("conf", 0o700); err != nil {
+		t.Fatalf("make config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join("conf", "ghost-wispr.yaml"), []byte("db_path: data/ghost-wispr.db\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(config.EnvPrefix+"CONFIG", filepath.Join("conf", "ghost-wispr.yaml"))
+	t.Setenv(config.EnvPrefix+"DB_PATH", "")
+
+	recorderStore, _, err := loadRuntimeConfig(configPathFromEnvironment())
+	if err != nil {
+		t.Fatalf("load recorder configuration: %v", err)
+	}
+	recorderDB, err := databasePath(recorderStore.Get().DBPath)
+	if err != nil {
+		t.Fatalf("resolve recorder database: %v", err)
+	}
+
+	var out bytes.Buffer
+	seededDB, err := seedPausedState(configPathFromEnvironment(), &out)
+	if err != nil {
+		t.Fatalf("seed paused state: %v", err)
+	}
+	if seededDB != recorderDB {
+		t.Fatalf("seed-paused-state wrote %s, the recorder opens %s", seededDB, recorderDB)
+	}
+	if want := filepath.Join(root, "data", "ghost-wispr.db"); recorderDB != want {
+		t.Fatalf("recorder database = %s, want %s", recorderDB, want)
+	}
+	if !strings.Contains(out.String(), recorderDB) {
+		t.Fatalf("seed-paused-state printed %q, want the absolute database path %s", out.String(), recorderDB)
+	}
+	store, err := storage.NewSQLiteStore(recorderDB)
+	if err != nil {
+		t.Fatalf("open recorder database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if value, ok, err := store.GetAppState(storage.AppStateCapturePaused); err != nil || !ok || value != "1" {
+		t.Fatalf("recorder database capture pause = %q, %v, %v; want 1", value, ok, err)
+	}
 }

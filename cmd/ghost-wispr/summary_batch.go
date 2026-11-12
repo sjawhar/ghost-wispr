@@ -56,7 +56,7 @@ func applySummaryBatchResults(store *storage.SQLiteStore, hub summaryBroadcaster
 			failed++
 			continue
 		}
-		if err := store.UpdateSummaryAtGeneration(result.SessionID, result.Title, result.Summary, storage.SummaryCompleted, result.PresetName, result.SpeakerNames, batchSession.Generation); err != nil {
+		if err := store.UpdateSummaryAtGeneration(result.SessionID, result.Title, result.Summary, storage.SummaryCompleted, result.PresetName, result.SpeakerNames, result.Model, batchSession.Generation); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				if err := store.MarkSummaryBatchSessionDone(batchName, result.SessionID, batchResultDiscarded); err != nil {
 					return succeeded, failed, err

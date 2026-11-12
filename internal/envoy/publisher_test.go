@@ -277,6 +277,7 @@ func TestPublishSummaryReadyUsesSummaryVersionAndMarksStatus(t *testing.T) {
 			Status:         storage.SessionEnded,
 			SummaryStatus:  storage.SummaryCompleted,
 			SummaryPreset:  "default",
+			SummaryModel:   "provider-summary-model",
 			SummaryVersion: 3,
 		},
 	}}
@@ -295,6 +296,9 @@ func TestPublishSummaryReadyUsesSummaryVersionAndMarksStatus(t *testing.T) {
 	}
 	if got[0].delivery != "session-1.summary_ready.3" {
 		t.Fatalf("delivery = %q, want session-1.summary_ready.3", got[0].delivery)
+	}
+	if got, _ := got[0].body.Payload["summary_model"].(string); got != "provider-summary-model" {
+		t.Fatalf("summary_model = %q, want provider-summary-model", got)
 	}
 }
 
@@ -592,7 +596,7 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Canonicalize: %v", err)
 	}
-	if err := store.UpdateSummaryAtGeneration("session-1", "", "", storage.SummaryCompleted, "", "{}", generation); err != nil {
+	if err := store.UpdateSummaryAtGeneration("session-1", "", "", storage.SummaryCompleted, "", "{}", "", generation); err != nil {
 		t.Fatalf("complete empty summary: %v", err)
 	}
 
@@ -622,7 +626,7 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 	if err := store.StartSummary("session-1"); err != nil {
 		t.Fatalf("StartSummary: %v", err)
 	}
-	if err := store.UpdateSummaryAtGeneration("session-1", "Title", "A real summary.", storage.SummaryCompleted, "default", "{}", generation); err != nil {
+	if err := store.UpdateSummaryAtGeneration("session-1", "Title", "A real summary.", storage.SummaryCompleted, "default", "{}", "", generation); err != nil {
 		t.Fatalf("store a real summary: %v", err)
 	}
 	if ids, err = store.GetSessionsNeedingEnvoyPublish(); err != nil || len(ids) != 1 {

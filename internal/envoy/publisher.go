@@ -319,6 +319,7 @@ func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *
 	event := Event{Type: eventType, SessionID: sess.ID, Payload: payload}
 	if eventType == eventSummaryReady {
 		payload["summary_preset"] = sess.SummaryPreset
+		payload["summary_model"] = sess.SummaryModel
 		event.SummaryVersion = sess.SummaryVersion
 	}
 	return p.client.Send(ctx, event)

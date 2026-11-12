@@ -118,9 +118,9 @@ func TestAReplacedMarkNeedsTheFolderReplacement(t *testing.T) {
 	}
 }
 
-// TestGCAndMergeCheckTheLedger fails if GC (with or without the sync gate)
-// or a merge treats a session whose Drive folder another deletion still owes
-// a replacement as free, as DeleteSession does not.
+// TestGCAndMergeCheckTheLedger fails if GC or a merge treats a synced
+// session whose Drive folder another deletion still owes a replacement as
+// free, as DeleteSession does not.
 func TestGCAndMergeCheckTheLedger(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	started := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
@@ -139,19 +139,17 @@ func TestGCAndMergeCheckTheLedger(t *testing.T) {
 	if _, err := store.DB().Exec(`INSERT INTO drive_replacement_folders(session_id, generation, folder_session_id, state) VALUES('other', 1, 'owed-folder', ?)`, DriveReplacementFolderOwed); err != nil {
 		t.Fatal(err)
 	}
-	for _, syncGated := range []bool{false, true} {
-		recordings, err := store.Recordings(syncGated)
-		if err != nil {
-			t.Fatal(err)
+	recordings, err := store.Recordings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, recording := range recordings {
+		if recording.ID == "owed-folder" && recording.Removable {
+			t.Error("GC may remove the recording of a session whose folder is owed")
 		}
-		for _, recording := range recordings {
-			if recording.ID == "owed-folder" && recording.Removable {
-				t.Errorf("sync gate %v: GC may remove the recording of a session whose folder is owed", syncGated)
-			}
-		}
-		if deleted, err := store.DeleteEndedSession("owed-folder", "/audio/owed-folder.mp3", syncGated); err != nil || deleted {
-			t.Fatalf("sync gate %v: GC deleted a session whose folder is owed (%v)", syncGated, err)
-		}
+	}
+	if deleted, err := store.DeleteEndedSession("owed-folder", "/audio/owed-folder.mp3"); err != nil || deleted {
+		t.Fatalf("GC deleted a session whose folder is owed (%v)", err)
 	}
 	if err := store.MergeSessions("merged", []string{"owed-folder", "other"}, started, started.Add(2*time.Hour)); !errors.Is(err, ErrMergeReplacementPending) {
 		t.Errorf("merge of a session whose folder is owed = %v, want %v", err, ErrMergeReplacementPending)

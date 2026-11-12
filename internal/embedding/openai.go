@@ -3,6 +3,7 @@ package embedding
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -14,6 +15,9 @@ type openAIEmbedder interface {
 type openaiClient struct {
 	client openAIEmbedder
 	model  string
+
+	mu            sync.RWMutex
+	reportedModel string
 }
 
 func newOpenAIClient(apiKey, model string, opts *clientOptions) (*openaiClient, error) {
@@ -58,6 +62,17 @@ func (c *openaiClient) Embed(ctx context.Context, texts []string, _ TaskType) ([
 			return nil, fmt.Errorf("openai: missing embedding for input index %d", i)
 		}
 	}
+	c.mu.Lock()
+	c.reportedModel = c.model
+	c.mu.Unlock()
 
 	return vectors, nil
+}
+
+// ReportedModel returns the resolved request model after a successful
+// embedding response. OpenAI's embedding response does not echo one.
+func (c *openaiClient) ReportedModel() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.reportedModel
 }

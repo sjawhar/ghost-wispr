@@ -4,7 +4,8 @@
     "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "duration": 1.62,
     "channels": 1,
-    "models": ["nova-3"]
+    "models": ["nova-3"],
+    "model_info": {"nova-3": {"name": "general-nova-3", "arch": "nova-3"}}
   },
   "results": {
     "channels": [

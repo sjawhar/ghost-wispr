@@ -296,10 +296,20 @@ func TestDeleteSegmentClearsPriorDriveReplacementCycle(t *testing.T) {
 	}
 }
 
+// syncedWithoutOwedReplacement marks session id synced and owing Drive no
+// replacement, so only a pending splice can keep its recording from GC.
+func syncedWithoutOwedReplacement(t *testing.T, store *SQLiteStore, id string) {
+	t.Helper()
+	if _, err := store.DB().Exec(`UPDATE sessions SET sync_status = ?, sync_state = ?, drive_replace_pending = 0 WHERE id = ?`, SyncSynced, SyncStateSynced, id); err != nil {
+		t.Fatalf("mark session %s synced: %v", id, err)
+	}
+}
+
 func TestRecordingsStayRemovableWithoutPendingSplice(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "gc-baseline")
-	recordings, err := store.Recordings(false)
+	syncedWithoutOwedReplacement(t, store, "gc-baseline")
+	recordings, err := store.Recordings()
 	if err != nil {
 		t.Fatalf("recordings: %v", err)
 	}
@@ -318,7 +328,8 @@ func TestRecordingsSkipPendingSegmentSplice(t *testing.T) {
 	if err := store.DeleteSegment("pending-gc", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
-	recordings, err := store.Recordings(false)
+	syncedWithoutOwedReplacement(t, store, "pending-gc")
+	recordings, err := store.Recordings()
 	if err != nil {
 		t.Fatalf("Recordings: %v", err)
 	}

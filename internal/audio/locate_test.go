@@ -58,8 +58,8 @@ func wordsAtHalfSeconds(text string) []Word {
 
 type timestampedWordsFixture struct{}
 
-func (timestampedWordsFixture) Transcribe(context.Context, string) (string, error) {
-	return "refined text", nil
+func (timestampedWordsFixture) Transcribe(context.Context, string) (transcribe.BatchResult, error) {
+	return transcribe.BatchResult{Transcript: "refined text"}, nil
 }
 
 func (timestampedWordsFixture) Words(context.Context, string) ([]transcribe.TimestampedWord, error) {

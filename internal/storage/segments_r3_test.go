@@ -76,7 +76,7 @@ func TestR3BatchSummaryAtSubmitGenerationIsRefusedAfterDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = store.StartSummary("s")
-	err = store.UpdateSummaryAtGeneration("s", "Private deletion token", "about private deletion token", SummaryCompleted, "default", "{}", submitted)
+	err = store.UpdateSummaryAtGeneration("s", "Private deletion token", "about private deletion token", SummaryCompleted, "default", "{}", "", submitted)
 	sess, _ := store.GetSession("s")
 	if err == nil || sess.Title != "" {
 		t.Fatal("stale batch summary stored")

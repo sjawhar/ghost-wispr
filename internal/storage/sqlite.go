@@ -78,12 +78,14 @@ type Session struct {
 	EndedAt             *time.Time `json:"ended_at,omitempty"`
 	Status              string     `json:"status"`
 	Summary             string     `json:"summary"`
+	SummaryModel        string     `json:"summary_model"`
 	SummaryVersion      int        `json:"summary_version"`
 	SummaryStatus       string     `json:"summary_status"`
 	SummaryPreset       string     `json:"summary_preset"`
 	SpeakerNames        string     `json:"speaker_names"`
 	RefinedTranscript   string     `json:"refined_transcript"`
 	RefinementStatus    string     `json:"refinement_status"`
+	RefinementModel     string     `json:"refinement_model"`
 	AudioPath           string     `json:"audio_path"`
 	AudioRemovedAt      string     `json:"audio_removed_at"` // when disk pressure removed audio (RFC 3339), "" if never: all of it, or part when AudioPath names what is left; the session is kept
 	SummaryError        string     `json:"summary_error"`    // why the last summary attempt failed, "" once one completes; sync errors are in ErrorMessage
@@ -335,12 +337,14 @@ func (s *SQLiteStore) init(dbPath string) error {
 			ended_at TEXT,
 			status TEXT NOT NULL,
 			summary TEXT NOT NULL DEFAULT '',
+			summary_model TEXT NOT NULL DEFAULT '',
 			summary_version INTEGER NOT NULL DEFAULT 1,
 			summary_status TEXT NOT NULL DEFAULT 'pending',
 			summary_preset TEXT NOT NULL DEFAULT '',
 			speaker_names TEXT NOT NULL DEFAULT '{}',
 			refined_transcript TEXT NOT NULL DEFAULT '',
 			refinement_status TEXT NOT NULL DEFAULT 'pending',
+			refinement_model TEXT NOT NULL DEFAULT '',
 			audio_path TEXT NOT NULL DEFAULT '',
 			sync_status TEXT NOT NULL DEFAULT 'pending',
 			envoy_publish_status TEXT NOT NULL DEFAULT 'pending',
@@ -460,6 +464,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// The sync state a sync's claim came from, while it holds the session:
 		// startup recovery puts a sync claimed from REMOTE_DELETED back.
 		`ALTER TABLE sessions ADD COLUMN sync_claimed_from TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN summary_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN refinement_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN drive_replace_pending INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN deletion_generation INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN refinement_generation INTEGER NOT NULL DEFAULT 0`,
@@ -991,7 +997,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 }
 
 func (s *SQLiteStore) GetSessionsByDate(date string, includeDiscarded bool) ([]Session, error) {
-	query := `SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
+	query := `SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions
 		 WHERE substr(started_at, 1, 10) = ?`
 	if !includeDiscarded {
@@ -1035,7 +1041,7 @@ func (s *SQLiteStore) GetDates() ([]string, error) {
 // GetSessionsWithEmptyTitles returns sessions where the title is empty or NULL.
 func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
+		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions WHERE (title = '' OR title IS NULL) AND status NOT IN ('discarded', 'merged') ORDER BY started_at DESC`,
 	)
 	if err != nil {
@@ -1058,7 +1064,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 
 func getSession(q querier, id string) (Session, error) {
 	row := q.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -1066,7 +1072,7 @@ func getSession(q querier, id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryModel, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.RefinementModel, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -1183,17 +1189,26 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 // A changed completed summary not started by StartSummary (a batch result)
 // gets a new summary version when the session's current version may already
 // have been sent to Envoy, so Envoy does not drop it as a duplicate delivery.
+// UpdateSummary stores a summary when its producer has no provider model to
+// report, such as a restored or repaired legacy record.
 func (s *SQLiteStore) UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error {
-	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, -1)
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, "", -1)
 }
 
-// UpdateSummaryAtGeneration stores a summary only if the transcript generation
-// the writer read remains current.
-func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error {
-	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, generation)
+// UpdateSummaryWithModel atomically stores a summary and the model reported by
+// the provider that generated it.
+func (s *SQLiteStore) UpdateSummaryWithModel(sessionID, title, summary, status, preset, speakerNames, model string) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, model, -1)
 }
 
-func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, speakerNames string, generation int) error {
+// UpdateSummaryAtGeneration stores a summary, and the model reported by the
+// provider that generated it, only if the transcript generation the writer
+// read remains current.
+func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error {
+	return s.updateSummary(sessionID, title, summary, status, preset, speakerNames, model, generation)
+}
+
+func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin summary update for session %s: %w", sessionID, err)
@@ -1209,13 +1224,14 @@ func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, s
 			return fmt.Errorf("read summary generation for session %s: %w", sessionID, err)
 		}
 	}
-	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames)
+	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames, model)
 	res, err := tx.Exec(
 		`UPDATE sessions
 		 SET title = CASE WHEN ? != '' THEN ? ELSE title END,
 		     summary_preset = CASE WHEN ? != '' THEN ? ELSE summary_preset END,
 		     speaker_names = CASE WHEN ? != '' THEN ? ELSE speaker_names END,
 		     summary = CASE WHEN ? != '' THEN ? ELSE summary END,
+		     summary_model = CASE WHEN ? != '' THEN ? ELSE summary_model END,
 		     summary_version = CASE WHEN ? THEN summary_version + 1 ELSE summary_version END,
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
@@ -1225,6 +1241,7 @@ func (s *SQLiteStore) updateSummary(sessionID, title, summary, status, preset, s
 		summary, preset,
 		summary, speakerNames,
 		summary, summary,
+		model, model,
 		bumpVersion,
 		bumpVersion, EnvoyPublishPending,
 		status,
@@ -1257,7 +1274,7 @@ func (s *SQLiteStore) DeletionGeneration(sessionID string) (int, error) {
 	return generation, nil
 }
 
-func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames string) bool {
+func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames, model string) bool {
 	if status != SummaryCompleted || current.SummaryStatus == SummaryRunning {
 		return false
 	}
@@ -1265,6 +1282,9 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 		return false
 	}
 	if title != "" && title != current.Title {
+		return true
+	}
+	if model != "" && model != current.SummaryModel {
 		return true
 	}
 	return summary != "" && (summary != current.Summary || preset != current.SummaryPreset || speakerNames != current.SpeakerNames)
@@ -1360,11 +1380,23 @@ func (s *SQLiteStore) failSummary(id, errMsg string, generation int) (Session, e
 	return sess, nil
 }
 
+// UpdateRefinement stores a refinement when its producer did not expose a
+// model identity.
 func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
+	return s.UpdateRefinementWithModel(sessionID, transcript, status, "")
+}
+
+// UpdateRefinementWithModel atomically stores a refinement and the model
+// reported by its provider.
+func (s *SQLiteStore) UpdateRefinementWithModel(sessionID, transcript, status, model string) error {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = ?, refinement_status = ? WHERE id = ? AND refinement_generation = deletion_generation`,
+		`UPDATE sessions
+		 SET refined_transcript = ?, refinement_status = ?,
+		     refinement_model = CASE WHEN ? != '' THEN ? ELSE refinement_model END
+		 WHERE id = ? AND refinement_generation = deletion_generation`,
 		transcript,
 		status,
+		model, model,
 		sessionID,
 	)
 	if err != nil {
@@ -1390,7 +1422,7 @@ func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) err
 // takes nothing from a session whose refinement is running.
 func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != ''`,
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != ''`,
 		RefinementRunning, id, audioPath,
 	)
 	if err != nil {
@@ -1807,7 +1839,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 		var startedAt string
 		var endedAt sql.NullString
 		var lastSyncAttempt sql.NullString
-		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryModel, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.RefinementModel, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 
@@ -2006,7 +2038,7 @@ func (s *SQLiteStore) GetSessionsNeedingEnvoyPublish() ([]string, error) {
 
 func (s *SQLiteStore) GetSessionsBySyncState(syncState string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
+		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending
 		 FROM sessions
 		 WHERE status = 'ended' AND sync_state = ?
 		 ORDER BY started_at ASC`,
@@ -2034,25 +2066,24 @@ func ageCutoff(now time.Time, maxAgeDays int) (time.Time, bool) {
 }
 
 // GetGCEligibleSessions returns the sessions age-based GC deletes, oldest
-// first: ended, with a completed summary, synced if syncGated, with documents
-// not marked unverified on Drive (documents_unverified), never one whose
-// Drive folder is in the trash or gone (REMOTE_DELETED), and older than
-// maxAgeDays days. A session's age runs from when it started or, if it was
-// restored from Drive, from its restore, so the pass after a restore keeps
-// it. maxAgeDays <= 0 is no age limit: it returns none.
-func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+// first: ended, with a completed summary, synced, with documents not marked
+// unverified on Drive (documents_unverified), never one whose Drive folder is
+// in the trash or gone (REMOTE_DELETED), and older than maxAgeDays days. A
+// session's age runs from when it started or, if it was restored from Drive,
+// from its restore, so the pass after a restore keeps it. maxAgeDays <= 0 is
+// no age limit: it returns none.
+func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int) ([]string, error) {
 	cutoff, ok := ageCutoff(time.Now().UTC(), maxAgeDays)
 	if !ok {
 		return nil, nil
 	}
 	at := cutoff.Format(time.RFC3339Nano)
 	// restored_at is '' for a session recorded here, which is before any time.
-	cond, args := removable(syncGated)
 	// A session whose documents are unverified on Drive is never deleted.
-	query := `SELECT id FROM sessions WHERE summary_status = 'completed' AND started_at < ? AND restored_at < ? AND documents_unverified = 0 AND ` + cond +
-		` ORDER BY started_at ASC`
-
-	rows, err := s.db.Query(query, append([]any{at, at}, args...)...)
+	rows, err := s.db.Query(
+		`SELECT id FROM sessions WHERE summary_status = 'completed' AND started_at < ? AND restored_at < ? AND documents_unverified = 0 AND `+removableCondition+` ORDER BY started_at ASC`,
+		at, at,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible sessions: %w", err)
 	}
@@ -2081,29 +2112,23 @@ type SessionRecording struct {
 	Removable bool
 }
 
-// removable is the condition under which GC may remove a session's recording
-// (disk pressure) or the session with it (the age policy, which also needs
-// documents_unverified = 0), and its arguments: the session ended, no
-// refinement is reading the file, it owes Drive no replacement after a
-// segment deletion (drive_replace_pending: the replacement needs the row and
-// the spliced recording, sync gate or not), its Drive folder is not in the
-// trash or gone (REMOTE_DELETED: the device then holds its only lasting copy,
-// sync gate or not), and, when syncGated, it is synced. A session whose
-// documents are unverified on Drive (documents_unverified: synced by an
-// earlier version) has its audio on Drive: under the sync gate GC removes it
-// once Drive answers that the session's folder is there; with no sync gate
-// there is no Drive to ask, so it is kept. Any other sync state, a failure
-// included, keeps the recording.
-func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ? AND ` + noOwedDriveReplacement + `
-		AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)`
-	if syncGated {
-		cond += ` AND sync_status = ?`
-		return cond, []any{RefinementRunning, SyncStateRemoteDeleted, SyncSynced}
-	}
-	cond += ` AND documents_unverified = 0`
-	return cond, []any{RefinementRunning, SyncStateRemoteDeleted}
-}
+// removableCondition identifies a session whose recording GC may remove under
+// disk pressure or with the session under the age policy (which also requires
+// documents_unverified = 0): it ended, no refinement is reading the file, it
+// owes Drive no replacement after a segment deletion and its folder is owed
+// none (noOwedDriveReplacement: the replacement needs the row and the spliced
+// recording), no segment deletion's splice of its recording is unfinished,
+// its Drive folder is not in the trash or gone (REMOTE_DELETED: the device
+// then holds its only lasting copy), and it is synced. A session whose
+// documents are unverified on Drive (synced by an earlier version) has its
+// audio on Drive: GC removes it once Drive answers that the session's folder
+// is there. Any other sync state, a failure included, keeps the recording.
+const removableCondition = `status = 'ended'` +
+	` AND refinement_status != '` + RefinementRunning + `'` +
+	` AND sync_state != '` + SyncStateRemoteDeleted + `'` +
+	` AND sync_status = '` + SyncSynced + `'` +
+	` AND ` + noOwedDriveReplacement +
+	` AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)`
 
 // CountUnverifiedSessions returns how many sessions GC keeps until a sync
 // verifies their documents on Drive (documents_unverified), for the status
@@ -2118,12 +2143,22 @@ func (s *SQLiteStore) CountUnverifiedSessions() (int, error) {
 	return n, nil
 }
 
+// CountUnitOnlySessions returns how many sessions are kept on this unit
+// only: REMOTE_DELETED (their Drive folder is in the trash, gone, or cannot
+// be read) with their audio still named here, for the status the app
+// reports. No GC path deletes such a session or removes its audio.
+func (s *SQLiteStore) CountUnitOnlySessions() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sessions WHERE sync_state = ? AND audio_path != ''`, SyncStateRemoteDeleted).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count sessions kept on this unit only: %w", err)
+	}
+	return n, nil
+}
+
 // Recordings lists, oldest first, every session that names audio, and whether
-// disk pressure may remove its recording (see removable).
-func (s *SQLiteStore) Recordings(syncGated bool) ([]SessionRecording, error) {
-	cond, args := removable(syncGated)
-	rows, err := s.db.Query(`SELECT id, audio_path, (`+cond+`) FROM sessions
-		WHERE audio_path != '' ORDER BY started_at ASC`, args...)
+// disk pressure may remove its recording (see removableCondition).
+func (s *SQLiteStore) Recordings() ([]SessionRecording, error) {
+	rows, err := s.db.Query(`SELECT id, audio_path, (` + removableCondition + `) FROM sessions WHERE audio_path != '' ORDER BY started_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query recordings: %w", err)
 	}
@@ -2144,28 +2179,26 @@ func (s *SQLiteStore) Recordings(syncGated bool) ([]SessionRecording, error) {
 }
 
 // AudioRemoval is what MarkAudioRemoved changed in a session's row: its audio
-// path before and after, and its marker, refinement status and sync state
-// before, so RestoreAudio can put back the part whose files stayed on disk.
+// path before and after, and its marker and refinement status before, so
+// RestoreAudio can put back the part whose files stayed on disk.
 type AudioRemoval struct {
 	ID               string
 	Before, Left     string
 	RemovedAtBefore  string
 	RefinementBefore string
-	SyncStateBefore  string
 }
 
 // MarkAudioRemoved records that disk pressure is about to remove part or all
 // of session id's audio, before it removes any file, so the session never
 // names a file GC has removed. The audio path becomes left, what will be left
-// of before; the marker the UI shows is set to removedAt; and a refinement
-// that can no longer run (pending or failed) becomes no_audio when no
-// recording is left on disk (audioLeft false; left may still name a file GC
-// could not see, on a disk not mounted for the moment). It does this only
-// while the session's audio path is still before and disk pressure may still
-// remove it (see removable), so a refinement that started reading the file
-// since GC listed it keeps it. It reports whether it did, and returns the row
-// as it was, for RestoreAudio.
-func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncGated bool, removedAt time.Time) (AudioRemoval, bool, error) {
+// of before; the marker the UI shows is set to removedAt; and a pending or
+// failed refinement becomes no_audio when no recording is left on disk
+// (audioLeft false; left may still name a file GC could not see, on a disk not
+// mounted for the moment). It does this only while the session's audio path is
+// still before and disk pressure may still remove it (see removableCondition),
+// so a refinement that started reading the file since GC listed it keeps it.
+// It reports whether it did, and returns the row as it was, for RestoreAudio.
+func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft bool, removedAt time.Time) (AudioRemoval, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return AudioRemoval{}, false, fmt.Errorf("begin marking audio removed for session %s: %w", id, err)
@@ -2173,9 +2206,10 @@ func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncG
 	defer func() { _ = tx.Rollback() }()
 
 	removal := AudioRemoval{ID: id, Before: before, Left: left}
-	cond, args := removable(syncGated)
-	err = tx.QueryRow(`SELECT audio_removed_at, refinement_status, sync_state FROM sessions WHERE id = ? AND audio_path = ? AND `+cond,
-		append([]any{id, before}, args...)...).Scan(&removal.RemovedAtBefore, &removal.RefinementBefore, &removal.SyncStateBefore)
+	err = tx.QueryRow(
+		`SELECT audio_removed_at, refinement_status FROM sessions WHERE id = ? AND audio_path = ? AND `+removableCondition,
+		id, before,
+	).Scan(&removal.RemovedAtBefore, &removal.RefinementBefore)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AudioRemoval{}, false, nil
 	}
@@ -2202,23 +2236,25 @@ func (s *SQLiteStore) MarkAudioRemoved(id, before, left string, audioLeft, syncG
 // after all: the session's audio path becomes restored, what is still on disk
 // of removal.Before. With all of it back, the marker and refinement status
 // are as they were before the mark; with part of it, the marker stays and a
-// refinement the mark moved to no_audio goes back. A sync that finished
-// since the mark uploaded the row as marked, so the recordings put back may
-// not be on Drive: the session goes back to pending sync, keeping its folder.
-// It refuses a row whose audio path is no longer what the mark left.
+// refinement the mark moved to no_audio goes back. A sync may have finished
+// since the mark and uploaded the row as marked, so the recordings put back
+// may not be on Drive: a synced session goes back to pending sync, keeping its
+// folder. GC marks only synced sessions, so the state before the mark cannot
+// tell whether a sync ran since. It refuses a row whose audio path is no
+// longer what the mark left.
 func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions SET audio_path = ?,
 			audio_removed_at = CASE WHEN ? = ? THEN ? ELSE audio_removed_at END,
 			refinement_status = CASE WHEN ? != '' AND refinement_status = ? THEN ? ELSE refinement_status END,
-			sync_status = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_status END,
-			sync_state = CASE WHEN sync_state = ? AND sync_state != ? THEN ? ELSE sync_state END
+			sync_status = CASE WHEN sync_state = ? THEN ? ELSE sync_status END,
+			sync_state = CASE WHEN sync_state = ? THEN ? ELSE sync_state END
 		 WHERE id = ? AND audio_path = ? AND status = 'ended'`,
 		restored,
 		restored, removal.Before, removal.RemovedAtBefore,
 		restored, RefinementNoAudio, removal.RefinementBefore,
-		SyncStateSynced, removal.SyncStateBefore, SyncPending,
-		SyncStateSynced, removal.SyncStateBefore, SyncStatePending,
+		SyncStateSynced, SyncPending,
+		SyncStateSynced, SyncStatePending,
 		removal.ID, removal.Left,
 	)
 	if err != nil {
@@ -2244,7 +2280,7 @@ var ErrDeleteReplacementPending = errors.New("this session still has a deleted s
 
 // noOwedDriveReplacement is the condition, on a sessions row, that it owes
 // Google Drive no replacement and its folder is owed none. DeleteSession, GC
-// (removable) and MergeSessions all check it.
+// (removableCondition) and MergeSessions all check it.
 const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXISTS (
 	SELECT 1 FROM drive_replacement_folders
 	WHERE drive_replacement_folders.folder_session_id = sessions.id AND drive_replacement_folders.state = '` + DriveReplacementFolderOwed + `')`
@@ -2284,17 +2320,18 @@ func (s *SQLiteStore) DeleteSession(id string) (string, error) {
 }
 
 // DeleteEndedSession deletes session id for the age policy only while it is as
-// GC read it: ended, naming audioPath, with documents not marked unverified
-// on Drive, and, when syncGated, synced. It reports whether it did. A
-// session merged since GC read it gave its recording to the merged session,
-// so deleting it, and removing that recording with it, would leave the
-// merged session naming a file that is gone. One whose summary or transcript
-// changed since GC read it is waiting to sync them (see the
-// sessions_documents_changed trigger): until it does, the newest text is
-// only on the device.
-func (s *SQLiteStore) DeleteEndedSession(id, audioPath string, syncGated bool) (bool, error) {
-	cond, args := removable(syncGated)
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND documents_unverified = 0 AND `+cond, append([]any{id, audioPath}, args...)...)
+// GC read it: ended, synced, naming audioPath, with documents not marked
+// unverified on Drive. It reports whether it did. A session merged since GC
+// read it gave its recording to the merged session, so deleting it, and
+// removing that recording with it, would leave the merged session naming a
+// file that is gone. One whose summary or transcript changed since GC read it
+// is waiting to sync them (see the sessions_documents_changed trigger): until
+// it does, the newest text is only on the device.
+func (s *SQLiteStore) DeleteEndedSession(id, audioPath string) (bool, error) {
+	res, err := s.db.Exec(
+		`DELETE FROM sessions WHERE id = ? AND audio_path = ? AND documents_unverified = 0 AND `+removableCondition,
+		id, audioPath,
+	)
 	if err != nil {
 		return false, fmt.Errorf("delete session %s: %w", id, err)
 	}

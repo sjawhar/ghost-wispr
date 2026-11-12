@@ -26,7 +26,7 @@ func TestR6CanonicalizePairsItsTranscriptWithItsGeneration(t *testing.T) {
 	if err := store.StartSummary("s"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummaryAtGeneration("s", "Safe title", transcript, SummaryCompleted, "default", "{}", generation); err != nil {
+	if err := store.UpdateSummaryAtGeneration("s", "Safe title", transcript, SummaryCompleted, "default", "{}", "", generation); err != nil {
 		t.Fatalf("store summary at canonical generation: %v", err)
 	}
 	sess, _ := store.GetSession("s")

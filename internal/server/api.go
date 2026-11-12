@@ -231,6 +231,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
+		model := ""
+		if reporter, ok := embeddingClient.(interface{ ReportedModel() string }); ok {
+			model = reporter.ReportedModel()
+		}
+
 		allEmbeddings, err := store.GetAllEmbeddings()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load embeddings: %v", err))
@@ -295,7 +300,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			})
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{"results": results})
+		writeJSON(w, http.StatusOK, map[string]any{"model": model, "results": results})
 	})
 
 	// Full-text search endpoint
@@ -805,6 +810,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 			return
 		}
+		if controls.OnSessionDeleted != nil {
+			controls.OnSessionDeleted(sessionID)
+		}
 
 		// Erase the recordings the deleted row named, after the database
 		// deletion: removing a whole audio file overwrites it with zeros
@@ -883,6 +891,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("merge sessions: %v", err))
 			return
+		}
+		if controls.OnSessionsMerged != nil {
+			controls.OnSessionsMerged(body.SessionIDs)
 		}
 
 		if controls.OnSessionMerged != nil {
@@ -980,6 +991,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				continue
 			}
 			mergedIDs = append(mergedIDs, newID)
+			if controls.OnSessionsMerged != nil {
+				controls.OnSessionsMerged(group)
+			}
 			if controls.OnSessionMerged != nil {
 				go controls.OnSessionMerged(context.Background(), newID)
 			}
@@ -1302,6 +1316,13 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if unverified > 0 {
 			warnings = append(slices.Clip(warnings), unverifiedWarning(unverified))
 		}
+		unitOnly := 0
+		if controls.UnitOnlySessions != nil {
+			unitOnly = controls.UnitOnlySessions()
+		}
+		if unitOnly > 0 {
+			warnings = append(slices.Clip(warnings), unitOnlyWarning(unitOnly))
+		}
 		if warnings == nil {
 			warnings = []string{}
 		}
@@ -1323,6 +1344,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"kept_raw_bytes":            kept.Bytes,
 			"gc_hold":                   gcHold,
 			"unverified_sessions":       unverified,
+			"unit_only_sessions":        unitOnly,
 			"active_session_id":         activeSessionID,
 			"active_session_started_at": activeSessionStartedAt,
 		})
@@ -1505,7 +1527,30 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				return
 			}
 
-			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "queued"})
+			var speechStatus map[string]any
+			if controls.TTSWaitForSynthesis != nil {
+				var waitErr error
+				speechStatus, waitErr = controls.TTSWaitForSynthesis(r.Context(), id)
+				if waitErr != nil {
+					writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("TTS synthesis failed: %v", waitErr))
+					return
+				}
+			} else if controls.TTSStatus != nil {
+				speechStatus, _ = controls.TTSStatus(id)
+			}
+			if state, _ := speechStatus["status"].(string); state == tts.StatusFailed {
+				message, _ := speechStatus["error"].(string)
+				writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("TTS synthesis failed: %s", message))
+				return
+			}
+			if model, ok := speechStatus["model"].(string); ok && model != "" {
+				w.Header().Set("X-Ghost-Wispr-TTS-Model", model)
+			}
+			if voice, ok := speechStatus["voice"].(string); ok && voice != "" {
+				w.Header().Set("X-Ghost-Wispr-TTS-Voice", voice)
+			}
+
+			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "synthesized"})
 		})
 
 		mux.HandleFunc("GET /api/tts/status/{id}", func(w http.ResponseWriter, r *http.Request) {

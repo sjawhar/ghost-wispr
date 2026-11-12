@@ -184,7 +184,7 @@
   <div class="gc-section">
     {#if gcEnabled && !config.gdrive.sync_enabled}
       <div class="warning-banner">
-        ⚠️ Garbage collection will delete files without a Google Drive backup.
+        Garbage collection is on hold until Google Drive sync is enabled.
       </div>
     {/if}
 
@@ -200,18 +200,17 @@
         <label for="gc-max-age">Delete sessions older than (days)</label>
         <input id="gc-max-age" type="number" min="0" bind:value={gcMaxAgeDays} />
         <p class="hint">
-          0 = never. Deletes ended sessions that have a summary (only synced ones while sync is on),
-          with their transcripts and audio. A session restored from Drive counts from its restore.
+          0 = never. Deletes only ended sessions that have a verified copy in Google Drive. A
+          session restored from Drive counts from its restore.
         </p>
       </div>
       <div class="field">
         <label for="gc-max-size">Audio budget (MB)</label>
         <input id="gc-max-size" type="number" min="0" bind:value={gcMaxAudioSizeMB} />
         <p class="hint">
-          0 = no budget: GC removes no audio to free space. Past the budget, the oldest sessions'
-          audio is removed; the sessions, transcripts and summaries are kept. Recordings that could
-          not be saved, and audio not yet synced to Drive while sync is on, are not counted or
-          removed.
+          0 = no budget: GC removes no audio to free space. Past the budget, the oldest verified
+          Drive copies' local audio is removed; sessions, transcripts and summaries are kept.
+          Recordings without a verified Drive copy are not counted or removed.
         </p>
       </div>
     {/if}

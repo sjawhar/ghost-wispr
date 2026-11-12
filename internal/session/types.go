@@ -17,8 +17,10 @@ type Store interface {
 	AppendSegment(sessionID string, seg transcribe.Segment) error
 	GetSegments(sessionID string) ([]transcribe.Segment, error)
 	CountSegments(sessionID string) (int, error)
-	UpdateSummary(sessionID, title, summary, status, preset, speakerNames string) error
-	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames string, generation int) error
+	// UpdateSummaryAtGeneration stores the summary and the model its provider
+	// reported only while generation is still the session's transcript
+	// generation.
+	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error
 	// StartSummary marks the summary running; the session keeps its title
 	// and its last good summary until a new one is stored.
 	StartSummary(sessionID string) error
@@ -29,6 +31,7 @@ type Store interface {
 	// session's title and last good summary, and returns the session.
 	FailSummary(sessionID, errMsg string) (storage.Session, error)
 	UpdateRefinement(sessionID, transcript, status string) error
+	UpdateRefinementWithModel(sessionID, transcript, status, model string) error
 	// ClaimRefinement marks the refinement running while the session still
 	// names audioPath, the recording it will read, and reports whether it did.
 	ClaimRefinement(sessionID, audioPath string) (bool, error)
@@ -45,6 +48,12 @@ type Recorder interface {
 
 type Summarizer interface {
 	Summarize(ctx context.Context, sessionID, transcript string) (title, summary, preset, speakerNames string, err error)
+}
+
+// ReportedSummarizer returns a summary and its provider-reported model in one
+// result, avoiding a shared result cache across concurrent sessions.
+type ReportedSummarizer interface {
+	SummarizeReported(ctx context.Context, sessionID, transcript string) (title, summary, preset, speakerNames, model string, err error)
 }
 
 type SessionSyncer interface {

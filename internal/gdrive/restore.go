@@ -38,11 +38,18 @@ type RestoreResult struct {
 }
 
 // ListSessionFolders returns all subfolders in the configured root folder.
+// Drive lists no files, and no error, for a parent it does not have (and,
+// it is taken, for a shared drive the app is not a member of), so when it
+// lists none the root is asked for (rootReadable): a root that does not read
+// is an error, not an empty Drive. In a shared drive, the list without
+// corpora is taken to hold the folders the app made there (Drive documents
+// it; not measured), so when it lists none the drive's own list (corpora
+// "drive") is asked too: a folder there is an error, not an empty Drive.
 func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) {
 	var folders []*drive.File
 	pageToken := ""
+	q := fmt.Sprintf("'%s' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", strings.ReplaceAll(s.folderID, "'", `\'`))
 	for {
-		q := fmt.Sprintf("'%s' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", s.folderID)
 		call := s.service.Files.List().
 			Q(q).
 			Fields("nextPageToken, files(id, name, createdTime)").
@@ -64,7 +71,24 @@ func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) 
 		}
 		pageToken = resp.NextPageToken
 	}
-
+	if len(folders) > 0 {
+		return folders, nil
+	}
+	sharedDrive, err := s.rootReadable(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list session folders: none found, and the folder the app syncs into (%s) cannot be read, so access to Drive may be lost: %v", s.folderID, err)
+	}
+	if sharedDrive {
+		inDrive, err := s.service.Files.List().Corpora("drive").DriveId(s.folderID).Q(q).PageSize(1).
+			SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+			Fields("files(id)").Context(ctx).Do()
+		if err != nil {
+			return nil, fmt.Errorf("list session folders: none found, and shared drive %s could not be listed to check: %v", s.folderID, err)
+		}
+		if len(inDrive.Files) > 0 {
+			return nil, fmt.Errorf("list session folders: none found, though shared drive %s holds folder %s the app made: Drive's list of the drive's folders without corpora left it out, so a restore would miss sessions", s.folderID, inDrive.Files[0].Id)
+		}
+	}
 	return folders, nil
 }
 

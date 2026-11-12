@@ -40,6 +40,7 @@ type uploader interface {
 	Upload(ctx context.Context, folderName string, files []SyncFile) (string, error)
 	UploadInto(ctx context.Context, folderID string, files []SyncFile) error
 	FolderOnDrive(ctx context.Context, folderID string) (bool, error)
+	RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error)
 }
 
 type replacementInputStore interface {
@@ -98,6 +99,12 @@ func NewOrchestratorWithUploader(u uploader, store OrchestratorStore, logger ...
 // synced session or removes its audio.
 func (o *Orchestrator) FolderOnDrive(ctx context.Context, folderID string) (bool, error) {
 	return o.uploader.FolderOnDrive(ctx, folderID)
+}
+
+// RecordingsMatch reports whether Drive holds all supplied recordings with
+// their matching MD5 checksums. GC asks it before removing local audio.
+func (o *Orchestrator) RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error) {
+	return o.uploader.RecordingsMatch(ctx, folderID, checksums)
 }
 
 // CanSync reports why a sync of the session cannot start, if it cannot: the

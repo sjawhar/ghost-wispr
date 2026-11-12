@@ -1,7 +1,12 @@
 package main
 
 import (
+	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -9,13 +14,13 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 // gcHealth is whether the last GC pass held back, and how many sessions GC
 // keeps until a sync verifies their documents on Drive, for GET /api/status
-// and the web UI's warnings: a sync-gated GC that cannot check Drive deletes
-// nothing and removes no audio, and must not do so silently while the disk
-// fills.
+// and the web UI's warnings: a pass that cannot check Drive deletes nothing
+// and removes no audio, and must not do so silently while the disk fills.
 type gcHealth struct {
 	mu         sync.Mutex
 	hold       *server.GCHold
@@ -61,6 +66,27 @@ func (h *gcHealth) countUnverified(store gcStore) {
 	h.unverified = n
 }
 
+// unitOnlyCounter returns how many sessions store keeps on this unit only
+// (REMOTE_DELETED, with their audio still here), counted again at each call,
+// so GET /api/status shows a session marked by a sync or a GC pass at once,
+// and stops showing it once a retry syncs it. A count that fails gives the
+// last one.
+func unitOnlyCounter(store interface{ CountUnitOnlySessions() (int, error) }) func() int {
+	var mu sync.Mutex
+	last := 0
+	return func() int {
+		n, err := store.CountUnitOnlySessions()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			slog.Warn("could not count the sessions kept on this unit only", "operation", "status", "error", err)
+			return last
+		}
+		last = n
+		return n
+	}
+}
+
 // record keeps why a pass at now held back (held, nil when it did not), with
 // the disk use of dir's filesystem then. A hold that goes on keeps the time
 // it began.
@@ -95,13 +121,63 @@ func diskUse(dir string) (used, total int64, err error) {
 	return used, used + int64(st.Bavail)*block, nil
 }
 
+const recordingMismatchWarningPrefix = "recording-checksum-"
+
+// clearStaleRecordingMismatchWarnings removes warnings for sessions that a
+// later API or Drive action deleted, merged, or marked REMOTE_DELETED before
+// this pass started.
+
+func clearStaleRecordingMismatchWarnings(store gcStore, warnings *warningsRegistry, logger *slog.Logger) {
+	if warnings == nil {
+		return
+	}
+	for _, key := range warnings.KeysWithPrefix(recordingMismatchWarningPrefix) {
+		sessionID := strings.TrimPrefix(key, recordingMismatchWarningPrefix)
+		warnings.WithRecordingMismatch(func() {
+			session, err := store.GetSession(sessionID)
+			switch {
+			case errors.Is(err, sql.ErrNoRows), errors.Is(err, os.ErrNotExist):
+				warnings.Clear(key)
+			case err != nil:
+				logger.Warn("gc could not check whether a recording mismatch warning is stale", "operation", "clear_recording_mismatch_warning", "session_id", sessionID, "error", err)
+			case session.Status == storage.SessionMerged, session.SyncState == storage.SyncStateRemoteDeleted:
+				warnings.Clear(key)
+			}
+		})
+	}
+}
+
 // runGCPass runs one GC pass under cfg, with drive the running Drive syncer
 // (nil when none runs), and records in health whether it held back and how
 // many sessions it keeps until a sync verifies them. A pass that failed (the
 // store did not answer) says nothing about Drive: the last hold, if any,
 // stays.
-func runGCPass(store gcStore, cfg *config.Config, drive sessionSyncer, health *gcHealth, logger *slog.Logger) ([]string, error) {
-	collector := gc.New(store, gcConfig(cfg, drive), logger)
+func runGCPass(store gcStore, cfg *config.Config, drive sessionSyncer, health *gcHealth, warnings *warningsRegistry, logger *slog.Logger) ([]string, error) {
+	gcConfig := gcConfig(cfg, drive)
+	if warnings != nil {
+		gcConfig.OnRecordingMismatch = func(sessionID string, mismatch bool) {
+			key := recordingMismatchWarningPrefix + sessionID
+			warnings.WithRecordingMismatch(func() {
+				if !mismatch {
+					warnings.Clear(key)
+					return
+				}
+				session, err := store.GetSession(sessionID)
+				switch {
+				case errors.Is(err, sql.ErrNoRows), errors.Is(err, os.ErrNotExist):
+					warnings.Clear(key)
+				case err != nil:
+					logger.Warn("gc could not check whether a recording mismatch warning is current", "operation", "recording_mismatch", "session_id", sessionID, "error", err)
+				case session.Status == storage.SessionMerged, session.SyncState == storage.SyncStateRemoteDeleted:
+					warnings.Clear(key)
+				default:
+					warnings.Set(key, fmt.Sprintf("Recording for session %s does not match its Google Drive copy; local audio is retained.", sessionID))
+				}
+			})
+		}
+	}
+	clearStaleRecordingMismatchWarnings(store, warnings, logger)
+	collector := gc.New(store, gcConfig, logger)
 	deleted, err := collector.Run()
 	if err != nil {
 		return nil, err

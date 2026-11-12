@@ -10,8 +10,9 @@ import (
 // warningsRegistry holds independently-owned startup and hardware warnings for
 // GET /api/status without sharing mutable slices between goroutines.
 type warningsRegistry struct {
-	mu      sync.RWMutex
-	entries map[string]string
+	mu                sync.RWMutex
+	recordingMismatch sync.Mutex
+	entries           map[string]string
 }
 
 func newWarningsRegistry() *warningsRegistry {
@@ -43,6 +44,28 @@ func (r *warningsRegistry) ReplacePrefix(prefix string, entries map[string]strin
 	for key, text := range entries {
 		r.entries[key] = text
 	}
+}
+
+// KeysWithPrefix returns a sorted snapshot of keys beginning with prefix.
+func (r *warningsRegistry) KeysWithPrefix(prefix string) []string {
+	r.mu.RLock()
+	keys := make([]string, 0, len(r.entries))
+	for key := range r.entries {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	r.mu.RUnlock()
+	slices.Sort(keys)
+	return keys
+}
+
+// WithRecordingMismatch serializes a mismatch result with a lifecycle change
+// that clears its warning.
+func (r *warningsRegistry) WithRecordingMismatch(fn func()) {
+	r.recordingMismatch.Lock()
+	defer r.recordingMismatch.Unlock()
+	fn()
 }
 
 func (r *warningsRegistry) List() []string {

@@ -75,6 +75,10 @@ func (c *countingSyncer) CanSync(context.Context, string) error { return nil }
 
 func (c *countingSyncer) FolderOnDrive(context.Context, string) (bool, error) { return true, nil }
 
+func (*countingSyncer) RecordingsMatch(context.Context, string, map[string]string) (bool, error) {
+	return true, nil
+}
+
 // Review of #37, round 2, note 6 (on main since #13): turning Drive sync off
 // in the settings while the app runs cleared the syncer while the sync sweep
 // still called it: a data race, and a nil call that killed the process. The

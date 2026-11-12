@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -373,19 +372,22 @@ func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
 	}
 }
 
-// gcConfig is the GC configuration for one pass, with drive the running Drive
-// syncer (nil when none runs). With Drive sync on in the config, GC is
-// sync-gated whether or not the syncer is running: it deletes, and removes
-// the audio of, only sessions synced before, and only once the syncer says
-// Drive still has their folder out of the trash; with no syncer running it
-// deletes nothing.
+// gcConfig is the GC configuration for one pass. GC is always Drive-gated:
+// it may remove audio only after Drive answers that it still holds the session.
+// The current config decides whether a running syncer is usable. With sync off
+// or no folder, it passes nil so the collector holds every recording.
 func gcConfig(cfg *config.Config, drive sessionSyncer) gc.Config {
+	var holdReason error
+	if !cfg.GDriveSyncEnabled || cfg.GDriveFolderID == "" {
+		drive = nil
+		holdReason = gc.ErrDriveSyncOff
+	}
 	return gc.Config{
 		MaxAgeDays:     cfg.GCMaxAgeDays,
 		MaxAudioSizeMB: cfg.GCMaxAudioSizeMB,
-		SyncGated:      cfg.GDriveSyncEnabled,
 		AudioDir:       cfg.AudioDir,
-		// A nil sessionSyncer is a nil DriveFolders.
+		HoldReason:     holdReason,
+		// A nil sessionSyncer is a nil DriveVerifier.
 		Drive: drive,
 	}
 }
@@ -449,10 +451,7 @@ func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *int
 }
 
 func main() {
-	configPath := os.Getenv(config.EnvPrefix + "CONFIG")
-	if configPath == "" {
-		configPath = "ghost-wispr.yaml"
-	}
+	configPath := configPathFromEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
 		cfg, _, err := config.Load(configPath)
 		if err != nil {
@@ -461,6 +460,15 @@ func main() {
 		_, err = runGoogleIDTokenCommand(context.Background(), os.Args[1:], os.Stdout, cfg.GoogleCredentialsFile, googleauth.IDToken)
 		if err != nil {
 			log.Fatalf("google-id-token: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "seed-paused-state" {
+		if len(os.Args) != 2 {
+			log.Fatalf("seed-paused-state: expected no arguments")
+		}
+		if _, err := seedPausedState(configPath, os.Stdout); err != nil {
+			log.Fatalf("seed-paused-state: %v", err)
 		}
 		return
 	}
@@ -473,8 +481,7 @@ func main() {
 
 	log.Println("ghost-wispr: starting")
 
-	envPath := filepath.Join(filepath.Dir(configPath), ".env")
-	cfgStore, cfgWarnings, err := config.NewStoreWithEnv(configPath, envPath)
+	cfgStore, cfgWarnings, err := loadRuntimeConfig(configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
@@ -489,7 +496,11 @@ func main() {
 	// Startup validation: check component readiness from config.
 	startupStatus := config.ValidateStartup(&cfg)
 
-	store, err := storage.NewSQLiteStore(cfg.DBPath)
+	dbPath, err := databasePath(cfg.DBPath)
+	if err != nil {
+		log.Fatalf("storage init failed: %v", err)
+	}
+	store, err := storage.NewSQLiteStore(dbPath)
 	if err != nil {
 		log.Fatalf("storage init failed: %v", err)
 	}
@@ -867,13 +878,26 @@ func main() {
 	gcHealthState.countUnverified(store)
 
 	controlHooks := &server.ControlHooks{
-		IsPaused:           capture.IsPaused,
-		IsCapturing:        func() bool { return capture.capturing(micStatus) },
-		CaptureState:       func() string { return capture.captureState(micStatus) },
-		ActiveSession:      manager.ActiveSession,
-		Warnings:           warningRegistry.List,
+		IsPaused:      capture.IsPaused,
+		IsCapturing:   func() bool { return capture.capturing(micStatus) },
+		CaptureState:  func() string { return capture.captureState(micStatus) },
+		ActiveSession: manager.ActiveSession,
+		Warnings:      warningRegistry.List,
+		OnSessionDeleted: func(sessionID string) {
+			warningRegistry.WithRecordingMismatch(func() {
+				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
+			})
+		},
+		OnSessionsMerged: func(sessionIDs []string) {
+			warningRegistry.WithRecordingMismatch(func() {
+				for _, sessionID := range sessionIDs {
+					warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
+				}
+			})
+		},
 		GCHold:             gcHealthState.Hold,
 		UnverifiedSessions: gcHealthState.Unverified,
+		UnitOnlySessions:   unitOnlyCounter(store),
 		KeptRawRecordings: func() server.KeptRawRecordings {
 			if kept := keptRaw.Load(); kept != nil {
 				return *kept
@@ -976,7 +1000,7 @@ func main() {
 						speakerNames = "{}"
 					}
 
-					if err := store.UpdateSummary(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames); err != nil {
+					if err := store.UpdateSummaryWithModel(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames, sessions[i].SummaryModel); err != nil {
 						return repaired, err
 					}
 					if title != sessions[i].Title || summaryText != sessions[i].Summary || speakerNames != sessions[i].SpeakerNames {
@@ -1020,14 +1044,14 @@ func main() {
 			_ = store.StartSummary(sessionID)
 			hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
 
-			title, summaryText, preset, speakerNames, err := summarizer.Summarize(ctx, sessionID, transcript)
+			title, summaryText, preset, speakerNames, model, err := summarizer.SummarizeReported(ctx, sessionID, transcript)
 			if err != nil {
 				log.Printf("warning: summarization failed for merged session %s: %v", sessionID, err)
 				failSummary(store, hub, sessionID, err)
 				return
 			}
 
-			if err := store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
+			if err := store.UpdateSummaryWithModel(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model); err != nil {
 				log.Printf("warning: discarded stale merged summary for session %s: %v", sessionID, err)
 				return
 			}
@@ -1470,13 +1494,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					continue
 				}
 				_ = store.StartSummary(id)
-				title, summaryText, preset, speakerNames, err := startupSummarizer.Summarize(ctx, id, transcript)
+				title, summaryText, preset, speakerNames, model, err := startupSummarizer.SummarizeReported(ctx, id, transcript)
 				if err != nil {
 					log.Printf("warning: summarization failed for %s: %v", id, err)
 					failSummary(store, nil, id, err)
 					continue
 				}
-				_ = store.UpdateSummary(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames)
+				_ = store.UpdateSummaryWithModel(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model)
 				log.Printf("summarized session %s with preset %s", id, preset)
 				publishSummaryReady(id)
 			}
@@ -1533,7 +1557,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 						gcHealthState.record(nil, latestCfg.AudioDir, time.Now())
 						continue
 					}
-					deleted, err := runGCPass(store, &latestCfg, drive.Get(), gcHealthState, appLogger)
+					deleted, err := runGCPass(store, &latestCfg, drive.Get(), gcHealthState, warningRegistry, appLogger)
 					if err != nil {
 						log.Printf("gc error: %v", err)
 					} else if len(deleted) > 0 {
@@ -1726,6 +1750,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 					ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
 				}
 			}
+		case "gemini":
+			credentials, credentialErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+			if credentialErr != nil {
+				ttsErr = fmt.Errorf("detect Google credentials: %w", credentialErr)
+			} else {
+				ttsProvider, ttsErr = tts.NewGeminiProvider(
+					cfg.GCPProject,
+					cfg.TTSModel,
+					cfg.TTSVoice,
+					tts.WithGeminiAuthCredentials(credentials),
+				)
+			}
 		default:
 			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
 		}
@@ -1751,8 +1787,25 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				"status":        status.Status,
 				"bytes_written": status.BytesWritten,
 				"duration_ms":   status.DurationMs,
+				"model":         status.Model,
+				"voice":         status.Voice,
 				"error":         status.Error,
 			}, true
+		}
+		controlHooks.TTSWaitForSynthesis = func(ctx context.Context, id string) (map[string]any, error) {
+			status, err := ttsOrchestrator.WaitForSynthesis(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"id":            status.ID,
+				"status":        status.Status,
+				"bytes_written": status.BytesWritten,
+				"duration_ms":   status.DurationMs,
+				"model":         status.Model,
+				"voice":         status.Voice,
+				"error":         status.Error,
+			}, nil
 		}
 		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker

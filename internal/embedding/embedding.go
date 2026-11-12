@@ -13,6 +13,8 @@ import (
 
 const envPrefix = "GHOST_WISPR_"
 
+const ModelNotReportedByProvider = "not reported by provider"
+
 type TaskType string
 
 const (

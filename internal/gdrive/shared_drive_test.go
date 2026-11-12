@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -24,31 +25,38 @@ func TestEveryDriveCallSetsSupportsAllDrives(t *testing.T) {
 	}
 }
 
-func TestUploadIntoASharedDriveRoot(t *testing.T) {
-	wire, syncer := newWireDrive(t)
-	const sharedDriveID = "shared-drive-root"
-	wire.rootID = sharedDriveID
-	syncer.folderID = sharedDriveID
+// A sync into a shared drive's root, as the drive.file scope sees it:
+// files.get answers 404 for the root, so neither the first sync, which makes
+// the session's folder there, nor a re-sync, which updates that folder in
+// place, may depend on reading the root.
+func TestASyncIntoASharedDriveRoot(t *testing.T) {
+	wire, syncer := newSharedDriveWire(t)
+	store := openStore(t)
+	o := NewOrchestrator(syncer, store)
+	const id = "20261111090000"
+	summarizedSession(t, store, t.TempDir(), id, time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC), "The summary.")
+	folder := syncedSession(t, store, o, id)
 
-	err := syncer.UploadInto(context.Background(), sharedDriveID, []SyncFile{{
-		Name:        "transcript.md",
-		MimeType:    "application/vnd.google-apps.document",
-		Content:     []byte("shared-drive transcript"),
-		ContentType: "text/plain",
-	}})
-	if err != nil {
-		t.Fatalf("upload into shared-drive root: %v", err)
+	if err := store.UpdateTitle(id, "Renamed"); err != nil {
+		t.Fatalf("rename: %v", err)
 	}
-	if got := wire.in(sharedDriveID)["transcript.md"]; len(got) != 1 {
-		t.Fatalf("files in shared-drive root: %d transcript.md files, want 1", len(got))
+	if err := o.SyncSession(context.Background(), id); err != nil {
+		t.Fatalf("re-sync into the shared drive: %v", err)
+	}
+	if state, kept := sessionState(t, store, id); state != storage.SyncStateSynced || kept != folder {
+		t.Errorf("after the re-sync: %q in folder %q, want %q in %q", state, kept, storage.SyncStateSynced, folder)
+	}
+	if folders := wire.in(sharedDriveID); len(folders) != 1 {
+		t.Errorf("shared drive root holds %v, want the session's one folder", keysOf(folders))
+	}
+	summaries := wire.in(folder)["summary.md"]
+	if len(summaries) != 1 || !strings.Contains(string(summaries[0].Content), "Renamed") {
+		t.Errorf("summary.md: %d copies, want one updated in place to the new title", len(summaries))
 	}
 }
 
 func TestRestoreFromDriveListsSharedDriveFolders(t *testing.T) {
-	wire, syncer := newWireDrive(t)
-	const sharedDriveID = "shared-drive-root"
-	wire.rootID = sharedDriveID
-	syncer.folderID = sharedDriveID
+	wire, syncer := newSharedDriveWire(t)
 
 	started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
 	folderID := wire.add(sharedDriveID, "2026-11-10-standup", "application/vnd.google-apps.folder", nil, nil)
@@ -68,11 +76,69 @@ func TestRestoreFromDriveListsSharedDriveFolders(t *testing.T) {
 	}
 }
 
+// A restore lists a shared drive's session folders without corpora, a list
+// Drive documents as holding the folders the app made there (not measured
+// with folders there). Should it leave them out, a restore that lists none
+// while the drive's own list (corpora "drive") holds one fails, instead of
+// reporting an empty Drive. An empty drive still restores none, with no
+// error.
+func TestRestoreFailsWhenTheListWithoutCorporaMissesTheDrivesFolders(t *testing.T) {
+	wire, syncer := newSharedDriveWire(t)
+	wire.unscopedListsMiss = true
+	importNone := func(RestoredSession) error { return nil }
+
+	result, err := syncer.RestoreFromDrive(context.Background(), importNone)
+	if err != nil || result.Restored != 0 || len(result.Errors) != 0 {
+		t.Errorf("restore from an empty shared drive: %+v, %v; want none restored and no error", result, err)
+	}
+	folder := wire.add(sharedDriveID, "2026-11-10-standup", "application/vnd.google-apps.folder", nil, nil)
+	result, err = syncer.RestoreFromDrive(context.Background(), importNone)
+	if err == nil || !strings.Contains(err.Error(), folder) {
+		t.Errorf("restore with folder %s left out of the list without corpora: %+v, %v; want an error naming it", folder, result, err)
+	}
+}
+
+// A restore that lists no session folder in a shared drive that reads asks
+// the drive's own list for a folder; when that list does not answer, Drive
+// has not said the drive is empty, so the restore fails instead of
+// reporting none.
+func TestRestoreFailsWhenTheDrivesFolderListDoesNotAnswer(t *testing.T) {
+	wire, syncer := newSharedDriveWire(t)
+	wire.driveFolderListUnavailable = true
+
+	result, err := syncer.RestoreFromDrive(context.Background(), func(RestoredSession) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "could not be listed") {
+		t.Errorf("restore with the drive's folder list not answering: %+v, %v; want an error", result, err)
+	}
+}
+
+// The folder the app syncs into is set by hand, so a quote in its id is
+// escaped in the query that lists its session folders, as in the Syncer's
+// other queries: unescaped, Drive cannot read the query (400), and the
+// restore fails.
+func TestRestoreFromARootWhoseIDHasAQuote(t *testing.T) {
+	for _, root := range wireRoots {
+		t.Run(root.name, func(t *testing.T) {
+			wire, syncer := root.newWire(t)
+			const quoted = "root'with-a-quote"
+			wire.rootID, syncer.folderID = quoted, quoted
+			started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+			folder := wire.add(quoted, "2026-11-10-standup", "application/vnd.google-apps.folder", nil, nil)
+			transcript := RenderTranscriptMarkdown(&SyncSession{ID: "20261110090000", StartedAt: started}, []transcribe.Segment{{
+				Speaker: 0, Text: "a quoted root", Timestamp: started,
+			}})
+			wire.add(folder, "transcript.md", "application/vnd.google-apps.document", []byte(transcript), nil)
+
+			result, err := syncer.RestoreFromDrive(context.Background(), func(RestoredSession) error { return nil })
+			if err != nil || result.Restored != 1 || len(result.Errors) != 0 {
+				t.Errorf("restore from root %q: %+v, %v; want one restored session and no errors", quoted, result, err)
+			}
+		})
+	}
+}
+
 func TestRestoreFromDrivePaginatesSharedDriveLists(t *testing.T) {
-	wire, syncer := newWireDrive(t)
-	const sharedDriveID = "shared-drive-root"
-	wire.rootID = sharedDriveID
-	syncer.folderID = sharedDriveID
+	wire, syncer := newSharedDriveWire(t)
 
 	started := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
 	transcript := func(id, text string) []byte {

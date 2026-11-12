@@ -33,6 +33,8 @@ type storeMock struct {
 	preset   map[string]string
 	audio    map[string]string
 
+	summaryModel            map[string]string
+	refinementModel         map[string]string
 	refinementStatus        map[string]string
 	refinedTranscript       map[string]string
 	canonicalTranscript     map[string]string
@@ -57,6 +59,8 @@ func newStoreMock() *storeMock {
 		status:                 map[string]string{},
 		preset:                 map[string]string{},
 		audio:                  map[string]string{},
+		summaryModel:           map[string]string{},
+		refinementModel:        map[string]string{},
 		refinementStatus:       map[string]string{},
 		refinedTranscript:      map[string]string{},
 		canonicalTranscript:    map[string]string{},
@@ -104,17 +108,7 @@ func (s *storeMock) GetSegments(sessionID string) ([]transcribe.Segment, error) 
 	return list, nil
 }
 
-func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.title[sessionID] = title
-	s.summary[sessionID] = summary
-	s.status[sessionID] = status
-	s.preset[sessionID] = preset
-	return nil
-}
-
-func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, _ string, generation int) error {
+func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, _, model string, generation int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.summaryWriteGenerations = append(s.summaryWriteGenerations, generation)
@@ -125,6 +119,7 @@ func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status,
 	s.summary[sessionID] = summary
 	s.status[sessionID] = status
 	s.preset[sessionID] = preset
+	s.summaryModel[sessionID] = model
 	return nil
 }
 
@@ -175,6 +170,17 @@ func (s *storeMock) UpdateRefinement(sessionID, transcript, status string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refinementStatus[sessionID] = status
+	if transcript != "" {
+		s.refinedTranscript[sessionID] = transcript
+	}
+	return nil
+}
+
+func (s *storeMock) UpdateRefinementWithModel(sessionID, transcript, status, model string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refinementStatus[sessionID] = status
+	s.refinementModel[sessionID] = model
 	if transcript != "" {
 		s.refinedTranscript[sessionID] = transcript
 	}
@@ -311,12 +317,13 @@ func (s transcriptCapturingSummarizer) Summarize(_ context.Context, sessionID, t
 
 type batchTranscriberMock struct {
 	transcript string
+	model      string
 	err        error
 	delay      time.Duration
 	calledPath chan string
 }
 
-func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (string, error) {
+func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (transcribe.BatchResult, error) {
 	if b.calledPath != nil {
 		b.calledPath <- audioPath
 	}
@@ -324,9 +331,9 @@ func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (s
 		time.Sleep(b.delay)
 	}
 	if b.err != nil {
-		return "", b.err
+		return transcribe.BatchResult{}, b.err
 	}
-	return b.transcript, nil
+	return transcribe.BatchResult{Transcript: b.transcript, Model: b.model}, nil
 }
 
 type syncerMock struct {
@@ -391,6 +398,18 @@ func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript strin
 		s.called <- sessionID
 	}
 	return "Auto title", "## Summary\n- " + transcript, "default", "{}", nil
+}
+
+type providerReportingSummarizer struct {
+	model string
+}
+
+func (s providerReportingSummarizer) Summarize(context.Context, string, string) (string, string, string, string, error) {
+	return "Provider title", "Provider summary", "default", "{}", nil
+}
+
+func (s providerReportingSummarizer) SummarizeReported(context.Context, string, string) (string, string, string, string, string, error) {
+	return "Provider title", "Provider summary", "default", "{}", s.model, nil
 }
 
 type contextProbeSummarizer struct {
@@ -1659,12 +1678,12 @@ func TestManager_RefineSession_ErrorsWithoutAudio(t *testing.T) {
 // batch transcriber does, and counts its calls.
 type fileTranscriber struct{ calls atomic.Int32 }
 
-func (f *fileTranscriber) Transcribe(_ context.Context, audioPath string) (string, error) {
+func (f *fileTranscriber) Transcribe(_ context.Context, audioPath string) (transcribe.BatchResult, error) {
 	f.calls.Add(1)
 	if _, err := os.ReadFile(audioPath); err != nil {
-		return "", err
+		return transcribe.BatchResult{}, err
 	}
-	return "refined", nil
+	return transcribe.BatchResult{Transcript: "refined"}, nil
 }
 
 // Review note 5: a session's end saves its audio path, then its refinement
@@ -2201,5 +2220,49 @@ func TestManager_ResumeCaptureDropsWordsBufferedWhilePaused(t *testing.T) {
 	}
 	if text := segmentText(t, store, sessionID); strings.Contains(text, "stale") {
 		t.Fatalf("session after resume has words from before the pause: %q", text)
+	}
+}
+
+func TestManagerStoresProviderReportedSummaryModel(t *testing.T) {
+	const (
+		configuredModel = "configured-summary-model"
+		providerModel   = "provider-summary-model"
+		sessionID       = "summary-model-session"
+	)
+	store := newStoreMock()
+	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "enough transcript words to make a real summary request", Timestamp: time.Now().UTC()}); err != nil {
+		t.Fatalf("AppendSegment: %v", err)
+	}
+	manager := NewManager(store, nil, providerReportingSummarizer{model: providerModel}, nil, NewDetector(time.Hour), 0)
+	manager.generateSummary(context.Background(), sessionID, time.Now().UTC())
+
+	if got := store.summaryModel[sessionID]; got != providerModel {
+		t.Fatalf("stored summary model = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
+	}
+}
+
+func TestManagerStoresProviderReportedRefinementModel(t *testing.T) {
+	const (
+		configuredModel = "configured-refinement-model"
+		providerModel   = "provider-refinement-model"
+		sessionID       = "refinement-model-session"
+		audioPath       = "data/audio/refinement-model-session.mp3"
+	)
+	store := newStoreMock()
+	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession(sessionID, time.Now().UTC(), audioPath); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{transcript: "refined transcript", model: providerModel})
+	manager.runBatchRefinement(context.Background(), sessionID, audioPath)
+
+	if got := store.refinementModel[sessionID]; got != providerModel {
+		t.Fatalf("stored refinement model = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
 	}
 }

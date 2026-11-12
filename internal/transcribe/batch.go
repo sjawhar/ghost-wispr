@@ -10,8 +10,14 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 )
+
+type deepgramModelInfo struct {
+	Name string `json:"name"`
+	Arch string `json:"arch"`
+}
 
 type DeepgramBatchConfig struct {
 	APIKey     string
@@ -37,6 +43,8 @@ type deepgramBatchWord struct {
 type batchTranscriptionResult struct {
 	transcript string
 	words      []deepgramBatchWord
+	models     []string
+	modelInfo  map[string]deepgramModelInfo
 }
 
 func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchWordsTranscriber {
@@ -57,12 +65,18 @@ func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchWordsTranscriber 
 	}
 }
 
-func (d *deepgramBatchTranscriber) Transcribe(ctx context.Context, audioPath string) (string, error) {
+// Transcribe returns the recording's transcript and the one transcription
+// model the Deepgram response reports.
+func (d *deepgramBatchTranscriber) Transcribe(ctx context.Context, audioPath string) (BatchResult, error) {
 	result, err := d.transcribe(ctx, audioPath)
 	if err != nil {
-		return "", err
+		return BatchResult{}, err
 	}
-	return result.transcript, nil
+	model, err := deepgramResponseModel(result.models, result.modelInfo)
+	if err != nil {
+		return BatchResult{}, err
+	}
+	return BatchResult{Transcript: result.transcript, Model: model}, nil
 }
 
 func (d *deepgramBatchTranscriber) Words(ctx context.Context, audioPath string) ([]TimestampedWord, error) {
@@ -126,6 +140,10 @@ func (d *deepgramBatchTranscriber) transcribe(ctx context.Context, audioPath str
 	}
 
 	var decoded struct {
+		Metadata struct {
+			Models    []string                     `json:"models"`
+			ModelInfo map[string]deepgramModelInfo `json:"model_info"`
+		} `json:"metadata"`
 		Results struct {
 			Channels []struct {
 				Alternatives []struct {
@@ -146,5 +164,34 @@ func (d *deepgramBatchTranscriber) transcribe(ctx context.Context, audioPath str
 	return batchTranscriptionResult{
 		transcript: strings.TrimSpace(alternative.Transcript),
 		words:      alternative.Words,
+		models:     decoded.Metadata.Models,
+		modelInfo:  decoded.Metadata.ModelInfo,
 	}, nil
+}
+
+func deepgramResponseModel(models []string, modelInfo map[string]deepgramModelInfo) (string, error) {
+	if len(models) == 0 {
+		return "", fmt.Errorf("deepgram response missing metadata.models")
+	}
+	names := make([]string, 0, len(models))
+	for _, id := range models {
+		info, ok := modelInfo[id]
+		if !ok {
+			return "", fmt.Errorf("deepgram response metadata.models references unknown model %q", id)
+		}
+		name := strings.TrimSpace(info.Arch)
+		if name == "" {
+			name = strings.TrimSpace(info.Name)
+		}
+		if name == "" {
+			return "", fmt.Errorf("deepgram response metadata.model_info[%q] has no model identity", id)
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
+	if len(names) != 1 {
+		return "", fmt.Errorf("deepgram response must report exactly one transcription model, got %q", names)
+	}
+	return names[0], nil
 }

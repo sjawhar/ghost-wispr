@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -212,7 +213,7 @@ func recordingsInFolder(recordings []string, existing []*drive.File, rows []stor
 	}
 	var in []string
 	for _, recording := range recordings {
-		if held["audio-"+filepath.Base(recording)] {
+		if held[recordingname.FileName(recording)] {
 			in = append(in, recording)
 		}
 	}
@@ -362,7 +363,7 @@ func replacementFiles(sess *storage.Session, recordings []string) ([]SyncFile, s
 		if filepath.Ext(recording) == ".wav" {
 			mimeType = "audio/wav"
 		}
-		files = append(files, SyncFile{Name: "audio-" + filepath.Base(recording), MimeType: mimeType, LocalPath: recording, ContentType: mimeType, SHA256: hash})
+		files = append(files, SyncFile{Name: recordingname.FileName(recording), MimeType: mimeType, LocalPath: recording, ContentType: mimeType, SHA256: hash})
 	}
 	return files, sess.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(sess.Title), nil
 }

@@ -123,7 +123,7 @@ func TestR4BatchSubmitReadRefusesDeleteBetweenReadAndSubmit(t *testing.T) {
 	if err := store.StartSummary("a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummaryAtGeneration("a", "stale", sessions[0].Transcript, storage.SummaryCompleted, "default", "{}", generations["a"]); err == nil {
+	if err := store.UpdateSummaryAtGeneration("a", "stale", sessions[0].Transcript, storage.SummaryCompleted, "default", "{}", "", generations["a"]); err == nil {
 		t.Fatal("batch submit retained a transcript after its generation changed")
 	}
 }
@@ -151,5 +151,22 @@ func TestR4StaleBatchResultIsNotBroadcast(t *testing.T) {
 	}
 	if state := r4BatchState(t, store, batchName, "a"); state != "discarded" {
 		t.Fatalf("stale batch state = %q, want discarded", state)
+	}
+}
+
+// TestBatchResultStoresTheModelItReports fails if a batch summary stored at
+// its submitted generation drops the model the provider reported for it.
+func TestBatchResultStoresTheModelItReports(t *testing.T) {
+	store, _, batchName, _ := r4BatchStore(t, "a")
+	succeeded, _, err := applySummaryBatchResults(store, nil, nil, batchName, []summary.BatchResult{{SessionID: "a", Title: "A", Summary: "A summary", PresetName: "default", SpeakerNames: "{}", Model: "provider-batch-model"}})
+	if err != nil || succeeded != 1 {
+		t.Fatalf("apply batch = succeeded:%d err:%v, want 1 nil", succeeded, err)
+	}
+	session, err := store.GetSession("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SummaryModel != "provider-batch-model" {
+		t.Fatalf("stored summary model = %q, want the batch result's provider-batch-model", session.SummaryModel)
 	}
 }

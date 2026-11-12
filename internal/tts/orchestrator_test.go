@@ -20,6 +20,8 @@ type mockProvider struct {
 	audio       []byte
 	format      audio.AudioFormat
 	durationMs  int64
+	model       string
+	voice       string
 	err         error
 	calls       int
 	synthesized []SpeechRequest
@@ -49,6 +51,8 @@ func (m *mockProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Spee
 		Audio:      m.audio,
 		Format:     m.format,
 		DurationMs: m.durationMs,
+		Model:      m.model,
+		Voice:      m.voice,
 	}, nil
 }
 
@@ -92,6 +96,18 @@ func (m *mockOutputStream) Start() error { m.started = true; return nil }
 func (m *mockOutputStream) Stop() error  { m.stopped = true; return nil }
 func (m *mockOutputStream) Write() error { return m.writeErr }
 func (m *mockOutputStream) Close() error { m.closed = true; return nil }
+
+type blockingOutputStream struct {
+	mockOutputStream
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (s *blockingOutputStream) Write() error {
+	s.entered <- struct{}{}
+	<-s.release
+	return nil
+}
 
 func newTestSpeaker() *audio.Speaker {
 	s := audio.NewSpeaker("")
@@ -150,6 +166,52 @@ func TestOrchestrator_SpeakAndStatus(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *testing.T) {
+	provider := &mockProvider{
+		audio:  []byte{0x01, 0x00},
+		format: audio.AudioFormat{SampleRate: 16000, Channels: 1, Encoding: audio.EncodingPCM16},
+		model:  "provider-tts-model",
+		voice:  "provider-tts-voice",
+	}
+	playEntered := make(chan struct{}, 1)
+	releasePlay := make(chan struct{})
+	speaker := audio.NewSpeaker("")
+	speaker.SetOpenStreamForTest(func(int, int, int, []int16, string) (audio.OutputStream, error) {
+		return &blockingOutputStream{entered: playEntered, release: releasePlay}, nil
+	})
+	o := NewOrchestrator(provider, speaker, OrchestratorOpts{MaxRequestsPerMin: 100})
+	defer o.Stop()
+
+	id, err := o.Speak("model acceptance", "", "gemini")
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	type report struct{ model, voice string }
+	waited := make(chan report, 1)
+	go func() {
+		status, waitErr := o.WaitForSynthesis(context.Background(), id)
+		if waitErr != nil {
+			t.Errorf("WaitForSynthesis: %v", waitErr)
+			return
+		}
+		waited <- report{model: status.Model, voice: status.Voice}
+	}()
+	select {
+	case <-playEntered:
+	case <-time.After(time.Second):
+		t.Fatal("playback did not start")
+	}
+	select {
+	case status := <-waited:
+		if status.model != provider.model || status.voice != provider.voice {
+			t.Fatalf("provider report = %q/%q, want %q/%q", status.model, status.voice, provider.model, provider.voice)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForSynthesis did not return while Play was blocked")
+	}
+	close(releasePlay)
 }
 
 func TestOrchestrator_SpeakEmptyText(t *testing.T) {

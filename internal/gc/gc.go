@@ -2,8 +2,11 @@ package gc
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -13,16 +16,17 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 type Store interface {
-	GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error)
+	GetGCEligibleSessions(maxAgeDays int) ([]string, error)
 	GetSession(id string) (storage.Session, error)
-	DeleteEndedSession(id, audioPath string, syncGated bool) (bool, error)
+	DeleteEndedSession(id, audioPath string) (bool, error)
 	PurgeOldEvents(maxAge time.Duration) error
-	Recordings(syncGated bool) ([]storage.SessionRecording, error)
-	MarkAudioRemoved(id, before, left string, audioLeft, syncGated bool, removedAt time.Time) (storage.AudioRemoval, bool, error)
+	Recordings() ([]storage.SessionRecording, error)
+	MarkAudioRemoved(id, before, left string, audioLeft bool, removedAt time.Time) (storage.AudioRemoval, bool, error)
 	// RecordEraseDirectory records a directory before a whole-file erase in
 	// it begins, so the app finishes one a stop cut off as it starts again.
 	RecordEraseDirectory(dir string) error
@@ -30,11 +34,14 @@ type Store interface {
 	MarkRemoteDeleted(id, folderID, errorMessage string) (bool, error)
 }
 
-// DriveFolders tells GC whether Drive still has a session's folder.
-type DriveFolders interface {
+// DriveVerifier confirms that Drive retains every recording GC may remove.
+type DriveVerifier interface {
 	// FolderOnDrive reports whether Drive has folder id out of the trash,
 	// and an error when Drive cannot say.
 	FolderOnDrive(ctx context.Context, id string) (bool, error)
+	// RecordingsMatch reports whether folderID has every audio file named by
+	// checksums and with the matching Google Drive md5Checksum.
+	RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error)
 }
 
 type Config struct {
@@ -44,17 +51,22 @@ type Config struct {
 	// MaxAudioSizeMB is the audio budget: past it, disk pressure removes the
 	// oldest sessions' audio files. 0 (or less) is no budget.
 	MaxAudioSizeMB int
-	SyncGated      bool
 	AudioDir       string
-	// Drive, when GC is sync-gated, is asked before GC deletes a session or
-	// removes its audio whether Drive still has the session's folder out of
-	// the trash: one in the trash (which Drive empties after 30 days) or gone
-	// leaves the device with the only lasting copy. Nil when Drive sync is
-	// on but not running: then GC deletes nothing and removes no audio.
-	Drive DriveFolders
+	// HoldReason explains why a nil Drive intentionally holds a pass. When
+	// unset, a nil Drive means its configured syncer did not start.
+	HoldReason error
+	// Drive confirms that it has each session folder and every local recording
+	// under its recording name with matching content. A folder in the trash,
+	// a missing recording, or a mismatched checksum leaves the device with the
+	// only lasting copy.
+	Drive DriveVerifier
+	// OnRecordingMismatch is called with true to set a warning and false to
+	// clear it: Drive may match again, the session may be deleted, or its
+	// folder may be gone.
+	OnRecordingMismatch func(sessionID string, mismatch bool)
 }
 
-// driveCheckTimeout bounds one question to Drive.
+// driveCheckTimeout bounds Drive's confirmation of one session.
 const driveCheckTimeout = time.Minute
 
 var (
@@ -63,18 +75,31 @@ var (
 	errFolderGone = errors.New("its Drive folder is in the trash or gone, so the device holds its only lasting copy")
 	// errNoFolder: the session records no Drive folder to ask Drive about.
 	errNoFolder = errors.New("it records no Drive folder, so GC cannot check that Drive has it")
+	// errRecordingsDoNotMatch: Drive lacks a current local recording, or its
+	// MD5 differs, so GC keeps the local audio.
+	errRecordingsDoNotMatch = errors.New("drive does not have every recording with matching content, so the device holds its only lasting copy")
+	// errCannotReadRecording: a local recording cannot be read to verify it,
+	// so GC leaves it untouched.
+	errCannotReadRecording = errors.New("cannot read local recording to verify it on Drive")
 )
 
-// The reasons a sync-gated GC pass holds back, deleting and removing nothing
-// more (Held): the app reports them where the user sees its health, so a
-// broken sync is noticed before the disk fills.
+const driveSyncOffReason = "Google Drive sync is off, so recordings are kept on the unit"
+
+// The reasons a GC pass holds back, deleting and removing nothing more
+// (Held): the app reports them where the user sees its health, so a broken
+// sync is noticed before the disk fills.
 var (
+	// ErrDriveSyncOff: no Drive copy can be verified while sync is disabled
+	// or no shared-drive folder is configured, so GC keeps local recordings.
+	//nolint:staticcheck // Google Drive is a proper name shown to the operator.
+	ErrDriveSyncOff = errors.New(driveSyncOffReason)
 	// ErrDriveNotRunning: Drive sync is on but no syncer runs (it failed to
-	// start), so nothing can check that Drive still has a session.
-	ErrDriveNotRunning = errors.New("sync to Google Drive is on but not running, so nothing can check that Drive still has a session")
+	// start), so nothing can confirm a session's durable copy.
+	ErrDriveNotRunning = errors.New("sync to Google Drive is on but not running, so nothing can confirm a session's durable copy")
 	// ErrDriveCannotSay: Drive did not answer whether it has a session's
-	// folder; it cannot say for the other sessions either, so the pass stops.
-	ErrDriveCannotSay = errors.New("could not ask Drive whether it has the session's folder")
+	// folder or recordings; it cannot say for the other sessions either, so
+	// the pass stops.
+	ErrDriveCannotSay = errors.New("could not ask Drive whether it has a session's durable copy")
 )
 
 // AudioBudgetBytes returns an audio budget of maxAudioSizeMB megabytes in
@@ -115,15 +140,16 @@ func New(store Store, config Config, logger ...*slog.Logger) *Collector {
 }
 
 // Run applies the age policy, which deletes old sessions, then frees audio
-// space under the audio budget, which removes only audio files. It returns
-// the sessions it deleted. Sync-gated with no Drive to ask (sync on but not
-// running), it deletes nothing and removes no audio.
+// space under the audio budget, which removes only audio files. With no Drive
+// to ask, it deletes nothing and removes no audio.
 func (c *Collector) Run() ([]string, error) {
 	var deleted []string
 	c.held = nil
-	if c.config.SyncGated && c.config.Drive == nil {
-		c.held = ErrDriveNotRunning
-		c.logger.Warn("gc deletes no session and removes no audio", "operation", "run", "error", c.held)
+	if c.config.Drive == nil {
+		c.held = c.config.HoldReason
+		if c.held == nil {
+			c.held = ErrDriveNotRunning
+		}
 	} else {
 		var err error
 		if deleted, err = c.applyAgePolicy(); err != nil {
@@ -145,17 +171,17 @@ func (c *Collector) Run() ([]string, error) {
 }
 
 // applyAgePolicy deletes the sessions older than the age policy allows, and
-// returns them. A Drive that cannot say whether it has a session's folder
+// returns them. A Drive that cannot confirm a session's folder and recordings
 // stops it: it cannot say for the others either.
 func (c *Collector) applyAgePolicy() ([]string, error) {
-	ids, err := c.store.GetGCEligibleSessions(c.config.MaxAgeDays, c.config.SyncGated)
+	ids, err := c.store.GetGCEligibleSessions(c.config.MaxAgeDays)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible: %w", err)
 	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	recordings, err := c.store.Recordings(c.config.SyncGated)
+	recordings, err := c.store.Recordings()
 	if err != nil {
 		return nil, fmt.Errorf("list recordings: %w", err)
 	}
@@ -175,15 +201,12 @@ func (c *Collector) applyAgePolicy() ([]string, error) {
 	return deleted, nil
 }
 
-// onDrive returns nil when GC may delete session sess or remove its audio:
-// GC is not gated on sync, or Drive has the session's folder out of the
-// trash. Otherwise it returns why GC keeps the session: errFolderGone (the
-// session is then marked REMOTE_DELETED, so no GC path lists it again),
-// errNoFolder, or ErrDriveCannotSay.
+// onDrive returns nil when Drive has session sess's folder out of the trash
+// and every local recording with matching content. Otherwise it returns why
+// GC keeps the session: errFolderGone (the session is then marked
+// REMOTE_DELETED), errNoFolder, errRecordingsDoNotMatch,
+// errCannotReadRecording, or ErrDriveCannotSay.
 func (c *Collector) onDrive(sess *storage.Session) error {
-	if !c.config.SyncGated {
-		return nil
-	}
 	if sess.GDriveFolderID == "" {
 		return errNoFolder
 	}
@@ -193,9 +216,49 @@ func (c *Collector) onDrive(sess *storage.Session) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrDriveCannotSay, err)
 	}
-	if present {
+	if !present {
+		return c.folderGone(sess)
+	}
+
+	checksums, err := c.recordingChecksums(sess.AudioPath)
+	if err != nil {
+		return err
+	}
+	if len(checksums) == 0 {
+		c.recordingMismatch(sess.ID, false)
 		return nil
 	}
+	matches, err := c.config.Drive.RecordingsMatch(ctx, sess.GDriveFolderID, checksums)
+	if err != nil {
+		// A folder may disappear after the first check. Ask once more so a
+		// definite remote deletion retains its existing REMOTE_DELETED
+		// semantics; a still-present folder with a failed list holds the
+		// whole pass as Drive unavailable.
+		present, folderErr := c.config.Drive.FolderOnDrive(ctx, sess.GDriveFolderID)
+		switch {
+		case folderErr != nil:
+			return fmt.Errorf("%w: %w", ErrDriveCannotSay, errors.Join(err, folderErr))
+		case !present:
+			return c.folderGone(sess)
+		default:
+			return fmt.Errorf("%w: %w", ErrDriveCannotSay, err)
+		}
+	}
+	if !matches {
+		c.recordingMismatch(sess.ID, true)
+		return errRecordingsDoNotMatch
+	}
+	c.recordingMismatch(sess.ID, false)
+	return nil
+}
+
+func (c *Collector) recordingMismatch(sessionID string, mismatch bool) {
+	if c.config.OnRecordingMismatch != nil {
+		c.config.OnRecordingMismatch(sessionID, mismatch)
+	}
+}
+
+func (c *Collector) folderGone(sess *storage.Session) error {
 	marked, err := c.store.MarkRemoteDeleted(sess.ID, sess.GDriveFolderID, "GC found the Drive folder in the trash or gone; the device holds the only lasting copy")
 	switch {
 	case err != nil:
@@ -205,7 +268,51 @@ func (c *Collector) onDrive(sess *storage.Session) error {
 	default:
 		c.logger.Info("gc keeps a session whose Drive folder is in the trash or gone; it changed since GC read it, so it is not marked", "operation", "check_drive", "session_id", sess.ID, "drive_folder_id", sess.GDriveFolderID)
 	}
+	c.recordingMismatch(sess.ID, false)
 	return errFolderGone
+}
+
+// recordingChecksums returns every local saved recording's Drive name and
+// streaming MD5 checksum. Missing files name no local audio to remove; any
+// other failure keeps the session's local audio.
+func (c *Collector) recordingChecksums(audioPath string) (map[string]string, error) {
+	checksums := map[string]string{}
+	for _, entry := range splitAudioPath(audioPath) {
+		path := c.resolve(entry)
+		info, err := os.Stat(path)
+		switch {
+		case os.IsNotExist(err):
+			continue
+		case err != nil:
+			return nil, fmt.Errorf("%w: stat %s: %w", errCannotReadRecording, path, err)
+		case info.IsDir() || !info.Mode().IsRegular():
+			return nil, fmt.Errorf("%w: %s is not a regular file", errCannotReadRecording, path)
+		}
+		checksum, err := md5File(path)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %w", errCannotReadRecording, path, err)
+		}
+		name := recording.FileName(path)
+		if old, duplicate := checksums[name]; duplicate && old != checksum {
+			return nil, fmt.Errorf("%w: recordings named %s have different content", errRecordingsDoNotMatch, name)
+		}
+		checksums[name] = checksum
+	}
+	return checksums, nil
+}
+
+// md5File streams a file into MD5 so recordings are never loaded into memory.
+func md5File(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+	sum := md5.New()
+	if _, err := io.Copy(sum, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // recordingFile is a file of a session's saved recording that is on disk.
@@ -293,12 +400,12 @@ func (n names) forget(id string) {
 // deleteSession deletes session id under the age policy, with the files of
 // its saved recording that no other session names, as long as the session is
 // still as GC read it (a session merged meanwhile gave its recording to the
-// merged session; one whose summary or transcript changed meanwhile, under a
-// sync gate, is waiting to sync them) and, under a sync gate, Drive has its
-// folder out of the trash (onDrive). It removes the session's raw .pcm only
-// once a saved recording with audio in it is gone, so the raw file was a
-// redundant copy, and only when no session names it; otherwise the raw file
-// may be the only copy of the audio and stays: GC never removes one.
+// merged session; one whose summary or transcript changed meanwhile is
+// waiting to sync them) and Drive confirms its folder and recordings. It
+// removes the session's raw .pcm only once a saved recording with audio in it
+// is gone, so the raw file was a redundant copy, and only when no session
+// names it; otherwise the raw file may be the only copy of the audio and
+// stays: GC never removes one.
 func (c *Collector) deleteSession(id string, names names) error {
 	sess, err := c.store.GetSession(id)
 	if err != nil {
@@ -322,13 +429,14 @@ func (c *Collector) deleteSession(id string, names names) error {
 
 	// Delete DB record first — if this fails, audio files remain (recoverable).
 	// Reverse order (delete files first) risks permanent audio loss on DB failure.
-	deleted, err := c.store.DeleteEndedSession(id, sess.AudioPath, c.config.SyncGated)
+	deleted, err := c.store.DeleteEndedSession(id, sess.AudioPath)
 	if err != nil {
 		return fmt.Errorf("delete from db: %w", err)
 	}
 	if !deleted {
 		return fmt.Errorf("session changed since GC read it (merged, no longer ended, or waiting to sync a change); kept with its audio")
 	}
+	c.recordingMismatch(id, false)
 	names.forget(id)
 
 	saved := false
@@ -397,15 +505,14 @@ func (a *sessionAudio) size() int64 {
 }
 
 // removableAudio returns the audio disk pressure may remove, oldest session
-// first, and its total size on disk: the saved recordings of ended sessions
-// (synced ones only when Drive sync gates GC, so a sync that failed keeps its
-// file; not while a refinement reads one), and a raw .pcm beside a saved
+// first, and its total size on disk: the saved recordings of ended synced
+// sessions (not while a refinement reads one), and a raw .pcm beside a saved
 // recording that has audio in it. It never lists a raw recording that is the
 // only copy of a session's audio, the recording under way, or a file another
 // session names. The audio budget counts exactly these files, so what is
 // counted can be removed.
 func (c *Collector) removableAudio() ([]sessionAudio, int64, error) {
-	recordings, err := c.store.Recordings(c.config.SyncGated)
+	recordings, err := c.store.Recordings()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -459,12 +566,12 @@ func (c *Collector) removableAudio() ([]sessionAudio, int64, error) {
 // freeAudioSpace removes audio, oldest session first, while the audio disk
 // pressure may remove takes more than the audio budget. It deletes no
 // session: one whose recording it removed keeps its row, transcript and
-// summary, with its audio path naming only what is left and the marker the
-// UI shows. Under a sync gate it removes a session's audio only once Drive
-// says it has the session's folder out of the trash (onDrive); a session it
-// keeps no longer counts, and a Drive that cannot say ends the pass. A file
-// whose removal frees nothing (missing, empty, or refused) is skipped and
-// logged. The pass ends when the list is exhausted or the audio fits.
+// summary, with its audio path naming only what is left and the marker the UI
+// shows. It removes a session's audio only after Drive confirms its folder
+// and every local recording by content (onDrive); a session it keeps no
+// longer counts, and a Drive that cannot say ends the pass. A file whose
+// removal frees nothing (missing, empty, or refused) is skipped and logged.
+// The pass ends when the list is exhausted or the audio fits.
 func (c *Collector) freeAudioSpace() {
 	budget, limited := AudioBudgetBytes(c.config.MaxAudioSizeMB)
 	if !limited || c.config.AudioDir == "" {
@@ -510,12 +617,9 @@ func (c *Collector) freeAudioSpace() {
 	}
 }
 
-// driveKeeps returns why GC, gated on sync, keeps session id's audio, or nil
-// when it may remove it (see onDrive).
+// driveKeeps returns why GC keeps session id's audio, or nil when it may
+// remove it (see onDrive).
 func (c *Collector) driveKeeps(id string) error {
-	if !c.config.SyncGated {
-		return nil
-	}
 	sess, err := c.store.GetSession(id)
 	if err != nil {
 		return fmt.Errorf("get session: %w", err)
@@ -549,7 +653,7 @@ func (c *Collector) removeRecording(a *sessionAudio) int64 {
 		taking[f.path] = true
 	}
 	left := c.left(a, taking)
-	removal, ok, err := c.store.MarkAudioRemoved(a.id, a.audioPath, strings.Join(left, ","), c.audioLeft(a, left), c.config.SyncGated, time.Now())
+	removal, ok, err := c.store.MarkAudioRemoved(a.id, a.audioPath, strings.Join(left, ","), c.audioLeft(a, left), time.Now())
 	if err != nil {
 		c.logger.Error("gc could not record removing a session's audio, so it removed none", "operation", "free_audio_space", "session_id", a.id, "error", err)
 		return 0

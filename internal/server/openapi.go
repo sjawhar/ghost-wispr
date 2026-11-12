@@ -154,7 +154,7 @@ func OpenAPISpec() map[string]any {
 			"/api/search/semantic": map[string]any{
 				"get": map[string]any{
 					"summary":     "Semantic search",
-					"description": "Search across sessions using semantic similarity (embedding-based)",
+					"description": "Search across sessions using semantic similarity (embedding-based). The response model is the model reported by the embedding provider for that query.",
 					"tags":        []string{"search"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{
@@ -790,7 +790,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), and the active session",
+					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), unit_only_sessions (sessions marked REMOTE_DELETED whose audio is still on this unit: their Drive folder is gone or unreadable, so the unit holds the only copy; with a warning while there are any, until a retry syncs them), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

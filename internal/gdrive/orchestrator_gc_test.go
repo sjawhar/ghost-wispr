@@ -44,6 +44,10 @@ func (u *remountingUploader) FolderOnDrive(_ context.Context, folderID string) (
 	return folderID == "folder-1", nil
 }
 
+func (*remountingUploader) RecordingsMatch(context.Context, string, map[string]string) (bool, error) {
+	return true, nil
+}
+
 // Review of #37, round 2, blocker 1: a recording missing when the sync built
 // its file list, and back on disk by the end of the upload, was never
 // uploaded, yet the session was marked synced, so GC gated on sync removed a
@@ -82,7 +86,7 @@ func TestOrchestratorDoesNotMarkSyncedARecordingThatCameBackDuringTheUpload(t *t
 		t.Errorf("marked synced, but Drive got only %v: %s was never uploaded", uploader.uploaded, recording)
 	}
 
-	gcConfig := gc.Config{MaxAudioSizeMB: 1, SyncGated: true, AudioDir: dir, Drive: o}
+	gcConfig := gc.Config{MaxAudioSizeMB: 1, AudioDir: dir, Drive: o}
 	if _, err := gc.New(store, gcConfig, slog.New(slog.NewTextHandler(io.Discard, nil))).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
@@ -155,19 +159,19 @@ func TestGCNeverRemovesARecordingDriveSkippedOnARetry(t *testing.T) {
 		t.Fatalf("after the cut-off sync: %q in folder %q, want %q in its folder", sess.SyncState, folder, storage.SyncStateRetryScheduled)
 	}
 
-	// 2. Sync off, so GC is not gated; mnt is away for a pass over budget.
+	// 2. Drive has only one recording, so GC keeps both local copies.
 	away := filepath.Join(root, "mnt-away")
 	if err := os.Rename(mnt, away); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gc.New(store, gc.Config{MaxAudioSizeMB: 1, AudioDir: audioDir}, logger).Run(); err != nil {
+	if _, err := gc.New(store, gc.Config{MaxAudioSizeMB: 1, AudioDir: audioDir, Drive: o}, logger).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	if err := os.Rename(away, mnt); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(a); !os.IsNotExist(err) {
-		t.Fatalf("GC kept %s (%v); the test needs it removed", a, err)
+	if _, err := os.Stat(a); err != nil {
+		t.Fatalf("GC removed %s before Drive held every recording: %v", a, err)
 	}
 
 	// 3. mnt back, sync on, the retry.
@@ -181,7 +185,7 @@ func TestGCNeverRemovesARecordingDriveSkippedOnARetry(t *testing.T) {
 	}
 
 	// 4. A pass of GC gated on sync.
-	if _, err := gc.New(store, gc.Config{MaxAudioSizeMB: 1, SyncGated: true, AudioDir: audioDir, Drive: o}, logger).Run(); err != nil {
+	if _, err := gc.New(store, gc.Config{MaxAudioSizeMB: 1, AudioDir: audioDir, Drive: o}, logger).Run(); err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	for _, path := range paths {
@@ -272,11 +276,13 @@ func (s pausingStore) RestoreAudio(removal *storage.AudioRemoval, restored strin
 	return s.SQLiteStore.RestoreAudio(removal, restored)
 }
 
-// gcRestoreRace sets up a session whose two recordings disk pressure takes,
-// one of which (on a directory that refuses removals) it then has to put
-// back, and runs that GC pass up to the put-back. It returns the store, the
-// session id, the recording GC puts back with its content, a function that
-// lets GC finish and waits for it, and the GC logger.
+// gcRestoreRace sets up a synced session whose two recordings disk pressure
+// takes, one of which (on a directory that refuses removals) it then has to
+// put back. GC is Drive-gated, with a verifier that confirms the Drive copy
+// so the pass removes audio; it runs up to the put-back. Its title then
+// changes, so the session needs a sync while GC has the row marked. It
+// returns the store, the session id, the recording GC puts back with its
+// content, and a function that lets GC finish and waits for it.
 func gcRestoreRace(t *testing.T) (*storage.SQLiteStore, string, string, []byte, func()) {
 	t.Helper()
 	if os.Geteuid() == 0 {
@@ -311,13 +317,13 @@ func gcRestoreRace(t *testing.T) (*storage.SQLiteStore, string, string, []byte, 
 	if err := store.UpdateSummary(id, "", "A summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
+	syncTo(t, store, id, storage.SyncStateSynced, "folder-gc-race", 0, "")
 
 	paused := pausingStore{store, make(chan struct{}), make(chan struct{})}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// Sync is off, so GC is not gated.
-		if _, err := gc.New(paused, gc.Config{MaxAudioSizeMB: 1, AudioDir: audioDir}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run(); err != nil {
+		if _, err := gc.New(paused, gc.Config{MaxAudioSizeMB: 1, AudioDir: audioDir, Drive: allFoldersOnDrive{}}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run(); err != nil {
 			t.Errorf("gc run: %v", err)
 		}
 	}()
@@ -334,6 +340,12 @@ func gcRestoreRace(t *testing.T) (*storage.SQLiteStore, string, string, []byte, 
 		})
 	}
 	t.Cleanup(finishGC)
+	if err := store.UpdateTitle(id, "Renamed while GC had the row marked"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if sess, err := store.GetSession(id); err != nil || sess.SyncState != storage.SyncStatePending {
+		t.Fatalf("after the rename: %q (%v), want %q so a sync runs while GC has the row marked", sess.SyncState, err, storage.SyncStatePending)
+	}
 	return store, id, stuck, content, finishGC
 }
 

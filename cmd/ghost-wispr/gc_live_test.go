@@ -20,8 +20,10 @@ import (
 
 // Reviews of #36, rounds 1 to 4: GC never touches the recording under way.
 // Twenty sessions through the real Manager, Recorder and SQLiteStore, against
-// a collector sweeping without pause at a 1 MB budget: after every write the
-// live raw recording is whole, and every session keeps its row and either its
+// a Drive-gated collector sweeping without pause at a 1 MB budget. Each
+// session is marked synced as soon as it ends and the verifier confirms its
+// Drive copy, so GC removes audio under pressure. After every write the live
+// raw recording is whole, and every session keeps its row and either its
 // recording on disk or the marker saying GC removed it, never a path to a
 // file that is gone.
 func TestGCNeverTouchesTheLiveRecording(t *testing.T) {
@@ -42,8 +44,14 @@ func TestGCNeverTouchesTheLiveRecording(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var passes atomic.Int64
 	swept := goDone(func() {
-		collector := gc.New(store, gc.Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: audioDir}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		collector := gc.New(store, gc.Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: audioDir, Drive: &countingSyncer{}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		for ctx.Err() == nil {
+			// A sync that completed: ended sessions are synced into a folder.
+			if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ?, gdrive_folder_id = 'folder'
+				WHERE status = ? AND sync_state = ?`, storage.SyncStateSynced, storage.SyncSynced, storage.SessionEnded, storage.SyncStatePending); err != nil {
+				t.Errorf("mark ended sessions synced: %v", err)
+				return
+			}
 			if _, err := collector.Run(); err != nil {
 				t.Errorf("gc run: %v", err)
 				return
@@ -120,15 +128,14 @@ func TestGCNeverTouchesTheLiveRecording(t *testing.T) {
 	t.Logf("%d collector passes; %d of %d sessions had their recording removed to free space", passes.Load(), removed, len(ids))
 }
 
-// With Drive sync on in the config, GC is sync-gated whether or not the
-// syncer started: it deletes, and removes the audio of, only sessions synced
-// to Drive, and only after Drive answers that their folder is there, out of
-// the trash. When the syncer failed to start (credentials unreadable, say),
-// nothing can ask Drive, so GC deletes nothing and removes no audio: a synced
-// session's folder may be in the trash since, which Drive empties after 30
-// days. GC used to run ungated then, deleting sessions never backed up, and
-// later deleted the synced ones without asking Drive.
-func TestGCStaysSyncGatedWhenDriveSyncIsOnButNotRunning(t *testing.T) {
+// GC deletes and removes audio only after Drive answers that it has the
+// session folder, out of the trash. When the syncer failed to start
+// (credentials unreadable, say), nothing can ask Drive, so GC deletes nothing
+// and removes no audio: a synced session's folder may be in the trash since,
+// which Drive empties after 30 days. GC used to run ungated then, deleting
+// sessions never backed up, and later deleted the synced ones without asking
+// Drive.
+func TestGCStaysDriveGatedWhenSyncIsNotRunning(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -159,9 +166,6 @@ func TestGCStaysSyncGatedWhenDriveSyncIsOnButNotRunning(t *testing.T) {
 
 	cfg := config.Config{GCEnabled: true, GCMaxAgeDays: 30, GCMaxAudioSizeMB: 1, GDriveSyncEnabled: true, AudioDir: audioDir}
 	gcCfg := gcConfig(&cfg, nil) // no syncer: it failed to start
-	if !gcCfg.SyncGated {
-		t.Errorf("Drive sync on but not running: GC sync gate off")
-	}
 	deleted, err := gc.New(store, gcCfg, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"google.golang.org/genai"
 
@@ -14,6 +15,9 @@ import (
 type geminiClient struct {
 	client *genai.Client
 	model  string
+
+	mu            sync.RWMutex
+	reportedModel string
 }
 
 func newGeminiClient(apiKey, model string, opts *clientOptions) (*geminiClient, error) {
@@ -80,6 +84,7 @@ func (c *geminiClient) Complete(ctx context.Context, messages []Message) (string
 	if text == "" {
 		return "", fmt.Errorf("gemini: empty response text")
 	}
+	c.recordReportedModel(result.ModelVersion)
 	return text, nil
 }
 
@@ -111,5 +116,25 @@ func (c *geminiClient) CompleteJSON(ctx context.Context, messages []Message, sch
 	if text == "" {
 		return nil, fmt.Errorf("gemini: empty response text")
 	}
+	c.recordReportedModel(result.ModelVersion)
 	return json.RawMessage(text), nil
+}
+
+// ReportedModel returns ModelVersion from the latest successful Vertex
+// response. Vertex may omit ModelVersion; in that documented case the model
+// resolved into the request is the only model identity the API provides.
+func (c *geminiClient) ReportedModel() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.reportedModel
+}
+
+func (c *geminiClient) recordReportedModel(modelVersion string) {
+	model := strings.TrimSpace(modelVersion)
+	if model == "" {
+		model = ModelNotReportedByProvider
+	}
+	c.mu.Lock()
+	c.reportedModel = model
+	c.mu.Unlock()
 }
