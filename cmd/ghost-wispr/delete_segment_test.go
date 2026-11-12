@@ -337,16 +337,22 @@ func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
 }
 
 // eraseDirectoryLister lists dirs as recording directories and records the
-// ones the cleanup forgets.
+// ones the cleanup forgets and records.
 type eraseDirectoryLister struct {
 	dirs      []string
 	forgotten []string
+	recorded  []string
 }
 
 func (l *eraseDirectoryLister) RecordingDirectories() ([]string, error) { return l.dirs, nil }
 
 func (l *eraseDirectoryLister) ForgetEraseDirectories(dirs []string) error {
 	l.forgotten = append(l.forgotten, dirs...)
+	return nil
+}
+
+func (l *eraseDirectoryLister) RecordEraseDirectory(dir string) error {
+	l.recorded = append(l.recorded, dir)
 	return nil
 }
 
@@ -422,6 +428,44 @@ func TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere(t *testing.T) {
 	}
 	if !slices.Contains(dirs, unplugged) {
 		t.Error("the erase directory that was not there was forgotten")
+	}
+}
+
+// TestStartupRecordsTheAudioDirectoryForALaterStart fails if the audio
+// directory is not recorded as an erase directory as the app starts, after
+// the cleanup: the recorder erases a saved session's raw recording there
+// without recording it, so an erase of it a stop cut off would not be
+// finished at a start with another audio_dir.
+func TestStartupRecordsTheAudioDirectoryForALaterStart(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	oldAudioDir, newAudioDir := t.TempDir(), t.TempDir()
+	if err := cleanupRecordingDirectories(store, oldAudioDir); err != nil {
+		t.Fatalf("cleanup at the first start: %v", err)
+	}
+	// The recorder's erase of a raw recording is cut off by a stop.
+	audio := []byte("a saved session's raw recording")
+	cutOff := filepath.Join(oldAudioDir, ".erasing-cut-off")
+	if err := os.WriteFile(cutOff, audio, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held := holdRecording(t, cutOff)
+
+	if err := cleanupRecordingDirectories(store, newAudioDir); err != nil {
+		t.Fatalf("cleanup at a start with another audio_dir: %v", err)
+	}
+	if _, err := os.Stat(cutOff); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the cut-off erase in the earlier audio directory remains: %v", err)
+	}
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the cut-off erase was left holding %q", got)
 	}
 }
 

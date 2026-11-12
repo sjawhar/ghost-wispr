@@ -592,11 +592,12 @@ func cleanupSpliceTempCopies(audioDir string) error {
 }
 
 // recordingDirectoryLister lists the directories recordings are kept or
-// erased in outside the audio directory, and forgets the erase directories
-// the startup cleanup has finished.
+// erased in outside the audio directory, forgets the erase directories the
+// startup cleanup has finished, and records the audio directory as one.
 type recordingDirectoryLister interface {
 	RecordingDirectories() ([]string, error)
 	ForgetEraseDirectories(dirs []string) error
+	RecordEraseDirectory(dir string) error
 }
 
 // cleanupRecordingDirectories runs cleanupSpliceTempCopies, as the app
@@ -606,7 +607,10 @@ type recordingDirectoryLister interface {
 // recording they copy or erase. Each directory is named by its absolute path,
 // as the store lists it, so a relative audio_dir is cleaned once. It then
 // hands the directories it cleaned without an error to
-// ForgetEraseDirectories, which forgets those that were there to clean.
+// ForgetEraseDirectories, which forgets those that were there to clean, and
+// last records audioDir as an erase directory: the recorder erases a saved
+// session's raw recording there without recording where, so an erase of it a
+// stop cuts off is still finished at a start with another audio_dir.
 func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string) error {
 	audioDir, err := filepath.Abs(audioDir)
 	if err != nil {
@@ -615,7 +619,7 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 	dirs := []string{audioDir}
 	others, err := store.RecordingDirectories()
 	if err != nil {
-		return errors.Join(err, cleanupSpliceTempCopies(audioDir))
+		return errors.Join(err, cleanupSpliceTempCopies(audioDir), store.RecordEraseDirectory(audioDir))
 	}
 	for _, dir := range others {
 		if dir, err = filepath.Abs(dir); err != nil {
@@ -634,7 +638,7 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 		}
 		cleaned = append(cleaned, dir)
 	}
-	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned))
+	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned), store.RecordEraseDirectory(audioDir))
 }
 
 func neighbourText(segments []transcribe.Segment, index int) (before, after string) {

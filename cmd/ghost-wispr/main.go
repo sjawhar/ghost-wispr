@@ -1870,7 +1870,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// using only while none runs. The recorder, started above, may already
 	// erase a saved session's raw recording in the audio directory:
 	// erase.Remove makes no second name, and either erase finishing the file
-	// overwrites it.
+	// overwrites it. The cleanup then records the audio directory
+	// (RecordEraseDirectory), so an erase the recorder cuts off there is
+	// still finished at a start with another audio_dir.
 	if err := cleanupRecordingDirectories(store, cfg.AudioDir); err != nil {
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
