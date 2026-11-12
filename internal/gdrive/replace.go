@@ -25,7 +25,7 @@ type replacementStore interface {
 	MarkDriveReplacementDeleted(sessionID, name, oldID string, generation int) error
 	DeletionGeneration(sessionID string) (int, error)
 	ClearDriveReplacementPending(sessionID string, generation int) error
-	DriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
+	EnsureDriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
 	MarkDriveReplacementFolder(sessionID string, generation int, folderSessionID, state string) error
 	FinishDriveReplacement(sessionID string, generation int) error
 }
@@ -104,7 +104,7 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 	if len(recordings) == 0 {
 		recordings = []string{splicedRecording}
 	}
-	folders, err := s.replacements.DriveReplacementFolders(current.ID, generation)
+	folders, err := s.replacements.EnsureDriveReplacementFolders(current.ID, generation)
 	if err != nil {
 		return outcome, err
 	}

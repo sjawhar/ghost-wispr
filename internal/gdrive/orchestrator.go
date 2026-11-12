@@ -48,7 +48,9 @@ type replacementInputStore interface {
 	ClearDriveReplacementPending(sessionID string, generation int) error
 	HasPendingSplice(sessionID string) (bool, error)
 	OldestPendingSplice(sessionID string) (time.Time, bool, error)
-	DriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
+	// EnsureDriveReplacementFolders reads the deletion's owed folders,
+	// rebuilding a ledger that is empty while the deletion is pending.
+	EnsureDriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
 	// RecordDriveReplacementFailure counts a failed replacement attempt of
 	// the session's deletion generation, with why; the app's status warning
 	// is read from these counts (storage.OwedDriveReplacements).
@@ -199,13 +201,13 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				o.logger.Warn("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
 				return nil
 			}
-			folders, err := replacements.DriveReplacementFolders(sessionID, generation)
+			folders, err := replacements.EnsureDriveReplacementFolders(sessionID, generation)
 			if err != nil {
 				return err
 			}
 			if len(folders) == 0 {
 				// The deletion owes Drive no folder: none held the session's
-				// files when it committed, and no sync made one since.
+				// files, its own or a merged source's, even rebuilt.
 				if err := replacements.ClearDriveReplacementPending(sessionID, generation); err != nil {
 					return err
 				}

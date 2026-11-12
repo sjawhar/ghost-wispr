@@ -217,9 +217,10 @@ var postDeleteMaintenance = func(db *sql.DB) error {
 // assigned by time, without gaps: to the last recorded source (one nothing
 // is merged into) that started at or before the segment, or to the first
 // one if it started before every source. Sessions are recorded one at a
-// time, so a segment cannot fall in another source's time, and one stamped
-// after its session ended (a late final transcript) stays with it. A merged
-// source holds every segment of the sources merged into it.
+// time, so a segment cannot fall in another source's recording. One stamped
+// after its session ended (a late final transcript) stays with it only until
+// the next source started; one stamped later than that goes to that next
+// source. A merged source holds every segment of the sources merged into it.
 func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Segment, deletedAt time.Time) (sources, holders []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {

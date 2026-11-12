@@ -239,10 +239,11 @@ func TestFinishWaitsForEveryOwedFolder(t *testing.T) {
 	if _, err := store.DB().Exec(`UPDATE drive_replacements SET state = ? WHERE session_id = 's3'`, DriveReplacementDeleted); err != nil {
 		t.Fatal(err)
 	}
-	for _, folder := range []string{"m1", "s3"} {
-		if err := store.MarkDriveReplacementFolder("m2", generation, folder, DriveReplacementFolderReplaced); err != nil {
-			t.Fatal(err)
-		}
+	if err := store.MarkDriveReplacementFolder("m2", generation, "s3", DriveReplacementFolderReplaced); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkDriveReplacementFolder("m2", generation, "m1", DriveReplacementFolderGone); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.FinishDriveReplacement("m2", generation); err == nil || errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("FinishDriveReplacement with s1 still owed = %v, want a refusal naming the owed folder", err)

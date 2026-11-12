@@ -366,7 +366,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			session_id TEXT NOT NULL,
 			generation INTEGER NOT NULL,
 			folder_session_id TEXT NOT NULL,
-			state TEXT NOT NULL DEFAULT 'owed',
+			state TEXT NOT NULL DEFAULT '`+DriveReplacementFolderOwed+`',
 			PRIMARY KEY (session_id, generation, folder_session_id),
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
@@ -706,7 +706,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			SELECT owner.session_id, owner.generation, sessions.id FROM sessions JOIN owner ON sessions.merged_into = owner.folder_session_id
 		)
 		INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
-		SELECT owner.session_id, owner.generation, owner.folder_session_id, 'owed'
+		SELECT owner.session_id, owner.generation, owner.folder_session_id, '`+DriveReplacementFolderOwed+`'
 		FROM owner JOIN sessions ON sessions.id = owner.folder_session_id
 		WHERE sessions.gdrive_folder_id != ''
 	`); err != nil {
@@ -870,7 +870,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	}
 
 	var owing string
-	err = tx.QueryRow(fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND drive_replace_pending = 1 LIMIT 1`, strings.Join(placeholders, ",")), args[1:]...).Scan(&owing)
+	err = tx.QueryRow(fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND NOT (%s) LIMIT 1`, strings.Join(placeholders, ","), noOwedDriveReplacement), args[1:]...).Scan(&owing)
 	switch {
 	case err == nil:
 		return fmt.Errorf("merge session %s: %w", owing, ErrMergeReplacementPending)
@@ -1533,6 +1533,9 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	if rows == 0 {
 		return false, nil
 	}
+	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit marking session %s synced: %w", id, err)
 	}
@@ -1582,15 +1585,27 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 	if rows != 1 {
 		return false, nil
 	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
-		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND gdrive_folder_id != ''`,
-		DriveReplacementFolderOwed, id); err != nil {
-		return false, fmt.Errorf("owe the Drive folder of session %s its replacement: %w", id, err)
+	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit the end of the sync of session %s: %w", id, err)
 	}
 	return true, nil
+}
+
+// oweFolderOfPendingDeletion records, in tx, the Drive folder a sync just
+// recorded for session id as owed to the session's pending segment deletion,
+// if it has one: a sync that held the session while a segment was deleted
+// (DeleteSegment leaves the claim to it) uploaded the words before the
+// deletion. EndSync and MarkSynced both call it.
+func oweFolderOfPendingDeletion(tx *sql.Tx, id string) error {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
+		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND gdrive_folder_id != ''`,
+		DriveReplacementFolderOwed, id); err != nil {
+		return fmt.Errorf("owe the Drive folder of session %s its replacement: %w", id, err)
+	}
+	return nil
 }
 
 // RecoverInterruptedSyncs moves every session an earlier run of the app left
@@ -2033,7 +2048,7 @@ type SessionRecording struct {
 // there is no Drive to ask, so it is kept. Any other sync state, a failure
 // included, keeps the recording.
 func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ? AND drive_replace_pending = 0
+	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ? AND ` + noOwedDriveReplacement + `
 		AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)`
 	if syncGated {
 		cond += ` AND sync_status = ?`
@@ -2181,10 +2196,11 @@ func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error
 var ErrDeleteReplacementPending = errors.New("this session still has a deleted segment on Google Drive; delete it after its Drive files are replaced")
 
 // noOwedDriveReplacement is the condition, on a sessions row, that it owes
-// Google Drive no replacement and its folder is owed none.
-const noOwedDriveReplacement = `drive_replace_pending = 0 AND NOT EXISTS (
+// Google Drive no replacement and its folder is owed none. DeleteSession, GC
+// (removable) and MergeSessions all check it.
+const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXISTS (
 	SELECT 1 FROM drive_replacement_folders
-	WHERE drive_replacement_folders.folder_session_id = sessions.id AND drive_replacement_folders.state = 'owed')`
+	WHERE drive_replacement_folders.folder_session_id = sessions.id AND drive_replacement_folders.state = '` + DriveReplacementFolderOwed + `')`
 
 func (s *SQLiteStore) DeleteSession(id string) error {
 	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND `+noOwedDriveReplacement, id)

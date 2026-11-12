@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -73,11 +74,55 @@ func (s *SQLiteStore) DriveReplacementFolders(sessionID string, generation int) 
 	return folders, nil
 }
 
+// EnsureDriveReplacementFolders returns the ledger of the Drive folders
+// sessionID's segment deletion at generation owes, rebuilding it first when
+// it is empty while that deletion is still pending: from the session's own
+// folder and each merged source's that has one, as DeleteSegment records it.
+// A pending deletion with no ledger was made by a build that has none (one
+// deploy/pi/update.sh rolled back to, after this version's migration had
+// run), and read as owing nothing it would leave the words in those folders.
+// The ledger it returns is empty only if no such folder exists.
+func (s *SQLiteStore) EnsureDriveReplacementFolders(sessionID string, generation int) ([]DriveReplacementFolder, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin checking the owed Drive folders of session %s: %w", sessionID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var recorded int
+	if err := tx.QueryRow(`SELECT count(*) FROM drive_replacement_folders WHERE session_id = ? AND generation = ?`, sessionID, generation).Scan(&recorded); err != nil {
+		return nil, fmt.Errorf("count owed Drive folders of session %s: %w", sessionID, err)
+	}
+	if recorded == 0 {
+		var pending int
+		err := tx.QueryRow(`SELECT 1 FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, sessionID, generation).Scan(&pending)
+		switch {
+		case err == nil:
+			sources, err := mergedSourceIDs(tx, sessionID)
+			if err != nil {
+				return nil, err
+			}
+			if err := recordOwedDriveReplacementFolders(tx, sessionID, append([]string{sessionID}, sources...)); err != nil {
+				return nil, err
+			}
+		case !errors.Is(err, sql.ErrNoRows):
+			return nil, fmt.Errorf("check the pending deletion of session %s: %w", sessionID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit the owed Drive folders of session %s: %w", sessionID, err)
+	}
+	return s.DriveReplacementFolders(sessionID, generation)
+}
+
 // MarkDriveReplacementFolder records that the folder of folderSessionID, owed
-// by sessionID's deletion at generation, is replaced (every old file recorded
-// for it at generation is deleted) or gone. It changes nothing, and errs,
-// once a later deletion moved sessionID's generation, for a folder no longer
-// owed, or for a replaced folder with an old file left.
+// by sessionID's deletion at generation, is replaced or gone. Replaced needs
+// the folder's replacement recorded for generation, with every old file of it
+// deleted: a replacement always uploads summary.md and transcript.md, each
+// with a row (one with no old id when the folder had no such file), so a
+// folder with no rows was never replaced, even one that held no files. It
+// changes nothing, and errs, once a later deletion moved sessionID's
+// generation, for a folder no longer owed, or for a replaced folder with no
+// rows or an old file left.
 func (s *SQLiteStore) MarkDriveReplacementFolder(sessionID string, generation int, folderSessionID, state string) error {
 	switch state {
 	case DriveReplacementFolderReplaced, DriveReplacementFolderGone:
@@ -87,11 +132,13 @@ func (s *SQLiteStore) MarkDriveReplacementFolder(sessionID string, generation in
 	result, err := s.db.Exec(`UPDATE drive_replacement_folders SET state = ?
 		WHERE session_id = ? AND generation = ? AND folder_session_id = ? AND state = ?
 		  AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND deletion_generation = ?)
-		  AND (? = ? OR NOT EXISTS (SELECT 1 FROM drive_replacements
-		       WHERE session_id = ? AND generation = ? AND state != ?))`,
+		  AND (? = ? OR (
+		       EXISTS (SELECT 1 FROM drive_replacements WHERE session_id = ? AND generation = ?)
+		       AND NOT EXISTS (SELECT 1 FROM drive_replacements WHERE session_id = ? AND generation = ? AND state != ?)))`,
 		state, sessionID, generation, folderSessionID, DriveReplacementFolderOwed,
 		sessionID, generation,
 		state, DriveReplacementFolderGone,
+		folderSessionID, generation,
 		folderSessionID, generation, DriveReplacementDeleted)
 	if err != nil {
 		return fmt.Errorf("mark Drive folder of session %s %s: %w", folderSessionID, state, err)
