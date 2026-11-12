@@ -202,11 +202,15 @@ func normalizeRepairSpeakers(speakers map[string]repairSpeakerMetadata) map[stri
 	return normalized
 }
 
+// errDeepgramKeyMissing is why the default batch transcription, Deepgram's,
+// cannot run: no Deepgram API key is configured.
+var errDeepgramKeyMissing = errors.New("deepgram API key not configured")
+
 func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.BatchTranscription.Provider)) {
 	case "", "deepgram":
 		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
-			return nil, fmt.Errorf("deepgram API key not configured")
+			return nil, errDeepgramKeyMissing
 		}
 		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
 			APIKey: cfg.DeepgramAPIKey,
@@ -217,6 +221,25 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 	default:
 		return nil, fmt.Errorf("unsupported batch transcription provider %q", cfg.BatchTranscription.Provider)
 	}
+}
+
+// segmentDeletionTranscriber returns the batch transcriber a segment deletion
+// under cfg finds the segment's words with. With no Deepgram API key, its
+// error wraps server.ErrBatchTranscriptionNotConfigured, which the API
+// answers with what to configure.
+func segmentDeletionTranscriber(cfg *config.Config) (transcribe.BatchWordsTranscriber, error) {
+	batch, err := makeBatchTranscriber(cfg)
+	if errors.Is(err, errDeepgramKeyMissing) {
+		return nil, fmt.Errorf("%w: %w", server.ErrBatchTranscriptionNotConfigured, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("configure batch transcription for deletion: %w", err)
+	}
+	wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
+	if !ok {
+		return nil, fmt.Errorf("configured batch transcription does not return word timestamps")
+	}
+	return wordTranscriber, nil
 }
 
 type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
@@ -920,13 +943,9 @@ func main() {
 				return err
 			}
 			latestCfg := cfgStore.Get()
-			batch, err := makeBatchTranscriber(&latestCfg)
+			wordTranscriber, err := segmentDeletionTranscriber(&latestCfg)
 			if err != nil {
-				return fmt.Errorf("configure batch transcription for deletion: %w", err)
-			}
-			wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
-			if !ok {
-				return fmt.Errorf("configured batch transcription does not return word timestamps")
+				return err
 			}
 			runner := segmentDeleteRunner{
 				store:       store,

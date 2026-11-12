@@ -758,6 +758,15 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			wantError: "s1.pcm",
 		},
 		{
+			name:    "no batch transcription",
+			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook: func(context.Context, string, int64) error {
+				return fmt.Errorf("%w: deepgram API key not configured", ErrBatchTranscriptionNotConfigured)
+			},
+			wantCode:  http.StatusServiceUnavailable,
+			wantError: "Segment deletion needs batch transcription, which is not configured: add a Deepgram API key.",
+		},
+		{
 			name:    "active",
 			session: storage.Session{ID: "s1", Status: storage.SessionActive},
 			hook: func(context.Context, string, int64) error {
