@@ -276,10 +276,10 @@ func TestFinishWaitsForEveryOwedFolder(t *testing.T) {
 func TestDeleteSessionRefusesASourceWhoseFolderIsOwed(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	deleteSecret(t, store, nestedMerge(t, store))
-	if _, err := store.DeleteSession("s1"); !errors.Is(err, ErrDeleteReplacementPending) {
+	if _, err := store.DeleteSession("s1", ""); !errors.Is(err, ErrDeleteReplacementPending) {
 		t.Fatalf("DeleteSession of a source with an owed folder = %v, want %v", err, ErrDeleteReplacementPending)
 	}
-	if _, err := store.DeleteSession("s2"); err != nil {
+	if _, err := store.DeleteSession("s2", ""); err != nil {
 		t.Errorf("DeleteSession of a source with no folder: %v", err)
 	}
 }

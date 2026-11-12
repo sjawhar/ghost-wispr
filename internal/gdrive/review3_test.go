@@ -112,6 +112,9 @@ func (s *spliceHookStore) HasPendingSplice(sessionID string) (bool, error) {
 
 // TestReview3NoFolderBranchDoesNotClearANewerDeletion proves a no-folder
 // replacement cannot clear a deletion that commits while it checks readiness.
+// A spliced deletion with no folder to owe settles as it is marked complete
+// (storage.MarkSpliceComplete), unless a sync holds the session then; one cut
+// off by a stop leaves it owed for the no-folder branch, as here.
 func TestReview3NoFolderBranchDoesNotClearANewerDeletion(t *testing.T) {
 	store := openStore(t)
 	const id = "20261106180000"
@@ -124,8 +127,17 @@ func TestReview3NoFolderBranchDoesNotClearANewerDeletion(t *testing.T) {
 	if err := os.WriteFile(recording, []byte("audio still holding CHARLIE"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if _, claimed, err := store.ClaimSync(id, storage.SyncStatePending, "cut-off-sync", time.Now().UTC()); err != nil || !claimed {
+		t.Fatalf("claim a sync the app stops in: %v, %v", claimed, err)
+	}
 	if err := store.MarkSpliceComplete(&span1); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := store.RecoverInterruptedSyncs(MaxSyncRetries, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if sess, err := store.GetSession(id); err != nil || !sess.DriveReplacePending || sess.GDriveFolderID != "" {
+		t.Fatalf("control: before the sync, pending=%v folder=%q (%v); want owed with no folder", sess.DriveReplacePending, sess.GDriveFolderID, err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ?, summary_status = ? WHERE id = ?`,
 		storage.RefinementCompleted, storage.SummaryCompleted, id); err != nil {

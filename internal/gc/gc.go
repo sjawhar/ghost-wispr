@@ -335,13 +335,20 @@ func splitAudioPath(audioPath string) []string {
 }
 
 // resolve returns the file an audio path entry names, as an absolute path so
-// two spellings of one file compare equal: the entry itself if it is
-// absolute, else its name in the audio directory.
+// two spellings of one file compare equal: where recording.Resolve finds it,
+// the entry as written if a file is there, else its name in the audio
+// directory, as every other reader of a recording finds it.
 func (c *Collector) resolve(entry string) string {
-	path := entry
-	if !filepath.IsAbs(path) && c.config.AudioDir != "" {
-		path = filepath.Join(c.config.AudioDir, filepath.Base(path))
-	}
+	return absolute(recording.Resolve(entry, c.config.AudioDir))
+}
+
+// rawPath returns, as an absolute path, where the recorder keeps session
+// id's raw recording: in the audio directory.
+func (c *Collector) rawPath(id string) string {
+	return absolute(filepath.Join(c.config.AudioDir, id+".pcm"))
+}
+
+func absolute(path string) string {
 	if abs, err := filepath.Abs(path); err == nil {
 		return abs
 	}
@@ -427,8 +434,21 @@ func (c *Collector) deleteSession(id string, names names) error {
 		files = append(files, f)
 	}
 
-	// Delete DB record first — if this fails, audio files remain (recoverable).
-	// Reverse order (delete files first) risks permanent audio loss on DB failure.
+	// Record where the files are erased before the row that names them
+	// goes, so an erase a stop cuts off is finished as the app starts; what
+	// GC cannot record, it does not delete. Then delete the row first: if
+	// that fails, the audio files remain (recoverable), while the reverse
+	// order risks permanent audio loss on a database failure.
+	erased := make([]string, 0, len(files)+1)
+	for _, f := range files {
+		erased = append(erased, f.path)
+	}
+	if c.config.AudioDir != "" {
+		erased = append(erased, c.rawPath(id))
+	}
+	if err := c.recordEraseDirectories(erased); err != nil {
+		return fmt.Errorf("kept with its audio: %w", err)
+	}
 	deleted, err := c.store.DeleteEndedSession(id, sess.AudioPath)
 	if err != nil {
 		return fmt.Errorf("delete from db: %w", err)
@@ -450,7 +470,7 @@ func (c *Collector) deleteSession(id string, names names) error {
 		saved = saved || f.size > 0
 	}
 	if saved && c.config.AudioDir != "" {
-		rawPath := c.resolve(id + ".pcm")
+		rawPath := c.rawPath(id)
 		if len(names[rawPath]) > 0 {
 			return nil
 		}
@@ -461,19 +481,34 @@ func (c *Collector) deleteSession(id string, names names) error {
 	return nil
 }
 
+// recordEraseDirectories records the directory of each of paths before GC
+// changes the row that names them or erases them, so an erase a stop cuts off
+// is finished as the app starts, also once no row names the file. It reports
+// the first failure; GC then changes and erases none of them.
+func (c *Collector) recordEraseDirectories(paths []string) error {
+	recorded := map[string]bool{}
+	for _, path := range paths {
+		dir := filepath.Dir(path)
+		if recorded[dir] {
+			continue
+		}
+		if err := c.store.RecordEraseDirectory(dir); err != nil {
+			return fmt.Errorf("record the erase directory %s: %w", dir, err)
+		}
+		recorded[dir] = true
+	}
+	return nil
+}
+
 // removeErasing removes the audio file at path, overwriting its bytes with
 // zeros before the file system frees them (erase.Remove): a whole-file audio
 // removal zeroes (Sami, 2026-11-12, "Zero every audio removal",
-// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). It first
-// records path's directory, as GC resolves it (a relative entry is in the
-// audio directory), so an erase a stop cuts off is finished as the app
-// starts, also once no row names the file. It reports an error only if path
-// still names the file. A file gone from path whose bytes could not be
-// overwritten is logged; erase.Leftovers finishes it as the app starts.
+// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). Its caller
+// has recorded path's directory (recordEraseDirectories). It reports an error
+// only if path still names the file. A file gone from path whose bytes could
+// not be overwritten is logged; erase.Leftovers finishes it as the app
+// starts.
 func (c *Collector) removeErasing(sessionID, path string) error {
-	if err := c.store.RecordEraseDirectory(filepath.Dir(path)); err != nil {
-		c.logger.Warn("gc could not record where it erases an audio file; a stop during the erase would leave it", "operation", "erase_audio", "session_id", sessionID, "audio_path", path, "error", err)
-	}
 	err := erase.Remove(path)
 	if errors.Is(err, erase.ErrLeftover) {
 		c.logger.Warn("gc removed an audio file but could not overwrite it yet; it is erased as the app starts", "operation", "erase_audio", "session_id", sessionID, "audio_path", path, "error", err)
@@ -534,13 +569,9 @@ func (c *Collector) removableAudio() ([]sessionAudio, int64, error) {
 			seen[path] = true
 			info, err := os.Stat(path)
 			if os.IsNotExist(err) {
-				// It names nothing only if the entry's own path has no file
-				// either: after audio_dir changes, the file is where the entry
-				// points (where the app plays and syncs it), not where it
-				// resolves. Such an entry is left as it is.
-				if _, ownErr := os.Stat(entry); os.IsNotExist(ownErr) {
-					a.dead[path] = true
-				}
+				// It names nothing: recording.Resolve found no file where the
+				// entry points either.
+				a.dead[path] = true
 				continue
 			}
 			if err != nil || info.IsDir() {
@@ -552,7 +583,7 @@ func (c *Collector) removableAudio() ([]sessionAudio, int64, error) {
 		}
 		if saved && c.config.AudioDir != "" {
 			// A .pcm a session names is that session's recording, not a raw copy.
-			rawPath := c.resolve(rec.ID + ".pcm")
+			rawPath := c.rawPath(rec.ID)
 			if raw, ok := c.audioFile(rawPath); ok && len(names[rawPath]) == 0 {
 				a.raw = &raw
 				total += raw.size
@@ -599,9 +630,12 @@ func (c *Collector) freeAudioSpace() {
 			continue
 		}
 		// The raw copy first: if the saved recording then cannot go, its audio
-		// is still on disk.
+		// is still on disk. Its directory is recorded before it is erased, and
+		// it is kept if that fails.
 		if a.raw != nil {
-			if freed := c.removeAudioFile(a.id, *a.raw); freed > 0 {
+			if err := c.recordEraseDirectories([]string{a.raw.path}); err != nil {
+				c.logger.Warn("gc kept a raw recording: it could not record where it erases it", "operation", "free_audio_space", "session_id", a.id, "raw_audio", a.raw.path, "error", err)
+			} else if freed := c.removeAudioFile(a.id, *a.raw); freed > 0 {
 				total -= freed
 				c.logger.Info("gc removed a raw recording beside its saved recording to free space", "operation", "free_audio_space", "session_id", a.id, "raw_audio", a.raw.path)
 			}
@@ -628,14 +662,16 @@ func (c *Collector) driveKeeps(id string) error {
 }
 
 // removeRecording removes the files of session a's saved recording that free
-// space, and returns the bytes that freed. It records the removal first: the
-// session's row stops naming those files before any of them goes, so the row
-// never names a file GC removed. It keeps naming every other entry, one whose
-// file it cannot see too: that file may be on a disk not mounted for the
-// moment, and a name dropped cannot be recovered. If the row cannot be
-// changed (the database fails, a refinement started reading the file, the
-// session changed since it was listed), nothing is removed. A file that does
-// not go is put back in the row.
+// space, and returns the bytes that freed. It first records the files'
+// directories, and then the removal: the session's row stops naming those
+// files before any of them goes, so the row never names a file GC removed,
+// and an erase a stop cuts off is finished as the app starts. It keeps naming
+// every other entry, one whose file it cannot see too: that file may be on a
+// disk not mounted for the moment, and a name dropped cannot be recovered. If
+// the directories cannot be recorded or the row cannot be changed (the
+// database fails, a refinement started reading the file, the session changed
+// since it was listed), nothing is removed. A file that does not go is put
+// back in the row.
 func (c *Collector) removeRecording(a *sessionAudio) int64 {
 	var take []recordingFile
 	for _, f := range a.files {
@@ -653,6 +689,14 @@ func (c *Collector) removeRecording(a *sessionAudio) int64 {
 		taking[f.path] = true
 	}
 	left := c.left(a, taking)
+	erased := make([]string, 0, len(take))
+	for _, f := range take {
+		erased = append(erased, f.path)
+	}
+	if err := c.recordEraseDirectories(erased); err != nil {
+		c.logger.Error("gc could not record where it erases a session's audio, so it removed none", "operation", "free_audio_space", "session_id", a.id, "error", err)
+		return 0
+	}
 	removal, ok, err := c.store.MarkAudioRemoved(a.id, a.audioPath, strings.Join(left, ","), c.audioLeft(a, left), time.Now())
 	if err != nil {
 		c.logger.Error("gc could not record removing a session's audio, so it removed none", "operation", "free_audio_space", "session_id", a.id, "error", err)

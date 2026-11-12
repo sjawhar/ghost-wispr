@@ -19,6 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -664,9 +665,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 	// erase cut off by a stop leaves a .erasing-* file there that no row may
 	// lead to any more; the startup cleanup finishes it and then forgets the
 	// directory, once it was there to clean (RecordingDirectories,
-	// ForgetEraseDirectories).
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS erase_directories (path TEXT PRIMARY KEY, device INTEGER NOT NULL)`); err != nil {
-		return fmt.Errorf("create erase_directories table: %w", err)
+	// ForgetEraseDirectories). A row is kept per directory and file system,
+	// so an erase on one file system does not replace the row of an erase
+	// owed on another (a disk not mounted, its mount point showing the file
+	// system below).
+	if err := migrateEraseDirectories(s.db); err != nil {
+		return err
 	}
 
 	if _, err := s.db.Exec(`
@@ -1050,6 +1054,70 @@ func (s *SQLiteStore) GetSessionsWithEmptyTitles() ([]Session, error) {
 	defer func() { _ = rows.Close() }()
 
 	return scanSessions(rows)
+}
+
+// migrateEraseDirectories creates erase_directories keyed on the directory
+// and its file system, and rebuilds, keeping its rows, one an earlier build
+// keyed on the directory alone. That build recorded a directory as the
+// caller named it, so a relative one (a relative audio_dir) is made absolute
+// from the working directory, which the service fixes; RecordEraseDirectory
+// now records only absolute paths. Every erase_directories table has the
+// device column: none was published without it (no release holds the table
+// at all, and main does not have it), so no ALTER adds it.
+func migrateEraseDirectories(db *sql.DB) error {
+	var keyColumns int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('erase_directories') WHERE pk > 0`).Scan(&keyColumns); err != nil {
+		return fmt.Errorf("read the erase_directories key: %w", err)
+	}
+	if keyColumns == 2 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin keying erase_directories on the file system: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	type eraseDirectory struct {
+		path   string
+		device int64
+	}
+	var earlier []eraseDirectory
+	if keyColumns == 1 {
+		rows, err := tx.Query(`SELECT path, device FROM erase_directories`)
+		if err != nil {
+			return fmt.Errorf("read the earlier erase directories: %w", err)
+		}
+		for rows.Next() {
+			var dir eraseDirectory
+			if err := rows.Scan(&dir.path, &dir.device); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan an earlier erase directory: %w", err)
+			}
+			if dir.path, err = filepath.Abs(dir.path); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("make an earlier erase directory absolute: %w", err)
+			}
+			earlier = append(earlier, dir)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return fmt.Errorf("read the earlier erase directories: %w", err)
+		}
+		if _, err := tx.Exec(`DROP TABLE erase_directories`); err != nil {
+			return fmt.Errorf("drop the earlier erase directories: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`CREATE TABLE erase_directories (path TEXT NOT NULL, device INTEGER NOT NULL, PRIMARY KEY (path, device))`); err != nil {
+		return fmt.Errorf("create erase_directories table: %w", err)
+	}
+	for _, dir := range earlier {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO erase_directories(path, device) VALUES(?, ?)`, dir.path, dir.device); err != nil {
+			return fmt.Errorf("keep the earlier erase directory %s: %w", dir.path, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit keying erase_directories on the file system: %w", err)
+	}
+	return nil
 }
 
 // querier is what reading a session needs: the database, or a transaction.
@@ -1669,14 +1737,16 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 // recorded for session id as owed to the session's pending segment deletion,
 // if it has one: a sync that held the session while a segment was deleted
 // (DeleteSegment leaves the claim to it) uploaded the words before the
-// deletion. EndSync and MarkSynced both call it.
+// deletion. A sync that made no folder leaves nothing to owe, and the
+// deletion is then settled as owing Drive nothing once its splices are done
+// (settleUnownedDriveReplacement). EndSync and MarkSynced both call it.
 func oweFolderOfPendingDeletion(tx *sql.Tx, id string) error {
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
 		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND gdrive_folder_id != ''`,
 		DriveReplacementFolderOwed, id); err != nil {
 		return fmt.Errorf("owe the Drive folder of session %s its replacement: %w", id, err)
 	}
-	return nil
+	return settleUnownedDriveReplacement(tx, id)
 }
 
 // RecoverInterruptedSyncs moves every session an earlier run of the app left
@@ -2280,8 +2350,12 @@ const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXIST
 // DeleteSession deletes session id, refusing one that owes Google Drive a
 // replacement (ErrDeleteReplacementPending), and returns the audio_path the
 // deleted row had: the recordings the caller then erases are the ones the
-// row named when it went, not ones it read before.
-func (s *SQLiteStore) DeleteSession(id string) (string, error) {
+// row named when it went, not ones it read before. In the same transaction,
+// before the row goes, it records the directory of each of those
+// recordings, found where recording.Resolve finds it in audioDir (the one
+// the caller then erases), so an erase a stop cuts off is finished as the
+// app starts; it deletes nothing if it cannot record one.
+func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", fmt.Errorf("begin deleting session %s: %w", id, err)
@@ -2301,6 +2375,14 @@ func (s *SQLiteStore) DeleteSession(id string) (string, error) {
 		}
 	case err != nil:
 		return "", fmt.Errorf("read session %s to delete it: %w", id, err)
+	}
+	for _, entry := range strings.Split(audioPath, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {
+			return "", fmt.Errorf("delete session %s: %w", id, err)
+		}
 	}
 	if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
 		return "", fmt.Errorf("delete session %s: %w", id, err)
