@@ -233,6 +233,51 @@ func TestCleanupSpliceTempCopies(t *testing.T) {
 	}
 }
 
+// TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory fails if a
+// copy a stopped splice or erase left beside a recording kept outside the
+// audio directory (a session's absolute audio_path) is not erased as the app
+// starts.
+func TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory(t *testing.T) {
+	audioDir, elsewhere := t.TempDir(), t.TempDir()
+	recording := filepath.Join(elsewhere, "recording.mp3")
+	if err := os.WriteFile(recording, []byte("recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, _, _ := newDeletionTestStore(t, recording)
+	held := map[string]*os.File{}
+	for _, name := range []string{".erasing-cut-off", ".splice-cut-off.mp3"} {
+		path := filepath.Join(elsewhere, name)
+		if err := os.WriteFile(path, []byte("audio of "+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		held[name] = f
+	}
+
+	if err := cleanupRecordingDirectories(store, audioDir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	for name, f := range held {
+		if _, err := os.Stat(filepath.Join(elsewhere, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s beside a recording outside the audio directory remains: %v", name, err)
+		}
+		got := make([]byte, len("audio of "+name))
+		if _, err := f.ReadAt(got, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, make([]byte, len(got))) {
+			t.Errorf("%s was removed still holding %q", name, got)
+		}
+	}
+	if got, err := os.ReadFile(recording); err != nil || string(got) != "recording" {
+		t.Errorf("the recording after cleanup = %q (%v), want it whole", got, err)
+	}
+}
+
 func TestStartupRecoveryContinuesPastBadSplice(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "recovery.db"))
 	if err != nil {

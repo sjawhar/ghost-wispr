@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -338,6 +340,39 @@ func tableExists(tx *sql.Tx, name string) (bool, error) {
 // one) hold the merged session's audio, in session time order.
 func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 	return mergedSourceIDs(s.db, mergedID)
+}
+
+// RecordingDirectories returns the directories, other than the audio
+// directory, that sessions keep recordings in: those of every absolute path in
+// a session's audio_path or a deleted span's audio_path. A relative path is
+// read from the audio directory.
+func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
+	rows, err := s.db.Query(`SELECT audio_path FROM sessions WHERE audio_path != ''
+		UNION SELECT audio_path FROM deleted_segments WHERE audio_path != ''`)
+	if err != nil {
+		return nil, fmt.Errorf("list recording paths: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var dirs []string
+	for rows.Next() {
+		var paths string
+		if err := rows.Scan(&paths); err != nil {
+			return nil, fmt.Errorf("scan recording paths: %w", err)
+		}
+		for _, path := range strings.Split(paths, ",") {
+			path = strings.TrimSpace(path)
+			if !filepath.IsAbs(path) {
+				continue
+			}
+			if dir := filepath.Dir(path); !slices.Contains(dirs, dir) {
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recording paths: %w", err)
+	}
+	return dirs, nil
 }
 
 // mergedSourceIDs returns the sessions merged, directly or through another

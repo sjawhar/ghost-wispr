@@ -1804,7 +1804,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 
 	lightOff := hardware.Done()
-	if err := cleanupSpliceTempCopies(cfg.AudioDir); err != nil {
+	if err := cleanupRecordingDirectories(store, cfg.AudioDir); err != nil {
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
 	}

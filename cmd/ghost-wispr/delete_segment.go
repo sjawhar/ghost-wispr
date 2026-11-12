@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -527,6 +528,34 @@ func cleanupSpliceTempCopies(audioDir string) error {
 		}
 	}
 	return errors.Join(cleanupErr, erase.Leftovers(audioDir))
+}
+
+// recordingDirectoryLister lists the directories recordings are kept in
+// outside the audio directory.
+type recordingDirectoryLister interface {
+	RecordingDirectories() ([]string, error)
+}
+
+// cleanupRecordingDirectories runs cleanupSpliceTempCopies, as the app
+// starts, in audioDir and in every directory a session keeps a recording in
+// (an absolute audio_path outside audioDir): splice copies, downloads and
+// cut-off erasures are made beside the recording they copy.
+func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string) error {
+	dirs := []string{filepath.Clean(audioDir)}
+	others, err := store.RecordingDirectories()
+	if err != nil {
+		return errors.Join(err, cleanupSpliceTempCopies(audioDir))
+	}
+	for _, dir := range others {
+		if dir = filepath.Clean(dir); !slices.Contains(dirs, dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	var cleanupErr error
+	for _, dir := range dirs {
+		cleanupErr = errors.Join(cleanupErr, cleanupSpliceTempCopies(dir))
+	}
+	return cleanupErr
 }
 
 func neighbourText(segments []transcribe.Segment, index int) (before, after string) {
