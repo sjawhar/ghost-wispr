@@ -27,13 +27,13 @@ type Store interface {
 	// StartEmptySummary marks the summary running, with no summarizer to make
 	// one: the summary version and Envoy delivery state stay as they are.
 	StartEmptySummary(sessionID string) error
-	// FailSummary records that the summary failed, and why, keeping the
-	// session's title and last good summary, and returns the session.
-	FailSummary(sessionID, errMsg string) (storage.Session, error)
-	// FailSummaryAtGeneration records the failed summary, as FailSummary
-	// does, only while generation is still the session's transcript
+	// FailSummaryAtGeneration records that the summary failed, and why,
+	// keeping the session's title and last good summary, and returns the
+	// session, only while generation is still the session's transcript
 	// generation.
 	FailSummaryAtGeneration(sessionID, errMsg string, generation int) (storage.Session, error)
+	// DeletionGeneration returns the session's transcript generation.
+	DeletionGeneration(sessionID string) (int, error)
 	// UpdateRefinementAtGeneration stores the refinement and the model its
 	// provider reported only while generation, the one ClaimRefinement
 	// returned, is still the session's transcript generation.

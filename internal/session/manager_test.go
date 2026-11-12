@@ -43,9 +43,10 @@ type storeMock struct {
 	canonicalizeGeneration  map[string]int
 	summaryWriteGenerations []int
 
-	endSessionErr   error
-	endSessionCalls int
-	canonicalizeErr error
+	endSessionErr         error
+	endSessionCalls       int
+	canonicalizeErr       error
+	deletionGenerationErr error
 	// appendHook, when set, runs first in AppendSegment, outside the lock.
 	appendHook func()
 }
@@ -136,26 +137,28 @@ func (s *storeMock) StartEmptySummary(sessionID string) error {
 	return s.StartSummary(sessionID)
 }
 
-// FailSummary keeps the title and summary, as the store does.
-func (s *storeMock) FailSummary(sessionID, errMsg string) (storage.Session, error) {
+// FailSummaryAtGeneration keeps the title and summary, and fails the summary
+// only while generation is the session's transcript generation, as the store
+// does.
+func (s *storeMock) FailSummaryAtGeneration(sessionID, errMsg string, generation int) (storage.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return storage.Session{}, sql.ErrNoRows
+	}
 	s.status[sessionID] = storage.SummaryFailed
 	s.errorMessage[sessionID] = errMsg
 	return storage.Session{ID: sessionID, Title: s.title[sessionID], Summary: s.summary[sessionID],
 		SummaryStatus: storage.SummaryFailed, SummaryPreset: s.preset[sessionID], SummaryError: errMsg}, nil
 }
 
-// FailSummaryAtGeneration fails the summary only while generation is the
-// session's transcript generation, as the store does.
-func (s *storeMock) FailSummaryAtGeneration(sessionID, errMsg string, generation int) (storage.Session, error) {
+func (s *storeMock) DeletionGeneration(sessionID string) (int, error) {
 	s.mu.Lock()
-	stale := generation != s.canonicalizeGeneration[sessionID]
-	s.mu.Unlock()
-	if stale {
-		return storage.Session{}, sql.ErrNoRows
+	defer s.mu.Unlock()
+	if s.deletionGenerationErr != nil {
+		return 0, s.deletionGenerationErr
 	}
-	return s.FailSummary(sessionID, errMsg)
+	return s.canonicalizeGeneration[sessionID], nil
 }
 
 func (s *storeMock) UpdateTitle(sessionID, title string) error {

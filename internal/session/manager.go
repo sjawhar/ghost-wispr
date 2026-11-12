@@ -574,6 +574,17 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	publisher := m.publisher
 	m.mu.Unlock()
 
+	// The transcript generation before the run starts. A failure before the
+	// run has read its text is recorded only at it, so once a segment
+	// deletion has changed the text, and its own run has started, this run
+	// records nothing over that one. It is read before the run starts, so a
+	// deletion between the two also makes such a failure refused.
+	startGeneration, err := m.store.DeletionGeneration(sessionID)
+	if err != nil {
+		m.logger.Error("failed to read the transcript generation", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		return
+	}
+
 	if summarizer == nil {
 		// Without a summarizer the summary completes empty, which keeps the
 		// session's summary as it is. StartEmptySummary binds it to the
@@ -589,7 +600,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 			// Terminal, so a Drive replacement waiting for this session's
 			// summary stops waiting; the sync still runs, with the canonical
 			// transcript the session already has.
-			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
+			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 			m.triggerDriveSync(syncer, sessionID)
 			return
@@ -615,7 +626,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	// Canonicalize the transcript (picks refined if available, else assembles streaming).
 	transcript, generation, err := m.store.Canonicalize(sessionID)
 	if err != nil {
-		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
+		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		return
 	}
@@ -638,7 +649,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		m.failSummaryAtGeneration(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
+		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
 		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
@@ -655,7 +666,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 	if storeErr != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
-		m.failSummaryAtGeneration(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr), generation)
+		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr), generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
@@ -698,26 +709,13 @@ func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, pres
 	}
 }
 
-// failSummary records that making session sessionID's summary failed before
-// its text was read, and why (reason), and announces the title and summary
-// the session keeps: its last good ones, if it has them.
-func (m *Manager) failSummary(sessionID, reason string) {
-	kept, err := m.store.FailSummary(sessionID, reason)
-	m.announceFailedSummary(sessionID, reason, &kept, err)
-}
-
-// failSummaryAtGeneration records, as failSummary does, that making the
-// summary from the text of transcript generation generation failed. Once the
-// text has changed since (a segment deletion), it records nothing: the newer
-// run's status stays.
-func (m *Manager) failSummaryAtGeneration(sessionID, reason string, generation int) {
+// failSummary records that making session sessionID's summary from the text
+// of transcript generation generation failed, and why (reason), and announces
+// the title and summary the session keeps: its last good ones, if it has
+// them. Once the text has changed since (a segment deletion), it records
+// nothing: the newer run's status stays.
+func (m *Manager) failSummary(sessionID, reason string, generation int) {
 	kept, err := m.store.FailSummaryAtGeneration(sessionID, reason, generation)
-	m.announceFailedSummary(sessionID, reason, &kept, err)
-}
-
-// announceFailedSummary announces the summary the session keeps (kept) once
-// its failure is recorded (err is nil), and logs why it is not otherwise.
-func (m *Manager) announceFailedSummary(sessionID, reason string, kept *storage.Session, err error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		m.logger.Warn("discarded a stale failed summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID, "reason", reason)
 		return
