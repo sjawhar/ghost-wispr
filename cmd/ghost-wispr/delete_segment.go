@@ -21,6 +21,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -131,10 +132,10 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 			return deletionRecordingSet{}, fmt.Errorf("list Drive recordings: %w", err)
 		}
 		for _, file := range files {
-			if !strings.HasPrefix(file.MimeType, "audio/") || !strings.HasPrefix(file.Name, "audio-") {
+			name, ok := recordingname.LocalName(file.Name)
+			if !strings.HasPrefix(file.MimeType, "audio/") || !ok {
 				continue
 			}
-			name := strings.TrimPrefix(file.Name, "audio-")
 			if _, known := byName[name]; !known {
 				if strings.TrimSpace(audioDir) == "" {
 					return deletionRecordingSet{}, fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
@@ -163,7 +164,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		if source == nil || session.GDriveFolderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := source.DownloadRecording(ctx, session.GDriveFolderID, "audio-"+name, path); err != nil {
+		if err := source.DownloadRecording(ctx, session.GDriveFolderID, recordingname.FileName(path), path); err != nil {
 			return deletionRecordingSet{}, fmt.Errorf("restore recording %s: %w", name, err)
 		}
 		set.Paths = append(set.Paths, path)

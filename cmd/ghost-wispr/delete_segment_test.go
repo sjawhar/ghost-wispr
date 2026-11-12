@@ -19,6 +19,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -1041,6 +1042,37 @@ func TestRestoreDeletionRecordingsHandlesTypedNilDriveSource(t *testing.T) {
 	}
 	if len(set.Paths) != 0 {
 		t.Fatalf("restore paths = %v, want no Drive download while sync is off", set.Paths)
+	}
+}
+
+// TestRestoreDeletionRecordingsRestoresOnlyRecordingNames fails if a segment
+// deletion restores, from the session's Drive folder, a file whose name is
+// not one recording.FileName gives a recording: one named to reach outside
+// the audio directory ("audio-../...") would be written there. A recording
+// Drive names as FileName does is restored into the audio directory.
+func TestRestoreDeletionRecordingsRestoresOnlyRecordingNames(t *testing.T) {
+	root := t.TempDir()
+	audioDir := filepath.Join(root, "audio")
+	if err := os.Mkdir(audioDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(audioDir, "20261111130000.mp3")
+	drive := &deletionDriveFake{
+		files: []*drive.File{
+			{Name: recordingname.FileName(missing), MimeType: "audio/mpeg"},
+			{Name: "audio-../escape.mp3", MimeType: "audio/mpeg"},
+		},
+		downloads: map[string][]byte{recordingname.FileName(missing): []byte("restored audio"), "audio-../escape.mp3": []byte("escaped")},
+	}
+	set, err := restoreDeletionRecordings(context.Background(), &storage.Session{GDriveFolderID: "folder"}, audioDir, drive)
+	if err != nil {
+		t.Fatalf("restore deletion recordings: %v", err)
+	}
+	if !slices.Equal(set.Paths, []string{missing}) || !slices.Equal(drive.downloaded, []string{recordingname.FileName(missing)}) {
+		t.Errorf("restored %v (downloaded %v), want only %s", set.Paths, drive.downloaded, missing)
+	}
+	if _, err := os.Stat(filepath.Join(root, "escape.mp3")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a Drive file named to reach outside the audio directory was written there: %v", err)
 	}
 }
 
