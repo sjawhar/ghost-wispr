@@ -39,7 +39,7 @@ func (folderBackUploader) RecordingsMatch(context.Context, string, map[string]st
 // back on Drive.
 func TestStatusWarnsWhileASessionIsKeptOnThisUnitOnly(t *testing.T) {
 	const id = "20261001130000"
-	const warning = "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back"
+	const warning = "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back, or, if its Drive folder was deleted on purpose, remove the session from this unit"
 	store, cfg := recordingMismatchSession(t, id)
 	handler, err := server.Handler(fstest.MapFS{"index.html": {Data: []byte("ok")}}, server.NewHub(), store,
 		&server.ControlHooks{UnitOnlySessions: unitOnlyCounter(store)}, "", nil)

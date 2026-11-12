@@ -277,6 +277,23 @@ ssh ghost-wispr@ghost-wispr 'curl -fsS http://127.0.0.1:8080/api/version'
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user list-timers ghost-wispr-update.timer'
 ```
 
+## Sessions kept on this unit only
+
+`/api/status` warns "N sessions are kept on this unit only, because their Drive folder is gone
+or unreadable; retry sync once the folder is back, or, if its Drive folder was deleted on
+purpose, remove the session from this unit" while any session is marked deleted on Drive and
+still has its audio on the Pi. Its card says "Sync: deleted on Drive". Garbage collection never
+frees that audio, so clear each such session one of two ways:
+
+- The folder should be on Drive: restore it from the Drive trash, or fix the app's access to the
+  drive, then press the session card's retry button (`POST /api/sessions/{id}/retry-sync`).
+  The session syncs into its folder.
+- The folder was deleted on purpose: remove the session from the unit with the card's
+  "Delete from this unit; this unit holds the only copy" control, or
+  `DELETE /api/sessions/{id}`. That deletes the session and its audio from the Pi for good.
+
+The warning goes once no such session is left. The count is read again at each status request.
+
 ## Accept slice 1
 
 Run the acceptance driver from a tailnet member. Give it the relay URL. To run the signed

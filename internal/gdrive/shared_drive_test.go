@@ -98,6 +98,20 @@ func TestRestoreFailsWhenTheListWithoutCorporaMissesTheDrivesFolders(t *testing.
 	}
 }
 
+// A restore that lists no session folder in a shared drive that reads asks
+// the drive's own list for a folder; when that list does not answer, Drive
+// has not said the drive is empty, so the restore fails instead of
+// reporting none.
+func TestRestoreFailsWhenTheDrivesFolderListDoesNotAnswer(t *testing.T) {
+	wire, syncer := newSharedDriveWire(t)
+	wire.driveFolderListUnavailable = true
+
+	result, err := syncer.RestoreFromDrive(context.Background(), func(RestoredSession) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "could not be listed") {
+		t.Errorf("restore with the drive's folder list not answering: %+v, %v; want an error", result, err)
+	}
+}
+
 // The folder the app syncs into is set by hand, so a quote in its id is
 // escaped in the query that lists its session folders, as in the Syncer's
 // other queries: unescaped, Drive cannot read the query (400), and the

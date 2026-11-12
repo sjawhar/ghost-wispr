@@ -93,6 +93,10 @@ type wireDrive struct {
 	// driveUnavailable makes Drive answer 503 to every list of a shared
 	// drive's files (corpora "drive").
 	driveUnavailable bool
+	// driveFolderListUnavailable makes Drive answer 503 only to a list of a
+	// shared drive's folders (corpora "drive", asking for folders), so the
+	// list of any of its files still answers.
+	driveFolderListUnavailable bool
 	// unscopedListsMiss makes every list without corpora answer 200 with no
 	// files, while the shared drive's own list (corpora "drive") still holds
 	// the files the app made: Drive not keeping what its documentation says
@@ -303,7 +307,7 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "unexpected corpora", http.StatusBadRequest)
 				return
 			}
-			if d.driveUnavailable {
+			if d.driveUnavailable || (d.driveFolderListUnavailable && strings.Contains(r.URL.Query().Get("q"), "mimeType = 'application/vnd.google-apps.folder'")) {
 				http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
 				return
 			}

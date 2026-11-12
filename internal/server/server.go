@@ -78,12 +78,13 @@ func unverifiedWarning(n int) string {
 }
 
 // unitOnlyWarning tells the user in GET /api/status how many sessions are
-// kept on this unit only, their Drive folder gone or unreadable.
+// kept on this unit only, their Drive folder gone or unreadable, and how the
+// warning clears.
 func unitOnlyWarning(n int) string {
 	if n == 1 {
-		return "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back"
+		return "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back, or, if its Drive folder was deleted on purpose, remove the session from this unit"
 	}
-	return fmt.Sprintf("%d sessions are kept on this unit only, because their Drive folder is gone or unreadable; retry sync once the folder is back", n)
+	return fmt.Sprintf("%d sessions are kept on this unit only, because their Drive folder is gone or unreadable; retry sync once the folder is back, or, if a session's Drive folder was deleted on purpose, remove the session from this unit", n)
 }
 
 type ControlHooks struct {

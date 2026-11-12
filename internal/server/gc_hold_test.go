@@ -120,8 +120,8 @@ func TestAPIStatusReportsUnverifiedSessions(t *testing.T) {
 func TestAPIStatusReportsSessionsKeptOnThisUnitOnly(t *testing.T) {
 	for n, warning := range map[int]string{
 		0: "",
-		1: "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back",
-		3: "3 sessions are kept on this unit only, because their Drive folder is gone or unreadable; retry sync once the folder is back",
+		1: "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back, or, if its Drive folder was deleted on purpose, remove the session from this unit",
+		3: "3 sessions are kept on this unit only, because their Drive folder is gone or unreadable; retry sync once the folder is back, or, if a session's Drive folder was deleted on purpose, remove the session from this unit",
 	} {
 		h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
 			sessionsByDate: map[string][]storage.Session{},
