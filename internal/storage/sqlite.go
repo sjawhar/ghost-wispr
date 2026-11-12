@@ -1961,16 +1961,18 @@ type SessionRecording struct {
 // removable is the condition under which GC may remove a session's recording
 // (disk pressure) or the session with it (the age policy, which also needs
 // documents_unverified = 0), and its arguments: the session ended, no
-// refinement is reading the file, its Drive folder is not in the trash or
-// gone (REMOTE_DELETED: the device then holds its only lasting copy, sync
-// gate or not), and, when syncGated, it is synced. A session whose documents
-// are unverified on Drive (documents_unverified: synced by an earlier
-// version) has its audio on Drive: under the sync gate GC removes it once
-// Drive answers that the session's folder is there; with no sync gate there
-// is no Drive to ask, so it is kept. Any other sync state, a failure
+// refinement is reading the file, it owes Drive no replacement after a
+// segment deletion (drive_replace_pending: the replacement needs the row and
+// the spliced recording, sync gate or not), its Drive folder is not in the
+// trash or gone (REMOTE_DELETED: the device then holds its only lasting copy,
+// sync gate or not), and, when syncGated, it is synced. A session whose
+// documents are unverified on Drive (documents_unverified: synced by an
+// earlier version) has its audio on Drive: under the sync gate GC removes it
+// once Drive answers that the session's folder is there; with no sync gate
+// there is no Drive to ask, so it is kept. Any other sync state, a failure
 // included, keeps the recording.
 func removable(syncGated bool) (string, []any) {
-	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ?
+	cond := `status = 'ended' AND refinement_status != ? AND sync_state != ? AND drive_replace_pending = 0
 		AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)`
 	if syncGated {
 		cond += ` AND sync_status = ?`
@@ -2109,8 +2111,14 @@ func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error
 	return nil
 }
 
+// ErrDeleteReplacementPending is the error DeleteSession returns, deleting
+// nothing, for a session that still owes Google Drive a replacement after a
+// segment deletion: with its row would go the replacement and its warning,
+// and the Drive folder would keep the deleted words.
+var ErrDeleteReplacementPending = errors.New("this session still has a deleted segment on Google Drive; delete it after its Drive files are replaced")
+
 func (s *SQLiteStore) DeleteSession(id string) error {
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND drive_replace_pending = 0`, id)
 	if err != nil {
 		return fmt.Errorf("delete session %s: %w", id, err)
 	}
@@ -2119,7 +2127,15 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 		return fmt.Errorf("delete session rows affected: %w", err)
 	}
 	if rows == 0 {
-		return sql.ErrNoRows
+		var pending int
+		switch err := s.db.QueryRow(`SELECT drive_replace_pending FROM sessions WHERE id = ?`, id).Scan(&pending); {
+		case errors.Is(err, sql.ErrNoRows):
+			return sql.ErrNoRows
+		case err != nil:
+			return fmt.Errorf("delete session %s: %w", id, err)
+		default:
+			return fmt.Errorf("delete session %s: %w", id, ErrDeleteReplacementPending)
+		}
 	}
 	return nil
 }

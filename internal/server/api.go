@@ -791,6 +791,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		if err := store.DeleteSession(sessionID); err != nil {
+			if errors.Is(err, storage.ErrDeleteReplacementPending) {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 			return
 		}

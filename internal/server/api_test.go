@@ -749,6 +749,43 @@ func TestMergeSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
 	}
 }
 
+// TestDeleteSession_RefusesASessionThatOwesADriveReplacement fails if the
+// delete route removes a session whose deleted segment is still on Google
+// Drive: with its row go its replacement ledger and its status warning, and
+// the Drive folder keeps the words.
+func TestDeleteSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	const id = "20261106100000"
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+id, nil))
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "deleted segment on Google Drive") {
+		t.Fatalf("delete of a session owing a Drive replacement = %d %s, want 409 with the reason", rr.Code, rr.Body.String())
+	}
+	if _, err := store.GetSession(id); err != nil {
+		t.Fatalf("the refused delete removed the session: %v", err)
+	}
+}
+
 func TestAPIAudioRange(t *testing.T) {
 	root := t.TempDir()
 	audioFile := "audio.mp3"
