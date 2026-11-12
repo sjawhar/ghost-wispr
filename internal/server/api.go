@@ -841,7 +841,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			p = recordingname.Resolve(p, recordingDir)
 			hidden, err := erase.Begin(p)
-			if err != nil {
+			switch {
+			case errors.Is(err, erase.ErrLeftover):
+				// The file has its hidden name, but the rename may not be on
+				// disk yet; Finish flushes the directory again.
+				slog.Warn("could not flush the removal of a deleted session's recording; it is erased after the answer", "session_id", sessionID, "audio_path", p, "error", err)
+			case err != nil:
 				if !errors.Is(err, os.ErrNotExist) {
 					slog.Warn("could not remove a deleted session's recording", "session_id", sessionID, "audio_path", p, "error", err)
 				}
