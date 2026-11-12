@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -29,14 +31,14 @@ type summaryBroadcaster interface {
 // resummarize makes session sessionID's summary again, with preset if one is
 // named and with one the summarizer picks if not, and publishes it once
 // stored (publish). While it runs, and if it fails, the session keeps its
-// title and its last good summary (failSummary).
+// title and its last good summary (failSummary). The summary is stored only
+// while the session has the transcript generation read with the text it
+// summarizes, so a summary of the text before a segment deletion is refused.
 func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer presetSummarizer, hub summaryBroadcaster, publish func(sessionID string), sessionID, preset string) error {
-	segments, err := store.GetSegments(sessionID)
+	transcript, generation, err := store.Canonicalize(sessionID)
 	if err != nil {
 		return err
 	}
-
-	transcript := buildCanonicalTranscript(store, sessionID, segments)
 
 	_ = store.StartSummary(sessionID)
 	hub.BroadcastSummaryReady(sessionID, "", "", storage.SummaryRunning, "")
@@ -59,7 +61,7 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 		return err
 	}
 
-	if err := store.UpdateSummaryWithModel(sessionID, title, summaryText, storage.SummaryCompleted, presetUsed, speakerNames, model); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, presetUsed, speakerNames, model, generation); err != nil {
 		err = fmt.Errorf("store summary: %w", err)
 		failSummary(store, hub, sessionID, err)
 		return err
@@ -71,17 +73,16 @@ func resummarize(ctx context.Context, store *storage.SQLiteStore, summarizer pre
 
 // summarizeMergedSession makes the summary of sessionID, a session a merge
 // just made, and publishes it once stored (publish). A merged session with no
-// words gets an empty completed summary.
+// words gets an empty completed summary. Each is stored only at the
+// transcript generation read with the text.
 func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, summarizer session.ReportedSummarizer, hub summaryBroadcaster, publish func(sessionID string), sessionID string) {
-	segments, err := store.GetSegments(sessionID)
+	transcript, generation, err := store.Canonicalize(sessionID)
 	if err != nil {
-		log.Printf("warning: failed to get segments for merged session %s: %v", sessionID, err)
+		log.Printf("warning: failed to read the transcript of merged session %s: %v", sessionID, err)
 		return
 	}
-
-	transcript := buildCanonicalTranscript(store, sessionID, segments)
-	if transcript == "" {
-		_ = store.UpdateSummary(sessionID, "", "", storage.SummaryCompleted, "", "{}")
+	if strings.TrimSpace(transcript) == "" {
+		_ = store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", "", generation)
 		return
 	}
 
@@ -95,7 +96,7 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 		return
 	}
 
-	if err := store.UpdateSummaryWithModel(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model, generation); err != nil {
 		log.Printf("warning: discarded stale merged summary for session %s: %v", sessionID, err)
 		return
 	}
@@ -106,14 +107,17 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 // summarizeBackfillSession makes, at startup, the summary of session id, one
 // whose summary is missing, failed or never ended, and publishes it once
 // stored (publish). A session with no words gets an empty completed summary.
+// Each is stored only at the transcript generation read with the text.
 func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, summarizer session.ReportedSummarizer, publish func(sessionID string), id string) {
 	log.Printf("startup: summarizing session %s synchronously", id)
-	transcript, ok := loadSessionTranscript(store, id)
-	if !ok {
+	transcript, generation, err := store.Canonicalize(id)
+	if err != nil {
+		log.Printf("warning: failed to read the transcript of session %s: %v", id, err)
 		return
 	}
+	transcript = strings.TrimSpace(transcript)
 	if transcript == "" {
-		_ = store.UpdateSummary(id, "", "", storage.SummaryCompleted, "", "{}")
+		_ = store.UpdateSummaryAtGeneration(id, "", "", storage.SummaryCompleted, "", "{}", "", generation)
 		return
 	}
 	_ = store.StartSummary(id)
@@ -123,7 +127,10 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 		failSummary(store, nil, id, err)
 		return
 	}
-	_ = store.UpdateSummaryWithModel(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model)
+	if err := store.UpdateSummaryAtGeneration(id, title, summaryText, storage.SummaryCompleted, preset, speakerNames, model, generation); err != nil {
+		log.Printf("warning: discarded stale summary for session %s: %v", id, err)
+		return
+	}
 	log.Printf("summarized session %s with preset %s", id, preset)
 	publish(id)
 }
@@ -149,11 +156,21 @@ func loadSessionTranscript(store *storage.SQLiteStore, sessionID string) (string
 	return strings.TrimSpace(buildCanonicalTranscript(store, sessionID, segments)), true
 }
 
+// summaryRepairStore is what repairing stored summaries reads and writes.
+type summaryRepairStore interface {
+	GetDates() ([]string, error)
+	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
+	GetSessionWithGeneration(id string) (storage.Session, int, error)
+	UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, speakerNames, model string, generation int) error
+}
+
 // repairStructuredSummaries rewrites every stored summary that is still the
 // raw structured (JSON) reply of a summarizer as its title, summary text and
 // speaker names, publishes each one that changed (publish), and returns how
-// many it rewrote.
-func repairStructuredSummaries(ctx context.Context, store *storage.SQLiteStore, publish func(sessionID string)) (int, error) {
+// many it rewrote. It reads each summary with its transcript generation and
+// rewrites it only at that generation, so it skips a summary a segment
+// deletion cleared since: it never writes the deleted words back.
+func repairStructuredSummaries(ctx context.Context, store summaryRepairStore, publish func(sessionID string)) (int, error) {
 	dates, err := store.GetDates()
 	if err != nil {
 		return 0, err
@@ -179,7 +196,14 @@ func repairStructuredSummaries(ctx context.Context, store *storage.SQLiteStore, 
 			}
 			seenSessionIDs[sessions[i].ID] = struct{}{}
 
-			trimmedSummary := strings.TrimSpace(sessions[i].Summary)
+			if !strings.HasPrefix(strings.TrimSpace(sessions[i].Summary), "{") {
+				continue
+			}
+			sess, generation, err := store.GetSessionWithGeneration(sessions[i].ID)
+			if err != nil {
+				return repaired, err
+			}
+			trimmedSummary := strings.TrimSpace(sess.Summary)
 			if !strings.HasPrefix(trimmedSummary, "{") {
 				continue
 			}
@@ -189,17 +213,21 @@ func repairStructuredSummaries(ctx context.Context, store *storage.SQLiteStore, 
 				continue
 			}
 			if title == "" {
-				title = sessions[i].Title
+				title = sess.Title
 			}
 			if speakerNames == "" {
 				speakerNames = "{}"
 			}
 
-			if err := store.UpdateSummaryWithModel(sessions[i].ID, title, summaryText, sessions[i].SummaryStatus, sessions[i].SummaryPreset, speakerNames, sessions[i].SummaryModel); err != nil {
+			if err := store.UpdateSummaryAtGeneration(sess.ID, title, summaryText, sess.SummaryStatus, sess.SummaryPreset, speakerNames, sess.SummaryModel, generation); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					log.Printf("warning: discarded the repair of session %s's summary: its transcript changed since it was read", sess.ID)
+					continue
+				}
 				return repaired, err
 			}
-			if title != sessions[i].Title || summaryText != sessions[i].Summary || speakerNames != sessions[i].SpeakerNames {
-				publish(sessions[i].ID)
+			if title != sess.Title || summaryText != sess.Summary || speakerNames != sess.SpeakerNames {
+				publish(sess.ID)
 			}
 			repaired++
 		}

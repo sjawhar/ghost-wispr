@@ -1274,6 +1274,27 @@ func (s *SQLiteStore) DeletionGeneration(sessionID string) (int, error) {
 	return generation, nil
 }
 
+// GetSessionWithGeneration reads session id and its transcript generation in
+// one transaction, so a writer that derives a summary from the session can
+// store it only at the generation of the text it read
+// (UpdateSummaryAtGeneration).
+func (s *SQLiteStore) GetSessionWithGeneration(id string) (Session, int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Session{}, 0, fmt.Errorf("begin read of session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	sess, err := getSession(tx, id)
+	if err != nil {
+		return Session{}, 0, err
+	}
+	var generation int
+	if err := tx.QueryRow(`SELECT deletion_generation FROM sessions WHERE id = ?`, id).Scan(&generation); err != nil {
+		return Session{}, 0, fmt.Errorf("read deletion generation for session %s: %w", id, err)
+	}
+	return sess, generation, nil
+}
+
 func summaryVersionChanges(current *Session, title, summary, status, preset, speakerNames, model string) bool {
 	if status != SummaryCompleted || current.SummaryStatus == SummaryRunning {
 		return false
