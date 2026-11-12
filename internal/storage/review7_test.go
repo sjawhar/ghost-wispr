@@ -24,9 +24,6 @@ func TestAnEmptyLedgerIsRebuiltForAPendingDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if stale, err := store.EnsureDriveReplacementFolders("m2", generation-1); err != nil || len(stale) != 0 {
-		t.Fatalf("ledger of an earlier generation = %+v, %v; want none rebuilt", stale, err)
-	}
 	folders, err := store.EnsureDriveReplacementFolders("m2", generation)
 	if err != nil {
 		t.Fatal(err)
@@ -39,6 +36,21 @@ func TestAnEmptyLedgerIsRebuiltForAPendingDeletion(t *testing.T) {
 	}
 	if !slices.Equal(owed, []string{"m1", "s1", "s3"}) {
 		t.Errorf("rebuilt ledger owes %v, want every folder that can hold the words: m1, s1 and s3", owed)
+	}
+
+	// An earlier generation is not rebuilt, and asking for it leaves the
+	// current ledger, a folder already settled included, as it is.
+	if err := store.MarkDriveReplacementFolder("m2", generation, "m1", DriveReplacementFolderGone); err != nil {
+		t.Fatal(err)
+	}
+	if stale, err := store.EnsureDriveReplacementFolders("m2", generation-1); err != nil || len(stale) != 0 {
+		t.Fatalf("ledger of an earlier generation = %+v, %v; want none rebuilt", stale, err)
+	}
+	if folders, err = store.DriveReplacementFolders("m2", generation); err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 3 || folders[0].FolderSessionID != "m1" || folders[0].State != DriveReplacementFolderGone {
+		t.Errorf("current ledger after asking for an earlier generation = %+v, want m1 still gone", folders)
 	}
 }
 

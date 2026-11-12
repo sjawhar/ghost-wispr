@@ -11,7 +11,8 @@ import (
 const backupSecret = "backup-held-deletion-phrase-77c2e1"
 
 // openWithSecret opens a store at path holding session "backed-up", whose
-// middle segment holds backupSecret, then closes it.
+// middle segment, canonical transcript, summary and one live transcript event
+// hold backupSecret, then closes it.
 func openWithSecret(t *testing.T, path string) {
 	t.Helper()
 	store, err := NewSQLiteStore(path)
@@ -27,6 +28,12 @@ func openWithSecret(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	if _, _, err := store.Canonicalize("backed-up"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummary("backed-up", "Title", "The summary of "+backupSecret+".", SummaryCompleted, "default", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StoreEvent("live_transcript", `{"type":"live_transcript","session_id":"backed-up","text":"`+backupSecret+`","start_time":2,"end_time":4}`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
