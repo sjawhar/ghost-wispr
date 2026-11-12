@@ -663,9 +663,39 @@ h1 {
   padding: 0.2rem 0.4rem;
 }
 
-.segment-delete-btn:hover:not(:disabled) {
+.segment-delete-btn:hover:not(:disabled),
+.segment-delete-action:hover {
   background: var(--danger);
   color: #fff;
+}
+
+.segment-delete-menu {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.15rem 0 0.4rem 0.4rem;
+}
+
+.segment-delete-option {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.segment-delete-action {
+  flex: none;
+  border: 1px solid var(--danger);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.7rem;
+  padding: 0.2rem 0.4rem;
+}
+
+.segment-delete-note {
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
 .segment-delete-btn:disabled {

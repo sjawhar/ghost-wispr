@@ -1,7 +1,12 @@
 <script lang="ts">
   import { tick } from 'svelte'
   import { appState, setActiveAudioSession } from '../lib/state.svelte'
-  import { RequestError, deleteSessionSegment, requestErrorMessage } from '../lib/api'
+  import {
+    RequestError,
+    deleteSessionSegment,
+    requestErrorMessage,
+    type SegmentDeleteMode,
+  } from '../lib/api'
   import { RefinementStatus, type Segment, type SessionSummary } from '../lib/types'
   import { copyText } from '../lib/clipboard'
   import { audioLeftNote, recordingsNamed } from '../lib/audio'
@@ -32,6 +37,25 @@
   const audioVersion = $derived(visibleSegments.map((segment) => segment.id ?? '').join('.'))
   let segmentDeleteError = $state('')
   let deletingSegmentID = $state<number | null>(null)
+  // The segment whose delete actions are shown.
+  let deleteMenuFor = $state<number | null>(null)
+
+  // The two deletion actions (Sami, 2026-11-12): their names, the one
+  // sentence that says what each does, and the question asked before it.
+  const deleteActions: { mode: SegmentDeleteMode; name: string; note: string; ask: string }[] = [
+    {
+      mode: 'text',
+      name: 'Delete text',
+      note: 'Removes the words from the transcript, summary and search, while the recording and its Drive copy stay as they are.',
+      ask: "Delete this segment's text? This cannot be undone.",
+    },
+    {
+      mode: 'text_and_audio',
+      name: 'Delete text and audio',
+      note: 'Also cuts the words out of the recording and replaces the transcript, summary and recording in Drive, so their links change.',
+      ask: "Delete this segment's text and audio? This cannot be undone.",
+    },
+  ]
 
   // Refined transcript: prefer the explicit refined_transcript, fall back to
   // canonical_transcript when the source is 'refined' (covers historical sessions
@@ -99,21 +123,21 @@
   }
 
   async function handleDeleteSegment(
-    event: MouseEvent,
     segmentID: number | undefined,
+    action: (typeof deleteActions)[number],
   ): Promise<void> {
+    deleteMenuFor = null
     if (segmentID === undefined || deletingSegmentID !== null) {
       return
     }
-    if (!confirm('Delete this segment? This cannot be undone.')) {
+    if (!confirm(action.ask)) {
       return
     }
-
     deletingSegmentID = segmentID
     segmentDeleteError = ''
     try {
       try {
-        await deleteSessionSegment(sessionId, segmentID)
+        await deleteSessionSegment(sessionId, segmentID, action.mode)
       } catch (error) {
         const message = requestErrorMessage(error)
         if (error instanceof RequestError && [403, 409, 422, 503].includes(error.status)) {
@@ -318,14 +342,34 @@
               class="segment-delete-btn"
               aria-label="Delete segment"
               aria-describedby={`segment-${segment.id ?? index}`}
+              aria-expanded={deleteMenuFor === segment.id}
               title="Delete segment"
               disabled={deletingSegmentID !== null}
-              onclick={(event) => void handleDeleteSegment(event, segment.id)}
+              onclick={() => (deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!)}
             >
               {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
             </button>
           {/if}
         </div>
+        {#if segment.id !== undefined && deleteMenuFor === segment.id}
+          <div class="segment-delete-menu" role="group" aria-label="Delete options">
+            {#each deleteActions as action (action.mode)}
+              <div class="segment-delete-option">
+                <button
+                  type="button"
+                  class="segment-delete-action"
+                  aria-describedby={`segment-${segment.id}-${action.mode}`}
+                  onclick={() => void handleDeleteSegment(segment.id, action)}
+                >
+                  {action.name}
+                </button>
+                <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
+                  >{action.note}</span
+                >
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/each}
     </div>
   {/if}

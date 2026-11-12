@@ -39,8 +39,9 @@
       Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
     </p>
     <p>
-      Tap the button on the recorder to pause or resume. To delete a segment, open the conversation,
-      switch to segments, and choose Delete on that segment.
+      Tap the button on the recorder to pause or resume. To have a segment’s text and audio removed,
+      open the conversation, switch to segments, choose Delete on that segment, and choose Delete
+      text and audio.
     </p>
   </dialog>
 {/if}
