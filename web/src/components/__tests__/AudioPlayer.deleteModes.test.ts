@@ -104,4 +104,23 @@ describe('AudioPlayer segment deletion actions', () => {
     ])
     expect(fetch).not.toHaveBeenCalled()
   })
+
+  it('closes its delete menu on Escape or a click outside it', async () => {
+    renderPlayer()
+
+    const opener = screen.getAllByRole('button', { name: 'Delete segment' })[0]
+    await fireEvent.click(opener)
+    expect(screen.getByRole('group', { name: 'Delete options' })).toBeTruthy()
+
+    await fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByRole('group', { name: 'Delete options' })).toBeNull()
+    expect(screen.getByText('Orange tractor ninety')).toBeTruthy()
+
+    await fireEvent.click(opener)
+    expect(screen.getByRole('group', { name: 'Delete options' })).toBeTruthy()
+
+    await fireEvent.click(document.body)
+    expect(screen.queryByRole('group', { name: 'Delete options' })).toBeNull()
+    expect(screen.getByText('Orange tractor ninety')).toBeTruthy()
+  })
 })

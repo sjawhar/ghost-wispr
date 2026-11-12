@@ -57,6 +57,18 @@
     },
   ]
 
+  function closeDeleteMenuOnEscape(event: KeyboardEvent): void {
+    if (event.key === 'Escape') {
+      deleteMenuFor = null
+    }
+  }
+
+  function closeDeleteMenuOnOutsideClick(event: MouseEvent): void {
+    if (!(event.target instanceof Element) || !event.target.closest('.segment-delete-controls')) {
+      deleteMenuFor = null
+    }
+  }
+
   // Refined transcript: prefer the explicit refined_transcript, fall back to
   // canonical_transcript when the source is 'refined' (covers historical sessions
   // where the backend canonicalized into canonical_transcript).
@@ -237,6 +249,9 @@
   })
 </script>
 
+<svelte:window onkeydown={closeDeleteMenuOnEscape} />
+<svelte:document onclick={closeDeleteMenuOnOutsideClick} />
+
 <div class="audio-player" data-testid="audio-player">
   {#if audioRemoved && !audioLeft}
     <p class="audio-note">
@@ -337,39 +352,41 @@
             <span class="line-text" id={`segment-${segment.id ?? index}`}>{segment.text}</span>
           </button>
           {#if segment.id !== undefined}
-            <button
-              type="button"
-              class="segment-delete-btn"
-              aria-label="Delete segment"
-              aria-describedby={`segment-${segment.id ?? index}`}
-              aria-expanded={deleteMenuFor === segment.id}
-              title="Delete segment"
-              disabled={deletingSegmentID !== null}
-              onclick={() => (deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!)}
-            >
-              {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
-            </button>
+            <div class="segment-delete-controls">
+              <button
+                type="button"
+                class="segment-delete-btn"
+                aria-label="Delete segment"
+                aria-describedby={`segment-${segment.id ?? index}`}
+                aria-expanded={deleteMenuFor === segment.id}
+                title="Delete segment"
+                disabled={deletingSegmentID !== null}
+                onclick={() => (deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!)}
+              >
+                {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
+              </button>
+              {#if deleteMenuFor === segment.id}
+                <div class="segment-delete-menu" role="group" aria-label="Delete options">
+                  {#each deleteActions as action (action.mode)}
+                    <div class="segment-delete-option">
+                      <button
+                        type="button"
+                        class="segment-delete-action"
+                        aria-describedby={`segment-${segment.id}-${action.mode}`}
+                        onclick={() => void handleDeleteSegment(segment.id, action)}
+                      >
+                        {action.name}
+                      </button>
+                      <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
+                        >{action.note}</span
+                      >
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
           {/if}
         </div>
-        {#if segment.id !== undefined && deleteMenuFor === segment.id}
-          <div class="segment-delete-menu" role="group" aria-label="Delete options">
-            {#each deleteActions as action (action.mode)}
-              <div class="segment-delete-option">
-                <button
-                  type="button"
-                  class="segment-delete-action"
-                  aria-describedby={`segment-${segment.id}-${action.mode}`}
-                  onclick={() => void handleDeleteSegment(segment.id, action)}
-                >
-                  {action.name}
-                </button>
-                <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
-                  >{action.note}</span
-                >
-              </div>
-            {/each}
-          </div>
-        {/if}
       {/each}
     </div>
   {/if}
