@@ -103,6 +103,12 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		return fmt.Errorf("delete segment %d from session %s: %w", segmentID, sessionID, err)
 	}
 	canonical := canonicalTranscript(remaining)
+	// The session goes back to pending sync, but for two sync states: one
+	// a sync holds (SYNCING) is left to that sync, whose end records the
+	// folder it made as owed (oweFolderOfPendingDeletion); one whose Drive
+	// folder is in the trash or gone (REMOTE_DELETED) stays kept on this
+	// unit only, and the sweep, which reads every owed session in any state
+	// no sync holds, runs its replacement once the folder is back.
 	if _, err := tx.Exec(`
 		UPDATE sessions
 		SET title = '',
@@ -119,8 +125,8 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			summary_version = summary_version + 1,
 			deletion_generation = deletion_generation + 1,
 			envoy_publish_status = ?,
-			sync_status = CASE WHEN sync_state = ? THEN sync_status ELSE ? END,
-			sync_state = CASE WHEN sync_state = ? THEN sync_state ELSE ? END,
+			sync_status = CASE WHEN sync_state IN (?, ?) THEN sync_status ELSE ? END,
+			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END,
 			drive_replace_pending = 1,
 			drive_replace_since = CASE WHEN drive_replace_pending = 1 AND drive_replace_since != '' THEN drive_replace_since ELSE ? END,
 			drive_replace_failures = 0,
@@ -133,8 +139,8 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		canonical,
 		TranscriptSourceStreaming,
 		EnvoyPublishPending,
-		SyncStateSyncing, SyncPending,
-		SyncStateSyncing, SyncStatePending,
+		SyncStateSyncing, SyncStateRemoteDeleted, SyncPending,
+		SyncStateSyncing, SyncStateRemoteDeleted, SyncStatePending,
 		time.Now().UTC().Format(time.RFC3339Nano),
 		fullAudioPath,
 		sessionID,

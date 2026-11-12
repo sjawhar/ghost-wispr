@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -134,5 +135,47 @@ func TestCountUnitOnlySessionsCountsOnlyRemoteDeletedSessionsWithAudio(t *testin
 	}
 	if n, err := store.CountUnitOnlySessions(); err != nil || n != 1 {
 		t.Errorf("CountUnitOnlySessions = %d, %v; want 1, the REMOTE_DELETED session with audio only", n, err)
+	}
+}
+
+// TestDeleteSegmentKeepsARemoteDeletedSessionRemoteDeleted fails if a segment
+// deletion moves a session whose Drive folder is in the trash or gone out of
+// REMOTE_DELETED: the status warning stops counting it as kept on this unit
+// only, and with sync off it stays uncounted. It also fails if the sweep no
+// longer lists the session, so the Drive replacement would not reach it.
+func TestDeleteSegmentKeepsARemoteDeletedSessionRemoteDeleted(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	const id = "20261106090500"
+	segmentTestSession(t, store, id)
+	syncTo(t, store, id, SyncStateSynced, "folder-1", 0, "")
+	if marked, err := store.MarkRemoteDeleted(id, "folder-1", "the folder is in the trash"); err != nil || !marked {
+		t.Fatalf("mark remote deleted: %v, %v", marked, err)
+	}
+	before, err := store.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := store.CountUnitOnlySessions(); err != nil || n != 1 {
+		t.Fatalf("control: CountUnitOnlySessions = %d, %v before the deletion; want 1", n, err)
+	}
+	segments, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegment(id, segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	after, err := store.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SyncState != SyncStateRemoteDeleted || after.SyncStatus != before.SyncStatus {
+		t.Errorf("after the deletion: sync_state %q, sync_status %q; want %q and %q as before", after.SyncState, after.SyncStatus, SyncStateRemoteDeleted, before.SyncStatus)
+	}
+	if n, err := store.CountUnitOnlySessions(); err != nil || n != 1 {
+		t.Errorf("CountUnitOnlySessions = %d, %v after the deletion; want 1, the REMOTE_DELETED session", n, err)
+	}
+	if ids, err := store.GetSessionsNeedingSync(); err != nil || !slices.Contains(ids, id) {
+		t.Errorf("sessions needing sync = %v, %v; want the session that owes Drive a replacement", ids, err)
 	}
 }
