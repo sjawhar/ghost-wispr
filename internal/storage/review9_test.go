@@ -37,7 +37,7 @@ func TestReview9AnOwedEraseOutlivesItsSession(t *testing.T) {
 				if _, err := store.DB().Exec(`UPDATE drive_replacement_folders SET state = ? WHERE session_id = 'backed-up'`, DriveReplacementFolderReplaced); err != nil {
 					t.Fatal(err)
 				}
-				if err := store.DeleteSession("backed-up"); err != nil {
+				if _, err := store.DeleteSession("backed-up"); err != nil {
 					t.Fatalf("DeleteSession: %v", err)
 				}
 				t.Logf("owed erasures after the session's deletion: %d", owedErasures(t, store))

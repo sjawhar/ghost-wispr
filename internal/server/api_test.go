@@ -40,6 +40,10 @@ type apiStoreStub struct {
 	allEmbeddings      []storage.StoredEmbedding
 	allEmbeddingsErr   error
 	getEventsSinceFunc func(cursor int64, limit int) ([]storage.StoredEvent, error)
+	// deletedAudioPath, when set, is the audio_path DeleteSession reports the
+	// deleted row had, in place of the one GetSession showed.
+	deletedAudioPath     string
+	recordEraseDirectory func(dir string) error
 }
 
 type embeddingClientStub struct {
@@ -158,11 +162,22 @@ func (s *apiStoreStub) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
-func (s *apiStoreStub) DeleteSession(id string) error {
-	if _, ok := s.sessions[id]; !ok {
-		return os.ErrNotExist
+func (s *apiStoreStub) DeleteSession(id string) (string, error) {
+	sess, ok := s.sessions[id]
+	if !ok {
+		return "", os.ErrNotExist
 	}
 	delete(s.sessions, id)
+	if s.deletedAudioPath != "" {
+		return s.deletedAudioPath, nil
+	}
+	return sess.AudioPath, nil
+}
+
+func (s *apiStoreStub) RecordEraseDirectory(dir string) error {
+	if s.recordEraseDirectory != nil {
+		return s.recordEraseDirectory(dir)
+	}
 	return nil
 }
 
@@ -505,6 +520,65 @@ func deleteSessionWithRecording(t *testing.T, audio []byte, finish func(string, 
 		answered <- rr
 	}()
 	return recording, held, answered
+}
+
+// TestDeleteSession_ErasesWhatTheDeletedRowNamed fails if the session delete
+// erases the recordings it read before the delete rather than those the row
+// named when it went, or begins an erase before recording the recording's
+// directory (an erase a stop cuts off would then not be found as the app
+// starts).
+func TestDeleteSession_ErasesWhatTheDeletedRowNamed(t *testing.T) {
+	dir := t.TempDir()
+	read, deleted := filepath.Join(dir, "read.mp3"), filepath.Join(dir, "deleted.mp3")
+	for _, path := range []string{read, deleted} {
+		if err := os.WriteFile(path, []byte("audio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	var recorded []string
+	store := &apiStoreStub{
+		sessionsByDate:   map[string][]storage.Session{},
+		sessions:         map[string]storage.Session{"s1": {ID: "s1", AudioPath: read}},
+		segments:         map[string][]transcribe.Segment{},
+		deletedAudioPath: deleted,
+		recordEraseDirectory: func(recordedDir string) error {
+			recorded = append(recorded, recordedDir)
+			if _, err := os.Stat(deleted); err != nil {
+				t.Errorf("the recording was moved before its directory was recorded: %v", err)
+			}
+			return nil
+		},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(deleted); !os.IsNotExist(err) {
+		t.Errorf("the recording the deleted row named is still there: %v", err)
+	}
+	if _, err := os.Stat(read); err != nil {
+		t.Errorf("the recording read before the delete was erased: %v", err)
+	}
+	if !slices.Equal(recorded, []string{dir}) {
+		t.Errorf("recorded erase directories %v, want %s", recorded, dir)
+	}
 }
 
 // TestDeleteSession_ZeroesItsAudio fails if deleting a session removes its

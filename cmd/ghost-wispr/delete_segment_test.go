@@ -299,11 +299,14 @@ func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	store, _, _ := newDeletionTestStore(t, recording)
-	if err := store.DeleteSession("session"); err != nil {
+	if _, err := store.DeleteSession("session"); err != nil {
 		t.Fatal(err)
 	}
-	// The route's erase moved the recording to its hidden name, and the app
-	// stopped before it overwrote it.
+	// The route recorded the recording's directory, moved the recording to
+	// its hidden name, and the app stopped before it overwrote it.
+	if err := store.RecordEraseDirectory(elsewhere); err != nil {
+		t.Fatal(err)
+	}
 	hidden := filepath.Join(elsewhere, ".erasing-cut-off")
 	if err := os.Rename(recording, hidden); err != nil {
 		t.Fatal(err)
@@ -329,6 +332,75 @@ func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
 	}
 	if slices.Contains(dirs, elsewhere) {
 		t.Error("the directory is still listed after the cleanup finished it")
+	}
+}
+
+// eraseDirectoryLister lists dirs as recording directories and records the
+// ones the cleanup forgets.
+type eraseDirectoryLister struct {
+	dirs      []string
+	forgotten []string
+}
+
+func (l *eraseDirectoryLister) RecordingDirectories() ([]string, error) { return l.dirs, nil }
+
+func (l *eraseDirectoryLister) ForgetEraseDirectories(dirs []string) error {
+	l.forgotten = append(l.forgotten, dirs...)
+	return nil
+}
+
+// TestStartupCleanupForgetsNoDirectoryItFailedToClean fails if the startup
+// cleanup forgets a directory whose cleanup failed: a cut-off erase left
+// there would never be finished. A path that is a file, not a directory,
+// makes the cleanup fail; the directory beside it is cleaned and forgotten.
+func TestStartupCleanupForgetsNoDirectoryItFailedToClean(t *testing.T) {
+	audioDir, good := t.TempDir(), t.TempDir()
+	failing := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(failing, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lister := &eraseDirectoryLister{dirs: []string{failing, good}}
+	if err := cleanupRecordingDirectories(lister, audioDir); err == nil {
+		t.Fatal("control: cleaning a path that is not a directory did not fail")
+	}
+	if slices.Contains(lister.forgotten, failing) {
+		t.Errorf("the directory whose cleanup failed was forgotten: %v", lister.forgotten)
+	}
+	if !slices.Contains(lister.forgotten, good) {
+		t.Errorf("the directory cleaned beside it was not forgotten: %v", lister.forgotten)
+	}
+}
+
+// TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere fails if an erase
+// directory that is not there as the app starts (a disk not mounted) is
+// forgotten: a cut-off erase in it is finished at a later start, once it is
+// back.
+func TestStartupCleanupKeepsAnEraseDirectoryThatIsNotThere(t *testing.T) {
+	audioDir := t.TempDir()
+	unplugged := filepath.Join(t.TempDir(), "usb")
+	if err := os.Mkdir(unplugged, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.RecordEraseDirectory(unplugged); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(unplugged); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupRecordingDirectories(store, audioDir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	dirs, err := store.RecordingDirectories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(dirs, unplugged) {
+		t.Error("the erase directory that was not there was forgotten")
 	}
 }
 

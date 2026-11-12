@@ -359,9 +359,9 @@ func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 // RecordingDirectories returns the directories, other than the audio
 // directory, that recordings are kept or erased in: those of every absolute
 // path in a session's audio_path or a deleted span's audio_path, and those a
-// whole-file erase was started in after the row naming its file went
-// (erase_directories), until ForgetEraseDirectories forgets them. A relative
-// path is read from the audio directory.
+// whole-file erase was started in (RecordEraseDirectory) until
+// ForgetEraseDirectories forgets them. A relative path is read from the audio
+// directory.
 func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	rows, err := s.db.Query(`SELECT audio_path FROM sessions WHERE audio_path != ''
 		UNION SELECT audio_path FROM deleted_segments WHERE audio_path != ''`)
@@ -375,8 +375,12 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 		if err := rows.Scan(&paths); err != nil {
 			return nil, fmt.Errorf("scan recording paths: %w", err)
 		}
-		for _, dir := range recordingDirectories(paths) {
-			if !slices.Contains(dirs, dir) {
+		for _, path := range strings.Split(paths, ",") {
+			path = strings.TrimSpace(path)
+			if !filepath.IsAbs(path) {
+				continue
+			}
+			if dir := filepath.Dir(path); !slices.Contains(dirs, dir) {
 				dirs = append(dirs, dir)
 			}
 		}
@@ -404,38 +408,40 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	return dirs, nil
 }
 
-// recordingDirectories returns the directory of each absolute entry in
-// paths, a comma-separated audio_path.
-func recordingDirectories(paths string) []string {
-	var dirs []string
-	for _, path := range strings.Split(paths, ",") {
-		path = strings.TrimSpace(path)
-		if filepath.IsAbs(path) {
-			dirs = append(dirs, filepath.Dir(path))
-		}
+// RecordEraseDirectory records dir, as the caller names it, before a
+// whole-file erase in it begins (erase_directories), with the file system it
+// is on. An erase cut off by a stop leaves its .erasing-* file there, and the
+// row that named the file may be gone: the startup cleanup still reaches dir.
+// A directory that is not there holds nothing to erase and is not recorded.
+func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
+	dir = filepath.Clean(dir)
+	info, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	return dirs
-}
-
-// recordEraseDirectories records, in tx, the directories of the absolute
-// entries of audioPath (erase_directories), before the row naming them goes
-// and their files are erased. An erase cut off by a stop then leaves its
-// .erasing-* file in a directory the startup cleanup still reaches.
-func recordEraseDirectories(tx *sql.Tx, audioPath string) error {
-	for _, dir := range recordingDirectories(audioPath) {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO erase_directories(path) VALUES(?)`, dir); err != nil {
-			return fmt.Errorf("record erase directory %s: %w", dir, err)
-		}
+	if err != nil {
+		return fmt.Errorf("stat erase directory %s: %w", dir, err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO erase_directories(path, device) VALUES(?, ?)
+		ON CONFLICT(path) DO UPDATE SET device = excluded.device`, dir, fileSystemOf(info)); err != nil {
+		return fmt.Errorf("record erase directory %s: %w", dir, err)
 	}
 	return nil
 }
 
-// ForgetEraseDirectories forgets the erase directories among dirs, once the
-// startup cleanup has finished every erase left in them. Nothing else erases
-// while it runs, so no erase recorded since is forgotten.
+// ForgetEraseDirectories forgets the erase directories among dirs that the
+// startup cleanup has finished every erase left in. One that is not there, or
+// is on another file system than the erase was (a disk not mounted, its mount
+// point showing the file system below), was not cleaned and is kept for a
+// later start. Nothing else erases while the cleanup runs, so no erase
+// recorded since is forgotten.
 func (s *SQLiteStore) ForgetEraseDirectories(dirs []string) error {
 	for _, dir := range dirs {
-		if _, err := s.db.Exec(`DELETE FROM erase_directories WHERE path = ?`, dir); err != nil {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if _, err := s.db.Exec(`DELETE FROM erase_directories WHERE path = ? AND device = ?`, filepath.Clean(dir), fileSystemOf(info)); err != nil {
 			return fmt.Errorf("forget erase directory %s: %w", dir, err)
 		}
 	}

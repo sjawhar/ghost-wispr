@@ -91,6 +91,27 @@ func TestBeginLeavesTheFileForFinishOrLeftovers(t *testing.T) {
 	}
 }
 
+// TestFinishAfterOrphansFinishedTheFileReportsNothing fails if Finish
+// reports a file left unerased when Orphans (the sync sweep, in the same
+// directory) zeroed and removed it first: that is a false warning, since the
+// file is erased.
+func TestFinishAfterOrphansFinishedTheFileReportsNothing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recording.mp3")
+	held := holdOpen(t, path, []byte(secret))
+	pending, err := Begin(path)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if err := Orphans(dir); err != nil {
+		t.Fatalf("Orphans: %v", err)
+	}
+	assertZeroed(t, held, len(secret))
+	if err := pending.Finish(); err != nil {
+		t.Errorf("Finish after Orphans erased the file = %v, want nil", err)
+	}
+}
+
 func TestRemoveOfAMissingFileChangesNothing(t *testing.T) {
 	if err := Remove(filepath.Join(t.TempDir(), "missing.mp3")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("Remove of a missing file = %v, want not-exist", err)

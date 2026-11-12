@@ -23,6 +23,9 @@ type Store interface {
 	PurgeOldEvents(maxAge time.Duration) error
 	Recordings(syncGated bool) ([]storage.SessionRecording, error)
 	MarkAudioRemoved(id, before, left string, audioLeft, syncGated bool, removedAt time.Time) (storage.AudioRemoval, bool, error)
+	// RecordEraseDirectory records a directory before a whole-file erase in
+	// it begins, so the app finishes one a stop cut off as it starts again.
+	RecordEraseDirectory(dir string) error
 	RestoreAudio(removal *storage.AudioRemoval, restored string) error
 	MarkRemoteDeleted(id, folderID, errorMessage string) (bool, error)
 }
@@ -353,10 +356,16 @@ func (c *Collector) deleteSession(id string, names names) error {
 // removeErasing removes the audio file at path, overwriting its bytes with
 // zeros before the file system frees them (erase.Remove): a whole-file audio
 // removal zeroes (Sami, 2026-11-12, "Zero every audio removal",
-// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). It reports an error
-// only if path still names the file. A file gone from path whose bytes could
-// not be overwritten is logged; erase.Leftovers finishes it as the app starts.
+// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). It first
+// records path's directory, as GC resolves it (a relative entry is in the
+// audio directory), so an erase a stop cuts off is finished as the app
+// starts, also once no row names the file. It reports an error only if path
+// still names the file. A file gone from path whose bytes could not be
+// overwritten is logged; erase.Leftovers finishes it as the app starts.
 func (c *Collector) removeErasing(sessionID, path string) error {
+	if err := c.store.RecordEraseDirectory(filepath.Dir(path)); err != nil {
+		c.logger.Warn("gc could not record where it erases an audio file; a stop during the erase would leave it", "operation", "erase_audio", "session_id", sessionID, "audio_path", path, "error", err)
+	}
 	err := erase.Remove(path)
 	if errors.Is(err, erase.ErrLeftover) {
 		c.logger.Warn("gc removed an audio file but could not overwrite it yet; it is erased as the app starts", "operation", "erase_audio", "session_id", sessionID, "audio_path", path, "error", err)

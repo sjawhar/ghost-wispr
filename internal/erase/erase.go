@@ -98,12 +98,18 @@ func Begin(path string) (Pending, error) {
 }
 
 // Finish is the second half of Remove: it overwrites the file Begin hid with
-// zeros, flushes it, and removes it. Its error wraps ErrLeftover.
+// zeros, flushes it, and removes it. A hidden file another erase finished
+// first (Orphans, Leftovers) is done: only those remove one, after zeroing
+// it. Its error wraps ErrLeftover.
 func (p Pending) Finish() error {
 	if p.hidden == "" {
 		return nil
 	}
-	if err := errors.Join(syncDir(filepath.Dir(p.hidden)), eraseFile(p.hidden)); err != nil {
+	erased := eraseFile(p.hidden)
+	if errors.Is(erased, os.ErrNotExist) {
+		erased = nil
+	}
+	if err := errors.Join(syncDir(filepath.Dir(p.hidden)), erased); err != nil {
 		return fmt.Errorf("erase %s: %w: %w", p.path, ErrLeftover, err)
 	}
 	return nil

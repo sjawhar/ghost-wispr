@@ -24,6 +24,18 @@ type mockStore struct {
 	gcEligible    map[int][]string
 	deletedIDs    []string
 	remoteDeleted []string
+	eraseDirs     []string
+	// onRecordEraseDirectory, when set, runs as an erase directory is
+	// recorded.
+	onRecordEraseDirectory func(dir string)
+}
+
+func (m *mockStore) RecordEraseDirectory(dir string) error {
+	m.eraseDirs = append(m.eraseDirs, dir)
+	if m.onRecordEraseDirectory != nil {
+		m.onRecordEraseDirectory(dir)
+	}
+	return nil
 }
 
 // The mock serves age-based retention only; disk pressure runs against the
@@ -267,6 +279,44 @@ func TestGCZeroesTheAudioItRemoves(t *testing.T) {
 		}
 		if !bytes.Equal(got, make([]byte, len(got))) {
 			t.Errorf("GC removed %s still holding %q", name, got)
+		}
+	}
+}
+
+// TestGCRecordsWhereItErasesBeforeItErases fails if GC begins a whole-file
+// erase before recording its directory, or records the directory other than
+// as it resolves the file (a relative entry is in the audio directory): an
+// erase a stop cut off after the row went would then not be found as the app
+// starts.
+func TestGCRecordsWhereItErasesBeforeItErases(t *testing.T) {
+	dir := t.TempDir()
+	recording := filepath.Join(dir, "20261106140930.wav")
+	if err := os.WriteFile(recording, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &mockStore{
+		sessions:   map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: "20261106140930.wav"}},
+		gcEligible: map[int][]string{30: {"20261106140930"}},
+	}
+	store.onRecordEraseDirectory = func(string) {
+		// The first erase is the recording's; the raw copy's follows.
+		if len(store.eraseDirs) != 1 {
+			return
+		}
+		if _, err := os.Stat(recording); err != nil {
+			t.Errorf("the recording was moved before its directory was recorded: %v", err)
+		}
+	}
+	if _, err := New(store, Config{MaxAgeDays: 30, AudioDir: dir}).Run(); err != nil {
+		t.Fatalf("gc run: %v", err)
+	}
+	expectRemoved(t, recording)
+	if len(store.eraseDirs) == 0 {
+		t.Fatal("GC erased the recording with no erase directory recorded")
+	}
+	for _, recorded := range store.eraseDirs {
+		if recorded != dir {
+			t.Errorf("recorded erase directory %s, want the audio directory %s", recorded, dir)
 		}
 	}
 }
