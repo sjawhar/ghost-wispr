@@ -310,6 +310,58 @@ func TestRecorderZeroesTheRawRecordingItSaved(t *testing.T) {
 	}
 }
 
+// TestRecorderZeroesAPartialEncoderOutput fails if the partial recording that
+// failed encoders left is removed without its bytes overwritten. Removing a
+// whole audio file zeroes it (Sami, 2026-11-12, option "Zero every audio
+// removal", dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
+func TestRecorderZeroesAPartialEncoderOutput(t *testing.T) {
+	const partial = "partial audio"
+	bin := t.TempDir()
+	script := "#!/bin/sh\nfor out; do :; done\nprintf '" + partial + "' > \"$out\"\nexit 1\n"
+	for _, name := range []string{"ffmpeg", "lame"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", bin)
+
+	dir := t.TempDir()
+	// The fake encoders write into this file in place (a shell redirection
+	// keeps its inode), so a descriptor held on it reads what the removal
+	// leaves in the blocks.
+	mp3Path := filepath.Join(dir, "meeting.mp3")
+	if err := os.WriteFile(mp3Path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(mp3Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+
+	recorder := NewRecorder(dir)
+	if err := recorder.StartSession("meeting"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 3200)); err != nil {
+		t.Fatal(err)
+	}
+	path, err := recorder.EndSession("meeting")
+	if err != nil || !strings.HasSuffix(path, ".wav") {
+		t.Fatalf("EndSession = (%q, %v), want the WAV fallback", path, err)
+	}
+	if _, err := os.Stat(mp3Path); !os.IsNotExist(err) {
+		t.Fatalf("partial MP3 left behind: %v", err)
+	}
+	got := make([]byte, len(partial))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatalf("read the removed partial MP3: %v", err)
+	}
+	if !bytes.Equal(got, make([]byte, len(partial))) {
+		t.Errorf("the removed partial MP3 still holds %q", got)
+	}
+}
+
 // When the session end gives up on a recording it cannot save, the recorder
 // stops retrying it and leaves its raw audio on disk for recovery by hand,
 // reporting where; with the raw file already gone, it reports none.
