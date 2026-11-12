@@ -373,7 +373,7 @@ func TestDeleteSegmentRejectsStaleRefinementAndSummaryWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get segments: %v", err)
 	}
-	claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
+	_, claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
 	if err != nil || !claimed {
 		t.Fatalf("claim refinement = %v, %v", claimed, err)
 	}

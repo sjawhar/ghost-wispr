@@ -915,7 +915,7 @@ func TestClaimRefinement(t *testing.T) {
 	if _, err := store.DB().Exec(`UPDATE sessions SET refined_transcript = 'stale' WHERE id = ?`, "20261106140000"); err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := store.ClaimRefinement("20261106140000", "/audio/a.mp3"); err != nil || !claimed {
+	if _, claimed, err := store.ClaimRefinement("20261106140000", "/audio/a.mp3"); err != nil || !claimed {
 		t.Fatalf("ClaimRefinement = %v, %v; want claimed", claimed, err)
 	}
 	if transcript, status, err := store.GetRefinement("20261106140000"); err != nil || transcript != "" || status != RefinementRunning {
@@ -930,12 +930,12 @@ func TestClaimRefinement(t *testing.T) {
 		t.Fatalf("MarkAudioRemoved = %v, %v", ok, err)
 	}
 	for _, audioPath := range []string{"/audio/b.mp3", ""} {
-		if claimed, err := store.ClaimRefinement("20261106140100", audioPath); err != nil || claimed {
+		if _, claimed, err := store.ClaimRefinement("20261106140100", audioPath); err != nil || claimed {
 			t.Errorf("ClaimRefinement(%q) after GC removed the audio = %v, %v; want not claimed", audioPath, claimed, err)
 		}
 	}
 	expectAudio(t, store, "20261106140100", "", removedAt.Format(time.RFC3339Nano), RefinementNoAudio)
-	if claimed, err := store.ClaimRefinement("20261106990000", "/audio/z.mp3"); err != nil || claimed {
+	if _, claimed, err := store.ClaimRefinement("20261106990000", "/audio/z.mp3"); err != nil || claimed {
 		t.Errorf("ClaimRefinement of a missing session = %v, %v; want not claimed", claimed, err)
 	}
 }
@@ -2731,8 +2731,8 @@ func TestProviderModelsPersistWithSummaryAndRefinement(t *testing.T) {
 	if err := store.UpdateSummaryWithModel(id, "Model report", "Summary", SummaryCompleted, "default", "{}", "provider-summary-model"); err != nil {
 		t.Fatalf("UpdateSummaryWithModel: %v", err)
 	}
-	if err := store.UpdateRefinementWithModel(id, "Refined transcript", RefinementCompleted, "provider-refinement-model"); err != nil {
-		t.Fatalf("UpdateRefinementWithModel: %v", err)
+	if err := store.UpdateRefinementAtGeneration(id, "Refined transcript", RefinementCompleted, "provider-refinement-model", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration: %v", err)
 	}
 	sess, err := store.GetSession(id)
 	if err != nil {

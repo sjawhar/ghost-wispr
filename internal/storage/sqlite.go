@@ -1401,24 +1401,36 @@ func (s *SQLiteStore) failSummary(id, errMsg string, generation int) (Session, e
 	return sess, nil
 }
 
-// UpdateRefinement stores a refinement when its producer did not expose a
-// model identity.
+// UpdateRefinement stores a refinement, with no model, while the session's
+// refinement was claimed at its current transcript generation. A refinement
+// that claimed the session stores its result with
+// UpdateRefinementAtGeneration.
 func (s *SQLiteStore) UpdateRefinement(sessionID, transcript, status string) error {
-	return s.UpdateRefinementWithModel(sessionID, transcript, status, "")
+	return s.updateRefinement(sessionID, transcript, status, "", -1)
 }
 
-// UpdateRefinementWithModel atomically stores a refinement and the model
-// reported by its provider.
-func (s *SQLiteStore) UpdateRefinementWithModel(sessionID, transcript, status, model string) error {
+// UpdateRefinementAtGeneration atomically stores a refinement and the model
+// reported by its provider, only while generation, the transcript generation
+// ClaimRefinement returned, is still the session's. A refinement of the
+// recording from before a segment deletion is refused (sql.ErrNoRows), also
+// once the deletion's own refinement has claimed the session.
+func (s *SQLiteStore) UpdateRefinementAtGeneration(sessionID, transcript, status, model string, generation int) error {
+	return s.updateRefinement(sessionID, transcript, status, model, generation)
+}
+
+// updateRefinement stores a refinement at generation, or, when generation is
+// negative, at the session's current transcript generation.
+func (s *SQLiteStore) updateRefinement(sessionID, transcript, status, model string, generation int) error {
 	res, err := s.db.Exec(
 		`UPDATE sessions
 		 SET refined_transcript = ?, refinement_status = ?,
 		     refinement_model = CASE WHEN ? != '' THEN ? ELSE refinement_model END
-		 WHERE id = ? AND refinement_generation = deletion_generation`,
+		 WHERE id = ? AND refinement_generation = deletion_generation AND (? < 0 OR deletion_generation = ?)`,
 		transcript,
 		status,
 		model, model,
 		sessionID,
+		generation, generation,
 	)
 	if err != nil {
 		return fmt.Errorf("update refinement for session %s: %w", sessionID, err)
@@ -1436,24 +1448,25 @@ func (s *SQLiteStore) UpdateRefinementWithModel(sessionID, transcript, status, m
 }
 
 // ClaimRefinement marks session id's refinement running, dropping any earlier
-// refined transcript, only while the session still names audioPath, the
-// recording the refinement will read. Disk pressure changes the audio path
-// before it removes a file (MarkAudioRemoved), so once GC has taken the
-// recording this reports false and the refinement must not start; and GC
-// takes nothing from a session whose refinement is running.
-func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (bool, error) {
-	res, err := s.db.Exec(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != ''`,
+// refined transcript and its model, only while the session still names
+// audioPath, the recording the refinement will read. Disk pressure changes
+// the audio path before it removes a file (MarkAudioRemoved), so once GC has
+// taken the recording this reports false and the refinement must not start;
+// and GC takes nothing from a session whose refinement is running. It returns
+// the transcript generation it claimed at, the one the refinement stores its
+// result at (UpdateRefinementAtGeneration).
+func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (generation int, claimed bool, err error) {
+	err = s.db.QueryRow(
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != '' RETURNING refinement_generation`,
 		RefinementRunning, id, audioPath,
-	)
-	if err != nil {
-		return false, fmt.Errorf("claim refinement of session %s: %w", id, err)
+	).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
 	}
-	rows, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("claim refinement rows affected: %w", err)
+		return 0, false, fmt.Errorf("claim refinement of session %s: %w", id, err)
 	}
-	return rows == 1, nil
+	return generation, true, nil
 }
 
 func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {

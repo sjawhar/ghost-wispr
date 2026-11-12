@@ -166,17 +166,7 @@ func (s *storeMock) CountSegments(sessionID string) (int, error) {
 	return len(s.segments[sessionID]), nil
 }
 
-func (s *storeMock) UpdateRefinement(sessionID, transcript, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.refinementStatus[sessionID] = status
-	if transcript != "" {
-		s.refinedTranscript[sessionID] = transcript
-	}
-	return nil
-}
-
-func (s *storeMock) UpdateRefinementWithModel(sessionID, transcript, status, model string) error {
+func (s *storeMock) UpdateRefinementAtGeneration(sessionID, transcript, status, model string, _ int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refinementStatus[sessionID] = status
@@ -189,15 +179,15 @@ func (s *storeMock) UpdateRefinementWithModel(sessionID, transcript, status, mod
 
 // ClaimRefinement claims the refinement only while the session still names
 // audioPath, as the real store does.
-func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (bool, error) {
+func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (int, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if audioPath == "" || s.audio[sessionID] != audioPath {
-		return false, nil
+		return 0, false, nil
 	}
 	s.refinementStatus[sessionID] = "running"
 	delete(s.refinedTranscript, sessionID)
-	return true, nil
+	return s.canonicalizeGeneration[sessionID], true, nil
 }
 
 func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {

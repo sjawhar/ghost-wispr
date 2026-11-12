@@ -502,8 +502,10 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 
 	// Claim the refinement only while the session still names the recording:
 	// disk pressure may have removed it since the session ended, and it
-	// removes nothing while the refinement runs.
-	claimed, err := m.store.ClaimRefinement(sessionID, audioPath)
+	// removes nothing while the refinement runs. The result is stored only at
+	// the transcript generation claimed here, so a refinement of the
+	// recording from before a segment deletion cannot be stored.
+	generation, claimed, err := m.store.ClaimRefinement(sessionID, audioPath)
 	if err != nil {
 		m.batchLogger.Error("failed to mark refinement running", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
@@ -516,7 +518,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
 	result, err := batchTranscriber.Transcribe(ctx, audioPath)
 	if err != nil {
-		if updateErr := m.store.UpdateRefinement(sessionID, "", storage.RefinementFailed); updateErr != nil {
+		if updateErr := m.store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
 		}
 		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
@@ -526,7 +528,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinementWithModel(sessionID, result.Transcript, storage.RefinementCompleted, result.Model); err != nil {
+	if err := m.store.UpdateRefinementAtGeneration(sessionID, result.Transcript, storage.RefinementCompleted, result.Model, generation); err != nil {
 		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}

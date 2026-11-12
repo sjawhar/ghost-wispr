@@ -30,11 +30,14 @@ type Store interface {
 	// FailSummary records that the summary failed, and why, keeping the
 	// session's title and last good summary, and returns the session.
 	FailSummary(sessionID, errMsg string) (storage.Session, error)
-	UpdateRefinement(sessionID, transcript, status string) error
-	UpdateRefinementWithModel(sessionID, transcript, status, model string) error
+	// UpdateRefinementAtGeneration stores the refinement and the model its
+	// provider reported only while generation, the one ClaimRefinement
+	// returned, is still the session's transcript generation.
+	UpdateRefinementAtGeneration(sessionID, transcript, status, model string, generation int) error
 	// ClaimRefinement marks the refinement running while the session still
-	// names audioPath, the recording it will read, and reports whether it did.
-	ClaimRefinement(sessionID, audioPath string) (bool, error)
+	// names audioPath, the recording it will read, reports whether it did,
+	// and returns the transcript generation it claimed at.
+	ClaimRefinement(sessionID, audioPath string) (generation int, claimed bool, err error)
 	GetRefinement(sessionID string) (transcript, status string, err error)
 	UpdateTitle(sessionID, title string) error
 	Canonicalize(sessionID string) (transcript string, generation int, err error)
