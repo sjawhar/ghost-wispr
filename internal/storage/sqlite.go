@@ -17,6 +17,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -189,10 +190,12 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	// so one that database/sql opens again after dropping the first has them
 	// too: secure_delete (a deleted segment's freed pages are zeroed, the
 	// freelist included, which is what keeps its words out of the database
-	// file; see postDeleteMaintenance), foreign keys (the cascades that remove
-	// a session's rows) and the busy timeout. Set with PRAGMA once, they held
-	// for the first connection only.
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=secure_delete(1)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	// file; see postDeleteMaintenance), temporary data in memory (a sort or
+	// index SQLite spills to a temporary file would leave transcript text in
+	// the blocks it frees), foreign keys (the cascades that remove a session's
+	// rows) and the busy timeout. Set with PRAGMA once, they held for the first
+	// connection only.
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -220,9 +223,11 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 // sqlite3 command, a backup script) that opens and closes the database after
 // that takes itself for its last user and deletes the write-ahead log, and
 // every later write of the app then goes to a deleted file, lost on a crash.
-// The copy is written beside the backup, flushed to disk and renamed over it,
-// so a backup cut off part way leaves the last one as it was; a backup that
-// fails removes its unfinished copy.
+// The copy is written beside the backup, flushed to disk and put in its
+// place, so a backup cut off part way leaves the last one as it was; a backup
+// that fails removes its unfinished copy. The backup it replaces, and an
+// unfinished copy it removes, are overwritten with zeros before the file
+// system frees them (erase): they hold transcripts.
 // If the DB file doesn't exist (fresh install), the backup is skipped.
 // If backup fails, a warning is logged but startup continues (degraded is better than dead).
 func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
@@ -240,12 +245,12 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 	partPath := backupPath + ".part"
 	// VACUUM INTO writes only a file that does not exist yet: remove the
 	// copy a backup cut off part way left.
-	if err := os.Remove(partPath); err != nil && !os.IsNotExist(err) {
+	if err := erase.Remove(partPath); err != nil && !os.IsNotExist(err) && !errors.Is(err, erase.ErrLeftover) {
 		return fmt.Errorf("remove unfinished backup: %w", err)
 	}
 	defer func() {
 		if err != nil {
-			_ = os.Remove(partPath)
+			_ = erase.Remove(partPath)
 		}
 	}()
 	// VACUUM INTO reads one consistent snapshot of the database, the
@@ -257,7 +262,7 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 	if err := syncFile(partPath); err != nil {
 		return fmt.Errorf("flush backup: %w", err)
 	}
-	if err := os.Rename(partPath, backupPath); err != nil {
+	if err := erase.Replace(partPath, backupPath); err != nil && !errors.Is(err, erase.ErrLeftover) {
 		return fmt.Errorf("replace backup: %w", err)
 	}
 	// The rename lasts only once the directory naming it is on disk.
@@ -290,6 +295,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 		if _, err := s.db.Exec(p); err != nil {
 			return fmt.Errorf("apply pragma %q: %w", p, err)
 		}
+	}
+	// Finish erasing a backup the app stopped part way through replacing.
+	if err := erase.Leftovers(filepath.Dir(dbPath)); err != nil {
+		slog.Warn("failed to erase leftover backups", "path", dbPath, "error", err)
 	}
 
 	// Create pre-migration backup after pragmas are set (which creates the DB file)
@@ -714,6 +723,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 		WHERE sessions.gdrive_folder_id != ''
 	`); err != nil {
 		return fmt.Errorf("record owed drive replacement folders: %w", err)
+	}
+	// A scratch table overwriteWriteAheadLog left when the app stopped.
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + walScratchTable); err != nil {
+		return fmt.Errorf("drop the write-ahead log scratch table: %w", err)
 	}
 
 	return nil

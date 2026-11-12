@@ -417,15 +417,18 @@ func TestEveryConnectionErasesDeletedText(t *testing.T) {
 	}
 	// Every statement from here on runs on a connection opened for it.
 	store.DB().SetMaxIdleConns(0)
-	var secureDelete, foreignKeys int
+	var secureDelete, foreignKeys, tempStore int
 	if err := store.DB().QueryRow(`PRAGMA secure_delete`).Scan(&secureDelete); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DB().QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
 		t.Fatal(err)
 	}
-	if secureDelete != 1 || foreignKeys != 1 {
-		t.Errorf("a reopened connection has secure_delete=%d foreign_keys=%d, want both on", secureDelete, foreignKeys)
+	if err := store.DB().QueryRow(`PRAGMA temp_store`).Scan(&tempStore); err != nil {
+		t.Fatal(err)
+	}
+	if secureDelete != 1 || foreignKeys != 1 || tempStore != 2 {
+		t.Errorf("a reopened connection has secure_delete=%d foreign_keys=%d temp_store=%d, want 1, 1 and 2 (memory: no temporary file frees blocks holding text)", secureDelete, foreignKeys, tempStore)
 	}
 	_, _ = segmentTestSession(t, store, "reconnect")
 	segments, err := store.GetSegments("reconnect")

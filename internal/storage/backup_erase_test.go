@@ -45,12 +45,28 @@ func openWithSecret(t *testing.T, path string) {
 // deletes the segment holding backupSecret.
 func deleteSecretFrom(t *testing.T, path string) *SQLiteStore {
 	t.Helper()
+	store := openStoreWithBackup(t, path)
+	deleteBackedUpSecret(t, store)
+	return store
+}
+
+// openStoreWithBackup reopens the store at path, which takes the backup, and
+// checks that the backup holds backupSecret.
+func openStoreWithBackup(t *testing.T, path string) *SQLiteStore {
+	t.Helper()
 	store, err := NewSQLiteStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	assertBackupHolds(t, path, backupSecret, true)
+	return store
+}
+
+// deleteBackedUpSecret deletes the segment of session "backed-up" holding
+// backupSecret.
+func deleteBackedUpSecret(t *testing.T, store *SQLiteStore) {
+	t.Helper()
 	segments, err := store.GetSegments("backed-up")
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +74,6 @@ func deleteSecretFrom(t *testing.T, path string) *SQLiteStore {
 	if err := store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
-	return store
 }
 
 // assertBackupHolds fails unless the backup beside the database at path, with

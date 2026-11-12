@@ -7,6 +7,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // preMigrationBackupPath is the backup createPreMigrationBackup keeps beside
@@ -65,6 +67,10 @@ func (s *SQLiteStore) eraseFromBackup(segmentID int64, deletedText string, sessi
 	return scrubErr
 }
 
+// commitBackupScrub commits the scrub of the backup (tx). Tests replace it to
+// look at the files beside the backup while the scrub is open.
+var commitBackupScrub = func(tx *sql.Tx) error { return tx.Commit() }
+
 // sameSchema reports whether databases a and b have the same schema: the same
 // tables, indexes and triggers, defined alike, and the same data migrations
 // recorded (runOnce), so that one written in the other's place loses nothing
@@ -119,8 +125,26 @@ func sameSchema(a, b *sql.DB) (bool, error) {
 }
 
 // scrubBackup removes the deleted segment from the backup at backup, in its
-// own schema, and checkpoints its write-ahead log away.
-func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs, holderIDs []string, span *DeletedSpan) error {
+// own schema. It works through a write-ahead log, not the rollback journal a
+// backup made by VACUUM INTO has: a rollback journal holds each page as it
+// was before the change, the deleted words included, and is unlinked at the
+// commit, leaving them in blocks the file system frees; a write-ahead log
+// holds only the pages as they are after it, with secure_delete's zeros. The
+// backup is left in the journal mode it had, with no log beside it.
+func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs, holderIDs []string, span *DeletedSpan) (err error) {
+	var mode string
+	if err := backup.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		return fmt.Errorf("read backup journal mode: %w", err)
+	}
+	if _, err := backup.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		return fmt.Errorf("give the backup a write-ahead log: %w", err)
+	}
+	defer func() {
+		// Back to its mode, the log checkpointed and removed.
+		if _, restoreErr := backup.Exec(`PRAGMA journal_mode = ` + mode); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore backup journal mode %s: %w", mode, restoreErr))
+		}
+	}()
 	tx, err := backup.Begin()
 	if err != nil {
 		return fmt.Errorf("begin scrubbing backup: %w", err)
@@ -181,10 +205,13 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 			}
 		}
 	}
-	if line := strings.TrimSpace(deletedText); sessions["canonical_transcript"] && line != "" {
-		if _, err := tx.Exec(`UPDATE sessions SET canonical_transcript = replace(canonical_transcript, ?, '') WHERE id IN (`+placeholders+`)`,
-			append([]any{line}, args...)...); err != nil {
-			return fmt.Errorf("scrub backup canonical transcripts: %w", err)
+	// Each affected session's canonical transcript is rebuilt from the
+	// backup's own remaining segments, in its order, as this version writes
+	// one; a schema without them has it cleared. Nothing depends on how the
+	// build that made the backup formatted it.
+	if sessions["canonical_transcript"] {
+		if err := rebuildBackupCanonical(tx, segments, affected); err != nil {
+			return err
 		}
 	}
 	if embeddings, err := columns("embeddings"); err != nil {
@@ -208,11 +235,48 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 			return fmt.Errorf("rebuild backup search index: %w", err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitBackupScrub(tx); err != nil {
 		return fmt.Errorf("commit backup scrub: %w", err)
 	}
-	if _, err := backup.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return fmt.Errorf("checkpoint backup: %w", err)
+	return nil
+}
+
+// rebuildBackupCanonical sets the canonical transcript of each session in
+// sessionIDs from the backup's remaining segments of that session, in the
+// order getSegments reads them (by id), when its segments table has the
+// session and text columns that needs (segmentColumns), and clears it when
+// it does not.
+func rebuildBackupCanonical(tx *sql.Tx, segmentColumns map[string]bool, sessionIDs []string) error {
+	for _, id := range sessionIDs {
+		canonical := ""
+		if segmentColumns["session_id"] && segmentColumns["text"] {
+			order := "rowid"
+			if segmentColumns["id"] {
+				order = "id"
+			}
+			rows, err := tx.Query(`SELECT text FROM segments WHERE session_id = ? ORDER BY `+order, id)
+			if err != nil {
+				return fmt.Errorf("read backup segments of session %s: %w", id, err)
+			}
+			var remaining []transcribe.Segment
+			for rows.Next() {
+				var segment transcribe.Segment
+				if err := rows.Scan(&segment.Text); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("scan backup segment of session %s: %w", id, err)
+				}
+				remaining = append(remaining, segment)
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("iterate backup segments of session %s: %w", id, err)
+			}
+			_ = rows.Close()
+			canonical = canonicalTranscript(remaining)
+		}
+		if _, err := tx.Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, canonical, id); err != nil {
+			return fmt.Errorf("rebuild backup canonical transcript of session %s: %w", id, err)
+		}
 	}
 	return nil
 }

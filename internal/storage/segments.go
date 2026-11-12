@@ -180,7 +180,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
 	}
-	if err := postDeleteMaintenance(s.db); err != nil {
+	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
 		return fmt.Errorf("%w: %v", ErrSegmentPostCommitMaintenance, err)
 	}
 	if err := s.eraseFromBackup(segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span); err != nil {
@@ -190,18 +190,19 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 }
 
 // postDeleteMaintenance moves a committed deletion out of the write-ahead log
-// and empties the log: its older frames still hold the deleted words. The
-// database file itself needs nothing more. Every connection has
-// secure_delete on (NewSQLiteStore), which zeroes the deleted content in the
-// pages the deletion rewrites and every page it frees, the freelist included
-// (SQLite's "fast" setting would leave the freelist; ON does not), so a
-// VACUUM would only shrink the file: it rewrote the whole database through
-// the log on every deletion.
-var postDeleteMaintenance = func(db *sql.DB) error {
-	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return fmt.Errorf("checkpoint: %w", err)
+// at walPath and empties the log, overwriting its older frames first: they
+// still hold the deleted words, and truncating the log alone would leave them
+// in blocks the file system frees. The database file itself needs nothing
+// more. Every connection has secure_delete on (NewSQLiteStore), which zeroes
+// the deleted content in the pages the deletion rewrites and every page it
+// frees, the freelist included (SQLite's "fast" setting would leave the
+// freelist; ON does not), so a VACUUM would only shrink the file: it rewrote
+// the whole database through the log on every deletion.
+var postDeleteMaintenance = func(db *sql.DB, walPath string) error {
+	if err := overwriteWriteAheadLog(db, walPath); err != nil {
+		return err
 	}
-	return nil
+	return truncateWriteAheadLog(db)
 }
 
 // scrubMergedSources removes a deleted segment's words from every session
