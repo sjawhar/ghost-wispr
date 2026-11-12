@@ -505,6 +505,40 @@ func (s *SQLiteStore) OldestPendingSplice(sessionID string) (time.Time, bool, er
 	return at, true, nil
 }
 
+// DeletionsToRefine returns the sessions whose segment deletion has its
+// recording spliced (none of its splices is pending) but whose refinement or
+// summary has not run since: refinement still pending, as the deletion set
+// it, or a summary pending or cut off running. The deletion runner refines
+// and summarizes the session after its splice, so a stop between the two
+// leaves such a session, and nothing else starts either. The Drive
+// replacement waits for both, so the startup recovery runs them. A merged
+// session's sources and an active session are not listed.
+func (s *SQLiteStore) DeletionsToRefine() ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM sessions
+		WHERE status NOT IN (?, ?)
+		  AND EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id)
+		  AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)
+		  AND (refinement_status = ? OR summary_status IN (?, ?))
+		ORDER BY started_at ASC`,
+		SessionActive, SessionMerged, RefinementPending, SummaryPending, SummaryRunning)
+	if err != nil {
+		return nil, fmt.Errorf("list segment deletions to refine: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan segment deletion to refine: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate segment deletions to refine: %w", err)
+	}
+	return ids, nil
+}
+
 // rewriteDeletedTextEvents removes a deleted segment's words from stored
 // events. Every session in sessionIDs (the one it was deleted from and those
 // merged into it, whose summaries are cleared) loses its summary_ready events

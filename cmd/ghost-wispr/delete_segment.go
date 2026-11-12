@@ -389,20 +389,64 @@ func (e refinementAfterSegmentDeletionError) Error() string {
 func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
 
 // recoverPendingSplices completes recordings whose deletion transaction
-// committed before its replacement file reached disk. It returns one outcome
-// per pending span, so the caller owns the lifetime of each status warning.
+// committed before its replacement file reached disk, then refines, and
+// with it summarizes, every session whose deletion has its splice done but
+// whose refinement or summary a stop cut off (storage.DeletionsToRefine): a
+// splice found complete is not the end of the deletion, whose Drive
+// replacement waits for both. It returns one outcome per pending span and
+// per session it refines only, so the caller owns the lifetime of each
+// status warning.
 func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (outcomes []pendingSpliceOutcome, err error) {
 	spans, err := store.PendingSplices()
 	if err != nil {
 		return nil, err
 	}
 	outcomes = make([]pendingSpliceOutcome, 0, len(spans))
+	refined := make(map[string]bool)
 	for i := range spans {
 		span := spans[i]
 		recovered, recoveryErr := recoverPendingSplice(ctx, store, audioDir, source, splice, refine, &span)
 		outcomes = append(outcomes, pendingSpliceOutcome{Span: span, Recovered: recovered, Err: recoveryErr})
+		// A splice recovered here was refined with it.
+		refined[span.SessionID] = refined[span.SessionID] || recovered
+	}
+	if refine == nil {
+		return outcomes, nil
+	}
+	sessionIDs, err := store.DeletionsToRefine()
+	if err != nil {
+		return outcomes, err
+	}
+	for _, sessionID := range sessionIDs {
+		if !refined[sessionID] {
+			outcomes = append(outcomes, refineUnfinishedDeletion(ctx, store, refine, sessionID))
+		}
 	}
 	return outcomes, nil
+}
+
+// refineUnfinishedDeletion runs the refinement, and with it the summary, of
+// session sessionID, whose segment deletion has its splice done but whose
+// refinement or summary a stop cut off, as the deletion runner runs them
+// after its splice. A deletion of the session is refused while it runs, as
+// during a splice recovery; one already under way finishes first, and the
+// session is read as it left it.
+func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, refine func(context.Context, string, string, time.Time) error, sessionID string) pendingSpliceOutcome {
+	deleteLocks.setRecovering(sessionID, true)
+	defer deleteLocks.setRecovering(sessionID, false)
+	unlock := deleteLocks.lock(sessionID)
+	session, err := store.GetSession(sessionID)
+	unlock()
+	outcome := pendingSpliceOutcome{Span: storage.DeletedSpan{SessionID: sessionID, AudioPath: session.AudioPath}}
+	if err == nil {
+		err = refine(ctx, sessionID, session.AudioPath, session.StartedAt)
+	} else {
+		err = fmt.Errorf("get session %s to refine it: %w", sessionID, err)
+	}
+	if err != nil {
+		outcome.Err = refinementAfterSegmentDeletionError{sessionID: sessionID, err: err}
+	}
+	return outcome
 }
 
 func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, span *storage.DeletedSpan) (bool, error) {

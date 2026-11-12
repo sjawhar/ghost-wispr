@@ -1101,6 +1101,105 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	assertRecordingUnwritten(t, held, string(original))
 }
 
+// TestStartupRefinesADeletionCutOffAfterItsSplice fails if a segment
+// deletion that the app stopped after its splice, but before its refinement
+// and summary ran, is not refined and summarized as the app starts. The
+// deletion left both pending, nothing else starts them, and the Drive
+// replacement waits for both, so Drive would keep the deleted words. The
+// cases are a stop after the spliced recording replaced the original but
+// before the splice was marked complete, a stop after the mark, and a stop
+// during the refinement (failed at the start, its summary never run). A
+// deletion whose refinement and summary finished is not refined again.
+func TestStartupRefinesADeletionCutOffAfterItsSplice(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		stop        func(t *testing.T, store *storage.SQLiteStore, span *storage.DeletedSpan)
+		wantRefined bool
+	}{
+		{"stopped after the rename", func(*testing.T, *storage.SQLiteStore, *storage.DeletedSpan) {}, true},
+		{"stopped after the splice was marked complete", func(t *testing.T, store *storage.SQLiteStore, span *storage.DeletedSpan) {
+			if err := store.MarkSpliceComplete(span); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"stopped during the refinement", func(t *testing.T, store *storage.SQLiteStore, span *storage.DeletedSpan) {
+			if err := store.MarkSpliceComplete(span); err != nil {
+				t.Fatal(err)
+			}
+			if claimed, err := store.ClaimRefinement("session", span.AudioPath); err != nil || !claimed {
+				t.Fatalf("claim refinement: %v, %v", claimed, err)
+			}
+			if err := store.RecoverStaleRefinements(); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"control: refinement and summary finished", func(t *testing.T, store *storage.SQLiteStore, span *storage.DeletedSpan) {
+			if err := store.MarkSpliceComplete(span); err != nil {
+				t.Fatal(err)
+			}
+			if claimed, err := store.ClaimRefinement("session", span.AudioPath); err != nil || !claimed {
+				t.Fatalf("claim refinement: %v, %v", claimed, err)
+			}
+			if err := store.UpdateRefinement("session", "before bridge after bridge", storage.RefinementCompleted); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.StartSummary("session"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateSummary("session", "Title", "Summary", storage.SummaryCompleted, "default", "{}"); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recording := filepath.Join(t.TempDir(), "recording.mp3")
+			if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, segmentID, started := newDeletionTestStore(t, recording)
+			span := storage.DeletedSpan{
+				SessionID: "session", AudioPath: recording, Start: 1, End: 2,
+				SHA256Before: hashBytesForDeleteTest([]byte("original")), SHA256After: hashBytesForDeleteTest([]byte("spliced")),
+			}
+			if err := store.DeleteSegment("session", segmentID, span); err != nil {
+				t.Fatalf("delete segment: %v", err)
+			}
+			// The spliced recording replaced the original, as the runner's
+			// rename does, and then the app stopped.
+			if err := os.WriteFile(recording, []byte("spliced"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tc.stop(t, store, &span)
+
+			var refined []string
+			outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, func(_ context.Context, sessionID, audioPath string, gotStarted time.Time) error {
+				if audioPath != recording || !gotStarted.Equal(started) {
+					t.Errorf("refined session %s with audio %q started %s, want %q started %s", sessionID, audioPath, gotStarted, recording, started)
+				}
+				refined = append(refined, sessionID)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("startup recovery: %v", err)
+			}
+			for i := range outcomes {
+				if outcomes[i].Err != nil {
+					t.Errorf("startup recovery outcome for %s: %v", outcomes[i].Span.SessionID, outcomes[i].Err)
+				}
+			}
+			if tc.wantRefined && !slices.Equal(refined, []string{"session"}) {
+				t.Fatalf("refinements run at startup = %v, want the deletion's session refined once", refined)
+			}
+			if !tc.wantRefined && len(refined) != 0 {
+				t.Fatalf("refinements run at startup = %v, want none for a deletion whose refinement and summary finished", refined)
+			}
+			if pending, err := store.HasPendingSplice("session"); err != nil || pending {
+				t.Errorf("splice still pending after startup (%v, %v)", pending, err)
+			}
+		})
+	}
+}
+
 func hashBytesForDeleteTest(value []byte) string {
 	hash := sha256.Sum256(value)
 	return hex.EncodeToString(hash[:])
