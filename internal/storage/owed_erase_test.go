@@ -451,10 +451,9 @@ func TestALaterDeletionFinishesAnEarlierOwedErase(t *testing.T) {
 }
 
 // TestARetryKeepsAnEraseOwedSinceItRead fails if a retry clears the owed
-// erase although a deletion counted another after the retry read the count:
-// that deletion's erase would be lost. A deletion in this process waits for
-// the retry (eraseMu); the count is checked again so that one that does not
-// still keeps its erase owed.
+// erase although a deletion counted another after the retry read the count
+// (a deletion commits while the retry erases, and waits for eraseMu only for
+// its own erase): that deletion's erase would be lost if its own then failed.
 func TestARetryKeepsAnEraseOwedSinceItRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	openWithSecret(t, path)
