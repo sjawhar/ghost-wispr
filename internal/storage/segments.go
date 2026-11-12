@@ -309,26 +309,11 @@ func tableExists(tx *sql.Tx, name string) (bool, error) {
 	return true, nil
 }
 
-// SourceSessionIDs returns the source sessions whose recordings a merged
-// session owns, in session time order.
+// SourceSessionIDs returns the sessions merged, directly or through another
+// merge, into mergedID, whose recordings (and any raw recording kept beside
+// one) hold the merged session's audio, in session time order.
 func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
-	rows, err := s.db.Query(`SELECT id FROM sessions WHERE merged_into = ? ORDER BY started_at ASC`, mergedID)
-	if err != nil {
-		return nil, fmt.Errorf("query merged sources for %s: %w", mergedID, err)
-	}
-	defer func() { _ = rows.Close() }()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan merged source: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate merged sources for %s: %w", mergedID, err)
-	}
-	return ids, nil
+	return mergedSourceIDs(s.db, mergedID)
 }
 
 // mergedSourceIDs returns the sessions merged, directly or through another

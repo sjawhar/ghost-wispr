@@ -627,6 +627,45 @@ func TestSegmentDeleteRunnerRefusesKeptRawRecordingFromMergedSource(t *testing.T
 	}
 }
 
+// TestSegmentDeleteRunnerRefusesKeptRawRecordingThroughAChainedMerge fails if
+// a raw recording kept beside a session merged into the deleting one through
+// another merge (A into M1, M1 into this session) lets the deletion go ahead:
+// the raw file would keep the deleted segment's audio as a live file.
+func TestSegmentDeleteRunnerRefusesKeptRawRecordingThroughAChainedMerge(t *testing.T) {
+	audioDir := t.TempDir()
+	recording := filepath.Join(audioDir, "merged.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write recording: %v", err)
+	}
+	store, segmentID, _ := newDeletionTestStore(t, recording)
+	for _, id := range []string{"middle-merge", "recorded-source"} {
+		if err := store.CreateSession(id, time.Now().UTC()); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = 'merged', merged_into = CASE id WHEN 'middle-merge' THEN 'session' ELSE 'middle-merge' END
+		WHERE id IN ('middle-merge', 'recorded-source')`); err != nil {
+		t.Fatalf("chain the merges: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(audioDir, "recorded-source.pcm"), []byte("raw audio"), 0o600); err != nil {
+		t.Fatalf("write source raw audio: %v", err)
+	}
+	runner := segmentDeleteRunner{
+		store:       store,
+		audioDir:    audioDir,
+		transcriber: deletionWordsFake{before: initialWords(), after: cutWords()},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			t.Fatal("recordings checked after kept raw audio of a chained source")
+			return deletionRecordingSet{}, nil
+		},
+		splice: fakeSplice,
+	}
+	err := runner.Delete(context.Background(), "session", segmentID)
+	if !errors.Is(err, server.ErrSegmentRawAudioKept) || !strings.Contains(err.Error(), "recorded-source.pcm") {
+		t.Fatalf("delete error = %v, want the chained source's raw recording named", err)
+	}
+}
+
 func TestSegmentDeleteRunnerRefusesOverCutWithoutChangingRecording(t *testing.T) {
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("original")
