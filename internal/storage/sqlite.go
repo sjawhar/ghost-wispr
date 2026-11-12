@@ -161,6 +161,9 @@ var ftsQueryTokenPattern = regexp.MustCompile(`[-+]?[\p{L}\p{N}_]+`)
 
 type SQLiteStore struct {
 	db *sql.DB
+	// path is the database file, beside which createPreMigrationBackup keeps
+	// its backup.
+	path string
 }
 
 func syncStatusFromState(syncState string) string {
@@ -199,7 +202,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	store := &SQLiteStore{db: db}
+	store := &SQLiteStore{db: db, path: dbPath}
 
 	if err := store.init(dbPath); err != nil {
 		_ = db.Close()
@@ -233,7 +236,7 @@ func createPreMigrationBackup(db *sql.DB, dbPath string) (err error) {
 		return fmt.Errorf("stat db file: %w", err)
 	}
 
-	backupPath := dbPath + ".pre-migrate.bak"
+	backupPath := preMigrationBackupPath(dbPath)
 	partPath := backupPath + ".part"
 	// VACUUM INTO writes only a file that does not exist yet: remove the
 	// copy a backup cut off part way left.

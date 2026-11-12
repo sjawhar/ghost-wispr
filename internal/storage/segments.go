@@ -183,6 +183,9 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if err := postDeleteMaintenance(s.db); err != nil {
 		return fmt.Errorf("%w: %v", ErrSegmentPostCommitMaintenance, err)
 	}
+	if err := s.eraseFromBackup(segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span); err != nil {
+		return fmt.Errorf("%w: pre-migration backup: %v", ErrSegmentPostCommitMaintenance, err)
+	}
 	return nil
 }
 
