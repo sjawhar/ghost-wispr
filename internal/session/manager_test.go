@@ -206,6 +206,12 @@ func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
 	return s.refinedTranscript[sessionID], s.refinementStatus[sessionID], nil
 }
 
+// TextDeletionSpans reports no "Delete text" spans: the mock's sessions
+// have none.
+func (s *storeMock) TextDeletionSpans(string) ([]storage.TextDeletionSpan, error) {
+	return nil, nil
+}
+
 func (s *storeMock) Canonicalize(sessionID string) (string, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
