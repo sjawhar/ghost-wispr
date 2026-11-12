@@ -262,14 +262,22 @@ func (p *resilientClientProxy) IsConnected() bool {
 // again, after an attempt failed or PortAudio failed to initialize.
 const micRetryEvery = 15 * time.Second
 
+// resumeWaiter is the part of the capture gate a microphone start waits on:
+// waitResumed blocks until the gate is open, and finishResume ends a resume's
+// "resuming" state once the start that brings capture back has finished.
+type resumeWaiter interface {
+	waitResumed(ctx context.Context) bool
+	finishResume()
+}
+
 // retryMicStartup runs start every retryInterval until it succeeds or ctx
 // ends. A paused instance opens no input device: a retry that comes due
-// while capture is paused waits (waitResumed) until capture resumes.
+// while capture is paused waits (capture.waitResumed) until capture resumes.
 func retryMicStartup(
 	ctx context.Context,
 	retryInterval time.Duration,
 	after func(time.Duration) <-chan time.Time,
-	waitResumed func(context.Context) bool,
+	capture resumeWaiter,
 	onRetry func(),
 	start func() error,
 	onError func(error),
@@ -285,7 +293,7 @@ func retryMicStartup(
 			return
 		case <-after(retryInterval):
 		}
-		if !waitResumed(ctx) {
+		if !capture.waitResumed(ctx) {
 			return
 		}
 
@@ -299,7 +307,10 @@ func retryMicStartup(
 			return
 		}
 
+		// The attempt, whether it works or not, ends a resume's "resuming"
+		// state: readiness then reports what came back.
 		err := start()
+		capture.finishResume()
 		if err != nil {
 			if onError != nil {
 				onError(err)
@@ -318,8 +329,9 @@ func retryMicStartup(
 // runs retry in loops if start fails or PortAudio is not ready. A paused
 // instance opens no input device until it resumes: while the capture gate is
 // closed, start runs in loops once the gate opens, with atBoot false, and
-// startMicrophone returns deferred true. Otherwise start runs at once with
-// atBoot true, so it can write the start-up status.
+// startMicrophone returns deferred true; that start, whether it works or not,
+// ends the resume's "resuming" state (finishResume). Otherwise start runs at
+// once with atBoot true, so it can write the start-up status.
 //
 // Nothing runs in loops before booted closes, once start-up has sent its
 // component statuses: a power-button resume can come during start-up, and
@@ -341,7 +353,9 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 			if !capture.waitResumed(ctx) {
 				return
 			}
-			if portAudioReady && start(false) == nil {
+			started := portAudioReady && start(false) == nil
+			capture.finishResume()
+			if started {
 				return
 			}
 			retry()
@@ -1756,7 +1770,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			ctx,
 			micRetryEvery,
 			time.After,
-			capture.waitResumed,
+			capture,
 			func() {
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
@@ -2099,11 +2113,15 @@ func streamMicWithRetry(
 			if err = capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone restart: %v", err)
 				closeMic(streamer, "without a red recording light", logf)
+				capture.finishResume()
 				wait(backoff)
 				continue
 			}
 			err = streamer.Start()
 			capture.finishMicStart()
+			// This start, whether it works or not, ends the resume's
+			// "resuming" state: readiness then reports what came back.
+			capture.finishResume()
 			if err == nil {
 				logf("microphone restarted: capture resumed")
 				if hub != nil {

@@ -437,6 +437,48 @@ func TestResumeFallsBackToReopenWhenMicCannotRestart(t *testing.T) {
 	}
 }
 
+// TestMicLoopEndsTheResumeWindowWithItsStart fails if the mic loop, starting
+// the device again on resume, does not end the resume's resuming state once
+// that start has finished, whether it started the device or the light refused
+// it: readiness and capture_state would say resuming until the stall limit.
+func TestMicLoopEndsTheResumeWindowWithItsStart(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		lightErr error
+		want     []string
+	}{
+		{name: "started", want: []string{"start", "stream"}},
+		{name: "light refused", lightErr: errors.New("light stayed off"), want: []string{"close"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			capture.Pause()
+			capture.beforeMicStart = func() error { return tc.lightErr }
+			mic := newScriptedMic()
+			runMicLoop(t, capture, mic, io.Discard, (&recordedWaits{}).wait, nil)
+			mic.expectEvents(t, "stop")
+
+			capture.Resume()
+			mic.expectEvents(t, tc.want...)
+			waitMicHold(t, capture, "")
+		})
+	}
+}
+
+// waitMicHold fails the test unless capture's mic hold is want within testWait.
+func waitMicHold(t *testing.T, capture *captureGate, want string) {
+	t.Helper()
+	deadline := time.Now().Add(testWait)
+	got := capture.MicHold()
+	for got != want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		got = capture.MicHold()
+	}
+	if got != want {
+		t.Fatalf("mic hold = %q after %v, want %q", got, testWait, want)
+	}
+}
+
 // waitOpen fails the test unless the gate opens within testWait.
 func waitOpen(t *testing.T, capture *captureGate) {
 	t.Helper()
@@ -1128,6 +1170,63 @@ func TestCaptureStateReportsAStalledResume(t *testing.T) {
 	}
 	if got := capture.MicHold(); got != "" {
 		t.Fatalf("mic hold with the gate open = %q, want none", got)
+	}
+}
+
+// TestResumingLastsUntilTheResumeStartFinishes fails if the capture stops
+// reporting resuming as soon as the gate opens, before the start that brings
+// the microphone and Deepgram back has finished: readiness then answers 503
+// for a unit that is only resuming, and capture_state says the microphone is
+// unavailable. The start finishing ends it, a start finishing for an earlier
+// resume does not end a later one, and a pause reports paused.
+func TestResumingLastsUntilTheResumeStartFinishes(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	closedMic := fakeMicState(false)
+	capture.Pause()
+	capture.Resume()
+	waitOpen(t, capture)
+	if got := capture.MicHold(); got != captureResuming {
+		t.Fatalf("mic hold with the gate open and the resume's start not finished = %q, want %q", got, captureResuming)
+	}
+	if got := capture.captureState(closedMic); got != captureResuming {
+		t.Fatalf("capture state with the gate open and the resume's start not finished = %q, want %q", got, captureResuming)
+	}
+
+	capture.finishResume()
+	if got := capture.MicHold(); got != "" {
+		t.Fatalf("mic hold once the resume's start finished = %q, want none", got)
+	}
+	if got := capture.captureState(closedMic); got != captureMicUnavailable {
+		t.Fatalf("capture state once the resume's start finished with the mic closed = %q, want %q", got, captureMicUnavailable)
+	}
+
+	capture.Pause()
+	capture.finishResume() // a start for the earlier resume, finishing during the pause
+	if got := capture.MicHold(); got != capturePaused {
+		t.Fatalf("mic hold while paused = %q, want %q", got, capturePaused)
+	}
+	capture.Resume()
+	waitOpen(t, capture)
+	if got := capture.MicHold(); got != captureResuming {
+		t.Fatalf("mic hold after a later resume, its own start not finished = %q, want %q", got, captureResuming)
+	}
+}
+
+// TestResumingEndsAtTheStallLimit fails if a resume whose start never
+// finishes keeps reporting resuming past the stall limit, which would hide a
+// microphone or Deepgram that does not come back.
+func TestResumingEndsAtTheStallLimit(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	capture.stallAfter = 50 * time.Millisecond
+	capture.Pause()
+	capture.Resume()
+	waitOpen(t, capture)
+	time.Sleep(2 * capture.stallAfter)
+	if got := capture.MicHold(); got != "" {
+		t.Fatalf("mic hold with the gate open past the stall limit = %q, want none", got)
+	}
+	if got := capture.captureState(fakeMicState(false)); got != captureMicUnavailable {
+		t.Fatalf("capture state past the stall limit with the mic closed = %q, want %q", got, captureMicUnavailable)
 	}
 }
 

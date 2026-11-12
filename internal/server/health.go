@@ -110,16 +110,17 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// A paused capture stops the mic on purpose, and a resume takes a moment to
-	// save the paused session first; neither is an outage. A resume that has
-	// not brought the mic back past its stall limit is.
+	// A paused capture stops the mic on purpose, and a resume takes a moment:
+	// to save the paused session first, then to start the mic and connect to
+	// Deepgram. Neither is an outage. A resume that has not brought the mic
+	// back past its stall limit is.
 	hold := checker.MicHold()
 	held := hold == storage.ComponentStatusPaused || hold == storage.ComponentStatusResuming
 
 	// While capture is held so, nothing is sent to Deepgram, and a unit that
-	// starts paused connects to it only once audio flows: Deepgram not
-	// connected then reports the hold. With no Deepgram configured, or once
-	// audio flows, it is a fault.
+	// starts paused connects to it only on resume: Deepgram not connected then
+	// reports the hold. With no Deepgram configured, or once the resume's
+	// start has finished, it is a fault.
 	deepgramStatus := storage.ComponentStatusDisconnected
 	switch {
 	case checker.IsDeepgramConnected():
@@ -136,10 +137,14 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 		dbStatus = storage.ComponentStatusOK
 	}
 
+	// A resume reports the mic open as soon as it is.
 	micStatus := storage.ComponentStatusClosed
-	if hold != "" {
+	switch {
+	case hold == storage.ComponentStatusResuming && checker.IsMicOpen():
+		micStatus = storage.ComponentStatusOpen
+	case hold != "":
 		micStatus = hold
-	} else if checker.IsMicOpen() {
+	case checker.IsMicOpen():
 		micStatus = storage.ComponentStatusOpen
 	}
 

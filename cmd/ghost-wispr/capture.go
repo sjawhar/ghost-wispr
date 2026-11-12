@@ -19,7 +19,8 @@ const captureFinalizeWait = 2 * time.Second
 // captureStallAfter is how long the switch may be on with the gate still closed
 // (the paused session is not ended yet) before the capture is reported as
 // stalled, a fault, rather than resuming. A stall does not always clear by
-// itself; see newSessionCaptureGate.
+// itself; see newSessionCaptureGate. It also bounds how long after a resume
+// the capture reports resuming once the gate is open (see MicHold).
 const captureStallAfter = 30 * time.Second
 
 // captureWriteWait is how long a pause waits for an audio write that passed
@@ -77,6 +78,7 @@ type captureGate struct {
 	mu                  sync.Mutex    // guards the fields below
 	switchOff           bool          // Pause was called and Resume has not been since
 	resumedAt           time.Time     // when Resume last moved the switch on
+	starting            bool          // that Resume's start of the microphone, and Deepgram, has not finished (finishResume)
 	closed              bool          // no audio passes the gate
 	closings            int           // counts closings, so a Resume left from an earlier one does nothing
 	resumed             chan struct{} // closed while the gate is open
@@ -179,12 +181,14 @@ func (g *captureGate) RequestResume() error {
 	}
 	g.switchOff = false
 	g.resumedAt = time.Now()
+	g.starting = true
 	go g.openAfter(g.closings, g.settled)
 	return nil
 }
 
 // captureState reports what capture is doing: paused, resuming or stalled
-// while the gate is closed, then capturing or mic_unavailable.
+// while the gate is closed, resuming until the resume's start has finished
+// (MicHold), then capturing or mic_unavailable.
 func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 	if hold := g.MicHold(); hold != "" {
 		return hold
@@ -198,13 +202,19 @@ func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 	return captureCapturing
 }
 
-// MicHold reports why the gate is holding the microphone off: paused, resuming
-// or stalled, or "" while the gate is open. Readiness checks read it.
+// MicHold reports why capture is not up on purpose: paused, or stalled or
+// resuming while the gate is closed; and resuming after the gate opens, until
+// the start that brings the microphone and Deepgram back has finished
+// (finishResume) or the stall limit has passed. It is "" otherwise.
+// Readiness checks read it.
 func (g *captureGate) MicHold() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	switch {
 	case !g.closed:
+		if g.starting && !g.switchOff && time.Since(g.resumedAt) <= g.stallAfter {
+			return captureResuming
+		}
 		return ""
 	case g.switchOff:
 		return capturePaused
@@ -311,6 +321,19 @@ func (g *captureGate) IsPaused() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.switchOff
+}
+
+// finishResume ends the resuming state of the latest Resume once its start of
+// the microphone, and Deepgram, has finished, whether it worked or failed:
+// readiness then reports what is up and what is not. A start that finishes
+// while the gate is closed again does not end the next Resume's state; that
+// Resume's own start does.
+func (g *captureGate) finishResume() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.closed {
+		g.starting = false
+	}
 }
 
 // isClosed reports the gate: true while no audio passes. It stays true after
