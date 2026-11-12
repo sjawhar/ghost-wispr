@@ -117,11 +117,13 @@ func TestSpliceCutsTheSpan(t *testing.T) {
 	}
 }
 
-// TestSpliceZeroesTheRecordingItReplaces fails if the recording a splice
-// replaces (it holds the audio cut out) is renamed over without its bytes
-// overwritten: the file system would free blocks still holding that audio.
-// A descriptor held on the original reads its inode after the splice.
-func TestSpliceZeroesTheRecordingItReplaces(t *testing.T) {
+// TestSpliceDoesNotRewriteTheFileItReplaces fails if a splice overwrites the
+// file it replaces before freeing it. A segment deletion zeroes no whole
+// audio file (Sami, 2026-11-12: "Do NOT zero entire files if people just want
+// to delete certain segments",
+// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). A
+// descriptor held on the file reads its inode after the splice.
+func TestSpliceDoesNotRewriteTheFileItReplaces(t *testing.T) {
 	requireFFmpeg(t)
 	path := filepath.Join(t.TempDir(), "tones.mp3")
 	makeThreeToneMP3(t, path)
@@ -142,17 +144,15 @@ func TestSpliceZeroesTheRecordingItReplaces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != len(original) || !bytes.Equal(got, make([]byte, len(original))) {
-		t.Errorf("the replaced recording still holds %d nonzero bytes of %d (length %d)", nonzero(got), len(original), len(got))
+	if !bytes.Equal(got, original) {
+		t.Errorf("the splice rewrote the file it replaced (%d of %d bytes still the original)", commonPrefix(got, original), len(original))
 	}
 }
 
-func nonzero(b []byte) int {
+func commonPrefix(a, b []byte) int {
 	n := 0
-	for _, c := range b {
-		if c != 0 {
-			n++
-		}
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
 	}
 	return n
 }

@@ -2,7 +2,6 @@ package gdrive
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,7 +14,6 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
-	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -124,7 +122,7 @@ func (s *Syncer) DownloadRecording(ctx context.Context, folderID, name, destinat
 	keepTemp := false
 	defer func() {
 		if !keepTemp {
-			_ = erase.Remove(tempPath)
+			_ = os.Remove(tempPath)
 		}
 	}()
 	response, err := s.service.Files.Get(recording.Id).SupportsAllDrives(true).Context(ctx).Download()
@@ -144,9 +142,7 @@ func (s *Syncer) DownloadRecording(ctx context.Context, folderID, name, destinat
 	if err := temp.Close(); err != nil {
 		return fmt.Errorf("close downloaded recording %s: %w", destination, err)
 	}
-	// A recording this replaces is overwritten before the file system frees
-	// it; one left erased part way is finished by erase.Leftovers.
-	if err := erase.Replace(tempPath, destination); err != nil && !errors.Is(err, erase.ErrLeftover) {
+	if err := os.Rename(tempPath, destination); err != nil {
 		return fmt.Errorf("replace recording %s: %w", destination, err)
 	}
 	keepTemp = true

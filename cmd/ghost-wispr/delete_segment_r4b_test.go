@@ -56,7 +56,7 @@ func (f *heldDownloadFake) DownloadRecording(ctx context.Context, folderID, name
 // TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers fails if a
 // recovery whose re-splice produces another hash leaves the recording it
 // downloaded from Drive (the unspliced original, deleted segment included) at
-// the recording's path, or removes it without overwriting its bytes.
+// the recording's path.
 func TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers(t *testing.T) {
 	store, recording, _ := r4PendingStore(t)
 	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'folder' WHERE id = 'session'`); err != nil {
@@ -90,13 +90,6 @@ func TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers(t *testing.T) {
 	}
 	if _, err := os.Stat(recording); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the recording downloaded for the failed recovery is still at %s (%v)", recording, err)
-	}
-	got := make([]byte, len("original"))
-	if _, err := drive.held[0].ReadAt(got, 0); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, make([]byte, len(got))) {
-		t.Errorf("the removed download still holds %q", got)
 	}
 }
 

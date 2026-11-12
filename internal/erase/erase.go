@@ -5,19 +5,26 @@
 // audio or words still in them, where a later look at the device can read
 // them.
 //
-// Erasing costs a second write of the file's size, and the unit records to an
-// SD card with finite write endurance, so it is used only where a person's
-// segment deletion is the reason the bytes must go: the recording a splice
-// replaces, the splice's copies, recordings downloaded for a splice, and the
-// database backups a deletion refreshes. Other removals stay plain os.Remove.
+// Which removals zero follows Sami's answer of 2026-11-12
+// (dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81), option
+// "Zero every audio removal", with: "This is really not very important. Do
+// NOT zero entire files if people just want to delete certain segments." So the
+// removal of a whole audio file uses Remove: GC's age and disk-pressure
+// removal and its raw copies, a saved session's raw recording, a partial
+// encoder output, and DELETE /api/sessions/{id}. A segment deletion zeroes no
+// audio file: its splice and the copies it makes are renamed and removed
+// plainly, so audio a segment deletion cuts stays recoverable at the block
+// level, which that answer accepts. The database's pre-migration backup,
+// which holds transcript text, is replaced and removed through Replace and
+// Remove.
 //
 // A file being erased is first given a hidden name beside it (.erasing-*), so
 // one cut off by the app stopping is found and finished by Leftovers.
 //
 // Replace needs the file system to support hard links: it keeps the file it
 // replaces under a second name until the rename is done. On one without them
-// (vfat, for example) Replace fails and changes nothing, so a segment deletion
-// fails closed.
+// (vfat, for example) Replace fails and changes nothing: the backup is then
+// not taken again, and an owed erase of it removes it instead.
 //
 // Limits: the zeros go to the blocks the file system has for the file, which
 // a copy-on-write file system (btrfs, ZFS) would not overwrite in place, and

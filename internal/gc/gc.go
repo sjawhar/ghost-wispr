@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
@@ -329,7 +330,7 @@ func (c *Collector) deleteSession(id string, names names) error {
 
 	saved := false
 	for _, f := range files {
-		if err := os.Remove(f.path); err != nil {
+		if err := c.removeErasing(id, f.path); err != nil {
 			if !os.IsNotExist(err) {
 				c.logger.Warn("gc failed to remove audio file", "operation", "remove_audio", "session_id", id, "audio_path", f.path, "error", err)
 			}
@@ -342,11 +343,26 @@ func (c *Collector) deleteSession(id string, names names) error {
 		if len(names[rawPath]) > 0 {
 			return nil
 		}
-		if err := os.Remove(rawPath); err != nil && !os.IsNotExist(err) {
+		if err := c.removeErasing(id, rawPath); err != nil && !os.IsNotExist(err) {
 			c.logger.Warn("gc failed to remove raw recording", "operation", "remove_raw_audio", "session_id", id, "raw_audio", rawPath, "error", err)
 		}
 	}
 	return nil
+}
+
+// removeErasing removes the audio file at path, overwriting its bytes with
+// zeros before the file system frees them (erase.Remove): a whole-file audio
+// removal zeroes (Sami, 2026-11-12, "Zero every audio removal",
+// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). It reports an error
+// only if path still names the file. A file gone from path whose bytes could
+// not be overwritten is logged; erase.Leftovers finishes it as the app starts.
+func (c *Collector) removeErasing(sessionID, path string) error {
+	err := erase.Remove(path)
+	if errors.Is(err, erase.ErrLeftover) {
+		c.logger.Warn("gc removed an audio file but could not overwrite it yet; it is erased as the app starts", "operation", "erase_audio", "session_id", sessionID, "audio_path", path, "error", err)
+		return nil
+	}
+	return err
 }
 
 // sessionAudio is a session's audio that disk pressure may remove.
@@ -600,7 +616,7 @@ func (c *Collector) removeAudioFile(sessionID string, f recordingFile) int64 {
 		c.logger.Warn("gc skipped an audio file that would free nothing", "operation", "free_audio_space", "session_id", sessionID, "audio_path", f.path)
 		return 0
 	}
-	if err := os.Remove(f.path); err != nil {
+	if err := c.removeErasing(sessionID, f.path); err != nil {
 		c.logger.Warn("gc could not remove an audio file", "operation", "free_audio_space", "session_id", sessionID, "audio_path", f.path, "error", err)
 		return 0
 	}

@@ -136,7 +136,7 @@ func TestSegmentDeleteRunnerSplicesAndRefinesTheRecording(t *testing.T) {
 	if refinedPath != recording {
 		t.Fatalf("refinement read %q, want spliced %q", refinedPath, recording)
 	}
-	assertRecordingZeroed(t, held, len("original"))
+	assertRecordingUnwritten(t, held, "original")
 }
 
 // holdRecording opens the recording at path, so the test still reads its
@@ -151,17 +151,19 @@ func holdRecording(t *testing.T, path string) *os.File {
 	return f
 }
 
-// assertRecordingZeroed fails unless the recording held reads size zero
-// bytes: the one a splice replaced, which holds the audio cut out, was
-// overwritten before the file system freed its blocks.
-func assertRecordingZeroed(t *testing.T, held *os.File, size int) {
+// assertRecordingUnwritten fails unless the recording held still reads want:
+// the one a splice replaced is freed by a plain rename, not overwritten
+// first. A segment deletion zeroes no whole audio file, because removing
+// filler words must not set off a write of the whole recording (Sami,
+// 2026-11-12, dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
+func assertRecordingUnwritten(t *testing.T, held *os.File, want string) {
 	t.Helper()
-	got := make([]byte, size)
+	got := make([]byte, len(want))
 	if _, err := held.ReadAt(got, 0); err != nil {
 		t.Fatalf("read the replaced recording: %v", err)
 	}
-	if !bytes.Equal(got, make([]byte, size)) {
-		t.Errorf("the replaced recording still holds %q", got)
+	if string(got) != want {
+		t.Errorf("a segment deletion rewrote the recording it replaced: it holds %q, want %q", got, want)
 	}
 }
 
@@ -196,9 +198,10 @@ func TestSegmentDeleteRunnerUsesProbedRecordingDuration(t *testing.T) {
 }
 
 // TestCleanupSpliceTempCopies fails if a copy of a recording a stopped app
-// left (a splice's copy or output, a Drive download, an erasure cut off) is
-// still there after the app starts, or was removed without its bytes
-// overwritten, or if a recording is touched.
+// left (a splice's copy or output, a Drive download) or a whole-file erase it
+// cut off is still there after the app starts, if a copy is rewritten before
+// it is removed (a segment deletion zeroes no whole audio file), if the
+// cut-off erase is not finished with zeros, or if a recording is touched.
 func TestCleanupSpliceTempCopies(t *testing.T) {
 	dir := t.TempDir()
 	held := map[string]*os.File{}
@@ -224,8 +227,12 @@ func TestCleanupSpliceTempCopies(t *testing.T) {
 		if _, err := held[name].ReadAt(got, 0); err != nil {
 			t.Fatalf("read the removed %s: %v", name, err)
 		}
-		if !bytes.Equal(got, make([]byte, len(got))) {
-			t.Errorf("temp copy %s was removed still holding %q", name, got)
+		zeroed := bytes.Equal(got, make([]byte, len(got)))
+		if name == ".erasing-cut-off" && !zeroed {
+			t.Errorf("the cut-off erase %s was removed still holding %q", name, got)
+		}
+		if name != ".erasing-cut-off" && zeroed {
+			t.Errorf("the splice copy %s was rewritten before it was removed", name)
 		}
 	}
 	if got, err := os.ReadFile(filepath.Join(dir, "recording.mp3")); err != nil || string(got) != "audio of recording.mp3" {
@@ -234,9 +241,10 @@ func TestCleanupSpliceTempCopies(t *testing.T) {
 }
 
 // TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory fails if a
-// copy a stopped splice or erase left beside a recording kept outside the
-// audio directory (a session's absolute audio_path) is not erased as the app
-// starts.
+// copy a stopped splice left, or a whole-file erase it cut off, beside a
+// recording kept outside the audio directory (a session's absolute
+// audio_path) is not removed as the app starts, or the cut-off erase is not
+// finished with zeros.
 func TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory(t *testing.T) {
 	audioDir, elsewhere := t.TempDir(), t.TempDir()
 	recording := filepath.Join(elsewhere, "recording.mp3")
@@ -269,7 +277,7 @@ func TestStartupCleanupReachesRecordingsOutsideTheAudioDirectory(t *testing.T) {
 		if _, err := f.ReadAt(got, 0); err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(got, make([]byte, len(got))) {
+		if name == ".erasing-cut-off" && !bytes.Equal(got, make([]byte, len(got))) {
 			t.Errorf("%s was removed still holding %q", name, got)
 		}
 	}
@@ -887,7 +895,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("pending splices after recovery = %+v", pending)
 	}
-	assertRecordingZeroed(t, held, len(original))
+	assertRecordingUnwritten(t, held, string(original))
 }
 
 func hashBytesForDeleteTest(value []byte) string {
