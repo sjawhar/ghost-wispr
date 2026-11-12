@@ -320,9 +320,24 @@ func retryMicStartup(
 // closed, start runs in loops once the gate opens, with atBoot false, and
 // startMicrophone returns deferred true. Otherwise start runs at once with
 // atBoot true, so it can write the start-up status.
-func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, portAudioReady bool, start func(atBoot bool) error, retry func()) (deferred bool) {
-	if capture.isClosed() {
+//
+// Nothing runs in loops before booted closes, once start-up has sent its
+// component statuses: a power-button resume can come during start-up, and
+// the statuses its start sends (microphone and Deepgram connected) must not be
+// followed by the start-up ones (paused), which would then stand for every
+// page that connects later.
+func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, booted <-chan struct{}, portAudioReady bool, start func(atBoot bool) error, retry func()) (deferred bool) {
+	afterBoot := func(run func()) {
 		loops.Go(func() {
+			select {
+			case <-booted:
+				run()
+			case <-ctx.Done():
+			}
+		})
+	}
+	if capture.isClosed() {
+		afterBoot(func() {
 			if !capture.waitResumed(ctx) {
 				return
 			}
@@ -336,7 +351,7 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 	if portAudioReady && start(true) == nil {
 		return false
 	}
-	loops.Go(retry)
+	afterBoot(retry)
 	return false
 }
 
@@ -1771,7 +1786,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		return err
 	}
-	if startMicrophone(ctx, &micLoops, capture, !paInitFailed, startMic, retryMic) {
+	// booted closes once start-up has sent its component statuses.
+	booted := make(chan struct{})
+	if startMicrophone(ctx, &micLoops, capture, booted, !paInitFailed, startMic, retryMic) {
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
 		if cfg.DeepgramAPIKey != "" {
 			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
@@ -1972,6 +1989,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	for _, c := range startupStatus.Components() {
 		hub.BroadcastComponentStatus(c.Name, c.Status, c.Message)
 	}
+	close(booted)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

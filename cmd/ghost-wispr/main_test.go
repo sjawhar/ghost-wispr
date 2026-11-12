@@ -388,6 +388,13 @@ func oneShotAfter() func(time.Duration) <-chan time.Time {
 // neverPaused is a waitResumed for a capture that is never paused.
 func neverPaused(context.Context) bool { return true }
 
+// alreadyBooted is a booted channel for start-up that has sent its statuses.
+func alreadyBooted() <-chan struct{} {
+	booted := make(chan struct{})
+	close(booted)
+	return booted
+}
+
 // TestPausedStartOpensNoInputDeviceUntilResume fails if an instance that
 // starts paused opens the input device before someone resumes it: an open
 // capture stream holds the microphone, which a test instance on the Pi would
@@ -405,7 +412,7 @@ func TestPausedStartOpensNoInputDeviceUntilResume(t *testing.T) {
 		}
 	})
 
-	deferred := startMicrophone(ctx, &loops, capture, true, func(atBoot bool) error {
+	deferred := startMicrophone(ctx, &loops, capture, alreadyBooted(), true, func(atBoot bool) error {
 		opened <- atBoot
 		return nil
 	}, func() { t.Error("the start-up retried, but no attempt failed") })
@@ -435,7 +442,7 @@ func TestPausedStartOpensNoInputDeviceUntilResume(t *testing.T) {
 func TestUnpausedStartOpensTheInputDeviceAtOnce(t *testing.T) {
 	var loops sync.WaitGroup
 	var attempts []bool
-	deferred := startMicrophone(context.Background(), &loops, newCaptureGate(nil, nil, nil), true, func(atBoot bool) error {
+	deferred := startMicrophone(context.Background(), &loops, newCaptureGate(nil, nil, nil), alreadyBooted(), true, func(atBoot bool) error {
 		attempts = append(attempts, atBoot)
 		return nil
 	}, func() { t.Error("the start-up retried, but no attempt failed") })
@@ -444,6 +451,58 @@ func TestUnpausedStartOpensTheInputDeviceAtOnce(t *testing.T) {
 	}
 	if !joinMicLoops(&loops, testWait) {
 		t.Fatal("a start that succeeded left a start-up goroutine running")
+	}
+}
+
+// TestDeferredMicStartWaitsForTheStartUpStatus fails if a start that waits
+// for resume, or a start-up retry, runs before start-up has sent its
+// component statuses. A power-button resume can come during start-up; its
+// start reports the microphone and Deepgram connected, and the start-up
+// statuses sent after it (paused) would then stand for every page that
+// connects later, while the unit records.
+func TestDeferredMicStartWaitsForTheStartUpStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		paused         bool
+		portAudioReady bool
+	}{
+		{name: "resume during start-up", paused: true, portAudioReady: true},
+		{name: "retry after PortAudio failed", portAudioReady: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			if tc.paused {
+				capture.Pause()
+			}
+			ran := make(chan string, 4)
+			booted := make(chan struct{})
+			var loops sync.WaitGroup
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(func() {
+				cancel()
+				if !joinMicLoops(&loops, testWait) {
+					t.Error("microphone start-up still running after shutdown")
+				}
+			})
+			startMicrophone(ctx, &loops, capture, booted, tc.portAudioReady, func(bool) error {
+				ran <- "start"
+				return nil
+			}, func() { ran <- "retry" })
+			capture.Resume()
+			waitOpen(t, capture)
+			select {
+			case got := <-ran:
+				t.Fatalf("the background %s ran before start-up sent its statuses", got)
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			close(booted)
+			select {
+			case <-ran:
+			case <-time.After(testWait):
+				t.Fatal("the background start-up did not run once start-up sent its statuses")
+			}
+		})
 	}
 }
 
