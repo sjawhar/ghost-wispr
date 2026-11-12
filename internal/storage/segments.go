@@ -51,7 +51,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	if span.SHA256After == "" {
 		return fmt.Errorf("delete segment: invalid deleted span")
 	}
-	return s.deleteSegment(sessionID, segmentID, span, false)
+	return s.deleteSegment(sessionID, segmentID, &span, false)
 }
 
 // deleteSegment is both deletion actions. Each removes the segment and its
@@ -60,7 +60,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 // "Delete text and audio" (keepAudio false) records the splice of span's
 // recording and owes Google Drive a replacement; "Delete text" (keepAudio
 // true) records span, in the unchanged recording, for refinement to drop.
-func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span DeletedSpan, keepAudio bool) error {
+func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *DeletedSpan, keepAudio bool) error {
 	if strings.TrimSpace(sessionID) == "" {
 		return fmt.Errorf("delete segment: session ID is required")
 	}
@@ -160,10 +160,10 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span Dele
 		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
 	}
 	if keepAudio {
-		if err := recordTextDeletionSpan(tx, sessionID, sources, &span); err != nil {
+		if err := recordTextDeletionSpan(tx, sessionID, sources, span); err != nil {
 			return err
 		}
-	} else if err := recordSplice(tx, sessionID, owners, &span, session.AudioPath); err != nil {
+	} else if err := recordSplice(tx, sessionID, owners, span, session.AudioPath); err != nil {
 		return err
 	}
 	// The erase after the commit is owed until it finishes, so a failure, or
@@ -172,7 +172,7 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span Dele
 	if err != nil {
 		return err
 	}
-	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, &span); err != nil {
+	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, span); err != nil {
 		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
@@ -181,7 +181,7 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span Dele
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
 	}
-	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span)
+	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, append([]string{sessionID}, holders...), span)
 }
 
 // recordSplice records, in tx, what only "Delete text and audio" does beyond

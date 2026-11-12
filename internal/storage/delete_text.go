@@ -47,7 +47,7 @@ func TextDeleted(spans []TextDeletionSpan, start, end float64) bool {
 //
 //nolint:gocritic // One span by value, as DeleteSegment takes its span.
 func (s *SQLiteStore) DeleteSegmentText(sessionID string, segmentID int64, span TextDeletionSpan) error {
-	return s.deleteSegment(sessionID, segmentID, DeletedSpan{
+	return s.deleteSegment(sessionID, segmentID, &DeletedSpan{
 		SessionID:    sessionID,
 		AudioPath:    span.AudioPath,
 		Start:        span.Start,

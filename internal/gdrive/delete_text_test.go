@@ -1,6 +1,7 @@
 package gdrive
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -128,7 +129,7 @@ func TestDeleteTextUpdatesTheDriveDocumentsInPlace(t *testing.T) {
 			if !strings.Contains(string(after["transcript.md"].Content), "charlie stays.") {
 				t.Errorf("Drive's transcript lost the words it keeps: %q", after["transcript.md"].Content)
 			}
-			if string(after[recordingName].Content) != string(before[recordingName].Content) || after[recordingName].RevisionCount != before[recordingName].RevisionCount {
+			if !bytes.Equal(after[recordingName].Content, before[recordingName].Content) || after[recordingName].RevisionCount != before[recordingName].RevisionCount {
 				t.Error("the sync after Delete text changed the recording on Drive")
 			}
 			if got := recordingHash(t, recording); got != recordingBefore {
