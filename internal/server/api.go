@@ -23,7 +23,6 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
-	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -800,13 +799,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		// Erase the audio files after the database deletion: each is
-		// overwritten with zeros before the file system frees its blocks.
+		// Clean up audio files after successful DB deletion.
 		if sessionData.AudioPath != "" {
 			for _, p := range strings.Split(sessionData.AudioPath, ",") {
 				p = strings.TrimSpace(p)
 				if p != "" {
-					_ = erase.Remove(p)
+					_ = os.Remove(p)
 				}
 			}
 		}

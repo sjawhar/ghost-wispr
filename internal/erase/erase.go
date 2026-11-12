@@ -5,6 +5,12 @@
 // audio or words still in them, where a later look at the device can read
 // them.
 //
+// Erasing costs a second write of the file's size, and the unit records to an
+// SD card with finite write endurance, so it is used only where a person's
+// segment deletion is the reason the bytes must go: the recording a splice
+// replaces, the splice's copies, recordings downloaded for a splice, and the
+// database backups a deletion refreshes. Other removals stay plain os.Remove.
+//
 // A file being erased is first given a hidden name beside it (.erasing-*), so
 // one cut off by the app stopping is found and finished by Leftovers.
 //

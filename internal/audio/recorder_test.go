@@ -275,41 +275,6 @@ func TestRecorderEndSessionRetriesARecordingItCouldNotSave(t *testing.T) {
 	}
 }
 
-// TestRecorderZeroesTheRawRecordingItSaved fails if the raw recording a saved
-// session leaves behind is removed without its bytes overwritten: it holds
-// every word of the session, a segment deleted later included, and the file
-// system would free blocks still holding them.
-func TestRecorderZeroesTheRawRecordingItSaved(t *testing.T) {
-	dir := t.TempDir()
-	recorder := NewRecorder(dir)
-	var held *os.File
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
-		var err error
-		if held, err = os.Open(rawPath); err != nil {
-			return "", err
-		}
-		out := filepath.Join(dir, sessionID+".mp3")
-		return out, os.WriteFile(out, []byte("encoded"), 0o644)
-	}
-	if err := recorder.StartSession("meeting"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write([]byte{1, 2, 3, 4}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := recorder.EndSession("meeting"); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = held.Close() }()
-	got := make([]byte, 4)
-	if _, err := held.ReadAt(got, 0); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, make([]byte, 4)) {
-		t.Errorf("the removed raw recording still holds %v", got)
-	}
-}
-
 // When the session end gives up on a recording it cannot save, the recorder
 // stops retrying it and leaves its raw audio on disk for recovery by hand,
 // reporting where; with the raw file already gone, it reports none.

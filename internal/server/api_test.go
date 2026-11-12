@@ -471,46 +471,6 @@ func TestDeleteSession_Success(t *testing.T) {
 	}
 }
 
-// TestDeleteSession_ZeroesItsAudio fails if deleting a session removes its
-// recordings without overwriting their bytes before the file system frees
-// them.
-func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
-	recording := filepath.Join(t.TempDir(), "s1.mp3")
-	audio := []byte("the session's audio")
-	if err := os.WriteFile(recording, audio, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	held, err := os.Open(recording)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = held.Close() }()
-	store := &apiStoreStub{
-		sessionsByDate: map[string][]storage.Session{},
-		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: recording}},
-		segments:       map[string][]transcribe.Segment{},
-	}
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
-	if rr.Code != http.StatusNoContent {
-		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
-	}
-	if _, err := os.Stat(recording); !os.IsNotExist(err) {
-		t.Fatalf("the recording is still there: %v", err)
-	}
-	got := make([]byte, len(audio))
-	if _, err := held.ReadAt(got, 0); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, make([]byte, len(got))) {
-		t.Errorf("the removed recording still holds %q", got)
-	}
-}
-
 func TestDeleteSession_NotFound(t *testing.T) {
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
