@@ -113,6 +113,10 @@ func usableRecordingSource(source deletionRecordingSource) bool {
 
 // restoreDeletionRecordings combines the session's locally known recordings
 // with every audio file Drive has for it, restoring only missing local files.
+// Each entry of the session's audio path is read where recording.Resolve
+// finds it (as written, then in audioDir), so the recording spliced is the one
+// the app plays and syncs; one found in neither place is restored into
+// audioDir.
 func restoreDeletionRecordings(ctx context.Context, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
 	byName := make(map[string]string)
 	for _, entry := range strings.Split(session.AudioPath, ",") {
@@ -120,10 +124,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		if entry == "" {
 			continue
 		}
-		path := entry
-		if !filepath.IsAbs(path) && audioDir != "" {
-			path = filepath.Join(audioDir, filepath.Base(path))
-		}
+		path := recordingname.Resolve(entry, audioDir)
 		byName[filepath.Base(path)] = path
 	}
 	if session.GDriveFolderID != "" && usableRecordingSource(source) {

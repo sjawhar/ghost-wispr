@@ -62,6 +62,16 @@ type Orchestrator struct {
 	uploader uploader
 	store    OrchestratorStore
 	logger   *slog.Logger
+	// audioDir is the audio directory a recording is uploaded from when it
+	// is not where its entry points (recording.Resolve).
+	audioDir string
+}
+
+// SetAudioDir sets the audio directory a sync reads a recording from when it
+// is not where the session's entry points (recording.Resolve). Call it before
+// the orchestrator syncs.
+func (o *Orchestrator) SetAudioDir(dir string) {
+	o.audioDir = dir
 }
 
 // replacementFailed records a failed replacement attempt of sessionID's
@@ -267,7 +277,11 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	}
 	syncSess := toSyncSession(&sess)
 
-	files, folderName, unreadable, err := buildSyncFiles(&syncSess, segments, sess.AudioPath)
+	// Each recording is uploaded from where every reader of a recording
+	// finds it (recording.Resolve); one found nowhere is left out, and
+	// notUploaded names it.
+	audioPath := resolvedAudioPath(sess.AudioPath, o.audioDir)
+	files, folderName, unreadable, err := buildSyncFiles(&syncSess, segments, audioPath)
 	if err != nil {
 		o.endSync(sessionID, claim, storage.SyncStateFailed, sess.GDriveFolderID, sess.RetryCount, time.Now().UTC(), err)
 		return fmt.Errorf("build sync files %s: %w", sessionID, err)
@@ -292,7 +306,7 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	if err == nil && len(unreadable) != 0 {
 		err = fmt.Errorf("recordings could not be read, not uploaded: %s", strings.Join(unreadable, ", "))
 	}
-	if missing := notUploaded(sess.AudioPath, files); err == nil && len(missing) > 0 {
+	if missing := notUploaded(audioPath, files); err == nil && len(missing) > 0 {
 		err = fmt.Errorf("recordings not on disk, not uploaded: %s", strings.Join(missing, ", "))
 	}
 	if err == nil {

@@ -1076,6 +1076,57 @@ func TestRestoreDeletionRecordingsRestoresOnlyRecordingNames(t *testing.T) {
 	}
 }
 
+// TestSegmentDeleteRunnerSplicesTheRecordingLeftInPlaceAfterAnAudioDirChange
+// fails if, after audio_dir changes with the old recordings left in place, a
+// segment deletion splices a copy of the recording downloaded from Drive into
+// the new audio directory (sjawhar/ghost-wispr#50's runner): the recording
+// where the session's entry points, which the app plays and syncs, would
+// keep the deleted audio as a live file. The recorder writes
+// filepath.Join(audio_dir, name), relative to the working directory.
+func TestSegmentDeleteRunnerSplicesTheRecordingLeftInPlaceAfterAnAudioDirChange(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	newAudioDir := filepath.Join(root, "new-audio")
+	for _, dir := range []string{"old-audio", newAudioDir} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recording := filepath.Join("old-audio", "20261111120000.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, segmentID, _ := newDeletionTestStore(t, recording)
+	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'folder' WHERE id = 'session'`); err != nil {
+		t.Fatal(err)
+	}
+	drive := &deletionDriveFake{
+		files:     []*drive.File{{Name: recordingname.FileName(recording), MimeType: "audio/mpeg"}},
+		downloads: map[string][]byte{recordingname.FileName(recording): []byte("original")},
+	}
+	runner := segmentDeleteRunner{
+		store:       store,
+		transcriber: deletionWordsFake{before: initialWords(), after: cutWords()},
+		audioDir:    newAudioDir,
+		ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+			return restoreDeletionRecordings(ctx, &session, newAudioDir, drive)
+		},
+		splice: fakeSplice,
+	}
+	if err := runner.Delete(context.Background(), "session", segmentID); err != nil {
+		t.Fatalf("delete segment: %v", err)
+	}
+	if got, err := os.ReadFile(recording); err != nil || string(got) != "spliced" {
+		t.Errorf("the recording where the entry points = %q (%v), want it spliced", got, err)
+	}
+	if len(drive.downloaded) != 0 {
+		t.Errorf("downloaded %v from Drive, want none: the recording is on disk where its entry points", drive.downloaded)
+	}
+	if _, err := os.Stat(filepath.Join(newAudioDir, filepath.Base(recording))); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a copy of the recording is in the new audio directory: %v", err)
+	}
+}
+
 func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	recording := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("original")

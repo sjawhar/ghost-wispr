@@ -1,6 +1,8 @@
 package recording
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -24,4 +26,28 @@ func LocalName(name string) (string, bool) {
 		return "", false
 	}
 	return base, true
+}
+
+// Resolve returns the file one entry of a session's audio path names: the
+// entry as written, when a file is there, else the file of the entry's name
+// in audioDir, the audio directory now. The recorder writes
+// filepath.Join(audio_dir, name), relative to the working directory when
+// audio_dir is, so after audio_dir changes a recording left in place is where
+// its entry points, and one moved with the setting is in the new directory.
+// Every reader of a recording uses this one rule (GC, the session delete, the
+// audio route, the Drive upload and the segment deletion), so all of them
+// find the same file. An entry that cannot be read for another reason than
+// being missing is returned as written, so its reader reports why; with no
+// audio directory, so is every entry.
+func Resolve(entry, audioDir string) string {
+	info, err := os.Stat(entry)
+	switch {
+	case err == nil && !info.IsDir():
+		return entry
+	case err != nil && !errors.Is(err, os.ErrNotExist):
+		return entry
+	case audioDir == "":
+		return entry
+	}
+	return filepath.Join(audioDir, filepath.Base(entry))
 }

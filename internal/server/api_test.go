@@ -593,6 +593,95 @@ func TestDeleteSession_ErasesWhatTheDeletedRowNamed(t *testing.T) {
 	}
 }
 
+// configStoreWithAudioDir is a config store whose audio_dir is dir.
+func configStoreWithAudioDir(t *testing.T, dir string) *config.Store {
+	t.Helper()
+	cfgStore := newTestConfigStore(t)
+	if err := cfgStore.Update(func(c *config.Config) { c.AudioDir = dir }); err != nil {
+		t.Fatal(err)
+	}
+	return cfgStore
+}
+
+// TestDeleteSession_ErasesARecordingMovedWithTheAudioDir fails if the session
+// delete erases only the recording where the row's entry points: after
+// audio_dir changes and the recordings move with it, the recording is in the
+// new audio directory (recording.Resolve), and it would stay on the unit,
+// named by no row.
+func TestDeleteSession_ErasesARecordingMovedWithTheAudioDir(t *testing.T) {
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	moved := filepath.Join(newDir, "s1.mp3")
+	if err := os.WriteFile(moved, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	var recorded []string
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: filepath.Join(oldDir, "s1.mp3")}},
+		segments:       map[string][]transcribe.Segment{},
+		recordEraseDirectory: func(dir string) error {
+			recorded = append(recorded, dir)
+			return nil
+		},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, newDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(moved); !os.IsNotExist(err) {
+		t.Errorf("the recording moved with the audio directory is still there: %v", err)
+	}
+	if !slices.Equal(recorded, []string{newDir}) {
+		t.Errorf("recorded erase directories %v, want %s", recorded, newDir)
+	}
+}
+
+// TestAPIAudioServesARecordingMovedWithTheAudioDir fails if the audio route
+// looks for a recording only where the row's entry points: after audio_dir
+// changes and the recordings move with it, the recording is in the new audio
+// directory (recording.Resolve).
+func TestAPIAudioServesARecordingMovedWithTheAudioDir(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.Mkdir("new", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("new", "s1.mp3"), []byte("the moved recording"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: filepath.Join("old", "s1.mp3")}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, "new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/s1/audio", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "the moved recording" {
+		t.Errorf("GET audio = %d %q, want the recording in the new audio directory", rr.Code, rr.Body.String())
+	}
+}
+
 // TestDeleteSession_ZeroesItsAudio fails if deleting a session removes its
 // recordings without overwriting their bytes before the file system frees
 // them.

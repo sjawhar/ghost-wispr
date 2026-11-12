@@ -335,13 +335,20 @@ func splitAudioPath(audioPath string) []string {
 }
 
 // resolve returns the file an audio path entry names, as an absolute path so
-// two spellings of one file compare equal: the entry itself if it is
-// absolute, else its name in the audio directory.
+// two spellings of one file compare equal: where recording.Resolve finds it,
+// the entry as written if a file is there, else its name in the audio
+// directory, as every other reader of a recording finds it.
 func (c *Collector) resolve(entry string) string {
-	path := entry
-	if !filepath.IsAbs(path) && c.config.AudioDir != "" {
-		path = filepath.Join(c.config.AudioDir, filepath.Base(path))
-	}
+	return absolute(recording.Resolve(entry, c.config.AudioDir))
+}
+
+// rawPath returns, as an absolute path, where the recorder keeps session
+// id's raw recording: in the audio directory.
+func (c *Collector) rawPath(id string) string {
+	return absolute(filepath.Join(c.config.AudioDir, id+".pcm"))
+}
+
+func absolute(path string) string {
 	if abs, err := filepath.Abs(path); err == nil {
 		return abs
 	}
@@ -450,7 +457,7 @@ func (c *Collector) deleteSession(id string, names names) error {
 		saved = saved || f.size > 0
 	}
 	if saved && c.config.AudioDir != "" {
-		rawPath := c.resolve(id + ".pcm")
+		rawPath := c.rawPath(id)
 		if len(names[rawPath]) > 0 {
 			return nil
 		}
@@ -465,8 +472,8 @@ func (c *Collector) deleteSession(id string, names names) error {
 // zeros before the file system frees them (erase.Remove): a whole-file audio
 // removal zeroes (Sami, 2026-11-12, "Zero every audio removal",
 // dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81). It first
-// records path's directory, as GC resolves it (a relative entry is in the
-// audio directory), so an erase a stop cuts off is finished as the app
+// records path's directory, as GC resolves it (recording.Resolve), so an
+// erase a stop cuts off is finished as the app
 // starts, also once no row names the file. It reports an error only if path
 // still names the file. A file gone from path whose bytes could not be
 // overwritten is logged; erase.Leftovers finishes it as the app starts.
@@ -534,13 +541,9 @@ func (c *Collector) removableAudio() ([]sessionAudio, int64, error) {
 			seen[path] = true
 			info, err := os.Stat(path)
 			if os.IsNotExist(err) {
-				// It names nothing only if the entry's own path has no file
-				// either: after audio_dir changes, the file is where the entry
-				// points (where the app plays and syncs it), not where it
-				// resolves. Such an entry is left as it is.
-				if _, ownErr := os.Stat(entry); os.IsNotExist(ownErr) {
-					a.dead[path] = true
-				}
+				// It names nothing: recording.Resolve found no file where the
+				// entry points either.
+				a.dead[path] = true
 				continue
 			}
 			if err != nil || info.IsDir() {
@@ -552,7 +555,7 @@ func (c *Collector) removableAudio() ([]sessionAudio, int64, error) {
 		}
 		if saved && c.config.AudioDir != "" {
 			// A .pcm a session names is that session's recording, not a raw copy.
-			rawPath := c.resolve(rec.ID + ".pcm")
+			rawPath := c.rawPath(rec.ID)
 			if raw, ok := c.audioFile(rawPath); ok && len(names[rawPath]) == 0 {
 				a.raw = &raw
 				total += raw.size

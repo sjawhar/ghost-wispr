@@ -1421,7 +1421,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if err != nil {
 				return nil, err
 			}
-			return gdrive.NewOrchestrator(syncer, store, appLogger), nil
+			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
+			orchestrator.SetAudioDir(cfg.AudioDir)
+			return orchestrator, nil
 		},
 		func(syncer sessionSyncer) {
 			if syncer == nil {
@@ -1521,6 +1523,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		} else {
 			deletionDrive = syncer
 			orchestrator := gdrive.NewOrchestrator(syncer, store, appLogger)
+			orchestrator.SetAudioDir(cfg.AudioDir)
 			drive.Set(orchestrator)
 			manager.SetSyncer(orchestrator)
 		}

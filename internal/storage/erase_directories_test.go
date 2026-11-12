@@ -29,6 +29,32 @@ func TestDeleteSessionReturnsTheAudioPathItDeleted(t *testing.T) {
 	}
 }
 
+// TestRecordingDirectoriesListsWhereARelativeEntryPoints fails if the
+// directory a relative audio path entry points to (from the working
+// directory, as the recorder writes filepath.Join(audio_dir, name)) is not
+// listed, as an absolute path: after audio_dir changes with the recording
+// left there, a segment deletion splices it there (recording.Resolve), and
+// the startup cleanup must reach the copies a stop leaves beside it.
+func TestRecordingDirectoriesListsWhereARelativeEntryPoints(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("left", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("left", started.Add(time.Minute), filepath.Join("old-audio", "left.mp3")); err != nil {
+		t.Fatal(err)
+	}
+	dirs, err := store.RecordingDirectories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(root, "old-audio"); !slices.Contains(dirs, want) {
+		t.Errorf("recording directories %v, want %s, where the relative entry points", dirs, want)
+	}
+}
+
 // TestEraseDirectoriesAreForgottenOnlyWhereTheyWereCleaned fails if an
 // erase directory is forgotten when the startup cleanup could not have
 // reached it: when it is not there, or is on another file system than the

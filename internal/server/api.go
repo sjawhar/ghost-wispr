@@ -24,6 +24,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -126,6 +127,14 @@ func getSpeakerIndexByName(speakerNames string, name string) int {
 }
 
 func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
+	// audioDir is the audio directory a recording is read from when it is not
+	// where its entry points (recording.Resolve).
+	audioDir := func() string {
+		if cfgStore == nil {
+			return ""
+		}
+		return cfgStore.Get().AudioDir
+	}
 
 	// Health check endpoints
 	mux.HandleFunc("GET /healthz/live", func(w http.ResponseWriter, r *http.Request) {
@@ -821,13 +830,15 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
 		// Each one's directory, named as the erase names it, is recorded
 		// first, so an erase cut off by a stop is finished as the app starts.
-		// The files leave their names before the answer; the zeros, a write
-		// as large as the recordings, follow it.
+		// Each recording is erased where recording.Resolve finds it, as the
+		// app plays and syncs it. The files leave their names before the
+		// answer; the zeros, a write as large as the recordings, follow it.
 		var pending []erase.Pending
 		for _, p := range strings.Split(audioPath, ",") {
 			if p = strings.TrimSpace(p); p == "" {
 				continue
 			}
+			p = recordingname.Resolve(p, audioDir())
 			if err := store.RecordEraseDirectory(filepath.Dir(p)); err != nil {
 				slog.Warn("could not record where a deleted session's recording is erased; a stop during the erase would leave it", "session_id", sessionID, "audio_path", p, "error", err)
 			}
@@ -1115,8 +1126,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusForbidden, "invalid audio path")
 			return
 		}
+		// Read where every reader of a recording finds it: as written, else
+		// its name in the audio directory.
+		recordingPath := recordingname.Resolve(cleanPath, audioDir())
 
-		f, err := os.Open(cleanPath)
+		f, err := os.Open(recordingPath)
 		if err != nil {
 			writeJSONError(w, http.StatusNotFound, "audio file not found")
 			return
@@ -1133,8 +1147,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// No browser keeps a copy: a segment deletion splices this file, and
 		// the spliced recording is served at this same URL (noStoreAPI).
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", contentTypeForAudio(cleanPath))
-		http.ServeContent(w, r, filepath.Base(cleanPath), info.ModTime(), f)
+		w.Header().Set("Content-Type", contentTypeForAudio(recordingPath))
+		http.ServeContent(w, r, filepath.Base(recordingPath), info.ModTime(), f)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/context", func(w http.ResponseWriter, r *http.Request) {

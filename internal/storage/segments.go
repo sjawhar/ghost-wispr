@@ -366,12 +366,13 @@ func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 	return mergedSourceIDs(s.db, mergedID)
 }
 
-// RecordingDirectories returns the directories, other than the audio
-// directory, that recordings are kept or erased in: those of every absolute
-// path in a session's audio_path or a deleted span's audio_path, and those a
-// whole-file erase was started in (RecordEraseDirectory) until
-// ForgetEraseDirectories forgets them. A relative path is read from the audio
-// directory.
+// RecordingDirectories returns the directories, besides the audio directory,
+// that recordings are kept or erased in: that of every path in a session's
+// audio_path or a deleted span's audio_path, where the path points (a
+// relative one from the working directory, where the recorder writes
+// filepath.Join(audio_dir, name) and recording.Resolve reads it first), as an
+// absolute path, and those a whole-file erase was started in
+// (RecordEraseDirectory) until ForgetEraseDirectories forgets them.
 func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	rows, err := s.db.Query(`SELECT audio_path FROM sessions WHERE audio_path != ''
 		UNION SELECT audio_path FROM deleted_segments WHERE audio_path != ''`)
@@ -386,11 +387,14 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 			return nil, fmt.Errorf("scan recording paths: %w", err)
 		}
 		for _, path := range strings.Split(paths, ",") {
-			path = strings.TrimSpace(path)
-			if !filepath.IsAbs(path) {
+			if path = strings.TrimSpace(path); path == "" {
 				continue
 			}
-			if dir := filepath.Dir(path); !slices.Contains(dirs, dir) {
+			dir, err := filepath.Abs(filepath.Dir(path))
+			if err != nil {
+				return nil, fmt.Errorf("find the directory of recording %s: %w", path, err)
+			}
+			if !slices.Contains(dirs, dir) {
 				dirs = append(dirs, dir)
 			}
 		}
