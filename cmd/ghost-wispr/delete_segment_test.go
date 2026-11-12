@@ -475,12 +475,17 @@ func TestDeleteSegmentWhenGCRemovedTheLocalAudio(t *testing.T) {
 	}
 }
 
+// TestDeleteSegmentRemovesDownloadedAudioOnRefusal fails if a refused
+// deletion leaves a recording it downloaded from Drive, or rewrites it before
+// removing it: a segment deletion zeroes no whole audio file (Sami,
+// 2026-11-12, dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
 func TestDeleteSegmentRemovesDownloadedAudioOnRefusal(t *testing.T) {
 	downloaded := filepath.Join(t.TempDir(), "downloaded.mp3")
 	if err := os.WriteFile(downloaded, []byte("downloaded"), 0o600); err != nil {
 		t.Fatalf("write downloaded recording: %v", err)
 	}
 	store, segmentID, _ := newDeletionTestStore(t, downloaded)
+	held := holdRecording(t, downloaded)
 	runner := segmentDeleteRunner{
 		store:       store,
 		transcriber: deletionWordsFake{before: initialWords(), after: append(cutWords(), audio.Word{Text: "private", Start: 0.9, End: 1})},
@@ -494,6 +499,86 @@ func TestDeleteSegmentRemovesDownloadedAudioOnRefusal(t *testing.T) {
 	}
 	if _, err := os.Stat(downloaded); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("downloaded recording still exists after refusal: %v", err)
+	}
+	assertRecordingUnwritten(t, held, "downloaded")
+}
+
+// TestTheRecordingDirectoryIsFlushedBeforeTheSpliceIsMarkedComplete fails
+// if the runner or the startup recovery marks a splice complete before the
+// directory holding the spliced recording is flushed: after a power loss the
+// mark could stand beside the unspliced recording, which the Drive
+// replacement would then upload as the clean copy.
+func TestTheRecordingDirectoryIsFlushedBeforeTheSpliceIsMarkedComplete(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64)
+	}{
+		{"deletion runner", func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64) {
+			runner := r4Runner(store, recording)
+			if err := runner.Delete(context.Background(), "session", segmentID); err != nil {
+				t.Fatalf("delete segment: %v", err)
+			}
+		}},
+		{"recovery that splices again", func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64) {
+			recoverInterruptedDeletion(t, store, recording, segmentID, nil)
+		}},
+		{"recovery of a spliced recording from Drive", func(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64) {
+			if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'folder' WHERE id = 'session'`); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(recording); err != nil {
+				t.Fatal(err)
+			}
+			name := "audio-" + filepath.Base(recording)
+			recoverInterruptedDeletion(t, store, recording, segmentID, &deletionDriveFake{
+				files:     []*drive.File{{Name: name, MimeType: "audio/mpeg"}},
+				downloads: map[string][]byte{name: []byte("spliced")},
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recording := filepath.Join(t.TempDir(), "recording.mp3")
+			if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, segmentID, _ := newDeletionTestStore(t, recording)
+			original := syncRecordingDirectory
+			t.Cleanup(func() { syncRecordingDirectory = original })
+			flushed := 0
+			syncRecordingDirectory = func(path string) error {
+				flushed++
+				if contents, err := os.ReadFile(path); err != nil || string(contents) != "spliced" {
+					t.Errorf("flushed the directory of %s holding %q (%v), want the spliced recording", path, contents, err)
+				}
+				if pending, err := store.HasPendingSplice("session"); err != nil || !pending {
+					t.Errorf("flushed the directory after the splice was marked complete (pending %v, %v)", pending, err)
+				}
+				return original(path)
+			}
+			tc.run(t, store, recording, segmentID)
+			if flushed != 1 {
+				t.Errorf("the recording directory was flushed %d times before the splice was marked complete, want 1", flushed)
+			}
+			if pending, err := store.HasPendingSplice("session"); err != nil || pending {
+				t.Fatalf("control: splice still pending (%v, %v)", pending, err)
+			}
+		})
+	}
+}
+
+// recoverInterruptedDeletion records a deletion of segmentID whose splice did
+// not reach recording, then runs the startup recovery with Drive as source.
+func recoverInterruptedDeletion(t *testing.T, store *storage.SQLiteStore, recording string, segmentID int64, source deletionRecordingSource) {
+	t.Helper()
+	if err := store.DeleteSegment("session", segmentID, storage.DeletedSpan{
+		SessionID: "session", AudioPath: recording, Start: 1, End: 2,
+		SHA256Before: hashBytesForDeleteTest([]byte("original")), SHA256After: hashBytesForDeleteTest([]byte("spliced")),
+	}); err != nil {
+		t.Fatalf("record interrupted delete: %v", err)
+	}
+	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), source, fakeSplice, nil)
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+		t.Fatalf("recover pending splice: outcomes=%v err=%v", outcomes, err)
 	}
 }
 

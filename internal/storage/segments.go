@@ -669,11 +669,26 @@ func (s *SQLiteStore) PendingSplices() ([]DeletedSpan, error) {
 		return nil, fmt.Errorf("close deleted spans: %w", err)
 	}
 	for _, span := range complete {
+		if err := flushRecordingDirectory(span.AudioPath); err != nil {
+			return nil, err
+		}
 		if err := s.MarkSpliceComplete(&span); err != nil {
 			return nil, err
 		}
 	}
 	return pending, nil
+}
+
+// flushRecordingDirectory flushes the directory holding recording, so the
+// rename that put the spliced recording there is on disk before the splice is
+// marked complete: after a power loss the mark must not stand beside the
+// unspliced recording, which the Drive replacement would upload as the clean
+// copy.
+var flushRecordingDirectory = func(recording string) error {
+	if err := syncFile(filepath.Dir(recording)); err != nil {
+		return fmt.Errorf("flush recording directory of %s: %w", recording, err)
+	}
+	return nil
 }
 
 // MarkSpliceComplete lets garbage collection proceed after the recording has

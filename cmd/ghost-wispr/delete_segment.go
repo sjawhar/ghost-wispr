@@ -336,6 +336,9 @@ func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segm
 		return fmt.Errorf("replace recording %s: %w", recording, err)
 	}
 	keepTemp = true
+	if err := syncRecordingDirectory(recording); err != nil {
+		return err
+	}
 	if err := d.store.MarkSpliceComplete(&span); err != nil {
 		return err
 	}
@@ -439,6 +442,9 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 		return false, fmt.Errorf("hash pending splice recording %s: %w", recording, err)
 	}
 	if hash == span.SHA256After {
+		if err := syncRecordingDirectory(recording); err != nil {
+			return false, err
+		}
 		if err := store.MarkSpliceComplete(span); err != nil {
 			return false, err
 		}
@@ -467,6 +473,9 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	if err := os.Rename(tempPath, recording); err != nil {
 		return false, fmt.Errorf("replace recovered recording %s: %w", recording, err)
 	}
+	if err := syncRecordingDirectory(recording); err != nil {
+		return false, err
+	}
 	if err := store.MarkSpliceComplete(span); err != nil {
 		return false, err
 	}
@@ -478,6 +487,24 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 		}
 	}
 	return true, nil
+}
+
+// syncRecordingDirectory flushes the directory holding recording, so the
+// rename that put the spliced recording there is on disk before the splice is
+// marked complete: after a power loss the mark must not stand beside the
+// unspliced recording, which the Drive replacement would then upload as the
+// clean copy.
+var syncRecordingDirectory = func(recording string) error {
+	dir := filepath.Dir(recording)
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open recording directory %s: %w", dir, err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("flush recording directory %s: %w", dir, err)
+	}
+	return nil
 }
 
 // removeFiles removes paths with a plain unlink: a segment deletion zeroes
