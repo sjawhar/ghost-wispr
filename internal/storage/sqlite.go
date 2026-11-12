@@ -369,7 +369,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			session_id TEXT NOT NULL,
 			generation INTEGER NOT NULL,
 			folder_session_id TEXT NOT NULL,
-			state TEXT NOT NULL DEFAULT '`+DriveReplacementFolderOwed+`',
+			state TEXT NOT NULL DEFAULT '` + DriveReplacementFolderOwed + `',
 			PRIMARY KEY (session_id, generation, folder_session_id),
 			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
