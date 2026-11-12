@@ -115,11 +115,18 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *Del
 	canonical := canonicalTranscript(remaining)
 	// A session with no recording left to refine ("Delete text" of one whose
 	// audio was removed to free space) has nothing a refinement could run on.
+	// The session goes back to pending sync, but for two sync states: one
+	// a sync holds (SYNCING) is left to that sync, whose end records the
+	// folder it made as owed (oweFolderOfPendingDeletion); one whose Drive
+	// folder is in the trash or gone (REMOTE_DELETED) stays kept on this
+	// unit only, and the sweep, which reads every owed session in any state
+	// no sync holds, runs its replacement once the folder is back.
 	if _, err := tx.Exec(`
 		UPDATE sessions
 		SET title = '',
 			summary = '',
 			summary_model = '',
+			speaker_names = '{}',
 			refined_transcript = '',
 			refinement_model = '',
 			refinement_status = CASE WHEN ? AND audio_path = '' THEN ? ELSE ? END,
@@ -130,16 +137,16 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *Del
 			summary_version = summary_version + 1,
 			deletion_generation = deletion_generation + 1,
 			envoy_publish_status = ?,
-			sync_status = CASE WHEN sync_state = ? THEN sync_status ELSE ? END,
-			sync_state = CASE WHEN sync_state = ? THEN sync_state ELSE ? END
+			sync_status = CASE WHEN sync_state IN (?, ?) THEN sync_status ELSE ? END,
+			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END
 		WHERE id = ?`,
 		keepAudio, RefinementNoAudio, RefinementPending,
 		SummaryPending,
 		canonical,
 		TranscriptSourceStreaming,
 		EnvoyPublishPending,
-		SyncStateSyncing, SyncPending,
-		SyncStateSyncing, SyncStatePending,
+		SyncStateSyncing, SyncStateRemoteDeleted, SyncPending,
+		SyncStateSyncing, SyncStateRemoteDeleted, SyncStatePending,
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("clear deleted segment derivatives for session %s: %w", sessionID, err)
@@ -292,10 +299,11 @@ var postDeleteMaintenance = func(db *sql.DB, walPath string) error {
 // (holders: the recorded session it came from, and each merged session
 // between that one and sessionID). A merge moves its sources' segments to
 // the merged session and leaves each source row (status merged) with the
-// text it had: its title, summary, canonical and refined transcripts. A
-// source's canonical transcript is rebuilt from the merged session's
-// remaining segments that came from it; its title, summary and refined
-// transcript, which cannot be rebuilt without the words, are cleared. The
+// text it had: its title, summary, speaker names, canonical and refined
+// transcripts. A source's canonical transcript is rebuilt from the merged
+// session's remaining segments that came from it; its title, summary,
+// speaker names and refined transcript, which cannot be rebuilt without the
+// words, are cleared. The
 // full-text index is rebuilt from these rows in the same transaction.
 //
 // A segment does not record the session it was recorded in, so it is
@@ -357,7 +365,7 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 	}
 	for _, id := range sources {
 		if _, err := tx.Exec(`UPDATE sessions
-			SET title = '', summary = '', summary_model = '', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?
+			SET title = '', summary = '', summary_model = '', speaker_names = '{}', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?
 			WHERE id = ?`, canonicalTranscript(own[id]), TranscriptSourceStreaming, id); err != nil {
 			return nil, nil, fmt.Errorf("scrub merged source %s: %w", id, err)
 		}
@@ -397,12 +405,13 @@ func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 	return mergedSourceIDs(s.db, mergedID)
 }
 
-// RecordingDirectories returns the directories, other than the audio
-// directory, that recordings are kept or erased in: those of every absolute
-// path in a session's audio_path or a deleted span's audio_path, and those a
-// whole-file erase was started in (RecordEraseDirectory) until
-// ForgetEraseDirectories forgets them. A relative path is read from the audio
-// directory.
+// RecordingDirectories returns the directories, besides the audio directory,
+// that recordings are kept or erased in: that of every path in a session's
+// audio_path or a deleted span's audio_path, where the path points (a
+// relative one from the working directory, where the recorder writes
+// filepath.Join(audio_dir, name) and recording.Resolve reads it first), as an
+// absolute path, and those a whole-file erase was started in
+// (RecordEraseDirectory) until ForgetEraseDirectories forgets them.
 func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	rows, err := s.db.Query(`SELECT audio_path FROM sessions WHERE audio_path != ''
 		UNION SELECT audio_path FROM deleted_segments WHERE audio_path != ''`)
@@ -417,11 +426,14 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 			return nil, fmt.Errorf("scan recording paths: %w", err)
 		}
 		for _, path := range strings.Split(paths, ",") {
-			path = strings.TrimSpace(path)
-			if !filepath.IsAbs(path) {
+			if path = strings.TrimSpace(path); path == "" {
 				continue
 			}
-			if dir := filepath.Dir(path); !slices.Contains(dirs, dir) {
+			dir, err := filepath.Abs(filepath.Dir(path))
+			if err != nil {
+				return nil, fmt.Errorf("find the directory of recording %s: %w", path, err)
+			}
+			if !slices.Contains(dirs, dir) {
 				dirs = append(dirs, dir)
 			}
 		}
@@ -449,13 +461,27 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 	return dirs, nil
 }
 
-// RecordEraseDirectory records dir, as the caller names it, before a
-// whole-file erase in it begins (erase_directories), with the file system it
-// is on. An erase cut off by a stop leaves its .erasing-* file there, and the
-// row that named the file may be gone: the startup cleanup still reaches dir.
-// A directory that is not there holds nothing to erase and is not recorded.
+// RecordEraseDirectory records dir, as an absolute path, before a whole-file
+// erase in it begins (erase_directories), with the file system it is on. An
+// erase cut off by a stop leaves its .erasing-* file there, and the row that
+// named the file may be gone: the startup cleanup still reaches dir. A
+// directory that is not there holds nothing to erase and is not recorded.
 func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
-	dir = filepath.Clean(dir)
+	return recordEraseDirectory(s.db, dir)
+}
+
+// execer is what writing a row needs: the database, or a transaction.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// recordEraseDirectory is RecordEraseDirectory in q: DeleteSession records
+// in the transaction that deletes the row.
+func recordEraseDirectory(q execer, dir string) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("find the erase directory %s: %w", dir, err)
+	}
 	info, err := os.Stat(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -463,8 +489,7 @@ func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
 	if err != nil {
 		return fmt.Errorf("stat erase directory %s: %w", dir, err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO erase_directories(path, device) VALUES(?, ?)
-		ON CONFLICT(path) DO UPDATE SET device = excluded.device`, dir, fileSystemOf(info)); err != nil {
+	if _, err := q.Exec(`INSERT OR IGNORE INTO erase_directories(path, device) VALUES(?, ?)`, dir, fileSystemOf(info)); err != nil {
 		return fmt.Errorf("record erase directory %s: %w", dir, err)
 	}
 	return nil
@@ -478,11 +503,15 @@ func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
 // recorded since is forgotten.
 func (s *SQLiteStore) ForgetEraseDirectories(dirs []string) error {
 	for _, dir := range dirs {
+		dir, err := filepath.Abs(dir)
+		if err != nil {
+			return fmt.Errorf("find the erase directory %s: %w", dir, err)
+		}
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
 			continue
 		}
-		if _, err := s.db.Exec(`DELETE FROM erase_directories WHERE path = ? AND device = ?`, filepath.Clean(dir), fileSystemOf(info)); err != nil {
+		if _, err := s.db.Exec(`DELETE FROM erase_directories WHERE path = ? AND device = ?`, dir, fileSystemOf(info)); err != nil {
 			return fmt.Errorf("forget erase directory %s: %w", dir, err)
 		}
 	}
@@ -542,6 +571,44 @@ func (s *SQLiteStore) OldestPendingSplice(sessionID string) (time.Time, bool, er
 		return time.Time{}, false, fmt.Errorf("parse oldest pending splice for %s: %w", sessionID, err)
 	}
 	return at, true, nil
+}
+
+// DeletionsToRefine returns the sessions whose segment deletion has its
+// recording spliced (none of its splices is pending), or that "Delete text"
+// changed, but whose refinement or summary has not run since: refinement
+// still pending, as the deletion set it, or a summary pending or cut off
+// running. The deletion runner refines and summarizes the session after its
+// splice, or after "Delete text", so a stop between the two leaves such a
+// session, and nothing else starts either. The Drive replacement waits for
+// both, so the startup recovery runs them. A merged session's sources, an
+// active session, and one with no audio to refine (the startup summary pass
+// makes its summary) are not listed.
+func (s *SQLiteStore) DeletionsToRefine() ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM sessions
+		WHERE status NOT IN (?, ?)
+		  AND (EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id)
+		       OR EXISTS (SELECT 1 FROM deleted_text_spans WHERE deleted_text_spans.session_id = sessions.id))
+		  AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)
+		  AND audio_path != '' AND refinement_status != ?
+		  AND (refinement_status = ? OR summary_status IN (?, ?))
+		ORDER BY started_at ASC`,
+		SessionActive, SessionMerged, RefinementNoAudio, RefinementPending, SummaryPending, SummaryRunning)
+	if err != nil {
+		return nil, fmt.Errorf("list segment deletions to refine: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan segment deletion to refine: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate segment deletions to refine: %w", err)
+	}
+	return ids, nil
 }
 
 // rewriteDeletedTextEvents removes a deleted segment's words from stored
@@ -739,7 +806,9 @@ var flushRecordingDirectory = func(recording string) error {
 // been atomically replaced with the span's expected post-splice bytes. In the
 // same transaction, the first time it marks the span, it moves the spans
 // "Delete text" recorded in the recording's pre-splice bytes to where their
-// words are in the spliced one (moveTextDeletionSpans).
+// words are in the spliced one (moveTextDeletionSpans), and it clears the
+// session's pending Drive replacement when the deletion owes Drive nothing
+// (settleUnownedDriveReplacement).
 func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -764,9 +833,10 @@ func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 		if marked == 0 {
 			return fmt.Errorf("mark deleted span complete: %w", sql.ErrNoRows)
 		}
-		return nil
+	} else if err := moveTextDeletionSpans(tx, span); err != nil {
+		return err
 	}
-	if err := moveTextDeletionSpans(tx, span); err != nil {
+	if err := settleUnownedDriveReplacement(tx, span.SessionID); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

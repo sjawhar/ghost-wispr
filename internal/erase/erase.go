@@ -19,8 +19,9 @@
 // which holds transcript text, is replaced and removed through Replace and
 // Remove.
 //
-// A file being erased is first given a hidden name beside it (.erasing-*), so
-// one cut off by the app stopping is found and finished by Leftovers. The
+// A file being erased is first given a hidden name beside it (.erasing-*),
+// and the directory is flushed, so one cut off by the app stopping, or by a
+// power loss, is found and finished by Leftovers. The
 // app runs Leftovers as it starts in every directory it records a recording
 // or an erase in (storage.RecordingDirectories).
 //
@@ -62,9 +63,10 @@ var ErrLeftover = errors.New("the old content is left under a hidden name (.eras
 // os.Remove removes it.
 func Remove(path string) error {
 	pending, err := Begin(path)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrLeftover) {
 		return err
 	}
+	// A rename Begin could not flush is flushed with the removal.
 	return pending.Finish()
 }
 
@@ -74,11 +76,15 @@ type Pending struct {
 }
 
 // Begin is the first half of Remove: it moves the file at path to a hidden
-// name beside it (.erasing-*), so path no longer names it, and returns it for
-// Finish, which a caller may run later. Until Finish is done, a stop leaves
-// the file under its hidden name for Leftovers. An error means path still
-// names the file, unchanged. A path that is not a regular file is removed as
-// os.Remove removes it, and Finish then has nothing to do.
+// name beside it (.erasing-*), so path no longer names it, flushes the
+// directory so the rename is on disk (a power loss then cannot bring the file
+// back under its name, where nothing finishes it), and returns it for Finish,
+// which a caller may run later. Until Finish is done, a stop leaves the file
+// under its hidden name for Leftovers. An error that does not wrap
+// ErrLeftover means path still names the file, unchanged; one that does
+// means the rename is done but the flush failed: the Pending returned is
+// still the file's, for Finish. A path that is not a regular file is removed
+// as os.Remove removes it, and Finish then has nothing to do.
 func Begin(path string) (Pending, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -87,14 +93,19 @@ func Begin(path string) (Pending, error) {
 	if !info.Mode().IsRegular() {
 		return Pending{}, os.Remove(path)
 	}
-	hidden, err := hiddenName(filepath.Dir(path))
+	dir := filepath.Dir(path)
+	hidden, err := hiddenName(dir)
 	if err != nil {
 		return Pending{}, err
 	}
 	if err := os.Rename(path, hidden); err != nil {
 		return Pending{}, err
 	}
-	return Pending{path: path, hidden: hidden}, nil
+	pending := Pending{path: path, hidden: hidden}
+	if err := syncDirectory(dir); err != nil {
+		return pending, fmt.Errorf("flush the rename of %s: %w: %w", path, ErrLeftover, err)
+	}
+	return pending, nil
 }
 
 // Finish is the second half of Remove: it overwrites the file Begin hid with
@@ -109,7 +120,7 @@ func (p Pending) Finish() error {
 	if errors.Is(erased, os.ErrNotExist) {
 		erased = nil
 	}
-	if err := errors.Join(syncDir(filepath.Dir(p.hidden)), erased); err != nil {
+	if err := errors.Join(syncDirectory(filepath.Dir(p.hidden)), erased); err != nil {
 		return fmt.Errorf("erase %s: %w: %w", p.path, ErrLeftover, err)
 	}
 	return nil
@@ -143,7 +154,7 @@ func Replace(from, to string) error {
 	if old == "" {
 		return nil
 	}
-	if err := errors.Join(syncDir(dir), eraseFile(old)); err != nil {
+	if err := errors.Join(syncDirectory(dir), eraseFile(old)); err != nil {
 		return fmt.Errorf("erase the file %s replaced: %w: %w", to, ErrLeftover, err)
 	}
 	return nil
@@ -262,6 +273,10 @@ func hiddenName(dir string) (string, error) {
 	}
 	return filepath.Join(dir, hiddenPrefix+hex.EncodeToString(random)), nil
 }
+
+// syncDirectory flushes a directory, so a rename or removal in it is on disk.
+// Tests replace it to see when it runs.
+var syncDirectory = syncDir
 
 func syncDir(dir string) error {
 	d, err := os.Open(dir)

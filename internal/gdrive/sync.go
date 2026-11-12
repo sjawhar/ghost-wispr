@@ -173,6 +173,17 @@ func recordingEntries(audioPath string) []string {
 	return recordings
 }
 
+// resolvedAudioPath returns audioPath with each recording it names replaced
+// by where recording.Resolve finds it: as written, else its name in
+// audioDir.
+func resolvedAudioPath(audioPath, audioDir string) string {
+	entries := recordingEntries(audioPath)
+	for i, entry := range entries {
+		entries[i] = recordingname.Resolve(entry, audioDir)
+	}
+	return strings.Join(entries, ",")
+}
+
 // notUploaded returns the recordings an audio path names that files, the
 // files built for an upload, leave out: they were missing from disk when the
 // list was built (their disk not mounted, say).

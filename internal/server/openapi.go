@@ -61,11 +61,14 @@ func OpenAPISpec() map[string]any {
 			"/healthz/ready": map[string]any{
 				"get": map[string]any{
 					"summary":     "Readiness probe",
-					"description": "Check if the service is ready to handle requests",
+					"description": "Check if the service is ready to handle requests. While capture is paused or resuming, a microphone that is closed and a Deepgram connection that is not made yet are reported as paused or resuming, not as faults: a unit that starts paused connects to Deepgram only when it resumes. Resuming lasts from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 seconds. With no Deepgram API key, Deepgram is a fault whether paused or not.",
 					"tags":        []string{"health"},
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Service is ready",
+						},
+						"503": map[string]any{
+							"description": "A component is not ready; the body names each component's state",
 						},
 					},
 				},
@@ -578,6 +581,7 @@ func OpenAPISpec() map[string]any {
 						"404": map[string]any{"description": "Session or segment not found"},
 						"409": map[string]any{"description": "Session is still recording or an earlier segment deletion is recovering"},
 						"422": map[string]any{"description": "Segment could not be found or removed cleanly"},
+						"503": map[string]any{"description": "Segment deletion is not configured, or batch transcription, which it needs, is not configured"},
 					},
 				},
 			},
@@ -798,7 +802,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), unit_only_sessions (sessions marked REMOTE_DELETED whose audio is still on this unit: their Drive folder is gone or unreadable, so the unit holds the only copy; with a warning while there are any, until a retry syncs them), and the active session",
+					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 seconds, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), unit_only_sessions (sessions marked REMOTE_DELETED whose audio is still on this unit: their Drive folder is gone or unreadable, so the unit holds the only copy; with a warning while there are any, until a retry syncs them), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

@@ -223,6 +223,33 @@ func (s *SQLiteStore) ClearDriveReplacementPending(sessionID string, generation 
 	return nil
 }
 
+// settleUnownedDriveReplacement clears, in tx, session id's pending Drive
+// replacement once its segment deletion owes Google Drive nothing, so that
+// with sync off a session no Drive folder holds is not left owing one (merge
+// and delete refused, a warning that Drive holds the words). That is so once
+// every splice of the session is done (until then the mark keeps a first
+// sync from uploading the unspliced recording), no sync holds the session (a
+// sync under way may have made a folder it has not recorded yet: its end
+// records it, oweFolderOfPendingDeletion, and settles again), the ledger
+// owes no folder at the current generation, and neither the session nor any
+// session merged into it, directly or through another merge, has a Drive
+// folder. MarkSpliceComplete, EndSync and MarkSynced call it.
+func settleUnownedDriveReplacement(tx *sql.Tx, id string) error {
+	if _, err := tx.Exec(`UPDATE sessions SET drive_replace_pending = 0, drive_replace_since = '', drive_replace_failures = 0, drive_replace_error = ''
+		WHERE id = ? AND drive_replace_pending = 1 AND sync_state != ?
+		  AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)
+		  AND NOT EXISTS (SELECT 1 FROM drive_replacement_folders WHERE drive_replacement_folders.session_id = sessions.id AND generation = sessions.deletion_generation)
+		  AND NOT EXISTS (
+			WITH RECURSIVE held(id) AS (
+				SELECT ?
+				UNION SELECT merged.id FROM sessions AS merged JOIN held ON merged.merged_into = held.id
+			) SELECT 1 FROM sessions AS folder JOIN held ON folder.id = held.id WHERE folder.gdrive_folder_id != '')`,
+		id, SyncStateSyncing, id); err != nil {
+		return fmt.Errorf("settle the Drive replacement of session %s: %w", id, err)
+	}
+	return nil
+}
+
 // OwedDriveReplacement is a session that still owes Google Drive a
 // replacement after a segment deletion: since when (its first deletion not
 // yet replaced), and how many replacement attempts failed in a row since.

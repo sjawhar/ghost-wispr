@@ -21,6 +21,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -113,6 +114,10 @@ func usableRecordingSource(source deletionRecordingSource) bool {
 
 // restoreDeletionRecordings combines the session's locally known recordings
 // with every audio file Drive has for it, restoring only missing local files.
+// Each entry of the session's audio path is read where recording.Resolve
+// finds it (as written, then in audioDir), so the recording spliced is the one
+// the app plays and syncs; one found in neither place is restored into
+// audioDir.
 func restoreDeletionRecordings(ctx context.Context, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
 	byName := make(map[string]string)
 	for _, entry := range strings.Split(session.AudioPath, ",") {
@@ -120,10 +125,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		if entry == "" {
 			continue
 		}
-		path := entry
-		if !filepath.IsAbs(path) && audioDir != "" {
-			path = filepath.Join(audioDir, filepath.Base(path))
-		}
+		path := recordingname.Resolve(entry, audioDir)
 		byName[filepath.Base(path)] = path
 	}
 	if session.GDriveFolderID != "" && usableRecordingSource(source) {
@@ -132,10 +134,10 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 			return deletionRecordingSet{}, fmt.Errorf("list Drive recordings: %w", err)
 		}
 		for _, file := range files {
-			if !strings.HasPrefix(file.MimeType, "audio/") || !strings.HasPrefix(file.Name, "audio-") {
+			name, ok := recordingname.LocalName(file.Name)
+			if !strings.HasPrefix(file.MimeType, "audio/") || !ok {
 				continue
 			}
-			name := strings.TrimPrefix(file.Name, "audio-")
 			if _, known := byName[name]; !known {
 				if strings.TrimSpace(audioDir) == "" {
 					return deletionRecordingSet{}, fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
@@ -164,7 +166,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		if source == nil || session.GDriveFolderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := source.DownloadRecording(ctx, session.GDriveFolderID, "audio-"+name, path); err != nil {
+		if err := source.DownloadRecording(ctx, session.GDriveFolderID, recordingname.FileName(path), path); err != nil {
 			return deletionRecordingSet{}, fmt.Errorf("restore recording %s: %w", name, err)
 		}
 		set.Paths = append(set.Paths, path)
@@ -511,20 +513,64 @@ func (e refinementAfterSegmentDeletionError) Error() string {
 func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
 
 // recoverPendingSplices completes recordings whose deletion transaction
-// committed before its replacement file reached disk. It returns one outcome
-// per pending span, so the caller owns the lifetime of each status warning.
+// committed before its replacement file reached disk, then refines, and
+// with it summarizes, every session whose deletion has its splice done but
+// whose refinement or summary a stop cut off (storage.DeletionsToRefine): a
+// splice found complete is not the end of the deletion, whose Drive
+// replacement waits for both. It returns one outcome per pending span and
+// per session it refines only, so the caller owns the lifetime of each
+// status warning.
 func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (outcomes []pendingSpliceOutcome, err error) {
 	spans, err := store.PendingSplices()
 	if err != nil {
 		return nil, err
 	}
 	outcomes = make([]pendingSpliceOutcome, 0, len(spans))
+	refined := make(map[string]bool)
 	for i := range spans {
 		span := spans[i]
 		recovered, recoveryErr := recoverPendingSplice(ctx, store, audioDir, source, splice, refine, &span)
 		outcomes = append(outcomes, pendingSpliceOutcome{Span: span, Recovered: recovered, Err: recoveryErr})
+		// A splice recovered here was refined with it.
+		refined[span.SessionID] = refined[span.SessionID] || recovered
+	}
+	if refine == nil {
+		return outcomes, nil
+	}
+	sessionIDs, err := store.DeletionsToRefine()
+	if err != nil {
+		return outcomes, err
+	}
+	for _, sessionID := range sessionIDs {
+		if !refined[sessionID] {
+			outcomes = append(outcomes, refineUnfinishedDeletion(ctx, store, refine, sessionID))
+		}
 	}
 	return outcomes, nil
+}
+
+// refineUnfinishedDeletion runs the refinement, and with it the summary, of
+// session sessionID, whose segment deletion has its splice done but whose
+// refinement or summary a stop cut off, as the deletion runner runs them
+// after its splice. A deletion of the session is refused while it runs, as
+// during a splice recovery; one already under way finishes first, and the
+// session is read as it left it.
+func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, refine func(context.Context, string, string, time.Time) error, sessionID string) pendingSpliceOutcome {
+	deleteLocks.setRecovering(sessionID, true)
+	defer deleteLocks.setRecovering(sessionID, false)
+	unlock := deleteLocks.lock(sessionID)
+	session, err := store.GetSession(sessionID)
+	unlock()
+	outcome := pendingSpliceOutcome{Span: storage.DeletedSpan{SessionID: sessionID, AudioPath: session.AudioPath}}
+	if err == nil {
+		err = refine(ctx, sessionID, session.AudioPath, session.StartedAt)
+	} else {
+		err = fmt.Errorf("get session %s to refine it: %w", sessionID, err)
+	}
+	if err != nil {
+		outcome.Err = refinementAfterSegmentDeletionError{sessionID: sessionID, err: err}
+	}
+	return outcome
 }
 
 func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, span *storage.DeletedSpan) (bool, error) {
@@ -668,28 +714,40 @@ func cleanupSpliceTempCopies(audioDir string) error {
 }
 
 // recordingDirectoryLister lists the directories recordings are kept or
-// erased in outside the audio directory, and forgets the erase directories
-// the startup cleanup has finished.
+// erased in outside the audio directory, forgets the erase directories the
+// startup cleanup has finished, and records the audio directory as one.
 type recordingDirectoryLister interface {
 	RecordingDirectories() ([]string, error)
 	ForgetEraseDirectories(dirs []string) error
+	RecordEraseDirectory(dir string) error
 }
 
 // cleanupRecordingDirectories runs cleanupSpliceTempCopies, as the app
 // starts, in audioDir and in every directory a session keeps a recording in
 // or a whole-file erase was started in (storage.RecordingDirectories):
 // splice copies, downloads and cut-off erasures are made beside the
-// recording they copy or erase. It then hands the directories it cleaned
-// without an error to ForgetEraseDirectories, which forgets those that were
-// there to clean.
+// recording they copy or erase. Each directory is named by its absolute path,
+// as the store lists it, so a relative audio_dir is cleaned once. It then
+// hands the directories it cleaned without an error to
+// ForgetEraseDirectories, which forgets those that were there to clean, and
+// last records audioDir as an erase directory: the recorder erases a saved
+// session's raw recording there without recording where, so an erase of it a
+// stop cuts off is still finished at a start with another audio_dir.
 func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string) error {
-	dirs := []string{filepath.Clean(audioDir)}
+	audioDir, err := filepath.Abs(audioDir)
+	if err != nil {
+		return fmt.Errorf("find the audio directory: %w", err)
+	}
+	dirs := []string{audioDir}
 	others, err := store.RecordingDirectories()
 	if err != nil {
-		return errors.Join(err, cleanupSpliceTempCopies(audioDir))
+		return errors.Join(err, cleanupSpliceTempCopies(audioDir), store.RecordEraseDirectory(audioDir))
 	}
 	for _, dir := range others {
-		if dir = filepath.Clean(dir); !slices.Contains(dirs, dir) {
+		if dir, err = filepath.Abs(dir); err != nil {
+			return fmt.Errorf("find the recording directory: %w", err)
+		}
+		if !slices.Contains(dirs, dir) {
 			dirs = append(dirs, dir)
 		}
 	}
@@ -702,7 +760,7 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 		}
 		cleaned = append(cleaned, dir)
 	}
-	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned))
+	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned), store.RecordEraseDirectory(audioDir))
 }
 
 func neighbourText(segments []transcribe.Segment, index int) (before, after string) {

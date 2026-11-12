@@ -542,8 +542,8 @@ func TestFailedSummaryDeliversAfterSecretIsFixed(t *testing.T) {
 	if err := store.EndSession("session-1", startedAt.Add(time.Minute), ""); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
-	if err := store.UpdateSummary("session-1", "Title", "Summary", storage.SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary: %v", err)
+	if err := store.UpdateSummaryAtGeneration("session-1", "Title", "Summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 	}
 
 	listener, requests := newListenerTestServer(t, "fixed-secret")

@@ -91,6 +91,49 @@ func TestBeginLeavesTheFileForFinishOrLeftovers(t *testing.T) {
 	}
 }
 
+// TestBeginFlushesTheRenameBeforeItReturns fails if Begin returns before the
+// directory holding the file is flushed after the rename to its hidden name:
+// DELETE /api/sessions/{id} answers once Begin returns, and a power loss
+// could then bring the recording back under its own name, which no row names
+// and the startup cleanup does not erase. If the flush fails, Begin's error
+// wraps ErrLeftover (the file is under its hidden name, for Finish or
+// Leftovers) and Finish still erases it.
+func TestBeginFlushesTheRenameBeforeItReturns(t *testing.T) {
+	for _, flushErr := range []error{nil, errors.New("input/output error")} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "recording.mp3")
+		held := holdOpen(t, path, []byte(secret))
+		var flushed []string
+		original := syncDirectory
+		syncDirectory = func(d string) error {
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("a flush of %s ran with the file still at its name: %v", d, err)
+			}
+			flushed = append(flushed, d)
+			if len(flushed) == 1 {
+				return flushErr
+			}
+			return nil
+		}
+		pending, err := Begin(path)
+		beganFlushes := len(flushed)
+		syncDirectory = original
+		if flushErr == nil && err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		if flushErr != nil && !errors.Is(err, ErrLeftover) {
+			t.Errorf("Begin with a failed flush = %v, want an error wrapping ErrLeftover", err)
+		}
+		if beganFlushes != 1 || flushed[0] != dir {
+			t.Fatalf("Begin flushed %v, want the directory %s once", flushed, dir)
+		}
+		if err := pending.Finish(); err != nil {
+			t.Fatalf("Finish: %v", err)
+		}
+		assertZeroed(t, held, len(secret))
+	}
+}
+
 // TestFinishAfterOrphansFinishedTheFileReportsNothing fails if Finish
 // reports a file left unerased when Orphans (the sync sweep, in the same
 // directory) zeroed and removed it first: that is a false warning, since the

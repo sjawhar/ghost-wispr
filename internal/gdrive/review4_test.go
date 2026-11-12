@@ -2,6 +2,7 @@ package gdrive
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +136,83 @@ func TestReplacementWaitsForATrashedFolderAndRunsOnceItIsBack(t *testing.T) {
 	sweepOnce(t, fixture.store, fixture.orchestrator)
 	if !sameIDs(fixture.wire.deletedIDs, fixture.oldIDs) {
 		t.Errorf("once the folder was restored, the sweep deleted %v, want the old ids %v", fixture.wire.deletedIDs, fixture.oldIDs)
+	}
+}
+
+// TestASegmentDeletionInARemoteDeletedSessionIsReplacedOnceTheFolderIsBack
+// fails if a segment deletion takes a session whose Drive folder is in the
+// trash out of REMOTE_DELETED (the status warning stops counting it as kept
+// on this unit only), or if the Drive replacement then never reaches it: the
+// sweep must wait while the folder is in the trash and replace the folder's
+// old files once it is back.
+func TestASegmentDeletionInARemoteDeletedSessionIsReplacedOnceTheFolderIsBack(t *testing.T) {
+	fixture := newReplacementFixture(t)
+	fixture.wire.allowDeletes = true
+	fixture.wire.trash(fixture.folder)
+	if marked, err := fixture.store.MarkRemoteDeleted(fixture.id, fixture.folder, "the folder is in the trash"); err != nil || !marked {
+		t.Fatalf("mark remote deleted: %v, %v", marked, err)
+	}
+	segments, err := fixture.store.GetSegments(fixture.id)
+	if err != nil || len(segments) == 0 {
+		t.Fatalf("segments: %v, %v", segments, err)
+	}
+	before, err := fileSHA256(fixture.recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.recording+".spliced", []byte("recording without the deleted phrase"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := fileSHA256(fixture.recording + ".spliced")
+	if err != nil {
+		t.Fatal(err)
+	}
+	span := storage.DeletedSpan{SessionID: fixture.id, AudioPath: fixture.recording, Start: 0, End: 1, SHA256Before: before, SHA256After: after}
+	if err := fixture.store.DeleteSegment(fixture.id, segments[0].ID, span); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	if err := os.Rename(fixture.recording+".spliced", fixture.recording); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.MarkSpliceComplete(&span); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`UPDATE sessions SET refinement_status = ?, summary_status = ? WHERE id = ?`, storage.RefinementCompleted, storage.SummaryCompleted, fixture.id); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := fixture.store.GetSession(fixture.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.SyncState != storage.SyncStateRemoteDeleted || !sess.DriveReplacePending {
+		t.Fatalf("after the deletion: state=%q pending=%v, want %q with the replacement owed", sess.SyncState, sess.DriveReplacePending, storage.SyncStateRemoteDeleted)
+	}
+	if n, err := fixture.store.CountUnitOnlySessions(); err != nil || n != 1 {
+		t.Errorf("after the deletion: CountUnitOnlySessions = %d, %v; want 1", n, err)
+	}
+
+	uploads := fixture.wire.uploads
+	sweepOnce(t, fixture.store, fixture.orchestrator)
+	if sess, err = fixture.store.GetSession(fixture.id); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.wire.uploads != uploads || len(fixture.wire.deletedIDs) != 0 || sess.SyncState != storage.SyncStateRemoteDeleted || !sess.DriveReplacePending {
+		t.Errorf("with the folder in the trash: uploaded %d, deleted %v, state=%q pending=%v; want nothing touched, %q, still owed",
+			fixture.wire.uploads-uploads, fixture.wire.deletedIDs, sess.SyncState, sess.DriveReplacePending, storage.SyncStateRemoteDeleted)
+	}
+
+	fixture.wire.mu.Lock()
+	delete(fixture.wire.trashed, fixture.folder)
+	fixture.wire.mu.Unlock()
+	sweepOnce(t, fixture.store, fixture.orchestrator)
+	if !sameIDs(fixture.wire.deletedIDs, fixture.oldIDs) {
+		t.Errorf("once the folder was back, the sweep deleted %v, want the old ids %v", fixture.wire.deletedIDs, fixture.oldIDs)
+	}
+	if sess, err = fixture.store.GetSession(fixture.id); err != nil {
+		t.Fatal(err)
+	}
+	if sess.DriveReplacePending || sess.SyncState != storage.SyncStatePending {
+		t.Errorf("after the replacement: state=%q pending=%v, want %q with nothing owed", sess.SyncState, sess.DriveReplacePending, storage.SyncStatePending)
 	}
 }
 

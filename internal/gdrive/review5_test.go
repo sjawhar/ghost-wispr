@@ -33,7 +33,7 @@ func TestReview5DeletionInAMergedSessionLeavesTheSourceFolder(t *testing.T) {
 	if _, _, err := store.Canonicalize(merged); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary(merged, "Merged", "merged summary", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(merged, "Merged", "merged summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	mergedFolder := syncedSession(t, store, o, merged)
@@ -106,7 +106,7 @@ func mergedDeletion(t *testing.T, store *storage.SQLiteStore, o *Orchestrator, s
 	if _, _, err := store.Canonicalize(merged); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary(merged, "Merged", "merged summary", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(merged, "Merged", "merged summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if syncMerged {

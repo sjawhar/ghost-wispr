@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -502,8 +503,10 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 
 	// Claim the refinement only while the session still names the recording:
 	// disk pressure may have removed it since the session ended, and it
-	// removes nothing while the refinement runs.
-	claimed, err := m.store.ClaimRefinement(sessionID, audioPath)
+	// removes nothing while the refinement runs. The result is stored only at
+	// the transcript generation claimed here, so a refinement of the
+	// recording from before a segment deletion cannot be stored.
+	generation, claimed, err := m.store.ClaimRefinement(sessionID, audioPath)
 	if err != nil {
 		m.batchLogger.Error("failed to mark refinement running", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
@@ -516,7 +519,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
 	result, err := m.transcribeRecordings(ctx, batchTranscriber, audioPath)
 	if err != nil {
-		if updateErr := m.store.UpdateRefinement(sessionID, "", storage.RefinementFailed); updateErr != nil {
+		if updateErr := m.store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
 		}
 		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
@@ -526,7 +529,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinementWithModel(sessionID, result.Transcript, storage.RefinementCompleted, result.Model); err != nil {
+	if err := m.store.UpdateRefinementAtGeneration(sessionID, result.Transcript, storage.RefinementCompleted, result.Model, generation); err != nil {
 		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}
@@ -580,6 +583,17 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	publisher := m.publisher
 	m.mu.Unlock()
 
+	// The transcript generation before the run starts. A failure before the
+	// run has read its text is recorded only at it, so once a segment
+	// deletion has changed the text, and its own run has started, this run
+	// records nothing over that one. It is read before the run starts, so a
+	// deletion between the two also makes such a failure refused.
+	startGeneration, err := m.store.DeletionGeneration(sessionID)
+	if err != nil {
+		m.logger.Error("failed to read the transcript generation", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		return
+	}
+
 	if summarizer == nil {
 		// Without a summarizer the summary completes empty, which keeps the
 		// session's summary as it is. StartEmptySummary binds it to the
@@ -595,7 +609,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 			// Terminal, so a Drive replacement waiting for this session's
 			// summary stops waiting; the sync still runs, with the canonical
 			// transcript the session already has.
-			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
+			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 			m.triggerDriveSync(syncer, sessionID)
 			return
@@ -621,7 +635,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	// Canonicalize the transcript (picks refined if available, else assembles streaming).
 	transcript, generation, err := m.store.Canonicalize(sessionID)
 	if err != nil {
-		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err))
+		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
 		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		return
 	}
@@ -644,7 +658,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
+		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
 		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
@@ -653,9 +667,15 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	storeErr := m.store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, summaryModel, generation)
+	if errors.Is(storeErr, sql.ErrNoRows) {
+		// The text changed since it was read (a segment deletion): a newer
+		// run owns the summary, so this one records no failure.
+		m.logger.Warn("discarded a stale summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID)
+		return
+	}
 	if storeErr != nil {
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
-		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr))
+		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr), generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
@@ -698,11 +718,17 @@ func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, pres
 	}
 }
 
-// failSummary records that making session sessionID's summary failed, and why
-// (reason), and announces the title and summary the session keeps: its last
-// good ones, if it has them.
-func (m *Manager) failSummary(sessionID, reason string) {
-	kept, err := m.store.FailSummary(sessionID, reason)
+// failSummary records that making session sessionID's summary from the text
+// of transcript generation generation failed, and why (reason), and announces
+// the title and summary the session keeps: its last good ones, if it has
+// them. Once the text has changed since (a segment deletion), it records
+// nothing: the newer run's status stays.
+func (m *Manager) failSummary(sessionID, reason string, generation int) {
+	kept, err := m.store.FailSummaryAtGeneration(sessionID, reason, generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		m.logger.Warn("discarded a stale failed summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID, "reason", reason)
+		return
+	}
 	if err != nil {
 		m.logger.Error("failed to record the failed summary", "operation", "generate_summary", "session_id", sessionID, "reason", reason, "error", err)
 		return

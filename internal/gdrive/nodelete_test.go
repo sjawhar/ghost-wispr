@@ -60,7 +60,7 @@ func TestResyncOfAMainEraFolderUpdatesTheDocumentsInPlace(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Merged", "The current summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Merged", "The current summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	// As the re-sync migration leaves it: pending, its folder kept.
@@ -593,7 +593,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
@@ -614,7 +614,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 		if !fired.CompareAndSwap(false, true) {
 			return
 		}
-		if err := store.UpdateSummary(id, "", "The summary, made again.", storage.SummaryCompleted, "default", "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "", "The summary, made again.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 			t.Errorf("summarize again: %v", err)
 		}
 		if err := o.SyncSession(ctx, id); err != nil {

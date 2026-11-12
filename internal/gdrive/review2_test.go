@@ -33,7 +33,7 @@ func round2Session(t *testing.T, store *storage.SQLiteStore, id string, texts []
 	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary(id, "Standup", "summary", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := store.GetSegments(id)

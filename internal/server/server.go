@@ -31,6 +31,10 @@ var (
 	ErrSegmentNotRemovedCleanly = errors.New("segment could not be removed cleanly")
 	// ErrSegmentRawAudioKept means a recoverable raw recording still holds the audio.
 	ErrSegmentRawAudioKept = errors.New("a kept raw recording prevents segment deletion")
+	// ErrBatchTranscriptionNotConfigured is what DeleteSegment wraps when no
+	// batch transcription is configured: a deletion finds the segment in the
+	// recording by the words batch transcription times.
+	ErrBatchTranscriptionNotConfigured = errors.New("batch transcription is not configured")
 )
 
 // The modes a segment deletion takes (DELETE

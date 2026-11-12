@@ -89,7 +89,7 @@ func TestDeleteTextUpdatesTheDriveDocumentsInPlace(t *testing.T) {
 			store := openStore(t)
 			const id = "20261112090000"
 			recording, _ := round2Session(t, store, id, []string{"alpha stays.", textSecret + ".", "charlie stays."})
-			if err := store.UpdateSummary(id, "Standup", "The summary names the "+textSecret+".", storage.SummaryCompleted, "default", "{}"); err != nil {
+			if err := store.UpdateSummaryAtGeneration(id, "Standup", "The summary names the "+textSecret+".", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 				t.Fatal(err)
 			}
 			wire, syncer := newWireDrive(t)
@@ -152,7 +152,7 @@ func TestDeleteTextUpdatesTheDriveDocumentsInPlace(t *testing.T) {
 func TestDeleteTextUpdatesMergedSourceFoldersInPlace(t *testing.T) {
 	store := openStore(t)
 	recA, _ := round2Session(t, store, "20261112080000", []string{"alpha stays.", textSecret + "."})
-	if err := store.UpdateSummary("20261112080000", "Standup", "The summary names the "+textSecret+".", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("20261112080000", "Standup", "The summary names the "+textSecret+".", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = round2Session(t, store, "20261112083000", []string{"charlie stays."})
@@ -172,7 +172,7 @@ func TestDeleteTextUpdatesMergedSourceFoldersInPlace(t *testing.T) {
 	if _, _, err := store.Canonicalize(merged); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary(merged, "Merged", "merged summary", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(merged, "Merged", "merged summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	mergedFolder := syncedSession(t, store, o, merged)
