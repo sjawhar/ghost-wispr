@@ -108,6 +108,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		SET title = '',
 			summary = '',
 			summary_model = '',
+			speaker_names = '{}',
 			refined_transcript = '',
 			refinement_model = '',
 			refinement_status = ?,
@@ -253,10 +254,11 @@ var postDeleteMaintenance = func(db *sql.DB, walPath string) error {
 // (holders: the recorded session it came from, and each merged session
 // between that one and sessionID). A merge moves its sources' segments to
 // the merged session and leaves each source row (status merged) with the
-// text it had: its title, summary, canonical and refined transcripts. A
-// source's canonical transcript is rebuilt from the merged session's
-// remaining segments that came from it; its title, summary and refined
-// transcript, which cannot be rebuilt without the words, are cleared. The
+// text it had: its title, summary, speaker names, canonical and refined
+// transcripts. A source's canonical transcript is rebuilt from the merged
+// session's remaining segments that came from it; its title, summary,
+// speaker names and refined transcript, which cannot be rebuilt without the
+// words, are cleared. The
 // full-text index is rebuilt from these rows in the same transaction.
 //
 // A segment does not record the session it was recorded in, so it is
@@ -318,7 +320,7 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 	}
 	for _, id := range sources {
 		if _, err := tx.Exec(`UPDATE sessions
-			SET title = '', summary = '', summary_model = '', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?
+			SET title = '', summary = '', summary_model = '', speaker_names = '{}', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?
 			WHERE id = ?`, canonicalTranscript(own[id]), TranscriptSourceStreaming, id); err != nil {
 			return nil, nil, fmt.Errorf("scrub merged source %s: %w", id, err)
 		}

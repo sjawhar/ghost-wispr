@@ -225,10 +225,10 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	if err != nil {
 		return err
 	}
-	for _, column := range []string{"title", "summary", "refined_transcript"} {
-		if sessions[column] {
-			if _, err := tx.Exec(`UPDATE sessions SET `+column+` = '' WHERE id IN (`+placeholders+`)`, args...); err != nil {
-				return fmt.Errorf("clear backup sessions %s: %w", column, err)
+	for _, column := range []struct{ name, empty string }{{"title", ""}, {"summary", ""}, {"speaker_names", "{}"}, {"refined_transcript", ""}} {
+		if sessions[column.name] {
+			if _, err := tx.Exec(`UPDATE sessions SET `+column.name+` = ? WHERE id IN (`+placeholders+`)`, append([]any{column.empty}, args...)...); err != nil {
+				return fmt.Errorf("clear backup sessions %s: %w", column.name, err)
 			}
 		}
 	}
