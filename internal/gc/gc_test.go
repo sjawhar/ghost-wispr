@@ -28,6 +28,9 @@ type mockStore struct {
 	// onRecordEraseDirectory, when set, runs as an erase directory is
 	// recorded.
 	onRecordEraseDirectory func(dir string)
+	// recordEraseErr, when set, is the error recording an erase directory
+	// returns.
+	recordEraseErr error
 }
 
 func (m *mockStore) RecordEraseDirectory(dir string) error {
@@ -35,7 +38,7 @@ func (m *mockStore) RecordEraseDirectory(dir string) error {
 	if m.onRecordEraseDirectory != nil {
 		m.onRecordEraseDirectory(dir)
 	}
-	return nil
+	return m.recordEraseErr
 }
 
 // The mock serves age-based retention only; disk pressure runs against the
@@ -336,6 +339,28 @@ func TestGCRecordsWhereItErasesBeforeItErases(t *testing.T) {
 			t.Errorf("recorded erase directory %s, want the audio directory %s", recorded, dir)
 		}
 	}
+}
+
+// TestGCAgeChangesNothingWhenItCannotRecordWhereItErases fails if GC deletes
+// a session by age, or erases its recording, when it could not record the
+// recording's directory first: an erase a stop then cuts off, its row gone,
+// would never be finished as the app starts.
+func TestGCAgeChangesNothingWhenItCannotRecordWhereItErases(t *testing.T) {
+	dir := t.TempDir()
+	recording := filepath.Join(dir, "20261106140930.wav")
+	if err := os.WriteFile(recording, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &mockStore{
+		sessions:       map[string]storage.Session{"20261106140930": {ID: "20261106140930", Status: storage.SessionEnded, AudioPath: recording, GDriveFolderID: "folder"}},
+		gcEligible:     map[int][]string{30: {"20261106140930"}},
+		recordEraseErr: errors.New("database is locked"),
+	}
+	deleted, _ := New(store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}).Run()
+	if len(deleted) != 0 || len(store.deletedIDs) != 0 {
+		t.Errorf("deleted %v (store: %v) with its erase directory unrecorded, want the session kept", deleted, store.deletedIDs)
+	}
+	expectKept(t, recording)
 }
 
 // A raw .pcm whose session's saved recording is gone from disk is not a
@@ -894,6 +919,33 @@ func TestGCRemovesNoFileItCannotRecord(t *testing.T) {
 	}
 	expectAudioKept(t, store, "20261106100000", saved)
 	expectNoSessionNamesAMissingFile(t, store, "20261106100000")
+}
+
+// recordFailsStore is the real store whose records of an erase directory
+// fail, as a locked or full database's do.
+type recordFailsStore struct{ *storage.SQLiteStore }
+
+func (recordFailsStore) RecordEraseDirectory(string) error {
+	return errors.New("database is locked")
+}
+
+// TestGCDiskPressureRemovesNoFileWhoseDirectoryItCannotRecord fails if disk
+// pressure takes a recording out of its session's row, or erases it, when it
+// could not record the recording's directory first: an erase a stop then cuts
+// off, no row naming the file, would never be finished as the app starts.
+func TestGCDiskPressureRemovesNoFileWhoseDirectoryItCannotRecord(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	const id = "20261106100000"
+	saved := endWithRecording(t, store, dir, id, time.Now().UTC().Add(-time.Hour), 2*1024*1024)
+	raw := writeRaw(t, dir, id, 1024, time.Now())
+	runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1) // marks the fixture synced; no budget, no removal
+
+	if _, err := New(recordFailsStore{store}, Config{MaxAgeDays: 30, MaxAudioSizeMB: 1, AudioDir: dir, Drive: &driveFolders{}}).Run(); err != nil {
+		t.Fatalf("gc run: %v", err)
+	}
+	expectAudioKept(t, store, id, saved)
+	expectKept(t, raw)
 }
 
 // Review note 2: removing a merged session's audio left its source sessions

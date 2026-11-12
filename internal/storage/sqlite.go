@@ -19,6 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	gwstatus "github.com/sjawhar/ghost-wispr/internal/status"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -2357,8 +2358,12 @@ const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXIST
 // DeleteSession deletes session id, refusing one that owes Google Drive a
 // replacement (ErrDeleteReplacementPending), and returns the audio_path the
 // deleted row had: the recordings the caller then erases are the ones the
-// row named when it went, not ones it read before.
-func (s *SQLiteStore) DeleteSession(id string) (string, error) {
+// row named when it went, not ones it read before. In the same transaction,
+// before the row goes, it records the directory of each of those
+// recordings, found where recording.Resolve finds it in audioDir (the one
+// the caller then erases), so an erase a stop cuts off is finished as the
+// app starts; it deletes nothing if it cannot record one.
+func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", fmt.Errorf("begin deleting session %s: %w", id, err)
@@ -2378,6 +2383,14 @@ func (s *SQLiteStore) DeleteSession(id string) (string, error) {
 		}
 	case err != nil:
 		return "", fmt.Errorf("read session %s to delete it: %w", id, err)
+	}
+	for _, entry := range strings.Split(audioPath, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {
+			return "", fmt.Errorf("delete session %s: %w", id, err)
+		}
 	}
 	if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
 		return "", fmt.Errorf("delete session %s: %w", id, err)

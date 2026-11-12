@@ -428,6 +428,17 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 // named the file may be gone: the startup cleanup still reaches dir. A
 // directory that is not there holds nothing to erase and is not recorded.
 func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
+	return recordEraseDirectory(s.db, dir)
+}
+
+// execer is what writing a row needs: the database, or a transaction.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// recordEraseDirectory is RecordEraseDirectory in q: DeleteSession records
+// in the transaction that deletes the row.
+func recordEraseDirectory(q execer, dir string) error {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return fmt.Errorf("find the erase directory %s: %w", dir, err)
@@ -439,7 +450,7 @@ func (s *SQLiteStore) RecordEraseDirectory(dir string) error {
 	if err != nil {
 		return fmt.Errorf("stat erase directory %s: %w", dir, err)
 	}
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO erase_directories(path, device) VALUES(?, ?)`, dir, fileSystemOf(info)); err != nil {
+	if _, err := q.Exec(`INSERT OR IGNORE INTO erase_directories(path, device) VALUES(?, ?)`, dir, fileSystemOf(info)); err != nil {
 		return fmt.Errorf("record erase directory %s: %w", dir, err)
 	}
 	return nil

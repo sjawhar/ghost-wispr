@@ -20,12 +20,59 @@ func TestDeleteSessionReturnsTheAudioPathItDeleted(t *testing.T) {
 	if err := store.EndSession("gone", started.Add(time.Minute), "data/audio/gone.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	audioPath, err := store.DeleteSession("gone")
+	audioPath, err := store.DeleteSession("gone", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if audioPath != "data/audio/gone.mp3" {
 		t.Errorf("DeleteSession returned %q, want the deleted row's audio_path", audioPath)
+	}
+}
+
+// TestDeleteSessionRecordsWhereItsRecordingsAreErasedFirst fails if
+// DeleteSession deletes a session's row without first recording the
+// directory of each recording it named, found where recording.Resolve finds
+// it (as written, else in the audio directory), or deletes the row when it
+// cannot record one: an erase of the recording a stop cut off after the row
+// went would then never be finished as the app starts.
+func TestDeleteSessionRecordsWhereItsRecordingsAreErasedFirst(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+	end := func(id, audioPath string) {
+		t.Helper()
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	elsewhere, audioDir := t.TempDir(), t.TempDir()
+	for _, path := range []string{filepath.Join(elsewhere, "gone.mp3"), filepath.Join(audioDir, "moved.mp3")} {
+		if err := os.WriteFile(path, []byte("audio"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	end("gone", filepath.Join(elsewhere, "gone.mp3")+","+filepath.Join(t.TempDir(), "missing", "moved.mp3"))
+	if _, err := store.DeleteSession("gone", audioDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{elsewhere, audioDir} {
+		if n := eraseDirectoryRows(t, store, dir); n != 1 {
+			t.Errorf("%d rows of %s after the session went, want its erase directory recorded", n, dir)
+		}
+	}
+
+	notADirectory := filepath.Join(t.TempDir(), "a-file")
+	if err := os.WriteFile(notADirectory, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	end("kept", filepath.Join(notADirectory, "sub", "kept.mp3"))
+	if _, err := store.DeleteSession("kept", audioDir); err == nil {
+		t.Error("DeleteSession deleted a session whose recording's directory it could not record")
+	}
+	if _, err := store.GetSession("kept"); err != nil {
+		t.Errorf("the session is gone though its erase directory was not recorded: %v", err)
 	}
 }
 

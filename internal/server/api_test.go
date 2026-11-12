@@ -43,8 +43,9 @@ type apiStoreStub struct {
 	getEventsSinceFunc func(cursor int64, limit int) ([]storage.StoredEvent, error)
 	// deletedAudioPath, when set, is the audio_path DeleteSession reports the
 	// deleted row had, in place of the one GetSession showed.
-	deletedAudioPath     string
-	recordEraseDirectory func(dir string) error
+	deletedAudioPath string
+	// deleteAudioDir is the audio directory the last DeleteSession was given.
+	deleteAudioDir string
 }
 
 type embeddingClientStub struct {
@@ -168,23 +169,17 @@ func (s *apiStoreStub) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
-func (s *apiStoreStub) DeleteSession(id string) (string, error) {
+func (s *apiStoreStub) DeleteSession(id, audioDir string) (string, error) {
 	sess, ok := s.sessions[id]
 	if !ok {
 		return "", os.ErrNotExist
 	}
+	s.deleteAudioDir = audioDir
 	delete(s.sessions, id)
 	if s.deletedAudioPath != "" {
 		return s.deletedAudioPath, nil
 	}
 	return sess.AudioPath, nil
-}
-
-func (s *apiStoreStub) RecordEraseDirectory(dir string) error {
-	if s.recordEraseDirectory != nil {
-		return s.recordEraseDirectory(dir)
-	}
-	return nil
 }
 
 func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
@@ -536,9 +531,8 @@ func deleteSessionWithRecording(t *testing.T, audio []byte, finish func(string, 
 
 // TestDeleteSession_ErasesWhatTheDeletedRowNamed fails if the session delete
 // erases the recordings it read before the delete rather than those the row
-// named when it went, or begins an erase before recording the recording's
-// directory (an erase a stop cuts off would then not be found as the app
-// starts).
+// named when it went. (DeleteSession records their directories before the
+// row goes: storage.TestDeleteSessionRecordsWhereItsRecordingsAreErasedFirst.)
 func TestDeleteSession_ErasesWhatTheDeletedRowNamed(t *testing.T) {
 	dir := t.TempDir()
 	read, deleted := filepath.Join(dir, "read.mp3"), filepath.Join(dir, "deleted.mp3")
@@ -554,19 +548,11 @@ func TestDeleteSession_ErasesWhatTheDeletedRowNamed(t *testing.T) {
 		defer close(finished)
 		finish(sessionID, pending)
 	}
-	var recorded []string
 	store := &apiStoreStub{
 		sessionsByDate:   map[string][]storage.Session{},
 		sessions:         map[string]storage.Session{"s1": {ID: "s1", AudioPath: read}},
 		segments:         map[string][]transcribe.Segment{},
 		deletedAudioPath: deleted,
-		recordEraseDirectory: func(recordedDir string) error {
-			recorded = append(recorded, recordedDir)
-			if _, err := os.Stat(deleted); err != nil {
-				t.Errorf("the recording was moved before its directory was recorded: %v", err)
-			}
-			return nil
-		},
 	}
 	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
 	if err != nil {
@@ -588,9 +574,6 @@ func TestDeleteSession_ErasesWhatTheDeletedRowNamed(t *testing.T) {
 	if _, err := os.Stat(read); err != nil {
 		t.Errorf("the recording read before the delete was erased: %v", err)
 	}
-	if !slices.Equal(recorded, []string{dir}) {
-		t.Errorf("recorded erase directories %v, want %s", recorded, dir)
-	}
 }
 
 // configStoreWithAudioDir is a config store whose audio_dir is dir.
@@ -607,7 +590,8 @@ func configStoreWithAudioDir(t *testing.T, dir string) *config.Store {
 // delete erases only the recording where the row's entry points: after
 // audio_dir changes and the recordings move with it, the recording is in the
 // new audio directory (recording.Resolve), and it would stay on the unit,
-// named by no row.
+// named by no row. It also fails if DeleteSession, which records the
+// directories it is erased in, is not given that audio directory.
 func TestDeleteSession_ErasesARecordingMovedWithTheAudioDir(t *testing.T) {
 	oldDir, newDir := t.TempDir(), t.TempDir()
 	moved := filepath.Join(newDir, "s1.mp3")
@@ -621,15 +605,10 @@ func TestDeleteSession_ErasesARecordingMovedWithTheAudioDir(t *testing.T) {
 		defer close(finished)
 		finish(sessionID, pending)
 	}
-	var recorded []string
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: filepath.Join(oldDir, "s1.mp3")}},
 		segments:       map[string][]transcribe.Segment{},
-		recordEraseDirectory: func(dir string) error {
-			recorded = append(recorded, dir)
-			return nil
-		},
 	}
 	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, newDir))
 	if err != nil {
@@ -648,8 +627,8 @@ func TestDeleteSession_ErasesARecordingMovedWithTheAudioDir(t *testing.T) {
 	if _, err := os.Stat(moved); !os.IsNotExist(err) {
 		t.Errorf("the recording moved with the audio directory is still there: %v", err)
 	}
-	if !slices.Equal(recorded, []string{newDir}) {
-		t.Errorf("recorded erase directories %v, want %s", recorded, newDir)
+	if store.deleteAudioDir != newDir {
+		t.Errorf("DeleteSession was given audio directory %q, want %s", store.deleteAudioDir, newDir)
 	}
 }
 

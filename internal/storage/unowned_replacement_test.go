@@ -55,7 +55,7 @@ func TestASegmentDeletionWithNoDriveFolderOwesDriveNothingOnceSpliced(t *testing
 	if owed, err := store.OwedDriveReplacements(); err != nil || len(owed) != 0 {
 		t.Errorf("owed Drive replacements = %+v, %v; want none", owed, err)
 	}
-	if _, err := store.DeleteSession("unsynced"); err != nil {
+	if _, err := store.DeleteSession("unsynced", ""); err != nil {
 		t.Errorf("DeleteSession after the spliced deletion: %v, want the session deleted", err)
 	}
 }

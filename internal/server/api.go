@@ -42,11 +42,10 @@ type SessionStore interface {
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
 	// DeleteSession deletes the session and returns the audio_path its row
-	// had when it went.
-	DeleteSession(id string) (string, error)
-	// RecordEraseDirectory records a directory before a whole-file erase in
-	// it begins, so the app finishes one a stop cut off as it starts again.
-	RecordEraseDirectory(dir string) error
+	// had when it went. It first records the directory of each recording the
+	// row names, found as recording.Resolve finds it in audioDir, and
+	// deletes nothing if it cannot.
+	DeleteSession(id, audioDir string) (string, error)
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
@@ -810,7 +809,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		audioPath, err := store.DeleteSession(sessionID)
+		recordingDir := audioDir()
+		audioPath, err := store.DeleteSession(sessionID, recordingDir)
 		if err != nil {
 			if errors.Is(err, storage.ErrDeleteReplacementPending) {
 				writeJSONError(w, http.StatusConflict, err.Error())
@@ -828,20 +828,18 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// before the file system frees its blocks (Sami, 2026-11-12, "Zero
 		// every audio removal",
 		// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
-		// Each one's directory, named as the erase names it, is recorded
-		// first, so an erase cut off by a stop is finished as the app starts.
-		// Each recording is erased where recording.Resolve finds it, as the
-		// app plays and syncs it. The files leave their names before the
-		// answer; the zeros, a write as large as the recordings, follow it.
+		// DeleteSession recorded each one's directory before the row went,
+		// so an erase cut off by a stop is finished as the app starts. Each
+		// recording is erased where recording.Resolve finds it, as the app
+		// plays and syncs it, and as DeleteSession recorded it. The files
+		// leave their names before the answer; the zeros, a write as large
+		// as the recordings, follow it.
 		var pending []erase.Pending
 		for _, p := range strings.Split(audioPath, ",") {
 			if p = strings.TrimSpace(p); p == "" {
 				continue
 			}
-			p = recordingname.Resolve(p, audioDir())
-			if err := store.RecordEraseDirectory(filepath.Dir(p)); err != nil {
-				slog.Warn("could not record where a deleted session's recording is erased; a stop during the erase would leave it", "session_id", sessionID, "audio_path", p, "error", err)
-			}
+			p = recordingname.Resolve(p, recordingDir)
 			hidden, err := erase.Begin(p)
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) {

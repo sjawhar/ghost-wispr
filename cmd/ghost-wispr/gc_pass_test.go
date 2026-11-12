@@ -260,7 +260,7 @@ func TestGCPassPrunesRecordingMismatchWarningsForSessionsGCWillNeverCheckAgain(t
 		{
 			name: "deleted",
 			end: func(store *storage.SQLiteStore, id string) error {
-				_, err := store.DeleteSession(id)
+				_, err := store.DeleteSession(id, "")
 				return err
 			},
 		},

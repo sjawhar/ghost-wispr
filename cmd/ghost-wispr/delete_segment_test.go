@@ -300,7 +300,7 @@ func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	store, _, _ := newDeletionTestStore(t, recording)
-	if _, err := store.DeleteSession("session"); err != nil {
+	if _, err := store.DeleteSession("session", audioDir); err != nil {
 		t.Fatal(err)
 	}
 	// The route recorded the recording's directory, moved the recording to

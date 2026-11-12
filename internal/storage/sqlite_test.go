@@ -1586,7 +1586,7 @@ func TestDeleteSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := store.DeleteSession(sessionID); err != nil {
+	if _, err := store.DeleteSession(sessionID, ""); err != nil {
 		t.Fatalf("delete session: %v", err)
 	}
 
@@ -1603,7 +1603,7 @@ func TestDeleteSession(t *testing.T) {
 		t.Fatalf("expected 0 segments, got %d", len(segs))
 	}
 
-	_, err = store.DeleteSession("nonexistent")
+	_, err = store.DeleteSession("nonexistent", "")
 	if err == nil {
 		t.Fatal("expected error deleting nonexistent session")
 	}
@@ -2094,7 +2094,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected one updated match for fts-sync, got %+v", results)
 	}
 
-	if _, err := store.DeleteSession("fts-sync"); err != nil {
+	if _, err := store.DeleteSession("fts-sync", ""); err != nil {
 		t.Fatalf("delete session: %v", err)
 	}
 
