@@ -940,6 +940,28 @@ func TestClaimRefinement(t *testing.T) {
 	}
 }
 
+// A claimed refinement drops the refinement before it, its model included,
+// so a running, failed or refused refinement never carries the name of a
+// model whose text is gone.
+func TestClaimRefinementClearsTheRefinementModel(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	const id = "20261106140000"
+	endedWith(t, store, id, "/audio/a.mp3", RefinementPending)
+	if err := store.UpdateRefinementAtGeneration(id, "The refined transcript.", RefinementCompleted, "nova-3", 0); err != nil {
+		t.Fatalf("store a refinement: %v", err)
+	}
+	if _, claimed, err := store.ClaimRefinement(id, "/audio/a.mp3"); err != nil || !claimed {
+		t.Fatalf("ClaimRefinement = %v, %v; want claimed", claimed, err)
+	}
+	sess, err := store.GetSession(id)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.RefinedTranscript != "" || sess.RefinementModel != "" {
+		t.Errorf("claimed refinement keeps transcript %q from model %q; want neither", sess.RefinedTranscript, sess.RefinementModel)
+	}
+}
+
 // DeleteEndedSession deletes a session for the age policy only while it is as
 // GC read it: ended, synced, and naming that audio path. A session merged
 // since gave its recording to the merged session, which keeps both.
