@@ -313,6 +313,25 @@ frees that audio, so clear each such session one of two ways:
   "Delete from this unit; this unit holds the only copy" control, or
   `DELETE /api/sessions/{id}`. That deletes the session and its audio from the Pi for good.
 
+If a segment of the session was deleted, that delete can answer 409 "delete session ID: this
+session still has a deleted segment on Google Drive; delete it after its Drive files are
+replaced". The segment deletion still owes the session's Drive folder new files without the
+deleted words, and a folder in the Drive trash still holds the old ones. The sync sweep retries
+the replacement every 5 minutes while Drive sync is on, but it cannot reach a folder in the
+trash. To clear it:
+
+1. In Google Drive, open the trash, find the session's folder (named for the session's date and
+   title) and choose "Delete forever". If the folder should be on Drive after all, restore it
+   instead: the sweeps then replace its files and sync the session, with no retry needed.
+2. Wait for the next sweep (up to 5 minutes). It finds the folder gone, and the segment deletion
+   owes nothing more. With `id` set to the session ID the 409 names, this prints `false`:
+
+   ```bash
+   ssh ghost-wispr@ghost-wispr "curl -fsS http://127.0.0.1:8080/api/sessions/$id | jq .session.drive_replace_pending"
+   ```
+
+3. Delete the session from the unit again.
+
 The warning goes once no such session is left. The count is read again at each status request.
 
 ## Accept slice 1
@@ -361,7 +380,10 @@ its certificate config in a private temporary directory, point the copied certif
 at the certificate that expires in 10 days, and use a copied YAML that sets its
 `google_credentials_file`, separate `db_path` and `audio_dir`, and disables Drive sync, GC,
 Envoy, speaker, indicator light, and power button. Before starting it, seed its
-separate database as paused. This prevents the test instance from opening the microphone:
+separate database as paused. A paused instance opens the microphone, and connects to Deepgram,
+only when someone resumes it, so the test instance does not hold the recorder's microphone; do
+not resume it. PortAudio still checks the audio devices once as the app starts. Seed and start
+it like this:
 
 ```bash
 GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \

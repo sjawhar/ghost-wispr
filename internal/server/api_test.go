@@ -208,6 +208,7 @@ func (s *apiStoreStub) GetSessionsForBackfill() ([]string, error) {
 
 type healthCheckerStub struct{}
 
+func (h *healthCheckerStub) IsDeepgramConfigured() bool           { return true }
 func (h *healthCheckerStub) IsDeepgramConnected() bool            { return true }
 func (h *healthCheckerStub) IsDBHealthy(ctx context.Context) bool { return true }
 func (h *healthCheckerStub) IsMicOpen() bool                      { return true }
@@ -824,6 +825,15 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			},
 			wantCode:  http.StatusUnprocessableEntity,
 			wantError: "s1.pcm",
+		},
+		{
+			name:    "no batch transcription",
+			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook: func(context.Context, string, int64) error {
+				return fmt.Errorf("%w: deepgram API key not configured", ErrBatchTranscriptionNotConfigured)
+			},
+			wantCode:  http.StatusServiceUnavailable,
+			wantError: "Segment deletion needs batch transcription, which is not configured: add a Deepgram API key.",
 		},
 		{
 			name:    "active",

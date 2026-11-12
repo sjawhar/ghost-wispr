@@ -202,11 +202,15 @@ func normalizeRepairSpeakers(speakers map[string]repairSpeakerMetadata) map[stri
 	return normalized
 }
 
+// errDeepgramKeyMissing is why the default batch transcription, Deepgram's,
+// cannot run: no Deepgram API key is configured.
+var errDeepgramKeyMissing = errors.New("deepgram API key not configured")
+
 func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.BatchTranscription.Provider)) {
 	case "", "deepgram":
 		if strings.TrimSpace(cfg.DeepgramAPIKey) == "" {
-			return nil, fmt.Errorf("deepgram API key not configured")
+			return nil, errDeepgramKeyMissing
 		}
 		return transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{
 			APIKey: cfg.DeepgramAPIKey,
@@ -217,6 +221,25 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 	default:
 		return nil, fmt.Errorf("unsupported batch transcription provider %q", cfg.BatchTranscription.Provider)
 	}
+}
+
+// segmentDeletionTranscriber returns the batch transcriber a segment deletion
+// under cfg finds the segment's words with. With no Deepgram API key, its
+// error wraps server.ErrBatchTranscriptionNotConfigured, which the API
+// answers with what to configure.
+func segmentDeletionTranscriber(cfg *config.Config) (transcribe.BatchWordsTranscriber, error) {
+	batch, err := makeBatchTranscriber(cfg)
+	if errors.Is(err, errDeepgramKeyMissing) {
+		return nil, fmt.Errorf("%w: %w", server.ErrBatchTranscriptionNotConfigured, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("configure batch transcription for deletion: %w", err)
+	}
+	wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
+	if !ok {
+		return nil, fmt.Errorf("configured batch transcription does not return word timestamps")
+	}
+	return wordTranscriber, nil
 }
 
 type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
@@ -235,10 +258,26 @@ func (p *resilientClientProxy) IsConnected() bool {
 	return client != nil && client.IsConnected()
 }
 
+// micRetryEvery is how long the microphone start-up waits before it tries
+// again, after an attempt failed or PortAudio failed to initialize.
+const micRetryEvery = 15 * time.Second
+
+// resumeWaiter is the part of the capture gate a microphone start waits on:
+// waitResumed blocks until the gate is open, and finishResume ends a resume's
+// "resuming" state once the start that brings capture back has finished.
+type resumeWaiter interface {
+	waitResumed(ctx context.Context) bool
+	finishResume()
+}
+
+// retryMicStartup runs start every retryInterval until it succeeds or ctx
+// ends. A paused instance opens no input device: a retry that comes due
+// while capture is paused waits (capture.waitResumed) until capture resumes.
 func retryMicStartup(
 	ctx context.Context,
 	retryInterval time.Duration,
 	after func(time.Duration) <-chan time.Time,
+	capture resumeWaiter,
 	onRetry func(),
 	start func() error,
 	onError func(error),
@@ -254,6 +293,9 @@ func retryMicStartup(
 			return
 		case <-after(retryInterval):
 		}
+		if !capture.waitResumed(ctx) {
+			return
+		}
 
 		if onRetry != nil {
 			onRetry()
@@ -265,7 +307,10 @@ func retryMicStartup(
 			return
 		}
 
+		// The attempt, whether it works or not, ends a resume's "resuming"
+		// state: readiness then reports what came back.
 		err := start()
+		capture.finishResume()
 		if err != nil {
 			if onError != nil {
 				onError(err)
@@ -278,6 +323,50 @@ func retryMicStartup(
 		}
 		return
 	}
+}
+
+// startMicrophone opens the input device and starts capture with start, and
+// runs retry in loops if start fails or PortAudio is not ready. A paused
+// instance opens no input device until it resumes: while the capture gate is
+// closed, start runs in loops once the gate opens, with atBoot false, and
+// startMicrophone returns deferred true; that start, whether it works or not,
+// ends the resume's "resuming" state (finishResume). Otherwise start runs at
+// once with atBoot true, so it can write the start-up status.
+//
+// Nothing runs in loops before booted closes, once start-up has sent its
+// component statuses: a power-button resume can come during start-up, and
+// the statuses its start sends (microphone and Deepgram connected) must not be
+// followed by the start-up ones (paused), which would then stand for every
+// page that connects later.
+func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, booted <-chan struct{}, portAudioReady bool, start func(atBoot bool) error, retry func()) (deferred bool) {
+	afterBoot := func(run func()) {
+		loops.Go(func() {
+			select {
+			case <-booted:
+				run()
+			case <-ctx.Done():
+			}
+		})
+	}
+	if capture.isClosed() {
+		afterBoot(func() {
+			if !capture.waitResumed(ctx) {
+				return
+			}
+			started := portAudioReady && start(false) == nil
+			capture.finishResume()
+			if started {
+				return
+			}
+			retry()
+		})
+		return true
+	}
+	if portAudioReady && start(true) == nil {
+		return false
+	}
+	afterBoot(retry)
+	return false
 }
 
 type transcriptCallback struct {
@@ -898,13 +987,9 @@ func main() {
 				return err
 			}
 			latestCfg := cfgStore.Get()
-			batch, err := makeBatchTranscriber(&latestCfg)
+			wordTranscriber, err := segmentDeletionTranscriber(&latestCfg)
 			if err != nil {
-				return fmt.Errorf("configure batch transcription for deletion: %w", err)
-			}
-			wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
-			if !ok {
-				return fmt.Errorf("configured batch transcription does not return word timestamps")
+				return err
 			}
 			runner := segmentDeleteRunner{
 				store:       store,
@@ -1426,32 +1511,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}()
 
-	if cfg.GCEnabled {
-		go func() {
-			ticker := time.NewTicker(1 * time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					latestCfg := cfgStore.Get()
-					if !latestCfg.GCEnabled {
-						// GC off holds nothing back.
-						gcHealthState.record(nil, latestCfg.AudioDir, time.Now())
-						continue
-					}
-					deleted, err := runGCPass(store, &latestCfg, drive.Get(), gcHealthState, warningRegistry, appLogger)
-					if err != nil {
-						log.Printf("gc error: %v", err)
-					} else if len(deleted) > 0 {
-						log.Printf("gc: deleted %d sessions", len(deleted))
-					}
-				}
-			}
-		}()
-	}
-
 	var dgStop func()
 	if cfg.DeepgramAPIKey != "" {
 		controlHooks.FaultDeepgramDisconnect = func() error {
@@ -1504,8 +1563,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if mic == nil {
+			warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 			if updateStartupState {
-				warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 			}
 			return fmt.Errorf("microphone unavailable")
@@ -1515,10 +1574,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
-		if err := startMicIfUnpaused(capture, mic.Start); err != nil {
-			micRef.Store(nil)
+		if err := startOpenedMic(capture, mic, func() { micRef.Store(nil) }, log.Printf); err != nil {
+			warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
 			if updateStartupState {
-				warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
 				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
 			}
 			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
@@ -1572,8 +1630,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		initialClient, err := factory(ctx)
 		if err != nil {
 			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
-			if updateStartupState {
-				warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
+			warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
+			if !updateStartupState && hub != nil {
+				hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusError, "Deepgram initialization failed")
 			}
 			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
 			return nil
@@ -1581,16 +1640,56 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 		candidateResilient.Client = initialClient
 		resilientRef.Store(candidateResilient)
+		if !updateStartupState && hub != nil {
+			// A resilient client starts connected and reports only changes.
+			hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusConnected, "Deepgram connected")
+		}
 
 		startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub)
 		return nil
 	}
 
-	shouldRetryMicStartup := paInitFailed
-	if !paInitFailed {
-		if err := startMicPipeline(true); err != nil {
+	retryMic := func() {
+		retryMicStartup(
+			ctx,
+			micRetryEvery,
+			time.After,
+			capture,
+			func() {
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
+				}
+			},
+			func() error {
+				if err := audio.ReinitPortAudio(); err != nil {
+					return err
+				}
+				return startMicPipeline(false)
+			},
+			func(err error) {
+				log.Printf("mic startup retry failed: %v", err)
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
+				}
+			},
+			func() {
+				log.Printf("mic startup retry succeeded")
+			},
+		)
+	}
+	startMic := func(atBoot bool) error {
+		err := startMicPipeline(atBoot)
+		if err != nil {
 			slog.Warn("microphone unavailable, running API/UI only", "error", err)
-			shouldRetryMicStartup = true
+		}
+		return err
+	}
+	// booted closes once start-up has sent its component statuses.
+	booted := make(chan struct{})
+	if startMicrophone(ctx, &micLoops, capture, booted, !paInitFailed, startMic, retryMic) {
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
+		if cfg.DeepgramAPIKey != "" {
+			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
 		}
 	}
 
@@ -1695,10 +1794,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
 	}
 
-	// Wire up mic diagnostic hook now that mic is initialized.
+	// Wire up the mic diagnostic hook. A paused instance opens the mic only on
+	// resume, so until then there is none to diagnose.
 	controlHooks.DiagnoseMic = func(ctx context.Context) (map[string]any, error) {
 		mic := micRef.Load()
 		if mic == nil {
+			if capture.IsPaused() {
+				return nil, fmt.Errorf("microphone not opened while capture is paused")
+			}
 			return nil, fmt.Errorf("microphone not available")
 		}
 		sampleRate := mic.SampleRate()
@@ -1710,41 +1813,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}, nil
 	}
 
-	if shouldRetryMicStartup {
-		micLoops.Go(func() {
-			retryMicStartup(
-				ctx,
-				15*time.Second,
-				time.After,
-				func() {
-					if hub != nil {
-						hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Retrying microphone initialization...")
-					}
-				},
-				func() error {
-					if err := audio.ReinitPortAudio(); err != nil {
-						return err
-					}
-					return startMicPipeline(false)
-				},
-				func(err error) {
-					log.Printf("mic startup retry failed: %v", err)
-					if hub != nil {
-						hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
-					}
-				},
-				func() {
-					log.Printf("mic startup retry succeeded")
-				},
-			)
-		})
-	}
-
 	lightOff := hardware.Done()
 	// This cleanup must run before anything else splices or erases in these
 	// directories: before the HTTP listener below (segment and session
-	// deletions), before recoverPendingSplices, and before the first Drive
-	// sweep (5 minutes) and GC pass (an hour), whose tickers start above.
+	// deletions), before recoverPendingSplices, before the first Drive sweep
+	// (5 minutes), whose ticker starts above, and before GC, which starts
+	// below with a pass at once.
 	// erase.Leftovers unlinks the second name an erase.Replace under way still
 	// needs, cleanupSpliceTempCopies removes the copies a running deletion
 	// splices, and ForgetEraseDirectories forgets directories no erase is
@@ -1758,9 +1832,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
 	}
+	if cfg.GCEnabled {
+		go collectGarbage(ctx, cfgStore, store, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
+	}
 
-	// Create health checker with actual component references
-	healthChecker := server.NewDefaultHealthChecker(&resilientClientProxy{ref: &resilientRef}, store, micStatus, capture, llmTracker)
+	// Create health checker with actual component references. With no Deepgram
+	// API key it gets no Deepgram client source, so readiness never excuses
+	// Deepgram, paused or not.
+	var deepgramHealth interface{ IsConnected() bool }
+	if cfg.DeepgramAPIKey != "" {
+		deepgramHealth = &resilientClientProxy{ref: &resilientRef}
+	}
+	healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, capture, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
@@ -1806,6 +1889,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	for _, c := range startupStatus.Components() {
 		hub.BroadcastComponentStatus(c.Name, c.Status, c.Message)
 	}
+	close(booted)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -1866,6 +1950,7 @@ type micStreamer interface {
 	Stream(writer io.Writer) error
 	Start() error
 	Stop() error
+	Close() error
 	Reopen() error
 }
 
@@ -1913,11 +1998,16 @@ func streamMicWithRetry(
 			}
 			if err = capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone restart: %v", err)
+				closeMic(streamer, "without a red recording light", logf)
+				capture.finishResume()
 				wait(backoff)
 				continue
 			}
 			err = streamer.Start()
 			capture.finishMicStart()
+			// This start, whether it works or not, ends the resume's
+			// "resuming" state: readiness then reports what came back.
+			capture.finishResume()
 			if err == nil {
 				logf("microphone restarted: capture resumed")
 				if hub != nil {
@@ -1925,7 +2015,10 @@ func streamMicWithRetry(
 				}
 				continue
 			}
-			// The device did not come back (unplugged during the pause): reconnect below.
+			// The device did not come back (unplugged during the pause): close
+			// it, so it holds no input device through the backoff, and
+			// reconnect below.
+			closeMic(streamer, "that did not restart", logf)
 		} else {
 			err = streamer.Stream(gated)
 			if err == nil || ctx.Err() != nil {
@@ -1955,7 +2048,7 @@ func streamMicWithRetry(
 			}
 			if err := capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone reconnect: %v", err)
-				stopMicWithoutRed(streamer, logf)
+				closeMic(streamer, "without a red recording light", logf)
 				continue
 			}
 			reopenErr := streamer.Reopen()
@@ -1992,7 +2085,7 @@ func streamMicWithRetry(
 
 		if err := capture.confirmMicStart(); err != nil {
 			logf("recording light unavailable before microphone reconnect: %v", err)
-			stopMicWithoutRed(streamer, logf)
+			closeMic(streamer, "without a red recording light", logf)
 			continue
 		}
 		reopenErr := streamer.Reopen()
@@ -2014,14 +2107,15 @@ func streamMicWithRetry(
 	}
 }
 
-// stopMicWithoutRed stops a device the reconnect could not confirm red for.
-// An overflow, or a transient read error, leaves the device capturing with
-// IsOpen false, so the light goes dark while audio still flows. The next
-// Stream then fails on the stopped device, and the error path backs off and
-// confirms red again before it reopens.
-func stopMicWithoutRed(streamer micStreamer, logf func(string, ...any)) {
-	if err := streamer.Stop(); err != nil {
-		logf("warning: stop microphone without a red recording light: %v", err)
+// closeMic closes a device that failed to start, or that the light could not
+// be confirmed red for, so it holds no input device meanwhile. An overflow, or
+// a transient read error, leaves the device capturing with IsOpen false, so
+// the light goes dark while audio still flows; a resume finds the device
+// stopped but open. The next Stream then fails on the closed device, and the
+// error path backs off and confirms red again before it reopens.
+func closeMic(streamer micStreamer, which string, logf func(string, ...any)) {
+	if err := streamer.Close(); err != nil {
+		logf("warning: close microphone %s: %v", which, err)
 	}
 }
 

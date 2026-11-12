@@ -15,6 +15,9 @@ import (
 
 // HealthChecker defines the interface for checking component health
 type HealthChecker interface {
+	// IsDeepgramConfigured reports whether the app has a Deepgram API key, so
+	// live transcription can run at all.
+	IsDeepgramConfigured() bool
 	IsDeepgramConnected() bool
 	IsDBHealthy(ctx context.Context) bool
 	IsMicOpen() bool
@@ -97,7 +100,9 @@ func handleHealthzLive(w http.ResponseWriter, r *http.Request, checker HealthChe
 }
 
 // handleHealthzReady handles the /healthz/ready endpoint
-// Returns 200 only if all components are healthy (Deepgram connected, DB accessible, mic open, paused on purpose, or resuming)
+// Returns 200 only if all components are healthy (Deepgram connected, or not
+// needed while capture is paused on purpose or resuming; DB accessible; mic
+// open, paused on purpose, or resuming)
 // Returns 503 with component breakdown if any component is unhealthy
 func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthChecker) {
 	logger := logging.FromContext(r.Context(), slog.Default())
@@ -105,10 +110,23 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// Check component health
+	// A paused capture stops the mic on purpose, and a resume takes a moment:
+	// to save the paused session first, then to start the mic and connect to
+	// Deepgram. Neither is an outage. A resume that has not brought the mic
+	// back past its stall limit is.
+	hold := checker.MicHold()
+	held := hold == storage.ComponentStatusPaused || hold == storage.ComponentStatusResuming
+
+	// While capture is held so, nothing is sent to Deepgram, and a unit that
+	// starts paused connects to it only on resume: Deepgram not connected then
+	// reports the hold. With no Deepgram configured, or once the resume's
+	// start has finished, it is a fault.
 	deepgramStatus := storage.ComponentStatusDisconnected
-	if checker.IsDeepgramConnected() {
+	switch {
+	case checker.IsDeepgramConnected():
 		deepgramStatus = storage.ComponentStatusConnected
+	case held && checker.IsDeepgramConfigured():
+		deepgramStatus = hold
 	}
 
 	dbStatus := storage.ComponentStatusError
@@ -119,13 +137,14 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 		dbStatus = storage.ComponentStatusOK
 	}
 
-	// A paused capture stops the mic on purpose, and a resume takes a moment to
-	// save the paused session first; neither is an outage. A resume that has
-	// not brought the mic back past its stall limit is.
+	// A resume reports the mic open as soon as it is.
 	micStatus := storage.ComponentStatusClosed
-	if hold := checker.MicHold(); hold != "" {
+	switch {
+	case hold == storage.ComponentStatusResuming && checker.IsMicOpen():
+		micStatus = storage.ComponentStatusOpen
+	case hold != "":
 		micStatus = hold
-	} else if checker.IsMicOpen() {
+	case checker.IsMicOpen():
 		micStatus = storage.ComponentStatusOpen
 	}
 
@@ -139,8 +158,9 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 	}
 
 	// Determine overall health
-	micReady := micStatus == storage.ComponentStatusOpen || micStatus == storage.ComponentStatusPaused || micStatus == storage.ComponentStatusResuming
-	allHealthy := deepgramStatus == storage.ComponentStatusConnected && dbStatus == storage.ComponentStatusOK && micReady && llmStatus != storage.ComponentStatusError
+	deepgramReady := deepgramStatus == storage.ComponentStatusConnected || (held && deepgramStatus == hold)
+	micReady := micStatus == storage.ComponentStatusOpen || held
+	allHealthy := deepgramReady && dbStatus == storage.ComponentStatusOK && micReady && llmStatus != storage.ComponentStatusError
 
 	if allHealthy {
 		w.WriteHeader(http.StatusOK)
@@ -174,7 +194,9 @@ type DefaultHealthChecker struct {
 	}
 }
 
-// NewDefaultHealthChecker creates a new DefaultHealthChecker
+// NewDefaultHealthChecker creates a new DefaultHealthChecker. resilientClient
+// is nil when no Deepgram API key is configured: readiness then never excuses
+// Deepgram not being connected.
 func NewDefaultHealthChecker(resilientClient interface{ IsConnected() bool }, store interface {
 	Ping(ctx context.Context) error
 }, mic interface{ IsOpen() bool }, capture interface{ MicHold() string }, llmTracker interface{ Status() string }) *DefaultHealthChecker {
@@ -207,6 +229,12 @@ func isNilInterfaceValue(v any) bool {
 	default:
 		return false
 	}
+}
+
+// IsDeepgramConfigured reports whether a Deepgram client source was given,
+// which the app does only when a Deepgram API key is configured.
+func (d *DefaultHealthChecker) IsDeepgramConfigured() bool {
+	return !isNilInterfaceValue(d.resilientClient)
 }
 
 // IsDeepgramConnected returns true if Deepgram is connected

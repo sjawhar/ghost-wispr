@@ -735,6 +735,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be removed cleanly; nothing was deleted")
 			case errors.Is(err, ErrSegmentRawAudioKept):
 				writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			case errors.Is(err, ErrBatchTranscriptionNotConfigured):
+				writeJSONError(w, http.StatusServiceUnavailable, "Segment deletion needs batch transcription, which is not configured: add a Deepgram API key.")
 			default:
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete segment: %v", err))
 			}
