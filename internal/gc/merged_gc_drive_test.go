@@ -192,10 +192,116 @@ func TestGCLogsTheSourceThatBlocksAgeDeletion(t *testing.T) {
 	if deleted, err := collector.Run(); err != nil || len(deleted) != 0 {
 		t.Fatalf("GC with an owed source refresh = %v, %v; want no deletion", deleted, err)
 	}
+	deleteWarnings := 0
+	identified := false
 	for _, line := range logLines(t, &logs) {
+		if line["operation"] == "delete_session" && line["level"] == "WARN" {
+			deleteWarnings++
+		}
 		if line["source_session_id"] == "source-a" && line["source_block_reason"] == "documents need Drive refresh" {
-			return
+			identified = true
 		}
 	}
-	t.Fatalf("GC did not identify the source and reason:\n%s", logs.String())
+	if !identified || deleteWarnings != 1 {
+		t.Fatalf("GC source block warnings = %d, identified=%v:\n%s", deleteWarnings, identified, logs.String())
+	}
+}
+
+func TestGCReportsEveryMergedSourceBlockReason(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		set    func(t *testing.T, store *storage.SQLiteStore, dir string)
+	}{
+		{
+			name:   "active",
+			reason: "active",
+			set: func(t *testing.T, store *storage.SQLiteStore, _ string) {
+				if _, err := store.DB().Exec(`UPDATE sessions SET status = ? WHERE id = 'source-a'`, storage.SessionActive); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "remote deleted",
+			reason: "remote-deleted",
+			set: func(t *testing.T, store *storage.SQLiteStore, _ string) {
+				if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ? WHERE id = 'source-a'`, storage.SyncStateRemoteDeleted, storage.SyncFailed); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "refinement running",
+			reason: "refinement running",
+			set: func(t *testing.T, store *storage.SQLiteStore, _ string) {
+				if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ? WHERE id = 'source-a'`, storage.RefinementRunning); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "replacement owed",
+			reason: "Drive replacement owed",
+			set: func(t *testing.T, store *storage.SQLiteStore, _ string) {
+				if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = 'source-a'`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "folder replacement owed",
+			reason: "Drive folder replacement owed",
+			set: func(t *testing.T, store *storage.SQLiteStore, _ string) {
+				if _, err := store.DB().Exec(`INSERT INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
+					VALUES('source-a', 1, 'source-a', ?)`, storage.DriveReplacementFolderOwed); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:   "document refresh owed",
+			reason: "documents need Drive refresh",
+			set: func(t *testing.T, store *storage.SQLiteStore, dir string) {
+				segments, err := store.GetSegments("merged")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.DeleteSegmentText("merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, drive_documents_pending = 0 WHERE id = 'merged'`, storage.SummaryCompleted); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, dir, _ := mergedGCFolderStore(t)
+			tc.set(t, store, dir)
+			syncTo(t, store, "merged", storage.SyncStateSynced, "merged-folder", 0, "")
+			var logs bytes.Buffer
+			collector := New(store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}, slog.New(slog.NewJSONHandler(&logs, nil)))
+			if deleted, err := collector.Run(); err != nil || len(deleted) != 0 {
+				t.Fatalf("GC with source %s = %v, %v; want no deletion", tc.name, deleted, err)
+			}
+			for _, line := range logLines(t, &logs) {
+				if line["source_session_id"] == "source-a" && line["source_block_reason"] == tc.reason {
+					return
+				}
+			}
+			t.Fatalf("GC did not log source reason %q:\n%s", tc.reason, logs.String())
+		})
+	}
+}
+
+func TestGCKeepsMergedSessionWhileItsOwnRefreshIsOwed(t *testing.T) {
+	store, dir, _ := mergedGCFolderStore(t)
+	syncTo(t, store, "merged", storage.SyncStateSynced, "merged-folder", 0, "")
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = 'merged'`); err != nil {
+		t.Fatal(err)
+	}
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
+		t.Fatalf("GC deleted %v while the merged session refresh is owed, want none", deleted)
+	}
 }

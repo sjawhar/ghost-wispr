@@ -2792,8 +2792,7 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 			ELSE 'documents need Drive refresh'
 		END
 		FROM sessions AS member JOIN doomed ON member.id = doomed.id
-		WHERE member.id != ?
-		  AND (
+		WHERE (
 			member.status = ?
 			OR member.sync_state = ?
 			OR member.refinement_status = ?
@@ -2807,34 +2806,18 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 		  )
 		LIMIT 1`,
 		id, SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed,
-		id, SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed).Scan(&block.SessionID, &block.Reason)
+		SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed).Scan(&block.SessionID, &block.Reason)
 	switch {
 	case err == nil:
 		return nil, false, &block
 	case !errors.Is(err, sql.ErrNoRows):
-		return nil, false, fmt.Errorf("check source sessions of %s before GC deletion: %w", id, err)
+		return nil, false, fmt.Errorf("check session set of %s before GC deletion: %w", id, err)
 	}
 	var eligible int
-	err = tx.QueryRow(`WITH RECURSIVE doomed(id) AS (
-			SELECT ?
-			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
-		) SELECT 1 FROM sessions
+	err = tx.QueryRow(`SELECT 1 FROM sessions
 		WHERE sessions.id = ? AND sessions.audio_path = ? AND sessions.documents_unverified = 0
-		  AND `+removableCondition+`
-		  AND NOT EXISTS (
-			SELECT 1 FROM sessions AS member JOIN doomed ON member.id = doomed.id
-			WHERE member.status = ?
-			   OR member.sync_state = ?
-			   OR member.refinement_status = ?
-			   OR member.drive_replace_pending = 1
-			   OR EXISTS (
-				SELECT 1 FROM drive_replacement_folders
-				WHERE drive_replacement_folders.folder_session_id = member.id
-				  AND drive_replacement_folders.state = ?
-			   )
-			   OR (member.gdrive_folder_id != '' AND member.drive_documents_pending != 0)
-		  )`,
-		id, id, audioPath, SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed).Scan(&eligible)
+		  AND `+removableCondition,
+		id, audioPath).Scan(&eligible)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil

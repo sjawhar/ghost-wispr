@@ -192,7 +192,10 @@ func (c *Collector) applyAgePolicy() ([]string, error) {
 	var deleted []string
 	for _, id := range ids {
 		if err := c.deleteSession(id, names); err != nil {
-			c.logger.Warn("gc skipped session", "operation", "delete_session", "session_id", id, "error", err)
+			var block *storage.GCSourceBlockError
+			if !errors.As(err, &block) {
+				c.logger.Warn("gc skipped session", "operation", "delete_session", "session_id", id, "error", err)
+			}
 			if errors.Is(err, ErrDriveCannotSay) {
 				c.held = err
 				break
@@ -510,6 +513,7 @@ func (c *Collector) deleteSession(id string, names names) error {
 		var block *storage.GCSourceBlockError
 		if errors.As(err, &block) {
 			c.logger.Warn("gc source blocks age deletion", "operation", "delete_session", "session_id", id, "source_session_id", block.SessionID, "source_block_reason", block.Reason)
+			return err
 		}
 		return fmt.Errorf("delete from db: %w", err)
 	}
