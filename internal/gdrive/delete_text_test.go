@@ -145,6 +145,35 @@ func TestDeleteTextUpdatesTheDriveDocumentsInPlace(t *testing.T) {
 	}
 }
 
+// TestDeleteTextRenamesTheDriveFolderForTheRegeneratedTitle fails if the
+// folder's old title still holds deleted words after Delete text: it is part
+// of the current Drive view, though its id and all files must stay.
+func TestDeleteTextRenamesTheDriveFolderForTheRegeneratedTitle(t *testing.T) {
+	store := openStore(t)
+	const id = "20261112100000"
+	recording, _ := round2Session(t, store, id, []string{"alpha stays.", textSecret + "."})
+	if err := store.UpdateSummaryAtGeneration(id, "About "+textSecret, "summary "+textSecret, storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	wire, syncer := newWireDrive(t)
+	o := NewOrchestrator(syncer, store)
+	folder := syncedSession(t, store, o, id)
+	if got := wire.find(folder).Name; !strings.Contains(got, "bravo-text-secret") {
+		t.Fatalf("control: folder name %q does not hold the deleted words", got)
+	}
+
+	deleteTextFrom(t, store, id, recording, "clean summary")
+	if _, err := store.DB().Exec(`UPDATE sessions SET title = 'Clean office meeting' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.SyncSession(context.Background(), id); err != nil {
+		t.Fatalf("sync after Delete text: %v", err)
+	}
+	if got := wire.find(folder).Name; got != "2026-11-06-clean-office-meeting" {
+		t.Errorf("folder %s name = %q, want its regenerated title", folder, got)
+	}
+}
+
 // TestDeleteTextUpdatesMergedSourceFoldersInPlace fails if "Delete text" in
 // a merged session leaves the words in the current documents of a source
 // session's own Drive folder, which the merge left on Drive, or replaces

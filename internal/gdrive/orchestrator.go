@@ -308,6 +308,13 @@ func (o *Orchestrator) syncSession(ctx context.Context, sessionID string) error 
 	} else {
 		driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
 	}
+	if err == nil && sess.GDriveFolderID != "" {
+		// Delete text can change the title that names the existing folder.
+		// Rename it in place: its id and the links to its files stay.
+		if syncer, ok := o.uploader.(*Syncer); ok {
+			err = syncer.renameSessionFolder(ctx, driveFolderID, folderName)
+		}
+	}
 	// A recording the upload left out (missing from disk when the file list
 	// was built: its disk not mounted, say; or there but unreadable) was not
 	// uploaded: the session is not synced until a retry, with the sync's
