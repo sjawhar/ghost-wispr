@@ -53,7 +53,6 @@ type folderCreatingUploader interface {
 	UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error)
 }
 
-
 type replacementInputStore interface {
 	DriveReplacementInput(sessionID string) (pending bool, splicedRecording string, err error)
 	DeletionGeneration(sessionID string) (int, error)

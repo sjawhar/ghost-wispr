@@ -92,7 +92,6 @@ func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) 
 	return folders, nil
 }
 
-
 // ListFolderFiles returns files inside a specific folder.
 func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive.File, error) {
 	q := fmt.Sprintf("'%s' in parents and trashed = false", folderID)
