@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AudioPlayer from '../AudioPlayer.svelte'
 import { resetState } from '../../lib/state.svelte'
+import { RefinementStatus } from '../../lib/types'
 
 const segments = [
   {
@@ -11,6 +12,7 @@ const segments = [
     start_time: 0,
     end_time: 2,
     timestamp: '2026-11-12T10:00:00Z',
+    transcript_revision: 1,
   },
   {
     id: 43,
@@ -19,6 +21,7 @@ const segments = [
     start_time: 2,
     end_time: 4,
     timestamp: '2026-11-12T10:00:02Z',
+    transcript_revision: 1,
   },
 ]
 
@@ -26,10 +29,46 @@ function renderPlayer() {
   return render(AudioPlayer, {
     sessionId: 's1',
     segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: 'pending',
+      summary_preset: '',
+      audio_path: 'recording.mp3',
+      refinement_status: RefinementStatus.Completed,
+      refined_revision: 1,
+    },
     onDeleted: vi.fn(),
     onNotFound: vi.fn().mockResolvedValue(false),
   })
 }
+
+  it('disables Delete until timed refined segments exist', () => {
+    render(AudioPlayer, {
+      sessionId: 's1',
+      segments,
+      session: {
+        id: 's1',
+        title: '',
+        started_at: '2026-11-12T10:00:00Z',
+        status: 'ended',
+        summary: '',
+        summary_status: 'pending',
+        summary_preset: '',
+        audio_path: 'recording.mp3',
+        refinement_status: RefinementStatus.Pending,
+      },
+      onDeleted: vi.fn(),
+      onNotFound: vi.fn().mockResolvedValue(false),
+    })
+    for (const button of screen.getAllByRole('button', { name: 'Delete segment' })) {
+      expect(button.hasAttribute('disabled')).toBe(true)
+    }
+    expect(screen.getAllByText('This conversation is still being refined; delete once it finishes.')).toHaveLength(2)
+  })
 
 describe('AudioPlayer segment deletion actions', () => {
   afterEach(() => {
@@ -76,7 +115,7 @@ describe('AudioPlayer segment deletion actions', () => {
     await fireEvent.click(screen.getByRole('button', { name: action }))
 
     await waitFor(() => {
-      expect(fetch).toHaveBeenCalledExactlyOnceWith(`/api/sessions/s1/segments/42?mode=${mode}`, {
+      expect(fetch).toHaveBeenCalledExactlyOnceWith(`/api/sessions/s1/segments/42?mode=${mode}&revision=1`, {
         method: 'DELETE',
       })
     })

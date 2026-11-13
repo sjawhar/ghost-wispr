@@ -18,13 +18,13 @@ func deleteModeHandler(t *testing.T, withSession bool, ran *[]string) http.Handl
 	t.Helper()
 	sessions := map[string]storage.Session{}
 	if withSession {
-		sessions["s1"] = storage.Session{ID: "s1", Status: storage.SessionEnded}
+		sessions["s1"] = storage.Session{ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted}
 	}
 	store := &apiStoreStub{sessionsByDate: map[string][]storage.Session{}, sessions: sessions, segments: map[string][]transcribe.Segment{}}
-	hook := func(name string) func(context.Context, string, int64) error {
-		return func(_ context.Context, sessionID string, segmentID int64) error {
-			if sessionID != "s1" || segmentID != 42 {
-				t.Errorf("%s hook got session %q segment %d", name, sessionID, segmentID)
+	hook := func(name string) func(context.Context, string, int64, int) error {
+		return func(_ context.Context, sessionID string, segmentID int64, revision int) error {
+			if sessionID != "s1" || segmentID != 42 || revision != 1 {
+				t.Errorf("%s hook got session %q segment %d revision %d", name, sessionID, segmentID, revision)
 			}
 			*ran = append(*ran, name)
 			return nil
@@ -72,10 +72,73 @@ func TestDeleteSegmentAPIRunsTheChosenMode(t *testing.T) {
 	for _, mode := range []string{"text", "text_and_audio"} {
 		var ran []string
 		response := httptest.NewRecorder()
-		deleteModeHandler(t, true, &ran).ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode="+mode, nil))
+		deleteModeHandler(t, true, &ran).ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode="+mode+"&revision=1", nil))
 		if response.Code != http.StatusNoContent || len(ran) != 1 || ran[0] != mode {
 			t.Errorf("mode %s: status %d body %s, ran %v; want 204 and only %s", mode, response.Code, response.Body.String(), ran, mode)
 		}
+	}
+}
+
+func TestDeleteSegmentAPIRefusesUntilRefinementCompletes(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementPending},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	called := false
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		DeleteSegment: func(context.Context, string, int64, int) error {
+			called = true
+			return nil
+		},
+		DeleteSegmentText: func(context.Context, string, int64, int) error {
+			called = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text&revision=1", nil))
+	var body struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(response.Body.Bytes(), &body)
+	if response.Code != http.StatusConflict || body.Error != "this conversation is still being refined; delete once it finishes" || called {
+		t.Fatalf("delete before refinement = %d %q called=%v, want 409, the refinement message, and no deletion", response.Code, body.Error, called)
+	}
+}
+
+
+func TestDeleteSegmentAPIRequiresTranscriptRevision(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	called := false
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		DeleteSegmentText: func(context.Context, string, int64, int) error {
+			called = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text", nil))
+	var body struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(response.Body.Bytes(), &body)
+	if response.Code != http.StatusBadRequest || !strings.Contains(body.Error, "revision") || called {
+		t.Fatalf("delete without revision = %d %q called=%v, want 400 naming revision and no deletion", response.Code, body.Error, called)
 	}
 }
 

@@ -56,7 +56,7 @@ func (t WordsTranscriber) Words(ctx context.Context, path string) ([]Word, error
 
 	words := make([]Word, len(batchWords))
 	for i, word := range batchWords {
-		words[i] = Word(word)
+		words[i] = Word{Text: word.Text, Start: word.Start, End: word.End}
 	}
 	return words, nil
 }

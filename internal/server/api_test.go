@@ -857,16 +857,24 @@ func TestDeleteSegmentAPI(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			session := tc.session
+			if session.ID != "" && session.Status != storage.SessionActive {
+				session.RefinementStatus = storage.RefinementCompleted
+			}
 			sessions := map[string]storage.Session{}
-			if tc.session.ID != "" {
-				sessions[tc.session.ID] = tc.session
+			if session.ID != "" {
+				sessions[session.ID] = session
 			}
 			store := &apiStoreStub{sessionsByDate: map[string][]storage.Session{}, sessions: sessions, segments: map[string][]transcribe.Segment{}}
-			handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{DeleteSegment: tc.hook}, "", nil)
+			handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+				DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, _ int) error {
+					return tc.hook(ctx, sessionID, segmentID)
+				},
+			}, "", nil)
 			if err != nil {
 				t.Fatalf("handler: %v", err)
 			}
-			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text_and_audio", nil)
+			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text_and_audio&revision=1", nil)
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, req)
 			if response.Code != tc.wantCode {

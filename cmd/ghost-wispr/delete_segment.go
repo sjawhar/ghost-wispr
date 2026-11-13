@@ -175,6 +175,223 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 	return set, nil
 }
 
+// DeleteRefinedText removes one selected batch-derived occurrence and then
+// regenerates its summary. The segment id and revision are the authority; no
+// text is aligned against another transcription.
+func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+	if d.store == nil {
+		return fmt.Errorf("segment deletion storage is not configured")
+	}
+	unlock := deleteLocks.lock(sessionID)
+	defer unlock()
+	if deleteLocks.isRecovering(sessionID) {
+		return storage.ErrSegmentSplicePending
+	}
+	session, err := d.store.GetSession(sessionID)
+	if err != nil {
+		return err
+	}
+	if session.Status == storage.SessionActive {
+		return storage.ErrSegmentSessionActive
+	}
+	if session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
+		// Old completed sessions have live-only segments. Start the existing
+		// batch refinement path, then require selection from its new table.
+		if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision == 0 &&
+			d.refine != nil && strings.TrimSpace(session.AudioPath) != "" {
+			go func() { _ = d.refine(context.Background(), sessionID, session.AudioPath, session.StartedAt) }()
+		}
+		return storage.ErrRefinedSegmentsUnavailable
+	}
+	if err := d.store.DeleteRefinedSegmentText(sessionID, segmentID, revision); err != nil {
+		return err
+	}
+	if d.summarize != nil {
+		if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {
+			return fmt.Errorf("summarize refined text deletion: %w", err)
+		}
+	}
+	return nil
+}
+
+// DeleteRefinedAudio removes the selected stored word span from its recording.
+// Its boundary comes from the persisted occurrence; a small margin is used
+// only when no neighbouring stored word occupies it.
+func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+	if d.store == nil || d.ensureRecordings == nil || d.splice == nil {
+		return fmt.Errorf("segment deletion is not configured")
+	}
+	unlock := deleteLocks.lock(sessionID)
+	defer unlock()
+	if deleteLocks.isRecovering(sessionID) {
+		return storage.ErrSegmentSplicePending
+	}
+	session, err := d.store.GetSession(sessionID)
+	if err != nil {
+		return err
+	}
+	if session.Status == storage.SessionActive {
+		return storage.ErrSegmentSessionActive
+	}
+	if session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
+		if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision == 0 &&
+			d.refine != nil && strings.TrimSpace(session.AudioPath) != "" {
+			go func() { _ = d.refine(context.Background(), sessionID, session.AudioPath, session.StartedAt) }()
+		}
+		return storage.ErrRefinedSegmentsUnavailable
+	}
+	if revision != session.RefinedRevision {
+		return storage.ErrStaleTranscriptRevision
+	}
+	if pending, err := d.store.HasPendingSplice(sessionID); err != nil {
+		return err
+	} else if pending {
+		return storage.ErrSegmentSplicePending
+	}
+	segments, err := d.store.GetSegments(sessionID)
+	if err != nil {
+		return err
+	}
+	var selected transcribe.Segment
+	found := false
+	for _, segment := range segments {
+		if segment.ID == segmentID {
+			selected, found = segment, true
+			break
+		}
+	}
+	if !found {
+		return storage.ErrSegmentNotFound
+	}
+	if selected.TranscriptRevision != revision || selected.RecordingPath == "" || selected.RecordingSHA256 == "" {
+		return storage.ErrRefinedSegmentsUnavailable
+	}
+	if strings.TrimSpace(d.audioDir) != "" {
+		rawSessionIDs := []string{sessionID}
+		sources, err := d.store.SourceSessionIDs(sessionID)
+		if err != nil {
+			return err
+		}
+		rawSessionIDs = append(rawSessionIDs, sources...)
+		for _, rawSessionID := range rawSessionIDs {
+			rawPath := filepath.Join(d.audioDir, rawSessionID+".pcm")
+			if info, err := os.Stat(rawPath); err == nil && !info.IsDir() {
+				return fmt.Errorf("%w: %s", server.ErrSegmentRawAudioKept, rawPath)
+			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("check raw recording %s: %w", rawPath, err)
+			}
+		}
+	}
+	recordingSet, err := d.ensureRecordings(ctx, session)
+	if err != nil {
+		return fmt.Errorf("get recordings: %w", err)
+	}
+	keepDownloaded := false
+	defer func() {
+		if !keepDownloaded {
+			removeFiles(recordingSet.Downloaded)
+		}
+	}()
+	recording := ""
+	for _, path := range recordingSet.Paths {
+		if filepath.Base(path) == filepath.Base(selected.RecordingPath) {
+			recording = path
+			break
+		}
+	}
+	if recording == "" {
+		return fmt.Errorf("recording %s is unavailable", selected.RecordingPath)
+	}
+	beforeHash, err := fileSHA256(recording)
+	if err != nil {
+		return fmt.Errorf("hash recording %s before splice: %w", recording, err)
+	}
+	if beforeHash != selected.RecordingSHA256 {
+		return fmt.Errorf("recording %s changed since refinement; refresh it before deleting", recording)
+	}
+	words, err := d.store.RefinedWords(sessionID, revision)
+	if err != nil {
+		return err
+	}
+	start, end := refinedSpliceBounds(words, selected)
+	if d.duration != nil {
+		duration, err := d.duration(ctx, recording)
+		if err != nil {
+			return fmt.Errorf("probe recording %s: %w", recording, err)
+		}
+		if end > duration {
+			end = duration
+		}
+	}
+	if end <= start {
+		return fmt.Errorf("stored word span for segment %d has no removable audio", segmentID)
+	}
+	tempPath, err := copyForSplice(recording)
+	if err != nil {
+		return err
+	}
+	keepTemp := false
+	defer func() {
+		if !keepTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	afterHash, err := d.splice(ctx, tempPath, start, end)
+	if err != nil {
+		return fmt.Errorf("splice recording %s: %w", recording, err)
+	}
+	if afterHash == "" {
+		afterHash, err = fileSHA256(tempPath)
+		if err != nil {
+			return fmt.Errorf("hash spliced recording %s: %w", tempPath, err)
+		}
+	}
+	span := storage.DeletedSpan{
+		SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordingSet.Paths, ","),
+		Start: start, End: end, SHA256Before: beforeHash, SHA256After: afterHash,
+	}
+	if err := d.store.DeleteRefinedSegmentAudio(sessionID, segmentID, revision, span); err != nil {
+		return err
+	}
+	keepDownloaded = true
+	if err := os.Rename(tempPath, recording); err != nil {
+		return fmt.Errorf("replace recording %s: %w", recording, err)
+	}
+	keepTemp = true
+	if err := syncRecordingDirectory(recording); err != nil {
+		return err
+	}
+	if err := d.store.MarkSpliceComplete(&span); err != nil {
+		return err
+	}
+	if d.summarize != nil {
+		if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {
+			return fmt.Errorf("summarize refined audio deletion: %w", err)
+		}
+	}
+	return nil
+}
+
+func refinedSpliceBounds(words []storage.RefinedWord, selected transcribe.Segment) (float64, float64) {
+	const margin = 0.25
+	start, end := selected.StartTime-margin, selected.EndTime+margin
+	if start < 0 {
+		start = 0
+	}
+	for _, word := range words {
+		if word.RecordingPath != selected.RecordingPath || word.RecordingSHA256 != selected.RecordingSHA256 {
+			continue
+		}
+		if word.End <= selected.StartTime && word.End > start {
+			start = word.End
+		}
+		if word.Start >= selected.EndTime && word.Start < end {
+			end = word.Start
+		}
+	}
+	return start, end
+}
+
 // Delete is "Delete text and audio": it removes the segment's words from
 // every text store, cuts its span out of the recording, and owes Google
 // Drive a replacement of the session's files (storage.DeleteSegment).

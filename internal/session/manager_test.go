@@ -192,6 +192,28 @@ func (s *storeMock) UpdateRefinementAtGeneration(sessionID, transcript, status, 
 	return nil
 }
 
+func (s *storeMock) PublishRefinementAtGeneration(sessionID, transcript, model string, _ []storage.RefinedWord, segments []storage.RefinedSegment, generation int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return 0, sql.ErrNoRows
+	}
+	s.refinementStatus[sessionID] = storage.RefinementCompleted
+	s.refinementModel[sessionID] = model
+	s.refinedTranscript[sessionID] = transcript
+	s.canonicalTranscript[sessionID] = transcript
+	s.transcriptSource[sessionID] = storage.TranscriptSourceRefined
+	s.segments[sessionID] = make([]transcribe.Segment, len(segments))
+	for i, segment := range segments {
+		s.segments[sessionID][i] = transcribe.Segment{
+			Speaker: segment.Speaker, Text: segment.Text, StartTime: segment.Start, EndTime: segment.End,
+			TranscriptRevision: 1, RecordingPath: segment.RecordingPath, RecordingSHA256: segment.RecordingSHA256,
+			RecordingOrdinal: segment.RecordingOrdinal, FirstWordOrdinal: segment.FirstWordOrdinal, LastWordOrdinal: segment.LastWordOrdinal,
+		}
+	}
+	return 1, nil
+}
+
 // ClaimRefinement claims the refinement only while the session still names
 // audioPath, as the real store does.
 func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (int, bool, error) {
@@ -252,9 +274,10 @@ type recorderMock struct {
 	startErr error
 	// endErr, when set, fails every EndSession; unsavedPath is the raw file
 	// DiscardUnsaved then reports, and discards counts its calls.
-	endErr      error
-	unsavedPath string
-	discards    int
+	endErr        error
+	unsavedPath   string
+	recordingPath string
+	discards      int
 	// startHook and endHook, when set, run first in StartSession and
 	// EndSession, outside the mock's lock, so a test can hold a call open.
 	startHook func()
@@ -290,6 +313,15 @@ func (r *recorderMock) EndSession(sessionID string) (string, error) {
 	}
 	if sessionID == "" || !slices.Contains(r.started, sessionID) {
 		return "", nil
+	}
+	if r.recordingPath != "" {
+		if err := os.MkdirAll(filepath.Dir(r.recordingPath), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(r.recordingPath, []byte("recorded audio"), 0o600); err != nil {
+			return "", err
+		}
+		return r.recordingPath, nil
 	}
 	return "data/audio/" + sessionID + ".mp3", nil
 }
@@ -344,7 +376,13 @@ func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (t
 	if b.err != nil {
 		return transcribe.BatchResult{}, b.err
 	}
-	return transcribe.BatchResult{Transcript: b.transcript, Model: b.model}, nil
+	var words []transcribe.TimestampedWord
+	start := 0.0
+	for _, text := range strings.Fields(b.transcript) {
+		words = append(words, transcribe.TimestampedWord{Text: text, Start: start, End: start + 0.3})
+		start += 0.35
+	}
+	return transcribe.BatchResult{Transcript: b.transcript, Model: b.model, Words: words}, nil
 }
 
 type syncerMock struct {
@@ -1359,7 +1397,7 @@ func TestWaitForLifecyclePublishesHonorsContext(t *testing.T) {
 
 func TestManager_BatchRefinement_SubmitsAndStoresRefinedTranscript(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	calledPath := make(chan string, 1)
 	transcriptC := make(chan string, 1)
 
@@ -1412,7 +1450,7 @@ func TestManager_BatchRefinement_SubmitsAndStoresRefinedTranscript(t *testing.T)
 
 func TestManager_BatchRefinement_TimeoutFallsBackToStreamingTranscript(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1460,7 +1498,7 @@ func TestManager_BatchRefinement_TimeoutFallsBackToStreamingTranscript(t *testin
 
 func TestManager_Canonicalization_UsesCanonicalTranscriptForSummary(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1509,7 +1547,7 @@ func TestManager_Canonicalization_UsesCanonicalTranscriptForSummary(t *testing.T
 
 func TestManager_BatchRefinement_LateCompletionRecanonicalizes(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1636,7 +1674,11 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	if err := store.CreateSession("sess-refine", time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-	if err := store.EndSession("sess-refine", time.Now().UTC(), "data/audio/sess-refine.mp3"); err != nil {
+	audioPath := filepath.Join(t.TempDir(), "sess-refine.mp3")
+	if err := os.WriteFile(audioPath, []byte("recorded audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("sess-refine", time.Now().UTC(), audioPath); err != nil {
 		t.Fatalf("EndSession failed: %v", err)
 	}
 	hub := &hubMock{}
@@ -1644,7 +1686,7 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, hub, NewDetector(time.Hour), 0)
 	manager.SetBatchTranscriber(batchTranscriberMock{transcript: "refined transcript text"})
 
-	err := manager.RefineSession(context.Background(), "sess-refine", "data/audio/sess-refine.mp3", time.Time{})
+	err := manager.RefineSession(context.Background(), "sess-refine", audioPath, time.Time{})
 	if err != nil {
 		t.Fatalf("RefineSession: %v", err)
 	}
@@ -2260,9 +2302,12 @@ func TestManagerStoresProviderReportedRefinementModel(t *testing.T) {
 		configuredModel = "configured-refinement-model"
 		providerModel   = "provider-refinement-model"
 		sessionID       = "refinement-model-session"
-		audioPath       = "data/audio/refinement-model-session.mp3"
 	)
 	store := newStoreMock()
+	audioPath := filepath.Join(t.TempDir(), "refinement-model-session.mp3")
+	if err := os.WriteFile(audioPath, []byte("recorded audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

@@ -69,27 +69,21 @@
     }
   }
 
-  // Refined transcript: prefer the explicit refined_transcript, fall back to
-  // canonical_transcript when the source is 'refined' (covers historical sessions
-  // where the backend canonicalized into canonical_transcript).
-  const refinedText = $derived.by(() => {
-    if (!session) return ''
-    const refined = session.refined_transcript?.trim()
-    if (refined) return refined
-    if (session.transcript_source === 'refined') {
-      return session.canonical_transcript?.trim() ?? ''
-    }
-    return ''
-  })
-
-  const refinementCompleted = $derived(
-    session?.refinement_status === RefinementStatus.Completed && refinedText.length > 0,
-  )
-
   const refinementInFlight = $derived(
     session?.refinement_status === RefinementStatus.Pending ||
       session?.refinement_status === RefinementStatus.Running,
   )
+
+  // The completed default view is the timed segment table rebuilt from batch
+  // words. Live segments remain readable while refinement runs, but cannot
+  // identify a word occurrence safely enough to delete.
+  const deletionAvailable = $derived(
+    session?.refinement_status === RefinementStatus.Completed &&
+      visibleSegments.length > 0 &&
+      visibleSegments.every((segment) => (segment.transcript_revision ?? 0) > 0),
+  )
+  const deleteUnavailableNote =
+    'This conversation is still being refined; delete once it finishes.'
 
   // Disk pressure removed the session's audio to free space: all of it, or
   // part of it, when the audio path still names what is left.
@@ -98,10 +92,6 @@
   // The session ended without a saved recording: nothing to play or refine.
   const noRecording = $derived(session?.refinement_status === RefinementStatus.NoAudio)
 
-  type View = 'refined' | 'segments'
-  // Refined is the default when it exists; deletion is available in Segments.
-  let view = $derived<View>(refinementCompleted ? 'refined' : 'segments')
-
   function segmentsAsText(): string {
     return visibleSegments
       .map((s) => `[${prettyTime(s.start_time)}] Speaker ${s.speaker}: ${s.text}`)
@@ -109,7 +99,7 @@
   }
 
   async function copyTranscript() {
-    const text = view === 'refined' && refinedText ? refinedText : segmentsAsText()
+    const text = segmentsAsText()
     const ok = await copyText(text)
     if (ok) {
       transcriptCopied = true
@@ -135,11 +125,18 @@
   }
 
   async function handleDeleteSegment(
-    segmentID: number | undefined,
+    segment: Segment,
     action: (typeof deleteActions)[number],
   ): Promise<void> {
     deleteMenuFor = null
-    if (segmentID === undefined || deletingSegmentID !== null) {
+    const segmentID = segment.id
+    const revision = segment.transcript_revision
+    if (
+      segmentID === undefined ||
+      revision === undefined ||
+      !deletionAvailable ||
+      deletingSegmentID !== null
+    ) {
       return
     }
     if (!confirm(action.ask)) {
@@ -149,7 +146,7 @@
     segmentDeleteError = ''
     try {
       try {
-        await deleteSessionSegment(sessionId, segmentID, action.mode)
+        await deleteSessionSegment(sessionId, segmentID, action.mode, revision)
       } catch (error) {
         const message = requestErrorMessage(error)
         if (error instanceof RequestError && [403, 409, 422, 503].includes(error.status)) {
@@ -160,7 +157,7 @@
         try {
           const clearLocally = await onNotFound(segmentID)
           if (clearLocally) {
-            visibleSegments = visibleSegments.filter((segment) => segment.id !== segmentID)
+            visibleSegments = visibleSegments.filter((candidate) => candidate.id !== segmentID)
             await reloadAudio()
           }
         } catch {
@@ -168,7 +165,7 @@
         }
         return
       }
-      visibleSegments = visibleSegments.filter((segment) => segment.id !== segmentID)
+      visibleSegments = visibleSegments.filter((candidate) => candidate.id !== segmentID)
       await reloadAudio()
       await onDeleted(segmentID)
     } catch (error) {
@@ -298,31 +295,7 @@
   <div class="transcript-header">
     <span class="transcript-label">Transcript</span>
     <div class="transcript-header-actions">
-      {#if refinementCompleted}
-        <div
-          class="transcript-toggle"
-          role="group"
-          aria-label="Transcript view"
-          data-testid="transcript-view-toggle"
-        >
-          <button
-            type="button"
-            class={`toggle-btn ${view === 'refined' ? 'active' : ''}`}
-            aria-pressed={view === 'refined'}
-            onclick={() => (view = 'refined')}
-          >
-            Refined
-          </button>
-          <button
-            type="button"
-            class={`toggle-btn ${view === 'segments' ? 'active' : ''}`}
-            aria-pressed={view === 'segments'}
-            onclick={() => (view = 'segments')}
-          >
-            Segments
-          </button>
-        </div>
-      {:else if refinementInFlight}
+      {#if refinementInFlight}
         <span class="refining-indicator" data-testid="refining-indicator">Refining…</span>
       {/if}
       <button type="button" class="copy-btn" onclick={copyTranscript}>
@@ -335,59 +308,59 @@
     <p class="segment-delete-error" role="alert">{segmentDeleteError}</p>
   {/if}
 
-  {#if view === 'refined' && refinedText}
-    <div class="transcript-refined" data-testid="transcript-refined">
-      {refinedText}
-    </div>
-  {:else}
-    <div class="transcript-sync">
-      {#each visibleSegments as segment, index (segment.id ?? segment.timestamp + segment.text + index)}
-        <div class="transcript-line">
-          <button
-            type="button"
-            class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
-            onclick={() => seekTo(segment.start_time)}
-          >
-            <span class="line-time">{prettyTime(segment.start_time)}</span>
-            <span class="line-text" id={`segment-${segment.id ?? index}`}>{segment.text}</span>
-          </button>
-          {#if segment.id !== undefined}
-            <div class="segment-delete-controls">
-              <button
-                type="button"
-                class="segment-delete-btn"
-                aria-label="Delete segment"
-                aria-describedby={`segment-${segment.id ?? index}`}
-                aria-expanded={deleteMenuFor === segment.id}
-                title="Delete segment"
-                disabled={deletingSegmentID !== null}
-                onclick={() => (deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!)}
-              >
-                {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
-              </button>
-              {#if deleteMenuFor === segment.id}
-                <div class="segment-delete-menu" role="group" aria-label="Delete options">
-                  {#each deleteActions as action (action.mode)}
-                    <div class="segment-delete-option">
-                      <button
-                        type="button"
-                        class="segment-delete-action"
-                        aria-describedby={`segment-${segment.id}-${action.mode}`}
-                        onclick={() => void handleDeleteSegment(segment.id, action)}
-                      >
-                        {action.name}
-                      </button>
-                      <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
-                        >{action.note}</span
-                      >
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {/each}
-    </div>
-  {/if}
+  <div class="transcript-sync">
+    {#each visibleSegments as segment, index (segment.id ?? segment.timestamp + segment.text + index)}
+      <div class="transcript-line">
+        <button
+          type="button"
+          class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
+          onclick={() => seekTo(segment.start_time)}
+        >
+          <span class="line-time">{prettyTime(segment.start_time)}</span>
+          <span class="line-text" id={`segment-${segment.id ?? index}`}>{segment.text}</span>
+        </button>
+        {#if segment.id !== undefined}
+          <div class="segment-delete-controls">
+            <button
+              type="button"
+              class="segment-delete-btn"
+              aria-label="Delete segment"
+              aria-describedby={`segment-${segment.id ?? index}`}
+              aria-expanded={deletionAvailable && deleteMenuFor === segment.id}
+              title="Delete segment"
+              disabled={!deletionAvailable || deletingSegmentID !== null}
+              onclick={() => {
+                if (deletionAvailable) {
+                  deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!
+                }
+              }}
+            >
+              {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
+            </button>
+            {#if !deletionAvailable}
+              <span class="segment-delete-note">{deleteUnavailableNote}</span>
+            {:else if deleteMenuFor === segment.id}
+              <div class="segment-delete-menu" role="group" aria-label="Delete options">
+                {#each deleteActions as action (action.mode)}
+                  <div class="segment-delete-option">
+                    <button
+                      type="button"
+                      class="segment-delete-action"
+                      aria-describedby={`segment-${segment.id}-${action.mode}`}
+                      onclick={() => void handleDeleteSegment(segment, action)}
+                    >
+                      {action.name}
+                    </button>
+                    <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
+                      >{action.note}</span
+                    >
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/each}
+  </div>
 </div>

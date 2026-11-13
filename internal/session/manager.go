@@ -529,19 +529,14 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinementAtGeneration(sessionID, result.Transcript, storage.RefinementCompleted, result.Model, generation); err != nil {
-		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+	if _, err := m.store.PublishRefinementAtGeneration(sessionID, result.Transcript, result.Model, result.Words, result.Segments, generation); err != nil {
+		m.batchLogger.Error("failed to publish refined words and segments", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}
 
 	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID, "model", result.Model)
 	if m.hub != nil {
 		m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
-	}
-
-	// Re-canonicalize now that refined transcript is available.
-	if _, _, err := m.store.Canonicalize(sessionID); err != nil {
-		m.batchLogger.Error("failed to re-canonicalize after batch refinement", "operation", "batch_refinement", "session_id", sessionID, "error", err)
 	}
 }
 

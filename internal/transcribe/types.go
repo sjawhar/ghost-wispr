@@ -72,10 +72,12 @@ type BatchTranscriber interface {
 	Transcribe(ctx context.Context, audioPath string) (BatchResult, error)
 }
 
-// TimestampedWord is a word in a batch transcription with its recording span in seconds.
+// TimestampedWord is a word in a batch transcription with its recording span
+// in seconds and the diarized speaker Deepgram assigned to it.
 type TimestampedWord struct {
 	Text       string
 	Start, End float64
+	Speaker    int
 }
 
 // BatchWordsTranscriber transcribes a recording as text and timestamped words.

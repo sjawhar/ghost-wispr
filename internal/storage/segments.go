@@ -27,6 +27,12 @@ var (
 	ErrSegmentPostCommitMaintenance = errors.New("segment deletion post-commit maintenance failed")
 	// ErrSegmentSplicePending means an earlier deletion still needs recovery.
 	ErrSegmentSplicePending = errors.New("segment splice is pending")
+	// ErrStaleTranscriptRevision means a browser selected a segment before a
+	// later refinement or deletion rebuilt the timed segment table.
+	ErrStaleTranscriptRevision = errors.New("stale transcript revision")
+	// ErrRefinedSegmentsUnavailable means a session needs batch refinement
+	// before an occurrence-based deletion can be made.
+	ErrRefinedSegmentsUnavailable = errors.New("refined segments are unavailable")
 )
 
 // DeletedSpan identifies the session recording span removed for a segment and
@@ -837,8 +843,13 @@ func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 		if marked == 0 {
 			return fmt.Errorf("mark deleted span complete: %w", sql.ErrNoRows)
 		}
-	} else if err := moveTextDeletionSpans(tx, span); err != nil {
-		return err
+	} else {
+		if err := moveTextDeletionSpans(tx, span); err != nil {
+			return err
+		}
+		if err := moveRefinedWordsAfterSplice(tx, span); err != nil {
+			return err
+		}
 	}
 	if err := settleUnownedDriveReplacement(tx, span.SessionID); err != nil {
 		return err

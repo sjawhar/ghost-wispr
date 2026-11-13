@@ -87,6 +87,7 @@ type Session struct {
 	RefinedTranscript   string     `json:"refined_transcript"`
 	RefinementStatus    string     `json:"refinement_status"`
 	RefinementModel     string     `json:"refinement_model"`
+	RefinedRevision     int        `json:"refined_revision"`
 	AudioPath           string     `json:"audio_path"`
 	AudioRemovedAt      string     `json:"audio_removed_at"` // when disk pressure removed audio (RFC 3339), "" if never: all of it, or part when AudioPath names what is left; the session is kept
 	SummaryError        string     `json:"summary_error"`    // why the last summary attempt failed, "" once one completes; sync errors are in ErrorMessage
@@ -346,8 +347,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 			refined_transcript TEXT NOT NULL DEFAULT '',
 			refinement_status TEXT NOT NULL DEFAULT 'pending',
 			refinement_model TEXT NOT NULL DEFAULT '',
+			refined_revision INTEGER NOT NULL DEFAULT 0,
 			audio_path TEXT NOT NULL DEFAULT '',
-			sync_status TEXT NOT NULL DEFAULT 'pending',
 			envoy_publish_status TEXT NOT NULL DEFAULT 'pending',
 			gdrive_folder_id TEXT NOT NULL DEFAULT '',
 			merged_into TEXT NOT NULL DEFAULT '',
@@ -467,6 +468,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN sync_claimed_from TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN summary_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN refinement_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN refined_revision INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN drive_replace_pending INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN deletion_generation INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN refinement_generation INTEGER NOT NULL DEFAULT 0`,
@@ -641,10 +643,48 @@ func (s *SQLiteStore) init(dbPath string) error {
 			start_time REAL NOT NULL,
 			end_time REAL NOT NULL,
 			timestamp TEXT NOT NULL,
+			transcript_revision INTEGER NOT NULL DEFAULT 0,
+			recording_path TEXT NOT NULL DEFAULT '',
+			recording_sha256 TEXT NOT NULL DEFAULT '',
+			recording_ordinal INTEGER NOT NULL DEFAULT 0,
+			first_word_ordinal INTEGER NOT NULL DEFAULT -1,
+			last_word_ordinal INTEGER NOT NULL DEFAULT -1,
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
 		return fmt.Errorf("create segments table: %w", err)
+	}
+
+	for _, stmt := range []string{
+		`ALTER TABLE segments ADD COLUMN transcript_revision INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE segments ADD COLUMN recording_path TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE segments ADD COLUMN recording_sha256 TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE segments ADD COLUMN recording_ordinal INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE segments ADD COLUMN first_word_ordinal INTEGER NOT NULL DEFAULT -1`,
+		`ALTER TABLE segments ADD COLUMN last_word_ordinal INTEGER NOT NULL DEFAULT -1`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate segment provenance: %w", err)
+		}
+	}
+
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS refined_words (
+			session_id TEXT NOT NULL,
+			transcript_revision INTEGER NOT NULL,
+			recording_path TEXT NOT NULL,
+			recording_sha256 TEXT NOT NULL,
+			recording_ordinal INTEGER NOT NULL,
+			ordinal INTEGER NOT NULL,
+			text TEXT NOT NULL,
+			speaker INTEGER NOT NULL,
+			start_time REAL NOT NULL,
+			end_time REAL NOT NULL,
+			PRIMARY KEY (session_id, transcript_revision, recording_path, recording_sha256, ordinal),
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create refined words table: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -1156,7 +1196,7 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 
 func getSession(q querier, id string) (Session, error) {
 	row := q.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending FROM sessions WHERE id = ?`,
+		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, refined_revision, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, summary_error, drive_replace_pending FROM sessions WHERE id = ?`,
 		id,
 	)
 
@@ -1164,7 +1204,7 @@ func getSession(q querier, id string) (Session, error) {
 	var startedAt string
 	var endedAt sql.NullString
 	var lastSyncAttempt sql.NullString
-	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryModel, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.RefinementModel, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
+	if err := row.Scan(&sess.ID, &sess.Title, &startedAt, &endedAt, &sess.Status, &sess.Summary, &sess.SummaryModel, &sess.SummaryVersion, &sess.SummaryStatus, &sess.SummaryPreset, &sess.SpeakerNames, &sess.RefinedTranscript, &sess.RefinementStatus, &sess.RefinementModel, &sess.RefinedRevision, &sess.AudioPath, &sess.SyncStatus, &sess.EnvoyPublishStatus, &sess.SyncState, &sess.RetryCount, &lastSyncAttempt, &sess.ErrorMessage, &sess.GDriveFolderID, &sess.MergedInto, &sess.CanonicalTranscript, &sess.TranscriptSource, &sess.AudioRemovedAt, &sess.SummaryError, &sess.DriveReplacePending); err != nil {
 		return Session{}, fmt.Errorf("query session %s: %w", id, err)
 	}
 
@@ -1199,7 +1239,9 @@ func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error
 
 func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	rows, err := q.Query(
-		`SELECT id, speaker, text, start_time, end_time, timestamp
+		`SELECT id, speaker, text, start_time, end_time, timestamp,
+		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
+		        first_word_ordinal, last_word_ordinal
 		 FROM segments
 		 WHERE session_id = ?
 		 ORDER BY id ASC`,
@@ -1214,7 +1256,9 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	for rows.Next() {
 		var seg transcribe.Segment
 		var ts string
-		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
+			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
+			&seg.FirstWordOrdinal, &seg.LastWordOrdinal); err != nil {
 			return nil, fmt.Errorf("scan segment for session %s: %w", sessionID, err)
 		}
 
@@ -1236,7 +1280,9 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 
 func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
 	rows, err := s.db.Query(
-		`SELECT id, speaker, text, start_time, end_time, timestamp
+		`SELECT id, speaker, text, start_time, end_time, timestamp,
+		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
+		        first_word_ordinal, last_word_ordinal
 		 FROM segments
 		 WHERE session_id = ? AND start_time >= ? AND end_time <= ?
 		 ORDER BY start_time`,
@@ -1251,7 +1297,9 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	for rows.Next() {
 		var seg transcribe.Segment
 		var ts string
-		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts); err != nil {
+		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
+			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
+			&seg.FirstWordOrdinal, &seg.LastWordOrdinal); err != nil {
 			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
 		}
 

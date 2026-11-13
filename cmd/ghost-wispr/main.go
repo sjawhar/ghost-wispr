@@ -944,21 +944,14 @@ func main() {
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
-	// deletionRunner makes the runner both segment deletion actions use,
-	// with the configuration as it is now.
-	deletionRunner := func(sessionID string, segmentID int64) (*segmentDeleteRunner, error) {
-		if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {
-			return nil, err
-		}
+	// deletionRunner makes the occurrence-based deletion actions use the
+	// configuration as it is now. Batch transcription has already persisted
+	// their exact word spans, so deleting never creates a locator.
+	deletionRunner := func() *segmentDeleteRunner {
 		latestCfg := cfgStore.Get()
-		wordTranscriber, err := segmentDeletionTranscriber(&latestCfg)
-		if err != nil {
-			return nil, err
-		}
 		return &segmentDeleteRunner{
-			store:       store,
-			transcriber: audio.WordsTranscriber{Batch: wordTranscriber},
-			audioDir:    latestCfg.AudioDir,
+			store:    store,
+			audioDir: latestCfg.AudioDir,
 			ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
 				var source deletionRecordingSource
 				if session.GDriveFolderID != "" {
@@ -981,7 +974,7 @@ func main() {
 			splice:    audio.Splice,
 			refine:    manager.RefineSession,
 			summarize: manager.SummarizeSession,
-		}, nil
+		}
 	}
 
 	controlHooks := &server.ControlHooks{
@@ -1022,19 +1015,11 @@ func main() {
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
 			return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
 		},
-		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
-			runner, err := deletionRunner(sessionID, segmentID)
-			if err != nil {
-				return err
-			}
-			return runner.Delete(ctx, sessionID, segmentID)
+		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+			return deletionRunner().DeleteRefinedAudio(ctx, sessionID, segmentID, revision)
 		},
-		DeleteSegmentText: func(ctx context.Context, sessionID string, segmentID int64) error {
-			runner, err := deletionRunner(sessionID, segmentID)
-			if err != nil {
-				return err
-			}
-			return runner.DeleteText(ctx, sessionID, segmentID)
+		DeleteSegmentText: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+			return deletionRunner().DeleteRefinedText(ctx, sessionID, segmentID, revision)
 		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			return repairStructuredSummaries(ctx, store, publishSummaryReady)

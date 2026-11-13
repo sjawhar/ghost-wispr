@@ -137,6 +137,8 @@ export interface Segment {
   start_time: number
   end_time: number
   timestamp: string
+  transcript_revision?: number
+  recording_path?: string
 }
 
 export interface SessionSummary {
@@ -158,6 +160,7 @@ export interface SessionSummary {
   // Why the last summary attempt failed, when it did.
   summary_error?: string
   refinement_status?: RefinementStatus
+  refined_revision?: number
   transcript_source?: string
   refined_transcript?: string
   canonical_transcript?: string

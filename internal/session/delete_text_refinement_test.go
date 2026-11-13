@@ -136,6 +136,20 @@ func TestRefinementDropsTheWordsOfDeletedText(t *testing.T) {
 	if strings.Contains(sess.CanonicalTranscript, "tractor") || !strings.Contains(sess.CanonicalTranscript, "And then left.") {
 		t.Errorf("canonical transcript = %q, want the refined transcript without the deleted words", sess.CanonicalTranscript)
 	}
+	segments, err := store.GetSegments("20261112100000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2 || segments[0].TranscriptRevision != 1 || segments[0].RecordingPath != recording || segments[0].FirstWordOrdinal != 0 || segments[1].FirstWordOrdinal != 6 {
+		t.Fatalf("rebuilt refined segments = %#v, want timed segments with the deleted words absent", segments)
+	}
+	words, err := store.RefinedWords("20261112100000", sess.RefinedRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(words) != 6 || strings.Contains(strings.Join([]string{words[0].Text, words[1].Text, words[2].Text, words[3].Text, words[4].Text, words[5].Text}, " "), "tractor") {
+		t.Fatalf("persisted refined words = %#v, want only the six retained words", words)
+	}
 }
 
 // TestRefinementRefusesARecordingChangedSinceATextDeletion fails if a

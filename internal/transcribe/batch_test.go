@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -59,6 +60,36 @@ func TestBatchRefinement_DeepgramSubmissionAndTranscriptExtraction(t *testing.T)
 	}
 	if string(gotBody) != "fake-audio" {
 		t.Fatalf("expected raw audio body %q, got %q", "fake-audio", string(gotBody))
+	}
+}
+
+func TestBatchRequestsFillerWordsAndDiarization(t *testing.T) {
+	audioPath := filepath.Join(t.TempDir(), "session.mp3")
+	if err := os.WriteFile(audioPath, []byte("fake-audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var fillerWords, diarize string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fillerWords = r.URL.Query().Get("filler_words")
+		diarize = r.URL.Query().Get("diarize")
+		_, _ = w.Write([]byte(`{"metadata":{"models":["provider-id"],"model_info":{"provider-id":{"name":"general-nova","arch":"nova-3"}}},"results":{"channels":[{"alternatives":[{"transcript":"um hello","words":[{"word":"um","start":0,"end":0.2,"speaker":3},{"word":"hello","start":0.2,"end":0.5,"speaker":3}]}]}]}}`))
+	}))
+	defer server.Close()
+
+	result, err := NewDeepgramBatchTranscriber(DeepgramBatchConfig{BaseURL: server.URL}).Transcribe(context.Background(), audioPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fillerWords != "true" || diarize != "true" {
+		t.Fatalf("batch query filler_words=%q diarize=%q, want both true", fillerWords, diarize)
+	}
+	if len(result.Words) == 0 {
+		t.Fatal("batch result has no words")
+	}
+	speaker := reflect.ValueOf(result.Words[0]).FieldByName("Speaker")
+	if !speaker.IsValid() || speaker.Kind() != reflect.Int || speaker.Int() != 3 {
+		t.Fatalf("batch word speaker = %v, want 3", speaker)
 	}
 }
 

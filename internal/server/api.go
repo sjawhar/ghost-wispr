@@ -702,7 +702,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// The two deletion actions (Sami, 2026-11-12,
 		// dispatch://INFRA-2961/ask/8dcb4d3f-a256-45dd-b0ac-ed4b06fe2a05): no
 		// client gets one by default.
-		var deleteSegment func(context.Context, string, int64) error
+		var deleteSegment func(context.Context, string, int64, int) error
 		switch modes := r.URL.Query()["mode"]; {
 		case len(modes) == 1 && modes[0] == segmentDeleteText:
 			deleteSegment = controls.DeleteSegmentText
@@ -715,6 +715,16 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		segmentID, err := strconv.ParseInt(r.PathValue("segmentID"), 10, 64)
 		if err != nil || segmentID <= 0 {
 			writeJSONError(w, http.StatusNotFound, "segment not found")
+			return
+		}
+		revisions := r.URL.Query()["revision"]
+		if len(revisions) != 1 {
+			writeJSONError(w, http.StatusBadRequest, "transcript revision is required")
+			return
+		}
+		revision, err := strconv.Atoi(revisions[0])
+		if err != nil || revision <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "transcript revision must be a positive integer")
 			return
 		}
 		sessionData, err := store.GetSession(sessionID)
@@ -730,11 +740,19 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
 			return
 		}
+		if sessionData.RefinementStatus != storage.RefinementCompleted {
+			if sessionData.RefinementStatus == storage.RefinementFailed {
+				writeJSONError(w, http.StatusConflict, "this conversation's refinement failed; retry refinement before deleting")
+			} else {
+				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+			}
+			return
+		}
 		if deleteSegment == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "segment deletion is not configured")
 			return
 		}
-		if err := deleteSegment(r.Context(), sessionID, segmentID); err != nil {
+		if err := deleteSegment(r.Context(), sessionID, segmentID, revision); err != nil {
 			switch {
 			case errors.Is(err, storage.ErrSegmentNotFound):
 				writeJSONError(w, http.StatusNotFound, "segment not found")
@@ -742,6 +760,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
 			case errors.Is(err, storage.ErrSegmentSplicePending):
 				writeJSONError(w, http.StatusConflict, "A previous segment deletion is still being recovered. Try again after it completes.")
+			case errors.Is(err, storage.ErrStaleTranscriptRevision):
+				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
+			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):
+				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
 			case errors.Is(err, ErrSegmentNotFoundInRecording):
 				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be found in the recording; nothing was deleted")
 			case errors.Is(err, ErrSegmentNotRemovedCleanly):

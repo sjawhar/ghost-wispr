@@ -34,10 +34,12 @@ type Store interface {
 	FailSummaryAtGeneration(sessionID, errMsg string, generation int) (storage.Session, error)
 	// DeletionGeneration returns the session's transcript generation.
 	DeletionGeneration(sessionID string) (int, error)
-	// UpdateRefinementAtGeneration stores the refinement and the model its
-	// provider reported only while generation, the one ClaimRefinement
-	// returned, is still the session's transcript generation.
+	// UpdateRefinementAtGeneration records a failed refinement while its
+	// claimed transcript generation is still current.
 	UpdateRefinementAtGeneration(sessionID, transcript, status, model string, generation int) error
+	// PublishRefinementAtGeneration atomically publishes the completed
+	// refinement's words, rebuilt segments and both transcript views.
+	PublishRefinementAtGeneration(sessionID, transcript, model string, words []storage.RefinedWord, segments []storage.RefinedSegment, generation int) (int, error)
 	// ClaimRefinement marks the refinement running while the session still
 	// names audioPath, the recording it will read, reports whether it did,
 	// and returns the transcript generation it claimed at.
