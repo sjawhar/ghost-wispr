@@ -38,24 +38,3 @@ func TestRecordSyncFolderOwesAPendingDeletion(t *testing.T) {
 	}
 }
 
-// TestRecoverInterruptedSyncMarksAnOlderFolderlessSync fails if recovery of a
-// pre-upgrade SYNCING row first increments retry_count but never marks the
-// unrecorded folder that its later deletion must search for.
-func TestRecoverInterruptedSyncMarksAnOlderFolderlessSync(t *testing.T) {
-	store := newTestSQLiteStore(t)
-	_, _ = segmentTestSession(t, store, "legacy-cut-off")
-	if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_claim = 'old-claim', sync_claimed_from = ? WHERE id = ?`,
-		SyncStateSyncing, SyncStatePending, "legacy-cut-off"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.RecoverInterruptedSyncs(5, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-	var marked int
-	if err := store.DB().QueryRow(`SELECT count(*) FROM unrecorded_sync_folders WHERE session_id = ?`, "legacy-cut-off").Scan(&marked); err != nil {
-		t.Fatal(err)
-	}
-	if marked != 1 {
-		t.Fatalf("recovered folderless sync marker = %d, want 1", marked)
-	}
-}

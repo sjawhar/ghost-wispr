@@ -412,24 +412,6 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create drive replacement folders table: %w", err)
 	}
 
-	// unrecorded_sync_folders marks a first sync that may have created a
-	// folder before power stopped it. A segment deletion keeps its Drive
-	// replacement pending until that retry has searched for the folder.
-	if _, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS unrecorded_sync_folders (
-			session_id TEXT PRIMARY KEY,
-			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-		);
-	`); err != nil {
-		return fmt.Errorf("create unrecorded sync folders table: %w", err)
-	}
-	// A database from before durable folder recording has no marker. Any
-	// folderless retry may have been cut off after Drive created its folder,
-	// so make its next sync search before a deletion can settle.
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO unrecorded_sync_folders(session_id)
-		SELECT id FROM sessions WHERE gdrive_folder_id = '' AND retry_count > 0`); err != nil {
-		return fmt.Errorf("mark earlier folderless retries for Drive discovery: %w", err)
-	}
 
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS envoy_lifecycle_events (
@@ -1678,10 +1660,6 @@ func (s *SQLiteStore) ClaimSync(id, from, claim string, at time.Time) (Session, 
 	if rows == 0 {
 		return Session{}, false, nil
 	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO unrecorded_sync_folders(session_id)
-		SELECT id FROM sessions WHERE id = ? AND gdrive_folder_id = '' AND drive_replace_pending = 0`, id); err != nil {
-		return Session{}, false, fmt.Errorf("mark session %s as having an unrecorded Drive folder: %w", id, err)
-	}
 	sess, err := getSession(tx, id)
 	if err != nil {
 		return Session{}, false, err
@@ -1743,9 +1721,6 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
 		return false, err
 	}
-	if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
-		return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
-	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit marking session %s synced: %w", id, err)
 	}
@@ -1789,9 +1764,6 @@ func (s *SQLiteStore) RecordSyncFolder(id, claim, driveFolderID string) (bool, e
 	}
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
 		return false, err
-	}
-	if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
-		return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit Drive folder of session %s: %w", id, err)
@@ -1845,13 +1817,8 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
 		return false, err
 	}
-	if !strings.HasPrefix(errorMessage, "folder discovery failed:") {
-		if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
-			return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
-		}
-		if err := settleUnownedDriveReplacement(tx, id); err != nil {
-			return false, err
-		}
+	if err := settleUnownedDriveReplacement(tx, id); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit the end of the sync of session %s: %w", id, err)
@@ -1936,17 +1903,6 @@ func (s *SQLiteStore) RecoverInterruptedSyncs(maxRetries int, at time.Time) ([]s
 	}
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close recovered syncs: %w", err)
-	}
-	if len(ids) > 0 {
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-		args := make([]any, len(ids))
-		for i := range ids {
-			args[i] = ids[i]
-		}
-		if _, err := s.db.Exec(`INSERT OR IGNORE INTO unrecorded_sync_folders(session_id)
-			SELECT id FROM sessions WHERE id IN (`+placeholders+`) AND gdrive_folder_id = ''`, args...); err != nil {
-			return nil, fmt.Errorf("mark recovered folderless syncs for Drive discovery: %w", err)
-		}
 	}
 	return ids, nil
 }

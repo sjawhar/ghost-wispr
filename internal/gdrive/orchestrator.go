@@ -53,15 +53,6 @@ type folderCreatingUploader interface {
 	UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error)
 }
 
-// sessionFolderFinder lists the Drive folders the app made under its root
-// that hold only one session's files, so a sync cut off before it recorded
-// its folder can adopt that orphan.
-type sessionFolderFinder interface {
-	FindSessionFolders(ctx context.Context, sessionID, audioPath string) ([]string, error)
-}
-
-var _ folderCreatingUploader = (*Syncer)(nil)
-var _ sessionFolderFinder = (*Syncer)(nil)
 
 type replacementInputStore interface {
 	DriveReplacementInput(sessionID string) (pending bool, splicedRecording string, err error)
@@ -72,7 +63,6 @@ type replacementInputStore interface {
 	// EnsureDriveReplacementFolders reads the deletion's owed folders,
 	// rebuilding a ledger that is empty while the deletion is pending.
 	EnsureDriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
-	UnrecordedDriveFolderSessions(sessionID string) ([]storage.Session, error)
 	// RecordDriveReplacementFailure counts a failed replacement attempt of
 	// the session's deletion generation, with why; the app's status warning
 	// is read from these counts (storage.OwedDriveReplacements).
@@ -136,62 +126,6 @@ func (o *Orchestrator) recordSyncFolder(sessionID, claim, folderID string) error
 	return nil
 }
 
-// adoptSessionFolder records for the sync claim names an app-made Drive
-// folder named folderName that holds only this session's files and that no
-// other local session records, and returns its id; "" when there is none to
-// adopt (no finder, or no such folder: a same-named folder holding another
-// session's files, or recorded by another session, is not this session's
-// orphan).
-func (o *Orchestrator) adoptSessionFolder(ctx context.Context, sessionID, claim, audioPath string) (string, error) {
-	finder, ok := o.uploader.(sessionFolderFinder)
-	if !ok {
-		return "", nil
-	}
-	folderIDs, err := finder.FindSessionFolders(ctx, sessionID, audioPath)
-	if err != nil {
-		return "", fmt.Errorf("find Drive folder for sync %s: %w", sessionID, err)
-	}
-	for _, folderID := range folderIDs {
-		switch err := o.recordSyncFolder(sessionID, claim, folderID); {
-		case errors.Is(err, storage.ErrDriveFolderRecorded):
-			continue
-		case err != nil:
-			return "", fmt.Errorf("record existing Drive folder for sync %s: %w", sessionID, err)
-		}
-		return folderID, nil
-	}
-	return "", nil
-}
-
-// adoptPendingReplacementFolder claims sess long enough to record an orphan
-// Drive folder before the replacement ledger decides it has none. It reports
-// claimed false when another sync took the session first.
-func (o *Orchestrator) adoptPendingReplacementFolder(ctx context.Context, sess *storage.Session) (adopted, claimed bool, err error) {
-	if sess.GDriveFolderID != "" || sess.LastSyncAttempt == nil {
-		return false, true, nil
-	}
-	claim := uuid.NewString()
-	held, claimed, err := o.store.ClaimSync(sess.ID, sess.SyncState, claim, time.Now().UTC())
-	if err != nil || !claimed {
-		return false, claimed, err
-	}
-	folderID, adoptErr := o.adoptSessionFolder(ctx, sess.ID, claim, resolvedAudioPath(sess.AudioPath, o.audioDir))
-	message := ""
-	if adoptErr != nil {
-		message = "folder discovery failed: " + adoptErr.Error()
-	}
-	released, releaseErr := o.store.EndSync(sess.ID, claim, sess.SyncState, folderID, held.RetryCount, time.Now().UTC(), message)
-	if releaseErr != nil {
-		return false, true, fmt.Errorf("release folder-discovery claim for session %s: %w", sess.ID, releaseErr)
-	}
-	if !released {
-		return false, false, nil
-	}
-	if adoptErr != nil {
-		return false, true, adoptErr
-	}
-	return folderID != "", true, nil
-}
 
 // FolderOnDrive reports whether Drive has session folder folderID out of the
 // trash, and an error when Drive cannot say. GC asks it before it deletes a
@@ -318,25 +252,6 @@ func (o *Orchestrator) syncSession(ctx context.Context, sessionID string) error 
 				o.logger.Warn("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
 				return nil
 			}
-			unrecorded, err := replacements.UnrecordedDriveFolderSessions(sessionID)
-			if err != nil {
-				return err
-			}
-			for i := range unrecorded {
-				_, claimed, err := o.adoptPendingReplacementFolder(ctx, &unrecorded[i])
-				if err != nil {
-					return err
-				}
-				if !claimed {
-					o.logger.Info("gdrive replacement was claimed by another sync first, skipping", "operation", "replace_session_files", "session_id", sessionID)
-					return nil
-				}
-			}
-			if read, err = o.store.GetSession(sessionID); err != nil {
-				return fmt.Errorf("get session %s after Drive folder discovery: %w", sessionID, err)
-			} else if !read.DriveReplacePending {
-				return o.SyncSession(ctx, sessionID)
-			}
 			folders, err := replacements.EnsureDriveReplacementFolders(sessionID, generation)
 			if err != nil {
 				return err
@@ -408,22 +323,9 @@ func (o *Orchestrator) syncSession(ctx context.Context, sessionID string) error 
 
 	// A session synced before keeps its folder, and so does one whose first
 	// sync created its folder and then failed: syncing it again adds what the
-	// folder lacks instead of creating a second folder. A sync cut off after
-	// Drive made its folder but before the folder was recorded (or by a build
-	// that did not record new folders) left one under the app's Drive root;
-	// the retry finds and stores that folder before uploading into it. Only a
-	// retry looks: a session no sync attempted has no folder of its own. A
-	// retry adopts only a folder holding nothing of another session: a
-	// same-named folder can be another session's, one deleted here, say, whose
-	// documents an upload would overwrite (FindSessionFolders). A summary the
-	// session no longer has is emptied in an adopted folder too.
+	// folder lacks instead of creating a second folder. A summary the session
+	// no longer has is emptied in that existing folder.
 	driveFolderID := sess.GDriveFolderID
-	if driveFolderID == "" && read.LastSyncAttempt != nil {
-		driveFolderID, err = o.adoptSessionFolder(ctx, sessionID, claim, audioPath)
-		if err != nil {
-			err = fmt.Errorf("folder discovery failed: %w", err)
-		}
-	}
 	if err == nil {
 		if driveFolderID != "" {
 			err = o.uploader.UploadInto(ctx, driveFolderID, withEmptiedSummary(files))

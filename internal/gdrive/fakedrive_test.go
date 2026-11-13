@@ -140,9 +140,6 @@ func (d *fakeDrive) UploadInto(_ context.Context, folderID string, files []SyncF
 	return nil
 }
 
-func (*fakeDrive) FindSessionFolders(context.Context, string, string) ([]string, error) {
-	return nil, nil
-}
 
 // FolderOnDrive reports whether the fake holds folder folderID.
 func (d *fakeDrive) FolderOnDrive(_ context.Context, folderID string) (bool, error) {

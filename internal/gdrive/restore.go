@@ -14,7 +14,6 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
-	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -93,62 +92,6 @@ func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) 
 	return folders, nil
 }
 
-// FindSessionFolders returns the app-made folders under the configured Drive
-// root that hold an identity-bearing file for sessionID. It lists through the
-// drive.file scope, so it can adopt only folders this app made or previously
-// accessed. A date-and-title name is not enough: two sessions can share it,
-// and a locally deleted session records no folder.
-func (s *Syncer) FindSessionFolders(ctx context.Context, sessionID, audioPath string) ([]string, error) {
-	folders, err := s.ListSessionFolders(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var own []string
-	for _, folder := range folders {
-		only, err := s.folderHoldsOnly(ctx, folder.Id, sessionID, audioPath)
-		if err != nil {
-			return nil, err
-		}
-		if only {
-			own = append(own, folder.Id)
-		}
-	}
-	return own, nil
-}
-
-// folderHoldsOnly reports whether folderID has an identity-bearing file of
-// sessionID and no file of another session: a document whose frontmatter names
-// sessionID, or a recording name in audioPath. An empty folder cannot be
-// adopted because it identifies no session.
-func (s *Syncer) folderHoldsOnly(ctx context.Context, folderID, sessionID, audioPath string) (bool, error) {
-	recordings := map[string]bool{}
-	for _, entry := range recordingEntries(audioPath) {
-		recordings[recordingname.FileName(entry)] = true
-	}
-	contents, err := s.ListFolderFiles(ctx, folderID)
-	if err != nil {
-		return false, err
-	}
-	identified := false
-	for _, f := range contents {
-		switch {
-		case recordings[f.Name]:
-			identified = true
-		case (f.Name == "summary.md" || f.Name == "transcript.md") && f.MimeType == "application/vnd.google-apps.document":
-			text, err := s.ExportGoogleDoc(ctx, f.Id)
-			if err != nil {
-				return false, err
-			}
-			if meta, _ := parseFrontmatter(text); meta.ID != sessionID {
-				return false, nil
-			}
-			identified = true
-		default:
-			return false, nil
-		}
-	}
-	return identified, nil
-}
 
 // ListFolderFiles returns files inside a specific folder.
 func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive.File, error) {
