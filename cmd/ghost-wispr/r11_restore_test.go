@@ -105,7 +105,7 @@ func TestR11RestoreFindsPreMergeSourceFolder(t *testing.T) {
 	name := recordingname.FileName(path)
 	drive := &r11FolderDrive{
 		files: map[string][]*drive.File{
-			"source-folder": []*drive.File{{Name: name, MimeType: "audio/mpeg"}},
+			"source-folder": {{Name: name, MimeType: "audio/mpeg"}},
 		},
 		downloads: map[string][]byte{"source-folder/" + name: []byte("source recording")},
 	}
