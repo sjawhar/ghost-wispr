@@ -10,9 +10,8 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// TestR10OldMergeSubsetRestoreKeepsMarker fails if a merge made before
-// recording_sources existed accepts a subset after garbage collection removed
-// every recording.
+// TestR10OldMergeWithoutProvenanceRefusesRestore confirms that a database
+// without recording_sources refuses rather than guessing its recordings.
 func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
 	dir := t.TempDir()
 	store, session, names := r9MergedRestoreSession(t, "")
@@ -28,10 +27,10 @@ func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
 		return deletionRecordingSet{Paths: restored, Downloaded: restored}, nil
 	})
 	if err == nil {
-		t.Fatal("old merged session accepted a subset restore")
+		t.Fatal("old merged session accepted a restore without provenance")
 	}
-	if !strings.Contains(err.Error(), names[1]) || strings.Contains(err.Error(), names[0]) {
-		t.Fatalf("old merge restore refusal = %q, want only missing %s", err, names[1])
+	if !strings.Contains(err.Error(), "recording provenance is unavailable") {
+		t.Fatalf("old merge restore refusal = %q, want provenance error", err)
 	}
 	after, err := store.GetSession("merged")
 	if err != nil {

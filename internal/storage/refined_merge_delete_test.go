@@ -60,9 +60,6 @@ func TestDeleteRefinedSegmentScrubsMergedSourcesByRecording(t *testing.T) {
 			secret = segments[i].ID
 		}
 	}
-	if _, err := store.DB().Exec(`DELETE FROM recording_sources`); err != nil {
-		t.Fatal(err)
-	}
 	if err := store.DeleteRefinedSegmentText("merged", secret, revision); err != nil {
 		t.Fatal(err)
 	}

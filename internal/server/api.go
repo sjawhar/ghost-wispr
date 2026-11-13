@@ -758,6 +758,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		if sessionData.RefinementStatus == storage.RefinementNoAudio {
+			if controls.RefinementRecordingAvailable != nil {
+				if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
+					writeJSONError(w, http.StatusConflict, err.Error())
+					return
+				}
+			}
 			if controls.RetryRefinement == nil {
 				writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
 				return

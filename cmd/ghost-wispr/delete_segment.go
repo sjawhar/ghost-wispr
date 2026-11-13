@@ -167,6 +167,16 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 				if sourceSession.GDriveFolderID == "" {
 					continue
 				}
+				foundInKnownRecordings := false
+				for name := range byName {
+					if strings.TrimSuffix(name, filepath.Ext(name)) == sourceSession.ID {
+						foundInKnownRecordings = true
+						break
+					}
+				}
+				if foundInKnownRecordings {
+					continue
+				}
 				if err := addDriveFiles(sourceSession.GDriveFolderID, sourceSession.ID); err != nil {
 					return deletionRecordingSet{}, err
 				}
