@@ -57,6 +57,12 @@
     },
   ]
 
+  function actionsForSegment(segment: Segment): (typeof deleteActions)[number][] {
+    return segment.untimed
+      ? deleteActions.filter((action) => action.mode === 'text')
+      : deleteActions
+  }
+
   function closeDeleteMenuOnEscape(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       deleteMenuFor = null
@@ -74,15 +80,20 @@
       session?.refinement_status === RefinementStatus.Running,
   )
 
-  // The completed default view is the timed segment table rebuilt from batch
-  // words. Live segments remain readable while refinement runs, but cannot
-  // identify a word occurrence safely enough to delete.
-  const deletionAvailable = $derived(
+  // Timed segments are rebuilt from batch words. Untimed segments come from a
+  // merged source with no recording and can safely use only Delete text.
+  const timedDeletionAvailable = $derived(
     session?.refinement_status === RefinementStatus.Completed &&
       (session.refined_revision ?? 0) > 0 &&
-      visibleSegments.length > 0 &&
-      visibleSegments.every((segment) => (segment.transcript_revision ?? 0) > 0),
+      visibleSegments.some((segment) => !segment.untimed) &&
+      visibleSegments
+        .filter((segment) => !segment.untimed)
+        .every((segment) => (segment.transcript_revision ?? 0) > 0),
   )
+
+  function canDeleteSegment(segment: Segment): boolean {
+    return segment.untimed || timedDeletionAvailable
+  }
   const deleteUnavailableNote = $derived.by(() => {
     if (session?.refinement_status === RefinementStatus.Failed) {
       return 'Refinement failed; retry refinement before deleting.'
@@ -157,7 +168,7 @@
     if (
       segmentID === undefined ||
       revision === undefined ||
-      !deletionAvailable ||
+      !canDeleteSegment(segment) ||
       deletingSegmentID !== null
     ) {
       return
@@ -346,9 +357,15 @@
         <button
           type="button"
           class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
-          onclick={() => seekTo(segment.start_time)}
+          onclick={() => {
+            if (!segment.untimed) {
+              seekTo(segment.start_time)
+            }
+          }}
         >
-          <span class="line-time">{prettyTime(segment.start_time)}</span>
+          <span class="line-time"
+            >{segment.untimed ? 'Untimed' : prettyTime(segment.start_time)}</span
+          >
           <span class="line-text" id={`segment-${segment.id ?? index}`}>{segment.text}</span>
         </button>
         {#if segment.id !== undefined}
@@ -358,22 +375,22 @@
               class="segment-delete-btn"
               aria-label="Delete segment"
               aria-describedby={`segment-${segment.id ?? index}`}
-              aria-expanded={deletionAvailable && deleteMenuFor === segment.id}
+              aria-expanded={canDeleteSegment(segment) && deleteMenuFor === segment.id}
               title="Delete segment"
-              disabled={!deletionAvailable || deletingSegmentID !== null}
+              disabled={!canDeleteSegment(segment) || deletingSegmentID !== null}
               onclick={() => {
-                if (deletionAvailable) {
+                if (canDeleteSegment(segment)) {
                   deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!
                 }
               }}
             >
               {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
             </button>
-            {#if !deletionAvailable}
+            {#if !canDeleteSegment(segment)}
               <span class="segment-delete-note">{deleteUnavailableNote}</span>
             {:else if deleteMenuFor === segment.id}
               <div class="segment-delete-menu" role="group" aria-label="Delete options">
-                {#each deleteActions as action (action.mode)}
+                {#each actionsForSegment(segment) as action (action.mode)}
                   <div class="segment-delete-option">
                     <button
                       type="button"
@@ -384,7 +401,9 @@
                       {action.name}
                     </button>
                     <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
-                      >{action.note}</span
+                      >{segment.untimed
+                        ? 'This text came from a source with no recording, so only Delete text is available.'
+                        : action.note}</span
                     >
                   </div>
                 {/each}

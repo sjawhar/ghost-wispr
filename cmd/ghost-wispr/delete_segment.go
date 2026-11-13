@@ -140,7 +140,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 	}
 	driveFiles := make(map[string][]*drive.File)
 	driveFolders := make(map[string]string)
-	addDriveFiles := func(folderID, sourceID string) error {
+	addDriveFiles := func(folderID string, expected map[string]struct{}) error {
 		files, err := source.ListFolderFiles(ctx, folderID)
 		if err != nil {
 			return fmt.Errorf("list Drive recordings in folder %s: %w", folderID, err)
@@ -150,8 +150,10 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 			if !strings.HasPrefix(file.MimeType, "audio/") || !ok {
 				continue
 			}
-			if sourceID != "" && strings.TrimSuffix(name, filepath.Ext(name)) != sourceID {
-				continue
+			if len(expected) != 0 {
+				if _, matches := expected[recordingRequirementKey(name)]; !matches {
+					continue
+				}
 			}
 			driveFiles[name] = append(driveFiles[name], file)
 			if _, known := byName[name]; !known {
@@ -168,7 +170,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 	}
 	if usableRecordingSource(source) {
 		if session.GDriveFolderID != "" {
-			if err := addDriveFiles(session.GDriveFolderID, ""); err != nil {
+			if err := addDriveFiles(session.GDriveFolderID, nil); err != nil {
 				return deletionRecordingSet{}, err
 			}
 		}
@@ -181,17 +183,33 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 				if sourceSession.GDriveFolderID == "" {
 					continue
 				}
-				foundInKnownRecordings := false
-				for name := range byName {
-					if strings.TrimSuffix(name, filepath.Ext(name)) == sourceSession.ID {
-						foundInKnownRecordings = true
+				expected := make(map[string]struct{}, len(sourceSession.RecordingPaths))
+				for _, path := range sourceSession.RecordingPaths {
+					if key := recordingRequirementKey(path); key != "" && key != "." {
+						expected[key] = struct{}{}
+					}
+				}
+				if len(expected) == 0 {
+					expected[sourceSession.ID] = struct{}{}
+				}
+				allKnown := true
+				for key := range expected {
+					found := false
+					for name := range byName {
+						if recordingRequirementKey(name) == key {
+							found = true
+							break
+						}
+					}
+					if !found {
+						allKnown = false
 						break
 					}
 				}
-				if foundInKnownRecordings {
+				if allKnown {
 					continue
 				}
-				if err := addDriveFiles(sourceSession.GDriveFolderID, sourceSession.ID); err != nil {
+				if err := addDriveFiles(sourceSession.GDriveFolderID, expected); err != nil {
 					return deletionRecordingSet{}, err
 				}
 			}
@@ -294,6 +312,17 @@ func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID s
 	}
 	if session.Status == storage.SessionActive {
 		return storage.ErrSegmentSessionActive
+	}
+	if revision == 0 {
+		if err := d.store.DeleteRefinedSegmentText(sessionID, segmentID, revision); err != nil {
+			return err
+		}
+		if d.summarize != nil {
+			if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {
+				return fmt.Errorf("summarize untimed text deletion: %w", err)
+			}
+		}
+		return nil
 	}
 	if session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
 		// Old completed sessions have live-only segments. Start the existing

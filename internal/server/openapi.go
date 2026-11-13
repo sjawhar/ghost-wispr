@@ -577,9 +577,9 @@ func OpenAPISpec() map[string]any {
 						{
 							"name":        "revision",
 							"in":          "query",
-							"description": "The positive transcript revision carried by the selected timed segment. A changed revision returns 409; refresh and try again.",
+							"description": "The transcript revision carried by the selected segment. Timed segments use a positive revision; an untimed segment from a source with no recording uses 0 with mode=text only. A changed revision returns 409; refresh and try again.",
 							"required":    true,
-							"schema":      map[string]any{"type": "integer", "minimum": 1},
+							"schema":      map[string]any{"type": "integer", "minimum": 0},
 						},
 					},
 					"responses": map[string]any{

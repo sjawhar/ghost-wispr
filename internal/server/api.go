@@ -718,9 +718,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// dispatch://INFRA-2961/ask/8dcb4d3f-a256-45dd-b0ac-ed4b06fe2a05): no
 		// client gets one by default.
 		var deleteSegment func(context.Context, string, int64, int) error
+		textOnly := false
 		switch modes := r.URL.Query()["mode"]; {
 		case len(modes) == 1 && modes[0] == segmentDeleteText:
 			deleteSegment = controls.DeleteSegmentText
+			textOnly = true
 		case len(modes) == 1 && modes[0] == segmentDeleteTextAndAudio:
 			deleteSegment = controls.DeleteSegment
 		default:
@@ -738,8 +740,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		revision, err := strconv.Atoi(revisions[0])
-		if err != nil || revision <= 0 {
-			writeJSONError(w, http.StatusBadRequest, "transcript revision must be a positive integer")
+		if err != nil || revision < 0 || (revision == 0 && !textOnly) {
+			writeJSONError(w, http.StatusBadRequest, "transcript revision must be a positive integer, except 0 for an untimed Delete text segment")
 			return
 		}
 		sessionData, err := store.GetSession(sessionID)
@@ -755,41 +757,43 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
 			return
 		}
-		if sessionData.RefinementStatus == storage.RefinementCompleted && sessionData.RefinedRevision == 0 {
-			if controls.RetryRefinement == nil {
-				writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
-				return
-			}
-			go func() {
-				_ = controls.RetryRefinement(context.Background(), sessionID)
-			}()
-			writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
-			return
-		}
-		if sessionData.RefinementStatus == storage.RefinementNoAudio {
-			if controls.RefinementRecordingAvailable != nil {
-				if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
-					writeJSONError(w, http.StatusConflict, err.Error())
+		if !textOnly || revision != 0 {
+			if sessionData.RefinementStatus == storage.RefinementCompleted && sessionData.RefinedRevision == 0 {
+				if controls.RetryRefinement == nil {
+					writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
 					return
 				}
-			}
-			if controls.RetryRefinement == nil {
-				writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+				go func() {
+					_ = controls.RetryRefinement(context.Background(), sessionID)
+				}()
+				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
 				return
 			}
-			go func() {
-				_ = controls.RetryRefinement(context.Background(), sessionID)
-			}()
-			writeJSONError(w, http.StatusConflict, "no recording is on this unit; restoring it from Drive before deletion")
-			return
-		}
-		if sessionData.RefinementStatus != storage.RefinementCompleted {
-			if sessionData.RefinementStatus == storage.RefinementFailed {
-				writeJSONError(w, http.StatusConflict, "this conversation's refinement failed; retry refinement before deleting")
-			} else {
-				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+			if sessionData.RefinementStatus == storage.RefinementNoAudio {
+				if controls.RefinementRecordingAvailable != nil {
+					if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
+						writeJSONError(w, http.StatusConflict, err.Error())
+						return
+					}
+				}
+				if controls.RetryRefinement == nil {
+					writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+					return
+				}
+				go func() {
+					_ = controls.RetryRefinement(context.Background(), sessionID)
+				}()
+				writeJSONError(w, http.StatusConflict, "no recording is on this unit; restoring it from Drive before deletion")
+				return
 			}
-			return
+			if sessionData.RefinementStatus != storage.RefinementCompleted {
+				if sessionData.RefinementStatus == storage.RefinementFailed {
+					writeJSONError(w, http.StatusConflict, "this conversation's refinement failed; retry refinement before deleting")
+				} else {
+					writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+				}
+				return
+			}
 		}
 		if deleteSegment == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "segment deletion is not configured")

@@ -11,9 +11,128 @@ import (
 
 // DeleteRefinedSegmentText removes exactly the persisted word occurrences of
 // a batch-derived segment. It never tries to find the displayed text in a new
-// transcription.
+// transcription. An untimed segment comes from a merge source with no
+// recording, so its revision is zero and Delete text removes its row directly.
 func (s *SQLiteStore) DeleteRefinedSegmentText(sessionID string, segmentID int64, revision int) error {
+	if revision == 0 {
+		return s.deleteUntimedSegmentText(sessionID, segmentID)
+	}
 	return s.deleteRefinedSegment(sessionID, segmentID, revision, nil, true)
+}
+
+func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64) error {
+	if segmentID <= 0 {
+		return ErrSegmentNotFound
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin untimed segment deletion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	session, err := getSession(tx, sessionID)
+	if err != nil {
+		return err
+	}
+	if session.Status == SessionActive {
+		return ErrSegmentSessionActive
+	}
+	var deletedText string
+	if err := tx.QueryRow(`SELECT text FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&deletedText); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrSegmentNotFound
+		}
+		return fmt.Errorf("read untimed segment %d: %w", segmentID, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID); err != nil {
+		return fmt.Errorf("remove untimed segment %d: %w", segmentID, err)
+	}
+
+	nextRevision := session.RefinedRevision
+	if nextRevision > 0 {
+		words, err := refinedWords(tx, sessionID, session.RefinedRevision)
+		if err != nil {
+			return err
+		}
+		nextRevision++
+		if _, err := tx.Exec(`UPDATE refined_words SET transcript_revision = ? WHERE session_id = ? AND transcript_revision = ?`, nextRevision, sessionID, session.RefinedRevision); err != nil {
+			return fmt.Errorf("advance refined word revision after untimed deletion: %w", err)
+		}
+		if err := replaceRefinedSegments(tx, sessionID, nextRevision, session.StartedAt, words); err != nil {
+			return err
+		}
+	}
+	remaining, err := getSegments(tx, sessionID)
+	if err != nil {
+		return err
+	}
+	transcript := canonicalTranscript(remaining)
+	source := TranscriptSourceStreaming
+	if session.RefinementStatus == RefinementCompleted {
+		source = TranscriptSourceRefined
+	}
+	if _, err := tx.Exec(`UPDATE sessions
+		SET title = '', summary = '', summary_model = '', speaker_names = '{}',
+			refined_transcript = ?, canonical_transcript = ?, transcript_source = ?,
+			summary_status = ?, summary_error = '', summary_version = summary_version + 1,
+			deletion_generation = deletion_generation + 1,
+			refinement_generation = deletion_generation + 1,
+			refined_revision = ?,
+			envoy_publish_status = ?,
+			sync_status = CASE WHEN sync_state IN (?, ?) THEN sync_status ELSE ? END,
+			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END
+		WHERE id = ? AND refined_revision = ? AND status != ?`,
+		transcript, transcript, source,
+		SummaryPending, nextRevision, EnvoyPublishPending,
+		SyncStateSyncing, SyncStateRemoteDeleted, SyncPending,
+		SyncStateSyncing, SyncStateRemoteDeleted, SyncStatePending,
+		sessionID, session.RefinedRevision, SessionMerged); err != nil {
+		return fmt.Errorf("update untimed segment deletion session: %w", err)
+	}
+	sources, _, err := scrubMergedSourcesByRecording(tx, sessionID, "", remaining)
+	if err != nil {
+		return err
+	}
+	if len(sources) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sources)), ",")
+		args := make([]any, len(sources))
+		for i, sourceID := range sources {
+			args[i] = sourceID
+		}
+		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return fmt.Errorf("drop source refined words after untimed deletion: %w", err)
+		}
+		if _, err := tx.Exec(`DELETE FROM segments WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return fmt.Errorf("drop source segments after untimed deletion: %w", err)
+		}
+	}
+	owners := append([]string{sessionID}, sources...)
+	if err := dropLiveTranscriptEvents(tx, owners); err != nil {
+		return err
+	}
+	for _, owner := range owners {
+		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
+			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO summary_requests(session_id, prompt_hash) VALUES(?, 'segment-delete')
+		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
+		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
+	}
+	owed, earlierOwed, err := recordOwedErase(tx)
+	if err != nil {
+		return err
+	}
+	if err := rewriteDeletedTextEvents(tx, owners, nil, deletedText, nil); err != nil {
+		return fmt.Errorf("rewrite events for untimed deletion: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("rebuild search after untimed deletion: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit untimed segment deletion: %w", err)
+	}
+	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, nil, nil)
 }
 
 // DeleteRefinedSegmentAudio records an occurrence-based deletion before the
@@ -87,7 +206,10 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	if err != nil {
 		return err
 	}
-	transcript := RefinedTranscript(words)
+	transcript, err := transcriptWithUntimedSegments(tx, sessionID, RefinedTranscript(words))
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`UPDATE sessions
 		SET title = '', summary = '', summary_model = '', speaker_names = '{}',
 			refined_transcript = ?, refinement_status = ?, canonical_transcript = ?, transcript_source = ?,
@@ -118,6 +240,9 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		}
 		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
 			return fmt.Errorf("drop source refined words after merged deletion: %w", err)
+		}
+		if _, err := tx.Exec(`DELETE FROM segments WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return fmt.Errorf("drop source segments after merged deletion: %w", err)
 		}
 	}
 	owners := append([]string{sessionID}, sources...)
@@ -178,7 +303,7 @@ func refinedSegment(q querier, sessionID string, segmentID int64, revision int) 
 }
 
 func replaceRefinedSegments(tx *sql.Tx, sessionID string, revision int, startedAt time.Time, words []RefinedWord) error {
-	if _, err := tx.Exec(`DELETE FROM segments WHERE session_id = ?`, sessionID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM segments WHERE session_id = ? AND untimed = 0`, sessionID); err != nil {
 		return fmt.Errorf("clear refined segments: %w", err)
 	}
 	for _, segment := range BuildRefinedSegments(words) {

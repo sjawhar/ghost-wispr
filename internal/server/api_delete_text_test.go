@@ -142,6 +142,34 @@ func TestDeleteSegmentAPIRequiresTranscriptRevision(t *testing.T) {
 	}
 }
 
+func TestDeleteSegmentAPIAllowsTextOnlyForAnUntimedSegment(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementNoAudio},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	deleted := false
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		DeleteSegmentText: func(_ context.Context, sessionID string, segmentID int64, revision int) error {
+			if sessionID != "s1" || segmentID != 42 || revision != 0 {
+				t.Fatalf("text deletion = session:%q segment:%d revision:%d", sessionID, segmentID, revision)
+			}
+			deleted = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text&revision=0", nil))
+	if response.Code != http.StatusNoContent || !deleted {
+		t.Fatalf("untimed text delete = %d %s deleted=%t, want 204", response.Code, response.Body.String(), deleted)
+	}
+}
+
 // TestOpenAPISpecDocumentsTheDeletionModes fails if the OpenAPI document
 // does not give the segment deletion its required mode, with exactly the two
 // modes, and its 400 refusal.
@@ -197,8 +225,11 @@ func TestOpenAPISpecDocumentsTranscriptRevisionAndStaleConflict(t *testing.T) {
 	if revision == nil || revision["in"] != "query" || revision["required"] != true {
 		t.Fatalf("revision parameter = %#v, want a required query parameter", revision)
 	}
-	if schema, _ := revision["schema"].(map[string]any); schema["type"] != "integer" || schema["minimum"] != float64(1) {
-		t.Errorf("revision schema = %#v, want positive integer", schema)
+	if schema, _ := revision["schema"].(map[string]any); schema["type"] != "integer" || schema["minimum"] != float64(0) {
+		t.Errorf("revision schema = %#v, want zero only for untimed text", schema)
+	}
+	if description, _ := revision["description"].(string); !strings.Contains(description, "untimed") {
+		t.Errorf("revision description %q does not explain untimed text", description)
 	}
 	if description, _ := dig(t, spec, append(operation, "responses", "409", "description")...).(string); !strings.Contains(description, "refresh") {
 		t.Errorf("409 description %q does not say to refresh a stale transcript", description)

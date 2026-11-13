@@ -26,6 +26,8 @@ type Segment struct {
 	RecordingOrdinal   int       `json:"recording_ordinal,omitempty"`
 	FirstWordOrdinal   int       `json:"first_word_ordinal,omitempty"`
 	LastWordOrdinal    int       `json:"last_word_ordinal,omitempty"`
+	Untimed            bool      `json:"untimed,omitempty"`
+	UntimedSourceID    string    `json:"-"`
 }
 
 func GroupWordsBySpeaker(words []Word) []Segment {

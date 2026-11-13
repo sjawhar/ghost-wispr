@@ -217,6 +217,10 @@ func TestDeleteRefinedSegmentTextScrubsMergedSources(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	secret := mergedSessionWithSecret(t, store)
+	if _, err := store.DB().Exec(`INSERT INTO segments(session_id, speaker, text, start_time, end_time, timestamp)
+		VALUES('source-a', 0, ?, 0, 1, ?)`, mergedSourceSecret, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := store.DeleteRefinedSegmentText("merged", secret.id, secret.revision); err != nil {
 		t.Fatalf("DeleteRefinedSegmentText: %v", err)
@@ -227,6 +231,13 @@ func TestDeleteRefinedSegmentTextScrubsMergedSources(t *testing.T) {
 		if strings.Contains(value, mergedSourceSecret) {
 			t.Errorf("the merged source's %s still holds the deleted words: %q", field, value)
 		}
+	}
+	var sourceSegments int
+	if err := store.DB().QueryRow(`SELECT count(*) FROM segments WHERE session_id = 'source-a'`).Scan(&sourceSegments); err != nil {
+		t.Fatal(err)
+	}
+	if sourceSegments != 0 {
+		t.Fatalf("Delete text left %d stale source segment rows", sourceSegments)
 	}
 	if !strings.Contains(source.CanonicalTranscript, "alpha stays") {
 		t.Errorf("the merged source's canonical transcript lost the words it keeps: %q", source.CanonicalTranscript)

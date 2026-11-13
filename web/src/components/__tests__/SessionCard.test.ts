@@ -474,8 +474,7 @@ describe('SessionCard', () => {
     }
   })
 
-  it('keeps Retry refinement disabled until the session leaves no_audio', async () => {
-    vi.useFakeTimers()
+  it('refreshes Retry refinement and re-enables it when the status changes', async () => {
     vi.stubGlobal(
       'fetch',
       vi
@@ -484,16 +483,18 @@ describe('SessionCard', () => {
           new Response('{}', { status: 202, headers: { 'Content-Type': 'application/json' } }),
         ),
     )
-    render({
-      session: {
-        ...baseSession,
-        audio_path: '',
-        audio_removed_at: '2026-11-07T09:30:00Z',
-        refinement_status: RefinementStatus.NoAudio,
-        sync_status: SyncStatus.Synced,
-        sync_state: SyncState.Synced,
-        gdrive_folder_id: 'folder-1',
-      },
+    const session = {
+      ...baseSession,
+      audio_path: '',
+      audio_removed_at: '2026-11-07T09:30:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.Synced,
+      gdrive_folder_id: 'folder-1',
+    }
+    const onRefreshSession = vi.fn().mockResolvedValue(undefined)
+    const props = {
+      session,
       detail: undefined,
       expanded: false,
       presets: {},
@@ -501,12 +502,21 @@ describe('SessionCard', () => {
       onLoadDetail: vi.fn(),
       onResummarize: vi.fn(),
       onDelete: vi.fn(),
-    })
+      onRefreshSession,
+    }
+    const view = render(props)
 
-    const retry = screen.getByTestId('retry-refinement-btn')
-    await fireEvent.click(retry)
-    await vi.advanceTimersByTimeAsync(1001)
-    expect(retry.hasAttribute('disabled')).toBe(true)
+    await fireEvent.click(screen.getByTestId('retry-refinement-btn'))
+    await waitFor(() => {
+      expect(onRefreshSession).toHaveBeenCalledExactlyOnceWith('s1')
+    })
+    await view.rerender({
+      ...props,
+      session: { ...session, refinement_status: RefinementStatus.Failed },
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('retry-refinement-btn').hasAttribute('disabled')).toBe(false)
+    })
   })
 
   it('styles the audio-removed marker', () => {

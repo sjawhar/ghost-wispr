@@ -764,6 +764,28 @@ func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *int
 	}
 }
 
+type mergedSessionHookStore interface {
+	GetSession(string) (storage.Session, error)
+}
+
+func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, sessionID string) {
+	merged, err := store.GetSession(sessionID)
+	if err != nil {
+		log.Printf("warning: read merged session %s before refinement: %v", sessionID, err)
+		return
+	}
+	if merged.AudioPath != "" {
+		if err := refine(ctx, sessionID, merged.AudioPath, merged.StartedAt); err == nil {
+			return
+		} else {
+			log.Printf("warning: refine merged session %s: %v", sessionID, err)
+		}
+	}
+	if err := summarize(ctx, sessionID, merged.StartedAt); err != nil {
+		log.Printf("warning: summarize merged session %s: %v", sessionID, err)
+	}
+}
+
 func main() {
 	configPath := configPathFromEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
@@ -1288,18 +1310,19 @@ func main() {
 			return resummarize(ctx, store, summarizer, hub, publishSummaryReady, sessionID, preset)
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
-			merged, err := store.GetSession(sessionID)
-			if err != nil {
-				log.Printf("warning: read merged session %s before refinement: %v", sessionID, err)
-			} else if merged.AudioPath != "" {
-				if err := manager.RefineSession(ctx, sessionID, merged.AudioPath, merged.StartedAt); err != nil {
-					log.Printf("warning: refine merged session %s: %v", sessionID, err)
-				}
-			}
-			if summarizer == nil {
-				return
-			}
-			summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
+			onSessionMerged(
+				ctx,
+				store,
+				manager.RefineSession,
+				func(ctx context.Context, sessionID string, startedAt time.Time) error {
+					if summarizer == nil {
+						return manager.SummarizeSession(ctx, sessionID, startedAt)
+					}
+					summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
+					return nil
+				},
+				sessionID,
+			)
 		},
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)

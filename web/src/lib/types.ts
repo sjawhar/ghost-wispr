@@ -139,6 +139,7 @@ export interface Segment {
   timestamp: string
   transcript_revision?: number
   recording_path?: string
+  untimed?: boolean
 }
 
 export interface SessionSummary {

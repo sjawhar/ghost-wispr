@@ -678,6 +678,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 			recording_ordinal INTEGER NOT NULL DEFAULT 0,
 			first_word_ordinal INTEGER NOT NULL DEFAULT -1,
 			last_word_ordinal INTEGER NOT NULL DEFAULT -1,
+			untimed INTEGER NOT NULL DEFAULT 0,
+			untimed_source_id TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
@@ -691,6 +693,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE segments ADD COLUMN recording_ordinal INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE segments ADD COLUMN first_word_ordinal INTEGER NOT NULL DEFAULT -1`,
 		`ALTER TABLE segments ADD COLUMN last_word_ordinal INTEGER NOT NULL DEFAULT -1`,
+		`ALTER TABLE segments ADD COLUMN untimed INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE segments ADD COLUMN untimed_source_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate segment provenance: %w", err)
@@ -968,40 +972,50 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 type RefinementRecordingSource struct {
 	ID             string
 	GDriveFolderID string
+	RecordingPaths []string
 }
 
-// RefinementRecordingSources returns only source sessions recorded in
-// recording_sources. Without provenance, a restore must refuse rather than
-// guess which recordings belong to the merge.
+// RefinementRecordingSources follows recording provenance through nested
+// merges to the original source session that owns each recording and Drive
+// folder. Without provenance, a restore must refuse rather than guess.
 func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]RefinementRecordingSource, error) {
-	rows, err := s.db.Query(`SELECT DISTINCT source_session_id FROM recording_sources
-		WHERE merged_session_id = ? ORDER BY source_session_id`, sessionID)
+	rows, err := s.db.Query(`WITH RECURSIVE source(recording_path, session_id) AS (
+			SELECT recording_path, source_session_id FROM recording_sources WHERE merged_session_id = ?
+			UNION ALL
+			SELECT source.recording_path, nested.source_session_id
+			FROM source JOIN recording_sources AS nested
+			  ON nested.merged_session_id = source.session_id
+			 AND nested.recording_path = source.recording_path
+		)
+		SELECT source.session_id, sessions.gdrive_folder_id, source.recording_path
+		FROM source JOIN sessions ON sessions.id = source.session_id
+		WHERE NOT EXISTS (
+			SELECT 1 FROM recording_sources AS nested
+			WHERE nested.merged_session_id = source.session_id
+			  AND nested.recording_path = source.recording_path
+		)
+		ORDER BY sessions.started_at, source.recording_path`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("list recording sources for session %s: %w", sessionID, err)
 	}
-	var ids []string
+	defer func() { _ = rows.Close() }()
+	byID := make(map[string]int)
+	var sources []RefinementRecordingSource
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
+		var id, folderID, path string
+		if err := rows.Scan(&id, &folderID, &path); err != nil {
 			return nil, fmt.Errorf("scan recording source for session %s: %w", sessionID, err)
 		}
-		ids = append(ids, id)
+		index, found := byID[id]
+		if !found {
+			index = len(sources)
+			byID[id] = index
+			sources = append(sources, RefinementRecordingSource{ID: id, GDriveFolderID: folderID})
+		}
+		sources[index].RecordingPaths = append(sources[index].RecordingPaths, path)
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
 		return nil, fmt.Errorf("iterate recording sources for session %s: %w", sessionID, err)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close recording sources for session %s: %w", sessionID, err)
-	}
-	sources := make([]RefinementRecordingSource, 0, len(ids))
-	for _, id := range ids {
-		source := RefinementRecordingSource{ID: id}
-		if err := s.db.QueryRow(`SELECT gdrive_folder_id FROM sessions WHERE id = ?`, source.ID).Scan(&source.GDriveFolderID); err != nil {
-			return nil, fmt.Errorf("read recording source %s: %w", source.ID, err)
-		}
-		sources = append(sources, source)
 	}
 	return sources, nil
 }
@@ -1180,6 +1194,27 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	if err != nil {
 		return fmt.Errorf("create merged session: %w", err)
 	}
+	noAudioRows, err := tx.Query(
+		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND audio_path = ''`, strings.Join(placeholders, ",")),
+		args[1:]...,
+	)
+	if err != nil {
+		return fmt.Errorf("list sources without recordings: %w", err)
+	}
+	for noAudioRows.Next() {
+		var sourceID string
+		if err := noAudioRows.Scan(&sourceID); err != nil {
+			_ = noAudioRows.Close()
+			return fmt.Errorf("scan source without recording: %w", err)
+		}
+		if _, err := tx.Exec(`UPDATE segments SET untimed = 1, untimed_source_id = ? WHERE session_id = ?`, sourceID, sourceID); err != nil {
+			_ = noAudioRows.Close()
+			return fmt.Errorf("mark source segments untimed: %w", err)
+		}
+	}
+	if err := errors.Join(noAudioRows.Err(), noAudioRows.Close()); err != nil {
+		return fmt.Errorf("list sources without recordings: %w", err)
+	}
 	segQuery := fmt.Sprintf(
 		`UPDATE segments SET session_id = ? WHERE session_id IN (%s)`,
 		strings.Join(placeholders, ","),
@@ -1221,6 +1256,18 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("iterate audio paths: %w", err)
 	}
 	_ = rows.Close()
+	var audioRemovedAt string
+	if err := tx.QueryRow(
+		fmt.Sprintf(`SELECT COALESCE(MAX(audio_removed_at), '') FROM sessions WHERE id IN (%s)`, strings.Join(placeholders, ",")),
+		args[1:]...,
+	).Scan(&audioRemovedAt); err != nil {
+		return fmt.Errorf("read source audio removal: %w", err)
+	}
+	if audioRemovedAt != "" {
+		if _, err := tx.Exec(`UPDATE sessions SET audio_removed_at = ? WHERE id = ?`, audioRemovedAt, newID); err != nil {
+			return fmt.Errorf("record removed source audio: %w", err)
+		}
+	}
 
 	if len(audioPaths) > 0 {
 		_, err = tx.Exec(`UPDATE sessions SET audio_path = ?, refinement_status = 'pending' WHERE id = ?`, strings.Join(audioPaths, ","), newID)
@@ -1233,7 +1280,9 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	// each file, so removing the merged session's audio leaves no source
 	// naming a file that is gone.
 	markQuery := fmt.Sprintf(
-		`UPDATE sessions SET status = 'merged', merged_into = ?, audio_path = '' WHERE id IN (%s)`,
+		`UPDATE sessions
+		 SET status = 'merged', merged_into = ?, audio_path = '', deletion_generation = deletion_generation + 1
+		 WHERE id IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 	markArgs := make([]any, 0, len(sourceIDs)+1)
@@ -1416,6 +1465,16 @@ func getSession(q querier, id string) (Session, error) {
 }
 
 func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error) {
+	session, err := s.GetSession(sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return []transcribe.Segment{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if session.Status == SessionMerged {
+		return []transcribe.Segment{}, nil
+	}
 	return getSegments(s.db, sessionID)
 }
 
@@ -1423,7 +1482,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	rows, err := q.Query(
 		`SELECT id, speaker, text, start_time, end_time, timestamp,
 		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
-		        first_word_ordinal, last_word_ordinal
+		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id
 		 FROM segments
 		 WHERE session_id = ?
 		 ORDER BY id ASC`,
@@ -1440,7 +1499,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 		var ts string
 		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
 			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
-			&seg.FirstWordOrdinal, &seg.LastWordOrdinal); err != nil {
+			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID); err != nil {
 			return nil, fmt.Errorf("scan segment for session %s: %w", sessionID, err)
 		}
 
@@ -1461,12 +1520,19 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 }
 
 func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
+	session, err := s.GetSession(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session.Status == SessionMerged {
+		return []transcribe.Segment{}, nil
+	}
 	rows, err := s.db.Query(
 		`SELECT id, speaker, text, start_time, end_time, timestamp,
 		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
-		        first_word_ordinal, last_word_ordinal
+		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id
 		 FROM segments
-		 WHERE session_id = ? AND start_time >= ? AND end_time <= ?
+		 WHERE session_id = ? AND start_time >= ? AND end_time <= ? AND untimed = 0
 		 ORDER BY start_time`,
 		sessionID, startTime, endTime,
 	)
@@ -1481,7 +1547,7 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 		var ts string
 		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
 			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
-			&seg.FirstWordOrdinal, &seg.LastWordOrdinal); err != nil {
+			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID); err != nil {
 			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
 		}
 
@@ -1528,6 +1594,9 @@ func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, statu
 	if err != nil {
 		return err
 	}
+	if current.Status == SessionMerged {
+		return sql.ErrNoRows
+	}
 	bumpVersion := summaryVersionChanges(&current, title, summary, status, preset, speakerNames, model)
 	res, err := tx.Exec(
 		`UPDATE sessions
@@ -1540,7 +1609,7 @@ func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, statu
 		     envoy_publish_status = CASE WHEN ? THEN ? ELSE envoy_publish_status END,
 		     summary_status = ?,
 		     summary_error = CASE WHEN ? = ? THEN '' ELSE summary_error END
-		 WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ?`,
+		 WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ? AND status != ?`,
 		title, title,
 		summary, preset,
 		summary, speakerNames,
@@ -1552,6 +1621,7 @@ func (s *SQLiteStore) UpdateSummaryAtGeneration(sessionID, title, summary, statu
 		status, SummaryCompleted,
 		sessionID,
 		generation,
+		SessionMerged,
 	)
 	if err != nil {
 		return fmt.Errorf("update summary for session %s: %w", sessionID, err)
@@ -1625,8 +1695,8 @@ func summaryVersionChanges(current *Session, title, summary, status, preset, spe
 // or Envoy publishing
 // of it was attempted.
 func (s *SQLiteStore) StartSummary(id string) error {
-	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_generation = deletion_generation, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ?`,
-		SummaryRunning, EnvoyPublishPending, SummaryCompleted, EnvoyPublishPending, id)
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, envoy_publish_status = ?, summary_generation = deletion_generation, summary_version = CASE WHEN summary_status = ? OR summary != '' OR envoy_publish_status != ? THEN summary_version + 1 ELSE summary_version END WHERE id = ? AND status != ?`,
+		SummaryRunning, EnvoyPublishPending, SummaryCompleted, EnvoyPublishPending, id, SessionMerged)
 	if err != nil {
 		return fmt.Errorf("start summary of session %s: %w", id, err)
 	}
@@ -1647,7 +1717,7 @@ func (s *SQLiteStore) StartSummary(id string) error {
 // for Envoy again, and a summary Envoy already has is not sent at a new
 // version.
 func (s *SQLiteStore) StartEmptySummary(id string) error {
-	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, summary_generation = deletion_generation WHERE id = ?`, SummaryRunning, id)
+	res, err := s.db.Exec(`UPDATE sessions SET summary_status = ?, summary_generation = deletion_generation WHERE id = ? AND status != ?`, SummaryRunning, id, SessionMerged)
 	if err != nil {
 		return fmt.Errorf("start empty summary of session %s: %w", id, err)
 	}
@@ -1667,8 +1737,8 @@ func (s *SQLiteStore) StartEmptySummary(id string) error {
 func (s *SQLiteStore) StartEmptySummaryAtGeneration(id string, generation int) error {
 	res, err := s.db.Exec(`UPDATE sessions
 		SET summary_status = ?, summary_generation = deletion_generation
-		WHERE id = ? AND deletion_generation = ? AND summary_status IN (?, ?, ?)`,
-		SummaryRunning, id, generation, SummaryPending, SummaryFailed, SummaryRunning)
+		WHERE id = ? AND deletion_generation = ? AND summary_status IN (?, ?, ?) AND status != ?`,
+		SummaryRunning, id, generation, SummaryPending, SummaryFailed, SummaryRunning, SessionMerged)
 	if err != nil {
 		return fmt.Errorf("start empty summary of session %s at generation %d: %w", id, generation, err)
 	}
@@ -1695,7 +1765,7 @@ func (s *SQLiteStore) FailSummaryAtGeneration(id, errMsg string, generation int)
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ?`, SummaryFailed, errMsg, id, generation)
+	res, err := tx.Exec(`UPDATE sessions SET summary_status = ?, summary_error = ? WHERE id = ? AND summary_generation = deletion_generation AND deletion_generation = ? AND status != ?`, SummaryFailed, errMsg, id, generation, SessionMerged)
 	if err != nil {
 		return Session{}, fmt.Errorf("fail summary of session %s: %w", id, err)
 	}
@@ -1726,12 +1796,13 @@ func (s *SQLiteStore) UpdateRefinementAtGeneration(sessionID, transcript, status
 		`UPDATE sessions
 		 SET refined_transcript = ?, refinement_status = ?,
 		     refinement_model = CASE WHEN ? != '' THEN ? ELSE refinement_model END
-		 WHERE id = ? AND refinement_generation = deletion_generation AND deletion_generation = ?`,
+		 WHERE id = ? AND refinement_generation = deletion_generation AND deletion_generation = ? AND status != ?`,
 		transcript,
 		status,
 		model, model,
 		sessionID,
 		generation,
+		SessionMerged,
 	)
 	if err != nil {
 		return fmt.Errorf("update refinement for session %s: %w", sessionID, err)
@@ -1758,8 +1829,8 @@ func (s *SQLiteStore) UpdateRefinementAtGeneration(sessionID, transcript, status
 // result at (UpdateRefinementAtGeneration).
 func (s *SQLiteStore) ClaimRefinement(id, audioPath string) (generation int, claimed bool, err error) {
 	err = s.db.QueryRow(
-		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != '' RETURNING refinement_generation`,
-		RefinementRunning, id, audioPath,
+		`UPDATE sessions SET refined_transcript = '', refinement_status = ?, refinement_model = '', refinement_generation = deletion_generation WHERE id = ? AND audio_path = ? AND audio_path != '' AND status != ? RETURNING refinement_generation`,
+		RefinementRunning, id, audioPath, SessionMerged,
 	).Scan(&generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil

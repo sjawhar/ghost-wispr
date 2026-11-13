@@ -33,6 +33,31 @@ type RefinedSegment struct {
 	Timestamp        time.Time
 }
 
+func transcriptWithUntimedSegments(q querier, sessionID, refined string) (string, error) {
+	rows, err := q.Query(`SELECT text FROM segments WHERE session_id = ? AND untimed = 1 ORDER BY timestamp, id`, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("list untimed segments for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	parts := make([]string, 0, 2)
+	if refined = strings.TrimSpace(refined); refined != "" {
+		parts = append(parts, refined)
+	}
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			return "", fmt.Errorf("scan untimed segment for session %s: %w", sessionID, err)
+		}
+		if text = strings.TrimSpace(text); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate untimed segments for session %s: %w", sessionID, err)
+	}
+	return strings.Join(parts, "\n\n"), nil
+}
+
 // PublishRefinementAtGeneration replaces live segments with a completed batch
 // refinement in one transaction. The generation fence rejects a result that
 // started before a deletion changed the session.
@@ -44,9 +69,12 @@ func (s *SQLiteStore) PublishRefinementAtGeneration(sessionID, transcript, model
 	defer func() { _ = tx.Rollback() }()
 
 	var deletionGeneration, refinementGeneration, revision int
-	var startedAt string
-	if err := tx.QueryRow(`SELECT deletion_generation, refinement_generation, refined_revision, started_at FROM sessions WHERE id = ?`, sessionID).Scan(&deletionGeneration, &refinementGeneration, &revision, &startedAt); err != nil {
+	var status, startedAt string
+	if err := tx.QueryRow(`SELECT deletion_generation, refinement_generation, refined_revision, status, started_at FROM sessions WHERE id = ?`, sessionID).Scan(&deletionGeneration, &refinementGeneration, &revision, &status, &startedAt); err != nil {
 		return 0, fmt.Errorf("read refinement generation for session %s: %w", sessionID, err)
+	}
+	if status == SessionMerged {
+		return 0, sql.ErrNoRows
 	}
 	if deletionGeneration != generation || refinementGeneration != generation {
 		return 0, sql.ErrNoRows
@@ -60,7 +88,7 @@ func (s *SQLiteStore) PublishRefinementAtGeneration(sessionID, transcript, model
 	if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id = ?`, sessionID); err != nil {
 		return 0, fmt.Errorf("clear refined words for session %s: %w", sessionID, err)
 	}
-	if _, err := tx.Exec(`DELETE FROM segments WHERE session_id = ?`, sessionID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM segments WHERE session_id = ? AND untimed = 0`, sessionID); err != nil {
 		return 0, fmt.Errorf("clear live segments for session %s: %w", sessionID, err)
 	}
 	for _, word := range words {
@@ -89,12 +117,16 @@ func (s *SQLiteStore) PublishRefinementAtGeneration(sessionID, transcript, model
 		}
 	}
 
-	canonical := strings.TrimSpace(transcript)
+	canonical, err := transcriptWithUntimedSegments(tx, sessionID, transcript)
+	if err != nil {
+		return 0, err
+	}
 	res, err := tx.Exec(`UPDATE sessions
 		SET refined_transcript = ?, refinement_status = ?, refinement_model = ?,
 			canonical_transcript = ?, transcript_source = ?, refined_revision = ?
-		WHERE id = ? AND deletion_generation = ? AND refinement_generation = ?`,
-		canonical, RefinementCompleted, model, canonical, TranscriptSourceRefined, nextRevision, sessionID, generation, generation)
+		WHERE id = ? AND deletion_generation = ? AND refinement_generation = ? AND status != ?`,
+		canonical, RefinementCompleted, model, canonical, TranscriptSourceRefined, nextRevision,
+		sessionID, generation, generation, SessionMerged)
 	if err != nil {
 		return 0, fmt.Errorf("publish refinement for session %s: %w", sessionID, err)
 	}

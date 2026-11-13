@@ -72,6 +72,48 @@ it('disables Delete until timed refined segments exist', () => {
   ).toHaveLength(2)
 })
 
+it('offers only Delete text for untimed source text', async () => {
+  render(AudioPlayer, {
+    sessionId: 'merged',
+    segments: [
+      {
+        id: 42,
+        speaker: 0,
+        text: 'Words from the source without a recording',
+        start_time: 0,
+        end_time: 0,
+        timestamp: '2026-11-12T10:00:00Z',
+        transcript_revision: 0,
+        untimed: true,
+      },
+    ],
+    session: {
+      id: 'merged',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      refinement_status: RefinementStatus.NoAudio,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  const deleteButton = screen.getByRole('button', { name: 'Delete segment' })
+  expect(deleteButton.hasAttribute('disabled')).toBe(false)
+  await fireEvent.click(deleteButton)
+  expect(screen.getByRole('button', { name: 'Delete text' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Delete text and audio' })).toBeNull()
+  expect(
+    screen.getByText(
+      'This text came from a source with no recording, so only Delete text is available.',
+    ),
+  ).toBeTruthy()
+})
+
 it('says a completed conversation without timed words needs refinement before deletion', () => {
   render(AudioPlayer, {
     sessionId: 's1',
