@@ -14,7 +14,7 @@ import (
 func TestDeleteSegmentAPIRefusesWhileASpliceIsPending(t *testing.T) {
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
-		sessions:       map[string]storage.Session{"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted}},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted, RefinedRevision: 1}},
 		segments:       map[string][]transcribe.Segment{},
 	}
 	hook := func(context.Context, string, int64, int) error { return storage.ErrSegmentSplicePending }

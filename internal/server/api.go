@@ -740,6 +740,17 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
 			return
 		}
+		if sessionData.RefinementStatus == storage.RefinementCompleted && sessionData.RefinedRevision == 0 {
+			if controls.RetryRefinement == nil {
+				writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+				return
+			}
+			go func() {
+				_ = controls.RetryRefinement(context.Background(), sessionID)
+			}()
+			writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+			return
+		}
 		if sessionData.RefinementStatus != storage.RefinementCompleted {
 			if sessionData.RefinementStatus == storage.RefinementFailed {
 				writeJSONError(w, http.StatusConflict, "this conversation's refinement failed; retry refinement before deleting")
@@ -764,14 +775,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
 			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):
 				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
-			case errors.Is(err, ErrSegmentNotFoundInRecording):
-				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be found in the recording; nothing was deleted")
-			case errors.Is(err, ErrSegmentNotRemovedCleanly):
-				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be removed cleanly; nothing was deleted")
 			case errors.Is(err, ErrSegmentRawAudioKept):
 				writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
-			case errors.Is(err, ErrBatchTranscriptionNotConfigured):
-				writeJSONError(w, http.StatusServiceUnavailable, "Segment deletion needs batch transcription, which is not configured: add a Deepgram API key.")
 			default:
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete segment: %v", err))
 			}

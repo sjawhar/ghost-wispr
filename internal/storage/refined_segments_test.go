@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -179,5 +180,39 @@ func TestAudioCutShiftsLaterRefinedWords(t *testing.T) {
 	}
 	if len(afterSegments) != 1 || afterSegments[0].StartTime != 0.5 || afterSegments[0].EndTime != 1 {
 		t.Fatalf("segments after splice = %#v, want shifted timed segment", afterSegments)
+	}
+}
+
+func TestDeleteRefinedSegmentRefusesStaleRevision(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("s1", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	words := []RefinedWord{{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Text: "Keep.", Start: 0, End: 0.5}}
+	revision, err := store.PublishRefinementAtGeneration("s1", RefinedTranscript(words), "nova-3", words, BuildRefinedSegments(words), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRefinedSegmentText("s1", segments[0].ID, revision+1); !errors.Is(err, ErrStaleTranscriptRevision) {
+		t.Fatalf("stale refined delete = %v, want stale transcript revision", err)
+	}
+	remaining, err := store.RefinedWords("s1", revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("stale revision deleted words: %#v", remaining)
 	}
 }

@@ -275,4 +275,16 @@ func TestRefinementOfAMergedSessionDropsDeletedTextInItsRecordings(t *testing.T)
 	if want := "Alpha stays here.\n\nBravo stays. Charlie stays."; sess.RefinementStatus != storage.RefinementCompleted || sess.RefinedTranscript != want {
 		t.Errorf("merged refinement = %q %q, want completed %q", sess.RefinementStatus, sess.RefinedTranscript, want)
 	}
+	refinedSegments, err := store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, segment := range refinedSegments {
+		if strings.Contains(segment.Text, "Alpha") && segment.RecordingPath != recordings["a"] {
+			t.Fatalf("alpha provenance = %q, want recording %q", segment.RecordingPath, recordings["a"])
+		}
+		if strings.Contains(segment.Text, "Charlie") && segment.RecordingPath != recordings["b"] {
+			t.Fatalf("charlie provenance = %q, want recording %q", segment.RecordingPath, recordings["b"])
+		}
+	}
 }

@@ -323,9 +323,10 @@
                 ? 'no recording'
                 : session.refinement_status}
             </span>
-            {#if session.refinement_status === RefinementStatus.Failed}
+            {#if session.refinement_status === RefinementStatus.Failed || (session.refinement_status === RefinementStatus.Completed && !session.refined_revision)}
               <button
                 class="retry-btn"
+                aria-label="Retry refinement"
                 onclick={handleRetryRefinement}
                 disabled={retryingRefinement}
                 data-testid="retry-refinement-btn"

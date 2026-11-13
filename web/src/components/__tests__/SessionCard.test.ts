@@ -22,6 +22,8 @@ const baseSession: SessionSummary = {
   summary_status: SummaryStatus.Pending,
   summary_preset: 'default',
   audio_path: 'data/audio/s1.mp3',
+  refinement_status: RefinementStatus.Completed,
+  refined_revision: 1,
 }
 
 type SessionCardProps = ComponentProps<typeof SessionCard>
@@ -380,6 +382,7 @@ describe('SessionCard', () => {
             start_time: 0,
             end_time: 2,
             timestamp: '2026-11-11T10:00:00Z',
+            transcript_revision: 1,
           },
         ],
       },

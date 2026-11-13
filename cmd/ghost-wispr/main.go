@@ -223,24 +223,6 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 	}
 }
 
-// segmentDeletionTranscriber returns the batch transcriber a segment deletion
-// under cfg finds the segment's words with. With no Deepgram API key, its
-// error wraps server.ErrBatchTranscriptionNotConfigured, which the API
-// answers with what to configure.
-func segmentDeletionTranscriber(cfg *config.Config) (transcribe.BatchWordsTranscriber, error) {
-	batch, err := makeBatchTranscriber(cfg)
-	if errors.Is(err, errDeepgramKeyMissing) {
-		return nil, fmt.Errorf("%w: %w", server.ErrBatchTranscriptionNotConfigured, err)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("configure batch transcription for deletion: %w", err)
-	}
-	wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
-	if !ok {
-		return nil, fmt.Errorf("configured batch transcription does not return word timestamps")
-	}
-	return wordTranscriber, nil
-}
 
 type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
 

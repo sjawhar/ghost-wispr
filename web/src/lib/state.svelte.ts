@@ -127,9 +127,9 @@ export function setLiveSegmentsForSession(
   appState.liveSegments = segments
 }
 
-// What the server holds once a segment is deleted: it cleared every field that
-// can quote the segment and queued a new refinement and summary. Applied before
-// the session is fetched again, so the deleted words leave the screen at once.
+// The server has removed the selected timed occurrence and queued a fresh
+// summary. Keep the completed-refinement state so the remaining timed
+// segments remain the default view until the detail refresh arrives.
 function withoutDeletedText(session: SessionSummary): SessionSummary {
   return {
     ...session,
@@ -137,10 +137,9 @@ function withoutDeletedText(session: SessionSummary): SessionSummary {
     summary: '',
     summary_status: SummaryStatus.Pending,
     summary_error: '',
-    refinement_status: RefinementStatus.Pending,
     refined_transcript: '',
     canonical_transcript: '',
-    transcript_source: 'streaming',
+    transcript_source: 'refined',
   }
 }
 

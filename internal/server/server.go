@@ -25,16 +25,8 @@ var (
 	// answer a question the retry needs answered first: the retry may work once
 	// Drive answers.
 	ErrDriveUnavailable = errors.New("google drive did not answer")
-	// ErrSegmentNotFoundInRecording means alignment could not locate a segment.
-	ErrSegmentNotFoundInRecording = errors.New("segment could not be found in recording")
-	// ErrSegmentNotRemovedCleanly means post-splice validation rejected the cut.
-	ErrSegmentNotRemovedCleanly = errors.New("segment could not be removed cleanly")
 	// ErrSegmentRawAudioKept means a recoverable raw recording still holds the audio.
 	ErrSegmentRawAudioKept = errors.New("a kept raw recording prevents segment deletion")
-	// ErrBatchTranscriptionNotConfigured is what DeleteSegment wraps when no
-	// batch transcription is configured: a deletion finds the segment in the
-	// recording by the words batch transcription times.
-	ErrBatchTranscriptionNotConfigured = errors.New("batch transcription is not configured")
 )
 
 // The modes a segment deletion takes (DELETE

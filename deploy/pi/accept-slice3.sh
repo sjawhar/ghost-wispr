@@ -733,33 +733,43 @@ check_session_settled() {
   esac
 }
 
-# segment_ids_matching DETAIL PATTERN: the ids of the segments whose text holds PATTERN.
+# segment_ids_matching DETAIL PATTERN: the ids of timed, batch-derived
+# segments whose text holds PATTERN. Live segments must never reach deletion.
 segment_ids_matching() {
   local id text
   while IFS=$'\t' read -r id text; do
     if [[ "$id" =~ ^[0-9]+$ ]] && matches "$text" "$2"; then
       printf '%s\n' "$id"
     fi
-  done < <(jq -r '.segments[]? | [(.id | tostring), (.text // "")] | @tsv' <<<"$1" 2>/dev/null)
+  done < <(jq -r '.segments[]? | select((.transcript_revision // 0) > 0) | [(.id | tostring), (.text // "")] | @tsv' <<<"$1" 2>/dev/null)
 }
 
-# choose_segments DETAIL: find the one segment that holds each phrase. Each phrase's words must be
-# in that segment alone, and the control phrase in another, or the checks after a delete could
-# not pass for the right reason.
+segment_revision() {
+  jq -r --argjson id "$2" '[.segments[]? | select(.id == $id) | .transcript_revision] | if length == 1 then .[0] else empty end' <<<"$1" 2>/dev/null
+}
+
+# choose_segments waits for completed refinement and then selects the unique
+# timed segments and revisions that carry each acceptance phrase.
 choose_segments() {
   local detail=$1 text_only_ids audio_ids control_ids
   text_only_ids=$(segment_ids_matching "$detail" "$text_only_pair")
   audio_ids=$(segment_ids_matching "$detail" "$audio_pair")
   if [[ $(line_count "$text_only_ids") != 1 ]]; then
-    reason="\"$text_only_phrase\" is in $(line_count "$text_only_ids") segments, not one"
+    reason="\"$text_only_phrase\" is in $(line_count "$text_only_ids") refined timed segments, not one"
     return 2
   fi
   if [[ $(line_count "$audio_ids") != 1 ]]; then
-    reason="\"$audio_phrase\" is in $(line_count "$audio_ids") segments, not one"
+    reason="\"$audio_phrase\" is in $(line_count "$audio_ids") refined timed segments, not one"
     return 2
   fi
   if [[ "$text_only_ids" == "$audio_ids" ]]; then
     reason="both phrases are in segment $audio_ids"
+    return 2
+  fi
+  text_only_revision=$(segment_revision "$detail" "$text_only_ids")
+  audio_revision=$(segment_revision "$detail" "$audio_ids")
+  if [[ ! "$text_only_revision" =~ ^[1-9][0-9]*$ ]] || [[ ! "$audio_revision" =~ ^[1-9][0-9]*$ ]]; then
+    reason='the selected segment has no positive transcript revision'
     return 2
   fi
   if [[ "$(segment_ids_matching "$detail" "$text_only_trace")" != "$text_only_ids" ]]; then
@@ -772,12 +782,12 @@ choose_segments() {
   fi
   control_ids=$(segment_ids_matching "$detail" "$control_pair" | grep -Fvx -e "$text_only_ids" -e "$audio_ids")
   if [[ -z "$control_ids" ]]; then
-    reason="no other segment holds the control phrase \"$control_phrase\""
+    reason="no other refined timed segment holds the control phrase \"$control_phrase\""
     return 2
   fi
   text_only_segment_id=$text_only_ids
   audio_segment_id=$audio_ids
-  reason="segment $text_only_segment_id holds \"$text_only_phrase\", segment $audio_segment_id holds \"$audio_phrase\", and segment $(one_line "$control_ids") holds \"$control_phrase\""
+  reason="segment $text_only_segment_id revision $text_only_revision holds \"$text_only_phrase\", segment $audio_segment_id revision $audio_revision holds \"$audio_phrase\", and segment $(one_line "$control_ids") holds \"$control_phrase\""
   return 0
 }
 
@@ -1414,9 +1424,9 @@ run_a11_text_only() {
     printf 'A11 text only UNKNOWN: a check could not see "%s" before the delete, so its absence after the delete would prove nothing. Nothing was deleted.\n' "$text_only_phrase"
     return 2
   fi
-  printf 'A11 text only RAN: choose "Delete text" on segment %s: DELETE /api/sessions/%s/segments/%s?mode=text\n' \
-    "$text_only_segment_id" "$acceptance_session_id" "$text_only_segment_id"
-  code=$(delete_segment "$acceptance_session_id" "$text_only_segment_id" 'mode=text' "$body_file")
+  printf 'A11 text only RAN: choose "Delete text" on segment %s revision %s: DELETE /api/sessions/%s/segments/%s?mode=text&revision=%s\n' \
+    "$text_only_segment_id" "$text_only_revision" "$acceptance_session_id" "$text_only_segment_id" "$text_only_revision"
+  code=$(delete_segment "$acceptance_session_id" "$text_only_segment_id" "mode=text&revision=$text_only_revision" "$body_file")
   if [[ "$code" != 204 ]]; then
     printf 'A11 text only FAILED: "Delete text" answered %s: %s\n' "${code:-nothing}" "$(result "$scratch_dir" delete-text.json)" >&2
     return 1
@@ -1445,9 +1455,9 @@ run_a11() {
     printf 'A11 UNKNOWN: a check could not see "%s" before the delete, so its absence after the delete would prove nothing. Nothing was deleted.\n' "$audio_phrase"
     return 2
   fi
-  printf 'A11 RAN: choose "Delete text and audio" on segment %s: DELETE /api/sessions/%s/segments/%s?mode=text_and_audio\n' \
-    "$audio_segment_id" "$acceptance_session_id" "$audio_segment_id"
-  code=$(delete_segment "$acceptance_session_id" "$audio_segment_id" 'mode=text_and_audio' "$body_file")
+  printf 'A11 RAN: choose "Delete text and audio" on segment %s revision %s: DELETE /api/sessions/%s/segments/%s?mode=text_and_audio&revision=%s\n' \
+    "$audio_segment_id" "$audio_revision" "$acceptance_session_id" "$audio_segment_id" "$audio_revision"
+  code=$(delete_segment "$acceptance_session_id" "$audio_segment_id" "mode=text_and_audio&revision=$audio_revision" "$body_file")
   if [[ "$code" != 204 ]]; then
     printf 'A11 FAILED: "Delete text and audio" answered %s: %s\n' "${code:-nothing}" "$(result "$scratch_dir" delete-text-and-audio.json)" >&2
     return 1
@@ -1915,10 +1925,10 @@ run_self_test() (
     {id: 2, text: "B: Purple elephant 17."},
     {id: 3, text: "A: Which machine do we order to clear the yard?"},
     {id: 4, text: "B: Orange tractor ninety."},
-    {id: 5, text: $control}]}')
+    {id: 5, text: $control}]}' | jq '.segments |= map(. + {transcript_revision: 1})')
   expect 0 'one segment per phrase and the control phrase elsewhere is chosen' choose_segments "$detail"
-  [[ "$text_only_segment_id" == 4 && "$audio_segment_id" == 2 ]] \
-    || fail "self-test: chose segments $text_only_segment_id and $audio_segment_id, want 4 and 2"
+  [[ "$text_only_segment_id" == 4 && "$audio_segment_id" == 2 && "$text_only_revision" == 1 && "$audio_revision" == 1 ]] \
+    || fail "self-test: chose segments $text_only_segment_id/$text_only_revision and $audio_segment_id/$audio_revision, want 4/1 and 2/1"
   expect 2 'a phrase word in a second segment stops the run' choose_segments \
     "$(jq '.segments[2].text = "A: Which orange machine do we order?"' <<<"$detail")"
   expect 2 'a phrase in two segments stops the run' choose_segments \
@@ -2203,7 +2213,9 @@ $(session_field "$detail" summary)"
     : >"$marker"
     conversation_ready=true
     text_only_segment_id=4
+    text_only_revision=1
     audio_segment_id=2
+    audio_revision=1
     delete_segment() { printf '%s\n' "$3" >>"$marker"; printf 204; }
     retry_refinement() { :; }
     sleep() { :; }
@@ -2222,18 +2234,20 @@ $(session_field "$detail" summary)"
     : >"$marker"
     conversation_ready=true
     text_only_segment_id=4
+    text_only_revision=1
     delete_segment() { printf '%s %s\n' "$2" "$3" >>"$marker"; printf 204; }
     text_only_round() { round_reset; round_lines=('PASS: planted'); }
     retry_refinement() { printf 'retry\n' >>"$marker"; }
     sleep() { :; }
     run_a11_text_only >/dev/null 2>&1 || fail 'self-test: A11 text only did not pass on planted passing rounds'
-    [[ "$(<"$marker")" == $'4 mode=text\nretry' ]] || fail "self-test: A11 text only sent $(one_line "$(<"$marker")")"
+    [[ "$(<"$marker")" == $'4 mode=text&revision=1\nretry' ]] || fail "self-test: A11 text only sent $(one_line "$(<"$marker")")"
   ) || exit 1
-  printf 'A11 text only self-test RAN: "Delete text" sends mode=text on its segment, then retries refinement\n'
+  printf 'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement\n'
   (
     : >"$marker"
     conversation_ready=true
     audio_segment_id=2
+    audio_revision=1
     delete_segment() { printf '%s\n' "$3" >>"$marker"; printf 204; }
     sleep() { :; }
     audio_round() {
@@ -2251,12 +2265,13 @@ $(session_field "$detail" summary)"
     : >"$marker"
     conversation_ready=true
     audio_segment_id=2
+    audio_revision=1
     delete_segment() { printf '%s %s\n' "$2" "$3" >>"$marker"; printf 204; }
     audio_round() { round_reset; round_lines=('PASS: planted'); }
     run_a11 >/dev/null 2>&1 || fail 'self-test: A11 did not pass on planted passing rounds'
-    [[ "$(<"$marker")" == '2 mode=text_and_audio' ]] || fail "self-test: A11 sent $(one_line "$(<"$marker")")"
+    [[ "$(<"$marker")" == '2 mode=text_and_audio&revision=1' ]] || fail "self-test: A11 sent $(one_line "$(<"$marker")")"
   ) || exit 1
-  printf 'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio on its segment\n'
+  printf 'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio and its revision on its segment\n'
 )
 
 while [[ $# -gt 0 ]]; do
@@ -2302,7 +2317,9 @@ acceptance_session_id=
 conversation_ready=false
 conversation_problem='the setup did not finish'
 text_only_segment_id=
+text_only_revision=
 audio_segment_id=
+audio_revision=
 text_only_ids_before=
 text_only_hashes_before=
 text_only_audio_path_before=

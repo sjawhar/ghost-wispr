@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -18,7 +19,7 @@ func deleteModeHandler(t *testing.T, withSession bool, ran *[]string) http.Handl
 	t.Helper()
 	sessions := map[string]storage.Session{}
 	if withSession {
-		sessions["s1"] = storage.Session{ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted}
+		sessions["s1"] = storage.Session{ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted, RefinedRevision: 1}
 	}
 	store := &apiStoreStub{sessionsByDate: map[string][]storage.Session{}, sessions: sessions, segments: map[string][]transcribe.Segment{}}
 	hook := func(name string) func(context.Context, string, int64, int) error {
@@ -174,5 +175,104 @@ func TestOpenAPISpecDocumentsTheDeletionModes(t *testing.T) {
 	}
 	if description, _ := dig(t, spec, append(operation, "responses", "400", "description")...).(string); !strings.Contains(description, "mode") {
 		t.Errorf("400 description %q does not name the mode", description)
+	}
+}
+
+func TestOpenAPISpecDocumentsTranscriptRevisionAndStaleConflict(t *testing.T) {
+	raw, err := OpenAPISpecJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	operation := []string{"paths", "/api/sessions/{id}/segments/{segmentID}", "delete"}
+	parameters, _ := dig(t, spec, append(operation, "parameters")...).([]any)
+	var revision map[string]any
+	for _, parameter := range parameters {
+		if p, _ := parameter.(map[string]any); p["name"] == "revision" {
+			revision = p
+		}
+	}
+	if revision == nil || revision["in"] != "query" || revision["required"] != true {
+		t.Fatalf("revision parameter = %#v, want a required query parameter", revision)
+	}
+	if schema, _ := revision["schema"].(map[string]any); schema["type"] != "integer" || schema["minimum"] != float64(1) {
+		t.Errorf("revision schema = %#v, want positive integer", schema)
+	}
+	if description, _ := dig(t, spec, append(operation, "responses", "409", "description")...).(string); !strings.Contains(description, "refresh") {
+		t.Errorf("409 description %q does not say to refresh a stale transcript", description)
+	}
+}
+
+func TestDeleteSegmentAPIStartsRefinementForOldSegments(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	retried := make(chan string, 1)
+	deleted := false
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		RetryRefinement: func(_ context.Context, sessionID string) error {
+			retried <- sessionID
+			return nil
+		},
+		DeleteSegmentText: func(context.Context, string, int64, int) error {
+			deleted = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text&revision=1", nil))
+	var body struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(response.Body.Bytes(), &body)
+	if response.Code != http.StatusConflict || body.Error != "this conversation is still being refined; delete once it finishes" || deleted {
+		t.Fatalf("old-session delete = %d %q deleted=%v, want 409 refinement message without deletion", response.Code, body.Error, deleted)
+	}
+	select {
+	case sessionID := <-retried:
+		if sessionID != "s1" {
+			t.Fatalf("retry session = %q, want s1", sessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old-session deletion did not start refinement")
+	}
+}
+
+func TestDeleteSegmentAPIRefusesStaleRevision(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted, RefinedRevision: 2},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		DeleteSegmentText: func(context.Context, string, int64, int) error {
+			return storage.ErrStaleTranscriptRevision
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text&revision=1", nil))
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusConflict || body.Error != "the transcript changed; refresh and try again" {
+		t.Fatalf("stale revision response = %d %q, want 409 refresh message", response.Code, body.Error)
 	}
 }

@@ -804,20 +804,6 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			wantCode: http.StatusNotFound,
 		},
 		{
-			name:      "not found in recording",
-			session:   storage.Session{ID: "s1", Status: storage.SessionEnded},
-			hook:      func(context.Context, string, int64) error { return ErrSegmentNotFoundInRecording },
-			wantCode:  http.StatusUnprocessableEntity,
-			wantError: "The segment could not be found in the recording; nothing was deleted",
-		},
-		{
-			name:      "not removed cleanly",
-			session:   storage.Session{ID: "s1", Status: storage.SessionEnded},
-			hook:      func(context.Context, string, int64) error { return ErrSegmentNotRemovedCleanly },
-			wantCode:  http.StatusUnprocessableEntity,
-			wantError: "The segment could not be removed cleanly; nothing was deleted",
-		},
-		{
 			name:    "kept raw recording",
 			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
 			hook: func(context.Context, string, int64) error {
@@ -825,15 +811,6 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			},
 			wantCode:  http.StatusUnprocessableEntity,
 			wantError: "s1.pcm",
-		},
-		{
-			name:    "no batch transcription",
-			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
-			hook: func(context.Context, string, int64) error {
-				return fmt.Errorf("%w: deepgram API key not configured", ErrBatchTranscriptionNotConfigured)
-			},
-			wantCode:  http.StatusServiceUnavailable,
-			wantError: "Segment deletion needs batch transcription, which is not configured: add a Deepgram API key.",
 		},
 		{
 			name:    "active",
@@ -860,6 +837,7 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			session := tc.session
 			if session.ID != "" && session.Status != storage.SessionActive {
 				session.RefinementStatus = storage.RefinementCompleted
+				session.RefinedRevision = 1
 			}
 			sessions := map[string]storage.Session{}
 			if session.ID != "" {

@@ -78,10 +78,10 @@ describe('applySegmentDeletion', () => {
       summary: '',
       summary_status: SummaryStatus.Pending,
       summary_error: '',
-      refinement_status: RefinementStatus.Pending,
+      refinement_status: RefinementStatus.Completed,
       refined_transcript: '',
       canonical_transcript: '',
-      transcript_source: 'streaming',
+      transcript_source: 'refined',
     })
     expect(appState.sessionsByDate.get('2026-11-11')?.[1]).toEqual(untouched)
     expect(appState.sessionDetails.get('s1')).toEqual({

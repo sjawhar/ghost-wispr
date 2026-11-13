@@ -457,16 +457,18 @@ One run records one conversation for both rows:
 3. The driver starts a conversation and prints its script (`Setup NEEDS-PERSON`). Two people
    read it: "purple elephant seventeen", the topic, and "orange tractor ninety" are each said
    alone in their own turn, and the control phrase "blue harbor lantern" in another. Press Enter
-   after the last line. The driver waits until the conversation is refined, summarized and
-   synced, and finds the one segment that holds each phrase.
+   after the last line. The driver waits until refinement, summary and sync finish. It selects
+   only batch-derived timed segments with a positive transcript revision.
 4. It restarts `ghost-wispr.service` once no conversation is recording. Ghost Wispr writes the
    pre-migration backup at each start, so the backup then holds the conversation. That is the
    control for the backup check.
 5. A11 text only: every check runs once and must find "orange tractor ninety". The driver then
-   chooses "Delete text" on that segment (`?mode=text`) and checks again until the phrase is
-   gone or 15 minutes pass. It then chooses "retry refinement" and checks once more.
-6. A11: every check runs once and must find "purple elephant seventeen". The driver then
-   chooses "Delete text and audio" on that segment (`?mode=text_and_audio`) and checks again.
+   chooses "Delete text" on that timed segment with its revision
+   (`?mode=text&revision=N`) and checks again until the phrase is gone or 15 minutes pass. It
+   then chooses "retry refinement" and checks once more.
+6. A11: every check runs once and must find "purple elephant seventeen". The driver then chooses
+   "Delete text and audio" on that timed segment with its revision
+   (`?mode=text_and_audio&revision=N`) and checks again.
 
 `--session ID` uses a conversation already recorded from the script, and skips the precheck.
 

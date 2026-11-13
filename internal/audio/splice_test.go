@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"math"
 	"os"
@@ -217,20 +216,3 @@ func TestSpliceIsAtomic(t *testing.T) {
 	}
 }
 
-func TestSurvivorsReturnsUniqueSegmentTokensLeftNearSplice(t *testing.T) {
-	words := []Word{
-		{Text: "before", Start: 8.5, End: 8.9},
-		{Text: "secret", Start: 10.1, End: 10.5},
-		{Text: "after", Start: 11, End: 11.3},
-	}
-	if got, want := Survivors(words, 10, "secret bridge", "before bridge", "after bridge"), []string{"secret"}; fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("Survivors = %v, want %v", got, want)
-	}
-}
-
-func TestSurvivorsAllowsSegmentTokensSharedWithNeighbours(t *testing.T) {
-	words := []Word{{Text: "bridge", Start: 10.1, End: 10.4}}
-	if got := Survivors(words, 10, "secret bridge", "before bridge", "after bridge"); len(got) != 0 {
-		t.Fatalf("Survivors = %v, want no survivor for a neighbour word", got)
-	}
-}
