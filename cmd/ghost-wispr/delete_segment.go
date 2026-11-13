@@ -494,12 +494,17 @@ func (d *segmentDeleteRunner) deleteText(ctx context.Context, sessionID string, 
 // span and each aligned neighbour (or recording edge). A text deletion has
 // no audio splice to validate afterwards, so it validates the words already
 // transcribed to locate it before it records the span.
+type textDeletionBounds struct {
+	lower, upper       float64
+	hasLower, hasUpper bool
+}
+
 func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, start, end float64, segments []transcribe.Segment, index int) error {
 	words := candidates[recordIndex].Words
 	text := segments[index].Text
 	before, after := neighbourText(segments, index)
 	beforeInRecord, afterInRecord := false, false
-	lower, upper := -1.0, -1.0
+	var bounds textDeletionBounds
 	length := end - start
 
 	if index > 0 {
@@ -519,7 +524,7 @@ func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, sta
 			}
 			// Bound survivors by the neighbour's outer edge, not merely
 			// the edge beside the deleted span.
-			lower, beforeInRecord = neighbourStart, true
+			bounds.lower, bounds.hasLower, beforeInRecord = neighbourStart, true, true
 		} else if recordingHasWordsOnSide(words, start, end, true) {
 			return fmt.Errorf("%w: words before the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
 		}
@@ -540,7 +545,7 @@ func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, sta
 			if neighbourStart < end || wordsRemainBetween(words, end, neighbourStart) {
 				return fmt.Errorf("%w: words between the segment and its after-neighbour are outside the aligned span", server.ErrSegmentNotRemovedCleanly)
 			}
-			upper, afterInRecord = neighbourEnd-length, true
+			bounds.upper, bounds.hasUpper, afterInRecord = neighbourEnd-length, true, true
 		} else if recordingHasWordsOnSide(words, start, end, false) {
 			return fmt.Errorf("%w: words after the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
 		}
@@ -549,7 +554,7 @@ func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, sta
 	}
 
 	afterWords := wordsAfterTextDeletion(words, start, end)
-	if survivors := audio.Survivors(wordsBetweenBounds(afterWords, lower, upper), start, text, before, after); len(survivors) > 0 {
+	if survivors := audio.Survivors(wordsBetweenBounds(afterWords, bounds), start, text, before, after); len(survivors) > 0 {
 		return fmt.Errorf("%w: surviving words: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(survivors, ", "))
 	}
 	if beforeInRecord {
@@ -597,11 +602,13 @@ func wordsRemainBetween(words []audio.Word, lower, upper float64) bool {
 
 // wordsBetweenBounds restricts Survivors to the aligned neighbouring
 // segments. A missing boundary is a recording edge; validateTextDeletionSpan
-// has already proved it holds no unspanned words.
-func wordsBetweenBounds(words []audio.Word, lower, upper float64) []audio.Word {
+// has already proved it holds no unspanned words. Explicit flags keep a real
+// word boundary at 0.0 distinct from no boundary.
+func wordsBetweenBounds(words []audio.Word, bounds textDeletionBounds) []audio.Word {
 	near := make([]audio.Word, 0, len(words))
 	for _, word := range words {
-		if (lower < 0 || word.End >= lower) && (upper < 0 || word.Start <= upper) {
+		if (!bounds.hasLower || word.End >= bounds.lower) &&
+			(!bounds.hasUpper || word.Start <= bounds.upper) {
 			near = append(near, word)
 		}
 	}

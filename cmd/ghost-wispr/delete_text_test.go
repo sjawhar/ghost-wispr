@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -664,4 +665,32 @@ func TestDeleteTextRefusesWrongRepeatedContentRun(t *testing.T) {
 		{Text: "Okay.", Start: 14, End: 14.2}, {Text: "Yeah.", Start: 14.3, End: 14.5}, {Text: "Purple", Start: 14.6, End: 14.8}, {Text: "elephant", Start: 14.85, End: 15.1}, {Text: "seventeen.", Start: 15.15, End: 15.4}, {Text: "The", Start: 15.5, End: 15.7}, {Text: "budget", Start: 15.75, End: 16}, {Text: "is", Start: 16.05, End: 16.2}, {Text: "fine.", Start: 16.25, End: 16.5}, {Text: "Great.", Start: 16.6, End: 16.8},
 	}
 	assertDeleteTextRefusedWithoutSpan(t, store, "content-run", stored[2].ID, recording, words)
+}
+
+// TestOuterSurvivorBoundsKeepASegmentWordSwallowedByANeighbour fails if the
+// survivor window starts at a before-neighbour's inner edge: its outer match
+// can include the first words of the deleted segment, and those words must
+// still be visible to Survivors.
+func TestOuterSurvivorBoundsKeepASegmentWordSwallowedByANeighbour(t *testing.T) {
+	afterDelete := []audio.Word{
+		{Text: "Right.", Start: 0, End: 0.2},
+		// The before-neighbour's outer match swallowed this first segment word.
+		{Text: "purple", Start: 0.3, End: 0.5},
+		{Text: "Yeah.", Start: 0.6, End: 0.8},
+	}
+	outer := wordsBetweenBounds(afterDelete, textDeletionBounds{
+		lower: 0, hasLower: true,
+		upper: 0.8, hasUpper: true,
+	})
+	if survivors := audio.Survivors(outer, 0.6, "Purple elephant.", "Right.", "Yeah."); !slices.Contains(survivors, "purple") {
+		t.Fatalf("outer bounds survivors = %v, want the swallowed segment word purple", survivors)
+	}
+
+	inner := wordsBetweenBounds(afterDelete, textDeletionBounds{
+		lower: 0.55, hasLower: true,
+		upper: 0.8, hasUpper: true,
+	})
+	if survivors := audio.Survivors(inner, 0.6, "Purple elephant.", "Right.", "Yeah."); len(survivors) != 0 {
+		t.Fatalf("inner bounds survivors = %v, want none: this is the blind control", survivors)
+	}
 }
