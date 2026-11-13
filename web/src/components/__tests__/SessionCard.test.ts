@@ -262,6 +262,33 @@ describe('SessionCard', () => {
     expect(Boolean(screen.queryByTestId('retry-refinement-btn'))).toBe(wantsRetry)
   })
 
+  it('identifies a retryable session restored from Drive', () => {
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-13T09:01:00Z',
+        restored_at: '2026-11-13T09:01:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      } as SessionSummary & { restored_at: string },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('refinement-badge').getAttribute('title')).toBe(
+      'This conversation was restored from Drive; retry refinement to delete from it',
+    )
+    expect(screen.getByTestId('retry-refinement-btn')).toBeTruthy()
+  })
+
   it('marks a session whose audio was removed to free space, refined or not', () => {
     for (const refinementStatus of [RefinementStatus.Completed, RefinementStatus.NoAudio]) {
       const { unmount } = render({

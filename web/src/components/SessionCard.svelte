@@ -316,11 +316,13 @@
               class={`status-badge ${session.refinement_status}`}
               data-testid="refinement-badge"
               title={session.refinement_status === RefinementStatus.NoAudio
-                ? session.audio_removed_at
-                  ? recordingsNamed(session.audio_path) > 0
-                    ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
-                    : 'The audio was removed to free space, so it cannot be refined'
-                  : 'No recording was saved for this session, so it cannot be refined'
+                ? session.restored_at
+                  ? 'This conversation was restored from Drive; retry refinement to delete from it'
+                  : session.audio_removed_at
+                    ? recordingsNamed(session.audio_path) > 0
+                      ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
+                      : 'The audio was removed to free space, so it cannot be refined'
+                    : 'No recording was saved for this session, so it cannot be refined'
                 : undefined}
             >
               Refine: {session.refinement_status === RefinementStatus.NoAudio

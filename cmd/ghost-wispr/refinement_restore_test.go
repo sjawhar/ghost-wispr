@@ -74,6 +74,22 @@ func TestRestoreRefinementRecordingRejectsAChangedAudioPath(t *testing.T) {
 	}
 }
 
+func TestRestoreRefinementRecordingRestoresMissingNamedAudio(t *testing.T) {
+	audio := filepath.Join(t.TempDir(), "missing.mp3")
+	store := &refinementRestoreStoreFake{ok: true}
+	restoreCalled := false
+	err := restoreRefinementRecording(context.Background(), store, &storage.Session{ID: "s1", AudioPath: audio}, filepath.Dir(audio), func(context.Context, storage.Session) (deletionRecordingSet, error) {
+		restoreCalled = true
+		return deletionRecordingSet{Paths: []string{audio}, Downloaded: []string{audio}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restoreCalled {
+		t.Fatal("missing named audio skipped the Drive restoration")
+	}
+}
+
 func TestRetryRefinementFailureWarnsBySession(t *testing.T) {
 	registry := newWarningsRegistry()
 	failure := errors.New("Drive listing timed out")

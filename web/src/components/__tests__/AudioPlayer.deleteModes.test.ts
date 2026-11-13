@@ -99,6 +99,34 @@ it('says a completed conversation without timed words needs refinement before de
   ).toHaveLength(2)
 })
 
+it('identifies a Drive-restored session as retryable before deletion', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      audio_removed_at: '2026-11-13T09:01:00Z',
+      restored_at: '2026-11-13T09:01:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(
+    screen.getAllByText(
+      'This conversation was restored from Drive; retry refinement to delete from it',
+    ),
+  ).toHaveLength(2)
+})
+
 describe('AudioPlayer segment deletion actions', () => {
   afterEach(() => {
     vi.unstubAllGlobals()

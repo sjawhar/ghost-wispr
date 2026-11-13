@@ -133,10 +133,11 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 	if len(recordings.Paths) == 0 {
 		return errors.New("no recording is available on this unit or Drive")
 	}
-	if len(recordings.Downloaded) == 0 {
+	restoredAudioPath := strings.Join(recordings.Paths, ",")
+	if restoredAudioPath == session.AudioPath && session.AudioRemovedAt == "" {
 		return nil
 	}
-	restored, err := store.RestoreAudioForRefinement(session.ID, session.AudioPath, strings.Join(recordings.Paths, ","))
+	restored, err := store.RestoreAudioForRefinement(session.ID, session.AudioPath, restoredAudioPath)
 	if err != nil {
 		return fmt.Errorf("record restored audio for refinement: %w", err)
 	}
@@ -158,6 +159,23 @@ func retryRefinementWithFailureWarning(ctx context.Context, registry *warningsRe
 	log.Printf("warning: %s", warning)
 	registry.Set(refinementRetryWarningKeyPrefix+sessionID, warning)
 	return err
+}
+
+func newRetryRefinementHook(store *storage.SQLiteStore, audioDir func() string, restore func(context.Context, storage.Session) (deletionRecordingSet, error), registry *warningsRegistry, refine func(context.Context, string, string, time.Time) error) func(context.Context, string) error {
+	ensure := func(ctx context.Context, sessionID string) error {
+		session, err := store.GetSession(sessionID)
+		if err != nil {
+			return err
+		}
+		return restoreRefinementRecording(ctx, store, &session, audioDir(), restore)
+	}
+	return func(ctx context.Context, sessionID string) error {
+		return retryRefinementWithFailureWarning(ctx, registry, sessionID, func(ctx context.Context, sessionID string) error {
+			return retryRefinementAfterRestoringRecording(ctx, sessionID, ensure, func(ctx context.Context, sessionID string) error {
+				return retryRefinementWithWarningClear(ctx, registry, store, sessionID, refine)
+			})
+		})
+	}
 }
 
 func restoredDriveSession(rs *gdrive.RestoredSession, restoredAt time.Time) storage.Session {
@@ -1091,14 +1109,6 @@ func main() {
 		return refinementRecordingAvailable(&sess, cfgStore.Get().AudioDir)
 	}
 
-	ensureRefinementRecording := func(ctx context.Context, sessionID string) error {
-		sess, err := store.GetSession(sessionID)
-		if err != nil {
-			return err
-		}
-		return restoreRefinementRecording(ctx, store, &sess, cfgStore.Get().AudioDir, deletionRunner().ensureRecordings)
-	}
-
 	controlHooks := &server.ControlHooks{
 		IsPaused:    capture.IsPaused,
 		IsCapturing: func() bool { return capture.capturing(micStatus) },
@@ -1143,13 +1153,15 @@ func main() {
 			return retrySync(ctx, drive.Get(), sessionID)
 		},
 		RefinementRecordingAvailable: checkRefinementRecording,
-		RetryRefinement: func(ctx context.Context, sessionID string) error {
-			return retryRefinementWithFailureWarning(ctx, warningRegistry, sessionID, func(ctx context.Context, sessionID string) error {
-				return retryRefinementAfterRestoringRecording(ctx, sessionID, ensureRefinementRecording, func(ctx context.Context, sessionID string) error {
-					return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
-				})
-			})
-		},
+		RetryRefinement: newRetryRefinementHook(
+			store,
+			func() string { return cfgStore.Get().AudioDir },
+			func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+				return deletionRunner().ensureRecordings(ctx, session)
+			},
+			warningRegistry,
+			manager.RefineSession,
+		),
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
 			return deletionRunner().DeleteRefinedAudio(ctx, sessionID, segmentID, revision)
 		},

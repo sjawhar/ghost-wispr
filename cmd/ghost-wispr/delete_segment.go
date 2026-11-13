@@ -422,7 +422,7 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	}
 	for _, sessionID := range sessionIDs {
 		if !refined[sessionID] {
-			outcomes = append(outcomes, refineUnfinishedDeletion(ctx, store, refine, sessionID))
+			outcomes = append(outcomes, refineUnfinishedDeletion(ctx, store, audioDir, source, refine, sessionID))
 		}
 	}
 	return outcomes, nil
@@ -434,7 +434,7 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 // after its splice. A deletion of the session is refused while it runs, as
 // during a splice recovery; one already under way finishes first, and the
 // session is read as it left it.
-func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, refine func(context.Context, string, string, time.Time) error, sessionID string) pendingSpliceOutcome {
+func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, refine func(context.Context, string, string, time.Time) error, sessionID string) pendingSpliceOutcome {
 	deleteLocks.setRecovering(sessionID, true)
 	defer deleteLocks.setRecovering(sessionID, false)
 	unlock := deleteLocks.lock(sessionID)
@@ -442,9 +442,17 @@ func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, r
 	unlock()
 	outcome := pendingSpliceOutcome{Span: storage.DeletedSpan{SessionID: sessionID, AudioPath: session.AudioPath}}
 	if err == nil {
+		err = restoreRefinementRecording(ctx, store, &session, audioDir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+			return restoreDeletionRecordings(ctx, &current, audioDir, source)
+		})
+	}
+	if err == nil {
+		session, err = store.GetSession(sessionID)
+	}
+	if err == nil {
 		err = refine(ctx, sessionID, session.AudioPath, session.StartedAt)
 	} else {
-		err = fmt.Errorf("get session %s to refine it: %w", sessionID, err)
+		err = fmt.Errorf("get or restore session %s to refine it: %w", sessionID, err)
 	}
 	if err != nil {
 		outcome.Err = refinementAfterSegmentDeletionError{sessionID: sessionID, err: err}
