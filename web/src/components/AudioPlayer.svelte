@@ -7,7 +7,7 @@
     requestErrorMessage,
     type SegmentDeleteMode,
   } from '../lib/api'
-  import { RefinementStatus, type Segment, type SessionSummary } from '../lib/types'
+  import { RefinementStatus, SyncState, SyncStatus, type Segment, type SessionSummary } from '../lib/types'
   import { copyText } from '../lib/clipboard'
   import { audioLeftNote, recordingsNamed } from '../lib/audio'
 
@@ -87,7 +87,13 @@
       return 'Refinement failed; retry refinement before deleting.'
     }
     if (session?.refinement_status === RefinementStatus.NoAudio) {
-      return 'No recording is on this unit. Use Retry refinement to restore it from Drive, then delete.'
+      if (session.audio_removed_at && session.sync_status === SyncStatus.Synced && session.sync_state !== SyncState.RemoteDeleted) {
+        return 'No recording is on this unit. Use Retry refinement to restore it from Drive, then delete.'
+      }
+      return 'No recording was saved for this conversation, so it cannot be refined or deleted.'
+    }
+    if (session?.refinement_status === RefinementStatus.Completed && !session.refined_revision) {
+      return 'This conversation completed without timed words. Use Retry refinement before deleting.'
     }
     return 'This conversation is still being refined; delete once it finishes.'
   })

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const backupSecret = "backup-held-deletion-phrase-77c2e1"
@@ -237,4 +238,71 @@ func TestARefinedFillerDeletionErasesAnOlderSchemaBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertBackupOmits(t, path, backupSecret)
+}
+
+func TestOlderSchemaBackupScrubsRefinedWords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("s1", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	words := []RefinedWord{
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Text: "after bridge.", Start: 0, End: 1},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 1, Text: backupSecret + ".", Start: 2, End: 3},
+	}
+	revision, err := store.PublishRefinementAtGeneration("s1", RefinedTranscript(words), "test", words, BuildRefinedSegments(words), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`ALTER TABLE sessions DROP COLUMN drive_replace_error`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store = openStoreWithBackup(t, path)
+	var before int
+	if err := sqlCount(preMigrationBackupPath(path), `SELECT count(*) FROM refined_words WHERE text LIKE ?`, "%"+backupSecret+"%", &before); err != nil {
+		t.Fatal(err)
+	}
+	if before != 1 {
+		t.Fatalf("control: backup refined words with secret = %d, want 1", before)
+	}
+	segments, err := store.GetSegments("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRefinedSegmentText("s1", segments[1].ID, revision); err != nil {
+		t.Fatal(err)
+	}
+	var after int
+	if err := sqlCount(preMigrationBackupPath(path), `SELECT count(*) FROM refined_words WHERE text LIKE ?`, "%"+backupSecret+"%", &after); err != nil {
+		t.Fatal(err)
+	}
+	if after != 0 {
+		t.Errorf("backup refined words with secret after delete = %d, want 0", after)
+	}
+}
+
+func sqlCount(path, query string, argument any, count *int) error {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return db.QueryRow(query, argument).Scan(count)
 }

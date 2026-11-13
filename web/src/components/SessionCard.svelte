@@ -59,6 +59,7 @@
   // Why the last sync retry was refused, if it was.
   let retrySyncError = $state('')
   let retryingRefinement = $state(false)
+  let retryRefinementError = $state('')
 
   async function copySummary() {
     if (!session.summary) return
@@ -154,8 +155,11 @@
   async function handleRetryRefinement(e: Event) {
     e.stopPropagation()
     retryingRefinement = true
+    retryRefinementError = ''
     try {
       await retryRefinement(session.id)
+    } catch (error) {
+      retryRefinementError = requestErrorMessage(error)
     } finally {
       setTimeout(() => (retryingRefinement = false), 1000)
     }
@@ -323,7 +327,7 @@
                 ? 'no recording'
                 : session.refinement_status}
             </span>
-            {#if session.refinement_status === RefinementStatus.Failed || session.refinement_status === RefinementStatus.NoAudio || (session.refinement_status === RefinementStatus.Completed && !session.refined_revision)}
+            {#if session.refinement_status === RefinementStatus.Failed || (session.refinement_status === RefinementStatus.NoAudio && onDrive) || (session.refinement_status === RefinementStatus.Completed && !session.refined_revision)}
               <button
                 class="retry-btn"
                 aria-label="Retry refinement"
@@ -333,6 +337,9 @@
               >
                 {retryingRefinement ? '...' : '↻'}
               </button>
+            {/if}
+            {#if retryRefinementError}
+              <p class="retry-error">{retryRefinementError}</p>
             {/if}
           </div>
         {/if}

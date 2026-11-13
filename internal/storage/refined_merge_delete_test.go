@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 func TestDeleteRefinedSegmentScrubsMergedSourcesByRecording(t *testing.T) {
@@ -91,5 +93,58 @@ func TestDeleteRefinedSegmentScrubsMergedSourcesByRecording(t *testing.T) {
 	}
 	if events != 0 {
 		t.Fatalf("source live events still contain deleted text: %d", events)
+	}
+}
+
+func TestRefinedDeleteKeepsAnAudiolessSourceText(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "audioless.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	startA := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	startB := startA.Add(time.Hour)
+	if err := store.CreateSession("a", startA); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("a", startA.Add(time.Minute), "a.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession("b", startB); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSegment("b", transcribe.Segment{Text: "bravo only live words", StartTime: 0, EndTime: 1, Timestamp: startB}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("b", startB.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Canonicalize("b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("merged", []string{"a", "b"}, startA, startB.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	words := []RefinedWord{
+		{RecordingPath: "a.mp3", RecordingSHA256: "a", Ordinal: 0, Text: "Alpha stays.", Start: 0, End: 1},
+		{RecordingPath: "a.mp3", RecordingSHA256: "a", Ordinal: 1, Text: "secret.", Start: 2, End: 3},
+	}
+	revision, err := store.PublishRefinementAtGeneration("merged", RefinedTranscript(words), "test", words, BuildRefinedSegments(words), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRefinedSegmentText("merged", segments[1].ID, revision); err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.GetSession("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(source.CanonicalTranscript, "bravo") {
+		t.Errorf("audioless source text after another recording deletion = %q", source.CanonicalTranscript)
 	}
 }

@@ -87,9 +87,21 @@ func TestDeleteRefinedAudioChecksHashBeforeSplice(t *testing.T) {
 	if err := os.WriteFile(fixture.recording, []byte("changed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	spliced := false
 	runner := fixture.runner()
+	runner.splice = func(context.Context, string, float64, float64) (string, error) {
+		spliced = true
+		return "after", nil
+	}
 	if err := runner.DeleteRefinedAudio(context.Background(), "s", fixture.segmentID, fixture.revision); err == nil {
 		t.Fatal("delete accepted a recording changed since refinement")
+	}
+	if spliced {
+		t.Fatal("delete spliced a recording whose hash no longer matches refinement")
+	}
+	contents, err := os.ReadFile(fixture.recording)
+	if err != nil || string(contents) != "changed" {
+		t.Fatalf("recording after hash refusal = %q (%v), want unchanged bytes", contents, err)
 	}
 }
 

@@ -266,6 +266,13 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 			return fmt.Errorf("clear backup embeddings: %w", err)
 		}
 	}
+	if refinedWords, err := columns("refined_words"); err != nil {
+		return err
+	} else if refinedWords["session_id"] {
+		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return fmt.Errorf("clear backup refined words: %w", err)
+		}
+	}
 	if events, err := columns("mcp_events"); err != nil {
 		return err
 	} else if events["payload"] {

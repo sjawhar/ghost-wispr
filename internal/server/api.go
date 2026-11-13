@@ -1583,9 +1583,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		go func() {
-			_ = controls.RetryRefinement(context.Background(), sessionID)
-		}()
+		if err := controls.RetryRefinement(r.Context(), sessionID); err != nil {
+			writeJSONError(w, http.StatusConflict, err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
 	})

@@ -735,7 +735,7 @@ func OpenAPISpec() map[string]any {
 							"description": "Retry triggered",
 						},
 						"409": map[string]any{
-							"description": "The session has no saved recording to refine (refinement_status no_audio)",
+							"description": "No local recording or Drive copy can be restored for this session",
 						},
 					},
 				},
