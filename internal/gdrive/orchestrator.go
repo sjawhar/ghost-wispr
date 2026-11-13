@@ -63,6 +63,10 @@ type sessionFolderFinder interface {
 var _ folderCreatingUploader = (*Syncer)(nil)
 var _ sessionFolderFinder = (*Syncer)(nil)
 
+type legacyFolderRecorder interface {
+	RecordLegacyDriveFolders(sessionID, claim string, folderIDs []string) error
+}
+
 type replacementInputStore interface {
 	DriveReplacementInput(sessionID string) (pending bool, splicedRecording string, err error)
 	DeletionGeneration(sessionID string) (int, error)
@@ -151,12 +155,17 @@ func (o *Orchestrator) adoptSessionFolder(ctx context.Context, sessionID, claim,
 	if err != nil {
 		return "", fmt.Errorf("find Drive folder for sync %s: %w", sessionID, err)
 	}
-	for _, folderID := range folderIDs {
+	for i, folderID := range folderIDs {
 		switch err := o.recordSyncFolder(sessionID, claim, folderID); {
 		case errors.Is(err, storage.ErrDriveFolderRecorded):
 			continue
 		case err != nil:
 			return "", fmt.Errorf("record existing Drive folder for sync %s: %w", sessionID, err)
+		}
+		if recorder, ok := o.store.(legacyFolderRecorder); ok && i+1 < len(folderIDs) {
+			if err := recorder.RecordLegacyDriveFolders(sessionID, claim, folderIDs[i+1:]); err != nil {
+				return "", fmt.Errorf("record additional legacy Drive folders for sync %s: %w", sessionID, err)
+			}
 		}
 		return folderID, nil
 	}

@@ -29,6 +29,7 @@ const (
 // replacement: that of session FolderSessionID, in state State.
 type DriveReplacementFolder struct {
 	FolderSessionID string
+	FolderID        string
 	State           string
 }
 
@@ -54,8 +55,11 @@ func recordOwedDriveReplacementFolders(tx *sql.Tx, sessionID string, folderSessi
 // DriveReplacementFolders returns the ledger of the Drive folders sessionID's
 // segment deletion at generation owes a replacement.
 func (s *SQLiteStore) DriveReplacementFolders(sessionID string, generation int) ([]DriveReplacementFolder, error) {
-	rows, err := s.db.Query(`SELECT folder_session_id, state FROM drive_replacement_folders
-		WHERE session_id = ? AND generation = ? ORDER BY folder_session_id`, sessionID, generation)
+	rows, err := s.db.Query(`SELECT folder_session_id, COALESCE((SELECT gdrive_folder_id FROM sessions WHERE id = folder_session_id), ''), state
+		FROM drive_replacement_folders WHERE session_id = ? AND generation = ?
+		UNION ALL
+		SELECT folder_session_id, folder_id, state FROM legacy_drive_replacement_folders WHERE session_id = ? AND generation = ?
+		ORDER BY folder_session_id, folder_id`, sessionID, generation, sessionID, generation)
 	if err != nil {
 		return nil, fmt.Errorf("list owed Drive folders of session %s: %w", sessionID, err)
 	}
@@ -63,7 +67,7 @@ func (s *SQLiteStore) DriveReplacementFolders(sessionID string, generation int) 
 	var folders []DriveReplacementFolder
 	for rows.Next() {
 		var folder DriveReplacementFolder
-		if err := rows.Scan(&folder.FolderSessionID, &folder.State); err != nil {
+		if err := rows.Scan(&folder.FolderSessionID, &folder.FolderID, &folder.State); err != nil {
 			return nil, fmt.Errorf("scan owed Drive folder of session %s: %w", sessionID, err)
 		}
 		folders = append(folders, folder)
@@ -89,7 +93,8 @@ func (s *SQLiteStore) EnsureDriveReplacementFolders(sessionID string, generation
 	}
 	defer func() { _ = tx.Rollback() }()
 	var recorded int
-	if err := tx.QueryRow(`SELECT count(*) FROM drive_replacement_folders WHERE session_id = ? AND generation = ?`, sessionID, generation).Scan(&recorded); err != nil {
+	if err := tx.QueryRow(`SELECT (SELECT count(*) FROM drive_replacement_folders WHERE session_id = ? AND generation = ?)
+		+ (SELECT count(*) FROM legacy_drive_replacement_folders WHERE session_id = ? AND generation = ?)`, sessionID, generation, sessionID, generation).Scan(&recorded); err != nil {
 		return nil, fmt.Errorf("count owed Drive folders of session %s: %w", sessionID, err)
 	}
 	if recorded == 0 {
@@ -150,6 +155,26 @@ func (s *SQLiteStore) MarkDriveReplacementFolder(sessionID string, generation in
 	if rows == 0 {
 		return fmt.Errorf("mark Drive folder of session %s %s for session %s generation %d: it is no longer owed, the generation moved, or an old file is left: %w",
 			folderSessionID, state, sessionID, generation, sql.ErrNoRows)
+	}
+	return nil
+}
+
+// MarkLegacyDriveReplacementFolder records the outcome of replacing one
+// additional identity-matching folder an earlier build left for the same
+// session.
+func (s *SQLiteStore) MarkLegacyDriveReplacementFolder(sessionID string, generation int, folderSessionID, folderID, state string) error {
+	result, err := s.db.Exec(`UPDATE legacy_drive_replacement_folders SET state = ?
+		WHERE session_id = ? AND generation = ? AND folder_session_id = ? AND folder_id = ? AND state = ?`,
+		state, sessionID, generation, folderSessionID, folderID, DriveReplacementFolderOwed)
+	if err != nil {
+		return fmt.Errorf("mark legacy Drive folder %s: %w", folderID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count legacy Drive folder %s: %w", folderID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("mark legacy Drive folder %s: %w", folderID, sql.ErrNoRows)
 	}
 	return nil
 }
@@ -449,13 +474,14 @@ func (s *SQLiteStore) FinishDriveReplacement(sessionID string, generation int) e
 		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?
 		  AND EXISTS (SELECT 1 FROM drive_replacement_folders WHERE session_id = ? AND generation = ?)
 		  AND NOT EXISTS (SELECT 1 FROM drive_replacement_folders WHERE session_id = ? AND generation = ? AND state = ?)
+		  AND NOT EXISTS (SELECT 1 FROM legacy_drive_replacement_folders WHERE session_id = ? AND generation = ? AND state = ?)
 		  AND NOT EXISTS (
 			WITH RECURSIVE held(id) AS (
 				SELECT ?
 				UNION SELECT merged.id FROM sessions AS merged JOIN held ON merged.merged_into = held.id
 			) SELECT 1 FROM unrecorded_sync_folders AS unrecorded JOIN held ON unrecorded.session_id = held.id
 		  )`,
-		sessionID, generation, sessionID, generation, sessionID, generation, DriveReplacementFolderOwed, sessionID)
+		sessionID, generation, sessionID, generation, sessionID, generation, DriveReplacementFolderOwed, sessionID, generation, DriveReplacementFolderOwed, sessionID)
 	if err != nil {
 		return fmt.Errorf("finish drive replacement for session %s: %w", sessionID, err)
 	}

@@ -28,6 +28,7 @@ type replacementStore interface {
 	ClearDriveReplacementPending(sessionID string, generation int) error
 	EnsureDriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
 	MarkDriveReplacementFolder(sessionID string, generation int, folderSessionID, state string) error
+	MarkLegacyDriveReplacementFolder(sessionID string, generation int, folderSessionID, folderID, state string) error
 	FinishDriveReplacement(sessionID string, generation int) error
 }
 
@@ -127,13 +128,21 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 				continue
 			}
 		}
+		if folder.FolderID != "" {
+			folderSession.GDriveFolderID = folder.FolderID
+		}
 		if err := s.checkFolder(ctx, folderSession.GDriveFolderID); err != nil {
 			switch {
 			case errors.Is(err, ErrFolderTrashed):
 				outcome.ownTrashed = outcome.ownTrashed || own
 				failures = append(failures, fmt.Errorf("the Drive folder of session %s is in the trash, and its replacement runs once it is restored: %w", folderSession.ID, err))
 			case IsRemoteDeletedError(err):
-				if err := s.replacements.MarkDriveReplacementFolder(current.ID, generation, folderSession.ID, storage.DriveReplacementFolderGone); err != nil {
+				if folder.FolderID != "" {
+					err = s.replacements.MarkLegacyDriveReplacementFolder(current.ID, generation, folderSession.ID, folder.FolderID, storage.DriveReplacementFolderGone)
+				} else {
+					err = s.replacements.MarkDriveReplacementFolder(current.ID, generation, folderSession.ID, storage.DriveReplacementFolderGone)
+				}
+				if err != nil {
 					failures = append(failures, err)
 					continue
 				}
@@ -143,7 +152,7 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 			}
 			continue
 		}
-		if err := s.replaceFolder(ctx, current.ID, generation, &folderSession, recordings, own); err != nil {
+		if err := s.replaceFolder(ctx, current.ID, generation, &folderSession, recordings, own, folder.FolderID); err != nil {
 			failures = append(failures, err)
 			continue
 		}
@@ -160,7 +169,7 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 // deletes its old files and duplicates, renames it and records it replaced.
 // A merged source's folder (own false) gets the spliced recordings it holds,
 // under their own names, and its scrubbed transcript and summary.
-func (s *Syncer) replaceFolder(ctx context.Context, ownerID string, generation int, folderSession *storage.Session, recordings []string, own bool) error {
+func (s *Syncer) replaceFolder(ctx context.Context, ownerID string, generation int, folderSession *storage.Session, recordings []string, own bool, folderID string) error {
 	target := &replacementTarget{
 		session:    *folderSession,
 		folderName: folderSession.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(folderSession.Title),
@@ -196,6 +205,9 @@ func (s *Syncer) replaceFolder(ctx context.Context, ownerID string, generation i
 	}
 	if err := s.renameSessionFolder(ctx, target.session.GDriveFolderID, target.folderName); err != nil {
 		return err
+	}
+	if folderID != "" {
+		return s.replacements.MarkLegacyDriveReplacementFolder(ownerID, generation, target.session.ID, folderID, storage.DriveReplacementFolderReplaced)
 	}
 	return s.replacements.MarkDriveReplacementFolder(ownerID, generation, target.session.ID, storage.DriveReplacementFolderReplaced)
 }

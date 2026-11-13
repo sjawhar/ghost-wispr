@@ -125,6 +125,7 @@ func (s *Syncer) folderHoldsOnly(ctx context.Context, folderID, sessionID, audio
 	for _, entry := range recordingEntries(audioPath) {
 		recordings[recordingname.FileName(entry)] = true
 	}
+	legacyRecording := len(recordings) == 1
 	contents, err := s.ListFolderFiles(ctx, folderID)
 	if err != nil {
 		return false, err
@@ -132,7 +133,7 @@ func (s *Syncer) folderHoldsOnly(ctx context.Context, folderID, sessionID, audio
 	identified := false
 	for _, f := range contents {
 		switch {
-		case recordings[f.Name]:
+		case recordings[f.Name] || legacyRecording && f.Name == "audio.mp3" && strings.HasPrefix(f.MimeType, "audio/"):
 			identified = true
 		case (f.Name == "summary.md" || f.Name == "transcript.md") && f.MimeType == "application/vnd.google-apps.document":
 			text, err := s.ExportGoogleDoc(ctx, f.Id)
