@@ -58,3 +58,20 @@ func TestARetryAdoptsAnOrphanHoldingItsOwnTranscript(t *testing.T) {
 		t.Fatalf("sync stored Drive folder %q, want the orphan %q that holds this session's transcript", got, orphan)
 	}
 }
+
+// TestARetryDoesNotAdoptAFolderWithOnlyAnotherTranscript fails if removing
+// the frontmatter identity check lets a foreign folder without any audio
+// short-circuit the rejection.
+func TestARetryDoesNotAdoptAFolderWithOnlyAnotherTranscript(t *testing.T) {
+	store := openStore(t)
+	const own, foreign = "own-session", "foreign-session"
+	_, _ = round2Session(t, store, own, []string{"own", "session"})
+	_, _ = round2Session(t, store, foreign, []string{"foreign", "session"})
+	wire, syncer := newWireDrive(t)
+	foreignFolder := wire.add(wire.rootID, "any-name", "application/vnd.google-apps.folder", nil, nil)
+	wire.add(foreignFolder, "transcript.md", "application/vnd.google-apps.document", []byte("---\nid: \""+foreign+"\"\n---\n"), nil)
+	cutOffBeforeFolderRecorded(t, store, own)
+	if got := syncedSession(t, store, NewOrchestrator(syncer, store), own); got == foreignFolder {
+		t.Fatalf("retry adopted foreign folder %q from its transcript alone", foreignFolder)
+	}
+}

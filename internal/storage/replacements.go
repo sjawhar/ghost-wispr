@@ -207,9 +207,47 @@ func (s *SQLiteStore) PendingDriveReplacementRecordings(sessionID string) ([]str
 	return recordings, nil
 }
 
+// UnrecordedDriveFolderSessions returns sessionID and each source merged into
+// it whose interrupted first sync still needs Drive-folder discovery.
+func (s *SQLiteStore) UnrecordedDriveFolderSessions(sessionID string) ([]Session, error) {
+	rows, err := s.db.Query(`WITH RECURSIVE held(id) AS (
+		SELECT ?
+		UNION SELECT merged.id FROM sessions AS merged JOIN held ON merged.merged_into = held.id
+	) SELECT held.id FROM held JOIN unrecorded_sync_folders AS unrecorded ON unrecorded.session_id = held.id`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list unrecorded Drive folders of session %s: %w", sessionID, err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan unrecorded Drive folder session: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("iterate unrecorded Drive folder sessions: %w", err)
+	}
+	sessions := make([]Session, 0, len(ids))
+	for _, id := range ids {
+		session, err := s.GetSession(id)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, nil
+}
 func (s *SQLiteStore) ClearDriveReplacementPending(sessionID string, generation int) error {
 	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0, drive_replace_since = '', drive_replace_failures = 0, drive_replace_error = ''
-		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?`, sessionID, generation)
+		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?
+		  AND NOT EXISTS (
+			WITH RECURSIVE held(id) AS (
+				SELECT ?
+				UNION SELECT merged.id FROM sessions AS merged JOIN held ON merged.merged_into = held.id
+			) SELECT 1 FROM unrecorded_sync_folders AS unrecorded JOIN held ON unrecorded.session_id = held.id
+		  )`, sessionID, generation, sessionID)
 	if err != nil {
 		return fmt.Errorf("clear drive replacement for session %s: %w", sessionID, err)
 	}
@@ -410,8 +448,14 @@ func (s *SQLiteStore) FinishDriveReplacement(sessionID string, generation int) e
 	result, err := s.db.Exec(`UPDATE sessions SET drive_replace_pending = 0, drive_replace_since = '', drive_replace_failures = 0, drive_replace_error = ''
 		WHERE id = ? AND drive_replace_pending = 1 AND deletion_generation = ?
 		  AND EXISTS (SELECT 1 FROM drive_replacement_folders WHERE session_id = ? AND generation = ?)
-		  AND NOT EXISTS (SELECT 1 FROM drive_replacement_folders WHERE session_id = ? AND generation = ? AND state = ?)`,
-		sessionID, generation, sessionID, generation, sessionID, generation, DriveReplacementFolderOwed)
+		  AND NOT EXISTS (SELECT 1 FROM drive_replacement_folders WHERE session_id = ? AND generation = ? AND state = ?)
+		  AND NOT EXISTS (
+			WITH RECURSIVE held(id) AS (
+				SELECT ?
+				UNION SELECT merged.id FROM sessions AS merged JOIN held ON merged.merged_into = held.id
+			) SELECT 1 FROM unrecorded_sync_folders AS unrecorded JOIN held ON unrecorded.session_id = held.id
+		  )`,
+		sessionID, generation, sessionID, generation, sessionID, generation, DriveReplacementFolderOwed, sessionID)
 	if err != nil {
 		return fmt.Errorf("finish drive replacement for session %s: %w", sessionID, err)
 	}

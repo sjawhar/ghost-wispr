@@ -72,6 +72,7 @@ type replacementInputStore interface {
 	// EnsureDriveReplacementFolders reads the deletion's owed folders,
 	// rebuilding a ledger that is empty while the deletion is pending.
 	EnsureDriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
+	UnrecordedDriveFolderSessions(sessionID string) ([]storage.Session, error)
 	// RecordDriveReplacementFailure counts a failed replacement attempt of
 	// the session's deletion generation, with why; the app's status warning
 	// is read from these counts (storage.OwedDriveReplacements).
@@ -177,7 +178,7 @@ func (o *Orchestrator) adoptPendingReplacementFolder(ctx context.Context, sess *
 	folderID, adoptErr := o.adoptSessionFolder(ctx, sess.ID, claim, resolvedAudioPath(sess.AudioPath, o.audioDir))
 	message := ""
 	if adoptErr != nil {
-		message = adoptErr.Error()
+		message = "folder discovery failed: " + adoptErr.Error()
 	}
 	released, releaseErr := o.store.EndSync(sess.ID, claim, sess.SyncState, folderID, held.RetryCount, time.Now().UTC(), message)
 	if releaseErr != nil {
@@ -306,19 +307,21 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				o.logger.Warn("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
 				return nil
 			}
-			adopted, claimed, err := o.adoptPendingReplacementFolder(ctx, &read)
+			unrecorded, err := replacements.UnrecordedDriveFolderSessions(sessionID)
 			if err != nil {
 				return err
 			}
-			if !claimed {
-				o.logger.Info("gdrive replacement was claimed by another sync first, skipping", "operation", "replace_session_files", "session_id", sessionID)
-				return nil
-			}
-			if adopted {
-				if read, err = o.store.GetSession(sessionID); err != nil {
-					return fmt.Errorf("get session %s after Drive folder adoption: %w", sessionID, err)
+			for i := range unrecorded {
+				_, claimed, err := o.adoptPendingReplacementFolder(ctx, &unrecorded[i])
+				if err != nil {
+					return err
 				}
-			} else if read, err = o.store.GetSession(sessionID); err != nil {
+				if !claimed {
+					o.logger.Info("gdrive replacement was claimed by another sync first, skipping", "operation", "replace_session_files", "session_id", sessionID)
+					return nil
+				}
+			}
+			if read, err = o.store.GetSession(sessionID); err != nil {
 				return fmt.Errorf("get session %s after Drive folder discovery: %w", sessionID, err)
 			} else if !read.DriveReplacePending {
 				return o.SyncSession(ctx, sessionID)
@@ -405,6 +408,9 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	driveFolderID := sess.GDriveFolderID
 	if driveFolderID == "" && read.LastSyncAttempt != nil {
 		driveFolderID, err = o.adoptSessionFolder(ctx, sessionID, claim, audioPath)
+		if err != nil {
+			err = fmt.Errorf("folder discovery failed: %w", err)
+		}
 	}
 	if err == nil {
 		if driveFolderID != "" {

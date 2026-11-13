@@ -1432,8 +1432,8 @@ func (s *SQLiteStore) StartEmptySummary(id string) error {
 func (s *SQLiteStore) StartEmptySummaryAtGeneration(id string, generation int) error {
 	res, err := s.db.Exec(`UPDATE sessions
 		SET summary_status = ?, summary_generation = deletion_generation
-		WHERE id = ? AND deletion_generation = ? AND summary_status IN (?, ?)`,
-		SummaryRunning, id, generation, SummaryPending, SummaryFailed)
+		WHERE id = ? AND deletion_generation = ? AND summary_status IN (?, ?, ?)`,
+		SummaryRunning, id, generation, SummaryPending, SummaryFailed, SummaryRunning)
 	if err != nil {
 		return fmt.Errorf("start empty summary of session %s at generation %d: %w", id, generation, err)
 	}
@@ -1655,7 +1655,7 @@ func (s *SQLiteStore) ClaimSync(id, from, claim string, at time.Time) (Session, 
 		return Session{}, false, nil
 	}
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO unrecorded_sync_folders(session_id)
-		SELECT id FROM sessions WHERE id = ? AND gdrive_folder_id = ''`, id); err != nil {
+		SELECT id FROM sessions WHERE id = ? AND gdrive_folder_id = '' AND drive_replace_pending = 0`, id); err != nil {
 		return Session{}, false, fmt.Errorf("mark session %s as having an unrecorded Drive folder: %w", id, err)
 	}
 	sess, err := getSession(tx, id)
@@ -1821,11 +1821,13 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
 		return false, err
 	}
-	if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
-		return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
-	}
-	if err := settleUnownedDriveReplacement(tx, id); err != nil {
-		return false, err
+	if !strings.HasPrefix(errorMessage, "folder discovery failed:") {
+		if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
+			return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
+		}
+		if err := settleUnownedDriveReplacement(tx, id); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit the end of the sync of session %s: %w", id, err)
@@ -1895,7 +1897,6 @@ func (s *SQLiteStore) RecoverInterruptedSyncs(maxRetries int, at time.Time) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("recover interrupted syncs: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
 
 	var ids []string
 	for rows.Next() {
@@ -1906,7 +1907,22 @@ func (s *SQLiteStore) RecoverInterruptedSyncs(maxRetries int, at time.Time) ([]s
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return nil, fmt.Errorf("recover interrupted syncs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close recovered syncs: %w", err)
+	}
+	if len(ids) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, len(ids))
+		for i := range ids {
+			args[i] = ids[i]
+		}
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO unrecorded_sync_folders(session_id)
+			SELECT id FROM sessions WHERE id IN (`+placeholders+`) AND gdrive_folder_id = ''`, args...); err != nil {
+			return nil, fmt.Errorf("mark recovered folderless syncs for Drive discovery: %w", err)
+		}
 	}
 	return ids, nil
 }
@@ -2493,6 +2509,29 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	case err != nil:
 		return "", fmt.Errorf("read session %s to delete it: %w", id, err)
 	}
+	rows, err := tx.Query(`WITH RECURSIVE doomed(id) AS (
+			SELECT ?
+			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
+		) SELECT sessions.id, sessions.audio_path FROM sessions JOIN doomed ON sessions.id = doomed.id`, id)
+	if err != nil {
+		return "", fmt.Errorf("list merged sources of session %s: %w", id, err)
+	}
+	paths := []string{audioPath}
+	for rows.Next() {
+		var sourceID, sourceAudioPath string
+		if err := rows.Scan(&sourceID, &sourceAudioPath); err != nil {
+			_ = rows.Close()
+			return "", fmt.Errorf("scan merged source of session %s: %w", id, err)
+		}
+		if sourceID == id {
+			continue
+		}
+		paths = append(paths, sourceAudioPath, filepath.Join(audioDir, sourceID+".pcm"))
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return "", fmt.Errorf("list merged sources of session %s: %w", id, err)
+	}
+	audioPath = strings.Join(paths, ",")
 	for _, entry := range append(strings.Split(audioPath, ","), id+".pcm") {
 		if entry = strings.TrimSpace(entry); entry == "" {
 			continue
@@ -2501,8 +2540,11 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 			return "", fmt.Errorf("delete session %s: %w", id, err)
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
-		return "", fmt.Errorf("delete session %s: %w", id, err)
+	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
+			SELECT ?
+			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
+		) DELETE FROM sessions WHERE id IN (SELECT id FROM doomed)`, id); err != nil {
+		return "", fmt.Errorf("delete session %s and its merged sources: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("commit deleting session %s: %w", id, err)

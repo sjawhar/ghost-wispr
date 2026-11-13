@@ -349,3 +349,32 @@ func TestAStaleEmptyCompletionLeavesANewerCompletedSummary(t *testing.T) {
 		t.Fatalf("summary status = %q, want the newer completed summary left alone", session.SummaryStatus)
 	}
 }
+
+// TestStartupBackfillCompletesAnEmptySummaryLeftRunning fails if a stop left
+// an empty summary running and startup refuses to finish that same generation.
+func TestStartupBackfillCompletesAnEmptySummaryLeftRunning(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "running-empty.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	const id = "running-empty"
+	started := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(id, started.Add(time.Second), "recording.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, summary_generation = 0 WHERE id = ?`, storage.SummaryRunning, id); err != nil {
+		t.Fatal(err)
+	}
+	summarizeBackfillSession(context.Background(), store, &racingSummarizer{}, func(string) {}, id)
+	session, err := store.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SummaryStatus != storage.SummaryCompleted {
+		t.Fatalf("summary status = %q, want the recovered empty summary completed", session.SummaryStatus)
+	}
+}
