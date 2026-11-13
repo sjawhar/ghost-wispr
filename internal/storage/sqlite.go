@@ -2773,18 +2773,17 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 		  AND NOT EXISTS (
 			SELECT 1 FROM sessions AS member JOIN doomed ON member.id = doomed.id
 			WHERE member.status = ?
+			   OR member.sync_state = ?
+			   OR member.refinement_status = ?
 			   OR member.drive_replace_pending = 1
 			   OR EXISTS (
 				SELECT 1 FROM drive_replacement_folders
 				WHERE drive_replacement_folders.folder_session_id = member.id
 				  AND drive_replacement_folders.state = ?
 			   )
-			   OR (member.gdrive_folder_id != '' AND (
-				member.drive_documents_pending != 0
-				OR member.refinement_status = ?
-			   ))
+			   OR (member.gdrive_folder_id != '' AND member.drive_documents_pending != 0)
 		  )`,
-		id, id, audioPath, SessionActive, DriveReplacementFolderOwed, RefinementRunning).Scan(&eligible)
+		id, id, audioPath, SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed).Scan(&eligible)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil

@@ -116,3 +116,58 @@ func TestGCStopsWhenASourceFolderCheckErrors(t *testing.T) {
 		t.Fatalf("GC hold after source Drive error = %v, want %v", collector.Held(), ErrDriveCannotSay)
 	}
 }
+
+func TestGCKeepsMergedSessionWhileASourceRefreshIsOwed(t *testing.T) {
+	store, dir, _ := mergedGCFolderStore(t)
+	segments, err := store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegmentText("merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, drive_documents_pending = 0 WHERE id = 'merged'`, storage.SummaryCompleted); err != nil {
+		t.Fatal(err)
+	}
+	var pending int
+	if err := store.DB().QueryRow(`SELECT drive_documents_pending FROM sessions WHERE id = 'source-a'`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 {
+		t.Fatalf("source-a refresh mark = %d, want 1", pending)
+	}
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
+		t.Fatalf("GC deleted %v while source refresh is owed, want none", deleted)
+	}
+}
+
+func TestGCRefusesAFolderlessRefiningSource(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	endWithRecording(t, store, dir, "source-a", started, 1024)
+	syncTo(t, store, "source-a", storage.SyncStateSynced, "source-folder-a", 0, "")
+	endWithRecording(t, store, dir, "source-b", started.Add(time.Hour), 1024)
+	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ? WHERE id = 'source-b'`, storage.RefinementRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, started, started.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("merged", "", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
+		t.Fatalf("GC deleted %v with a folderless refining source, want none", deleted)
+	}
+}
+
+func TestGCRefusesARemoteDeletedSource(t *testing.T) {
+	store, dir, _ := mergedGCFolderStore(t)
+	if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ? WHERE id = 'source-a'`, storage.SyncStateRemoteDeleted, storage.SyncFailed); err != nil {
+		t.Fatal(err)
+	}
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
+		t.Fatalf("GC deleted %v with a remote-deleted source, want none", deleted)
+	}
+}
