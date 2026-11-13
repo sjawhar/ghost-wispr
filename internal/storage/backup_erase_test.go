@@ -96,8 +96,8 @@ func assertBackupHolds(t *testing.T, path, text string, want bool) {
 			t.Fatal(err)
 		}
 	}
-	if !strings.Contains(all, "after bridge") {
-		t.Fatal("control: the backup does not hold the kept text, so the read saw no data")
+	if want && !strings.Contains(all, "after bridge") {
+		t.Fatal("control: the backup does not hold the kept text before the deletion")
 	}
 	if got := strings.Contains(all, text); got != want {
 		t.Errorf("backup holds %q = %v, want %v", text, got, want)

@@ -220,9 +220,8 @@ func TestOpeningTheStoreRetriesAnOwedErasure(t *testing.T) {
 }
 
 // TestABackupWithoutSegmentIDsLosesTheDeletedWords fails if the scrub of a
-// backup whose segments table has no id column leaves the deleted segment in
-// it, or writes its words back into the canonical transcript it rebuilds
-// from the segments it could not delete from.
+// backup whose segments table has no id column leaves any segment of the
+// affected session or rebuilds a canonical transcript from uncertain rows.
 func TestABackupWithoutSegmentIDsLosesTheDeletedWords(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	openWithSecret(t, path)
@@ -257,8 +256,8 @@ func TestABackupWithoutSegmentIDsLosesTheDeletedWords(t *testing.T) {
 	if err := check.QueryRow(`SELECT count(*) FROM segments WHERE session_id = 'backed-up'`).Scan(&kept); err != nil {
 		t.Fatal(err)
 	}
-	if kept != 2 {
-		t.Errorf("the backup keeps %d of the session's segments, want the two not deleted", kept)
+	if kept != 0 {
+		t.Errorf("the backup keeps %d segments of the affected session, want none", kept)
 	}
 	var canonical string
 	if err := check.QueryRow(`SELECT canonical_transcript FROM sessions WHERE id = 'backed-up'`).Scan(&canonical); err != nil {
