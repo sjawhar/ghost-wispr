@@ -139,10 +139,11 @@ type ControlHooks struct {
 	// RetrySync starts a sync of the session in the background and returns
 	// at once: ErrSyncNotConfigured when sync is off, or why no sync can
 	// start for the session.
-	RetrySync       func(ctx context.Context, sessionID string) error
-	RetryRefinement func(ctx context.Context, sessionID string) error
-	RepairSummaries func(ctx context.Context) (int, error)
-	DiagnoseMic     func(ctx context.Context) (map[string]any, error)
+	RetrySync                 func(ctx context.Context, sessionID string) error
+	EnsureRefinementRecording func(ctx context.Context, sessionID string) error
+	RetryRefinement           func(ctx context.Context, sessionID string) error
+	RepairSummaries           func(ctx context.Context) (int, error)
+	DiagnoseMic               func(ctx context.Context) (map[string]any, error)
 	// DeleteSegment is "Delete text and audio" (mode=text_and_audio) for a
 	// specific batch transcript revision.
 	DeleteSegment func(ctx context.Context, sessionID string, segmentID int64, revision int) error

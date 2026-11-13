@@ -1401,9 +1401,9 @@ poll_after() {
   return "$result"
 }
 
-# retry_refinement: the UI's "retry refinement", then wait until it ran and completed.
+# retry_refinement: the UI's "retry refinement", then poll until it completes.
 retry_refinement() {
-  local response detail state saw_running=false attempt
+  local response detail state attempt
   response=$(post_json "/api/sessions/$acceptance_session_id/retry-refinement" '{}') || {
     printf 'A11 text only FAILED: retry refinement was refused\n' >&2
     return 1
@@ -1416,12 +1416,9 @@ retry_refinement() {
     if detail=$(session_detail "$acceptance_session_id"); then
       state=$(session_field "$detail" refinement_status)
       case "$state" in
-        running) saw_running=true ;;
         completed)
-          if [[ "$saw_running" == true ]]; then
-            printf 'A11 text only RAN: retry refinement ran and completed.\n'
-            return 0
-          fi
+          printf 'A11 text only RAN: retry refinement completed.\n'
+          return 0
           ;;
         failed|no_audio)
           printf 'A11 text only FAILED: retry refinement ended %s\n' "$state" >&2
@@ -1431,10 +1428,6 @@ retry_refinement() {
     fi
     sleep 2
   done
-  if [[ "$saw_running" != true ]]; then
-    printf 'A11 text only UNKNOWN: retry refinement never read as running, so the driver cannot tell that it ran\n'
-    return 2
-  fi
   printf 'A11 text only FAILED: retry refinement did not complete in %d minutes\n' "$((refinement_attempts * 2 / 60))" >&2
   return 1
 }

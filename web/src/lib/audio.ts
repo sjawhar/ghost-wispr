@@ -1,4 +1,4 @@
-import { RefinementStatus, type SessionSummary } from './types'
+import { RefinementStatus, SyncState, SyncStatus, type SessionSummary } from './types'
 
 // The number of recordings a session's audio path names: a merged session's
 // names several, separated by commas.
@@ -24,4 +24,12 @@ export function audioLeftNote(session: SessionSummary): string {
   }
   const notOnDisk = recordingsNamed(session.audio_path) === 1 ? 'it was' : 'they were'
   return `${left}, but ${notOnDisk} not on disk when the rest was removed`
+}
+
+export function canRestoreRefinement(session: SessionSummary | undefined): boolean {
+  return Boolean(
+    session?.audio_removed_at &&
+    session.sync_status === SyncStatus.Synced &&
+    session.sync_state !== SyncState.RemoteDeleted,
+  )
 }

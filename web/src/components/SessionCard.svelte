@@ -11,7 +11,7 @@
     type SessionSummary,
   } from '../lib/types'
   import { copyText } from '../lib/clipboard'
-  import { audioLeftNote, recordingsNamed } from '../lib/audio'
+  import { audioLeftNote, canRestoreRefinement, recordingsNamed } from '../lib/audio'
   import {
     updateSessionTitle,
     retrySummary,
@@ -327,7 +327,7 @@
                 ? 'no recording'
                 : session.refinement_status}
             </span>
-            {#if session.refinement_status === RefinementStatus.Failed || (session.refinement_status === RefinementStatus.NoAudio && onDrive) || (session.refinement_status === RefinementStatus.Completed && !session.refined_revision)}
+            {#if session.refinement_status === RefinementStatus.Failed || (session.refinement_status === RefinementStatus.NoAudio && canRestoreRefinement(session)) || (session.refinement_status === RefinementStatus.Completed && !session.refined_revision)}
               <button
                 class="retry-btn"
                 aria-label="Retry refinement"

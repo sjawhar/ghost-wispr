@@ -247,7 +247,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording strin
 	holders = recordingChain(deletedRecording)
 	mappedRecording := len(holders) != 0
 	for _, source := range sources {
-		if mappedRecording && len(own[source]) == 0 {
+		if mappedRecording && len(own[source]) == 0 && !slices.Contains(holders, source) {
 			continue
 		}
 		if _, err := tx.Exec(`UPDATE sessions

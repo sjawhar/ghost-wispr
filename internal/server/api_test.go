@@ -4525,8 +4525,8 @@ func TestRetryRefinementWithoutLocalAudioStartsRestore(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/sessions/s1/retry-refinement", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("retry refinement without local audio = %d %s, want 200", response.Code, response.Body.String())
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("retry refinement without local audio = %d %s, want 202", response.Code, response.Body.String())
 	}
 	select {
 	case sessionID := <-started:

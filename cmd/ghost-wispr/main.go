@@ -961,6 +961,24 @@ func main() {
 		}
 	}
 
+	ensureRefinementRecording := func(ctx context.Context, sessionID string) error {
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(sess.AudioPath) != "" {
+			return nil
+		}
+		recordings, err := deletionRunner().ensureRecordings(ctx, sess)
+		if err != nil {
+			return fmt.Errorf("no recording on this unit or on Drive: %w", err)
+		}
+		if len(recordings.Paths) == 0 {
+			return errors.New("no recording on this unit or on Drive")
+		}
+		return store.RestoreAudioForRefinement(sessionID, strings.Join(recordings.Paths, ","))
+	}
+
 	controlHooks := &server.ControlHooks{
 		IsPaused:    capture.IsPaused,
 		IsCapturing: func() bool { return capture.capturing(micStatus) },
@@ -1004,23 +1022,8 @@ func main() {
 		RetrySync: func(ctx context.Context, sessionID string) error {
 			return retrySync(ctx, drive.Get(), sessionID)
 		},
+		EnsureRefinementRecording: ensureRefinementRecording,
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
-			sess, err := store.GetSession(sessionID)
-			if err != nil {
-				return err
-			}
-			if strings.TrimSpace(sess.AudioPath) == "" {
-				recordings, err := deletionRunner().ensureRecordings(ctx, sess)
-				if err != nil {
-					return fmt.Errorf("no recording on this unit or on Drive: %w", err)
-				}
-				if len(recordings.Paths) == 0 {
-					return errors.New("no recording on this unit or on Drive")
-				}
-				if err := store.RestoreAudioForRefinement(sessionID, strings.Join(recordings.Paths, ",")); err != nil {
-					return err
-				}
-			}
 			return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
 		},
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {

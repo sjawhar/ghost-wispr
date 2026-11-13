@@ -1583,12 +1583,17 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		if err := controls.RetryRefinement(r.Context(), sessionID); err != nil {
-			writeJSONError(w, http.StatusConflict, err.Error())
-			return
+		if controls.EnsureRefinementRecording != nil {
+			if err := controls.EnsureRefinementRecording(r.Context(), sessionID); err != nil {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 		}
+		go func() {
+			_ = controls.RetryRefinement(context.Background(), sessionID)
+		}()
 
-		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+		writeJSON(w, http.StatusAccepted, map[string]bool{"triggered": true})
 	})
 
 	// Config endpoints — only registered if cfgStore is provided.
