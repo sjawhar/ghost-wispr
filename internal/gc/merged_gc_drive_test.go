@@ -198,13 +198,39 @@ func TestGCLogsTheSourceThatBlocksAgeDeletion(t *testing.T) {
 		if line["operation"] == "delete_session" && line["level"] == "WARN" {
 			deleteWarnings++
 		}
-		if line["source_session_id"] == "source-a" && line["source_block_reason"] == "documents need Drive refresh" {
+		if line["msg"] == "gc session blocks age deletion" &&
+			line["blocking_session_id"] == "source-a" &&
+			line["blocking_session_role"] == "source" &&
+			line["blocking_session_block_reason"] == "documents need Drive refresh" {
 			identified = true
 		}
 	}
 	if !identified || deleteWarnings != 1 {
 		t.Fatalf("GC source block warnings = %d, identified=%v:\n%s", deleteWarnings, identified, logs.String())
 	}
+}
+
+func TestGCLogsTheTargetThatBlocksAgeDeletion(t *testing.T) {
+	store, dir, _ := mergedGCFolderStore(t)
+	syncTo(t, store, "merged", storage.SyncStateSynced, "merged-folder", 0, "")
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = 'merged'`); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	collector := New(store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if deleted, err := collector.Run(); err != nil || len(deleted) != 0 {
+		t.Fatalf("GC with an owed target refresh = %v, %v; want no deletion", deleted, err)
+	}
+	for _, line := range logLines(t, &logs) {
+		if line["msg"] == "gc session blocks age deletion" &&
+			line["blocking_session_id"] == "merged" &&
+			line["blocking_session_role"] == "target" &&
+			line["blocking_session_block_reason"] == "documents need Drive refresh" {
+			return
+		}
+	}
+	t.Fatalf("GC did not identify the target as the blocking session:\n%s", logs.String())
 }
 
 func TestGCReportsEveryMergedSourceBlockReason(t *testing.T) {
@@ -286,7 +312,10 @@ func TestGCReportsEveryMergedSourceBlockReason(t *testing.T) {
 				t.Fatalf("GC with source %s = %v, %v; want no deletion", tc.name, deleted, err)
 			}
 			for _, line := range logLines(t, &logs) {
-				if line["source_session_id"] == "source-a" && line["source_block_reason"] == tc.reason {
+				if line["msg"] == "gc session blocks age deletion" &&
+					line["blocking_session_id"] == "source-a" &&
+					line["blocking_session_role"] == "source" &&
+					line["blocking_session_block_reason"] == tc.reason {
 					return
 				}
 			}

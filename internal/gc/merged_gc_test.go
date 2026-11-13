@@ -242,6 +242,28 @@ func TestGCKeepsMergedSessionWhenASourceSavedRecordingVanishes(t *testing.T) {
 	}
 }
 
+// A zero-byte saved recording cannot prove the source's raw PCM is redundant.
+func TestGCKeepsMergedSessionWhenASourceSavedRecordingIsEmpty(t *testing.T) {
+	store, dir, _ := mergedGCFolderStore(t)
+	raw := filepath.Join(dir, "source-b.pcm")
+	if err := os.WriteFile(raw, []byte("source-b only audio beside empty saved recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(filepath.Join(dir, "source-b.mp3"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
+		t.Fatalf("GC deleted %v though source-b has only raw audio, want none", deleted)
+	}
+	if _, err := store.GetSession("merged"); err != nil {
+		t.Fatalf("merged session after GC = %v, want kept", err)
+	}
+	if _, err := os.Stat(raw); err != nil {
+		t.Fatalf("source-b raw after GC = %v, want kept", err)
+	}
+}
+
 func TestGCChecksEachMergedSourceDriveFolder(t *testing.T) {
 	dir := t.TempDir()
 	store := newStore(t)
