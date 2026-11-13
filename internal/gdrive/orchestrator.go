@@ -438,8 +438,8 @@ func (o *Orchestrator) syncSession(ctx context.Context, sessionID string) error 
 			err = o.uploader.UploadInto(ctx, driveFolderID, withEmptiedSummary(files))
 		} else if creator, ok := o.uploader.(folderCreatingUploader); ok {
 			driveFolderID, err = creator.UploadWithFolderRecorded(ctx, folderName, files, func(folderID string) error {
-			return o.recordSyncFolder(sessionID, claim, folderID)
-		})
+				return o.recordSyncFolder(sessionID, claim, folderID)
+			})
 		} else {
 			driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
 		}
