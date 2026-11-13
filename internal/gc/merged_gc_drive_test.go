@@ -1,8 +1,10 @@
 package gc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"testing"
 	"time"
@@ -170,4 +172,30 @@ func TestGCRefusesARemoteDeletedSource(t *testing.T) {
 	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
 		t.Fatalf("GC deleted %v with a remote-deleted source, want none", deleted)
 	}
+}
+
+func TestGCLogsTheSourceThatBlocksAgeDeletion(t *testing.T) {
+	store, dir, _ := mergedGCFolderStore(t)
+	segments, err := store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegmentText("merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, drive_documents_pending = 0 WHERE id = 'merged'`, storage.SummaryCompleted); err != nil {
+		t.Fatal(err)
+	}
+	syncTo(t, store, "merged", storage.SyncStateSynced, "merged-folder", 0, "")
+	var logs bytes.Buffer
+	collector := New(store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: &driveFolders{}}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if deleted, err := collector.Run(); err != nil || len(deleted) != 0 {
+		t.Fatalf("GC with an owed source refresh = %v, %v; want no deletion", deleted, err)
+	}
+	for _, line := range logLines(t, &logs) {
+		if line["source_session_id"] == "source-a" && line["source_block_reason"] == "documents need Drive refresh" {
+			return
+		}
+	}
+	t.Fatalf("GC did not identify the source and reason:\n%s", logs.String())
 }

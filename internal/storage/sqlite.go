@@ -2460,6 +2460,17 @@ var ErrDeleteReplacementPending = errors.New("this session still has a deleted s
 // active. The later merge or recorder would lose its source.
 var ErrDeleteMergeActive = errors.New("this session is part of another merge or has an active merged source")
 
+// GCSourceBlockError identifies the source that prevents age GC from deleting
+// a merged session.
+type GCSourceBlockError struct {
+	SessionID string
+	Reason    string
+}
+
+func (e *GCSourceBlockError) Error() string {
+	return fmt.Sprintf("merged source %s blocks age GC: %s", e.SessionID, e.Reason)
+}
+
 // noOwedDriveReplacement is the condition, on a sessions row, that it owes
 // Google Drive no replacement and its folder is owed none. GC
 // (removableCondition) and MergeSessions check it; DeleteSession applies it
@@ -2754,8 +2765,9 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 
 // DeleteEndedSessionAndSources deletes an age-eligible merged session and its
 // source rows in one transaction. It records every raw capture directory
-// before the rows go, and refuses the whole delete when any member is active,
-// owes a replacement, or has an owed folder. It returns the deleted session
+// before the rows go. It refuses when a source is active, remote-deleted,
+// refining, owes a Drive replacement, has an owed Drive folder, or has a
+// folder whose documents still need refresh. It returns the deleted session
 // IDs so GC can erase each now-redundant raw capture.
 func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir string) ([]string, bool, error) {
 	tx, err := s.db.Begin()
@@ -2763,6 +2775,45 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 		return nil, false, fmt.Errorf("begin deleting session %s and its sources: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var block GCSourceBlockError
+	err = tx.QueryRow(`WITH RECURSIVE doomed(id) AS (
+			SELECT ?
+			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
+		) SELECT member.id, CASE
+			WHEN member.status = ? THEN 'active'
+			WHEN member.sync_state = ? THEN 'remote-deleted'
+			WHEN member.refinement_status = ? THEN 'refinement running'
+			WHEN member.drive_replace_pending = 1 THEN 'Drive replacement owed'
+			WHEN EXISTS (
+				SELECT 1 FROM drive_replacement_folders
+				WHERE drive_replacement_folders.folder_session_id = member.id
+				  AND drive_replacement_folders.state = ?
+			) THEN 'Drive folder replacement owed'
+			ELSE 'documents need Drive refresh'
+		END
+		FROM sessions AS member JOIN doomed ON member.id = doomed.id
+		WHERE member.id != ?
+		  AND (
+			member.status = ?
+			OR member.sync_state = ?
+			OR member.refinement_status = ?
+			OR member.drive_replace_pending = 1
+			OR EXISTS (
+				SELECT 1 FROM drive_replacement_folders
+				WHERE drive_replacement_folders.folder_session_id = member.id
+				  AND drive_replacement_folders.state = ?
+			)
+			OR (member.gdrive_folder_id != '' AND member.drive_documents_pending != 0)
+		  )
+		LIMIT 1`,
+		id, SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed,
+		id, SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed).Scan(&block.SessionID, &block.Reason)
+	switch {
+	case err == nil:
+		return nil, false, &block
+	case !errors.Is(err, sql.ErrNoRows):
+		return nil, false, fmt.Errorf("check source sessions of %s before GC deletion: %w", id, err)
+	}
 	var eligible int
 	err = tx.QueryRow(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?

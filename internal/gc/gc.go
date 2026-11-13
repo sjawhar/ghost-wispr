@@ -507,6 +507,10 @@ func (c *Collector) deleteSession(id string, names names) error {
 	}
 	deletedIDs, deleted, err := c.store.DeleteEndedSessionAndSources(id, sess.AudioPath, c.config.AudioDir)
 	if err != nil {
+		var block *storage.GCSourceBlockError
+		if errors.As(err, &block) {
+			c.logger.Warn("gc source blocks age deletion", "operation", "delete_session", "session_id", id, "source_session_id", block.SessionID, "source_block_reason", block.Reason)
+		}
 		return fmt.Errorf("delete from db: %w", err)
 	}
 	if !deleted {
