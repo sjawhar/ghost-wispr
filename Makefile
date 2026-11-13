@@ -6,12 +6,12 @@ LDFLAGS    := -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
 
 build: frontend-build embed-assets backend-build
 
-# The web build's dependencies, installed again whenever its lock file changes.
-web/node_modules: web/package-lock.json
+# The stamp exists only after npm ci succeeds, so a failed install is retried.
+web/node_modules/.install-stamp: web/package-lock.json
 	npm --prefix web ci
-	touch web/node_modules
+	touch $@
 
-frontend-build: web/node_modules
+frontend-build: web/node_modules/.install-stamp
 	npm --prefix web run build
 
 embed-assets:

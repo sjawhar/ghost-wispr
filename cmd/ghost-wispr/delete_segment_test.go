@@ -217,7 +217,7 @@ func TestCleanupSpliceTempCopies(t *testing.T) {
 		t.Cleanup(func() { _ = f.Close() })
 		held[name] = f
 	}
-	if err := cleanupSpliceTempCopies(dir); err != nil {
+	if err := cleanupSpliceTempCopiesExcept(dir, nil); err != nil {
 		t.Fatalf("cleanup splice temp copies: %v", err)
 	}
 	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", ".erasing-cut-off"} {
@@ -340,11 +340,16 @@ func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
 // ones the cleanup forgets and records.
 type eraseDirectoryLister struct {
 	dirs      []string
+	reserved  map[string]bool
 	forgotten []string
 	recorded  []string
 }
 
 func (l *eraseDirectoryLister) RecordingDirectories() ([]string, error) { return l.dirs, nil }
+
+func (l *eraseDirectoryLister) ReservedRawErasePaths() (map[string]bool, error) {
+	return l.reserved, nil
+}
 
 func (l *eraseDirectoryLister) ForgetEraseDirectories(dirs []string) error {
 	l.forgotten = append(l.forgotten, dirs...)
@@ -1238,7 +1243,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	if !bytes.Equal(contents, []byte("spliced")) {
 		t.Fatalf("re-spliced recording = %q", contents)
 	}
-	pending, err := store.PendingSplices()
+	pending, err := store.PendingSplices(filepath.Dir(recording))
 	if err != nil {
 		t.Fatalf("check completed splice: %v", err)
 	}

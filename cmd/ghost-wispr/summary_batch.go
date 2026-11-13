@@ -41,6 +41,9 @@ func readBatchSummarySessions(store *storage.SQLiteStore, sessionIDs []string) (
 // since is left to the summary run of that change.
 func completeEmptySummaries(store *storage.SQLiteStore, emptyTranscripts map[string]int) {
 	for id, generation := range emptyTranscripts {
+		if err := store.StartEmptySummaryAtGeneration(id, generation); err != nil {
+			continue
+		}
 		_ = store.UpdateSummaryAtGeneration(id, "", "", storage.SummaryCompleted, "", "{}", "", generation)
 	}
 }

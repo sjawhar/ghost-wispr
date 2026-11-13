@@ -22,7 +22,7 @@ func FileName(path string) string {
 // directory would name a path outside it.
 func LocalName(name string) (string, bool) {
 	base, ok := strings.CutPrefix(name, driveNamePrefix)
-	if !ok || base == "" || base == "." || base == ".." || filepath.Base(base) != base {
+	if !ok || base == "" || base == "." || base == ".." || strings.ContainsRune(base, '/') || filepath.Base(base) != base {
 		return "", false
 	}
 	return base, true

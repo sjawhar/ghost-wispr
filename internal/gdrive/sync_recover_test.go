@@ -60,6 +60,64 @@ func TestAnInterruptedSyncIsRetriedInItsFolderAfterARestart(t *testing.T) {
 	}
 }
 
+// TestFirstSyncCutOffAfterFolderCreationReusesTheFolderAndOwesIt fails if a
+// power loss after Drive creates a first folder leaves its id only in memory:
+// the retry would make another folder, and a later segment deletion would
+// leave the first one out of the replacement ledger.
+func TestFirstSyncCutOffAfterFolderCreationReusesTheFolderAndOwesIt(t *testing.T) {
+	store := openStore(t)
+	const id = "20261106110000"
+	_, segments := round2Session(t, store, id, []string{"kept", "deleted"})
+	drive := newFakeDrive()
+	o := NewOrchestratorWithUploader(drive, store)
+
+	drive.onFolderCreated = func() { panic("power loss") }
+	stopped := false
+	func() {
+		defer func() {
+			stopped = recover() != nil
+		}()
+		_ = o.SyncSession(context.Background(), id)
+	}()
+	if !stopped {
+		t.Fatal("the first sync did not stop after creating its Drive folder")
+	}
+	state, folder := sessionState(t, store, id)
+	if state != storage.SyncStateSyncing || folder == "" {
+		t.Fatalf("after the cut-off: state=%q folder=%q, want syncing with the created folder", state, folder)
+	}
+
+	drive.onFolderCreated = nil
+	if _, err := store.RecoverInterruptedSyncs(MaxSyncRetries, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.SyncSession(context.Background(), id); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if state, after := sessionState(t, store, id); state != storage.SyncStateSynced || after != folder {
+		t.Fatalf("after the retry: state=%q folder=%q, want synced in the first folder %q", state, after, folder)
+	}
+	if len(drive.folders) != 1 {
+		t.Fatalf("Drive folders = %d, want the first folder reused", len(drive.folders))
+	}
+
+	span := storage.DeletedSpan{SessionID: id, AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteSegment(id, segments[1].ID, span); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	generation, err := store.DeletionGeneration(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owed, err := store.DriveReplacementFolders(id, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owed) != 1 || owed[0].FolderSessionID != id || owed[0].State != storage.DriveReplacementFolderOwed {
+		t.Fatalf("replacement ledger = %+v, want the first folder owed", owed)
+	}
+}
+
 // A sync whose every closing write fails (the database refuses them) leaves
 // its session SYNCING: no other sync takes it meanwhile, and the next start
 // of the app sends it to a retry in its folder.

@@ -122,6 +122,8 @@ type wireDrive struct {
 	// of a list without corpora (the files the user has accessed, shared
 	// drives' too), which was not measured with files there.
 	unscopedListsMiss bool
+	// listUnavailable makes every Drive file listing answer 503.
+	listUnavailable bool
 	// onGet, when set, runs as Drive is asked for a file (Files.Get), with
 	// its id, while the server holds its lock.
 	onGet     func(id string)
@@ -365,6 +367,10 @@ func (d *wireDrive) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		request := wireListRequest{Parent: m[1], PageToken: r.URL.Query().Get("pageToken")}
+		if d.listUnavailable {
+			http.Error(w, `{"error":{"code":503,"message":"Backend Error"}}`, http.StatusServiceUnavailable)
+			return
+		}
 		d.listRequests = append(d.listRequests, request)
 		if pages := d.listPages[request.Parent]; pages != nil {
 			page, ok := pages[request.PageToken]

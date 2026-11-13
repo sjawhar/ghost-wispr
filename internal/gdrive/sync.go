@@ -201,7 +201,19 @@ func notUploaded(audioPath string, files []SyncFile) []string {
 	return missing
 }
 
+// Upload creates a session folder and puts files into it. Callers that need
+// the folder durable before the first upload use UploadWithFolderRecorded.
 func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile) (string, error) {
+	return s.upload(ctx, folderName, files, nil)
+}
+
+// UploadWithFolderRecorded creates a session folder, calls record with its id
+// before the first file upload, then uploads files into it.
+func (s *Syncer) UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
+	return s.upload(ctx, folderName, files, record)
+}
+
+func (s *Syncer) upload(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -221,7 +233,11 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	if err != nil {
 		return "", fmt.Errorf("create folder %s: %w", folderName, err)
 	}
-
+	if record != nil {
+		if err := record(folder.Id); err != nil {
+			return folder.Id, fmt.Errorf("record created folder %s: %w", folder.Id, err)
+		}
+	}
 	for i := range files {
 		if files[i].UpdateOnly {
 			continue

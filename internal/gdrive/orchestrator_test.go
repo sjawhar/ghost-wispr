@@ -111,6 +111,14 @@ func (f *fakeOrchestratorStore) MarkSynced(_, claim, driveFolderID string, uncha
 	return true, nil
 }
 
+func (f *fakeOrchestratorStore) RecordSyncFolder(_, claim, driveFolderID string) (bool, error) {
+	if f.session.SyncState != storage.SyncStateSyncing || claim != f.claim {
+		return false, nil
+	}
+	f.session.GDriveFolderID = driveFolderID
+	return true, nil
+}
+
 // EndSync records the sync's end while it holds the session, and refuses a
 // state a sync does not end in unsynced, as the real store does.
 func (f *fakeOrchestratorStore) EndSync(_, claim, state, driveFolderID string, retryCount int, at time.Time, errorMessage string) (bool, error) {

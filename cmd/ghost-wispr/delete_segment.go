@@ -658,7 +658,7 @@ func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
 // per session it refines only, so the caller owns the lifetime of each
 // status warning.
 func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (outcomes []pendingSpliceOutcome, err error) {
-	spans, err := store.PendingSplices()
+	spans, err := store.PendingSplices(audioDir)
 	if err != nil {
 		return nil, err
 	}
@@ -820,16 +820,14 @@ func removeFiles(paths []string) {
 	}
 }
 
-// cleanupSpliceTempCopies removes, as the app starts and before any deletion
-// or recovery runs, the temporary files a stopped app can leave in audioDir,
-// each a whole copy of a recording: a splice's copy (.delete-segment-*) and
-// output (.splice-*), and a recording downloaded from Drive for a splice
-// (.download-*, gdrive.Syncer.DownloadRecording). It removes them with a
-// plain unlink, since a segment deletion zeroes no whole audio file, and
-// finishes overwriting any file a whole-file removal (GC, the session delete
-// route, a saved session's raw recording) left part way erased
-// (erase.Leftovers).
-func cleanupSpliceTempCopies(audioDir string) error {
+// cleanupSpliceTempCopiesExcept removes, as the app starts and before any
+// deletion or recovery runs, the temporary files a stopped app can leave in
+// audioDir: a splice's copy (.delete-segment-*), output (.splice-*), and a
+// recording downloaded from Drive for a splice (.download-*). It removes them
+// with a plain unlink, since a segment deletion zeroes no whole audio file,
+// and finishes overwriting any cut-off whole-file removal, except a reserved
+// hidden raw capture whose session still exists and could not be restored.
+func cleanupSpliceTempCopiesExcept(audioDir string, reserved map[string]bool) error {
 	entries, err := os.ReadDir(audioDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -847,7 +845,7 @@ func cleanupSpliceTempCopies(audioDir string) error {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
-	return errors.Join(cleanupErr, erase.Leftovers(audioDir))
+	return errors.Join(cleanupErr, erase.LeftoversExcept(audioDir, func(path string) bool { return reserved[path] }))
 }
 
 // recordingDirectoryLister lists the directories recordings are kept or
@@ -855,11 +853,12 @@ func cleanupSpliceTempCopies(audioDir string) error {
 // startup cleanup has finished, and records the audio directory as one.
 type recordingDirectoryLister interface {
 	RecordingDirectories() ([]string, error)
+	ReservedRawErasePaths() (map[string]bool, error)
 	ForgetEraseDirectories(dirs []string) error
 	RecordEraseDirectory(dir string) error
 }
 
-// cleanupRecordingDirectories runs cleanupSpliceTempCopies, as the app
+// cleanupRecordingDirectories runs cleanupSpliceTempCopiesExcept, as the app
 // starts, in audioDir and in every directory a session keeps a recording in
 // or a whole-file erase was started in (storage.RecordingDirectories):
 // splice copies, downloads and cut-off erasures are made beside the
@@ -875,10 +874,14 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 	if err != nil {
 		return fmt.Errorf("find the audio directory: %w", err)
 	}
+	reserved, err := store.ReservedRawErasePaths()
+	if err != nil {
+		return fmt.Errorf("list reserved raw erases: %w", err)
+	}
 	dirs := []string{audioDir}
 	others, err := store.RecordingDirectories()
 	if err != nil {
-		return errors.Join(err, cleanupSpliceTempCopies(audioDir), store.RecordEraseDirectory(audioDir))
+		return errors.Join(err, cleanupSpliceTempCopiesExcept(audioDir, reserved), store.RecordEraseDirectory(audioDir))
 	}
 	for _, dir := range others {
 		if dir, err = filepath.Abs(dir); err != nil {
@@ -891,7 +894,7 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 	var cleanupErr error
 	var cleaned []string
 	for _, dir := range dirs {
-		if err := cleanupSpliceTempCopies(dir); err != nil {
+		if err := cleanupSpliceTempCopiesExcept(dir, reserved); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue
 		}

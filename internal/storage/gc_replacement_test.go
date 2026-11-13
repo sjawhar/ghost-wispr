@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -30,9 +31,10 @@ func TestGCKeepsASessionThatOwesADriveReplacement(t *testing.T) {
 	if len(recordings) != 1 || recordings[0].Removable {
 		t.Errorf("recordings = %+v, want the owed session's recording kept", recordings)
 	}
-	deleted, err := store.DeleteEndedSession(id, "/audio/recording.mp3")
-	if err != nil {
-		t.Fatal(err)
+	deleted, err := deleteAgeEligibleForTest(store, id, "/audio/recording.mp3")
+	var block *GCSourceBlockError
+	if !errors.As(err, &block) || block.SessionID != id || block.Reason != "Drive replacement owed" {
+		t.Fatalf("age delete of a session that owes Drive = %v (%+v)", err, block)
 	}
 	if deleted {
 		t.Fatal("GC deleted a session that owes Drive a replacement")

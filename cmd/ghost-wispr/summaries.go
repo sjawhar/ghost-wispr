@@ -88,6 +88,10 @@ func summarizeMergedSession(ctx context.Context, store *storage.SQLiteStore, sum
 		return
 	}
 	if strings.TrimSpace(transcript) == "" {
+		if err := store.StartEmptySummaryAtGeneration(sessionID, generation); err != nil {
+			log.Printf("warning: failed to start empty summary for merged session %s: %v", sessionID, err)
+			return
+		}
 		_ = store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", "", generation)
 		return
 	}
@@ -123,6 +127,10 @@ func summarizeBackfillSession(ctx context.Context, store *storage.SQLiteStore, s
 	}
 	transcript = strings.TrimSpace(transcript)
 	if transcript == "" {
+		if err := store.StartEmptySummaryAtGeneration(id, generation); err != nil {
+			log.Printf("warning: failed to start empty summary for session %s: %v", id, err)
+			return
+		}
 		_ = store.UpdateSummaryAtGeneration(id, "", "", storage.SummaryCompleted, "", "{}", "", generation)
 		return
 	}
