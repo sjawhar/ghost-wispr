@@ -71,7 +71,7 @@ func measureOne(recording, hash string, words []storage.RefinedWord, segments []
 	if err != nil {
 		return "make scratch store"
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(previous)
@@ -79,7 +79,7 @@ func measureOne(recording, hash string, words []storage.RefinedWord, segments []
 	if err != nil {
 		return "open scratch store"
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
 	if err := store.CreateSession("measurement", started); err != nil {
 		return "create session"
