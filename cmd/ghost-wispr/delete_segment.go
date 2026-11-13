@@ -575,9 +575,6 @@ func recoverLostSplicedRecording(ctx context.Context, store *storage.SQLiteStore
 		}
 		hash = afterHash
 	}
-	if hash != spans[len(spans)-1].SHA256After {
-		return false, fmt.Errorf("recovered cut recording %s has SHA-256 %s, want latest %s", downloaded, hash, spans[len(spans)-1].SHA256After)
-	}
 	if err := os.Rename(downloaded, recording); err != nil {
 		return false, fmt.Errorf("install recovered cut recording %s: %w", recording, err)
 	}
