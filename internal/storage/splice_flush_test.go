@@ -45,7 +45,7 @@ func TestPendingSplicesFlushesTheDirectoryBeforeMarkingASpliceComplete(t *testin
 		return original(path)
 	}
 
-	pending, err := store.PendingSplices()
+	pending, err := store.PendingSplices("")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -701,30 +702,37 @@ func redactEventText(value any, deletedText string) (any, bool) {
 }
 
 // PendingSplices returns deletions whose recording still has the pre-splice
-// hash, plus rows whose recording is absent and must be restored first. A row
+// hash, plus rows whose recording is absent and must be restored first. It
+// finds each recording where recording.Resolve finds it in audioDir. A row
 // with the recorded post-splice hash is completed before this returns.
-func (s *SQLiteStore) PendingSplices() ([]DeletedSpan, error) {
+func (s *SQLiteStore) PendingSplices(audioDir string) ([]DeletedSpan, error) {
 	rows, err := s.db.Query(`SELECT session_id, audio_path, start, end, sha256_before, sha256_after FROM deleted_segments WHERE splice_complete = 0 ORDER BY deleted_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query deleted spans: %w", err)
 	}
 
-	var pending, complete []DeletedSpan
+	type completedSplice struct {
+		span      DeletedSpan
+		recording string
+	}
+	var pending []DeletedSpan
+	var complete []completedSplice
 	for rows.Next() {
 		var span DeletedSpan
 		if err := rows.Scan(&span.SessionID, &span.AudioPath, &span.Start, &span.End, &span.SHA256Before, &span.SHA256After); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan deleted span: %w", err)
 		}
-		hash, err := sha256ForFile(span.AudioPath)
+		path := recording.Resolve(span.AudioPath, audioDir)
+		hash, err := sha256ForFile(path)
 		switch {
 		case errors.Is(err, os.ErrNotExist), hash == span.SHA256Before:
 			pending = append(pending, span)
 		case err != nil:
 			_ = rows.Close()
-			return nil, fmt.Errorf("hash deleted recording %s: %w", span.AudioPath, err)
+			return nil, fmt.Errorf("hash deleted recording %s: %w", path, err)
 		case hash == span.SHA256After:
-			complete = append(complete, span)
+			complete = append(complete, completedSplice{span: span, recording: path})
 		default:
 			pending = append(pending, span)
 		}
@@ -736,11 +744,11 @@ func (s *SQLiteStore) PendingSplices() ([]DeletedSpan, error) {
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close deleted spans: %w", err)
 	}
-	for _, span := range complete {
-		if err := flushRecordingDirectory(span.AudioPath); err != nil {
+	for i := range complete {
+		if err := flushRecordingDirectory(complete[i].recording); err != nil {
 			return nil, err
 		}
-		if err := s.MarkSpliceComplete(&span); err != nil {
+		if err := s.MarkSpliceComplete(&complete[i].span); err != nil {
 			return nil, err
 		}
 	}

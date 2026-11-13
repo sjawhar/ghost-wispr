@@ -1238,7 +1238,7 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 	if !bytes.Equal(contents, []byte("spliced")) {
 		t.Fatalf("re-spliced recording = %q", contents)
 	}
-	pending, err := store.PendingSplices()
+	pending, err := store.PendingSplices(filepath.Dir(recording))
 	if err != nil {
 		t.Fatalf("check completed splice: %v", err)
 	}

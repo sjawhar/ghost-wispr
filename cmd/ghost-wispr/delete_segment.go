@@ -399,7 +399,7 @@ func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
 // per session it refines only, so the caller owns the lifetime of each
 // status warning.
 func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (outcomes []pendingSpliceOutcome, err error) {
-	spans, err := store.PendingSplices()
+	spans, err := store.PendingSplices(audioDir)
 	if err != nil {
 		return nil, err
 	}

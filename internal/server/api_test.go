@@ -693,6 +693,62 @@ func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
 	}
 }
 
+// TestDeleteSession_ZeroesItsRawPCM fails if a session delete leaves the raw
+// microphone capture beside the saved recording. Raw PCM is whole-session
+// audio, so it follows the same zero-before-unlink rule as the saved file.
+func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
+	dir := t.TempDir()
+	saved, raw := filepath.Join(dir, "s1.mp3"), filepath.Join(dir, "s1.pcm")
+	if err := os.WriteFile(saved, []byte("saved session audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rawBytes := []byte("raw microphone audio")
+	if err := os.WriteFile(raw, rawBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: saved}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(raw); !os.IsNotExist(err) {
+		t.Fatalf("the raw PCM is still on disk: %v", err)
+	}
+	got := make([]byte, len(rawBytes))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the removed raw PCM still holds %q", got)
+	}
+}
+
 // TestDeleteSession_AnswersBeforeItZeroesTheAudio fails if deleting a session
 // holds the request until its recordings are overwritten, a write as large as
 // they are, or answers before they have left their names.

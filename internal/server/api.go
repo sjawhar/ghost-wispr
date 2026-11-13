@@ -825,19 +825,19 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			controls.OnSessionDeleted(sessionID)
 		}
 
-		// Erase the recordings the deleted row named, after the database
-		// deletion: removing a whole audio file overwrites it with zeros
-		// before the file system frees its blocks (Sami, 2026-11-12, "Zero
-		// every audio removal",
+		// Erase the recordings the deleted row named and its raw microphone
+		// capture, after the database deletion: removing a whole audio file
+		// overwrites it with zeros before the file system frees its blocks
+		// (Sami, 2026-11-12, "Zero every audio removal",
 		// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
-		// DeleteSession recorded each one's directory before the row went,
+		// DeleteSession recorded every erase directory before the row went,
 		// so an erase cut off by a stop is finished as the app starts. Each
 		// recording is erased where recording.Resolve finds it, as the app
 		// plays and syncs it, and as DeleteSession recorded it. The files
 		// leave their names before the answer; the zeros, a write as large
 		// as the recordings, follow it.
 		var pending []erase.Pending
-		for _, p := range strings.Split(audioPath, ",") {
+		for _, p := range append(strings.Split(audioPath, ","), sessionID+".pcm") {
 			if p = strings.TrimSpace(p); p == "" {
 				continue
 			}

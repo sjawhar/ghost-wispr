@@ -238,3 +238,114 @@ func TestAnEmptyBatchSummaryLeavesARunStartedSinceRunning(t *testing.T) {
 		t.Errorf("summary status %q; want the newer run's: %q", sess.SummaryStatus, storage.SummaryRunning)
 	}
 }
+
+// TestEmptySummaryWritesStartAtTheDeletionGeneration fails if an empty
+// summary write after a deletion is refused because its writer did not first
+// bind the empty run to the deletion's generation.
+func TestEmptySummaryWritesStartAtTheDeletionGeneration(t *testing.T) {
+	const id = "empty-after-delete"
+	newStore := func(t *testing.T) *storage.SQLiteStore {
+		t.Helper()
+		store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "empty-after-delete.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		started := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendSegment(id, transcribe.Segment{Text: deletedWords, StartTime: 0, EndTime: 1, Timestamp: started}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, started.Add(time.Second), "recording.mp3"); err != nil {
+			t.Fatal(err)
+		}
+		segments, err := store.GetSegments(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DeleteSegment(id, segments[0].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	for _, writer := range []struct {
+		name string
+		run  func(*storage.SQLiteStore)
+	}{
+		{"merged session", func(store *storage.SQLiteStore) {
+			summarizeMergedSession(context.Background(), store, &racingSummarizer{}, &recordingBroadcaster{}, func(string) {}, id)
+		}},
+		{"startup", func(store *storage.SQLiteStore) {
+			summarizeBackfillSession(context.Background(), store, &racingSummarizer{}, func(string) {}, id)
+		}},
+		{"batch", func(store *storage.SQLiteStore) {
+			sessions, _, empty, err := readBatchSummarySessions(store, []string{id})
+			if err != nil || len(sessions) != 0 || len(empty) != 1 {
+				t.Fatalf("batch input: sessions %+v, empty %v, %v; want one empty transcript", sessions, empty, err)
+			}
+			completeEmptySummaries(store, empty)
+		}},
+	} {
+		t.Run(writer.name, func(t *testing.T) {
+			store := newStore(t)
+			writer.run(store)
+			sess, err := store.GetSession(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sess.SummaryStatus != storage.SummaryCompleted {
+				t.Fatalf("summary status = %q, want %q after the empty completion", sess.SummaryStatus, storage.SummaryCompleted)
+			}
+		})
+	}
+}
+
+// TestAStaleEmptyCompletionLeavesANewerCompletedSummary fails if an empty
+// completion that read an earlier generation reopens a summary the deletion
+// already completed at its newer generation.
+func TestAStaleEmptyCompletionLeavesANewerCompletedSummary(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "stale-empty.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	const id = "stale-empty"
+	started := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if err := store.AppendSegment(id, transcribe.Segment{Text: " ", StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession(id, started.Add(2*time.Second), "recording.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, empty, err := readBatchSummarySessions(store, []string{id})
+	if err != nil || len(empty) != 1 {
+		t.Fatalf("read empty batch summary = %v, %v; want one session", empty, err)
+	}
+	segments, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteAndStartNewerSummary(t, store, id, segments[1].ID)
+	generation, err := store.DeletionGeneration(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration(id, "", "", storage.SummaryCompleted, "", "{}", "", generation); err != nil {
+		t.Fatalf("complete newer empty summary: %v", err)
+	}
+	completeEmptySummaries(store, empty)
+	session, err := store.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SummaryStatus != storage.SummaryCompleted {
+		t.Fatalf("summary status = %q, want the newer completed summary left alone", session.SummaryStatus)
+	}
+}

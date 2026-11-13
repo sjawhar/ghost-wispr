@@ -152,3 +152,41 @@ func TestASegmentDeletionStaysOwedWhileDriveMayHoldItsWords(t *testing.T) {
 		})
 	}
 }
+
+// TestSettlementKeepsADeletionOwedWhenAMergedSourceGainsAFolder fails if
+// settlement trusts an empty ledger but ignores a merged source's folder. A
+// sync can record that folder after the deletion made its ledger; it still
+// holds the deleted words until the replacement finishes.
+func TestSettlementKeepsADeletionOwedWhenAMergedSourceGainsAFolder(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	base := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	recordedSession(t, store, "source", base, base.Add(time.Minute), map[float64]string{1: "kept", 2: "deleted"})
+	recordedSession(t, store, "other", base.Add(time.Hour), base.Add(61*time.Minute), map[float64]string{1: "other"})
+	if err := store.MergeSessions("merged", []string{"source", "other"}, base, base.Add(61*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	span := DeletedSpan{SessionID: "merged", AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteSegment("merged", segments[0].ID, span); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	generation, err := store.DeletionGeneration("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folders, err := store.DriveReplacementFolders("merged", generation); err != nil || len(folders) != 0 {
+		t.Fatalf("deletion ledger before the source sync = %+v, %v; want empty", folders, err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'source-folder' WHERE id = 'source'`); err != nil {
+		t.Fatalf("record merged source folder: %v", err)
+	}
+	if err := store.MarkSpliceComplete(&span); err != nil {
+		t.Fatal(err)
+	}
+	if !replacementOwed(t, store, "merged") {
+		t.Fatal("the deletion settled though its merged source's Drive folder can hold the deleted words")
+	}
+}

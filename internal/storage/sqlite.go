@@ -1407,6 +1407,27 @@ func (s *SQLiteStore) StartEmptySummary(id string) error {
 	return nil
 }
 
+// StartEmptySummaryAtGeneration marks session id's empty summary running only
+// while generation is still current and no completed summary owns it. A stale
+// empty writer must leave a newer completion alone.
+func (s *SQLiteStore) StartEmptySummaryAtGeneration(id string, generation int) error {
+	res, err := s.db.Exec(`UPDATE sessions
+		SET summary_status = ?, summary_generation = deletion_generation
+		WHERE id = ? AND deletion_generation = ? AND summary_status IN (?, ?)`,
+		SummaryRunning, id, generation, SummaryPending, SummaryFailed)
+	if err != nil {
+		return fmt.Errorf("start empty summary of session %s at generation %d: %w", id, generation, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("start empty summary rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // FailSummaryAtGeneration records that making session id's summary failed,
 // and why (errMsg, in summary_error: error_message keeps the last sync's
 // error), and returns the session as it then is, only while generation, the
@@ -1681,6 +1702,50 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	return true, nil
 }
 
+// ErrDriveFolderRecorded means a Drive folder belongs to another local
+// session, so a first sync must not adopt it just because its display name
+// matches.
+var ErrDriveFolderRecorded = errors.New("drive folder is already recorded for another session")
+
+// RecordSyncFolder records a folder just created for the sync claim that
+// names it, before that sync uploads its first file. A stopped process then
+// leaves a retry with the folder to reuse. When a segment deletion is pending,
+// the same transaction puts the folder in its replacement ledger.
+func (s *SQLiteStore) RecordSyncFolder(id, claim, driveFolderID string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin recording Drive folder of session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var owner string
+	switch err := tx.QueryRow(`SELECT id FROM sessions WHERE gdrive_folder_id = ? AND id != ?`, driveFolderID, id).Scan(&owner); {
+	case err == nil:
+		return false, fmt.Errorf("%w: %s", ErrDriveFolderRecorded, owner)
+	case !errors.Is(err, sql.ErrNoRows):
+		return false, fmt.Errorf("find owner of Drive folder %s: %w", driveFolderID, err)
+	}
+	res, err := tx.Exec(`UPDATE sessions SET gdrive_folder_id = ?
+		WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
+		driveFolderID, id, SyncStateSyncing, claim)
+	if err != nil {
+		return false, fmt.Errorf("record Drive folder of session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count recorded Drive folder of session %s: %w", id, err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit Drive folder of session %s: %w", id, err)
+	}
+	return true, nil
+}
+
 // EndSync records the end of the sync claim names, which did not mark
 // session id synced: its sync state becomes state (back to pending when the
 // session changed during the upload, a retry, a failure, or its Drive folder
@@ -1734,16 +1799,21 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 }
 
 // oweFolderOfPendingDeletion records, in tx, the Drive folder a sync just
-// recorded for session id as owed to the session's pending segment deletion,
-// if it has one: a sync that held the session while a segment was deleted
-// (DeleteSegment leaves the claim to it) uploaded the words before the
-// deletion. A sync that made no folder leaves nothing to owe, and the
-// deletion is then settled as owing Drive nothing once its splices are done
-// (settleUnownedDriveReplacement). EndSync and MarkSynced both call it.
+// recorded for session id as owed to every pending deletion that contains
+// that session, directly or through a merge. A sync that held either the
+// owner or a merged source while a segment was deleted uploaded the words
+// before the deletion. A sync that made no folder leaves nothing to owe, and
+// its deletion is settled only once no folder can hold the words.
 func oweFolderOfPendingDeletion(tx *sql.Tx, id string) error {
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
-		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND gdrive_folder_id != ''`,
-		DriveReplacementFolderOwed, id); err != nil {
+	if _, err := tx.Exec(`WITH RECURSIVE owners(id) AS (
+			SELECT ?
+			UNION SELECT source.merged_into FROM sessions AS source JOIN owners ON source.id = owners.id WHERE source.merged_into != ''
+		) INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
+		SELECT owner.id, owner.deletion_generation, ?, ?
+		FROM sessions AS owner JOIN owners ON owner.id = owners.id
+		WHERE owner.drive_replace_pending = 1
+		  AND EXISTS (SELECT 1 FROM sessions AS folder WHERE folder.id = ? AND folder.gdrive_folder_id != '')`,
+		id, id, DriveReplacementFolderOwed, id); err != nil {
 		return fmt.Errorf("owe the Drive folder of session %s its replacement: %w", id, err)
 	}
 	return settleUnownedDriveReplacement(tx, id)
@@ -2376,7 +2446,7 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	case err != nil:
 		return "", fmt.Errorf("read session %s to delete it: %w", id, err)
 	}
-	for _, entry := range strings.Split(audioPath, ",") {
+	for _, entry := range append(strings.Split(audioPath, ","), id+".pcm") {
 		if entry = strings.TrimSpace(entry); entry == "" {
 			continue
 		}

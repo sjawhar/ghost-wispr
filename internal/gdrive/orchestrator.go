@@ -30,6 +30,9 @@ type OrchestratorStore interface {
 	// holds it and unchanged reports true for it and its segments as they
 	// are now, and reports whether it did.
 	MarkSynced(sessionID, claim, driveFolderID string, unchanged func(storage.Session, []transcribe.Segment) bool) (bool, error)
+	// RecordSyncFolder stores a newly created Drive folder while the sync
+	// claim still holds the session, before its first upload.
+	RecordSyncFolder(sessionID, claim, driveFolderID string) (bool, error)
 	// EndSync records how the sync claim names ended, when it did not mark
 	// the session synced, only while that sync holds it, and reports whether
 	// it did.
@@ -41,6 +44,20 @@ type uploader interface {
 	UploadInto(ctx context.Context, folderID string, files []SyncFile) error
 	FolderOnDrive(ctx context.Context, folderID string) (bool, error)
 	RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error)
+}
+
+// folderCreatingUploader can record a newly made folder before its first
+// upload. Syncer implements it; the base uploader contract stays useful for
+// test uploaders that do not create remote folders.
+type folderCreatingUploader interface {
+	UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error)
+}
+
+// sessionFolderFinder lists the Drive folders the app made under its root
+// that hold only one session's files, so a sync cut off before it recorded
+// its folder can adopt that orphan.
+type sessionFolderFinder interface {
+	FindSessionFolders(ctx context.Context, sessionID, audioPath string) ([]string, error)
 }
 
 type replacementInputStore interface {
@@ -102,6 +119,74 @@ func NewOrchestratorWithUploader(u uploader, store OrchestratorStore, logger ...
 	}
 
 	return &Orchestrator{uploader: u, store: store, logger: l}
+}
+
+func (o *Orchestrator) recordSyncFolder(sessionID, claim, folderID string) error {
+	recorded, err := o.store.RecordSyncFolder(sessionID, claim, folderID)
+	if err != nil {
+		return fmt.Errorf("record Drive folder %s: %w", folderID, err)
+	}
+	if !recorded {
+		return fmt.Errorf("record Drive folder %s: the sync no longer holds session %s", folderID, sessionID)
+	}
+	return nil
+}
+
+// adoptSessionFolder records for the sync claim names an app-made Drive
+// folder named folderName that holds only this session's files and that no
+// other local session records, and returns its id; "" when there is none to
+// adopt (no finder, or no such folder: a same-named folder holding another
+// session's files, or recorded by another session, is not this session's
+// orphan).
+func (o *Orchestrator) adoptSessionFolder(ctx context.Context, sessionID, claim, audioPath string) (string, error) {
+	finder, ok := o.uploader.(sessionFolderFinder)
+	if !ok {
+		return "", nil
+	}
+	folderIDs, err := finder.FindSessionFolders(ctx, sessionID, audioPath)
+	if err != nil {
+		return "", fmt.Errorf("find Drive folder for sync %s: %w", sessionID, err)
+	}
+	for _, folderID := range folderIDs {
+		switch err := o.recordSyncFolder(sessionID, claim, folderID); {
+		case errors.Is(err, storage.ErrDriveFolderRecorded):
+			continue
+		case err != nil:
+			return "", fmt.Errorf("record existing Drive folder for sync %s: %w", sessionID, err)
+		}
+		return folderID, nil
+	}
+	return "", nil
+}
+
+// adoptPendingReplacementFolder claims sess long enough to record an orphan
+// Drive folder before the replacement ledger decides it has none. It reports
+// claimed false when another sync took the session first.
+func (o *Orchestrator) adoptPendingReplacementFolder(ctx context.Context, sess *storage.Session) (adopted, claimed bool, err error) {
+	if sess.GDriveFolderID != "" || sess.LastSyncAttempt == nil {
+		return false, true, nil
+	}
+	claim := uuid.NewString()
+	held, claimed, err := o.store.ClaimSync(sess.ID, sess.SyncState, claim, time.Now().UTC())
+	if err != nil || !claimed {
+		return false, claimed, err
+	}
+	folderID, adoptErr := o.adoptSessionFolder(ctx, sess.ID, claim, resolvedAudioPath(sess.AudioPath, o.audioDir))
+	message := ""
+	if adoptErr != nil {
+		message = adoptErr.Error()
+	}
+	released, releaseErr := o.store.EndSync(sess.ID, claim, sess.SyncState, folderID, held.RetryCount, time.Now().UTC(), message)
+	if releaseErr != nil {
+		return false, true, fmt.Errorf("release folder-discovery claim for session %s: %w", sess.ID, releaseErr)
+	}
+	if !released {
+		return false, false, nil
+	}
+	if adoptErr != nil {
+		return false, true, adoptErr
+	}
+	return folderID != "", true, nil
 }
 
 // FolderOnDrive reports whether Drive has session folder folderID out of the
@@ -218,6 +303,19 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				o.logger.Warn("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
 				return nil
 			}
+			adopted, claimed, err := o.adoptPendingReplacementFolder(ctx, &read)
+			if err != nil {
+				return err
+			}
+			if !claimed {
+				o.logger.Info("gdrive replacement was claimed by another sync first, skipping", "operation", "replace_session_files", "session_id", sessionID)
+				return nil
+			}
+			if adopted {
+				if read, err = o.store.GetSession(sessionID); err != nil {
+					return fmt.Errorf("get session %s after Drive folder adoption: %w", sessionID, err)
+				}
+			}
 			folders, err := replacements.EnsureDriveReplacementFolders(sessionID, generation)
 			if err != nil {
 				return err
@@ -289,12 +387,28 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 
 	// A session synced before keeps its folder, and so does one whose first
 	// sync created its folder and then failed: syncing it again adds what the
-	// folder lacks instead of creating a second folder.
+	// folder lacks instead of creating a second folder. A sync cut off after
+	// Drive made its folder but before the folder was recorded (or by a build
+	// that did not record new folders) left one under the app's Drive root;
+	// the retry finds and stores that folder before uploading into it. Only a
+	// retry looks: a session no sync attempted has no folder of its own. A
+	// retry adopts only a folder holding nothing of another session: a
+	// same-named folder can be another session's, one deleted here, say, whose
+	// documents an upload would overwrite (FindSessionFolders).
 	driveFolderID := sess.GDriveFolderID
-	if driveFolderID != "" {
-		err = o.uploader.UploadInto(ctx, driveFolderID, files)
-	} else {
-		driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
+	if driveFolderID == "" && read.LastSyncAttempt != nil {
+		driveFolderID, err = o.adoptSessionFolder(ctx, sessionID, claim, audioPath)
+	}
+	if err == nil {
+		if driveFolderID != "" {
+			err = o.uploader.UploadInto(ctx, driveFolderID, files)
+		} else if creator, ok := o.uploader.(folderCreatingUploader); ok {
+			driveFolderID, err = creator.UploadWithFolderRecorded(ctx, folderName, files, func(folderID string) error {
+				return o.recordSyncFolder(sessionID, claim, folderID)
+			})
+		} else {
+			driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
+		}
 	}
 	// A recording the upload left out (missing from disk when the file list
 	// was built: its disk not mounted, say; or there but unreadable) was not

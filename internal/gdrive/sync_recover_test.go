@@ -60,6 +60,161 @@ func TestAnInterruptedSyncIsRetriedInItsFolderAfterARestart(t *testing.T) {
 	}
 }
 
+// TestFirstSyncCutOffAfterFolderCreationReusesTheFolderAndOwesIt fails if a
+// power loss after Drive creates a first folder leaves its id only in memory:
+// the retry would make another folder, and a later segment deletion would
+// leave the first one out of the replacement ledger.
+func TestFirstSyncCutOffAfterFolderCreationReusesTheFolderAndOwesIt(t *testing.T) {
+	store := openStore(t)
+	const id = "20261106110000"
+	_, segments := round2Session(t, store, id, []string{"kept", "deleted"})
+	drive := newFakeDrive()
+	o := NewOrchestratorWithUploader(drive, store)
+
+	drive.onFolderCreated = func() { panic("power loss") }
+	stopped := false
+	func() {
+		defer func() {
+			stopped = recover() != nil
+		}()
+		_ = o.SyncSession(context.Background(), id)
+	}()
+	if !stopped {
+		t.Fatal("the first sync did not stop after creating its Drive folder")
+	}
+	state, folder := sessionState(t, store, id)
+	if state != storage.SyncStateSyncing || folder == "" {
+		t.Fatalf("after the cut-off: state=%q folder=%q, want syncing with the created folder", state, folder)
+	}
+
+	drive.onFolderCreated = nil
+	if _, err := store.RecoverInterruptedSyncs(MaxSyncRetries, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.SyncSession(context.Background(), id); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if state, after := sessionState(t, store, id); state != storage.SyncStateSynced || after != folder {
+		t.Fatalf("after the retry: state=%q folder=%q, want synced in the first folder %q", state, after, folder)
+	}
+	if len(drive.folders) != 1 {
+		t.Fatalf("Drive folders = %d, want the first folder reused", len(drive.folders))
+	}
+
+	span := storage.DeletedSpan{SessionID: id, AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteSegment(id, segments[1].ID, span); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	generation, err := store.DeletionGeneration(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owed, err := store.DriveReplacementFolders(id, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owed) != 1 || owed[0].FolderSessionID != id || owed[0].State != storage.DriveReplacementFolderOwed {
+		t.Fatalf("replacement ledger = %+v, want the first folder owed", owed)
+	}
+}
+
+// TestSyncAdoptsAnAppMadeFolderMissingFromTheDatabase fails if the retry of
+// a sync cut off before it recorded its folder (or run by a build that did not
+// record new folders) makes another app-made folder instead of reusing the
+// matching one already listed under the Drive root.
+func TestSyncAdoptsAnAppMadeFolderMissingFromTheDatabase(t *testing.T) {
+	store := openStore(t)
+	const id = "20261106120000"
+	recording, _ := round2Session(t, store, id, []string{"kept", "deleted"})
+	wire, syncer := newWireDrive(t)
+	session, err := store.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncSession := toSyncSession(&session)
+	_, folderName, _, err := buildSyncFiles(&syncSession, segments, recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan := wire.add(wire.rootID, folderName, "application/vnd.google-apps.folder", nil, nil)
+	wire.add(orphan, "transcript.md", "application/vnd.google-apps.document", []byte("---\nid: \""+id+"\"\n---\n"), nil)
+	cutOffBeforeFolderRecorded(t, store, id)
+	if err := NewOrchestrator(syncer, store).SyncSession(context.Background(), id); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	session, err = store.GetSession(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.GDriveFolderID != orphan {
+		t.Fatalf("sync stored Drive folder %q, want the listed orphan %q", session.GDriveFolderID, orphan)
+	}
+	if folders, err := syncer.ListSessionFolders(context.Background()); err != nil || len(folders) != 1 {
+		t.Fatalf("app-made folders after adoption = %+v, %v; want the existing folder only", folders, err)
+	}
+}
+
+// TestSyncDoesNotAdoptAnotherSessionsSameNamedFolder fails if the retry of a
+// first sync adopts the folder of an already synced session with the same
+// date and title.
+func TestSyncDoesNotAdoptAnotherSessionsSameNamedFolder(t *testing.T) {
+	store := openStore(t)
+	_, syncer := newWireDrive(t)
+	o := NewOrchestrator(syncer, store)
+	_, _ = round2Session(t, store, "first", []string{"first", "session"})
+	_, _ = round2Session(t, store, "second", []string{"second", "session"})
+
+	first := syncedSession(t, store, o, "first")
+	cutOffBeforeFolderRecorded(t, store, "second")
+	second := syncedSession(t, store, o, "second")
+	if second == first {
+		t.Fatalf("second session adopted folder %q of the first session", first)
+	}
+	if folders, err := syncer.ListSessionFolders(context.Background()); err != nil || len(folders) != 2 {
+		t.Fatalf("app-made folders = %+v, %v; want one folder for each session", folders, err)
+	}
+}
+
+// TestFirstSyncDoesNotAdoptADeletedSessionsFolder fails if a session's first
+// sync adopts the same-named Drive folder of a session deleted here, which no
+// session records any more: the upload would replace that session's documents
+// on Drive with this one's and leave its recording in this session's folder.
+func TestFirstSyncDoesNotAdoptADeletedSessionsFolder(t *testing.T) {
+	store := openStore(t)
+	_, syncer := newWireDrive(t)
+	o := NewOrchestrator(syncer, store)
+	_, _ = round2Session(t, store, "deleted", []string{"deleted", "session"})
+	_, _ = round2Session(t, store, "later", []string{"later", "session"})
+
+	deleted := syncedSession(t, store, o, "deleted")
+	if _, err := store.DeleteSession("deleted", t.TempDir()); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+	if later := syncedSession(t, store, o, "later"); later == deleted {
+		t.Fatalf("first sync adopted folder %q of the deleted session", deleted)
+	}
+	if folders, err := syncer.ListSessionFolders(context.Background()); err != nil || len(folders) != 2 {
+		t.Fatalf("app-made folders = %+v, %v; want the deleted session's and the new session's", folders, err)
+	}
+}
+
+// cutOffBeforeFolderRecorded leaves session id as a sync stopped before it
+// recorded a Drive folder leaves it once the app starts again: claimed, then
+// sent to a retry (storage.RecoverInterruptedSyncs).
+func cutOffBeforeFolderRecorded(t *testing.T, store *storage.SQLiteStore, id string) {
+	t.Helper()
+	if _, claimed, err := store.ClaimSync(id, storage.SyncStatePending, "cut-off", time.Now().UTC()); err != nil || !claimed {
+		t.Fatalf("claim the cut-off sync of %s: claimed=%v, %v", id, claimed, err)
+	}
+	if _, err := store.RecoverInterruptedSyncs(MaxSyncRetries, time.Now().UTC()); err != nil {
+		t.Fatalf("recover the cut-off sync of %s: %v", id, err)
+	}
+}
+
 // A sync whose every closing write fails (the database refuses them) leaves
 // its session SYNCING: no other sync takes it meanwhile, and the next start
 // of the app sends it to a retry in its folder.

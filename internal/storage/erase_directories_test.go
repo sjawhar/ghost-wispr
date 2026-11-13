@@ -76,6 +76,35 @@ func TestDeleteSessionRecordsWhereItsRecordingsAreErasedFirst(t *testing.T) {
 	}
 }
 
+// TestDeleteSessionRecordsTheRawPCMsDirectoryFirst fails if DeleteSession
+// removes a row without recording the directory of its raw microphone capture:
+// after a stop cuts off its erase, startup must find the hidden raw file.
+func TestDeleteSessionRecordsTheRawPCMsDirectoryFirst(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+	audioDir, savedDir := t.TempDir(), t.TempDir()
+	raw := filepath.Join(audioDir, "raw.pcm")
+	if err := os.WriteFile(raw, []byte("raw audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	saved := filepath.Join(savedDir, "raw.mp3")
+	if err := os.WriteFile(saved, []byte("saved audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession("raw", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("raw", started.Add(time.Minute), saved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DeleteSession("raw", audioDir); err != nil {
+		t.Fatal(err)
+	}
+	if n := eraseDirectoryRows(t, store, audioDir); n != 1 {
+		t.Fatalf("%d rows of %s after the session went, want its raw PCM erase directory recorded", n, audioDir)
+	}
+}
+
 // TestRecordingDirectoriesListsWhereARelativeEntryPoints fails if the
 // directory a relative audio path entry points to (from the working
 // directory, as the recorder writes filepath.Join(audio_dir, name)) is not
