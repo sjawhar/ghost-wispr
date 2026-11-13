@@ -488,16 +488,19 @@ func (d *segmentDeleteRunner) deleteText(ctx context.Context, sessionID string, 
 	return maintenanceErr
 }
 
+// textDeletionBounds has explicit presence flags so a valid word boundary at
+// zero seconds is not mistaken for a missing recording-edge bound.
+type textDeletionBounds struct {
+	lower, upper       float64
+	hasLower, hasUpper bool
+}
+
 // validateTextDeletionSpan proves that the words a later refinement would
 // keep after leaving out start to end contain no named segment word, lose no
 // more than one word from either neighbour, and leave no word between the
 // span and each aligned neighbour (or recording edge). A text deletion has
 // no audio splice to validate afterwards, so it validates the words already
 // transcribed to locate it before it records the span.
-type textDeletionBounds struct {
-	lower, upper       float64
-	hasLower, hasUpper bool
-}
 
 func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, start, end float64, segments []transcribe.Segment, index int) error {
 	words := candidates[recordIndex].Words
