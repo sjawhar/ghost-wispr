@@ -69,6 +69,7 @@ func retryRefinementAfterRestoringRecording(ctx context.Context, sessionID strin
 
 type refinementAudioRestoreStore interface {
 	RestoreAudioForRefinement(id, beforeAudioPath, restoredAudioPath string) (bool, error)
+	DriveRestoreAllowed(sessionID string) (bool, error)
 }
 
 func hasLocalRefinementRecording(session *storage.Session, audioDir string) (bool, error) {
@@ -126,6 +127,13 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 	if local {
 		return nil
 	}
+	allowed, err := store.DriveRestoreAllowed(session.ID)
+	if err != nil {
+		return fmt.Errorf("check whether Drive restoration is allowed for session %s: %w", session.ID, err)
+	}
+	if !allowed {
+		return fmt.Errorf("drive restoration is blocked while session %s owes a replacement", session.ID)
+	}
 	recordings, err := restore(ctx, *session)
 	if err != nil {
 		return fmt.Errorf("restore recording for refinement: %w", err)
@@ -134,8 +142,11 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 		return errors.New("no recording is available on this unit or Drive")
 	}
 	restoredAudioPath := strings.Join(recordings.Paths, ",")
-	if restoredAudioPath == session.AudioPath && session.AudioRemovedAt == "" {
-		return nil
+	if restoredAudioPath == session.AudioPath {
+		if session.AudioRemovedAt == "" {
+			return nil
+		}
+		return errors.New("drive did not restore every recording removed from this unit")
 	}
 	restored, err := store.RestoreAudioForRefinement(session.ID, session.AudioPath, restoredAudioPath)
 	if err != nil {

@@ -16,6 +16,8 @@ func (s *partialRestoreStore) RestoreAudioForRefinement(_, _, _ string) (bool, e
 	return true, nil
 }
 
+func (*partialRestoreStore) DriveRestoreAllowed(string) (bool, error) { return true, nil }
+
 func TestPartlyRemovedSessionRestoresBeforeRefining(t *testing.T) {
 	dir := t.TempDir()
 	remaining := filepath.Join(dir, "20261106110000.mp3")

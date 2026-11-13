@@ -982,6 +982,23 @@ func (s *SQLiteStore) RestoreAudioForRefinement(id, beforeAudioPath, restoredAud
 	return rows > 0, nil
 }
 
+// DriveRestoreAllowed reports whether restoring this session's old Drive audio
+// cannot reintroduce a recording whose replacement is still owed.
+func (s *SQLiteStore) DriveRestoreAllowed(id string) (bool, error) {
+	var pending bool
+	if err := s.db.QueryRow(`SELECT drive_replace_pending FROM sessions WHERE id = ?`, id).Scan(&pending); err != nil {
+		return false, fmt.Errorf("read Drive replacement state for session %s: %w", id, err)
+	}
+	if pending {
+		return false, nil
+	}
+	var owed bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM drive_replacement_folders WHERE session_id = ? AND state = ?)`, id, DriveReplacementFolderOwed).Scan(&owed); err != nil {
+		return false, fmt.Errorf("read owed Drive replacement folders for session %s: %w", id, err)
+	}
+	return !owed, nil
+}
+
 func (s *SQLiteStore) DiscardSession(id string) error {
 	res, err := s.db.Exec(`UPDATE sessions SET status = 'discarded' WHERE id = ?`, id)
 	if err != nil {

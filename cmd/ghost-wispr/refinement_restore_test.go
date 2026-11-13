@@ -28,6 +28,8 @@ func (s *refinementRestoreStoreFake) RestoreAudioForRefinement(id, before, resto
 	return s.ok, s.err
 }
 
+func (*refinementRestoreStoreFake) DriveRestoreAllowed(string) (bool, error) { return true, nil }
+
 func TestRestoreRefinementRecordingSkipsDriveForLocalAudio(t *testing.T) {
 	audio := filepath.Join(t.TempDir(), "recording.mp3")
 	if err := os.WriteFile(audio, []byte("audio"), 0o600); err != nil {

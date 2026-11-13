@@ -346,7 +346,7 @@
           </div>
         {/if}
 
-        {#if session.audio_removed_at}
+        {#if session.audio_removed_at && !session.restored_at}
           {@const partly = recordingsNamed(session.audio_path) > 0}
           <span
             class="status-badge audio-removed"

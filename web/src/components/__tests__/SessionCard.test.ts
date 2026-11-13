@@ -287,6 +287,7 @@ describe('SessionCard', () => {
       'This conversation was restored from Drive; retry refinement to delete from it',
     )
     expect(screen.getByTestId('retry-refinement-btn')).toBeTruthy()
+    expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
   })
 
   it('marks a session whose audio was removed to free space, refined or not', () => {

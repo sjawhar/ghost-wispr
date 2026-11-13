@@ -267,7 +267,11 @@
 <svelte:document onclick={closeDeleteMenuOnOutsideClick} />
 
 <div class="audio-player" data-testid="audio-player">
-  {#if audioRemoved && !audioLeft}
+  {#if session?.restored_at}
+    <p class="audio-note">
+      This conversation was restored from Drive; retry refinement to delete from it
+    </p>
+  {:else if audioRemoved && !audioLeft}
     <p class="audio-note">
       The audio was removed to free space. The transcript and summary are kept.
     </p>
