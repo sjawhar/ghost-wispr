@@ -837,36 +837,35 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		rawIDs := append([]string{sessionID}, sourceIDs...)
-		var rawPending []erase.Pending
 		var rawReservations []rawEraseReservation
 		for _, rawID := range rawIDs {
 			rawPath, err := filepath.Abs(filepath.Join(recordingDir, rawID+".pcm"))
 			if err != nil {
-				restoreRawSessionErasures(store, rawReservations)
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("find raw session recording: %v", err))
 				return
 			}
 			reservation, err := erase.Reserve(rawPath)
 			if err != nil {
-				restoreRawSessionErasures(store, rawReservations)
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reserve raw session erase: %v", err))
 				return
 			}
 			persistedHiddenPath, err := store.ReserveRawSessionErase(rawID, reservation.OriginalPath(), reservation.HiddenPath())
 			if err != nil {
-				restoreRawSessionErasures(store, rawReservations)
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reserve raw session erase: %v", err))
 				return
 			}
 			reusedReservation := persistedHiddenPath != reservation.HiddenPath()
 			reservation, err = erase.ReservationAt(rawPath, persistedHiddenPath)
 			if err != nil {
-				restoreRawSessionErasures(store, rawReservations)
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
 				_ = store.CancelRawSessionErase(rawID, persistedHiddenPath)
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reuse raw session erase reservation: %v", err))
 				return
 			}
-			rawReservation := rawEraseReservation{sessionID: rawID, hiddenPath: persistedHiddenPath}
+			rawReservation := rawEraseReservation{sessionID: rawID, originalPath: rawPath, hiddenPath: persistedHiddenPath}
 			rawReservations = append(rawReservations, rawReservation)
 			hidden, rawErr := beginReservedErasing(reservation)
 			rawReservations[len(rawReservations)-1].pending = hidden
@@ -874,19 +873,20 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			switch {
 			case errors.Is(rawErr, erase.ErrLeftover):
 				slog.Warn("could not flush the removal of a deleted session's raw recording; it is erased after the answer", "session_id", rawID, "audio_path", rawPath, "error", rawErr)
-				rawPending = append(rawPending, hidden)
 			case errors.Is(rawErr, os.ErrNotExist):
 			case rawErr != nil:
-				restoreRawSessionErasures(store, rawReservations)
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("hide raw session recording: %v", rawErr))
 				return
-			default:
-				rawPending = append(rawPending, hidden)
 			}
 		}
 		audioPath, err := store.DeleteSession(sessionID, recordingDir)
 		if err != nil {
-			restoreRawSessionErasures(store, rawReservations)
+			if errors.Is(err, sql.ErrNoRows) {
+				finishRawErasing(store, rawReservations)
+			} else {
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
+			}
 			if errors.Is(err, storage.ErrDeleteReplacementPending) || errors.Is(err, storage.ErrDeleteMergeActive) {
 				writeJSONError(w, http.StatusConflict, err.Error())
 				return
@@ -907,7 +907,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// DeleteSession recorded every erase directory before the row went, so
 		// an erase cut off by a stop is finished as the app starts. The files
 		// leave their names before the answer; the zeros follow it.
-		pending := rawPending
+		pending := make([]erase.Pending, 0)
 		for _, p := range strings.Split(audioPath, ",") {
 			if p = strings.TrimSpace(p); p == "" {
 				continue
@@ -926,6 +926,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				continue
 			}
 			pending = append(pending, hidden)
+		}
+		if len(rawReservations) > 0 {
+			go finishRawErasing(store, rawReservations)
 		}
 		if len(pending) > 0 {
 			go finishErasing(sessionID, pending)
@@ -1698,26 +1701,50 @@ var beginReservedErasing = func(reservation erase.Reservation) (erase.Pending, e
 }
 
 type rawEraseReservation struct {
-	sessionID, hiddenPath string
-	pending               erase.Pending
-	keepHidden            bool
+	sessionID, originalPath, hiddenPath string
+	pending                             erase.Pending
+	keepHidden                          bool
 }
 
 // restoreRawSessionErasures restores every hidden raw file after a delete
 // aborts. A failed restore stays reserved for startup recovery. Each error
 // names the raw file's own session, which can be a merged source rather than
 // the API target.
-func restoreRawSessionErasures(store SessionStore, reservations []rawEraseReservation) {
+func restoreRawSessionErasures(store SessionStore, reservations []rawEraseReservation, refreshWarning func()) {
 	for _, reservation := range reservations {
 		if reservation.keepHidden {
 			continue
 		}
 		if err := reservation.pending.Restore(); err != nil {
-			slog.Error("could not restore a raw session recording after its delete failed", "session_id", reservation.sessionID, "error", err)
+			slog.Warn("could not restore a raw session recording after its delete failed", "session_id", reservation.sessionID, "error", err)
+			if refreshWarning != nil {
+				refreshWarning()
+			}
 			continue
 		}
 		if err := store.CancelRawSessionErase(reservation.sessionID, reservation.hiddenPath); err != nil {
 			slog.Error("could not cancel a restored raw session erase", "session_id", reservation.sessionID, "error", err)
+		}
+	}
+}
+
+// finishRawErasing zeroes hidden raw files after their session rows are gone.
+// It also reaches a persisted hidden name that a retry reuses but Begin cannot
+// return because its original name is already gone.
+var finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+	for _, reservation := range reservations {
+		var err error
+		if reservation.keepHidden {
+			err = erase.Finish(reservation.originalPath, reservation.hiddenPath)
+		} else {
+			err = reservation.pending.Finish()
+		}
+		if err != nil {
+			slog.Warn("could not overwrite a deleted raw session recording; it is erased as the app starts", "session_id", reservation.sessionID, "audio_path", reservation.originalPath, "error", err)
+			continue
+		}
+		if err := store.CancelRawSessionErase(reservation.sessionID, reservation.hiddenPath); err != nil {
+			slog.Warn("could not clear a completed raw erase reservation", "session_id", reservation.sessionID, "hidden_path", reservation.hiddenPath, "error", err)
 		}
 	}
 }

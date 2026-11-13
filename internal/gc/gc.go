@@ -24,6 +24,9 @@ type Store interface {
 	GetGCEligibleSessions(maxAgeDays int) ([]string, error)
 	GetSession(id string) (storage.Session, error)
 	DeleteEndedSessionAndSources(id, audioPath, audioDir string) (deletedIDs []string, deleted bool, err error)
+	RawOnlySourceSessionIDs(mergedID string) ([]string, error)
+	RawEraseReservations() ([]storage.RawEraseReservation, error)
+	CancelRawSessionErase(id, hiddenPath string) error
 	PurgeOldEvents(maxAge time.Duration) error
 	Recordings() ([]storage.SessionRecording, error)
 	MarkAudioRemoved(id, before, left string, audioLeft bool, removedAt time.Time) (storage.AudioRemoval, bool, error)
@@ -421,6 +424,28 @@ func (c *Collector) deleteSession(id string, names names) error {
 	if err := c.onDrive(&sess); err != nil {
 		return err
 	}
+	reservations, err := c.store.RawEraseReservations()
+	if err != nil {
+		return fmt.Errorf("list raw erase reservations: %w", err)
+	}
+	rawOnlySources, err := c.store.RawOnlySourceSessionIDs(id)
+	if err != nil {
+		return fmt.Errorf("list raw-only merged sources: %w", err)
+	}
+	if c.config.AudioDir != "" {
+		for _, sourceID := range rawOnlySources {
+			if kept, err := rawReservationExists(sourceID, reservations); err != nil {
+				return err
+			} else if kept {
+				return fmt.Errorf("merged source %s keeps its only audio as a reserved raw PCM", sourceID)
+			}
+			if _, err := os.Stat(c.rawPath(sourceID)); err == nil {
+				return fmt.Errorf("merged source %s keeps its only audio as raw PCM", sourceID)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("stat raw PCM of merged source %s: %w", sourceID, err)
+			}
+		}
+	}
 	var files []recordingFile
 	for _, entry := range splitAudioPath(sess.AudioPath) {
 		f, ok := c.audioFile(entry)
@@ -432,6 +457,20 @@ func (c *Collector) deleteSession(id string, names names) error {
 			continue
 		}
 		files = append(files, f)
+	}
+	hasSavedAudio := false
+	for _, f := range files {
+		hasSavedAudio = hasSavedAudio || f.size > 0
+	}
+	if !hasSavedAudio {
+		for _, reservation := range reservations {
+			if reservation.SessionID != id {
+				continue
+			}
+			if err := restoreReservedRaw(c.store, reservation); err != nil {
+				return fmt.Errorf("keep raw recording of session %s: %w", id, err)
+			}
+		}
 	}
 
 	// Record where the saved files are erased before the row that names them
@@ -452,7 +491,9 @@ func (c *Collector) deleteSession(id string, names names) error {
 	if !deleted {
 		return fmt.Errorf("session changed since GC read it (merged, no longer ended, or waiting to sync a change); kept with its audio")
 	}
+	deletedSet := make(map[string]bool, len(deletedIDs))
 	for _, deletedID := range deletedIDs {
+		deletedSet[deletedID] = true
 		c.recordingMismatch(deletedID, false)
 		names.forget(deletedID)
 	}
@@ -478,7 +519,45 @@ func (c *Collector) deleteSession(id string, names names) error {
 			}
 		}
 	}
+	for _, reservation := range reservations {
+		if !deletedSet[reservation.SessionID] {
+			continue
+		}
+		if saved {
+			if err := erase.Finish(reservation.OriginalPath, reservation.HiddenPath); err != nil {
+				c.logger.Warn("gc could not overwrite a reserved raw recording", "operation", "remove_raw_audio", "session_id", reservation.SessionID, "raw_audio", reservation.OriginalPath, "error", err)
+				continue
+			}
+		} else if err := erase.Restore(reservation.OriginalPath, reservation.HiddenPath); err != nil {
+			c.logger.Warn("gc could not restore the only raw recording", "operation", "keep_raw_audio", "session_id", reservation.SessionID, "raw_audio", reservation.OriginalPath, "error", err)
+			continue
+		}
+		if err := c.store.CancelRawSessionErase(reservation.SessionID, reservation.HiddenPath); err != nil {
+			c.logger.Warn("gc could not clear a raw erase reservation", "operation", "remove_raw_audio", "session_id", reservation.SessionID, "raw_audio", reservation.OriginalPath, "error", err)
+		}
+	}
 	return nil
+}
+
+func rawReservationExists(sessionID string, reservations []storage.RawEraseReservation) (bool, error) {
+	for _, reservation := range reservations {
+		if reservation.SessionID != sessionID {
+			continue
+		}
+		if _, err := os.Stat(reservation.HiddenPath); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("stat reserved raw PCM of merged source %s: %w", sessionID, err)
+		}
+	}
+	return false, nil
+}
+
+func restoreReservedRaw(store Store, reservation storage.RawEraseReservation) error {
+	if err := erase.Restore(reservation.OriginalPath, reservation.HiddenPath); err != nil {
+		return err
+	}
+	return store.CancelRawSessionErase(reservation.SessionID, reservation.HiddenPath)
 }
 
 // recordEraseDirectories records the directory of each of paths before GC

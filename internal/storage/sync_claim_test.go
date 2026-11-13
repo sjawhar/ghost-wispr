@@ -173,11 +173,11 @@ func TestDeleteEndedSessionRequiresSync(t *testing.T) {
 	if err := store.UpdateTitle(id, "Planning"); err != nil {
 		t.Fatalf("UpdateTitle: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession(id, "/audio/"+id+".mp3"); err != nil || deleted {
+	if deleted, err := deleteEndedSessionForTest(store, id, "/audio/"+id+".mp3"); err != nil || deleted {
 		t.Errorf("DeleteEndedSession of a session waiting to sync = %v, %v; want kept", deleted, err)
 	}
 	syncTo(t, store, id, SyncStateSynced, "folder-1", 0, "")
-	if deleted, err := store.DeleteEndedSession(id, "/audio/"+id+".mp3"); err != nil || !deleted {
+	if deleted, err := deleteEndedSessionForTest(store, id, "/audio/"+id+".mp3"); err != nil || !deleted {
 		t.Fatalf("DeleteEndedSession after sync = %v, %v; want deleted", deleted, err)
 	}
 	if _, err := store.GetSession(id); err == nil {

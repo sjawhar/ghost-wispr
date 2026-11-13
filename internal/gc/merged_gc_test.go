@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -17,6 +18,9 @@ func TestGCDeletesMergedSourcesAndTheirRawRecordings(t *testing.T) {
 	for i, id := range []string{"source-a", "source-b"} {
 		at := started.Add(time.Duration(i) * time.Hour)
 		endWithRecording(t, store, dir, id, at, 1024)
+	}
+	for _, id := range []string{"source-a", "source-b"} {
+		syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")
 	}
 	if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, started, started.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
@@ -88,6 +92,34 @@ func TestGCRefusesMergedSessionWithAnUnsafeSource(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name: "remote deleted",
+			set: func(store *storage.SQLiteStore) error {
+				_, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ? WHERE id = 'source-a'`, storage.SyncStateRemoteDeleted, storage.SyncFailed)
+				return err
+			},
+		},
+		{
+			name: "unsynced",
+			set: func(store *storage.SQLiteStore) error {
+				_, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ? WHERE id = 'source-a'`, storage.SyncStatePending, storage.SyncPending)
+				return err
+			},
+		},
+		{
+			name: "documents unverified",
+			set: func(store *storage.SQLiteStore) error {
+				_, err := store.DB().Exec(`UPDATE sessions SET documents_unverified = 1 WHERE id = 'source-a'`)
+				return err
+			},
+		},
+		{
+			name: "refinement running",
+			set: func(store *storage.SQLiteStore) error {
+				_, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ? WHERE id = 'source-a'`, storage.RefinementRunning)
+				return err
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -95,6 +127,9 @@ func TestGCRefusesMergedSessionWithAnUnsafeSource(t *testing.T) {
 			started := time.Now().UTC().Add(-40 * 24 * time.Hour)
 			for i, id := range []string{"source-a", "source-b"} {
 				endWithRecording(t, store, dir, id, started.Add(time.Duration(i)*time.Hour), 1024)
+			}
+			for _, id := range []string{"source-a", "source-b"} {
+				syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")
 			}
 			if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, started, started.Add(2*time.Hour)); err != nil {
 				t.Fatal(err)
@@ -115,5 +150,85 @@ func TestGCRefusesMergedSessionWithAnUnsafeSource(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGCKeepsMergedSessionWhenASourceRawIsItsOnlyCopy(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	endWithRecording(t, store, dir, "source-a", started, 1024)
+	if err := store.CreateSession("source-b", started.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("source-b", started.Add(time.Hour+time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"source-a", "source-b"} {
+		syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")
+	}
+	raw := filepath.Join(dir, "source-b.pcm")
+	if err := os.WriteFile(raw, []byte("the source's only audio copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, started, started.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("merged", "", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
+		t.Fatalf("GC deleted %v though source-b has only raw audio, want none", deleted)
+	}
+	if _, err := store.GetSession("merged"); err != nil {
+		t.Fatalf("merged session after GC = %v, want kept", err)
+	}
+	if _, err := os.Stat(raw); err != nil {
+		t.Fatalf("source-b raw after GC = %v, want kept", err)
+	}
+}
+
+func TestGCZeroesReservedRawWhenDeletingASession(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	endWithRecording(t, store, dir, "session", started, 1024)
+	if err := store.UpdateSummaryAtGeneration("session", "", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	raw := filepath.Join(dir, "session.pcm")
+	contents := []byte("raw recording hidden before GC deletion")
+	if err := os.WriteFile(raw, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := erase.Reserve(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReserveRawSessionErase("session", reservation.OriginalPath(), reservation.HiddenPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(reservation.HiddenPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 1 {
+		t.Fatalf("GC deleted %v, want [session]", deleted)
+	}
+	if _, err := os.Stat(reservation.HiddenPath()); !os.IsNotExist(err) {
+		t.Fatalf("hidden raw after GC = %v, want removed", err)
+	}
+	got := make([]byte, len(contents))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Fatalf("hidden raw after GC = %q, want zeroed", got)
 	}
 }

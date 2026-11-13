@@ -4368,8 +4368,8 @@ func newMergedDeleteStore(t *testing.T) (*storage.SQLiteStore, string, map[strin
 
 func TestDeleteSessionHidesEveryMergedSourceRawPCM(t *testing.T) {
 	store, audioDir, raw := newMergedDeleteStore(t)
-	finish := finishErasing
-	t.Cleanup(func() { finishErasing = finish })
+	finish := finishRawErasing
+	t.Cleanup(func() { finishRawErasing = finish })
 	entered, release := make(chan struct{}), make(chan struct{})
 	released := false
 	t.Cleanup(func() {
@@ -4377,10 +4377,10 @@ func TestDeleteSessionHidesEveryMergedSourceRawPCM(t *testing.T) {
 			close(release)
 		}
 	})
-	finishErasing = func(sessionID string, pending []erase.Pending) {
+	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
 		close(entered)
 		<-release
-		finish(sessionID, pending)
+		finish(store, reservations)
 	}
 
 	checkedStore := &sourceRawPredeleteStore{

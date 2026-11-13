@@ -988,8 +988,13 @@ func main() {
 	}
 
 	controlHooks := &server.ControlHooks{
-		IsPaused:      capture.IsPaused,
-		IsCapturing:   func() bool { return capture.capturing(micStatus) },
+		IsPaused:    capture.IsPaused,
+		IsCapturing: func() bool { return capture.capturing(micStatus) },
+		RefreshRawEraseWarnings: func() {
+			if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
+				log.Printf("warning: raw erase reservations after delete failure: %v", err)
+			}
+		},
 		CaptureState:  func() string { return capture.captureState(micStatus) },
 		ActiveSession: manager.ActiveSession,
 		Warnings:      warningRegistry.List,

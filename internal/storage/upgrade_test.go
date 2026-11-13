@@ -77,7 +77,7 @@ func TestUnverifiedDocumentsHoldOffTheAgePolicy(t *testing.T) {
 	if ids, err := store.GetGCEligibleSessions(30); err != nil || len(ids) != 0 {
 		t.Errorf("GetGCEligibleSessions = %v, %v; want none", ids, err)
 	}
-	if deleted, err := store.DeleteEndedSession(id, audio); err != nil || deleted {
+	if deleted, err := deleteEndedSessionForTest(store, id, audio); err != nil || deleted {
 		t.Errorf("DeleteEndedSession = %v, %v; want kept", deleted, err)
 	}
 	recordings, err := store.Recordings()

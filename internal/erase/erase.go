@@ -139,6 +139,11 @@ func (r Reservation) Begin() (Pending, error) {
 	if !info.Mode().IsRegular() {
 		return Pending{}, os.Remove(r.path)
 	}
+	if _, err := os.Lstat(r.hidden); err == nil {
+		return Pending{}, fmt.Errorf("reserve hidden erase name %s: already exists", r.hidden)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Pending{}, err
+	}
 	if err := os.Rename(r.path, r.hidden); err != nil {
 		return Pending{}, err
 	}
@@ -188,6 +193,13 @@ func (p Pending) Restore() error {
 // leave a Pending value in memory.
 func Restore(originalPath, hiddenPath string) error {
 	return Pending{path: originalPath, hidden: hiddenPath}.Restore()
+}
+
+// Finish overwrites and removes a hidden file named by a persisted
+// reservation. It is for a caller that no longer has the Pending value which
+// began the erase.
+func Finish(originalPath, hiddenPath string) error {
+	return Pending{path: originalPath, hidden: hiddenPath}.Finish()
 }
 
 // Replace renames from to to, as os.Rename does, and erases the file to named

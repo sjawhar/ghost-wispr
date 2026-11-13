@@ -820,21 +820,13 @@ func removeFiles(paths []string) {
 	}
 }
 
-// cleanupSpliceTempCopies removes, as the app starts and before any deletion
-// or recovery runs, the temporary files a stopped app can leave in audioDir,
-// each a whole copy of a recording: a splice's copy (.delete-segment-*) and
-// output (.splice-*), and a recording downloaded from Drive for a splice
-// (.download-*, gdrive.Syncer.DownloadRecording). It removes them with a
-// plain unlink, since a segment deletion zeroes no whole audio file, and
-// finishes overwriting any file a whole-file removal (GC, the session delete
-// route, a saved session's raw recording) left part way erased
-// (erase.Leftovers).
-func cleanupSpliceTempCopies(audioDir string) error {
-	return cleanupSpliceTempCopiesExcept(audioDir, nil)
-}
-
-// cleanupSpliceTempCopiesExcept leaves reserved hidden raw captures whole:
-// their session still exists, and startup could not restore them yet.
+// cleanupSpliceTempCopiesExcept removes, as the app starts and before any
+// deletion or recovery runs, the temporary files a stopped app can leave in
+// audioDir: a splice's copy (.delete-segment-*), output (.splice-*), and a
+// recording downloaded from Drive for a splice (.download-*). It removes them
+// with a plain unlink, since a segment deletion zeroes no whole audio file,
+// and finishes overwriting any cut-off whole-file removal, except a reserved
+// hidden raw capture whose session still exists and could not be restored.
 func cleanupSpliceTempCopiesExcept(audioDir string, reserved map[string]bool) error {
 	entries, err := os.ReadDir(audioDir)
 	if errors.Is(err, os.ErrNotExist) {

@@ -30,7 +30,7 @@ func TestGCKeepsASessionThatOwesADriveReplacement(t *testing.T) {
 	if len(recordings) != 1 || recordings[0].Removable {
 		t.Errorf("recordings = %+v, want the owed session's recording kept", recordings)
 	}
-	deleted, err := store.DeleteEndedSession(id, "/audio/recording.mp3")
+	deleted, err := deleteEndedSessionForTest(store, id, "/audio/recording.mp3")
 	if err != nil {
 		t.Fatal(err)
 	}

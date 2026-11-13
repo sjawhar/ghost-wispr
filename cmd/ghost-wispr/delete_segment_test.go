@@ -217,7 +217,7 @@ func TestCleanupSpliceTempCopies(t *testing.T) {
 		t.Cleanup(func() { _ = f.Close() })
 		held[name] = f
 	}
-	if err := cleanupSpliceTempCopies(dir); err != nil {
+	if err := cleanupSpliceTempCopiesExcept(dir, nil); err != nil {
 		t.Fatalf("cleanup splice temp copies: %v", err)
 	}
 	for _, name := range []string{".delete-segment-before.mp3", ".splice-before.mp3", ".download-before.mp3", ".erasing-cut-off"} {

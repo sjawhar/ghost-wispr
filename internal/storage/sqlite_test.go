@@ -30,6 +30,11 @@ func newTestSQLiteStore(t *testing.T) *SQLiteStore {
 	return store
 }
 
+func deleteEndedSessionForTest(store *SQLiteStore, id, audioPath string) (bool, error) {
+	_, deleted, err := store.DeleteEndedSessionAndSources(id, audioPath, "")
+	return deleted, err
+}
+
 func setEnvoyPublishStatus(store *SQLiteStore, sessionID, status string) error {
 	session, err := store.GetSession(sessionID)
 	if err != nil {
@@ -965,16 +970,16 @@ func TestClaimRefinementClearsTheRefinementModel(t *testing.T) {
 // DeleteEndedSession deletes a session for the age policy only while it is as
 // GC read it: ended, synced, and naming that audio path. A session merged
 // since gave its recording to the merged session, which keeps both.
-func TestDeleteEndedSession(t *testing.T) {
+func TestAgeDelete(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	endedAndSynced(t, store, "20261106140000", "/audio/a.mp3", RefinementCompleted)
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/other.mp3"); err != nil || deleted {
+	if deleted, err := deleteEndedSessionForTest(store, "20261106140000", "/audio/other.mp3"); err != nil || deleted {
 		t.Errorf("DeleteEndedSession with another audio path = %v, %v; want kept", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err != nil {
 		t.Fatalf("session deleted: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/a.mp3"); err != nil || !deleted {
+	if deleted, err := deleteEndedSessionForTest(store, "20261106140000", "/audio/a.mp3"); err != nil || !deleted {
 		t.Errorf("DeleteEndedSession = %v, %v; want deleted", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err == nil {
@@ -985,10 +990,10 @@ func TestDeleteEndedSession(t *testing.T) {
 	if err := store.MergeSessions("20261106140100-merged", []string{"20261106140100"}, time.Date(2026, 11, 6, 14, 1, 0, 0, time.UTC), time.Date(2026, 11, 6, 14, 2, 0, 0, time.UTC)); err != nil {
 		t.Fatalf("MergeSessions: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140100", "/audio/b.mp3"); err != nil || deleted {
+	if deleted, err := deleteEndedSessionForTest(store, "20261106140100", "/audio/b.mp3"); err != nil || deleted {
 		t.Errorf("DeleteEndedSession of a merged source = %v, %v; want kept", deleted, err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106990000", ""); err != nil || deleted {
+	if deleted, err := deleteEndedSessionForTest(store, "20261106990000", ""); err != nil || deleted {
 		t.Errorf("DeleteEndedSession of a missing session = %v, %v; want nothing", deleted, err)
 	}
 }

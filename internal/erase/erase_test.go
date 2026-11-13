@@ -333,3 +333,28 @@ func TestLeftoverFinishersSkipReservedHiddenPaths(t *testing.T) {
 		})
 	}
 }
+
+func TestReservationDoesNotOverwriteAnExistingHiddenFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recording.mp3")
+	hidden := filepath.Join(dir, hiddenPrefix+"already-reserved")
+	if err := os.WriteFile(path, []byte("new raw recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hidden, []byte("existing hidden recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := ReservationAt(path, hidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.Begin(); err == nil {
+		t.Fatal("Begin overwrote an existing hidden recording")
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "new raw recording" {
+		t.Fatalf("raw recording after refused reservation = %q (%v), want unchanged", got, err)
+	}
+	if got, err := os.ReadFile(hidden); err != nil || string(got) != "existing hidden recording" {
+		t.Fatalf("hidden recording after refused reservation = %q (%v), want unchanged", got, err)
+	}
+}

@@ -70,6 +70,12 @@ func (m *mockStore) DeleteEndedSessionAndSources(id, _, _ string) ([]string, boo
 	return []string{id}, true, nil
 }
 
+func (*mockStore) RawOnlySourceSessionIDs(string) ([]string, error) { return nil, nil }
+
+func (*mockStore) RawEraseReservations() ([]storage.RawEraseReservation, error) { return nil, nil }
+
+func (*mockStore) CancelRawSessionErase(string, string) error { return nil }
+
 func (m *mockStore) PurgeOldEvents(maxAge time.Duration) error {
 	return nil
 }
