@@ -8,16 +8,13 @@ import (
 )
 
 // TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites holds Canonicalize between
-// its read and write, then waits for DeleteSegment to block on the only
+// its read and write, then waits for refined deletion to block on the only
 // connection. The transaction must write before the delete can commit;
 // otherwise the stale canonical text would land after the delete.
 func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "s")
-	segments, err := store.GetSegments("s")
-	if err != nil {
-		t.Fatal(err)
-	}
+	revision, segments := publishRefinedSegmentTestSession(t, store, "s", "recording.mp3", "b")
 
 	read := make(chan struct{})
 	allowWrite := make(chan struct{})
@@ -40,9 +37,8 @@ func TestR7CanonicalizeKeepsTheDeleteOutUntilItWrites(t *testing.T) {
 	deleteDone := make(chan error, 1)
 	go func() {
 		close(deleteStarted)
-		deleteDone <- store.DeleteSegment("s", segments[1].ID, DeletedSpan{
-			AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a",
-		})
+		span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}
+		deleteDone <- store.DeleteRefinedSegmentAudio("s", segments[1].ID, revision, &span)
 	}()
 	<-deleteStarted
 	waitForConnectionWait(t, store.DB(), allowWrite)
@@ -81,7 +77,7 @@ func waitForConnectionWait(t *testing.T, db *sql.DB, release chan<- struct{}) {
 		select {
 		case <-deadline.C:
 			close(release)
-			t.Fatal("DeleteSegment did not block on Canonicalize's transaction")
+			t.Fatal("refined deletion did not block on Canonicalize's transaction")
 		case <-ticker.C:
 		}
 	}

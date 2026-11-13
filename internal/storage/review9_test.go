@@ -24,7 +24,7 @@ func TestReview9AnOwedEraseOutlivesItsSession(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"})
+			err = deleteRefinedAudioTestSegment(t, store, "backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"})
 			if !errors.Is(err, ErrSegmentPostCommitMaintenance) {
 				t.Fatalf("DeleteSegment with a full disk = %v, want %v", err, ErrSegmentPostCommitMaintenance)
 			}

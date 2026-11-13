@@ -68,6 +68,68 @@ func fileHash(t *testing.T, path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.DeletedSpan) error {
+	t.Helper()
+	index := liveSegmentIndex(t, store, sessionID, liveSegmentID)
+	revision, refined := publishRefinedSegmentsForTest(t, store, sessionID, span.AudioPath, span.SHA256Before)
+	return store.DeleteRefinedSegmentAudio(sessionID, refined[index].ID, revision, &span)
+}
+
+func deleteRefinedTextForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.TextDeletionSpan) error {
+	t.Helper()
+	index := liveSegmentIndex(t, store, sessionID, liveSegmentID)
+	revision, refined := publishRefinedSegmentsForTest(t, store, sessionID, span.AudioPath, span.SHA256)
+	return store.DeleteRefinedSegmentText(sessionID, refined[index].ID, revision)
+}
+
+func publishRefinedSegmentsForTest(t *testing.T, store *storage.SQLiteStore, sessionID, recordingPath, recordingHash string) (int, []transcribe.Segment) {
+	t.Helper()
+	live, err := store.GetSegments(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := make([]storage.RefinedWord, 0, len(live))
+	refined := make([]storage.RefinedSegment, 0, len(live))
+	for i, segment := range live {
+		words = append(words, storage.RefinedWord{
+			RecordingPath: recordingPath, RecordingSHA256: recordingHash, Ordinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+		refined = append(refined, storage.RefinedSegment{
+			RecordingPath: recordingPath, RecordingSHA256: recordingHash, FirstWordOrdinal: i, LastWordOrdinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+	}
+	generation, err := store.DeletionGeneration(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), "test", words, refined, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision, segments
+}
+
+func liveSegmentIndex(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64) int {
+	t.Helper()
+	live, err := store.GetSegments(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range live {
+		if live[i].ID == liveSegmentID {
+			return i
+		}
+	}
+	t.Fatalf("live segment %d not found", liveSegmentID)
+	return 0
+}
+
 // deletedTextSession makes ended session id, recorded in a file holding
 // audio, with segments "So we met.", "Orange tractor ninety." and "And then
 // left.", deletes the middle one with "Delete text" at its span in the
@@ -100,8 +162,8 @@ func deletedTextSession(t *testing.T, id, audio string) (*storage.SQLiteStore, s
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegmentText(id, segments[1].ID, storage.TextDeletionSpan{AudioPath: recording, Start: 1.0, End: 1.95, SHA256: fileHash(t, recording)}); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := deleteRefinedTextForTest(t, store, id, segments[1].ID, storage.TextDeletionSpan{AudioPath: recording, Start: 1.0, End: 1.95, SHA256: fileHash(t, recording)}); err != nil {
+		t.Fatalf("delete refined text: %v", err)
 	}
 	return store, recording, started
 }
@@ -140,8 +202,8 @@ func TestRefinementDropsTheWordsOfDeletedText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(segments) != 2 || segments[0].TranscriptRevision != 1 || segments[0].RecordingPath != recording || segments[0].FirstWordOrdinal != 0 || segments[1].FirstWordOrdinal != 6 {
-		t.Fatalf("rebuilt refined segments = %#v, want timed segments with the deleted words absent", segments)
+	if len(segments) != 2 || segments[0].TranscriptRevision != sess.RefinedRevision || segments[0].RecordingPath != recording || segments[0].FirstWordOrdinal != 0 || segments[1].FirstWordOrdinal != 6 {
+		t.Fatalf("rebuilt refined segments = %#v, want timed segments for revision %d with the deleted words absent", segments, sess.RefinedRevision)
 	}
 	words, err := store.RefinedWords("20261112100000", sess.RefinedRevision)
 	if err != nil {
@@ -253,8 +315,8 @@ func TestRefinementOfAMergedSessionDropsDeletedTextInItsRecordings(t *testing.T)
 			orange = segment.ID
 		}
 	}
-	if err := store.DeleteSegmentText("merged", orange, storage.TextDeletionSpan{AudioPath: recordings["b"], Start: 1.0, End: 1.95, SHA256: fileHash(t, recordings["b"])}); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := deleteRefinedTextForTest(t, store, "merged", orange, storage.TextDeletionSpan{AudioPath: recordings["b"], Start: 1.0, End: 1.95, SHA256: fileHash(t, recordings["b"])}); err != nil {
+		t.Fatalf("delete refined text: %v", err)
 	}
 	transcriber := &recordingTranscriber{results: map[string]transcribe.BatchResult{
 		recordings["a"]: refinementResult("nova-3", timedWords(0, "Alpha stays here.")),

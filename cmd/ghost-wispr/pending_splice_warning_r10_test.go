@@ -19,17 +19,19 @@ func r10Warning(t *testing.T) (*warningsRegistry, *storage.SQLiteStore) {
 	return registry, store
 }
 
-// A retry whose refinement never ran (claim refused, recording removed) leaves
-// refinement_status as the delete set it; the warning must stay.
-func TestR10RetryThatDoesNothingKeepsWarning(t *testing.T) {
+// A recovered refined deletion has already rebuilt its transcript. Retrying
+// refinement is a no-op and clears the stale recovery warning.
+func TestR10RetrySkipsCompletedRefinedDeletion(t *testing.T) {
 	registry, store := r10Warning(t)
 	sess, _ := store.GetSession("session")
 	if err := retryRefinementWithWarningClear(context.Background(), registry, store, "session", func(context.Context, string, string, time.Time) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("refinement_status before retry = %q", sess.RefinementStatus)
-	if w := statusWarnings(t, registry); len(w) != 1 {
-		t.Fatalf("no-op retry cleared the warning (status %q): %q", sess.RefinementStatus, w)
+	if sess.RefinementStatus != storage.RefinementCompleted {
+		t.Fatalf("refinement status before retry = %q, want completed", sess.RefinementStatus)
+	}
+	if w := statusWarnings(t, registry); len(w) != 0 {
+		t.Fatalf("no-op retry kept a stale warning: %q", w)
 	}
 }
 

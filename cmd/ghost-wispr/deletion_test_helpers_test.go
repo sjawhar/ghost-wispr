@@ -46,6 +46,49 @@ func newDeletionTestStore(t *testing.T, recording string) (*storage.SQLiteStore,
 	return store, segments[1].ID, started
 }
 
+func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.DeletedSpan) error {
+	t.Helper()
+	live, err := store.GetSegments(sessionID)
+	if err != nil {
+		return err
+	}
+	index := -1
+	for i := range live {
+		if live[i].ID == liveSegmentID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return storage.ErrSegmentNotFound
+	}
+	words := make([]storage.RefinedWord, 0, len(live))
+	refined := make([]storage.RefinedSegment, 0, len(live))
+	for i, segment := range live {
+		words = append(words, storage.RefinedWord{
+			RecordingPath: span.AudioPath, RecordingSHA256: span.SHA256Before, Ordinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+		refined = append(refined, storage.RefinedSegment{
+			RecordingPath: span.AudioPath, RecordingSHA256: span.SHA256Before, FirstWordOrdinal: i, LastWordOrdinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+	}
+	generation, err := store.DeletionGeneration(sessionID)
+	if err != nil {
+		return err
+	}
+	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), "test", words, refined, generation)
+	if err != nil {
+		return err
+	}
+	segments, err := store.GetSegments(sessionID)
+	if err != nil {
+		return err
+	}
+	return store.DeleteRefinedSegmentAudio(sessionID, segments[index].ID, revision, &span)
+}
+
 func fakeSplice(_ context.Context, path string, _, _ float64) (string, error) {
 	if err := os.WriteFile(path, []byte("spliced"), 0o600); err != nil {
 		return "", err
@@ -66,17 +109,17 @@ func r4PendingStore(t *testing.T) (*storage.SQLiteStore, string, []int64) {
 		t.Fatal(err)
 	}
 	store, segmentID, _ := newDeletionTestStore(t, recording)
-	segments, err := store.GetSegments("session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeleteSegment("session", segmentID, storage.DeletedSpan{
+	if err := deleteRefinedAudioForTest(t, store, "session", segmentID, storage.DeletedSpan{
 		SessionID: "session", AudioPath: recording, Start: 1, End: 2,
 		SHA256Before: hashBytesForDeleteTest(original), SHA256After: hashBytesForDeleteTest([]byte("spliced")),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return store, recording, []int64{segments[0].ID, segments[2].ID}
+	remaining, err := store.GetSegments("session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, recording, []int64{remaining[0].ID, remaining[1].ID}
 }
 
 type deletionDriveFake struct {

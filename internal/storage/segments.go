@@ -46,158 +46,6 @@ type DeletedSpan struct {
 	SHA256Before, SHA256After string
 }
 
-// DeleteSegment removes one saved segment and clears every derivative that can
-// carry its text ("Delete text and audio"). The database changes and the
-// deleted span record commit in one transaction. File replacement follows the
-// transaction; PendingSplices makes an interrupted replacement recoverable at
-// startup.
-//
-//nolint:gocritic // The approved storage contract passes one DeletedSpan by value.
-func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span DeletedSpan) error {
-	if span.SHA256After == "" {
-		return fmt.Errorf("delete segment: invalid deleted span")
-	}
-	return s.deleteSegment(sessionID, segmentID, &span, false)
-}
-
-// deleteSegment is both deletion actions. Each removes the segment and its
-// words from every text store, on the session and every merged source, and
-// erases them from the database files and the pre-migration backup. Only
-// "Delete text and audio" (keepAudio false) records the splice of span's
-// recording and owes Google Drive a replacement; "Delete text" (keepAudio
-// true) records span, in the unchanged recording, for refinement to drop.
-func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *DeletedSpan, keepAudio bool) error {
-	if strings.TrimSpace(sessionID) == "" {
-		return fmt.Errorf("delete segment: session ID is required")
-	}
-	if segmentID <= 0 {
-		return fmt.Errorf("delete segment: segment ID is required")
-	}
-	if strings.TrimSpace(span.AudioPath) == "" || span.Start < 0 || span.End <= span.Start || span.SHA256Before == "" {
-		return fmt.Errorf("delete segment: invalid deleted span")
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin delete segment: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	session, err := getSession(tx, sessionID)
-	if err != nil {
-		return fmt.Errorf("get session %s: %w", sessionID, err)
-	}
-	if session.Status == SessionActive {
-		return ErrSegmentSessionActive
-	}
-
-	var deletedText string
-	var segmentStart, segmentEnd float64
-	if err := tx.QueryRow(`SELECT text, start_time, end_time FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID).Scan(&deletedText, &segmentStart, &segmentEnd); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrSegmentNotFound
-		}
-		return fmt.Errorf("get segment %d from session %s: %w", segmentID, sessionID, err)
-	}
-	if span.StreamEnd <= span.StreamStart {
-		span.StreamStart, span.StreamEnd = segmentStart, segmentEnd
-	}
-	all, err := getSegments(tx, sessionID)
-	if err != nil {
-		return fmt.Errorf("get segments for session %s: %w", sessionID, err)
-	}
-	var deleted transcribe.Segment
-	remaining := make([]transcribe.Segment, 0, len(all))
-	for i := range all {
-		if all[i].ID == segmentID {
-			deleted = all[i]
-			continue
-		}
-		remaining = append(remaining, all[i])
-	}
-	if _, err := tx.Exec(`DELETE FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID); err != nil {
-		return fmt.Errorf("delete segment %d from session %s: %w", segmentID, sessionID, err)
-	}
-	canonical := canonicalTranscript(remaining)
-	// A session with no recording, or only part of it, left to refine
-	// ("Delete text" of one whose audio was removed to free space) has
-	// nothing a refinement could rebuild its whole transcript from.
-	// The session goes back to pending sync, but for two sync states: one
-	// a sync holds (SYNCING) is left to that sync, whose end records the
-	// folder it made as owed (oweFolderOfPendingDeletion); one whose Drive
-	// folder is in the trash or gone (REMOTE_DELETED) stays kept on this
-	// unit only, and the sweep, which reads every owed session in any state
-	// no sync holds, runs its replacement once the folder is back.
-	if _, err := tx.Exec(`
-		UPDATE sessions
-		SET title = '',
-			summary = '',
-			summary_model = '',
-			speaker_names = '{}',
-			refined_transcript = '',
-			refinement_model = '',
-			refinement_status = CASE WHEN ? AND (audio_path = '' OR audio_removed_at != '') THEN ? ELSE ? END,
-			summary_status = ?,
-			summary_error = '',
-			canonical_transcript = ?,
-			transcript_source = ?,
-			summary_version = summary_version + 1,
-			deletion_generation = deletion_generation + 1,
-			envoy_publish_status = ?,
-			sync_status = CASE WHEN sync_state IN (?, ?) THEN sync_status ELSE ? END,
-			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END
-		WHERE id = ?`,
-		keepAudio, RefinementNoAudio, RefinementPending,
-		SummaryPending,
-		canonical,
-		TranscriptSourceStreaming,
-		EnvoyPublishPending,
-		SyncStateSyncing, SyncStateRemoteDeleted, SyncPending,
-		SyncStateSyncing, SyncStateRemoteDeleted, SyncStatePending,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("clear deleted segment derivatives for session %s: %w", sessionID, err)
-	}
-	sources, holders, err := scrubMergedSources(tx, sessionID, remaining, deleted.Timestamp)
-	if err != nil {
-		return err
-	}
-	owners := append([]string{sessionID}, sources...)
-	for _, owner := range owners {
-		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
-			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
-		}
-	}
-	if _, err := tx.Exec(`
-		INSERT INTO summary_requests(session_id, prompt_hash) VALUES(?, 'segment-delete')
-		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
-		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
-	}
-	if keepAudio {
-		if err := recordTextDeletionSpan(tx, sessionID, sources, span); err != nil {
-			return err
-		}
-	} else if err := recordSplice(tx, sessionID, owners, span, session.AudioPath); err != nil {
-		return err
-	}
-	// The erase after the commit is owed until it finishes, so a failure, or
-	// the app stopping, leaves it for RetryOwedErasure.
-	owed, earlierOwed, err := recordOwedErase(tx)
-	if err != nil {
-		return err
-	}
-	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, span); err != nil {
-		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
-	}
-	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
-		return fmt.Errorf("rebuild sessions search index: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
-	}
-	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, append([]string{sessionID}, holders...), span)
-}
-
 // recordSplice records, in tx, what only "Delete text and audio" does beyond
 // the text side: the session names all its recordings again (span's
 // SessionAudioPath, the ones restored from Drive included, else audioPath),
@@ -391,31 +239,67 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording strin
 	if len(sources) == 0 {
 		return nil, nil, nil
 	}
-	rows, err := tx.Query(`SELECT recording_path, source_session_id FROM recording_sources WHERE merged_session_id = ?`, sessionID)
+	parents := make(map[string]string, len(sources))
+	for _, source := range sources {
+		session, err := getSession(tx, source)
+		if err != nil {
+			return nil, nil, fmt.Errorf("get merged source %s: %w", source, err)
+		}
+		parents[source] = session.MergedInto
+	}
+
+	rows, err := tx.Query(`WITH RECURSIVE merged(id) AS (
+			SELECT ? UNION SELECT sessions.id FROM sessions JOIN merged ON sessions.merged_into = merged.id
+		) SELECT merged_session_id, recording_path, source_session_id
+		FROM recording_sources WHERE merged_session_id IN (SELECT id FROM merged)`, sessionID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read merged recording sources: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	owners := make(map[string]string)
+	owners := make(map[string]map[string]string)
 	for rows.Next() {
-		var recording, source string
-		if err := rows.Scan(&recording, &source); err != nil {
+		var merged, recording, source string
+		if err := rows.Scan(&merged, &recording, &source); err != nil {
 			return nil, nil, fmt.Errorf("scan merged recording source: %w", err)
 		}
-		owners[recording] = source
+		if owners[merged] == nil {
+			owners[merged] = make(map[string]string)
+		}
+		owners[merged][recording] = source
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("iterate merged recording sources: %w", err)
 	}
+
+	recordingChain := func(recording string) []string {
+		owner := owners[sessionID][recording]
+		seen := make(map[string]struct{})
+		for owner != "" {
+			if _, duplicate := seen[owner]; duplicate {
+				return nil
+			}
+			seen[owner] = struct{}{}
+			if nested := owners[owner][recording]; nested != "" {
+				owner = nested
+				continue
+			}
+			break
+		}
+		var chain []string
+		for owner != "" && owner != sessionID {
+			chain = append(chain, owner)
+			owner = parents[owner]
+		}
+		return chain
+	}
+
 	own := make(map[string][]transcribe.Segment, len(sources))
 	for i := range remaining {
-		if source := owners[remaining[i].RecordingPath]; source != "" {
+		for _, source := range recordingChain(remaining[i].RecordingPath) {
 			own[source] = append(own[source], remaining[i])
 		}
 	}
-	if holder := owners[deletedRecording]; holder != "" {
-		holders = append(holders, holder)
-	}
+	holders = recordingChain(deletedRecording)
 	for _, source := range sources {
 		if _, err := tx.Exec(`UPDATE sessions
 			SET title = '', summary = '', summary_model = '', speaker_names = '{}',
@@ -813,7 +697,8 @@ func dropLiveTranscriptEvents(tx *sql.Tx, sessionIDs []string) error {
 		}
 		seen[sessionID] = struct{}{}
 		if _, err := tx.Exec(`DELETE FROM mcp_events
-			WHERE event_type = 'live_transcript'
+			WHERE (event_type IN ('live_transcript', 'live_transcript_interim')
+				OR (json_valid(payload) AND COALESCE(json_extract(payload, '$.type'), '') IN ('live_transcript', 'live_transcript_interim')))
 			  AND (NOT json_valid(payload) OR COALESCE(json_extract(payload, '$.session_id'), '') = ?)`, sessionID); err != nil {
 			return fmt.Errorf("drop live transcript events for session %s: %w", sessionID, err)
 		}

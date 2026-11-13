@@ -112,9 +112,9 @@ func oldReplacementIDs(t *testing.T, wire *wireDrive, folder, recording string) 
 	return ids
 }
 
-// setDriveReplacementPending records a segment deletion of sessionID, as
-// DeleteSegment does for Drive: a new deletion generation, the replacement
-// pending, and the session's folder owed in the ledger.
+// setDriveReplacementPending records a refined audio deletion of sessionID:
+// a new deletion generation, the replacement pending, and the session's
+// folder owed in the ledger.
 func setDriveReplacementPending(t *testing.T, store *storage.SQLiteStore, sessionID, audioPath string) {
 	t.Helper()
 	if _, err := store.DB().Exec(`DELETE FROM drive_replacements WHERE session_id = ?`, sessionID); err != nil {

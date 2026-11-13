@@ -50,8 +50,8 @@ func TestReview2NoFolderSyncBeforeSpliceRename(t *testing.T) {
 	wire, syncer := newWireDrive(t)
 	o := NewOrchestrator(syncer, store)
 	span := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
-	if err := store.DeleteSegment(id, segments[1].ID, span); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, span); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	_ = o.SyncSession(context.Background(), id)
 	if err := os.WriteFile(recording, []byte("spliced clean audio"), 0o644); err != nil {
@@ -102,8 +102,8 @@ func TestReview2DeletionBetweenSessionAndGenerationReads(t *testing.T) {
 	wire, syncer := newWireDrive(t)
 	o := NewOrchestrator(syncer, store)
 	folder := syncedSession(t, store, o, id)
-	span := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 0, End: 1, SHA256Before: "b", SHA256After: "a"}
-	if err := store.DeleteSegment(id, segments[1].ID, span); err != nil {
+	span := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
+	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, span); err != nil {
 		t.Fatalf("delete bravo: %v", err)
 	}
 	if err := store.MarkSpliceComplete(&span); err != nil {
@@ -113,12 +113,18 @@ func TestReview2DeletionBetweenSessionAndGenerationReads(t *testing.T) {
 		storage.RefinementCompleted, storage.SummaryCompleted, id); err != nil {
 		t.Fatal(err)
 	}
+	current, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlieID := current[1].ID
+	span2 := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "a", SHA256After: "b"}
 	race := &generationRaceStore{SQLiteStore: store}
 	race.hook = func() {
-		if err := store.DeleteSegment(id, segments[2].ID, span); err != nil {
+		if err := deleteRefinedAudioForTest(t, store, id, charlieID, span2); err != nil {
 			t.Errorf("delete charlie: %v", err)
 		}
-		if err := store.MarkSpliceComplete(&span); err != nil {
+		if err := store.MarkSpliceComplete(&span2); err != nil {
 			t.Errorf("mark charlie spliced: %v", err)
 		}
 	}

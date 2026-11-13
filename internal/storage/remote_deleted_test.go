@@ -162,7 +162,7 @@ func TestDeleteSegmentKeepsARemoteDeletedSessionRemoteDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment(id, segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	if err := deleteRefinedAudioTestSegment(t, store, id, segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
 	after, err := store.GetSession(id)

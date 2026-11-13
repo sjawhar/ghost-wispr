@@ -209,8 +209,8 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
 
-	// One connection keeps DeleteSegment out of Canonicalize's transaction.
-	// TestR7OpenTransactionExcludesDeleteSegment guards this invariant.
+	// One connection keeps refined deletion out of Canonicalize's transaction.
+	// TestR7OpenTransactionExcludesRefinedDelete guards this invariant.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -477,8 +477,8 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN drive_replace_failures INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN drive_replace_error TEXT NOT NULL DEFAULT ''`,
 		// 1 while a merged source's own Drive folder holds documents that
-		// "Delete text" in the session it was merged into changed
-		// (DeleteSegmentText): the next sync of either updates them in place
+		// a refined "Delete text" in the session it was merged into changed:
+		// the next sync of either updates them in place
 		// (DriveDocumentsOwed, ClearDriveDocumentsPending).
 		`ALTER TABLE sessions ADD COLUMN drive_documents_pending INTEGER NOT NULL DEFAULT 0`,
 	} {
@@ -718,11 +718,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("migrate deleted_segments splice completion: %w", err)
 	}
 	// deleted_text_spans: where, in a recording that keeps them, the words of
-	// a segment "Delete text" deleted are (DeleteSegmentText): the recording's
-	// file name, the span's times in it and the recording's SHA-256, never
-	// the words. Refinement drops the words it finds in a span. A span
-	// belongs to its recording, not to the session the deletion was made in
-	// (session_id), which a merge can leave as a row of its own that is
+	// a refined "Delete text" are: the recording's file name, its span and
+	// SHA-256, never the words. Refinement drops the words it finds in a span.
+	// A span belongs to its recording, not to the session the deletion was
+	// made in (session_id), which a merge can leave as a row of its own that is
 	// deleted while the recording lives on: so no foreign key takes it.
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS deleted_text_spans (
@@ -826,7 +825,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 
 	// A session that owed Drive a replacement before the folder ledger
 	// existed owes it for its own folder and each merged source's that has
-	// one, as DeleteSegment records it now.
+	// one, as refined audio deletion records it now.
 	if err := s.runOnce("record-owed-drive-replacement-folders", `
 		WITH RECURSIVE owner(session_id, generation, folder_session_id) AS (
 			SELECT id, deletion_generation, id FROM sessions WHERE drive_replace_pending = 1
@@ -1621,7 +1620,7 @@ func (s *SQLiteStore) GetRefinement(sessionID string) (string, string, error) {
 
 // Canonicalize sets the canonical transcript and source for sessionID. It
 // returns the transcript and deletion generation it read in the transaction
-// that writes it. With the store's single connection, DeleteSegment cannot
+// that writes it. With the store's single connection, refined deletion cannot
 // interleave, so this does not retry a deletion.
 func (s *SQLiteStore) Canonicalize(sessionID string) (string, int, error) {
 	return s.canonicalize(sessionID, nil)
@@ -1806,9 +1805,9 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 // reports whether it did. Any other state is an error and changes nothing:
 // SYNCED would skip MarkSynced's check that Drive has the session as it is
 // now, and SYNCING would leave the session held by no sync. A sync that held
-// the session while one of its segments was deleted (DeleteSegment leaves the
-// claim to it) uploaded the words before the deletion; the folder it made is
-// recorded as owed to that deletion's replacement in the same transaction.
+// the session while a refined segment was deleted uploaded the words before
+// the deletion; the folder it made is recorded as owed to that deletion's
+// replacement in the same transaction.
 func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount int, at time.Time, errorMessage string) (bool, error) {
 	switch state {
 	case SyncStatePending, SyncStateRetryScheduled, SyncStateFailed, SyncStateRemoteDeleted:
@@ -1849,12 +1848,12 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 }
 
 // oweFolderOfPendingDeletion records, in tx, the Drive folder a sync just
-// recorded for session id as owed to the session's pending segment deletion,
-// if it has one: a sync that held the session while a segment was deleted
-// (DeleteSegment leaves the claim to it) uploaded the words before the
-// deletion. A sync that made no folder leaves nothing to owe, and the
-// deletion is then settled as owing Drive nothing once its splices are done
-// (settleUnownedDriveReplacement). EndSync and MarkSynced both call it.
+// recorded for session id as owed to the session's pending refined deletion,
+// if it has one: a sync that held the session while that segment was deleted
+// uploaded the words before the deletion. A sync that made no folder leaves
+// nothing to owe, and the deletion is then settled as owing Drive nothing
+// once its splices are done (settleUnownedDriveReplacement). EndSync and
+// MarkSynced both call it.
 func oweFolderOfPendingDeletion(tx *sql.Tx, id string) error {
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO drive_replacement_folders(session_id, generation, folder_session_id, state)
 		SELECT id, deletion_generation, id, ? FROM sessions WHERE id = ? AND drive_replace_pending = 1 AND gdrive_folder_id != ''`,

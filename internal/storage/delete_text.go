@@ -35,28 +35,6 @@ func TextDeleted(spans []TextDeletionSpan, start, end float64) bool {
 	return false
 }
 
-// DeleteSegmentText is "Delete text": it removes one saved segment and its
-// words from every text store, on the session and every merged source, and
-// erases them from the database files and the pre-migration backup, exactly
-// as DeleteSegment does, and records span, located in the unchanged
-// recording, so that refinement drops the words found there. It changes no
-// audio path, records no splice and owes Google Drive no replacement: the
-// session goes back to pending sync, and the ordinary sync updates its Drive
-// documents in place. The deletion generation moves, so a refinement or
-// summary started before it cannot store text it read before.
-//
-//nolint:gocritic // One span by value, as DeleteSegment takes its span.
-func (s *SQLiteStore) DeleteSegmentText(sessionID string, segmentID int64, span TextDeletionSpan) error {
-	return s.deleteSegment(sessionID, segmentID, &DeletedSpan{
-		SessionID:    sessionID,
-		AudioPath:    span.AudioPath,
-		Start:        span.Start,
-		End:          span.End,
-		SHA256Before: span.SHA256,
-		SHA256After:  span.SHA256,
-	}, true)
-}
-
 // recordTextDeletionSpan records, in tx, the span of sessionID's recording
 // that a "Delete text" deletion's words are in: the recording's file name,
 // the times and the recording's SHA-256, never the words. And sessionID and

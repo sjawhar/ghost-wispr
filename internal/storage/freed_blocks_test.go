@@ -70,8 +70,8 @@ func TestTheWriteAheadLogIsOverwrittenBeforeItIsTruncated(t *testing.T) {
 		return truncate(db)
 	}
 
-	if err := store.DeleteSegment("logged", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := deleteRefinedAudioTestSegment(t, store, "logged", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	if !checked {
 		t.Fatal("the deletion never truncated the write-ahead log")

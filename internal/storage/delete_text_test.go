@@ -23,18 +23,18 @@ func textSpan() TextDeletionSpan {
 	return TextDeletionSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256: "recording-sha"}
 }
 
-// TestDeleteSegmentTextRemovesTextEverywhere fails if "Delete text" leaves
-// the segment's words in any text store DeleteSegment clears, or if it
-// starts any of the audio action's work: a Drive replacement, a splice, a
-// new audio path.
-func TestDeleteSegmentTextRemovesTextEverywhere(t *testing.T) {
+// TestDeleteRefinedSegmentTextRemovesTextEverywhere fails if "Delete text"
+// leaves a selected refined occurrence in a text store, or starts the audio
+// action's Drive replacement or splice work.
+func TestDeleteRefinedSegmentTextRemovesTextEverywhere(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "text-everywhere")
+	revision, segments := publishRefinedSegmentTestSession(t, store, "text-everywhere", "recording.mp3", "recording-sha")
 	if err := store.UpdateSummaryAtGeneration("text-everywhere", "private deletion token title", "summary names private deletion token", SummaryCompleted, "default", `{"1":{"name":"private deletion token","confidence":"mentioned"}}`, "", 0); err != nil {
 		t.Fatalf("set summary: %v", err)
 	}
-	if _, err := store.DB().Exec(`UPDATE sessions SET refined_transcript = ?, refinement_status = ?, canonical_transcript = ?, envoy_publish_status = ?, sync_status = ?, sync_state = ?, gdrive_folder_id = 'folder' WHERE id = ?`,
-		"before bridge private deletion token after bridge", RefinementCompleted, "before bridge private deletion token after bridge", EnvoyPublishPublished, SyncSynced, SyncStateSynced, "text-everywhere"); err != nil {
+	if _, err := store.DB().Exec(`UPDATE sessions SET envoy_publish_status = ?, sync_status = ?, sync_state = ?, gdrive_folder_id = 'folder' WHERE id = ?`,
+		EnvoyPublishPublished, SyncSynced, SyncStateSynced, "text-everywhere"); err != nil {
 		t.Fatalf("set completed session state: %v", err)
 	}
 	if _, err := store.DB().Exec(`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES(?, 0, X'01', 'hash', 'model')`, "text-everywhere"); err != nil {
@@ -43,18 +43,14 @@ func TestDeleteSegmentTextRemovesTextEverywhere(t *testing.T) {
 	if err := store.StoreEvent("summary_ready", `{"type":"summary_ready","session_id":"text-everywhere","title":"private deletion token title","summary":"summary names private deletion token"}`); err != nil {
 		t.Fatalf("store event: %v", err)
 	}
-	segments, err := store.GetSegments("text-everywhere")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
-	}
 	before := storeSession(t, store, "text-everywhere")
 	generationBefore, err := store.DeletionGeneration("text-everywhere")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := store.DeleteSegmentText("text-everywhere", segments[1].ID, textSpan()); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := store.DeleteRefinedSegmentText("text-everywhere", segments[1].ID, revision); err != nil {
+		t.Fatalf("DeleteRefinedSegmentText: %v", err)
 	}
 
 	remaining, err := store.GetSegments("text-everywhere")
@@ -65,14 +61,14 @@ func TestDeleteSegmentTextRemovesTextEverywhere(t *testing.T) {
 		t.Fatalf("remaining segments = %+v, want the two neighbours", remaining)
 	}
 	session := storeSession(t, store, "text-everywhere")
-	if session.Title != "" || session.Summary != "" || session.RefinedTranscript != "" || session.SpeakerNames != "{}" {
+	if session.Title != "" || session.Summary != "" || strings.Contains(session.RefinedTranscript, "private deletion token") || session.SpeakerNames != "{}" {
 		t.Errorf("session still has deleted derived text: title %q summary %q refined %q speakers %q", session.Title, session.Summary, session.RefinedTranscript, session.SpeakerNames)
 	}
-	if session.CanonicalTranscript != "before bridge\nafter bridge\n" || session.TranscriptSource != TranscriptSourceStreaming {
-		t.Errorf("canonical transcript = %q from %q, want remaining streaming segments", session.CanonicalTranscript, session.TranscriptSource)
+	if session.CanonicalTranscript != "before bridge after bridge" || session.TranscriptSource != TranscriptSourceRefined {
+		t.Errorf("canonical transcript = %q from %q, want remaining refined words", session.CanonicalTranscript, session.TranscriptSource)
 	}
-	if session.RefinementStatus != RefinementPending || session.SummaryStatus != SummaryPending || session.EnvoyPublishStatus != EnvoyPublishPending {
-		t.Errorf("follow-up states = refinement:%q summary:%q envoy:%q, want pending", session.RefinementStatus, session.SummaryStatus, session.EnvoyPublishStatus)
+	if session.RefinementStatus != RefinementCompleted || session.SummaryStatus != SummaryPending || session.EnvoyPublishStatus != EnvoyPublishPending {
+		t.Errorf("follow-up states = refinement:%q summary:%q envoy:%q, want refined completion and pending follow-up work", session.RefinementStatus, session.SummaryStatus, session.EnvoyPublishStatus)
 	}
 	if session.SummaryVersion != before.SummaryVersion+1 {
 		t.Errorf("summary version = %d, want %d", session.SummaryVersion, before.SummaryVersion+1)
@@ -132,8 +128,8 @@ func TestDeleteSegmentTextKeepsNoTextInTheSpanTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegmentText("span-columns", segments[1].ID, textSpan()); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := deleteRefinedTextTestSegment(t, store, "span-columns", segments[1].ID, textSpan()); err != nil {
+		t.Fatalf("delete refined text: %v", err)
 	}
 	rows, err := store.DB().Query(`SELECT * FROM deleted_text_spans`)
 	if err != nil {
@@ -200,8 +196,8 @@ func TestDeleteSegmentTextErasesTheDatabaseFilesAndTheBackup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := store.DeleteSegmentText("backed-up", segments[1].ID, textSpan()); err != nil {
-				t.Fatalf("DeleteSegmentText: %v", err)
+			if err := deleteRefinedTextTestSegment(t, store, "backed-up", segments[1].ID, textSpan()); err != nil {
+				t.Fatalf("delete refined text: %v", err)
 			}
 			assertDatabaseFilesLack(t, path, backupSecret, "after bridge")
 			assertBackupHolds(t, path, backupSecret, false)
@@ -209,20 +205,20 @@ func TestDeleteSegmentTextErasesTheDatabaseFilesAndTheBackup(t *testing.T) {
 	}
 }
 
-// TestDeleteSegmentTextScrubsMergedSources fails if "Delete text" on a
-// merged session leaves the words in a merged source's row, the search
-// index, its embeddings or the database files.
-func TestDeleteSegmentTextScrubsMergedSources(t *testing.T) {
+// TestDeleteRefinedSegmentTextScrubsMergedSources fails if "Delete text" on
+// a merged refined session leaves the words in a merged source's row, search
+// index, embeddings or database files.
+func TestDeleteRefinedSegmentTextScrubsMergedSources(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "merged.db")
 	store, err := NewSQLiteStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	secretID := mergedSessionWithSecret(t, store)
+	secret := mergedSessionWithSecret(t, store)
 
-	if err := store.DeleteSegmentText("merged", secretID, TextDeletionSpan{AudioPath: "recording-source-a.mp3", Start: 2, End: 4, SHA256: "a-sha"}); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := store.DeleteRefinedSegmentText("merged", secret.id, secret.revision); err != nil {
+		t.Fatalf("DeleteRefinedSegmentText: %v", err)
 	}
 
 	source := storeSession(t, store, "source-a")
@@ -252,18 +248,21 @@ func TestDeleteSegmentTextScrubsMergedSources(t *testing.T) {
 	assertDatabaseFilesLack(t, path, mergedSourceSecret, "alpha stays")
 }
 
-// mergedSessionWithSecret makes session "merged" of "source-a" (recording
-// recording-source-a.mp3, whose second segment, title, summary, refined
-// transcript, embedding and events hold mergedSourceSecret) and "source-b",
-// and returns the id of the segment holding the secret.
-func mergedSessionWithSecret(t *testing.T, store *SQLiteStore) int64 {
+type refinedSegmentSelection struct {
+	id       int64
+	revision int
+}
+
+// mergedSessionWithSecret makes a merged session whose refined segment owns
+// the secret occurrence from source-a.
+func mergedSessionWithSecret(t *testing.T, store *SQLiteStore) refinedSegmentSelection {
 	t.Helper()
 	return mergedSessionWithSecretAfter(t, store, func() {})
 }
 
-// mergedSessionWithSecretAfter is mergedSessionWithSecret, running beforeMerge
-// just before the sources are merged.
-func mergedSessionWithSecretAfter(t *testing.T, store *SQLiteStore, beforeMerge func()) int64 {
+// mergedSessionWithSecretAfter runs beforeMerge just before the sources are
+// merged, then publishes the merged session's timed word occurrences.
+func mergedSessionWithSecretAfter(t *testing.T, store *SQLiteStore, beforeMerge func()) refinedSegmentSelection {
 	t.Helper()
 	startA := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	startB := startA.Add(time.Hour)
@@ -303,43 +302,47 @@ func mergedSessionWithSecretAfter(t *testing.T, store *SQLiteStore, beforeMerge 
 	if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, startA, startB.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.Canonicalize("merged"); err != nil {
-		t.Fatal(err)
+	words := []RefinedWord{
+		{RecordingPath: "recording-source-a.mp3", RecordingSHA256: "a-sha", Ordinal: 0, Text: "alpha stays", Start: 0, End: 2},
+		{RecordingPath: "recording-source-a.mp3", RecordingSHA256: "a-sha", Ordinal: 1, Text: "the " + mergedSourceSecret + " words", Start: 2, End: 4},
+		{RecordingPath: "recording-source-b.mp3", RecordingSHA256: "b-sha", RecordingOrdinal: 1, Ordinal: 0, Text: "charlie stays", Start: 0, End: 2},
 	}
-	segments, err := store.GetSegments("merged")
+	segments := []RefinedSegment{
+		{RecordingPath: "recording-source-a.mp3", RecordingSHA256: "a-sha", FirstWordOrdinal: 0, LastWordOrdinal: 0, Text: words[0].Text, Start: 0, End: 2},
+		{RecordingPath: "recording-source-a.mp3", RecordingSHA256: "a-sha", FirstWordOrdinal: 1, LastWordOrdinal: 1, Text: words[1].Text, Start: 2, End: 4},
+		{RecordingPath: "recording-source-b.mp3", RecordingSHA256: "b-sha", RecordingOrdinal: 1, FirstWordOrdinal: 0, LastWordOrdinal: 0, Text: words[2].Text, Start: 0, End: 2},
+	}
+	revision, err := store.PublishRefinementAtGeneration("merged", RefinedTranscript(words), "nova-3", words, segments, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range segments {
-		if strings.Contains(segments[i].Text, mergedSourceSecret) {
-			return segments[i].ID
+	refined, err := store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range refined {
+		if strings.Contains(refined[i].Text, mergedSourceSecret) {
+			return refinedSegmentSelection{id: refined[i].ID, revision: revision}
 		}
 	}
-	t.Fatal("control: no merged segment holds the secret")
-	return 0
+	t.Fatal("control: no merged refined segment holds the secret")
+	return refinedSegmentSelection{}
 }
 
-// TestDeleteSegmentTextFencesStaleRefinementAndSummary fails if a
+// TestDeleteRefinedSegmentTextFencesStaleRefinementAndSummary fails if a
 // refinement or summary started before "Delete text" can still store text
 // read before it.
-func TestDeleteSegmentTextFencesStaleRefinementAndSummary(t *testing.T) {
+func TestDeleteRefinedSegmentTextFencesStaleRefinementAndSummary(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "text-fence")
-	segments, err := store.GetSegments("text-fence")
-	if err != nil {
-		t.Fatal(err)
-	}
-	claimedAt, claimed, err := store.ClaimRefinement("text-fence", "recording.mp3")
-	if err != nil || !claimed {
-		t.Fatalf("claim refinement = %v, %v", claimed, err)
-	}
+	revision, segments := publishRefinedSegmentTestSession(t, store, "text-fence", "recording.mp3", "recording-sha")
 	if err := store.StartSummary("text-fence"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegmentText("text-fence", segments[1].ID, textSpan()); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := store.DeleteRefinedSegmentText("text-fence", segments[1].ID, revision); err != nil {
+		t.Fatalf("DeleteRefinedSegmentText: %v", err)
 	}
-	if err := store.UpdateRefinementAtGeneration("text-fence", "stale private deletion token", RefinementCompleted, "", claimedAt); err == nil {
+	if err := store.UpdateRefinementAtGeneration("text-fence", "stale private deletion token", RefinementCompleted, "", 0); err == nil {
 		t.Error("a refinement started before Delete text stored its transcript")
 	}
 	if err := store.UpdateSummaryAtGeneration("text-fence", "stale", "stale private deletion token", SummaryCompleted, "default", "{}", "", 0); err == nil {
@@ -348,53 +351,6 @@ func TestDeleteSegmentTextFencesStaleRefinementAndSummary(t *testing.T) {
 	session := storeSession(t, store, "text-fence")
 	if strings.Contains(session.RefinedTranscript, "private") || strings.Contains(session.Summary, "private") {
 		t.Fatalf("stale words returned to the session: refined %q summary %q", session.RefinedTranscript, session.Summary)
-	}
-}
-
-// TestDeleteSegmentTextRefusesAnInvalidSpan fails if "Delete text" changes
-// anything without a span to record: refinement would bring the words back.
-func TestDeleteSegmentTextRefusesAnInvalidSpan(t *testing.T) {
-	store := newTestSQLiteStore(t)
-	_, _ = segmentTestSession(t, store, "text-invalid")
-	segments, err := store.GetSegments("text-invalid")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, span := range map[string]TextDeletionSpan{
-		"no recording":  {Start: 2, End: 4, SHA256: "sha"},
-		"empty span":    {AudioPath: "recording.mp3", Start: 4, End: 4, SHA256: "sha"},
-		"negative time": {AudioPath: "recording.mp3", Start: -1, End: 4, SHA256: "sha"},
-		"no hash":       {AudioPath: "recording.mp3", Start: 2, End: 4},
-	} {
-		if err := store.DeleteSegmentText("text-invalid", segments[1].ID, span); err == nil {
-			t.Errorf("%s: DeleteSegmentText accepted %+v", name, span)
-		}
-	}
-	if remaining, err := store.GetSegments("text-invalid"); err != nil || len(remaining) != 3 {
-		t.Fatalf("segments after refused deletions = %d (%v), want 3", len(remaining), err)
-	}
-}
-
-// TestDeleteSegmentTextWithoutLocalAudioLeavesNothingToRefine fails if
-// "Delete text" on a session whose audio was removed to free space leaves
-// its refinement pending: no refinement can run without audio, and a Drive
-// sync or summary would wait for it.
-func TestDeleteSegmentTextWithoutLocalAudioLeavesNothingToRefine(t *testing.T) {
-	store := newTestSQLiteStore(t)
-	_, _ = segmentTestSession(t, store, "text-no-audio")
-	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = '', audio_removed_at = '2026-11-11T11:00:00Z', refinement_status = ? WHERE id = 'text-no-audio'`, RefinementCompleted); err != nil {
-		t.Fatal(err)
-	}
-	segments, err := store.GetSegments("text-no-audio")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeleteSegmentText("text-no-audio", segments[1].ID, textSpan()); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
-	}
-	session := storeSession(t, store, "text-no-audio")
-	if session.RefinementStatus != RefinementNoAudio || session.AudioPath != "" || session.AudioRemovedAt == "" {
-		t.Errorf("refinement %q, audio path %q, removed at %q; want no_audio and the audio still removed", session.RefinementStatus, session.AudioPath, session.AudioRemovedAt)
 	}
 }
 
@@ -426,8 +382,8 @@ func TestASpliceMovesTheTextDeletionSpansAfterIt(t *testing.T) {
 		}
 	}
 	cut := DeletedSpan{SessionID: "text-then-audio", AudioPath: "/audio/recording.mp3", Start: 2, End: 4, SHA256Before: "original", SHA256After: "spliced"}
-	if err := store.DeleteSegment("text-then-audio", segments[1].ID, cut); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := deleteRefinedAudioTestSegment(t, store, "text-then-audio", segments[1].ID, cut); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	// Committed, not yet spliced: the spans still describe the recording on disk.
 	if spans, err := store.TextDeletionSpans("recording.mp3"); err != nil || len(spans) != 5 || spans[0].SHA256 != "original" {
@@ -461,36 +417,6 @@ func TestASpliceMovesTheTextDeletionSpansAfterIt(t *testing.T) {
 	}
 }
 
-// TestATextDeletionCutOffBeforeItsRefinementIsRefinedAtStartup fails if the
-// startup recovery does not list a session whose "Delete text" committed
-// but whose refinement and summary a stop cut off: nothing else would run
-// them, and its summary would stay empty. A session with no audio left is
-// not listed (its summary is made by the startup summary pass).
-func TestATextDeletionCutOffBeforeItsRefinementIsRefinedAtStartup(t *testing.T) {
-	store := newTestSQLiteStore(t)
-	_, _ = segmentTestSession(t, store, "text-cut-off")
-	_, _ = segmentTestSession(t, store, "text-cut-off-no-audio")
-	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = '', audio_removed_at = '2026-11-11T11:00:00Z' WHERE id = 'text-cut-off-no-audio'`); err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{"text-cut-off", "text-cut-off-no-audio"} {
-		segments, err := store.GetSegments(id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := store.DeleteSegmentText(id, segments[1].ID, textSpan()); err != nil {
-			t.Fatalf("DeleteSegmentText %s: %v", id, err)
-		}
-	}
-	ids, err := store.DeletionsToRefine()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ids) != 1 || ids[0] != "text-cut-off" {
-		t.Errorf("DeletionsToRefine = %v, want [text-cut-off]", ids)
-	}
-}
-
 // TestDeleteTextFencesMergedSourcesToo fails if a refinement or summary of a
 // merged source, started before "Delete text" in the session it was merged
 // into, can still store the words it read: the scrub must move the source's
@@ -498,14 +424,14 @@ func TestATextDeletionCutOffBeforeItsRefinementIsRefinedAtStartup(t *testing.T) 
 func TestDeleteTextFencesMergedSourcesToo(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	claimedAt, claimed, err := 0, false, error(nil)
-	secretID := mergedSessionWithSecretAfter(t, store, func() {
+	target := mergedSessionWithSecretAfter(t, store, func() {
 		claimedAt, claimed, err = store.ClaimRefinement("source-a", "recording-source-a.mp3")
 	})
 	if err != nil || !claimed {
 		t.Fatalf("claim the source's refinement before the merge = %v, %v", claimed, err)
 	}
-	if err := store.DeleteSegmentText("merged", secretID, TextDeletionSpan{AudioPath: "recording-source-a.mp3", Start: 2, End: 4, SHA256: "a-sha"}); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := store.DeleteRefinedSegmentText("merged", target.id, target.revision); err != nil {
+		t.Fatalf("DeleteRefinedSegmentText: %v", err)
 	}
 	if err := store.UpdateRefinementAtGeneration("source-a", "stale "+mergedSourceSecret, RefinementCompleted, "", claimedAt); err == nil {
 		t.Error("a refinement of a merged source started before Delete text stored its transcript")
@@ -532,8 +458,8 @@ func TestASessionMergedBeforeItsDocumentsSyncedStillOwesThem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegmentText("text-then-merge", segments[1].ID, textSpan()); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := deleteRefinedTextTestSegment(t, store, "text-then-merge", segments[1].ID, textSpan()); err != nil {
+		t.Fatalf("delete refined text: %v", err)
 	}
 	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
 	if err := store.MergeSessions("text-then-merge-merged", []string{"text-then-merge"}, started, started.Add(time.Minute)); err != nil {
@@ -559,8 +485,8 @@ func TestDeletingTheSessionADeletionWasMadeInKeepsItsSpans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegmentText("text-then-gone", segments[1].ID, textSpan()); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := deleteRefinedTextTestSegment(t, store, "text-then-gone", segments[1].ID, textSpan()); err != nil {
+		t.Fatalf("delete refined text: %v", err)
 	}
 	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
 	if err := store.MergeSessions("text-then-gone-merged", []string{"text-then-gone"}, started, started.Add(time.Minute)); err != nil {
@@ -591,27 +517,5 @@ func TestARefreshThatLostARaceIsOwedAgain(t *testing.T) {
 	}
 	if pending != 1 {
 		t.Errorf("drive_documents_pending = %d after a refresh that lost a race, want 1", pending)
-	}
-}
-
-// TestDeleteTextWithPartOfTheAudioRemovedDoesNotRefine fails if "Delete
-// text" of a session whose audio was partly removed to free space leaves its
-// refinement to run: a refinement of what is left would drop the words of
-// the removed recordings from the transcript.
-func TestDeleteTextWithPartOfTheAudioRemovedDoesNotRefine(t *testing.T) {
-	store := newTestSQLiteStore(t)
-	_, _ = segmentTestSession(t, store, "text-partial")
-	if _, err := store.DB().Exec(`UPDATE sessions SET audio_removed_at = '2026-11-11T11:00:00Z', refinement_status = ?, refined_transcript = 'old refined text with private deletion token' WHERE id = 'text-partial'`, RefinementCompleted); err != nil {
-		t.Fatal(err)
-	}
-	segments, err := store.GetSegments("text-partial")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeleteSegmentText("text-partial", segments[1].ID, textSpan()); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
-	}
-	if session := storeSession(t, store, "text-partial"); session.RefinementStatus != RefinementNoAudio || session.AudioPath != "recording.mp3" || session.RefinedTranscript != "" {
-		t.Errorf("refinement %q, audio path %q, refined %q; want no_audio, the audio left kept and no stale refinement", session.RefinementStatus, session.AudioPath, session.RefinedTranscript)
 	}
 }

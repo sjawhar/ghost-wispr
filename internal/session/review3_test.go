@@ -38,7 +38,7 @@ func TestReview3NoSummarizerCompletesSummaryAfterDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("s", segments[1].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, "s", segments[1].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatal(err)
 	}
 	manager.generateSummary(context.Background(), "s", started)

@@ -83,7 +83,7 @@ func r3SessionStore(t *testing.T) (*storage.SQLiteStore, int64) {
 
 func deleteR3Session(t *testing.T, store *storage.SQLiteStore, id int64) {
 	t.Helper()
-	if err := store.DeleteSegment("r3", id, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, "r3", id, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -91,7 +91,7 @@ func TestAFailedBackupEraseIsRetried(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"})
+	err = deleteRefinedAudioTestSegment(t, store, "backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"})
 	if !errors.Is(err, ErrSegmentPostCommitMaintenance) {
 		t.Fatalf("DeleteSegment with a full disk = %v, want %v", err, ErrSegmentPostCommitMaintenance)
 	}
@@ -123,7 +123,7 @@ func TestARetryThatCannotRefreshTheBackupErasesIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
+	if err := deleteRefinedAudioTestSegment(t, store, "backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
 		t.Fatalf("DeleteSegment with a full disk = %v", err)
 	}
 
@@ -157,7 +157,7 @@ func TestAFailedLogOverwriteIsRetried(t *testing.T) {
 	maintenance := postDeleteMaintenance
 	t.Cleanup(func() { postDeleteMaintenance = maintenance })
 	postDeleteMaintenance = func(*sql.DB, string) error { return errors.New("a reader kept the log from starting over") }
-	if err := store.DeleteSegment("logged", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
+	if err := deleteRefinedAudioTestSegment(t, store, "logged", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
 		t.Fatalf("DeleteSegment with a failing log overwrite = %v", err)
 	}
 	if log, err := os.ReadFile(path + "-wal"); err != nil || !bytes.Contains(log, []byte("private deletion token")) {
@@ -201,7 +201,7 @@ func TestOpeningTheStoreRetriesAnOwedErasure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
+	if err := deleteRefinedAudioTestSegment(t, store, "backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
 		t.Fatalf("DeleteSegment with a full disk = %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -337,7 +337,7 @@ func deleteSecretOwingTheErase(t *testing.T, store *SQLiteStore) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
+	if err := deleteRefinedAudioTestSegment(t, store, "backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); !errors.Is(err, ErrSegmentPostCommitMaintenance) {
 		t.Fatalf("DeleteSegment whose erase cannot finish = %v, want %v", err, ErrSegmentPostCommitMaintenance)
 	}
 	if owed := owedErasures(t, store); owed != 1 {
@@ -429,7 +429,7 @@ func TestALaterDeletionFinishesAnEarlierOwedErase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("backed-up", segments[0].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 2, SHA256Before: "c", SHA256After: "d"}); err != nil {
+	if err := deleteRefinedAudioTestSegment(t, store, "backed-up", segments[0].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 2, SHA256Before: "c", SHA256After: "d"}); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
 	if owed := owedErasures(t, store); owed != 0 {

@@ -25,7 +25,7 @@ func TestPendingSplicesFlushesTheDirectoryBeforeMarkingASpliceComplete(t *testin
 		sum := sha256.Sum256([]byte(contents))
 		return hex.EncodeToString(sum[:])
 	}
-	if err := store.DeleteSegment("spliced", segments[1].ID, DeletedSpan{AudioPath: recording, Start: 2, End: 4, SHA256Before: hash("original"), SHA256After: hash("spliced")}); err != nil {
+	if err := deleteRefinedAudioTestSegment(t, store, "spliced", segments[1].ID, DeletedSpan{AudioPath: recording, Start: 2, End: 4, SHA256Before: hash("original"), SHA256After: hash("spliced")}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(recording, []byte("spliced"), 0o600); err != nil {
