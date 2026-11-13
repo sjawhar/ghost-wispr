@@ -593,3 +593,75 @@ func assertDeleteTextRefusedWithoutSpan(t *testing.T, store *storage.SQLiteStore
 		t.Errorf("spans after refused Delete text = %+v (%v), want none", spans, err)
 	}
 }
+
+func TestDeleteTextRefusesWrongRepeatedFillerRun(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "delete.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 18, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("filler-run", started); err != nil {
+		t.Fatal(err)
+	}
+	segments := []string{"Right.", "Yeah.", "Um.", "Yeah.", "So.", "Right.", "Yeah.", "Um.", "Yeah.", "So."}
+	for i, text := range segments {
+		if err := store.AppendSegment("filler-run", transcribe.Segment{
+			Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession("filler-run", started.Add(10*time.Second), recording); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetSegments("filler-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := []audio.Word{
+		{Text: "Right.", Start: 0, End: 0.2}, {Text: "Yeah.", Start: 0.3, End: 0.5}, {Text: "uh", Start: 0.6, End: 0.8}, {Text: "Yeah.", Start: 0.9, End: 1.1}, {Text: "So.", Start: 1.2, End: 1.4},
+		{Text: "Right.", Start: 14, End: 14.2}, {Text: "Yeah.", Start: 14.3, End: 14.5}, {Text: "um", Start: 14.8, End: 15.1}, {Text: "Yeah.", Start: 15.2, End: 15.4}, {Text: "So.", Start: 15.5, End: 15.7},
+	}
+	assertDeleteTextRefusedWithoutSpan(t, store, "filler-run", stored[2].ID, recording, words)
+}
+
+func TestDeleteTextRefusesWrongRepeatedContentRun(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "delete.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 19, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("content-run", started); err != nil {
+		t.Fatal(err)
+	}
+	segments := []string{"Okay.", "Yeah.", "Purple elephant seventeen.", "The budget is fine.", "Great.", "Okay.", "Yeah.", "Purple elephant seventeen.", "The budget is fine.", "Great."}
+	for i, text := range segments {
+		if err := store.AppendSegment("content-run", transcribe.Segment{
+			Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession("content-run", started.Add(10*time.Second), recording); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetSegments("content-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := []audio.Word{
+		{Text: "Okay.", Start: 0, End: 0.2}, {Text: "Yeah.", Start: 0.3, End: 0.5}, {Text: "Purple", Start: 0.6, End: 0.8}, {Text: "elegant", Start: 0.85, End: 1.1}, {Text: "seventeen.", Start: 1.15, End: 1.4}, {Text: "The", Start: 1.5, End: 1.7}, {Text: "budget", Start: 1.75, End: 2}, {Text: "is", Start: 2.05, End: 2.2}, {Text: "fine.", Start: 2.25, End: 2.5}, {Text: "Great.", Start: 2.6, End: 2.8},
+		{Text: "Okay.", Start: 14, End: 14.2}, {Text: "Yeah.", Start: 14.3, End: 14.5}, {Text: "Purple", Start: 14.6, End: 14.8}, {Text: "elephant", Start: 14.85, End: 15.1}, {Text: "seventeen.", Start: 15.15, End: 15.4}, {Text: "The", Start: 15.5, End: 15.7}, {Text: "budget", Start: 15.75, End: 16}, {Text: "is", Start: 16.05, End: 16.2}, {Text: "fine.", Start: 16.25, End: 16.5}, {Text: "Great.", Start: 16.6, End: 16.8},
+	}
+	assertDeleteTextRefusedWithoutSpan(t, store, "content-run", stored[2].ID, recording, words)
+}

@@ -507,7 +507,9 @@ func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, sta
 		if index > 1 {
 			beforeBefore = segments[index-2].Text
 		}
-		neighbourRecord, _, neighbourEnd, _, err := audio.LocateWords(candidates, before, beforeBefore, text)
+		// Do not use text here: it is the disputed segment and an exact
+		// decoy can otherwise pull the neighbour match around itself.
+		neighbourRecord, neighbourStart, neighbourEnd, _, err := audio.LocateWords(candidates, before, beforeBefore, "")
 		if err != nil {
 			return fmt.Errorf("%w: before-neighbour could not be aligned", server.ErrSegmentNotRemovedCleanly)
 		}
@@ -515,7 +517,9 @@ func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, sta
 			if neighbourEnd > start || wordsRemainBetween(words, neighbourEnd, start) {
 				return fmt.Errorf("%w: words between the segment and its before-neighbour are outside the aligned span", server.ErrSegmentNotRemovedCleanly)
 			}
-			lower, beforeInRecord = neighbourEnd, true
+			// Bound survivors by the neighbour's outer edge, not merely
+			// the edge beside the deleted span.
+			lower, beforeInRecord = neighbourStart, true
 		} else if recordingHasWordsOnSide(words, start, end, true) {
 			return fmt.Errorf("%w: words before the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
 		}
@@ -528,7 +532,7 @@ func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, sta
 		if index+2 < len(segments) {
 			afterAfter = segments[index+2].Text
 		}
-		neighbourRecord, neighbourStart, _, _, err := audio.LocateWords(candidates, after, text, afterAfter)
+		neighbourRecord, neighbourStart, neighbourEnd, _, err := audio.LocateWords(candidates, after, "", afterAfter)
 		if err != nil {
 			return fmt.Errorf("%w: after-neighbour could not be aligned", server.ErrSegmentNotRemovedCleanly)
 		}
@@ -536,7 +540,7 @@ func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, sta
 			if neighbourStart < end || wordsRemainBetween(words, end, neighbourStart) {
 				return fmt.Errorf("%w: words between the segment and its after-neighbour are outside the aligned span", server.ErrSegmentNotRemovedCleanly)
 			}
-			upper, afterInRecord = neighbourStart-length, true
+			upper, afterInRecord = neighbourEnd-length, true
 		} else if recordingHasWordsOnSide(words, start, end, false) {
 			return fmt.Errorf("%w: words after the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
 		}
