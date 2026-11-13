@@ -82,7 +82,15 @@
       visibleSegments.length > 0 &&
       visibleSegments.every((segment) => (segment.transcript_revision ?? 0) > 0),
   )
-  const deleteUnavailableNote = 'This conversation is still being refined; delete once it finishes.'
+  const deleteUnavailableNote = $derived.by(() => {
+    if (session?.refinement_status === RefinementStatus.Failed) {
+      return 'Refinement failed; retry refinement before deleting.'
+    }
+    if (session?.refinement_status === RefinementStatus.NoAudio) {
+      return 'No recording is on this unit; restore it from Drive before deleting.'
+    }
+    return 'This conversation is still being refined; delete once it finishes.'
+  })
 
   // Disk pressure removed the session's audio to free space: all of it, or
   // part of it, when the audio path still names what is left.

@@ -688,6 +688,18 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS recording_sources (
+			merged_session_id TEXT NOT NULL,
+			recording_path TEXT NOT NULL,
+			source_session_id TEXT NOT NULL,
+			PRIMARY KEY (merged_session_id, recording_path),
+			FOREIGN KEY(merged_session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create recording sources table: %w", err)
+	}
+
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS deleted_segments (
 			session_id TEXT NOT NULL,
 			audio_path TEXT NOT NULL,
@@ -923,6 +935,26 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 	return nil
 }
 
+// RestoreAudioForRefinement records recordings restored from Drive so the
+// normal generation-fenced refinement path can claim and process them.
+func (s *SQLiteStore) RestoreAudioForRefinement(id, audioPath string) error {
+	if strings.TrimSpace(audioPath) == "" {
+		return errors.New("restored audio path is required")
+	}
+	res, err := s.db.Exec(`UPDATE sessions SET audio_path = ?, audio_removed_at = '', refinement_status = ? WHERE id = ?`, audioPath, RefinementPending, id)
+	if err != nil {
+		return fmt.Errorf("record restored audio for session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count restored audio session %s: %w", id, err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *SQLiteStore) DiscardSession(id string) error {
 	res, err := s.db.Exec(`UPDATE sessions SET status = 'discarded' WHERE id = ?`, id)
 	if err != nil {
@@ -1018,7 +1050,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	}
 
 	audioQuery := fmt.Sprintf(
-		`SELECT audio_path FROM sessions WHERE id IN (%s) AND audio_path != '' ORDER BY started_at ASC`,
+		`SELECT id, audio_path FROM sessions WHERE id IN (%s) AND audio_path != '' ORDER BY started_at ASC`,
 		strings.Join(placeholders, ","),
 	)
 	rows, err := tx.Query(audioQuery, args[1:]...)
@@ -1028,12 +1060,22 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 
 	var audioPaths []string
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		var sourceID, path string
+		if err := rows.Scan(&sourceID, &path); err != nil {
 			_ = rows.Close()
-			return fmt.Errorf("scan audio path: %w", err)
+			return fmt.Errorf("scan audio paths: %w", err)
 		}
-		audioPaths = append(audioPaths, p)
+		for _, recordingPath := range strings.Split(path, ",") {
+			recordingPath = strings.TrimSpace(recordingPath)
+			if recordingPath == "" {
+				continue
+			}
+			audioPaths = append(audioPaths, recordingPath)
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO recording_sources(merged_session_id, recording_path, source_session_id) VALUES(?, ?, ?)`, newID, recordingPath, sourceID); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("record merged recording source: %w", err)
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()

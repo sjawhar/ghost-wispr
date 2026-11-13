@@ -29,7 +29,7 @@ type batchRefinementResult struct {
 // cannot reintroduce deleted words.
 func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTranscriber, audioPath string) (batchRefinementResult, error) {
 	var result batchRefinementResult
-	recordingOrdinal := 0
+	recordingOrdinal, transcribedWords := 0, 0
 	for _, recording := range strings.Split(audioPath, ",") {
 		recording = strings.TrimSpace(recording)
 		if recording == "" {
@@ -46,9 +46,7 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 		if err != nil {
 			return batchRefinementResult{}, err
 		}
-		if len(batch.Words) == 0 && strings.TrimSpace(batch.Transcript) != "" {
-			return batchRefinementResult{}, fmt.Errorf("refine %s: the transcription gave no word times", recording)
-		}
+		transcribedWords += len(batch.Words)
 		recordingHash, err := recordingSHA256(recording)
 		if err != nil {
 			return batchRefinementResult{}, fmt.Errorf("hash recording %s: %w", recording, err)
@@ -72,6 +70,9 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 		}
 		result.Words = append(result.Words, kept...)
 		recordingOrdinal++
+	}
+	if transcribedWords == 0 {
+		return batchRefinementResult{}, fmt.Errorf("batch refinement returned no timed words")
 	}
 	result.Transcript = storage.RefinedTranscript(result.Words)
 	result.Segments = storage.BuildRefinedSegments(result.Words)

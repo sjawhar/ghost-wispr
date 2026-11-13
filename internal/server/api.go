@@ -751,6 +751,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
 			return
 		}
+		if sessionData.RefinementStatus == storage.RefinementNoAudio {
+			writeJSONError(w, http.StatusConflict, "no recording is on this unit; restore it from Drive before deleting")
+			return
+		}
 		if sessionData.RefinementStatus != storage.RefinementCompleted {
 			if sessionData.RefinementStatus == storage.RefinementFailed {
 				writeJSONError(w, http.StatusConflict, "this conversation's refinement failed; retry refinement before deleting")

@@ -61,7 +61,11 @@ func TestDeleteRefinedTextUsesStoredWordOccurrence(t *testing.T) {
 	if gotHash, err := fileSHA256(recording); err != nil || gotHash != hash {
 		t.Fatalf("DeleteRefinedText changed recording hash to %q (%v), want %q", gotHash, err, hash)
 	}
-	remaining, err := store.RefinedWords("s1", revision)
+	session, err := store.GetSession("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.RefinedWords("s1", session.RefinedRevision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +126,11 @@ func TestDeleteRefinedAudioSplicesWithFFmpegAndShiftsWords(t *testing.T) {
 	if !summarized {
 		t.Fatal("DeleteRefinedAudio did not regenerate the summary")
 	}
-	remaining, err := store.RefinedWords("s1", revision)
+	session, err := store.GetSession("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.RefinedWords("s1", session.RefinedRevision)
 	if err != nil {
 		t.Fatal(err)
 	}

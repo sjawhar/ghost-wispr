@@ -111,19 +111,25 @@ func TestDeleteRefinedSegmentTextDeletesOnlyTheSelectedRepeatedWords(t *testing.
 	if len(after) != 1 || after[0].Text != "Repeat stays." || after[0].FirstWordOrdinal != 2 {
 		t.Fatalf("remaining segments = %#v, want only the selected occurrence removed", after)
 	}
-	remaining, err := store.RefinedWords("s1", revision)
+	session, err := store.GetSession("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.RefinedRevision != revision+1 {
+		t.Fatalf("revision after deletion = %d, want %d", session.RefinedRevision, revision+1)
+	}
+	remaining, err := store.RefinedWords("s1", session.RefinedRevision)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(remaining) != 2 || remaining[0].Ordinal != 2 || remaining[1].Ordinal != 3 {
 		t.Fatalf("remaining words = %#v, want only the selected occurrence removed", remaining)
 	}
-	session, err := store.GetSession("s1")
-	if err != nil {
-		t.Fatal(err)
-	}
 	if session.RefinementStatus != RefinementCompleted || session.RefinedTranscript != "Repeat stays." || session.CanonicalTranscript != "Repeat stays." || session.TranscriptSource != TranscriptSourceRefined {
 		t.Fatalf("session after refined deletion = %#v, want the rebuilt refined transcript", session)
+	}
+	if err := store.DeleteRefinedSegmentText("s1", before[1].ID, revision); !errors.Is(err, ErrStaleTranscriptRevision) {
+		t.Fatalf("stale selection after rebuilt ids = %v, want stale transcript revision", err)
 	}
 	spans, err := store.TextDeletionSpans("recording.mp3")
 	if err != nil {
@@ -167,7 +173,11 @@ func TestAudioCutShiftsLaterRefinedWords(t *testing.T) {
 	if err := store.MarkSpliceComplete(&span); err != nil {
 		t.Fatalf("MarkSpliceComplete: %v", err)
 	}
-	remaining, err := store.RefinedWords("s1", revision)
+	session, err := store.GetSession("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.RefinedWords("s1", session.RefinedRevision)
 	if err != nil {
 		t.Fatal(err)
 	}

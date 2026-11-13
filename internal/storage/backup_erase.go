@@ -183,8 +183,9 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	if err != nil {
 		return err
 	}
-	// rebuildable: the deleted segment was found by its id, so the remaining
-	// segments are the ones the canonical transcript may be rebuilt from.
+	// An old backup may predate the refined segment ids. Prefer the id when
+	// it exists; otherwise remove the segment rows that still contain the
+	// selected persisted word text in affected sessions.
 	rebuildable := false
 	switch {
 	case segments["id"]:
@@ -194,17 +195,35 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 		case err == nil:
 			affected = append(affected, holder)
 			holders = append(holders, holder)
+			if _, err := tx.Exec(`DELETE FROM segments WHERE id = ?`, segmentID); err != nil {
+				return fmt.Errorf("delete the segment from the backup: %w", err)
+			}
+			rebuildable = true
+		case errors.Is(err, sql.ErrNoRows) && segments["text"]:
+			needle := strings.Trim(strings.TrimSpace(deletedText), ".,!?;:")
+			if needle != "" {
+				query := `DELETE FROM segments WHERE text LIKE ?`
+				args := []any{"%" + needle + "%"}
+				if segments["session_id"] {
+					query += ` AND session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
+					for _, id := range affected {
+						args = append(args, id)
+					}
+				}
+				res, err := tx.Exec(query, args...)
+				if err != nil {
+					return fmt.Errorf("delete refined words from the older backup: %w", err)
+				}
+				rows, err := res.RowsAffected()
+				if err != nil {
+					return fmt.Errorf("count older backup segment scrub: %w", err)
+				}
+				rebuildable = rows > 0
+			}
 		case !errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("find the deleted segment in the backup: %w", err)
 		}
-		if _, err := tx.Exec(`DELETE FROM segments WHERE id = ?`, segmentID); err != nil {
-			return fmt.Errorf("delete the segment from the backup: %w", err)
-		}
-		rebuildable = true
 	case segments["text"]:
-		// With no id, the segment is found by its text, in the sessions that
-		// can hold it: every segment there with that text goes, an identical
-		// line kept elsewhere in those sessions with it.
 		query, args := `DELETE FROM segments WHERE text = ?`, []any{deletedText}
 		if segments["session_id"] {
 			query += ` AND session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
@@ -257,6 +276,9 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	if events, err := columns("mcp_events"); err != nil {
 		return err
 	} else if events["payload"] {
+		if err := dropLiveTranscriptEvents(tx, holders); err != nil {
+			return fmt.Errorf("drop backup live transcript events: %w", err)
+		}
 		if err := rewriteDeletedTextEvents(tx, affected, holders, deletedText, span); err != nil {
 			return fmt.Errorf("rewrite backup events: %w", err)
 		}

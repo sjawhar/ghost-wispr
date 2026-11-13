@@ -383,6 +383,51 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 	return sources, chainOf(deletedAt), nil
 }
 
+func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording string, remaining []transcribe.Segment) (sources, holders []string, err error) {
+	sources, err = mergedSourceIDs(tx, sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(sources) == 0 {
+		return nil, nil, nil
+	}
+	rows, err := tx.Query(`SELECT recording_path, source_session_id FROM recording_sources WHERE merged_session_id = ?`, sessionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read merged recording sources: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	owners := make(map[string]string)
+	for rows.Next() {
+		var recording, source string
+		if err := rows.Scan(&recording, &source); err != nil {
+			return nil, nil, fmt.Errorf("scan merged recording source: %w", err)
+		}
+		owners[recording] = source
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate merged recording sources: %w", err)
+	}
+	own := make(map[string][]transcribe.Segment, len(sources))
+	for i := range remaining {
+		if source := owners[remaining[i].RecordingPath]; source != "" {
+			own[source] = append(own[source], remaining[i])
+		}
+	}
+	if holder := owners[deletedRecording]; holder != "" {
+		holders = append(holders, holder)
+	}
+	for _, source := range sources {
+		if _, err := tx.Exec(`UPDATE sessions
+			SET title = '', summary = '', summary_model = '', speaker_names = '{}',
+			    refined_transcript = '', refinement_model = '',
+			    canonical_transcript = ?, transcript_source = ?, deletion_generation = deletion_generation + 1
+			WHERE id = ?`, canonicalTranscript(own[source]), TranscriptSourceStreaming, source); err != nil {
+			return nil, nil, fmt.Errorf("scrub merged source %s by recording: %w", source, err)
+		}
+	}
+	return sources, holders, nil
+}
+
 func canonicalTranscript(segments []transcribe.Segment) string {
 	var builder strings.Builder
 	for i := range segments {
@@ -747,10 +792,33 @@ func redactEventText(value any, deletedText string) (any, bool) {
 			copy[key] = redacted
 			changed = changed || entryChanged
 		}
+
 		return copy, changed
 	default:
 		return value, false
 	}
+}
+
+// dropLiveTranscriptEvents removes live transcript events for sessions whose
+// segment table was rebuilt. Their socket-relative times cannot safely map to
+// a batch recording occurrence.
+func dropLiveTranscriptEvents(tx *sql.Tx, sessionIDs []string) error {
+	seen := make(map[string]struct{}, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if sessionID == "" {
+			continue
+		}
+		if _, duplicate := seen[sessionID]; duplicate {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		if _, err := tx.Exec(`DELETE FROM mcp_events
+			WHERE event_type = 'live_transcript'
+			  AND (NOT json_valid(payload) OR COALESCE(json_extract(payload, '$.session_id'), '') = ?)`, sessionID); err != nil {
+			return fmt.Errorf("drop live transcript events for session %s: %w", sessionID, err)
+		}
+	}
+	return nil
 }
 
 // PendingSplices returns deletions whose recording still has the pre-splice

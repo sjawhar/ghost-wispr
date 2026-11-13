@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -75,7 +76,11 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	if err != nil {
 		return err
 	}
-	if err := replaceRefinedSegments(tx, sessionID, revision, session.StartedAt, words); err != nil {
+	nextRevision := revision + 1
+	if _, err := tx.Exec(`UPDATE refined_words SET transcript_revision = ? WHERE session_id = ? AND transcript_revision = ?`, nextRevision, sessionID, revision); err != nil {
+		return fmt.Errorf("advance refined word revision: %w", err)
+	}
+	if err := replaceRefinedSegments(tx, sessionID, nextRevision, session.StartedAt, words); err != nil {
 		return err
 	}
 	remaining, err := getSegments(tx, sessionID)
@@ -89,22 +94,37 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 			summary_status = ?, summary_error = '', summary_version = summary_version + 1,
 			deletion_generation = deletion_generation + 1,
 			refinement_generation = deletion_generation + 1,
+			refined_revision = ?,
 			envoy_publish_status = ?,
 			sync_status = CASE WHEN sync_state IN (?, ?) THEN sync_status ELSE ? END,
 			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END
 		WHERE id = ? AND refined_revision = ?`,
 		transcript, RefinementCompleted, transcript, TranscriptSourceRefined,
-		SummaryPending, EnvoyPublishPending,
+		SummaryPending, nextRevision, EnvoyPublishPending,
 		SyncStateSyncing, SyncStateRemoteDeleted, SyncPending,
 		SyncStateSyncing, SyncStateRemoteDeleted, SyncStatePending,
 		sessionID, revision); err != nil {
 		return fmt.Errorf("update refined segment deletion session: %w", err)
 	}
-	sources, holders, err := scrubMergedSources(tx, sessionID, remaining, time.Now().UTC())
+	sources, holders, err := scrubMergedSourcesByRecording(tx, sessionID, selected.RecordingPath, remaining)
 	if err != nil {
 		return err
 	}
+	if len(sources) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sources)), ",")
+		args := make([]any, 0, len(sources)+5)
+		for _, source := range sources {
+			args = append(args, source)
+		}
+		args = append(args, selected.RecordingPath, selected.RecordingSHA256, selected.FirstWordOrdinal, selected.LastWordOrdinal)
+		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`) AND recording_path = ? AND recording_sha256 = ? AND ordinal BETWEEN ? AND ?`, args...); err != nil {
+			return fmt.Errorf("scrub source refined words: %w", err)
+		}
+	}
 	owners := append([]string{sessionID}, sources...)
+	if err := dropLiveTranscriptEvents(tx, owners); err != nil {
+		return err
+	}
 	for _, owner := range owners {
 		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
 			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
@@ -134,7 +154,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit refined text deletion: %w", err)
 	}
-	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, selected.Text, owners, append([]string{sessionID}, holders...), span)
+	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, selected.Text, owners, owners, span)
 }
 
 func refinedSegment(q querier, sessionID string, segmentID int64, revision int) (RefinedSegment, error) {

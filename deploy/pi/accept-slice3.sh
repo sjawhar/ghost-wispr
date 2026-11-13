@@ -791,6 +791,34 @@ choose_segments() {
   return 0
 }
 
+# choose_audio_segment re-reads the replacement table after Delete text rebuilt
+# every id and retry refinement advanced the transcript revision.
+choose_audio_segment() {
+  local detail=$1 audio_ids control_ids
+  audio_ids=$(segment_ids_matching "$detail" "$audio_pair")
+  if [[ $(line_count "$audio_ids") != 1 ]]; then
+    reason="\"$audio_phrase\" is in $(line_count "$audio_ids") refined timed segments, not one"
+    return 2
+  fi
+  if [[ "$(segment_ids_matching "$detail" "$audio_trace")" != "$audio_ids" ]]; then
+    reason="a word of \"$audio_phrase\" is in another segment too"
+    return 2
+  fi
+  audio_revision=$(segment_revision "$detail" "$audio_ids")
+  if [[ ! "$audio_revision" =~ ^[1-9][0-9]*$ ]]; then
+    reason='the audio segment has no positive transcript revision'
+    return 2
+  fi
+  control_ids=$(segment_ids_matching "$detail" "$control_pair" | grep -Fvx -e "$audio_ids")
+  if [[ -z "$control_ids" ]]; then
+    reason="no other refined timed segment holds the control phrase \"$control_phrase\""
+    return 2
+  fi
+  audio_segment_id=$audio_ids
+  reason="segment $audio_segment_id revision $audio_revision holds \"$audio_phrase\""
+  return 0
+}
+
 recording_hashes() {
   local dir=$1 detail=$2 index=0 recording hash
   while IFS= read -r recording; do
@@ -1443,9 +1471,17 @@ run_a11_text_only() {
 }
 
 run_a11() {
-  local body_file="$scratch_dir/delete-text-and-audio.json" code
+  local body_file="$scratch_dir/delete-text-and-audio.json" code detail
   if [[ "$conversation_ready" != true ]]; then
     printf 'A11 UNKNOWN: not run: %s\n' "$conversation_problem"
+    return 2
+  fi
+  detail=$(session_detail "$acceptance_session_id") || {
+    printf 'A11 UNKNOWN: cannot read refined segments before audio delete\n'
+    return 2
+  }
+  if ! choose_audio_segment "$detail"; then
+    printf 'A11 UNKNOWN: %s\n' "$reason"
     return 2
   fi
   printf 'A11 RAN: before "Delete text and audio", every check must find "%s"; that finding is the control for the same check after the delete.\n' "$audio_phrase"
@@ -1929,6 +1965,8 @@ run_self_test() (
   expect 0 'one segment per phrase and the control phrase elsewhere is chosen' choose_segments "$detail"
   [[ "$text_only_segment_id" == 4 && "$audio_segment_id" == 2 && "$text_only_revision" == 1 && "$audio_revision" == 1 ]] \
     || fail "self-test: chose segments $text_only_segment_id/$text_only_revision and $audio_segment_id/$audio_revision, want 4/1 and 2/1"
+  expect 2 'a live segment without a transcript revision stops the run' choose_segments \
+    "$(jq '.segments[1].transcript_revision = 0' <<<"$detail")"
   expect 2 'a phrase word in a second segment stops the run' choose_segments \
     "$(jq '.segments[2].text = "A: Which orange machine do we order?"' <<<"$detail")"
   expect 2 'a phrase in two segments stops the run' choose_segments \
@@ -2249,6 +2287,8 @@ $(session_field "$detail" summary)"
     audio_segment_id=2
     audio_revision=1
     delete_segment() { printf '%s\n' "$3" >>"$marker"; printf 204; }
+    choose_audio_segment() { :; }
+    session_detail() { printf '{}'; }
     sleep() { :; }
     audio_round() {
       round_reset
@@ -2267,6 +2307,8 @@ $(session_field "$detail" summary)"
     audio_segment_id=2
     audio_revision=1
     delete_segment() { printf '%s %s\n' "$2" "$3" >>"$marker"; printf 204; }
+    choose_audio_segment() { :; }
+    session_detail() { printf '{}'; }
     audio_round() { round_reset; round_lines=('PASS: planted'); }
     run_a11 >/dev/null 2>&1 || fail 'self-test: A11 did not pass on planted passing rounds'
     [[ "$(<"$marker")" == '2 mode=text_and_audio&revision=1' ]] || fail "self-test: A11 sent $(one_line "$(<"$marker")")"
