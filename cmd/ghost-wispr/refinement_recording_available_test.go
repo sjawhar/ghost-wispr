@@ -44,3 +44,14 @@ func TestRefinementRecordingAvailableRejectsRemoteDeletedDriveFolder(t *testing.
 		t.Fatal("remote-deleted Drive folder was accepted as a recording source")
 	}
 }
+
+func TestRefinementRecordingAvailableRejectsNeverRecordedDriveSession(t *testing.T) {
+	session := storage.Session{
+		SyncStatus:     storage.SyncSynced,
+		SyncState:      storage.SyncStateSynced,
+		GDriveFolderID: "folder-1",
+	}
+	if err := refinementRecordingAvailable(&session, t.TempDir()); err == nil {
+		t.Fatal("never-recorded session was accepted from its Drive folder")
+	}
+}

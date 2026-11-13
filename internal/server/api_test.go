@@ -241,7 +241,7 @@ func TestAPISessionsList(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{
-			"2026-02-26": {{ID: "s1", StartedAt: started, SummaryStatus: storage.SummaryCompleted}},
+			"2026-02-26": {{ID: "s1", StartedAt: started, SummaryStatus: storage.SummaryCompleted, RefinedRevision: 7}},
 		},
 		sessions: map[string]storage.Session{},
 		segments: map[string][]transcribe.Segment{},
@@ -264,8 +264,12 @@ func TestAPISessionsList(t *testing.T) {
 	if got := rr.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
 		t.Fatalf("expected application/json content-type, got %q", got)
 	}
-	if !strings.Contains(rr.Body.String(), "s1") {
-		t.Fatalf("expected body to contain session id, got %s", rr.Body.String())
+	var sessions []storage.Session
+	if err := json.Unmarshal(rr.Body.Bytes(), &sessions); err != nil {
+		t.Fatalf("decode session list: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].RefinedRevision != 7 {
+		t.Fatalf("session list refined revision = %#v, want 7", sessions)
 	}
 }
 

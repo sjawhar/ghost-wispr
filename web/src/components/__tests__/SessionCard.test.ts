@@ -235,6 +235,18 @@ describe('SessionCard', () => {
       },
       false,
     ],
+    [
+      'a never-recorded session with a Drive folder',
+      {
+        ...baseSession,
+        audio_path: '',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      },
+      false,
+    ],
   ])('offers Retry refinement only for %s', (_, session, wantsRetry) => {
     render({
       session,
@@ -371,9 +383,14 @@ describe('SessionCard', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ error: 'the recording was removed from this unit and its Drive folder is deleted' }), {
-          status: 409,
-        }),
+        new Response(
+          JSON.stringify({
+            error: 'the recording was removed from this unit and its Drive folder is deleted',
+          }),
+          {
+            status: 409,
+          },
+        ),
       ),
     )
     try {
@@ -397,7 +414,11 @@ describe('SessionCard', () => {
       })
 
       await fireEvent.click(screen.getByTestId('retry-refinement-btn'))
-      expect(await screen.findByText('the recording was removed from this unit and its Drive folder is deleted')).toBeTruthy()
+      expect(
+        await screen.findByText(
+          'the recording was removed from this unit and its Drive folder is deleted',
+        ),
+      ).toBeTruthy()
     } finally {
       vi.unstubAllGlobals()
     }

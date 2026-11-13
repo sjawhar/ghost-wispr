@@ -93,7 +93,9 @@ it('says a completed conversation without timed words needs refinement before de
   })
 
   expect(
-    screen.getAllByText('This conversation completed without timed words. Use Retry refinement before deleting.'),
+    screen.getAllByText(
+      'This conversation completed without timed words. Use Retry refinement before deleting.',
+    ),
   ).toHaveLength(2)
 })
 

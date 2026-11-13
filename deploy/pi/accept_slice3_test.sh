@@ -25,6 +25,7 @@ for line in \
   'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement' \
   'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes' \
   'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes' \
+  'A11 text only self-test RAN: retry refinement waits for a newer revision' \
   'A11 self-test RAN: planted failure rejected' \
   'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence' \
   'A11 self-test RAN: a failed control stops the row before "Delete text and audio"' \
@@ -119,6 +120,8 @@ assert_mutation_caught 'a Drive token that can write' \
 assert_mutation_caught 'a retry refinement that rejects a 202 response' \
   'retry_http_status=202' 'retry_http_status=500'
 assert_mutation_caught 'a slow refinement that skips its running state' \
-  '{"session":{"refinement_status":"running"}}' '{"session":{"refinement_status":"completed"}}'
+  '{"session":{"refinement_status":"running","refined_revision":1}}' '{"session":{"refinement_status":"completed","refined_revision":2}}'
+assert_mutation_caught 'a retry refinement that returns before polling' \
+  $'retry_refinement() {\n' $'retry_refinement() {\n  return 0\n'
 
 printf 'slice 3 acceptance test passed\n'

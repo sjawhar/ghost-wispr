@@ -1401,9 +1401,19 @@ poll_after() {
   return "$result"
 }
 
-# retry_refinement: the UI's "retry refinement", then poll until it completes.
+# retry_refinement: the UI's "retry refinement", then poll until a newer
+# refinement revision completes.
 retry_refinement() {
-  local response detail state attempt
+  local response detail state revision before_revision attempt
+  if ! detail=$(session_detail "$acceptance_session_id"); then
+    printf 'A11 text only FAILED: could not read the refinement before retrying\n' >&2
+    return 1
+  fi
+  before_revision=$(session_field "$detail" refined_revision)
+  if ! [[ "$before_revision" =~ ^[0-9]+$ ]]; then
+    printf 'A11 text only FAILED: the refinement before retrying has no revision\n' >&2
+    return 1
+  fi
   response=$(post_json "/api/sessions/$acceptance_session_id/retry-refinement" '{}') || {
     printf 'A11 text only FAILED: retry refinement was refused\n' >&2
     return 1
@@ -1415,10 +1425,13 @@ retry_refinement() {
   for (( attempt = 1; attempt <= refinement_attempts; attempt++ )); do
     if detail=$(session_detail "$acceptance_session_id"); then
       state=$(session_field "$detail" refinement_status)
+      revision=$(session_field "$detail" refined_revision)
       case "$state" in
         completed)
-          printf 'A11 text only RAN: retry refinement completed.\n'
-          return 0
+          if [[ "$revision" =~ ^[0-9]+$ ]] && (( 10#$revision > 10#$before_revision )); then
+            printf 'A11 text only RAN: retry refinement completed at revision %s.\n' "$revision"
+            return 0
+          fi
           ;;
         failed|no_audio)
           printf 'A11 text only FAILED: retry refinement ended %s\n' "$state" >&2
@@ -1428,7 +1441,7 @@ retry_refinement() {
     fi
     sleep 2
   done
-  printf 'A11 text only FAILED: retry refinement did not complete in %d minutes\n' "$((refinement_attempts * 2 / 60))" >&2
+  printf 'A11 text only FAILED: retry refinement did not complete a newer revision in %d minutes\n' "$((refinement_attempts * 2 / 60))" >&2
   return 1
 }
 
@@ -2277,14 +2290,24 @@ $(session_field "$detail" summary)"
 
   (
     unit_url=https://unit.test
+    marker="$controls_dir/fast-refinement"
+    : >"$marker"
     retry_http_status=202
     curl() {
       [[ "$retry_http_status" == 202 ]] || return 1
       [[ " $* " == *" --fail "* ]] || return 1
       printf '{"triggered":true}'
     }
-    session_detail() { printf '{"session":{"refinement_status":"completed"}}'; }
+    session_detail() {
+      printf 'read\n' >>"$marker"
+      if [[ "$(wc -l <"$marker")" == 1 ]]; then
+        printf '{"session":{"refinement_status":"completed","refined_revision":1}}'
+      else
+        printf '{"session":{"refinement_status":"completed","refined_revision":2}}'
+      fi
+    }
     retry_refinement >/dev/null || fail 'self-test: a fast refinement did not accept the planted 202'
+    [[ "$(wc -l <"$marker")" == 2 ]] || fail 'self-test: a fast refinement did not read the newer revision'
   ) || exit 1
   printf 'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes\n'
   (
@@ -2299,17 +2322,41 @@ $(session_field "$detail" summary)"
     }
     session_detail() {
       printf 'read\n' >>"$marker"
-      if [[ "$(wc -l <"$marker")" == 1 ]]; then
-        printf '{"session":{"refinement_status":"running"}}'
-      else
-        printf '{"session":{"refinement_status":"completed"}}'
-      fi
+      case "$(wc -l <"$marker")" in
+        1) printf '{"session":{"refinement_status":"completed","refined_revision":1}}' ;;
+        2) printf '{"session":{"refinement_status":"running","refined_revision":1}}' ;;
+        *) printf '{"session":{"refinement_status":"completed","refined_revision":2}}' ;;
+      esac
     }
     sleep() { :; }
     retry_refinement >/dev/null || fail 'self-test: a slow refinement did not complete after the planted running state'
-    [[ "$(wc -l <"$marker")" == 2 ]] || fail 'self-test: a slow refinement did not wait for completion'
+    [[ "$(wc -l <"$marker")" == 3 ]] || fail 'self-test: a slow refinement did not wait for completion'
   ) || exit 1
   printf 'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes\n'
+  (
+    unit_url=https://unit.test
+    marker="$controls_dir/stale-refinement"
+    : >"$marker"
+    retry_http_status=202
+    curl() {
+      [[ "$retry_http_status" == 202 ]] || return 1
+      [[ " $* " == *" --fail "* ]] || return 1
+      printf '{"triggered":true}'
+    }
+    session_detail() {
+      printf 'read\n' >>"$marker"
+      case "$(wc -l <"$marker")" in
+        1|2) printf '{"session":{"refinement_status":"completed","refined_revision":1}}' ;;
+        *) printf '{"session":{"refinement_status":"failed","refined_revision":1}}' ;;
+      esac
+    }
+    sleep() { :; }
+    if retry_refinement >/dev/null 2>&1; then
+      fail 'self-test: a stale completed revision passed as the retry'
+    fi
+    [[ "$(wc -l <"$marker")" == 3 ]] || fail 'self-test: a stale completed revision was not polled again'
+  ) || exit 1
+  printf 'A11 text only self-test RAN: retry refinement waits for a newer revision\n'
   (
     : >"$marker"
     conversation_ready=true

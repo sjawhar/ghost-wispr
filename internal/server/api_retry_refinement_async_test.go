@@ -99,3 +99,37 @@ func TestRetryRefinementReturnsRecordingAvailabilityError(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func TestRetryRefinementRefusesNeverRecordedSession(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementNoAudio},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	retried := make(chan struct{}, 1)
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		RefinementRecordingAvailable: func(context.Context, string) error {
+			return errors.New("no recording is available on this unit or Drive")
+		},
+		RetryRefinement: func(context.Context, string) error {
+			retried <- struct{}{}
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/sessions/s1/retry-refinement", nil))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "no recording is available") {
+		t.Fatalf("retry refinement for a never-recorded session = %d %s, want 409 naming the missing recording", response.Code, response.Body.String())
+	}
+	select {
+	case <-retried:
+		t.Fatal("retry refinement started for a never-recorded session")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
