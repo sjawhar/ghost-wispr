@@ -1292,7 +1292,7 @@ func main() {
 			if err != nil {
 				log.Printf("warning: read merged session %s before refinement: %v", sessionID, err)
 			} else if merged.AudioPath != "" {
-				if err := manager.RefineSession(ctx, sessionID); err != nil {
+				if err := manager.RefineSession(ctx, sessionID, merged.AudioPath, merged.StartedAt); err != nil {
 					log.Printf("warning: refine merged session %s: %v", sessionID, err)
 				}
 			}
