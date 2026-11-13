@@ -27,8 +27,8 @@ func TestR11SpliceQueriesUseInsertionOrder(t *testing.T) {
 	}{
 		{"completed.mp3", "first", "2026-11-13T12:00:00Z", 1},
 		{"completed.mp3", "second", "2026-11-13T12:00:00.1Z", 1},
-		{"pending-a.mp3", "first-pending", "2026-11-13T12:00:00.1Z", 0},
-		{"pending-b.mp3", "second-pending", "2026-11-13T12:00:00Z", 0},
+		{"pending-a.mp3", "first-pending", "2026-11-13T12:00:00Z", 0},
+		{"pending-b.mp3", "second-pending", "2026-11-13T12:00:00.1Z", 0},
 	} {
 		if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, splice_complete)
 			VALUES('session', ?, 1, 2, 'before', ?, ?, ?)`, row.path, row.after, row.deletedAt, row.complete); err != nil {
@@ -42,10 +42,6 @@ func TestR11SpliceQueriesUseInsertionOrder(t *testing.T) {
 	pending, err := store.PendingSplices("")
 	if err != nil || len(pending) != 2 || pending[0].AudioPath != "pending-a.mp3" || pending[1].AudioPath != "pending-b.mp3" {
 		t.Fatalf("pending splices = %+v, err=%v; want insertion order", pending, err)
-	}
-	oldest, found, err := store.OldestPendingSplice("session")
-	if err != nil || !found || !oldest.Equal(started.Add(100*time.Millisecond)) {
-		t.Fatalf("oldest pending = %s, found:%t err:%v; want first inserted pending splice", oldest, found, err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = 'session'`); err != nil {
 		t.Fatal(err)
@@ -88,5 +84,32 @@ func TestR12DriveReplacementInputUsesInsertionOrder(t *testing.T) {
 	pending, recording, err := store.DriveReplacementInput("session")
 	if err != nil || !pending || recording != "latest.mp3" {
 		t.Fatalf("replacement input = pending:%t recording:%q err:%v, want latest.mp3", pending, recording, err)
+	}
+}
+
+// TestR12OldestPendingSpliceUsesInsertionOrder fails if a text ordering picks
+// a later insertion as the oldest pending splice.
+func TestR12OldestPendingSpliceUsesInsertionOrder(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "oldest-order.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("session", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, deletedAt := range []string{"2026-11-13T12:00:00.1Z", "2026-11-13T12:00:00Z"} {
+		if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
+			VALUES('session', 'recording.mp3', 1, 2, 'before', 'after', ?)`, deletedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldest, found, err := store.OldestPendingSplice("session")
+	if err != nil || !found || !oldest.Equal(started.Add(100*time.Millisecond)) {
+		t.Fatalf("oldest pending = %s, found:%t err:%v; want first inserted pending splice", oldest, found, err)
 	}
 }
