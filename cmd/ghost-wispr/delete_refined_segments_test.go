@@ -9,6 +9,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 func TestDeleteRefinedTextUsesStoredWordOccurrence(t *testing.T) {
@@ -139,5 +140,18 @@ func TestDeleteRefinedAudioSplicesWithFFmpegAndShiftsWords(t *testing.T) {
 	}
 	if duration, err := audio.Duration(context.Background(), recording); err != nil || duration >= 2 {
 		t.Fatalf("spliced recording duration = %v, %v; want a shorter recording", duration, err)
+	}
+}
+
+func TestRefinedSpliceBoundsClampBothNeighbours(t *testing.T) {
+	selected := transcribe.Segment{RecordingPath: "recording.mp3", RecordingSHA256: "hash", StartTime: 1, EndTime: 2}
+	words := []storage.RefinedWord{
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Start: 0.4, End: 0.9},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 1, Start: 1, End: 2},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 2, Start: 2.1, End: 2.5},
+	}
+	start, end := refinedSpliceBounds(words, &selected)
+	if start != 0.9 || end != 2.1 {
+		t.Fatalf("splice bounds = %v..%v, want both neighbouring word boundaries", start, end)
 	}
 }

@@ -172,6 +172,7 @@ func RefinedTranscript(words []RefinedWord) string {
 // new segment.
 func BuildRefinedSegments(words []RefinedWord) []RefinedSegment {
 	const pause = 800 * time.Millisecond
+	const pauseTolerance = time.Millisecond
 	segments := make([]RefinedSegment, 0)
 	current := RefinedSegment{FirstWordOrdinal: -1}
 	for _, word := range words {
@@ -182,7 +183,7 @@ func BuildRefinedSegments(words []RefinedWord) []RefinedSegment {
 				word.RecordingPath != current.RecordingPath ||
 				word.RecordingSHA256 != current.RecordingSHA256 ||
 				word.Speaker != current.Speaker ||
-				gap >= pause
+				gap >= pause-pauseTolerance
 		}
 		if start {
 			if current.FirstWordOrdinal >= 0 {
