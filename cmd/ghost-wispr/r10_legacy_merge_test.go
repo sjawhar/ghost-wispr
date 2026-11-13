@@ -41,9 +41,9 @@ func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
 	}
 }
 
-// TestR10RecordingSourcesPrecedeLegacyNames fails if an existing provenance
-// row is discarded for the old-merge filename fallback. A source recording
-// need not have its source session identifier as its basename.
+// TestR10RecordingSourcesPreserveCustomNames fails if a merge's recorded
+// provenance is discarded. A source recording need not use its session
+// identifier as its basename.
 func TestR10RecordingSourcesPrecedeLegacyNames(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "source-names.db"))
 	if err != nil {
