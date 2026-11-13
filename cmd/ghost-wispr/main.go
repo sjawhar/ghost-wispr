@@ -1288,6 +1288,14 @@ func main() {
 			return resummarize(ctx, store, summarizer, hub, publishSummaryReady, sessionID, preset)
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
+			merged, err := store.GetSession(sessionID)
+			if err != nil {
+				log.Printf("warning: read merged session %s before refinement: %v", sessionID, err)
+			} else if merged.AudioPath != "" {
+				if err := manager.RefineSession(ctx, sessionID); err != nil {
+					log.Printf("warning: refine merged session %s: %v", sessionID, err)
+				}
+			}
 			if summarizer == nil {
 				return
 			}

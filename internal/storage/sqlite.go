@@ -1172,7 +1172,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	}
 
 	_, err = tx.Exec(
-		`INSERT INTO sessions(id, started_at, ended_at, status, summary_status) VALUES(?, ?, ?, 'ended', 'pending')`,
+		`INSERT INTO sessions(id, started_at, ended_at, status, summary_status, refinement_status) VALUES(?, ?, ?, 'ended', 'pending', 'no_audio')`,
 		newID,
 		startedAt.UTC().Format(time.RFC3339Nano),
 		endedAt.UTC().Format(time.RFC3339Nano),
@@ -1223,7 +1223,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	_ = rows.Close()
 
 	if len(audioPaths) > 0 {
-		_, err = tx.Exec(`UPDATE sessions SET audio_path = ? WHERE id = ?`, strings.Join(audioPaths, ","), newID)
+		_, err = tx.Exec(`UPDATE sessions SET audio_path = ?, refinement_status = 'pending' WHERE id = ?`, strings.Join(audioPaths, ","), newID)
 		if err != nil {
 			return fmt.Errorf("set merged audio paths: %w", err)
 		}
