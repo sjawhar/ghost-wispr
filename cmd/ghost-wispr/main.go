@@ -176,6 +176,12 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 	if err != nil {
 		return fmt.Errorf("restore recording for refinement: %w", err)
 	}
+	keepDownloads := false
+	defer func() {
+		if !keepDownloads {
+			removeFiles(recordings.Downloaded)
+		}
+	}()
 	if len(recordings.Paths) == 0 {
 		return errors.New("no recording is available on this unit or Drive")
 	}
@@ -205,6 +211,7 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 	if !restored {
 		return fmt.Errorf("recording changed while restoring it for refinement")
 	}
+	keepDownloads = true
 	return nil
 }
 
