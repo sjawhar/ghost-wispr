@@ -310,3 +310,26 @@ func TestReservationChoosesTheHiddenPathBeforeTheRename(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLeftoverFinishersSkipReservedHiddenPaths(t *testing.T) {
+	for name, finish := range map[string]func(string, func(string) bool) error{
+		"Leftovers": LeftoversExcept,
+		"Orphans":   OrphansExcept,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			hidden := filepath.Join(dir, hiddenPrefix+"reserved")
+			held := holdOpen(t, hidden, []byte(secret))
+			if err := finish(dir, func(path string) bool { return path == hidden }); err != nil {
+				t.Fatalf("%s with reserved path: %v", name, err)
+			}
+			if got, err := os.ReadFile(hidden); err != nil || string(got) != secret {
+				t.Fatalf("%s changed reserved hidden path to %q (%v)", name, got, err)
+			}
+			if err := finish(dir, nil); err != nil {
+				t.Fatalf("%s without reservation: %v", name, err)
+			}
+			assertZeroed(t, held, len(secret))
+		})
+	}
+}

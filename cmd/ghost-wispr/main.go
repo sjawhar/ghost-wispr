@@ -784,6 +784,9 @@ func main() {
 	for i, warning := range cfgWarnings {
 		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
 	}
+	if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
+		log.Printf("warning: raw erase reservations: %v", err)
+	}
 	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
 	if restorePauseErr != nil {
 		warningRegistry.Set("capture-state", "Capture pause state could not be restored; the recorder started paused")
@@ -994,6 +997,9 @@ func main() {
 			warningRegistry.WithRecordingMismatch(func() {
 				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
 			})
+			if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
+				log.Printf("warning: raw erase reservations after deleting session %s: %v", sessionID, err)
+			}
 		},
 		OnSessionsMerged: func(sessionIDs []string) {
 			warningRegistry.WithRecordingMismatch(func() {

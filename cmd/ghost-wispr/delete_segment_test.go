@@ -340,11 +340,16 @@ func TestStartupFinishesAnEraseCutOffAfterItsSessionWasDeleted(t *testing.T) {
 // ones the cleanup forgets and records.
 type eraseDirectoryLister struct {
 	dirs      []string
+	reserved  map[string]bool
 	forgotten []string
 	recorded  []string
 }
 
 func (l *eraseDirectoryLister) RecordingDirectories() ([]string, error) { return l.dirs, nil }
+
+func (l *eraseDirectoryLister) ReservedRawErasePaths() (map[string]bool, error) {
+	return l.reserved, nil
+}
 
 func (l *eraseDirectoryLister) ForgetEraseDirectories(dirs []string) error {
 	l.forgotten = append(l.forgotten, dirs...)

@@ -224,5 +224,12 @@ func runGCPass(store gcStore, cfg *config.Config, drive sessionSyncer, health *g
 	}
 	health.record(collector.Held(), cfg.AudioDir, time.Now())
 	health.countUnverified(store)
+	if warnings != nil {
+		if reservationStore, ok := store.(rawEraseReservationStore); ok {
+			if err := refreshRawEraseReservationWarnings(reservationStore, warnings); err != nil {
+				logger.Warn("gc could not refresh raw erase reservation warnings", "error", err)
+			}
+		}
+	}
 	return deleted, nil
 }

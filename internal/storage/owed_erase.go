@@ -168,7 +168,11 @@ func (s *SQLiteStore) eraseOrphans() error {
 	if s.path == "" {
 		return nil
 	}
-	if err := erase.Orphans(filepath.Dir(s.path)); err != nil {
+	reserved, err := s.ReservedRawErasePaths()
+	if err != nil {
+		return fmt.Errorf("list reserved raw erases: %w", err)
+	}
+	if err := erase.OrphansExcept(filepath.Dir(s.path), func(path string) bool { return reserved[path] }); err != nil {
 		return fmt.Errorf("erase leftover backups: %w", err)
 	}
 	return nil

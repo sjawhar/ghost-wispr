@@ -49,9 +49,9 @@ type warningAfterVerificationStore struct {
 	warnings *warningsRegistry
 }
 
-func (s warningAfterVerificationStore) DeleteEndedSession(id, audioPath string) (bool, error) {
+func (s warningAfterVerificationStore) DeleteEndedSessionAndSources(id, audioPath, audioDir string) ([]string, bool, error) {
 	s.warnings.Set("recording-checksum-"+id, "Recording for session "+id+" does not match its Google Drive copy; local audio is retained.")
-	return s.SQLiteStore.DeleteEndedSession(id, audioPath)
+	return s.SQLiteStore.DeleteEndedSessionAndSources(id, audioPath, audioDir)
 }
 
 func recordingMismatchSession(t *testing.T, id string) (*storage.SQLiteStore, config.Config) {

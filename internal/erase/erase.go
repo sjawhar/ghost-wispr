@@ -86,6 +86,15 @@ func Reserve(path string) (Reservation, error) {
 	return Reservation{path: path, hidden: hidden}, nil
 }
 
+// ReservationAt rebuilds a previously persisted reservation. Both names must
+// be beside each other, and hiddenPath must be an erase name made by Reserve.
+func ReservationAt(path, hiddenPath string) (Reservation, error) {
+	if filepath.Dir(path) != filepath.Dir(hiddenPath) || !strings.HasPrefix(filepath.Base(hiddenPath), hiddenPrefix) {
+		return Reservation{}, fmt.Errorf("invalid erase reservation for %s", path)
+	}
+	return Reservation{path: path, hidden: hiddenPath}, nil
+}
+
 // OriginalPath is the name that a reservation will hide.
 func (r Reservation) OriginalPath() string {
 	return r.path
@@ -223,7 +232,13 @@ func Replace(from, to string) error {
 // in dir (as the app starts): an erase under way keeps such a second name
 // until its rename.
 func Leftovers(dir string) error {
-	return finish(dir, true)
+	return LeftoversExcept(dir, nil)
+}
+
+// LeftoversExcept is Leftovers except for paths skip keeps for a caller's
+// durable recovery. A skipped file remains whole under its hidden name.
+func LeftoversExcept(dir string, skip func(path string) bool) error {
+	return finish(dir, true, skip)
 }
 
 // Orphans finishes, while the app runs, the erase of every file in dir that
@@ -232,14 +247,20 @@ func Leftovers(dir string) error {
 // another name still links is left alone, since a Replace under way may still
 // need it.
 func Orphans(dir string) error {
-	return finish(dir, false)
+	return OrphansExcept(dir, nil)
+}
+
+// OrphansExcept is Orphans except for paths skip keeps for a caller's durable
+// recovery.
+func OrphansExcept(dir string, skip func(path string) bool) error {
+	return finish(dir, false, skip)
 }
 
 // finish erases the .erasing-* regular files in dir, and unlinks those another
 // name still links when unlinkSecondNames is set. Anything else with that
 // prefix (a symbolic link, a directory) is not one Remove or Replace makes and
 // is left alone.
-func finish(dir string, unlinkSecondNames bool) error {
+func finish(dir string, unlinkSecondNames bool, skip func(path string) bool) error {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -253,6 +274,9 @@ func finish(dir string, unlinkSecondNames bool) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
+		if skip != nil && skip(path) {
+			continue
+		}
 		if !unlinkSecondNames {
 			info, err := os.Lstat(path)
 			if errors.Is(err, os.ErrNotExist) {

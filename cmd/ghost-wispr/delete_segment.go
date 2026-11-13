@@ -830,6 +830,12 @@ func removeFiles(paths []string) {
 // route, a saved session's raw recording) left part way erased
 // (erase.Leftovers).
 func cleanupSpliceTempCopies(audioDir string) error {
+	return cleanupSpliceTempCopiesExcept(audioDir, nil)
+}
+
+// cleanupSpliceTempCopiesExcept leaves reserved hidden raw captures whole:
+// their session still exists, and startup could not restore them yet.
+func cleanupSpliceTempCopiesExcept(audioDir string, reserved map[string]bool) error {
 	entries, err := os.ReadDir(audioDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -847,7 +853,7 @@ func cleanupSpliceTempCopies(audioDir string) error {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
-	return errors.Join(cleanupErr, erase.Leftovers(audioDir))
+	return errors.Join(cleanupErr, erase.LeftoversExcept(audioDir, func(path string) bool { return reserved[path] }))
 }
 
 // recordingDirectoryLister lists the directories recordings are kept or
@@ -855,6 +861,7 @@ func cleanupSpliceTempCopies(audioDir string) error {
 // startup cleanup has finished, and records the audio directory as one.
 type recordingDirectoryLister interface {
 	RecordingDirectories() ([]string, error)
+	ReservedRawErasePaths() (map[string]bool, error)
 	ForgetEraseDirectories(dirs []string) error
 	RecordEraseDirectory(dir string) error
 }
@@ -875,10 +882,14 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 	if err != nil {
 		return fmt.Errorf("find the audio directory: %w", err)
 	}
+	reserved, err := store.ReservedRawErasePaths()
+	if err != nil {
+		return fmt.Errorf("list reserved raw erases: %w", err)
+	}
 	dirs := []string{audioDir}
 	others, err := store.RecordingDirectories()
 	if err != nil {
-		return errors.Join(err, cleanupSpliceTempCopies(audioDir), store.RecordEraseDirectory(audioDir))
+		return errors.Join(err, cleanupSpliceTempCopiesExcept(audioDir, reserved), store.RecordEraseDirectory(audioDir))
 	}
 	for _, dir := range others {
 		if dir, err = filepath.Abs(dir); err != nil {
@@ -891,7 +902,7 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 	var cleanupErr error
 	var cleaned []string
 	for _, dir := range dirs {
-		if err := cleanupSpliceTempCopies(dir); err != nil {
+		if err := cleanupSpliceTempCopiesExcept(dir, reserved); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue
 		}

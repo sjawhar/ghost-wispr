@@ -182,11 +182,11 @@ func (s *apiStoreStub) DeleteSession(id, audioDir string) (string, error) {
 	return sess.AudioPath, nil
 }
 
-func (s *apiStoreStub) ReserveRawSessionErase(id, _, _ string) error {
+func (s *apiStoreStub) ReserveRawSessionErase(id, _, hiddenPath string) (string, error) {
 	if _, ok := s.sessions[id]; !ok {
-		return os.ErrNotExist
+		return "", os.ErrNotExist
 	}
-	return nil
+	return hiddenPath, nil
 }
 
 func (*apiStoreStub) CancelRawSessionErase(string, string) error {

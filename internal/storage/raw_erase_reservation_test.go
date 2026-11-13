@@ -35,7 +35,7 @@ func TestOpeningStoreRestoresReservedRawEraseBeforeDeletingLeftovers(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ReserveRawSessionErase("session", reservation.OriginalPath(), reservation.HiddenPath()); err != nil {
+	if _, err := store.ReserveRawSessionErase("session", reservation.OriginalPath(), reservation.HiddenPath()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reservation.Begin(); err != nil {
@@ -85,7 +85,7 @@ func TestOpeningStoreFinishesReservedRawEraseAfterDeleteCommits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ReserveRawSessionErase("session", reservation.OriginalPath(), reservation.HiddenPath()); err != nil {
+	if _, err := store.ReserveRawSessionErase("session", reservation.OriginalPath(), reservation.HiddenPath()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reservation.Begin(); err != nil {

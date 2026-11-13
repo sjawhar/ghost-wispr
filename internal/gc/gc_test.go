@@ -65,9 +65,9 @@ func (m *mockStore) GetSession(id string) (storage.Session, error) {
 	return storage.Session{}, os.ErrNotExist
 }
 
-func (m *mockStore) DeleteEndedSession(id, _ string) (bool, error) {
+func (m *mockStore) DeleteEndedSessionAndSources(id, _, _ string) ([]string, bool, error) {
 	m.deletedIDs = append(m.deletedIDs, id)
-	return true, nil
+	return []string{id}, true, nil
 }
 
 func (m *mockStore) PurgeOldEvents(maxAge time.Duration) error {
