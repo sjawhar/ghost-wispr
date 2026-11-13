@@ -92,6 +92,7 @@ func (s *storeMock) EndSession(id string, _ time.Time, audioPath string) error {
 	return nil
 }
 
+//nolint:gocritic // Test double matches the production Store contract.
 func (s *storeMock) AppendSegment(sessionID string, seg transcribe.Segment) error {
 	if s.appendHook != nil {
 		s.appendHook()
@@ -251,8 +252,8 @@ func (s *storeMock) Canonicalize(sessionID string) (string, int, error) {
 		s.transcriptSource[sessionID] = "refined"
 	} else {
 		var b strings.Builder
-		for _, seg := range s.segments[sessionID] {
-			text := strings.TrimSpace(seg.Text)
+		for i := range s.segments[sessionID] {
+			text := strings.TrimSpace(s.segments[sessionID][i].Text)
 			if text == "" {
 				continue
 			}
@@ -506,6 +507,7 @@ type hubMock struct {
 	endedHook func(sessionID string)
 }
 
+//nolint:gocritic // Test double matches the Hub contract.
 func (h *hubMock) BroadcastLiveTranscript(_ string, _ transcribe.Segment) {
 	h.mu.Lock()
 	h.liveCount++
@@ -1815,8 +1817,8 @@ func segmentText(t *testing.T, store *storeMock, sessionID string) string {
 		t.Fatalf("GetSegments failed: %v", err)
 	}
 	var text []string
-	for _, seg := range segments {
-		text = append(text, seg.Text)
+	for i := range segments {
+		text = append(text, segments[i].Text)
 	}
 	return strings.Join(text, " ")
 }

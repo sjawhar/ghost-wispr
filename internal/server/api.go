@@ -76,8 +76,8 @@ func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speaker
 	// Try to parse as numeric index first
 	if idx, err := strconv.Atoi(speaker); err == nil {
 		// Numeric speaker index
-		for _, seg := range segments {
-			if seg.Speaker == idx {
+		for i := range segments {
+			if segments[i].Speaker == idx {
 				return true
 			}
 		}
@@ -90,8 +90,8 @@ func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speaker
 		return false
 	}
 
-	for _, seg := range segments {
-		if seg.Speaker == speakerIndex {
+	for i := range segments {
+		if segments[i].Speaker == speakerIndex {
 			return true
 		}
 	}
@@ -610,9 +610,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			sinceTimeObj := time.Unix(0, sinceTime*int64(time.Millisecond))
 			filtered := make([]transcribe.Segment, 0, len(segments))
-			for _, seg := range segments {
-				if seg.Timestamp.After(sinceTimeObj) {
-					filtered = append(filtered, seg)
+			for i := range segments {
+				if segments[i].Timestamp.After(sinceTimeObj) {
+					filtered = append(filtered, segments[i])
 				}
 			}
 			segments = filtered
@@ -682,9 +682,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		speaker := strings.TrimSpace(r.URL.Query().Get("speaker"))
 		if speaker != "" {
 			filtered := make([]transcribe.Segment, 0, len(segments))
-			for _, seg := range segments {
-				if hasSegmentForSpeaker([]transcribe.Segment{seg}, speaker, sess.SpeakerNames) {
-					filtered = append(filtered, seg)
+			for i := range segments {
+				if hasSegmentForSpeaker(segments[i:i+1], speaker, sess.SpeakerNames) {
+					filtered = append(filtered, segments[i])
 				}
 			}
 			segments = filtered
@@ -1239,9 +1239,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		qLower := strings.ToLower(q)
 		var matchTime float64
 		found := false
-		for _, seg := range segments {
-			if strings.Contains(strings.ToLower(seg.Text), qLower) {
-				matchTime = seg.StartTime
+		for i := range segments {
+			if strings.Contains(strings.ToLower(segments[i].Text), qLower) {
+				matchTime = segments[i].StartTime
 				found = true
 				break
 			}

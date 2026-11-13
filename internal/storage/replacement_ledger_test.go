@@ -72,9 +72,9 @@ func nestedMerge(t *testing.T, store *SQLiteStore) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, segment := range segments {
-		if strings.Contains(segment.Text, ledgerSecret) {
-			return segment.ID
+	for i := range segments {
+		if strings.Contains(segments[i].Text, ledgerSecret) {
+			return segments[i].ID
 		}
 	}
 	t.Fatal("no secret segment in m2")

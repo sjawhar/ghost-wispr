@@ -26,12 +26,13 @@ func newDeletionTestStore(t *testing.T, recording string) (*storage.SQLiteStore,
 	if err := store.CreateSession("session", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	for _, segment := range []transcribe.Segment{
+	testSegments := []transcribe.Segment{
 		{Speaker: 0, Text: "before bridge", StartTime: 0, EndTime: 1, Timestamp: started},
 		{Speaker: 1, Text: "private deletion token", StartTime: 1, EndTime: 2, Timestamp: started.Add(time.Second)},
 		{Speaker: 0, Text: "after bridge", StartTime: 2, EndTime: 3, Timestamp: started.Add(2 * time.Second)},
-	} {
-		if err := store.AppendSegment("session", segment); err != nil {
+	}
+	for i := range testSegments {
+		if err := store.AppendSegment("session", testSegments[i]); err != nil {
 			t.Fatalf("append segment: %v", err)
 		}
 	}

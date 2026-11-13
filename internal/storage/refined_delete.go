@@ -17,8 +17,11 @@ func (s *SQLiteStore) DeleteRefinedSegmentText(sessionID string, segmentID int64
 
 // DeleteRefinedSegmentAudio records an occurrence-based deletion before the
 // caller atomically replaces the recording with span's already-spliced bytes.
-func (s *SQLiteStore) DeleteRefinedSegmentAudio(sessionID string, segmentID int64, revision int, span DeletedSpan) error {
-	return s.deleteRefinedSegment(sessionID, segmentID, revision, &span, false)
+func (s *SQLiteStore) DeleteRefinedSegmentAudio(sessionID string, segmentID int64, revision int, span *DeletedSpan) error {
+	if span == nil {
+		return fmt.Errorf("delete refined segment: missing audio span")
+	}
+	return s.deleteRefinedSegment(sessionID, segmentID, revision, span, false)
 }
 
 func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, revision int, span *DeletedSpan, keepAudio bool) error {

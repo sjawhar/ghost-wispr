@@ -104,9 +104,9 @@ func (s *apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, erro
 func (s *apiStoreStub) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
 	all := s.segments[sessionID]
 	var result []transcribe.Segment
-	for _, seg := range all {
-		if seg.StartTime >= startTime && seg.EndTime <= endTime {
-			result = append(result, seg)
+	for i := range all {
+		if all[i].StartTime >= startTime && all[i].EndTime <= endTime {
+			result = append(result, all[i])
 		}
 	}
 	return result, nil

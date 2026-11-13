@@ -215,4 +215,3 @@ func TestSpliceIsAtomic(t *testing.T) {
 		t.Fatalf("failed splice changed recording: got %q, want %q", after, original)
 	}
 }
-

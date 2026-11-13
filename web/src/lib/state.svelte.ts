@@ -1,4 +1,4 @@
-import { ComponentStatus as ComponentStatusValue, RefinementStatus, SummaryStatus } from './types'
+import { ComponentStatus as ComponentStatusValue, SummaryStatus } from './types'
 import type {
   ComponentStatusEvent,
   LiveTranscriptEvent,

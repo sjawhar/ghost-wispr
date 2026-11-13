@@ -14,18 +14,18 @@ type Word struct {
 }
 
 type Segment struct {
-	ID                  int64     `json:"id,omitempty"`
-	Speaker             int       `json:"speaker"`
-	Text                string    `json:"text"`
-	StartTime           float64   `json:"start_time"`
-	EndTime             float64   `json:"end_time"`
-	Timestamp           time.Time `json:"timestamp"`
-	TranscriptRevision  int       `json:"transcript_revision,omitempty"`
-	RecordingPath       string    `json:"recording_path,omitempty"`
-	RecordingSHA256     string    `json:"recording_sha256,omitempty"`
-	RecordingOrdinal    int       `json:"recording_ordinal,omitempty"`
-	FirstWordOrdinal    int       `json:"first_word_ordinal,omitempty"`
-	LastWordOrdinal     int       `json:"last_word_ordinal,omitempty"`
+	ID                 int64     `json:"id,omitempty"`
+	Speaker            int       `json:"speaker"`
+	Text               string    `json:"text"`
+	StartTime          float64   `json:"start_time"`
+	EndTime            float64   `json:"end_time"`
+	Timestamp          time.Time `json:"timestamp"`
+	TranscriptRevision int       `json:"transcript_revision,omitempty"`
+	RecordingPath      string    `json:"recording_path,omitempty"`
+	RecordingSHA256    string    `json:"recording_sha256,omitempty"`
+	RecordingOrdinal   int       `json:"recording_ordinal,omitempty"`
+	FirstWordOrdinal   int       `json:"first_word_ordinal,omitempty"`
+	LastWordOrdinal    int       `json:"last_word_ordinal,omitempty"`
 }
 
 func GroupWordsBySpeaker(words []Word) []Segment {
@@ -74,7 +74,7 @@ func GroupWordsBySpeaker(words []Word) []Segment {
 	return segments
 }
 
-func (s Segment) FormatMarkdown() string {
+func (s *Segment) FormatMarkdown() string {
 	ts := s.Timestamp.Format("15:04:05")
 	return fmt.Sprintf("**[%s] Speaker %d:** %s", ts, s.Speaker, strings.TrimSpace(s.Text))
 }

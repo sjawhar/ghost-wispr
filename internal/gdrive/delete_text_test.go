@@ -52,9 +52,9 @@ func deleteTextFrom(t *testing.T, store *storage.SQLiteStore, id, recording, sum
 		t.Fatal(err)
 	}
 	var secretID int64
-	for _, segment := range segments {
-		if strings.Contains(segment.Text, textSecret) {
-			secretID = segment.ID
+	for i := range segments {
+		if strings.Contains(segments[i].Text, textSecret) {
+			secretID = segments[i].ID
 		}
 	}
 	if secretID == 0 {

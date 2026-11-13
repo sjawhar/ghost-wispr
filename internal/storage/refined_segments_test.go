@@ -161,7 +161,7 @@ func TestAudioCutShiftsLaterRefinedWords(t *testing.T) {
 		t.Fatal(err)
 	}
 	span := DeletedSpan{SessionID: "s1", AudioPath: "recording.mp3", SessionAudioPath: "recording.mp3", Start: 0, End: 0.5, SHA256Before: "before", SHA256After: "after"}
-	if err := store.DeleteRefinedSegmentAudio("s1", segments[0].ID, revision, span); err != nil {
+	if err := store.DeleteRefinedSegmentAudio("s1", segments[0].ID, revision, &span); err != nil {
 		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 	if err := store.MarkSpliceComplete(&span); err != nil {

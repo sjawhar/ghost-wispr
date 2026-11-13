@@ -24,8 +24,8 @@ func segmentTestSession(t *testing.T, store *SQLiteStore, id string) (time.Time,
 		{Speaker: 1, Text: "private deletion token", StartTime: 2, EndTime: 4, Timestamp: started.Add(2 * time.Second)},
 		{Speaker: 0, Text: "after bridge", StartTime: 4, EndTime: 6, Timestamp: started.Add(4 * time.Second)},
 	}
-	for _, segment := range segments {
-		if err := store.AppendSegment(id, segment); err != nil {
+	for i := range segments {
+		if err := store.AppendSegment(id, segments[i]); err != nil {
 			t.Fatalf("append segment: %v", err)
 		}
 	}

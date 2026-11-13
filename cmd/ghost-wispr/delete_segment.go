@@ -235,15 +235,14 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	if err != nil {
 		return err
 	}
-	var selected transcribe.Segment
-	found := false
-	for _, segment := range segments {
-		if segment.ID == segmentID {
-			selected, found = segment, true
+	var selected *transcribe.Segment
+	for i := range segments {
+		if segments[i].ID == segmentID {
+			selected = &segments[i]
 			break
 		}
 	}
-	if !found {
+	if selected == nil {
 		return storage.ErrSegmentNotFound
 	}
 	if selected.TranscriptRevision != revision || selected.RecordingPath == "" || selected.RecordingSHA256 == "" {
@@ -333,7 +332,7 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 		SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordingSet.Paths, ","),
 		Start: start, End: end, SHA256Before: beforeHash, SHA256After: afterHash,
 	}
-	if err := d.store.DeleteRefinedSegmentAudio(sessionID, segmentID, revision, span); err != nil {
+	if err := d.store.DeleteRefinedSegmentAudio(sessionID, segmentID, revision, &span); err != nil {
 		return err
 	}
 	keepDownloaded = true
@@ -355,7 +354,7 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	return nil
 }
 
-func refinedSpliceBounds(words []storage.RefinedWord, selected transcribe.Segment) (float64, float64) {
+func refinedSpliceBounds(words []storage.RefinedWord, selected *transcribe.Segment) (float64, float64) {
 	const margin = 0.25
 	start, end := selected.StartTime-margin, selected.EndTime+margin
 	if start < 0 {
@@ -374,7 +373,6 @@ func refinedSpliceBounds(words []storage.RefinedWord, selected transcribe.Segmen
 	}
 	return start, end
 }
-
 
 type pendingSpliceOutcome struct {
 	Span      storage.DeletedSpan
@@ -643,7 +641,6 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 	}
 	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned), store.RecordEraseDirectory(audioDir))
 }
-
 
 func copyForSplice(source string) (string, error) {
 	input, err := os.Open(source)

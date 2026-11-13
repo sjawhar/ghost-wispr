@@ -946,6 +946,7 @@ func (s *SQLiteStore) CountSegments(sessionID string) (int, error) {
 	return count, nil
 }
 
+//nolint:gocritic // Store's established append API passes one immutable segment by value.
 func (s *SQLiteStore) AppendSegment(sessionID string, seg transcribe.Segment) error {
 	_, err := s.db.Exec(
 		`INSERT INTO segments(session_id, speaker, text, start_time, end_time, timestamp) VALUES(?, ?, ?, ?, ?, ?)`,
@@ -2581,15 +2582,15 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		return fmt.Errorf("insert session %s: %w", sess.ID, err)
 	}
 
-	for _, seg := range segments {
+	for i := range segments {
 		_, err = tx.Exec(
 			`INSERT INTO segments(session_id, speaker, text, start_time, end_time, timestamp) VALUES(?, ?, ?, ?, ?, ?)`,
 			sess.ID,
-			seg.Speaker,
-			strings.TrimSpace(seg.Text),
-			seg.StartTime,
-			seg.EndTime,
-			seg.Timestamp.UTC().Format(time.RFC3339Nano),
+			segments[i].Speaker,
+			strings.TrimSpace(segments[i].Text),
+			segments[i].StartTime,
+			segments[i].EndTime,
+			segments[i].Timestamp.UTC().Format(time.RFC3339Nano),
 		)
 		if err != nil {
 			return fmt.Errorf("insert segment for session %s: %w", sess.ID, err)

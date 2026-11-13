@@ -117,9 +117,9 @@ func mergedDeletion(t *testing.T, store *storage.SQLiteStore, o *Orchestrator, s
 		t.Fatal(err)
 	}
 	var secretID int64
-	for _, s := range segments {
-		if strings.Contains(s.Text, "bravo merged secret") {
-			secretID = s.ID
+	for i := range segments {
+		if strings.Contains(segments[i].Text, "bravo merged secret") {
+			secretID = segments[i].ID
 		}
 	}
 	span := storage.DeletedSpan{SessionID: merged, AudioPath: recA, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}

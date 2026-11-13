@@ -49,8 +49,8 @@ func RenderTranscriptMarkdown(s *SyncSession, segments []transcribe.Segment) str
 	var b strings.Builder
 
 	speakerSet := make(map[int]struct{})
-	for _, seg := range segments {
-		speakerSet[seg.Speaker] = struct{}{}
+	for i := range segments {
+		speakerSet[segments[i].Speaker] = struct{}{}
 	}
 	speakers := make([]int, 0, len(speakerSet))
 	for sp := range speakerSet {
@@ -75,7 +75,8 @@ func RenderTranscriptMarkdown(s *SyncSession, segments []transcribe.Segment) str
 
 	b.WriteString("# Transcript\n\n")
 
-	for _, seg := range segments {
+	for i := range segments {
+		seg := &segments[i]
 		ts := seg.Timestamp.UTC().Format("15:04:05")
 		text := strings.TrimSpace(seg.Text)
 		if text == "" {

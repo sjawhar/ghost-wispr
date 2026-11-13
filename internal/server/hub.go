@@ -97,6 +97,7 @@ func (h *Hub) Broadcast(msg []byte) {
 	}
 }
 
+//nolint:gocritic // Hub's event API passes one immutable segment by value.
 func (h *Hub) BroadcastLiveTranscript(sessionID string, seg transcribe.Segment) {
 	h.broadcastEvent(LiveTranscriptEvent{
 		Event:     newEvent("live_transcript", seg.Timestamp),

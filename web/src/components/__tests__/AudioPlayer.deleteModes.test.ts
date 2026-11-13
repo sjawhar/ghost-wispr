@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AudioPlayer from '../AudioPlayer.svelte'
 import { resetState } from '../../lib/state.svelte'
-import { RefinementStatus } from '../../lib/types'
+import { RefinementStatus, SummaryStatus } from '../../lib/types'
 
 const segments = [
   {
@@ -35,7 +35,7 @@ function renderPlayer() {
       started_at: '2026-11-12T10:00:00Z',
       status: 'ended',
       summary: '',
-      summary_status: 'pending',
+      summary_status: SummaryStatus.Pending,
       summary_preset: '',
       audio_path: 'recording.mp3',
       refinement_status: RefinementStatus.Completed,
@@ -46,29 +46,31 @@ function renderPlayer() {
   })
 }
 
-  it('disables Delete until timed refined segments exist', () => {
-    render(AudioPlayer, {
-      sessionId: 's1',
-      segments,
-      session: {
-        id: 's1',
-        title: '',
-        started_at: '2026-11-12T10:00:00Z',
-        status: 'ended',
-        summary: '',
-        summary_status: 'pending',
-        summary_preset: '',
-        audio_path: 'recording.mp3',
-        refinement_status: RefinementStatus.Pending,
-      },
-      onDeleted: vi.fn(),
-      onNotFound: vi.fn().mockResolvedValue(false),
-    })
-    for (const button of screen.getAllByRole('button', { name: 'Delete segment' })) {
-      expect(button.hasAttribute('disabled')).toBe(true)
-    }
-    expect(screen.getAllByText('This conversation is still being refined; delete once it finishes.')).toHaveLength(2)
+it('disables Delete until timed refined segments exist', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: 'recording.mp3',
+      refinement_status: RefinementStatus.Pending,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
   })
+  for (const button of screen.getAllByRole('button', { name: 'Delete segment' })) {
+    expect(button.hasAttribute('disabled')).toBe(true)
+  }
+  expect(
+    screen.getAllByText('This conversation is still being refined; delete once it finishes.'),
+  ).toHaveLength(2)
+})
 
 describe('AudioPlayer segment deletion actions', () => {
   afterEach(() => {
@@ -115,9 +117,12 @@ describe('AudioPlayer segment deletion actions', () => {
     await fireEvent.click(screen.getByRole('button', { name: action }))
 
     await waitFor(() => {
-      expect(fetch).toHaveBeenCalledExactlyOnceWith(`/api/sessions/s1/segments/42?mode=${mode}&revision=1`, {
-        method: 'DELETE',
-      })
+      expect(fetch).toHaveBeenCalledExactlyOnceWith(
+        `/api/sessions/s1/segments/42?mode=${mode}&revision=1`,
+        {
+          method: 'DELETE',
+        },
+      )
     })
     await waitFor(() => {
       expect(screen.queryByText('Orange tractor ninety')).toBeNull()

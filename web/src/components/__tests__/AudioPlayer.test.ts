@@ -271,9 +271,12 @@ describe('AudioPlayer', () => {
     })
     expect(confirm).toHaveBeenCalledTimes(1)
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(fetch).toHaveBeenCalledWith('/api/sessions/s1/segments/42?mode=text_and_audio&revision=1', {
-      method: 'DELETE',
-    })
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions/s1/segments/42?mode=text_and_audio&revision=1',
+      {
+        method: 'DELETE',
+      },
+    )
     expect(onDeleted).toHaveBeenCalledTimes(1)
     expect(onDeleted).toHaveBeenCalledWith(42)
     expect(screen.getByText('Keep this segment')).toBeTruthy()

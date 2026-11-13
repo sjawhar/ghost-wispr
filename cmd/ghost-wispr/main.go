@@ -61,9 +61,9 @@ var staticFiles embed.FS
 
 func buildTranscript(segments []transcribe.Segment) string {
 	var b strings.Builder
-	for _, seg := range segments {
-		if strings.TrimSpace(seg.Text) != "" {
-			b.WriteString(seg.Text)
+	for i := range segments {
+		if strings.TrimSpace(segments[i].Text) != "" {
+			b.WriteString(segments[i].Text)
 			b.WriteString("\n")
 		}
 	}
@@ -222,7 +222,6 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 		return nil, fmt.Errorf("unsupported batch transcription provider %q", cfg.BatchTranscription.Provider)
 	}
 }
-
 
 type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
 
@@ -603,9 +602,9 @@ func main() {
 			sess := &emptyTitleSessions[i]
 			segments, _ := store.GetSegments(sess.ID)
 			var transcript string
-			for _, seg := range segments {
-				if strings.TrimSpace(seg.Text) != "" {
-					transcript += seg.Text + "\n"
+			for j := range segments {
+				if strings.TrimSpace(segments[j].Text) != "" {
+					transcript += segments[j].Text + "\n"
 				}
 			}
 			title := summary.GenerateTitle("", transcript, segments, sess.StartedAt)

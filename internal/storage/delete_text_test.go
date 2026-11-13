@@ -310,9 +310,9 @@ func mergedSessionWithSecretAfter(t *testing.T, store *SQLiteStore, beforeMerge 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, segment := range segments {
-		if strings.Contains(segment.Text, mergedSourceSecret) {
-			return segment.ID
+	for i := range segments {
+		if strings.Contains(segments[i].Text, mergedSourceSecret) {
+			return segments[i].ID
 		}
 	}
 	t.Fatal("control: no merged segment holds the secret")

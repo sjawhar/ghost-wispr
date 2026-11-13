@@ -66,4 +66,3 @@ func TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers(t *testing.T) {
 		t.Errorf("the recording downloaded for the failed recovery is still at %s (%v)", recording, err)
 	}
 }
-

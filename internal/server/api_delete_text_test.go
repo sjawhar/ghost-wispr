@@ -113,7 +113,6 @@ func TestDeleteSegmentAPIRefusesUntilRefinementCompletes(t *testing.T) {
 	}
 }
 
-
 func TestDeleteSegmentAPIRequiresTranscriptRevision(t *testing.T) {
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},

@@ -78,7 +78,6 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 	return result, nil
 }
 
-
 // spansDescribe returns an error unless recording's bytes are the ones each
 // of its text deletion spans was recorded in (storage.TextDeletionSpan.SHA256).
 func spansDescribe(recording string, spans []storage.TextDeletionSpan) error {
@@ -108,24 +107,4 @@ func recordingSHA256(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-// withoutDeletedText rebuilds result's transcript from its words, leaving out
-// every word whose middle is in one of spans: the words of segments "Delete
-// text" removed, which the recording still holds. A transcription with text
-// and no word times cannot say which words those are, and is refused.
-func withoutDeletedText(result *transcribe.BatchResult, spans []storage.TextDeletionSpan) (string, error) {
-	if len(result.Words) == 0 {
-		if strings.TrimSpace(result.Transcript) != "" {
-			return "", fmt.Errorf("the transcription gave no word times, so the words of deleted text cannot be left out")
-		}
-		return "", nil
-	}
-	kept := make([]string, 0, len(result.Words))
-	for _, word := range result.Words {
-		if !storage.TextDeleted(spans, word.Start, word.End) {
-			kept = append(kept, word.Text)
-		}
-	}
-	return strings.Join(kept, " "), nil
 }

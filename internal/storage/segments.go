@@ -108,12 +108,12 @@ func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *Del
 	}
 	var deleted transcribe.Segment
 	remaining := make([]transcribe.Segment, 0, len(all))
-	for _, segment := range all {
-		if segment.ID == segmentID {
-			deleted = segment
+	for i := range all {
+		if all[i].ID == segmentID {
+			deleted = all[i]
 			continue
 		}
-		remaining = append(remaining, segment)
+		remaining = append(remaining, all[i])
 	}
 	if _, err := tx.Exec(`DELETE FROM segments WHERE id = ? AND session_id = ?`, segmentID, sessionID); err != nil {
 		return fmt.Errorf("delete segment %d from session %s: %w", segmentID, sessionID, err)
@@ -365,9 +365,9 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 	}
 
 	own := make(map[string][]transcribe.Segment, len(sources))
-	for _, segment := range remaining {
-		for _, id := range chainOf(segment.Timestamp) {
-			own[id] = append(own[id], segment)
+	for i := range remaining {
+		for _, id := range chainOf(remaining[i].Timestamp) {
+			own[id] = append(own[id], remaining[i])
 		}
 	}
 	for _, id := range sources {
@@ -385,8 +385,8 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 
 func canonicalTranscript(segments []transcribe.Segment) string {
 	var builder strings.Builder
-	for _, segment := range segments {
-		text := strings.TrimSpace(segment.Text)
+	for i := range segments {
+		text := strings.TrimSpace(segments[i].Text)
 		if text == "" {
 			continue
 		}
