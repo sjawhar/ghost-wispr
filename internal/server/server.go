@@ -37,6 +37,14 @@ var (
 	ErrBatchTranscriptionNotConfigured = errors.New("batch transcription is not configured")
 )
 
+// The modes a segment deletion takes (DELETE
+// /api/sessions/{id}/segments/{segmentID}?mode=): "Delete text" and "Delete
+// text and audio".
+const (
+	segmentDeleteText         = "text"
+	segmentDeleteTextAndAudio = "text_and_audio"
+)
+
 // KeptRawRecordings are the raw recordings kept in the audio directory because
 // they could not be saved, for recovery or deletion by hand.
 type KeptRawRecordings struct {
@@ -140,8 +148,13 @@ type ControlHooks struct {
 	RetryRefinement func(ctx context.Context, sessionID string) error
 	RepairSummaries func(ctx context.Context) (int, error)
 	DiagnoseMic     func(ctx context.Context) (map[string]any, error)
-	// DeleteSegment locates, validates, splices, and records a segment deletion.
-	DeleteSegment       func(ctx context.Context, sessionID string, segmentID int64) error
+	// DeleteSegment is "Delete text and audio" (mode=text_and_audio): it
+	// locates, validates, splices, and records a segment deletion.
+	DeleteSegment func(ctx context.Context, sessionID string, segmentID int64) error
+	// DeleteSegmentText is "Delete text" (mode=text): it locates the
+	// segment's words and removes them from every text store, leaving the
+	// recording and the Drive files as they are.
+	DeleteSegmentText   func(ctx context.Context, sessionID string, segmentID int64) error
 	BatchBackfill       func(ctx context.Context) (batchName string, sessionCount int, err error)
 	BatchPoll           func(ctx context.Context, batchName string) (map[string]any, error)
 	TTSSpeak            func(text, voice, provider string) (string, error)

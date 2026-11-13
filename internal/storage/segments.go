@@ -42,19 +42,33 @@ type DeletedSpan struct {
 }
 
 // DeleteSegment removes one saved segment and clears every derivative that can
-// carry its text. The database changes and the deleted span record commit in
-// one transaction. File replacement follows the transaction; PendingSplices
-// makes an interrupted replacement recoverable at startup.
+// carry its text ("Delete text and audio"). The database changes and the
+// deleted span record commit in one transaction. File replacement follows the
+// transaction; PendingSplices makes an interrupted replacement recoverable at
+// startup.
 //
 //nolint:gocritic // The approved storage contract passes one DeletedSpan by value.
 func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span DeletedSpan) error {
+	if span.SHA256After == "" {
+		return fmt.Errorf("delete segment: invalid deleted span")
+	}
+	return s.deleteSegment(sessionID, segmentID, &span, false)
+}
+
+// deleteSegment is both deletion actions. Each removes the segment and its
+// words from every text store, on the session and every merged source, and
+// erases them from the database files and the pre-migration backup. Only
+// "Delete text and audio" (keepAudio false) records the splice of span's
+// recording and owes Google Drive a replacement; "Delete text" (keepAudio
+// true) records span, in the unchanged recording, for refinement to drop.
+func (s *SQLiteStore) deleteSegment(sessionID string, segmentID int64, span *DeletedSpan, keepAudio bool) error {
 	if strings.TrimSpace(sessionID) == "" {
 		return fmt.Errorf("delete segment: session ID is required")
 	}
 	if segmentID <= 0 {
 		return fmt.Errorf("delete segment: segment ID is required")
 	}
-	if strings.TrimSpace(span.AudioPath) == "" || span.Start < 0 || span.End <= span.Start || span.SHA256Before == "" || span.SHA256After == "" {
+	if strings.TrimSpace(span.AudioPath) == "" || span.Start < 0 || span.End <= span.Start || span.SHA256Before == "" {
 		return fmt.Errorf("delete segment: invalid deleted span")
 	}
 
@@ -70,10 +84,6 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	}
 	if session.Status == SessionActive {
 		return ErrSegmentSessionActive
-	}
-	fullAudioPath := span.SessionAudioPath
-	if fullAudioPath == "" {
-		fullAudioPath = session.AudioPath
 	}
 
 	var deletedText string
@@ -104,6 +114,9 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		return fmt.Errorf("delete segment %d from session %s: %w", segmentID, sessionID, err)
 	}
 	canonical := canonicalTranscript(remaining)
+	// A session with no recording, or only part of it, left to refine
+	// ("Delete text" of one whose audio was removed to free space) has
+	// nothing a refinement could rebuild its whole transcript from.
 	// The session goes back to pending sync, but for two sync states: one
 	// a sync holds (SYNCING) is left to that sync, whose end records the
 	// folder it made as owed (oweFolderOfPendingDeletion); one whose Drive
@@ -118,7 +131,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			speaker_names = '{}',
 			refined_transcript = '',
 			refinement_model = '',
-			refinement_status = ?,
+			refinement_status = CASE WHEN ? AND (audio_path = '' OR audio_removed_at != '') THEN ? ELSE ? END,
 			summary_status = ?,
 			summary_error = '',
 			canonical_transcript = ?,
@@ -127,23 +140,15 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			deletion_generation = deletion_generation + 1,
 			envoy_publish_status = ?,
 			sync_status = CASE WHEN sync_state IN (?, ?) THEN sync_status ELSE ? END,
-			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END,
-			drive_replace_pending = 1,
-			drive_replace_since = CASE WHEN drive_replace_pending = 1 AND drive_replace_since != '' THEN drive_replace_since ELSE ? END,
-			drive_replace_failures = 0,
-			drive_replace_error = '',
-			audio_path = ?,
-			audio_removed_at = ''
+			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END
 		WHERE id = ?`,
-		RefinementPending,
+		keepAudio, RefinementNoAudio, RefinementPending,
 		SummaryPending,
 		canonical,
 		TranscriptSourceStreaming,
 		EnvoyPublishPending,
 		SyncStateSyncing, SyncStateRemoteDeleted, SyncPending,
 		SyncStateSyncing, SyncStateRemoteDeleted, SyncStatePending,
-		time.Now().UTC().Format(time.RFC3339Nano),
-		fullAudioPath,
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("clear deleted segment derivatives for session %s: %w", sessionID, err)
@@ -153,13 +158,69 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 		return err
 	}
 	owners := append([]string{sessionID}, sources...)
-	if err := recordOwedDriveReplacementFolders(tx, sessionID, owners); err != nil {
-		return err
-	}
 	for _, owner := range owners {
 		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
 			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
 		}
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO summary_requests(session_id, prompt_hash) VALUES(?, 'segment-delete')
+		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
+		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
+	}
+	if keepAudio {
+		if err := recordTextDeletionSpan(tx, sessionID, sources, span); err != nil {
+			return err
+		}
+	} else if err := recordSplice(tx, sessionID, owners, span, session.AudioPath); err != nil {
+		return err
+	}
+	// The erase after the commit is owed until it finishes, so a failure, or
+	// the app stopping, leaves it for RetryOwedErasure.
+	owed, earlierOwed, err := recordOwedErase(tx)
+	if err != nil {
+		return err
+	}
+	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, span); err != nil {
+		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
+	}
+	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("rebuild sessions search index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
+	}
+	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, append([]string{sessionID}, holders...), span)
+}
+
+// recordSplice records, in tx, what only "Delete text and audio" does beyond
+// the text side: the session names all its recordings again (span's
+// SessionAudioPath, the ones restored from Drive included, else audioPath),
+// owes Google Drive a replacement of every folder in owners that has one,
+// with no earlier replacement's progress, and the span cut from its recording
+// is recorded (deleted_segments) until its splice completes.
+func recordSplice(tx *sql.Tx, sessionID string, owners []string, span *DeletedSpan, audioPath string) error {
+	fullAudioPath := span.SessionAudioPath
+	if fullAudioPath == "" {
+		fullAudioPath = audioPath
+	}
+	if _, err := tx.Exec(`
+		UPDATE sessions
+		SET drive_replace_pending = 1,
+			drive_replace_since = CASE WHEN drive_replace_pending = 1 AND drive_replace_since != '' THEN drive_replace_since ELSE ? END,
+			drive_replace_failures = 0,
+			drive_replace_error = '',
+			audio_path = ?,
+			audio_removed_at = ''
+		WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		fullAudioPath,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf("owe a Drive replacement for session %s: %w", sessionID, err)
+	}
+	if err := recordOwedDriveReplacementFolders(tx, sessionID, owners); err != nil {
+		return err
 	}
 	if exists, err := tableExists(tx, "drive_replacements"); err != nil {
 		return fmt.Errorf("check prior Drive replacements for session %s: %w", sessionID, err)
@@ -170,12 +231,6 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 			}
 		}
 	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO summary_requests(session_id, prompt_hash) VALUES(?, 'segment-delete')
-		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
-		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
-	}
 	if _, err := tx.Exec(`
 		INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?)`,
@@ -183,22 +238,7 @@ func (s *SQLiteStore) DeleteSegment(sessionID string, segmentID int64, span Dele
 	); err != nil {
 		return fmt.Errorf("record deleted span for session %s: %w", sessionID, err)
 	}
-	// The erase after the commit is owed until it finishes, so a failure, or
-	// the app stopping, leaves it for RetryOwedErasure.
-	owed, earlierOwed, err := recordOwedErase(tx)
-	if err != nil {
-		return err
-	}
-	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), deletedText, &span); err != nil {
-		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
-	}
-	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
-		return fmt.Errorf("rebuild sessions search index: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit delete segment for session %s: %w", sessionID, err)
-	}
-	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, append([]string{sessionID}, holders...), &span)
+	return nil
 }
 
 // eraseAfterDeletion erases a committed deletion from the write-ahead log and
@@ -326,8 +366,11 @@ func scrubMergedSources(tx *sql.Tx, sessionID string, remaining []transcribe.Seg
 		}
 	}
 	for _, id := range sources {
+		// The source's generation moves too, so a refinement or summary of
+		// it started before the deletion cannot store the words it read.
 		if _, err := tx.Exec(`UPDATE sessions
-			SET title = '', summary = '', summary_model = '', speaker_names = '{}', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?
+			SET title = '', summary = '', summary_model = '', speaker_names = '{}', refined_transcript = '', refinement_model = '', canonical_transcript = ?, transcript_source = ?,
+				deletion_generation = deletion_generation + 1
 			WHERE id = ?`, canonicalTranscript(own[id]), TranscriptSourceStreaming, id); err != nil {
 			return nil, nil, fmt.Errorf("scrub merged source %s: %w", id, err)
 		}
@@ -536,21 +579,25 @@ func (s *SQLiteStore) OldestPendingSplice(sessionID string) (time.Time, bool, er
 }
 
 // DeletionsToRefine returns the sessions whose segment deletion has its
-// recording spliced (none of its splices is pending) but whose refinement or
-// summary has not run since: refinement still pending, as the deletion set
-// it, or a summary pending or cut off running. The deletion runner refines
-// and summarizes the session after its splice, so a stop between the two
-// leaves such a session, and nothing else starts either. The Drive
-// replacement waits for both, so the startup recovery runs them. A merged
-// session's sources and an active session are not listed.
+// recording spliced (none of its splices is pending), or that "Delete text"
+// changed, but whose refinement or summary has not run since: refinement
+// still pending, as the deletion set it, or a summary pending or cut off
+// running. The deletion runner refines and summarizes the session after its
+// splice, or after "Delete text", so a stop between the two leaves such a
+// session, and nothing else starts either. The Drive replacement waits for
+// both, so the startup recovery runs them. A merged session's sources, an
+// active session, and one with no audio to refine (the startup summary pass
+// makes its summary) are not listed.
 func (s *SQLiteStore) DeletionsToRefine() ([]string, error) {
 	rows, err := s.db.Query(`SELECT id FROM sessions
 		WHERE status NOT IN (?, ?)
-		  AND EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id)
+		  AND (EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id)
+		       OR EXISTS (SELECT 1 FROM deleted_text_spans WHERE deleted_text_spans.session_id = sessions.id))
 		  AND NOT EXISTS (SELECT 1 FROM deleted_segments WHERE deleted_segments.session_id = sessions.id AND splice_complete = 0)
+		  AND audio_path != '' AND refinement_status != ?
 		  AND (refinement_status = ? OR summary_status IN (?, ?))
 		ORDER BY started_at ASC`,
-		SessionActive, SessionMerged, RefinementPending, SummaryPending, SummaryRunning)
+		SessionActive, SessionMerged, RefinementNoAudio, RefinementPending, SummaryPending, SummaryRunning)
 	if err != nil {
 		return nil, fmt.Errorf("list segment deletions to refine: %w", err)
 	}
@@ -769,20 +816,20 @@ var flushRecordingDirectory = func(recording string) error {
 
 // MarkSpliceComplete lets garbage collection proceed after the recording has
 // been atomically replaced with the span's expected post-splice bytes. In the
-// same transaction it clears the session's pending Drive replacement when the
-// deletion owes Drive nothing (settleUnownedDriveReplacement).
+// same transaction, the first time it marks the span, it moves the spans
+// "Delete text" recorded in the recording's pre-splice bytes to where their
+// words are in the spliced one (moveTextDeletionSpans), and it clears the
+// session's pending Drive replacement when the deletion owes Drive nothing
+// (settleUnownedDriveReplacement).
 func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin marking deleted span complete: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.Exec(`
-		UPDATE deleted_segments SET splice_complete = 1
-		WHERE session_id = ? AND audio_path = ? AND start = ? AND end = ?
-		  AND sha256_before = ? AND sha256_after = ?`,
-		span.SessionID, span.AudioPath, span.Start, span.End, span.SHA256Before, span.SHA256After,
-	)
+	match := `session_id = ? AND audio_path = ? AND start = ? AND end = ? AND sha256_before = ? AND sha256_after = ?`
+	args := []any{span.SessionID, span.AudioPath, span.Start, span.End, span.SHA256Before, span.SHA256After}
+	result, err := tx.Exec(`UPDATE deleted_segments SET splice_complete = 1 WHERE splice_complete = 0 AND `+match, args...)
 	if err != nil {
 		return fmt.Errorf("mark deleted span complete: %w", err)
 	}
@@ -791,7 +838,15 @@ func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 		return fmt.Errorf("count completed deleted span: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("mark deleted span complete: %w", sql.ErrNoRows)
+		var marked int
+		if err := tx.QueryRow(`SELECT count(*) FROM deleted_segments WHERE `+match, args...).Scan(&marked); err != nil {
+			return fmt.Errorf("read deleted span: %w", err)
+		}
+		if marked == 0 {
+			return fmt.Errorf("mark deleted span complete: %w", sql.ErrNoRows)
+		}
+	} else if err := moveTextDeletionSpans(tx, span); err != nil {
+		return err
 	}
 	if err := settleUnownedDriveReplacement(tx, span.SessionID); err != nil {
 		return err

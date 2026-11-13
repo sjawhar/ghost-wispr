@@ -34,6 +34,13 @@ function render(
   })
 }
 
+// chooseDelete opens a segment's delete actions with button and chooses
+// action, "Delete text and audio" unless named.
+async function chooseDelete(button: HTMLElement, action = 'Delete text and audio') {
+  await fireEvent.click(button)
+  await fireEvent.click(screen.getByRole('button', { name: action }))
+}
+
 describe('AudioPlayer', () => {
   beforeEach(() => {
     Object.defineProperty(HTMLMediaElement.prototype, 'play', {
@@ -324,14 +331,16 @@ describe('AudioPlayer', () => {
       onDeleted,
     })
 
-    await fireEvent.click(screen.getAllByRole('button', { name: 'Delete segment' })[0])
+    await chooseDelete(screen.getAllByRole('button', { name: 'Delete segment' })[0])
 
     await waitFor(() => {
       expect(screen.queryByText('Delete this segment')).toBeNull()
     })
     expect(confirm).toHaveBeenCalledTimes(1)
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(fetch).toHaveBeenCalledWith('/api/sessions/s1/segments/42', { method: 'DELETE' })
+    expect(fetch).toHaveBeenCalledWith('/api/sessions/s1/segments/42?mode=text_and_audio', {
+      method: 'DELETE',
+    })
     expect(onDeleted).toHaveBeenCalledTimes(1)
     expect(onDeleted).toHaveBeenCalledWith(42)
     expect(screen.getByText('Keep this segment')).toBeTruthy()
@@ -369,7 +378,7 @@ describe('AudioPlayer', () => {
 
     expect(audio?.getAttribute('src')).toBe('/api/sessions/s1/audio?v=42')
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await chooseDelete(screen.getByRole('button', { name: 'Delete segment' }))
 
     await waitFor(() => {
       expect(audio?.getAttribute('src')).toBe('/api/sessions/s1/audio?v=')
@@ -409,7 +418,7 @@ describe('AudioPlayer', () => {
     const deleteButtons = screen.getAllByRole('button', { name: 'Delete segment' })
     const deleteButton = deleteButtons[0]
 
-    await fireEvent.click(deleteButton)
+    await chooseDelete(deleteButton)
 
     await waitFor(() => {
       expect(deleteButton.textContent).toContain('Deleting…')
@@ -447,7 +456,7 @@ describe('AudioPlayer', () => {
       onDeleted,
     })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await chooseDelete(screen.getByRole('button', { name: 'Delete segment' }))
 
     expect(confirm).toHaveBeenCalledTimes(1)
     expect(fetch).not.toHaveBeenCalled()
@@ -492,7 +501,7 @@ describe('AudioPlayer', () => {
       onNotFound,
     })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await chooseDelete(screen.getByRole('button', { name: 'Delete segment' }))
 
     expect((await screen.findByRole('alert')).textContent).toBe(message)
     expect(screen.getByText(text)).toBeTruthy()
@@ -524,7 +533,7 @@ describe('AudioPlayer', () => {
       onNotFound,
     })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await chooseDelete(screen.getByRole('button', { name: 'Delete segment' }))
 
     await waitFor(() => {
       expect(onNotFound).toHaveBeenCalledTimes(1)
@@ -566,7 +575,7 @@ describe('AudioPlayer', () => {
       onNotFound,
     })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await chooseDelete(screen.getByRole('button', { name: 'Delete segment' }))
 
     await waitFor(() => {
       expect(onNotFound).toHaveBeenCalledTimes(1)
@@ -625,7 +634,7 @@ describe('AudioPlayer', () => {
     rerender = result.rerender
 
     await fireEvent.click(screen.getByRole('button', { name: 'Segments' }))
-    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await chooseDelete(screen.getByRole('button', { name: 'Delete segment' }))
 
     await waitFor(() => {
       expect(onNotFound).toHaveBeenCalledTimes(1)

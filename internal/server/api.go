@@ -702,6 +702,19 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
+		// The two deletion actions (Sami, 2026-11-12,
+		// dispatch://INFRA-2961/ask/8dcb4d3f-a256-45dd-b0ac-ed4b06fe2a05): no
+		// client gets one by default.
+		var deleteSegment func(context.Context, string, int64) error
+		switch modes := r.URL.Query()["mode"]; {
+		case len(modes) == 1 && modes[0] == segmentDeleteText:
+			deleteSegment = controls.DeleteSegmentText
+		case len(modes) == 1 && modes[0] == segmentDeleteTextAndAudio:
+			deleteSegment = controls.DeleteSegment
+		default:
+			writeJSONError(w, http.StatusBadRequest, `mode must be "text" (Delete text: the words only; the recording and the Drive files stay) or "text_and_audio" (Delete text and audio: the words, their audio, and the Drive files replaced)`)
+			return
+		}
 		segmentID, err := strconv.ParseInt(r.PathValue("segmentID"), 10, 64)
 		if err != nil || segmentID <= 0 {
 			writeJSONError(w, http.StatusNotFound, "segment not found")
@@ -720,11 +733,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
 			return
 		}
-		if controls.DeleteSegment == nil {
+		if deleteSegment == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "segment deletion is not configured")
 			return
 		}
-		if err := controls.DeleteSegment(r.Context(), sessionID, segmentID); err != nil {
+		if err := deleteSegment(r.Context(), sessionID, segmentID); err != nil {
 			switch {
 			case errors.Is(err, storage.ErrSegmentNotFound):
 				writeJSONError(w, http.StatusNotFound, "segment not found")

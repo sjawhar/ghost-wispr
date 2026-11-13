@@ -18,13 +18,15 @@ func TestDeleteSegmentAPIRefusesWhileASpliceIsPending(t *testing.T) {
 		segments:       map[string][]transcribe.Segment{},
 	}
 	hook := func(context.Context, string, int64) error { return storage.ErrSegmentSplicePending }
-	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{DeleteSegment: hook}, "", nil)
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{DeleteSegment: hook, DeleteSegmentText: hook}, "", nil)
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42", nil))
-	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "previous segment deletion") {
-		t.Fatalf("status = %d body=%s, want 409 naming the pending deletion", response.Code, response.Body.String())
+	for _, mode := range []string{"text", "text_and_audio"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode="+mode, nil))
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "previous segment deletion") {
+			t.Fatalf("mode %s: status = %d body=%s, want 409 naming the pending deletion", mode, response.Code, response.Body.String())
+		}
 	}
 }

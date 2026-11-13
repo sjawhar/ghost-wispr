@@ -43,6 +43,9 @@ type Store interface {
 	// and returns the transcript generation it claimed at.
 	ClaimRefinement(sessionID, audioPath string) (generation int, claimed bool, err error)
 	GetRefinement(sessionID string) (transcript, status string, err error)
+	// TextDeletionSpans returns the spans "Delete text" recorded in
+	// recording, whose words a refinement of it leaves out.
+	TextDeletionSpans(recording string) ([]storage.TextDeletionSpan, error)
 	UpdateTitle(sessionID, title string) error
 	Canonicalize(sessionID string) (transcript string, generation int, err error)
 }

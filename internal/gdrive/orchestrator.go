@@ -277,8 +277,19 @@ const spliceWaitWarningAfter = 5 * time.Minute
 // claims its session first (ClaimSync), so retry-sync, the sync after a
 // summary and the sweep never sync one session at once. Every state it
 // writes after the claim is under that claim, so a sync that no longer holds
-// its session changes nothing in it.
+// its session changes nothing in it. First it updates in place the Drive
+// documents of the merged sources "Delete text" in the session changed, or of
+// the session itself when it is such a source (refreshOwedDocuments).
 func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error {
+	refreshErr := o.refreshOwedDocuments(ctx, sessionID)
+	err := o.syncSession(ctx, sessionID)
+	if refreshErr == nil {
+		return err
+	}
+	return errors.Join(refreshErr, err)
+}
+
+func (o *Orchestrator) syncSession(ctx context.Context, sessionID string) error {
 	read, err := o.store.GetSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("get session %s: %w", sessionID, err)
@@ -413,7 +424,8 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	// retry looks: a session no sync attempted has no folder of its own. A
 	// retry adopts only a folder holding nothing of another session: a
 	// same-named folder can be another session's, one deleted here, say, whose
-	// documents an upload would overwrite (FindSessionFolders).
+	// documents an upload would overwrite (FindSessionFolders). A summary the
+	// session no longer has is emptied in an adopted folder too.
 	driveFolderID := sess.GDriveFolderID
 	if driveFolderID == "" && read.LastSyncAttempt != nil {
 		driveFolderID, err = o.adoptSessionFolder(ctx, sessionID, claim, audioPath)
@@ -423,13 +435,20 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 	}
 	if err == nil {
 		if driveFolderID != "" {
-			err = o.uploader.UploadInto(ctx, driveFolderID, files)
+			err = o.uploader.UploadInto(ctx, driveFolderID, withEmptiedSummary(files))
 		} else if creator, ok := o.uploader.(folderCreatingUploader); ok {
 			driveFolderID, err = creator.UploadWithFolderRecorded(ctx, folderName, files, func(folderID string) error {
-				return o.recordSyncFolder(sessionID, claim, folderID)
-			})
+			return o.recordSyncFolder(sessionID, claim, folderID)
+		})
 		} else {
 			driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
+		}
+	}
+	if err == nil && sess.GDriveFolderID != "" {
+		// Delete text can change the title that names the existing folder.
+		// Rename it in place: its id and the links to its files stay.
+		if syncer, ok := o.uploader.(*Syncer); ok {
+			err = syncer.renameSessionFolder(ctx, driveFolderID, folderName)
 		}
 	}
 	// A recording the upload left out (missing from disk when the file list

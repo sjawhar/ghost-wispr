@@ -65,8 +65,8 @@ func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchWordsTranscriber 
 	}
 }
 
-// Transcribe returns the recording's transcript and the one transcription
-// model the Deepgram response reports.
+// Transcribe returns the recording's transcript, its words with their times,
+// and the one transcription model the Deepgram response reports.
 func (d *deepgramBatchTranscriber) Transcribe(ctx context.Context, audioPath string) (BatchResult, error) {
 	result, err := d.transcribe(ctx, audioPath)
 	if err != nil {
@@ -76,7 +76,7 @@ func (d *deepgramBatchTranscriber) Transcribe(ctx context.Context, audioPath str
 	if err != nil {
 		return BatchResult{}, err
 	}
-	return BatchResult{Transcript: result.transcript, Model: model}, nil
+	return BatchResult{Transcript: result.transcript, Model: model, Words: timestampedWords(result.words)}, nil
 }
 
 func (d *deepgramBatchTranscriber) Words(ctx context.Context, audioPath string) ([]TimestampedWord, error) {
@@ -84,16 +84,22 @@ func (d *deepgramBatchTranscriber) Words(ctx context.Context, audioPath string) 
 	if err != nil {
 		return nil, err
 	}
+	return timestampedWords(result.words), nil
+}
 
-	words := make([]TimestampedWord, len(result.words))
-	for i, word := range result.words {
+// timestampedWords is Deepgram's words with their times, each as it is
+// punctuated in the transcript, or as heard when Deepgram gives no punctuated
+// form.
+func timestampedWords(batchWords []deepgramBatchWord) []TimestampedWord {
+	words := make([]TimestampedWord, len(batchWords))
+	for i, word := range batchWords {
 		text := word.PunctuatedWord
 		if text == "" {
 			text = word.Word
 		}
 		words[i] = TimestampedWord{Text: text, Start: word.Start, End: word.End}
 	}
-	return words, nil
+	return words
 }
 
 func (d *deepgramBatchTranscriber) transcribe(ctx context.Context, audioPath string) (batchTranscriptionResult, error) {
