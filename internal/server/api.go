@@ -758,7 +758,14 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		if sessionData.RefinementStatus == storage.RefinementNoAudio {
-			writeJSONError(w, http.StatusConflict, "no recording is on this unit; restore it from Drive before deleting")
+			if controls.RetryRefinement == nil {
+				writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+				return
+			}
+			go func() {
+				_ = controls.RetryRefinement(context.Background(), sessionID)
+			}()
+			writeJSONError(w, http.StatusConflict, "no recording is on this unit; restoring it from Drive before deletion")
 			return
 		}
 		if sessionData.RefinementStatus != storage.RefinementCompleted {
@@ -1576,11 +1583,6 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		// Refinement transcribes the saved recording; without one it can only fail.
-		if sess, err := store.GetSession(sessionID); err == nil && sess.AudioPath == "" {
-			writeJSONError(w, http.StatusConflict, "session has no saved recording to refine")
-			return
-		}
 
 		go func() {
 			_ = controls.RetryRefinement(context.Background(), sessionID)

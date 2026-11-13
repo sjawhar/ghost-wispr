@@ -165,6 +165,34 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording strin
 		parents[source] = session.MergedInto
 	}
 
+	// Merges made before recording_sources existed still carry recording paths
+	// whose base name is their source session id. Backfill those direct
+	// ownership rows before assigning retained words to source transcripts.
+	sourceForRecording := func(recording string) string {
+		base := strings.TrimSuffix(filepath.Base(recording), filepath.Ext(recording))
+		base = strings.TrimPrefix(base, "recording-")
+		base = strings.TrimPrefix(base, "audio-")
+		for _, source := range sources {
+			if source == base {
+				return source
+			}
+		}
+		return ""
+	}
+	recordings := []string{deletedRecording}
+	for i := range remaining {
+		recordings = append(recordings, remaining[i].RecordingPath)
+	}
+	for _, recording := range recordings {
+		source := sourceForRecording(recording)
+		if source == "" {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO recording_sources(merged_session_id, recording_path, source_session_id) VALUES(?, ?, ?)`, sessionID, recording, source); err != nil {
+			return nil, nil, fmt.Errorf("backfill merged recording source %s: %w", recording, err)
+		}
+	}
+
 	rows, err := tx.Query(`WITH RECURSIVE merged(id) AS (
 			SELECT ? UNION SELECT sessions.id FROM sessions JOIN merged ON sessions.merged_into = merged.id
 		) SELECT merged_session_id, recording_path, source_session_id

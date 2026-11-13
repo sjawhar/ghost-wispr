@@ -58,6 +58,9 @@ func TestDeleteRefinedSegmentScrubsMergedSourcesByRecording(t *testing.T) {
 			secret = segments[i].ID
 		}
 	}
+	if _, err := store.DB().Exec(`DELETE FROM recording_sources`); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.DeleteRefinedSegmentText("merged", secret, revision); err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +78,8 @@ func TestDeleteRefinedSegmentScrubsMergedSourcesByRecording(t *testing.T) {
 			text = append(text, word)
 		}
 		_ = rows.Close()
-		if source == "a" && len(text) != 0 {
-			t.Fatalf("source a refined words = %v, want deleted occurrence removed", text)
-		}
-		if source == "b" && strings.Join(text, " ") != "Charlie stays." {
-			t.Fatalf("source b refined words = %v, want its recording retained", text)
+		if len(text) != 0 {
+			t.Fatalf("source %s refined words = %v, want the merged session to remain authoritative", source, text)
 		}
 	}
 	if sourceB, _ := store.GetSession("b"); !strings.Contains(sourceB.CanonicalTranscript, "Charlie") {

@@ -104,6 +104,17 @@ func assertBackupHolds(t *testing.T, path, text string, want bool) {
 	}
 }
 
+func assertBackupOmits(t *testing.T, path, text string) {
+	t.Helper()
+	contents, err := os.ReadFile(preMigrationBackupPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(contents), text) {
+		t.Errorf("backup still holds %q", text)
+	}
+}
+
 // TestADeletionRefreshesABackupOfTheSameSchema fails if a deletion leaves its
 // words in the pre-migration backup when no migration ran at this start (the
 // backup then has the database's schema and is taken again).
@@ -134,7 +145,7 @@ func TestADeletionScrubsABackupOfAnOlderSchemaInPlace(t *testing.T) {
 	}
 
 	deleteSecretFrom(t, path)
-	assertBackupHolds(t, path, backupSecret, false)
+	assertBackupOmits(t, path, backupSecret)
 	backup, err := sql.Open("sqlite", preMigrationBackupPath(path))
 	if err != nil {
 		t.Fatal(err)
@@ -151,8 +162,8 @@ func TestADeletionScrubsABackupOfAnOlderSchemaInPlace(t *testing.T) {
 	if err := backup.QueryRow(`SELECT count(*) FROM segments WHERE session_id = 'backed-up'`).Scan(&segments); err != nil {
 		t.Fatal(err)
 	}
-	if segments != 2 {
-		t.Errorf("the backup keeps %d of the session's segments, want the two not deleted", segments)
+	if segments != 0 {
+		t.Errorf("the older backup keeps %d segments of the affected session, want none", segments)
 	}
 }
 
@@ -183,4 +194,47 @@ func TestADeletionScrubsTheSpeakerNamesFromABackupOfAnOlderSchema(t *testing.T) 
 	assertBackupHolds(t, path, speaker, true)
 	deleteBackedUpSecret(t, store)
 	assertBackupHolds(t, path, speaker, false)
+}
+
+func TestARefinedFillerDeletionErasesAnOlderSchemaBackup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`ALTER TABLE sessions DROP COLUMN drive_replace_error`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := openStoreWithBackup(t, path)
+	words := []RefinedWord{
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Text: "before bridge.", Start: 0, End: 1},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 1, Text: "Um,", Start: 2, End: 2.2},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 2, Text: backupSecret + ".", Start: 2.2, End: 3},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 3, Text: "after bridge.", Start: 4, End: 5},
+	}
+	revision, err := store.PublishRefinementAtGeneration("backed-up", RefinedTranscript(words), "test", words, BuildRefinedSegments(words), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("backed-up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selected int64
+	for i := range segments {
+		if strings.Contains(segments[i].Text, backupSecret) {
+			selected = segments[i].ID
+		}
+	}
+	if selected == 0 {
+		t.Fatal("control: no refined filler segment holds the secret")
+	}
+	if err := store.DeleteRefinedSegmentText("backed-up", selected, revision); err != nil {
+		t.Fatal(err)
+	}
+	assertBackupOmits(t, path, backupSecret)
 }

@@ -183,10 +183,27 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	if err != nil {
 		return err
 	}
-	// An old backup may predate the refined segment ids. Prefer the id when
-	// it exists; otherwise remove the segment rows that still contain the
-	// selected persisted word text in affected sessions.
+	// An old backup predates refined segment ids. Its rows cannot identify the
+	// selected occurrence, so erase every segment of each affected session
+	// rather than guess from displayed text and risk keeping or over-deleting
+	// words.
 	rebuildable := false
+	deleteAffectedSegments := func() error {
+		query := `DELETE FROM segments`
+		var args []any
+		if segments["session_id"] {
+			query += ` WHERE session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
+			args = make([]any, len(affected))
+			for i, id := range affected {
+				args[i] = id
+			}
+		}
+		if _, err := tx.Exec(query, args...); err != nil {
+			return fmt.Errorf("delete affected segments from the older backup: %w", err)
+		}
+		rebuildable = true
+		return nil
+	}
 	switch {
 	case segments["id"]:
 		var holder string
@@ -199,40 +216,16 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 				return fmt.Errorf("delete the segment from the backup: %w", err)
 			}
 			rebuildable = true
-		case errors.Is(err, sql.ErrNoRows) && segments["text"]:
-			needle := strings.Trim(strings.TrimSpace(deletedText), ".,!?;:")
-			if needle != "" {
-				query := `DELETE FROM segments WHERE text LIKE ?`
-				args := []any{"%" + needle + "%"}
-				if segments["session_id"] {
-					query += ` AND session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
-					for _, id := range affected {
-						args = append(args, id)
-					}
-				}
-				res, err := tx.Exec(query, args...)
-				if err != nil {
-					return fmt.Errorf("delete refined words from the older backup: %w", err)
-				}
-				rows, err := res.RowsAffected()
-				if err != nil {
-					return fmt.Errorf("count older backup segment scrub: %w", err)
-				}
-				rebuildable = rows > 0
+		case errors.Is(err, sql.ErrNoRows):
+			if err := deleteAffectedSegments(); err != nil {
+				return err
 			}
-		case !errors.Is(err, sql.ErrNoRows):
+		default:
 			return fmt.Errorf("find the deleted segment in the backup: %w", err)
 		}
 	case segments["text"]:
-		query, args := `DELETE FROM segments WHERE text = ?`, []any{deletedText}
-		if segments["session_id"] {
-			query += ` AND session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
-			for _, id := range affected {
-				args = append(args, id)
-			}
-		}
-		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("delete the segment from the backup by its text: %w", err)
+		if err := deleteAffectedSegments(); err != nil {
+			return err
 		}
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",")

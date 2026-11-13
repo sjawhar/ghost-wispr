@@ -4504,3 +4504,36 @@ func TestDeleteSessionRefusesAnActiveMergedSource(t *testing.T) {
 		t.Fatalf("active source after refused delete = %+v (%v), want active", sess, err)
 	}
 }
+
+func TestRetryRefinementWithoutLocalAudioStartsRestore(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementNoAudio},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	started := make(chan string, 1)
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		RetryRefinement: func(_ context.Context, sessionID string) error {
+			started <- sessionID
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/sessions/s1/retry-refinement", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("retry refinement without local audio = %d %s, want 200", response.Code, response.Body.String())
+	}
+	select {
+	case sessionID := <-started:
+		if sessionID != "s1" {
+			t.Fatalf("restore refinement session = %q, want s1", sessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry refinement without local audio did not start restoration")
+	}
+}

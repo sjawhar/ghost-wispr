@@ -188,7 +188,7 @@ describe('SessionCard', () => {
     expect(screen.getByText('Summary unavailable')).toBeTruthy()
   })
 
-  it('says a session with no saved recording cannot be refined, and offers no retry', () => {
+  it('offers retry refinement to restore a session with no local recording', () => {
     render({
       session: { ...baseSession, audio_path: '', refinement_status: RefinementStatus.NoAudio },
       detail: undefined,
@@ -205,7 +205,7 @@ describe('SessionCard', () => {
     expect(badge.getAttribute('title')).toBe(
       'No recording was saved for this session, so it cannot be refined',
     )
-    expect(screen.queryByTestId('retry-refinement-btn')).toBeNull()
+    expect(screen.getByTestId('retry-refinement-btn')).toBeTruthy()
     expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
   })
 
@@ -236,8 +236,10 @@ describe('SessionCard', () => {
         expect(screen.getByTestId('refinement-badge').getAttribute('title')).toBe(
           'The audio was removed to free space, so it cannot be refined',
         )
+        expect(screen.getByTestId('retry-refinement-btn')).toBeTruthy()
+      } else {
+        expect(screen.queryByTestId('retry-refinement-btn')).toBeNull()
       }
-      expect(screen.queryByTestId('retry-refinement-btn')).toBeNull()
       unmount()
     }
   })

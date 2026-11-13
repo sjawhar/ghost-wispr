@@ -87,7 +87,7 @@
       return 'Refinement failed; retry refinement before deleting.'
     }
     if (session?.refinement_status === RefinementStatus.NoAudio) {
-      return 'No recording is on this unit; restore it from Drive before deleting.'
+      return 'No recording is on this unit. Use Retry refinement to restore it from Drive, then delete.'
     }
     return 'This conversation is still being refined; delete once it finishes.'
   })

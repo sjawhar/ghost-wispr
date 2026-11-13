@@ -112,13 +112,12 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	}
 	if len(sources) > 0 {
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sources)), ",")
-		args := make([]any, 0, len(sources)+5)
-		for _, source := range sources {
-			args = append(args, source)
+		args := make([]any, len(sources))
+		for i, source := range sources {
+			args[i] = source
 		}
-		args = append(args, selected.RecordingPath, selected.RecordingSHA256, selected.FirstWordOrdinal, selected.LastWordOrdinal)
-		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`) AND recording_path = ? AND recording_sha256 = ? AND ordinal BETWEEN ? AND ?`, args...); err != nil {
-			return fmt.Errorf("scrub source refined words: %w", err)
+		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return fmt.Errorf("drop source refined words after merged deletion: %w", err)
 		}
 	}
 	owners := append([]string{sessionID}, sources...)
