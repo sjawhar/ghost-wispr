@@ -33,6 +33,15 @@ import (
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+type recordingRestoreInProgress interface {
+	RecordingRestoreInProgress()
+}
+
+func isRecordingRestoreInProgress(err error) bool {
+	var restoring recordingRestoreInProgress
+	return errors.As(err, &restoring)
+}
+
 type SessionStore interface {
 	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
 	GetSession(id string) (storage.Session, error)
@@ -792,8 +801,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				writeJSONError(w, http.StatusNotFound, "segment not found")
 			case errors.Is(err, storage.ErrSegmentSessionActive):
 				writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
-			case errors.Is(err, storage.ErrSegmentSplicePending):
+			case isRecordingRestoreInProgress(err):
 				writeJSONError(w, http.StatusConflict, "Restoring the recording; try again shortly.")
+			case errors.Is(err, storage.ErrSegmentSplicePending):
+				writeJSONError(w, http.StatusConflict, "A previous segment deletion is still being recovered. Try again after it completes.")
 			case errors.Is(err, storage.ErrStaleTranscriptRevision):
 				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
 			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):

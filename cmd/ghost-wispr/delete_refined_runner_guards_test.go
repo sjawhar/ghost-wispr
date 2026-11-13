@@ -115,13 +115,28 @@ func TestDeleteRefinedTextRefusesRecovery(t *testing.T) {
 	}
 }
 
-func TestDeleteRefinedAudioRefusesRecovery(t *testing.T) {
+func TestDeleteRefinedAudioRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *testing.T) {
 	fixture := newRefinedRunnerFixture(t)
 	deleteLocks.setRecovering("s", true)
 	t.Cleanup(func() { deleteLocks.setRecovering("s", false) })
+	unlock := deleteLocks.lock("s")
+	t.Cleanup(unlock)
 	runner := fixture.runner()
-	if err := runner.DeleteRefinedAudio(context.Background(), "s", fixture.segmentID, fixture.revision); !errors.Is(err, storage.ErrSegmentSplicePending) {
-		t.Fatalf("audio delete during recovery = %v, want %v", err, storage.ErrSegmentSplicePending)
+	result := make(chan error, 1)
+	go func() {
+		result <- runner.DeleteRefinedAudio(context.Background(), "s", fixture.segmentID, fixture.revision)
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, storage.ErrSegmentSplicePending) {
+			t.Fatalf("audio delete during recovery = %v, want %v", err, storage.ErrSegmentSplicePending)
+		}
+		var restoring interface{ RecordingRestoreInProgress() }
+		if !errors.As(err, &restoring) {
+			t.Fatalf("audio delete during recovery = %v, want recording restore marker", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("audio delete waited for the recovery lock instead of refusing at once")
 	}
 }
 

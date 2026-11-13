@@ -92,6 +92,20 @@ func (l *sessionDeletionLocks) isRecovering(sessionID string) bool {
 
 var deleteLocks sessionDeletionLocks
 
+type recordingRestoreInProgressError struct {
+	cause error
+}
+
+func (e recordingRestoreInProgressError) Error() string { return e.cause.Error() }
+
+func (e recordingRestoreInProgressError) Unwrap() error { return e.cause }
+
+func (recordingRestoreInProgressError) RecordingRestoreInProgress() {}
+
+func recordingRestoreInProgress() error {
+	return recordingRestoreInProgressError{cause: storage.ErrSegmentSplicePending}
+}
+
 func usableRecordingSource(source deletionRecordingSource) bool {
 	if source == nil {
 		return false
@@ -270,7 +284,7 @@ func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID s
 		return fmt.Errorf("segment deletion storage is not configured")
 	}
 	if deleteLocks.isRecovering(sessionID) {
-		return storage.ErrSegmentSplicePending
+		return recordingRestoreInProgress()
 	}
 	unlock := deleteLocks.lock(sessionID)
 	defer unlock()
@@ -309,7 +323,7 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 		return fmt.Errorf("segment deletion is not configured")
 	}
 	if deleteLocks.isRecovering(sessionID) {
-		return storage.ErrSegmentSplicePending
+		return recordingRestoreInProgress()
 	}
 	unlock := deleteLocks.lock(sessionID)
 	defer unlock()

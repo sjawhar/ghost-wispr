@@ -156,7 +156,7 @@
   async function handleRetryRefinement(e: Event) {
     e.stopPropagation()
     retryingRefinement = true
-    retryingRefinementStatus = session.refinement_status
+    retryingRefinementStatus = session.refinement_status ?? null
     retryRefinementError = ''
     try {
       await retryRefinement(session.id)
