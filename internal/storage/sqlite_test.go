@@ -2092,6 +2092,9 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 	if err := store.CreateSession("fts-sync", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
+	if err := store.EndSession("fts-sync", started.Add(time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
 	if err := store.UpdateSummaryAtGeneration("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary initial: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -278,4 +279,34 @@ func TestOrphansLeavesASecondNameAlone(t *testing.T) {
 		t.Errorf("the orphan is still there: %v", err)
 	}
 	assertZeroed(t, held, len(secret))
+}
+
+func TestReservationChoosesTheHiddenPathBeforeTheRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(path, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := Reserve(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation.OriginalPath() != path {
+		t.Errorf("reserved original path = %q, want %q", reservation.OriginalPath(), path)
+	}
+	if filepath.Dir(reservation.HiddenPath()) != filepath.Dir(path) || !strings.HasPrefix(filepath.Base(reservation.HiddenPath()), hiddenPrefix) {
+		t.Errorf("reserved hidden path = %q, want an erasing name beside %q", reservation.HiddenPath(), path)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("reservation hid %q before Begin: %v", path, err)
+	}
+	pending, err := reservation.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(reservation.HiddenPath()); err != nil {
+		t.Fatalf("Begin did not use the reserved hidden path %q: %v", reservation.HiddenPath(), err)
+	}
+	if err := pending.Restore(); err != nil {
+		t.Fatal(err)
+	}
 }

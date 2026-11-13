@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -548,10 +549,10 @@ func TestASessionMergedBeforeItsDocumentsSyncedStillOwesThem(t *testing.T) {
 	}
 }
 
-// TestDeletingTheSessionADeletionWasMadeInKeepsItsSpans fails if deleting the
-// row of the session "Delete text" was made in takes its spans with it while
-// its recording lives on in the session it was merged into: a refinement
-// there would bring the words back.
+// TestDeletingTheSessionADeletionWasMadeInKeepsItsSpans fails if a delete can
+// remove a merged source's row and its "Delete text" span while the recording
+// lives on in the session it was merged into: a refinement there would bring
+// the words back.
 func TestDeletingTheSessionADeletionWasMadeInKeepsItsSpans(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "text-then-gone")
@@ -566,11 +567,11 @@ func TestDeletingTheSessionADeletionWasMadeInKeepsItsSpans(t *testing.T) {
 	if err := store.MergeSessions("text-then-gone-merged", []string{"text-then-gone"}, started, started.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DeleteSession("text-then-gone", t.TempDir()); err != nil {
-		t.Fatalf("delete the merged source: %v", err)
+	if _, err := store.DeleteSession("text-then-gone", t.TempDir()); !errors.Is(err, ErrDeleteMergeActive) {
+		t.Fatalf("delete the merged source = %v, want %v", err, ErrDeleteMergeActive)
 	}
 	if spans, err := store.TextDeletionSpans("recording.mp3"); err != nil || len(spans) != 1 {
-		t.Errorf("spans after the source row went = %+v (%v), want the one recorded", spans, err)
+		t.Errorf("spans after refused source delete = %+v (%v), want the one recorded", spans, err)
 	}
 }
 

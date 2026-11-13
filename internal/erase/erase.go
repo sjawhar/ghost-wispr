@@ -70,40 +70,72 @@ func Remove(path string) error {
 	return pending.Finish()
 }
 
+// Reservation chooses the hidden name a whole-file erase will use before it
+// moves the file there. A caller that must make the move recoverable across a
+// database transaction persists both paths before calling Begin.
+type Reservation struct {
+	path, hidden string
+}
+
+// Reserve chooses a hidden name beside path without changing either name.
+func Reserve(path string) (Reservation, error) {
+	hidden, err := hiddenName(filepath.Dir(path))
+	if err != nil {
+		return Reservation{}, err
+	}
+	return Reservation{path: path, hidden: hidden}, nil
+}
+
+// OriginalPath is the name that a reservation will hide.
+func (r Reservation) OriginalPath() string {
+	return r.path
+}
+
+// HiddenPath is the name that a reservation will use while it is erased.
+func (r Reservation) HiddenPath() string {
+	return r.hidden
+}
+
 // Pending is a file Begin moved to a hidden name, for Finish to erase.
 type Pending struct {
 	path, hidden string
 }
 
-// Begin is the first half of Remove: it moves the file at path to a hidden
-// name beside it (.erasing-*), so path no longer names it, flushes the
-// directory so the rename is on disk (a power loss then cannot bring the file
-// back under its name, where nothing finishes it), and returns it for Finish,
-// which a caller may run later. Until Finish is done, a stop leaves the file
-// under its hidden name for Leftovers. An error that does not wrap
-// ErrLeftover means path still names the file, unchanged; one that does
-// means the rename is done but the flush failed: the Pending returned is
-// still the file's, for Finish. A path that is not a regular file is removed
-// as os.Remove removes it, and Finish then has nothing to do.
+// Begin is the first half of Remove: it reserves a hidden name beside path
+// (.erasing-*), moves the file there, flushes the directory so the rename is
+// on disk (a power loss then cannot bring the file back under its name, where
+// nothing finishes it), and returns it for Finish, which a caller may run
+// later. Until Finish is done, a stop leaves the file under its hidden name
+// for Leftovers. An error that does not wrap ErrLeftover means path still names
+// the file, unchanged; one that does means the rename is done but the flush
+// failed: the Pending returned is still the file's, for Finish. A path that is
+// not a regular file is removed as os.Remove removes it, and Finish then has
+// nothing to do.
 func Begin(path string) (Pending, error) {
-	info, err := os.Lstat(path)
+	reservation, err := Reserve(path)
+	if err != nil {
+		return Pending{}, err
+	}
+	return reservation.Begin()
+}
+
+// Begin starts a reserved erase. Its hidden name was chosen before a caller
+// persisted it, so startup can restore a live file that a stop hid before the
+// caller committed the operation that deletes its row.
+func (r Reservation) Begin() (Pending, error) {
+	info, err := os.Lstat(r.path)
 	if err != nil {
 		return Pending{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return Pending{}, os.Remove(path)
+		return Pending{}, os.Remove(r.path)
 	}
-	dir := filepath.Dir(path)
-	hidden, err := hiddenName(dir)
-	if err != nil {
+	if err := os.Rename(r.path, r.hidden); err != nil {
 		return Pending{}, err
 	}
-	if err := os.Rename(path, hidden); err != nil {
-		return Pending{}, err
-	}
-	pending := Pending{path: path, hidden: hidden}
-	if err := syncDirectory(dir); err != nil {
-		return pending, fmt.Errorf("flush the rename of %s: %w: %w", path, ErrLeftover, err)
+	pending := Pending(r)
+	if err := syncDirectory(filepath.Dir(r.path)); err != nil {
+		return pending, fmt.Errorf("flush the rename of %s: %w: %w", r.path, ErrLeftover, err)
 	}
 	return pending, nil
 }
@@ -140,6 +172,13 @@ func (p Pending) Restore() error {
 		return fmt.Errorf("flush restored %s: %w", p.path, err)
 	}
 	return nil
+}
+
+// Restore gives a hidden file back to originalPath. It is for startup
+// recovery, where a persisted reservation names a pending erase that did not
+// leave a Pending value in memory.
+func Restore(originalPath, hiddenPath string) error {
+	return Pending{path: originalPath, hidden: hiddenPath}.Restore()
 }
 
 // Replace renames from to to, as os.Rename does, and erases the file to named

@@ -182,11 +182,15 @@ func (s *apiStoreStub) DeleteSession(id, audioDir string) (string, error) {
 	return sess.AudioPath, nil
 }
 
-func (s *apiStoreStub) PrepareRawSessionErase(id, audioDir string) (string, error) {
+func (s *apiStoreStub) ReserveRawSessionErase(id, _, _ string) error {
 	if _, ok := s.sessions[id]; !ok {
-		return "", os.ErrNotExist
+		return os.ErrNotExist
 	}
-	return filepath.Join(audioDir, id+".pcm"), nil
+	return nil
+}
+
+func (*apiStoreStub) CancelRawSessionErase(string, string) error {
+	return nil
 }
 
 func (*apiStoreStub) SourceSessionIDs(string) ([]string, error) {
@@ -764,11 +768,11 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 // row has gone: the user then cannot retry its secure removal.
 func TestDeleteSessionKeepsItsRowWhenRawPCMCannotBeHidden(t *testing.T) {
 	dir := t.TempDir()
-	original := beginErasing
-	t.Cleanup(func() { beginErasing = original })
-	beginErasing = func(path string) (erase.Pending, error) {
-		if path != filepath.Join(dir, "s1.pcm") {
-			t.Errorf("raw erase path = %q, want %q", path, filepath.Join(dir, "s1.pcm"))
+	original := beginReservedErasing
+	t.Cleanup(func() { beginReservedErasing = original })
+	beginReservedErasing = func(reservation erase.Reservation) (erase.Pending, error) {
+		if reservation.OriginalPath() != filepath.Join(dir, "s1.pcm") {
+			t.Errorf("raw erase path = %q, want %q", reservation.OriginalPath(), filepath.Join(dir, "s1.pcm"))
 		}
 		return erase.Pending{}, errors.New("rename raw pcm: input/output error")
 	}
@@ -4297,5 +4301,220 @@ func TestTTSSpeakReturnsBadGatewayAfterSynthesisFailure(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "provider refused synthesis") {
 		t.Fatalf("failure response %q omits synthesis error", rr.Body.String())
+	}
+}
+
+type deleteSessionErrorStore struct {
+	*storage.SQLiteStore
+	err error
+}
+
+func (s *deleteSessionErrorStore) DeleteSession(string, string) (string, error) {
+	return "", s.err
+}
+
+type sourceRawPredeleteStore struct {
+	*storage.SQLiteStore
+	sourceRaw  []string
+	stillNamed []string
+}
+
+func (s *sourceRawPredeleteStore) DeleteSession(id, audioDir string) (string, error) {
+	for _, raw := range s.sourceRaw {
+		if _, err := os.Stat(raw); err == nil {
+			s.stillNamed = append(s.stillNamed, raw)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return s.SQLiteStore.DeleteSession(id, audioDir)
+}
+
+func newMergedDeleteStore(t *testing.T) (*storage.SQLiteStore, string, map[string][]byte) {
+	t.Helper()
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	started := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"source", "later-source"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), id+".mp3"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MergeSessions("merged", []string{"source", "later-source"}, started, started.Add(61*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	audioDir := t.TempDir()
+	raw := map[string][]byte{
+		"merged":       []byte("merged raw microphone capture"),
+		"source":       []byte("source raw microphone capture"),
+		"later-source": []byte("later source raw microphone capture"),
+	}
+	for id, contents := range raw {
+		if err := os.WriteFile(filepath.Join(audioDir, id+".pcm"), contents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return store, audioDir, raw
+}
+
+func TestDeleteSessionHidesEveryMergedSourceRawPCM(t *testing.T) {
+	store, audioDir, raw := newMergedDeleteStore(t)
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	entered, release := make(chan struct{}), make(chan struct{})
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+	})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		close(entered)
+		<-release
+		finish(sessionID, pending)
+	}
+
+	checkedStore := &sourceRawPredeleteStore{
+		SQLiteStore: store,
+		sourceRaw: []string{
+			filepath.Join(audioDir, "source.pcm"),
+			filepath.Join(audioDir, "later-source.pcm"),
+		},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), checkedStore, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete merged session = %d %s", rr.Code, rr.Body.String())
+	}
+	if len(checkedStore.stillNamed) != 0 {
+		t.Errorf("merged source raw PCM still named when DeleteSession ran: %v", checkedStore.stillNamed)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the post-delete erasure did not begin")
+	}
+	for id := range raw {
+		if _, err := os.Stat(filepath.Join(audioDir, id+".pcm")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("raw PCM for %s after merged delete = %v, want hidden before the answer", id, err)
+		}
+	}
+	close(release)
+	released = true
+}
+
+func TestDeleteSessionRestoresMergedSourcesWhenRowDeleteFails(t *testing.T) {
+	store, audioDir, raw := newMergedDeleteStore(t)
+	h, err := Handler(testStaticFS(t), NewHub(), &deleteSessionErrorStore{SQLiteStore: store, err: errors.New("database unavailable")}, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("delete with database failure = %d %s, want 500", rr.Code, rr.Body.String())
+	}
+	for id, want := range raw {
+		if got, err := os.ReadFile(filepath.Join(audioDir, id+".pcm")); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("raw PCM for %s after failed row delete = %q (%v), want restored source bytes", id, got, err)
+		}
+	}
+}
+
+func TestDeleteSessionRestoresEarlierRawPCMWhenALaterHideFails(t *testing.T) {
+	store, audioDir, raw := newMergedDeleteStore(t)
+	original := beginReservedErasing
+	t.Cleanup(func() { beginReservedErasing = original })
+	failedPath := filepath.Join(audioDir, "source.pcm")
+	beginReservedErasing = func(reservation erase.Reservation) (erase.Pending, error) {
+		if reservation.OriginalPath() == failedPath {
+			return erase.Pending{}, errors.New("cannot hide source raw PCM")
+		}
+		return original(reservation)
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("delete with later raw hide failure = %d %s, want 500", rr.Code, rr.Body.String())
+	}
+	for id, want := range raw {
+		if got, err := os.ReadFile(filepath.Join(audioDir, id+".pcm")); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("raw PCM for %s after later hide failure = %q (%v), want restored bytes", id, got, err)
+		}
+	}
+}
+
+func TestDeleteSessionRefusesNestedMergeTarget(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"source", "middle-sibling", "outer-sibling"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MergeSessions("middle", []string{"source", "middle-sibling"}, started, started.Add(61*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("outer", []string{"middle", "outer-sibling"}, started, started.Add(121*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/middle", nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete of nested merge target = %d %s, want 409", rr.Code, rr.Body.String())
+	}
+	for _, id := range []string{"source", "middle-sibling", "middle", "outer", "outer-sibling"} {
+		if _, err := store.GetSession(id); err != nil {
+			t.Errorf("nested delete refusal removed %s: %v", id, err)
+		}
+	}
+}
+
+func TestDeleteSessionRefusesAnActiveMergedSource(t *testing.T) {
+	store, audioDir, _ := newMergedDeleteStore(t)
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = ? WHERE id = 'source'`, storage.SessionActive); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete of merged session with active source = %d %s, want 409", rr.Code, rr.Body.String())
+	}
+	if sess, err := store.GetSession("source"); err != nil || sess.Status != storage.SessionActive {
+		t.Fatalf("active source after refused delete = %+v (%v), want active", sess, err)
 	}
 }

@@ -312,6 +312,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 			return fmt.Errorf("apply pragma %q: %w", p, err)
 		}
 	}
+	// A session delete records a raw erase before it moves the raw file to its
+	// hidden name. Restore those live files before any Leftovers pass can
+	// overwrite them. Fresh and older databases have no reservation table yet.
+	if err := s.restoreRawEraseReservations(); err != nil {
+		return err
+	}
 	// Finish erasing a backup the app stopped part way through replacing.
 	if err := erase.Leftovers(filepath.Dir(dbPath)); err != nil {
 		slog.Warn("failed to erase leftover backups", "path", dbPath, "error", err)
@@ -367,6 +373,22 @@ func (s *SQLiteStore) init(dbPath string) error {
 		);
 	`); err != nil {
 		return fmt.Errorf("create sessions table: %w", err)
+	}
+
+	// raw_erase_reservations names a raw file's original and hidden paths
+	// before the session delete moves it. On the next startup, a reservation
+	// whose session still exists restores that raw file before Leftovers
+	// overwrites hidden erasures. DeleteSession removes its reservations in
+	// the same transaction as their session rows.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS raw_erase_reservations (
+			session_id TEXT NOT NULL,
+			original_path TEXT NOT NULL,
+			hidden_path TEXT NOT NULL UNIQUE,
+			PRIMARY KEY (session_id, original_path)
+		);
+	`); err != nil {
+		return fmt.Errorf("create raw erase reservations table: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -1726,11 +1748,6 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	return true, nil
 }
 
-// ErrDriveFolderRecorded means a Drive folder belongs to another local
-// session, so a first sync must not adopt it just because its display name
-// matches.
-var ErrDriveFolderRecorded = errors.New("drive folder is already recorded for another session")
-
 // RecordSyncFolder records a folder just created for the sync claim that
 // names it, before that sync uploads its first file. A stopped process then
 // leaves a retry with the folder to reuse. When a segment deletion is pending,
@@ -1741,13 +1758,6 @@ func (s *SQLiteStore) RecordSyncFolder(id, claim, driveFolderID string) (bool, e
 		return false, fmt.Errorf("begin recording Drive folder of session %s: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var owner string
-	switch err := tx.QueryRow(`SELECT id FROM sessions WHERE gdrive_folder_id = ? AND id != ?`, driveFolderID, id).Scan(&owner); {
-	case err == nil:
-		return false, fmt.Errorf("%w: %s", ErrDriveFolderRecorded, owner)
-	case !errors.Is(err, sql.ErrNoRows):
-		return false, fmt.Errorf("find owner of Drive folder %s: %w", driveFolderID, err)
-	}
 	res, err := tx.Exec(`UPDATE sessions SET gdrive_folder_id = ?
 		WHERE id = ? AND sync_state = ? AND sync_claim = ?`,
 		driveFolderID, id, SyncStateSyncing, claim)
@@ -1814,9 +1824,6 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 		return false, nil
 	}
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
-		return false, err
-	}
-	if err := settleUnownedDriveReplacement(tx, id); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -2436,40 +2443,150 @@ func (s *SQLiteStore) RestoreAudio(removal *AudioRemoval, restored string) error
 }
 
 // ErrDeleteReplacementPending is the error DeleteSession returns, deleting
-// nothing, for a session that still owes Google Drive a replacement after a
-// segment deletion, or whose Drive folder one still owes (a source merged
-// into the session the segment was deleted from): with its row would go the
-// replacement, its warning, or the folder the replacement must reach, and
-// the Drive folder would keep the deleted words.
+// nothing, for a session or source that still owes Google Drive a replacement
+// after a segment deletion, or whose Drive folder one still owes: with its row
+// would go the replacement, its warning, or the folder the replacement must
+// reach, and the Drive folder would keep the deleted words.
 var ErrDeleteReplacementPending = errors.New("this session still has a deleted segment on Google Drive; delete it after its Drive files are replaced")
 
+// ErrDeleteMergeActive is the error DeleteSession returns when the target is
+// already part of a later merge, or a source it would recursively delete is
+// active. The later merge or recorder would lose its source.
+var ErrDeleteMergeActive = errors.New("this session is part of another merge or has an active merged source")
+
 // noOwedDriveReplacement is the condition, on a sessions row, that it owes
-// Google Drive no replacement and its folder is owed none. DeleteSession, GC
-// (removableCondition) and MergeSessions all check it.
+// Google Drive no replacement and its folder is owed none. GC
+// (removableCondition) and MergeSessions check it; DeleteSession applies it
+// to its full merged-source set.
 const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXISTS (
 	SELECT 1 FROM drive_replacement_folders
 	WHERE drive_replacement_folders.folder_session_id = sessions.id AND drive_replacement_folders.state = '` + DriveReplacementFolderOwed + `')`
 
-// PrepareRawSessionErase records the directory of session id's raw microphone
-// capture before the API hides it. The session row stays intact if the rename
-// cannot start, so the caller can retry rather than losing the only handle to
-// the raw audio.
-func (s *SQLiteStore) PrepareRawSessionErase(id, audioDir string) (string, error) {
-	rawPath := filepath.Join(audioDir, id+".pcm")
-	if err := s.RecordEraseDirectory(filepath.Dir(rawPath)); err != nil {
-		return "", fmt.Errorf("prepare raw erase for session %s: %w", id, err)
+// ReserveRawSessionErase records the raw microphone capture's two names
+// before the API moves it to the hidden one. The record commits before the
+// rename, so startup can restore a session whose delete did not commit.
+func (s *SQLiteStore) ReserveRawSessionErase(id, originalPath, hiddenPath string) error {
+	originalPath, err := filepath.Abs(originalPath)
+	if err != nil {
+		return fmt.Errorf("find raw erase path for session %s: %w", id, err)
 	}
-	return rawPath, nil
+	hiddenPath, err = filepath.Abs(hiddenPath)
+	if err != nil {
+		return fmt.Errorf("find hidden raw erase path for session %s: %w", id, err)
+	}
+	if filepath.Dir(originalPath) != filepath.Dir(hiddenPath) {
+		return fmt.Errorf("reserve raw erase for session %s: paths are in different directories", id)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin reserving raw erase for session %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := recordEraseDirectory(tx, filepath.Dir(originalPath)); err != nil {
+		return fmt.Errorf("reserve raw erase for session %s: %w", id, err)
+	}
+	res, err := tx.Exec(`INSERT INTO raw_erase_reservations(session_id, original_path, hidden_path)
+		SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)`,
+		id, originalPath, hiddenPath, id)
+	if err != nil {
+		return fmt.Errorf("record raw erase reservation for session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count raw erase reservations for session %s: %w", id, err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit raw erase reservation for session %s: %w", id, err)
+	}
+	return nil
 }
 
-// DeleteSession deletes session id, refusing one that owes Google Drive a
-// replacement (ErrDeleteReplacementPending), and returns the audio_path the
-// deleted row had: the recordings the caller then erases are the ones the
-// row named when it went, not ones it read before. In the same transaction,
-// before the row goes, it records the directory of each of those
-// recordings, found where recording.Resolve finds it in audioDir (the one
-// the caller then erases), so an erase a stop cuts off is finished as the
-// app starts; it deletes nothing if it cannot record one.
+// CancelRawSessionErase forgets a reservation whose delete did not continue.
+// A restore that fails deliberately keeps its reservation for startup to
+// recover rather than allowing Leftovers to zero a live session's raw file.
+func (s *SQLiteStore) CancelRawSessionErase(id, hiddenPath string) error {
+	hiddenPath, err := filepath.Abs(hiddenPath)
+	if err != nil {
+		return fmt.Errorf("find hidden raw erase path for session %s: %w", id, err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM raw_erase_reservations WHERE session_id = ? AND hidden_path = ?`, id, hiddenPath); err != nil {
+		return fmt.Errorf("cancel raw erase reservation for session %s: %w", id, err)
+	}
+	return nil
+}
+
+// restoreRawEraseReservations makes a raw recording visible again when its
+// session survived the delete that hid it. It must run before any
+// erase.Leftovers pass. A record whose session is gone lets Leftovers finish
+// the hidden file, and is then discarded.
+func (s *SQLiteStore) restoreRawEraseReservations() error {
+	rows, err := s.db.Query(`SELECT reservation.session_id, reservation.original_path, reservation.hidden_path
+		FROM raw_erase_reservations AS reservation
+		JOIN sessions ON sessions.id = reservation.session_id`)
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return nil
+		}
+		return fmt.Errorf("list raw erase reservations: %w", err)
+	}
+	type reservation struct {
+		sessionID, originalPath, hiddenPath string
+	}
+	var reservations []reservation
+	for rows.Next() {
+		var r reservation
+		if err := rows.Scan(&r.sessionID, &r.originalPath, &r.hiddenPath); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan raw erase reservation: %w", err)
+		}
+		reservations = append(reservations, r)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("list raw erase reservations: %w", err)
+	}
+	for _, r := range reservations {
+		hidden, err := os.Lstat(r.hiddenPath)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return fmt.Errorf("read hidden raw erase for session %s: %w", r.sessionID, err)
+		case !hidden.Mode().IsRegular():
+			return fmt.Errorf("hidden raw erase for session %s is not a regular file", r.sessionID)
+		default:
+			_, originalErr := os.Lstat(r.originalPath)
+			switch {
+			case errors.Is(originalErr, os.ErrNotExist):
+				if err := erase.Restore(r.originalPath, r.hiddenPath); err != nil {
+					return fmt.Errorf("restore raw erase for session %s: %w", r.sessionID, err)
+				}
+			case originalErr != nil:
+				return fmt.Errorf("read raw erase destination for session %s: %w", r.sessionID, originalErr)
+			}
+		}
+		if err := s.CancelRawSessionErase(r.sessionID, r.hiddenPath); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`DELETE FROM raw_erase_reservations
+		WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.id = raw_erase_reservations.session_id)`); err != nil {
+		return fmt.Errorf("discard deleted raw erase reservations: %w", err)
+	}
+	return nil
+}
+
+// DeleteSession deletes session id and its merged-source set, refusing a target
+// that feeds another merge (ErrDeleteMergeActive), any active member, or any
+// member that owes Google Drive a replacement
+// (ErrDeleteReplacementPending). It returns the target row's audio path: the
+// recordings the caller then erases are the ones the row named when it went,
+// not ones it read before. In the same transaction, before the rows go, it
+// records the directory of each of those recordings, found where
+// recording.Resolve finds it in audioDir (the one the caller then erases), so
+// an erase a stop cuts off is finished as the app starts; it deletes nothing
+// if it cannot record one.
 func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -2477,16 +2594,52 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	var audioPath string
-	switch err := tx.QueryRow(`SELECT audio_path FROM sessions WHERE id = ? AND `+noOwedDriveReplacement, id).Scan(&audioPath); {
+	switch err := tx.QueryRow(`WITH RECURSIVE doomed(id) AS (
+			SELECT ?
+			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
+		) SELECT target.audio_path
+		FROM sessions AS target
+		WHERE target.id = ? AND target.merged_into = ''
+		  AND NOT EXISTS (
+			SELECT 1 FROM sessions AS member JOIN doomed ON member.id = doomed.id
+			WHERE member.status = ?
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM sessions AS member JOIN doomed ON member.id = doomed.id
+			WHERE member.drive_replace_pending = 1
+			   OR EXISTS (
+				SELECT 1 FROM drive_replacement_folders
+				WHERE drive_replacement_folders.folder_session_id = member.id
+				  AND drive_replacement_folders.state = ?
+			   )
+		  )`,
+		id, id, SessionActive, DriveReplacementFolderOwed).Scan(&audioPath); {
 	case errors.Is(err, sql.ErrNoRows):
-		var pending int
-		switch err := tx.QueryRow(`SELECT drive_replace_pending FROM sessions WHERE id = ?`, id).Scan(&pending); {
+		var exists int
+		switch err := tx.QueryRow(`SELECT 1 FROM sessions WHERE id = ?`, id).Scan(&exists); {
 		case errors.Is(err, sql.ErrNoRows):
 			return "", sql.ErrNoRows
 		case err != nil:
-			return "", fmt.Errorf("delete session %s: %w", id, err)
-		default:
+			return "", fmt.Errorf("read session %s to delete it: %w", id, err)
+		}
+		var unsafe int
+		err := tx.QueryRow(`WITH RECURSIVE doomed(id) AS (
+				SELECT ?
+				UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
+			) SELECT 1
+			WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ? AND merged_into != '')
+			   OR EXISTS (
+				SELECT 1 FROM sessions AS member JOIN doomed ON member.id = doomed.id
+				WHERE member.status = ?
+			   )`,
+			id, id, SessionActive).Scan(&unsafe)
+		switch {
+		case err == nil:
+			return "", fmt.Errorf("delete session %s: %w", id, ErrDeleteMergeActive)
+		case errors.Is(err, sql.ErrNoRows):
 			return "", fmt.Errorf("delete session %s: %w", id, ErrDeleteReplacementPending)
+		default:
+			return "", fmt.Errorf("check whether session %s is safe to delete: %w", id, err)
 		}
 	case err != nil:
 		return "", fmt.Errorf("read session %s to delete it: %w", id, err)
@@ -2521,6 +2674,12 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {
 			return "", fmt.Errorf("delete session %s: %w", id, err)
 		}
+	}
+	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
+			SELECT ?
+			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
+		) DELETE FROM raw_erase_reservations WHERE session_id IN (SELECT id FROM doomed)`, id); err != nil {
+		return "", fmt.Errorf("clear raw erase reservations for session %s: %w", id, err)
 	}
 	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?

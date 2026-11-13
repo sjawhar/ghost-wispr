@@ -448,7 +448,7 @@ func OpenAPISpec() map[string]any {
 							"description": "Session deleted",
 						},
 						"409": map[string]any{
-							"description": "The session is active, or still has a deleted segment on Google Drive; delete it after its Drive files are replaced",
+							"description": "The session is active, is part of another merge, or it or a merged source still has a deleted segment on Google Drive; delete it after its Drive files are replaced",
 						},
 					},
 				},
