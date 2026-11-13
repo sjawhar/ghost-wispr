@@ -45,6 +45,10 @@ type deletionRecordingSource interface {
 	DownloadRecording(ctx context.Context, folderID, name, destination string) error
 }
 
+type recordingRestoreGuard interface {
+	LatestRecordingSHA256(sessionID, recording string) (string, bool, error)
+}
+
 type sessionDeletionLocks struct {
 	mu         sync.Mutex
 	locks      map[string]*sync.Mutex
@@ -101,7 +105,7 @@ func usableRecordingSource(source deletionRecordingSource) bool {
 // finds it (as written, then in audioDir), so the recording spliced is the one
 // the app plays and syncs; one found in neither place is restored into
 // audioDir.
-func restoreDeletionRecordings(ctx context.Context, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
+func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
 	byName := make(map[string]string)
 	for _, entry := range strings.Split(session.AudioPath, ",") {
 		entry = strings.TrimSpace(entry)
@@ -111,6 +115,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		path := recordingname.Resolve(entry, audioDir)
 		byName[filepath.Base(path)] = path
 	}
+	driveFiles := make(map[string][]*drive.File)
 	if session.GDriveFolderID != "" && usableRecordingSource(source) {
 		files, err := source.ListFolderFiles(ctx, session.GDriveFolderID)
 		if err != nil {
@@ -121,6 +126,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 			if !strings.HasPrefix(file.MimeType, "audio/") || !ok {
 				continue
 			}
+			driveFiles[name] = append(driveFiles[name], file)
 			if _, known := byName[name]; !known {
 				if strings.TrimSpace(audioDir) == "" {
 					return deletionRecordingSet{}, fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
@@ -149,13 +155,48 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		if source == nil || session.GDriveFolderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := source.DownloadRecording(ctx, session.GDriveFolderID, recordingname.FileName(path), path); err != nil {
-			return deletionRecordingSet{}, fmt.Errorf("restore recording %s: %w", name, err)
+		if err := downloadDriveRecording(ctx, guard, session.ID, session.GDriveFolderID, source, driveFiles[name], path, false); err != nil {
+			return deletionRecordingSet{}, err
 		}
 		set.Paths = append(set.Paths, path)
 		set.Downloaded = append(set.Downloaded, path)
 	}
 	return set, nil
+}
+
+func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, sessionID, folderID string, source deletionRecordingSource, files []*drive.File, destination string, allowPrecut bool) error {
+	if len(files) == 0 {
+		return fmt.Errorf("Drive has no recording named %s", recordingname.FileName(destination))
+	}
+	expected, cut, err := "", false, error(nil)
+	if guard != nil {
+		expected, cut, err = guard.LatestRecordingSHA256(sessionID, destination)
+		if err != nil {
+			return fmt.Errorf("read latest cut hash for recording %s: %w", destination, err)
+		}
+	}
+	if cut && !allowPrecut {
+		for _, file := range files {
+			if file.Sha256Checksum != expected {
+				return fmt.Errorf("refuse Drive recording %s: SHA-256 %q does not match the latest cut hash %q", file.Name, file.Sha256Checksum, expected)
+			}
+		}
+	}
+	if err := source.DownloadRecording(ctx, folderID, recordingname.FileName(destination), destination); err != nil {
+		return fmt.Errorf("restore recording %s: %w", filepath.Base(destination), err)
+	}
+	if cut && !allowPrecut {
+		hash, err := fileSHA256(destination)
+		if err != nil {
+			_ = os.Remove(destination)
+			return fmt.Errorf("hash restored recording %s: %w", destination, err)
+		}
+		if hash != expected {
+			_ = os.Remove(destination)
+			return fmt.Errorf("refuse restored recording %s: SHA-256 %q does not match the latest cut hash %q", destination, hash, expected)
+		}
+	}
+	return nil
 }
 
 // DeleteRefinedText removes one selected batch-derived occurrence and then
@@ -443,7 +484,7 @@ func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, a
 	outcome := pendingSpliceOutcome{Span: storage.DeletedSpan{SessionID: sessionID, AudioPath: session.AudioPath}}
 	if err == nil {
 		err = restoreRefinementRecording(ctx, store, &session, audioDir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-			return restoreDeletionRecordings(ctx, &current, audioDir, source)
+			return restoreDeletionRecordings(ctx, store, &current, audioDir, source)
 		})
 	}
 	if err == nil {
@@ -476,7 +517,7 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	if err != nil {
 		return false, fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err)
 	}
-	recordingSet, err := restoreDeletionRecordings(ctx, &session, audioDir, source)
+	recordingSet, err := restoreDeletionRecordings(ctx, store, &session, audioDir, source)
 	if err != nil {
 		return false, fmt.Errorf("restore pending splice %s: %w", span.AudioPath, err)
 	}

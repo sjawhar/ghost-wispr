@@ -86,7 +86,7 @@ func TestR9MovedAudioDirDoesNotClearTheMarker(t *testing.T) {
 	}
 
 	err := restoreRefinementRecording(context.Background(), store, &session, newDir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-		return restoreDeletionRecordings(ctx, &current, newDir, nil)
+		return restoreDeletionRecordings(ctx, store, &current, newDir, nil)
 	})
 	if err == nil {
 		t.Fatal("restored only the moved survivor")

@@ -42,7 +42,7 @@ func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
 	registry := newWarningsRegistry()
 	refined := make(chan struct{}, 1)
 	hook := newRetryRefinementHook(store, func() string { return dir }, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-		return restoreDeletionRecordings(ctx, &current, dir, drive)
+		return restoreDeletionRecordings(ctx, store, &current, dir, drive)
 	}, registry, func(_ context.Context, id, audioPath string, at time.Time) error {
 		generation, claimed, err := store.ClaimRefinement(id, audioPath)
 		if err != nil {

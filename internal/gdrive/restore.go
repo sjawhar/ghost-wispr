@@ -100,7 +100,7 @@ func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive
 	for {
 		call := s.service.Files.List().
 			Q(q).
-			Fields("nextPageToken, files(id, name, mimeType, appProperties, modifiedTime)").
+			Fields("nextPageToken, files(id, name, mimeType, sha256Checksum, appProperties, modifiedTime)").
 			SupportsAllDrives(true).
 			IncludeItemsFromAllDrives(true).
 			PageSize(100).
