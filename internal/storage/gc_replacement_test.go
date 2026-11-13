@@ -32,9 +32,12 @@ func TestGCKeepsASessionThatOwesADriveReplacement(t *testing.T) {
 		t.Errorf("recordings = %+v, want the owed session's recording kept", recordings)
 	}
 	deleted, err := deleteAgeEligibleForTest(store, id, "/audio/recording.mp3")
-	var block *GCSourceBlockError
-	if !errors.As(err, &block) || block.SessionID != id || block.Reason != "Drive replacement owed" {
+	var block *GCSessionBlockError
+	if !errors.As(err, &block) || block.BlockingSessionID != id || !block.BlockingSessionIsTarget || block.Reason != "Drive replacement owed" {
 		t.Fatalf("age delete of a session that owes Drive = %v (%+v)", err, block)
+	}
+	if got, want := block.Error(), "target session "+id+" blocks age GC: Drive replacement owed"; got != want {
+		t.Errorf("GC block error = %q, want %q", got, want)
 	}
 	if deleted {
 		t.Fatal("GC deleted a session that owes Drive a replacement")

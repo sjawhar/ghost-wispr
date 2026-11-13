@@ -192,7 +192,7 @@ func (c *Collector) applyAgePolicy() ([]string, error) {
 	var deleted []string
 	for _, id := range ids {
 		if err := c.deleteSession(id, names); err != nil {
-			var block *storage.GCSourceBlockError
+			var block *storage.GCSessionBlockError
 			if !errors.As(err, &block) {
 				c.logger.Warn("gc skipped session", "operation", "delete_session", "session_id", id, "error", err)
 			}
@@ -510,9 +510,13 @@ func (c *Collector) deleteSession(id string, names names) error {
 	}
 	deletedIDs, deleted, err := c.store.DeleteEndedSessionAndSources(id, sess.AudioPath, c.config.AudioDir)
 	if err != nil {
-		var block *storage.GCSourceBlockError
+		var block *storage.GCSessionBlockError
 		if errors.As(err, &block) {
-			c.logger.Warn("gc source blocks age deletion", "operation", "delete_session", "session_id", id, "source_session_id", block.SessionID, "source_block_reason", block.Reason)
+			blockRole := "source"
+			if block.BlockingSessionIsTarget {
+				blockRole = "target"
+			}
+			c.logger.Warn("gc session blocks age deletion", "operation", "delete_session", "session_id", id, "blocking_session_id", block.BlockingSessionID, "blocking_session_role", blockRole, "blocking_session_block_reason", block.Reason)
 			return err
 		}
 		return fmt.Errorf("delete from db: %w", err)
@@ -592,7 +596,7 @@ func restoreReservedRaw(store Store, reservation storage.RawEraseReservation) er
 func sourceHasSavedAudio(sourceID string, files []recordingFile) bool {
 	for _, file := range files {
 		base := filepath.Base(file.path)
-		if strings.TrimSuffix(base, filepath.Ext(base)) == sourceID {
+		if strings.TrimSuffix(base, filepath.Ext(base)) == sourceID && file.size > 0 {
 			return true
 		}
 	}

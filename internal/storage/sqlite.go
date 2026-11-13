@@ -2460,15 +2460,19 @@ var ErrDeleteReplacementPending = errors.New("this session still has a deleted s
 // active. The later merge or recorder would lose its source.
 var ErrDeleteMergeActive = errors.New("this session is part of another merge or has an active merged source")
 
-// GCSourceBlockError identifies the source that prevents age GC from deleting
-// a merged session.
-type GCSourceBlockError struct {
-	SessionID string
-	Reason    string
+// GCSessionBlockError identifies the session that prevents an age GC deletion.
+type GCSessionBlockError struct {
+	BlockingSessionID       string
+	BlockingSessionIsTarget bool
+	Reason                  string
 }
 
-func (e *GCSourceBlockError) Error() string {
-	return fmt.Sprintf("merged source %s blocks age GC: %s", e.SessionID, e.Reason)
+func (e *GCSessionBlockError) Error() string {
+	role := "source"
+	if e.BlockingSessionIsTarget {
+		role = "target"
+	}
+	return fmt.Sprintf("%s session %s blocks age GC: %s", role, e.BlockingSessionID, e.Reason)
 }
 
 // noOwedDriveReplacement is the condition, on a sessions row, that it owes
@@ -2765,17 +2769,17 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 
 // DeleteEndedSessionAndSources deletes an age-eligible merged session and its
 // source rows in one transaction. It records every raw capture directory
-// before the rows go. It refuses when a source is active, remote-deleted,
-// refining, owes a Drive replacement, has an owed Drive folder, or has a
-// folder whose documents still need refresh. It returns the deleted session
-// IDs so GC can erase each now-redundant raw capture.
+// before the rows go. It refuses when a session in that deletion set is
+// active, remote-deleted, refining, owes a Drive replacement, has an owed
+// Drive folder, or has a folder whose documents still need refresh. It returns
+// the deleted session IDs so GC can erase each now-redundant raw capture.
 func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir string) ([]string, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, false, fmt.Errorf("begin deleting session %s and its sources: %w", id, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var block GCSourceBlockError
+	var block GCSessionBlockError
 	err = tx.QueryRow(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
 			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
@@ -2806,9 +2810,10 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 		  )
 		LIMIT 1`,
 		id, SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed,
-		SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed).Scan(&block.SessionID, &block.Reason)
+		SessionActive, SyncStateRemoteDeleted, RefinementRunning, DriveReplacementFolderOwed).Scan(&block.BlockingSessionID, &block.Reason)
 	switch {
 	case err == nil:
+		block.BlockingSessionIsTarget = block.BlockingSessionID == id
 		return nil, false, &block
 	case !errors.Is(err, sql.ErrNoRows):
 		return nil, false, fmt.Errorf("check session set of %s before GC deletion: %w", id, err)
