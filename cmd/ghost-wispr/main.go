@@ -121,25 +121,36 @@ func refinementRecordingAvailable(session *storage.Session, audioDir string) err
 	return nil
 }
 
+func recordingRequirementKey(path string) string {
+	name := filepath.Base(strings.TrimSpace(path))
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp3", ".wav":
+		return strings.TrimSuffix(name, filepath.Ext(name))
+	default:
+		return name
+	}
+}
+
 func missingRefinementRecordings(required, restored []string) []string {
 	available := make(map[string]struct{}, len(restored))
 	for _, path := range restored {
-		if name := filepath.Base(strings.TrimSpace(path)); name != "" && name != "." {
-			available[name] = struct{}{}
+		if key := recordingRequirementKey(path); key != "" && key != "." {
+			available[key] = struct{}{}
 		}
 	}
 	missing := make([]string, 0, len(required))
 	seen := make(map[string]struct{}, len(required))
 	for _, path := range required {
 		name := filepath.Base(strings.TrimSpace(path))
-		if name == "" || name == "." {
+		key := recordingRequirementKey(path)
+		if key == "" || key == "." {
 			continue
 		}
-		if _, duplicate := seen[name]; duplicate {
+		if _, duplicate := seen[key]; duplicate {
 			continue
 		}
-		seen[name] = struct{}{}
-		if _, found := available[name]; !found {
+		seen[key] = struct{}{}
+		if _, found := available[key]; !found {
 			missing = append(missing, name)
 		}
 	}

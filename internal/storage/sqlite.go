@@ -982,6 +982,22 @@ func (s *SQLiteStore) RefinementRecordingPaths(sessionID string) ([]string, erro
 	if err != nil {
 		return nil, fmt.Errorf("list refined recording paths for session %s: %w", sessionID, err)
 	}
+	if len(paths) != 0 {
+		return paths, nil
+	}
+	sources, err := mergedSourceIDs(s.db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for _, sourceID := range sources {
+		var refinementStatus string
+		if err := s.db.QueryRow(`SELECT refinement_status FROM sessions WHERE id = ?`, sourceID).Scan(&refinementStatus); err != nil {
+			return nil, fmt.Errorf("read refinement status for merged source %s: %w", sourceID, err)
+		}
+		if refinementStatus != RefinementNoAudio {
+			paths = append(paths, sourceID+".mp3")
+		}
+	}
 	return paths, nil
 }
 
