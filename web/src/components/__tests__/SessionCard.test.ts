@@ -290,6 +290,27 @@ describe('SessionCard', () => {
     expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
   })
 
+  it('keeps the removal badge after a restored refinement fails', () => {
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-13T09:01:00Z',
+        restored_at: '2026-11-13T09:01:00Z',
+        refinement_status: RefinementStatus.Failed,
+      } as SessionSummary & { restored_at: string },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('audio-removed-badge')).toBeTruthy()
+  })
+
   it('marks a session whose audio was removed to free space, refined or not', () => {
     for (const refinementStatus of [RefinementStatus.Completed, RefinementStatus.NoAudio]) {
       const { unmount } = render({

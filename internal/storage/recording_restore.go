@@ -10,7 +10,7 @@ import (
 // cut recording on the unit.
 func (s *SQLiteStore) LatestRecordingSHA256(sessionID, recording string) (string, bool, error) {
 	rows, err := s.db.Query(`SELECT audio_path, sha256_after FROM deleted_segments
-		WHERE session_id = ? ORDER BY deleted_at DESC, rowid DESC`, sessionID)
+		WHERE session_id = ? ORDER BY rowid DESC`, sessionID)
 	if err != nil {
 		return "", false, fmt.Errorf("list deleted recording hashes for session %s: %w", sessionID, err)
 	}
