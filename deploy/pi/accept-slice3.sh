@@ -2274,6 +2274,42 @@ $(session_field "$detail" summary)"
     [[ "$(<"$marker")" == $'4 mode=text&revision=1\nretry' ]] || fail "self-test: A11 text only sent $(one_line "$(<"$marker")")"
   ) || exit 1
   printf 'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement\n'
+
+  (
+    unit_url=https://unit.test
+    retry_http_status=202
+    curl() {
+      [[ "$retry_http_status" == 202 ]] || return 1
+      [[ " $* " == *" --fail "* ]] || return 1
+      printf '{"triggered":true}'
+    }
+    session_detail() { printf '{"session":{"refinement_status":"completed"}}'; }
+    retry_refinement >/dev/null || fail 'self-test: a fast refinement did not accept the planted 202'
+  ) || exit 1
+  printf 'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes\n'
+  (
+    unit_url=https://unit.test
+    marker="$controls_dir/slow-refinement"
+    : >"$marker"
+    retry_http_status=202
+    curl() {
+      [[ "$retry_http_status" == 202 ]] || return 1
+      [[ " $* " == *" --fail "* ]] || return 1
+      printf '{"triggered":true}'
+    }
+    session_detail() {
+      printf 'read\n' >>"$marker"
+      if [[ "$(wc -l <"$marker")" == 1 ]]; then
+        printf '{"session":{"refinement_status":"running"}}'
+      else
+        printf '{"session":{"refinement_status":"completed"}}'
+      fi
+    }
+    sleep() { :; }
+    retry_refinement >/dev/null || fail 'self-test: a slow refinement did not complete after the planted running state'
+    [[ "$(wc -l <"$marker")" == 2 ]] || fail 'self-test: a slow refinement did not wait for completion'
+  ) || exit 1
+  printf 'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes\n'
   (
     : >"$marker"
     conversation_ready=true

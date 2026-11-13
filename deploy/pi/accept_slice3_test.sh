@@ -23,6 +23,8 @@ for line in \
   'A11 text only self-test RAN: the database scan sees a planted phrase in binary data in the database, its log and its backup' \
   'A11 text only self-test RAN: a failed control stops the row before "Delete text"' \
   'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement' \
+  'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes' \
+  'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes' \
   'A11 self-test RAN: planted failure rejected' \
   'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence' \
   'A11 self-test RAN: a failed control stops the row before "Delete text and audio"' \
@@ -113,5 +115,10 @@ assert_mutation_caught 'a Deepgram key passed as an argument' \
 assert_mutation_caught 'a Drive token that can write' \
   'readonly drive_scope=https://www.googleapis.com/auth/drive.readonly' \
   'readonly drive_scope=https://www.googleapis.com/auth/drive'
+
+assert_mutation_caught 'a retry refinement that rejects a 202 response' \
+  'retry_http_status=202' 'retry_http_status=500'
+assert_mutation_caught 'a slow refinement that skips its running state' \
+  '{"session":{"refinement_status":"running"}}' '{"session":{"refinement_status":"completed"}}'
 
 printf 'slice 3 acceptance test passed\n'
