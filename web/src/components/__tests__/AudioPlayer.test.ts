@@ -534,6 +534,7 @@ describe('AudioPlayer', () => {
     })
     const session = makeSession({
       refinement_status: RefinementStatus.Completed,
+      refined_revision: 1,
       refined_transcript: 'Refined transcript with the stored segment.',
       transcript_source: 'refined',
     })

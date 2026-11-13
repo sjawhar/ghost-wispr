@@ -29,7 +29,8 @@ export function audioLeftNote(session: SessionSummary): string {
 export function canRestoreRefinement(session: SessionSummary | undefined): boolean {
   return Boolean(
     session?.audio_removed_at &&
-    session.sync_status === SyncStatus.Synced &&
-    session.sync_state !== SyncState.RemoteDeleted,
+      session.gdrive_folder_id &&
+      session.sync_status === SyncStatus.Synced &&
+      session.sync_state !== SyncState.RemoteDeleted,
   )
 }

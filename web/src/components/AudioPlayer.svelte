@@ -79,6 +79,7 @@
   // identify a word occurrence safely enough to delete.
   const deletionAvailable = $derived(
     session?.refinement_status === RefinementStatus.Completed &&
+      (session.refined_revision ?? 0) > 0 &&
       visibleSegments.length > 0 &&
       visibleSegments.every((segment) => (segment.transcript_revision ?? 0) > 0),
   )

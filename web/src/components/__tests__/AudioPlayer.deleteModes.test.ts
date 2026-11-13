@@ -72,6 +72,31 @@ it('disables Delete until timed refined segments exist', () => {
   ).toHaveLength(2)
 })
 
+it('says a completed conversation without timed words needs refinement before deletion', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: 'recording.mp3',
+      refinement_status: RefinementStatus.Completed,
+      refined_revision: 0,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(
+    screen.getAllByText('This conversation completed without timed words. Use Retry refinement before deleting.'),
+  ).toHaveLength(2)
+})
+
 describe('AudioPlayer segment deletion actions', () => {
   afterEach(() => {
     vi.unstubAllGlobals()

@@ -155,6 +155,7 @@ export interface SessionSummary {
   // empty or absent if it did not. All of it, or part of it when audio_path
   // still names what is left. The session itself is kept.
   audio_removed_at?: string
+  gdrive_folder_id?: string
   sync_status?: SyncStatus
   sync_state?: SyncState
   // Why the last summary attempt failed, when it did.

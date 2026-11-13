@@ -209,6 +209,47 @@ describe('SessionCard', () => {
     expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
   })
 
+  it.each([
+    [
+      'a listed Drive recording',
+      {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      } as SessionSummary & { gdrive_folder_id: string },
+      true,
+    ],
+    [
+      'a session without a listed Drive folder',
+      {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+      },
+      false,
+    ],
+  ])('offers Retry refinement only for %s', (_, session, wantsRetry) => {
+    render({
+      session,
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(Boolean(screen.queryByTestId('retry-refinement-btn'))).toBe(wantsRetry)
+  })
+
   it('marks a session whose audio was removed to free space, refined or not', () => {
     for (const refinementStatus of [RefinementStatus.Completed, RefinementStatus.NoAudio]) {
       const { unmount } = render({
@@ -321,6 +362,42 @@ describe('SessionCard', () => {
       expect(reason.textContent).toBe(
         'cannot sync session s1 now: invalid sync state transition: REMOTE_DELETED -> SYNCING',
       )
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('shows why a refinement retry was refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: 'the recording was removed from this unit and its Drive folder is deleted' }), {
+          status: 409,
+        }),
+      ),
+    )
+    try {
+      render({
+        session: {
+          ...baseSession,
+          audio_path: '',
+          audio_removed_at: '2026-11-07T09:30:00Z',
+          refinement_status: RefinementStatus.NoAudio,
+          sync_status: SyncStatus.Synced,
+          sync_state: SyncState.Synced,
+          gdrive_folder_id: 'folder-1',
+        },
+        detail: undefined,
+        expanded: false,
+        presets: {},
+        onToggle: vi.fn(),
+        onLoadDetail: vi.fn(),
+        onResummarize: vi.fn(),
+        onDelete: vi.fn(),
+      })
+
+      await fireEvent.click(screen.getByTestId('retry-refinement-btn'))
+      expect(await screen.findByText('the recording was removed from this unit and its Drive folder is deleted')).toBeTruthy()
     } finally {
       vi.unstubAllGlobals()
     }
