@@ -178,7 +178,9 @@ it('explains when a restored session has no Drive folder to restore from', () =>
   })
 
   expect(
-    screen.getAllByText("This conversation's Drive folder was deleted, so its recording cannot be restored or refined."),
+    screen.getAllByText(
+      "This conversation's Drive folder was deleted, so its recording cannot be restored or refined.",
+    ),
   ).not.toHaveLength(0)
   expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
 })
