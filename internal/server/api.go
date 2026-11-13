@@ -1583,7 +1583,6 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-
 		go func() {
 			_ = controls.RetryRefinement(context.Background(), sessionID)
 		}()
