@@ -88,7 +88,7 @@
       return 'Refinement failed; retry refinement before deleting.'
     }
     if (session?.refinement_status === RefinementStatus.NoAudio) {
-      if (session.restored_at) {
+      if (session.restored_at && canRestoreRefinement(session)) {
         return 'This conversation was restored from Drive; retry refinement to delete from it'
       }
       if (canRestoreRefinement(session)) {

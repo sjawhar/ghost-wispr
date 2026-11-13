@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AudioPlayer from '../AudioPlayer.svelte'
 import { resetState } from '../../lib/state.svelte'
-import { RefinementStatus, SummaryStatus } from '../../lib/types'
+import { RefinementStatus, SummaryStatus, SyncState, SyncStatus } from '../../lib/types'
 
 const segments = [
   {
@@ -115,6 +115,9 @@ it('identifies a Drive-restored session as retryable before deletion', () => {
       audio_removed_at: '2026-11-13T09:01:00Z',
       restored_at: '2026-11-13T09:01:00Z',
       refinement_status: RefinementStatus.NoAudio,
+      gdrive_folder_id: 'folder-1',
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.Synced,
     },
     onDeleted: vi.fn(),
     onNotFound: vi.fn().mockResolvedValue(false),
@@ -124,7 +127,31 @@ it('identifies a Drive-restored session as retryable before deletion', () => {
     screen.getAllByText(
       'This conversation was restored from Drive; retry refinement to delete from it',
     ),
-  ).toHaveLength(2)
+  ).toHaveLength(3)
+})
+
+it('does not offer a refinement retry when a restored session cannot restore audio', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      audio_removed_at: '2026-11-13T09:01:00Z',
+      restored_at: '2026-11-13T09:01:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
 })
 
 describe('AudioPlayer segment deletion actions', () => {
