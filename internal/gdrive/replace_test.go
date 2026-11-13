@@ -117,6 +117,10 @@ func oldReplacementIDs(t *testing.T, wire *wireDrive, folder, recording string) 
 // folder owed in the ledger.
 func setDriveReplacementPending(t *testing.T, store *storage.SQLiteStore, sessionID, audioPath string) {
 	t.Helper()
+	hash, err := fileSHA256(audioPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.DB().Exec(`DELETE FROM drive_replacements WHERE session_id = ?`, sessionID); err != nil {
 		t.Fatalf("clear completed drive replacements: %v", err)
 	}
@@ -131,7 +135,7 @@ func setDriveReplacementPending(t *testing.T, store *storage.SQLiteStore, sessio
 		t.Fatalf("owe the session's folder: %v", err)
 	}
 	if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, splice_complete)
-		VALUES(?, ?, 1, 2, 'before', 'after', ?, 1)`, sessionID, audioPath, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		VALUES(?, ?, 1, 2, 'before', ?, ?, 1)`, sessionID, audioPath, hash, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatalf("record deleted segment: %v", err)
 	}
 }
@@ -232,7 +236,7 @@ func TestReplaceDeletesExtraAppCreatedUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, _, err := replacementFiles(&session, []string{fixture.recording})
+	files, _, err := replacementFiles(fixture.id, &session, []string{fixture.recording}, fixture.store)
 	if err != nil {
 		t.Fatal(err)
 	}

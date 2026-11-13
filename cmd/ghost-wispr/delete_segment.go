@@ -155,7 +155,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 		if source == nil || session.GDriveFolderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := downloadDriveRecording(ctx, guard, session.ID, session.GDriveFolderID, source, driveFiles[name], path, filepath.Base(path) == allowPrecutRecording); err != nil {
+		if err := downloadDriveRecording(ctx, guard, session.ID, session.GDriveFolderID, source, driveFiles[name], path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
 			return deletionRecordingSet{}, err
 		}
 		set.Paths = append(set.Paths, path)
@@ -164,9 +164,9 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 	return set, nil
 }
 
-func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, sessionID, folderID string, source deletionRecordingSource, files []*drive.File, destination string, allowPrecut bool) error {
+func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, sessionID, folderID string, source deletionRecordingSource, files []*drive.File, destination, driveName string, allowPrecut bool) error {
 	if len(files) == 0 {
-		return fmt.Errorf("drive has no recording named %s", recordingname.FileName(destination))
+		return fmt.Errorf("drive has no recording named %s", driveName)
 	}
 	expected, cut, err := "", false, error(nil)
 	if guard != nil {
@@ -182,7 +182,7 @@ func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, se
 			}
 		}
 	}
-	if err := source.DownloadRecording(ctx, folderID, recordingname.FileName(destination), destination); err != nil {
+	if err := source.DownloadRecording(ctx, folderID, driveName, destination); err != nil {
 		return fmt.Errorf("restore recording %s: %w", filepath.Base(destination), err)
 	}
 	if cut && !allowPrecut {
@@ -522,13 +522,18 @@ func recoverLostSplicedRecording(ctx context.Context, store *storage.SQLiteStore
 			candidates = append(candidates, file)
 		}
 	}
-	if err := downloadDriveRecording(ctx, store, session.ID, session.GDriveFolderID, source, candidates, recording, true); err != nil {
+	downloaded, err := downloadDestination(recording)
+	if err != nil {
+		return false, err
+	}
+	if err := downloadDriveRecording(ctx, store, session.ID, session.GDriveFolderID, source, candidates, downloaded, recordingname.FileName(recording), true); err != nil {
+		_ = os.Remove(downloaded)
 		return false, fmt.Errorf("restore pre-cut recording %s: %w", recording, err)
 	}
-	keepRestored := false
+	keepDownloaded := false
 	defer func() {
-		if !keepRestored {
-			_ = os.Remove(recording)
+		if !keepDownloaded {
+			_ = os.Remove(downloaded)
 		}
 	}()
 	spans, err := store.CompletedSplicesForRecording(first.SessionID, first.AudioPath)
@@ -538,39 +543,48 @@ func recoverLostSplicedRecording(ctx context.Context, store *storage.SQLiteStore
 	if len(spans) == 0 {
 		return false, fmt.Errorf("recover lost cut recording %s: no completed cut is recorded", recording)
 	}
-	hash, err := fileSHA256(recording)
+	hash, err := fileSHA256(downloaded)
 	if err != nil {
-		return false, fmt.Errorf("hash restored pre-cut recording %s: %w", recording, err)
+		return false, fmt.Errorf("hash restored pre-cut recording %s: %w", downloaded, err)
 	}
 	for _, span := range spans {
 		if hash == span.SHA256After {
 			continue
 		}
 		if hash != span.SHA256Before {
-			return false, fmt.Errorf("restored pre-cut recording %s has SHA-256 %s, want %s", recording, hash, span.SHA256Before)
+			return false, fmt.Errorf("restored pre-cut recording %s has SHA-256 %s, want %s", downloaded, hash, span.SHA256Before)
 		}
-		tempPath, err := copyForSplice(recording)
+		tempPath, err := copyForSplice(downloaded)
 		if err != nil {
-			return false, fmt.Errorf("copy lost cut recording %s: %w", recording, err)
+			return false, fmt.Errorf("copy lost cut recording %s: %w", downloaded, err)
 		}
 		afterHash, err := splice(ctx, tempPath, span.Start, span.End)
 		if err != nil {
 			_ = os.Remove(tempPath)
-			return false, fmt.Errorf("re-splice lost cut recording %s: %w", recording, err)
+			return false, fmt.Errorf("re-splice lost cut recording %s: %w", downloaded, err)
 		}
 		if afterHash != span.SHA256After {
 			_ = os.Remove(tempPath)
-			return false, fmt.Errorf("re-splice lost cut recording %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After)
+			return false, fmt.Errorf("re-splice lost cut recording %s produced SHA-256 %s, want %s", downloaded, afterHash, span.SHA256After)
 		}
-		if err := os.Rename(tempPath, recording); err != nil {
-			return false, fmt.Errorf("replace lost cut recording %s: %w", recording, err)
+		if err := os.Rename(tempPath, downloaded); err != nil {
+			return false, fmt.Errorf("replace recovered cut %s: %w", downloaded, err)
 		}
-		if err := syncRecordingDirectory(recording); err != nil {
+		if err := syncRecordingDirectory(downloaded); err != nil {
 			return false, err
 		}
 		hash = afterHash
 	}
-	keepRestored = true
+	if hash != spans[len(spans)-1].SHA256After {
+		return false, fmt.Errorf("recovered cut recording %s has SHA-256 %s, want latest %s", downloaded, hash, spans[len(spans)-1].SHA256After)
+	}
+	if err := os.Rename(downloaded, recording); err != nil {
+		return false, fmt.Errorf("install recovered cut recording %s: %w", recording, err)
+	}
+	if err := syncRecordingDirectory(recording); err != nil {
+		return false, err
+	}
+	keepDownloaded = true
 	unlock()
 	locked = false
 	if refine != nil {
@@ -804,6 +818,19 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 		cleaned = append(cleaned, dir)
 	}
 	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned), store.RecordEraseDirectory(audioDir))
+}
+
+func downloadDestination(recording string) (string, error) {
+	output, err := os.CreateTemp(filepath.Dir(recording), ".download-*"+filepath.Ext(recording))
+	if err != nil {
+		return "", fmt.Errorf("create recovery download beside %s: %w", recording, err)
+	}
+	path := output.Name()
+	if err := output.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close recovery download %s: %w", path, err)
+	}
+	return path, nil
 }
 
 func copyForSplice(source string) (string, error) {

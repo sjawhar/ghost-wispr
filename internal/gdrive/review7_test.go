@@ -62,6 +62,13 @@ func TestADeletionMadeByARolledBackBuildIsStillReplaced(t *testing.T) {
 	if migrated != 1 || ledger != 0 {
 		t.Fatalf("control: migration recorded %d times, %d ledger rows; want the migration already run and no ledger", migrated, ledger)
 	}
+	expected, err := fileSHA256(fixture.recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE deleted_segments SET sha256_after = ? WHERE session_id = ?`, expected, fixture.id); err != nil {
+		t.Fatal(err)
+	}
 	o := NewOrchestrator(fixture.syncer, store)
 	fixture.wire.allowDeletes = true
 
