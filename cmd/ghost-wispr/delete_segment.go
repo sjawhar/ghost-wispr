@@ -194,7 +194,20 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 		if source == nil || folderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := downloadDriveRecording(ctx, guard, session.ID, folderID, source, driveFiles[name], path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
+		staged, err := downloadDestination(path)
+		if err != nil {
+			return deletionRecordingSet{}, err
+		}
+		if err := downloadDriveRecording(ctx, guard, session.ID, folderID, source, driveFiles[name], staged, path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
+			_ = os.Remove(staged)
+			return deletionRecordingSet{}, err
+		}
+		if err := os.Rename(staged, path); err != nil {
+			_ = os.Remove(staged)
+			return deletionRecordingSet{}, fmt.Errorf("install restored recording %s: %w", path, err)
+		}
+		if err := syncRecordingDirectory(path); err != nil {
+			_ = os.Remove(path)
 			return deletionRecordingSet{}, err
 		}
 		set.Paths = append(set.Paths, path)
@@ -204,13 +217,13 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 	return set, nil
 }
 
-func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, sessionID, folderID string, source deletionRecordingSource, files []*drive.File, destination, driveName string, allowPrecut bool) error {
+func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, sessionID, folderID string, source deletionRecordingSource, files []*drive.File, destination, recordingPath, driveName string, allowPrecut bool) error {
 	if len(files) == 0 {
 		return fmt.Errorf("drive has no recording named %s", driveName)
 	}
 	expected, cut, err := "", false, error(nil)
 	if guard != nil {
-		expected, cut, err = guard.LatestRecordingSHA256(sessionID, destination)
+		expected, cut, err = guard.LatestRecordingSHA256(sessionID, recordingPath)
 		if err != nil {
 			return fmt.Errorf("read latest cut hash for recording %s: %w", destination, err)
 		}
@@ -566,7 +579,7 @@ func recoverLostSplicedRecording(ctx context.Context, store *storage.SQLiteStore
 	if err != nil {
 		return false, err
 	}
-	if err := downloadDriveRecording(ctx, store, session.ID, session.GDriveFolderID, source, candidates, downloaded, recordingname.FileName(recording), true); err != nil {
+	if err := downloadDriveRecording(ctx, store, session.ID, session.GDriveFolderID, source, candidates, downloaded, recording, recordingname.FileName(recording), true); err != nil {
 		_ = os.Remove(downloaded)
 		return false, fmt.Errorf("restore pre-cut recording %s: %w", recording, err)
 	}
