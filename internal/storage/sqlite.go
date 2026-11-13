@@ -2780,12 +2780,11 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 				  AND drive_replacement_folders.state = ?
 			   )
 			   OR (member.gdrive_folder_id != '' AND (
-				member.sync_state != ?
-				OR member.documents_unverified != 0
+				member.drive_documents_pending != 0
 				OR member.refinement_status = ?
 			   ))
 		  )`,
-		id, id, audioPath, SessionActive, DriveReplacementFolderOwed, SyncStateSynced, RefinementRunning).Scan(&eligible)
+		id, id, audioPath, SessionActive, DriveReplacementFolderOwed, RefinementRunning).Scan(&eligible)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil

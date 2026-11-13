@@ -93,27 +93,6 @@ func TestGCRefusesMergedSessionWithAnUnsafeSource(t *testing.T) {
 			},
 		},
 		{
-			name: "remote deleted",
-			set: func(store *storage.SQLiteStore) error {
-				_, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ? WHERE id = 'source-a'`, storage.SyncStateRemoteDeleted, storage.SyncFailed)
-				return err
-			},
-		},
-		{
-			name: "unsynced",
-			set: func(store *storage.SQLiteStore) error {
-				_, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ? WHERE id = 'source-a'`, storage.SyncStatePending, storage.SyncPending)
-				return err
-			},
-		},
-		{
-			name: "documents unverified",
-			set: func(store *storage.SQLiteStore) error {
-				_, err := store.DB().Exec(`UPDATE sessions SET documents_unverified = 1 WHERE id = 'source-a'`)
-				return err
-			},
-		},
-		{
 			name: "refinement running",
 			set: func(store *storage.SQLiteStore) error {
 				_, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ? WHERE id = 'source-a'`, storage.RefinementRunning)
