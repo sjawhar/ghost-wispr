@@ -1846,7 +1846,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// (5 minutes), whose ticker starts above, and before GC, which starts
 	// below with a pass at once.
 	// erase.Leftovers unlinks the second name an erase.Replace under way still
-	// needs, cleanupSpliceTempCopies removes the copies a running deletion
+	// needs, cleanupSpliceTempCopiesExcept removes the copies a running deletion
 	// splices, and ForgetEraseDirectories forgets directories no erase is
 	// using only while none runs. The recorder, started above, may already
 	// erase a saved session's raw recording in the audio directory:

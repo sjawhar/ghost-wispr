@@ -410,33 +410,6 @@ func (s *SQLiteStore) SourceSessionIDs(mergedID string) ([]string, error) {
 	return mergedSourceIDs(s.db, mergedID)
 }
 
-// RawOnlySourceSessionIDs returns merged sources whose raw PCM was their only
-// audio when they were merged. GC must retain the whole merged session while
-// such a raw file still exists.
-func (s *SQLiteStore) RawOnlySourceSessionIDs(mergedID string) ([]string, error) {
-	rows, err := s.db.Query(`WITH RECURSIVE source(id) AS (
-			SELECT id FROM sessions WHERE merged_into = ?
-			UNION SELECT sessions.id FROM sessions JOIN source ON sessions.merged_into = source.id
-		) SELECT sessions.id FROM sessions JOIN source ON sessions.id = source.id
-		WHERE sessions.raw_audio_only = 1`, mergedID)
-	if err != nil {
-		return nil, fmt.Errorf("list raw-only source sessions of %s: %w", mergedID, err)
-	}
-	defer func() { _ = rows.Close() }()
-	var sourceIDs []string
-	for rows.Next() {
-		var sourceID string
-		if err := rows.Scan(&sourceID); err != nil {
-			return nil, fmt.Errorf("scan raw-only source session of %s: %w", mergedID, err)
-		}
-		sourceIDs = append(sourceIDs, sourceID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list raw-only source sessions of %s: %w", mergedID, err)
-	}
-	return sourceIDs, nil
-}
-
 // RecordingDirectories returns the directories, besides the audio directory,
 // that recordings are kept or erased in: that of every path in a session's
 // audio_path or a deleted span's audio_path, where the path points (a

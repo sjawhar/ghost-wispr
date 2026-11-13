@@ -858,7 +858,7 @@ type recordingDirectoryLister interface {
 	RecordEraseDirectory(dir string) error
 }
 
-// cleanupRecordingDirectories runs cleanupSpliceTempCopies, as the app
+// cleanupRecordingDirectories runs cleanupSpliceTempCopiesExcept, as the app
 // starts, in audioDir and in every directory a session keeps a recording in
 // or a whole-file erase was started in (storage.RecordingDirectories):
 // splice copies, downloads and cut-off erasures are made beside the

@@ -359,7 +359,6 @@ func (s *SQLiteStore) init(dbPath string) error {
 			refinement_status TEXT NOT NULL DEFAULT 'pending',
 			refinement_model TEXT NOT NULL DEFAULT '',
 			audio_path TEXT NOT NULL DEFAULT '',
-			raw_audio_only INTEGER NOT NULL DEFAULT 0,
 			sync_status TEXT NOT NULL DEFAULT 'pending',
 			envoy_publish_status TEXT NOT NULL DEFAULT 'pending',
 			gdrive_folder_id TEXT NOT NULL DEFAULT '',
@@ -474,7 +473,6 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE sessions ADD COLUMN refined_transcript TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN refinement_status TEXT NOT NULL DEFAULT 'pending'`,
 		`ALTER TABLE sessions ADD COLUMN merged_into TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE sessions ADD COLUMN raw_audio_only INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sessions ADD COLUMN last_sync_attempt TEXT`,
 		`ALTER TABLE sessions ADD COLUMN error_message TEXT NOT NULL DEFAULT ''`,
@@ -534,15 +532,6 @@ func (s *SQLiteStore) init(dbPath string) error {
 		RefinementNoAudio, RefinementPending,
 	); err != nil {
 		return fmt.Errorf("mark sessions without a recording no_audio: %w", err)
-	}
-
-	// A merged source whose older row had no saved recording can retain only
-	// its raw PCM. Record that before the older audio-path migration clears
-	// every merged source path.
-	if err := s.runOnce("mark-legacy-merged-raw-only",
-		`UPDATE sessions SET raw_audio_only = 1 WHERE status = 'merged' AND audio_path = ''`,
-	); err != nil {
-		return err
 	}
 
 	// A merge used to leave its sources naming the recordings it gave the
@@ -1050,9 +1039,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	// each file, so removing the merged session's audio leaves no source
 	// naming a file that is gone.
 	markQuery := fmt.Sprintf(
-		`UPDATE sessions
-		 SET status = 'merged', merged_into = ?, raw_audio_only = CASE WHEN audio_path = '' THEN 1 ELSE raw_audio_only END, audio_path = ''
-		 WHERE id IN (%s)`,
+		`UPDATE sessions SET status = 'merged', merged_into = ?, audio_path = '' WHERE id IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 	markArgs := make([]any, 0, len(sourceIDs)+1)
@@ -2786,17 +2773,19 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 		  AND NOT EXISTS (
 			SELECT 1 FROM sessions AS member JOIN doomed ON member.id = doomed.id
 			WHERE member.status = ?
-			   OR member.sync_state != ?
-			   OR member.documents_unverified != 0
-			   OR member.refinement_status = ?
 			   OR member.drive_replace_pending = 1
 			   OR EXISTS (
 				SELECT 1 FROM drive_replacement_folders
 				WHERE drive_replacement_folders.folder_session_id = member.id
 				  AND drive_replacement_folders.state = ?
 			   )
+			   OR (member.gdrive_folder_id != '' AND (
+				member.sync_state != ?
+				OR member.documents_unverified != 0
+				OR member.refinement_status = ?
+			   ))
 		  )`,
-		id, id, audioPath, SessionActive, SyncStateSynced, RefinementRunning, DriveReplacementFolderOwed).Scan(&eligible)
+		id, id, audioPath, SessionActive, DriveReplacementFolderOwed, SyncStateSynced, RefinementRunning).Scan(&eligible)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, false, nil

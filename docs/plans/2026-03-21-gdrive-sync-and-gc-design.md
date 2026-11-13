@@ -118,8 +118,7 @@ GC has two independent rules.
 
 **Age (`gc_max_age_days`, the user's retention policy):** a session older than this is deleted in one pass:
 - The local audio file (MP3/WAV), unless another session names it, and a raw `.pcm` beside it only once the saved recording is removed and no session names the `.pcm`
-- The SQLite rows (session record, transcript segments, summary)
-
+- The SQLite rows (session record, transcript segments, summary). An age deletion of a merged session deletes its source rows in the same transaction only when every source is safe: an active or Drive-owing source holds it; a source with a Drive folder must still be synced, have verified documents, have no refinement running, and have that folder still on Drive; a folderless source owes Drive nothing. GC checks whether each source raw `.pcm` is its only copy against that source's saved recording on disk, and keeps the merged session when it is.
 This is a clean "this session lives on Drive now" model. The web UI shows empty state for GC'd dates. Restore from Drive brings back the session, its transcript and its summary (its audio stays on Drive), and a restored session's age runs from its restore (`restored_at`), so the next pass does not delete it again; it is deleted `gc_max_age_days` after the restore.
 
 **Audio budget (`gc_max_audio_size_mb`):** a budget for the audio GC may remove, not for the whole `audio_dir`. It removes audio files only, never a session, transcript or summary. The removable audio is the saved recordings of ended sessions (synced ones only; a session whose sync failed, permanently or not, keeps its file; not while a refinement reads it), plus a raw `.pcm` beside a saved recording. When those files together exceed the budget, GC removes them oldest session first until they fit or none are left. A file whose removal frees nothing (missing, empty, or refused) is skipped and logged.

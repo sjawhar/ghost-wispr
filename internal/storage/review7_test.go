@@ -148,7 +148,7 @@ func TestGCAndMergeCheckTheLedger(t *testing.T) {
 			t.Error("GC may remove the recording of a session whose folder is owed")
 		}
 	}
-	if deleted, err := deleteEndedSessionForTest(store, "owed-folder", "/audio/owed-folder.mp3"); err != nil || deleted {
+	if deleted, err := deleteAgeEligibleForTest(store, "owed-folder", "/audio/owed-folder.mp3"); err != nil || deleted {
 		t.Fatalf("GC deleted a session whose folder is owed (%v)", err)
 	}
 	if err := store.MergeSessions("merged", []string{"owed-folder", "other"}, started, started.Add(2*time.Hour)); !errors.Is(err, ErrMergeReplacementPending) {

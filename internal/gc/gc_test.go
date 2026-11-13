@@ -70,7 +70,7 @@ func (m *mockStore) DeleteEndedSessionAndSources(id, _, _ string) ([]string, boo
 	return []string{id}, true, nil
 }
 
-func (*mockStore) RawOnlySourceSessionIDs(string) ([]string, error) { return nil, nil }
+func (*mockStore) SourceSessionIDs(string) ([]string, error) { return nil, nil }
 
 func (*mockStore) RawEraseReservations() ([]storage.RawEraseReservation, error) { return nil, nil }
 

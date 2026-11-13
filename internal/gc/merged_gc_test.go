@@ -232,3 +232,81 @@ func TestGCZeroesReservedRawWhenDeletingASession(t *testing.T) {
 		t.Fatalf("hidden raw after GC = %q, want zeroed", got)
 	}
 }
+
+func TestGCKeepsMergedSessionWhenASourceSavedRecordingVanishes(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	for i, id := range []string{"source-a", "source-b"} {
+		endWithRecording(t, store, dir, id, started.Add(time.Duration(i)*time.Hour), 1024)
+		syncTo(t, store, id, storage.SyncStateSynced, "folder-"+id, 0, "")
+	}
+	raw := filepath.Join(dir, "source-b.pcm")
+	if err := os.WriteFile(raw, []byte("source-b only audio after its saved recording vanishes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, started, started.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("merged", "", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "source-b.mp3")); err != nil {
+		t.Fatal(err)
+	}
+
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 0 {
+		t.Fatalf("GC deleted %v after source-b saved recording vanished, want none", deleted)
+	}
+	if _, err := os.Stat(raw); err != nil {
+		t.Fatalf("source-b raw after GC = %v, want kept", err)
+	}
+}
+
+func TestGCChecksEachMergedSourceDriveFolder(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	for i, id := range []string{"source-a", "source-b"} {
+		endWithRecording(t, store, dir, id, started.Add(time.Duration(i)*time.Hour), 1024)
+		syncTo(t, store, id, storage.SyncStateSynced, "source-folder-"+id, 0, "")
+	}
+	if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, started, started.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("merged", "", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	drive := &driveFolders{}
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir, Drive: drive}, 1); len(deleted) != 1 || deleted[0] != "merged" {
+		t.Fatalf("GC deleted %v, want [merged]", deleted)
+	}
+	asked := make(map[string]bool, len(drive.asked))
+	for _, folderID := range drive.asked {
+		asked[folderID] = true
+	}
+	for _, folderID := range []string{"source-folder-source-a", "source-folder-source-b"} {
+		if !asked[folderID] {
+			t.Errorf("Drive checks = %v, want %s", drive.asked, folderID)
+		}
+	}
+}
+
+func TestGCAllowsFolderlessUnsyncedMergedSource(t *testing.T) {
+	dir := t.TempDir()
+	store := newStore(t)
+	started := time.Now().UTC().Add(-40 * 24 * time.Hour)
+	endWithRecording(t, store, dir, "source-a", started, 1024)
+	syncTo(t, store, "source-a", storage.SyncStateSynced, "source-folder-a", 0, "")
+	endWithRecording(t, store, dir, "source-b", started.Add(time.Hour), 1024)
+	if err := store.MergeSessions("merged", []string{"source-a", "source-b"}, started, started.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("merged", "", "summary", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if deleted := runGC(t, store, Config{MaxAgeDays: 30, AudioDir: dir}, 1); len(deleted) != 1 || deleted[0] != "merged" {
+		t.Fatalf("GC deleted %v with a folderless unsynced source, want [merged]", deleted)
+	}
+}
