@@ -517,7 +517,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 
 	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
-	result, err := batchTranscriber.Transcribe(ctx, audioPath)
+	result, err := m.transcribeRecordings(ctx, batchTranscriber, audioPath)
 	if err != nil {
 		if updateErr := m.store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
@@ -563,6 +563,15 @@ func (m *Manager) RefineSession(ctx context.Context, sessionID, audioPath string
 	}
 
 	m.runBatchRefinement(ctx, sessionID, audioPath)
+	m.generateSummary(ctx, sessionID, startedAt)
+	return nil
+}
+
+// SummarizeSession makes session sessionID's summary again from its
+// transcript as it is, without refining it, then indexes and syncs it as a
+// refinement's summary is: "Delete text" of a session whose audio is gone,
+// so there is nothing to refine.
+func (m *Manager) SummarizeSession(ctx context.Context, sessionID string, startedAt time.Time) error {
 	m.generateSummary(ctx, sessionID, startedAt)
 	return nil
 }

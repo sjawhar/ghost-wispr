@@ -397,6 +397,7 @@ describe('SessionCard', () => {
       },
     })
     await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete text and audio' }))
 
     await waitFor(() => {
       expect(onRefreshSession).toHaveBeenCalledExactlyOnceWith('s1')

@@ -420,3 +420,73 @@ The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
 Record the Drive, search, Envoy, model-call, read-only-member, and (without `--cert-test`)
 expiring-certificate observations requested by its `NEEDS-PERSON` rows before accepting
 the slice.
+
+## Accept slice 3
+
+Run both from a tailnet member once the slice 3 build is on the Pi. The self-test plants, and
+must reject, a transcript, Drive document, recording transcription, title or folder name that
+still holds the phrase; a changed recording sha256 or path; a Drive file id that answers 404
+after "Delete text", or an old one that answers 200 after "Delete text and audio"; a new Drive
+file with two revisions; a database, write-ahead log or pre-migration backup that still holds
+the phrase; and a build that does not refuse a deletion without a mode. An empty download, a
+failed search, a database scan without one of its files, and a read without the control phrase
+must each be UNKNOWN, not PASS. The self-test also runs the database scan over planted binary
+files, and the Pi-side token, Drive and Deepgram requests against a fake `curl`; it fails if a
+token or key reaches a `curl` argument or the evidence.
+
+```bash
+deploy/pi/accept-slice3.sh --self-test
+deploy/pi/accept-slice3.sh
+```
+
+The driver uses `ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net`. It reaches Drive with the
+Pi's own credential: on the Pi, it exchanges the X.509 certificate for a token and impersonates
+`ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com` with the read-only Drive scope. It
+transcribes recordings on the Pi with the Deepgram key in `/opt/ghost-wispr/.env`. Neither
+credential leaves the Pi, and the driver prints neither.
+
+One run records one conversation for both rows:
+
+1. The mode guard sends `DELETE` for a segment of a session that does not exist, once without
+   a mode and once with `mode=bogus`. Both must answer 400 with an error that names `text` and
+   `text_and_audio`. A build without the modes would read `mode=text` as "Delete text and
+   audio", so the driver stops here, before it records anything.
+2. The precheck requires that no conversation and no file in the database's directory already
+   holds "orange tractor ninety" or "purple elephant seventeen". If one does, delete that
+   conversation from the unit and run again.
+3. The driver starts a conversation and prints its script (`Setup NEEDS-PERSON`). Two people
+   read it: "purple elephant seventeen", the topic, and "orange tractor ninety" are each said
+   alone in their own turn, and the control phrase "blue harbor lantern" in another. Press Enter
+   after the last line. The driver waits until the conversation is refined, summarized and
+   synced, and finds the one segment that holds each phrase.
+4. It restarts `ghost-wispr.service` once no conversation is recording. Ghost Wispr writes the
+   pre-migration backup at each start, so the backup then holds the conversation. That is the
+   control for the backup check.
+5. A11 text only: every check runs once and must find "orange tractor ninety". The driver then
+   chooses "Delete text" on that segment (`?mode=text`) and checks again until the phrase is
+   gone or 15 minutes pass. It then chooses "retry refinement" and checks once more.
+6. A11: every check runs once and must find "purple elephant seventeen". The driver then
+   chooses "Delete text and audio" on that segment (`?mode=text_and_audio`) and checks again.
+
+`--session ID` uses a conversation already recorded from the script, and skips the precheck.
+
+The live driver reports `PASS`, `FAILED` or `UNKNOWN` for each check, and a verdict for each
+row and for the run.
+
+- Before each delete, each check must find the phrase. That finding is the control for the
+  same check after the delete. If a check cannot find the phrase, the row is UNKNOWN and
+  nothing is deleted; record a new conversation and run again.
+- After a delete, a read that is empty, that failed, or that does not hold "blue harbor
+  lantern" is UNKNOWN, not PASS.
+- A11 text only checks the segments, the transcript, the refined transcript, the summary, the
+  UI search and, with `grep` while Ghost Wispr runs, every file in the database's directory: the
+  database, its write-ahead log and the pre-migration backup. It exports the Drive
+  `transcript.md` and `summary.md` as text, and requires the recording's sha256 on the unit and
+  every Drive file id to stay the same, each id still answering 200.
+- A11 checks the segments, the transcript, the refined transcript, the summary, the title, the
+  UI search, a Deepgram transcription of the unit's recording and the Drive folder name. It
+  exports the new `transcript.md` and `summary.md`, and downloads and transcribes the new
+  recording. Each old file id must answer 404 to `files.get` and `revisions.list`, and each new
+  file must hold one revision. It also checks that "orange tractor ninety" stays gone.
+- The database check finds the phrase where SQLite keeps it as text. The search index keeps
+  its words in a compressed form that `grep` cannot read; the UI search check covers the index.

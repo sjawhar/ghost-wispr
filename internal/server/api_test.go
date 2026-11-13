@@ -866,7 +866,7 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			if err != nil {
 				t.Fatalf("handler: %v", err)
 			}
-			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42", nil)
+			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text_and_audio", nil)
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, req)
 			if response.Code != tc.wantCode {

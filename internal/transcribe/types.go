@@ -58,9 +58,14 @@ type ClientFactory func(ctx context.Context) (io.WriteCloser, error)
 // It's called whenever the connection state changes (e.g., for logging or metrics).
 type ConnectionCallback func(state ConnectionState)
 
+// BatchResult is a recording's batch transcription: its transcript, the
+// model the provider reported, and its words with their times when the
+// provider gives them. Refinement rebuilds the transcript from Words to drop
+// the words "Delete text" removed.
 type BatchResult struct {
 	Transcript string
 	Model      string
+	Words      []TimestampedWord
 }
 
 type BatchTranscriber interface {

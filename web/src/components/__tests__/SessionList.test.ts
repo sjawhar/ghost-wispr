@@ -140,6 +140,7 @@ describe('SessionList', () => {
     expect(await screen.findByTestId('search-results')).toBeTruthy()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete text and audio' }))
 
     await waitFor(() => {
       expect(onSegmentDeleted).toHaveBeenCalledTimes(deletedCalls)
@@ -199,6 +200,7 @@ describe('SessionList', () => {
     })
 
     await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete text and audio' }))
 
     await waitFor(() => {
       expect(onSegmentDeleted).toHaveBeenCalledWith('s1', 42)

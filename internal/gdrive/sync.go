@@ -44,6 +44,10 @@ type SyncFile struct {
 	ContentType   string
 	SHA256        string
 	AppProperties map[string]string
+	// UpdateOnly is a document a re-sync updates in place if the folder has
+	// one, and creates in no folder: the summary a segment deletion emptied
+	// (emptiedSummary), whose earlier copy would keep the deleted words.
+	UpdateOnly bool
 }
 
 func NewSyncer(ctx context.Context, credentials *auth.Credentials, folderID string, logger ...*slog.Logger) (*Syncer, error) {
@@ -219,6 +223,9 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	}
 
 	for i := range files {
+		if files[i].UpdateOnly {
+			continue
+		}
 		if err := s.uploadFile(ctx, folder.Id, &files[i]); err != nil {
 			return folder.Id, err
 		}
@@ -434,7 +441,9 @@ func planUpload(existing []driveFile, files []SyncFile) (create []SyncFile, upda
 		have := byName[f.Name]
 		switch {
 		case len(have) == 0:
-			create = append(create, *f)
+			if !f.UpdateOnly {
+				create = append(create, *f)
+			}
 		case f.LocalPath != "":
 			// The recording is there.
 		default:

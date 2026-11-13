@@ -944,6 +944,46 @@ func main() {
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
+	// deletionRunner makes the runner both segment deletion actions use,
+	// with the configuration as it is now.
+	deletionRunner := func(sessionID string, segmentID int64) (*segmentDeleteRunner, error) {
+		if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {
+			return nil, err
+		}
+		latestCfg := cfgStore.Get()
+		wordTranscriber, err := segmentDeletionTranscriber(&latestCfg)
+		if err != nil {
+			return nil, err
+		}
+		return &segmentDeleteRunner{
+			store:       store,
+			transcriber: audio.WordsTranscriber{Batch: wordTranscriber},
+			audioDir:    latestCfg.AudioDir,
+			ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+				var source deletionRecordingSource
+				if session.GDriveFolderID != "" {
+					if latestCfg.GDriveFolderID == "" {
+						return deletionRecordingSet{}, fmt.Errorf("google Drive root folder is not configured")
+					}
+					credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+					if err != nil {
+						return deletionRecordingSet{}, fmt.Errorf("detect Google credentials: %w", err)
+					}
+					syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID, appLogger)
+					if err != nil {
+						return deletionRecordingSet{}, fmt.Errorf("create Drive syncer: %w", err)
+					}
+					source = syncer
+				}
+				return restoreDeletionRecordings(ctx, &session, latestCfg.AudioDir, source)
+			},
+			duration:  audio.Duration,
+			splice:    audio.Splice,
+			refine:    manager.RefineSession,
+			summarize: manager.SummarizeSession,
+		}, nil
+	}
+
 	controlHooks := &server.ControlHooks{
 		IsPaused:      capture.IsPaused,
 		IsCapturing:   func() bool { return capture.capturing(micStatus) },
@@ -983,43 +1023,18 @@ func main() {
 			return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
 		},
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
-			if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {
-				return err
-			}
-			latestCfg := cfgStore.Get()
-			wordTranscriber, err := segmentDeletionTranscriber(&latestCfg)
+			runner, err := deletionRunner(sessionID, segmentID)
 			if err != nil {
 				return err
 			}
-			runner := segmentDeleteRunner{
-				store:       store,
-				transcriber: audio.WordsTranscriber{Batch: wordTranscriber},
-				audioDir:    latestCfg.AudioDir,
-				ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
-					var source deletionRecordingSource
-					if session.GDriveFolderID != "" {
-						if latestCfg.GDriveFolderID == "" {
-							return deletionRecordingSet{}, fmt.Errorf("google Drive root folder is not configured")
-						}
-						credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
-						if err != nil {
-							return deletionRecordingSet{}, fmt.Errorf("detect Google credentials: %w", err)
-						}
-						syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID, appLogger)
-						if err != nil {
-							return deletionRecordingSet{}, fmt.Errorf("create Drive syncer: %w", err)
-						}
-						source = syncer
-					}
-					return restoreDeletionRecordings(ctx, &session, latestCfg.AudioDir, source)
-				},
-				duration: audio.Duration,
-				splice:   audio.Splice,
-				refine: func(ctx context.Context, sessionID, recording string, startedAt time.Time) error {
-					return manager.RefineSession(ctx, sessionID, recording, startedAt)
-				},
-			}
 			return runner.Delete(ctx, sessionID, segmentID)
+		},
+		DeleteSegmentText: func(ctx context.Context, sessionID string, segmentID int64) error {
+			runner, err := deletionRunner(sessionID, segmentID)
+			if err != nil {
+				return err
+			}
+			return runner.DeleteText(ctx, sessionID, segmentID)
 		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			return repairStructuredSummaries(ctx, store, publishSummaryReady)

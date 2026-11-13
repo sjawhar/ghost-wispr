@@ -104,9 +104,17 @@ export function deleteSession(id: string): Promise<void> {
   return request<void>(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
-export function deleteSessionSegment(sessionID: string, segmentID: number): Promise<void> {
+// The two segment deletion actions: "Delete text" (text) and "Delete text and
+// audio" (text_and_audio). The API refuses a deletion without one.
+export type SegmentDeleteMode = 'text' | 'text_and_audio'
+
+export function deleteSessionSegment(
+  sessionID: string,
+  segmentID: number,
+  mode: SegmentDeleteMode,
+): Promise<void> {
   return request<void>(
-    `/api/sessions/${encodeURIComponent(sessionID)}/segments/${encodeURIComponent(segmentID)}`,
+    `/api/sessions/${encodeURIComponent(sessionID)}/segments/${encodeURIComponent(segmentID)}?mode=${mode}`,
     { method: 'DELETE' },
   )
 }

@@ -76,3 +76,19 @@ jobs:
 
       - name: Test
         run: npm run test
+
+  slice3-acceptance:
+    name: Slice 3 acceptance driver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq
+
+      - name: Test
+        timeout-minutes: 15
+        run: bash deploy/pi/accept_slice3_test.sh
