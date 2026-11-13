@@ -128,7 +128,7 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 				continue
 			}
 		}
-		if folder.FolderID != "" {
+		if folder.Legacy {
 			folderSession.GDriveFolderID = folder.FolderID
 		}
 		if err := s.checkFolder(ctx, folderSession.GDriveFolderID); err != nil {
@@ -137,7 +137,7 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 				outcome.ownTrashed = outcome.ownTrashed || own
 				failures = append(failures, fmt.Errorf("the Drive folder of session %s is in the trash, and its replacement runs once it is restored: %w", folderSession.ID, err))
 			case IsRemoteDeletedError(err):
-				if folder.FolderID != "" {
+				if folder.Legacy {
 					err = s.replacements.MarkLegacyDriveReplacementFolder(current.ID, generation, folderSession.ID, folder.FolderID, storage.DriveReplacementFolderGone)
 				} else {
 					err = s.replacements.MarkDriveReplacementFolder(current.ID, generation, folderSession.ID, storage.DriveReplacementFolderGone)
@@ -152,7 +152,11 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 			}
 			continue
 		}
-		if err := s.replaceFolder(ctx, current.ID, generation, &folderSession, recordings, own, folder.FolderID); err != nil {
+		legacyFolderID := ""
+		if folder.Legacy {
+			legacyFolderID = folder.FolderID
+		}
+		if err := s.replaceFolder(ctx, current.ID, generation, &folderSession, recordings, own, legacyFolderID); err != nil {
 			failures = append(failures, err)
 			continue
 		}

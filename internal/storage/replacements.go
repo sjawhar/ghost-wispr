@@ -30,6 +30,7 @@ const (
 type DriveReplacementFolder struct {
 	FolderSessionID string
 	FolderID        string
+	Legacy          bool
 	State           string
 }
 
@@ -55,10 +56,10 @@ func recordOwedDriveReplacementFolders(tx *sql.Tx, sessionID string, folderSessi
 // DriveReplacementFolders returns the ledger of the Drive folders sessionID's
 // segment deletion at generation owes a replacement.
 func (s *SQLiteStore) DriveReplacementFolders(sessionID string, generation int) ([]DriveReplacementFolder, error) {
-	rows, err := s.db.Query(`SELECT folder_session_id, COALESCE((SELECT gdrive_folder_id FROM sessions WHERE id = folder_session_id), ''), state
+	rows, err := s.db.Query(`SELECT folder_session_id, COALESCE((SELECT gdrive_folder_id FROM sessions WHERE id = folder_session_id), ''), 0, state
 		FROM drive_replacement_folders WHERE session_id = ? AND generation = ?
 		UNION ALL
-		SELECT folder_session_id, folder_id, state FROM legacy_drive_replacement_folders WHERE session_id = ? AND generation = ?
+		SELECT folder_session_id, folder_id, 1, state FROM legacy_drive_replacement_folders WHERE session_id = ? AND generation = ?
 		ORDER BY folder_session_id, folder_id`, sessionID, generation, sessionID, generation)
 	if err != nil {
 		return nil, fmt.Errorf("list owed Drive folders of session %s: %w", sessionID, err)
@@ -67,9 +68,11 @@ func (s *SQLiteStore) DriveReplacementFolders(sessionID string, generation int) 
 	var folders []DriveReplacementFolder
 	for rows.Next() {
 		var folder DriveReplacementFolder
-		if err := rows.Scan(&folder.FolderSessionID, &folder.FolderID, &folder.State); err != nil {
+		var legacy int
+		if err := rows.Scan(&folder.FolderSessionID, &folder.FolderID, &legacy, &folder.State); err != nil {
 			return nil, fmt.Errorf("scan owed Drive folder of session %s: %w", sessionID, err)
 		}
+		folder.Legacy = legacy != 0
 		folders = append(folders, folder)
 	}
 	if err := rows.Err(); err != nil {
