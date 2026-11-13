@@ -35,6 +35,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -58,6 +59,43 @@ var vertexCredentialCache sync.Map
 
 //go:embed static/*
 var staticFiles embed.FS
+
+func retryRefinementAfterRestoringRecording(ctx context.Context, sessionID string, restore func(context.Context, string) error, refine func(context.Context, string) error) error {
+	if err := restore(ctx, sessionID); err != nil {
+		return err
+	}
+	return refine(ctx, sessionID)
+}
+
+func refinementRecordingAvailable(session *storage.Session, audioDir string) error {
+	for _, entry := range strings.Split(session.AudioPath, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		path := recording.Resolve(entry, audioDir)
+		info, err := os.Stat(path)
+		switch {
+		case err == nil && !info.IsDir():
+			return nil
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			return fmt.Errorf("check recording %s: %w", path, err)
+		}
+	}
+	if session.AudioRemovedAt == "" {
+		return errors.New("no recording is available on this unit or Drive")
+	}
+	if strings.TrimSpace(session.GDriveFolderID) == "" {
+		return errors.New("the recording was removed from this unit, but no Drive folder is listed")
+	}
+	if session.SyncState == storage.SyncStateRemoteDeleted {
+		return errors.New("the recording was removed from this unit and its Drive folder is deleted")
+	}
+	if session.SyncStatus != storage.SyncSynced {
+		return errors.New("the recording was removed from this unit and its Drive copy is not synced")
+	}
+	return nil
+}
 
 func buildTranscript(segments []transcribe.Segment) string {
 	var b strings.Builder
@@ -961,20 +999,25 @@ func main() {
 		}
 	}
 
+	checkRefinementRecording := func(_ context.Context, sessionID string) error {
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			return err
+		}
+		return refinementRecordingAvailable(&sess, cfgStore.Get().AudioDir)
+	}
+
 	ensureRefinementRecording := func(ctx context.Context, sessionID string) error {
 		sess, err := store.GetSession(sessionID)
 		if err != nil {
 			return err
 		}
-		if strings.TrimSpace(sess.AudioPath) != "" {
-			return nil
-		}
 		recordings, err := deletionRunner().ensureRecordings(ctx, sess)
 		if err != nil {
-			return fmt.Errorf("no recording on this unit or on Drive: %w", err)
+			return fmt.Errorf("restore recording for refinement: %w", err)
 		}
 		if len(recordings.Paths) == 0 {
-			return errors.New("no recording on this unit or on Drive")
+			return errors.New("no recording is available on this unit or Drive")
 		}
 		return store.RestoreAudioForRefinement(sessionID, strings.Join(recordings.Paths, ","))
 	}
@@ -1022,9 +1065,11 @@ func main() {
 		RetrySync: func(ctx context.Context, sessionID string) error {
 			return retrySync(ctx, drive.Get(), sessionID)
 		},
-		EnsureRefinementRecording: ensureRefinementRecording,
+		RefinementRecordingAvailable: checkRefinementRecording,
 		RetryRefinement: func(ctx context.Context, sessionID string) error {
-			return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
+			return retryRefinementAfterRestoringRecording(ctx, sessionID, ensureRefinementRecording, func(ctx context.Context, sessionID string) error {
+				return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
+			})
 		},
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
 			return deletionRunner().DeleteRefinedAudio(ctx, sessionID, segmentID, revision)

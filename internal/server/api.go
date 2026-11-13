@@ -1583,8 +1583,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		if controls.EnsureRefinementRecording != nil {
-			if err := controls.EnsureRefinementRecording(r.Context(), sessionID); err != nil {
+		if controls.RefinementRecordingAvailable != nil {
+			if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
 				writeJSONError(w, http.StatusConflict, err.Error())
 				return
 			}
