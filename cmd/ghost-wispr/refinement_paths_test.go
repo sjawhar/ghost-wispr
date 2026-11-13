@@ -24,6 +24,8 @@ func (s *resolvedPathsRestoreStore) RestoreAudioForRefinement(_, before, restore
 
 func (*resolvedPathsRestoreStore) DriveRestoreAllowed(string) (bool, error) { return true, nil }
 
+func (*resolvedPathsRestoreStore) RefinementRecordingPaths(string) ([]string, error) { return nil, nil }
+
 func TestRestoreRefinementNamesRecordingsAlreadyOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	removed := filepath.Join(dir, "20261106100000.mp3")

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,6 +71,7 @@ func retryRefinementAfterRestoringRecording(ctx context.Context, sessionID strin
 type refinementAudioRestoreStore interface {
 	RestoreAudioForRefinement(id, beforeAudioPath, restoredAudioPath string) (bool, error)
 	DriveRestoreAllowed(sessionID string) (bool, error)
+	RefinementRecordingPaths(sessionID string) ([]string, error)
 }
 
 func hasLocalRefinementRecording(session *storage.Session, audioDir string) (bool, error) {
@@ -119,6 +121,31 @@ func refinementRecordingAvailable(session *storage.Session, audioDir string) err
 	return nil
 }
 
+func missingRefinementRecordings(required, restored []string) []string {
+	available := make(map[string]struct{}, len(restored))
+	for _, path := range restored {
+		if name := filepath.Base(strings.TrimSpace(path)); name != "" && name != "." {
+			available[name] = struct{}{}
+		}
+	}
+	missing := make([]string, 0, len(required))
+	seen := make(map[string]struct{}, len(required))
+	for _, path := range required {
+		name := filepath.Base(strings.TrimSpace(path))
+		if name == "" || name == "." {
+			continue
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		if _, found := available[name]; !found {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
 func restoreRefinementRecording(ctx context.Context, store refinementAudioRestoreStore, session *storage.Session, audioDir string, restore func(context.Context, storage.Session) (deletionRecordingSet, error)) error {
 	local, err := hasLocalRefinementRecording(session, audioDir)
 	if err != nil {
@@ -140,6 +167,18 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 	}
 	if len(recordings.Paths) == 0 {
 		return errors.New("no recording is available on this unit or Drive")
+	}
+	if session.AudioRemovedAt != "" {
+		required, err := store.RefinementRecordingPaths(session.ID)
+		if err != nil {
+			return fmt.Errorf("list recordings known to session %s: %w", session.ID, err)
+		}
+		if len(required) == 0 {
+			required = strings.Split(session.AudioPath, ",")
+		}
+		if missing := missingRefinementRecordings(required, recordings.Paths); len(missing) > 0 {
+			return fmt.Errorf("drive did not restore recording %s for session %s; restore it from Drive's trash, then retry refinement", strings.Join(missing, ", "), session.ID)
+		}
 	}
 	restoredAudioPath := strings.Join(recordings.Paths, ",")
 	if restoredAudioPath == session.AudioPath {

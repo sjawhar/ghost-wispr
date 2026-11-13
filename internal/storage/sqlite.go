@@ -963,6 +963,48 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 	return nil
 }
 
+// RefinementRecordingPaths returns the recordings whose content belongs to a
+// session. Merged sessions retain their source paths even when their current
+// audio path was cleared by garbage collection; other refined sessions retain
+// paths in their current stored word occurrences.
+func (s *SQLiteStore) RefinementRecordingPaths(sessionID string) ([]string, error) {
+	paths, err := refinementRecordingPaths(s.db, `SELECT recording_path FROM recording_sources
+		WHERE merged_session_id = ? ORDER BY recording_path`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list merged recording sources for session %s: %w", sessionID, err)
+	}
+	if len(paths) != 0 {
+		return paths, nil
+	}
+	paths, err = refinementRecordingPaths(s.db, `SELECT DISTINCT recording_path FROM refined_words
+		WHERE session_id = ? AND transcript_revision = (SELECT refined_revision FROM sessions WHERE id = ?)
+		ORDER BY recording_path`, sessionID, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list refined recording paths for session %s: %w", sessionID, err)
+	}
+	return paths, nil
+}
+
+func refinementRecordingPaths(q querier, query string, args ...any) ([]string, error) {
+	rows, err := q.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
 // RestoreAudioForRefinement records recordings restored from Drive so the
 // normal generation-fenced refinement path can claim and process them. It
 // writes only when audioPath remains the path read before the restoration.
