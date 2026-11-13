@@ -24,14 +24,15 @@ import (
 )
 
 type storeMock struct {
-	mu       sync.Mutex
-	sessions map[string]time.Time
-	segments map[string][]transcribe.Segment
-	title    map[string]string
-	summary  map[string]string
-	status   map[string]string
-	preset   map[string]string
-	audio    map[string]string
+	mu            sync.Mutex
+	sessions      map[string]time.Time
+	segments      map[string][]transcribe.Segment
+	title         map[string]string
+	summary       map[string]string
+	status        map[string]string
+	summaryStatus map[string]string
+	preset        map[string]string
+	audio         map[string]string
 
 	summaryModel            map[string]string
 	refinementModel         map[string]string
@@ -58,6 +59,7 @@ func newStoreMock() *storeMock {
 		title:                  map[string]string{},
 		summary:                map[string]string{},
 		status:                 map[string]string{},
+		summaryStatus:          map[string]string{},
 		preset:                 map[string]string{},
 		audio:                  map[string]string{},
 		summaryModel:           map[string]string{},
@@ -92,6 +94,27 @@ func (s *storeMock) EndSession(id string, _ time.Time, audioPath string) error {
 	return nil
 }
 
+// TestStoreMockSeparatesSessionAndSummaryStatus fails if the test double lets
+// an asynchronous summary completion overwrite the session lifecycle state.
+func TestStoreMockSeparatesSessionAndSummaryStatus(t *testing.T) {
+	store := newStoreMock()
+	started := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("session", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("session", started.Add(time.Minute), "session.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("session", "title", "summary", storage.SummaryCompleted, "default", "{}", "model", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got := store.status["session"]; got != storage.SessionEnded {
+		t.Fatalf("session status = %q, want %q", got, storage.SessionEnded)
+	}
+}
+
 //nolint:gocritic // Test double matches the production Store contract.
 func (s *storeMock) AppendSegment(sessionID string, seg transcribe.Segment) error {
 	if s.appendHook != nil {
@@ -119,7 +142,7 @@ func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status,
 	}
 	s.title[sessionID] = title
 	s.summary[sessionID] = summary
-	s.status[sessionID] = status
+	s.summaryStatus[sessionID] = status
 	s.preset[sessionID] = preset
 	s.summaryModel[sessionID] = model
 	return nil
@@ -129,7 +152,7 @@ func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status,
 func (s *storeMock) StartSummary(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.status[sessionID] = storage.SummaryRunning
+	s.summaryStatus[sessionID] = storage.SummaryRunning
 	return nil
 }
 
@@ -147,7 +170,7 @@ func (s *storeMock) FailSummaryAtGeneration(sessionID, errMsg string, generation
 	if generation != s.canonicalizeGeneration[sessionID] {
 		return storage.Session{}, sql.ErrNoRows
 	}
-	s.status[sessionID] = storage.SummaryFailed
+	s.summaryStatus[sessionID] = storage.SummaryFailed
 	s.errorMessage[sessionID] = errMsg
 	return storage.Session{ID: sessionID, Title: s.title[sessionID], Summary: s.summary[sessionID],
 		SummaryStatus: storage.SummaryFailed, SummaryPreset: s.preset[sessionID], SummaryError: errMsg}, nil
@@ -696,7 +719,7 @@ func TestManager_ForceEndSession_SummaryCompletes(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		store.mu.Lock()
-		status := store.status[sessionID]
+		status := store.summaryStatus[sessionID]
 		store.mu.Unlock()
 		if status == storage.SummaryCompleted {
 			break
@@ -1175,7 +1198,7 @@ func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T)
 	}
 
 	store.mu.Lock()
-	status := store.status["session-no-summarizer"]
+	status := store.summaryStatus["session-no-summarizer"]
 	store.mu.Unlock()
 	if status != storage.SummaryCompleted {
 		t.Errorf("summary status = %q, want %q", status, storage.SummaryCompleted)
@@ -1623,8 +1646,8 @@ func TestManager_GenerateSummary_StoresErrorOnFailure(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if store.status["sess-err"] != storage.SummaryFailed {
-		t.Fatalf("expected summary_status %q, got %q", storage.SummaryFailed, store.status["sess-err"])
+	if store.summaryStatus["sess-err"] != storage.SummaryFailed {
+		t.Fatalf("expected summary_status %q, got %q", storage.SummaryFailed, store.summaryStatus["sess-err"])
 	}
 	if store.errorMessage["sess-err"] == "" {
 		t.Fatal("expected error_message to be set, got empty string")
