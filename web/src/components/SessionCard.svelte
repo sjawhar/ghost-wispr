@@ -59,6 +59,7 @@
   // Why the last sync retry was refused, if it was.
   let retrySyncError = $state('')
   let retryingRefinement = $state(false)
+  let retryingRefinementStatus = $state<RefinementStatus | null>(null)
   let retryRefinementError = $state('')
 
   async function copySummary() {
@@ -155,18 +156,22 @@
   async function handleRetryRefinement(e: Event) {
     e.stopPropagation()
     retryingRefinement = true
+    retryingRefinementStatus = session.refinement_status
     retryRefinementError = ''
     try {
       await retryRefinement(session.id)
+      await onRefreshSession(session.id)
     } catch (error) {
       retryRefinementError = requestErrorMessage(error)
       retryingRefinement = false
+      retryingRefinementStatus = null
     }
   }
 
   $effect(() => {
-    if (retryingRefinement && session.refinement_status !== RefinementStatus.NoAudio) {
+    if (retryingRefinement && session.refinement_status !== retryingRefinementStatus) {
       retryingRefinement = false
+      retryingRefinementStatus = null
     }
   })
 
