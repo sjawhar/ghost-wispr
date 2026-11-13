@@ -160,10 +160,15 @@
       await retryRefinement(session.id)
     } catch (error) {
       retryRefinementError = requestErrorMessage(error)
-    } finally {
-      setTimeout(() => (retryingRefinement = false), 1000)
+      retryingRefinement = false
     }
   }
+
+  $effect(() => {
+    if (retryingRefinement && session.refinement_status !== RefinementStatus.NoAudio) {
+      retryingRefinement = false
+    }
+  })
 
   // Drive holds a copy only once the session synced and its Drive folder was
   // not deleted since; otherwise this unit holds the only copy.
@@ -317,7 +322,7 @@
               data-testid="refinement-badge"
               title={session.refinement_status === RefinementStatus.NoAudio
                 ? session.restored_at && session.sync_state === SyncState.RemoteDeleted
-                  ? "This conversation's Drive folder was deleted, so its recording cannot be restored or refined."
+                  ? "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined."
                   : session.restored_at &&
                       session.refinement_status === RefinementStatus.NoAudio &&
                       canRestoreRefinement(session)

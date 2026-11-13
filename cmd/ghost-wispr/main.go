@@ -158,6 +158,18 @@ func missingRefinementRecordings(required, restored []string) []string {
 }
 
 func restoreRefinementRecording(ctx context.Context, store refinementAudioRestoreStore, session *storage.Session, audioDir string, restore func(context.Context, storage.Session) (deletionRecordingSet, error)) error {
+	unlock := deleteLocks.lock(session.ID)
+	defer unlock()
+	if reader, ok := store.(interface {
+		GetSession(string) (storage.Session, error)
+	}); ok {
+		current, err := reader.GetSession(session.ID)
+		if err != nil {
+			return fmt.Errorf("read session %s before restoring its recording: %w", session.ID, err)
+		}
+		*session = current
+	}
+
 	local, err := hasLocalRefinementRecording(session, audioDir)
 	if err != nil {
 		return err
@@ -176,12 +188,8 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 	if err != nil {
 		return fmt.Errorf("restore recording for refinement: %w", err)
 	}
-	keepDownloads := false
-	defer func() {
-		if !keepDownloads {
-			removeFiles(recordings.Downloaded)
-		}
-	}()
+	cleanupDownloads := recordings.Downloaded
+	defer func() { removeFiles(cleanupDownloads) }()
 	if len(recordings.Paths) == 0 {
 		return errors.New("no recording is available on this unit or Drive")
 	}
@@ -200,6 +208,7 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 	restoredAudioPath := strings.Join(recordings.Paths, ",")
 	if restoredAudioPath == session.AudioPath {
 		if session.AudioRemovedAt == "" {
+			cleanupDownloads = nil
 			return nil
 		}
 		return errors.New("drive did not restore every recording removed from this unit")
@@ -209,10 +218,33 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 		return fmt.Errorf("record restored audio for refinement: %w", err)
 	}
 	if !restored {
+		if reader, ok := store.(interface {
+			GetSession(string) (storage.Session, error)
+		}); ok {
+			if current, err := reader.GetSession(session.ID); err == nil {
+				cleanupDownloads = downloadsNotNamedBy(current.AudioPath, recordings.Downloaded)
+			}
+		}
 		return fmt.Errorf("recording changed while restoring it for refinement")
 	}
-	keepDownloads = true
+	cleanupDownloads = nil
 	return nil
+}
+
+func downloadsNotNamedBy(audioPath string, downloads []string) []string {
+	named := make(map[string]struct{})
+	for _, path := range strings.Split(audioPath, ",") {
+		if name := filepath.Base(strings.TrimSpace(path)); name != "" && name != "." {
+			named[name] = struct{}{}
+		}
+	}
+	unclaimed := make([]string, 0, len(downloads))
+	for _, path := range downloads {
+		if _, found := named[filepath.Base(path)]; !found {
+			unclaimed = append(unclaimed, path)
+		}
+	}
+	return unclaimed
 }
 
 const refinementRetryWarningKeyPrefix = "retry-refinement-"

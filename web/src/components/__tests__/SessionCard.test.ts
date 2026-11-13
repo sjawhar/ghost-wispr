@@ -41,6 +41,7 @@ function render(
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('SessionCard', () => {
@@ -471,6 +472,37 @@ describe('SessionCard', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+
+  it('keeps Retry refinement disabled until the session leaves no_audio', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response('{}', { status: 202, headers: { 'Content-Type': 'application/json' } })),
+    )
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    const retry = screen.getByTestId('retry-refinement-btn')
+    await fireEvent.click(retry)
+    await vi.advanceTimersByTimeAsync(1001)
+    expect(retry.hasAttribute('disabled')).toBe(true)
   })
 
   it('styles the audio-removed marker', () => {
