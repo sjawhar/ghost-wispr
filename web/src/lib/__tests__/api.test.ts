@@ -27,17 +27,34 @@ describe('api client', () => {
     await expect(fetchDates()).resolves.toEqual(['2026-02-26'])
   })
 
-  it('fetches sessions for date', async () => {
+  it('preserves refined revisions from list responses', async () => {
+    const listResponse = [
+      {
+        id: 's1',
+        title: 'List-shaped session',
+        started_at: '2026-11-13T09:00:00Z',
+        ended_at: '2026-11-13T09:01:00Z',
+        status: 'ended',
+        summary: '',
+        summary_status: 'completed',
+        summary_preset: 'default',
+        audio_path: 'recording.mp3',
+        refinement_status: 'completed',
+        refined_revision: 7,
+      },
+    ]
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
         ok: true,
         status: 200,
-        json: async () => [{ id: 's1' }],
+        json: async () => listResponse,
       }),
     )
 
-    await expect(fetchSessions('2026-02-26')).resolves.toEqual([{ id: 's1' }])
+    const sessions = await fetchSessions('2026-11-13')
+    expect(sessions).toEqual(listResponse)
+    expect(sessions[0].refined_revision).toBe(7)
   })
 
   it('fetches session details', async () => {

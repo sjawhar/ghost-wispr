@@ -60,6 +60,20 @@ func TestRestoreRefinementRecordingStoresDownloadedAudio(t *testing.T) {
 	}
 }
 
+func TestRestoreRefinementRecordingRejectsAChangedAudioPath(t *testing.T) {
+	audio := filepath.Join(t.TempDir(), "restored.mp3")
+	store := &refinementRestoreStoreFake{ok: false}
+	err := restoreRefinementRecording(context.Background(), store, &storage.Session{ID: "s1"}, filepath.Dir(audio), func(context.Context, storage.Session) (deletionRecordingSet, error) {
+		return deletionRecordingSet{Paths: []string{audio}, Downloaded: []string{audio}}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "recording changed") {
+		t.Fatalf("restore with changed audio path = %v, want refusal", err)
+	}
+	if !store.called {
+		t.Fatal("changed-audio restoration did not attempt its fenced write")
+	}
+}
+
 func TestRetryRefinementFailureWarnsBySession(t *testing.T) {
 	registry := newWarningsRegistry()
 	failure := errors.New("Drive listing timed out")

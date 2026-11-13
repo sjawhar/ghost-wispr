@@ -72,21 +72,27 @@ type refinementAudioRestoreStore interface {
 }
 
 func hasLocalRefinementRecording(session *storage.Session, audioDir string) (bool, error) {
+	if session.AudioRemovedAt != "" {
+		return false, nil
+	}
+	entries := 0
 	for _, entry := range strings.Split(session.AudioPath, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
+		entries++
 		path := recording.Resolve(entry, audioDir)
 		info, err := os.Stat(path)
 		switch {
 		case err == nil && !info.IsDir():
-			return true, nil
 		case err != nil && !errors.Is(err, os.ErrNotExist):
 			return false, fmt.Errorf("check recording %s: %w", path, err)
+		default:
+			return false, nil
 		}
 	}
-	return false, nil
+	return entries > 0, nil
 }
 
 func refinementRecordingAvailable(session *storage.Session, audioDir string) error {
@@ -152,6 +158,27 @@ func retryRefinementWithFailureWarning(ctx context.Context, registry *warningsRe
 	log.Printf("warning: %s", warning)
 	registry.Set(refinementRetryWarningKeyPrefix+sessionID, warning)
 	return err
+}
+
+func restoredDriveSession(rs *gdrive.RestoredSession, restoredAt time.Time) storage.Session {
+	summaryStatus := storage.SummaryPending
+	if rs.Summary != "" {
+		summaryStatus = storage.SummaryCompleted
+	}
+	return storage.Session{
+		ID:               rs.ID,
+		Title:            rs.Title,
+		StartedAt:        rs.StartedAt,
+		EndedAt:          rs.EndedAt,
+		Status:           storage.SessionEnded,
+		Summary:          rs.Summary,
+		SummaryStatus:    summaryStatus,
+		SummaryPreset:    rs.SummaryPreset,
+		RefinementStatus: storage.RefinementNoAudio,
+		AudioRemovedAt:   restoredAt.UTC().Format(time.RFC3339Nano),
+		SyncStatus:       storage.SyncSynced,
+		GDriveFolderID:   rs.DriveFolderID,
+	}
 }
 
 func buildTranscript(segments []transcribe.Segment) string {
@@ -1326,22 +1353,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				return nil, fmt.Errorf("create syncer: %w", err)
 			}
 			result, err := syncer.RestoreFromDrive(ctx, func(rs gdrive.RestoredSession) error {
-				summaryStatus := storage.SummaryPending
-				if rs.Summary != "" {
-					summaryStatus = storage.SummaryCompleted
-				}
-				sess := storage.Session{
-					ID:             rs.ID,
-					Title:          rs.Title,
-					StartedAt:      rs.StartedAt,
-					EndedAt:        rs.EndedAt,
-					Status:         storage.SessionEnded,
-					Summary:        rs.Summary,
-					SummaryStatus:  summaryStatus,
-					SummaryPreset:  rs.SummaryPreset,
-					SyncStatus:     storage.SyncSynced,
-					GDriveFolderID: rs.DriveFolderID,
-				}
+				sess := restoredDriveSession(&rs, time.Now().UTC())
 				return store.ImportSession(&sess, rs.Segments)
 			})
 			if err != nil {
