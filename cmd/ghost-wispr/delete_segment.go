@@ -269,11 +269,11 @@ func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID s
 	if d.store == nil {
 		return fmt.Errorf("segment deletion storage is not configured")
 	}
-	unlock := deleteLocks.lock(sessionID)
-	defer unlock()
 	if deleteLocks.isRecovering(sessionID) {
 		return storage.ErrSegmentSplicePending
 	}
+	unlock := deleteLocks.lock(sessionID)
+	defer unlock()
 	session, err := d.store.GetSession(sessionID)
 	if err != nil {
 		return err
@@ -308,11 +308,11 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	if d.store == nil || d.ensureRecordings == nil || d.splice == nil {
 		return fmt.Errorf("segment deletion is not configured")
 	}
-	unlock := deleteLocks.lock(sessionID)
-	defer unlock()
 	if deleteLocks.isRecovering(sessionID) {
 		return storage.ErrSegmentSplicePending
 	}
+	unlock := deleteLocks.lock(sessionID)
+	defer unlock()
 	session, err := d.store.GetSession(sessionID)
 	if err != nil {
 		return err

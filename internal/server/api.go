@@ -793,7 +793,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			case errors.Is(err, storage.ErrSegmentSessionActive):
 				writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
 			case errors.Is(err, storage.ErrSegmentSplicePending):
-				writeJSONError(w, http.StatusConflict, "A previous segment deletion is still being recovered. Try again after it completes.")
+				writeJSONError(w, http.StatusConflict, "Restoring the recording; try again shortly.")
 			case errors.Is(err, storage.ErrStaleTranscriptRevision):
 				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
 			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):
