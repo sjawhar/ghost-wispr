@@ -478,7 +478,11 @@ describe('SessionCard', () => {
     vi.useFakeTimers()
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(new Response('{}', { status: 202, headers: { 'Content-Type': 'application/json' } })),
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response('{}', { status: 202, headers: { 'Content-Type': 'application/json' } }),
+        ),
     )
     render({
       session: {

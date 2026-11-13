@@ -275,7 +275,8 @@
 <div class="audio-player" data-testid="audio-player">
   {#if session?.restored_at && noRecording && session.sync_state === SyncState.RemoteDeleted}
     <p class="audio-note">
-      This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined.
+      This conversation's Drive folder is unavailable or in the trash, so its recording cannot be
+      restored or refined.
     </p>
   {:else if session?.restored_at && noRecording && canRestoreRefinement(session)}
     <p class="audio-note">

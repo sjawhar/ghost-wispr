@@ -152,7 +152,9 @@ it('does not offer a refinement retry when a restored session cannot restore aud
   })
   expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
   expect(
-    screen.getAllByText('The audio was removed from this unit and Drive has no copy, so it cannot be refined or deleted.'),
+    screen.getAllByText(
+      'The audio was removed from this unit and Drive has no copy, so it cannot be refined or deleted.',
+    ),
   ).not.toHaveLength(0)
 })
 
@@ -175,7 +177,11 @@ it('says when no recording was ever saved', () => {
     onNotFound: vi.fn().mockResolvedValue(false),
   })
 
-  expect(screen.getAllByText('No recording was saved for this conversation, so it cannot be refined or deleted.')).not.toHaveLength(0)
+  expect(
+    screen.getAllByText(
+      'No recording was saved for this conversation, so it cannot be refined or deleted.',
+    ),
+  ).not.toHaveLength(0)
   expect(screen.queryByText(/still being refined/)).toBeNull()
 })
 
