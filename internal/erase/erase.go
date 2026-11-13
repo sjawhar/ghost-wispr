@@ -126,6 +126,22 @@ func (p Pending) Finish() error {
 	return nil
 }
 
+// Restore gives a Pending file back its original name if a caller cannot
+// complete the operation that required it hidden. It flushes that rename so a
+// stop cannot leave a live session's raw recording invisible.
+func (p Pending) Restore() error {
+	if p.hidden == "" {
+		return nil
+	}
+	if err := os.Rename(p.hidden, p.path); err != nil {
+		return fmt.Errorf("restore %s: %w", p.path, err)
+	}
+	if err := syncDirectory(filepath.Dir(p.path)); err != nil {
+		return fmt.Errorf("flush restored %s: %w", p.path, err)
+	}
+	return nil
+}
+
 // Replace renames from to to, as os.Rename does, and erases the file to named
 // before. That file is kept under a hidden second name until the rename is
 // done, so the app stopping at any point leaves the recording whole under to

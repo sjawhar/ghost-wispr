@@ -243,9 +243,10 @@ func settleUnownedDriveReplacement(tx *sql.Tx, id string) error {
 			WITH RECURSIVE held(id) AS (
 				SELECT ?
 				UNION SELECT merged.id FROM sessions AS merged JOIN held ON merged.merged_into = held.id
-			) SELECT 1 FROM sessions AS folder JOIN held ON folder.id = held.id
-			  WHERE folder.gdrive_folder_id != ''
-			     OR (folder.gdrive_folder_id = '' AND folder.last_sync_attempt IS NOT NULL))`,
+			) SELECT 1 FROM held
+			  JOIN sessions AS folder ON folder.id = held.id
+			  LEFT JOIN unrecorded_sync_folders AS unrecorded ON unrecorded.session_id = held.id
+			  WHERE folder.gdrive_folder_id != '' OR unrecorded.session_id IS NOT NULL)`,
 		id, SyncStateSyncing, id); err != nil {
 		return fmt.Errorf("settle the Drive replacement of session %s: %w", id, err)
 	}

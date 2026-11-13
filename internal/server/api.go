@@ -45,6 +45,9 @@ type SessionStore interface {
 	// had when it went. It first records the directory of each recording the
 	// row names, found as recording.Resolve finds it in audioDir, and
 	// deletes nothing if it cannot.
+	// PrepareRawSessionErase records the raw microphone capture directory
+	// before the API hides that file; it leaves the session row intact.
+	PrepareRawSessionErase(id, audioDir string) (string, error)
 	DeleteSession(id, audioDir string) (string, error)
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
@@ -812,8 +815,28 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		recordingDir := audioDir()
+		rawPath, err := store.PrepareRawSessionErase(sessionID, recordingDir)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("prepare raw session erase: %v", err))
+			return
+		}
+		rawPending, rawErr := beginErasing(rawPath)
+		rawHidden := rawErr == nil || errors.Is(rawErr, erase.ErrLeftover)
+		switch {
+		case errors.Is(rawErr, erase.ErrLeftover):
+			slog.Warn("could not flush the removal of a deleted session's raw recording; it is erased after the answer", "session_id", sessionID, "audio_path", rawPath, "error", rawErr)
+		case errors.Is(rawErr, os.ErrNotExist):
+		case rawErr != nil:
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("hide raw session recording: %v", rawErr))
+			return
+		}
 		audioPath, err := store.DeleteSession(sessionID, recordingDir)
 		if err != nil {
+			if rawHidden {
+				if restoreErr := rawPending.Restore(); restoreErr != nil {
+					slog.Error("could not restore a raw session recording after its row delete failed", "session_id", sessionID, "audio_path", rawPath, "error", restoreErr)
+				}
+			}
 			if errors.Is(err, storage.ErrDeleteReplacementPending) {
 				writeJSONError(w, http.StatusConflict, err.Error())
 				return
@@ -825,24 +848,25 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			controls.OnSessionDeleted(sessionID)
 		}
 
-		// Erase the recordings the deleted row named and its raw microphone
-		// capture, after the database deletion: removing a whole audio file
-		// overwrites it with zeros before the file system frees its blocks
-		// (Sami, 2026-11-12, "Zero every audio removal",
-		// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
-		// DeleteSession recorded every erase directory before the row went,
-		// so an erase cut off by a stop is finished as the app starts. Each
-		// recording is erased where recording.Resolve finds it, as the app
-		// plays and syncs it, and as DeleteSession recorded it. The files
-		// leave their names before the answer; the zeros, a write as large
-		// as the recordings, follow it.
+		// Erase the recordings the deleted row named after the database
+		// deletion. The raw microphone capture was hidden first, while its row
+		// still existed, so a failed rename leaves the session available to
+		// retry. Removing a whole audio file overwrites it with zeros before
+		// the file system frees its blocks (Sami, 2026-11-12, "Zero every
+		// audio removal", dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
+		// DeleteSession recorded every erase directory before the row went, so
+		// an erase cut off by a stop is finished as the app starts. The files
+		// leave their names before the answer; the zeros follow it.
 		var pending []erase.Pending
-		for _, p := range append(strings.Split(audioPath, ","), sessionID+".pcm") {
+		if rawHidden {
+			pending = append(pending, rawPending)
+		}
+		for _, p := range strings.Split(audioPath, ",") {
 			if p = strings.TrimSpace(p); p == "" {
 				continue
 			}
 			p = recordingname.Resolve(p, recordingDir)
-			hidden, err := erase.Begin(p)
+			hidden, err := beginErasing(p)
 			switch {
 			case errors.Is(err, erase.ErrLeftover):
 				// The file has its hidden name, but the rename may not be on
@@ -1614,6 +1638,10 @@ func cosineSimilarity(a, b []float32) float32 {
 
 	return float32(dot / (math.Sqrt(normA) * math.Sqrt(normB)))
 }
+
+// beginErasing hides a whole recording before it is zeroed. Tests replace it
+// to exercise failures before a session row is deleted.
+var beginErasing = erase.Begin
 
 // finishErasing overwrites with zeros and removes the recordings a session
 // delete moved to hidden names, after the response. One it cannot finish

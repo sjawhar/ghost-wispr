@@ -182,6 +182,13 @@ func (s *apiStoreStub) DeleteSession(id, audioDir string) (string, error) {
 	return sess.AudioPath, nil
 }
 
+func (s *apiStoreStub) PrepareRawSessionErase(id, audioDir string) (string, error) {
+	if _, ok := s.sessions[id]; !ok {
+		return "", os.ErrNotExist
+	}
+	return filepath.Join(audioDir, id+".pcm"), nil
+}
+
 func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	endedAtPtr := &endedAt
 	s.sessions[newID] = storage.Session{
@@ -746,6 +753,38 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 	}
 	if !bytes.Equal(got, make([]byte, len(got))) {
 		t.Errorf("the removed raw PCM still holds %q", got)
+	}
+}
+
+// TestDeleteSessionKeepsItsRowWhenRawPCMCannotBeHidden fails if a raw
+// microphone capture that cannot be renamed is left behind after the session
+// row has gone: the user then cannot retry its secure removal.
+func TestDeleteSessionKeepsItsRowWhenRawPCMCannotBeHidden(t *testing.T) {
+	dir := t.TempDir()
+	original := beginErasing
+	t.Cleanup(func() { beginErasing = original })
+	beginErasing = func(path string) (erase.Pending, error) {
+		if path != filepath.Join(dir, "s1.pcm") {
+			t.Errorf("raw erase path = %q, want %q", path, filepath.Join(dir, "s1.pcm"))
+		}
+		return erase.Pending{}, errors.New("rename raw pcm: input/output error")
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: filepath.Join(dir, "s1.mp3")}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("delete = %d %s, want raw erase failure", rr.Code, rr.Body.String())
+	}
+	if _, found := store.sessions["s1"]; !found {
+		t.Fatal("session row was deleted after its raw PCM could not be hidden")
 	}
 }
 

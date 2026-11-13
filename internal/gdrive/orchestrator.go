@@ -60,6 +60,9 @@ type sessionFolderFinder interface {
 	FindSessionFolders(ctx context.Context, sessionID, audioPath string) ([]string, error)
 }
 
+var _ folderCreatingUploader = (*Syncer)(nil)
+var _ sessionFolderFinder = (*Syncer)(nil)
+
 type replacementInputStore interface {
 	DriveReplacementInput(sessionID string) (pending bool, splicedRecording string, err error)
 	DeletionGeneration(sessionID string) (int, error)
@@ -315,6 +318,10 @@ func (o *Orchestrator) SyncSession(ctx context.Context, sessionID string) error 
 				if read, err = o.store.GetSession(sessionID); err != nil {
 					return fmt.Errorf("get session %s after Drive folder adoption: %w", sessionID, err)
 				}
+			} else if read, err = o.store.GetSession(sessionID); err != nil {
+				return fmt.Errorf("get session %s after Drive folder discovery: %w", sessionID, err)
+			} else if !read.DriveReplacePending {
+				return o.SyncSession(ctx, sessionID)
 			}
 			folders, err := replacements.EnsureDriveReplacementFolders(sessionID, generation)
 			if err != nil {

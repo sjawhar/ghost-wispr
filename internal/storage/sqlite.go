@@ -412,6 +412,25 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create drive replacement folders table: %w", err)
 	}
 
+	// unrecorded_sync_folders marks a first sync that may have created a
+	// folder before power stopped it. A segment deletion keeps its Drive
+	// replacement pending until that retry has searched for the folder.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS unrecorded_sync_folders (
+			session_id TEXT PRIMARY KEY,
+			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create unrecorded sync folders table: %w", err)
+	}
+	// A database from before durable folder recording has no marker. Any
+	// folderless retry may have been cut off after Drive created its folder,
+	// so make its next sync search before a deletion can settle.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO unrecorded_sync_folders(session_id)
+		SELECT id FROM sessions WHERE gdrive_folder_id = '' AND retry_count > 0`); err != nil {
+		return fmt.Errorf("mark earlier folderless retries for Drive discovery: %w", err)
+	}
+
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS envoy_lifecycle_events (
 			event_type TEXT NOT NULL,
@@ -1635,6 +1654,10 @@ func (s *SQLiteStore) ClaimSync(id, from, claim string, at time.Time) (Session, 
 	if rows == 0 {
 		return Session{}, false, nil
 	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO unrecorded_sync_folders(session_id)
+		SELECT id FROM sessions WHERE id = ? AND gdrive_folder_id = ''`, id); err != nil {
+		return Session{}, false, fmt.Errorf("mark session %s as having an unrecorded Drive folder: %w", id, err)
+	}
 	sess, err := getSession(tx, id)
 	if err != nil {
 		return Session{}, false, err
@@ -1696,6 +1719,9 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
 		return false, err
 	}
+	if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
+		return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit marking session %s synced: %w", id, err)
 	}
@@ -1739,6 +1765,9 @@ func (s *SQLiteStore) RecordSyncFolder(id, claim, driveFolderID string) (bool, e
 	}
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
 		return false, err
+	}
+	if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
+		return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit Drive folder of session %s: %w", id, err)
@@ -1790,6 +1819,12 @@ func (s *SQLiteStore) EndSync(id, claim, state, driveFolderID string, retryCount
 		return false, nil
 	}
 	if err := oweFolderOfPendingDeletion(tx, id); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`DELETE FROM unrecorded_sync_folders WHERE session_id = ?`, id); err != nil {
+		return false, fmt.Errorf("clear unrecorded Drive folder of session %s: %w", id, err)
+	}
+	if err := settleUnownedDriveReplacement(tx, id); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -2416,6 +2451,18 @@ var ErrDeleteReplacementPending = errors.New("this session still has a deleted s
 const noOwedDriveReplacement = `sessions.drive_replace_pending = 0 AND NOT EXISTS (
 	SELECT 1 FROM drive_replacement_folders
 	WHERE drive_replacement_folders.folder_session_id = sessions.id AND drive_replacement_folders.state = '` + DriveReplacementFolderOwed + `')`
+
+// PrepareRawSessionErase records the directory of session id's raw microphone
+// capture before the API hides it. The session row stays intact if the rename
+// cannot start, so the caller can retry rather than losing the only handle to
+// the raw audio.
+func (s *SQLiteStore) PrepareRawSessionErase(id, audioDir string) (string, error) {
+	rawPath := filepath.Join(audioDir, id+".pcm")
+	if err := s.RecordEraseDirectory(filepath.Dir(rawPath)); err != nil {
+		return "", fmt.Errorf("prepare raw erase for session %s: %w", id, err)
+	}
+	return rawPath, nil
+}
 
 // DeleteSession deletes session id, refusing one that owes Google Drive a
 // replacement (ErrDeleteReplacementPending), and returns the audio_path the
