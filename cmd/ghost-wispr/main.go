@@ -205,9 +205,6 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 				}
 			}
 		}
-		if len(required) == 0 {
-			return fmt.Errorf("cannot restore session %s safely: its recording provenance is unavailable", session.ID)
-		}
 		if missing := missingRefinementRecordings(required, recordings.Paths); len(missing) > 0 {
 			return fmt.Errorf("drive did not restore recording %s for session %s; restore it from Drive's trash, then retry refinement", strings.Join(missing, ", "), session.ID)
 		}

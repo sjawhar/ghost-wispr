@@ -1025,7 +1025,17 @@ func (s *SQLiteStore) RefinementRecordingPaths(sessionID string) ([]string, erro
 	if err != nil {
 		return nil, fmt.Errorf("list refined recording paths for session %s: %w", sessionID, err)
 	}
-	return paths, nil
+	if len(paths) != 0 {
+		return paths, nil
+	}
+	var merged int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE merged_into = ?`, sessionID).Scan(&merged); err != nil {
+		return nil, fmt.Errorf("check merged recording provenance for session %s: %w", sessionID, err)
+	}
+	if merged != 0 {
+		return nil, fmt.Errorf("recording provenance is unavailable for merged session %s", sessionID)
+	}
+	return nil, nil
 }
 
 func refinementRecordingPaths(q querier, query string, args ...any) ([]string, error) {
