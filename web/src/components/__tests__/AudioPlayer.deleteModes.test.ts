@@ -151,6 +151,32 @@ it('does not offer a refinement retry when a restored session cannot restore aud
     onNotFound: vi.fn().mockResolvedValue(false),
   })
   expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
+  expect(
+    screen.getAllByText('The audio was removed from this unit and Drive has no copy, so it cannot be refined or deleted.'),
+  ).not.toHaveLength(0)
+})
+
+it('says when no recording was ever saved', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      refinement_status: RefinementStatus.NoAudio,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(screen.getAllByText('No recording was saved for this conversation, so it cannot be refined or deleted.')).not.toHaveLength(0)
+  expect(screen.queryByText(/still being refined/)).toBeNull()
 })
 
 it('explains when a restored session has no Drive folder to restore from', () => {
@@ -179,7 +205,7 @@ it('explains when a restored session has no Drive folder to restore from', () =>
 
   expect(
     screen.getAllByText(
-      "This conversation's Drive folder was deleted, so its recording cannot be restored or refined.",
+      "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined.",
     ),
   ).not.toHaveLength(0)
   expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()

@@ -89,7 +89,7 @@
     }
     if (session?.refinement_status === RefinementStatus.NoAudio) {
       if (session.restored_at && session.sync_state === SyncState.RemoteDeleted) {
-        return "This conversation's Drive folder was deleted, so its recording cannot be restored or refined."
+        return "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined."
       }
       if (session.restored_at && canRestoreRefinement(session)) {
         return 'This conversation was restored from Drive; retry refinement to delete from it'
@@ -97,6 +97,10 @@
       if (canRestoreRefinement(session)) {
         return 'No recording is on this unit. Use Retry refinement to restore it from Drive, then delete.'
       }
+      if (session.audio_removed_at) {
+        return 'The audio was removed from this unit and Drive has no copy, so it cannot be refined or deleted.'
+      }
+      return 'No recording was saved for this conversation, so it cannot be refined or deleted.'
     }
     if (session?.refinement_status === RefinementStatus.Completed && !session.refined_revision) {
       return 'This conversation completed without timed words. Use Retry refinement before deleting.'
@@ -271,7 +275,7 @@
 <div class="audio-player" data-testid="audio-player">
   {#if session?.restored_at && noRecording && session.sync_state === SyncState.RemoteDeleted}
     <p class="audio-note">
-      This conversation's Drive folder was deleted, so its recording cannot be restored or refined.
+      This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined.
     </p>
   {:else if session?.restored_at && noRecording && canRestoreRefinement(session)}
     <p class="audio-note">
