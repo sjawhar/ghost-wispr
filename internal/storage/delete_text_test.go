@@ -601,7 +601,7 @@ func TestARefreshThatLostARaceIsOwedAgain(t *testing.T) {
 func TestDeleteTextWithPartOfTheAudioRemovedDoesNotRefine(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "text-partial")
-	if _, err := store.DB().Exec(`UPDATE sessions SET audio_removed_at = '2026-11-11T11:00:00Z', refinement_status = ? WHERE id = 'text-partial'`, RefinementCompleted); err != nil {
+	if _, err := store.DB().Exec(`UPDATE sessions SET audio_removed_at = '2026-11-11T11:00:00Z', refinement_status = ?, refined_transcript = 'old refined text with private deletion token' WHERE id = 'text-partial'`, RefinementCompleted); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := store.GetSegments("text-partial")
@@ -611,7 +611,7 @@ func TestDeleteTextWithPartOfTheAudioRemovedDoesNotRefine(t *testing.T) {
 	if err := store.DeleteSegmentText("text-partial", segments[1].ID, textSpan()); err != nil {
 		t.Fatalf("DeleteSegmentText: %v", err)
 	}
-	if session := storeSession(t, store, "text-partial"); session.RefinementStatus != RefinementNoAudio || session.AudioPath != "recording.mp3" {
-		t.Errorf("refinement %q, audio path %q; want no_audio and the audio left kept", session.RefinementStatus, session.AudioPath)
+	if session := storeSession(t, store, "text-partial"); session.RefinementStatus != RefinementNoAudio || session.AudioPath != "recording.mp3" || session.RefinedTranscript != "" {
+		t.Errorf("refinement %q, audio path %q, refined %q; want no_audio, the audio left kept and no stale refinement", session.RefinementStatus, session.AudioPath, session.RefinedTranscript)
 	}
 }

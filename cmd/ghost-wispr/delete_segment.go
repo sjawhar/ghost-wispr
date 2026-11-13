@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -453,6 +454,9 @@ func (d *segmentDeleteRunner) deleteText(ctx context.Context, sessionID string, 
 	if err := locatedRecording(recordIndex, len(recordings.Paths), err); err != nil {
 		return err
 	}
+	if err := validateTextDeletionSpan(candidates[recordIndex].Words, start, end, text, before, after); err != nil {
+		return err
+	}
 	recording := recordings.Paths[recordIndex]
 	hash, err := fileSHA256(recording)
 	if err != nil {
@@ -481,6 +485,120 @@ func (d *segmentDeleteRunner) deleteText(ctx context.Context, sessionID string, 
 		}
 	}
 	return maintenanceErr
+}
+
+// validateTextDeletionSpan proves that the words a later refinement would
+// keep after leaving out start to end contain no named segment word, lose no
+// more than one word from either neighbour, and do not hide unaccounted words
+// between the span and a neighbour (or a recording edge). A text deletion has
+// no audio splice to validate afterwards, so it validates the words already
+// transcribed to locate it before it records the span.
+func validateTextDeletionSpan(words []audio.Word, start, end float64, text, before, after string) error {
+	afterWords := wordsAfterTextDeletion(words, start, end)
+	if survivors := audio.Survivors(textDeletionNeighbourhood(words, afterWords, start, end, before, after), start, text, before, after); len(survivors) > 0 {
+		return fmt.Errorf("%w: surviving words: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(survivors, ", "))
+	}
+	beforeCheck := recordingHasWordsOnSide(words, start, end, true)
+	afterCheck := recordingHasWordsOnSide(words, start, end, false)
+	if beforeCheck {
+		if missing := missingNeighbourTokens(afterWords, start, before, true); len(missing) > 1 {
+			return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(missing, ", "))
+		}
+	}
+	if afterCheck {
+		if missing := missingNeighbourTokens(afterWords, start, after, false); len(missing) > 1 {
+			return fmt.Errorf("%w: after-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(missing, ", "))
+		}
+	}
+	if hasUnaccountedEdgeWords(words, start, end, before, after) {
+		return fmt.Errorf("%w: words between the segment and its neighbour or recording edge are outside the aligned span", server.ErrSegmentNotRemovedCleanly)
+	}
+	return nil
+}
+
+// wordsAfterTextDeletion returns words as a text deletion's later refinement
+// sees them: words whose middle is in the aligned span go, later words move
+// back by the missing duration.
+func wordsAfterTextDeletion(words []audio.Word, start, end float64) []audio.Word {
+	length := end - start
+	kept := make([]audio.Word, 0, len(words))
+	for _, word := range words {
+		middle := (word.Start + word.End) / 2
+		switch {
+		case middle >= start && middle <= end:
+			continue
+		case middle > end:
+			word.Start -= length
+			word.End -= length
+		}
+		kept = append(kept, word)
+	}
+	return kept
+}
+
+// hasUnaccountedEdgeWords reports words that lie after the span but before
+// the first matched after-neighbour word, or before it but after the last
+// matched before-neighbour word. With no neighbour on a side, every word
+// between the span and that recording edge must be in the span. Such a word
+// would remain in every later refinement even if the segment's named tokens
+// did not expose it (for example "to" after live "gonna").
+func hasUnaccountedEdgeWords(words []audio.Word, start, end float64, before, after string) bool {
+	beforeTokens := deletionTokens(before)
+	afterTokens := deletionTokens(after)
+	lastBefore := -1
+	firstAfter := len(words)
+	for i, word := range words {
+		tokens := deletionTokens(word.Text)
+		if word.End <= start && intersectsTokens(tokens, beforeTokens) {
+			lastBefore = i
+		}
+		if word.Start >= end && firstAfter == len(words) && intersectsTokens(tokens, afterTokens) {
+			firstAfter = i
+		}
+	}
+	for i, word := range words {
+		if word.End <= start && i > lastBefore {
+			return true
+		}
+		if word.Start >= end && i < firstAfter {
+			return true
+		}
+	}
+	return false
+}
+
+func intersectsTokens(left, right []string) bool {
+	for _, token := range left {
+		if slices.Contains(right, token) {
+			return true
+		}
+	}
+	return false
+}
+
+// textDeletionNeighbourhood keeps the simulated post-delete words between
+// the last matched before-neighbour word and the first matched
+// after-neighbour word. audio.Survivors deliberately searches a ten-second
+// window for an audio cut; for text deletion that would mistake a repeated
+// filler in an earlier or later, non-neighbour segment for a survivor.
+func textDeletionNeighbourhood(original, afterWords []audio.Word, start, end float64, before, after string) []audio.Word {
+	lower, upper := math.Inf(-1), math.Inf(1)
+	beforeTokens, afterTokens := deletionTokens(before), deletionTokens(after)
+	for _, word := range original {
+		if word.End <= start && intersectsTokens(deletionTokens(word.Text), beforeTokens) {
+			lower = math.Max(lower, word.Start)
+		}
+		if word.Start >= end && intersectsTokens(deletionTokens(word.Text), afterTokens) {
+			upper = math.Min(upper, word.End-(end-start))
+		}
+	}
+	near := make([]audio.Word, 0, len(afterWords))
+	for _, word := range afterWords {
+		if word.End >= lower && word.Start <= upper {
+			near = append(near, word)
+		}
+	}
+	return near
 }
 
 // recordingHasWordsOnSide reports whether the selected recording has words on

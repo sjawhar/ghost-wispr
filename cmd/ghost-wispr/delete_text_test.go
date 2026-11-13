@@ -374,3 +374,125 @@ func TestDeleteTextWithPartOfTheAudioRemovedSummarizesWithoutRefining(t *testing
 		t.Error("Delete text of a session with part of its audio removed did not make its summary again")
 	}
 }
+
+// TestDeleteTextRefusesASpanThatLeavesWordsBeforeTheRecordingEdge fails if
+// the live segment's "is gonna" aligns to the batch words "is going to" but
+// LocateWords stops before "to": a later refinement would keep "to".
+func TestDeleteTextRefusesASpanThatLeavesWordsBeforeTheRecordingEdge(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "delete.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 14, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("edge", started); err != nil {
+		t.Fatal(err)
+	}
+	for i, text := range []string{"We met at the office.", "Orange tractor ninety is gonna"} {
+		if err := store.AppendSegment("edge", transcribe.Segment{
+			Text: text, StartTime: float64(i * 2), EndTime: float64(i*2 + 2), Timestamp: started.Add(time.Duration(i*2) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession("edge", started.Add(4*time.Second), recording); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("edge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := []audio.Word{
+		{Text: "We", Start: 0, End: 0.2},
+		{Text: "met", Start: 0.25, End: 0.45},
+		{Text: "at", Start: 0.5, End: 0.65},
+		{Text: "the", Start: 0.7, End: 0.85},
+		{Text: "office.", Start: 0.9, End: 1.15},
+		{Text: "Orange", Start: 2, End: 2.25},
+		{Text: "tractor", Start: 2.3, End: 2.55},
+		{Text: "ninety", Start: 2.6, End: 2.85},
+		{Text: "is", Start: 2.9, End: 3.05},
+		{Text: "going", Start: 3.6, End: 3.9},
+		{Text: "to", Start: 3.95, End: 4.1},
+	}
+	runner := segmentDeleteRunner{
+		store:       store,
+		transcriber: deletionWordsFake{before: words},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		splice: refusingSplice(t),
+	}
+	if err := runner.DeleteText(context.Background(), "edge", segments[1].ID); !errors.Is(err, server.ErrSegmentNotRemovedCleanly) {
+		t.Fatalf("DeleteText error = %v, want %v", err, server.ErrSegmentNotRemovedCleanly)
+	}
+	if got, err := store.GetSegments("edge"); err != nil || len(got) != 2 {
+		t.Errorf("segments after refused Delete text = %+v (%v), want both", got, err)
+	}
+	if spans, err := store.TextDeletionSpans(recording); err != nil || len(spans) != 0 {
+		t.Errorf("spans after refused Delete text = %+v (%v), want none", spans, err)
+	}
+}
+
+// TestDeleteTextUsesNeighbourContextForRepeatedFiller fails if a repeated
+// filler word is refused even though its surrounding segments identify one
+// occurrence: filler words are the primary Delete text use case.
+func TestDeleteTextUsesNeighbourContextForRepeatedFiller(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "delete.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 15, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("repeat", started); err != nil {
+		t.Fatal(err)
+	}
+	texts := []string{"We should start", "um", "the unique middle context", "um", "then the unique ending"}
+	for i, text := range texts {
+		if err := store.AppendSegment("repeat", transcribe.Segment{
+			Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession("repeat", started.Add(5*time.Second), recording); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("repeat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := []audio.Word{
+		{Text: "We", Start: 0, End: 0.2}, {Text: "should", Start: 0.25, End: 0.45}, {Text: "start", Start: 0.5, End: 0.7},
+		{Text: "um", Start: 1, End: 1.15},
+		{Text: "the", Start: 2, End: 2.15}, {Text: "unique", Start: 2.2, End: 2.4}, {Text: "middle", Start: 2.45, End: 2.65}, {Text: "context", Start: 2.7, End: 2.9},
+		{Text: "um", Start: 3, End: 3.15},
+		{Text: "then", Start: 4, End: 4.15}, {Text: "the", Start: 4.2, End: 4.35}, {Text: "unique", Start: 4.4, End: 4.6}, {Text: "ending", Start: 4.65, End: 4.85},
+	}
+	runner := segmentDeleteRunner{
+		store:       store,
+		transcriber: deletionWordsFake{before: words},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		splice: refusingSplice(t),
+	}
+	if err := runner.DeleteText(context.Background(), "repeat", segments[3].ID); err != nil {
+		t.Fatalf("DeleteText of the context-identified filler: %v", err)
+	}
+	spans, err := store.TextDeletionSpans(recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spans) != 1 || spans[0].Start < 2.9 || spans[0].End > 3.2 {
+		t.Errorf("span for the second filler = %+v, want the occurrence at 3.0-3.15", spans)
+	}
+}
