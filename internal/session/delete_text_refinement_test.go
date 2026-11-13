@@ -68,11 +68,11 @@ func fileHash(t *testing.T, path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.DeletedSpan) error {
+func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span *storage.DeletedSpan) error {
 	t.Helper()
 	index := liveSegmentIndex(t, store, sessionID, liveSegmentID)
 	revision, refined := publishRefinedSegmentsForTest(t, store, sessionID, span.AudioPath, span.SHA256Before)
-	return store.DeleteRefinedSegmentAudio(sessionID, refined[index].ID, revision, &span)
+	return store.DeleteRefinedSegmentAudio(sessionID, refined[index].ID, revision, span)
 }
 
 func deleteRefinedTextForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.TextDeletionSpan) error {
@@ -90,7 +90,8 @@ func publishRefinedSegmentsForTest(t *testing.T, store *storage.SQLiteStore, ses
 	}
 	words := make([]storage.RefinedWord, 0, len(live))
 	refined := make([]storage.RefinedSegment, 0, len(live))
-	for i, segment := range live {
+	for i := range live {
+		segment := &live[i]
 		words = append(words, storage.RefinedWord{
 			RecordingPath: recordingPath, RecordingSHA256: recordingHash, Ordinal: i,
 			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,

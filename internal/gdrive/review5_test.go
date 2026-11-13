@@ -49,7 +49,7 @@ func TestReview5DeletionInAMergedSessionLeavesTheSourceFolder(t *testing.T) {
 		}
 	}
 	span := storage.DeletedSpan{SessionID: merged, AudioPath: recA, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
-	if err := deleteRefinedAudioForTest(t, store, merged, secretID, span); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, merged, secretID, &span); err != nil {
 		t.Fatalf("delete refined segment: %v", err)
 	}
 	if err := os.WriteFile(recA, []byte("spliced clean audio"), 0o644); err != nil {
@@ -123,7 +123,7 @@ func mergedDeletion(t *testing.T, store *storage.SQLiteStore, o *Orchestrator, s
 		}
 	}
 	span := storage.DeletedSpan{SessionID: merged, AudioPath: recA, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
-	if err := deleteRefinedAudioForTest(t, store, merged, secretID, span); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, merged, secretID, &span); err != nil {
 		t.Fatalf("delete refined segment: %v", err)
 	}
 	if err := os.WriteFile(recA, []byte("spliced clean audio"), 0o644); err != nil {

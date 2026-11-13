@@ -765,6 +765,9 @@ func main() {
 	for i, warning := range cfgWarnings {
 		warningRegistry.Set(fmt.Sprintf("config-%03d", i), warning)
 	}
+	if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
+		log.Printf("warning: raw erase reservations: %v", err)
+	}
 	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
 	if restorePauseErr != nil {
 		warningRegistry.Set("capture-state", "Capture pause state could not be restored; the recorder started paused")
@@ -959,8 +962,13 @@ func main() {
 	}
 
 	controlHooks := &server.ControlHooks{
-		IsPaused:      capture.IsPaused,
-		IsCapturing:   func() bool { return capture.capturing(micStatus) },
+		IsPaused:    capture.IsPaused,
+		IsCapturing: func() bool { return capture.capturing(micStatus) },
+		RefreshRawEraseWarnings: func() {
+			if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
+				log.Printf("warning: raw erase reservations after delete failure: %v", err)
+			}
+		},
 		CaptureState:  func() string { return capture.captureState(micStatus) },
 		ActiveSession: manager.ActiveSession,
 		Warnings:      warningRegistry.List,
@@ -968,6 +976,9 @@ func main() {
 			warningRegistry.WithRecordingMismatch(func() {
 				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
 			})
+			if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
+				log.Printf("warning: raw erase reservations after deleting session %s: %v", sessionID, err)
+			}
 		},
 		OnSessionsMerged: func(sessionIDs []string) {
 			warningRegistry.WithRecordingMismatch(func() {
@@ -1817,7 +1828,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// (5 minutes), whose ticker starts above, and before GC, which starts
 	// below with a pass at once.
 	// erase.Leftovers unlinks the second name an erase.Replace under way still
-	// needs, cleanupSpliceTempCopies removes the copies a running deletion
+	// needs, cleanupSpliceTempCopiesExcept removes the copies a running deletion
 	// splices, and ForgetEraseDirectories forgets directories no erase is
 	// using only while none runs. The recorder, started above, may already
 	// erase a saved session's raw recording in the audio directory:

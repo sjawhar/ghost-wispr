@@ -30,6 +30,9 @@ type OrchestratorStore interface {
 	// holds it and unchanged reports true for it and its segments as they
 	// are now, and reports whether it did.
 	MarkSynced(sessionID, claim, driveFolderID string, unchanged func(storage.Session, []transcribe.Segment) bool) (bool, error)
+	// RecordSyncFolder stores a newly created Drive folder while the sync
+	// claim still holds the session, before its first upload.
+	RecordSyncFolder(sessionID, claim, driveFolderID string) (bool, error)
 	// EndSync records how the sync claim names ended, when it did not mark
 	// the session synced, only while that sync holds it, and reports whether
 	// it did.
@@ -41,6 +44,13 @@ type uploader interface {
 	UploadInto(ctx context.Context, folderID string, files []SyncFile) error
 	FolderOnDrive(ctx context.Context, folderID string) (bool, error)
 	RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error)
+}
+
+// folderCreatingUploader can record a newly made folder before its first
+// upload. Syncer implements it; the base uploader contract stays useful for
+// test uploaders that do not create remote folders.
+type folderCreatingUploader interface {
+	UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error)
 }
 
 type replacementInputStore interface {
@@ -102,6 +112,17 @@ func NewOrchestratorWithUploader(u uploader, store OrchestratorStore, logger ...
 	}
 
 	return &Orchestrator{uploader: u, store: store, logger: l}
+}
+
+func (o *Orchestrator) recordSyncFolder(sessionID, claim, folderID string) error {
+	recorded, err := o.store.RecordSyncFolder(sessionID, claim, folderID)
+	if err != nil {
+		return fmt.Errorf("record Drive folder %s: %w", folderID, err)
+	}
+	if !recorded {
+		return fmt.Errorf("record Drive folder %s: the sync no longer holds session %s", folderID, sessionID)
+	}
+	return nil
 }
 
 // FolderOnDrive reports whether Drive has session folder folderID out of the
@@ -301,10 +322,14 @@ func (o *Orchestrator) syncSession(ctx context.Context, sessionID string) error 
 	// A session synced before keeps its folder, and so does one whose first
 	// sync created its folder and then failed: syncing it again adds what the
 	// folder lacks instead of creating a second folder. A summary the session
-	// no longer has (a segment deletion cleared it) is emptied there.
+	// no longer has is emptied in that existing folder.
 	driveFolderID := sess.GDriveFolderID
 	if driveFolderID != "" {
 		err = o.uploader.UploadInto(ctx, driveFolderID, withEmptiedSummary(files))
+	} else if creator, ok := o.uploader.(folderCreatingUploader); ok {
+		driveFolderID, err = creator.UploadWithFolderRecorded(ctx, folderName, files, func(folderID string) error {
+			return o.recordSyncFolder(sessionID, claim, folderID)
+		})
 	} else {
 		driveFolderID, err = o.uploader.Upload(ctx, folderName, files)
 	}

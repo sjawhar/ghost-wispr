@@ -45,7 +45,8 @@ func publishRefinedSegmentTestSession(t *testing.T, store *SQLiteStore, id, reco
 	}
 	words := make([]RefinedWord, 0, len(live))
 	refined := make([]RefinedSegment, 0, len(live))
-	for i, segment := range live {
+	for i := range live {
+		segment := &live[i]
 		words = append(words, RefinedWord{
 			RecordingPath: recordingPath, RecordingSHA256: recordingHash, Ordinal: i,
 			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
@@ -72,6 +73,8 @@ func publishRefinedSegmentTestSession(t *testing.T, store *SQLiteStore, id, reco
 
 // deleteRefinedAudioTestSegment publishes the session's existing live
 // segments as timed refined occurrences, then removes the selected occurrence.
+//
+//nolint:gocritic // Preserve the test span for assertions after the deletion.
 func deleteRefinedAudioTestSegment(t *testing.T, store *SQLiteStore, id string, liveSegmentID int64, span DeletedSpan) error {
 	t.Helper()
 	live, err := store.GetSegments(id)
@@ -310,7 +313,7 @@ func TestPendingSplicesReturnsOnlyRecordingsAtTheirBeforeHash(t *testing.T) {
 		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 
-	pending, err := store.PendingSplices()
+	pending, err := store.PendingSplices("")
 	if err != nil {
 		t.Fatalf("PendingSplices before rename: %v", err)
 	}
@@ -320,7 +323,7 @@ func TestPendingSplicesReturnsOnlyRecordingsAtTheirBeforeHash(t *testing.T) {
 	if err := os.WriteFile(path, changed, 0o600); err != nil {
 		t.Fatalf("replace recording: %v", err)
 	}
-	pending, err = store.PendingSplices()
+	pending, err = store.PendingSplices("")
 	if err != nil {
 		t.Fatalf("PendingSplices after rename: %v", err)
 	}
@@ -333,6 +336,33 @@ func TestPendingSplicesReturnsOnlyRecordingsAtTheirBeforeHash(t *testing.T) {
 	}
 	if complete != 1 {
 		t.Fatalf("splice completion = %d, want 1 after the new hash is present", complete)
+	}
+}
+
+// TestPendingSplicesChecksTheRecordingWhereReadersResolveIt fails if a
+// completed splice moved with audio_dir stays pending because PendingSplices
+// hashes only the path recorded before the directory changed.
+func TestPendingSplicesChecksTheRecordingWhereReadersResolveIt(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	_, _ = segmentTestSession(t, store, "moved-splice")
+	oldPath := filepath.Join(t.TempDir(), "old", "recording.mp3")
+	audioDir := t.TempDir()
+	moved := filepath.Join(audioDir, "recording.mp3")
+	before, after := []byte("before splice"), []byte("after splice")
+	if err := os.WriteFile(moved, after, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	revision, segments := publishRefinedSegmentTestSession(t, store, "moved-splice", oldPath, hashBytes(before))
+	span := DeletedSpan{SessionID: "moved-splice", AudioPath: oldPath, Start: 2, End: 4, SHA256Before: hashBytes(before), SHA256After: hashBytes(after)}
+	if err := store.DeleteRefinedSegmentAudio("moved-splice", segments[1].ID, revision, &span); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingSplices(audioDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending splices = %+v, want the moved completed splice marked complete", pending)
 	}
 }
 

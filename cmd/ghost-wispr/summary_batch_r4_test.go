@@ -117,7 +117,7 @@ func TestR4BatchSubmitReadRefusesDeleteBetweenReadAndSubmit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deleteRefinedAudioForTest(t, store, "a", segments[0].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, "a", segments[0].ID, &storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.StartSummary("a"); err != nil {
@@ -134,7 +134,7 @@ func TestR4StaleBatchResultIsNotBroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deleteRefinedAudioForTest(t, store, "a", segments[0].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, "a", segments[0].ID, &storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.StartSummary("a"); err != nil {

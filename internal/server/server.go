@@ -110,6 +110,9 @@ type ControlHooks struct {
 	OnStatusChanged   func(paused bool)
 	Warnings          func() []string
 	KeptRawRecordings func() KeptRawRecordings
+	// RefreshRawEraseWarnings updates GET /api/status after a delete leaves a
+	// raw erase reservation for startup recovery.
+	RefreshRawEraseWarnings func()
 	// GCHold is the hold of the last GC pass, nil when it did not hold back.
 	GCHold func() *GCHold
 	// UnverifiedSessions is how many sessions GC keeps until a sync verifies

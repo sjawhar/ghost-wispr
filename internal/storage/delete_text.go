@@ -51,7 +51,7 @@ func recordTextDeletionSpan(tx *sql.Tx, sessionID string, sources []string, span
 		return fmt.Errorf("record deleted text span for session %s: %w", sessionID, err)
 	}
 	for _, id := range append([]string{sessionID}, sources...) {
-		if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = ? AND gdrive_folder_id != ''`, id); err != nil {
+		if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = ?`, id); err != nil {
 			return fmt.Errorf("owe the Drive folder of session %s its documents: %w", id, err)
 		}
 	}

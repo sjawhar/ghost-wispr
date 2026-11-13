@@ -168,7 +168,7 @@ func TestASegmentDeletionInARemoteDeletedSessionIsReplacedOnceTheFolderIsBack(t 
 		t.Fatal(err)
 	}
 	span := storage.DeletedSpan{SessionID: fixture.id, AudioPath: fixture.recording, Start: 0, End: 1, SHA256Before: before, SHA256After: after}
-	if err := deleteRefinedAudioForTest(t, fixture.store, fixture.id, segments[0].ID, span); err != nil {
+	if err := deleteRefinedAudioForTest(t, fixture.store, fixture.id, segments[0].ID, &span); err != nil {
 		t.Fatalf("delete refined segment: %v", err)
 	}
 	if err := os.Rename(fixture.recording+".spliced", fixture.recording); err != nil {

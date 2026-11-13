@@ -50,7 +50,7 @@ func TestReview2NoFolderSyncBeforeSpliceRename(t *testing.T) {
 	wire, syncer := newWireDrive(t)
 	o := NewOrchestrator(syncer, store)
 	span := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
-	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, span); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, &span); err != nil {
 		t.Fatalf("delete refined segment: %v", err)
 	}
 	_ = o.SyncSession(context.Background(), id)
@@ -103,7 +103,7 @@ func TestReview2DeletionBetweenSessionAndGenerationReads(t *testing.T) {
 	o := NewOrchestrator(syncer, store)
 	folder := syncedSession(t, store, o, id)
 	span := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
-	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, span); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, &span); err != nil {
 		t.Fatalf("delete bravo: %v", err)
 	}
 	if err := store.MarkSpliceComplete(&span); err != nil {
@@ -121,7 +121,7 @@ func TestReview2DeletionBetweenSessionAndGenerationReads(t *testing.T) {
 	span2 := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "a", SHA256After: "b"}
 	race := &generationRaceStore{SQLiteStore: store}
 	race.hook = func() {
-		if err := deleteRefinedAudioForTest(t, store, id, charlieID, span2); err != nil {
+		if err := deleteRefinedAudioForTest(t, store, id, charlieID, &span2); err != nil {
 			t.Errorf("delete charlie: %v", err)
 		}
 		if err := store.MarkSpliceComplete(&span2); err != nil {

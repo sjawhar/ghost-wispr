@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -278,4 +279,82 @@ func TestOrphansLeavesASecondNameAlone(t *testing.T) {
 		t.Errorf("the orphan is still there: %v", err)
 	}
 	assertZeroed(t, held, len(secret))
+}
+
+func TestReservationChoosesTheHiddenPathBeforeTheRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(path, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := Reserve(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation.OriginalPath() != path {
+		t.Errorf("reserved original path = %q, want %q", reservation.OriginalPath(), path)
+	}
+	if filepath.Dir(reservation.HiddenPath()) != filepath.Dir(path) || !strings.HasPrefix(filepath.Base(reservation.HiddenPath()), hiddenPrefix) {
+		t.Errorf("reserved hidden path = %q, want an erasing name beside %q", reservation.HiddenPath(), path)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("reservation hid %q before Begin: %v", path, err)
+	}
+	pending, err := reservation.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(reservation.HiddenPath()); err != nil {
+		t.Fatalf("Begin did not use the reserved hidden path %q: %v", reservation.HiddenPath(), err)
+	}
+	if err := pending.Restore(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLeftoverFinishersSkipReservedHiddenPaths(t *testing.T) {
+	for name, finish := range map[string]func(string, func(string) bool) error{
+		"Leftovers": LeftoversExcept,
+		"Orphans":   OrphansExcept,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			hidden := filepath.Join(dir, hiddenPrefix+"reserved")
+			held := holdOpen(t, hidden, []byte(secret))
+			if err := finish(dir, func(path string) bool { return path == hidden }); err != nil {
+				t.Fatalf("%s with reserved path: %v", name, err)
+			}
+			if got, err := os.ReadFile(hidden); err != nil || string(got) != secret {
+				t.Fatalf("%s changed reserved hidden path to %q (%v)", name, got, err)
+			}
+			if err := finish(dir, nil); err != nil {
+				t.Fatalf("%s without reservation: %v", name, err)
+			}
+			assertZeroed(t, held, len(secret))
+		})
+	}
+}
+
+func TestReservationDoesNotOverwriteAnExistingHiddenFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recording.mp3")
+	hidden := filepath.Join(dir, hiddenPrefix+"already-reserved")
+	if err := os.WriteFile(path, []byte("new raw recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hidden, []byte("existing hidden recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := ReservationAt(path, hidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.Begin(); err == nil {
+		t.Fatal("Begin overwrote an existing hidden recording")
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "new raw recording" {
+		t.Fatalf("raw recording after refused reservation = %q (%v), want unchanged", got, err)
+	}
+	if got, err := os.ReadFile(hidden); err != nil || string(got) != "existing hidden recording" {
+		t.Fatalf("hidden recording after refused reservation = %q (%v), want unchanged", got, err)
+	}
 }

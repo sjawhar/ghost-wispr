@@ -133,8 +133,8 @@ func TestReviewStaleSnapshotClearsNewerDeletion(t *testing.T) {
 	if err != nil || len(segments) != 3 {
 		t.Fatalf("segments %v %v", segments, err)
 	}
-	span := func(start, end float64, before, after string) storage.DeletedSpan {
-		return storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: start, End: end, SHA256Before: before, SHA256After: after}
+	span := func(start, end float64, before, after string) *storage.DeletedSpan {
+		return &storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: start, End: end, SHA256Before: before, SHA256After: after}
 	}
 	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, span(1, 2, "b", "a")); err != nil {
 		t.Fatalf("delete bravo: %v", err)

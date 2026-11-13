@@ -289,16 +289,13 @@ func TestFinishWaitsForEveryOwedFolder(t *testing.T) {
 	}
 }
 
-// TestDeleteSessionRefusesASourceWhoseFolderIsOwed fails if deleting a merged
-// source whose Drive folder a deletion still owes a replacement removes it:
-// the replacement could no longer reach that folder.
-func TestDeleteSessionRefusesASourceWhoseFolderIsOwed(t *testing.T) {
+// TestDeleteSessionRefusesAMergedSessionWhoseSourceFolderIsOwed fails if the
+// recursive delete removes a source whose Drive folder a deletion still owes
+// a replacement: the replacement could no longer reach that folder.
+func TestDeleteSessionRefusesAMergedSessionWhoseSourceFolderIsOwed(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	deleteSecret(t, store, nestedMerge(t, store))
-	if _, err := store.DeleteSession("s1", ""); !errors.Is(err, ErrDeleteReplacementPending) {
-		t.Fatalf("DeleteSession of a source with an owed folder = %v, want %v", err, ErrDeleteReplacementPending)
-	}
-	if _, err := store.DeleteSession("s2", ""); err != nil {
-		t.Errorf("DeleteSession of a source with no folder: %v", err)
+	if _, err := store.DeleteSession("m2", ""); !errors.Is(err, ErrDeleteReplacementPending) {
+		t.Fatalf("DeleteSession of a merged session with an owed source folder = %v, want %v", err, ErrDeleteReplacementPending)
 	}
 }

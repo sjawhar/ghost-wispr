@@ -31,6 +31,9 @@ type fakeDrive struct {
 	// onUpload, when set, runs as an upload starts, outside the lock: what
 	// happens elsewhere while a sync uploads.
 	onUpload func()
+	// onFolderCreated runs after Upload creates a folder and before it puts
+	// the first file into it.
+	onFolderCreated func()
 }
 
 func newFakeDrive() *fakeDrive { return &fakeDrive{folders: map[string][]fakeDriveFile{}} }
@@ -78,15 +81,33 @@ func (d *fakeDrive) updateInPlace(folderID string, u *docUpdate) error {
 	return fmt.Errorf("update %s: no file %s", u.File.Name, u.ID)
 }
 
-func (d *fakeDrive) Upload(_ context.Context, _ string, files []SyncFile) (string, error) {
+func (d *fakeDrive) Upload(ctx context.Context, folderName string, files []SyncFile) (string, error) {
+	return d.upload(ctx, folderName, files, nil)
+}
+
+func (d *fakeDrive) UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
+	return d.upload(ctx, folderName, files, record)
+}
+
+func (d *fakeDrive) upload(_ context.Context, _ string, files []SyncFile, record func(folderID string) error) (string, error) {
 	if d.onUpload != nil {
 		d.onUpload()
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.nextID++
 	folderID := fmt.Sprintf("folder-%d", d.nextID)
 	d.folders[folderID] = nil
+	d.mu.Unlock()
+	if record != nil {
+		if err := record(folderID); err != nil {
+			return folderID, err
+		}
+	}
+	if d.onFolderCreated != nil {
+		d.onFolderCreated()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	for i := range files {
 		if err := d.put(folderID, &files[i]); err != nil {
 			return folderID, err

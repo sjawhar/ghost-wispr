@@ -65,10 +65,16 @@ func (m *mockStore) GetSession(id string) (storage.Session, error) {
 	return storage.Session{}, os.ErrNotExist
 }
 
-func (m *mockStore) DeleteEndedSession(id, _ string) (bool, error) {
+func (m *mockStore) DeleteEndedSessionAndSources(id, _, _ string) ([]string, bool, error) {
 	m.deletedIDs = append(m.deletedIDs, id)
-	return true, nil
+	return []string{id}, true, nil
 }
+
+func (*mockStore) SourceSessionIDs(string) ([]string, error) { return nil, nil }
+
+func (*mockStore) RawEraseReservations() ([]storage.RawEraseReservation, error) { return nil, nil }
+
+func (*mockStore) CancelRawSessionErase(string, string) error { return nil }
 
 func (m *mockStore) PurgeOldEvents(maxAge time.Duration) error {
 	return nil

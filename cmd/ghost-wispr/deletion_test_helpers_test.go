@@ -46,7 +46,7 @@ func newDeletionTestStore(t *testing.T, recording string) (*storage.SQLiteStore,
 	return store, segments[1].ID, started
 }
 
-func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.DeletedSpan) error {
+func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span *storage.DeletedSpan) error {
 	t.Helper()
 	live, err := store.GetSegments(sessionID)
 	if err != nil {
@@ -64,7 +64,8 @@ func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, session
 	}
 	words := make([]storage.RefinedWord, 0, len(live))
 	refined := make([]storage.RefinedSegment, 0, len(live))
-	for i, segment := range live {
+	for i := range live {
+		segment := &live[i]
 		words = append(words, storage.RefinedWord{
 			RecordingPath: span.AudioPath, RecordingSHA256: span.SHA256Before, Ordinal: i,
 			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
@@ -86,7 +87,7 @@ func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, session
 	if err != nil {
 		return err
 	}
-	return store.DeleteRefinedSegmentAudio(sessionID, segments[index].ID, revision, &span)
+	return store.DeleteRefinedSegmentAudio(sessionID, segments[index].ID, revision, span)
 }
 
 func fakeSplice(_ context.Context, path string, _, _ float64) (string, error) {
@@ -109,7 +110,7 @@ func r4PendingStore(t *testing.T) (*storage.SQLiteStore, string, []int64) {
 		t.Fatal(err)
 	}
 	store, segmentID, _ := newDeletionTestStore(t, recording)
-	if err := deleteRefinedAudioForTest(t, store, "session", segmentID, storage.DeletedSpan{
+	if err := deleteRefinedAudioForTest(t, store, "session", segmentID, &storage.DeletedSpan{
 		SessionID: "session", AudioPath: recording, Start: 1, End: 2,
 		SHA256Before: hashBytesForDeleteTest(original), SHA256After: hashBytesForDeleteTest([]byte("spliced")),
 	}); err != nil {
