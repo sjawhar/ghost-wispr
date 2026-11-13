@@ -150,7 +150,36 @@ it('does not offer a refinement retry when a restored session cannot restore aud
     onDeleted: vi.fn(),
     onNotFound: vi.fn().mockResolvedValue(false),
   })
+  expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
+})
 
+it('explains when a restored session has no Drive folder to restore from', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      audio_removed_at: '2026-11-13T09:01:00Z',
+      restored_at: '2026-11-13T09:01:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+      gdrive_folder_id: 'folder-1',
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.RemoteDeleted,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(
+    screen.getAllByText("This conversation's Drive folder was deleted, so its recording cannot be restored or refined."),
+  ).not.toHaveLength(0)
   expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
 })
 
