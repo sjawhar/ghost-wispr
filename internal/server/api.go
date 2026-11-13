@@ -48,6 +48,7 @@ type SessionStore interface {
 	// PrepareRawSessionErase records the raw microphone capture directory
 	// before the API hides that file; it leaves the session row intact.
 	PrepareRawSessionErase(id, audioDir string) (string, error)
+	SourceSessionIDs(sessionID string) ([]string, error)
 	DeleteSession(id, audioDir string) (string, error)
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
@@ -828,26 +829,40 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		recordingDir := audioDir()
-		rawPath, err := store.PrepareRawSessionErase(sessionID, recordingDir)
+		sourceIDs, err := store.SourceSessionIDs(sessionID)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("prepare raw session erase: %v", err))
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("list source sessions for raw erase: %v", err))
 			return
 		}
-		rawPending, rawErr := beginErasing(rawPath)
-		rawHidden := rawErr == nil || errors.Is(rawErr, erase.ErrLeftover)
-		switch {
-		case errors.Is(rawErr, erase.ErrLeftover):
-			slog.Warn("could not flush the removal of a deleted session's raw recording; it is erased after the answer", "session_id", sessionID, "audio_path", rawPath, "error", rawErr)
-		case errors.Is(rawErr, os.ErrNotExist):
-		case rawErr != nil:
-			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("hide raw session recording: %v", rawErr))
-			return
+		rawIDs := append([]string{sessionID}, sourceIDs...)
+		var rawPending []erase.Pending
+		for _, rawID := range rawIDs {
+			rawPath, err := store.PrepareRawSessionErase(rawID, recordingDir)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("prepare raw session erase: %v", err))
+				return
+			}
+			hidden, rawErr := beginErasing(rawPath)
+			switch {
+			case errors.Is(rawErr, erase.ErrLeftover):
+				slog.Warn("could not flush the removal of a deleted session's raw recording; it is erased after the answer", "session_id", rawID, "audio_path", rawPath, "error", rawErr)
+				rawPending = append(rawPending, hidden)
+			case errors.Is(rawErr, os.ErrNotExist):
+			case rawErr != nil:
+				for _, pending := range rawPending {
+					_ = pending.Restore()
+				}
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("hide raw session recording: %v", rawErr))
+				return
+			default:
+				rawPending = append(rawPending, hidden)
+			}
 		}
 		audioPath, err := store.DeleteSession(sessionID, recordingDir)
 		if err != nil {
-			if rawHidden {
-				if restoreErr := rawPending.Restore(); restoreErr != nil {
-					slog.Error("could not restore a raw session recording after its row delete failed", "session_id", sessionID, "audio_path", rawPath, "error", restoreErr)
+			for _, pending := range rawPending {
+				if restoreErr := pending.Restore(); restoreErr != nil {
+					slog.Error("could not restore a raw session recording after its row delete failed", "session_id", sessionID, "error", restoreErr)
 				}
 			}
 			if errors.Is(err, storage.ErrDeleteReplacementPending) {
@@ -870,10 +885,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// DeleteSession recorded every erase directory before the row went, so
 		// an erase cut off by a stop is finished as the app starts. The files
 		// leave their names before the answer; the zeros follow it.
-		var pending []erase.Pending
-		if rawHidden {
-			pending = append(pending, rawPending)
-		}
+		pending := rawPending
 		for _, p := range strings.Split(audioPath, ",") {
 			if p = strings.TrimSpace(p); p == "" {
 				continue

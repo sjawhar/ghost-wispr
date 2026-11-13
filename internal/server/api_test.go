@@ -189,6 +189,9 @@ func (s *apiStoreStub) PrepareRawSessionErase(id, audioDir string) (string, erro
 	return filepath.Join(audioDir, id+".pcm"), nil
 }
 
+func (*apiStoreStub) SourceSessionIDs(string) ([]string, error) {
+	return nil, nil
+}
 func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	endedAtPtr := &endedAt
 	s.sessions[newID] = storage.Session{

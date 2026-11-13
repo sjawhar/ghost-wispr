@@ -594,6 +594,36 @@ func TestARefreshThatLostARaceIsOwedAgain(t *testing.T) {
 	}
 }
 
+// TestDeleteTextKeepsAMergedSourcesDocumentsOwedBeforeItsFolderArrives fails
+// if a source whose Drive folder is recorded after the deletion never has its
+// changed documents refreshed.
+func TestDeleteTextKeepsAMergedSourcesDocumentsOwedBeforeItsFolderArrives(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	recordedSession(t, store, "source", started, started.Add(time.Minute), map[float64]string{1: "deleted"})
+	recordedSession(t, store, "other", started.Add(time.Hour), started.Add(61*time.Minute), map[float64]string{1: "other"})
+	if err := store.MergeSessions("merged", []string{"source", "other"}, started, started.Add(61*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSegmentText("merged", segments[0].ID, TextDeletionSpan{AudioPath: "recording-source.mp3", Start: 1, End: 3, SHA256: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET gdrive_folder_id = 'late-folder' WHERE id = 'source'`); err != nil {
+		t.Fatal(err)
+	}
+	owed, err := store.DriveDocumentsOwed("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owed) != 1 || owed[0] != "source" {
+		t.Fatalf("owed text-document folders = %v, want source", owed)
+	}
+}
+
 // TestDeleteTextWithPartOfTheAudioRemovedDoesNotRefine fails if "Delete
 // text" of a session whose audio was partly removed to free space leaves its
 // refinement to run: a refinement of what is left would drop the words of
