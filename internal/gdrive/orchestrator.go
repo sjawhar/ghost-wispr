@@ -125,7 +125,6 @@ func (o *Orchestrator) recordSyncFolder(sessionID, claim, folderID string) error
 	return nil
 }
 
-
 // FolderOnDrive reports whether Drive has session folder folderID out of the
 // trash, and an error when Drive cannot say. GC asks it before it deletes a
 // synced session or removes its audio.

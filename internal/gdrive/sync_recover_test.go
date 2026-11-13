@@ -118,7 +118,6 @@ func TestFirstSyncCutOffAfterFolderCreationReusesTheFolderAndOwesIt(t *testing.T
 	}
 }
 
-
 // A sync whose every closing write fails (the database refuses them) leaves
 // its session SYNCING: no other sync takes it meanwhile, and the next start
 // of the app sends it to a retry in its folder.

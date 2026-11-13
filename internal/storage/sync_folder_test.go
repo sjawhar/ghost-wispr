@@ -37,4 +37,3 @@ func TestRecordSyncFolderOwesAPendingDeletion(t *testing.T) {
 		t.Fatalf("replacement folders = %+v, want the created folder owed", folders)
 	}
 }
-

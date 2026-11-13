@@ -412,7 +412,6 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create drive replacement folders table: %w", err)
 	}
 
-
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS envoy_lifecycle_events (
 			event_type TEXT NOT NULL,
