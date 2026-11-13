@@ -412,20 +412,6 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create drive replacement folders table: %w", err)
 	}
 
-	if _, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS legacy_drive_replacement_folders (
-			session_id TEXT NOT NULL,
-			generation INTEGER NOT NULL,
-			folder_session_id TEXT NOT NULL,
-			folder_id TEXT NOT NULL,
-			state TEXT NOT NULL DEFAULT '` + DriveReplacementFolderOwed + `',
-			PRIMARY KEY (session_id, generation, folder_id),
-			FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-		);
-	`); err != nil {
-		return fmt.Errorf("create legacy drive replacement folders table: %w", err)
-	}
-
 	// unrecorded_sync_folders marks a first sync that may have created a
 	// folder before power stopped it. A segment deletion keeps its Drive
 	// replacement pending until that retry has searched for the folder.
@@ -1811,39 +1797,6 @@ func (s *SQLiteStore) RecordSyncFolder(id, claim, driveFolderID string) (bool, e
 		return false, fmt.Errorf("commit Drive folder of session %s: %w", id, err)
 	}
 	return true, nil
-}
-
-// RecordLegacyDriveFolders records additional identity-matching folders of a
-// session an older build left unrecorded. Each pending deletion that contains
-// the session owes every one, not only the folder chosen for future syncs.
-func (s *SQLiteStore) RecordLegacyDriveFolders(id, claim string, folderIDs []string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin recording legacy Drive folders of session %s: %w", id, err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	var held int
-	if err := tx.QueryRow(`SELECT 1 FROM sessions WHERE id = ? AND sync_state = ? AND sync_claim = ?`, id, SyncStateSyncing, claim).Scan(&held); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return sql.ErrNoRows
-		}
-		return fmt.Errorf("check sync claim of session %s: %w", id, err)
-	}
-	for _, folderID := range folderIDs {
-		if _, err := tx.Exec(`WITH RECURSIVE owners(id) AS (
-				SELECT ?
-				UNION SELECT source.merged_into FROM sessions AS source JOIN owners ON source.id = owners.id WHERE source.merged_into != ''
-			) INSERT OR IGNORE INTO legacy_drive_replacement_folders(session_id, generation, folder_session_id, folder_id, state)
-			SELECT owner.id, owner.deletion_generation, ?, ?, ?
-			FROM sessions AS owner JOIN owners ON owner.id = owners.id
-			WHERE owner.drive_replace_pending = 1`, id, id, folderID, DriveReplacementFolderOwed); err != nil {
-			return fmt.Errorf("record legacy Drive folder %s of session %s: %w", folderID, id, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit legacy Drive folders of session %s: %w", id, err)
-	}
-	return nil
 }
 
 // EndSync records the end of the sync claim names, which did not mark
