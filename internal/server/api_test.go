@@ -736,6 +736,13 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 		defer close(finished)
 		finish(sessionID, pending)
 	}
+	rawFinish := finishRawErasing
+	t.Cleanup(func() { finishRawErasing = rawFinish })
+	rawFinished := make(chan struct{})
+	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+		defer close(rawFinished)
+		rawFinish(store, reservations)
+	}
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: saved}},
@@ -754,6 +761,11 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 	case <-finished:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the erase after the response never finished")
+	}
+	select {
+	case <-rawFinished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the raw erase after the response never finished")
 	}
 	if _, err := os.Stat(raw); !os.IsNotExist(err) {
 		t.Fatalf("the raw PCM is still on disk: %v", err)
