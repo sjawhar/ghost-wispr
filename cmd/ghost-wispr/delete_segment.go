@@ -47,6 +47,7 @@ type deletionRecordingSource interface {
 
 type recordingRestoreGuard interface {
 	LatestRecordingSHA256(sessionID, recording string) (string, bool, error)
+	RefinementRecordingSources(sessionID string) ([]storage.RefinementRecordingSource, error)
 }
 
 type sessionDeletionLocks struct {
@@ -106,6 +107,14 @@ func usableRecordingSource(source deletionRecordingSource) bool {
 // the app plays and syncs; one found in neither place is restored into
 // audioDir.
 func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard, session *storage.Session, audioDir string, source deletionRecordingSource, allowPrecutRecording string) (deletionRecordingSet, error) {
+	set := deletionRecordingSet{}
+	keepDownloads := false
+	defer func() {
+		if !keepDownloads {
+			removeFiles(set.Downloaded)
+		}
+	}()
+
 	byName := make(map[string]string)
 	for _, entry := range strings.Split(session.AudioPath, ",") {
 		entry = strings.TrimSpace(entry)
@@ -116,22 +125,51 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 		byName[filepath.Base(path)] = path
 	}
 	driveFiles := make(map[string][]*drive.File)
-	if session.GDriveFolderID != "" && usableRecordingSource(source) {
-		files, err := source.ListFolderFiles(ctx, session.GDriveFolderID)
+	driveFolders := make(map[string]string)
+	addDriveFiles := func(folderID, sourceID string) error {
+		files, err := source.ListFolderFiles(ctx, folderID)
 		if err != nil {
-			return deletionRecordingSet{}, fmt.Errorf("list Drive recordings: %w", err)
+			return fmt.Errorf("list Drive recordings in folder %s: %w", folderID, err)
 		}
 		for _, file := range files {
 			name, ok := recordingname.LocalName(file.Name)
 			if !strings.HasPrefix(file.MimeType, "audio/") || !ok {
 				continue
 			}
+			if sourceID != "" && strings.TrimSuffix(name, filepath.Ext(name)) != sourceID {
+				continue
+			}
 			driveFiles[name] = append(driveFiles[name], file)
 			if _, known := byName[name]; !known {
 				if strings.TrimSpace(audioDir) == "" {
-					return deletionRecordingSet{}, fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
+					return fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
 				}
 				byName[name] = filepath.Join(audioDir, name)
+			}
+			if _, known := driveFolders[name]; !known {
+				driveFolders[name] = folderID
+			}
+		}
+		return nil
+	}
+	if usableRecordingSource(source) {
+		if session.GDriveFolderID != "" {
+			if err := addDriveFiles(session.GDriveFolderID, ""); err != nil {
+				return deletionRecordingSet{}, err
+			}
+		}
+		if session.AudioRemovedAt != "" && guard != nil {
+			sources, err := guard.RefinementRecordingSources(session.ID)
+			if err != nil {
+				return deletionRecordingSet{}, fmt.Errorf("list Drive recording sources for session %s: %w", session.ID, err)
+			}
+			for _, sourceSession := range sources {
+				if sourceSession.GDriveFolderID == "" {
+					continue
+				}
+				if err := addDriveFiles(sourceSession.GDriveFolderID, sourceSession.ID); err != nil {
+					return deletionRecordingSet{}, err
+				}
 			}
 		}
 	}
@@ -143,7 +181,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	set := deletionRecordingSet{Paths: make([]string, 0, len(names))}
+	set.Paths = make([]string, 0, len(names))
 	for _, name := range names {
 		path := byName[name]
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
@@ -152,15 +190,17 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return deletionRecordingSet{}, fmt.Errorf("stat recording %s: %w", path, err)
 		}
-		if source == nil || session.GDriveFolderID == "" {
+		folderID := driveFolders[name]
+		if source == nil || folderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := downloadDriveRecording(ctx, guard, session.ID, session.GDriveFolderID, source, driveFiles[name], path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
+		if err := downloadDriveRecording(ctx, guard, session.ID, folderID, source, driveFiles[name], path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
 			return deletionRecordingSet{}, err
 		}
 		set.Paths = append(set.Paths, path)
 		set.Downloaded = append(set.Downloaded, path)
 	}
+	keepDownloads = true
 	return set, nil
 }
 

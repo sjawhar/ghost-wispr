@@ -431,6 +431,33 @@ func mergedSourceIDs(q querier, sessionID string) ([]string, error) {
 	return sources, nil
 }
 
+// mergedLeafSourceIDs returns only the source sessions that still name a
+// recording. Intermediate merged sessions have no recording of their own.
+func mergedLeafSourceIDs(q querier, sessionID string) ([]string, error) {
+	rows, err := q.Query(`WITH RECURSIVE source(id) AS (
+			SELECT id FROM sessions WHERE merged_into = ?
+			UNION SELECT sessions.id FROM sessions JOIN source ON sessions.merged_into = source.id
+		) SELECT sessions.id FROM sessions JOIN source ON sessions.id = source.id
+		  WHERE NOT EXISTS (SELECT 1 FROM sessions AS child WHERE child.merged_into = sessions.id)
+		  ORDER BY sessions.started_at ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list merged recording sources of session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var sources []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan merged recording source of session %s: %w", sessionID, err)
+		}
+		sources = append(sources, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate merged recording sources of session %s: %w", sessionID, err)
+	}
+	return sources, nil
+}
+
 // HasPendingSplice reports whether a committed deletion for sessionID still
 // requires its recording replacement to complete.
 func (s *SQLiteStore) HasPendingSplice(sessionID string) (bool, error) {

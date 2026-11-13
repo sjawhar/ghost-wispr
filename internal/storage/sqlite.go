@@ -963,6 +963,36 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 	return nil
 }
 
+// RefinementRecordingSource identifies a leaf source recording and its Drive
+// folder. An intermediate merged session is intentionally absent: it never
+// owned a recording of its own.
+type RefinementRecordingSource struct {
+	ID             string
+	GDriveFolderID string
+}
+
+// RefinementRecordingSources returns the audio-bearing leaves of a merged
+// session's source tree, in recording order.
+func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]RefinementRecordingSource, error) {
+	ids, err := mergedLeafSourceIDs(s.db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	sources := make([]RefinementRecordingSource, 0, len(ids))
+	for _, id := range ids {
+		var source RefinementRecordingSource
+		var refinementStatus string
+		source.ID = id
+		if err := s.db.QueryRow(`SELECT gdrive_folder_id, refinement_status FROM sessions WHERE id = ?`, id).Scan(&source.GDriveFolderID, &refinementStatus); err != nil {
+			return nil, fmt.Errorf("read merged recording source %s: %w", id, err)
+		}
+		if refinementStatus != RefinementNoAudio {
+			sources = append(sources, source)
+		}
+	}
+	return sources, nil
+}
+
 // RefinementRecordingPaths returns the recordings whose content belongs to a
 // session. Merged sessions retain their source paths even when their current
 // audio path was cleared by garbage collection; other refined sessions retain
@@ -985,18 +1015,12 @@ func (s *SQLiteStore) RefinementRecordingPaths(sessionID string) ([]string, erro
 	if len(paths) != 0 {
 		return paths, nil
 	}
-	sources, err := mergedSourceIDs(s.db, sessionID)
+	sources, err := s.RefinementRecordingSources(sessionID)
 	if err != nil {
 		return nil, err
 	}
-	for _, sourceID := range sources {
-		var refinementStatus string
-		if err := s.db.QueryRow(`SELECT refinement_status FROM sessions WHERE id = ?`, sourceID).Scan(&refinementStatus); err != nil {
-			return nil, fmt.Errorf("read refinement status for merged source %s: %w", sourceID, err)
-		}
-		if refinementStatus != RefinementNoAudio {
-			paths = append(paths, sourceID+".mp3")
-		}
+	for _, source := range sources {
+		paths = append(paths, source.ID+".mp3")
 	}
 	return paths, nil
 }
