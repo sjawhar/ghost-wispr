@@ -177,7 +177,7 @@ func (s *SQLiteStore) DriveReplacementInput(sessionID string) (bool, string, err
 	}
 
 	var audioPath string
-	if err := s.db.QueryRow(`SELECT audio_path FROM deleted_segments WHERE session_id = ? ORDER BY deleted_at DESC, rowid DESC LIMIT 1`, sessionID).Scan(&audioPath); err != nil {
+	if err := s.db.QueryRow(`SELECT audio_path FROM deleted_segments WHERE session_id = ? ORDER BY rowid DESC LIMIT 1`, sessionID).Scan(&audioPath); err != nil {
 		if err == sql.ErrNoRows {
 			return false, "", fmt.Errorf("read drive replacement for session %s: no deleted segment", sessionID)
 		}

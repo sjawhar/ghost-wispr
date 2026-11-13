@@ -474,7 +474,7 @@ func (s *SQLiteStore) OldestPendingSplice(sessionID string) (time.Time, bool, er
 	var deletedAt string
 	err := s.db.QueryRow(`SELECT deleted_at FROM deleted_segments
 		WHERE session_id = ? AND splice_complete = 0
-		ORDER BY deleted_at ASC, rowid ASC LIMIT 1`, sessionID).Scan(&deletedAt)
+		ORDER BY rowid ASC LIMIT 1`, sessionID).Scan(&deletedAt)
 	if err == sql.ErrNoRows {
 		return time.Time{}, false, nil
 	}
@@ -689,7 +689,7 @@ func (s *SQLiteStore) MissingCompletedSplices(audioDir string) ([]DeletedSpan, e
 	rows, err := s.db.Query(`SELECT deleted_segments.session_id, deleted_segments.audio_path, deleted_segments.start, deleted_segments.end, deleted_segments.sha256_before, deleted_segments.sha256_after
 		FROM deleted_segments JOIN sessions ON sessions.id = deleted_segments.session_id
 		WHERE deleted_segments.splice_complete = 1 AND sessions.drive_replace_pending = 1
-		ORDER BY deleted_segments.deleted_at ASC, deleted_segments.rowid ASC`)
+		ORDER BY deleted_segments.rowid ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query missing completed deleted spans: %w", err)
 	}
@@ -717,7 +717,7 @@ func (s *SQLiteStore) MissingCompletedSplices(audioDir string) ([]DeletedSpan, e
 func (s *SQLiteStore) CompletedSplicesForRecording(sessionID, recordingPath string) ([]DeletedSpan, error) {
 	rows, err := s.db.Query(`SELECT session_id, audio_path, start, end, sha256_before, sha256_after
 		FROM deleted_segments WHERE session_id = ? AND splice_complete = 1
-		ORDER BY deleted_at ASC, rowid ASC`, sessionID)
+		ORDER BY rowid ASC`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("query completed deleted spans for session %s: %w", sessionID, err)
 	}
@@ -744,7 +744,7 @@ func (s *SQLiteStore) CompletedSplicesForRecording(sessionID, recordingPath stri
 // finds each recording where recording.Resolve finds it in audioDir. A row
 // with the recorded post-splice hash is completed before this returns.
 func (s *SQLiteStore) PendingSplices(audioDir string) ([]DeletedSpan, error) {
-	rows, err := s.db.Query(`SELECT session_id, audio_path, start, end, sha256_before, sha256_after FROM deleted_segments WHERE splice_complete = 0 ORDER BY deleted_at ASC`)
+	rows, err := s.db.Query(`SELECT session_id, audio_path, start, end, sha256_before, sha256_after FROM deleted_segments WHERE splice_complete = 0 ORDER BY rowid ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query deleted spans: %w", err)
 	}
