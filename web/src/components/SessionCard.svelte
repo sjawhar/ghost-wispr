@@ -316,7 +316,9 @@
               class={`status-badge ${session.refinement_status}`}
               data-testid="refinement-badge"
               title={session.refinement_status === RefinementStatus.NoAudio
-                ? session.restored_at
+                ? session.restored_at &&
+                  session.refinement_status === RefinementStatus.NoAudio &&
+                  canRestoreRefinement(session)
                   ? 'This conversation was restored from Drive; retry refinement to delete from it'
                   : session.audio_removed_at
                     ? recordingsNamed(session.audio_path) > 0
@@ -346,7 +348,7 @@
           </div>
         {/if}
 
-        {#if session.audio_removed_at && !session.restored_at}
+        {#if session.audio_removed_at && !(session.restored_at && session.refinement_status === RefinementStatus.NoAudio)}
           {@const partly = recordingsNamed(session.audio_path) > 0}
           <span
             class="status-badge audio-removed"

@@ -124,7 +124,7 @@ it('identifies a Drive-restored session as retryable before deletion', () => {
     screen.getAllByText(
       'This conversation was restored from Drive; retry refinement to delete from it',
     ),
-  ).toHaveLength(3)
+  ).toHaveLength(2)
 })
 
 describe('AudioPlayer segment deletion actions', () => {

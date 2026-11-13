@@ -267,7 +267,7 @@
 <svelte:document onclick={closeDeleteMenuOnOutsideClick} />
 
 <div class="audio-player" data-testid="audio-player">
-  {#if session?.restored_at}
+  {#if session?.restored_at && noRecording && canRestoreRefinement(session)}
     <p class="audio-note">
       This conversation was restored from Drive; retry refinement to delete from it
     </p>
