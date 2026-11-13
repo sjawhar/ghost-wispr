@@ -103,11 +103,18 @@ func TestR11RestoreFindsPreMergeSourceFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := recordingname.FileName(path)
+	unrelated := "audio-unrelated.mp3"
 	drive := &r11FolderDrive{
 		files: map[string][]*drive.File{
-			"source-folder": {{Name: name, MimeType: "audio/mpeg"}},
+			"source-folder": {
+				{Name: name, MimeType: "audio/mpeg"},
+				{Name: unrelated, MimeType: "audio/mpeg"},
+			},
 		},
-		downloads: map[string][]byte{"source-folder/" + name: []byte("source recording")},
+		downloads: map[string][]byte{
+			"source-folder/" + name:      []byte("source recording"),
+			"source-folder/" + unrelated: []byte("unrelated recording"),
+		},
 	}
 	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, drive, "")
@@ -116,5 +123,15 @@ func TestR11RestoreFindsPreMergeSourceFolder(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("source recording not restored: %v", err)
+	}
+	after, err := store.GetSession("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.AudioPath != path {
+		t.Fatalf("restored audio path = %q, want only source recording %q", after.AudioPath, path)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "unrelated.mp3")); !os.IsNotExist(err) {
+		t.Fatalf("unrelated source-folder recording was restored: %v", err)
 	}
 }

@@ -202,6 +202,9 @@ it('explains when a restored session has no Drive folder to restore from', () =>
     onDeleted: vi.fn(),
     onNotFound: vi.fn().mockResolvedValue(false),
   })
+  expect(screen.getByTestId('audio-player').querySelector('.audio-note')?.textContent).toContain(
+    'Drive folder is unavailable or in the trash',
+  )
 
   expect(
     screen.getAllByText(
