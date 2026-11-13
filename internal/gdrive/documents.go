@@ -69,12 +69,17 @@ func (o *Orchestrator) refreshDocuments(ctx context.Context, docs documentsStore
 		return fmt.Errorf("get segments %s: %w", id, err)
 	}
 	syncSess := toSyncSession(&sess)
-	files, _, _, err := buildSyncFiles(&syncSess, segments, "")
+	files, folderName, _, err := buildSyncFiles(&syncSess, segments, "")
 	if err != nil {
 		return fmt.Errorf("build the documents of merged session %s: %w", id, err)
 	}
 	summary, transcript := renderDocuments(&syncSess, segments)
 	err = o.uploader.UploadInto(ctx, sess.GDriveFolderID, withEmptiedSummary(files))
+	if err == nil {
+		if syncer, ok := o.uploader.(*Syncer); ok {
+			err = syncer.renameSessionFolder(ctx, sess.GDriveFolderID, folderName)
+		}
+	}
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrFolderTrashed):
@@ -88,7 +93,10 @@ func (o *Orchestrator) refreshDocuments(ctx context.Context, docs documentsStore
 	cleared, err := docs.ClearDriveDocumentsPending(id, func(now storage.Session) bool {
 		nowSync := toSyncSession(&now)
 		nowSummary, nowTranscript := renderDocuments(&nowSync, segments)
-		return now.GDriveFolderID == sess.GDriveFolderID && nowSummary == summary && nowTranscript == transcript
+		return now.GDriveFolderID == sess.GDriveFolderID &&
+			now.Title == sess.Title &&
+			nowSummary == summary &&
+			nowTranscript == transcript
 	})
 	if err != nil {
 		return err

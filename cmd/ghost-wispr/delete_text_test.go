@@ -496,3 +496,100 @@ func TestDeleteTextUsesNeighbourContextForRepeatedFiller(t *testing.T) {
 		t.Errorf("span for the second filler = %+v, want the occurrence at 3.0-3.15", spans)
 	}
 }
+
+func TestDeleteTextRefusesWrongRepeatedContentCopy(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "delete.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 16, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("wrong-content", started); err != nil {
+		t.Fatal(err)
+	}
+	for i, text := range []string{"So anyway", "Purple elephant seventeen.", "The budget is fine."} {
+		if err := store.AppendSegment("wrong-content", transcribe.Segment{
+			Text: text, StartTime: float64(i * 2), EndTime: float64(i*2 + 2), Timestamp: started.Add(time.Duration(i*2) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession("wrong-content", started.Add(6*time.Second), recording); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("wrong-content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := []audio.Word{
+		{Text: "So", Start: 0, End: 0.2}, {Text: "anyway", Start: 0.3, End: 0.6},
+		{Text: "purple", Start: 0.8, End: 1.0}, {Text: "elegant", Start: 1.05, End: 1.3}, {Text: "seventeen.", Start: 1.35, End: 1.6},
+		{Text: "The", Start: 2, End: 2.2}, {Text: "budget", Start: 2.25, End: 2.5}, {Text: "is", Start: 2.55, End: 2.7}, {Text: "fine.", Start: 2.75, End: 3.0},
+		// This exact decoy is more than ten seconds from the real words, so
+		// Survivors' own window cannot catch a wrong pick.
+		{Text: "We", Start: 14, End: 14.2}, {Text: "said", Start: 14.25, End: 14.45}, {Text: "anyway", Start: 14.5, End: 14.8},
+		{Text: "purple", Start: 15.8, End: 16.0}, {Text: "elephant", Start: 16.05, End: 16.3}, {Text: "seventeen", Start: 16.35, End: 16.6},
+		{Text: "the", Start: 16.65, End: 16.8}, {Text: "budget", Start: 16.85, End: 17.1}, {Text: "is", Start: 17.15, End: 17.3}, {Text: "fine", Start: 17.35, End: 17.55}, {Text: "again.", Start: 17.6, End: 17.85},
+	}
+	assertDeleteTextRefusedWithoutSpan(t, store, "wrong-content", segments[1].ID, recording, words)
+}
+
+func TestDeleteTextRefusesWrongRepeatedFillerCopy(t *testing.T) {
+	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "delete.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 17, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("wrong-filler", started); err != nil {
+		t.Fatal(err)
+	}
+	for i, text := range []string{"We begin", "Um.", "The budget is fine."} {
+		if err := store.AppendSegment("wrong-filler", transcribe.Segment{
+			Text: text, StartTime: float64(i * 2), EndTime: float64(i*2 + 2), Timestamp: started.Add(time.Duration(i*2) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EndSession("wrong-filler", started.Add(6*time.Second), recording); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("wrong-filler")
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := []audio.Word{
+		{Text: "We", Start: 0, End: 0.2}, {Text: "begin", Start: 0.25, End: 0.5},
+		{Text: "uh", Start: 0.8, End: 1.0},
+		{Text: "The", Start: 2, End: 2.2}, {Text: "budget", Start: 2.25, End: 2.5}, {Text: "is", Start: 2.55, End: 2.7}, {Text: "fine.", Start: 2.75, End: 3.0},
+		{Text: "We", Start: 8, End: 8.2}, {Text: "said", Start: 8.25, End: 8.5}, {Text: "um", Start: 9.8, End: 10.0},
+		{Text: "the", Start: 10.1, End: 10.25}, {Text: "budget", Start: 10.3, End: 10.55}, {Text: "is", Start: 10.6, End: 10.75}, {Text: "fine", Start: 10.8, End: 11.0},
+	}
+	assertDeleteTextRefusedWithoutSpan(t, store, "wrong-filler", segments[1].ID, recording, words)
+}
+
+func assertDeleteTextRefusedWithoutSpan(t *testing.T, store *storage.SQLiteStore, sessionID string, segmentID int64, recording string, words []audio.Word) {
+	t.Helper()
+	runner := segmentDeleteRunner{
+		store:       store,
+		transcriber: deletionWordsFake{before: words},
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		splice: refusingSplice(t),
+	}
+	if err := runner.DeleteText(context.Background(), sessionID, segmentID); !errors.Is(err, server.ErrSegmentNotRemovedCleanly) {
+		t.Fatalf("DeleteText error = %v, want %v", err, server.ErrSegmentNotRemovedCleanly)
+	}
+	if spans, err := store.TextDeletionSpans(recording); err != nil || len(spans) != 0 {
+		t.Errorf("spans after refused Delete text = %+v (%v), want none", spans, err)
+	}
+}
