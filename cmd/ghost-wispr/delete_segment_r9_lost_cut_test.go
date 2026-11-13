@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -39,7 +40,7 @@ func TestR9RecoversLostSplicedRecordingForPendingReplacement(t *testing.T) {
 		t.Fatal("recovered cut did not continue to refinement")
 	}
 	contents, err := os.ReadFile(fixture.audioC)
-	if err != nil || string(contents) != string(after) {
+	if err != nil || !bytes.Equal(contents, after) {
 		t.Fatalf("recovered C = %q, %v; want checked post-cut bytes", contents, err)
 	}
 	if got := strings.Join(fixture.drive.downloaded, ","); !strings.Contains(got, "audio-c.mp3") {

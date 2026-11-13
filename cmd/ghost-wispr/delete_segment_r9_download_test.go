@@ -70,7 +70,8 @@ func newR9MergedCutFixture(t *testing.T) r9MergedCutFixture {
 		t.Fatal(err)
 	}
 	var segmentA int64
-	for _, segment := range segments {
+	for i := range segments {
+		segment := &segments[i]
 		if filepath.Base(segment.RecordingPath) == filepath.Base(audioA) {
 			segmentA = segment.ID
 		}

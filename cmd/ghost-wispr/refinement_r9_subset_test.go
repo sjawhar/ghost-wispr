@@ -22,6 +22,7 @@ func r9MergedRestoreSession(t *testing.T, audioPath string) (*storage.SQLiteStor
 	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
 	names := []string{"20261113090000.mp3", "20261113100000.mp3", "20261113110000.mp3"}
 	ids := make([]string, len(names))
+	legacyDir := t.TempDir()
 	for i, name := range names {
 		id := strings.TrimSuffix(name, ".mp3")
 		ids[i] = id
@@ -29,7 +30,7 @@ func r9MergedRestoreSession(t *testing.T, audioPath string) (*storage.SQLiteStor
 		if err := store.CreateSession(id, at); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.EndSession(id, at.Add(time.Minute), filepath.Join("/legacy", name)); err != nil {
+		if err := store.EndSession(id, at.Add(time.Minute), filepath.Join(legacyDir, name)); err != nil {
 			t.Fatal(err)
 		}
 	}

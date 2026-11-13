@@ -166,7 +166,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 
 func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, sessionID, folderID string, source deletionRecordingSource, files []*drive.File, destination string, allowPrecut bool) error {
 	if len(files) == 0 {
-		return fmt.Errorf("Drive has no recording named %s", recordingname.FileName(destination))
+		return fmt.Errorf("drive has no recording named %s", recordingname.FileName(destination))
 	}
 	expected, cut, err := "", false, error(nil)
 	if guard != nil {
