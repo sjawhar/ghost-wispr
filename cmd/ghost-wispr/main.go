@@ -1142,7 +1142,7 @@ func main() {
 					}
 					source = syncer
 				}
-				return restoreDeletionRecordings(ctx, store, &session, latestCfg.AudioDir, source)
+				return restoreDeletionRecordings(ctx, store, &session, latestCfg.AudioDir, source, "")
 			},
 			duration:  audio.Duration,
 			splice:    audio.Splice,

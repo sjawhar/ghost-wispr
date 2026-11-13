@@ -27,7 +27,8 @@ func pendingSpliceWarningText(recoveryErr error) string {
 }
 
 func setPendingSpliceWarning(registry *warningsRegistry, sessionID, recording string, recoveryErr error) {
-	registry.Set(segmentDeletionWarningKey(pendingSpliceWarningKeyPrefix, sessionID, recording), pendingSpliceWarningText(recoveryErr))
+	registry.Set(segmentDeletionWarningKey(pendingSpliceWarningKeyPrefix, sessionID, recording),
+		fmt.Sprintf("A segment deletion for session %s needs audio recovery: %v", sessionID, recoveryErr))
 }
 
 func clearPendingSpliceWarning(registry *warningsRegistry, sessionID, recording string) {

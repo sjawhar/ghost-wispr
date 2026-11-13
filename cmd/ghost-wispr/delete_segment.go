@@ -105,7 +105,7 @@ func usableRecordingSource(source deletionRecordingSource) bool {
 // finds it (as written, then in audioDir), so the recording spliced is the one
 // the app plays and syncs; one found in neither place is restored into
 // audioDir.
-func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
+func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard, session *storage.Session, audioDir string, source deletionRecordingSource, allowPrecutRecording string) (deletionRecordingSet, error) {
 	byName := make(map[string]string)
 	for _, entry := range strings.Split(session.AudioPath, ",") {
 		entry = strings.TrimSpace(entry)
@@ -155,7 +155,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 		if source == nil || session.GDriveFolderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := downloadDriveRecording(ctx, guard, session.ID, session.GDriveFolderID, source, driveFiles[name], path, false); err != nil {
+		if err := downloadDriveRecording(ctx, guard, session.ID, session.GDriveFolderID, source, driveFiles[name], path, filepath.Base(path) == allowPrecutRecording); err != nil {
 			return deletionRecordingSet{}, err
 		}
 		set.Paths = append(set.Paths, path)
@@ -441,14 +441,32 @@ func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
 // per session it refines only, so the caller owns the lifetime of each
 // status warning.
 func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (outcomes []pendingSpliceOutcome, err error) {
-	spans, err := store.PendingSplices(audioDir)
+	pending, err := store.PendingSplices(audioDir)
 	if err != nil {
 		return nil, err
 	}
-	outcomes = make([]pendingSpliceOutcome, 0, len(spans))
+	lost, err := store.MissingCompletedSplices(audioDir)
+	if err != nil {
+		return nil, err
+	}
+	outcomes = make([]pendingSpliceOutcome, 0, len(pending)+len(lost))
 	refined := make(map[string]bool)
-	for i := range spans {
-		span := spans[i]
+	recoveredRecordings := make(map[string]bool)
+	for i := range lost {
+		span := lost[i]
+		key := span.SessionID + "\x00" + filepath.Base(span.AudioPath)
+		if recoveredRecordings[key] {
+			continue
+		}
+		recoveredRecordings[key] = true
+		recovered, recoveryErr := recoverLostSplicedRecording(ctx, store, audioDir, source, splice, refine, &span)
+		outcomes = append(outcomes, pendingSpliceOutcome{Span: span, Recovered: recovered, Err: recoveryErr})
+		// A failed lost-cut recovery already has the actionable outcome and
+		// must not also emit a second, generic Drive-refinement failure.
+		refined[span.SessionID] = true
+	}
+	for i := range pending {
+		span := pending[i]
 		recovered, recoveryErr := recoverPendingSplice(ctx, store, audioDir, source, splice, refine, &span)
 		outcomes = append(outcomes, pendingSpliceOutcome{Span: span, Recovered: recovered, Err: recoveryErr})
 		// A splice recovered here was refined with it.
@@ -469,6 +487,100 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	return outcomes, nil
 }
 
+func recoverLostSplicedRecording(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, first *storage.DeletedSpan) (bool, error) {
+	deleteLocks.setRecovering(first.SessionID, true)
+	defer deleteLocks.setRecovering(first.SessionID, false)
+	unlock := deleteLocks.lock(first.SessionID)
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+
+	session, err := store.GetSession(first.SessionID)
+	if err != nil {
+		return false, fmt.Errorf("get session %s for lost cut recovery: %w", first.SessionID, err)
+	}
+	recording := recordingname.Resolve(first.AudioPath, audioDir)
+	if _, err := os.Stat(recording); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat lost cut recording %s: %w", recording, err)
+	}
+	if !usableRecordingSource(source) || session.GDriveFolderID == "" {
+		return false, fmt.Errorf("recover lost cut recording %s: no Drive recording is available", recording)
+	}
+	files, err := source.ListFolderFiles(ctx, session.GDriveFolderID)
+	if err != nil {
+		return false, fmt.Errorf("list Drive recordings for lost cut %s: %w", recording, err)
+	}
+	var candidates []*drive.File
+	for _, file := range files {
+		name, ok := recordingname.LocalName(file.Name)
+		if ok && strings.HasPrefix(file.MimeType, "audio/") && name == filepath.Base(recording) {
+			candidates = append(candidates, file)
+		}
+	}
+	if err := downloadDriveRecording(ctx, store, session.ID, session.GDriveFolderID, source, candidates, recording, true); err != nil {
+		return false, fmt.Errorf("restore pre-cut recording %s: %w", recording, err)
+	}
+	keepRestored := false
+	defer func() {
+		if !keepRestored {
+			_ = os.Remove(recording)
+		}
+	}()
+	spans, err := store.CompletedSplicesForRecording(first.SessionID, first.AudioPath)
+	if err != nil {
+		return false, err
+	}
+	if len(spans) == 0 {
+		return false, fmt.Errorf("recover lost cut recording %s: no completed cut is recorded", recording)
+	}
+	hash, err := fileSHA256(recording)
+	if err != nil {
+		return false, fmt.Errorf("hash restored pre-cut recording %s: %w", recording, err)
+	}
+	for _, span := range spans {
+		if hash == span.SHA256After {
+			continue
+		}
+		if hash != span.SHA256Before {
+			return false, fmt.Errorf("restored pre-cut recording %s has SHA-256 %s, want %s", recording, hash, span.SHA256Before)
+		}
+		tempPath, err := copyForSplice(recording)
+		if err != nil {
+			return false, fmt.Errorf("copy lost cut recording %s: %w", recording, err)
+		}
+		afterHash, err := splice(ctx, tempPath, span.Start, span.End)
+		if err != nil {
+			_ = os.Remove(tempPath)
+			return false, fmt.Errorf("re-splice lost cut recording %s: %w", recording, err)
+		}
+		if afterHash != span.SHA256After {
+			_ = os.Remove(tempPath)
+			return false, fmt.Errorf("re-splice lost cut recording %s produced SHA-256 %s, want %s", recording, afterHash, span.SHA256After)
+		}
+		if err := os.Rename(tempPath, recording); err != nil {
+			return false, fmt.Errorf("replace lost cut recording %s: %w", recording, err)
+		}
+		if err := syncRecordingDirectory(recording); err != nil {
+			return false, err
+		}
+		hash = afterHash
+	}
+	keepRestored = true
+	unlock()
+	locked = false
+	if refine != nil {
+		if err := refine(ctx, first.SessionID, session.AudioPath, session.StartedAt); err != nil {
+			return true, refinementAfterSegmentDeletionError{sessionID: first.SessionID, err: err}
+		}
+	}
+	return true, nil
+}
+
 // refineUnfinishedDeletion runs the refinement, and with it the summary, of
 // session sessionID, whose segment deletion has its splice done but whose
 // refinement or summary a stop cut off, as the deletion runner runs them
@@ -484,7 +596,7 @@ func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, a
 	outcome := pendingSpliceOutcome{Span: storage.DeletedSpan{SessionID: sessionID, AudioPath: session.AudioPath}}
 	if err == nil {
 		err = restoreRefinementRecording(ctx, store, &session, audioDir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-			return restoreDeletionRecordings(ctx, store, &current, audioDir, source)
+			return restoreDeletionRecordings(ctx, store, &current, audioDir, source, "")
 		})
 	}
 	if err == nil {
@@ -517,7 +629,7 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	if err != nil {
 		return false, fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err)
 	}
-	recordingSet, err := restoreDeletionRecordings(ctx, store, &session, audioDir, source)
+	recordingSet, err := restoreDeletionRecordings(ctx, store, &session, audioDir, source, filepath.Base(span.AudioPath))
 	if err != nil {
 		return false, fmt.Errorf("restore pending splice %s: %w", span.AudioPath, err)
 	}

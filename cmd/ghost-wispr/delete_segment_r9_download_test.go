@@ -113,7 +113,7 @@ func TestR9DeleteAudioDoesNotRestorePrecutMergedRecording(t *testing.T) {
 		store:    fixture.store,
 		audioDir: fixture.dir,
 		ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
-			return restoreDeletionRecordings(ctx, fixture.store, &session, fixture.dir, fixture.drive)
+			return restoreDeletionRecordings(ctx, fixture.store, &session, fixture.dir, fixture.drive, "")
 		},
 		duration: func(context.Context, string) (float64, error) { return 10, nil },
 		splice:   fakeSplice,

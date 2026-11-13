@@ -42,7 +42,7 @@ func TestRestoreRefinementNamesRecordingsAlreadyOnDisk(t *testing.T) {
 	session := storage.Session{ID: "merged", AudioPath: remaining, AudioRemovedAt: "2026-11-13T12:00:00Z", GDriveFolderID: "folder", SyncStatus: storage.SyncSynced, SyncState: storage.SyncStateSynced}
 	store := &resolvedPathsRestoreStore{}
 	err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-		return restoreDeletionRecordings(ctx, nil, &current, dir, drive)
+		return restoreDeletionRecordings(ctx, nil, &current, dir, drive, "")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestRestoreRefinementRefusesWhenDriveLacksARemovedRecording(t *testing.T) {
 	session := storage.Session{ID: "merged", AudioPath: remaining, AudioRemovedAt: "2026-11-13T12:00:00Z", GDriveFolderID: "folder", SyncStatus: storage.SyncSynced, SyncState: storage.SyncStateSynced}
 	store := &resolvedPathsRestoreStore{}
 	err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-		return restoreDeletionRecordings(ctx, nil, &current, dir, drive)
+		return restoreDeletionRecordings(ctx, nil, &current, dir, drive, "")
 	})
 	if err == nil {
 		t.Fatal("restore succeeded after Drive omitted a removed recording")

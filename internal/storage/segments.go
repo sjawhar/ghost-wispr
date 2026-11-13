@@ -655,6 +655,63 @@ func dropLiveTranscriptEvents(tx *sql.Tx, sessionIDs []string) error {
 	return nil
 }
 
+// MissingCompletedSplices returns cut recordings that vanished locally while
+// their session still owes Drive a replacement. Their persisted cut spans are
+// complete, so normal pending-splice recovery does not list them.
+func (s *SQLiteStore) MissingCompletedSplices(audioDir string) ([]DeletedSpan, error) {
+	rows, err := s.db.Query(`SELECT deleted_segments.session_id, deleted_segments.audio_path, deleted_segments.start, deleted_segments.end, deleted_segments.sha256_before, deleted_segments.sha256_after
+		FROM deleted_segments JOIN sessions ON sessions.id = deleted_segments.session_id
+		WHERE deleted_segments.splice_complete = 1 AND sessions.drive_replace_pending = 1
+		ORDER BY deleted_segments.deleted_at ASC, deleted_segments.rowid ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query missing completed deleted spans: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var spans []DeletedSpan
+	for rows.Next() {
+		var span DeletedSpan
+		if err := rows.Scan(&span.SessionID, &span.AudioPath, &span.Start, &span.End, &span.SHA256Before, &span.SHA256After); err != nil {
+			return nil, fmt.Errorf("scan missing completed deleted span: %w", err)
+		}
+		if _, err := os.Stat(recording.Resolve(span.AudioPath, audioDir)); errors.Is(err, os.ErrNotExist) {
+			spans = append(spans, span)
+		} else if err != nil {
+			return nil, fmt.Errorf("stat completed deleted recording %s: %w", span.AudioPath, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate missing completed deleted spans: %w", err)
+	}
+	return spans, nil
+}
+
+// CompletedSplicesForRecording returns all completed cuts of one recording in
+// the order they were made, so a pre-cut Drive copy can be replayed safely.
+func (s *SQLiteStore) CompletedSplicesForRecording(sessionID, recordingPath string) ([]DeletedSpan, error) {
+	rows, err := s.db.Query(`SELECT session_id, audio_path, start, end, sha256_before, sha256_after
+		FROM deleted_segments WHERE session_id = ? AND splice_complete = 1
+		ORDER BY deleted_at ASC, rowid ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("query completed deleted spans for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var spans []DeletedSpan
+	name := filepath.Base(recordingPath)
+	for rows.Next() {
+		var span DeletedSpan
+		if err := rows.Scan(&span.SessionID, &span.AudioPath, &span.Start, &span.End, &span.SHA256Before, &span.SHA256After); err != nil {
+			return nil, fmt.Errorf("scan completed deleted span for session %s: %w", sessionID, err)
+		}
+		if filepath.Base(span.AudioPath) == name {
+			spans = append(spans, span)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate completed deleted spans for session %s: %w", sessionID, err)
+	}
+	return spans, nil
+}
+
 // PendingSplices returns deletions whose recording still has the pre-splice
 // hash, plus rows whose recording is absent and must be restored first. It
 // finds each recording where recording.Resolve finds it in audioDir. A row
