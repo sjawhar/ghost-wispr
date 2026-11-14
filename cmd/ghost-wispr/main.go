@@ -772,10 +772,16 @@ type mergedSessionHookStore interface {
 	GetSession(string) (storage.Session, error)
 }
 
-func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, sessionID string) {
+func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, retryRefinement func(context.Context, string) error, recordRefinementFailure func(context.Context, string, error), sessionID string) {
 	merged, err := store.GetSession(sessionID)
 	if err != nil {
 		log.Printf("warning: read merged session %s before refinement: %v", sessionID, err)
+		return
+	}
+	if merged.AudioRemovedAt != "" {
+		if err := retryRefinement(ctx, sessionID); err != nil {
+			recordRefinementFailure(ctx, sessionID, err)
+		}
 		return
 	}
 	if merged.AudioPath != "" {
@@ -1208,7 +1214,7 @@ func main() {
 			audioDir: latestCfg.AudioDir,
 			ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
 				var source deletionRecordingSource
-				if session.GDriveFolderID != "" {
+				if session.GDriveFolderID != "" || session.AudioRemovedAt != "" {
 					if latestCfg.GDriveFolderID == "" {
 						return deletionRecordingSet{}, fmt.Errorf("google Drive root folder is not configured")
 					}
@@ -1237,6 +1243,25 @@ func main() {
 			return err
 		}
 		return refinementRecordingAvailable(&sess, cfgStore.Get().AudioDir)
+	}
+
+	retryRefinement := newRetryRefinementHook(
+		store,
+		func() string { return cfgStore.Get().AudioDir },
+		func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+			return deletionRunner().ensureRecordings(ctx, session)
+		},
+		warningRegistry,
+		manager.RefineSession,
+	)
+	recordMergedRefinementFailure := func(_ context.Context, sessionID string, cause error) {
+		generation, err := store.DeletionGeneration(sessionID)
+		if err == nil {
+			err = store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation)
+		}
+		if err != nil {
+			log.Printf("warning: record failed merged refinement %s after %v: %v", sessionID, cause, err)
+		}
 	}
 
 	controlHooks := &server.ControlHooks{
@@ -1283,15 +1308,7 @@ func main() {
 			return retrySync(ctx, drive.Get(), sessionID)
 		},
 		RefinementRecordingAvailable: checkRefinementRecording,
-		RetryRefinement: newRetryRefinementHook(
-			store,
-			func() string { return cfgStore.Get().AudioDir },
-			func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
-				return deletionRunner().ensureRecordings(ctx, session)
-			},
-			warningRegistry,
-			manager.RefineSession,
-		),
+		RetryRefinement:              retryRefinement,
 		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
 			return deletionRunner().DeleteRefinedAudio(ctx, sessionID, segmentID, revision)
 		},
@@ -1325,6 +1342,8 @@ func main() {
 					summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
 					return nil
 				},
+				retryRefinement,
+				recordMergedRefinementFailure,
 				sessionID,
 			)
 		},

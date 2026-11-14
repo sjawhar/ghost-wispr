@@ -37,8 +37,8 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	if session.Status == SessionActive {
 		return ErrSegmentSessionActive
 	}
-	var deletedText string
-	if err := tx.QueryRow(`SELECT text FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&deletedText); err != nil {
+	var deletedText, untimedSourceID string
+	if err := tx.QueryRow(`SELECT text, untimed_source_id FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&deletedText, &untimedSourceID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrSegmentNotFound
 		}
@@ -90,7 +90,7 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 		sessionID, session.RefinedRevision, SessionMerged); err != nil {
 		return fmt.Errorf("update untimed segment deletion session: %w", err)
 	}
-	sources, _, err := scrubMergedSourcesByRecording(tx, sessionID, "", remaining)
+	sources, _, err := scrubMergedSourcesByRecording(tx, sessionID, "", untimedSourceID, remaining)
 	if err != nil {
 		return err
 	}
@@ -232,7 +232,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		sessionID, revision); err != nil {
 		return fmt.Errorf("update refined segment deletion session: %w", err)
 	}
-	sources, holders, err := scrubMergedSourcesByRecording(tx, sessionID, selected.RecordingPath, remaining)
+	sources, holders, err := scrubMergedSourcesByRecording(tx, sessionID, selected.RecordingPath, "", remaining)
 	if err != nil {
 		return err
 	}

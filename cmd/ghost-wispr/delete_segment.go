@@ -140,7 +140,8 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 	}
 	driveFiles := make(map[string][]*drive.File)
 	driveFolders := make(map[string]string)
-	addDriveFiles := func(folderID string, expected map[string]struct{}) error {
+	driveSourceIDs := make(map[string]string)
+	addDriveFiles := func(folderID string, expected map[string]struct{}, sourceID string) error {
 		files, err := source.ListFolderFiles(ctx, folderID)
 		if err != nil {
 			return fmt.Errorf("list Drive recordings in folder %s: %w", folderID, err)
@@ -164,13 +165,14 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 			}
 			if _, known := driveFolders[name]; !known {
 				driveFolders[name] = folderID
+				driveSourceIDs[name] = sourceID
 			}
 		}
 		return nil
 	}
 	if usableRecordingSource(source) {
 		if session.GDriveFolderID != "" {
-			if err := addDriveFiles(session.GDriveFolderID, nil); err != nil {
+			if err := addDriveFiles(session.GDriveFolderID, nil, session.ID); err != nil {
 				return deletionRecordingSet{}, err
 			}
 		}
@@ -209,7 +211,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 				if allKnown {
 					continue
 				}
-				if err := addDriveFiles(sourceSession.GDriveFolderID, expected); err != nil {
+				if err := addDriveFiles(sourceSession.GDriveFolderID, expected, sourceSession.ID); err != nil {
 					return deletionRecordingSet{}, err
 				}
 			}
@@ -240,7 +242,11 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 		if err != nil {
 			return deletionRecordingSet{}, err
 		}
-		if err := downloadDriveRecording(ctx, guard, session.ID, folderID, source, driveFiles[name], staged, path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
+		sourceID := driveSourceIDs[name]
+		if sourceID == "" {
+			sourceID = session.ID
+		}
+		if err := downloadDriveRecording(ctx, guard, sourceID, folderID, source, driveFiles[name], staged, path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
 			_ = os.Remove(staged)
 			return deletionRecordingSet{}, err
 		}

@@ -36,6 +36,8 @@ func TestOnSessionMergedRefinesAudioAndSummarizesOnce(t *testing.T) {
 			t.Fatal("hook summarized again after successful refinement")
 			return nil
 		},
+		func(context.Context, string) error { return nil },
+		func(context.Context, string, error) {},
 		"merged",
 	)
 	if summaries != 1 {
@@ -69,6 +71,8 @@ func TestOnSessionMergedSummarizesWithoutAudioOrAfterRefinementFailure(t *testin
 					summarized++
 					return nil
 				},
+				func(context.Context, string) error { return nil },
+				func(context.Context, string, error) {},
 				"merged",
 			)
 			if test.audioPath == "" && refined != 0 {
@@ -78,5 +82,39 @@ func TestOnSessionMergedSummarizesWithoutAudioOrAfterRefinementFailure(t *testin
 				t.Fatalf("summary calls = %d, want one", summarized)
 			}
 		})
+	}
+}
+
+func TestOnSessionMergedRestoresRemovedAudioBeforeRefining(t *testing.T) {
+	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	retried, failed := 0, 0
+	onSessionMerged(
+		context.Background(),
+		&mergedHookStore{session: storage.Session{ID: "merged", AudioPath: "/audio/available.mp3", AudioRemovedAt: "2026-11-13T12:00:00Z", StartedAt: started}},
+		func(context.Context, string, string, time.Time) error {
+			t.Fatal("merge hook refined removed audio without restoring it")
+			return nil
+		},
+		func(context.Context, string, time.Time) error {
+			t.Fatal("merge hook summarized before the retry path completed")
+			return nil
+		},
+		func(_ context.Context, id string) error {
+			if id != "merged" {
+				t.Fatalf("retry session = %q", id)
+			}
+			retried++
+			return errors.New("Drive restore failed")
+		},
+		func(_ context.Context, id string, err error) {
+			if id != "merged" || err == nil {
+				t.Fatalf("record failure = id:%q err:%v", id, err)
+			}
+			failed++
+		},
+		"merged",
+	)
+	if retried != 1 || failed != 1 {
+		t.Fatalf("removed merge retry=%d failed=%d, want one each", retried, failed)
 	}
 }

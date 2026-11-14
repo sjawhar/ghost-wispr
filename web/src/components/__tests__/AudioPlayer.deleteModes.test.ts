@@ -86,6 +86,7 @@ it('offers only Delete text for untimed source text', async () => {
         start_time: 0,
         end_time: 0,
         timestamp: '2026-11-12T10:00:00Z',
+        transcript_revision: 0,
         untimed: true,
       },
     ],

@@ -148,7 +148,7 @@ var postDeleteMaintenance = func(db *sql.DB, walPath string) error {
 	return truncateWriteAheadLog(db)
 }
 
-func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording string, remaining []transcribe.Segment) (sources, holders []string, err error) {
+func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources, holders []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -163,6 +163,19 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording strin
 			return nil, nil, fmt.Errorf("get merged source %s: %w", source, err)
 		}
 		parents[source] = session.MergedInto
+	}
+	if untimedHolder != "" {
+		sources = sources[:0]
+	}
+	if untimedHolder != "" {
+		current := untimedHolder
+		for current != "" && current != sessionID {
+			sources = append(sources, current)
+			current = parents[current]
+		}
+		if len(sources) == 0 {
+			return nil, nil, nil
+		}
 	}
 
 	rows, err := tx.Query(`WITH RECURSIVE merged(id) AS (
@@ -220,7 +233,11 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording strin
 			own[source] = append(own[source], remaining[i])
 		}
 	}
-	holders = recordingChain(deletedRecording)
+	if untimedHolder != "" {
+		holders = slices.Clone(sources)
+	} else {
+		holders = recordingChain(deletedRecording)
+	}
 	mappedRecording := len(holders) != 0
 	for _, source := range sources {
 		if mappedRecording && len(own[source]) == 0 && !slices.Contains(holders, source) {

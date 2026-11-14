@@ -1208,8 +1208,9 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 			return fmt.Errorf("scan source without recording: %w", err)
 		}
 		if _, err := tx.Exec(`UPDATE segments
-			SET untimed = 1, untimed_source_id = ?, transcript_revision = 0,
-				recording_path = '', recording_sha256 = '', recording_ordinal = 0,
+			SET untimed = 1,
+				untimed_source_id = CASE WHEN untimed_source_id != '' THEN untimed_source_id ELSE ? END,
+				transcript_revision = 0, recording_path = '', recording_sha256 = '', recording_ordinal = 0,
 				first_word_ordinal = -1, last_word_ordinal = -1
 			WHERE session_id = ?`, sourceID, sourceID); err != nil {
 			_ = noAudioRows.Close()
@@ -1279,6 +1280,9 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		if err != nil {
 			_ = removedRows.Close()
 			return fmt.Errorf("list removed recordings for source %s: %w", sourceID, err)
+		}
+		if len(paths) == 0 {
+			paths = []string{sourceID + ".mp3"}
 		}
 		for _, recordingPath := range paths {
 			if _, err := tx.Exec(`INSERT OR REPLACE INTO recording_sources(merged_session_id, recording_path, source_session_id) VALUES(?, ?, ?)`, newID, recordingPath, sourceID); err != nil {
