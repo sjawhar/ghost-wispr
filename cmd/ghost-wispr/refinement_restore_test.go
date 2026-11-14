@@ -34,6 +34,21 @@ func (*refinementRestoreStoreFake) RefinementRecordingPaths(string) ([]string, e
 	return nil, nil
 }
 
+type refinementRestoreStoreReaderFake struct {
+	*refinementRestoreStoreFake
+	initial storage.Session
+	current storage.Session
+	reads   int
+}
+
+func (s *refinementRestoreStoreReaderFake) GetSession(string) (storage.Session, error) {
+	s.reads++
+	if s.reads == 1 {
+		return s.initial, nil
+	}
+	return s.current, nil
+}
+
 func TestRestoreRefinementRecordingSkipsDriveForLocalAudio(t *testing.T) {
 	audio := filepath.Join(t.TempDir(), "recording.mp3")
 	if err := os.WriteFile(audio, []byte("audio"), 0o600); err != nil {
@@ -93,6 +108,48 @@ func TestRestoreRefinementRecordingRestoresMissingNamedAudio(t *testing.T) {
 	}
 	if !restoreCalled {
 		t.Fatal("missing named audio skipped the Drive restoration")
+	}
+}
+
+func TestRestoreRefinementRemovesDownloadsAfterARequiredRecordingIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	downloaded := filepath.Join(dir, "restored.mp3")
+	if err := os.WriteFile(downloaded, []byte("recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "missing.mp3")
+	session := &storage.Session{ID: "s1", AudioPath: downloaded + "," + missing, AudioRemovedAt: "2026-11-13T12:00:00Z"}
+	store := &refinementRestoreStoreFake{}
+	err := restoreRefinementRecording(context.Background(), store, session, dir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
+		return deletionRecordingSet{Paths: []string{downloaded}, Downloaded: []string{downloaded}}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not restore") {
+		t.Fatalf("partial restore = %v, want missing-recording refusal", err)
+	}
+	if _, err := os.Stat(downloaded); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial restore left downloaded recording: %v", err)
+	}
+}
+
+func TestRestoreRefinementKeepsDownloadsNamedByTheWinningWrite(t *testing.T) {
+	audio := filepath.Join(t.TempDir(), "restored.mp3")
+	if err := os.WriteFile(audio, []byte("recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial := storage.Session{ID: "s1", AudioRemovedAt: "2026-11-13T12:00:00Z"}
+	store := &refinementRestoreStoreReaderFake{
+		refinementRestoreStoreFake: &refinementRestoreStoreFake{ok: false},
+		initial:                    initial,
+		current:                    storage.Session{ID: "s1", AudioPath: audio},
+	}
+	err := restoreRefinementRecording(context.Background(), store, &initial, filepath.Dir(audio), func(context.Context, storage.Session) (deletionRecordingSet, error) {
+		return deletionRecordingSet{Paths: []string{audio}, Downloaded: []string{audio}}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "recording changed") {
+		t.Fatalf("raced restore = %v, want changed-recording refusal", err)
+	}
+	if _, err := os.Stat(audio); err != nil {
+		t.Fatalf("raced restore removed recording named by the winning write: %v", err)
 	}
 }
 

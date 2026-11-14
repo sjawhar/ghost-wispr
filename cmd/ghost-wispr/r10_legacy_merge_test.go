@@ -10,7 +10,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// TestR10OldMergeWithoutProvenanceRefusesRestore confirms that a database
+// TestR10OldMergeSubsetRestoreKeepsMarker confirms that a database
 // without recording_sources refuses rather than guessing its recordings.
 func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
 	dir := t.TempDir()
@@ -41,7 +41,7 @@ func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
 	}
 }
 
-// TestR10RecordingSourcesPreserveCustomNames fails if a merge's recorded
+// TestR10RecordingSourcesPrecedeLegacyNames fails if a merge's recorded
 // provenance is discarded. A source recording need not use its session
 // identifier as its basename.
 func TestR10RecordingSourcesPrecedeLegacyNames(t *testing.T) {

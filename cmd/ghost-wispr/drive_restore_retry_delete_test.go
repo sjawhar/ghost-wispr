@@ -31,6 +31,7 @@ func TestDriveRestoredSessionCanRetryBeforeDeletion(t *testing.T) {
 		StartedAt:     started,
 		EndedAt:       &ended,
 		DriveFolderID: "folder-1",
+		HasAudio:      true,
 	}
 	session := restoredDriveSession(&rs, ended)
 	if err := store.ImportSession(&session, nil); err != nil {
@@ -81,6 +82,18 @@ func TestDriveRestoredSessionCanRetryBeforeDeletion(t *testing.T) {
 	}
 	if got := <-retried; got != "restored" {
 		t.Fatalf("delete retry session = %q, want restored", got)
+	}
+}
+
+func TestDriveRestoredSessionWithoutAudioDoesNotClaimGarbageCollectionRemovedIt(t *testing.T) {
+	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	rs := gdrive.RestoredSession{ID: "no-audio", StartedAt: started, DriveFolderID: "folder-1"}
+	session := restoredDriveSession(&rs, started.Add(time.Minute))
+	if session.RefinementStatus != storage.RefinementNoAudio || session.AudioRemovedAt != "" {
+		t.Fatalf("restored session without audio = %+v, want no_audio without removal marker", session)
+	}
+	if err := refinementRecordingAvailable(&session, t.TempDir()); err == nil {
+		t.Fatal("session restored without an audio file was offered a refinement retry")
 	}
 }
 

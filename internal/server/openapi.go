@@ -731,8 +731,8 @@ func OpenAPISpec() map[string]any {
 						},
 					},
 					"responses": map[string]any{
-						"200": map[string]any{
-							"description": "Retry triggered",
+						"202": map[string]any{
+							"description": "Retry started in the background",
 						},
 						"409": map[string]any{
 							"description": "No local recording or Drive copy can be restored for this session",

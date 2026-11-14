@@ -102,14 +102,30 @@ func TestR12OldestPendingSpliceUsesInsertionOrder(t *testing.T) {
 	if err := store.EndSession("session", started.Add(time.Minute), ""); err != nil {
 		t.Fatal(err)
 	}
-	for _, deletedAt := range []string{"2026-11-13T12:00:00.1Z", "2026-11-13T12:00:00Z"} {
+	for _, deletedAt := range []string{"2026-11-13T12:00:00Z", "2026-11-13T12:00:00.1Z"} {
 		if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
 			VALUES('session', 'recording.mp3', 1, 2, 'before', 'after', ?)`, deletedAt); err != nil {
 			t.Fatal(err)
 		}
 	}
 	oldest, found, err := store.OldestPendingSplice("session")
-	if err != nil || !found || !oldest.Equal(started.Add(100*time.Millisecond)) {
+	if err != nil || !found || !oldest.Equal(started) {
 		t.Fatalf("oldest pending = %s, found:%t err:%v; want first inserted pending splice", oldest, found, err)
+	}
+	if err := store.CreateSession("reverse-session", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("reverse-session", started.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, deletedAt := range []string{"2026-11-13T12:00:00.1Z", "2026-11-13T12:00:00Z"} {
+		if _, err := store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at)
+			VALUES('reverse-session', 'recording.mp3', 1, 2, 'before', 'after', ?)`, deletedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldest, found, err = store.OldestPendingSplice("reverse-session")
+	if err != nil || !found || !oldest.Equal(started.Add(100*time.Millisecond)) {
+		t.Fatalf("reverse oldest pending = %s, found:%t err:%v; want first inserted pending splice", oldest, found, err)
 	}
 }

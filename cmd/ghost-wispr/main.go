@@ -287,6 +287,10 @@ func restoredDriveSession(rs *gdrive.RestoredSession, restoredAt time.Time) stor
 	if rs.Summary != "" {
 		summaryStatus = storage.SummaryCompleted
 	}
+	audioRemovedAt := ""
+	if rs.HasAudio {
+		audioRemovedAt = restoredAt.UTC().Format(time.RFC3339Nano)
+	}
 	return storage.Session{
 		ID:               rs.ID,
 		Title:            rs.Title,
@@ -297,7 +301,7 @@ func restoredDriveSession(rs *gdrive.RestoredSession, restoredAt time.Time) stor
 		SummaryStatus:    summaryStatus,
 		SummaryPreset:    rs.SummaryPreset,
 		RefinementStatus: storage.RefinementNoAudio,
-		AudioRemovedAt:   restoredAt.UTC().Format(time.RFC3339Nano),
+		AudioRemovedAt:   audioRemovedAt,
 		SyncStatus:       storage.SyncSynced,
 		GDriveFolderID:   rs.DriveFolderID,
 	}

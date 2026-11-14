@@ -332,24 +332,38 @@ func moveRefinedWordsAfterSplice(tx *sql.Tx, span *DeletedSpan) error {
 	if session.RefinedRevision == 0 {
 		return nil
 	}
+	nextRevision := session.RefinedRevision + 1
+	if _, err := tx.Exec(`UPDATE refined_words SET transcript_revision = ? WHERE session_id = ? AND transcript_revision = ?`,
+		nextRevision, span.SessionID, session.RefinedRevision); err != nil {
+		return fmt.Errorf("advance refined word revision after splice: %w", err)
+	}
 	length := span.End - span.Start
 	move := func(column string) string {
 		return `CASE WHEN ` + column + ` <= ?1 THEN ` + column + ` WHEN ` + column + ` >= ?2 THEN ` + column + ` - ?3 ELSE ?1 END`
 	}
+	recordingBase := filepath.Base(span.AudioPath)
 	if _, err := tx.Exec(`UPDATE refined_words SET start_time = `+move("start_time")+`, end_time = `+move("end_time")+`, recording_sha256 = ?4
 		WHERE session_id = ?5 AND transcript_revision = ?6 AND recording_sha256 = ?7
-		  AND instr(recording_path, ?8) > 0`,
-		span.Start, span.End, length, span.SHA256After, span.SessionID, session.RefinedRevision, span.SHA256Before, filepath.Base(span.AudioPath)); err != nil {
+		  AND (recording_path = ?8 OR recording_path LIKE ?9 OR recording_path = ?10)`,
+		span.Start, span.End, length, span.SHA256After, span.SessionID, nextRevision, span.SHA256Before,
+		span.AudioPath, "%/"+recordingBase, recordingBase); err != nil {
 		return fmt.Errorf("move refined words after splice: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM refined_words
 		WHERE session_id = ? AND transcript_revision = ? AND recording_sha256 = ? AND end_time <= start_time`,
-		span.SessionID, session.RefinedRevision, span.SHA256After); err != nil {
+		span.SessionID, nextRevision, span.SHA256After); err != nil {
 		return fmt.Errorf("drop refined words cut from recording: %w", err)
 	}
-	words, err := refinedWords(tx, span.SessionID, session.RefinedRevision)
+	words, err := refinedWords(tx, span.SessionID, nextRevision)
 	if err != nil {
 		return err
 	}
-	return replaceRefinedSegments(tx, span.SessionID, session.RefinedRevision, session.StartedAt, words)
+	if err := replaceRefinedSegments(tx, span.SessionID, nextRevision, session.StartedAt, words); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE sessions SET refined_revision = ? WHERE id = ? AND refined_revision = ?`,
+		nextRevision, span.SessionID, session.RefinedRevision); err != nil {
+		return fmt.Errorf("advance refined session revision after splice: %w", err)
+	}
+	return nil
 }

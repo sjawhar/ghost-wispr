@@ -29,7 +29,7 @@ func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
 	dir := t.TempDir()
 	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
 	ended := started.Add(time.Minute)
-	rs := gdrive.RestoredSession{ID: "restored", StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-1"}
+	rs := gdrive.RestoredSession{ID: "restored", StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-1", HasAudio: true}
 	session := restoredDriveSession(&rs, ended)
 	if err := store.ImportSession(&session, nil); err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func TestRetryRefinementHookWarnsWhenRestoreFails(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
 	ended := started.Add(time.Minute)
-	rs := gdrive.RestoredSession{ID: "restored", StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-1"}
+	rs := gdrive.RestoredSession{ID: "restored", StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-1", HasAudio: true}
 	session := restoredDriveSession(&rs, ended)
 	if err := store.ImportSession(&session, nil); err != nil {
 		t.Fatal(err)

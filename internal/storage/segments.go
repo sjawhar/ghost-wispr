@@ -622,9 +622,10 @@ func dropLiveTranscriptEvents(tx *sql.Tx, sessionIDs []string) error {
 		}
 		seen[sessionID] = struct{}{}
 		if _, err := tx.Exec(`DELETE FROM mcp_events
-			WHERE (event_type IN ('live_transcript', 'live_transcript_interim')
-				OR (json_valid(payload) AND COALESCE(json_extract(payload, '$.type'), '') IN ('live_transcript', 'live_transcript_interim')))
-			  AND (NOT json_valid(payload) OR COALESCE(json_extract(payload, '$.session_id'), '') = ?)`, sessionID); err != nil {
+			WHERE json_valid(payload)
+			  AND (event_type IN ('live_transcript', 'live_transcript_interim')
+				OR COALESCE(json_extract(payload, '$.type'), '') IN ('live_transcript', 'live_transcript_interim'))
+			  AND COALESCE(json_extract(payload, '$.session_id'), '') = ?`, sessionID); err != nil {
 			return fmt.Errorf("drop live transcript events for session %s: %w", sessionID, err)
 		}
 	}
