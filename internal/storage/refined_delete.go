@@ -90,7 +90,7 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 		sessionID, session.RefinedRevision, SessionMerged); err != nil {
 		return fmt.Errorf("update untimed segment deletion session: %w", err)
 	}
-	sources, _, err := scrubMergedSourcesByRecording(tx, sessionID, "", untimedSourceID, deletedText, remaining)
+	sources, _, err := scrubMergedSourcesByRecording(tx, sessionID, "", untimedSourceID, remaining)
 	if err != nil {
 		return err
 	}
@@ -229,7 +229,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		sessionID, revision); err != nil {
 		return fmt.Errorf("update refined segment deletion session: %w", err)
 	}
-	sources, holders, err := scrubMergedSourcesByRecording(tx, sessionID, selected.RecordingPath, "", selected.Text, remaining)
+	sources, holders, err := scrubMergedSourcesByRecording(tx, sessionID, selected.RecordingPath, "", remaining)
 	if err != nil {
 		return err
 	}

@@ -680,6 +680,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 			last_word_ordinal INTEGER NOT NULL DEFAULT -1,
 			untimed INTEGER NOT NULL DEFAULT 0,
 			untimed_source_id TEXT NOT NULL DEFAULT '',
+			source_session_id TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
@@ -695,6 +696,7 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`ALTER TABLE segments ADD COLUMN last_word_ordinal INTEGER NOT NULL DEFAULT -1`,
 		`ALTER TABLE segments ADD COLUMN untimed INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE segments ADD COLUMN untimed_source_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE segments ADD COLUMN source_session_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate segment provenance: %w", err)
@@ -1287,7 +1289,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("list sources without recordings: %w", err)
 	}
 	segQuery := fmt.Sprintf(
-		`UPDATE segments SET session_id = ? WHERE session_id IN (%s)`,
+		`UPDATE segments SET source_session_id = CASE WHEN source_session_id = '' THEN session_id ELSE source_session_id END, session_id = ? WHERE session_id IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 	if _, err := tx.Exec(segQuery, args...); err != nil {
@@ -1594,7 +1596,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 	rows, err := q.Query(
 		`SELECT id, speaker, text, start_time, end_time, timestamp,
 		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
-		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id
+		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id, source_session_id
 		 FROM segments
 		 WHERE session_id = ?
 		 ORDER BY id ASC`,
@@ -1611,7 +1613,7 @@ func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
 		var ts string
 		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
 			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
-			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID); err != nil {
+			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID, &seg.SourceSessionID); err != nil {
 			return nil, fmt.Errorf("scan segment for session %s: %w", sessionID, err)
 		}
 
@@ -1642,7 +1644,7 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	rows, err := s.db.Query(
 		`SELECT id, speaker, text, start_time, end_time, timestamp,
 		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
-		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id
+		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id, source_session_id
 		 FROM segments
 		 WHERE session_id = ? AND start_time >= ? AND end_time <= ? AND untimed = 0
 		 ORDER BY start_time`,
@@ -1659,7 +1661,7 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 		var ts string
 		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
 			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
-			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID); err != nil {
+			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID, &seg.SourceSessionID); err != nil {
 			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
 		}
 

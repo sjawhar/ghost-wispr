@@ -157,7 +157,7 @@ func recordingProvenanceKey(recording string) string {
 		return name
 	}
 }
-func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder, deletedText string, remaining []transcribe.Segment) (sources, holders []string, err error) {
+func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources, holders []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -166,14 +166,12 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 		return nil, nil, nil
 	}
 	parents := make(map[string]string, len(sources))
-	sourceSessions := make(map[string]Session, len(sources))
 	for _, source := range sources {
 		session, err := getSession(tx, source)
 		if err != nil {
 			return nil, nil, fmt.Errorf("get merged source %s: %w", source, err)
 		}
 		parents[source] = session.MergedInto
-		sourceSessions[source] = session
 	}
 	if untimedHolder != "" {
 		sources = sources[:0]
@@ -244,11 +242,26 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 
 	own := make(map[string][]transcribe.Segment, len(sources))
 	for i := range remaining {
-		if source := remaining[i].UntimedSourceID; source != "" {
-			own[source] = append(own[source], remaining[i])
+		source := remaining[i].SourceSessionID
+		if source == "" {
+			source = remaining[i].UntimedSourceID
+		}
+		if source != "" {
+			// A row is credited to the source that recorded it and to every
+			// intermediate merge that held it, never by matching its text.
+			if _, known := parents[source]; !known {
+				return nil, nil, ErrRefinedSegmentsUnavailable
+			}
+			for current := source; current != "" && current != sessionID; current = parents[current] {
+				own[current] = append(own[current], remaining[i])
+			}
 			continue
 		}
-		for _, source := range recordingChain(remaining[i].RecordingPath) {
+		chain := recordingChain(remaining[i].RecordingPath)
+		if len(chain) == 0 {
+			return nil, nil, ErrRefinedSegmentsUnavailable
+		}
+		for _, source := range chain {
 			own[source] = append(own[source], remaining[i])
 		}
 	}
@@ -263,9 +276,6 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			continue
 		}
 		canonical := canonicalTranscript(own[source])
-		if untimedHolder != "" && strings.TrimSpace(sourceSessions[source].CanonicalTranscript) != "" {
-			canonical = strings.TrimSpace(strings.ReplaceAll(sourceSessions[source].CanonicalTranscript, deletedText, ""))
-		}
 		if _, err := tx.Exec(`UPDATE sessions
 			SET title = '', summary = '', summary_model = '', speaker_names = '{}',
 			    refined_transcript = '', refinement_model = '',

@@ -28,6 +28,7 @@ type Segment struct {
 	LastWordOrdinal    int       `json:"last_word_ordinal,omitempty"`
 	Untimed            bool      `json:"untimed,omitempty"`
 	UntimedSourceID    string    `json:"-"`
+	SourceSessionID    string    `json:"-"`
 }
 
 func GroupWordsBySpeaker(words []Word) []Segment {
