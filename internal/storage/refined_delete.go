@@ -37,8 +37,8 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	if session.Status == SessionActive {
 		return ErrSegmentSessionActive
 	}
-	var deletedText, untimedSourceID string
-	if err := tx.QueryRow(`SELECT text, untimed_source_id FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&deletedText, &untimedSourceID); err != nil {
+	var untimedSourceID string
+	if err := tx.QueryRow(`SELECT untimed_source_id FROM segments WHERE id = ? AND session_id = ? AND untimed = 1`, segmentID, sessionID).Scan(&untimedSourceID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrSegmentNotFound
 		}
@@ -90,7 +90,7 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 		sessionID, session.RefinedRevision, SessionMerged); err != nil {
 		return fmt.Errorf("update untimed segment deletion session: %w", err)
 	}
-	sources, _, err := scrubMergedSourcesByRecording(tx, sessionID, "", untimedSourceID, remaining)
+	sources, err := scrubMergedSourcesByRecording(tx, sessionID, "", untimedSourceID, remaining)
 	if err != nil {
 		return err
 	}
@@ -108,7 +108,7 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 		}
 	}
 	owners := append([]string{sessionID}, sources...)
-	if err := dropLiveTranscriptEvents(tx, owners); err != nil {
+	if err := dropSupersededEvents(tx, owners); err != nil {
 		return err
 	}
 	for _, owner := range owners {
@@ -124,16 +124,13 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	if err != nil {
 		return err
 	}
-	if err := rewriteDeletedTextEvents(tx, owners, nil, deletedText, nil); err != nil {
-		return fmt.Errorf("rewrite events for untimed deletion: %w", err)
-	}
 	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
 		return fmt.Errorf("rebuild search after untimed deletion: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit untimed segment deletion: %w", err)
 	}
-	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, deletedText, owners, nil, nil)
+	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, owners)
 }
 
 // DeleteRefinedSegmentAudio records an occurrence-based deletion before the
@@ -229,7 +226,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		sessionID, revision); err != nil {
 		return fmt.Errorf("update refined segment deletion session: %w", err)
 	}
-	sources, holders, err := scrubMergedSourcesByRecording(tx, sessionID, selected.RecordingPath, "", remaining)
+	sources, err := scrubMergedSourcesByRecording(tx, sessionID, selected.RecordingPath, "", remaining)
 	if err != nil {
 		return err
 	}
@@ -244,7 +241,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		}
 	}
 	owners := append([]string{sessionID}, sources...)
-	if err := dropLiveTranscriptEvents(tx, owners); err != nil {
+	if err := dropSupersededEvents(tx, owners); err != nil {
 		return err
 	}
 	for _, owner := range owners {
@@ -267,16 +264,13 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	if err != nil {
 		return err
 	}
-	if err := rewriteDeletedTextEvents(tx, owners, append([]string{sessionID}, holders...), selected.Text, span); err != nil {
-		return fmt.Errorf("rewrite events for session %s: %w", sessionID, err)
-	}
 	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
 		return fmt.Errorf("rebuild search after deleting refined segment: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit refined text deletion: %w", err)
 	}
-	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, selected.Text, owners, owners, span)
+	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, owners)
 }
 
 func refinedSegment(q querier, sessionID string, segmentID int64, revision int) (RefinedSegment, error) {

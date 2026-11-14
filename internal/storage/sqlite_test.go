@@ -1485,7 +1485,7 @@ func TestGetGCEligibleSessionsMeasuresARestoredSessionFromItsRestore(t *testing.
 		ID: "20251001120000", StartedAt: started, EndedAt: &ended, Status: SessionEnded,
 		Summary: "A summary.", SummaryStatus: SummaryCompleted, SyncStatus: SyncSynced,
 	}
-	if err := store.ImportSession(&restored, nil); err != nil {
+	if err := store.ImportSession(&restored, nil, nil); err != nil {
 		t.Fatalf("ImportSession: %v", err)
 	}
 	summarizedSession(t, store, "20251001130000", started.Add(time.Hour)) // recorded here, never restored

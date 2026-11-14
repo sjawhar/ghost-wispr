@@ -22,7 +22,7 @@ func TestDropLiveTranscriptEventsLeavesUnparseableEventsOfOtherSessions(t *testi
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := dropLiveTranscriptEvents(tx, []string{"target"}); err != nil {
+	if err := dropSupersededEvents(tx, []string{"target"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {

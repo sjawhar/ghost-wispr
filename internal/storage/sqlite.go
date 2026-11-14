@@ -1053,23 +1053,6 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 	return sources, nil
 }
 
-// RecordRestoredRecordings records the recording file names a Drive restore
-// found in a restored session's folder (restored_recordings). They are names,
-// not provenance: a later merge or retry reads them to name the session's
-// recordings, whose audio is not on this unit.
-func (s *SQLiteStore) RecordRestoredRecordings(sessionID string, paths []string) error {
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		if _, err := s.db.Exec(`INSERT OR IGNORE INTO restored_recordings(session_id, recording_path) VALUES(?, ?)`, sessionID, path); err != nil {
-			return fmt.Errorf("record restored recording for session %s: %w", sessionID, err)
-		}
-	}
-	return nil
-}
-
 // RefinementRecordingPaths returns the recordings whose content belongs to a
 // session. Merged sessions retain their source paths even when their current
 // audio path was cleared by garbage collection; a session restored from Drive
@@ -3342,11 +3325,15 @@ func (s *SQLiteStore) MarkRemoteDeleted(id, folderID, errorMessage string) (bool
 	return rows == 1, nil
 }
 
-// ImportSession inserts a fully-formed session restored from a backup, and its
-// segments, in a single transaction. The session keeps the time it started,
-// but its age for the retention policy runs from now, its restore.
+// ImportSession inserts a fully-formed session restored from a backup, its
+// segments, and the file names of the recordings its Drive folder holds
+// (restored_recordings), in a single transaction: a session is never
+// imported without its recording names. The names are names, not
+// provenance: a later merge or retry reads them to name the session's
+// recordings, whose audio is not on this unit. The session keeps the time it
+// started, but its age for the retention policy runs from now, its restore.
 // Returns an error containing "already exists" if the session ID is already present.
-func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment) error {
+func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment, recordingPaths []string) error {
 	// Check for existing session first.
 	var exists int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, sess.ID).Scan(&exists); err != nil {
@@ -3421,6 +3408,15 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		)
 		if err != nil {
 			return fmt.Errorf("insert segment for session %s: %w", sess.ID, err)
+		}
+	}
+	for _, path := range recordingPaths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO restored_recordings(session_id, recording_path) VALUES(?, ?)`, sess.ID, path); err != nil {
+			return fmt.Errorf("record restored recording for session %s: %w", sess.ID, err)
 		}
 	}
 

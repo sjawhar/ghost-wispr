@@ -811,6 +811,8 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				writeJSONError(w, http.StatusConflict, "A previous segment deletion is still being recovered. Try again after it completes.")
 			case errors.Is(err, storage.ErrStaleTranscriptRevision):
 				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
+			case errors.Is(err, storage.ErrMergeProvenanceUnavailable):
+				writeJSONError(w, http.StatusConflict, "this conversation's merge history can't be traced for this segment, so it can't be deleted safely")
 			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):
 				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
 			case errors.Is(err, ErrSegmentRawAudioKept):

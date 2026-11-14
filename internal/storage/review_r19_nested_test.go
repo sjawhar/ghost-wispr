@@ -180,8 +180,8 @@ func reviewR19RefusesUncreditableHolderRow(t *testing.T, provenance string) {
 	if target == 0 {
 		t.Fatal("control: missing untimed deletion target")
 	}
-	if err := store.DeleteRefinedSegmentText("m2", target, 0); !errors.Is(err, ErrRefinedSegmentsUnavailable) {
-		t.Fatalf("delete with an uncreditable intermediate-holder row = %v, want %v", err, ErrRefinedSegmentsUnavailable)
+	if err := store.DeleteRefinedSegmentText("m2", target, 0); !errors.Is(err, ErrMergeProvenanceUnavailable) {
+		t.Fatalf("delete with an uncreditable intermediate-holder row = %v, want %v", err, ErrMergeProvenanceUnavailable)
 	}
 }
 

@@ -47,7 +47,7 @@ func reviewR19RestoredThenMergedDelete(t *testing.T, throughRestore bool) string
 		}
 	} else {
 		sess := restoredDriveSession(&rs, reviewR19RestoredAt)
-		if err := store.ImportSession(&sess, rs.Segments); err != nil {
+		if err := store.ImportSession(&sess, rs.Segments, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -222,5 +222,48 @@ func TestReviewR19RestoredMergeRetryNamesAMissingRecording(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), b+".mp3") {
 		t.Fatalf("retry with a recording missing from Drive = %v, want a refusal naming %s.mp3", err, b)
+	}
+}
+
+// The Drive restore imports a session and records its recording names in one
+// transaction: when the names cannot be written, the session is not imported
+// either, so the next restore imports it with its names rather than skip it.
+func TestImportRestoredDriveSessionIsAllOrNothing(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "atomic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	ended := start.Add(time.Minute)
+	id := "20261113090000"
+	local, ok := recordingname.LocalName(recordingname.FileName(filepath.Join(t.TempDir(), id+".mp3")))
+	if !ok {
+		t.Fatal("no local name")
+	}
+	rs := gdrive.RestoredSession{ID: id, StartedAt: start, EndedAt: &ended, DriveFolderID: "folder-r", HasAudio: true, RecordingPaths: []string{local},
+		Segments: []transcribe.Segment{{Speaker: 0, Text: "restored words", StartTime: 0, EndTime: 1, Timestamp: start}}}
+	restore := importRestoredDriveSession(store, func() time.Time { return reviewR19RestoredAt })
+	if _, err := store.DB().Exec(`CREATE TRIGGER refuse_restored_names BEFORE INSERT ON restored_recordings BEGIN SELECT RAISE(ABORT, 'names refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(rs); err == nil {
+		t.Fatal("control: the restore succeeded although its recording names could not be written")
+	}
+	if session, err := store.GetSession(id); err == nil {
+		t.Fatalf("the restore imported session %s (%+v) without its recording names", id, session)
+	}
+	if _, err := store.DB().Exec(`DROP TRIGGER refuse_restored_names`); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore(rs); err != nil {
+		t.Fatalf("the next restore: %v", err)
+	}
+	paths, err := store.RefinementRecordingPaths(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != local {
+		t.Fatalf("restored recording names = %q, want [%q]", paths, local)
 	}
 }

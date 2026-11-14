@@ -47,7 +47,7 @@ func TestSessionListsCarryRestoredAt(t *testing.T) {
 		SummaryStatus:  SummaryCompleted,
 		SyncStatus:     SyncSynced,
 		GDriveFolderID: "folder-1",
-	}, nil); err != nil {
+	}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	for name, list := range map[string]func() ([]Session, error){

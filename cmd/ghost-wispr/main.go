@@ -283,14 +283,12 @@ func newRetryRefinementHook(store *storage.SQLiteStore, audioDir func() string, 
 }
 
 // importRestoredDriveSession returns the Drive restore callback: it imports
-// one restored session and records the recording file names its folder holds.
+// one restored session with the recording file names its folder holds, in
+// one transaction.
 func importRestoredDriveSession(store *storage.SQLiteStore, restoredAt func() time.Time) func(gdrive.RestoredSession) error {
 	return func(rs gdrive.RestoredSession) error {
 		sess := restoredDriveSession(&rs, restoredAt())
-		if err := store.ImportSession(&sess, rs.Segments); err != nil {
-			return err
-		}
-		return store.RecordRestoredRecordings(sess.ID, rs.RecordingPaths)
+		return store.ImportSession(&sess, rs.Segments, rs.RecordingPaths)
 	}
 }
 

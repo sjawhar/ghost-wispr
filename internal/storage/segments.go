@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +32,11 @@ var (
 	// ErrRefinedSegmentsUnavailable means a session needs batch refinement
 	// before an occurrence-based deletion can be made.
 	ErrRefinedSegmentsUnavailable = errors.New("refined segments are unavailable")
+	// ErrMergeProvenanceUnavailable means a merged session holds a row that
+	// no source or intermediate merge can be credited with, so rebuilding
+	// their transcripts without the deleted segment could lose other words.
+	// The deletion is refused, changing nothing.
+	ErrMergeProvenanceUnavailable = errors.New("merged transcript provenance cannot be traced")
 )
 
 // DeletedSpan identifies the session recording span removed for a segment and
@@ -42,7 +46,6 @@ type DeletedSpan struct {
 	AudioPath                 string
 	SessionAudioPath          string
 	Start, End                float64
-	StreamStart, StreamEnd    float64
 	SHA256Before, SHA256After string
 }
 
@@ -102,14 +105,14 @@ func recordSplice(tx *sql.Tx, sessionID string, owners []string, span *DeletedSp
 // erase a retry runs, which covers both. A failure leaves the erase owed: the
 // deletion's error wraps ErrSegmentPostCommitMaintenance, and
 // RetryOwedErasure finishes it at the next start or sweep.
-func (s *SQLiteStore) eraseAfterDeletion(owed string, earlierOwed bool, segmentID int64, deletedText string, owners, holders []string, span *DeletedSpan) error {
+func (s *SQLiteStore) eraseAfterDeletion(owed string, earlierOwed bool, segmentID int64, owners []string) error {
 	s.eraseMu.Lock()
 	defer s.eraseMu.Unlock()
 	var err error
 	if earlierOwed {
 		err = s.eraseEveryOwed(false)
 	} else {
-		err = s.eraseDeletion(segmentID, deletedText, owners, holders, span)
+		err = s.eraseDeletion(segmentID, owners)
 	}
 	if err == nil {
 		err = clearOwedErase(s.db, owed)
@@ -122,11 +125,11 @@ func (s *SQLiteStore) eraseAfterDeletion(owed string, earlierOwed bool, segmentI
 
 // eraseDeletion erases one deletion's words from the write-ahead log and the
 // pre-migration backup, and finishes any backup erase left part way.
-func (s *SQLiteStore) eraseDeletion(segmentID int64, deletedText string, owners, holders []string, span *DeletedSpan) error {
+func (s *SQLiteStore) eraseDeletion(segmentID int64, owners []string) error {
 	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
 		return err
 	}
-	if err := s.eraseFromBackup(segmentID, deletedText, owners, holders, span); err != nil {
+	if err := s.eraseFromBackup(segmentID, owners); err != nil {
 		return fmt.Errorf("pre-migration backup: %w", err)
 	}
 	return s.eraseOrphans()
@@ -157,19 +160,19 @@ func recordingProvenanceKey(recording string) string {
 		return name
 	}
 }
-func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources, holders []string, err error) {
+func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if len(sources) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 	parents := make(map[string]string, len(sources))
 	for _, source := range sources {
 		session, err := getSession(tx, source)
 		if err != nil {
-			return nil, nil, fmt.Errorf("get merged source %s: %w", source, err)
+			return nil, fmt.Errorf("get merged source %s: %w", source, err)
 		}
 		parents[source] = session.MergedInto
 	}
@@ -183,7 +186,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			current = parents[current]
 		}
 		if len(sources) == 0 {
-			return nil, nil, nil
+			return nil, nil
 		}
 	}
 
@@ -192,14 +195,14 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 		) SELECT merged_session_id, recording_path, source_session_id
 		FROM recording_sources WHERE merged_session_id IN (SELECT id FROM merged)`, sessionID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read merged recording sources: %w", err)
+		return nil, fmt.Errorf("read merged recording sources: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	owners := make(map[string]map[string]string)
 	for rows.Next() {
 		var merged, recording, source string
 		if err := rows.Scan(&merged, &recording, &source); err != nil {
-			return nil, nil, fmt.Errorf("scan merged recording source: %w", err)
+			return nil, fmt.Errorf("scan merged recording source: %w", err)
 		}
 		if owners[merged] == nil {
 			owners[merged] = make(map[string]string)
@@ -208,7 +211,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 		owners[merged][recordingProvenanceKey(recording)] = source
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("iterate merged recording sources: %w", err)
+		return nil, fmt.Errorf("iterate merged recording sources: %w", err)
 	}
 
 	recordingChain := func(recording string) []string {
@@ -252,7 +255,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			// A row is credited to the source that recorded it and to every
 			// intermediate merge that held it, never by matching its text.
 			if _, known := parents[source]; !known {
-				return nil, nil, ErrRefinedSegmentsUnavailable
+				return nil, ErrMergeProvenanceUnavailable
 			}
 			for current := source; current != "" && current != sessionID; current = parents[current] {
 				own[current] = append(own[current], remaining[i])
@@ -261,12 +264,13 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 		}
 		chain := recordingChain(remaining[i].RecordingPath)
 		if len(chain) == 0 {
-			return nil, nil, ErrRefinedSegmentsUnavailable
+			return nil, ErrMergeProvenanceUnavailable
 		}
 		for _, source := range chain {
 			own[source] = append(own[source], remaining[i])
 		}
 	}
+	var holders []string
 	if untimedHolder != "" {
 		holders = slices.Clone(sources)
 	} else {
@@ -283,10 +287,10 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			    refined_transcript = '', refinement_model = '',
 			    canonical_transcript = ?, transcript_source = ?, deletion_generation = deletion_generation + 1
 			WHERE id = ?`, canonical, TranscriptSourceStreaming, source); err != nil {
-			return nil, nil, fmt.Errorf("scrub merged source %s by recording: %w", source, err)
+			return nil, fmt.Errorf("scrub merged source %s by recording: %w", source, err)
 		}
 	}
-	return sources, holders, nil
+	return sources, nil
 }
 
 func canonicalTranscript(segments []transcribe.Segment) string {
@@ -527,143 +531,14 @@ func (s *SQLiteStore) DeletionsToRefine() ([]string, error) {
 	return ids, nil
 }
 
-// rewriteDeletedTextEvents removes a deleted segment's words from stored
-// events. Every session in sessionIDs (the one it was deleted from and those
-// merged into it, whose summaries are cleared) loses its summary_ready events
-// and every event with the deleted text. Only the sessions in holderIDs (the
-// one it was deleted from and those that held the segment) lose the live
-// transcript events that overlap the deleted span: the span is in the
-// recording's own time, which every other session's live events share.
-func rewriteDeletedTextEvents(tx *sql.Tx, sessionIDs, holderIDs []string, deletedText string, span *DeletedSpan) error {
-	owners := make(map[string]bool, len(sessionIDs))
-	for _, id := range sessionIDs {
-		owners[id] = true
-	}
-	holders := make(map[string]bool, len(holderIDs))
-	for _, id := range holderIDs {
-		holders[id] = true
-	}
-	rows, err := tx.Query(`SELECT id, event_type, payload FROM mcp_events`)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = rows.Close() }()
-
-	type update struct {
-		id      int64
-		payload string
-		delete  bool
-	}
-	var updates []update
-	for rows.Next() {
-		var id int64
-		var eventType, payload string
-		if err := rows.Scan(&id, &eventType, &payload); err != nil {
-			return err
-		}
-		var event map[string]any
-		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			continue
-		}
-		eventSessionID, _ := event["session_id"].(string)
-		if !owners[eventSessionID] {
-			continue
-		}
-		if isSummaryReadyEvent(eventType, event) || holders[eventSessionID] && isLiveTranscriptEvent(eventType, event) && eventOverlapsDeletedSpan(event, span) {
-			updates = append(updates, update{id: id, delete: true})
-			continue
-		}
-		redacted, changed := redactEventText(event, deletedText)
-		if !changed {
-			continue
-		}
-		rewritten, err := json.Marshal(redacted)
-		if err != nil {
-			return err
-		}
-		updates = append(updates, update{id: id, payload: string(rewritten)})
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, update := range updates {
-		if update.delete {
-			if _, err := tx.Exec(`DELETE FROM mcp_events WHERE id = ?`, update.id); err != nil {
-				return err
-			}
-			continue
-		}
-		if _, err := tx.Exec(`UPDATE mcp_events SET payload = ? WHERE id = ?`, update.payload, update.id); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func isLiveTranscriptEvent(eventType string, event map[string]any) bool {
-	if eventType == "live_transcript" || eventType == "live_transcript_interim" {
-		return true
-	}
-	typeName, _ := event["type"].(string)
-	return typeName == "live_transcript" || typeName == "live_transcript_interim"
-}
-
-func isSummaryReadyEvent(eventType string, event map[string]any) bool {
-	if eventType == "summary_ready" {
-		return true
-	}
-	typeName, _ := event["type"].(string)
-	return typeName == "summary_ready"
-}
-
-func eventOverlapsDeletedSpan(event map[string]any, span *DeletedSpan) bool {
-	start, ok := event["start_time"].(float64)
-	if !ok {
-		return false
-	}
-	end, hasEnd := event["end_time"].(float64)
-	if !hasEnd {
-		return start >= span.StreamStart && start < span.StreamEnd
-	}
-	return start < span.StreamEnd && end > span.StreamStart
-}
-
-func redactEventText(value any, deletedText string) (any, bool) {
-	switch typed := value.(type) {
-	case string:
-		redacted := strings.ReplaceAll(typed, deletedText, "")
-		return redacted, redacted != typed
-	case []any:
-		changed := false
-		copy := make([]any, len(typed))
-		for i, entry := range typed {
-			redacted, entryChanged := redactEventText(entry, deletedText)
-			copy[i] = redacted
-			changed = changed || entryChanged
-		}
-		return copy, changed
-	case map[string]any:
-		changed := false
-		copy := make(map[string]any, len(typed))
-		for key, entry := range typed {
-			redacted, entryChanged := redactEventText(entry, deletedText)
-			copy[key] = redacted
-			changed = changed || entryChanged
-		}
-
-		return copy, changed
-	default:
-		return value, false
-	}
-}
-
-// dropLiveTranscriptEvents removes live transcript events for sessions whose
-// segment table was rebuilt. Their socket-relative times cannot safely map to
-// a batch recording occurrence.
-func dropLiveTranscriptEvents(tx *sql.Tx, sessionIDs []string) error {
+// dropSupersededEvents removes, for each session in sessionIDs (the sessions
+// that held a deleted segment), the stored events the deletion supersedes:
+// its summary_ready events, whose summary is made again, and all its live
+// transcript events. A live event names its session but no segment, and its
+// times are the live stream's, so it cannot be tied to the deleted refined
+// segment; the refined transcript replaces it. No event is edited by matching
+// its text.
+func dropSupersededEvents(tx *sql.Tx, sessionIDs []string) error {
 	seen := make(map[string]struct{}, len(sessionIDs))
 	for _, sessionID := range sessionIDs {
 		if sessionID == "" {
@@ -675,10 +550,10 @@ func dropLiveTranscriptEvents(tx *sql.Tx, sessionIDs []string) error {
 		seen[sessionID] = struct{}{}
 		if _, err := tx.Exec(`DELETE FROM mcp_events
 			WHERE json_valid(payload)
-			  AND (event_type IN ('live_transcript', 'live_transcript_interim')
-				OR COALESCE(json_extract(payload, '$.type'), '') IN ('live_transcript', 'live_transcript_interim'))
+			  AND (event_type IN ('live_transcript', 'live_transcript_interim', 'summary_ready')
+				OR COALESCE(json_extract(payload, '$.type'), '') IN ('live_transcript', 'live_transcript_interim', 'summary_ready'))
 			  AND COALESCE(json_extract(payload, '$.session_id'), '') = ?`, sessionID); err != nil {
-			return fmt.Errorf("drop live transcript events for session %s: %w", sessionID, err)
+			return fmt.Errorf("drop superseded events for session %s: %w", sessionID, err)
 		}
 	}
 	return nil

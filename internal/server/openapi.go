@@ -586,7 +586,7 @@ func OpenAPISpec() map[string]any {
 						"204": map[string]any{"description": "Segment deleted"},
 						"400": map[string]any{"description": "Missing or invalid mode or transcript revision"},
 						"404": map[string]any{"description": "Session or segment not found"},
-						"409": map[string]any{"description": "Session is still recording or refining, an earlier deletion is recovering, or the transcript changed; refresh and try again"},
+						"409": map[string]any{"description": "Session is still recording or refining, an earlier deletion is recovering, the transcript changed (refresh and try again), or the merge history can't be traced for this segment, so it can't be deleted safely"},
 					},
 				},
 			},

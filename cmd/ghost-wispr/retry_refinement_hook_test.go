@@ -31,7 +31,7 @@ func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
 	ended := started.Add(time.Minute)
 	rs := gdrive.RestoredSession{ID: "restored", StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-1", HasAudio: true}
 	session := restoredDriveSession(&rs, ended)
-	if err := store.ImportSession(&session, nil); err != nil {
+	if err := store.ImportSession(&session, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	file := filepath.Join(dir, "recording.mp3")
@@ -117,7 +117,7 @@ func TestRetryRefinementHookWarnsWhenRestoreFails(t *testing.T) {
 	ended := started.Add(time.Minute)
 	rs := gdrive.RestoredSession{ID: "restored", StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-1", HasAudio: true}
 	session := restoredDriveSession(&rs, ended)
-	if err := store.ImportSession(&session, nil); err != nil {
+	if err := store.ImportSession(&session, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	registry := newWarningsRegistry()

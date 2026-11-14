@@ -131,7 +131,7 @@ func TestADocumentChangeSendsARestoredSessionBackToSync(t *testing.T) {
 	if err := store.ImportSession(&Session{
 		ID: "20260301100000", Title: "Standup", StartedAt: started, EndedAt: &ended, Status: SessionEnded,
 		Summary: "The summary.", SummaryStatus: SummaryCompleted, SyncStatus: SyncSynced, GDriveFolderID: "folder-restored",
-	}, []transcribe.Segment{{Text: "said", EndTime: 1, Timestamp: started}}); err != nil {
+	}, []transcribe.Segment{{Text: "said", EndTime: 1, Timestamp: started}}, nil); err != nil {
 		t.Fatalf("ImportSession: %v", err)
 	}
 	if session, _ := store.GetSession("20260301100000"); session.SyncStatus != SyncSynced {

@@ -39,10 +39,9 @@ func backupDSN(backupPath string) string {
 // them in whatever of those tables and columns its schema has, and its
 // write-ahead log checkpointed away.
 //
-// segmentID and deletedText name the deleted segment; sessionIDs are the
-// sessions it was deleted from or merged into it, and holderIDs those that
-// held it (see rewriteDeletedTextEvents).
-func (s *SQLiteStore) eraseFromBackup(segmentID int64, deletedText string, sessionIDs, holderIDs []string, span *DeletedSpan) error {
+// segmentID names the deleted segment; sessionIDs are the sessions it was
+// deleted from or merged into it that held it (see dropSupersededEvents).
+func (s *SQLiteStore) eraseFromBackup(segmentID int64, sessionIDs []string) error {
 	if s.path == "" {
 		return nil
 	}
@@ -68,7 +67,7 @@ func (s *SQLiteStore) eraseFromBackup(segmentID int64, deletedText string, sessi
 		}
 		return createPreMigrationBackup(s.db, s.path)
 	}
-	scrubErr := scrubBackup(backup, segmentID, deletedText, sessionIDs, holderIDs, span)
+	scrubErr := scrubBackup(backup, segmentID, sessionIDs)
 	if err := backup.Close(); err != nil && scrubErr == nil {
 		return fmt.Errorf("close backup: %w", err)
 	}
@@ -139,7 +138,7 @@ func sameSchema(a, b *sql.DB) (bool, error) {
 // commit, leaving them in blocks the file system frees; a write-ahead log
 // holds only the pages as they are after it, with secure_delete's zeros. The
 // backup is left in the journal mode it had, with no log beside it.
-func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs, holderIDs []string, span *DeletedSpan) (err error) {
+func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) (err error) {
 	var mode string
 	if err := backup.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
 		return fmt.Errorf("read backup journal mode: %w", err)
@@ -178,7 +177,6 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	// The backup may predate a merge: the session that held the segment then
 	// is the one its row still names there.
 	affected := slices.Clone(sessionIDs)
-	holders := slices.Clone(holderIDs)
 	segments, err := columns("segments")
 	if err != nil {
 		return err
@@ -211,7 +209,6 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 		switch {
 		case err == nil:
 			affected = append(affected, holder)
-			holders = append(holders, holder)
 			if _, err := tx.Exec(`DELETE FROM segments WHERE id = ?`, segmentID); err != nil {
 				return fmt.Errorf("delete the segment from the backup: %w", err)
 			}
@@ -276,11 +273,8 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	if events, err := columns("mcp_events"); err != nil {
 		return err
 	} else if events["payload"] {
-		if err := dropLiveTranscriptEvents(tx, holders); err != nil {
-			return fmt.Errorf("drop backup live transcript events: %w", err)
-		}
-		if err := rewriteDeletedTextEvents(tx, affected, holders, deletedText, span); err != nil {
-			return fmt.Errorf("rewrite backup events: %w", err)
+		if err := dropSupersededEvents(tx, affected); err != nil {
+			return fmt.Errorf("drop backup superseded events: %w", err)
 		}
 	}
 	if search, err := columns("sessions_fts"); err != nil {

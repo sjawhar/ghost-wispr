@@ -34,7 +34,7 @@ func TestDriveRestoredSessionCanRetryBeforeDeletion(t *testing.T) {
 		HasAudio:      true,
 	}
 	session := restoredDriveSession(&rs, ended)
-	if err := store.ImportSession(&session, nil); err != nil {
+	if err := store.ImportSession(&session, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := store.GetSession("restored")
