@@ -14,9 +14,9 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
-// A deletion refused because a merged session holds a row that no source can
-// be credited with answers 409 with a sentence that says so: the conversation
-// is refined, so "still being refined" would not be true.
+// A deletion refused because any row in the conversation cannot be credited
+// to a source answers 409 with a sentence that says no part of the
+// conversation can be deleted safely.
 func TestDeleteRouteNamesAnUntraceableMergeHistory(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "provenance.db"))
 	if err != nil {
@@ -82,8 +82,8 @@ func TestDeleteRouteNamesAnUntraceableMergeHistory(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/sessions/m2/segments/%d?mode=text&revision=0", target), nil))
-	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "merge history can't be traced") {
-		t.Fatalf("delete with an untraceable merge history = %d %s, want 409 saying the merge history can't be traced", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "part of this conversation's merge history can't be traced, so nothing in it can be deleted safely") {
+		t.Fatalf("delete with an untraceable merge history = %d %s, want 409 saying no part of the conversation can be deleted safely", rr.Code, rr.Body.String())
 	}
 	if strings.Contains(rr.Body.String(), "still being refined") {
 		t.Fatalf("delete with an untraceable merge history says the conversation is still being refined: %s", rr.Body.String())

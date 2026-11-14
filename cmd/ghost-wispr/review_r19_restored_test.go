@@ -267,3 +267,31 @@ func TestImportRestoredDriveSessionIsAllOrNothing(t *testing.T) {
 		t.Fatalf("restored recording names = %q, want [%q]", paths, local)
 	}
 }
+
+// A Drive restore records each file name directly in restored_recordings,
+// never in recording_sources: the latter is only merge provenance.
+func TestImportRestoredDriveSessionKeepsNamesOutOfMergeProvenance(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "names.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	ended := started.Add(time.Minute)
+	id := "20261113090000"
+	paths := []string{"20261113090000.mp3", "20261113100000.mp3"}
+	rs := gdrive.RestoredSession{ID: id, StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-r", HasAudio: true, RecordingPaths: paths}
+	if err := importRestoredDriveSession(store, func() time.Time { return reviewR19RestoredAt })(rs); err != nil {
+		t.Fatal(err)
+	}
+	var provenanceCount, restoredCount int
+	if err := store.DB().QueryRow(`SELECT count(*) FROM recording_sources WHERE merged_session_id = ?`, id).Scan(&provenanceCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRow(`SELECT count(*) FROM restored_recordings WHERE session_id = ?`, id).Scan(&restoredCount); err != nil {
+		t.Fatal(err)
+	}
+	if provenanceCount != 0 || restoredCount != len(paths) {
+		t.Fatalf("restored names: recording_sources=%d restored_recordings=%d, want 0 and %d", provenanceCount, restoredCount, len(paths))
+	}
+}

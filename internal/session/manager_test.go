@@ -755,6 +755,31 @@ func TestManager_EndSession_StoreFailurePreservesState(t *testing.T) {
 	}
 }
 
+// A recorder can finish after another path merged its session. The store's
+// ErrSessionMerged is final: the manager clears its active state and does not
+// retry the end against the merged row.
+func TestManager_EndMergedSessionIsFinal(t *testing.T) {
+	store := newStoreMock()
+	store.endSessionErr = storage.ErrSessionMerged
+	recorder := &recorderMock{}
+	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour), 0)
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted: %v", err)
+	}
+	if err := manager.ForceEndSession(context.Background()); err != nil {
+		t.Fatalf("ending a merged session = %v, want final success", err)
+	}
+	if got := manager.currentSession(); got != "" {
+		t.Fatalf("manager retains merged session %q as active", got)
+	}
+	if err := manager.ForceEndSession(context.Background()); !errors.Is(err, ErrNoActiveSession) {
+		t.Fatalf("second end = %v, want %v", err, ErrNoActiveSession)
+	}
+	if _, ended := recorder.counts(); ended != 1 {
+		t.Fatalf("recorder ends = %d, want 1", ended)
+	}
+}
+
 // A session end whose database write failed is retried with the recording the
 // failed end saved. The recorder is not asked again: it handed that recording
 // over already, and a retry that asked it would save the session without it.

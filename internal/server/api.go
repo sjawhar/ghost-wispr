@@ -812,7 +812,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			case errors.Is(err, storage.ErrStaleTranscriptRevision):
 				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
 			case errors.Is(err, storage.ErrMergeProvenanceUnavailable):
-				writeJSONError(w, http.StatusConflict, "this conversation's merge history can't be traced for this segment, so it can't be deleted safely")
+				writeJSONError(w, http.StatusConflict, "part of this conversation's merge history can't be traced, so nothing in it can be deleted safely")
 			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):
 				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
 			case errors.Is(err, ErrSegmentRawAudioKept):
@@ -1034,7 +1034,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 		}
 
-		newID := earliest.UTC().Format("20060102150405") + "-merged"
+		newID, err := nextMergedSessionID(store, earliest)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("choose merged session id: %v", err))
+			return
+		}
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
 			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) || errors.Is(err, storage.ErrMergeSessionExists) {
 				writeJSONError(w, http.StatusConflict, err.Error())
@@ -1145,7 +1149,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 					latest = *sess.EndedAt
 				}
 			}
-			newID := earliest.UTC().Format("20060102150405") + "-merged"
+			newID, err := nextMergedSessionID(store, earliest)
+			if err != nil {
+				slog.Error("choose auto-merge session id", "group", group, "error", err)
+				continue
+			}
 			if err := store.MergeSessions(newID, group, earliest, latest); err != nil {
 				slog.Error("auto-merge failed", "group", group, "error", err)
 				continue
@@ -1827,6 +1835,23 @@ var finishErasing = func(sessionID string, pending []erase.Pending) {
 	for _, p := range pending {
 		if err := p.Finish(); err != nil {
 			slog.Warn("could not overwrite a deleted session's recording; it is erased as the app starts", "session_id", sessionID, "error", err)
+		}
+	}
+}
+
+func nextMergedSessionID(store SessionStore, earliest time.Time) (string, error) {
+	base := earliest.UTC().Format("20060102150405") + "-merged"
+	for suffix := 1; ; suffix++ {
+		id := base
+		if suffix > 1 {
+			id = fmt.Sprintf("%s-%d", base, suffix)
+		}
+		if _, err := store.GetSession(id); err == nil {
+			continue
+		} else if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+			return id, nil
+		} else {
+			return "", fmt.Errorf("check merged session id %s: %w", id, err)
 		}
 	}
 }

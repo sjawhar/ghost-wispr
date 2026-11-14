@@ -81,15 +81,35 @@ func TestMergeRouteRefusesARecordingSessionWith409(t *testing.T) {
 	assertMergeConflict(t, postMerge(t, store, "20261113090000", "20261113100000"), "20261113100000", "still recording")
 }
 
-// A merge takes its id from its earliest start, so merging a merge again
-// with a later session asks for the merge's own id.
-func TestMergeRouteRefusesAMergeAgainUnderItsOwnIDWith409(t *testing.T) {
+// A merge takes its id from its earliest start. Re-merging it with a later
+// session chooses the next available suffix rather than conflicting with its
+// own id.
+func TestMergeRouteRemergesUnderANewID(t *testing.T) {
 	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
 	store := mergeRouteStore(t, started, "20261113090000", "20261113100000", "20261113110000")
 	if rr := postMerge(t, store, "20261113090000", "20261113100000"); rr.Code != http.StatusOK {
 		t.Fatalf("first merge = %d %s, want 200", rr.Code, rr.Body.String())
 	}
-	assertMergeConflict(t, postMerge(t, store, "20261113090000-merged", "20261113110000"), "20261113090000-merged", "already exists")
+	rr := postMerge(t, store, "20261113090000-merged", "20261113110000")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("re-merge = %d %s, want 200", rr.Code, rr.Body.String())
+	}
+	var merged storage.Session
+	if err := json.Unmarshal(rr.Body.Bytes(), &merged); err != nil {
+		t.Fatal(err)
+	}
+	if merged.ID != "20261113090000-merged-2" {
+		t.Fatalf("re-merge id = %q, want the next available merge id", merged.ID)
+	}
+	for _, id := range []string{"20261113090000-merged", "20261113110000"} {
+		session, err := store.GetSession(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if session.Status != storage.SessionMerged || session.MergedInto != merged.ID {
+			t.Errorf("re-merge source %s = status:%q merged_into:%q, want merged into %q", id, session.Status, session.MergedInto, merged.ID)
+		}
+	}
 }
 
 // Auto-merge never groups across a session that is still recording: the
