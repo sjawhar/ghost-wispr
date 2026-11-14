@@ -169,3 +169,68 @@ func TestReviewR19NestedUntimedDeleteRefusesUncreditableHolderRow(t *testing.T) 
 		t.Fatalf("delete with an uncreditable intermediate-holder row = %v, want %v", err, ErrRefinedSegmentsUnavailable)
 	}
 }
+
+// n and x, neither recorded, merge into m1, which has no recording either, so
+// merging m1 into m2 marks n's rows untimed a second time. They keep n as
+// their source: deleting one scrubs n itself, not only m1.
+func TestNestedUntimedDeleteScrubsTheInnerSourceItself(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "inner-untimed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	start := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	for i, id := range []string{"n", "x"} {
+		at := start.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendSegment(id, transcribeSegment(id+" one "+reviewR19Secret, 0, at)); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendSegment(id, transcribeSegment(id+" two stays", 1, at)); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = 'n one ` + reviewR19Secret + `\nn two stays' WHERE id = 'n'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("m1", []string{"n", "x"}, start, start.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession("t", start.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("t", start.Add(181*time.Minute), "/audio/t.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("m2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var target int64
+	for i := range segments {
+		if segments[i].Text == "n one "+reviewR19Secret {
+			target = segments[i].ID
+		}
+	}
+	if target == 0 {
+		t.Fatalf("control: n's row is missing from m2: %+v", segments)
+	}
+	if err := store.DeleteRefinedSegmentText("m2", target, 0); err != nil {
+		t.Fatal(err)
+	}
+	n, err := store.GetSession("n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(n.CanonicalTranscript, reviewR19Secret) || !strings.Contains(n.CanonicalTranscript, "n two stays") {
+		t.Fatalf("n after deleting its row in m2 = %q, want its other row only", n.CanonicalTranscript)
+	}
+}
