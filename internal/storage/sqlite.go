@@ -971,7 +971,7 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 			return fmt.Errorf("read session %s after end: %w", id, err)
 		}
 		if status == SessionMerged {
-			return nil
+			return fmt.Errorf("end session %s: %w", id, ErrMergeSessionActive)
 		}
 		return sql.ErrNoRows
 	}
@@ -1001,6 +1001,7 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 			JOIN recording_sources AS nested
 			  ON nested.merged_session_id = source.session_id
 			 AND nested.recording_path = source.recording_path
+			 AND nested.source_session_id != source.session_id
 			JOIN sessions AS parent ON parent.id = source.session_id
 		)
 		SELECT source.session_id, folders.gdrive_folder_id, leaves.gdrive_folder_id, source.recording_path
@@ -1011,6 +1012,7 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 			SELECT 1 FROM recording_sources AS nested
 			WHERE nested.merged_session_id = source.session_id
 			  AND nested.recording_path = source.recording_path
+			  AND nested.source_session_id != source.session_id
 		)
 		ORDER BY folders.started_at, source.recording_path`, sessionID)
 	if err != nil {
@@ -1036,6 +1038,22 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 		return nil, fmt.Errorf("iterate recording sources for session %s: %w", sessionID, err)
 	}
 	return sources, nil
+}
+
+// RecordRestoredRecordingSources records the audio files a Drive restore saw
+// for a session that was itself a merge. A later merge can then recover those
+// recordings rather than guessing a name from the merged id.
+func (s *SQLiteStore) RecordRestoredRecordingSources(sessionID string, paths []string) error {
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO recording_sources(merged_session_id, recording_path, source_session_id) VALUES(?, ?, ?)`, sessionID, path, sessionID); err != nil {
+			return fmt.Errorf("record restored recording source for session %s: %w", sessionID, err)
+		}
+	}
+	return nil
 }
 
 // RefinementRecordingPaths returns the recordings whose content belongs to a
@@ -1176,6 +1194,10 @@ var ErrMergeReplacementPending = errors.New("a session to merge still has a dele
 // still recording. A recorder must finish before its session can be merged.
 var ErrMergeSessionActive = errors.New("a session to merge is still recording; end it before merging")
 
+// ErrMergeSourceUnavailable is returned without changing rows when a source
+// is already merged into another session or was discarded.
+var ErrMergeSourceUnavailable = errors.New("a session to merge is already unavailable")
+
 func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	if strings.TrimSpace(newID) == "" {
 		return errors.New("new session id is required")
@@ -1216,6 +1238,17 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("merge session %s: %w", active, ErrMergeSessionActive)
 	case !errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("check sources for active session: %w", err)
+	}
+	var unavailable string
+	err = tx.QueryRow(
+		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND status IN (?, ?) LIMIT 1`, strings.Join(placeholders, ",")),
+		append(args[1:], SessionMerged, SessionDiscarded)...,
+	).Scan(&unavailable)
+	switch {
+	case err == nil:
+		return fmt.Errorf("merge session %s: %w", unavailable, ErrMergeSourceUnavailable)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("check sources for unavailable session: %w", err)
 	}
 
 	_, err = tx.Exec(

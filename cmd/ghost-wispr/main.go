@@ -1527,7 +1527,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			}
 			result, err := syncer.RestoreFromDrive(ctx, func(rs gdrive.RestoredSession) error {
 				sess := restoredDriveSession(&rs, time.Now().UTC())
-				return store.ImportSession(&sess, rs.Segments)
+				if err := store.ImportSession(&sess, rs.Segments); err != nil {
+					return err
+				}
+				return store.RecordRestoredRecordingSources(sess.ID, rs.RecordingPaths)
 			})
 			if err != nil {
 				return nil, err

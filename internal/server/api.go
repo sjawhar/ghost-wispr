@@ -1034,7 +1034,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		newID := earliest.UTC().Format("20060102150405") + "-merged"
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
-			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) {
+			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) {
 				writeJSONError(w, http.StatusConflict, err.Error())
 				return
 			}
@@ -1092,7 +1092,16 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		for i := range sessions {
 			sess := &sessions[i]
-			if sess.Status == "merged" {
+			if sess.Status == storage.SessionMerged {
+				if len(currentGroup) >= 2 {
+					groups = append(groups, currentGroup)
+				}
+				currentGroup = nil
+				prevEnded = nil
+				continue
+			}
+			if sess.Status == storage.SessionActive {
+				slog.Warn("auto-merge skipped recording session", "session_id", sess.ID)
 				if len(currentGroup) >= 2 {
 					groups = append(groups, currentGroup)
 				}

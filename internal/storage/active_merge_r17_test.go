@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,8 +32,8 @@ func TestMergeSessionsRefusesActiveSourceAndEndDoesNotResurrectMergedRow(t *test
 	if err := store.MergeSessions("merged", []string{"active", "ended"}, started, started.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EndSession("active", started.Add(2*time.Minute), "/audio/active.mp3"); err != nil {
-		t.Fatal(err)
+	if err := store.EndSession("active", started.Add(2*time.Minute), "/audio/active.mp3"); !errors.Is(err, ErrMergeSessionActive) {
+		t.Fatalf("end merged source = %v, want active merge refusal", err)
 	}
 	active, err := store.GetSession("active")
 	if err != nil {

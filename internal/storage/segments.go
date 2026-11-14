@@ -157,7 +157,7 @@ func recordingProvenanceKey(recording string) string {
 		return name
 	}
 }
-func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources, holders []string, err error) {
+func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder, deletedText string, remaining []transcribe.Segment) (sources, holders []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -166,12 +166,14 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 		return nil, nil, nil
 	}
 	parents := make(map[string]string, len(sources))
+	sourceSessions := make(map[string]Session, len(sources))
 	for _, source := range sources {
 		session, err := getSession(tx, source)
 		if err != nil {
 			return nil, nil, fmt.Errorf("get merged source %s: %w", source, err)
 		}
 		parents[source] = session.MergedInto
+		sourceSessions[source] = session
 	}
 	if untimedHolder != "" {
 		sources = sources[:0]
@@ -262,11 +264,15 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 		if mappedRecording && len(own[source]) == 0 && !slices.Contains(holders, source) {
 			continue
 		}
+		canonical := canonicalTranscript(own[source])
+		if untimedHolder != "" && strings.TrimSpace(sourceSessions[source].CanonicalTranscript) != "" {
+			canonical = strings.TrimSpace(strings.ReplaceAll(sourceSessions[source].CanonicalTranscript, deletedText, ""))
+		}
 		if _, err := tx.Exec(`UPDATE sessions
 			SET title = '', summary = '', summary_model = '', speaker_names = '{}',
 			    refined_transcript = '', refinement_model = '',
 			    canonical_transcript = ?, transcript_source = ?, deletion_generation = deletion_generation + 1
-			WHERE id = ?`, canonicalTranscript(own[source]), TranscriptSourceStreaming, source); err != nil {
+			WHERE id = ?`, canonical, TranscriptSourceStreaming, source); err != nil {
 			return nil, nil, fmt.Errorf("scrub merged source %s by recording: %w", source, err)
 		}
 	}
