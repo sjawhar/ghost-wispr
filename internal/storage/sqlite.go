@@ -978,15 +978,15 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 		return fmt.Errorf("end session rows affected: %w", err)
 	}
 	if rows == 0 {
-		var status string
-		if err := s.db.QueryRow(`SELECT status FROM sessions WHERE id = ?`, id).Scan(&status); err != nil {
+		var status, mergedInto string
+		if err := s.db.QueryRow(`SELECT status, merged_into FROM sessions WHERE id = ?`, id).Scan(&status, &mergedInto); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return sql.ErrNoRows
 			}
 			return fmt.Errorf("read session %s after end: %w", id, err)
 		}
 		if status == SessionMerged {
-			return fmt.Errorf("end session %s: %w", id, ErrMergeSessionActive)
+			return &sessionRefusal{action: "end", sessionID: id, reason: "it was already merged into " + mergedInto, sentinel: ErrSessionMerged}
 		}
 		return sql.ErrNoRows
 	}
@@ -1215,11 +1215,35 @@ var ErrMergeReplacementPending = errors.New("a session to merge still has a dele
 
 // ErrMergeSessionActive is returned without changing rows when a source is
 // still recording. A recorder must finish before its session can be merged.
-var ErrMergeSessionActive = errors.New("a session to merge is still recording; end it before merging")
+var ErrMergeSessionActive = errors.New("it is still recording; end it before merging")
 
 // ErrMergeSourceUnavailable is returned without changing rows when a source
 // is already merged into another session or was discarded.
-var ErrMergeSourceUnavailable = errors.New("a session to merge is already unavailable")
+var ErrMergeSourceUnavailable = errors.New("it can no longer be merged")
+
+// ErrMergeSessionExists is returned without changing rows when the merged
+// session's id is already taken, as when a merge is merged again with a
+// session that started later and so keeps the same earliest start.
+var ErrMergeSessionExists = errors.New("a session with that id already exists")
+
+// ErrSessionMerged is returned without changing rows when a session to end
+// was already merged into another.
+var ErrSessionMerged = errors.New("it was already merged")
+
+// sessionRefusal is a refusal to change one session. Its sentence names the
+// session and the reason; errors.Is matches the sentinel it wraps.
+type sessionRefusal struct {
+	action    string
+	sessionID string
+	reason    string
+	sentinel  error
+}
+
+func (e *sessionRefusal) Error() string {
+	return fmt.Sprintf("cannot %s session %s: %s", e.action, e.sessionID, e.reason)
+}
+
+func (e *sessionRefusal) Unwrap() error { return e.sentinel }
 
 func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	if strings.TrimSpace(newID) == "" {
@@ -1258,20 +1282,31 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	).Scan(&active)
 	switch {
 	case err == nil:
-		return fmt.Errorf("merge session %s: %w", active, ErrMergeSessionActive)
+		return &sessionRefusal{action: "merge", sessionID: active, reason: ErrMergeSessionActive.Error(), sentinel: ErrMergeSessionActive}
 	case !errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("check sources for active session: %w", err)
 	}
-	var unavailable string
+	var unavailable, unavailableStatus, mergedInto string
 	err = tx.QueryRow(
-		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND status IN (?, ?) LIMIT 1`, strings.Join(placeholders, ",")),
+		fmt.Sprintf(`SELECT id, status, merged_into FROM sessions WHERE id IN (%s) AND status IN (?, ?) LIMIT 1`, strings.Join(placeholders, ",")),
 		append(args[1:], SessionMerged, SessionDiscarded)...,
-	).Scan(&unavailable)
+	).Scan(&unavailable, &unavailableStatus, &mergedInto)
 	switch {
 	case err == nil:
-		return fmt.Errorf("merge session %s: %w", unavailable, ErrMergeSourceUnavailable)
+		reason := "it was discarded"
+		if unavailableStatus == SessionMerged {
+			reason = "it was already merged into " + mergedInto
+		}
+		return &sessionRefusal{action: "merge", sessionID: unavailable, reason: reason, sentinel: ErrMergeSourceUnavailable}
 	case !errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("check sources for unavailable session: %w", err)
+	}
+	var taken int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, newID).Scan(&taken); err != nil {
+		return fmt.Errorf("check merged session id %s: %w", newID, err)
+	}
+	if taken != 0 {
+		return &sessionRefusal{action: "merge into", sessionID: newID, reason: ErrMergeSessionExists.Error(), sentinel: ErrMergeSessionExists}
 	}
 
 	_, err = tx.Exec(
