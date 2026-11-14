@@ -79,6 +79,15 @@ func TestR9LostCutRecoveryWarnsAndKeepsReplacementOwed(t *testing.T) {
 	if _, err := os.Stat(fixture.audioC); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed recovery left C's pre-cut bytes on disk: %v", err)
 	}
+	entries, err := os.ReadDir(fixture.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".download-") {
+			t.Fatalf("failed recovery left its Drive download %s", entry.Name())
+		}
+	}
 	registry := newWarningsRegistry()
 	applyPendingSpliceRecoveryWarnings(registry, []pendingSpliceOutcome{outcome})
 	warnings := strings.Join(statusWarnings(t, registry), "\n")

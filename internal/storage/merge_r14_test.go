@@ -105,11 +105,20 @@ func TestMergeFencesSourcesAndKeepsTheirSegmentsHidden(t *testing.T) {
 	if generation != 1 {
 		t.Fatalf("merged source deletion generation = %d, want 1", generation)
 	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = '/audio/a.mp3', refinement_generation = deletion_generation, summary_generation = deletion_generation WHERE id = 'a'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, claimed, err := store.ClaimRefinement("a", "/audio/a.mp3"); err != nil || claimed {
 		t.Fatalf("claim refinement for merged source = claimed:%t err:%v, want refused", claimed, err)
 	}
 	if err := store.StartSummary("a"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("start summary for merged source = %v, want refusal", err)
+	}
+	if err := store.UpdateSummaryAtGeneration("a", "stale", "stale", SummaryCompleted, "default", "{}", "test", generation); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("publish summary for merged source = %v, want refusal", err)
+	}
+	if _, err := store.PublishRefinementAtGeneration("a", "", "test", nil, nil, generation); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("publish refinement for merged source = %v, want refusal", err)
 	}
 	if _, err := store.DB().Exec(`INSERT INTO segments(session_id, speaker, text, start_time, end_time, timestamp) VALUES('a', 0, 'stale hidden text', 0, 1, ?)`, started.UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)

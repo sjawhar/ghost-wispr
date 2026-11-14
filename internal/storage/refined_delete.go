@@ -74,6 +74,7 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	if _, err := tx.Exec(`UPDATE sessions
 		SET title = '', summary = '', summary_model = '', speaker_names = '{}',
 			refined_transcript = ?, canonical_transcript = ?, transcript_source = ?,
+			refinement_status = CASE WHEN refinement_status = ? THEN ? ELSE refinement_status END,
 			summary_status = ?, summary_error = '', summary_version = summary_version + 1,
 			deletion_generation = deletion_generation + 1,
 			refinement_generation = deletion_generation + 1,
@@ -82,7 +83,7 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 			sync_status = CASE WHEN sync_state IN (?, ?) THEN sync_status ELSE ? END,
 			sync_state = CASE WHEN sync_state IN (?, ?) THEN sync_state ELSE ? END
 		WHERE id = ? AND refined_revision = ? AND status != ?`,
-		transcript, transcript, source,
+		transcript, transcript, source, RefinementRunning, RefinementFailed,
 		SummaryPending, nextRevision, EnvoyPublishPending,
 		SyncStateSyncing, SyncStateRemoteDeleted, SyncPending,
 		SyncStateSyncing, SyncStateRemoteDeleted, SyncStatePending,
@@ -91,6 +92,9 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	}
 	sources, _, err := scrubMergedSourcesByRecording(tx, sessionID, "", remaining)
 	if err != nil {
+		return err
+	}
+	if err := markDriveDocumentsPending(tx, sessionID, sources); err != nil {
 		return err
 	}
 	if len(sources) > 0 {
@@ -285,7 +289,7 @@ func refinedSegment(q querier, sessionID string, segmentID int64, revision int) 
 	var segment RefinedSegment
 	err := q.QueryRow(`SELECT text, recording_path, recording_sha256, recording_ordinal,
 		first_word_ordinal, last_word_ordinal, speaker, start_time, end_time
-		FROM segments WHERE id = ? AND session_id = ? AND transcript_revision = ?`,
+		FROM segments WHERE id = ? AND session_id = ? AND transcript_revision = ? AND untimed = 0`,
 		segmentID, sessionID, revision).Scan(
 		&segment.Text, &segment.RecordingPath, &segment.RecordingSHA256, &segment.RecordingOrdinal,
 		&segment.FirstWordOrdinal, &segment.LastWordOrdinal, &segment.Speaker, &segment.Start, &segment.End,

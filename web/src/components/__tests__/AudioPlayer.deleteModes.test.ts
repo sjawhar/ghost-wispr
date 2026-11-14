@@ -73,6 +73,9 @@ it('disables Delete until timed refined segments exist', () => {
 })
 
 it('offers only Delete text for untimed source text', async () => {
+  vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+  const fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+  vi.stubGlobal('fetch', fetch)
   render(AudioPlayer, {
     sessionId: 'merged',
     segments: [
@@ -83,7 +86,6 @@ it('offers only Delete text for untimed source text', async () => {
         start_time: 0,
         end_time: 0,
         timestamp: '2026-11-12T10:00:00Z',
-        transcript_revision: 0,
         untimed: true,
       },
     ],
@@ -105,13 +107,21 @@ it('offers only Delete text for untimed source text', async () => {
   const deleteButton = screen.getByRole('button', { name: 'Delete segment' })
   expect(deleteButton.hasAttribute('disabled')).toBe(false)
   await fireEvent.click(deleteButton)
-  expect(screen.getByRole('button', { name: 'Delete text' })).toBeTruthy()
+  const deleteText = screen.getByRole('button', { name: 'Delete text' })
+  expect(deleteText).toBeTruthy()
   expect(screen.queryByRole('button', { name: 'Delete text and audio' })).toBeNull()
   expect(
     screen.getByText(
       'This text came from a source with no recording, so only Delete text is available.',
     ),
   ).toBeTruthy()
+  await fireEvent.click(deleteText)
+  await waitFor(() => {
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining('mode=text&revision=0'),
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
 })
 
 it('says a completed conversation without timed words needs refinement before deletion', () => {

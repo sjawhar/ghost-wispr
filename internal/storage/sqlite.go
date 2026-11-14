@@ -1195,7 +1195,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("create merged session: %w", err)
 	}
 	noAudioRows, err := tx.Query(
-		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND audio_path = ''`, strings.Join(placeholders, ",")),
+		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND audio_path = '' AND audio_removed_at = ''`, strings.Join(placeholders, ",")),
 		args[1:]...,
 	)
 	if err != nil {
@@ -1207,7 +1207,11 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 			_ = noAudioRows.Close()
 			return fmt.Errorf("scan source without recording: %w", err)
 		}
-		if _, err := tx.Exec(`UPDATE segments SET untimed = 1, untimed_source_id = ? WHERE session_id = ?`, sourceID, sourceID); err != nil {
+		if _, err := tx.Exec(`UPDATE segments
+			SET untimed = 1, untimed_source_id = ?, transcript_revision = 0,
+				recording_path = '', recording_sha256 = '', recording_ordinal = 0,
+				first_word_ordinal = -1, last_word_ordinal = -1
+			WHERE session_id = ?`, sourceID, sourceID); err != nil {
 			_ = noAudioRows.Close()
 			return fmt.Errorf("mark source segments untimed: %w", err)
 		}
@@ -1256,6 +1260,36 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("iterate audio paths: %w", err)
 	}
 	_ = rows.Close()
+	removedRows, err := tx.Query(
+		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND audio_path = '' AND audio_removed_at != ''`, strings.Join(placeholders, ",")),
+		args[1:]...,
+	)
+	if err != nil {
+		return fmt.Errorf("list sources with removed recordings: %w", err)
+	}
+	for removedRows.Next() {
+		var sourceID string
+		if err := removedRows.Scan(&sourceID); err != nil {
+			_ = removedRows.Close()
+			return fmt.Errorf("scan source with removed recording: %w", err)
+		}
+		paths, err := refinementRecordingPaths(tx, `SELECT DISTINCT recording_path FROM refined_words
+			WHERE session_id = ? AND transcript_revision = (SELECT refined_revision FROM sessions WHERE id = ?)
+			ORDER BY recording_path`, sourceID, sourceID)
+		if err != nil {
+			_ = removedRows.Close()
+			return fmt.Errorf("list removed recordings for source %s: %w", sourceID, err)
+		}
+		for _, recordingPath := range paths {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO recording_sources(merged_session_id, recording_path, source_session_id) VALUES(?, ?, ?)`, newID, recordingPath, sourceID); err != nil {
+				_ = removedRows.Close()
+				return fmt.Errorf("record removed recording source: %w", err)
+			}
+		}
+	}
+	if err := errors.Join(removedRows.Err(), removedRows.Close()); err != nil {
+		return fmt.Errorf("list sources with removed recordings: %w", err)
+	}
 	var audioRemovedAt string
 	if err := tx.QueryRow(
 		fmt.Sprintf(`SELECT COALESCE(MAX(audio_removed_at), '') FROM sessions WHERE id IN (%s)`, strings.Join(placeholders, ",")),

@@ -164,7 +164,7 @@
   ): Promise<void> {
     deleteMenuFor = null
     const segmentID = segment.id
-    const revision = segment.transcript_revision
+    const revision = segment.transcript_revision ?? (segment.untimed ? 0 : undefined)
     if (
       segmentID === undefined ||
       revision === undefined ||

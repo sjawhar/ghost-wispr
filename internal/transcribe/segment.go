@@ -20,7 +20,7 @@ type Segment struct {
 	StartTime          float64   `json:"start_time"`
 	EndTime            float64   `json:"end_time"`
 	Timestamp          time.Time `json:"timestamp"`
-	TranscriptRevision int       `json:"transcript_revision,omitempty"`
+	TranscriptRevision int       `json:"transcript_revision"`
 	RecordingPath      string    `json:"recording_path,omitempty"`
 	RecordingSHA256    string    `json:"recording_sha256,omitempty"`
 	RecordingOrdinal   int       `json:"recording_ordinal,omitempty"`

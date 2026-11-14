@@ -170,6 +170,29 @@ func TestDeleteSegmentAPIAllowsTextOnlyForAnUntimedSegment(t *testing.T) {
 	}
 }
 
+func TestDeleteSegmentAPIRefusesAudioForAnUntimedRevision(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted, RefinedRevision: 1}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	called := false
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		DeleteSegment: func(context.Context, string, int64, int) error {
+			called = true
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text_and_audio&revision=0", nil))
+	if response.Code != http.StatusBadRequest || called {
+		t.Fatalf("untimed audio delete = %d %s called=%t, want 400 without deletion", response.Code, response.Body.String(), called)
+	}
+}
+
 // TestOpenAPISpecDocumentsTheDeletionModes fails if the OpenAPI document
 // does not give the segment deletion its required mode, with exactly the two
 // modes, and its 400 refusal.

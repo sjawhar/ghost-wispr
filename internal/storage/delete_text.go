@@ -35,6 +35,15 @@ func TextDeleted(spans []TextDeletionSpan, start, end float64) bool {
 	return false
 }
 
+func markDriveDocumentsPending(tx *sql.Tx, sessionID string, sources []string) error {
+	for _, id := range append([]string{sessionID}, sources...) {
+		if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("owe the Drive folder of session %s its documents: %w", id, err)
+		}
+	}
+	return nil
+}
+
 // recordTextDeletionSpan records, in tx, the span of sessionID's recording
 // that a "Delete text" deletion's words are in: the recording's file name,
 // the times and the recording's SHA-256, never the words. And sessionID and
@@ -50,12 +59,7 @@ func recordTextDeletionSpan(tx *sql.Tx, sessionID string, sources []string, span
 		sessionID, filepath.Base(strings.TrimSpace(span.AudioPath)), span.Start, span.End, span.SHA256Before, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("record deleted text span for session %s: %w", sessionID, err)
 	}
-	for _, id := range append([]string{sessionID}, sources...) {
-		if _, err := tx.Exec(`UPDATE sessions SET drive_documents_pending = 1 WHERE id = ?`, id); err != nil {
-			return fmt.Errorf("owe the Drive folder of session %s its documents: %w", id, err)
-		}
-	}
-	return nil
+	return markDriveDocumentsPending(tx, sessionID, sources)
 }
 
 // DriveDocumentsOwed returns the sessions whose own Drive folder holds
