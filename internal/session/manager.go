@@ -444,12 +444,8 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 		end.audioPath, end.saved = path, true
 	}
 
-	merged := false
 	if err := m.store.EndSession(sessionID, endedAt, end.audioPath); err != nil {
-		if !errors.Is(err, storage.ErrSessionMerged) {
-			return fmt.Errorf("end session: %w", err)
-		}
-		merged = true
+		return fmt.Errorf("end session: %w", err)
 	}
 
 	m.mu.Lock()
@@ -462,9 +458,6 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	ended = true
 	minSegs := m.minSessionSegments
 	m.mu.Unlock()
-	if merged {
-		return nil
-	}
 
 	// Check if session meets minimum segment threshold.
 	if minSegs > 0 {
