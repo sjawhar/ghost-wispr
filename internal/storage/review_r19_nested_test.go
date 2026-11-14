@@ -113,7 +113,22 @@ func TestReviewR19NestedUntimedDeleteKeepsAllOtherText(t *testing.T) {
 	}
 }
 
+// A row an intermediate holder cannot credit, because it names no source and
+// no recording, or a source outside the merge, refuses the deletion rather
+// than rebuilding the holder without that row.
 func TestReviewR19NestedUntimedDeleteRefusesUncreditableHolderRow(t *testing.T) {
+	for name, provenance := range map[string]string{
+		"no source":      `source_session_id = '', recording_path = ''`,
+		"unknown source": `source_session_id = 'gone', recording_path = ''`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			reviewR19RefusesUncreditableHolderRow(t, provenance)
+		})
+	}
+}
+
+func reviewR19RefusesUncreditableHolderRow(t *testing.T, provenance string) {
+	t.Helper()
 	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "uncreditable.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +164,7 @@ func TestReviewR19NestedUntimedDeleteRefusesUncreditableHolderRow(t *testing.T) 
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().Exec(`UPDATE segments SET source_session_id = '', recording_path = '' WHERE session_id = 'm2' AND text = 'uncreditable holder text'`); err != nil {
+	if _, err := store.DB().Exec(`UPDATE segments SET ` + provenance + ` WHERE session_id = 'm2' AND text = 'uncreditable holder text'`); err != nil {
 		t.Fatal(err)
 	}
 	segments, err := store.GetSegments("m2")
@@ -157,9 +172,9 @@ func TestReviewR19NestedUntimedDeleteRefusesUncreditableHolderRow(t *testing.T) 
 		t.Fatal(err)
 	}
 	var target int64
-	for _, segment := range segments {
-		if segment.Text == "november delete" {
-			target = segment.ID
+	for i := range segments {
+		if segments[i].Text == "november delete" {
+			target = segments[i].ID
 		}
 	}
 	if target == 0 {
