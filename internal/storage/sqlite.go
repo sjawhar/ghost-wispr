@@ -998,7 +998,7 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 			FROM recording_sources WHERE merged_session_id = ?
 			UNION ALL
 			SELECT source.recording_path, nested.source_session_id,
-				CASE WHEN parent.gdrive_folder_id != '' THEN source.session_id ELSE nested.source_session_id END
+				CASE WHEN parent.gdrive_folder_id != '' THEN source.session_id ELSE source.folder_session_id END
 			FROM source
 			JOIN recording_sources AS nested
 			  ON nested.merged_session_id = source.session_id
