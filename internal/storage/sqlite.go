@@ -1295,7 +1295,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	}
 	_ = rows.Close()
 	removedRows, err := tx.Query(
-		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND audio_path = '' AND audio_removed_at != ''`, strings.Join(placeholders, ",")),
+		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND audio_removed_at != ''`, strings.Join(placeholders, ",")),
 		args[1:]...,
 	)
 	if err != nil {

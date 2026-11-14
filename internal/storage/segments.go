@@ -148,6 +148,15 @@ var postDeleteMaintenance = func(db *sql.DB, walPath string) error {
 	return truncateWriteAheadLog(db)
 }
 
+func recordingProvenanceKey(recording string) string {
+	name := filepath.Base(strings.TrimSpace(recording))
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp3", ".wav":
+		return strings.TrimSuffix(name, filepath.Ext(name))
+	default:
+		return name
+	}
+}
 func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources, holders []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
@@ -196,6 +205,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			owners[merged] = make(map[string]string)
 		}
 		owners[merged][recording] = source
+		owners[merged][recordingProvenanceKey(recording)] = source
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("iterate merged recording sources: %w", err)
@@ -203,14 +213,21 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 
 	recordingChain := func(recording string) []string {
 		owner := owners[sessionID][recording]
+		if owner == "" {
+			owner = owners[sessionID][recordingProvenanceKey(recording)]
+		}
 		seen := make(map[string]struct{})
 		for owner != "" {
 			if _, duplicate := seen[owner]; duplicate {
 				return nil
 			}
 			seen[owner] = struct{}{}
-			if nested := owners[owner][recording]; nested != "" {
-				owner = nested
+			nestedOwner := owners[owner][recording]
+			if nestedOwner == "" {
+				nestedOwner = owners[owner][recordingProvenanceKey(recording)]
+			}
+			if nestedOwner != "" {
+				owner = nestedOwner
 				continue
 			}
 			break
@@ -226,7 +243,9 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 	own := make(map[string][]transcribe.Segment, len(sources))
 	for i := range remaining {
 		if source := remaining[i].UntimedSourceID; source != "" {
-			own[source] = append(own[source], remaining[i])
+			for current := source; current != "" && current != sessionID; current = parents[current] {
+				own[current] = append(own[current], remaining[i])
+			}
 			continue
 		}
 		for _, source := range recordingChain(remaining[i].RecordingPath) {
