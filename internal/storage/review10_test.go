@@ -80,7 +80,7 @@ func TestReview10ACompareAndClearKeepsALaterDeletionOwed(t *testing.T) {
 			if err := original(db, p); err != nil {
 				return err
 			}
-			go func() { dCommitted <- store.DeleteSegment("backed-up", secretSegments[1].ID, span) }()
+			go func() { dCommitted <- deleteRefinedAudioTestSegment(t, store, "backed-up", secretSegments[1].ID, span) }()
 			waitOwed(t, store)
 			return nil
 		case 3: // D's own refresh in step 5: a full disk
@@ -92,7 +92,7 @@ func TestReview10ACompareAndClearKeepsALaterDeletionOwed(t *testing.T) {
 
 	store.eraseMu.Lock()
 	aDone := make(chan error, 1)
-	go func() { aDone <- store.DeleteSegment("other", other[1].ID, span) }()
+	go func() { aDone <- deleteRefinedAudioTestSegment(t, store, "other", other[1].ID, span) }()
 	select {
 	case err := <-aDone:
 		store.eraseMu.Unlock()

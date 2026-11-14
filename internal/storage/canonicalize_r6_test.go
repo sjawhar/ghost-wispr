@@ -8,8 +8,9 @@ import (
 func TestR6CanonicalizePairsItsTranscriptWithItsGeneration(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "s")
-	segs, _ := store.GetSegments("s")
-	if err := store.DeleteSegment("s", segs[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	revision, segs := publishRefinedSegmentTestSession(t, store, "s", "recording.mp3", "b")
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}
+	if err := store.DeleteRefinedSegmentAudio("s", segs[1].ID, revision, &span); err != nil {
 		t.Fatal(err)
 	}
 	transcript, generation, err := store.Canonicalize("s")

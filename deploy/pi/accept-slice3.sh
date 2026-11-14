@@ -733,33 +733,43 @@ check_session_settled() {
   esac
 }
 
-# segment_ids_matching DETAIL PATTERN: the ids of the segments whose text holds PATTERN.
+# segment_ids_matching DETAIL PATTERN: the ids of timed, batch-derived
+# segments whose text holds PATTERN. Live segments must never reach deletion.
 segment_ids_matching() {
   local id text
   while IFS=$'\t' read -r id text; do
     if [[ "$id" =~ ^[0-9]+$ ]] && matches "$text" "$2"; then
       printf '%s\n' "$id"
     fi
-  done < <(jq -r '.segments[]? | [(.id | tostring), (.text // "")] | @tsv' <<<"$1" 2>/dev/null)
+  done < <(jq -r '.segments[]? | select((.transcript_revision // 0) > 0) | [(.id | tostring), (.text // "")] | @tsv' <<<"$1" 2>/dev/null)
 }
 
-# choose_segments DETAIL: find the one segment that holds each phrase. Each phrase's words must be
-# in that segment alone, and the control phrase in another, or the checks after a delete could
-# not pass for the right reason.
+segment_revision() {
+  jq -r --argjson id "$2" '[.segments[]? | select(.id == $id) | .transcript_revision] | if length == 1 then .[0] else empty end' <<<"$1" 2>/dev/null
+}
+
+# choose_segments waits for completed refinement and then selects the unique
+# timed segments and revisions that carry each acceptance phrase.
 choose_segments() {
   local detail=$1 text_only_ids audio_ids control_ids
   text_only_ids=$(segment_ids_matching "$detail" "$text_only_pair")
   audio_ids=$(segment_ids_matching "$detail" "$audio_pair")
   if [[ $(line_count "$text_only_ids") != 1 ]]; then
-    reason="\"$text_only_phrase\" is in $(line_count "$text_only_ids") segments, not one"
+    reason="\"$text_only_phrase\" is in $(line_count "$text_only_ids") refined timed segments, not one"
     return 2
   fi
   if [[ $(line_count "$audio_ids") != 1 ]]; then
-    reason="\"$audio_phrase\" is in $(line_count "$audio_ids") segments, not one"
+    reason="\"$audio_phrase\" is in $(line_count "$audio_ids") refined timed segments, not one"
     return 2
   fi
   if [[ "$text_only_ids" == "$audio_ids" ]]; then
     reason="both phrases are in segment $audio_ids"
+    return 2
+  fi
+  text_only_revision=$(segment_revision "$detail" "$text_only_ids")
+  audio_revision=$(segment_revision "$detail" "$audio_ids")
+  if [[ ! "$text_only_revision" =~ ^[1-9][0-9]*$ ]] || [[ ! "$audio_revision" =~ ^[1-9][0-9]*$ ]]; then
+    reason='the selected segment has no positive transcript revision'
     return 2
   fi
   if [[ "$(segment_ids_matching "$detail" "$text_only_trace")" != "$text_only_ids" ]]; then
@@ -772,12 +782,40 @@ choose_segments() {
   fi
   control_ids=$(segment_ids_matching "$detail" "$control_pair" | grep -Fvx -e "$text_only_ids" -e "$audio_ids")
   if [[ -z "$control_ids" ]]; then
-    reason="no other segment holds the control phrase \"$control_phrase\""
+    reason="no other refined timed segment holds the control phrase \"$control_phrase\""
     return 2
   fi
   text_only_segment_id=$text_only_ids
   audio_segment_id=$audio_ids
-  reason="segment $text_only_segment_id holds \"$text_only_phrase\", segment $audio_segment_id holds \"$audio_phrase\", and segment $(one_line "$control_ids") holds \"$control_phrase\""
+  reason="segment $text_only_segment_id revision $text_only_revision holds \"$text_only_phrase\", segment $audio_segment_id revision $audio_revision holds \"$audio_phrase\", and segment $(one_line "$control_ids") holds \"$control_phrase\""
+  return 0
+}
+
+# choose_audio_segment re-reads the replacement table after Delete text rebuilt
+# every id and retry refinement advanced the transcript revision.
+choose_audio_segment() {
+  local detail=$1 audio_ids control_ids
+  audio_ids=$(segment_ids_matching "$detail" "$audio_pair")
+  if [[ $(line_count "$audio_ids") != 1 ]]; then
+    reason="\"$audio_phrase\" is in $(line_count "$audio_ids") refined timed segments, not one"
+    return 2
+  fi
+  if [[ "$(segment_ids_matching "$detail" "$audio_trace")" != "$audio_ids" ]]; then
+    reason="a word of \"$audio_phrase\" is in another segment too"
+    return 2
+  fi
+  audio_revision=$(segment_revision "$detail" "$audio_ids")
+  if [[ ! "$audio_revision" =~ ^[1-9][0-9]*$ ]]; then
+    reason='the audio segment has no positive transcript revision'
+    return 2
+  fi
+  control_ids=$(segment_ids_matching "$detail" "$control_pair" | grep -Fvx -e "$audio_ids")
+  if [[ -z "$control_ids" ]]; then
+    reason="no other refined timed segment holds the control phrase \"$control_phrase\""
+    return 2
+  fi
+  audio_segment_id=$audio_ids
+  reason="segment $audio_segment_id revision $audio_revision holds \"$audio_phrase\""
   return 0
 }
 
@@ -1363,9 +1401,19 @@ poll_after() {
   return "$result"
 }
 
-# retry_refinement: the UI's "retry refinement", then wait until it ran and completed.
+# retry_refinement: the UI's "retry refinement", then poll until a newer
+# refinement revision completes.
 retry_refinement() {
-  local response detail state saw_running=false attempt
+  local response detail state revision before_revision attempt
+  if ! detail=$(session_detail "$acceptance_session_id"); then
+    printf 'A11 text only FAILED: could not read the refinement before retrying\n' >&2
+    return 1
+  fi
+  before_revision=$(session_field "$detail" refined_revision)
+  if ! [[ "$before_revision" =~ ^[0-9]+$ ]]; then
+    printf 'A11 text only FAILED: the refinement before retrying has no revision\n' >&2
+    return 1
+  fi
   response=$(post_json "/api/sessions/$acceptance_session_id/retry-refinement" '{}') || {
     printf 'A11 text only FAILED: retry refinement was refused\n' >&2
     return 1
@@ -1377,11 +1425,11 @@ retry_refinement() {
   for (( attempt = 1; attempt <= refinement_attempts; attempt++ )); do
     if detail=$(session_detail "$acceptance_session_id"); then
       state=$(session_field "$detail" refinement_status)
+      revision=$(session_field "$detail" refined_revision)
       case "$state" in
-        running) saw_running=true ;;
         completed)
-          if [[ "$saw_running" == true ]]; then
-            printf 'A11 text only RAN: retry refinement ran and completed.\n'
+          if [[ "$revision" =~ ^[0-9]+$ ]] && (( 10#$revision > 10#$before_revision )); then
+            printf 'A11 text only RAN: retry refinement completed at revision %s.\n' "$revision"
             return 0
           fi
           ;;
@@ -1393,11 +1441,7 @@ retry_refinement() {
     fi
     sleep 2
   done
-  if [[ "$saw_running" != true ]]; then
-    printf 'A11 text only UNKNOWN: retry refinement never read as running, so the driver cannot tell that it ran\n'
-    return 2
-  fi
-  printf 'A11 text only FAILED: retry refinement did not complete in %d minutes\n' "$((refinement_attempts * 2 / 60))" >&2
+  printf 'A11 text only FAILED: retry refinement did not complete a newer revision in %d minutes\n' "$((refinement_attempts * 2 / 60))" >&2
   return 1
 }
 
@@ -1414,9 +1458,9 @@ run_a11_text_only() {
     printf 'A11 text only UNKNOWN: a check could not see "%s" before the delete, so its absence after the delete would prove nothing. Nothing was deleted.\n' "$text_only_phrase"
     return 2
   fi
-  printf 'A11 text only RAN: choose "Delete text" on segment %s: DELETE /api/sessions/%s/segments/%s?mode=text\n' \
-    "$text_only_segment_id" "$acceptance_session_id" "$text_only_segment_id"
-  code=$(delete_segment "$acceptance_session_id" "$text_only_segment_id" 'mode=text' "$body_file")
+  printf 'A11 text only RAN: choose "Delete text" on segment %s revision %s: DELETE /api/sessions/%s/segments/%s?mode=text&revision=%s\n' \
+    "$text_only_segment_id" "$text_only_revision" "$acceptance_session_id" "$text_only_segment_id" "$text_only_revision"
+  code=$(delete_segment "$acceptance_session_id" "$text_only_segment_id" "mode=text&revision=$text_only_revision" "$body_file")
   if [[ "$code" != 204 ]]; then
     printf 'A11 text only FAILED: "Delete text" answered %s: %s\n' "${code:-nothing}" "$(result "$scratch_dir" delete-text.json)" >&2
     return 1
@@ -1433,9 +1477,17 @@ run_a11_text_only() {
 }
 
 run_a11() {
-  local body_file="$scratch_dir/delete-text-and-audio.json" code
+  local body_file="$scratch_dir/delete-text-and-audio.json" code detail
   if [[ "$conversation_ready" != true ]]; then
     printf 'A11 UNKNOWN: not run: %s\n' "$conversation_problem"
+    return 2
+  fi
+  detail=$(session_detail "$acceptance_session_id") || {
+    printf 'A11 UNKNOWN: cannot read refined segments before audio delete\n'
+    return 2
+  }
+  if ! choose_audio_segment "$detail"; then
+    printf 'A11 UNKNOWN: %s\n' "$reason"
     return 2
   fi
   printf 'A11 RAN: before "Delete text and audio", every check must find "%s"; that finding is the control for the same check after the delete.\n' "$audio_phrase"
@@ -1445,9 +1497,9 @@ run_a11() {
     printf 'A11 UNKNOWN: a check could not see "%s" before the delete, so its absence after the delete would prove nothing. Nothing was deleted.\n' "$audio_phrase"
     return 2
   fi
-  printf 'A11 RAN: choose "Delete text and audio" on segment %s: DELETE /api/sessions/%s/segments/%s?mode=text_and_audio\n' \
-    "$audio_segment_id" "$acceptance_session_id" "$audio_segment_id"
-  code=$(delete_segment "$acceptance_session_id" "$audio_segment_id" 'mode=text_and_audio' "$body_file")
+  printf 'A11 RAN: choose "Delete text and audio" on segment %s revision %s: DELETE /api/sessions/%s/segments/%s?mode=text_and_audio&revision=%s\n' \
+    "$audio_segment_id" "$audio_revision" "$acceptance_session_id" "$audio_segment_id" "$audio_revision"
+  code=$(delete_segment "$acceptance_session_id" "$audio_segment_id" "mode=text_and_audio&revision=$audio_revision" "$body_file")
   if [[ "$code" != 204 ]]; then
     printf 'A11 FAILED: "Delete text and audio" answered %s: %s\n' "${code:-nothing}" "$(result "$scratch_dir" delete-text-and-audio.json)" >&2
     return 1
@@ -1915,10 +1967,12 @@ run_self_test() (
     {id: 2, text: "B: Purple elephant 17."},
     {id: 3, text: "A: Which machine do we order to clear the yard?"},
     {id: 4, text: "B: Orange tractor ninety."},
-    {id: 5, text: $control}]}')
+    {id: 5, text: $control}]}' | jq '.segments |= map(. + {transcript_revision: 1})')
   expect 0 'one segment per phrase and the control phrase elsewhere is chosen' choose_segments "$detail"
-  [[ "$text_only_segment_id" == 4 && "$audio_segment_id" == 2 ]] \
-    || fail "self-test: chose segments $text_only_segment_id and $audio_segment_id, want 4 and 2"
+  [[ "$text_only_segment_id" == 4 && "$audio_segment_id" == 2 && "$text_only_revision" == 1 && "$audio_revision" == 1 ]] \
+    || fail "self-test: chose segments $text_only_segment_id/$text_only_revision and $audio_segment_id/$audio_revision, want 4/1 and 2/1"
+  expect 2 'a live segment without a transcript revision stops the run' choose_segments \
+    "$(jq '.segments[1].transcript_revision = 0' <<<"$detail")"
   expect 2 'a phrase word in a second segment stops the run' choose_segments \
     "$(jq '.segments[2].text = "A: Which orange machine do we order?"' <<<"$detail")"
   expect 2 'a phrase in two segments stops the run' choose_segments \
@@ -2203,7 +2257,9 @@ $(session_field "$detail" summary)"
     : >"$marker"
     conversation_ready=true
     text_only_segment_id=4
+    text_only_revision=1
     audio_segment_id=2
+    audio_revision=1
     delete_segment() { printf '%s\n' "$3" >>"$marker"; printf 204; }
     retry_refinement() { :; }
     sleep() { :; }
@@ -2222,19 +2278,93 @@ $(session_field "$detail" summary)"
     : >"$marker"
     conversation_ready=true
     text_only_segment_id=4
+    text_only_revision=1
     delete_segment() { printf '%s %s\n' "$2" "$3" >>"$marker"; printf 204; }
     text_only_round() { round_reset; round_lines=('PASS: planted'); }
     retry_refinement() { printf 'retry\n' >>"$marker"; }
     sleep() { :; }
     run_a11_text_only >/dev/null 2>&1 || fail 'self-test: A11 text only did not pass on planted passing rounds'
-    [[ "$(<"$marker")" == $'4 mode=text\nretry' ]] || fail "self-test: A11 text only sent $(one_line "$(<"$marker")")"
+    [[ "$(<"$marker")" == $'4 mode=text&revision=1\nretry' ]] || fail "self-test: A11 text only sent $(one_line "$(<"$marker")")"
   ) || exit 1
-  printf 'A11 text only self-test RAN: "Delete text" sends mode=text on its segment, then retries refinement\n'
+  printf 'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement\n'
+
+  (
+    unit_url=https://unit.test
+    marker="$controls_dir/fast-refinement"
+    : >"$marker"
+    retry_http_status=202
+    curl() {
+      [[ "$retry_http_status" == 202 ]] || return 1
+      [[ " $* " == *" --fail "* ]] || return 1
+      printf '{"triggered":true}'
+    }
+    session_detail() {
+      printf 'read\n' >>"$marker"
+      if [[ "$(wc -l <"$marker")" == 1 ]]; then
+        printf '{"session":{"refinement_status":"completed","refined_revision":1}}'
+      else
+        printf '{"session":{"refinement_status":"completed","refined_revision":2}}'
+      fi
+    }
+    retry_refinement >/dev/null || fail 'self-test: a fast refinement did not accept the planted 202'
+    [[ "$(wc -l <"$marker")" == 2 ]] || fail 'self-test: a fast refinement did not read the newer revision'
+  ) || exit 1
+  printf 'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes\n'
+  (
+    unit_url=https://unit.test
+    marker="$controls_dir/slow-refinement"
+    : >"$marker"
+    retry_http_status=202
+    curl() {
+      [[ "$retry_http_status" == 202 ]] || return 1
+      [[ " $* " == *" --fail "* ]] || return 1
+      printf '{"triggered":true}'
+    }
+    session_detail() {
+      printf 'read\n' >>"$marker"
+      case "$(wc -l <"$marker")" in
+        1) printf '{"session":{"refinement_status":"completed","refined_revision":1}}' ;;
+        2) printf '{"session":{"refinement_status":"running","refined_revision":1}}' ;;
+        *) printf '{"session":{"refinement_status":"completed","refined_revision":2}}' ;;
+      esac
+    }
+    sleep() { :; }
+    retry_refinement >/dev/null || fail 'self-test: a slow refinement did not complete after the planted running state'
+    [[ "$(wc -l <"$marker")" == 3 ]] || fail 'self-test: a slow refinement did not wait for completion'
+  ) || exit 1
+  printf 'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes\n'
+  (
+    unit_url=https://unit.test
+    marker="$controls_dir/stale-refinement"
+    : >"$marker"
+    retry_http_status=202
+    curl() {
+      [[ "$retry_http_status" == 202 ]] || return 1
+      [[ " $* " == *" --fail "* ]] || return 1
+      printf '{"triggered":true}'
+    }
+    session_detail() {
+      printf 'read\n' >>"$marker"
+      case "$(wc -l <"$marker")" in
+        1|2) printf '{"session":{"refinement_status":"completed","refined_revision":1}}' ;;
+        *) printf '{"session":{"refinement_status":"failed","refined_revision":1}}' ;;
+      esac
+    }
+    sleep() { :; }
+    if retry_refinement >/dev/null 2>&1; then
+      fail 'self-test: a stale completed revision passed as the retry'
+    fi
+    [[ "$(wc -l <"$marker")" == 3 ]] || fail 'self-test: a stale completed revision was not polled again'
+  ) || exit 1
+  printf 'A11 text only self-test RAN: retry refinement waits for a newer revision\n'
   (
     : >"$marker"
     conversation_ready=true
     audio_segment_id=2
+    audio_revision=1
     delete_segment() { printf '%s\n' "$3" >>"$marker"; printf 204; }
+    choose_audio_segment() { :; }
+    session_detail() { printf '{}'; }
     sleep() { :; }
     audio_round() {
       round_reset
@@ -2251,12 +2381,15 @@ $(session_field "$detail" summary)"
     : >"$marker"
     conversation_ready=true
     audio_segment_id=2
+    audio_revision=1
     delete_segment() { printf '%s %s\n' "$2" "$3" >>"$marker"; printf 204; }
+    choose_audio_segment() { :; }
+    session_detail() { printf '{}'; }
     audio_round() { round_reset; round_lines=('PASS: planted'); }
     run_a11 >/dev/null 2>&1 || fail 'self-test: A11 did not pass on planted passing rounds'
-    [[ "$(<"$marker")" == '2 mode=text_and_audio' ]] || fail "self-test: A11 sent $(one_line "$(<"$marker")")"
+    [[ "$(<"$marker")" == '2 mode=text_and_audio&revision=1' ]] || fail "self-test: A11 sent $(one_line "$(<"$marker")")"
   ) || exit 1
-  printf 'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio on its segment\n'
+  printf 'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio and its revision on its segment\n'
 )
 
 while [[ $# -gt 0 ]]; do
@@ -2302,7 +2435,9 @@ acceptance_session_id=
 conversation_ready=false
 conversation_problem='the setup did not finish'
 text_only_segment_id=
+text_only_revision=
 audio_segment_id=
+audio_revision=
 text_only_ids_before=
 text_only_hashes_before=
 text_only_audio_path_before=

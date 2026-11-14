@@ -482,7 +482,7 @@ func OpenAPISpec() map[string]any {
 							"description": "Merged session",
 						},
 						"409": map[string]any{
-							"description": "A session to merge still has a deleted segment on Google Drive; merge it after its Drive files are replaced",
+							"description": "A session to merge is still recording, was already merged or discarded, or still has a deleted segment on Google Drive, or the merged session's id is already taken; the message names the session and the reason",
 						},
 					},
 				},
@@ -574,14 +574,19 @@ func OpenAPISpec() map[string]any {
 							"required":    true,
 							"schema":      map[string]any{"type": "string", "enum": []string{"text", "text_and_audio"}},
 						},
+						{
+							"name":        "revision",
+							"in":          "query",
+							"description": "The transcript revision carried by the selected segment. Timed segments use a positive revision; an untimed segment from a source with no recording uses 0 with mode=text only. A changed revision returns 409; refresh and try again.",
+							"required":    true,
+							"schema":      map[string]any{"type": "integer", "minimum": 0},
+						},
 					},
 					"responses": map[string]any{
 						"204": map[string]any{"description": "Segment deleted"},
-						"400": map[string]any{"description": "No mode, or one that is neither text nor text_and_audio"},
+						"400": map[string]any{"description": "Missing or invalid mode or transcript revision"},
 						"404": map[string]any{"description": "Session or segment not found"},
-						"409": map[string]any{"description": "Session is still recording or an earlier segment deletion is recovering"},
-						"422": map[string]any{"description": "Segment could not be found or removed cleanly"},
-						"503": map[string]any{"description": "Segment deletion is not configured, or batch transcription, which it needs, is not configured"},
+						"409": map[string]any{"description": "Session is still recording or refining, an earlier deletion is recovering, the transcript changed (refresh and try again), or part of this conversation's merge history can't be traced, so nothing in it can be deleted safely"},
 					},
 				},
 			},
@@ -726,11 +731,11 @@ func OpenAPISpec() map[string]any {
 						},
 					},
 					"responses": map[string]any{
-						"200": map[string]any{
-							"description": "Retry triggered",
+						"202": map[string]any{
+							"description": "Retry started in the background",
 						},
 						"409": map[string]any{
-							"description": "The session has no saved recording to refine (refinement_status no_audio)",
+							"description": "No local recording or Drive copy can be restored for this session",
 						},
 					},
 				},

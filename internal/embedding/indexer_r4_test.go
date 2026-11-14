@@ -29,7 +29,7 @@ func (g *gateClient) Embed(_ context.Context, texts []string, _ TaskType) ([][]f
 	return out, nil
 }
 
-func r4Store(t *testing.T) (*storage.SQLiteStore, int64) {
+func r4Store(t *testing.T) (*storage.SQLiteStore, int64, int) {
 	t.Helper()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "r4.db"))
 	if err != nil {
@@ -38,19 +38,30 @@ func r4Store(t *testing.T) (*storage.SQLiteStore, int64) {
 	t.Cleanup(func() { _ = store.Close() })
 	started := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
 	_ = store.CreateSession("s", started)
-	for i, text := range []string{"before bridge", "private deletion token", "after bridge"} {
+	texts := []string{"before bridge", "private deletion token", "after bridge"}
+	for i, text := range texts {
 		_ = store.AppendSegment("s", transcribe.Segment{Text: text, StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started.Add(time.Duration(i) * time.Second)})
 	}
 	_ = store.EndSession("s", started.Add(3*time.Second), "recording.mp3")
-	if _, _, err := store.Canonicalize("s"); err != nil {
+	words := make([]storage.RefinedWord, 0, len(texts))
+	refined := make([]storage.RefinedSegment, 0, len(texts))
+	for i, text := range texts {
+		words = append(words, storage.RefinedWord{RecordingPath: "recording.mp3", RecordingSHA256: "b", Ordinal: i, Text: text, Start: float64(i), End: float64(i + 1)})
+		refined = append(refined, storage.RefinedSegment{RecordingPath: "recording.mp3", RecordingSHA256: "b", FirstWordOrdinal: i, LastWordOrdinal: i, Text: text, Start: float64(i), End: float64(i + 1)})
+	}
+	revision, err := store.PublishRefinementAtGeneration("s", storage.RefinedTranscript(words), "test", words, refined, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	segs, _ := store.GetSegments("s")
-	return store, segs[1].ID
+	segments, err := store.GetSegments("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, segments[1].ID, revision
 }
 
 func TestR4RealIndexerRefusesWriteAfterDelete(t *testing.T) {
-	store, id := r4Store(t)
+	store, id, revision := r4Store(t)
 	transcript, _, generation, err := store.GetCanonicalTranscriptWithGeneration("s")
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +74,8 @@ func TestR4RealIndexerRefusesWriteAfterDelete(t *testing.T) {
 		errc <- idx.IndexSessionAtGeneration(context.Background(), "s", "before bridge private deletion token after bridge "+transcript, generation)
 	}()
 	<-entered
-	if err := store.DeleteSegment("s", id, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	span := storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
+	if err := store.DeleteRefinedSegmentAudio("s", id, revision, &span); err != nil {
 		t.Fatal(err)
 	}
 	close(client.release)
@@ -76,7 +88,7 @@ func TestR4RealIndexerRefusesWriteAfterDelete(t *testing.T) {
 }
 
 func TestR4RealIndexerPrunesTrailingChunks(t *testing.T) {
-	store, _ := r4Store(t)
+	store, _, _ := r4Store(t)
 	_, _, generation, _ := store.GetCanonicalTranscriptWithGeneration("s")
 	idx := NewIndexer(&gateClient{}, store, 5)
 	long := strings.Repeat("alpha beta gamma delta epsilon ", 6)
@@ -95,13 +107,14 @@ func TestR4RealIndexerPrunesTrailingChunks(t *testing.T) {
 }
 
 func TestR4BackfillRefusesWriteAfterDelete(t *testing.T) {
-	store, id := r4Store(t)
+	store, id, revision := r4Store(t)
 	client := &gateClient{entered: make(chan struct{}), release: make(chan struct{})}
 	indexer := NewIndexer(client, store, 500)
 	errc := make(chan error, 1)
 	go func() { errc <- indexer.BackfillMissing(context.Background()) }()
 	<-client.entered
-	if err := store.DeleteSegment("s", id, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	span := storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
+	if err := store.DeleteRefinedSegmentAudio("s", id, revision, &span); err != nil {
 		t.Fatal(err)
 	}
 	close(client.release)

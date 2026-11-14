@@ -24,8 +24,8 @@ func segmentTestSession(t *testing.T, store *SQLiteStore, id string) (time.Time,
 		{Speaker: 1, Text: "private deletion token", StartTime: 2, EndTime: 4, Timestamp: started.Add(2 * time.Second)},
 		{Speaker: 0, Text: "after bridge", StartTime: 4, EndTime: 6, Timestamp: started.Add(4 * time.Second)},
 	}
-	for _, segment := range segments {
-		if err := store.AppendSegment(id, segment); err != nil {
+	for i := range segments {
+		if err := store.AppendSegment(id, segments[i]); err != nil {
 			t.Fatalf("append segment: %v", err)
 		}
 	}
@@ -33,6 +33,88 @@ func segmentTestSession(t *testing.T, store *SQLiteStore, id string) (time.Time,
 		t.Fatalf("end session: %v", err)
 	}
 	return started, segments
+}
+
+// publishRefinedSegmentTestSession replaces a test session's live segments
+// with provenance-carrying refined segments through the production publisher.
+func publishRefinedSegmentTestSession(t *testing.T, store *SQLiteStore, id, recordingPath, recordingHash string) (int, []transcribe.Segment) {
+	t.Helper()
+	live, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatalf("get live segments: %v", err)
+	}
+	words := make([]RefinedWord, 0, len(live))
+	refined := make([]RefinedSegment, 0, len(live))
+	for i := range live {
+		segment := &live[i]
+		words = append(words, RefinedWord{
+			RecordingPath: recordingPath, RecordingSHA256: recordingHash, Ordinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+		refined = append(refined, RefinedSegment{
+			RecordingPath: recordingPath, RecordingSHA256: recordingHash, FirstWordOrdinal: i, LastWordOrdinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+	}
+	generation, err := store.DeletionGeneration(id)
+	if err != nil {
+		t.Fatalf("read deletion generation: %v", err)
+	}
+	revision, err := store.PublishRefinementAtGeneration(id, RefinedTranscript(words), "test", words, refined, generation)
+	if err != nil {
+		t.Fatalf("publish refinement: %v", err)
+	}
+	segments, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatalf("get refined segments: %v", err)
+	}
+	return revision, segments
+}
+
+// deleteRefinedAudioTestSegment publishes the session's existing live
+// segments as timed refined occurrences, then removes the selected occurrence.
+//
+//nolint:gocritic // Preserve the test span for assertions after the deletion.
+func deleteRefinedAudioTestSegment(t *testing.T, store *SQLiteStore, id string, liveSegmentID int64, span DeletedSpan) error {
+	t.Helper()
+	live, err := store.GetSegments(id)
+	if err != nil {
+		return err
+	}
+	index := -1
+	for i := range live {
+		if live[i].ID == liveSegmentID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return ErrSegmentNotFound
+	}
+	revision, refined := publishRefinedSegmentTestSession(t, store, id, span.AudioPath, span.SHA256Before)
+	return store.DeleteRefinedSegmentAudio(id, refined[index].ID, revision, &span)
+}
+
+// deleteRefinedTextTestSegment publishes the session's existing live segments
+// as timed refined occurrences, then removes the selected occurrence's text.
+func deleteRefinedTextTestSegment(t *testing.T, store *SQLiteStore, id string, liveSegmentID int64, span TextDeletionSpan) error {
+	t.Helper()
+	live, err := store.GetSegments(id)
+	if err != nil {
+		return err
+	}
+	index := -1
+	for i := range live {
+		if live[i].ID == liveSegmentID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return ErrSegmentNotFound
+	}
+	revision, refined := publishRefinedSegmentTestSession(t, store, id, span.AudioPath, span.SHA256)
+	return store.DeleteRefinedSegmentText(id, refined[index].ID, revision)
 }
 
 func TestStoredSegmentsCarryIDs(t *testing.T) {
@@ -64,14 +146,15 @@ func TestStoredSegmentsCarryIDs(t *testing.T) {
 	}
 }
 
-func TestDeleteSegmentRemovesTextEverywhere(t *testing.T) {
+func TestDeleteRefinedSegmentRemovesTextEverywhere(t *testing.T) {
 	store := newTestSQLiteStore(t)
-	started, _ := segmentTestSession(t, store, "delete-everywhere")
+	_, _ = segmentTestSession(t, store, "delete-everywhere")
+	revision, segments := publishRefinedSegmentTestSession(t, store, "delete-everywhere", "recording.mp3", "before")
 	if err := store.UpdateSummaryAtGeneration("delete-everywhere", "private deletion token title", "summary names private deletion token", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("set summary: %v", err)
 	}
-	if _, err := store.DB().Exec(`UPDATE sessions SET refined_transcript = ?, refinement_status = ?, canonical_transcript = ?, envoy_publish_status = ?, sync_status = ?, sync_state = ? WHERE id = ?`,
-		"before bridge private deletion token after bridge", RefinementCompleted, "before bridge private deletion token after bridge", EnvoyPublishPublished, SyncSynced, SyncStateSynced, "delete-everywhere"); err != nil {
+	if _, err := store.DB().Exec(`UPDATE sessions SET envoy_publish_status = ?, sync_status = ?, sync_state = ? WHERE id = ?`,
+		EnvoyPublishPublished, SyncSynced, SyncStateSynced, "delete-everywhere"); err != nil {
 		t.Fatalf("set completed session state: %v", err)
 	}
 	if _, err := store.DB().Exec(`INSERT INTO embeddings(session_id, chunk_index, embedding, text_hash, model) VALUES(?, 0, X'01', 'hash', 'model')`, "delete-everywhere"); err != nil {
@@ -81,14 +164,10 @@ func TestDeleteSegmentRemovesTextEverywhere(t *testing.T) {
 		t.Fatalf("store event: %v", err)
 	}
 
-	segments, err := store.GetSegments("delete-everywhere")
-	if err != nil {
-		t.Fatalf("get segments before delete: %v", err)
-	}
 	before := storeSession(t, store, "delete-everywhere")
 	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}
-	if err := store.DeleteSegment("delete-everywhere", segments[1].ID, span); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := store.DeleteRefinedSegmentAudio("delete-everywhere", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 
 	remaining, err := store.GetSegments("delete-everywhere")
@@ -99,13 +178,13 @@ func TestDeleteSegmentRemovesTextEverywhere(t *testing.T) {
 		t.Fatalf("remaining segments = %+v, deleted text remains", remaining)
 	}
 	session := storeSession(t, store, "delete-everywhere")
-	if session.Title != "" || session.Summary != "" || session.RefinedTranscript != "" {
+	if session.Title != "" || session.Summary != "" || strings.Contains(session.RefinedTranscript, "private deletion token") {
 		t.Fatalf("session still has deleted derived text: %+v", session)
 	}
-	if session.CanonicalTranscript != "before bridge\nafter bridge\n" || session.TranscriptSource != TranscriptSourceStreaming {
-		t.Fatalf("canonical transcript = %q from %q, want remaining streaming segments", session.CanonicalTranscript, session.TranscriptSource)
+	if session.CanonicalTranscript != "before bridge after bridge" || session.TranscriptSource != TranscriptSourceRefined {
+		t.Fatalf("canonical transcript = %q from %q, want remaining refined words", session.CanonicalTranscript, session.TranscriptSource)
 	}
-	if session.RefinementStatus != RefinementPending || session.SummaryStatus != SummaryPending || session.EnvoyPublishStatus != EnvoyPublishPending {
+	if session.RefinementStatus != RefinementCompleted || session.SummaryStatus != SummaryPending || session.EnvoyPublishStatus != EnvoyPublishPending {
 		t.Fatalf("follow-up states = refinement:%q summary:%q envoy:%q", session.RefinementStatus, session.SummaryStatus, session.EnvoyPublishStatus)
 	}
 	if session.SummaryVersion != before.SummaryVersion+1 {
@@ -145,21 +224,17 @@ func TestDeleteSegmentRemovesTextEverywhere(t *testing.T) {
 	if err := store.DB().QueryRow(`SELECT audio_path, start, end, sha256_before, sha256_after FROM deleted_segments WHERE session_id = ?`, "delete-everywhere").Scan(&deleted.AudioPath, &deleted.Start, &deleted.End, &deleted.SHA256Before, &deleted.SHA256After); err != nil {
 		t.Fatalf("read deleted segment: %v", err)
 	}
-	if deleted != span {
+	if deleted.AudioPath != span.AudioPath || deleted.Start != span.Start || deleted.End != span.End || deleted.SHA256Before != span.SHA256Before || deleted.SHA256After != span.SHA256After {
 		t.Fatalf("deleted span = %+v, want %+v", deleted, span)
 	}
-	_ = started
 }
 
-func TestDeleteSegmentClearsOverlappingLiveEvents(t *testing.T) {
+func TestDeleteRefinedSegmentClearsOverlappingLiveEvents(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "event-clear")
+	revision, segments := publishRefinedSegmentTestSession(t, store, "event-clear", "recording.mp3", "before")
 	if err := store.CreateSession("other-session", time.Now().UTC()); err != nil {
 		t.Fatalf("create other session: %v", err)
-	}
-	segments, err := store.GetSegments("event-clear")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
 	}
 	for _, event := range []struct {
 		eventType string
@@ -177,23 +252,16 @@ func TestDeleteSegmentClearsOverlappingLiveEvents(t *testing.T) {
 		}
 	}
 
-	if err := store.DeleteSegment("event-clear", segments[1].ID, DeletedSpan{
-		AudioPath:    "recording.mp3",
-		Start:        20,
-		End:          22,
-		StreamStart:  2,
-		StreamEnd:    4,
-		SHA256Before: "before",
-		SHA256After:  "after",
-	}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteRefinedSegmentAudio("event-clear", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 	events, err := store.GetEventsSince(0, 10)
 	if err != nil {
 		t.Fatalf("read events: %v", err)
 	}
-	if len(events) != 2 || !strings.Contains(events[0].Payload, "after bridge") || !strings.Contains(events[1].Payload, "other session") {
-		t.Fatalf("remaining events = %+v, want the neighbouring and other-session events only", events)
+	if len(events) != 1 || !strings.Contains(events[0].Payload, "other session") {
+		t.Fatalf("remaining events = %+v, want only the other session's event", events)
 	}
 }
 
@@ -233,19 +301,16 @@ func TestOpeningStoreDiscardsUnattributableLegacyLiveEvents(t *testing.T) {
 func TestPendingSplicesReturnsOnlyRecordingsAtTheirBeforeHash(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "pending-splice")
-	segments, err := store.GetSegments("pending-splice")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
-	}
 	path := filepath.Join(t.TempDir(), "recording.mp3")
 	original := []byte("before splice")
 	if err := os.WriteFile(path, original, 0o600); err != nil {
 		t.Fatalf("write recording: %v", err)
 	}
+	revision, segments := publishRefinedSegmentTestSession(t, store, "pending-splice", path, hashBytes(original))
 	changed := []byte("after splice")
 	span := DeletedSpan{AudioPath: path, Start: 2, End: 4, SHA256Before: hashBytes(original), SHA256After: hashBytes(changed)}
-	if err := store.DeleteSegment("pending-splice", segments[1].ID, span); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := store.DeleteRefinedSegmentAudio("pending-splice", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 
 	pending, err := store.PendingSplices("")
@@ -280,10 +345,6 @@ func TestPendingSplicesReturnsOnlyRecordingsAtTheirBeforeHash(t *testing.T) {
 func TestPendingSplicesChecksTheRecordingWhereReadersResolveIt(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "moved-splice")
-	segments, err := store.GetSegments("moved-splice")
-	if err != nil {
-		t.Fatal(err)
-	}
 	oldPath := filepath.Join(t.TempDir(), "old", "recording.mp3")
 	audioDir := t.TempDir()
 	moved := filepath.Join(audioDir, "recording.mp3")
@@ -291,9 +352,10 @@ func TestPendingSplicesChecksTheRecordingWhereReadersResolveIt(t *testing.T) {
 	if err := os.WriteFile(moved, after, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	revision, segments := publishRefinedSegmentTestSession(t, store, "moved-splice", oldPath, hashBytes(before))
 	span := DeletedSpan{SessionID: "moved-splice", AudioPath: oldPath, Start: 2, End: 4, SHA256Before: hashBytes(before), SHA256After: hashBytes(after)}
-	if err := store.DeleteSegment("moved-splice", segments[1].ID, span); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := store.DeleteRefinedSegmentAudio("moved-splice", segments[1].ID, revision, &span); err != nil {
+		t.Fatal(err)
 	}
 	pending, err := store.PendingSplices(audioDir)
 	if err != nil {
@@ -304,18 +366,16 @@ func TestPendingSplicesChecksTheRecordingWhereReadersResolveIt(t *testing.T) {
 	}
 }
 
-func TestDeleteSegmentClearsPriorDriveReplacementCycle(t *testing.T) {
+func TestDeleteRefinedSegmentClearsPriorDriveReplacementCycle(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "replacement-cycle")
 	if _, err := store.DB().Exec(`INSERT INTO drive_replacements(session_id, generation, name, old_id, new_id, state) VALUES('replacement-cycle', 0, 'transcript.md', 'old', 'new', 'deleted')`); err != nil {
 		t.Fatalf("seed replacement: %v", err)
 	}
-	segments, err := store.GetSegments("replacement-cycle")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
-	}
-	if err := store.DeleteSegment("replacement-cycle", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	revision, segments := publishRefinedSegmentTestSession(t, store, "replacement-cycle", "recording.mp3", "before")
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteRefinedSegmentAudio("replacement-cycle", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 	var count int
 	if err := store.DB().QueryRow(`SELECT count(*) FROM drive_replacements WHERE session_id = 'replacement-cycle'`).Scan(&count); err != nil {
@@ -348,15 +408,13 @@ func TestRecordingsStayRemovableWithoutPendingSplice(t *testing.T) {
 	}
 }
 
-func TestRecordingsSkipPendingSegmentSplice(t *testing.T) {
+func TestRecordingsSkipPendingRefinedSegmentSplice(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "pending-gc")
-	segments, err := store.GetSegments("pending-gc")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
-	}
-	if err := store.DeleteSegment("pending-gc", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	revision, segments := publishRefinedSegmentTestSession(t, store, "pending-gc", "recording.mp3", "before")
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteRefinedSegmentAudio("pending-gc", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 	syncedWithoutOwedReplacement(t, store, "pending-gc")
 	recordings, err := store.Recordings()
@@ -368,27 +426,25 @@ func TestRecordingsSkipPendingSegmentSplice(t *testing.T) {
 	}
 }
 
-func TestDeleteSegmentRestoresTheFullAudioPath(t *testing.T) {
+func TestDeleteRefinedSegmentRestoresTheFullAudioPath(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "restored-audio")
-	segments, err := store.GetSegments("restored-audio")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
-	}
 	const first = "/audio/20261111120000.mp3"
 	const second = "/audio/20261111130000.mp3"
 	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ?, audio_removed_at = ? WHERE id = ?`, first, time.Now().UTC().Format(time.RFC3339Nano), "restored-audio"); err != nil {
 		t.Fatalf("mark audio removed: %v", err)
 	}
-	if err := store.DeleteSegment("restored-audio", segments[1].ID, DeletedSpan{
+	revision, segments := publishRefinedSegmentTestSession(t, store, "restored-audio", second, "before")
+	span := DeletedSpan{
 		AudioPath:        second,
 		SessionAudioPath: first + "," + second,
 		Start:            2,
 		End:              4,
 		SHA256Before:     "before",
 		SHA256After:      "after",
-	}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	}
+	if err := store.DeleteRefinedSegmentAudio("restored-audio", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 	session := storeSession(t, store, "restored-audio")
 	if session.AudioPath != first+","+second || session.AudioRemovedAt != "" {
@@ -396,27 +452,19 @@ func TestDeleteSegmentRestoresTheFullAudioPath(t *testing.T) {
 	}
 }
 
-func TestDeleteSegmentRejectsStaleRefinementAndSummaryWrites(t *testing.T) {
+func TestDeleteRefinedSegmentRejectsStaleRefinementAndSummaryWrites(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "generation-fence")
-	segments, err := store.GetSegments("generation-fence")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
-	}
-	claimedAt, claimed, err := store.ClaimRefinement("generation-fence", "recording.mp3")
-	if err != nil || !claimed {
-		t.Fatalf("claim refinement = %v, %v", claimed, err)
-	}
-	// A summary writer reads the text, and with it the generation, before
-	// the deletion.
+	revision, segments := publishRefinedSegmentTestSession(t, store, "generation-fence", "recording.mp3", "before")
 	_, summaryReadAt, err := store.Canonicalize("generation-fence")
 	if err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
-	if err := store.DeleteSegment("generation-fence", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteRefinedSegmentAudio("generation-fence", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
-	if err := store.UpdateRefinementAtGeneration("generation-fence", "stale private deletion token", RefinementCompleted, "", claimedAt); err == nil {
+	if err := store.UpdateRefinementAtGeneration("generation-fence", "stale private deletion token", RefinementCompleted, "", 0); err == nil {
 		t.Fatal("stale refinement write succeeded after deletion")
 	}
 	if err := store.UpdateSummaryAtGeneration("generation-fence", "stale private deletion token", "stale private deletion token", SummaryCompleted, "default", "{}", "", summaryReadAt); err == nil {
@@ -427,23 +475,21 @@ func TestDeleteSegmentRejectsStaleRefinementAndSummaryWrites(t *testing.T) {
 		t.Fatalf("stale words returned to session: %+v", session)
 	}
 }
-func TestDeleteSegmentSecurelyErasesDeletedText(t *testing.T) {
+func TestDeleteRefinedSegmentSecurelyErasesDeletedText(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "delete.db")
 	store, err := NewSQLiteStore(path)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	_, _ = segmentTestSession(t, store, "secure-delete")
-	segments, err := store.GetSegments("secure-delete")
-	if err != nil {
-		t.Fatalf("get segments: %v", err)
-	}
+	_, live := segmentTestSession(t, store, "secure-delete")
 	const unique = "unrecoverable-deletion-phrase-93d3ef"
-	if _, err := store.DB().Exec(`UPDATE segments SET text = ? WHERE id = ?`, unique, segments[1].ID); err != nil {
+	if _, err := store.DB().Exec(`UPDATE segments SET text = ? WHERE id = ?`, unique, live[1].ID); err != nil {
 		t.Fatalf("plant unique text: %v", err)
 	}
-	if err := store.DeleteSegment("secure-delete", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	revision, segments := publishRefinedSegmentTestSession(t, store, "secure-delete", "recording.mp3", "before")
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteRefinedSegmentAudio("secure-delete", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 	assertDatabaseFilesLack(t, path, unique, "after bridge")
 	if err := store.Close(); err != nil {
@@ -477,17 +523,15 @@ func TestEveryConnectionErasesDeletedText(t *testing.T) {
 	if secureDelete != 1 || foreignKeys != 1 || tempStore != 2 {
 		t.Errorf("a reopened connection has secure_delete=%d foreign_keys=%d temp_store=%d, want 1, 1 and 2 (memory: no temporary file frees blocks holding text)", secureDelete, foreignKeys, tempStore)
 	}
-	_, _ = segmentTestSession(t, store, "reconnect")
-	segments, err := store.GetSegments("reconnect")
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, live := segmentTestSession(t, store, "reconnect")
 	const unique = "reconnected-deletion-phrase-5be1a0"
-	if _, err := store.DB().Exec(`UPDATE segments SET text = ? WHERE id = ?`, unique, segments[1].ID); err != nil {
+	if _, err := store.DB().Exec(`UPDATE segments SET text = ? WHERE id = ?`, unique, live[1].ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("reconnect", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	revision, segments := publishRefinedSegmentTestSession(t, store, "reconnect", "recording.mp3", "before")
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}
+	if err := store.DeleteRefinedSegmentAudio("reconnect", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 	store.DB().SetMaxIdleConns(1)
 	if _, err := store.DB().Exec(`SELECT 1`); err != nil {

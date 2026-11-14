@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -59,11 +61,299 @@ var vertexCredentialCache sync.Map
 //go:embed static/*
 var staticFiles embed.FS
 
+func retryRefinementAfterRestoringRecording(ctx context.Context, sessionID string, restore func(context.Context, string) error, refine func(context.Context, string) error) error {
+	if err := restore(ctx, sessionID); err != nil {
+		return err
+	}
+	return refine(ctx, sessionID)
+}
+
+type refinementAudioRestoreStore interface {
+	RestoreAudioForRefinement(id, beforeAudioPath, restoredAudioPath string) (bool, error)
+	DriveRestoreAllowed(sessionID string) (bool, error)
+	RefinementRecordingPaths(sessionID string) ([]string, error)
+}
+
+func hasLocalRefinementRecording(session *storage.Session, audioDir string) (bool, error) {
+	if session.AudioRemovedAt != "" {
+		return false, nil
+	}
+	entries := 0
+	for _, entry := range strings.Split(session.AudioPath, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		entries++
+		path := recording.Resolve(entry, audioDir)
+		info, err := os.Stat(path)
+		switch {
+		case err == nil && !info.IsDir():
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			return false, fmt.Errorf("check recording %s: %w", path, err)
+		default:
+			return false, nil
+		}
+	}
+	return entries > 0, nil
+}
+
+func refinementRecordingAvailable(session *storage.Session, audioDir string) error {
+	local, err := hasLocalRefinementRecording(session, audioDir)
+	if err != nil {
+		return err
+	}
+	if local {
+		return nil
+	}
+	if session.AudioRemovedAt == "" {
+		return errors.New("no recording is available on this unit or Drive")
+	}
+	if strings.TrimSpace(session.GDriveFolderID) == "" {
+		return errors.New("the recording was removed from this unit, but no Drive folder is listed")
+	}
+	if session.SyncState == storage.SyncStateRemoteDeleted {
+		return errors.New("the recording was removed from this unit and its Drive folder is deleted")
+	}
+	if session.SyncStatus != storage.SyncSynced {
+		return errors.New("the recording was removed from this unit and its Drive copy is not synced")
+	}
+	return nil
+}
+
+func recordingRequirementKey(path string) string {
+	name := filepath.Base(strings.TrimSpace(path))
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp3", ".wav":
+		return strings.TrimSuffix(name, filepath.Ext(name))
+	default:
+		return name
+	}
+}
+
+func missingRefinementRecordings(required, restored []string) []string {
+	available := make(map[string]struct{}, len(restored))
+	for _, path := range restored {
+		if key := recordingRequirementKey(path); key != "" && key != "." {
+			available[key] = struct{}{}
+		}
+	}
+	missing := make([]string, 0, len(required))
+	seen := make(map[string]struct{}, len(required))
+	for _, path := range required {
+		name := filepath.Base(strings.TrimSpace(path))
+		key := recordingRequirementKey(path)
+		if key == "" || key == "." {
+			continue
+		}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, found := available[key]; !found {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+func restoreRefinementRecording(ctx context.Context, store refinementAudioRestoreStore, session *storage.Session, audioDir string, restore func(context.Context, storage.Session) (deletionRecordingSet, error)) error {
+	unlock := deleteLocks.lock(session.ID)
+	defer unlock()
+	if reader, ok := store.(interface {
+		GetSession(string) (storage.Session, error)
+	}); ok {
+		current, err := reader.GetSession(session.ID)
+		if err != nil {
+			return fmt.Errorf("read session %s before restoring its recording: %w", session.ID, err)
+		}
+		*session = current
+	}
+
+	local, err := hasLocalRefinementRecording(session, audioDir)
+	if err != nil {
+		return err
+	}
+	if local {
+		return nil
+	}
+	allowed, err := store.DriveRestoreAllowed(session.ID)
+	if err != nil {
+		return fmt.Errorf("check whether Drive restoration is allowed for session %s: %w", session.ID, err)
+	}
+	if !allowed {
+		return fmt.Errorf("drive restoration is blocked while session %s owes a replacement", session.ID)
+	}
+	recordings, err := restore(ctx, *session)
+	if err != nil {
+		return fmt.Errorf("restore recording for refinement: %w", err)
+	}
+	cleanupDownloads := recordings.Downloaded
+	defer func() { removeFiles(cleanupDownloads) }()
+	if len(recordings.Paths) == 0 {
+		return errors.New("no recording is available on this unit or Drive")
+	}
+	if session.AudioRemovedAt != "" {
+		required, err := store.RefinementRecordingPaths(session.ID)
+		if err != nil {
+			return fmt.Errorf("list recordings known to session %s: %w", session.ID, err)
+		}
+		if len(required) == 0 {
+			for _, path := range strings.Split(session.AudioPath, ",") {
+				if strings.TrimSpace(path) != "" {
+					required = append(required, path)
+				}
+			}
+		}
+		if missing := missingRefinementRecordings(required, recordings.Paths); len(missing) > 0 {
+			return fmt.Errorf("drive did not restore recording %s for session %s; restore it from Drive's trash, then retry refinement", strings.Join(missing, ", "), session.ID)
+		}
+	}
+	restoredAudioPath := strings.Join(recordings.Paths, ",")
+	if restoredAudioPath == session.AudioPath {
+		if session.AudioRemovedAt == "" {
+			cleanupDownloads = nil
+			return nil
+		}
+		return errors.New("drive did not restore every recording removed from this unit")
+	}
+	restored, err := store.RestoreAudioForRefinement(session.ID, session.AudioPath, restoredAudioPath)
+	if err != nil {
+		return fmt.Errorf("record restored audio for refinement: %w", err)
+	}
+	if !restored {
+		if reader, ok := store.(interface {
+			GetSession(string) (storage.Session, error)
+		}); ok {
+			if current, err := reader.GetSession(session.ID); err == nil {
+				cleanupDownloads = downloadsNotNamedBy(current.AudioPath, recordings.Downloaded)
+			}
+		}
+		return fmt.Errorf("recording changed while restoring it for refinement")
+	}
+	cleanupDownloads = nil
+	return nil
+}
+
+func downloadsNotNamedBy(audioPath string, downloads []string) []string {
+	named := make(map[string]struct{})
+	for _, path := range strings.Split(audioPath, ",") {
+		if name := filepath.Base(strings.TrimSpace(path)); name != "" && name != "." {
+			named[name] = struct{}{}
+		}
+	}
+	unclaimed := make([]string, 0, len(downloads))
+	for _, path := range downloads {
+		if _, found := named[filepath.Base(path)]; !found {
+			unclaimed = append(unclaimed, path)
+		}
+	}
+	return unclaimed
+}
+
+const refinementRetryWarningKeyPrefix = "retry-refinement-"
+
+func retryRefinementWithFailureWarning(ctx context.Context, registry *warningsRegistry, sessionID string, retry func(context.Context, string) error) error {
+	err := retry(ctx, sessionID)
+	if err == nil {
+		registry.Clear(refinementRetryWarningKeyPrefix + sessionID)
+		return nil
+	}
+	warning := fmt.Sprintf("Retry refinement failed for session %s: %v", sessionID, err)
+	log.Printf("warning: %s", warning)
+	registry.Set(refinementRetryWarningKeyPrefix+sessionID, warning)
+	return err
+}
+
+func newRetryRefinementHook(store *storage.SQLiteStore, audioDir func() string, restore func(context.Context, storage.Session) (deletionRecordingSet, error), registry *warningsRegistry, refine func(context.Context, string, string, time.Time) error) func(context.Context, string) error {
+	ensure := func(ctx context.Context, sessionID string) error {
+		session, err := store.GetSession(sessionID)
+		if err != nil {
+			return err
+		}
+		return restoreRefinementRecording(ctx, store, &session, audioDir(), restore)
+	}
+	return func(ctx context.Context, sessionID string) error {
+		return retryRefinementWithFailureWarning(ctx, registry, sessionID, func(ctx context.Context, sessionID string) error {
+			return retryRefinementAfterRestoringRecording(ctx, sessionID, ensure, func(ctx context.Context, sessionID string) error {
+				return retryRefinementWithWarningClear(ctx, registry, store, sessionID, refine)
+			})
+		})
+	}
+}
+
+// importRestoredDriveSession returns the Drive restore callback: it imports
+// one restored session with the recording file names its folder holds, in
+// one transaction.
+func importRestoredDriveSession(store *storage.SQLiteStore, restoredAt func() time.Time) func(gdrive.RestoredSession) error {
+	return func(rs gdrive.RestoredSession) error {
+		sess := restoredDriveSession(&rs, restoredAt())
+		return store.ImportSession(&sess, rs.Segments, rs.RecordingPaths)
+	}
+}
+
+// ensureDeletionRecordings finds or restores a session's recordings before a
+// deletion or a refinement. Drive is opened only for a session that has a
+// folder there or whose audio was removed from this unit: a merge whose audio
+// was removed before it had a folder of its own restores from its sources'
+// folders.
+func ensureDeletionRecordings(ctx context.Context, store *storage.SQLiteStore, session *storage.Session, audioDir string, openDrive func(context.Context) (deletionRecordingSource, error)) (deletionRecordingSet, error) {
+	var source deletionRecordingSource
+	if session.GDriveFolderID != "" || session.AudioRemovedAt != "" {
+		opened, err := openDrive(ctx)
+		if err != nil {
+			return deletionRecordingSet{}, err
+		}
+		source = opened
+	}
+	return restoreDeletionRecordings(ctx, store, session, audioDir, source, "")
+}
+
+// newMergedRefinementFailureRecorder returns the merge hook's failure
+// recorder: a merged session whose refinement could not run reads failed, so
+// the page offers Retry refinement rather than waiting forever.
+func newMergedRefinementFailureRecorder(store *storage.SQLiteStore) func(context.Context, string, error) {
+	return func(_ context.Context, sessionID string, cause error) {
+		generation, err := store.DeletionGeneration(sessionID)
+		if err == nil {
+			err = store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation)
+		}
+		if err != nil {
+			log.Printf("warning: record failed merged refinement %s after %v: %v", sessionID, cause, err)
+		}
+	}
+}
+
+func restoredDriveSession(rs *gdrive.RestoredSession, restoredAt time.Time) storage.Session {
+	summaryStatus := storage.SummaryPending
+	if rs.Summary != "" {
+		summaryStatus = storage.SummaryCompleted
+	}
+	audioRemovedAt := ""
+	if rs.HasAudio {
+		audioRemovedAt = restoredAt.UTC().Format(time.RFC3339Nano)
+	}
+	return storage.Session{
+		ID:               rs.ID,
+		Title:            rs.Title,
+		StartedAt:        rs.StartedAt,
+		EndedAt:          rs.EndedAt,
+		Status:           storage.SessionEnded,
+		Summary:          rs.Summary,
+		SummaryStatus:    summaryStatus,
+		SummaryPreset:    rs.SummaryPreset,
+		RefinementStatus: storage.RefinementNoAudio,
+		AudioRemovedAt:   audioRemovedAt,
+		SyncStatus:       storage.SyncSynced,
+		GDriveFolderID:   rs.DriveFolderID,
+	}
+}
+
 func buildTranscript(segments []transcribe.Segment) string {
 	var b strings.Builder
-	for _, seg := range segments {
-		if strings.TrimSpace(seg.Text) != "" {
-			b.WriteString(seg.Text)
+	for i := range segments {
+		if strings.TrimSpace(segments[i].Text) != "" {
+			b.WriteString(segments[i].Text)
 			b.WriteString("\n")
 		}
 	}
@@ -221,25 +511,6 @@ func makeBatchTranscriber(cfg *config.Config) (transcribe.BatchTranscriber, erro
 	default:
 		return nil, fmt.Errorf("unsupported batch transcription provider %q", cfg.BatchTranscription.Provider)
 	}
-}
-
-// segmentDeletionTranscriber returns the batch transcriber a segment deletion
-// under cfg finds the segment's words with. With no Deepgram API key, its
-// error wraps server.ErrBatchTranscriptionNotConfigured, which the API
-// answers with what to configure.
-func segmentDeletionTranscriber(cfg *config.Config) (transcribe.BatchWordsTranscriber, error) {
-	batch, err := makeBatchTranscriber(cfg)
-	if errors.Is(err, errDeepgramKeyMissing) {
-		return nil, fmt.Errorf("%w: %w", server.ErrBatchTranscriptionNotConfigured, err)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("configure batch transcription for deletion: %w", err)
-	}
-	wordTranscriber, ok := batch.(transcribe.BatchWordsTranscriber)
-	if !ok {
-		return nil, fmt.Errorf("configured batch transcription does not return word timestamps")
-	}
-	return wordTranscriber, nil
 }
 
 type micProxy struct{ ref *atomic.Pointer[audio.Mic] }
@@ -539,6 +810,37 @@ func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *int
 	}
 }
 
+type mergedSessionHookStore interface {
+	GetSession(string) (storage.Session, error)
+}
+
+func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, retryRefinement func(context.Context, string) error, recordRefinementFailure func(context.Context, string, error), sessionID string) {
+	merged, err := store.GetSession(sessionID)
+	if err != nil {
+		log.Printf("warning: read merged session %s before refinement: %v", sessionID, err)
+		return
+	}
+	if merged.AudioRemovedAt != "" {
+		if err := retryRefinement(ctx, sessionID); err != nil {
+			recordRefinementFailure(ctx, sessionID, err)
+			if err := summarize(ctx, sessionID, merged.StartedAt); err != nil {
+				log.Printf("warning: summarize failed merged session %s: %v", sessionID, err)
+			}
+		}
+		return
+	}
+	if merged.AudioPath != "" {
+		if err := refine(ctx, sessionID, merged.AudioPath, merged.StartedAt); err == nil {
+			return
+		} else {
+			log.Printf("warning: refine merged session %s: %v", sessionID, err)
+		}
+	}
+	if err := summarize(ctx, sessionID, merged.StartedAt); err != nil {
+		log.Printf("warning: summarize merged session %s: %v", sessionID, err)
+	}
+}
+
 func main() {
 	configPath := configPathFromEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
@@ -621,9 +923,9 @@ func main() {
 			sess := &emptyTitleSessions[i]
 			segments, _ := store.GetSegments(sess.ID)
 			var transcript string
-			for _, seg := range segments {
-				if strings.TrimSpace(seg.Text) != "" {
-					transcript += seg.Text + "\n"
+			for j := range segments {
+				if strings.TrimSpace(segments[j].Text) != "" {
+					transcript += segments[j].Text + "\n"
 				}
 			}
 			title := summary.GenerateTitle("", transcript, segments, sess.StartedAt)
@@ -947,45 +1249,55 @@ func main() {
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
-	// deletionRunner makes the runner both segment deletion actions use,
-	// with the configuration as it is now.
-	deletionRunner := func(sessionID string, segmentID int64) (*segmentDeleteRunner, error) {
-		if err := requireSegmentForDeletion(store, sessionID, segmentID); err != nil {
-			return nil, err
-		}
+	// deletionRunner makes the occurrence-based deletion actions use the
+	// configuration as it is now. Batch transcription has already persisted
+	// their exact word spans, so deleting never creates a locator.
+	deletionRunner := func() *segmentDeleteRunner {
 		latestCfg := cfgStore.Get()
-		wordTranscriber, err := segmentDeletionTranscriber(&latestCfg)
-		if err != nil {
-			return nil, err
-		}
 		return &segmentDeleteRunner{
-			store:       store,
-			transcriber: audio.WordsTranscriber{Batch: wordTranscriber},
-			audioDir:    latestCfg.AudioDir,
+			store:    store,
+			audioDir: latestCfg.AudioDir,
 			ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
-				var source deletionRecordingSource
-				if session.GDriveFolderID != "" {
+				return ensureDeletionRecordings(ctx, store, &session, latestCfg.AudioDir, func(ctx context.Context) (deletionRecordingSource, error) {
 					if latestCfg.GDriveFolderID == "" {
-						return deletionRecordingSet{}, fmt.Errorf("google Drive root folder is not configured")
+						return nil, fmt.Errorf("google Drive root folder is not configured")
 					}
 					credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
 					if err != nil {
-						return deletionRecordingSet{}, fmt.Errorf("detect Google credentials: %w", err)
+						return nil, fmt.Errorf("detect Google credentials: %w", err)
 					}
 					syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID, appLogger)
 					if err != nil {
-						return deletionRecordingSet{}, fmt.Errorf("create Drive syncer: %w", err)
+						return nil, fmt.Errorf("create Drive syncer: %w", err)
 					}
-					source = syncer
-				}
-				return restoreDeletionRecordings(ctx, &session, latestCfg.AudioDir, source)
+					return syncer, nil
+				})
 			},
 			duration:  audio.Duration,
 			splice:    audio.Splice,
 			refine:    manager.RefineSession,
 			summarize: manager.SummarizeSession,
-		}, nil
+		}
 	}
+
+	checkRefinementRecording := func(_ context.Context, sessionID string) error {
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			return err
+		}
+		return refinementRecordingAvailable(&sess, cfgStore.Get().AudioDir)
+	}
+
+	retryRefinement := newRetryRefinementHook(
+		store,
+		func() string { return cfgStore.Get().AudioDir },
+		func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+			return deletionRunner().ensureRecordings(ctx, session)
+		},
+		warningRegistry,
+		manager.RefineSession,
+	)
+	recordMergedRefinementFailure := newMergedRefinementFailureRecorder(store)
 
 	controlHooks := &server.ControlHooks{
 		IsPaused:    capture.IsPaused,
@@ -1030,22 +1342,13 @@ func main() {
 		RetrySync: func(ctx context.Context, sessionID string) error {
 			return retrySync(ctx, drive.Get(), sessionID)
 		},
-		RetryRefinement: func(ctx context.Context, sessionID string) error {
-			return retryRefinementWithWarningClear(ctx, warningRegistry, store, sessionID, manager.RefineSession)
+		RefinementRecordingAvailable: checkRefinementRecording,
+		RetryRefinement:              retryRefinement,
+		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+			return deletionRunner().DeleteRefinedAudio(ctx, sessionID, segmentID, revision)
 		},
-		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64) error {
-			runner, err := deletionRunner(sessionID, segmentID)
-			if err != nil {
-				return err
-			}
-			return runner.Delete(ctx, sessionID, segmentID)
-		},
-		DeleteSegmentText: func(ctx context.Context, sessionID string, segmentID int64) error {
-			runner, err := deletionRunner(sessionID, segmentID)
-			if err != nil {
-				return err
-			}
-			return runner.DeleteText(ctx, sessionID, segmentID)
+		DeleteSegmentText: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+			return deletionRunner().DeleteRefinedText(ctx, sessionID, segmentID, revision)
 		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			return repairStructuredSummaries(ctx, store, publishSummaryReady)
@@ -1063,10 +1366,21 @@ func main() {
 			return resummarize(ctx, store, summarizer, hub, publishSummaryReady, sessionID, preset)
 		},
 		OnSessionMerged: func(ctx context.Context, sessionID string) {
-			if summarizer == nil {
-				return
-			}
-			summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
+			onSessionMerged(
+				ctx,
+				store,
+				manager.RefineSession,
+				func(ctx context.Context, sessionID string, startedAt time.Time) error {
+					if summarizer == nil {
+						return manager.SummarizeSession(ctx, sessionID, startedAt)
+					}
+					summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
+					return nil
+				},
+				retryRefinement,
+				recordMergedRefinementFailure,
+				sessionID,
+			)
 		},
 		EndSession: func(ctx context.Context) error {
 			return manager.ForceEndSession(ctx)
@@ -1243,25 +1557,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if err != nil {
 				return nil, fmt.Errorf("create syncer: %w", err)
 			}
-			result, err := syncer.RestoreFromDrive(ctx, func(rs gdrive.RestoredSession) error {
-				summaryStatus := storage.SummaryPending
-				if rs.Summary != "" {
-					summaryStatus = storage.SummaryCompleted
-				}
-				sess := storage.Session{
-					ID:             rs.ID,
-					Title:          rs.Title,
-					StartedAt:      rs.StartedAt,
-					EndedAt:        rs.EndedAt,
-					Status:         storage.SessionEnded,
-					Summary:        rs.Summary,
-					SummaryStatus:  summaryStatus,
-					SummaryPreset:  rs.SummaryPreset,
-					SyncStatus:     storage.SyncSynced,
-					GDriveFolderID: rs.DriveFolderID,
-				}
-				return store.ImportSession(&sess, rs.Segments)
-			})
+			result, err := syncer.RestoreFromDrive(ctx, importRestoredDriveSession(store, func() time.Time { return time.Now().UTC() }))
 			if err != nil {
 				return nil, err
 			}

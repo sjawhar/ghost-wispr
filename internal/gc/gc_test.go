@@ -1245,7 +1245,7 @@ func TestGCKeepsSessionsJustRestoredFromDrive(t *testing.T) {
 	for i := range segments {
 		segments[i] = transcribe.Segment{Text: fmt.Sprintf("said in %s, part %d", id, i), StartTime: float64(i), EndTime: float64(i + 1), Timestamp: started}
 	}
-	if err := store.ImportSession(&restored, segments); err != nil {
+	if err := store.ImportSession(&restored, segments, nil); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 

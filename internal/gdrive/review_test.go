@@ -32,8 +32,9 @@ func TestReviewTwoRecordingsDeletedBeforeReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)
+	otherAfter := recordingHash(t, other)
 	if _, err := fixture.store.DB().Exec(`INSERT INTO deleted_segments(session_id, audio_path, start, end, sha256_before, sha256_after, deleted_at, splice_complete)
-		VALUES(?, ?, 1, 2, 'before', 'after', ?, 1)`, fixture.id, other, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		VALUES(?, ?, 1, 2, 'before', ?, ?, 1)`, fixture.id, other, otherAfter, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	fixture.wire.allowDeletes = true
@@ -133,10 +134,10 @@ func TestReviewStaleSnapshotClearsNewerDeletion(t *testing.T) {
 	if err != nil || len(segments) != 3 {
 		t.Fatalf("segments %v %v", segments, err)
 	}
-	span := func() storage.DeletedSpan {
-		return storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 0, End: 1, SHA256Before: "b", SHA256After: "a"}
+	span := func(start, end float64, before, after string) *storage.DeletedSpan {
+		return &storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: start, End: end, SHA256Before: before, SHA256After: after}
 	}
-	if err := store.DeleteSegment(id, segments[1].ID, span()); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, span(1, 2, "b", "a")); err != nil {
 		t.Fatalf("delete bravo: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ?, summary_status = ?, summary = 'about charlie', title = 'Charlie' WHERE id = ?`,
@@ -145,11 +146,16 @@ func TestReviewStaleSnapshotClearsNewerDeletion(t *testing.T) {
 	}
 	wire.allowDeletes = true
 
+	current, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlieID := current[1].ID
 	syncer.mu.Lock()
 	done := make(chan error, 1)
 	go func() { done <- o.SyncSession(context.Background(), id) }()
 	time.Sleep(300 * time.Millisecond)
-	if err := store.DeleteSegment(id, segments[2].ID, span()); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, id, charlieID, span(2, 3, "b", "a")); err != nil {
 		t.Fatalf("delete charlie: %v", err)
 	}
 	syncer.mu.Unlock()

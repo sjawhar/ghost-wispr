@@ -11,7 +11,7 @@
     type SessionSummary,
   } from '../lib/types'
   import { copyText } from '../lib/clipboard'
-  import { audioLeftNote, recordingsNamed } from '../lib/audio'
+  import { audioLeftNote, canRestoreRefinement, recordingsNamed } from '../lib/audio'
   import {
     updateSessionTitle,
     retrySummary,
@@ -59,6 +59,8 @@
   // Why the last sync retry was refused, if it was.
   let retrySyncError = $state('')
   let retryingRefinement = $state(false)
+  let retryingRefinementStatus = $state<RefinementStatus | null>(null)
+  let retryRefinementError = $state('')
 
   async function copySummary() {
     if (!session.summary) return
@@ -154,12 +156,24 @@
   async function handleRetryRefinement(e: Event) {
     e.stopPropagation()
     retryingRefinement = true
+    retryingRefinementStatus = session.refinement_status ?? null
+    retryRefinementError = ''
     try {
       await retryRefinement(session.id)
-    } finally {
-      setTimeout(() => (retryingRefinement = false), 1000)
+      await onRefreshSession(session.id)
+    } catch (error) {
+      retryRefinementError = requestErrorMessage(error)
+      retryingRefinement = false
+      retryingRefinementStatus = null
     }
   }
+
+  $effect(() => {
+    if (retryingRefinement && session.refinement_status !== retryingRefinementStatus) {
+      retryingRefinement = false
+      retryingRefinementStatus = null
+    }
+  })
 
   // Drive holds a copy only once the session synced and its Drive folder was
   // not deleted since; otherwise this unit holds the only copy.
@@ -312,20 +326,27 @@
               class={`status-badge ${session.refinement_status}`}
               data-testid="refinement-badge"
               title={session.refinement_status === RefinementStatus.NoAudio
-                ? session.audio_removed_at
-                  ? recordingsNamed(session.audio_path) > 0
-                    ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
-                    : 'The audio was removed to free space, so it cannot be refined'
-                  : 'No recording was saved for this session, so it cannot be refined'
+                ? session.restored_at && session.sync_state === SyncState.RemoteDeleted
+                  ? "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined."
+                  : session.restored_at &&
+                      session.refinement_status === RefinementStatus.NoAudio &&
+                      canRestoreRefinement(session)
+                    ? 'This conversation was restored from Drive; retry refinement to delete from it'
+                    : session.audio_removed_at
+                      ? recordingsNamed(session.audio_path) > 0
+                        ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
+                        : 'The audio was removed to free space, so it cannot be refined'
+                      : 'No recording was saved for this session, so it cannot be refined'
                 : undefined}
             >
               Refine: {session.refinement_status === RefinementStatus.NoAudio
                 ? 'no recording'
                 : session.refinement_status}
             </span>
-            {#if session.refinement_status === RefinementStatus.Failed}
+            {#if session.refinement_status === RefinementStatus.Failed || (session.refinement_status === RefinementStatus.NoAudio && canRestoreRefinement(session)) || (session.refinement_status === RefinementStatus.Completed && !session.refined_revision)}
               <button
                 class="retry-btn"
+                aria-label="Retry refinement"
                 onclick={handleRetryRefinement}
                 disabled={retryingRefinement}
                 data-testid="retry-refinement-btn"
@@ -333,10 +354,13 @@
                 {retryingRefinement ? '...' : '↻'}
               </button>
             {/if}
+            {#if retryRefinementError}
+              <p class="retry-error">{retryRefinementError}</p>
+            {/if}
           </div>
         {/if}
 
-        {#if session.audio_removed_at}
+        {#if session.audio_removed_at && !(session.restored_at && session.refinement_status === RefinementStatus.NoAudio)}
           {@const partly = recordingsNamed(session.audio_path) > 0}
           <span
             class="status-badge audio-removed"

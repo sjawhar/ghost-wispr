@@ -9,8 +9,8 @@ import (
 )
 
 // documentsStore is what a sync reads and writes to bring the Drive folders
-// of merged sources up to date after "Delete text" (storage.DeleteSegmentText)
-// changed their documents.
+// of merged sources up to date after refined "Delete text" changed their
+// documents.
 type documentsStore interface {
 	DriveDocumentsOwed(sessionID string) ([]string, error)
 	ClearDriveDocumentsPending(sessionID string, unchanged func(storage.Session) bool) (bool, error)

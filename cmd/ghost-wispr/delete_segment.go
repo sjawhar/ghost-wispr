@@ -15,11 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"google.golang.org/api/drive/v3"
 
-	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/erase"
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/server"
@@ -29,27 +27,12 @@ import (
 
 type segmentDeleteRunner struct {
 	store            *storage.SQLiteStore
-	transcriber      audio.Transcriber
 	audioDir         string
 	ensureRecordings func(context.Context, storage.Session) (deletionRecordingSet, error)
 	duration         func(context.Context, string) (float64, error)
 	splice           func(context.Context, string, float64, float64) (string, error)
 	refine           func(context.Context, string, string, time.Time) error
-	deleteSegment    func(sessionID string, segmentID int64, span storage.DeletedSpan) error
 	summarize        func(context.Context, string, time.Time) error
-}
-
-func requireSegmentForDeletion(store *storage.SQLiteStore, sessionID string, segmentID int64) error {
-	segments, err := store.GetSegments(sessionID)
-	if err != nil {
-		return err
-	}
-	for _, segment := range segments {
-		if segment.ID == segmentID {
-			return nil
-		}
-	}
-	return storage.ErrSegmentNotFound
 }
 
 type deletionRecordingSet struct {
@@ -60,6 +43,11 @@ type deletionRecordingSet struct {
 type deletionRecordingSource interface {
 	ListFolderFiles(ctx context.Context, folderID string) ([]*drive.File, error)
 	DownloadRecording(ctx context.Context, folderID, name, destination string) error
+}
+
+type recordingRestoreGuard interface {
+	LatestRecordingSHA256(sessionID, recording string) (string, bool, error)
+	RefinementRecordingSources(sessionID string) ([]storage.RefinementRecordingSource, error)
 }
 
 type sessionDeletionLocks struct {
@@ -104,6 +92,20 @@ func (l *sessionDeletionLocks) isRecovering(sessionID string) bool {
 
 var deleteLocks sessionDeletionLocks
 
+type recordingRestoreInProgressError struct {
+	cause error
+}
+
+func (e recordingRestoreInProgressError) Error() string { return e.cause.Error() }
+
+func (e recordingRestoreInProgressError) Unwrap() error { return e.cause }
+
+func (recordingRestoreInProgressError) RecordingRestoreInProgress() {}
+
+func recordingRestoreInProgress() error {
+	return recordingRestoreInProgressError{cause: storage.ErrSegmentSplicePending}
+}
+
 func usableRecordingSource(source deletionRecordingSource) bool {
 	if source == nil {
 		return false
@@ -118,7 +120,15 @@ func usableRecordingSource(source deletionRecordingSource) bool {
 // finds it (as written, then in audioDir), so the recording spliced is the one
 // the app plays and syncs; one found in neither place is restored into
 // audioDir.
-func restoreDeletionRecordings(ctx context.Context, session *storage.Session, audioDir string, source deletionRecordingSource) (deletionRecordingSet, error) {
+func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard, session *storage.Session, audioDir string, source deletionRecordingSource, allowPrecutRecording string) (deletionRecordingSet, error) {
+	set := deletionRecordingSet{}
+	keepDownloads := false
+	defer func() {
+		if !keepDownloads {
+			removeFiles(set.Downloaded)
+		}
+	}()
+
 	byName := make(map[string]string)
 	for _, entry := range strings.Split(session.AudioPath, ",") {
 		entry = strings.TrimSpace(entry)
@@ -128,21 +138,103 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		path := recordingname.Resolve(entry, audioDir)
 		byName[filepath.Base(path)] = path
 	}
-	if session.GDriveFolderID != "" && usableRecordingSource(source) {
-		files, err := source.ListFolderFiles(ctx, session.GDriveFolderID)
+	driveFiles := make(map[string][]*drive.File)
+	driveFolders := make(map[string]string)
+	driveSourceIDs := make(map[string]string)
+	addDriveFiles := func(folderID string, expected map[string]struct{}, sourceID string) error {
+		files, err := source.ListFolderFiles(ctx, folderID)
 		if err != nil {
-			return deletionRecordingSet{}, fmt.Errorf("list Drive recordings: %w", err)
+			return fmt.Errorf("list Drive recordings in folder %s: %w", folderID, err)
 		}
 		for _, file := range files {
 			name, ok := recordingname.LocalName(file.Name)
 			if !strings.HasPrefix(file.MimeType, "audio/") || !ok {
 				continue
 			}
+			if len(expected) != 0 {
+				if _, matches := expected[recordingRequirementKey(name)]; !matches {
+					continue
+				}
+			}
+			driveFiles[name] = append(driveFiles[name], file)
 			if _, known := byName[name]; !known {
 				if strings.TrimSpace(audioDir) == "" {
-					return deletionRecordingSet{}, fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
+					return fmt.Errorf("restore Drive recording %s: audio directory is not configured", file.Name)
 				}
 				byName[name] = filepath.Join(audioDir, name)
+			}
+			if _, known := driveFolders[name]; !known {
+				driveFolders[name] = folderID
+				driveSourceIDs[name] = sourceID
+			}
+		}
+		return nil
+	}
+	if usableRecordingSource(source) {
+		if session.GDriveFolderID != "" {
+			if err := addDriveFiles(session.GDriveFolderID, nil, session.ID); err != nil {
+				return deletionRecordingSet{}, err
+			}
+		}
+		if session.AudioRemovedAt != "" && guard != nil {
+			sources, err := guard.RefinementRecordingSources(session.ID)
+			if err != nil {
+				return deletionRecordingSet{}, fmt.Errorf("list Drive recording sources for session %s: %w", session.ID, err)
+			}
+			for _, sourceSession := range sources {
+				if sourceSession.GDriveFolderID == "" && sourceSession.FallbackGDriveFolderID == "" {
+					continue
+				}
+				expected := make(map[string]struct{}, len(sourceSession.RecordingPaths))
+				for _, path := range sourceSession.RecordingPaths {
+					if key := recordingRequirementKey(path); key != "" && key != "." {
+						expected[key] = struct{}{}
+					}
+				}
+				if len(expected) == 0 {
+					expected[sourceSession.ID] = struct{}{}
+				}
+				allKnown := true
+				for key := range expected {
+					found := false
+					for name := range byName {
+						if recordingRequirementKey(name) == key {
+							found = true
+							break
+						}
+					}
+					if !found {
+						allKnown = false
+						break
+					}
+				}
+				if allKnown {
+					continue
+				}
+				if sourceSession.FallbackGDriveFolderID != "" && sourceSession.FallbackGDriveFolderID != sourceSession.GDriveFolderID {
+					if err := addDriveFiles(sourceSession.FallbackGDriveFolderID, expected, sourceSession.ID); err != nil {
+						return deletionRecordingSet{}, err
+					}
+				}
+				allKnown = true
+				for key := range expected {
+					found := false
+					for name := range byName {
+						if recordingRequirementKey(name) == key {
+							found = true
+							break
+						}
+					}
+					if !found {
+						allKnown = false
+						break
+					}
+				}
+				if !allKnown && sourceSession.GDriveFolderID != "" {
+					if err := addDriveFiles(sourceSession.GDriveFolderID, expected, sourceSession.ID); err != nil {
+						return deletionRecordingSet{}, err
+					}
+				}
 			}
 		}
 	}
@@ -154,7 +246,7 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	set := deletionRecordingSet{Paths: make([]string, 0, len(names))}
+	set.Paths = make([]string, 0, len(names))
 	for _, name := range names {
 		path := byName[name]
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
@@ -163,48 +255,84 @@ func restoreDeletionRecordings(ctx context.Context, session *storage.Session, au
 		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return deletionRecordingSet{}, fmt.Errorf("stat recording %s: %w", path, err)
 		}
-		if source == nil || session.GDriveFolderID == "" {
+		folderID := driveFolders[name]
+		if source == nil || folderID == "" {
 			return deletionRecordingSet{}, fmt.Errorf("recording %s is missing locally and cannot be restored from Drive", path)
 		}
-		if err := source.DownloadRecording(ctx, session.GDriveFolderID, recordingname.FileName(path), path); err != nil {
-			return deletionRecordingSet{}, fmt.Errorf("restore recording %s: %w", name, err)
+		staged, err := downloadDestination(path)
+		if err != nil {
+			return deletionRecordingSet{}, err
+		}
+		sourceID := driveSourceIDs[name]
+		if sourceID == "" {
+			sourceID = session.ID
+		}
+		if err := downloadDriveRecording(ctx, guard, sourceID, folderID, source, driveFiles[name], staged, path, recordingname.FileName(path), filepath.Base(path) == allowPrecutRecording); err != nil {
+			_ = os.Remove(staged)
+			return deletionRecordingSet{}, err
+		}
+		if err := os.Rename(staged, path); err != nil {
+			_ = os.Remove(staged)
+			return deletionRecordingSet{}, fmt.Errorf("install restored recording %s: %w", path, err)
+		}
+		if err := syncRecordingDirectory(path); err != nil {
+			_ = os.Remove(path)
+			return deletionRecordingSet{}, err
 		}
 		set.Paths = append(set.Paths, path)
 		set.Downloaded = append(set.Downloaded, path)
 	}
+	keepDownloads = true
 	return set, nil
 }
 
-// Delete is "Delete text and audio": it removes the segment's words from
-// every text store, cuts its span out of the recording, and owes Google
-// Drive a replacement of the session's files (storage.DeleteSegment).
-func (d *segmentDeleteRunner) Delete(ctx context.Context, sessionID string, segmentID int64) error {
-	return d.delete(ctx, sessionID, segmentID, false)
+func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, sessionID, folderID string, source deletionRecordingSource, files []*drive.File, destination, recordingPath, driveName string, allowPrecut bool) error {
+	if len(files) == 0 {
+		return fmt.Errorf("drive has no recording named %s", driveName)
+	}
+	expected, cut, err := "", false, error(nil)
+	if guard != nil {
+		expected, cut, err = guard.LatestRecordingSHA256(sessionID, recordingPath)
+		if err != nil {
+			return fmt.Errorf("read latest cut hash for recording %s: %w", destination, err)
+		}
+	}
+	if cut && !allowPrecut {
+		for _, file := range files {
+			if file.Sha256Checksum != expected {
+				return fmt.Errorf("refuse Drive recording %s: SHA-256 %q does not match the latest cut hash %q", file.Name, file.Sha256Checksum, expected)
+			}
+		}
+	}
+	if err := source.DownloadRecording(ctx, folderID, driveName, destination); err != nil {
+		return fmt.Errorf("restore recording %s: %w", filepath.Base(destination), err)
+	}
+	if cut && !allowPrecut {
+		hash, err := fileSHA256(destination)
+		if err != nil {
+			_ = os.Remove(destination)
+			return fmt.Errorf("hash restored recording %s: %w", destination, err)
+		}
+		if hash != expected {
+			_ = os.Remove(destination)
+			return fmt.Errorf("refuse restored recording %s: SHA-256 %q does not match the latest cut hash %q", destination, hash, expected)
+		}
+	}
+	return nil
 }
 
-// DeleteText is "Delete text": it removes the segment's words from every
-// text store as Delete does, and records where they are in the recording,
-// which it leaves as it is, so refinement leaves them out
-// (storage.DeleteSegmentText). It splices nothing, keeps no recording it
-// downloads to find the words, and owes Drive no replacement: the ordinary
-// sync updates the session's Drive documents in place. A segment whose words
-// cannot be found in the recording is refused, as Delete refuses it.
-func (d *segmentDeleteRunner) DeleteText(ctx context.Context, sessionID string, segmentID int64) error {
-	return d.delete(ctx, sessionID, segmentID, true)
-}
-
-func (d *segmentDeleteRunner) delete(ctx context.Context, sessionID string, segmentID int64, keepAudio bool) error {
+// DeleteRefinedText removes one selected batch-derived occurrence and then
+// regenerates its summary. The segment id and revision are the authority; no
+// text is aligned against another transcription.
+func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID string, segmentID int64, revision int) error {
 	if d.store == nil {
 		return fmt.Errorf("segment deletion storage is not configured")
 	}
 	if deleteLocks.isRecovering(sessionID) {
-		return storage.ErrSegmentSplicePending
+		return recordingRestoreInProgress()
 	}
 	unlock := deleteLocks.lock(sessionID)
 	defer unlock()
-	if deleteLocks.isRecovering(sessionID) {
-		return storage.ErrSegmentSplicePending
-	}
 	session, err := d.store.GetSession(sessionID)
 	if err != nil {
 		return err
@@ -212,31 +340,89 @@ func (d *segmentDeleteRunner) delete(ctx context.Context, sessionID string, segm
 	if session.Status == storage.SessionActive {
 		return storage.ErrSegmentSessionActive
 	}
-	segments, err := d.store.GetSegments(sessionID)
+	if revision == 0 {
+		if err := d.store.DeleteRefinedSegmentText(sessionID, segmentID, revision); err != nil {
+			return err
+		}
+		if d.summarize != nil {
+			if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {
+				return fmt.Errorf("summarize untimed text deletion: %w", err)
+			}
+		}
+		return nil
+	}
+	if session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
+		// Old completed sessions have live-only segments. Start the existing
+		// batch refinement path, then require selection from its new table.
+		if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision == 0 &&
+			d.refine != nil && strings.TrimSpace(session.AudioPath) != "" {
+			go func() { _ = d.refine(context.Background(), sessionID, session.AudioPath, session.StartedAt) }()
+		}
+		return storage.ErrRefinedSegmentsUnavailable
+	}
+	if err := d.store.DeleteRefinedSegmentText(sessionID, segmentID, revision); err != nil {
+		return err
+	}
+	if d.summarize != nil {
+		if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {
+			return fmt.Errorf("summarize refined text deletion: %w", err)
+		}
+	}
+	return nil
+}
+
+// DeleteRefinedAudio removes the selected stored word span from its recording.
+// Its boundary comes from the persisted occurrence; a small margin is used
+// only when no neighbouring stored word occupies it.
+func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+	if d.store == nil || d.ensureRecordings == nil || d.splice == nil {
+		return fmt.Errorf("segment deletion is not configured")
+	}
+	if deleteLocks.isRecovering(sessionID) {
+		return recordingRestoreInProgress()
+	}
+	unlock := deleteLocks.lock(sessionID)
+	defer unlock()
+	session, err := d.store.GetSession(sessionID)
 	if err != nil {
 		return err
 	}
-	index := -1
-	for i, segment := range segments {
-		if segment.ID == segmentID {
-			index = i
-			break
-		}
+	if session.Status == storage.SessionActive {
+		return storage.ErrSegmentSessionActive
 	}
-	if index == -1 {
-		return storage.ErrSegmentNotFound
+	if session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
+		if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision == 0 &&
+			d.refine != nil && strings.TrimSpace(session.AudioPath) != "" {
+			go func() { _ = d.refine(context.Background(), sessionID, session.AudioPath, session.StartedAt) }()
+		}
+		return storage.ErrRefinedSegmentsUnavailable
+	}
+	if revision != session.RefinedRevision {
+		return storage.ErrStaleTranscriptRevision
 	}
 	if pending, err := d.store.HasPendingSplice(sessionID); err != nil {
 		return err
 	} else if pending {
 		return storage.ErrSegmentSplicePending
 	}
-	if d.transcriber == nil || d.ensureRecordings == nil || !keepAudio && d.splice == nil {
-		return fmt.Errorf("segment deletion is not configured")
+	segments, err := d.store.GetSegments(sessionID)
+	if err != nil {
+		return err
 	}
-	// A raw recording kept beside the session's would still hold the audio
-	// a splice cuts; "Delete text" cuts none.
-	if !keepAudio && strings.TrimSpace(d.audioDir) != "" {
+	var selected *transcribe.Segment
+	for i := range segments {
+		if segments[i].ID == segmentID {
+			selected = &segments[i]
+			break
+		}
+	}
+	if selected == nil {
+		return storage.ErrSegmentNotFound
+	}
+	if selected.TranscriptRevision != revision || selected.RecordingPath == "" || selected.RecordingSHA256 == "" {
+		return storage.ErrRefinedSegmentsUnavailable
+	}
+	if strings.TrimSpace(d.audioDir) != "" {
 		rawSessionIDs := []string{sessionID}
 		sources, err := d.store.SourceSessionIDs(sessionID)
 		if err != nil {
@@ -252,59 +438,49 @@ func (d *segmentDeleteRunner) delete(ctx context.Context, sessionID string, segm
 			}
 		}
 	}
-
 	recordingSet, err := d.ensureRecordings(ctx, session)
 	if err != nil {
 		return fmt.Errorf("get recordings: %w", err)
 	}
-	recordings := recordingSet.Paths
-	if len(recordings) == 0 {
-		return fmt.Errorf("session %s has no recording", sessionID)
-	}
 	keepDownloaded := false
 	defer func() {
-		if keepDownloaded {
-			return
-		}
-		for _, downloaded := range recordingSet.Downloaded {
-			_ = os.Remove(downloaded)
+		if !keepDownloaded {
+			removeFiles(recordingSet.Downloaded)
 		}
 	}()
-	// The words "Delete text" already removed are still in the recordings,
-	// but they are no segment's: they are neither the segment's nor its
-	// neighbours' when it is located and its cut is checked.
-	candidates := make([]audio.Recording, len(recordings))
-	textSpans := make([][]storage.TextDeletionSpan, len(recordings))
-	for i, recording := range recordings {
-		words, err := d.transcriber.Words(ctx, recording)
-		if err != nil {
-			return fmt.Errorf("transcribe recording %s: %w", recording, err)
+	recording := ""
+	for _, path := range recordingSet.Paths {
+		if filepath.Base(path) == filepath.Base(selected.RecordingPath) {
+			recording = path
+			break
 		}
-		duration := wordDuration(words)
-		if !keepAudio && d.duration != nil {
-			duration, err = d.duration(ctx, recording)
-			if err != nil {
-				return fmt.Errorf("probe recording %s: %w", recording, err)
-			}
-		}
-		if textSpans[i], err = d.deletedTextSpans(recording); err != nil {
-			return err
-		}
-		candidates[i] = audio.Recording{Words: wordsNotDeleted(words, textSpans[i], 0, 0), Duration: duration}
 	}
-	before, after := neighbourText(segments, index)
-	if keepAudio {
-		return d.deleteText(ctx, sessionID, segmentID, segments, index, &recordingSet, candidates)
+	if recording == "" {
+		return fmt.Errorf("recording %s is unavailable", selected.RecordingPath)
 	}
-	recordIndex, start, end, _, err := audio.Locate(candidates, segments[index].Text, before, after)
-	if err := locatedRecording(recordIndex, len(recordings), err); err != nil {
-		return err
-	}
-
-	recording := recordings[recordIndex]
 	beforeHash, err := fileSHA256(recording)
 	if err != nil {
 		return fmt.Errorf("hash recording %s before splice: %w", recording, err)
+	}
+	if beforeHash != selected.RecordingSHA256 {
+		return fmt.Errorf("recording %s changed since refinement; refresh it before deleting", recording)
+	}
+	words, err := d.store.RefinedWords(sessionID, revision)
+	if err != nil {
+		return err
+	}
+	start, end := refinedSpliceBounds(words, selected)
+	if d.duration != nil {
+		duration, err := d.duration(ctx, recording)
+		if err != nil {
+			return fmt.Errorf("probe recording %s: %w", recording, err)
+		}
+		if end > duration {
+			end = duration
+		}
+	}
+	if end <= start {
+		return fmt.Errorf("stored word span for segment %d has no removable audio", segmentID)
 	}
 	tempPath, err := copyForSplice(recording)
 	if err != nil {
@@ -326,38 +502,12 @@ func (d *segmentDeleteRunner) delete(ctx context.Context, sessionID string, segm
 			return fmt.Errorf("hash spliced recording %s: %w", tempPath, err)
 		}
 	}
-	wordsAfter, err := d.transcriber.Words(ctx, tempPath)
-	if err != nil {
-		return fmt.Errorf("transcribe spliced recording %s: %w", recording, err)
+	span := storage.DeletedSpan{
+		SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordingSet.Paths, ","),
+		Start: start, End: end, SHA256Before: beforeHash, SHA256After: afterHash,
 	}
-	wordsAfter = wordsNotDeleted(wordsAfter, textSpans[recordIndex], start, end-start)
-	if survivors := audio.Survivors(wordsAfter, start, segments[index].Text, before, after); len(survivors) > 0 {
-		return fmt.Errorf("%w: surviving words: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(survivors, ", "))
-	}
-	// A neighbour in another recording has no words on this recording's side
-	// of the cut, so it cannot have been over-cut here. Validate only sides
-	// for which the selected recording supplied pre-cut words.
-	beforeCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, true)
-	afterCheck := recordingHasWordsOnSide(candidates[recordIndex].Words, start, end, false)
-	if beforeCheck {
-		if beforeMissing := missingNeighbourTokens(wordsAfter, start, before, true); len(beforeMissing) > 1 {
-			return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(beforeMissing, ", "))
-		}
-	}
-	if afterCheck {
-		if afterMissing := missingNeighbourTokens(wordsAfter, start, after, false); len(afterMissing) > 1 {
-			return fmt.Errorf("%w: after-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(afterMissing, ", "))
-		}
-	}
-
-	span := storage.DeletedSpan{SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordings, ","), Start: start, End: end, StreamStart: segments[index].StartTime, StreamEnd: segments[index].EndTime, SHA256Before: beforeHash, SHA256After: afterHash}
-	deleteSegment := d.store.DeleteSegment
-	if d.deleteSegment != nil {
-		deleteSegment = d.deleteSegment
-	}
-	maintenanceErr := deleteSegment(sessionID, segmentID, span)
-	if maintenanceErr != nil && !errors.Is(maintenanceErr, storage.ErrSegmentPostCommitMaintenance) {
-		return maintenanceErr
+	if err := d.store.DeleteRefinedSegmentAudio(sessionID, segmentID, revision, &span); err != nil {
+		return err
 	}
 	keepDownloaded = true
 	if err := os.Rename(tempPath, recording); err != nil {
@@ -370,266 +520,32 @@ func (d *segmentDeleteRunner) delete(ctx context.Context, sessionID string, segm
 	if err := d.store.MarkSpliceComplete(&span); err != nil {
 		return err
 	}
-	if d.refine != nil {
-		updated, err := d.store.GetSession(sessionID)
-		if err != nil {
-			return fmt.Errorf("get spliced session %s: %w", sessionID, err)
+	if d.summarize != nil {
+		if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {
+			return fmt.Errorf("summarize refined audio deletion: %w", err)
 		}
-		if err := d.refine(ctx, sessionID, updated.AudioPath, updated.StartedAt); err != nil {
-			return fmt.Errorf("refine spliced session %s: %w", sessionID, err)
-		}
-	}
-	if maintenanceErr != nil {
-		return maintenanceErr
 	}
 	return nil
 }
 
-// deletedTextSpans returns the spans "Delete text" recorded in recording that
-// describe its bytes as they are now (storage.TextDeletionSpan.SHA256).
-func (d *segmentDeleteRunner) deletedTextSpans(recording string) ([]storage.TextDeletionSpan, error) {
-	spans, err := d.store.TextDeletionSpans(recording)
-	if err != nil || len(spans) == 0 {
-		return nil, err
+func refinedSpliceBounds(words []storage.RefinedWord, selected *transcribe.Segment) (float64, float64) {
+	const margin = 0.25
+	start, end := selected.StartTime-margin, selected.EndTime+margin
+	if start < 0 {
+		start = 0
 	}
-	hash, err := fileSHA256(recording)
-	if err != nil {
-		return nil, fmt.Errorf("hash recording %s: %w", recording, err)
-	}
-	current := spans[:0]
-	for _, span := range spans {
-		if span.SHA256 == hash {
-			current = append(current, span)
-		}
-	}
-	return current, nil
-}
-
-// wordsNotDeleted returns words without the ones "Delete text" removed from
-// their recording (storage.TextDeleted by spans). For the words of a copy
-// with cutLength seconds cut out at cutStart, a word after the cut is that
-// much later in the recording the spans describe.
-func wordsNotDeleted(words []audio.Word, spans []storage.TextDeletionSpan, cutStart, cutLength float64) []audio.Word {
-	if len(spans) == 0 {
-		return words
-	}
-	kept := make([]audio.Word, 0, len(words))
 	for _, word := range words {
-		start, end := word.Start, word.End
-		if cutLength > 0 && (start+end)/2 >= cutStart {
-			start, end = start+cutLength, end+cutLength
-		}
-		if !storage.TextDeleted(spans, start, end) {
-			kept = append(kept, word)
-		}
-	}
-	return kept
-}
-
-// locatedRecording is the runner's error for a locator's answer: none for a
-// match in one of n recordings, server.ErrSegmentNotFoundInRecording when the
-// segment's words were not found, so the deletion is refused.
-func locatedRecording(record, n int, err error) error {
-	if err != nil {
-		if errors.Is(err, audio.ErrSegmentNotFound) {
-			return server.ErrSegmentNotFoundInRecording
-		}
-		return fmt.Errorf("locate segment in recording: %w", err)
-	}
-	if record < 0 || record >= n {
-		return fmt.Errorf("locator returned recording index %d for %d recordings", record, n)
-	}
-	return nil
-}
-
-// deleteText is DeleteText's work once the recordings are transcribed
-// (candidates, the recordings' words, in session order): it locates the
-// segment's aligned words, records their span with the deletion, removes the
-// recordings it downloaded to find them, and makes the refinement and
-// summary again, without the words: the refinement when the session still
-// has audio, the summary alone when it has none.
-func (d *segmentDeleteRunner) deleteText(ctx context.Context, sessionID string, segmentID int64, segments []transcribe.Segment, index int, recordings *deletionRecordingSet, candidates []audio.Recording) error {
-	text := segments[index].Text
-	before, after := neighbourText(segments, index)
-	recordIndex, start, end, _, err := audio.LocateWords(candidates, text, before, after)
-	if err := locatedRecording(recordIndex, len(recordings.Paths), err); err != nil {
-		return err
-	}
-	if err := validateTextDeletionSpan(candidates, recordIndex, start, end, segments, index); err != nil {
-		return err
-	}
-	recording := recordings.Paths[recordIndex]
-	hash, err := fileSHA256(recording)
-	if err != nil {
-		return fmt.Errorf("hash recording %s: %w", recording, err)
-	}
-	maintenanceErr := d.store.DeleteSegmentText(sessionID, segmentID, storage.TextDeletionSpan{AudioPath: recording, Start: start, End: end, SHA256: hash})
-	if maintenanceErr != nil && !errors.Is(maintenanceErr, storage.ErrSegmentPostCommitMaintenance) {
-		return maintenanceErr
-	}
-	removeFiles(recordings.Downloaded)
-	updated, err := d.store.GetSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("get session %s after deleting text: %w", sessionID, err)
-	}
-	// The deletion leaves nothing to refine (no_audio) when the session's
-	// audio, or part of it, was removed to free space.
-	if updated.RefinementStatus != storage.RefinementNoAudio && strings.TrimSpace(updated.AudioPath) != "" {
-		if d.refine != nil {
-			if err := d.refine(ctx, sessionID, updated.AudioPath, updated.StartedAt); err != nil {
-				return fmt.Errorf("refine session %s after deleting text: %w", sessionID, err)
-			}
-		}
-	} else if d.summarize != nil {
-		if err := d.summarize(ctx, sessionID, updated.StartedAt); err != nil {
-			return fmt.Errorf("summarize session %s after deleting text: %w", sessionID, err)
-		}
-	}
-	return maintenanceErr
-}
-
-// textDeletionBounds has explicit presence flags so a valid word boundary at
-// zero seconds is not mistaken for a missing recording-edge bound.
-type textDeletionBounds struct {
-	lower, upper       float64
-	hasLower, hasUpper bool
-}
-
-// validateTextDeletionSpan proves that the words a later refinement would
-// keep after leaving out start to end contain no named segment word, lose no
-// more than one word from either neighbour, and leave no word between the
-// span and each aligned neighbour (or recording edge). A text deletion has
-// no audio splice to validate afterwards, so it validates the words already
-// transcribed to locate it before it records the span.
-
-func validateTextDeletionSpan(candidates []audio.Recording, recordIndex int, start, end float64, segments []transcribe.Segment, index int) error {
-	words := candidates[recordIndex].Words
-	text := segments[index].Text
-	before, after := neighbourText(segments, index)
-	beforeInRecord, afterInRecord := false, false
-	var bounds textDeletionBounds
-	length := end - start
-
-	if index > 0 {
-		beforeBefore := ""
-		if index > 1 {
-			beforeBefore = segments[index-2].Text
-		}
-		// Do not use text here: it is the disputed segment and an exact
-		// decoy can otherwise pull the neighbour match around itself.
-		neighbourRecord, neighbourStart, neighbourEnd, _, err := audio.LocateWords(candidates, before, beforeBefore, "")
-		if err != nil {
-			return fmt.Errorf("%w: before-neighbour could not be aligned", server.ErrSegmentNotRemovedCleanly)
-		}
-		if neighbourRecord == recordIndex {
-			if neighbourEnd > start || wordsRemainBetween(words, neighbourEnd, start) {
-				return fmt.Errorf("%w: words between the segment and its before-neighbour are outside the aligned span", server.ErrSegmentNotRemovedCleanly)
-			}
-			// Bound survivors by the neighbour's outer edge, not merely
-			// the edge beside the deleted span.
-			bounds.lower, bounds.hasLower, beforeInRecord = neighbourStart, true, true
-		} else if recordingHasWordsOnSide(words, start, end, true) {
-			return fmt.Errorf("%w: words before the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
-		}
-	} else if recordingHasWordsOnSide(words, start, end, true) {
-		return fmt.Errorf("%w: words before the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
-	}
-
-	if index+1 < len(segments) {
-		afterAfter := ""
-		if index+2 < len(segments) {
-			afterAfter = segments[index+2].Text
-		}
-		neighbourRecord, neighbourStart, neighbourEnd, _, err := audio.LocateWords(candidates, after, "", afterAfter)
-		if err != nil {
-			return fmt.Errorf("%w: after-neighbour could not be aligned", server.ErrSegmentNotRemovedCleanly)
-		}
-		if neighbourRecord == recordIndex {
-			if neighbourStart < end || wordsRemainBetween(words, end, neighbourStart) {
-				return fmt.Errorf("%w: words between the segment and its after-neighbour are outside the aligned span", server.ErrSegmentNotRemovedCleanly)
-			}
-			bounds.upper, bounds.hasUpper, afterInRecord = neighbourEnd-length, true, true
-		} else if recordingHasWordsOnSide(words, start, end, false) {
-			return fmt.Errorf("%w: words after the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
-		}
-	} else if recordingHasWordsOnSide(words, start, end, false) {
-		return fmt.Errorf("%w: words after the segment reach the recording edge", server.ErrSegmentNotRemovedCleanly)
-	}
-
-	afterWords := wordsAfterTextDeletion(words, start, end)
-	if survivors := audio.Survivors(wordsBetweenBounds(afterWords, bounds), start, text, before, after); len(survivors) > 0 {
-		return fmt.Errorf("%w: surviving words: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(survivors, ", "))
-	}
-	if beforeInRecord {
-		if missing := missingNeighbourTokens(afterWords, start, before, true); len(missing) > 1 {
-			return fmt.Errorf("%w: before-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(missing, ", "))
-		}
-	}
-	if afterInRecord {
-		if missing := missingNeighbourTokens(afterWords, start, after, false); len(missing) > 1 {
-			return fmt.Errorf("%w: after-neighbour words missing: %s", server.ErrSegmentNotRemovedCleanly, strings.Join(missing, ", "))
-		}
-	}
-	return nil
-}
-
-// wordsAfterTextDeletion returns words as a text deletion's later refinement
-// sees them: words whose middle is in the aligned span go, later words move
-// back by the missing duration.
-func wordsAfterTextDeletion(words []audio.Word, start, end float64) []audio.Word {
-	length := end - start
-	kept := make([]audio.Word, 0, len(words))
-	for _, word := range words {
-		middle := (word.Start + word.End) / 2
-		switch {
-		case middle >= start && middle <= end:
+		if word.RecordingPath != selected.RecordingPath || word.RecordingSHA256 != selected.RecordingSHA256 {
 			continue
-		case middle > end:
-			word.Start -= length
-			word.End -= length
 		}
-		kept = append(kept, word)
-	}
-	return kept
-}
-
-func wordsRemainBetween(words []audio.Word, lower, upper float64) bool {
-	for _, word := range words {
-		middle := (word.Start + word.End) / 2
-		if middle > lower && middle < upper {
-			return true
+		if word.End <= selected.StartTime && word.End > start {
+			start = word.End
+		}
+		if word.Start >= selected.EndTime && word.Start < end {
+			end = word.Start
 		}
 	}
-	return false
-}
-
-// wordsBetweenBounds restricts Survivors to the aligned neighbouring
-// segments. A missing boundary is a recording edge; validateTextDeletionSpan
-// has already proved it holds no unspanned words. Explicit flags keep a real
-// word boundary at 0.0 distinct from no boundary.
-func wordsBetweenBounds(words []audio.Word, bounds textDeletionBounds) []audio.Word {
-	near := make([]audio.Word, 0, len(words))
-	for _, word := range words {
-		if (!bounds.hasLower || word.End >= bounds.lower) &&
-			(!bounds.hasUpper || word.Start <= bounds.upper) {
-			near = append(near, word)
-		}
-	}
-	return near
-}
-
-// recordingHasWordsOnSide reports whether the selected recording has words on
-// the corresponding side of the cut.
-func recordingHasWordsOnSide(words []audio.Word, start, end float64, before bool) bool {
-	for _, word := range words {
-		if before && word.Start < start {
-			return true
-		}
-		if !before && word.End > end {
-			return true
-		}
-	}
-	return false
+	return start, end
 }
 
 type pendingSpliceOutcome struct {
@@ -658,14 +574,32 @@ func (e refinementAfterSegmentDeletionError) Unwrap() error { return e.err }
 // per session it refines only, so the caller owns the lifetime of each
 // status warning.
 func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error) (outcomes []pendingSpliceOutcome, err error) {
-	spans, err := store.PendingSplices(audioDir)
+	pending, err := store.PendingSplices(audioDir)
 	if err != nil {
 		return nil, err
 	}
-	outcomes = make([]pendingSpliceOutcome, 0, len(spans))
+	lost, err := store.MissingCompletedSplices(audioDir)
+	if err != nil {
+		return nil, err
+	}
+	outcomes = make([]pendingSpliceOutcome, 0, len(pending)+len(lost))
 	refined := make(map[string]bool)
-	for i := range spans {
-		span := spans[i]
+	recoveredRecordings := make(map[string]bool)
+	for i := range lost {
+		span := lost[i]
+		key := span.SessionID + "\x00" + filepath.Base(span.AudioPath)
+		if recoveredRecordings[key] {
+			continue
+		}
+		recoveredRecordings[key] = true
+		recovered, recoveryErr := recoverLostSplicedRecording(ctx, store, audioDir, source, splice, refine, &span)
+		outcomes = append(outcomes, pendingSpliceOutcome{Span: span, Recovered: recovered, Err: recoveryErr})
+		// A failed lost-cut recovery already has the actionable outcome and
+		// must not also emit a second, generic Drive-refinement failure.
+		refined[span.SessionID] = true
+	}
+	for i := range pending {
+		span := pending[i]
 		recovered, recoveryErr := recoverPendingSplice(ctx, store, audioDir, source, splice, refine, &span)
 		outcomes = append(outcomes, pendingSpliceOutcome{Span: span, Recovered: recovered, Err: recoveryErr})
 		// A splice recovered here was refined with it.
@@ -680,10 +614,115 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 	}
 	for _, sessionID := range sessionIDs {
 		if !refined[sessionID] {
-			outcomes = append(outcomes, refineUnfinishedDeletion(ctx, store, refine, sessionID))
+			outcomes = append(outcomes, refineUnfinishedDeletion(ctx, store, audioDir, source, refine, sessionID))
 		}
 	}
 	return outcomes, nil
+}
+
+func recoverLostSplicedRecording(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, splice func(context.Context, string, float64, float64) (string, error), refine func(context.Context, string, string, time.Time) error, first *storage.DeletedSpan) (bool, error) {
+	deleteLocks.setRecovering(first.SessionID, true)
+	defer deleteLocks.setRecovering(first.SessionID, false)
+	unlock := deleteLocks.lock(first.SessionID)
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+
+	session, err := store.GetSession(first.SessionID)
+	if err != nil {
+		return false, fmt.Errorf("get session %s for lost cut recovery: %w", first.SessionID, err)
+	}
+	recording := recordingname.Resolve(first.AudioPath, audioDir)
+	if _, err := os.Stat(recording); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat lost cut recording %s: %w", recording, err)
+	}
+	if !usableRecordingSource(source) || session.GDriveFolderID == "" {
+		return false, fmt.Errorf("recover lost cut recording %s: no Drive recording is available", recording)
+	}
+	files, err := source.ListFolderFiles(ctx, session.GDriveFolderID)
+	if err != nil {
+		return false, fmt.Errorf("list Drive recordings for lost cut %s: %w", recording, err)
+	}
+	var candidates []*drive.File
+	for _, file := range files {
+		name, ok := recordingname.LocalName(file.Name)
+		if ok && strings.HasPrefix(file.MimeType, "audio/") && name == filepath.Base(recording) {
+			candidates = append(candidates, file)
+		}
+	}
+	downloaded, err := downloadDestination(recording)
+	if err != nil {
+		return false, err
+	}
+	if err := downloadDriveRecording(ctx, store, session.ID, session.GDriveFolderID, source, candidates, downloaded, recording, recordingname.FileName(recording), true); err != nil {
+		_ = os.Remove(downloaded)
+		return false, fmt.Errorf("restore pre-cut recording %s: %w", recording, err)
+	}
+	keepDownloaded := false
+	defer func() {
+		if !keepDownloaded {
+			_ = os.Remove(downloaded)
+		}
+	}()
+	spans, err := store.CompletedSplicesForRecording(first.SessionID, first.AudioPath)
+	if err != nil {
+		return false, err
+	}
+	if len(spans) == 0 {
+		return false, fmt.Errorf("recover lost cut recording %s: no completed cut is recorded", recording)
+	}
+	hash, err := fileSHA256(downloaded)
+	if err != nil {
+		return false, fmt.Errorf("hash restored pre-cut recording %s: %w", downloaded, err)
+	}
+	for _, span := range spans {
+		if hash == span.SHA256After {
+			continue
+		}
+		if hash != span.SHA256Before {
+			return false, fmt.Errorf("restored pre-cut recording %s has SHA-256 %s, want %s", downloaded, hash, span.SHA256Before)
+		}
+		tempPath, err := copyForSplice(downloaded)
+		if err != nil {
+			return false, fmt.Errorf("copy lost cut recording %s: %w", downloaded, err)
+		}
+		afterHash, err := splice(ctx, tempPath, span.Start, span.End)
+		if err != nil {
+			_ = os.Remove(tempPath)
+			return false, fmt.Errorf("re-splice lost cut recording %s: %w", downloaded, err)
+		}
+		if afterHash != span.SHA256After {
+			_ = os.Remove(tempPath)
+			return false, fmt.Errorf("re-splice lost cut recording %s produced SHA-256 %s, want %s", downloaded, afterHash, span.SHA256After)
+		}
+		if err := os.Rename(tempPath, downloaded); err != nil {
+			return false, fmt.Errorf("replace recovered cut %s: %w", downloaded, err)
+		}
+		if err := syncRecordingDirectory(downloaded); err != nil {
+			return false, err
+		}
+		hash = afterHash
+	}
+	if err := os.Rename(downloaded, recording); err != nil {
+		return false, fmt.Errorf("install recovered cut recording %s: %w", recording, err)
+	}
+	if err := syncRecordingDirectory(recording); err != nil {
+		return false, err
+	}
+	keepDownloaded = true
+	unlock()
+	locked = false
+	if refine != nil {
+		if err := refine(ctx, first.SessionID, session.AudioPath, session.StartedAt); err != nil {
+			return true, refinementAfterSegmentDeletionError{sessionID: first.SessionID, err: err}
+		}
+	}
+	return true, nil
 }
 
 // refineUnfinishedDeletion runs the refinement, and with it the summary, of
@@ -692,7 +731,7 @@ func recoverPendingSplices(ctx context.Context, store *storage.SQLiteStore, audi
 // after its splice. A deletion of the session is refused while it runs, as
 // during a splice recovery; one already under way finishes first, and the
 // session is read as it left it.
-func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, refine func(context.Context, string, string, time.Time) error, sessionID string) pendingSpliceOutcome {
+func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, audioDir string, source deletionRecordingSource, refine func(context.Context, string, string, time.Time) error, sessionID string) pendingSpliceOutcome {
 	deleteLocks.setRecovering(sessionID, true)
 	defer deleteLocks.setRecovering(sessionID, false)
 	unlock := deleteLocks.lock(sessionID)
@@ -700,9 +739,17 @@ func refineUnfinishedDeletion(ctx context.Context, store *storage.SQLiteStore, r
 	unlock()
 	outcome := pendingSpliceOutcome{Span: storage.DeletedSpan{SessionID: sessionID, AudioPath: session.AudioPath}}
 	if err == nil {
+		err = restoreRefinementRecording(ctx, store, &session, audioDir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+			return restoreDeletionRecordings(ctx, store, &current, audioDir, source, "")
+		})
+	}
+	if err == nil {
+		session, err = store.GetSession(sessionID)
+	}
+	if err == nil {
 		err = refine(ctx, sessionID, session.AudioPath, session.StartedAt)
 	} else {
-		err = fmt.Errorf("get session %s to refine it: %w", sessionID, err)
+		err = fmt.Errorf("get or restore session %s to refine it: %w", sessionID, err)
 	}
 	if err != nil {
 		outcome.Err = refinementAfterSegmentDeletionError{sessionID: sessionID, err: err}
@@ -726,7 +773,7 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 	if err != nil {
 		return false, fmt.Errorf("get session %s for pending splice: %w", span.SessionID, err)
 	}
-	recordingSet, err := restoreDeletionRecordings(ctx, &session, audioDir, source)
+	recordingSet, err := restoreDeletionRecordings(ctx, store, &session, audioDir, source, filepath.Base(span.AudioPath))
 	if err != nil {
 		return false, fmt.Errorf("restore pending splice %s: %w", span.AudioPath, err)
 	}
@@ -903,102 +950,17 @@ func cleanupRecordingDirectories(store recordingDirectoryLister, audioDir string
 	return errors.Join(cleanupErr, store.ForgetEraseDirectories(cleaned), store.RecordEraseDirectory(audioDir))
 }
 
-func neighbourText(segments []transcribe.Segment, index int) (before, after string) {
-	if index > 0 {
-		before = segments[index-1].Text
+func downloadDestination(recording string) (string, error) {
+	output, err := os.CreateTemp(filepath.Dir(recording), ".download-*"+filepath.Ext(recording))
+	if err != nil {
+		return "", fmt.Errorf("create recovery download beside %s: %w", recording, err)
 	}
-	if index+1 < len(segments) {
-		after = segments[index+1].Text
+	path := output.Name()
+	if err := output.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close recovery download %s: %w", path, err)
 	}
-	return before, after
-}
-
-func wordDuration(words []audio.Word) float64 {
-	var duration float64
-	for _, word := range words {
-		if word.End > duration {
-			duration = word.End
-		}
-	}
-	return duration
-}
-
-const neighbourTokenLimit = 6
-
-func missingNeighbourTokens(words []audio.Word, splice float64, neighbour string, before bool) []string {
-	expected := nearestTokens(deletionTokens(neighbour), before)
-	if len(expected) == 0 {
-		return nil
-	}
-	var actual []string
-	for _, word := range words {
-		if before && word.End <= splice {
-			actual = append(actual, deletionTokens(word.Text)...)
-		}
-		if !before && word.Start >= splice {
-			actual = append(actual, deletionTokens(word.Text)...)
-		}
-	}
-	return orderedMissing(expected, nearestTokens(actual, before))
-}
-
-func nearestTokens(tokens []string, before bool) []string {
-	if len(tokens) <= neighbourTokenLimit {
-		return tokens
-	}
-	if before {
-		return tokens[len(tokens)-neighbourTokenLimit:]
-	}
-	return tokens[:neighbourTokenLimit]
-}
-
-func orderedMissing(expected, actual []string) []string {
-	rows := make([][]int, len(expected)+1)
-	for i := range rows {
-		rows[i] = make([]int, len(actual)+1)
-	}
-	for i := len(expected) - 1; i >= 0; i-- {
-		for j := len(actual) - 1; j >= 0; j-- {
-			switch {
-			case expected[i] == actual[j]:
-				rows[i][j] = rows[i+1][j+1] + 1
-			case rows[i+1][j] >= rows[i][j+1]:
-				rows[i][j] = rows[i+1][j]
-			default:
-				rows[i][j] = rows[i][j+1]
-			}
-		}
-	}
-	missing := make([]string, 0, len(expected)-rows[0][0])
-	for i, j := 0, 0; i < len(expected); {
-		switch {
-		case j < len(actual) && expected[i] == actual[j]:
-			i++
-			j++
-		case j < len(actual) && rows[i][j+1] > rows[i+1][j]:
-			j++
-		default:
-			missing = append(missing, expected[i])
-			i++
-		}
-	}
-	return missing
-}
-
-func deletionTokens(text string) []string {
-	var tokens []string
-	for _, field := range strings.Fields(text) {
-		var token strings.Builder
-		for _, r := range field {
-			if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsMark(r) {
-				token.WriteRune(unicode.ToLower(r))
-			}
-		}
-		if token.Len() > 0 {
-			tokens = append(tokens, token.String())
-		}
-	}
-	return tokens
+	return path, nil
 }
 
 func copyForSplice(source string) (string, error) {

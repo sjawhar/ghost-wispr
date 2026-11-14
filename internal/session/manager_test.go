@@ -24,14 +24,15 @@ import (
 )
 
 type storeMock struct {
-	mu       sync.Mutex
-	sessions map[string]time.Time
-	segments map[string][]transcribe.Segment
-	title    map[string]string
-	summary  map[string]string
-	status   map[string]string
-	preset   map[string]string
-	audio    map[string]string
+	mu            sync.Mutex
+	sessions      map[string]time.Time
+	segments      map[string][]transcribe.Segment
+	title         map[string]string
+	summary       map[string]string
+	status        map[string]string
+	summaryStatus map[string]string
+	preset        map[string]string
+	audio         map[string]string
 
 	summaryModel            map[string]string
 	refinementModel         map[string]string
@@ -58,6 +59,7 @@ func newStoreMock() *storeMock {
 		title:                  map[string]string{},
 		summary:                map[string]string{},
 		status:                 map[string]string{},
+		summaryStatus:          map[string]string{},
 		preset:                 map[string]string{},
 		audio:                  map[string]string{},
 		summaryModel:           map[string]string{},
@@ -92,6 +94,28 @@ func (s *storeMock) EndSession(id string, _ time.Time, audioPath string) error {
 	return nil
 }
 
+// TestStoreMockSeparatesSessionAndSummaryStatus fails if the test double lets
+// an asynchronous summary completion overwrite the session lifecycle state.
+func TestStoreMockSeparatesSessionAndSummaryStatus(t *testing.T) {
+	store := newStoreMock()
+	started := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("session", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("session", started.Add(time.Minute), "session.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("session", "title", "summary", storage.SummaryCompleted, "default", "{}", "model", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got := store.status["session"]; got != storage.SessionEnded {
+		t.Fatalf("session status = %q, want %q", got, storage.SessionEnded)
+	}
+}
+
+//nolint:gocritic // Test double matches the production Store contract.
 func (s *storeMock) AppendSegment(sessionID string, seg transcribe.Segment) error {
 	if s.appendHook != nil {
 		s.appendHook()
@@ -118,7 +142,7 @@ func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status,
 	}
 	s.title[sessionID] = title
 	s.summary[sessionID] = summary
-	s.status[sessionID] = status
+	s.summaryStatus[sessionID] = status
 	s.preset[sessionID] = preset
 	s.summaryModel[sessionID] = model
 	return nil
@@ -128,7 +152,7 @@ func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status,
 func (s *storeMock) StartSummary(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.status[sessionID] = storage.SummaryRunning
+	s.summaryStatus[sessionID] = storage.SummaryRunning
 	return nil
 }
 
@@ -146,7 +170,7 @@ func (s *storeMock) FailSummaryAtGeneration(sessionID, errMsg string, generation
 	if generation != s.canonicalizeGeneration[sessionID] {
 		return storage.Session{}, sql.ErrNoRows
 	}
-	s.status[sessionID] = storage.SummaryFailed
+	s.summaryStatus[sessionID] = storage.SummaryFailed
 	s.errorMessage[sessionID] = errMsg
 	return storage.Session{ID: sessionID, Title: s.title[sessionID], Summary: s.summary[sessionID],
 		SummaryStatus: storage.SummaryFailed, SummaryPreset: s.preset[sessionID], SummaryError: errMsg}, nil
@@ -192,6 +216,28 @@ func (s *storeMock) UpdateRefinementAtGeneration(sessionID, transcript, status, 
 	return nil
 }
 
+func (s *storeMock) PublishRefinementAtGeneration(sessionID, transcript, model string, _ []storage.RefinedWord, segments []storage.RefinedSegment, generation int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return 0, sql.ErrNoRows
+	}
+	s.refinementStatus[sessionID] = storage.RefinementCompleted
+	s.refinementModel[sessionID] = model
+	s.refinedTranscript[sessionID] = transcript
+	s.canonicalTranscript[sessionID] = transcript
+	s.transcriptSource[sessionID] = storage.TranscriptSourceRefined
+	s.segments[sessionID] = make([]transcribe.Segment, len(segments))
+	for i, segment := range segments {
+		s.segments[sessionID][i] = transcribe.Segment{
+			Speaker: segment.Speaker, Text: segment.Text, StartTime: segment.Start, EndTime: segment.End,
+			TranscriptRevision: 1, RecordingPath: segment.RecordingPath, RecordingSHA256: segment.RecordingSHA256,
+			RecordingOrdinal: segment.RecordingOrdinal, FirstWordOrdinal: segment.FirstWordOrdinal, LastWordOrdinal: segment.LastWordOrdinal,
+		}
+	}
+	return 1, nil
+}
+
 // ClaimRefinement claims the refinement only while the session still names
 // audioPath, as the real store does.
 func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (int, bool, error) {
@@ -229,8 +275,8 @@ func (s *storeMock) Canonicalize(sessionID string) (string, int, error) {
 		s.transcriptSource[sessionID] = "refined"
 	} else {
 		var b strings.Builder
-		for _, seg := range s.segments[sessionID] {
-			text := strings.TrimSpace(seg.Text)
+		for i := range s.segments[sessionID] {
+			text := strings.TrimSpace(s.segments[sessionID][i].Text)
 			if text == "" {
 				continue
 			}
@@ -252,9 +298,10 @@ type recorderMock struct {
 	startErr error
 	// endErr, when set, fails every EndSession; unsavedPath is the raw file
 	// DiscardUnsaved then reports, and discards counts its calls.
-	endErr      error
-	unsavedPath string
-	discards    int
+	endErr        error
+	unsavedPath   string
+	recordingPath string
+	discards      int
 	// startHook and endHook, when set, run first in StartSession and
 	// EndSession, outside the mock's lock, so a test can hold a call open.
 	startHook func()
@@ -290,6 +337,15 @@ func (r *recorderMock) EndSession(sessionID string) (string, error) {
 	}
 	if sessionID == "" || !slices.Contains(r.started, sessionID) {
 		return "", nil
+	}
+	if r.recordingPath != "" {
+		if err := os.MkdirAll(filepath.Dir(r.recordingPath), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(r.recordingPath, []byte("recorded audio"), 0o600); err != nil {
+			return "", err
+		}
+		return r.recordingPath, nil
 	}
 	return "data/audio/" + sessionID + ".mp3", nil
 }
@@ -344,7 +400,13 @@ func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (t
 	if b.err != nil {
 		return transcribe.BatchResult{}, b.err
 	}
-	return transcribe.BatchResult{Transcript: b.transcript, Model: b.model}, nil
+	var words []transcribe.TimestampedWord
+	start := 0.0
+	for _, text := range strings.Fields(b.transcript) {
+		words = append(words, transcribe.TimestampedWord{Text: text, Start: start, End: start + 0.3})
+		start += 0.35
+	}
+	return transcribe.BatchResult{Transcript: b.transcript, Model: b.model, Words: words}, nil
 }
 
 type syncerMock struct {
@@ -468,6 +530,7 @@ type hubMock struct {
 	endedHook func(sessionID string)
 }
 
+//nolint:gocritic // Test double matches the Hub contract.
 func (h *hubMock) BroadcastLiveTranscript(_ string, _ transcribe.Segment) {
 	h.mu.Lock()
 	h.liveCount++
@@ -656,7 +719,7 @@ func TestManager_ForceEndSession_SummaryCompletes(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		store.mu.Lock()
-		status := store.status[sessionID]
+		status := store.summaryStatus[sessionID]
 		store.mu.Unlock()
 		if status == storage.SummaryCompleted {
 			break
@@ -689,6 +752,31 @@ func TestManager_EndSession_StoreFailurePreservesState(t *testing.T) {
 
 	if got := manager.currentSession(); got == "" {
 		t.Fatal("expected manager to preserve currentSessionID on end failure")
+	}
+}
+
+// A recorder can finish after another path merged its session. The store's
+// ErrSessionMerged is final: the manager clears its active state and does not
+// retry the end against the merged row.
+func TestManager_EndMergedSessionIsFinal(t *testing.T) {
+	store := newStoreMock()
+	store.endSessionErr = storage.ErrSessionMerged
+	recorder := &recorderMock{}
+	manager := NewManager(store, recorder, nil, nil, NewDetector(time.Hour), 0)
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("ensureSessionStarted: %v", err)
+	}
+	if err := manager.ForceEndSession(context.Background()); err != nil {
+		t.Fatalf("ending a merged session = %v, want final success", err)
+	}
+	if got := manager.currentSession(); got != "" {
+		t.Fatalf("manager retains merged session %q as active", got)
+	}
+	if err := manager.ForceEndSession(context.Background()); !errors.Is(err, ErrNoActiveSession) {
+		t.Fatalf("second end = %v, want %v", err, ErrNoActiveSession)
+	}
+	if _, ended := recorder.counts(); ended != 1 {
+		t.Fatalf("recorder ends = %d, want 1", ended)
 	}
 }
 
@@ -1135,7 +1223,7 @@ func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T)
 	}
 
 	store.mu.Lock()
-	status := store.status["session-no-summarizer"]
+	status := store.summaryStatus["session-no-summarizer"]
 	store.mu.Unlock()
 	if status != storage.SummaryCompleted {
 		t.Errorf("summary status = %q, want %q", status, storage.SummaryCompleted)
@@ -1359,7 +1447,7 @@ func TestWaitForLifecyclePublishesHonorsContext(t *testing.T) {
 
 func TestManager_BatchRefinement_SubmitsAndStoresRefinedTranscript(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	calledPath := make(chan string, 1)
 	transcriptC := make(chan string, 1)
 
@@ -1412,7 +1500,7 @@ func TestManager_BatchRefinement_SubmitsAndStoresRefinedTranscript(t *testing.T)
 
 func TestManager_BatchRefinement_TimeoutFallsBackToStreamingTranscript(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1460,7 +1548,7 @@ func TestManager_BatchRefinement_TimeoutFallsBackToStreamingTranscript(t *testin
 
 func TestManager_Canonicalization_UsesCanonicalTranscriptForSummary(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1509,7 +1597,7 @@ func TestManager_Canonicalization_UsesCanonicalTranscriptForSummary(t *testing.T
 
 func TestManager_BatchRefinement_LateCompletionRecanonicalizes(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1583,8 +1671,8 @@ func TestManager_GenerateSummary_StoresErrorOnFailure(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if store.status["sess-err"] != storage.SummaryFailed {
-		t.Fatalf("expected summary_status %q, got %q", storage.SummaryFailed, store.status["sess-err"])
+	if store.summaryStatus["sess-err"] != storage.SummaryFailed {
+		t.Fatalf("expected summary_status %q, got %q", storage.SummaryFailed, store.summaryStatus["sess-err"])
 	}
 	if store.errorMessage["sess-err"] == "" {
 		t.Fatal("expected error_message to be set, got empty string")
@@ -1636,7 +1724,11 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	if err := store.CreateSession("sess-refine", time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-	if err := store.EndSession("sess-refine", time.Now().UTC(), "data/audio/sess-refine.mp3"); err != nil {
+	audioPath := filepath.Join(t.TempDir(), "sess-refine.mp3")
+	if err := os.WriteFile(audioPath, []byte("recorded audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("sess-refine", time.Now().UTC(), audioPath); err != nil {
 		t.Fatalf("EndSession failed: %v", err)
 	}
 	hub := &hubMock{}
@@ -1644,7 +1736,7 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, hub, NewDetector(time.Hour), 0)
 	manager.SetBatchTranscriber(batchTranscriberMock{transcript: "refined transcript text"})
 
-	err := manager.RefineSession(context.Background(), "sess-refine", "data/audio/sess-refine.mp3", time.Time{})
+	err := manager.RefineSession(context.Background(), "sess-refine", audioPath, time.Time{})
 	if err != nil {
 		t.Fatalf("RefineSession: %v", err)
 	}
@@ -1773,8 +1865,8 @@ func segmentText(t *testing.T, store *storeMock, sessionID string) string {
 		t.Fatalf("GetSegments failed: %v", err)
 	}
 	var text []string
-	for _, seg := range segments {
-		text = append(text, seg.Text)
+	for i := range segments {
+		text = append(text, segments[i].Text)
 	}
 	return strings.Join(text, " ")
 }
@@ -2260,9 +2352,12 @@ func TestManagerStoresProviderReportedRefinementModel(t *testing.T) {
 		configuredModel = "configured-refinement-model"
 		providerModel   = "provider-refinement-model"
 		sessionID       = "refinement-model-session"
-		audioPath       = "data/audio/refinement-model-session.mp3"
 	)
 	store := newStoreMock()
+	audioPath := filepath.Join(t.TempDir(), "refinement-model-session.mp3")
+	if err := os.WriteFile(audioPath, []byte("recorded audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

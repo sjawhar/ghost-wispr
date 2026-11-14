@@ -50,8 +50,8 @@ func TestR7GenerateSummaryReturnsAfterCanonicalizeError(t *testing.T) {
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.status["session"] != storage.SummaryFailed || !strings.Contains(store.errorMessage["session"], "canonicalization failed") {
-		t.Fatalf("summary after Canonicalize error = status %q, error %q; want failed status with the canonicalization error", store.status["session"], store.errorMessage["session"])
+	if store.summaryStatus["session"] != storage.SummaryFailed || !strings.Contains(store.errorMessage["session"], "canonicalization failed") {
+		t.Fatalf("summary after Canonicalize error = status %q, error %q; want failed status with the canonicalization error", store.summaryStatus["session"], store.errorMessage["session"])
 	}
 }
 
@@ -100,7 +100,7 @@ func TestR7SummaryCarriesCanonicalizeGenerationToItsWrite(t *testing.T) {
 	}
 	// A refused stale write records no failure: whatever changed the
 	// generation (a segment deletion) owns the summary's status now.
-	if store.status["session"] == storage.SummaryFailed || store.summary["session"] != "" {
-		t.Fatalf("summary after generation changed = status %q, text %q; want no failure recorded and no stale text stored", store.status["session"], store.summary["session"])
+	if store.summaryStatus["session"] == storage.SummaryFailed || store.summary["session"] != "" {
+		t.Fatalf("summary after generation changed = status %q, text %q; want no failure recorded and no stale text stored", store.summaryStatus["session"], store.summary["session"])
 	}
 }

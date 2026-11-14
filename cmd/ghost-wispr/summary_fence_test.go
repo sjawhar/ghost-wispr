@@ -57,8 +57,8 @@ func (r *racingSummarizer) SummarizeWithPresetReported(_ context.Context, _, tra
 // text (StartSummary): the newer run that an older one must leave alone.
 func deleteAndStartNewerSummary(t *testing.T, store *storage.SQLiteStore, id string, segmentID int64) {
 	t.Helper()
-	if err := store.DeleteSegment(id, segmentID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}); err != nil {
-		t.Fatalf("delete segment: %v", err)
+	if err := deleteRefinedAudioForTest(t, store, id, segmentID, &storage.DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	if err := store.StartSummary(id); err != nil {
 		t.Fatalf("start the newer summary: %v", err)
@@ -265,7 +265,7 @@ func TestEmptySummaryWritesStartAtTheDeletionGeneration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := store.DeleteSegment(id, segments[0].ID, storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
+		if err := deleteRefinedAudioForTest(t, store, id, segments[0].ID, &storage.DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 1, SHA256Before: "before", SHA256After: "after"}); err != nil {
 			t.Fatal(err)
 		}
 		return store

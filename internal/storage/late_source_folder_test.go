@@ -24,7 +24,7 @@ func TestRecordSyncFolderOwesAMergedTargetsDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("merged", segments[0].ID, DeletedSpan{AudioPath: "recording-source.mp3", Start: 1, End: 3, SHA256Before: "before", SHA256After: "after"}); err != nil {
+	if err := deleteRefinedAudioTestSegment(t, store, "merged", segments[0].ID, DeletedSpan{AudioPath: "recording-source.mp3", Start: 1, End: 3, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatal(err)
 	}
 	if recorded, err := store.RecordSyncFolder("source", "source-sync", "source-folder"); err != nil || !recorded {

@@ -70,8 +70,8 @@ func TestTheWriteAheadLogIsOverwrittenBeforeItIsTruncated(t *testing.T) {
 		return truncate(db)
 	}
 
-	if err := store.DeleteSegment("logged", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := deleteRefinedAudioTestSegment(t, store, "logged", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	if !checked {
 		t.Fatal("the deletion never truncated the write-ahead log")
@@ -96,10 +96,9 @@ func TestARefreshedBackupZeroesTheBackupItReplaces(t *testing.T) {
 	assertHeldZeroed(t, held, size, "backup the refresh replaced")
 }
 
-// TestABackupScrubRebuildsAFormattedCanonicalTranscript fails if the scrub of
-// a backup of an older schema keeps the deleted words in a canonical
-// transcript the build that made it formatted differently (it must not
-// depend on the deleted text appearing as this version writes it).
+// TestABackupScrubClearsTheCanonicalTranscript fails if the scrub of an
+// older-schema backup keeps a canonical transcript after every segment of
+// the affected session is removed.
 func TestABackupScrubRebuildsAFormattedCanonicalTranscript(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	openWithSecret(t, path)
@@ -131,8 +130,8 @@ func TestABackupScrubRebuildsAFormattedCanonicalTranscript(t *testing.T) {
 	if err := backup.QueryRow(`SELECT canonical_transcript FROM sessions WHERE id = 'backed-up'`).Scan(&canonical); err != nil {
 		t.Fatal(err)
 	}
-	if canonical != "before bridge\nafter bridge\n" {
-		t.Errorf("backup canonical transcript = %q, want it rebuilt from the remaining segments", canonical)
+	if canonical != "" {
+		t.Errorf("backup canonical transcript = %q, want empty after every affected segment was removed", canonical)
 	}
 }
 

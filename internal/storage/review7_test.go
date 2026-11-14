@@ -67,7 +67,7 @@ func TestMarkSyncedOwesTheFolderOfAPendingDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("marked", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	if err := deleteRefinedAudioTestSegment(t, store, "marked", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatal(err)
 	}
 	marked, err := store.MarkSynced("marked", "first-sync", "folder-marked-during-the-deletion", func(Session, []transcribe.Segment) bool { return true })

@@ -102,8 +102,8 @@ func TestFirstSyncCutOffAfterFolderCreationReusesTheFolderAndOwesIt(t *testing.T
 	}
 
 	span := storage.DeletedSpan{SessionID: id, AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}
-	if err := store.DeleteSegment(id, segments[1].ID, span); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, &span); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	generation, err := store.DeletionGeneration(id)
 	if err != nil {

@@ -61,10 +61,10 @@ func GenerateTitle(llmTitle, transcript string, segments []transcribe.Segment, s
 func uniqueSpeakers(segments []transcribe.Segment) []int {
 	seen := make(map[int]struct{})
 	var result []int
-	for _, seg := range segments {
-		if _, ok := seen[seg.Speaker]; !ok {
-			seen[seg.Speaker] = struct{}{}
-			result = append(result, seg.Speaker)
+	for i := range segments {
+		if _, ok := seen[segments[i].Speaker]; !ok {
+			seen[segments[i].Speaker] = struct{}{}
+			result = append(result, segments[i].Speaker)
 		}
 	}
 	sort.Ints(result)

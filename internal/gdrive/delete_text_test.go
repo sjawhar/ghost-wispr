@@ -27,6 +27,67 @@ func recordingHash(t *testing.T, path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span *storage.DeletedSpan) error {
+	t.Helper()
+	index, revision, segments := publishRefinedSegmentsForTest(t, store, sessionID, liveSegmentID, span.AudioPath, span.SHA256Before)
+	return store.DeleteRefinedSegmentAudio(sessionID, segments[index].ID, revision, span)
+}
+
+func deleteRefinedTextForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.TextDeletionSpan) error {
+	t.Helper()
+	index, revision, segments := publishRefinedSegmentsForTest(t, store, sessionID, liveSegmentID, span.AudioPath, span.SHA256)
+	return store.DeleteRefinedSegmentText(sessionID, segments[index].ID, revision)
+}
+
+func publishRefinedSegmentsForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, recordingPath, recordingHash string) (int, int, []storageSegmentForTest) {
+	t.Helper()
+	live, err := store.GetSegments(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := -1
+	words := make([]storage.RefinedWord, 0, len(live))
+	refined := make([]storage.RefinedSegment, 0, len(live))
+	for i := range live {
+		segment := &live[i]
+		if segment.ID == liveSegmentID {
+			index = i
+		}
+		words = append(words, storage.RefinedWord{
+			RecordingPath: recordingPath, RecordingSHA256: recordingHash, Ordinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+		refined = append(refined, storage.RefinedSegment{
+			RecordingPath: recordingPath, RecordingSHA256: recordingHash, FirstWordOrdinal: i, LastWordOrdinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+	}
+	if index < 0 {
+		t.Fatalf("live segment %d not found", liveSegmentID)
+	}
+	generation, err := store.DeletionGeneration(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), "test", words, refined, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]storageSegmentForTest, len(segments))
+	for i := range segments {
+		out[i] = storageSegmentForTest{ID: segments[i].ID}
+	}
+	return index, revision, out
+}
+
+type storageSegmentForTest struct {
+	ID int64
+}
+
 // folderFiles returns the id and content of each file in folder, by name,
 // failing the test if a name has another number of copies than one.
 func folderFiles(t *testing.T, wire *wireDrive, folder string) map[string]wireFile {
@@ -52,16 +113,16 @@ func deleteTextFrom(t *testing.T, store *storage.SQLiteStore, id, recording, sum
 		t.Fatal(err)
 	}
 	var secretID int64
-	for _, segment := range segments {
-		if strings.Contains(segment.Text, textSecret) {
-			secretID = segment.ID
+	for i := range segments {
+		if strings.Contains(segments[i].Text, textSecret) {
+			secretID = segments[i].ID
 		}
 	}
 	if secretID == 0 {
 		t.Fatalf("control: session %s has no segment holding the secret", id)
 	}
-	if err := store.DeleteSegmentText(id, secretID, storage.TextDeletionSpan{AudioPath: recording, Start: 1, End: 2, SHA256: recordingHash(t, recording)}); err != nil {
-		t.Fatalf("DeleteSegmentText: %v", err)
+	if err := deleteRefinedTextForTest(t, store, id, secretID, storage.TextDeletionSpan{AudioPath: recording, Start: 1, End: 2, SHA256: recordingHash(t, recording)}); err != nil {
+		t.Fatalf("delete refined text: %v", err)
 	}
 	status := storage.SummaryCompleted
 	if summary == "" {

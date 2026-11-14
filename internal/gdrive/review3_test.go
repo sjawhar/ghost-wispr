@@ -59,8 +59,8 @@ func TestReview3ReadySessionWithOpenSpliceUploadsNothing(t *testing.T) {
 				folder = syncedSession(t, store, o, id)
 			}
 			span := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b", SHA256After: "a"}
-			if err := store.DeleteSegment(id, segments[1].ID, span); err != nil {
-				t.Fatalf("DeleteSegment: %v", err)
+			if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, &span); err != nil {
+				t.Fatalf("delete refined segment: %v", err)
 			}
 			if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = ?, summary_status = ?, summary = 'clean', title = 'Clean' WHERE id = ?`,
 				storage.RefinementCompleted, storage.SummaryCompleted, id); err != nil {
@@ -121,7 +121,7 @@ func TestReview3NoFolderBranchDoesNotClearANewerDeletion(t *testing.T) {
 	recording, segments := round2Session(t, store, id, []string{"alpha stays.", "bravo secret.", "charlie secret."})
 	wire, syncer := newWireDrive(t)
 	span1 := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "b1", SHA256After: "a1"}
-	if err := store.DeleteSegment(id, segments[1].ID, span1); err != nil {
+	if err := deleteRefinedAudioForTest(t, store, id, segments[1].ID, &span1); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(recording, []byte("audio still holding CHARLIE"), 0o644); err != nil {
@@ -143,10 +143,15 @@ func TestReview3NoFolderBranchDoesNotClearANewerDeletion(t *testing.T) {
 		storage.RefinementCompleted, storage.SummaryCompleted, id); err != nil {
 		t.Fatal(err)
 	}
+	current, err := store.GetSegments(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlieID := current[1].ID
 	hooked := &spliceHookStore{SQLiteStore: store}
 	hooked.hook = func() {
-		span2 := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 2, End: 3, SHA256Before: "b2", SHA256After: "a2"}
-		if err := store.DeleteSegment(id, segments[2].ID, span2); err != nil {
+		span2 := storage.DeletedSpan{SessionID: id, AudioPath: recording, Start: 1, End: 2, SHA256Before: "a1", SHA256After: "a2"}
+		if err := deleteRefinedAudioForTest(t, store, id, charlieID, &span2); err != nil {
 			t.Errorf("delete charlie: %v", err)
 		}
 	}

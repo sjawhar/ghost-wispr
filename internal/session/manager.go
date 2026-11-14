@@ -444,8 +444,12 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 		end.audioPath, end.saved = path, true
 	}
 
+	merged := false
 	if err := m.store.EndSession(sessionID, endedAt, end.audioPath); err != nil {
-		return fmt.Errorf("end session: %w", err)
+		if !errors.Is(err, storage.ErrSessionMerged) {
+			return fmt.Errorf("end session: %w", err)
+		}
+		merged = true
 	}
 
 	m.mu.Lock()
@@ -458,6 +462,9 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	ended = true
 	minSegs := m.minSessionSegments
 	m.mu.Unlock()
+	if merged {
+		return nil
+	}
 
 	// Check if session meets minimum segment threshold.
 	if minSegs > 0 {
@@ -529,19 +536,14 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinementAtGeneration(sessionID, result.Transcript, storage.RefinementCompleted, result.Model, generation); err != nil {
-		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+	if _, err := m.store.PublishRefinementAtGeneration(sessionID, result.Transcript, result.Model, result.Words, result.Segments, generation); err != nil {
+		m.batchLogger.Error("failed to publish refined words and segments", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}
 
 	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID, "model", result.Model)
 	if m.hub != nil {
 		m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
-	}
-
-	// Re-canonicalize now that refined transcript is available.
-	if _, _, err := m.store.Canonicalize(sessionID); err != nil {
-		m.batchLogger.Error("failed to re-canonicalize after batch refinement", "operation", "batch_refinement", "session_id", sessionID, "error", err)
 	}
 }
 

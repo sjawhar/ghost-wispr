@@ -7,9 +7,9 @@
     requestErrorMessage,
     type SegmentDeleteMode,
   } from '../lib/api'
-  import { RefinementStatus, type Segment, type SessionSummary } from '../lib/types'
+  import { RefinementStatus, SyncState, type Segment, type SessionSummary } from '../lib/types'
   import { copyText } from '../lib/clipboard'
-  import { audioLeftNote, recordingsNamed } from '../lib/audio'
+  import { audioLeftNote, canRestoreRefinement, recordingsNamed } from '../lib/audio'
 
   let {
     sessionId,
@@ -57,6 +57,12 @@
     },
   ]
 
+  function actionsForSegment(segment: Segment): (typeof deleteActions)[number][] {
+    return segment.untimed
+      ? deleteActions.filter((action) => action.mode === 'text')
+      : deleteActions
+  }
+
   function closeDeleteMenuOnEscape(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       deleteMenuFor = null
@@ -69,27 +75,49 @@
     }
   }
 
-  // Refined transcript: prefer the explicit refined_transcript, fall back to
-  // canonical_transcript when the source is 'refined' (covers historical sessions
-  // where the backend canonicalized into canonical_transcript).
-  const refinedText = $derived.by(() => {
-    if (!session) return ''
-    const refined = session.refined_transcript?.trim()
-    if (refined) return refined
-    if (session.transcript_source === 'refined') {
-      return session.canonical_transcript?.trim() ?? ''
-    }
-    return ''
-  })
-
-  const refinementCompleted = $derived(
-    session?.refinement_status === RefinementStatus.Completed && refinedText.length > 0,
-  )
-
   const refinementInFlight = $derived(
     session?.refinement_status === RefinementStatus.Pending ||
       session?.refinement_status === RefinementStatus.Running,
   )
+
+  // Timed segments are rebuilt from batch words. Untimed segments come from a
+  // merged source with no recording and can safely use only Delete text.
+  const timedDeletionAvailable = $derived(
+    session?.refinement_status === RefinementStatus.Completed &&
+      (session.refined_revision ?? 0) > 0 &&
+      visibleSegments.some((segment) => !segment.untimed) &&
+      visibleSegments
+        .filter((segment) => !segment.untimed)
+        .every((segment) => (segment.transcript_revision ?? 0) > 0),
+  )
+
+  function canDeleteSegment(segment: Segment): boolean {
+    return segment.untimed || timedDeletionAvailable
+  }
+  const deleteUnavailableNote = $derived.by(() => {
+    if (session?.refinement_status === RefinementStatus.Failed) {
+      return 'Refinement failed; retry refinement before deleting.'
+    }
+    if (session?.refinement_status === RefinementStatus.NoAudio) {
+      if (session.restored_at && session.sync_state === SyncState.RemoteDeleted) {
+        return "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined."
+      }
+      if (session.restored_at && canRestoreRefinement(session)) {
+        return 'This conversation was restored from Drive; retry refinement to delete from it'
+      }
+      if (canRestoreRefinement(session)) {
+        return 'No recording is on this unit. Use Retry refinement to restore it from Drive, then delete.'
+      }
+      if (session.audio_removed_at) {
+        return 'The audio was removed from this unit and Drive has no copy, so it cannot be refined or deleted.'
+      }
+      return 'No recording was saved for this conversation, so it cannot be refined or deleted.'
+    }
+    if (session?.refinement_status === RefinementStatus.Completed && !session.refined_revision) {
+      return 'This conversation completed without timed words. Use Retry refinement before deleting.'
+    }
+    return 'This conversation is still being refined; delete once it finishes.'
+  })
 
   // Disk pressure removed the session's audio to free space: all of it, or
   // part of it, when the audio path still names what is left.
@@ -98,10 +126,6 @@
   // The session ended without a saved recording: nothing to play or refine.
   const noRecording = $derived(session?.refinement_status === RefinementStatus.NoAudio)
 
-  type View = 'refined' | 'segments'
-  // Refined is the default when it exists; deletion is available in Segments.
-  let view = $derived<View>(refinementCompleted ? 'refined' : 'segments')
-
   function segmentsAsText(): string {
     return visibleSegments
       .map((s) => `[${prettyTime(s.start_time)}] Speaker ${s.speaker}: ${s.text}`)
@@ -109,7 +133,7 @@
   }
 
   async function copyTranscript() {
-    const text = view === 'refined' && refinedText ? refinedText : segmentsAsText()
+    const text = segmentsAsText()
     const ok = await copyText(text)
     if (ok) {
       transcriptCopied = true
@@ -135,11 +159,18 @@
   }
 
   async function handleDeleteSegment(
-    segmentID: number | undefined,
+    segment: Segment,
     action: (typeof deleteActions)[number],
   ): Promise<void> {
     deleteMenuFor = null
-    if (segmentID === undefined || deletingSegmentID !== null) {
+    const segmentID = segment.id
+    const revision = segment.transcript_revision ?? (segment.untimed ? 0 : undefined)
+    if (
+      segmentID === undefined ||
+      revision === undefined ||
+      !canDeleteSegment(segment) ||
+      deletingSegmentID !== null
+    ) {
       return
     }
     if (!confirm(action.ask)) {
@@ -149,7 +180,7 @@
     segmentDeleteError = ''
     try {
       try {
-        await deleteSessionSegment(sessionId, segmentID, action.mode)
+        await deleteSessionSegment(sessionId, segmentID, action.mode, revision)
       } catch (error) {
         const message = requestErrorMessage(error)
         if (error instanceof RequestError && [403, 409, 422, 503].includes(error.status)) {
@@ -160,7 +191,7 @@
         try {
           const clearLocally = await onNotFound(segmentID)
           if (clearLocally) {
-            visibleSegments = visibleSegments.filter((segment) => segment.id !== segmentID)
+            visibleSegments = visibleSegments.filter((candidate) => candidate.id !== segmentID)
             await reloadAudio()
           }
         } catch {
@@ -168,7 +199,7 @@
         }
         return
       }
-      visibleSegments = visibleSegments.filter((segment) => segment.id !== segmentID)
+      visibleSegments = visibleSegments.filter((candidate) => candidate.id !== segmentID)
       await reloadAudio()
       await onDeleted(segmentID)
     } catch (error) {
@@ -253,7 +284,16 @@
 <svelte:document onclick={closeDeleteMenuOnOutsideClick} />
 
 <div class="audio-player" data-testid="audio-player">
-  {#if audioRemoved && !audioLeft}
+  {#if session?.restored_at && noRecording && session.sync_state === SyncState.RemoteDeleted}
+    <p class="audio-note">
+      This conversation's Drive folder is unavailable or in the trash, so its recording cannot be
+      restored or refined.
+    </p>
+  {:else if session?.restored_at && noRecording && canRestoreRefinement(session)}
+    <p class="audio-note">
+      This conversation was restored from Drive; retry refinement to delete from it
+    </p>
+  {:else if audioRemoved && !audioLeft}
     <p class="audio-note">
       The audio was removed to free space. The transcript and summary are kept.
     </p>
@@ -298,31 +338,7 @@
   <div class="transcript-header">
     <span class="transcript-label">Transcript</span>
     <div class="transcript-header-actions">
-      {#if refinementCompleted}
-        <div
-          class="transcript-toggle"
-          role="group"
-          aria-label="Transcript view"
-          data-testid="transcript-view-toggle"
-        >
-          <button
-            type="button"
-            class={`toggle-btn ${view === 'refined' ? 'active' : ''}`}
-            aria-pressed={view === 'refined'}
-            onclick={() => (view = 'refined')}
-          >
-            Refined
-          </button>
-          <button
-            type="button"
-            class={`toggle-btn ${view === 'segments' ? 'active' : ''}`}
-            aria-pressed={view === 'segments'}
-            onclick={() => (view = 'segments')}
-          >
-            Segments
-          </button>
-        </div>
-      {:else if refinementInFlight}
+      {#if refinementInFlight}
         <span class="refining-indicator" data-testid="refining-indicator">Refining…</span>
       {/if}
       <button type="button" class="copy-btn" onclick={copyTranscript}>
@@ -335,59 +351,67 @@
     <p class="segment-delete-error" role="alert">{segmentDeleteError}</p>
   {/if}
 
-  {#if view === 'refined' && refinedText}
-    <div class="transcript-refined" data-testid="transcript-refined">
-      {refinedText}
-    </div>
-  {:else}
-    <div class="transcript-sync">
-      {#each visibleSegments as segment, index (segment.id ?? segment.timestamp + segment.text + index)}
-        <div class="transcript-line">
-          <button
-            type="button"
-            class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
-            onclick={() => seekTo(segment.start_time)}
+  <div class="transcript-sync">
+    {#each visibleSegments as segment, index (segment.id ?? segment.timestamp + segment.text + index)}
+      <div class="transcript-line">
+        <button
+          type="button"
+          class={`line ${index === activeSegmentIndex ? 'active' : ''}`}
+          onclick={() => {
+            if (!segment.untimed) {
+              seekTo(segment.start_time)
+            }
+          }}
+        >
+          <span class="line-time"
+            >{segment.untimed ? 'Untimed' : prettyTime(segment.start_time)}</span
           >
-            <span class="line-time">{prettyTime(segment.start_time)}</span>
-            <span class="line-text" id={`segment-${segment.id ?? index}`}>{segment.text}</span>
-          </button>
-          {#if segment.id !== undefined}
-            <div class="segment-delete-controls">
-              <button
-                type="button"
-                class="segment-delete-btn"
-                aria-label="Delete segment"
-                aria-describedby={`segment-${segment.id ?? index}`}
-                aria-expanded={deleteMenuFor === segment.id}
-                title="Delete segment"
-                disabled={deletingSegmentID !== null}
-                onclick={() => (deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!)}
-              >
-                {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
-              </button>
-              {#if deleteMenuFor === segment.id}
-                <div class="segment-delete-menu" role="group" aria-label="Delete options">
-                  {#each deleteActions as action (action.mode)}
-                    <div class="segment-delete-option">
-                      <button
-                        type="button"
-                        class="segment-delete-action"
-                        aria-describedby={`segment-${segment.id}-${action.mode}`}
-                        onclick={() => void handleDeleteSegment(segment.id, action)}
-                      >
-                        {action.name}
-                      </button>
-                      <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
-                        >{action.note}</span
-                      >
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {/each}
-    </div>
-  {/if}
+          <span class="line-text" id={`segment-${segment.id ?? index}`}>{segment.text}</span>
+        </button>
+        {#if segment.id !== undefined}
+          <div class="segment-delete-controls">
+            <button
+              type="button"
+              class="segment-delete-btn"
+              aria-label="Delete segment"
+              aria-describedby={`segment-${segment.id ?? index}`}
+              aria-expanded={canDeleteSegment(segment) && deleteMenuFor === segment.id}
+              title="Delete segment"
+              disabled={!canDeleteSegment(segment) || deletingSegmentID !== null}
+              onclick={() => {
+                if (canDeleteSegment(segment)) {
+                  deleteMenuFor = deleteMenuFor === segment.id ? null : segment.id!
+                }
+              }}
+            >
+              {deletingSegmentID === segment.id ? 'Deleting…' : 'Delete'}
+            </button>
+            {#if !canDeleteSegment(segment)}
+              <span class="segment-delete-note">{deleteUnavailableNote}</span>
+            {:else if deleteMenuFor === segment.id}
+              <div class="segment-delete-menu" role="group" aria-label="Delete options">
+                {#each actionsForSegment(segment) as action (action.mode)}
+                  <div class="segment-delete-option">
+                    <button
+                      type="button"
+                      class="segment-delete-action"
+                      aria-describedby={`segment-${segment.id}-${action.mode}`}
+                      onclick={() => void handleDeleteSegment(segment, action)}
+                    >
+                      {action.name}
+                    </button>
+                    <span class="segment-delete-note" id={`segment-${segment.id}-${action.mode}`}
+                      >{segment.untimed
+                        ? 'This text came from a source with no recording, so only Delete text is available.'
+                        : action.note}</span
+                    >
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/each}
+  </div>
 </div>

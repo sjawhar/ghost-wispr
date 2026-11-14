@@ -22,6 +22,8 @@ const baseSession: SessionSummary = {
   summary_status: SummaryStatus.Pending,
   summary_preset: 'default',
   audio_path: 'data/audio/s1.mp3',
+  refinement_status: RefinementStatus.Completed,
+  refined_revision: 1,
 }
 
 type SessionCardProps = ComponentProps<typeof SessionCard>
@@ -39,6 +41,7 @@ function render(
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('SessionCard', () => {
@@ -207,6 +210,108 @@ describe('SessionCard', () => {
     expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
   })
 
+  it.each([
+    [
+      'a listed Drive recording',
+      {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      } as SessionSummary & { gdrive_folder_id: string },
+      true,
+    ],
+    [
+      'a session without a listed Drive folder',
+      {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+      },
+      false,
+    ],
+    [
+      'a never-recorded session with a Drive folder',
+      {
+        ...baseSession,
+        audio_path: '',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      },
+      false,
+    ],
+  ])('offers Retry refinement only for %s', (_, session, wantsRetry) => {
+    render({
+      session,
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(Boolean(screen.queryByTestId('retry-refinement-btn'))).toBe(wantsRetry)
+  })
+
+  it('identifies a retryable session restored from Drive', () => {
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-13T09:01:00Z',
+        restored_at: '2026-11-13T09:01:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      } as SessionSummary & { restored_at: string },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('refinement-badge').getAttribute('title')).toBe(
+      'This conversation was restored from Drive; retry refinement to delete from it',
+    )
+    expect(screen.getByTestId('retry-refinement-btn')).toBeTruthy()
+    expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
+  })
+
+  it('keeps the removal badge after a restored refinement fails', () => {
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-13T09:01:00Z',
+        restored_at: '2026-11-13T09:01:00Z',
+        refinement_status: RefinementStatus.Failed,
+      } as SessionSummary & { restored_at: string },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('audio-removed-badge')).toBeTruthy()
+  })
+
   it('marks a session whose audio was removed to free space, refined or not', () => {
     for (const refinementStatus of [RefinementStatus.Completed, RefinementStatus.NoAudio]) {
       const { unmount } = render({
@@ -324,6 +429,96 @@ describe('SessionCard', () => {
     }
   })
 
+  it('shows why a refinement retry was refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'the recording was removed from this unit and its Drive folder is deleted',
+          }),
+          {
+            status: 409,
+          },
+        ),
+      ),
+    )
+    try {
+      render({
+        session: {
+          ...baseSession,
+          audio_path: '',
+          audio_removed_at: '2026-11-07T09:30:00Z',
+          refinement_status: RefinementStatus.NoAudio,
+          sync_status: SyncStatus.Synced,
+          sync_state: SyncState.Synced,
+          gdrive_folder_id: 'folder-1',
+        },
+        detail: undefined,
+        expanded: false,
+        presets: {},
+        onToggle: vi.fn(),
+        onLoadDetail: vi.fn(),
+        onResummarize: vi.fn(),
+        onDelete: vi.fn(),
+      })
+
+      await fireEvent.click(screen.getByTestId('retry-refinement-btn'))
+      expect(
+        await screen.findByText(
+          'the recording was removed from this unit and its Drive folder is deleted',
+        ),
+      ).toBeTruthy()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('refreshes Retry refinement and re-enables it when the status changes', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response('{}', { status: 202, headers: { 'Content-Type': 'application/json' } }),
+        ),
+    )
+    const session = {
+      ...baseSession,
+      audio_path: '',
+      audio_removed_at: '2026-11-07T09:30:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.Synced,
+      gdrive_folder_id: 'folder-1',
+    }
+    const onRefreshSession = vi.fn().mockResolvedValue(undefined)
+    const props = {
+      session,
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+      onRefreshSession,
+    }
+    const view = render(props)
+
+    await fireEvent.click(screen.getByTestId('retry-refinement-btn'))
+    await waitFor(() => {
+      expect(onRefreshSession).toHaveBeenCalledExactlyOnceWith('s1')
+    })
+    await view.rerender({
+      ...props,
+      session: { ...session, refinement_status: RefinementStatus.Failed },
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('retry-refinement-btn').hasAttribute('disabled')).toBe(false)
+    })
+  })
+
   it('styles the audio-removed marker', () => {
     expect(sessionCardSource).toMatch(/\.status-badge\.audio-removed\b/)
   })
@@ -380,6 +575,7 @@ describe('SessionCard', () => {
             start_time: 0,
             end_time: 2,
             timestamp: '2026-11-11T10:00:00Z',
+            transcript_revision: 1,
           },
         ],
       },

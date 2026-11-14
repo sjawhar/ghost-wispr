@@ -104,9 +104,9 @@ func (s *apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, erro
 func (s *apiStoreStub) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
 	all := s.segments[sessionID]
 	var result []transcribe.Segment
-	for _, seg := range all {
-		if seg.StartTime >= startTime && seg.EndTime <= endTime {
-			result = append(result, seg)
+	for i := range all {
+		if all[i].StartTime >= startTime && all[i].EndTime <= endTime {
+			result = append(result, all[i])
 		}
 	}
 	return result, nil
@@ -241,7 +241,7 @@ func TestAPISessionsList(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{
-			"2026-02-26": {{ID: "s1", StartedAt: started, SummaryStatus: storage.SummaryCompleted}},
+			"2026-02-26": {{ID: "s1", StartedAt: started, SummaryStatus: storage.SummaryCompleted, RefinedRevision: 7}},
 		},
 		sessions: map[string]storage.Session{},
 		segments: map[string][]transcribe.Segment{},
@@ -264,8 +264,12 @@ func TestAPISessionsList(t *testing.T) {
 	if got := rr.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
 		t.Fatalf("expected application/json content-type, got %q", got)
 	}
-	if !strings.Contains(rr.Body.String(), "s1") {
-		t.Fatalf("expected body to contain session id, got %s", rr.Body.String())
+	var sessions []storage.Session
+	if err := json.Unmarshal(rr.Body.Bytes(), &sessions); err != nil {
+		t.Fatalf("decode session list: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].RefinedRevision != 7 {
+		t.Fatalf("session list refined revision = %#v, want 7", sessions)
 	}
 }
 
@@ -732,6 +736,13 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 		defer close(finished)
 		finish(sessionID, pending)
 	}
+	rawFinish := finishRawErasing
+	t.Cleanup(func() { finishRawErasing = rawFinish })
+	rawFinished := make(chan struct{})
+	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+		defer close(rawFinished)
+		rawFinish(store, reservations)
+	}
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
 		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: saved}},
@@ -750,6 +761,11 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 	case <-finished:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the erase after the response never finished")
+	}
+	select {
+	case <-rawFinished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the raw erase after the response never finished")
 	}
 	if _, err := os.Stat(raw); !os.IsNotExist(err) {
 		t.Fatalf("the raw PCM is still on disk: %v", err)
@@ -906,20 +922,6 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			wantCode: http.StatusNotFound,
 		},
 		{
-			name:      "not found in recording",
-			session:   storage.Session{ID: "s1", Status: storage.SessionEnded},
-			hook:      func(context.Context, string, int64) error { return ErrSegmentNotFoundInRecording },
-			wantCode:  http.StatusUnprocessableEntity,
-			wantError: "The segment could not be found in the recording; nothing was deleted",
-		},
-		{
-			name:      "not removed cleanly",
-			session:   storage.Session{ID: "s1", Status: storage.SessionEnded},
-			hook:      func(context.Context, string, int64) error { return ErrSegmentNotRemovedCleanly },
-			wantCode:  http.StatusUnprocessableEntity,
-			wantError: "The segment could not be removed cleanly; nothing was deleted",
-		},
-		{
 			name:    "kept raw recording",
 			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
 			hook: func(context.Context, string, int64) error {
@@ -927,15 +929,6 @@ func TestDeleteSegmentAPI(t *testing.T) {
 			},
 			wantCode:  http.StatusUnprocessableEntity,
 			wantError: "s1.pcm",
-		},
-		{
-			name:    "no batch transcription",
-			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
-			hook: func(context.Context, string, int64) error {
-				return fmt.Errorf("%w: deepgram API key not configured", ErrBatchTranscriptionNotConfigured)
-			},
-			wantCode:  http.StatusServiceUnavailable,
-			wantError: "Segment deletion needs batch transcription, which is not configured: add a Deepgram API key.",
 		},
 		{
 			name:    "active",
@@ -959,16 +952,25 @@ func TestDeleteSegmentAPI(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			session := tc.session
+			if session.ID != "" && session.Status != storage.SessionActive {
+				session.RefinementStatus = storage.RefinementCompleted
+				session.RefinedRevision = 1
+			}
 			sessions := map[string]storage.Session{}
-			if tc.session.ID != "" {
-				sessions[tc.session.ID] = tc.session
+			if session.ID != "" {
+				sessions[session.ID] = session
 			}
 			store := &apiStoreStub{sessionsByDate: map[string][]storage.Session{}, sessions: sessions, segments: map[string][]transcribe.Segment{}}
-			handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{DeleteSegment: tc.hook}, "", nil)
+			handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+				DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, _ int) error {
+					return tc.hook(ctx, sessionID, segmentID)
+				},
+			}, "", nil)
 			if err != nil {
 				t.Fatalf("handler: %v", err)
 			}
-			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text_and_audio", nil)
+			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text_and_audio&revision=1", nil)
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, req)
 			if response.Code != tc.wantCode {
@@ -4516,5 +4518,38 @@ func TestDeleteSessionRefusesAnActiveMergedSource(t *testing.T) {
 	}
 	if sess, err := store.GetSession("source"); err != nil || sess.Status != storage.SessionActive {
 		t.Fatalf("active source after refused delete = %+v (%v), want active", sess, err)
+	}
+}
+
+func TestRetryRefinementWithoutLocalAudioStartsRestore(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementNoAudio},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	started := make(chan string, 1)
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		RetryRefinement: func(_ context.Context, sessionID string) error {
+			started <- sessionID
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/sessions/s1/retry-refinement", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("retry refinement without local audio = %d %s, want 202", response.Code, response.Body.String())
+	}
+	select {
+	case sessionID := <-started:
+		if sessionID != "s1" {
+			t.Fatalf("restore refinement session = %q, want s1", sessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry refinement without local audio did not start restoration")
 	}
 }

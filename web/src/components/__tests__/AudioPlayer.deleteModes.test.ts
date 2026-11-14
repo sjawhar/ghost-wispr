@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AudioPlayer from '../AudioPlayer.svelte'
 import { resetState } from '../../lib/state.svelte'
+import { RefinementStatus, SummaryStatus, SyncState, SyncStatus } from '../../lib/types'
 
 const segments = [
   {
@@ -11,6 +12,7 @@ const segments = [
     start_time: 0,
     end_time: 2,
     timestamp: '2026-11-12T10:00:00Z',
+    transcript_revision: 1,
   },
   {
     id: 43,
@@ -19,6 +21,7 @@ const segments = [
     start_time: 2,
     end_time: 4,
     timestamp: '2026-11-12T10:00:02Z',
+    transcript_revision: 1,
   },
 ]
 
@@ -26,10 +29,249 @@ function renderPlayer() {
   return render(AudioPlayer, {
     sessionId: 's1',
     segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: 'recording.mp3',
+      refinement_status: RefinementStatus.Completed,
+      refined_revision: 1,
+    },
     onDeleted: vi.fn(),
     onNotFound: vi.fn().mockResolvedValue(false),
   })
 }
+
+it('disables Delete until timed refined segments exist', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: 'recording.mp3',
+      refinement_status: RefinementStatus.Pending,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+  for (const button of screen.getAllByRole('button', { name: 'Delete segment' })) {
+    expect(button.hasAttribute('disabled')).toBe(true)
+  }
+  expect(
+    screen.getAllByText('This conversation is still being refined; delete once it finishes.'),
+  ).toHaveLength(2)
+})
+
+it('offers only Delete text for untimed source text', async () => {
+  vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+  const fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+  vi.stubGlobal('fetch', fetch)
+  render(AudioPlayer, {
+    sessionId: 'merged',
+    segments: [
+      {
+        id: 42,
+        speaker: 0,
+        text: 'Words from the source without a recording',
+        start_time: 0,
+        end_time: 0,
+        timestamp: '2026-11-12T10:00:00Z',
+        transcript_revision: 0,
+        untimed: true,
+      },
+    ],
+    session: {
+      id: 'merged',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      refinement_status: RefinementStatus.NoAudio,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  const deleteButton = screen.getByRole('button', { name: 'Delete segment' })
+  expect(deleteButton.hasAttribute('disabled')).toBe(false)
+  await fireEvent.click(deleteButton)
+  const deleteText = screen.getByRole('button', { name: 'Delete text' })
+  expect(deleteText).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Delete text and audio' })).toBeNull()
+  expect(
+    screen.getByText(
+      'This text came from a source with no recording, so only Delete text is available.',
+    ),
+  ).toBeTruthy()
+  await fireEvent.click(deleteText)
+  await waitFor(() => {
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining('mode=text&revision=0'),
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+})
+
+it('says a completed conversation without timed words needs refinement before deletion', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: 'recording.mp3',
+      refinement_status: RefinementStatus.Completed,
+      refined_revision: 0,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(
+    screen.getAllByText(
+      'This conversation completed without timed words. Use Retry refinement before deleting.',
+    ),
+  ).toHaveLength(2)
+})
+
+it('identifies a Drive-restored session as retryable before deletion', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      audio_removed_at: '2026-11-13T09:01:00Z',
+      restored_at: '2026-11-13T09:01:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+      gdrive_folder_id: 'folder-1',
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.Synced,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(
+    screen.getAllByText(
+      'This conversation was restored from Drive; retry refinement to delete from it',
+    ),
+  ).toHaveLength(3)
+})
+
+it('does not offer a refinement retry when a restored session cannot restore audio', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      audio_removed_at: '2026-11-13T09:01:00Z',
+      restored_at: '2026-11-13T09:01:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+  expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
+  expect(
+    screen.getAllByText(
+      'The audio was removed from this unit and Drive has no copy, so it cannot be refined or deleted.',
+    ),
+  ).not.toHaveLength(0)
+})
+
+it('says when no recording was ever saved', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      refinement_status: RefinementStatus.NoAudio,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+
+  expect(
+    screen.getAllByText(
+      'No recording was saved for this conversation, so it cannot be refined or deleted.',
+    ),
+  ).not.toHaveLength(0)
+  expect(screen.queryByText(/still being refined/)).toBeNull()
+})
+
+it('explains when a restored session has no Drive folder to restore from', () => {
+  render(AudioPlayer, {
+    sessionId: 's1',
+    segments,
+    session: {
+      id: 's1',
+      title: '',
+      started_at: '2026-11-12T10:00:00Z',
+      status: 'ended',
+      summary: '',
+      summary_status: SummaryStatus.Pending,
+      summary_preset: '',
+      audio_path: '',
+      audio_removed_at: '2026-11-13T09:01:00Z',
+      restored_at: '2026-11-13T09:01:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+      gdrive_folder_id: 'folder-1',
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.RemoteDeleted,
+    },
+    onDeleted: vi.fn(),
+    onNotFound: vi.fn().mockResolvedValue(false),
+  })
+  expect(screen.getByTestId('audio-player').querySelector('.audio-note')?.textContent).toContain(
+    'Drive folder is unavailable or in the trash',
+  )
+
+  expect(
+    screen.getAllByText(
+      "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined.",
+    ),
+  ).not.toHaveLength(0)
+  expect(screen.queryByText(/retry refinement to delete from it/)).toBeNull()
+})
 
 describe('AudioPlayer segment deletion actions', () => {
   afterEach(() => {
@@ -76,9 +318,12 @@ describe('AudioPlayer segment deletion actions', () => {
     await fireEvent.click(screen.getByRole('button', { name: action }))
 
     await waitFor(() => {
-      expect(fetch).toHaveBeenCalledExactlyOnceWith(`/api/sessions/s1/segments/42?mode=${mode}`, {
-        method: 'DELETE',
-      })
+      expect(fetch).toHaveBeenCalledExactlyOnceWith(
+        `/api/sessions/s1/segments/42?mode=${mode}&revision=1`,
+        {
+          method: 'DELETE',
+        },
+      )
     })
     await waitFor(() => {
       expect(screen.queryByText('Orange tractor ninety')).toBeNull()

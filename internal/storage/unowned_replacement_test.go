@@ -22,8 +22,8 @@ func deleteSegmentAt(t *testing.T, store *SQLiteStore, id string, index int, sta
 		t.Fatal(err)
 	}
 	span := DeletedSpan{SessionID: id, AudioPath: "recording.mp3", Start: start, End: end, SHA256Before: "b", SHA256After: "a"}
-	if err := store.DeleteSegment(id, segments[index].ID, span); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := deleteRefinedAudioTestSegment(t, store, id, segments[index].ID, span); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	return span
 }
@@ -94,7 +94,7 @@ func TestASegmentDeletionStaysOwedWhileDriveMayHoldItsWords(t *testing.T) {
 			t.Fatal(err)
 		}
 		span := DeletedSpan{SessionID: "m", AudioPath: "recording-s1.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}
-		if err := store.DeleteSegment("m", segments[1].ID, span); err != nil {
+		if err := deleteRefinedAudioTestSegment(t, store, "m", segments[1].ID, span); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.MarkSpliceComplete(&span); err != nil {
@@ -169,9 +169,9 @@ func TestSettlementKeepsADeletionOwedWhenAMergedSourceGainsAFolder(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	span := DeletedSpan{SessionID: "merged", AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}
-	if err := store.DeleteSegment("merged", segments[0].ID, span); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	span := DeletedSpan{SessionID: "merged", AudioPath: "recording-source.mp3", Start: 1, End: 3, SHA256Before: "before", SHA256After: "after"}
+	if err := deleteRefinedAudioTestSegment(t, store, "merged", segments[0].ID, span); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 	generation, err := store.DeletionGeneration("merged")
 	if err != nil {

@@ -27,10 +27,19 @@ function render(
   props: Omit<AudioPlayerProps, 'onDeleted' | 'onNotFound'> &
     Partial<Pick<AudioPlayerProps, 'onDeleted' | 'onNotFound'>>,
 ) {
+  const segments = props.segments.map((segment) => ({
+    ...segment,
+    transcript_revision: segment.transcript_revision ?? 1,
+  }))
+  const session =
+    props.session ??
+    makeSession({ refinement_status: RefinementStatus.Completed, refined_revision: 1 })
   return renderSvelte(AudioPlayer, {
     onDeleted: vi.fn(),
     onNotFound: vi.fn().mockResolvedValue(false),
     ...props,
+    session,
+    segments,
   })
 }
 
@@ -86,13 +95,13 @@ describe('AudioPlayer', () => {
     expect(appState.activeAudioSessionId).toBe('s1')
   })
 
-  it('shows refined transcript and view toggle when refinement completed', () => {
+  it('renders completed refinement from timed segments by default', () => {
     render({
       sessionId: 's1',
       segments: [
         {
           speaker: 0,
-          text: 'raw streaming',
+          text: 'Timed refined segment.',
           start_time: 0,
           end_time: 2,
           timestamp: new Date().toISOString(),
@@ -100,128 +109,52 @@ describe('AudioPlayer', () => {
       ],
       session: makeSession({
         refinement_status: RefinementStatus.Completed,
-        refined_transcript: 'Polished refined transcript text.',
-        canonical_transcript: 'Polished refined transcript text.',
+        refined_revision: 1,
+        refined_transcript: 'This string is not the rendered transcript.',
         transcript_source: 'refined',
       }),
     })
 
-    expect(screen.getByTestId('transcript-refined').textContent).toContain(
-      'Polished refined transcript text.',
-    )
-    expect(screen.getByTestId('transcript-view-toggle')).toBeTruthy()
-    // Streaming segment should NOT be visible by default
-    expect(screen.queryByText('raw streaming')).toBeNull()
-  })
-
-  it('switches to segments view when toggle clicked', async () => {
-    render({
-      sessionId: 's1',
-      segments: [
-        {
-          speaker: 0,
-          text: 'raw streaming',
-          start_time: 0,
-          end_time: 2,
-          timestamp: new Date().toISOString(),
-        },
-      ],
-      session: makeSession({
-        refinement_status: RefinementStatus.Completed,
-        refined_transcript: 'Polished refined transcript text.',
-        transcript_source: 'refined',
-      }),
-    })
-
-    await fireEvent.click(screen.getByRole('button', { name: 'Segments' }))
-    expect(screen.getByText('raw streaming')).toBeTruthy()
-    expect(screen.queryByTestId('transcript-refined')).toBeNull()
-  })
-
-  it('falls back to segments view when refinement not completed', () => {
-    render({
-      sessionId: 's1',
-      segments: [
-        {
-          speaker: 0,
-          text: 'raw streaming',
-          start_time: 0,
-          end_time: 2,
-          timestamp: new Date().toISOString(),
-        },
-      ],
-      session: makeSession({
-        refinement_status: RefinementStatus.Pending,
-      }),
-    })
-
-    expect(screen.getByText('raw streaming')).toBeTruthy()
+    expect(screen.getByText('Timed refined segment.')).toBeTruthy()
+    expect(screen.queryByText('This string is not the rendered transcript.')).toBeNull()
     expect(screen.queryByTestId('transcript-view-toggle')).toBeNull()
+  })
+
+  it('keeps live segments readable while refinement is pending', () => {
+    render({
+      sessionId: 's1',
+      segments: [
+        {
+          speaker: 0,
+          text: 'raw streaming',
+          start_time: 0,
+          end_time: 2,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      session: makeSession({ refinement_status: RefinementStatus.Pending }),
+    })
+
+    expect(screen.getByText('raw streaming')).toBeTruthy()
     expect(screen.getByTestId('refining-indicator')).toBeTruthy()
   })
 
-  it('copies refined transcript when refined view active', async () => {
+  it('copies the rendered timed segments', async () => {
     render({
       sessionId: 's1',
       segments: [
         {
           speaker: 0,
-          text: 'raw streaming',
-          start_time: 0,
-          end_time: 2,
-          timestamp: new Date().toISOString(),
-        },
-      ],
-      session: makeSession({
-        refinement_status: RefinementStatus.Completed,
-        refined_transcript: 'Polished refined transcript text.',
-        transcript_source: 'refined',
-      }),
-    })
-
-    await fireEvent.click(screen.getByRole('button', { name: 'Copy transcript' }))
-    expect(writeText).toHaveBeenCalledWith('Polished refined transcript text.')
-  })
-
-  it('copies segment-formatted transcript when in segments view', async () => {
-    render({
-      sessionId: 's1',
-      segments: [
-        {
-          speaker: 0,
-          text: 'raw streaming',
+          text: 'timed transcript',
           start_time: 5,
           end_time: 8,
           timestamp: new Date().toISOString(),
         },
       ],
-      session: makeSession({
-        refinement_status: RefinementStatus.Completed,
-        refined_transcript: 'Polished refined transcript text.',
-        transcript_source: 'refined',
-      }),
     })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Segments' }))
     await fireEvent.click(screen.getByRole('button', { name: 'Copy transcript' }))
-    expect(writeText).toHaveBeenCalledWith('[00:05] Speaker 0: raw streaming')
-  })
-
-  it('uses canonical_transcript when source is refined and refined_transcript empty', () => {
-    render({
-      sessionId: 's1',
-      segments: [],
-      session: makeSession({
-        refinement_status: RefinementStatus.Completed,
-        refined_transcript: '',
-        canonical_transcript: 'Canonical refined output.',
-        transcript_source: 'refined',
-      }),
-    })
-
-    expect(screen.getByTestId('transcript-refined').textContent).toContain(
-      'Canonical refined output.',
-    )
+    expect(writeText).toHaveBeenCalledWith('[00:05] Speaker 0: timed transcript')
   })
 
   it('says no recording was saved instead of loading audio or showing refinement', () => {
@@ -259,7 +192,7 @@ describe('AudioPlayer', () => {
     ).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Play Audio' })).toBeNull()
     expect(screen.queryByText('Loading audio...')).toBeNull()
-    expect(screen.getByTestId('transcript-refined').textContent).toContain('The refined words.')
+    expect(screen.queryByTestId('transcript-refined')).toBeNull()
   })
 
   it('says what is left when only part of the audio was removed, and still offers to play it', () => {
@@ -338,9 +271,12 @@ describe('AudioPlayer', () => {
     })
     expect(confirm).toHaveBeenCalledTimes(1)
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(fetch).toHaveBeenCalledWith('/api/sessions/s1/segments/42?mode=text_and_audio', {
-      method: 'DELETE',
-    })
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions/s1/segments/42?mode=text_and_audio&revision=1',
+      {
+        method: 'DELETE',
+      },
+    )
     expect(onDeleted).toHaveBeenCalledTimes(1)
     expect(onDeleted).toHaveBeenCalledWith(42)
     expect(screen.getByText('Keep this segment')).toBeTruthy()
@@ -598,6 +534,7 @@ describe('AudioPlayer', () => {
     })
     const session = makeSession({
       refinement_status: RefinementStatus.Completed,
+      refined_revision: 1,
       refined_transcript: 'Refined transcript with the stored segment.',
       transcript_source: 'refined',
     })
@@ -633,7 +570,6 @@ describe('AudioPlayer', () => {
     const result = render({ ...props, onDeleted, onNotFound })
     rerender = result.rerender
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Segments' }))
     await chooseDelete(screen.getByRole('button', { name: 'Delete segment' }))
 
     await waitFor(() => {
@@ -643,7 +579,7 @@ describe('AudioPlayer', () => {
     expect(pause).not.toHaveBeenCalled()
     expect(load).not.toHaveBeenCalled()
   })
-  it('keeps the refined transcript as the default and exposes deletion in segments', async () => {
+  it('renders stored timed segments with deletion controls by default', () => {
     render({
       sessionId: 's1',
       segments: [
@@ -658,16 +594,12 @@ describe('AudioPlayer', () => {
       ],
       session: makeSession({
         refinement_status: RefinementStatus.Completed,
-        refined_transcript: 'Refined transcript with the stored segment.',
+        refined_revision: 1,
         transcript_source: 'refined',
       }),
     })
 
-    expect(screen.getByTestId('transcript-refined')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Delete segment' })).toBeNull()
-
-    await fireEvent.click(screen.getByRole('button', { name: 'Segments' }))
-
+    expect(screen.getByText('Stored segment')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Delete segment' })).toBeTruthy()
   })
   it('does not offer deletion for a segment that is not stored yet', () => {

@@ -40,9 +40,9 @@ func recordedSession(t *testing.T, store *SQLiteStore, id string, started, ended
 // nestedMerge records s1 (whose segment at 2 s holds ledgerSecret, and whose
 // segment at 300 s is stamped after s1 ended), s2 (whose first segment is
 // stamped at its very start) and s3, merges s1 and s2 into m1 and m1 and s3
-// into m2, gives s1, m1 and s3 Drive folders, and returns the id of the
-// secret segment in m2.
-func nestedMerge(t *testing.T, store *SQLiteStore) int64 {
+// into m2, gives s1, m1 and s3 Drive folders, and returns the refined secret
+// occurrence in m2.
+func nestedMerge(t *testing.T, store *SQLiteStore) refinedSegmentSelection {
 	t.Helper()
 	base := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	recordedSession(t, store, "s1", base, base.Add(time.Minute), map[float64]string{1: "s1 keeps", 2: "s1 " + ledgerSecret, 300: "s1 late final"})
@@ -68,23 +68,43 @@ func nestedMerge(t *testing.T, store *SQLiteStore) int64 {
 			t.Fatal(err)
 		}
 	}
-	segments, err := store.GetSegments("m2")
+	words := []RefinedWord{
+		{RecordingPath: "recording-s1.mp3", RecordingSHA256: "b", Ordinal: 0, Text: "s1 keeps", Start: 1, End: 3},
+		{RecordingPath: "recording-s1.mp3", RecordingSHA256: "b", Ordinal: 1, Text: "s1 " + ledgerSecret, Start: 2, End: 4},
+		{RecordingPath: "recording-s1.mp3", RecordingSHA256: "b", Ordinal: 2, Text: "s1 late final", Start: 300, End: 302},
+		{RecordingPath: "recording-s2.mp3", RecordingSHA256: "s2", RecordingOrdinal: 1, Ordinal: 0, Text: "s2 first", Start: 0, End: 2},
+		{RecordingPath: "recording-s2.mp3", RecordingSHA256: "s2", RecordingOrdinal: 1, Ordinal: 1, Text: "s2 keeps", Start: 1, End: 3},
+		{RecordingPath: "recording-s3.mp3", RecordingSHA256: "s3", RecordingOrdinal: 2, Ordinal: 0, Text: "s3 keeps", Start: 1, End: 3},
+	}
+	segments := make([]RefinedSegment, 0, len(words))
+	for _, word := range words {
+		segments = append(segments, RefinedSegment{
+			RecordingPath: word.RecordingPath, RecordingSHA256: word.RecordingSHA256, RecordingOrdinal: word.RecordingOrdinal,
+			FirstWordOrdinal: word.Ordinal, LastWordOrdinal: word.Ordinal, Text: word.Text, Start: word.Start, End: word.End,
+		})
+	}
+	revision, err := store.PublishRefinementAtGeneration("m2", RefinedTranscript(words), "nova-3", words, segments, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, segment := range segments {
-		if strings.Contains(segment.Text, ledgerSecret) {
-			return segment.ID
+	refined, err := store.GetSegments("m2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range refined {
+		if strings.Contains(refined[i].Text, ledgerSecret) {
+			return refinedSegmentSelection{id: refined[i].ID, revision: revision}
 		}
 	}
-	t.Fatal("no secret segment in m2")
-	return 0
+	t.Fatal("no refined secret segment in m2")
+	return refinedSegmentSelection{}
 }
 
-func deleteSecret(t *testing.T, store *SQLiteStore, segmentID int64) {
+func deleteSecret(t *testing.T, store *SQLiteStore, segment refinedSegmentSelection) {
 	t.Helper()
-	if err := store.DeleteSegment("m2", segmentID, DeletedSpan{AudioPath: "recording-s1.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	span := DeletedSpan{AudioPath: "recording-s1.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}
+	if err := store.DeleteRefinedSegmentAudio("m2", segment.id, segment.revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
 	}
 }
 
@@ -136,8 +156,8 @@ func TestSegmentsStayWithTheSourceTheyCameFrom(t *testing.T) {
 	if got := storeSession(t, store, "s1").CanonicalTranscript; got != "s1 keeps\ns1 late final\n" {
 		t.Errorf("s1 canonical transcript = %q, want its kept and its late segment", got)
 	}
-	if got := storeSession(t, store, "s2").CanonicalTranscript; got != "s2 first\ns2 keeps\n" {
-		t.Errorf("s2 canonical transcript = %q, want both its segments", got)
+	if got := storeSession(t, store, "s2").CanonicalTranscript; got != "s2 first s2 keeps\n" {
+		t.Errorf("s2 canonical transcript = %q, want both its words in their refined segment", got)
 	}
 	var s1Events, s3Events int
 	if err := store.DB().QueryRow(`SELECT count(*) FILTER (WHERE payload LIKE '%"session_id":"s1"%'), count(*) FILTER (WHERE payload LIKE '%"session_id":"s3"%') FROM mcp_events`).Scan(&s1Events, &s3Events); err != nil {
@@ -146,31 +166,32 @@ func TestSegmentsStayWithTheSourceTheyCameFrom(t *testing.T) {
 	if s1Events != 0 {
 		t.Errorf("the source that held the deleted segment keeps %d live events over its span", s1Events)
 	}
-	if s3Events != 1 {
-		t.Errorf("the sibling source has %d live events, want its one event kept", s3Events)
+	if s3Events != 0 {
+		t.Errorf("the sibling source has %d live events after its merged segment table changed, want none", s3Events)
 	}
 }
 
-// TestDeleteSegmentKeepsTheFirstOwedTime fails if a second deletion, before
-// the first is replaced on Drive, restarts the time the session has owed a
-// replacement, which the status warning is measured from.
-func TestDeleteSegmentKeepsTheFirstOwedTime(t *testing.T) {
+// TestDeleteRefinedSegmentKeepsTheFirstOwedTime fails if a second deletion,
+// before the first is replaced on Drive, restarts the time the session has
+// owed a replacement.
+func TestDeleteRefinedSegmentKeepsTheFirstOwedTime(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "owed-twice")
-	segments, err := store.GetSegments("owed-twice")
-	if err != nil {
-		t.Fatal(err)
-	}
+	revision, segments := publishRefinedSegmentTestSession(t, store, "owed-twice", "recording.mp3", "b")
 	span := DeletedSpan{AudioPath: "recording.mp3", Start: 0, End: 2, SHA256Before: "b", SHA256After: "a"}
-	if err := store.DeleteSegment("owed-twice", segments[0].ID, span); err != nil {
+	if err := store.DeleteRefinedSegmentAudio("owed-twice", segments[0].ID, revision, &span); err != nil {
 		t.Fatal(err)
 	}
 	first := time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339Nano)
 	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_since = ? WHERE id = 'owed-twice'`, first); err != nil {
 		t.Fatal(err)
 	}
+	segments, err := store.GetSegments("owed-twice")
+	if err != nil {
+		t.Fatal(err)
+	}
 	span.Start, span.End = 2, 4
-	if err := store.DeleteSegment("owed-twice", segments[1].ID, span); err != nil {
+	if err := store.DeleteRefinedSegmentAudio("owed-twice", segments[0].ID, revision+1, &span); err != nil {
 		t.Fatal(err)
 	}
 	var since string
@@ -189,14 +210,12 @@ func TestDeleteSegmentKeepsTheFirstOwedTime(t *testing.T) {
 func TestASyncHoldingTheSessionDuringADeletionOwesItsFolder(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	_, _ = segmentTestSession(t, store, "in-flight")
+	revision, segments := publishRefinedSegmentTestSession(t, store, "in-flight", "recording.mp3", "b")
 	if _, claimed, err := store.ClaimSync("in-flight", SyncStatePending, "first-sync", time.Now().UTC()); err != nil || !claimed {
 		t.Fatalf("ClaimSync = %v, %v", claimed, err)
 	}
-	segments, err := store.GetSegments("in-flight")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeleteSegment("in-flight", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}
+	if err := store.DeleteRefinedSegmentAudio("in-flight", segments[1].ID, revision, &span); err != nil {
 		t.Fatal(err)
 	}
 	ended, err := store.EndSync("in-flight", "first-sync", SyncStatePending, "folder-made-during-the-deletion", 0, time.Now().UTC(), "the session changed during the sync")

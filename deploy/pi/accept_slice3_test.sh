@@ -22,11 +22,14 @@ for line in \
   'A11 text only self-test RAN: planted failure rejected' \
   'A11 text only self-test RAN: the database scan sees a planted phrase in binary data in the database, its log and its backup' \
   'A11 text only self-test RAN: a failed control stops the row before "Delete text"' \
-  'A11 text only self-test RAN: "Delete text" sends mode=text on its segment, then retries refinement' \
+  'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement' \
+  'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes' \
+  'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes' \
+  'A11 text only self-test RAN: retry refinement waits for a newer revision' \
   'A11 self-test RAN: planted failure rejected' \
   'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence' \
   'A11 self-test RAN: a failed control stops the row before "Delete text and audio"' \
-  'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio on its segment' \
+  'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio and its revision on its segment' \
   'Mode guard self-test RAN: planted failure rejected' \
   'Mode guard self-test RAN: a build without the modes stops the run before recording'; do
   grep -Fxq -- "$line" <<<"$output" || fail "self-test did not print: $line"
@@ -44,8 +47,8 @@ line_of() {
 }
 
 # A11 text only runs ahead of A11's audio deletion, in the same conversation.
-text_delete=$(line_of "\"\$text_only_segment_id\" 'mode=text' \"\$body_file\"")
-audio_delete=$(line_of "\"\$audio_segment_id\" 'mode=text_and_audio' \"\$body_file\"")
+text_delete=$(line_of '"mode=text&revision=$text_only_revision"')
+audio_delete=$(line_of '"mode=text_and_audio&revision=$audio_revision"')
 (( text_delete < audio_delete )) || fail 'the driver sends mode=text_and_audio before mode=text'
 text_row=$(line_of "run_row 'A11 text only' run_a11_text_only")
 audio_row=$(line_of 'run_row A11 run_a11')
@@ -59,6 +62,7 @@ line_of '"Delete text" on the "$text_only_phrase" segment and "Delete text and a
 names=$(grep -oE '"Delete [^"]*"' "$driver" | LC_ALL=C sort -u)
 [[ "$names" == $'"Delete text and audio"\n"Delete text"' ]] \
   || fail "the driver names a deletion other than the UI's two: $(tr '\n' ' ' <<<"$names")"
+line_of 'select((.transcript_revision // 0) > 0)' >/dev/null
 
 mutation_dir=$(mktemp -d)
 trap 'rm -rf -- "$mutation_dir"' EXIT
@@ -112,5 +116,12 @@ assert_mutation_caught 'a Deepgram key passed as an argument' \
 assert_mutation_caught 'a Drive token that can write' \
   'readonly drive_scope=https://www.googleapis.com/auth/drive.readonly' \
   'readonly drive_scope=https://www.googleapis.com/auth/drive'
+
+assert_mutation_caught 'a retry refinement that rejects a 202 response' \
+  'retry_http_status=202' 'retry_http_status=500'
+assert_mutation_caught 'a slow refinement that skips its running state' \
+  '{"session":{"refinement_status":"running","refined_revision":1}}' '{"session":{"refinement_status":"completed","refined_revision":2}}'
+assert_mutation_caught 'a retry refinement that returns before polling' \
+  $'retry_refinement() {\n' $'retry_refinement() {\n  return 0\n'
 
 printf 'slice 3 acceptance test passed\n'

@@ -73,7 +73,7 @@ func TestASummaryRunThatCannotReadTheGenerationDoesNotStart(t *testing.T) {
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if status := store.status["session"]; status != "" {
+	if status := store.summaryStatus["session"]; status != "" {
 		t.Errorf("summary status %q; want it untouched", status)
 	}
 }

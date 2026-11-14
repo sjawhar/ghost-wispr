@@ -19,7 +19,7 @@ func TestRecordSyncFolderOwesAPendingDeletion(t *testing.T) {
 	if _, claimed, err := store.ClaimSync("folder-after-delete", SyncStatePending, claim, time.Now().UTC()); err != nil || !claimed {
 		t.Fatalf("ClaimSync = %v, %v", claimed, err)
 	}
-	if err := store.DeleteSegment("folder-after-delete", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 1, End: 2, SHA256Before: "before", SHA256After: "after"}); err != nil {
+	if err := deleteRefinedAudioTestSegment(t, store, "folder-after-delete", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "before", SHA256After: "after"}); err != nil {
 		t.Fatal(err)
 	}
 	if recorded, err := store.RecordSyncFolder("folder-after-delete", claim, "created-after-delete"); err != nil || !recorded {

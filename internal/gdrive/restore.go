@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,20 +15,22 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // RestoredSession holds all data parsed from a GDrive session folder.
 type RestoredSession struct {
-	ID            string
-	Title         string
-	StartedAt     time.Time
-	EndedAt       *time.Time
-	Summary       string
-	SummaryPreset string
-	Segments      []transcribe.Segment
-	DriveFolderID string
-	HasAudio      bool
+	ID             string
+	Title          string
+	StartedAt      time.Time
+	EndedAt        *time.Time
+	Summary        string
+	SummaryPreset  string
+	Segments       []transcribe.Segment
+	DriveFolderID  string
+	HasAudio       bool
+	RecordingPaths []string
 }
 
 // RestoreResult summarizes the outcome of a restore operation.
@@ -100,7 +103,7 @@ func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive
 	for {
 		call := s.service.Files.List().
 			Q(q).
-			Fields("nextPageToken, files(id, name, mimeType, appProperties, modifiedTime)").
+			Fields("nextPageToken, files(id, name, mimeType, sha256Checksum, appProperties, modifiedTime)").
 			SupportsAllDrives(true).
 			IncludeItemsFromAllDrives(true).
 			PageSize(100).
@@ -283,6 +286,7 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 	// re-sync updates it.
 	docs := map[string][]driveFile{}
 	hasAudio := false
+	var recordingPaths []string
 	for _, f := range files {
 		switch f.Name {
 		case "transcript.md", "summary.md":
@@ -290,9 +294,13 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 		default:
 			if strings.HasPrefix(f.MimeType, "audio/") {
 				hasAudio = true
+				if path, ok := recordingname.LocalName(f.Name); ok {
+					recordingPaths = append(recordingPaths, path)
+				}
 			}
 		}
 	}
+	sort.Strings(recordingPaths)
 	var transcriptFileID, summaryFileID string
 	if copies := docs["transcript.md"]; len(copies) > 0 {
 		transcriptFileID = newestFile(copies).ID
@@ -316,12 +324,13 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 	}
 
 	sess := &RestoredSession{
-		ID:            meta.ID,
-		StartedAt:     meta.StartedAt,
-		EndedAt:       meta.EndedAt,
-		Segments:      segments,
-		DriveFolderID: folder.Id,
-		HasAudio:      hasAudio,
+		ID:             meta.ID,
+		StartedAt:      meta.StartedAt,
+		EndedAt:        meta.EndedAt,
+		Segments:       segments,
+		DriveFolderID:  folder.Id,
+		HasAudio:       hasAudio,
+		RecordingPaths: recordingPaths,
 	}
 
 	if summaryFileID != "" {

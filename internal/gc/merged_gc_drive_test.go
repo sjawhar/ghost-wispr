@@ -30,6 +30,47 @@ func mergedGCFolderStore(t *testing.T) (*storage.SQLiteStore, string, time.Time)
 	return store, dir, started
 }
 
+func deleteRefinedTextForGCTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.TextDeletionSpan) error {
+	t.Helper()
+	live, err := store.GetSegments(sessionID)
+	if err != nil {
+		return err
+	}
+	index := -1
+	words := make([]storage.RefinedWord, 0, len(live))
+	refined := make([]storage.RefinedSegment, 0, len(live))
+	for i := range live {
+		segment := &live[i]
+		if segment.ID == liveSegmentID {
+			index = i
+		}
+		words = append(words, storage.RefinedWord{
+			RecordingPath: span.AudioPath, RecordingSHA256: span.SHA256, Ordinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+		refined = append(refined, storage.RefinedSegment{
+			RecordingPath: span.AudioPath, RecordingSHA256: span.SHA256, FirstWordOrdinal: i, LastWordOrdinal: i,
+			Text: segment.Text, Speaker: segment.Speaker, Start: segment.StartTime, End: segment.EndTime,
+		})
+	}
+	if index < 0 {
+		return storage.ErrSegmentNotFound
+	}
+	generation, err := store.DeletionGeneration(sessionID)
+	if err != nil {
+		return err
+	}
+	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), "test", words, refined, generation)
+	if err != nil {
+		return err
+	}
+	segments, err := store.GetSegments(sessionID)
+	if err != nil {
+		return err
+	}
+	return store.DeleteRefinedSegmentText(sessionID, segments[index].ID, revision)
+}
+
 func TestGCAgesMergedSourcesAfterTheirTextDocumentsRefresh(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -42,7 +83,7 @@ func TestGCAgesMergedSourcesAfterTheirTextDocumentsRefresh(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := store.DeleteSegmentText("merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
+				if err := deleteRefinedTextForGCTest(t, store, "merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
 					t.Fatal(err)
 				}
 				for _, id := range []string{"source-a", "source-b", "merged"} {
@@ -125,7 +166,7 @@ func TestGCKeepsMergedSessionWhileASourceRefreshIsOwed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegmentText("merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
+	if err := deleteRefinedTextForGCTest(t, store, "merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, drive_documents_pending = 0 WHERE id = 'merged'`, storage.SummaryCompleted); err != nil {
@@ -180,7 +221,7 @@ func TestGCLogsTheSourceThatBlocksAgeDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegmentText("merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
+	if err := deleteRefinedTextForGCTest(t, store, "merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, drive_documents_pending = 0 WHERE id = 'merged'`, storage.SummaryCompleted); err != nil {
@@ -293,7 +334,7 @@ func TestGCReportsEveryMergedSourceBlockReason(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := store.DeleteSegmentText("merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
+				if err := deleteRefinedTextForGCTest(t, store, "merged", segments[0].ID, storage.TextDeletionSpan{AudioPath: filepath.Join(dir, "source-a.mp3"), Start: 0, End: 1, SHA256: "before"}); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := store.DB().Exec(`UPDATE sessions SET summary_status = ?, drive_documents_pending = 0 WHERE id = 'merged'`, storage.SummaryCompleted); err != nil {

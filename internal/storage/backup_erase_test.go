@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const backupSecret = "backup-held-deletion-phrase-77c2e1"
@@ -71,8 +72,8 @@ func deleteBackedUpSecret(t *testing.T, store *SQLiteStore) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteSegment("backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
-		t.Fatalf("DeleteSegment: %v", err)
+	if err := deleteRefinedAudioTestSegment(t, store, "backed-up", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+		t.Fatalf("delete refined segment: %v", err)
 	}
 }
 
@@ -96,11 +97,22 @@ func assertBackupHolds(t *testing.T, path, text string, want bool) {
 			t.Fatal(err)
 		}
 	}
-	if !strings.Contains(all, "after bridge") {
-		t.Fatal("control: the backup does not hold the kept text, so the read saw no data")
+	if want && !strings.Contains(all, "after bridge") {
+		t.Fatal("control: the backup does not hold the kept text before the deletion")
 	}
 	if got := strings.Contains(all, text); got != want {
 		t.Errorf("backup holds %q = %v, want %v", text, got, want)
+	}
+}
+
+func assertBackupOmits(t *testing.T, path, text string) {
+	t.Helper()
+	contents, err := os.ReadFile(preMigrationBackupPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(contents), text) {
+		t.Errorf("backup still holds %q", text)
 	}
 }
 
@@ -134,7 +146,7 @@ func TestADeletionScrubsABackupOfAnOlderSchemaInPlace(t *testing.T) {
 	}
 
 	deleteSecretFrom(t, path)
-	assertBackupHolds(t, path, backupSecret, false)
+	assertBackupOmits(t, path, backupSecret)
 	backup, err := sql.Open("sqlite", preMigrationBackupPath(path))
 	if err != nil {
 		t.Fatal(err)
@@ -151,8 +163,8 @@ func TestADeletionScrubsABackupOfAnOlderSchemaInPlace(t *testing.T) {
 	if err := backup.QueryRow(`SELECT count(*) FROM segments WHERE session_id = 'backed-up'`).Scan(&segments); err != nil {
 		t.Fatal(err)
 	}
-	if segments != 2 {
-		t.Errorf("the backup keeps %d of the session's segments, want the two not deleted", segments)
+	if segments != 0 {
+		t.Errorf("the older backup keeps %d segments of the affected session, want none", segments)
 	}
 }
 
@@ -183,4 +195,114 @@ func TestADeletionScrubsTheSpeakerNamesFromABackupOfAnOlderSchema(t *testing.T) 
 	assertBackupHolds(t, path, speaker, true)
 	deleteBackedUpSecret(t, store)
 	assertBackupHolds(t, path, speaker, false)
+}
+
+func TestARefinedFillerDeletionErasesAnOlderSchemaBackup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	openWithSecret(t, path)
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`ALTER TABLE sessions DROP COLUMN drive_replace_error`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := openStoreWithBackup(t, path)
+	words := []RefinedWord{
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Text: "before bridge.", Start: 0, End: 1},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 1, Text: "Um,", Start: 2, End: 2.2},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 2, Text: backupSecret + ".", Start: 2.2, End: 3},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 3, Text: "after bridge.", Start: 4, End: 5},
+	}
+	revision, err := store.PublishRefinementAtGeneration("backed-up", RefinedTranscript(words), "test", words, BuildRefinedSegments(words), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := store.GetSegments("backed-up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selected int64
+	for i := range segments {
+		if strings.Contains(segments[i].Text, backupSecret) {
+			selected = segments[i].ID
+		}
+	}
+	if selected == 0 {
+		t.Fatal("control: no refined filler segment holds the secret")
+	}
+	if err := store.DeleteRefinedSegmentText("backed-up", selected, revision); err != nil {
+		t.Fatal(err)
+	}
+	assertBackupOmits(t, path, backupSecret)
+}
+
+func TestOlderSchemaBackupScrubsRefinedWords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("s1", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("s1", started.Add(time.Minute), "recording.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	words := []RefinedWord{
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Text: "after bridge.", Start: 0, End: 1},
+		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 1, Text: backupSecret + ".", Start: 2, End: 3},
+	}
+	revision, err := store.PublishRefinementAtGeneration("s1", RefinedTranscript(words), "test", words, BuildRefinedSegments(words), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`ALTER TABLE sessions DROP COLUMN drive_replace_error`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store = openStoreWithBackup(t, path)
+	var before int
+	if err := sqlCount(preMigrationBackupPath(path), `SELECT count(*) FROM refined_words WHERE text LIKE ?`, "%"+backupSecret+"%", &before); err != nil {
+		t.Fatal(err)
+	}
+	if before != 1 {
+		t.Fatalf("control: backup refined words with secret = %d, want 1", before)
+	}
+	segments, err := store.GetSegments("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRefinedSegmentText("s1", segments[1].ID, revision); err != nil {
+		t.Fatal(err)
+	}
+	var after int
+	if err := sqlCount(preMigrationBackupPath(path), `SELECT count(*) FROM refined_words WHERE text LIKE ?`, "%"+backupSecret+"%", &after); err != nil {
+		t.Fatal(err)
+	}
+	if after != 0 {
+		t.Errorf("backup refined words with secret after delete = %d, want 0", after)
+	}
+}
+
+func sqlCount(path, query string, argument any, count *int) error {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return db.QueryRow(query, argument).Scan(count)
 }

@@ -21,6 +21,7 @@ type replacementStore interface {
 	GetSession(id string) (storage.Session, error)
 	DriveReplacements(sessionID string, generation int) ([]storage.DriveReplacement, error)
 	PendingDriveReplacementRecordings(sessionID string) ([]string, error)
+	LatestRecordingSHA256(sessionID, recording string) (string, bool, error)
 	StartDriveReplacement(sessionID, name string, generation int, oldIDs []string) error
 	MarkDriveReplacementUploaded(sessionID, name string, generation int, newID string) error
 	MarkDriveReplacementDeleted(sessionID, name, oldID string, generation int) error
@@ -177,7 +178,7 @@ func (s *Syncer) replaceFolder(ctx context.Context, ownerID string, generation i
 		if !own {
 			folderRecordings = recordingsInFolder(recordings, target.existing, target.rows)
 		}
-		if target.files, _, err = replacementFiles(&target.session, folderRecordings); err != nil {
+		if target.files, _, err = replacementFiles(ownerID, &target.session, folderRecordings, s.replacements); err != nil {
 			return fmt.Errorf("build replacements for session %s: %w", target.session.ID, err)
 		}
 	}
@@ -344,7 +345,9 @@ func (s *Syncer) deleteReplacedFiles(ctx context.Context, ownerID string, target
 	return nil
 }
 
-func replacementFiles(sess *storage.Session, recordings []string) ([]SyncFile, string, error) {
+func replacementFiles(ownerID string, sess *storage.Session, recordings []string, checksums interface {
+	LatestRecordingSHA256(sessionID, recording string) (string, bool, error)
+}) ([]SyncFile, string, error) {
 	syncSession := toSyncSession(sess)
 	summary, transcript := renderDocuments(&syncSession, nil)
 	if sess.SummaryStatus != storage.SummaryCompleted {
@@ -358,6 +361,13 @@ func replacementFiles(sess *storage.Session, recordings []string) ([]SyncFile, s
 		hash, err := fileSHA256(recording)
 		if err != nil {
 			return nil, "", fmt.Errorf("hash spliced recording %s: %w", recording, err)
+		}
+		expected, cut, err := checksums.LatestRecordingSHA256(ownerID, recording)
+		if err != nil {
+			return nil, "", fmt.Errorf("read latest cut hash for recording %s: %w", recording, err)
+		}
+		if cut && hash != expected {
+			return nil, "", fmt.Errorf("refuse replacement recording %s: SHA-256 %q does not match the latest cut hash %q", recording, hash, expected)
 		}
 		mimeType := "audio/mpeg"
 		if filepath.Ext(recording) == ".wav" {

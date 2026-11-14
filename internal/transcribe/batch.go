@@ -38,6 +38,7 @@ type deepgramBatchWord struct {
 	PunctuatedWord string  `json:"punctuated_word"`
 	Start          float64 `json:"start"`
 	End            float64 `json:"end"`
+	Speaker        int     `json:"speaker"`
 }
 
 type batchTranscriptionResult struct {
@@ -97,7 +98,7 @@ func timestampedWords(batchWords []deepgramBatchWord) []TimestampedWord {
 		if text == "" {
 			text = word.Word
 		}
-		words[i] = TimestampedWord{Text: text, Start: word.Start, End: word.End}
+		words[i] = TimestampedWord{Text: text, Start: word.Start, End: word.End, Speaker: word.Speaker}
 	}
 	return words
 }
@@ -120,6 +121,8 @@ func (d *deepgramBatchTranscriber) transcribe(ctx context.Context, audioPath str
 	}
 	q.Set("smart_format", "true")
 	q.Set("punctuate", "true")
+	q.Set("filler_words", "true")
+	q.Set("diarize", "true")
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(audioBytes))

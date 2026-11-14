@@ -22,7 +22,7 @@ func TestOwedDriveReplacementsAreReadFromTheStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := time.Now().UTC().Add(-time.Second)
-	if err := store.DeleteSegment("owed", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
+	if err := deleteRefinedAudioTestSegment(t, store, "owed", segments[1].ID, DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}); err != nil {
 		t.Fatal(err)
 	}
 	generation, err := store.DeletionGeneration("owed")

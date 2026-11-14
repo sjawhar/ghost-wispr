@@ -39,10 +39,9 @@ func backupDSN(backupPath string) string {
 // them in whatever of those tables and columns its schema has, and its
 // write-ahead log checkpointed away.
 //
-// segmentID and deletedText name the deleted segment; sessionIDs are the
-// sessions it was deleted from or merged into it, and holderIDs those that
-// held it (see rewriteDeletedTextEvents).
-func (s *SQLiteStore) eraseFromBackup(segmentID int64, deletedText string, sessionIDs, holderIDs []string, span *DeletedSpan) error {
+// segmentID names the deleted segment; sessionIDs are the sessions it was
+// deleted from or merged into it that held it (see dropSupersededEvents).
+func (s *SQLiteStore) eraseFromBackup(segmentID int64, sessionIDs []string) error {
 	if s.path == "" {
 		return nil
 	}
@@ -68,7 +67,7 @@ func (s *SQLiteStore) eraseFromBackup(segmentID int64, deletedText string, sessi
 		}
 		return createPreMigrationBackup(s.db, s.path)
 	}
-	scrubErr := scrubBackup(backup, segmentID, deletedText, sessionIDs, holderIDs, span)
+	scrubErr := scrubBackup(backup, segmentID, sessionIDs)
 	if err := backup.Close(); err != nil && scrubErr == nil {
 		return fmt.Errorf("close backup: %w", err)
 	}
@@ -139,7 +138,7 @@ func sameSchema(a, b *sql.DB) (bool, error) {
 // commit, leaving them in blocks the file system frees; a write-ahead log
 // holds only the pages as they are after it, with secure_delete's zeros. The
 // backup is left in the journal mode it had, with no log beside it.
-func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs, holderIDs []string, span *DeletedSpan) (err error) {
+func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) (err error) {
 	var mode string
 	if err := backup.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
 		return fmt.Errorf("read backup journal mode: %w", err)
@@ -178,14 +177,31 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 	// The backup may predate a merge: the session that held the segment then
 	// is the one its row still names there.
 	affected := slices.Clone(sessionIDs)
-	holders := slices.Clone(holderIDs)
 	segments, err := columns("segments")
 	if err != nil {
 		return err
 	}
-	// rebuildable: the deleted segment was found by its id, so the remaining
-	// segments are the ones the canonical transcript may be rebuilt from.
+	// An old backup predates refined segment ids. Its rows cannot identify the
+	// selected occurrence, so erase every segment of each affected session
+	// rather than guess from displayed text and risk keeping or over-deleting
+	// words.
 	rebuildable := false
+	deleteAffectedSegments := func() error {
+		query := `DELETE FROM segments`
+		var args []any
+		if segments["session_id"] {
+			query += ` WHERE session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
+			args = make([]any, len(affected))
+			for i, id := range affected {
+				args[i] = id
+			}
+		}
+		if _, err := tx.Exec(query, args...); err != nil {
+			return fmt.Errorf("delete affected segments from the older backup: %w", err)
+		}
+		rebuildable = true
+		return nil
+	}
 	switch {
 	case segments["id"]:
 		var holder string
@@ -193,27 +209,20 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 		switch {
 		case err == nil:
 			affected = append(affected, holder)
-			holders = append(holders, holder)
-		case !errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.Exec(`DELETE FROM segments WHERE id = ?`, segmentID); err != nil {
+				return fmt.Errorf("delete the segment from the backup: %w", err)
+			}
+			rebuildable = true
+		case errors.Is(err, sql.ErrNoRows):
+			if err := deleteAffectedSegments(); err != nil {
+				return err
+			}
+		default:
 			return fmt.Errorf("find the deleted segment in the backup: %w", err)
 		}
-		if _, err := tx.Exec(`DELETE FROM segments WHERE id = ?`, segmentID); err != nil {
-			return fmt.Errorf("delete the segment from the backup: %w", err)
-		}
-		rebuildable = true
 	case segments["text"]:
-		// With no id, the segment is found by its text, in the sessions that
-		// can hold it: every segment there with that text goes, an identical
-		// line kept elsewhere in those sessions with it.
-		query, args := `DELETE FROM segments WHERE text = ?`, []any{deletedText}
-		if segments["session_id"] {
-			query += ` AND session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
-			for _, id := range affected {
-				args = append(args, id)
-			}
-		}
-		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("delete the segment from the backup by its text: %w", err)
+		if err := deleteAffectedSegments(); err != nil {
+			return err
 		}
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",")
@@ -254,11 +263,18 @@ func scrubBackup(backup *sql.DB, segmentID int64, deletedText string, sessionIDs
 			return fmt.Errorf("clear backup embeddings: %w", err)
 		}
 	}
+	if refinedWords, err := columns("refined_words"); err != nil {
+		return err
+	} else if refinedWords["session_id"] {
+		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return fmt.Errorf("clear backup refined words: %w", err)
+		}
+	}
 	if events, err := columns("mcp_events"); err != nil {
 		return err
 	} else if events["payload"] {
-		if err := rewriteDeletedTextEvents(tx, affected, holders, deletedText, span); err != nil {
-			return fmt.Errorf("rewrite backup events: %w", err)
+		if err := dropSupersededEvents(tx, affected); err != nil {
+			return fmt.Errorf("drop backup superseded events: %w", err)
 		}
 	}
 	if search, err := columns("sessions_fts"); err != nil {

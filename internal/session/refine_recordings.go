@@ -13,17 +13,23 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
-// transcribeRecordings is a session's batch refinement: each recording
-// audioPath names (a merged session's names several, in session order,
-// separated by commas) transcribed alone, with the words of every span
-// "Delete text" recorded in it dropped (withoutDeletedText), and the
-// transcripts joined, one paragraph each. The recordings must report one
-// model. A recording whose bytes are not the ones its spans were recorded in
-// is refused: the spans' times may no longer be where the deleted words are,
-// and a refinement must not bring them back.
-func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTranscriber, audioPath string) (transcribe.BatchResult, error) {
-	var transcripts []string
-	var model string
+// batchRefinementResult is the one atomic unit of a completed batch
+// refinement: transcript text, every retained word occurrence, and the
+// segment table derived from those occurrences.
+type batchRefinementResult struct {
+	Transcript string
+	Model      string
+	Words      []storage.RefinedWord
+	Segments   []storage.RefinedSegment
+}
+
+// transcribeRecordings transcribes each recording on its own, preserving the
+// recording revision and ordinal of every batch word. Text-deletion spans are
+// applied before segments and transcripts are built, so a later refinement
+// cannot reintroduce deleted words.
+func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTranscriber, audioPath string) (batchRefinementResult, error) {
+	var result batchRefinementResult
+	recordingOrdinal, transcribedWords := 0, 0
 	for _, recording := range strings.Split(audioPath, ",") {
 		recording = strings.TrimSpace(recording)
 		if recording == "" {
@@ -31,32 +37,46 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 		}
 		spans, err := m.store.TextDeletionSpans(recording)
 		if err != nil {
-			return transcribe.BatchResult{}, err
+			return batchRefinementResult{}, err
 		}
 		if err := spansDescribe(recording, spans); err != nil {
-			return transcribe.BatchResult{}, err
+			return batchRefinementResult{}, err
 		}
-		result, err := t.Transcribe(ctx, recording)
+		batch, err := t.Transcribe(ctx, recording)
 		if err != nil {
-			return transcribe.BatchResult{}, err
+			return batchRefinementResult{}, err
 		}
-		transcript := result.Transcript
-		if len(spans) > 0 {
-			if transcript, err = withoutDeletedText(&result, spans); err != nil {
-				return transcribe.BatchResult{}, fmt.Errorf("refine %s: %w", recording, err)
-			}
+		transcribedWords += len(batch.Words)
+		recordingHash, err := recordingSHA256(recording)
+		if err != nil {
+			return batchRefinementResult{}, fmt.Errorf("hash recording %s: %w", recording, err)
 		}
 		switch {
-		case model == "":
-			model = result.Model
-		case result.Model != "" && result.Model != model:
-			return transcribe.BatchResult{}, fmt.Errorf("refine %s: its transcription reports model %q, another recording of the session %q", recording, result.Model, model)
+		case result.Model == "":
+			result.Model = batch.Model
+		case batch.Model != "" && batch.Model != result.Model:
+			return batchRefinementResult{}, fmt.Errorf("refine %s: its transcription reports model %q, another recording of the session %q", recording, batch.Model, result.Model)
 		}
-		if transcript = strings.TrimSpace(transcript); transcript != "" {
-			transcripts = append(transcripts, transcript)
+
+		var kept []storage.RefinedWord
+		for ordinal, word := range batch.Words {
+			if storage.TextDeleted(spans, word.Start, word.End) {
+				continue
+			}
+			kept = append(kept, storage.RefinedWord{
+				RecordingPath: recording, RecordingSHA256: recordingHash, RecordingOrdinal: recordingOrdinal,
+				Ordinal: ordinal, Text: word.Text, Speaker: word.Speaker, Start: word.Start, End: word.End,
+			})
 		}
+		result.Words = append(result.Words, kept...)
+		recordingOrdinal++
 	}
-	return transcribe.BatchResult{Transcript: strings.Join(transcripts, "\n\n"), Model: model}, nil
+	if transcribedWords == 0 {
+		return batchRefinementResult{}, fmt.Errorf("batch refinement returned no timed words")
+	}
+	result.Transcript = storage.RefinedTranscript(result.Words)
+	result.Segments = storage.BuildRefinedSegments(result.Words)
+	return result, nil
 }
 
 // spansDescribe returns an error unless recording's bytes are the ones each
@@ -88,24 +108,4 @@ func recordingSHA256(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-// withoutDeletedText rebuilds result's transcript from its words, leaving out
-// every word whose middle is in one of spans: the words of segments "Delete
-// text" removed, which the recording still holds. A transcription with text
-// and no word times cannot say which words those are, and is refused.
-func withoutDeletedText(result *transcribe.BatchResult, spans []storage.TextDeletionSpan) (string, error) {
-	if len(result.Words) == 0 {
-		if strings.TrimSpace(result.Transcript) != "" {
-			return "", fmt.Errorf("the transcription gave no word times, so the words of deleted text cannot be left out")
-		}
-		return "", nil
-	}
-	kept := make([]string, 0, len(result.Words))
-	for _, word := range result.Words {
-		if !storage.TextDeleted(spans, word.Start, word.End) {
-			kept = append(kept, word.Text)
-		}
-	}
-	return strings.Join(kept, " "), nil
 }

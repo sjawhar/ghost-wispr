@@ -75,9 +75,9 @@ func (s *SQLiteStore) DriveReplacementFolders(sessionID string, generation int) 
 }
 
 // EnsureDriveReplacementFolders returns the ledger of the Drive folders
-// sessionID's segment deletion at generation owes, rebuilding it first when
-// it is empty while that deletion is still pending: from the session's own
-// folder and each merged source's that has one, as DeleteSegment records it.
+// sessionID's refined audio deletion at generation owes, rebuilding it first
+// while that deletion is still pending: from the session's own folder and
+// each merged source's that has one.
 // A pending deletion with no ledger was made by a build that has none (one
 // deploy/pi/update.sh rolled back to, after this version's migration had
 // run), and read as owing nothing it would leave the words in those folders.
@@ -177,7 +177,7 @@ func (s *SQLiteStore) DriveReplacementInput(sessionID string) (bool, string, err
 	}
 
 	var audioPath string
-	if err := s.db.QueryRow(`SELECT audio_path FROM deleted_segments WHERE session_id = ? ORDER BY deleted_at DESC, rowid DESC LIMIT 1`, sessionID).Scan(&audioPath); err != nil {
+	if err := s.db.QueryRow(`SELECT audio_path FROM deleted_segments WHERE session_id = ? ORDER BY rowid DESC LIMIT 1`, sessionID).Scan(&audioPath); err != nil {
 		if err == sql.ErrNoRows {
 			return false, "", fmt.Errorf("read drive replacement for session %s: no deleted segment", sessionID)
 		}

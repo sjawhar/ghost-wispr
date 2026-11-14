@@ -4,12 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import SessionList from '../SessionList.svelte'
 import { RequestError } from '../../lib/api'
 import {
+  RefinementStatus,
   SessionStatus,
   SummaryStatus,
   type SessionDetailResponse,
   type SessionSummary,
 } from '../../lib/types'
-
 type SessionListProps = ComponentProps<typeof SessionList>
 
 function render(
@@ -85,6 +85,8 @@ describe('SessionList', () => {
       summary_status: SummaryStatus.Pending,
       summary_preset: 'default',
       audio_path: 'fixture.mp3',
+      refinement_status: RefinementStatus.Completed,
+      refined_revision: 1,
     }
     const detail: SessionDetailResponse = {
       session,
@@ -96,6 +98,7 @@ describe('SessionList', () => {
           start_time: 0,
           end_time: 2,
           timestamp: '2026-11-11T10:00:00Z',
+          transcript_revision: 1,
         },
       ],
     }
@@ -162,6 +165,8 @@ describe('SessionList', () => {
       summary_status: SummaryStatus.Pending,
       summary_preset: 'default',
       audio_path: 'fixture.mp3',
+      refinement_status: RefinementStatus.Completed,
+      refined_revision: 1,
     }
     const onSegmentDeleted = vi.fn()
     vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
@@ -182,6 +187,7 @@ describe('SessionList', () => {
                 start_time: 0,
                 end_time: 2,
                 timestamp: '2026-11-11T10:00:00Z',
+                transcript_revision: 1,
               },
             ],
           },

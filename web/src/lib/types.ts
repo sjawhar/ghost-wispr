@@ -137,6 +137,9 @@ export interface Segment {
   start_time: number
   end_time: number
   timestamp: string
+  transcript_revision?: number
+  recording_path?: string
+  untimed?: boolean
 }
 
 export interface SessionSummary {
@@ -153,11 +156,14 @@ export interface SessionSummary {
   // empty or absent if it did not. All of it, or part of it when audio_path
   // still names what is left. The session itself is kept.
   audio_removed_at?: string
+  restored_at?: string
+  gdrive_folder_id?: string
   sync_status?: SyncStatus
   sync_state?: SyncState
   // Why the last summary attempt failed, when it did.
   summary_error?: string
   refinement_status?: RefinementStatus
+  refined_revision?: number
   transcript_source?: string
   refined_transcript?: string
   canonical_transcript?: string

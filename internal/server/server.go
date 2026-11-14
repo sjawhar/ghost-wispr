@@ -25,16 +25,8 @@ var (
 	// answer a question the retry needs answered first: the retry may work once
 	// Drive answers.
 	ErrDriveUnavailable = errors.New("google drive did not answer")
-	// ErrSegmentNotFoundInRecording means alignment could not locate a segment.
-	ErrSegmentNotFoundInRecording = errors.New("segment could not be found in recording")
-	// ErrSegmentNotRemovedCleanly means post-splice validation rejected the cut.
-	ErrSegmentNotRemovedCleanly = errors.New("segment could not be removed cleanly")
 	// ErrSegmentRawAudioKept means a recoverable raw recording still holds the audio.
 	ErrSegmentRawAudioKept = errors.New("a kept raw recording prevents segment deletion")
-	// ErrBatchTranscriptionNotConfigured is what DeleteSegment wraps when no
-	// batch transcription is configured: a deletion finds the segment in the
-	// recording by the words batch transcription times.
-	ErrBatchTranscriptionNotConfigured = errors.New("batch transcription is not configured")
 )
 
 // The modes a segment deletion takes (DELETE
@@ -147,17 +139,17 @@ type ControlHooks struct {
 	// RetrySync starts a sync of the session in the background and returns
 	// at once: ErrSyncNotConfigured when sync is off, or why no sync can
 	// start for the session.
-	RetrySync       func(ctx context.Context, sessionID string) error
-	RetryRefinement func(ctx context.Context, sessionID string) error
-	RepairSummaries func(ctx context.Context) (int, error)
-	DiagnoseMic     func(ctx context.Context) (map[string]any, error)
-	// DeleteSegment is "Delete text and audio" (mode=text_and_audio): it
-	// locates, validates, splices, and records a segment deletion.
-	DeleteSegment func(ctx context.Context, sessionID string, segmentID int64) error
-	// DeleteSegmentText is "Delete text" (mode=text): it locates the
-	// segment's words and removes them from every text store, leaving the
-	// recording and the Drive files as they are.
-	DeleteSegmentText   func(ctx context.Context, sessionID string, segmentID int64) error
+	RetrySync                    func(ctx context.Context, sessionID string) error
+	RefinementRecordingAvailable func(ctx context.Context, sessionID string) error
+	RetryRefinement              func(ctx context.Context, sessionID string) error
+	RepairSummaries              func(ctx context.Context) (int, error)
+	DiagnoseMic                  func(ctx context.Context) (map[string]any, error)
+	// DeleteSegment is "Delete text and audio" (mode=text_and_audio) for a
+	// specific batch transcript revision.
+	DeleteSegment func(ctx context.Context, sessionID string, segmentID int64, revision int) error
+	// DeleteSegmentText is "Delete text" (mode=text) for a specific batch
+	// transcript revision.
+	DeleteSegmentText   func(ctx context.Context, sessionID string, segmentID int64, revision int) error
 	BatchBackfill       func(ctx context.Context) (batchName string, sessionCount int, err error)
 	BatchPoll           func(ctx context.Context, batchName string) (map[string]any, error)
 	TTSSpeak            func(text, voice, provider string) (string, error)

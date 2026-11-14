@@ -33,6 +33,15 @@ import (
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+type recordingRestoreInProgress interface {
+	RecordingRestoreInProgress()
+}
+
+func isRecordingRestoreInProgress(err error) bool {
+	var restoring recordingRestoreInProgress
+	return errors.As(err, &restoring)
+}
+
 type SessionStore interface {
 	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
 	GetSession(id string) (storage.Session, error)
@@ -82,8 +91,8 @@ func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speaker
 	// Try to parse as numeric index first
 	if idx, err := strconv.Atoi(speaker); err == nil {
 		// Numeric speaker index
-		for _, seg := range segments {
-			if seg.Speaker == idx {
+		for i := range segments {
+			if segments[i].Speaker == idx {
 				return true
 			}
 		}
@@ -96,8 +105,8 @@ func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speaker
 		return false
 	}
 
-	for _, seg := range segments {
-		if seg.Speaker == speakerIndex {
+	for i := range segments {
+		if segments[i].Speaker == speakerIndex {
 			return true
 		}
 	}
@@ -616,9 +625,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			sinceTimeObj := time.Unix(0, sinceTime*int64(time.Millisecond))
 			filtered := make([]transcribe.Segment, 0, len(segments))
-			for _, seg := range segments {
-				if seg.Timestamp.After(sinceTimeObj) {
-					filtered = append(filtered, seg)
+			for i := range segments {
+				if segments[i].Timestamp.After(sinceTimeObj) {
+					filtered = append(filtered, segments[i])
 				}
 			}
 			segments = filtered
@@ -688,9 +697,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		speaker := strings.TrimSpace(r.URL.Query().Get("speaker"))
 		if speaker != "" {
 			filtered := make([]transcribe.Segment, 0, len(segments))
-			for _, seg := range segments {
-				if hasSegmentForSpeaker([]transcribe.Segment{seg}, speaker, sess.SpeakerNames) {
-					filtered = append(filtered, seg)
+			for i := range segments {
+				if hasSegmentForSpeaker(segments[i:i+1], speaker, sess.SpeakerNames) {
+					filtered = append(filtered, segments[i])
 				}
 			}
 			segments = filtered
@@ -708,10 +717,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// The two deletion actions (Sami, 2026-11-12,
 		// dispatch://INFRA-2961/ask/8dcb4d3f-a256-45dd-b0ac-ed4b06fe2a05): no
 		// client gets one by default.
-		var deleteSegment func(context.Context, string, int64) error
+		var deleteSegment func(context.Context, string, int64, int) error
+		textOnly := false
 		switch modes := r.URL.Query()["mode"]; {
 		case len(modes) == 1 && modes[0] == segmentDeleteText:
 			deleteSegment = controls.DeleteSegmentText
+			textOnly = true
 		case len(modes) == 1 && modes[0] == segmentDeleteTextAndAudio:
 			deleteSegment = controls.DeleteSegment
 		default:
@@ -721,6 +732,16 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		segmentID, err := strconv.ParseInt(r.PathValue("segmentID"), 10, 64)
 		if err != nil || segmentID <= 0 {
 			writeJSONError(w, http.StatusNotFound, "segment not found")
+			return
+		}
+		revisions := r.URL.Query()["revision"]
+		if len(revisions) != 1 {
+			writeJSONError(w, http.StatusBadRequest, "transcript revision is required")
+			return
+		}
+		revision, err := strconv.Atoi(revisions[0])
+		if err != nil || revision < 0 || (revision == 0 && !textOnly) {
+			writeJSONError(w, http.StatusBadRequest, "transcript revision must be a positive integer, except 0 for an untimed Delete text segment")
 			return
 		}
 		sessionData, err := store.GetSession(sessionID)
@@ -736,26 +757,66 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
 			return
 		}
+		if !textOnly || revision != 0 {
+			if sessionData.RefinementStatus == storage.RefinementCompleted && sessionData.RefinedRevision == 0 {
+				if controls.RetryRefinement == nil {
+					writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+					return
+				}
+				go func() {
+					_ = controls.RetryRefinement(context.Background(), sessionID)
+				}()
+				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+				return
+			}
+			if sessionData.RefinementStatus == storage.RefinementNoAudio {
+				if controls.RefinementRecordingAvailable != nil {
+					if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
+						writeJSONError(w, http.StatusConflict, err.Error())
+						return
+					}
+				}
+				if controls.RetryRefinement == nil {
+					writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+					return
+				}
+				go func() {
+					_ = controls.RetryRefinement(context.Background(), sessionID)
+				}()
+				writeJSONError(w, http.StatusConflict, "no recording is on this unit; restoring it from Drive before deletion")
+				return
+			}
+			if sessionData.RefinementStatus != storage.RefinementCompleted {
+				if sessionData.RefinementStatus == storage.RefinementFailed {
+					writeJSONError(w, http.StatusConflict, "this conversation's refinement failed; retry refinement before deleting")
+				} else {
+					writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+				}
+				return
+			}
+		}
 		if deleteSegment == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "segment deletion is not configured")
 			return
 		}
-		if err := deleteSegment(r.Context(), sessionID, segmentID); err != nil {
+		if err := deleteSegment(r.Context(), sessionID, segmentID, revision); err != nil {
 			switch {
 			case errors.Is(err, storage.ErrSegmentNotFound):
 				writeJSONError(w, http.StatusNotFound, "segment not found")
 			case errors.Is(err, storage.ErrSegmentSessionActive):
 				writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
+			case isRecordingRestoreInProgress(err):
+				writeJSONError(w, http.StatusConflict, "Restoring the recording; try again shortly.")
 			case errors.Is(err, storage.ErrSegmentSplicePending):
 				writeJSONError(w, http.StatusConflict, "A previous segment deletion is still being recovered. Try again after it completes.")
-			case errors.Is(err, ErrSegmentNotFoundInRecording):
-				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be found in the recording; nothing was deleted")
-			case errors.Is(err, ErrSegmentNotRemovedCleanly):
-				writeJSONError(w, http.StatusUnprocessableEntity, "The segment could not be removed cleanly; nothing was deleted")
+			case errors.Is(err, storage.ErrStaleTranscriptRevision):
+				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
+			case errors.Is(err, storage.ErrMergeProvenanceUnavailable):
+				writeJSONError(w, http.StatusConflict, "part of this conversation's merge history can't be traced, so nothing in it can be deleted safely")
+			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):
+				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
 			case errors.Is(err, ErrSegmentRawAudioKept):
 				writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
-			case errors.Is(err, ErrBatchTranscriptionNotConfigured):
-				writeJSONError(w, http.StatusServiceUnavailable, "Segment deletion needs batch transcription, which is not configured: add a Deepgram API key.")
 			default:
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete segment: %v", err))
 			}
@@ -973,9 +1034,13 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 		}
 
-		newID := earliest.UTC().Format("20060102150405") + "-merged"
+		newID, err := nextMergedSessionID(store, earliest)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("choose merged session id: %v", err))
+			return
+		}
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
-			if errors.Is(err, storage.ErrMergeReplacementPending) {
+			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) || errors.Is(err, storage.ErrMergeSessionExists) {
 				writeJSONError(w, http.StatusConflict, err.Error())
 				return
 			}
@@ -1033,7 +1098,16 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		for i := range sessions {
 			sess := &sessions[i]
-			if sess.Status == "merged" {
+			if sess.Status == storage.SessionMerged {
+				if len(currentGroup) >= 2 {
+					groups = append(groups, currentGroup)
+				}
+				currentGroup = nil
+				prevEnded = nil
+				continue
+			}
+			if sess.Status == storage.SessionActive {
+				slog.Warn("auto-merge skipped recording session", "session_id", sess.ID)
 				if len(currentGroup) >= 2 {
 					groups = append(groups, currentGroup)
 				}
@@ -1075,7 +1149,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 					latest = *sess.EndedAt
 				}
 			}
-			newID := earliest.UTC().Format("20060102150405") + "-merged"
+			newID, err := nextMergedSessionID(store, earliest)
+			if err != nil {
+				slog.Error("choose auto-merge session id", "group", group, "error", err)
+				continue
+			}
 			if err := store.MergeSessions(newID, group, earliest, latest); err != nil {
 				slog.Error("auto-merge failed", "group", group, "error", err)
 				continue
@@ -1273,9 +1351,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		qLower := strings.ToLower(q)
 		var matchTime float64
 		found := false
-		for _, seg := range segments {
-			if strings.Contains(strings.ToLower(seg.Text), qLower) {
-				matchTime = seg.StartTime
+		for i := range segments {
+			if strings.Contains(strings.ToLower(segments[i].Text), qLower) {
+				matchTime = segments[i].StartTime
 				found = true
 				break
 			}
@@ -1545,17 +1623,17 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		// Refinement transcribes the saved recording; without one it can only fail.
-		if sess, err := store.GetSession(sessionID); err == nil && sess.AudioPath == "" {
-			writeJSONError(w, http.StatusConflict, "session has no saved recording to refine")
-			return
+		if controls.RefinementRecordingAvailable != nil {
+			if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 		}
-
 		go func() {
 			_ = controls.RetryRefinement(context.Background(), sessionID)
 		}()
 
-		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+		writeJSON(w, http.StatusAccepted, map[string]bool{"triggered": true})
 	})
 
 	// Config endpoints — only registered if cfgStore is provided.
@@ -1757,6 +1835,23 @@ var finishErasing = func(sessionID string, pending []erase.Pending) {
 	for _, p := range pending {
 		if err := p.Finish(); err != nil {
 			slog.Warn("could not overwrite a deleted session's recording; it is erased as the app starts", "session_id", sessionID, "error", err)
+		}
+	}
+}
+
+func nextMergedSessionID(store SessionStore, earliest time.Time) (string, error) {
+	base := earliest.UTC().Format("20060102150405") + "-merged"
+	for suffix := 1; ; suffix++ {
+		id := base
+		if suffix > 1 {
+			id = fmt.Sprintf("%s-%d", base, suffix)
+		}
+		if _, err := store.GetSession(id); err == nil {
+			continue
+		} else if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+			return id, nil
+		} else {
+			return "", fmt.Errorf("check merged session id %s: %w", id, err)
 		}
 	}
 }

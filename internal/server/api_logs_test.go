@@ -105,11 +105,12 @@ func TestRetryEndpoints(t *testing.T) {
 	tests := []struct {
 		name     string
 		endpoint string
+		status   int
 		check    func() bool
 	}{
-		{"Retry Summary", "/api/sessions/test-session/retry-summary", summaryCalled.Load},
-		{"Retry Sync", "/api/sessions/test-session/retry-sync", syncCalled.Load},
-		{"Retry Refinement", "/api/sessions/test-session/retry-refinement", refinementCalled.Load},
+		{"Retry Summary", "/api/sessions/test-session/retry-summary", http.StatusOK, summaryCalled.Load},
+		{"Retry Sync", "/api/sessions/test-session/retry-sync", http.StatusOK, syncCalled.Load},
+		{"Retry Refinement", "/api/sessions/test-session/retry-refinement", http.StatusAccepted, refinementCalled.Load},
 	}
 
 	for _, tt := range tests {
@@ -121,8 +122,8 @@ func TestRetryEndpoints(t *testing.T) {
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
 
-			if rr.Code != http.StatusOK {
-				t.Errorf("expected status 200, got %d", rr.Code)
+			if rr.Code != tt.status {
+				t.Errorf("expected status %d, got %d", tt.status, rr.Code)
 			}
 
 			// Give the goroutine a moment to run
@@ -180,10 +181,9 @@ func TestRetrySyncSaysWhenNoSyncCanStart(t *testing.T) {
 	}
 }
 
-// Retry refinement on a session with no saved recording (refinement status
-// no_audio, or audio that disk pressure removed) is refused with the reason,
-// instead of reporting a retry that can only fail.
-func TestRetryRefinementRefusesASessionWithNoRecording(t *testing.T) {
+// Retry refinement starts Drive restoration when a session has no local
+// recording, including one GC removed to free space.
+func TestRetryRefinementStartsRestoreForASessionWithNoRecording(t *testing.T) {
 	cases := map[string]storage.Session{
 		"no recording saved": {ID: "20261106140930", Status: storage.SessionEnded, RefinementStatus: storage.RefinementNoAudio},
 		"audio removed to free space": {ID: "20261106140930", Status: storage.SessionEnded, RefinementStatus: storage.RefinementCompleted,
@@ -203,12 +203,12 @@ func TestRetryRefinementRefusesASessionWithNoRecording(t *testing.T) {
 
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/sessions/20261106140930/retry-refinement", nil))
-			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "no saved recording") {
-				t.Fatalf("retry refinement with no recording = %d %s, want 409 saying there is no saved recording", rr.Code, rr.Body.String())
+			if rr.Code != http.StatusAccepted || !strings.Contains(rr.Body.String(), "triggered") {
+				t.Fatalf("retry refinement with no recording = %d %s, want 202 and a restore retry", rr.Code, rr.Body.String())
 			}
 			time.Sleep(10 * time.Millisecond)
-			if called.Load() {
-				t.Fatal("refinement retried for a session with no recording")
+			if !called.Load() {
+				t.Fatal("refinement restoration did not start for a session with no recording")
 			}
 		})
 	}
