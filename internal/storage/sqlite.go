@@ -946,12 +946,13 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 	res, err := s.db.Exec(
 		`UPDATE sessions SET ended_at = ?, status = 'ended', audio_path = ?,
 			refinement_status = CASE WHEN ? = '' THEN ? ELSE refinement_status END
-		 WHERE id = ?`,
+		 WHERE id = ? AND status != ?`,
 		endedAt.UTC().Format(time.RFC3339Nano),
 		audioPath,
 		audioPath,
 		RefinementNoAudio,
 		id,
+		SessionMerged,
 	)
 	if err != nil {
 		return fmt.Errorf("end session %s: %w", id, err)
@@ -962,6 +963,16 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 		return fmt.Errorf("end session rows affected: %w", err)
 	}
 	if rows == 0 {
+		var status string
+		if err := s.db.QueryRow(`SELECT status FROM sessions WHERE id = ?`, id).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return sql.ErrNoRows
+			}
+			return fmt.Errorf("read session %s after end: %w", id, err)
+		}
+		if status == SessionMerged {
+			return nil
+		}
 		return sql.ErrNoRows
 	}
 	return nil
@@ -970,31 +981,38 @@ func (s *SQLiteStore) EndSession(id string, endedAt time.Time, audioPath string)
 // RefinementRecordingSource identifies a source session recorded with a
 // merged session's provenance.
 type RefinementRecordingSource struct {
-	ID             string
-	GDriveFolderID string
-	RecordingPaths []string
+	ID                     string
+	GDriveFolderID         string
+	FallbackGDriveFolderID string
+	RecordingPaths         []string
 }
 
 // RefinementRecordingSources follows recording provenance through nested
 // merges to the original source session that owns each recording and Drive
 // folder. Without provenance, a restore must refuse rather than guess.
 func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]RefinementRecordingSource, error) {
-	rows, err := s.db.Query(`WITH RECURSIVE source(recording_path, session_id) AS (
-			SELECT recording_path, source_session_id FROM recording_sources WHERE merged_session_id = ?
+	rows, err := s.db.Query(`WITH RECURSIVE source(recording_path, session_id, folder_session_id) AS (
+			SELECT recording_path, source_session_id, source_session_id
+			FROM recording_sources WHERE merged_session_id = ?
 			UNION ALL
-			SELECT source.recording_path, nested.source_session_id
-			FROM source JOIN recording_sources AS nested
+			SELECT source.recording_path, nested.source_session_id,
+				CASE WHEN parent.gdrive_folder_id != '' THEN source.session_id ELSE nested.source_session_id END
+			FROM source
+			JOIN recording_sources AS nested
 			  ON nested.merged_session_id = source.session_id
 			 AND nested.recording_path = source.recording_path
+			JOIN sessions AS parent ON parent.id = source.session_id
 		)
-		SELECT source.session_id, sessions.gdrive_folder_id, source.recording_path
-		FROM source JOIN sessions ON sessions.id = source.session_id
+		SELECT source.session_id, folders.gdrive_folder_id, leaves.gdrive_folder_id, source.recording_path
+		FROM source
+		JOIN sessions AS folders ON folders.id = source.folder_session_id
+		JOIN sessions AS leaves ON leaves.id = source.session_id
 		WHERE NOT EXISTS (
 			SELECT 1 FROM recording_sources AS nested
 			WHERE nested.merged_session_id = source.session_id
 			  AND nested.recording_path = source.recording_path
 		)
-		ORDER BY sessions.started_at, source.recording_path`, sessionID)
+		ORDER BY folders.started_at, source.recording_path`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("list recording sources for session %s: %w", sessionID, err)
 	}
@@ -1002,15 +1020,15 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 	byID := make(map[string]int)
 	var sources []RefinementRecordingSource
 	for rows.Next() {
-		var id, folderID, path string
-		if err := rows.Scan(&id, &folderID, &path); err != nil {
+		var id, folderID, fallbackFolderID, path string
+		if err := rows.Scan(&id, &folderID, &fallbackFolderID, &path); err != nil {
 			return nil, fmt.Errorf("scan recording source for session %s: %w", sessionID, err)
 		}
 		index, found := byID[id]
 		if !found {
 			index = len(sources)
 			byID[id] = index
-			sources = append(sources, RefinementRecordingSource{ID: id, GDriveFolderID: folderID})
+			sources = append(sources, RefinementRecordingSource{ID: id, GDriveFolderID: folderID, FallbackGDriveFolderID: fallbackFolderID})
 		}
 		sources[index].RecordingPaths = append(sources[index].RecordingPaths, path)
 	}
@@ -1154,6 +1172,10 @@ func (s *SQLiteStore) AppendSegment(sessionID string, seg transcribe.Segment) er
 // the deleted words.
 var ErrMergeReplacementPending = errors.New("a session to merge still has a deleted segment on Google Drive; merge it after its Drive files are replaced")
 
+// ErrMergeSessionActive is returned without changing rows when a source is
+// still recording. A recorder must finish before its session can be merged.
+var ErrMergeSessionActive = errors.New("a session to merge is still recording; end it before merging")
+
 func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	if strings.TrimSpace(newID) == "" {
 		return errors.New("new session id is required")
@@ -1183,6 +1205,17 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("merge session %s: %w", owing, ErrMergeReplacementPending)
 	case !errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("check sources for owed Drive replacements: %w", err)
+	}
+	var active string
+	err = tx.QueryRow(
+		fmt.Sprintf(`SELECT id FROM sessions WHERE id IN (%s) AND status = ? LIMIT 1`, strings.Join(placeholders, ",")),
+		append(args[1:], SessionActive)...,
+	).Scan(&active)
+	switch {
+	case err == nil:
+		return fmt.Errorf("merge session %s: %w", active, ErrMergeSessionActive)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("check sources for active session: %w", err)
 	}
 
 	_, err = tx.Exec(
@@ -1274,12 +1307,20 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 			_ = removedRows.Close()
 			return fmt.Errorf("scan source with removed recording: %w", err)
 		}
-		paths, err := refinementRecordingPaths(tx, `SELECT DISTINCT recording_path FROM refined_words
-			WHERE session_id = ? AND transcript_revision = (SELECT refined_revision FROM sessions WHERE id = ?)
-			ORDER BY recording_path`, sourceID, sourceID)
+		paths, err := refinementRecordingPaths(tx, `SELECT recording_path FROM recording_sources
+			WHERE merged_session_id = ? ORDER BY recording_path`, sourceID)
 		if err != nil {
 			_ = removedRows.Close()
-			return fmt.Errorf("list removed recordings for source %s: %w", sourceID, err)
+			return fmt.Errorf("list inherited recordings for source %s: %w", sourceID, err)
+		}
+		if len(paths) == 0 {
+			paths, err = refinementRecordingPaths(tx, `SELECT DISTINCT recording_path FROM refined_words
+				WHERE session_id = ? AND transcript_revision = (SELECT refined_revision FROM sessions WHERE id = ?)
+				ORDER BY recording_path`, sourceID, sourceID)
+			if err != nil {
+				_ = removedRows.Close()
+				return fmt.Errorf("list removed recordings for source %s: %w", sourceID, err)
+			}
 		}
 		if len(paths) == 0 {
 			paths = []string{sourceID + ".mp3"}

@@ -106,9 +106,6 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
 			return fmt.Errorf("drop source refined words after untimed deletion: %w", err)
 		}
-		if _, err := tx.Exec(`DELETE FROM segments WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
-			return fmt.Errorf("drop source segments after untimed deletion: %w", err)
-		}
 	}
 	owners := append([]string{sessionID}, sources...)
 	if err := dropLiveTranscriptEvents(tx, owners); err != nil {
@@ -244,9 +241,6 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		}
 		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
 			return fmt.Errorf("drop source refined words after merged deletion: %w", err)
-		}
-		if _, err := tx.Exec(`DELETE FROM segments WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
-			return fmt.Errorf("drop source segments after merged deletion: %w", err)
 		}
 	}
 	owners := append([]string{sessionID}, sources...)

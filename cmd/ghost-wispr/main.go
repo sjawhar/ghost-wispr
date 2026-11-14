@@ -781,6 +781,9 @@ func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine f
 	if merged.AudioRemovedAt != "" {
 		if err := retryRefinement(ctx, sessionID); err != nil {
 			recordRefinementFailure(ctx, sessionID, err)
+			if err := summarize(ctx, sessionID, merged.StartedAt); err != nil {
+				log.Printf("warning: summarize failed merged session %s: %v", sessionID, err)
+			}
 		}
 		return
 	}

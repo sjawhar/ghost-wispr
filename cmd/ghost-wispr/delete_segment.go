@@ -182,7 +182,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 				return deletionRecordingSet{}, fmt.Errorf("list Drive recording sources for session %s: %w", session.ID, err)
 			}
 			for _, sourceSession := range sources {
-				if sourceSession.GDriveFolderID == "" {
+				if sourceSession.GDriveFolderID == "" && sourceSession.FallbackGDriveFolderID == "" {
 					continue
 				}
 				expected := make(map[string]struct{}, len(sourceSession.RecordingPaths))
@@ -211,8 +211,29 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 				if allKnown {
 					continue
 				}
-				if err := addDriveFiles(sourceSession.GDriveFolderID, expected, sourceSession.ID); err != nil {
-					return deletionRecordingSet{}, err
+				if sourceSession.FallbackGDriveFolderID != "" && sourceSession.FallbackGDriveFolderID != sourceSession.GDriveFolderID {
+					if err := addDriveFiles(sourceSession.FallbackGDriveFolderID, expected, sourceSession.ID); err != nil {
+						return deletionRecordingSet{}, err
+					}
+				}
+				allKnown = true
+				for key := range expected {
+					found := false
+					for name := range byName {
+						if recordingRequirementKey(name) == key {
+							found = true
+							break
+						}
+					}
+					if !found {
+						allKnown = false
+						break
+					}
+				}
+				if !allKnown && sourceSession.GDriveFolderID != "" {
+					if err := addDriveFiles(sourceSession.GDriveFolderID, expected, sourceSession.ID); err != nil {
+						return deletionRecordingSet{}, err
+					}
 				}
 			}
 		}
