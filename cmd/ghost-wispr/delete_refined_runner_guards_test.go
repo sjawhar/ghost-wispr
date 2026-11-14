@@ -115,6 +115,27 @@ func TestDeleteRefinedTextRefusesRecovery(t *testing.T) {
 	}
 }
 
+func TestDeleteRefinedTextRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *testing.T) {
+	fixture := newRefinedRunnerFixture(t)
+	deleteLocks.setRecovering("s", true)
+	t.Cleanup(func() { deleteLocks.setRecovering("s", false) })
+	unlock := deleteLocks.lock("s")
+	t.Cleanup(unlock)
+	runner := fixture.runner()
+	result := make(chan error, 1)
+	go func() {
+		result <- runner.DeleteRefinedText(context.Background(), "s", fixture.segmentID, fixture.revision)
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, storage.ErrSegmentSplicePending) {
+			t.Fatalf("text delete during recovery = %v, want %v", err, storage.ErrSegmentSplicePending)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("text delete waited for the recovery lock instead of refusing at once")
+	}
+}
+
 func TestDeleteRefinedAudioRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *testing.T) {
 	fixture := newRefinedRunnerFixture(t)
 	deleteLocks.setRecovering("s", true)

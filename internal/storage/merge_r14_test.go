@@ -38,18 +38,44 @@ func TestMergeRefinementKeepsAndDeletesAnUntimedSourceSegment(t *testing.T) {
 	if _, err := store.PublishRefinementAtGeneration("merged", RefinedTranscript(words), "test", words, BuildRefinedSegments(words), 0); err != nil {
 		t.Fatal(err)
 	}
+	merged, err := store.GetSession("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(merged.CanonicalTranscript, "alpha words without a recording") {
+		t.Fatalf("merged canonical transcript dropped untimed text: %q", merged.CanonicalTranscript)
+	}
 	segments, err := store.GetSegments("merged")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var untimedID int64
+	var untimedID, timedID int64
+	for _, segment := range segments {
+		if strings.Contains(segment.Text, "alpha words") {
+			untimedID = segment.ID
+		}
+		if strings.Contains(segment.Text, "Bravo words") {
+			timedID = segment.ID
+		}
+	}
+	if untimedID == 0 {
+		t.Fatal("refinement dropped text from the source with no recording")
+	}
+	if err := store.DeleteRefinedSegmentText("merged", timedID, 1); err != nil {
+		t.Fatalf("delete timed text: %v", err)
+	}
+	segments, err = store.GetSegments("merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	untimedID = 0
 	for _, segment := range segments {
 		if strings.Contains(segment.Text, "alpha words") {
 			untimedID = segment.ID
 		}
 	}
 	if untimedID == 0 {
-		t.Fatal("refinement dropped text from the source with no recording")
+		t.Fatal("timed delete rebuilt away the untimed segment")
 	}
 	if err := store.DeleteRefinedSegmentText("merged", untimedID, 0); err != nil {
 		t.Fatalf("delete untimed text: %v", err)
