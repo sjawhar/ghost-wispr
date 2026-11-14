@@ -245,9 +245,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 	own := make(map[string][]transcribe.Segment, len(sources))
 	for i := range remaining {
 		if source := remaining[i].UntimedSourceID; source != "" {
-			for current := source; current != "" && current != sessionID; current = parents[current] {
-				own[current] = append(own[current], remaining[i])
-			}
+			own[source] = append(own[source], remaining[i])
 			continue
 		}
 		for _, source := range recordingChain(remaining[i].RecordingPath) {
