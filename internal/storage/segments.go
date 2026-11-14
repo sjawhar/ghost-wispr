@@ -226,7 +226,9 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			if nestedOwner == "" {
 				nestedOwner = owners[owner][recordingProvenanceKey(recording)]
 			}
-			if nestedOwner != "" {
+			// A session that names itself as its recording's owner is the
+			// leaf: the chain ends there rather than looping.
+			if nestedOwner != "" && nestedOwner != owner {
 				owner = nestedOwner
 				continue
 			}

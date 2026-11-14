@@ -733,6 +733,19 @@ func (s *SQLiteStore) init(dbPath string) error {
 	`); err != nil {
 		return fmt.Errorf("create recording sources table: %w", err)
 	}
+	// restored_recordings: the recording file names a Drive restore found in
+	// a restored session's folder. A restored session's audio is not on this
+	// unit, so a later merge or retry names its recordings from here.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS restored_recordings (
+			session_id TEXT NOT NULL,
+			recording_path TEXT NOT NULL,
+			PRIMARY KEY (session_id, recording_path),
+			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+		);
+	`); err != nil {
+		return fmt.Errorf("create restored recordings table: %w", err)
+	}
 
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS deleted_segments (
@@ -1003,7 +1016,6 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 			JOIN recording_sources AS nested
 			  ON nested.merged_session_id = source.session_id
 			 AND nested.recording_path = source.recording_path
-			 AND nested.source_session_id != source.session_id
 			JOIN sessions AS parent ON parent.id = source.session_id
 		)
 		SELECT source.session_id, folders.gdrive_folder_id, leaves.gdrive_folder_id, source.recording_path
@@ -1014,7 +1026,6 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 			SELECT 1 FROM recording_sources AS nested
 			WHERE nested.merged_session_id = source.session_id
 			  AND nested.recording_path = source.recording_path
-			  AND nested.source_session_id != source.session_id
 		)
 		ORDER BY folders.started_at, source.recording_path`, sessionID)
 	if err != nil {
@@ -1042,17 +1053,18 @@ func (s *SQLiteStore) RefinementRecordingSources(sessionID string) ([]Refinement
 	return sources, nil
 }
 
-// RecordRestoredRecordingSources records the audio files a Drive restore saw
-// for a session that was itself a merge. A later merge can then recover those
-// recordings rather than guessing a name from the merged id.
-func (s *SQLiteStore) RecordRestoredRecordingSources(sessionID string, paths []string) error {
+// RecordRestoredRecordings records the recording file names a Drive restore
+// found in a restored session's folder (restored_recordings). They are names,
+// not provenance: a later merge or retry reads them to name the session's
+// recordings, whose audio is not on this unit.
+func (s *SQLiteStore) RecordRestoredRecordings(sessionID string, paths []string) error {
 	for _, path := range paths {
 		path = strings.TrimSpace(path)
 		if path == "" {
 			continue
 		}
-		if _, err := s.db.Exec(`INSERT OR IGNORE INTO recording_sources(merged_session_id, recording_path, source_session_id) VALUES(?, ?, ?)`, sessionID, path, sessionID); err != nil {
-			return fmt.Errorf("record restored recording source for session %s: %w", sessionID, err)
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO restored_recordings(session_id, recording_path) VALUES(?, ?)`, sessionID, path); err != nil {
+			return fmt.Errorf("record restored recording for session %s: %w", sessionID, err)
 		}
 	}
 	return nil
@@ -1060,13 +1072,22 @@ func (s *SQLiteStore) RecordRestoredRecordingSources(sessionID string, paths []s
 
 // RefinementRecordingPaths returns the recordings whose content belongs to a
 // session. Merged sessions retain their source paths even when their current
-// audio path was cleared by garbage collection; other refined sessions retain
-// paths in their current stored word occurrences.
+// audio path was cleared by garbage collection; a session restored from Drive
+// has the names its folder held; other refined sessions retain paths in their
+// current stored word occurrences.
 func (s *SQLiteStore) RefinementRecordingPaths(sessionID string) ([]string, error) {
 	paths, err := refinementRecordingPaths(s.db, `SELECT recording_path FROM recording_sources
 		WHERE merged_session_id = ? ORDER BY recording_path`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("list merged recording sources for session %s: %w", sessionID, err)
+	}
+	if len(paths) != 0 {
+		return paths, nil
+	}
+	paths, err = refinementRecordingPaths(s.db, `SELECT recording_path FROM restored_recordings
+		WHERE session_id = ? ORDER BY recording_path`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list restored recordings for session %s: %w", sessionID, err)
 	}
 	if len(paths) != 0 {
 		return paths, nil
@@ -1347,6 +1368,14 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		if err != nil {
 			_ = removedRows.Close()
 			return fmt.Errorf("list inherited recordings for source %s: %w", sourceID, err)
+		}
+		if len(paths) == 0 {
+			paths, err = refinementRecordingPaths(tx, `SELECT recording_path FROM restored_recordings
+				WHERE session_id = ? ORDER BY recording_path`, sourceID)
+			if err != nil {
+				_ = removedRows.Close()
+				return fmt.Errorf("list restored recordings for source %s: %w", sourceID, err)
+			}
 		}
 		if len(paths) == 0 {
 			paths, err = refinementRecordingPaths(tx, `SELECT DISTINCT recording_path FROM refined_words

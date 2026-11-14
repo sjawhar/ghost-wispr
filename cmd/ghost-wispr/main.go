@@ -282,6 +282,18 @@ func newRetryRefinementHook(store *storage.SQLiteStore, audioDir func() string, 
 	}
 }
 
+// importRestoredDriveSession returns the Drive restore callback: it imports
+// one restored session and records the recording file names its folder holds.
+func importRestoredDriveSession(store *storage.SQLiteStore, restoredAt func() time.Time) func(gdrive.RestoredSession) error {
+	return func(rs gdrive.RestoredSession) error {
+		sess := restoredDriveSession(&rs, restoredAt())
+		if err := store.ImportSession(&sess, rs.Segments); err != nil {
+			return err
+		}
+		return store.RecordRestoredRecordings(sess.ID, rs.RecordingPaths)
+	}
+}
+
 func restoredDriveSession(rs *gdrive.RestoredSession, restoredAt time.Time) storage.Session {
 	summaryStatus := storage.SummaryPending
 	if rs.Summary != "" {
@@ -1525,13 +1537,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if err != nil {
 				return nil, fmt.Errorf("create syncer: %w", err)
 			}
-			result, err := syncer.RestoreFromDrive(ctx, func(rs gdrive.RestoredSession) error {
-				sess := restoredDriveSession(&rs, time.Now().UTC())
-				if err := store.ImportSession(&sess, rs.Segments); err != nil {
-					return err
-				}
-				return store.RecordRestoredRecordingSources(sess.ID, rs.RecordingPaths)
-			})
+			result, err := syncer.RestoreFromDrive(ctx, importRestoredDriveSession(store, func() time.Time { return time.Now().UTC() }))
 			if err != nil {
 				return nil, err
 			}
