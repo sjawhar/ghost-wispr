@@ -792,6 +792,24 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec(`UPDATE deleted_text_spans SET model = COALESCE((SELECT refinement_model FROM sessions WHERE sessions.id = deleted_text_spans.session_id), '') WHERE model = ''`); err != nil {
 		return fmt.Errorf("backfill deleted_text_spans model: %w", err)
 	}
+	// refused_cuts: a "Delete text and audio" the check after the cut refused
+	// (RecordRefusedCut), so the segment's words are still in its recording:
+	// the recording's file name and the segment's time, never the words. The
+	// status page warns of it until the words are gone; a splice of the
+	// recording moves or drops it (moveRefusedCutsAfterSplice). Like
+	// deleted_text_spans it belongs to the recording, so no foreign key.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS refused_cuts (
+			session_id TEXT NOT NULL,
+			recording TEXT NOT NULL,
+			start REAL NOT NULL,
+			end REAL NOT NULL,
+			refused_at TEXT NOT NULL,
+			UNIQUE(session_id, recording, start, end)
+		);
+	`); err != nil {
+		return fmt.Errorf("create refused_cuts table: %w", err)
+	}
 	// erase_directories: a directory a whole-file audio erase was started in
 	// (RecordEraseDirectory), and the file system it was on (device). An
 	// erase cut off by a stop leaves a .erasing-* file there that no row may

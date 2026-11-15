@@ -486,7 +486,10 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	tempPath, start, end, afterHash, err := d.cutAndCheck(ctx, session.RefinementModel, recording, words, selected, duration)
 	if err != nil {
 		if errors.Is(err, errDeletionCutHeard) && d.refused != nil {
-			d.refused.Refused(refusedCut{SessionID: sessionID, Recording: filepath.Base(selected.RecordingPath), Start: selected.StartTime, End: selected.EndTime})
+			cut := storage.RefusedCut{SessionID: sessionID, Recording: filepath.Base(selected.RecordingPath), Start: selected.StartTime, End: selected.EndTime}
+			if keepErr := d.refused.Refused(cut); keepErr != nil {
+				return fmt.Errorf("%w; its status warning could not be kept: %v", err, keepErr)
+			}
 		}
 		return err
 	}
@@ -513,9 +516,6 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	}
 	if err := d.store.MarkSpliceComplete(&span); err != nil {
 		return err
-	}
-	if d.refused != nil {
-		d.refused.Cut(sessionID, filepath.Base(selected.RecordingPath), start, end)
 	}
 	if d.summarize != nil {
 		if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {

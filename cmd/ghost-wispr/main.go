@@ -1245,9 +1245,10 @@ func main() {
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
-	// refusedCuts keeps a refused "Delete text and audio" on /api/status while
-	// its segment is there, naming the session and the segment's time.
-	refusedCuts := newRefusedCuts(refusedCutPresent(store))
+	// refusedCuts keeps a refused "Delete text and audio" on /api/status, in
+	// the store, while its segment is there, naming the session and the
+	// segment's time.
+	refusedCuts := newRefusedCuts(store)
 	// deletionRunner makes the occurrence-based deletion actions use the
 	// configuration as it is now. Batch transcription has already persisted
 	// their exact word spans, so deleting never creates a locator.
@@ -1290,7 +1291,6 @@ func main() {
 				}
 				return result.Words, nil
 			},
-			refused: refusedCuts,
 		}
 	}
 
@@ -1323,7 +1323,8 @@ func main() {
 		},
 		CaptureState:  func() string { return capture.captureState(micStatus) },
 		ActiveSession: manager.ActiveSession,
-		Warnings:      apiStatusWarnings(warningRegistry, refusedCuts),
+		// Warnings, DeleteSegment and DeleteSegmentText: wireSegmentDeletion,
+		// below.
 		OnSessionDeleted: func(sessionID string) {
 			warningRegistry.WithRecordingMismatch(func() {
 				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
@@ -1358,12 +1359,6 @@ func main() {
 		},
 		RefinementRecordingAvailable: checkRefinementRecording,
 		RetryRefinement:              retryRefinement,
-		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
-			return deletionRunner().DeleteRefinedAudio(ctx, sessionID, segmentID, revision)
-		},
-		DeleteSegmentText: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
-			return deletionRunner().DeleteRefinedText(ctx, sessionID, segmentID, revision)
-		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			return repairStructuredSummaries(ctx, store, publishSummaryReady)
 		},
@@ -1595,6 +1590,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			return pollSummaryBatch(ctx, batchName)
 		},
 	}
+	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletionRunner)
 
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.

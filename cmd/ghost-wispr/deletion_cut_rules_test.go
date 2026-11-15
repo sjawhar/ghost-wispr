@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -141,10 +142,19 @@ func TestCutCheckRetriesAnEmptyTranscription(t *testing.T) {
 }
 
 // refusedCutFixture is an ended session whose second refined segment, by
-// another speaker, says "Orange tractor ninety." from 3 to 4.4 s.
+// another speaker, says "Orange tractor ninety." from 3 to 4.4 s, in an open
+// store.
 func refusedCutFixture(t *testing.T) (*storage.SQLiteStore, string, int64, int) {
 	t.Helper()
-	recording := filepath.Join(t.TempDir(), "recording.mp3")
+	dbPath, recording, segmentID, revision := refusedCutDatabase(t)
+	return openTestStore(t, dbPath), recording, segmentID, revision
+}
+
+// refusedCutDatabase writes refusedCutFixture's session to a database file,
+// closed, and returns its path.
+func refusedCutDatabase(t *testing.T) (dbPath, recording string, segmentID int64, revision int) {
+	t.Helper()
+	recording = filepath.Join(t.TempDir(), "recording.mp3")
 	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -152,11 +162,12 @@ func refusedCutFixture(t *testing.T) (*storage.SQLiteStore, string, int64, int) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	dbPath = filepath.Join(t.TempDir(), "test.db")
+	store, err := storage.NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	defer func() { _ = store.Close() }()
 	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
 	if err := store.CreateSession("s", started); err != nil {
 		t.Fatal(err)
@@ -172,7 +183,7 @@ func refusedCutFixture(t *testing.T) (*storage.SQLiteStore, string, int64, int) 
 		word(3, 1, "Orange", 63.0, 63.4), word(4, 1, "tractor", 63.5, 63.9), word(5, 1, "ninety.", 64.0, 64.4),
 		word(6, 0, "Then", 66.5, 66.8), word(7, 0, "left.", 66.9, 67.2),
 	}
-	revision, err := store.PublishRefinementAtGeneration("s", storage.RefinedTranscript(words), "nova-3", words, storage.BuildRefinedSegments(words), 0)
+	revision, err = store.PublishRefinementAtGeneration("s", storage.RefinedTranscript(words), "nova-3", words, storage.BuildRefinedSegments(words), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,11 +193,22 @@ func refusedCutFixture(t *testing.T) (*storage.SQLiteStore, string, int64, int) 
 	}
 	for i := range segments {
 		if strings.Contains(segments[i].Text, "tractor") {
-			return store, recording, segments[i].ID, revision
+			return dbPath, recording, segments[i].ID, revision
 		}
 	}
 	t.Fatalf("no refined segment says tractor: %+v", segments)
-	return nil, "", 0, 0
+	return "", "", 0, 0
+}
+
+// openTestStore opens the database at dbPath until the test ends.
+func openTestStore(t *testing.T, dbPath string) *storage.SQLiteStore {
+	t.Helper()
+	store, err := storage.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
 }
 
 // TestRefusedCutShowsOnTheStatusPageWithoutItsWords fails if a refused "Delete
@@ -195,7 +217,7 @@ func refusedCutFixture(t *testing.T) (*storage.SQLiteStore, string, int64, int) 
 // and the segment's time, or if it stays once "Delete text" removes them.
 func TestRefusedCutShowsOnTheStatusPageWithoutItsWords(t *testing.T) {
 	store, recording, segmentID, revision := refusedCutFixture(t)
-	refused := newRefusedCuts(refusedCutPresent(store))
+	refused := newRefusedCuts(store)
 	registry := newWarningsRegistry()
 	registry.Set("other", "Another warning")
 	status := apiStatusWarnings(registry, refused)
@@ -239,15 +261,64 @@ func TestRefusedCutShowsOnTheStatusPageWithoutItsWords(t *testing.T) {
 
 // TestRefusedCutWarningMovesWithALaterCut fails if a successful cut earlier in
 // the recording leaves a refused cut's warning naming its old time, or drops
-// it, and if a cut of the refused segment itself keeps it.
+// it, and if a cut of the refused segment itself keeps it. The cuts run
+// through the deletion runner, so the store moves the refused cut in the
+// splice's own transaction.
 func TestRefusedCutWarningMovesWithALaterCut(t *testing.T) {
-	refused := newRefusedCuts(nil)
-	refused.Refused(refusedCut{SessionID: "s", Recording: "recording.mp3", Start: 63, End: 64.4})
-	refused.Cut("s", "recording.mp3", 10, 13)
-	if got := refused.Warnings(); len(got) != 1 || !strings.Contains(got[0], "1:00–1:01") {
-		t.Fatalf("warnings after a cut before the segment = %q, want its time moved back 3 s", got)
+	store, recording, segmentID, revision := refusedCutFixture(t)
+	refused := newRefusedCuts(store)
+	heard := []transcribe.TimestampedWord{{Text: "tractor", Start: 62.4, End: 62.7}}
+	runner := segmentDeleteRunner{
+		store: store,
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		// The copy's bytes name the cut, so each cut is a new recording.
+		splice: func(_ context.Context, path string, start, end float64) (string, error) {
+			if err := os.WriteFile(path, fmt.Appendf(nil, "cut %.3f-%.3f of %s", start, end, path), 0o600); err != nil {
+				return "", err
+			}
+			return fileSHA256(path)
+		},
+		transcribeCut: func(context.Context, string, string) ([]transcribe.TimestampedWord, error) { return heard, nil },
+		refused:       refused,
 	}
-	refused.Cut("s", "recording.mp3", 59.5, 61.9)
+	if err := runner.DeleteRefinedAudio(context.Background(), "s", segmentID, revision); !errors.Is(err, errDeletionCutHeard) {
+		t.Fatalf("delete = %v, want refused", err)
+	}
+	segmentSaying := func(text string) (int64, int) {
+		t.Helper()
+		session, err := store.GetSession("s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		segments, err := store.GetSegments("s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range segments {
+			if strings.Contains(segments[i].Text, text) {
+				return segments[i].ID, session.RefinedRevision
+			}
+		}
+		t.Fatalf("no segment says %q: %+v", text, segments)
+		return 0, 0
+	}
+
+	// A clean cut of "So we met." takes 0 to 1.65 s out of the recording.
+	heard = []transcribe.TimestampedWord{{Text: "Then", Start: 70, End: 70.3}}
+	first, revision := segmentSaying("So we met.")
+	if err := runner.DeleteRefinedAudio(context.Background(), "s", first, revision); err != nil {
+		t.Fatalf("clean cut before the refused segment: %v", err)
+	}
+	if got := refused.Warnings(); len(got) != 1 || !strings.Contains(got[0], "1:01–1:02") {
+		t.Fatalf("warnings after a cut before the segment = %q, want one with its time moved back 1.65 s", got)
+	}
+
+	tractor, revision := segmentSaying("tractor")
+	if err := runner.DeleteRefinedAudio(context.Background(), "s", tractor, revision); err != nil {
+		t.Fatalf("clean cut of the refused segment: %v", err)
+	}
 	if got := refused.Warnings(); len(got) != 0 {
 		t.Fatalf("warnings after the segment was cut = %q, want none", got)
 	}
