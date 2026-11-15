@@ -686,26 +686,61 @@ func (c transcriptCallback) Error(er *api.ErrorResponse) error {
 
 func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
 
+// deepgramWriteTimeout bounds one write to the Deepgram socket. A write that
+// takes longer fails, so the resilient client buffers and reconnects.
+var deepgramWriteTimeout = 5 * time.Second
+
+// deepgramWriter is one Deepgram socket. Its writes run on a goroutine of
+// their own and are bounded by deepgramWriteTimeout: the SDK's write has no
+// deadline, and a peer or path that stops taking data would otherwise block
+// it for as long as the kernel keeps retrying. A write past the bound breaks
+// the writer, so the resilient client buffers and dials a new socket; the
+// stuck write is left to end with the old socket, which is then stopped.
 type deepgramWriter struct {
 	client interface {
 		io.Writer
 		Finalize() error
 	}
+	mu       sync.Mutex
+	start    sync.Once
+	requests chan []byte
+	results  chan error
+	timer    *time.Timer
+	buf      []byte
+	broken   error
 }
+
+var errDeepgramWriteTimeout = errors.New("deepgram write timed out")
 
 // streamMicLoopStarter runs a mic loop in loops, the group shutdown waits for.
 var streamMicLoopStarter = func(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
 	loops.Go(func() { streamMicWithRetry(ctx, capture, streamer, writer, wait, logf, hub) })
 }
 
-func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+// deepgramSendChunks is how many microphone buffers (250 ms each) the
+// Deepgram send queues while a write waits: more than deepgramWriteTimeout.
+const deepgramSendChunks = 64
+
+// startMicMonitoring starts the mic loop. The recorder gets each buffer
+// first, and downstream, live transcription, gets it through a bounded queue
+// that never blocks the loop (transcribe.AsyncSender), so no Deepgram
+// trouble stops the recording. It returns that queue, whose Finalize the
+// capture pause uses, or nil without downstream.
+func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream interface {
+	io.Writer
+	Finalize() error
+}, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) *transcribe.AsyncSender {
 	if streamer == nil || recorder == nil {
-		return
+		return nil
 	}
-	if downstream == nil {
-		downstream = io.Discard
+	var sender *transcribe.AsyncSender
+	var send io.Writer = io.Discard
+	if downstream != nil {
+		sender = transcribe.NewAsyncSender(ctx, downstream, deepgramSendChunks, logf)
+		send = sender
 	}
-	streamMicLoopStarter(ctx, loops, capture, streamer, recorder.Writer(downstream), wait, logf, hub)
+	streamMicLoopStarter(ctx, loops, capture, streamer, recorder.Writer(send), wait, logf, hub)
+	return sender
 }
 
 // micShutdownWait is how long shutdown waits for the mic loops to end. A loop
@@ -785,7 +820,51 @@ func refreshKeptRawRecordings(ctx context.Context, recorder *audio.Recorder, bud
 }
 
 func (dw *deepgramWriter) Write(p []byte) (int, error) {
-	return dw.client.Write(p)
+	dw.mu.Lock()
+	defer dw.mu.Unlock()
+	if dw.broken != nil {
+		return 0, dw.broken
+	}
+	dw.start.Do(func() {
+		dw.requests = make(chan []byte)
+		dw.results = make(chan error, 1)
+		dw.timer = time.NewTimer(deepgramWriteTimeout)
+		go func(requests <-chan []byte, results chan<- error) {
+			for chunk := range requests {
+				_, err := dw.client.Write(chunk)
+				results <- err
+			}
+		}(dw.requests, dw.results)
+	})
+	dw.buf = append(dw.buf[:0], p...)
+	dw.timer.Reset(deepgramWriteTimeout)
+	select {
+	case dw.requests <- dw.buf:
+	case <-dw.timer.C:
+		return 0, dw.breakOnTimeout()
+	}
+	select {
+	case err := <-dw.results:
+		dw.timer.Stop()
+		if err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	case <-dw.timer.C:
+		return 0, dw.breakOnTimeout()
+	}
+}
+
+// breakOnTimeout marks the socket dead after a write passed its bound. The
+// caller holds mu. The write goroutine ends once the stuck write returns, and
+// the socket is stopped then, since the SDK's Stop waits for that write.
+func (dw *deepgramWriter) breakOnTimeout() error {
+	dw.broken = fmt.Errorf("%w after %v", errDeepgramWriteTimeout, deepgramWriteTimeout)
+	close(dw.requests)
+	if stopper, ok := dw.client.(interface{ Stop() }); ok {
+		go stopper.Stop()
+	}
+	return dw.broken
 }
 
 func (dw *deepgramWriter) Close() error {
@@ -1061,11 +1140,16 @@ func main() {
 	defer cancel()
 
 	var resilientRef atomic.Pointer[transcribe.ResilientClient]
+	var deepgramSendRef atomic.Pointer[transcribe.AsyncSender]
 	var micRef atomic.Pointer[audio.Mic]
 	micStatus := &micProxy{ref: &micRef}
 	// capture is the one pause switch: POST /api/pause and /api/resume (and any
 	// later hardware button) call its Pause and Resume.
 	capture := newSessionCaptureGate(ctx, manager, audioRecorder, func() deepgramFinalizer {
+		// The send queue first: its Finalize follows the audio queued before it.
+		if send := deepgramSendRef.Load(); send != nil {
+			return send
+		}
 		if dg := resilientRef.Load(); dg != nil {
 			return dg
 		}
@@ -1582,6 +1666,16 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 
+	// A refinement that cannot use the model a "Delete text" was recorded
+	// under publishes nothing and says so here, until the session refines.
+	manager.SetRefinementWarningHook(func(sessionID, warning string) {
+		key := "refinement-model-" + sessionID
+		if warning == "" {
+			warningRegistry.Clear(key)
+			return
+		}
+		warningRegistry.Set(key, fmt.Sprintf("Session %s was not refined, and keeps its deleted text out: %s", sessionID, warning))
+	})
 	hardware := startHardware(ctx, &cfg, capture, micStatus, warningRegistry, hub)
 	pauseControls := newPersistentControls(
 		store,
@@ -1970,7 +2064,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusConnected, "Deepgram connected")
 		}
 
-		startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub)
+		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub))
 		return nil
 	}
 
@@ -2452,7 +2546,11 @@ func holdMicWhilePaused(ctx context.Context, capture *captureGate, streamer micS
 	}
 	logf("microphone stopped: capture paused")
 	if hub != nil {
-		hub.BroadcastComponentStatus("mic", storage.ComponentStatusPaused, "Microphone stopped while capture is paused")
+		if capture.isLightHeld() && !capture.IsPaused() {
+			hub.BroadcastComponentStatus("mic", captureLightUnavailable, "Microphone stopped: the recording light is not confirmed red")
+		} else {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusPaused, "Microphone stopped while capture is paused")
+		}
 	}
 	return capture.waitResumed(ctx)
 }

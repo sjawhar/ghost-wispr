@@ -73,7 +73,7 @@ func (l *pluggableLight) isRed() bool {
 // startTestLight starts the recording light as the recorder does, on device,
 // checking it every checkEvery and retrying a lost device every few
 // milliseconds.
-func startTestLight(t *testing.T, device *pluggableLight, checkEvery time.Duration, capture *captureGate, mic *openMicFake, warnings *warningsRegistry) *hardwareControl {
+func startTestLight(t *testing.T, device *pluggableLight, checkEvery time.Duration, capture *captureGate, mic interface{ IsOpen() bool }, warnings *warningsRegistry) *hardwareControl {
 	t.Helper()
 	originalOpen, originalCheck, originalRetry := openBlink1, lightCheckEvery, lightRetryEvery
 	openBlink1 = func(string, string) (indicator.Light, error) {
@@ -209,9 +209,9 @@ func TestLightReturnKeepsAPersonsPause(t *testing.T) {
 	capture.Pause()
 	device.plug(true)
 	time.Sleep(50 * time.Millisecond)
-	if !capture.IsPaused() || !capture.isClosed() || device.isRed() {
-		t.Fatalf("after the light came back: paused=%t closed=%t red=%t, want paused, closed and dark",
-			capture.IsPaused(), capture.isClosed(), device.isRed())
+	if !capture.IsPaused() || !capture.isClosed() || device.isRed() || capture.isLightHeld() {
+		t.Fatalf("after the light came back: paused=%t closed=%t red=%t light hold=%t, want paused, closed, dark and the light hold released",
+			capture.IsPaused(), capture.isClosed(), device.isRed(), capture.isLightHeld())
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/session"
@@ -42,6 +43,7 @@ const (
 	captureStalled          = storage.ComponentStatusStalled  // as resuming, past captureStallAfter
 	captureLightUnavailable = "light_unavailable"             // switch on, gate held closed until the light is confirmed red
 	captureMicUnavailable   = "mic_unavailable"               // gate open, microphone not capturing
+	captureNoAudio          = "no_audio"                      // gate open, microphone open, no audio reaches the recording
 	captureCapturing        = "capturing"                     // gate open, microphone capturing
 )
 
@@ -92,6 +94,27 @@ type captureGate struct {
 	settled             chan struct{} // closed once the latest closing has settled
 	writing             int           // writes that passed the gate and are still running
 	writesDone          *sync.Cond    // signalled (with mu) when a write finishes
+	// audioAt is when audio last reached the recording through the gate, or
+	// when a start or gate opening gave it audioStallAfter to begin
+	// (armAudio), in Unix nanoseconds; 0 before the first. While it is older
+	// than audioStallAfter, the unit is not recording: the light goes off and
+	// the status says no_audio.
+	audioAt atomic.Int64
+}
+
+// audioStallAfter is how long the microphone may deliver nothing to the
+// recording, with the gate and the device open, before the unit counts as not
+// recording. The device delivers a buffer every 250 ms.
+const audioStallAfter = 2 * time.Second
+
+// armAudio gives a capture that is starting audioStallAfter to deliver.
+func (g *captureGate) armAudio() { g.audioAt.Store(time.Now().UnixNano()) }
+
+// audioFlowing reports whether audio reached the recording within
+// audioStallAfter. Before any start it has nothing to judge, and says yes.
+func (g *captureGate) audioFlowing() bool {
+	at := g.audioAt.Load()
+	return at == 0 || time.Since(time.Unix(0, at)) <= audioStallAfter
 }
 
 func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
@@ -257,6 +280,9 @@ func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 	if !mic.IsOpen() {
 		return captureMicUnavailable
 	}
+	if !g.audioFlowing() {
+		return captureNoAudio
+	}
 	return captureCapturing
 }
 
@@ -334,6 +360,7 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 	close(g.resumed)
 	g.closing = make(chan struct{})
 	g.mu.Unlock()
+	g.armAudio()
 	g.control.Unlock()
 	if g.afterGateOpen != nil {
 		g.afterGateOpen()
@@ -348,6 +375,7 @@ func (g *captureGate) confirmMicStart() error {
 }
 
 func (g *captureGate) finishMicStart() {
+	g.armAudio()
 	if g.afterMicStart != nil {
 		g.afterMicStart()
 	}
@@ -411,10 +439,10 @@ func (g *captureGate) isClosed() bool {
 	return g.closed
 }
 
-// capturing reports whether audio is flowing: the gate is open and the
-// microphone device is capturing.
+// capturing reports whether the unit records: the gate is open, the
+// microphone device is capturing, and its audio reaches the recording.
 func (g *captureGate) capturing(mic interface{ IsOpen() bool }) bool {
-	return !g.isClosed() && mic.IsOpen()
+	return !g.isClosed() && mic.IsOpen() && g.audioFlowing()
 }
 
 // sleepUnlessPaused sleeps for d, or until the gate closes or ctx ends. The mic
@@ -470,7 +498,11 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 	g.writing++
 	g.mu.Unlock()
 	defer g.finishWrite()
-	return w.dst.Write(p)
+	n, err := w.dst.Write(p)
+	if err == nil {
+		g.audioAt.Store(time.Now().UnixNano())
+	}
+	return n, err
 }
 
 // captureSessions is the part of *session.Manager a capture pause uses.
