@@ -15,11 +15,14 @@ import (
 )
 
 // pluggableLight is a blink(1) that can be unplugged and plugged back in.
-// Unplugged, each feature report fails and discovery finds no device.
+// Unplugged, each feature report fails and discovery finds no device. With
+// readsOff it takes every colour but always reads back off, as a light whose
+// LED has failed.
 type pluggableLight struct {
-	mu      sync.Mutex
-	present bool
-	colour  [3]uint8
+	mu       sync.Mutex
+	present  bool
+	readsOff bool
+	colour   [3]uint8
 }
 
 var errLightUnplugged = errors.New("blink(1) feature report: no such device")
@@ -39,6 +42,9 @@ func (l *pluggableLight) ReadRGB() (uint8, uint8, uint8, error) {
 	defer l.mu.Unlock()
 	if !l.present {
 		return 0, 0, 0, errLightUnplugged
+	}
+	if l.readsOff {
+		return 0, 0, 0, nil
 	}
 	return l.colour[0], l.colour[1], l.colour[2], nil
 }
@@ -64,10 +70,16 @@ func (l *pluggableLight) plug(present bool) {
 	}
 }
 
+func (l *pluggableLight) setReadsOff(readsOff bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.readsOff = readsOff
+}
+
 func (l *pluggableLight) isRed() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.present && l.colour == [3]uint8{255, 0, 0}
+	return l.present && !l.readsOff && l.colour == [3]uint8{255, 0, 0}
 }
 
 // startTestLight starts the recording light as the recorder does, on device,

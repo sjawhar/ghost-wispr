@@ -93,14 +93,6 @@ func (rc *ResilientClient) Close() error {
 	return nil
 }
 
-// SetConnected resets backoff and marks connection as alive (called by Deepgram Open callback).
-func (rc *ResilientClient) SetConnected() {
-	rc.Mu.Lock()
-	defer rc.Mu.Unlock()
-	rc.reconnectDelay = rc.Config.InitialReconnectDelay
-	rc.setStateLocked(StateConnected)
-}
-
 // setStateLocked updates state and invokes callback. Must be called with rc.Mu held.
 func (rc *ResilientClient) setStateLocked(newState ConnectionState) {
 	if rc.State == newState {

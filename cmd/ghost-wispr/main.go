@@ -641,8 +641,7 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 }
 
 type transcriptCallback struct {
-	manager   session.LifecycleManager
-	resilient *transcribe.ResilientClient
+	manager session.LifecycleManager
 }
 
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
@@ -652,11 +651,12 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 	return c.manager.Message(mr)
 }
 
+// Open logs the socket. It leaves the resilient client's state alone: the
+// app-owned socket reports Open while it dials, which during a reconnect is
+// before the new socket replaces the dead one, and the reconnect marks the
+// client connected itself once its buffered audio is sent.
 func (c transcriptCallback) Open(*api.OpenResponse) error {
 	log.Println("connected to Deepgram")
-	if c.resilient != nil {
-		c.resilient.SetConnected()
-	}
 	return nil
 }
 

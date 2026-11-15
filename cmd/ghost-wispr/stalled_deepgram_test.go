@@ -315,6 +315,37 @@ func TestLightGoesOffWhenNoAudioIsRecorded(t *testing.T) {
 	})
 }
 
+// TestFailedLightConfirmAfterAStallHoldsCaptureForTheLight fails if audio
+// that comes back after a stall, with a light that cannot be confirmed red,
+// leaves capture_state no_audio, a microphone fault, rather than
+// light_unavailable with the light's warning. The light reads back off, as
+// the controller wants while nothing is recorded, so only the red
+// confirmation finds it broken. Nothing may be recorded meanwhile, and
+// capture comes back once the light reads back red.
+func TestFailedLightConfirmAfterAStallHoldsCaptureForTheLight(t *testing.T) {
+	rig := startMicRig(t, true, 300*time.Millisecond)
+	rig.mic.held.Store(true)
+	waitForHardwareWithin(t, 5*time.Second, "the light off while no audio is recorded", func() bool {
+		return !rig.device.isRed() && rig.capture.captureState(rig.mic) == captureNoAudio
+	})
+	rig.device.setReadsOff(true)
+	before := rig.recorded.bytes.Load()
+	rig.mic.held.Store(false)
+	waitForHardwareWithin(t, 5*time.Second, "capture held for the light after the stall", func() bool {
+		return rig.capture.captureState(rig.mic) == captureLightUnavailable
+	})
+	if !warningAbout(rig.warnings, "Recording light", "does not record") {
+		t.Errorf("warnings with the light unconfirmed = %v, want one naming the light", rig.warnings.List())
+	}
+	if got := rig.recorded.bytes.Load(); got != before {
+		t.Fatalf("%d bytes were recorded after the stall with the light unconfirmed", got-before)
+	}
+	rig.device.setReadsOff(false)
+	waitForHardwareWithin(t, 5*time.Second, "capture again once the light reads back red", func() bool {
+		return rig.device.isRed() && rig.capture.captureState(rig.mic) == captureCapturing
+	})
+}
+
 // TestAudioAfterAStallIsRecordedOnlyWithTheLightRed fails if audio that
 // comes back after a stall turned the light off reaches the recording before
 // the light is red again: up to a light check's interval of it was recorded

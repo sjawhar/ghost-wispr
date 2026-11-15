@@ -8,11 +8,13 @@ import (
 
 // lightGuard keeps capture closed while the recording light cannot be
 // confirmed red, as the consent rule "record only while the light is on"
-// requires. The light controller reports each check to report; a failed check
-// holds the capture gate (captureGate.HoldForLight) and names the cause on
-// /api/status, and the first good check after that releases the hold, so the
-// gate opens again once beforeGateOpen has confirmed the light red. A person's
-// pause is left as it is.
+// requires. The light controller reports each check to report, and so does a
+// red confirmation for audio that comes back after a stall
+// (hardwareControl.LightUnconfirmed); a failed check holds the capture gate
+// (captureGate.HoldForLight) and names the cause on /api/status, and the
+// first good check after that releases the hold, so the gate opens again
+// once beforeGateOpen has confirmed the light red. A person's pause is left
+// as it is.
 //
 // The gate's lock can wait on a paused session's save, so the controller never
 // takes it: report only records the result, and run applies it.

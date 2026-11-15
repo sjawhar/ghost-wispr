@@ -156,6 +156,18 @@ type hardwareControl struct {
 	done       <-chan struct{}
 	redHolds   atomic.Int32
 	stopped    atomic.Bool
+	// reportLight hands a failed light check to the light guard; nil without
+	// a light.
+	reportLight func(error)
+}
+
+// LightUnconfirmed reports a red confirmation that failed outside the
+// controller's own checks, so the light guard holds capture for the light.
+// It never blocks.
+func (h *hardwareControl) LightUnconfirmed(err error) {
+	if h.reportLight != nil {
+		h.reportLight(err)
+	}
 }
 
 func (h *hardwareControl) Done() <-chan struct{} {
@@ -244,6 +256,7 @@ func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings 
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
+	capture.onLightUnconfirmed = hardware.LightUnconfirmed
 	guardResumeWithLight(capture, warnings, onResumeRefused)
 }
 
@@ -263,6 +276,7 @@ func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate
 			retryEvery: lightRetryEvery,
 		}
 		guard := newLightGuard(capture, warnings, lightRetryEvery)
+		hardware.reportLight = guard.report
 		hardware.controller = indicator.NewController(hardware.light, wantRed, lightCheckEvery, guard.report)
 		go guard.run(ctx)
 		go func() {

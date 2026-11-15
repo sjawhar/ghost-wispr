@@ -79,6 +79,7 @@ type captureGate struct {
 	beforeMicStart      func() error
 	afterMicStart       func()
 	afterGateOpen       func()
+	onLightUnconfirmed  func(error)   // a red confirmation for audio after a stall failed; must not block
 	stallAfter          time.Duration // see captureStallAfter
 	writeWait           time.Duration // see captureWriteWait
 	control             sync.Mutex    // serializes closing and opening the gate, with their steps
@@ -492,7 +493,10 @@ type gatedWriter struct {
 // light off, is recorded only once the light is confirmed red again
 // (beforeMicStart, as for a microphone start): otherwise it would be recorded
 // with the light off until the light's next check. Audio the light cannot be
-// confirmed red for is dropped; the light guard then closes the gate.
+// confirmed red for is dropped, and the failure goes to the light guard
+// (onLightUnconfirmed), which holds the gate for the light: the light can read
+// back off, as its controller wants while nothing is recorded, so only this
+// confirmation finds it broken.
 func (w *gatedWriter) Write(p []byte) (int, error) {
 	g := w.gate
 	g.mu.Lock()
@@ -505,6 +509,9 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 	defer g.finishWrite()
 	if !g.audioFlowing() {
 		if err := g.confirmMicStart(); err != nil {
+			if g.onLightUnconfirmed != nil {
+				g.onLightUnconfirmed(err)
+			}
 			return len(p), nil
 		}
 		defer g.finishMicStart()
