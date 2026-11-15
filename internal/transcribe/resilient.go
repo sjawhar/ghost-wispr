@@ -152,7 +152,20 @@ func (rc *ResilientClient) reconnect() {
 		rc.setStateLocked(StateDraining)
 		rc.Mu.Unlock()
 
-		rc.drainBuffer()
+		if err := rc.drainBuffer(); err != nil {
+			// The new socket is dead too: keep the rest of the buffer for
+			// the next one rather than throwing it into this one.
+			rc.log("deepgram socket failed while draining buffered audio (redialling in %v): %v", delay, err)
+			rc.Mu.Lock()
+			rc.setStateLocked(StateReconnecting)
+			rc.Mu.Unlock()
+			_ = newClient.Close()
+			delay *= 2
+			if delay > rc.Config.MaxReconnectBackoff {
+				delay = rc.Config.MaxReconnectBackoff
+			}
+			continue
+		}
 
 		rc.Mu.Lock()
 		rc.setStateLocked(StateConnected)
@@ -164,18 +177,23 @@ func (rc *ResilientClient) reconnect() {
 	}
 }
 
-// drainBuffer writes all buffered audio to the current client.
-// Does NOT hold rc.Mu during external writes to avoid deadlock; drainMu covers
-// the read and the write of each chunk, so Finalize waits for a chunk already
-// read and no chunk is read after it.
-func (rc *ResilientClient) drainBuffer() {
+// drainBuffer writes all buffered audio to the current client, and stops at
+// the first chunk the client fails to take, whose error it returns; that chunk
+// is lost. Does NOT hold rc.Mu during external writes to avoid deadlock;
+// drainMu covers the read and the write of each chunk, so Finalize waits for a
+// chunk already read and no chunk is read after it.
+func (rc *ResilientClient) drainBuffer() error {
 	buf := make([]byte, 4096)
-	for rc.drainChunk(buf) {
+	for {
+		more, err := rc.drainChunk(buf)
+		if err != nil || !more {
+			return err
+		}
 	}
 }
 
 // drainChunk writes one buffered chunk and reports whether to drain another.
-func (rc *ResilientClient) drainChunk(buf []byte) bool {
+func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	rc.drainMu.Lock()
 	defer rc.drainMu.Unlock()
 
@@ -185,12 +203,12 @@ func (rc *ResilientClient) drainChunk(buf []byte) bool {
 	rc.Mu.Unlock()
 
 	if n == 0 || client == nil {
-		return false
+		return false, nil
 	}
 	if _, err := client.Write(buf[:n]); err != nil {
-		rc.log("failed to drain buffered audio: %v", err)
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
 // IsConnected returns true if the Deepgram connection is currently connected.

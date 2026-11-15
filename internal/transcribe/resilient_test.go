@@ -219,6 +219,54 @@ func TestResilientClient_ReconnectDrainsBuffer(t *testing.T) {
 	}
 }
 
+// TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining fails if
+// a reconnect whose new socket fails while it drains the buffer keeps that
+// dead socket as connected, throwing the rest of the buffer into it, rather
+// than dialling again and draining the rest into the next socket. With audio
+// arriving faster than the dead socket refuses it, the drain never ended.
+func TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dead := &mockWriter{writeErr: errors.New("write: broken pipe")}
+	live := &mockWriter{}
+	var dials atomic.Int32
+	factory := func(context.Context) (io.WriteCloser, error) {
+		if dials.Add(1) == 1 {
+			return dead, nil
+		}
+		return live, nil
+	}
+	rc := NewResilientClient(ctx, factory, ResilientConfig{
+		BufferSize:            3 * 4096,
+		InitialReconnectDelay: 10 * time.Millisecond,
+		MaxReconnectBackoff:   10 * time.Millisecond,
+	}, nil, nil)
+	rc.State = StateDisconnected
+	buffered := bytes.Repeat([]byte{7}, 3*4096)
+	if _, err := rc.Buffer.Write(buffered); err != nil {
+		t.Fatal(err)
+	}
+	rc.startReconnect()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (!rc.IsConnected() || len(live.getData()) == 0) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	rc.Mu.Lock()
+	client := rc.Client
+	rc.Mu.Unlock()
+	if client != live || !rc.IsConnected() {
+		t.Fatalf("after the new socket failed while draining: connected=%t, client is the live one=%t, dials=%d; want a new socket", rc.IsConnected(), client == live, dials.Load())
+	}
+	if got := len(live.getData()); got != 2*4096 {
+		t.Fatalf("the next socket got %d bytes of buffered audio, want the %d the dead one did not take", got, 2*4096)
+	}
+	if !dead.isClosed() {
+		t.Fatal("the socket that failed while draining was not closed")
+	}
+}
+
 func TestResilientClient_ReconnectBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -471,7 +519,9 @@ func TestResilientClient_FinalizeDropsAudioBufferedWhileDisconnected(t *testing.
 		rc.Mu.Lock()
 		rc.Client = reconnected
 		rc.Mu.Unlock()
-		rc.drainBuffer()
+		if err := rc.drainBuffer(); err != nil {
+			t.Fatalf("%v: drain: %v", state, err)
+		}
 		if got := reconnected.getData(); len(got) != 0 {
 			t.Fatalf("%v: reconnect drained %d bytes of pre-pause audio to Deepgram, want 0", state, len(got))
 		}
@@ -553,7 +603,9 @@ func TestResilientClient_FinalizeWaitsForTheChunkBeingDrained(t *testing.T) {
 
 	drained := make(chan struct{})
 	go func() {
-		rc.drainBuffer()
+		if err := rc.drainBuffer(); err != nil {
+			t.Errorf("drain: %v", err)
+		}
 		close(drained)
 	}()
 	<-client.entered
