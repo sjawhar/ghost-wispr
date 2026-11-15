@@ -291,6 +291,40 @@ describe('SessionCard', () => {
     expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
   })
 
+  it.each([
+    [
+      'a session never restored, whose removed audio Drive still holds',
+      { restored_at: undefined, sync_state: SyncState.Synced },
+      'The audio was removed to free space, so it cannot be refined',
+    ],
+    [
+      'a restored session whose Drive folder is gone',
+      { restored_at: '2026-11-13T09:01:00Z', sync_state: SyncState.RemoteDeleted },
+      "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined.",
+    ],
+  ])('says why %s has no recording to refine', (_, fields, title) => {
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-13T09:01:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        gdrive_folder_id: 'folder-1',
+        ...fields,
+      },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('refinement-badge').getAttribute('title')).toBe(title)
+  })
+
   it('keeps the removal badge after a restored refinement fails', () => {
     render({
       session: {
