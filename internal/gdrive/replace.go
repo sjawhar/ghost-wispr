@@ -123,8 +123,11 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 	}
 	var outcome replacementOutcome
 	replaceErr := o.uploader.Serialize(func() error {
-		var err error
-		outcome, err = o.replaceOwedFolders(ctx, &claimed, generation, folders, splicedRecording)
+		current, err := o.unchangedSinceTheChecks(sessionID, generation)
+		if err != nil || current == nil {
+			return err
+		}
+		outcome, err = o.replaceOwedFolders(ctx, current, generation, folders, splicedRecording)
 		return err
 	})
 	release := syncStateOf(sess)
@@ -156,6 +159,28 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 	return nil
 }
 
+// unchangedSinceTheChecks reads session sessionID's deletion generation and
+// the session again, once the replacement has the Drive lock, and returns the
+// session as it is now, or nil when a deletion committed since the checks
+// before the claim read generation: the replacement then does nothing, and
+// the next sync replaces what the newer deletion owes. Waiting for the lock,
+// behind an upload of another session, can take as long as that upload.
+func (o *Orchestrator) unchangedSinceTheChecks(sessionID string, generation int) (*storage.Session, error) {
+	now, err := o.store.DeletionGeneration(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+	}
+	current, err := o.store.GetSession(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("read replacement session %s: %w", sessionID, err)
+	}
+	if now != generation {
+		o.logger.Info("gdrive replacement waits for a newer deletion", "operation", "replace_session_files", "session_id", sessionID, "generation", generation, "newer_generation", now)
+		return nil, nil
+	}
+	return &current, nil
+}
+
 // replaceOwedFolders replaces each of folders that current's segment
 // deletion of generation still owes and Drive can reach now, one folder at a
 // time: it uploads and verifies the folder's replacements, recording each new
@@ -166,9 +191,9 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 // owed: the attempt fails, and the sweep comes back until the folder is
 // restored. The folders Drive can reach are replaced meanwhile, so one in the
 // trash does not keep the words in the others. The deletion finishes once no
-// folder is owed. current is the session as the sync claim read it: a
-// replacement that finished, or a deletion not yet refined and summarized
-// again, since the checks before the claim, replaces nothing.
+// folder is owed. current is the session read under the Drive lock
+// (unchangedSinceTheChecks): one whose replacement finished, or whose
+// deletion is not yet refined and summarized again, replaces nothing.
 func (o *Orchestrator) replaceOwedFolders(ctx context.Context, current *storage.Session, generation int, folders []storage.DriveReplacementFolder, splicedRecording string) (replacementOutcome, error) {
 	var outcome replacementOutcome
 	if !current.DriveReplacePending || !replacementReady(current) {
