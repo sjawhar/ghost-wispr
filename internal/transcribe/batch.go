@@ -80,6 +80,13 @@ func (d *deepgramBatchTranscriber) Transcribe(ctx context.Context, audioPath str
 	return BatchResult{Transcript: result.transcript, Model: model, Words: timestampedWords(result.words)}, nil
 }
 
+// WithModel returns the transcriber with model in place of its configured one.
+func (d *deepgramBatchTranscriber) WithModel(model string) BatchTranscriber {
+	copied := *d
+	copied.model = strings.TrimSpace(model)
+	return &copied
+}
+
 // timestampedWords is Deepgram's words with their times, each as it is
 // punctuated in the transcript, or as heard when Deepgram gives no punctuated
 // form.

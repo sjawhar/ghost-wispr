@@ -254,7 +254,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
 	}
 	if keepAudio {
-		if err := recordTextDeletionSpan(tx, sessionID, sources, span); err != nil {
+		if err := recordTextDeletionSpan(tx, sessionID, session.RefinementModel, sources, span); err != nil {
 			return err
 		}
 	} else if err := recordSplice(tx, sessionID, owners, span, session.AudioPath); err != nil {

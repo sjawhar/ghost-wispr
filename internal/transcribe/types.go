@@ -80,6 +80,13 @@ type TimestampedWord struct {
 	Speaker    int
 }
 
+// ModelSelector is a BatchTranscriber that can transcribe with another
+// model. A refinement of a recording with "Delete text" spans uses the model
+// the spans were recorded under.
+type ModelSelector interface {
+	WithModel(model string) BatchTranscriber
+}
+
 // ResilientClient wraps an io.WriteCloser (Deepgram client) and buffers audio during disconnects.
 // All fields are exported for testing purposes.
 type ResilientClient struct {

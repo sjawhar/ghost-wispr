@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -23,13 +25,23 @@ type batchRefinementResult struct {
 	Segments   []storage.RefinedSegment
 }
 
+// ErrRefinementModel is why a refinement refused to publish: it cannot
+// transcribe with the model the recordings' "Delete text" spans were recorded
+// under, so another model's word times could bring deleted words back.
+var ErrRefinementModel = errors.New("refinement refused")
+
 // transcribeRecordings transcribes each recording on its own, preserving the
 // recording revision and ordinal of every batch word. Text-deletion spans are
 // applied before segments and transcripts are built, so a later refinement
-// cannot reintroduce deleted words.
+// cannot reintroduce deleted words. Spans hold their model's word times, so a
+// session with spans is transcribed with that model (transcribe.ModelSelector),
+// and the result is refused (ErrRefinementModel) when that model cannot be
+// used: the spans name no model or two, or the transcription reports another.
 func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTranscriber, audioPath string) (batchRefinementResult, error) {
 	var result batchRefinementResult
-	recordingOrdinal, transcribedWords := 0, 0
+	var recordings []string
+	spansOf := map[string][]storage.TextDeletionSpan{}
+	spanModel := ""
 	for _, recording := range strings.Split(audioPath, ",") {
 		recording = strings.TrimSpace(recording)
 		if recording == "" {
@@ -42,9 +54,33 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 		if err := spansDescribe(recording, spans); err != nil {
 			return batchRefinementResult{}, err
 		}
+		for _, span := range spans {
+			switch {
+			case span.Model == "":
+				return batchRefinementResult{}, fmt.Errorf("%w: the model text was deleted under in %s is unknown, so another model could bring the deleted words back", ErrRefinementModel, filepath.Base(recording))
+			case spanModel == "":
+				spanModel = span.Model
+			case span.Model != spanModel:
+				return batchRefinementResult{}, fmt.Errorf("%w: text was deleted under two models, %q and %q", ErrRefinementModel, spanModel, span.Model)
+			}
+		}
+		recordings = append(recordings, recording)
+		spansOf[recording] = spans
+	}
+	if spanModel != "" {
+		if selector, ok := t.(transcribe.ModelSelector); ok {
+			t = selector.WithModel(spanModel)
+		}
+	}
+	recordingOrdinal, transcribedWords := 0, 0
+	for _, recording := range recordings {
+		spans := spansOf[recording]
 		batch, err := t.Transcribe(ctx, recording)
 		if err != nil {
 			return batchRefinementResult{}, err
+		}
+		if spanModel != "" && batch.Model != spanModel {
+			return batchRefinementResult{}, fmt.Errorf("%w: text was deleted under model %q, and the transcription reports model %q, whose word times could bring the deleted words back", ErrRefinementModel, spanModel, batch.Model)
 		}
 		transcribedWords += len(batch.Words)
 		recordingHash, err := recordingSHA256(recording)

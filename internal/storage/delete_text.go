@@ -18,6 +18,10 @@ type TextDeletionSpan struct {
 	AudioPath  string
 	Start, End float64
 	SHA256     string
+	// Model is the batch transcription model whose word times the span was
+	// taken from. Another model times the same words differently, so a
+	// refinement applies the span only to that model's words.
+	Model string
 }
 
 // TextDeleted reports whether a word heard from start to end seconds in a
@@ -54,9 +58,9 @@ func markDriveDocumentsPending(tx *sql.Tx, sessionID string, sources []string) e
 // own reaches, is refreshed by every sync of the session it was merged into
 // and by the sweep (DriveDocumentsOwed), also when the session the deletion
 // was made in is merged before its sync ran.
-func recordTextDeletionSpan(tx *sql.Tx, sessionID string, sources []string, span *DeletedSpan) error {
-	if _, err := tx.Exec(`INSERT INTO deleted_text_spans(session_id, recording, start, end, sha256, deleted_at) VALUES(?, ?, ?, ?, ?, ?)`,
-		sessionID, filepath.Base(strings.TrimSpace(span.AudioPath)), span.Start, span.End, span.SHA256Before, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+func recordTextDeletionSpan(tx *sql.Tx, sessionID, model string, sources []string, span *DeletedSpan) error {
+	if _, err := tx.Exec(`INSERT INTO deleted_text_spans(session_id, recording, start, end, sha256, deleted_at, model) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, filepath.Base(strings.TrimSpace(span.AudioPath)), span.Start, span.End, span.SHA256Before, time.Now().UTC().Format(time.RFC3339Nano), model); err != nil {
 		return fmt.Errorf("record deleted text span for session %s: %w", sessionID, err)
 	}
 	return markDriveDocumentsPending(tx, sessionID, sources)
@@ -126,7 +130,7 @@ func (s *SQLiteStore) ClearDriveDocumentsPending(id string, unchanged func(Sessi
 // in time order. AudioPath is the recording's file name.
 func (s *SQLiteStore) TextDeletionSpans(recording string) ([]TextDeletionSpan, error) {
 	name := filepath.Base(strings.TrimSpace(recording))
-	rows, err := s.db.Query(`SELECT recording, start, end, sha256 FROM deleted_text_spans WHERE recording = ? ORDER BY start, end, rowid`, name)
+	rows, err := s.db.Query(`SELECT recording, start, end, sha256, model FROM deleted_text_spans WHERE recording = ? ORDER BY start, end, rowid`, name)
 	if err != nil {
 		return nil, fmt.Errorf("list deleted text spans of %s: %w", name, err)
 	}
@@ -134,7 +138,7 @@ func (s *SQLiteStore) TextDeletionSpans(recording string) ([]TextDeletionSpan, e
 	var spans []TextDeletionSpan
 	for rows.Next() {
 		var span TextDeletionSpan
-		if err := rows.Scan(&span.AudioPath, &span.Start, &span.End, &span.SHA256); err != nil {
+		if err := rows.Scan(&span.AudioPath, &span.Start, &span.End, &span.SHA256, &span.Model); err != nil {
 			return nil, fmt.Errorf("scan deleted text span of %s: %w", name, err)
 		}
 		spans = append(spans, span)

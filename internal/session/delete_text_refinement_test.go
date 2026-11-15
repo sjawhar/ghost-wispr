@@ -105,7 +105,7 @@ func publishRefinedSegmentsForTest(t *testing.T, store *storage.SQLiteStore, ses
 	if err != nil {
 		t.Fatal(err)
 	}
-	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), "test", words, refined, generation)
+	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), "nova-3", words, refined, generation)
 	if err != nil {
 		t.Fatal(err)
 	}

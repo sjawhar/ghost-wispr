@@ -33,6 +33,7 @@ type Manager struct {
 	batchLogger        *slog.Logger
 	batchTranscriber   transcribe.BatchTranscriber
 	refinementWait     time.Duration
+	refinementWarning  func(sessionID, warning string)
 
 	mu                             sync.Mutex
 	currentSessionID               string
@@ -518,15 +519,24 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 
 	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
 	result, err := m.transcribeRecordings(ctx, batchTranscriber, audioPath)
+	m.mu.Lock()
+	warn := m.refinementWarning
+	m.mu.Unlock()
 	if err != nil {
 		if updateErr := m.store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
 		}
 		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+		if warn != nil && errors.Is(err, ErrRefinementModel) {
+			warn(sessionID, err.Error())
+		}
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusError, fmt.Sprintf("Batch refinement failed for session %s", sessionID))
 		}
 		return
+	}
+	if warn != nil {
+		warn(sessionID, "")
 	}
 
 	if _, err := m.store.PublishRefinementAtGeneration(sessionID, result.Transcript, result.Model, result.Words, result.Segments, generation); err != nil {
@@ -770,6 +780,15 @@ func (m *Manager) SetMinSessionSegments(n int) {
 		n = 0
 	}
 	m.minSessionSegments = n
+}
+
+// SetRefinementWarningHook sets what a refinement reports for /api/status: a
+// warning when it refused to publish because the deleted text's model cannot
+// be used, and an empty warning once a refinement of the session completes.
+func (m *Manager) SetRefinementWarningHook(hook func(sessionID, warning string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refinementWarning = hook
 }
 
 func (m *Manager) SetBatchTranscriber(t transcribe.BatchTranscriber) {

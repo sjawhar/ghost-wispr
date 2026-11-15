@@ -778,10 +778,19 @@ func (s *SQLiteStore) init(dbPath string) error {
 			start REAL NOT NULL,
 			end REAL NOT NULL,
 			sha256 TEXT NOT NULL,
-			deleted_at TEXT NOT NULL
+			deleted_at TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT ''
 		);
 	`); err != nil {
 		return fmt.Errorf("create deleted_text_spans table: %w", err)
+	}
+	// model: the batch model the span's word times came from. A span recorded
+	// before the column existed takes its session's refinement model.
+	if _, err := s.db.Exec(`ALTER TABLE deleted_text_spans ADD COLUMN model TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate deleted_text_spans model: %w", err)
+	}
+	if _, err := s.db.Exec(`UPDATE deleted_text_spans SET model = COALESCE((SELECT refinement_model FROM sessions WHERE sessions.id = deleted_text_spans.session_id), '') WHERE model = ''`); err != nil {
+		return fmt.Errorf("backfill deleted_text_spans model: %w", err)
 	}
 	// erase_directories: a directory a whole-file audio erase was started in
 	// (RecordEraseDirectory), and the file system it was on (device). An
