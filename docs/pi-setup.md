@@ -123,6 +123,7 @@ where it is. Apply `bootstrap` through its normal reviewed CI route. Then read t
 on a development machine whose `gcloud` is the devbox identity (the reader `bootstrap/README.md`
 names), check it, install it on the Pi and restart Ghost Wispr:
 
+<!-- provision_bundle_test.sh: renew -->
 ```bash
 crt=$(mktemp) &&
 gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$crt" &&

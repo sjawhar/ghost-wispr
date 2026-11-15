@@ -3,18 +3,22 @@ package main
 // The #65 review's stalled-peer probe (B2) as a test. Everything is production
 // code except the microphone, a fake that delivers audio like a device, and
 // the light, the test blink(1): streamMicWithRetry -> captureGate.Writer ->
-// Recorder.Writer -> the Deepgram send -> ResilientClient -> deepgramWriter ->
-// the Deepgram SDK, connected by makeDeepgramClientFactory to a local
-// websocket peer.
+// Recorder.Writer -> the Deepgram send queue -> ResilientClient ->
+// deepgramSocket, dialled by makeDeepgramClientFactory to a local websocket
+// peer.
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -81,14 +85,19 @@ type micRig struct {
 	warnings *warningsRegistry
 	dials    *atomic.Int64
 	recorded *recordedBytes
+	port     int // the local Deepgram peer's port
 }
 
 // startMicRig runs the production microphone chain against a local Deepgram
-// peer that reads, or that stops reading as a stalled network path does.
-func startMicRig(t *testing.T, peerReads bool) *micRig {
+// peer that reads, or that stops reading every connection as a stalled
+// network path does, with writeLimit as the Deepgram socket's write limit.
+func startMicRig(t *testing.T, peerReads bool, writeLimit time.Duration) *micRig {
 	t.Helper()
-	stop := make(chan struct{})
 	var dials atomic.Int64
+	// A stalled peer keeps each connection open and unread, with no
+	// goroutine of its own, so the test's goroutine count is the client's.
+	var stalledMu sync.Mutex
+	var stalled []*websocket.Conn
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := upgrader.Upgrade(w, r, nil)
@@ -96,8 +105,8 @@ func startMicRig(t *testing.T, peerReads bool) *micRig {
 			return
 		}
 		dials.Add(1)
-		defer func() { _ = c.Close() }()
 		if peerReads {
+			defer func() { _ = c.Close() }()
 			for {
 				if _, _, err := c.ReadMessage(); err != nil {
 					return
@@ -107,13 +116,19 @@ func startMicRig(t *testing.T, peerReads bool) *micRig {
 		if tcp, ok := c.UnderlyingConn().(*net.TCPConn); ok {
 			_ = tcp.SetReadBuffer(4096)
 		}
-		<-stop
+		stalledMu.Lock()
+		stalled = append(stalled, c)
+		stalledMu.Unlock()
 	}))
 	ctx, cancel := context.WithCancel(context.Background())
 	var loops sync.WaitGroup
 	t.Cleanup(func() {
 		cancel()
-		close(stop)
+		stalledMu.Lock()
+		for _, c := range stalled {
+			_ = c.Close()
+		}
+		stalledMu.Unlock()
 		srv.CloseClientConnections()
 		srv.Close()
 		loops.Wait()
@@ -121,7 +136,7 @@ func startMicRig(t *testing.T, peerReads bool) *micRig {
 
 	cOptions := &interfaces.ClientOptions{Host: "ws://" + srv.Listener.Addr().String(), EnableKeepAlive: true}
 	tOptions := &interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1}
-	factory := makeDeepgramClientFactory(ctx, "test-key", cOptions, tOptions, transcriptCallback{}, 300*time.Millisecond)
+	factory := makeDeepgramClientFactory(ctx, "test-key", cOptions, tOptions, transcriptCallback{}, writeLimit)
 	initial, err := factory(ctx)
 	if err != nil {
 		t.Fatalf("connect the Deepgram client to the local peer: %v", err)
@@ -139,6 +154,7 @@ func startMicRig(t *testing.T, peerReads bool) *micRig {
 		device:   &pluggableLight{present: true},
 		warnings: newWarningsRegistry(),
 		dials:    &dials,
+		port:     srv.Listener.Addr().(*net.TCPAddr).Port,
 	}
 	rig.recorded = &recordedBytes{}
 	startTestLight(t, rig.device, 100*time.Millisecond, rig.capture, rig.mic, rig.warnings)
@@ -167,7 +183,7 @@ func TestStalledDeepgramKeepsRecording(t *testing.T) {
 			name = "the peer stops reading"
 		}
 		t.Run(name, func(t *testing.T) {
-			rig := startMicRig(t, peerReads)
+			rig := startMicRig(t, peerReads, 300*time.Millisecond)
 			time.Sleep(time.Second) // fill the socket buffers
 			before := rig.recorded.bytes.Load()
 			time.Sleep(2 * time.Second)
@@ -185,11 +201,76 @@ func TestStalledDeepgramKeepsRecording(t *testing.T) {
 	}
 }
 
+// TestSendQueueKeepsRecordingUnderALongWriteLimit fails if the microphone
+// loop writes to Deepgram directly rather than through the send queue: with
+// the write limit longer than the window watched, a stalled socket then holds
+// the loop, and the recording, for the whole limit.
+func TestSendQueueKeepsRecordingUnderALongWriteLimit(t *testing.T) {
+	rig := startMicRig(t, false, 30*time.Second)
+	time.Sleep(time.Second) // fill the socket buffers
+	before := rig.recorded.bytes.Load()
+	time.Sleep(2 * time.Second)
+	if after := rig.recorded.bytes.Load(); after == before {
+		t.Fatalf("no audio reached the recording for 2 s (%d bytes) while a Deepgram write waited on its 30 s limit", after)
+	}
+}
+
+// TestStalledDeepgramSocketsDoNotPileUp is the #65 round 2 review's
+// leaking-peer probe: a peer that accepts every connection and stops reading
+// each one. It fails if a stalled socket outlives its replacement, so that
+// sockets and goroutines grow with every reconnect; the control, a peer that
+// reads, keeps one socket.
+func TestStalledDeepgramSocketsDoNotPileUp(t *testing.T) {
+	for _, peerReads := range []bool{true, false} {
+		name := "control: the peer reads"
+		if !peerReads {
+			name = "the peer stops reading every connection"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := startMicRig(t, peerReads, 300*time.Millisecond)
+			time.Sleep(time.Second)
+			goroutinesBefore := runtime.NumGoroutine()
+			dialsBefore := rig.dials.Load()
+			time.Sleep(4 * time.Second)
+			sockets := establishedTo(t, rig.port)
+			grown := runtime.NumGoroutine() - goroutinesBefore
+			reconnects := rig.dials.Load() - dialsBefore
+			t.Logf("over 4 s: %d reconnects, %d established sockets to the peer, goroutines %+d", reconnects, sockets, grown)
+			if !peerReads && reconnects < 4 {
+				t.Fatalf("only %d reconnects in 4 s; the stall did not replace the socket", reconnects)
+			}
+			if sockets > 2 || grown > 4 {
+				t.Fatalf("after %d reconnects: %d established sockets to the peer and goroutines %+d, want at most 2 and a flat count", reconnects, sockets, grown)
+			}
+		})
+	}
+}
+
+// establishedTo counts this host's established TCP connections to local port
+// port, from the client side, read from /proc/net/tcp.
+func establishedTo(t *testing.T, port int) int {
+	t.Helper()
+	data, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		t.Skipf("no /proc/net/tcp to count sockets: %v", err)
+	}
+	want := fmt.Sprintf(":%04X", port)
+	count := 0
+	for _, line := range strings.Split(string(data), "\n")[1:] {
+		fields := strings.Fields(line)
+		// fields: sl local_address rem_address st ...; 01 is ESTABLISHED.
+		if len(fields) > 3 && strings.HasSuffix(fields[2], want) && fields[3] == "01" {
+			count++
+		}
+	}
+	return count
+}
+
 // TestLightGoesOffWhenNoAudioIsRecorded fails if the light stays red, or the
 // status says capturing, while no audio reaches the recording, or if both do
 // not come back when audio does.
 func TestLightGoesOffWhenNoAudioIsRecorded(t *testing.T) {
-	rig := startMicRig(t, true)
+	rig := startMicRig(t, true, 300*time.Millisecond)
 	rig.mic.held.Store(true)
 	waitForHardwareWithin(t, 5*time.Second, "the light off while no audio is recorded", func() bool {
 		return !rig.device.isRed() && rig.capture.captureState(rig.mic) == captureNoAudio

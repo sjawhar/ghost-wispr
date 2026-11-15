@@ -29,7 +29,7 @@ block() {
   ' "$doc"
 }
 
-for name in credentials prepare provision accept; do
+for name in credentials prepare provision accept renew; do
   [[ -n $(block "$name") ]] || fail "docs/pi-setup.md has no bash block after <!-- provision_bundle_test.sh: $name -->"
 done
 runbook="$work_dir/runbook.sh"
@@ -90,6 +90,10 @@ if [[ $1 == iam && $2 == workload-identity-pools && $3 == create-cred-config && 
 fi
 case "$*" in
   'secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra')
+    if [[ -n ${TEST_CERT_READ_FAIL:-} ]]; then
+      printf 'fake gcloud: PERMISSION_DENIED reading ghost-wispr-device-certificate\n' >&2
+      exit 1
+    fi
     cat "$TEST_CERTIFICATE"
     ;;
   'secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra')
@@ -137,6 +141,7 @@ while [[ $1 == --* ]]; do
   esac
 done
 [[ $register == true && $ttl == 1h ]] || { printf 'fake secret-run: wants --register --ttl 1h\n' >&2; exit 1; }
+[[ -z ${TEST_SECRET_READ_FAIL:-} ]] || { printf 'fake secret-run: the grant was denied\n' >&2; exit 1; }
 key=$1
 [[ $2 == -- ]] || exit 2
 shift 2
@@ -182,6 +187,7 @@ case "$command" in
     exit "${TEST_PROVISION_EXIT:-0}"
     ;;
   *'rm -rf --'*) printf '%s\n' "$command" >>"$TEST_PI/removed" ;;
+  *'/opt/ghost-wispr/device.crt'*) cat >"$TEST_PI/renewed.crt" ;;
   *) printf 'fake ssh: unexpected command %s\n' "$command" >&2; exit 1 ;;
 esac
 EOF
@@ -259,6 +265,7 @@ TEST_PROVISION_EXIT=255 TEST_PROVISION_SAYS='ghost-wispr provision: starting the
 # Slice 1 acceptance: the secret reaches the driver's environment alone, read under a grant.
 cat >"$work_dir/accept-driver" <<'EOF'
 #!/usr/bin/env bash
+[[ -z ${TEST_ACCEPT_INVOKED:-} ]] || touch "$TEST_ACCEPT_INVOKED"
 [[ $GHOST_WISPR_RELAY_URL == https://relay.example.test/webhook/ghostwispr ]] || exit 3
 [[ $GHOST_WISPR_ENVOY_WEBHOOK_SECRET == "$WEBHOOK_SECRET" ]] || exit 4
 touch "$TEST_ACCEPT_RAN"
@@ -277,6 +284,38 @@ for broker_host in "" broker.example; do
   [[ -e $accept_dir/ran && $(<"$accept_dir/grants") == GCLOUD_SAMI ]] \
     || fail "the slice 1 driver did not run with the secret read under a GCLOUD_SAMI grant"
 done
+
+# A person pastes the block into a shell without set -e: a failed secret read must run no
+# acceptance, which would otherwise sign nothing and report the signed probe as skipped.
+accept_dir="$work_dir/accept-failed-read"
+mkdir -p "$accept_dir/home/src/agent-infra/envoy-cluster"
+: >"$accept_dir/grants"
+(
+  cd "$repo_root"
+  HOME="$accept_dir/home" TEST_GRANTS="$accept_dir/grants" TEST_ACCEPT_DRIVER="$work_dir/accept-driver" \
+    TEST_ACCEPT_RAN="$accept_dir/ran" TEST_ACCEPT_INVOKED="$accept_dir/invoked" TEST_SECRET_READ_FAIL=1 \
+    PATH="$work_dir/bin:$PATH" broker_host="" broker_key="" bash "$accept"
+) >/dev/null 2>&1 || true
+[[ ! -e $accept_dir/invoked ]] || fail "slice 1 acceptance ran although the secret read failed"
+
+# Certificate renewal, pasted the same way: the Pi gets the certificate Secret Manager holds,
+# and nothing at all when the read fails.
+renew="$work_dir/renew.sh"
+block renew >"$renew"
+run_renew() {
+  local case_dir=$1
+  mkdir -p "$case_dir/pi" "$case_dir/tmp"
+  (
+    cd "$repo_root"
+    TMPDIR="$case_dir/tmp" TEST_PI="$case_dir/pi" PATH="$work_dir/bin:$PATH" bash "$renew"
+  ) >/dev/null 2>&1 || true
+}
+run_renew "$work_dir/renew"
+cmp -s "$work_dir/renew/pi/renewed.crt" "$TEST_CERTIFICATE" || fail "renewal did not install Secret Manager's certificate on the Pi"
+TEST_CERT_READ_FAIL=1 run_renew "$work_dir/renew-failed"
+[[ ! -e $work_dir/renew-failed/pi/renewed.crt ]] || fail "renewal installed a certificate on the Pi although the read failed"
+[[ -z $(find "$work_dir/renew/tmp" "$work_dir/renew-failed/tmp" -mindepth 1 -print -quit) ]] \
+  || fail "renewal left its certificate file behind"
 
 if grep -F -e "$WEBHOOK_SECRET" -e "$DEEPGRAM_SECRET" "$TEST_ARGV_LOG" >/dev/null; then
   fail "a secret was passed as a command argument"

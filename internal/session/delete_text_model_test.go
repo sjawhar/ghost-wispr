@@ -121,3 +121,35 @@ func TestRefinementRefusesAModelItCannotUse(t *testing.T) {
 		t.Fatalf("refusal warnings = %q, want one naming the session and both models", warnings)
 	}
 }
+
+// TestRefinementRefusesASpanWithNoModel fails if a "Delete text" span that
+// names no model, as one recorded under a refinement with no model would, is
+// applied to whatever model the refinement uses, which publishes the deleted
+// words that model times differently.
+func TestRefinementRefusesASpanWithNoModel(t *testing.T) {
+	store, recording, started := deletedTextSessionWithModel(t, "20261112100000", "audio", "")
+	spans, err := store.TextDeletionSpans(recording)
+	if err != nil || len(spans) != 1 || spans[0].Model != "" {
+		t.Fatalf("spans = %+v (%v), want one with no model", spans, err)
+	}
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(fixedModelTranscriber{result: crossModelWords("nova-2")})
+	var warnings []string
+	manager.SetRefinementWarningHook(func(sessionID, warning string) {
+		warnings = append(warnings, sessionID+": "+warning)
+	})
+	_ = manager.RefineSession(context.Background(), "20261112100000", recording, started)
+	sess, err := store.GetSession("20261112100000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sess.CanonicalTranscript, "tractor") || strings.Contains(sess.RefinedTranscript, "tractor") {
+		t.Fatalf("a span with no model was applied, and a deleted word was published: canonical %q, refined %q", sess.CanonicalTranscript, sess.RefinedTranscript)
+	}
+	if sess.RefinementStatus == storage.RefinementCompleted {
+		t.Fatal("a refinement over a span with no model completed, want it refused")
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "unknown") {
+		t.Fatalf("refusal warnings = %q, want one saying the span's model is unknown", warnings)
+	}
+}

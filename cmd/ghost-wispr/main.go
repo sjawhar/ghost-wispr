@@ -686,34 +686,6 @@ func (c transcriptCallback) Error(er *api.ErrorResponse) error {
 
 func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
 
-// deepgramWriteTimeout bounds one write to the Deepgram socket. A write that
-// takes longer fails, so the resilient client buffers and reconnects.
-const deepgramWriteTimeout = 5 * time.Second
-
-// deepgramWriter is one Deepgram socket. Its writes, and its Finalize, run on
-// a goroutine of their own and are bounded by timeout: the SDK's
-// write has no deadline, a peer or path that stops taking data would
-// otherwise block it for as long as the kernel keeps retrying, and the SDK's
-// Finalize waits for that write's lock. A call past the bound breaks the
-// writer, so the resilient client buffers and dials a new socket; the stuck
-// call is left to end with the old socket, which is then stopped.
-type deepgramWriter struct {
-	client interface {
-		io.Writer
-		Finalize() error
-	}
-	timeout  time.Duration
-	mu       sync.Mutex
-	start    sync.Once
-	requests chan func() error
-	results  chan error
-	timer    *time.Timer
-	buf      []byte
-	broken   error
-}
-
-var errDeepgramWriteTimeout = errors.New("deepgram write timed out")
-
 // streamMicLoopStarter runs a mic loop in loops, the group shutdown waits for.
 var streamMicLoopStarter = func(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
 	loops.Go(func() { streamMicWithRetry(ctx, capture, streamer, writer, wait, logf, hub) })
@@ -821,91 +793,11 @@ func refreshKeptRawRecordings(ctx context.Context, recorder *audio.Recorder, bud
 	}
 }
 
-func (dw *deepgramWriter) Write(p []byte) (int, error) {
-	dw.mu.Lock()
-	defer dw.mu.Unlock()
-	if dw.broken != nil {
-		return 0, dw.broken
-	}
-	dw.buf = append(dw.buf[:0], p...)
-	if err := dw.bounded(func() error {
-		_, err := dw.client.Write(dw.buf)
-		return err
-	}); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-// bounded runs op on the socket's goroutine and waits for it up to
-// deepgramWriteTimeout. The caller holds mu, and has checked broken.
-func (dw *deepgramWriter) bounded(op func() error) error {
-	dw.start.Do(func() {
-		dw.requests = make(chan func() error)
-		dw.results = make(chan error, 1)
-		dw.timer = time.NewTimer(dw.timeout)
-		go func(requests <-chan func() error, results chan<- error) {
-			for op := range requests {
-				results <- op()
-			}
-		}(dw.requests, dw.results)
-	})
-	dw.timer.Reset(dw.timeout)
-	select {
-	case dw.requests <- op:
-	case <-dw.timer.C:
-		return dw.breakOnTimeout()
-	}
-	select {
-	case err := <-dw.results:
-		dw.timer.Stop()
-		return err
-	case <-dw.timer.C:
-		return dw.breakOnTimeout()
-	}
-}
-
-// breakOnTimeout marks the socket dead after a call passed its bound. The
-// caller holds mu. The socket's goroutine ends once the stuck call returns,
-// and the socket is stopped then, since the SDK's Stop waits for that call.
-func (dw *deepgramWriter) breakOnTimeout() error {
-	dw.broken = fmt.Errorf("%w after %v", errDeepgramWriteTimeout, dw.timeout)
-	close(dw.requests)
-	if stopper, ok := dw.client.(interface{ Stop() }); ok {
-		go stopper.Stop()
-	}
-	return dw.broken
-}
-
-// Close finalizes the socket, as Finalize does; a broken socket is being
-// stopped already.
-func (dw *deepgramWriter) Close() error {
-	if err := dw.Finalize(); err != nil && !errors.Is(err, errDeepgramWriteTimeout) {
-		return err
-	}
-	return nil
-}
-
-// Finalize asks Deepgram to return final results for the audio it has.
-func (dw *deepgramWriter) Finalize() error {
-	dw.mu.Lock()
-	defer dw.mu.Unlock()
-	if dw.broken != nil {
-		return dw.broken
-	}
-	return dw.bounded(dw.client.Finalize)
-}
-
-func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
+// makeDeepgramClientFactory dials live-transcription sockets the app owns
+// (deepgramSocket), each write bounded by writeTimeout.
+func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
 	return func(factoryCtx context.Context) (io.WriteCloser, error) {
-		dgClient, err := client.NewWSUsingCallback(factoryCtx, apiKey, cOptions, tOptions, callback)
-		if err != nil {
-			return nil, err
-		}
-		if !dgClient.Connect() {
-			return nil, fmt.Errorf("deepgram connect failed")
-		}
-		return &deepgramWriter{client: dgClient, timeout: writeTimeout}, nil
+		return dialDeepgramLive(factoryCtx, apiKey, cOptions, tOptions, callback, writeTimeout)
 	}
 }
 
@@ -1353,6 +1245,9 @@ func main() {
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
+	// refusedCuts keeps a refused "Delete text and audio" on /api/status while
+	// its segment is there, naming the session and the segment's time.
+	refusedCuts := newRefusedCuts(refusedCutPresent(store))
 	// deletionRunner makes the occurrence-based deletion actions use the
 	// configuration as it is now. Batch transcription has already persisted
 	// their exact word spans, so deleting never creates a locator.
@@ -1395,13 +1290,7 @@ func main() {
 				}
 				return result.Words, nil
 			},
-			warn: func(sessionID, warning string) {
-				if warning == "" {
-					warningRegistry.Clear("deletion-cut-" + sessionID)
-					return
-				}
-				warningRegistry.Set("deletion-cut-"+sessionID, warning)
-			},
+			refused: refusedCuts,
 		}
 	}
 
@@ -1434,7 +1323,7 @@ func main() {
 		},
 		CaptureState:  func() string { return capture.captureState(micStatus) },
 		ActiveSession: manager.ActiveSession,
-		Warnings:      warningRegistry.List,
+		Warnings:      apiStatusWarnings(warningRegistry, refusedCuts),
 		OnSessionDeleted: func(sessionID string) {
 			warningRegistry.WithRecordingMismatch(func() {
 				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)

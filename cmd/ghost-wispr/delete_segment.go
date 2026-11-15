@@ -38,8 +38,9 @@ type segmentDeleteRunner struct {
 	// session was refined with, for the check after each cut of "Delete text
 	// and audio". Production always sets it; nil skips the check.
 	transcribeCut func(ctx context.Context, model, path string) ([]transcribe.TimestampedWord, error)
-	// warn puts a refused deletion on /api/status.
-	warn func(sessionID, warning string)
+	// refused keeps a refused cut's /api/status warning while its segment is
+	// there.
+	refused *refusedCuts
 }
 
 type deletionRecordingSet struct {
@@ -484,13 +485,10 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	}
 	tempPath, start, end, afterHash, err := d.cutAndCheck(ctx, session.RefinementModel, recording, words, selected, duration)
 	if err != nil {
-		if errors.Is(err, errDeletionCutHeard) && d.warn != nil {
-			d.warn(sessionID, fmt.Sprintf("\"Delete text and audio\" was refused for session %s: %v", sessionID, err))
+		if errors.Is(err, errDeletionCutHeard) && d.refused != nil {
+			d.refused.Refused(refusedCut{SessionID: sessionID, Recording: filepath.Base(selected.RecordingPath), Start: selected.StartTime, End: selected.EndTime})
 		}
 		return err
-	}
-	if d.warn != nil {
-		d.warn(sessionID, "")
 	}
 	keepTemp := false
 	defer func() {
@@ -516,6 +514,9 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	if err := d.store.MarkSpliceComplete(&span); err != nil {
 		return err
 	}
+	if d.refused != nil {
+		d.refused.Cut(sessionID, filepath.Base(selected.RecordingPath), start, end)
+	}
 	if d.summarize != nil {
 		if err := d.summarize(ctx, sessionID, session.StartedAt); err != nil {
 			return fmt.Errorf("summarize refined audio deletion: %w", err)
@@ -528,11 +529,14 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 // deleted segment's first and last word times on each side, also into
 // touching neighbours: Deepgram's word times are tighter than the spoken
 // words, so a cut at them leaves an onset or a tail a transcription still
-// hears. Losing a little neighbouring audio is accepted (Sami's decision on
-// the #65 review). Measured on the review's recordings with
-// TestMeasureDeletionAudioPad: 0.45 s left a deleted word heard in 2 and 4 of
-// 30 cuts, where no pad left 5 and 7, for about 0.7 s of neighbouring speech
-// per cut; the check after each cut handles what it leaves.
+// hears. Under the consent rule the deleted words must be gone, and a sliver
+// of neighbouring speech is the cost (the INFRA-1027 coordinator's decision
+// on the #65 review). Measured with TestMeasureDeletionAudioPad on the
+// review's two recordings, 30 cuts each, by the check's rule
+// (testdata/deletion_cut): with no pad 9 and 6 cuts left a deleted word heard
+// next to the cut; with 0.45 s, 1 and 2, for 0.67 to 0.72 s of neighbouring
+// speech per cut on average and at most 0.90 s. The check after each cut
+// handles what the pad leaves.
 const deletionAudioPad = 0.45
 
 func refinedSpliceBounds(words []storage.RefinedWord, selected *transcribe.Segment) (float64, float64) {
@@ -575,20 +579,21 @@ var deletionCutPads = []float64{deletionAudioPad, 0.6, 0.8}
 // TestMeasureDeletionAudioPad.
 const deletionCutWindow = 0.5
 
-// deletionNeighbourWindow is how far before and after the cut the
-// neighbours' own words are counted, to explain a heard word as theirs.
-const deletionNeighbourWindow = 3.5
-
 // errDeletionCutHeard refuses a "Delete text and audio" whose every cut
-// still left a deleted word heard next to it.
-var errDeletionCutHeard = errors.New("a word of the deleted segment is still heard next to the cut")
+// still left a deleted word heard next to it. It names no word: they are the
+// ones the person asked to delete.
+var errDeletionCutHeard = errors.New("part of the deleted segment is still heard next to the cut")
+
+// errDeletionCutUnchecked refuses a "Delete text and audio" whose cut
+// recording the check heard no words in, twice: a transcription that hears
+// nothing cannot say the deleted words are gone.
+var errDeletionCutUnchecked = errors.New("a transcription of the cut recording heard no words, so the cut could not be checked")
 
 // cutAndCheck cuts the selected segment out of a copy of recording, with each
 // of deletionCutPads in turn, until a transcription of the copy hears no word
 // of the segment next to the cut. It returns the accepted copy, its bounds and
 // its hash; it removes every copy it does not return. duration < 0 is unknown.
 func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording string, words []storage.RefinedWord, selected *transcribe.Segment, duration float64) (string, float64, float64, string, error) {
-	var heardLast []string
 	for _, pad := range deletionCutPads {
 		start, end := refinedSpliceBoundsWithPad(words, selected, pad)
 		if duration >= 0 && end > duration {
@@ -615,26 +620,45 @@ func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording 
 		if d.transcribeCut == nil {
 			return tempPath, start, end, afterHash, nil
 		}
-		heard, err := d.transcribeCut(ctx, model, tempPath)
+		heard, err := d.transcribeCutHearingWords(ctx, model, tempPath)
 		if err != nil {
 			_ = os.Remove(tempPath)
+			if errors.Is(err, errDeletionCutUnchecked) {
+				return "", 0, 0, "", fmt.Errorf("%w; the recording is unchanged", err)
+			}
 			return "", 0, 0, "", fmt.Errorf("check the cut recording %s: %w", recording, err)
 		}
-		heardLast = leftoverWords(words, selected, start, end, heard, deletionCutWindow)
-		if len(heardLast) == 0 {
+		if len(leftoverWords(words, selected, start, end, heard, deletionCutWindow)) == 0 {
 			return tempPath, start, end, afterHash, nil
 		}
 		_ = os.Remove(tempPath)
 	}
-	return "", 0, 0, "", fmt.Errorf("%w: %q, even cutting %.2f s past its words on each side; the recording is unchanged",
-		errDeletionCutHeard, heardLast, deletionCutPads[len(deletionCutPads)-1])
+	return "", 0, 0, "", fmt.Errorf("%w, even cutting %.2f s past its words on each side; the recording is unchanged",
+		errDeletionCutHeard, deletionCutPads[len(deletionCutPads)-1])
+}
+
+// transcribeCutHearingWords transcribes a cut recording, once more when the
+// first transcription holds no words, and fails with errDeletionCutUnchecked
+// when neither does.
+func (d *segmentDeleteRunner) transcribeCutHearingWords(ctx context.Context, model, path string) ([]transcribe.TimestampedWord, error) {
+	for range 2 {
+		heard, err := d.transcribeCut(ctx, model, path)
+		if err != nil {
+			return nil, err
+		}
+		if len(heard) > 0 {
+			return heard, nil
+		}
+	}
+	return nil, errDeletionCutUnchecked
 }
 
 // leftoverWords returns the words of the selected segment that heard, a
 // transcription of the recording cut from start to end, holds within window
-// seconds of the cut point beyond the neighbours' own words around the cut.
-// A neighbour's word the pad cut into, or cut out, counts as the neighbours':
-// a transcription of the cut recording can hear what is left of it.
+// seconds of the cut point beyond the neighbours' own words there. A
+// neighbour word counts only where the listening window can hold it: within
+// window of the cut's edges, or cut into or out by the pad. A neighbour
+// further away saying the same word does not explain it.
 func leftoverWords(words []storage.RefinedWord, selected *transcribe.Segment, start, end float64, heard []transcribe.TimestampedWord, window float64) []string {
 	segment, near := map[string]int{}, map[string]int{}
 	for _, word := range words {
@@ -646,7 +670,7 @@ func leftoverWords(words []storage.RefinedWord, selected *transcribe.Segment, st
 		case text == "":
 		case word.Start >= selected.StartTime && word.End <= selected.EndTime:
 			segment[text]++
-		case word.End > start-deletionNeighbourWindow && word.Start < end+deletionNeighbourWindow:
+		case word.End > start-window && word.Start < end+window:
 			near[text]++
 		}
 	}
