@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -817,7 +818,7 @@ func expectNoSessionNamesAMissingFile(t *testing.T, store *storage.SQLiteStore, 
 			t.Errorf("session %s deleted: %v", id, err)
 			continue
 		}
-		for _, entry := range splitAudioPath(sess.AudioPath) {
+		for _, entry := range recording.Entries(sess.AudioPath) {
 			if _, err := os.Stat(entry); err != nil {
 				t.Errorf("session %s names %s, which is gone (%v)", id, entry, err)
 			}

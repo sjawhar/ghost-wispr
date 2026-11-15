@@ -334,10 +334,7 @@ func (s *SQLiteStore) RecordingDirectories() ([]string, error) {
 		if err := rows.Scan(&paths); err != nil {
 			return nil, fmt.Errorf("scan recording paths: %w", err)
 		}
-		for _, path := range strings.Split(paths, ",") {
-			if path = strings.TrimSpace(path); path == "" {
-				continue
-			}
+		for _, path := range recordingname.Entries(paths) {
 			dir, err := filepath.Abs(filepath.Dir(path))
 			if err != nil {
 				return nil, fmt.Errorf("find the directory of recording %s: %w", path, err)

@@ -1388,11 +1388,7 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 			_ = rows.Close()
 			return fmt.Errorf("scan audio paths: %w", err)
 		}
-		for _, recordingPath := range strings.Split(path, ",") {
-			recordingPath = strings.TrimSpace(recordingPath)
-			if recordingPath == "" {
-				continue
-			}
+		for _, recordingPath := range recording.Entries(path) {
 			audioPaths = append(audioPaths, recordingPath)
 			if _, err := tx.Exec(`INSERT OR REPLACE INTO recording_sources(merged_session_id, recording_path, source_session_id) VALUES(?, ?, ?)`, newID, recordingPath, sourceID); err != nil {
 				_ = rows.Close()
@@ -3214,16 +3210,13 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		if sourceID == id {
 			continue
 		}
-		paths = append(paths, sourceAudioPath, filepath.Join(audioDir, sourceID+".pcm"))
+		paths = append(paths, sourceAudioPath, recording.RawPath(audioDir, sourceID))
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return "", fmt.Errorf("list merged sources of session %s: %w", id, err)
 	}
 	audioPath = strings.Join(paths, ",")
-	for _, entry := range append(strings.Split(audioPath, ","), id+".pcm") {
-		if entry = strings.TrimSpace(entry); entry == "" {
-			continue
-		}
+	for _, entry := range append(recording.Entries(audioPath), recording.RawPath(audioDir, id)) {
 		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {
 			return "", fmt.Errorf("delete session %s: %w", id, err)
 		}
@@ -3329,7 +3322,7 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 	}
 	if audioDir != "" {
 		for _, deletedID := range deletedIDs {
-			if err := recordEraseDirectory(tx, filepath.Dir(filepath.Join(audioDir, deletedID+".pcm"))); err != nil {
+			if err := recordEraseDirectory(tx, filepath.Dir(recording.RawPath(audioDir, deletedID))); err != nil {
 				return nil, false, fmt.Errorf("record raw erase directory for session %s: %w", deletedID, err)
 			}
 		}

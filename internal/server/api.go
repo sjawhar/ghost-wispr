@@ -900,7 +900,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		rawIDs := append([]string{sessionID}, sourceIDs...)
 		var rawReservations []rawEraseReservation
 		for _, rawID := range rawIDs {
-			rawPath, err := filepath.Abs(filepath.Join(recordingDir, rawID+".pcm"))
+			rawPath, err := filepath.Abs(recordingname.RawPath(recordingDir, rawID))
 			if err != nil {
 				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("find raw session recording: %v", err))
@@ -969,10 +969,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		// an erase cut off by a stop is finished as the app starts. The files
 		// leave their names before the answer; the zeros follow it.
 		pending := make([]erase.Pending, 0)
-		for _, p := range strings.Split(audioPath, ",") {
-			if p = strings.TrimSpace(p); p == "" {
-				continue
-			}
+		for _, p := range recordingname.Entries(audioPath) {
 			p = recordingname.Resolve(p, recordingDir)
 			hidden, err := beginErasing(p)
 			switch {

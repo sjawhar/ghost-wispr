@@ -136,11 +136,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 	}()
 
 	byName := make(map[string]string)
-	for _, entry := range strings.Split(session.AudioPath, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
+	for _, entry := range recordingname.Entries(session.AudioPath) {
 		path := recordingname.Resolve(entry, audioDir)
 		byName[filepath.Base(path)] = path
 	}
@@ -430,7 +426,7 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 		}
 		rawSessionIDs = append(rawSessionIDs, sources...)
 		for _, rawSessionID := range rawSessionIDs {
-			rawPath := filepath.Join(d.audioDir, rawSessionID+".pcm")
+			rawPath := recordingname.RawPath(d.audioDir, rawSessionID)
 			if info, err := os.Stat(rawPath); err == nil && !info.IsDir() {
 				return fmt.Errorf("%w: %s", server.ErrSegmentRawAudioKept, rawPath)
 			} else if err != nil && !errors.Is(err, os.ErrNotExist) {

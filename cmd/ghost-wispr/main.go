@@ -83,11 +83,7 @@ func hasLocalRefinementRecording(session *storage.Session, audioDir string) (boo
 		return false, nil
 	}
 	entries := 0
-	for _, entry := range strings.Split(session.AudioPath, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
+	for _, entry := range recording.Entries(session.AudioPath) {
 		entries++
 		path := recording.Resolve(entry, audioDir)
 		info, err := os.Stat(path)
@@ -193,11 +189,7 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 			return fmt.Errorf("list recordings known to session %s: %w", session.ID, err)
 		}
 		if len(required) == 0 {
-			for _, path := range strings.Split(session.AudioPath, ",") {
-				if strings.TrimSpace(path) != "" {
-					required = append(required, path)
-				}
-			}
+			required = recording.Entries(session.AudioPath)
 		}
 		if missing := missingRefinementRecordings(required, recordings.Paths); len(missing) > 0 {
 			return fmt.Errorf("drive did not restore recording %s for session %s; restore it from Drive's trash, then retry refinement", strings.Join(missing, ", "), session.ID)
@@ -231,8 +223,8 @@ func restoreRefinementRecording(ctx context.Context, store refinementAudioRestor
 
 func downloadsNotNamedBy(audioPath string, downloads []string) []string {
 	named := make(map[string]struct{})
-	for _, path := range strings.Split(audioPath, ",") {
-		if name := filepath.Base(strings.TrimSpace(path)); name != "" && name != "." {
+	for _, path := range recording.Entries(audioPath) {
+		if name := filepath.Base(path); name != "." {
 			named[name] = struct{}{}
 		}
 	}

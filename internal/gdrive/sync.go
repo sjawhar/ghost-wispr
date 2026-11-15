@@ -134,7 +134,7 @@ func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 	// only find the recording it uploaded before. One missing from disk is
 	// left out here; notUploaded names it, and the sync does not count as
 	// done without it.
-	for _, recording := range recordingEntries(audioPath) {
+	for _, recording := range recordingname.Entries(audioPath) {
 		if _, err := os.Stat(recording); err != nil {
 			continue
 		}
@@ -161,23 +161,11 @@ func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 	return files, folderName, unreadable, nil
 }
 
-// recordingEntries returns the recordings an audio path names: a merged
-// session's names several, separated by commas.
-func recordingEntries(audioPath string) []string {
-	var recordings []string
-	for _, entry := range strings.Split(audioPath, ",") {
-		if entry = strings.TrimSpace(entry); entry != "" {
-			recordings = append(recordings, entry)
-		}
-	}
-	return recordings
-}
-
 // resolvedAudioPath returns audioPath with each recording it names replaced
 // by where recording.Resolve finds it: as written, else its name in
 // audioDir.
 func resolvedAudioPath(audioPath, audioDir string) string {
-	entries := recordingEntries(audioPath)
+	entries := recordingname.Entries(audioPath)
 	for i, entry := range entries {
 		entries[i] = recordingname.Resolve(entry, audioDir)
 	}
@@ -193,7 +181,7 @@ func notUploaded(audioPath string, files []SyncFile) []string {
 		uploaded[files[i].LocalPath] = true
 	}
 	var missing []string
-	for _, recording := range recordingEntries(audioPath) {
+	for _, recording := range recordingname.Entries(audioPath) {
 		if !uploaded[recording] {
 			missing = append(missing, recording)
 		}
