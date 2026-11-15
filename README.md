@@ -138,6 +138,19 @@ open in a tailnet member's browser, cannot use it, the `/ws` handshake and every
 origins are the host the request came to and `public_url`. A client that sends no `Origin`, such
 as `curl` or an agent, is not affected.
 
+### Envoy events
+
+With `envoy_enabled`, Ghost Wispr posts `session_started`, `session_ended` and `summary_ready` to
+`envoy_webhook_url`, signed with `GHOST_WISPR_ENVOY_WEBHOOK_SECRET`; Envoy publishes them under
+`notifications.ghostwispr.<session>.{session.started,session.ended,summary.ready}`. No event
+carries a session's title, summary or transcript, because Envoy keeps every event for 72 hours
+and a segment deletion cannot recall it. Each payload has `session_id`, `type`, `started_at`,
+`ended_at` (once the session has ended), `duration` in seconds, `drive_folder_url` (once the
+session has a Drive folder) and `session_url` (`public_url` + `/api/sessions/{id}`, when
+`public_url` is set). `summary_ready` adds `summary_preset`, `summary_model` and `version`. To
+read the text, fetch `session_url`, which returns what is left after any deletion.
+`GET /api/openapi.json` describes the payload under `webhooks`.
+
 ## Development
 
 ```bash

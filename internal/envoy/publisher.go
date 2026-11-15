@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -46,16 +47,39 @@ type Event struct {
 	Payload        map[string]any
 }
 
-// Option configures a Client.
-type Option func(*Client)
+// Option configures a Client or a Publisher.
+type Option func(*options)
+
+type options struct {
+	logger    *slog.Logger
+	publicURL string
+}
 
 // WithLogger sets the logger used for webhook request failures and retries.
 func WithLogger(logger *slog.Logger) Option {
-	return func(c *Client) {
+	return func(o *options) {
 		if logger != nil {
-			c.logger = logging.WithModule(logger, "envoy")
+			o.logger = logging.WithModule(logger, "envoy")
 		}
 	}
+}
+
+// WithPublicURL sets the unit's own HTTPS address (config public_url): a
+// Publisher's events link to each session's API resource under it.
+func WithPublicURL(publicURL string) Option {
+	return func(o *options) {
+		o.publicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
+	}
+}
+
+func collectOptions(opts []Option) options {
+	collected := options{logger: logging.WithModule(slog.Default(), "envoy")}
+	for _, option := range opts {
+		if option != nil {
+			option(&collected)
+		}
+	}
+	return collected
 }
 
 // Client sends Ghost Wispr events to Envoy's webhook.
@@ -79,9 +103,13 @@ func (err *webhookStatusError) Error() string {
 // NewClient creates a webhook client. It does not contact the relay until Send.
 // It trims the URL and secret as Envoy trims ENVOY_GHOSTWISPR_SIGNING_SECRET,
 // so both sides sign with the same key.
-func NewClient(url, secret string, opts ...Option) *Client {
-	client := &Client{
-		url:    strings.TrimSpace(url),
+func NewClient(webhookURL, secret string, opts ...Option) *Client {
+	return newClient(webhookURL, secret, collectOptions(opts))
+}
+
+func newClient(webhookURL, secret string, opts options) *Client {
+	return &Client{
+		url:    strings.TrimSpace(webhookURL),
 		secret: []byte(strings.TrimSpace(secret)),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
@@ -89,17 +117,11 @@ func NewClient(url, secret string, opts ...Option) *Client {
 				return http.ErrUseLastResponse
 			},
 		},
-		logger:      logging.WithModule(slog.Default(), "envoy"),
+		logger:      opts.logger,
 		now:         func() time.Time { return time.Now().UTC() },
 		sleep:       sleepWithContext,
 		retryDelays: append([]time.Duration(nil), defaultRetryDelays...),
 	}
-	for _, option := range opts {
-		if option != nil {
-			option(client)
-		}
-	}
-	return client
 }
 
 // Send posts ev to Envoy's webhook. It retries transient failures with the
@@ -185,16 +207,18 @@ func (c *Client) sendOnce(ctx context.Context, eventType EventType, delivery str
 
 // Publisher builds Ghost Wispr event payloads from stored sessions.
 type Publisher struct {
-	store  Store
-	client *Client
+	store     Store
+	client    *Client
+	publicURL string
 }
 
 // NewPublisher creates a session-aware Envoy webhook publisher.
-func NewPublisher(url, secret string, store Store, opts ...Option) *Publisher {
-	client := NewClient(url, secret, opts...)
+func NewPublisher(webhookURL, secret string, store Store, opts ...Option) *Publisher {
+	collected := collectOptions(opts)
 	return &Publisher{
-		store:  store,
-		client: client,
+		store:     store,
+		client:    newClient(webhookURL, secret, collected),
+		publicURL: collected.publicURL,
 	}
 }
 
@@ -301,11 +325,25 @@ func (p *Publisher) PublishPendingLifecycleEvents(ctx context.Context) error {
 	return firstErr
 }
 
+// sendSession sends an event about sess that carries no text of the session:
+// no title and no summary. Envoy keeps every event for 72 hours and no
+// deletion can recall it, so text sent there would outlive a segment
+// deletion that removed the words it repeats. The event says which session
+// it is, when it ran, and where an agent reads its current text: the
+// session's API resource on the unit (session_url) and its Drive folder.
 func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *storage.Session) error {
 	payload := map[string]any{
-		"title":    sess.Title,
-		"summary":  sess.Summary,
-		"duration": sessionDuration(sess),
+		"started_at": sess.StartedAt.UTC().Format(time.RFC3339),
+		"duration":   sessionDuration(sess),
+	}
+	if sess.EndedAt != nil {
+		payload["ended_at"] = sess.EndedAt.UTC().Format(time.RFC3339)
+	}
+	if sess.GDriveFolderID != "" {
+		payload["drive_folder_url"] = driveFolderURL + url.PathEscape(sess.GDriveFolderID)
+	}
+	if p.publicURL != "" {
+		payload["session_url"] = p.publicURL + "/api/sessions/" + url.PathEscape(sess.ID)
 	}
 	event := Event{Type: eventType, SessionID: sess.ID, Payload: payload}
 	if eventType == eventSummaryReady {
@@ -315,6 +353,9 @@ func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *
 	}
 	return p.client.Send(ctx, event)
 }
+
+// driveFolderURL is where Google Drive shows a folder, by its id.
+const driveFolderURL = "https://drive.google.com/drive/folders/"
 
 // summaryCompleted reports whether sess is an ended session whose summary
 // completed. Only one with summary text is announced to Envoy.

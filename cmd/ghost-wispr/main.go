@@ -1726,6 +1726,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			currentCfg.EnvoyWebhookSecret,
 			store,
 			envoy.WithLogger(appLogger),
+			envoy.WithPublicURL(currentCfg.PublicURL),
 		)
 		warningRegistry.Clear("envoy")
 		setSummaryPublisher(pub)
