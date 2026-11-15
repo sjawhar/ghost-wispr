@@ -123,11 +123,11 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 	}
 	var outcome replacementOutcome
 	replaceErr := o.uploader.Serialize(func() error {
-		current, err := o.unchangedSinceTheChecks(sessionID, generation)
+		current, replacing, owed, err := o.replacementUnderLock(sessionID, generation, folders)
 		if err != nil || current == nil {
 			return err
 		}
-		outcome, err = o.replaceOwedFolders(ctx, current, generation, folders, splicedRecording)
+		outcome, err = o.replaceOwedFolders(ctx, current, replacing, owed, splicedRecording)
 		return err
 	})
 	release := syncStateOf(sess)
@@ -159,26 +159,41 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 	return nil
 }
 
-// unchangedSinceTheChecks reads session sessionID's deletion generation and
-// the session again, once the replacement has the Drive lock, and returns the
-// session as it is now, or nil when a deletion committed since the checks
-// before the claim read generation: the replacement then does nothing, and
-// the next sync replaces what the newer deletion owes. Waiting for the lock,
-// behind an upload of another session, can take as long as that upload.
-func (o *Orchestrator) unchangedSinceTheChecks(sessionID string, generation int) (*storage.Session, error) {
+// replacementUnderLock reads session sessionID's deletion generation and the
+// session again once the replacement has the Drive lock, which it can wait
+// for as long as an upload of another session takes, and returns the
+// session, generation and folders to replace, or a nil session when there is
+// nothing to replace now. When no deletion committed during the wait, that is
+// the fresh session with generation and folders, as the checks before the
+// claim read them. When one did, it replaces for that newer deletion, as the
+// replacement did before the gdrive refactor: if the fresh session is pending
+// and ready (refined and summarized again), it ensures the newer
+// generation's folders, clearing the pending flag when the deletion owes
+// none; otherwise it replaces nothing, and a later sync does.
+func (o *Orchestrator) replacementUnderLock(sessionID string, generation int, folders []storage.DriveReplacementFolder) (*storage.Session, int, []storage.DriveReplacementFolder, error) {
 	now, err := o.store.DeletionGeneration(sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+		return nil, 0, nil, fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
 	}
 	current, err := o.store.GetSession(sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("read replacement session %s: %w", sessionID, err)
+		return nil, 0, nil, fmt.Errorf("read replacement session %s: %w", sessionID, err)
 	}
-	if now != generation {
-		o.logger.Info("gdrive replacement waits for a newer deletion", "operation", "replace_session_files", "session_id", sessionID, "generation", generation, "newer_generation", now)
-		return nil, nil
+	if now == generation {
+		return &current, generation, folders, nil
 	}
-	return &current, nil
+	if !current.DriveReplacePending || !replacementReady(&current) {
+		o.logger.Info("gdrive replacement waits for a newer deletion's refinement and summary", "operation", "replace_session_files", "session_id", sessionID, "generation", generation, "newer_generation", now)
+		return nil, 0, nil, nil
+	}
+	if folders, err = o.store.EnsureDriveReplacementFolders(sessionID, now); err != nil {
+		return nil, 0, nil, err
+	}
+	if len(folders) == 0 {
+		// The newer deletion owes Drive no folder.
+		return nil, 0, nil, o.store.ClearDriveReplacementPending(sessionID, now)
+	}
+	return &current, now, folders, nil
 }
 
 // replaceOwedFolders replaces each of folders that current's segment
@@ -192,7 +207,7 @@ func (o *Orchestrator) unchangedSinceTheChecks(sessionID string, generation int)
 // restored. The folders Drive can reach are replaced meanwhile, so one in the
 // trash does not keep the words in the others. The deletion finishes once no
 // folder is owed. current is the session read under the Drive lock
-// (unchangedSinceTheChecks): one whose replacement finished, or whose
+// (replacementUnderLock): one whose replacement finished, or whose
 // deletion is not yet refined and summarized again, replaces nothing.
 func (o *Orchestrator) replaceOwedFolders(ctx context.Context, current *storage.Session, generation int, folders []storage.DriveReplacementFolder, splicedRecording string) (replacementOutcome, error) {
 	var outcome replacementOutcome
