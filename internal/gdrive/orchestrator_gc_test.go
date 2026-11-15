@@ -20,8 +20,17 @@ import (
 // remountingUploader brings a recording back on disk while it uploads the
 // session's other files: a disk remounted during a sync.
 type remountingUploader struct {
+	syncOnlyDrive
 	recording string
 	uploaded  []string
+}
+
+// UploadWithFolderRecorded records the one folder it makes, then uploads.
+func (u *remountingUploader) UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
+	if err := record("folder-1"); err != nil {
+		return "folder-1", err
+	}
+	return u.Upload(ctx, folderName, files)
 }
 
 func (u *remountingUploader) Upload(_ context.Context, _ string, files []SyncFile) (string, error) {

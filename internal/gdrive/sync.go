@@ -27,11 +27,11 @@ import (
 )
 
 type Syncer struct {
-	service      *drive.Service
-	folderID     string
-	logger       *slog.Logger
-	mu           sync.Mutex
-	replacements replacementStore
+	service  *drive.Service
+	folderID string
+	logger   *slog.Logger
+	// mu keeps one upload or replacement (Serialize) at a time.
+	mu sync.Mutex
 }
 
 const resumableUploadThresholdBytes int64 = 5 * 1024 * 1024

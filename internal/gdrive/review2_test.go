@@ -80,14 +80,24 @@ func TestReview2NoFolderSyncBeforeSpliceRename(t *testing.T) {
 	}
 }
 
+// generationRaceStore runs hook once, as the first session read after a
+// deletion generation read returns: a deletion committing between the two
+// reads a replacement makes.
 type generationRaceStore struct {
 	*storage.SQLiteStore
-	hook func()
+	hook  func()
+	armed bool
+}
+
+func (s *generationRaceStore) DeletionGeneration(id string) (int, error) {
+	generation, err := s.SQLiteStore.DeletionGeneration(id)
+	s.armed = true
+	return generation, err
 }
 
 func (s *generationRaceStore) GetSession(id string) (storage.Session, error) {
 	sess, err := s.SQLiteStore.GetSession(id)
-	if s.hook != nil {
+	if s.armed && s.hook != nil {
 		hook := s.hook
 		s.hook = nil
 		hook()
@@ -136,9 +146,8 @@ func TestReview2DeletionBetweenSessionAndGenerationReads(t *testing.T) {
 			t.Errorf("mark charlie spliced: %v", err)
 		}
 	}
-	syncer.setReplacementStore(race)
 	wire.allowDeletes = true
-	_ = o.SyncSession(context.Background(), id)
+	_ = NewOrchestrator(syncer, race).SyncSession(context.Background(), id)
 	sess, _ := store.GetSession(id)
 	var transcript string
 	for _, f := range wire.in(folder)["transcript.md"] {

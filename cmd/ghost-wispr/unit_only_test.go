@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,26 +12,50 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"google.golang.org/api/drive/v3"
+
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 // folderBackUploader is a Drive that has every session folder again: a retry
-// syncs into it.
+// syncs into it. It replaces no files.
 type folderBackUploader struct{}
 
-func (folderBackUploader) Upload(context.Context, string, []gdrive.SyncFile) (string, error) {
-	return "folder-1", nil
+var errFolderBackReplaces = errors.New("this test Drive does not replace files")
+
+func (folderBackUploader) UploadWithFolderRecorded(_ context.Context, _ string, _ []gdrive.SyncFile, record func(string) error) (string, error) {
+	return "folder-1", record("folder-1")
 }
 
 func (folderBackUploader) UploadInto(context.Context, string, []gdrive.SyncFile) error { return nil }
+
+func (folderBackUploader) RenameFolder(context.Context, string, string) error { return nil }
 
 func (folderBackUploader) FolderOnDrive(context.Context, string) (bool, error) { return true, nil }
 
 func (folderBackUploader) RecordingsMatch(context.Context, string, map[string]string) (bool, error) {
 	return true, nil
 }
+
+func (folderBackUploader) Serialize(fn func() error) error { return fn() }
+
+func (folderBackUploader) CheckFolder(context.Context, string) error { return errFolderBackReplaces }
+
+func (folderBackUploader) ListFolderFiles(context.Context, string) ([]*drive.File, error) {
+	return nil, errFolderBackReplaces
+}
+
+func (folderBackUploader) UploadFile(context.Context, string, *gdrive.SyncFile) (string, error) {
+	return "", errFolderBackReplaces
+}
+
+func (folderBackUploader) VerifyFile(context.Context, string, *gdrive.SyncFile) error {
+	return errFolderBackReplaces
+}
+
+func (folderBackUploader) DeleteFile(context.Context, string) error { return errFolderBackReplaces }
 
 // A session whose Drive folder GC finds gone (deleted by hand, or a folder
 // the app can no longer read in a drive that still reads) is kept on this

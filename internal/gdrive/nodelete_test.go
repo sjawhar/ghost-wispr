@@ -380,13 +380,15 @@ func isDriveDeleteCall(name string) bool {
 }
 
 // replacementDeleteFunction is the one function with a Drive delete call:
-// replaceFolder (replace.go), which a segment deletion's replacement runs for
-// each folder it owes.
-const replacementDeleteFunction = "replaceFolder"
+// Syncer.DeleteFile (replace.go), which only a segment deletion's
+// replacement calls (Orchestrator.deleteReplacedFiles) for each folder it
+// owes.
+const replacementDeleteFunction = "DeleteFile"
 
-// No app code deletes or trashes a Drive file except replaceFolder, which
-// removes recorded old files and duplicate app-created replacement uploads
-// only after it stores the replacement to retain.
+// No app code deletes or trashes a Drive file except Syncer.DeleteFile,
+// which the replacement calls to remove recorded old files and duplicate
+// app-created replacement uploads only after it stores the replacement to
+// retain.
 func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
 	root := moduleRoot(t)
 	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")

@@ -22,6 +22,7 @@ type fakeDriveFile struct {
 // Drive's storage faked. failAfter > 0 makes uploads fail once that many files
 // went up.
 type fakeDrive struct {
+	syncOnlyDrive
 	mu        sync.Mutex
 	folders   map[string][]fakeDriveFile
 	nextID    int

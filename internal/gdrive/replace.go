@@ -11,26 +11,14 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/api/drive/v3"
 
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-type replacementStore interface {
-	GetSession(id string) (storage.Session, error)
-	DriveReplacements(sessionID string, generation int) ([]storage.DriveReplacement, error)
-	PendingDriveReplacementRecordings(sessionID string) ([]string, error)
-	LatestRecordingSHA256(sessionID, recording string) (string, bool, error)
-	StartDriveReplacement(sessionID, name string, generation int, oldIDs []string) error
-	MarkDriveReplacementUploaded(sessionID, name string, generation int, newID string) error
-	MarkDriveReplacementDeleted(sessionID, name, oldID string, generation int) error
-	DeletionGeneration(sessionID string) (int, error)
-	ClearDriveReplacementPending(sessionID string, generation int) error
-	EnsureDriveReplacementFolders(sessionID string, generation int) ([]storage.DriveReplacementFolder, error)
-	MarkDriveReplacementFolder(sessionID string, generation int, folderSessionID, state string) error
-	FinishDriveReplacement(sessionID string, generation int) error
-}
+const spliceWaitWarningAfter = 5 * time.Minute
 
 // replacementTarget is one Drive folder a replacement covers: the session's
 // own, or that of a session merged into it, which the merge left on Drive
@@ -55,64 +43,143 @@ type replacementOutcome struct {
 	ownReplaced, ownTrashed, ownGone bool
 }
 
-func (s *Syncer) setReplacementStore(store replacementStore) {
-	s.replacements = store
+// replaceOwedFiles is a sync of session sessionID while its segment deletion
+// still owes Drive a replacement: it waits for the splice, then for
+// refinement and summary, then replaces the folders the deletion owes. A
+// deletion that owes no folder is cleared, and the session synced as a first
+// sync.
+func (o *Orchestrator) replaceOwedFiles(ctx context.Context, sessionID, splicedRecording string) error {
+	// Read the generation before the snapshot the checks below use, so a
+	// deletion committing during them makes the clear and the finish refuse.
+	generation, err := o.store.DeletionGeneration(sessionID)
+	if err != nil {
+		return fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+	}
+	read, err := o.store.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("get session %s: %w", sessionID, err)
+	}
+	if spliceOpen, err := o.store.HasPendingSplice(sessionID); err != nil {
+		return err
+	} else if spliceOpen {
+		started, found, err := o.store.OldestPendingSplice(sessionID)
+		if err != nil {
+			return err
+		}
+		if found && time.Since(started) >= spliceWaitWarningAfter {
+			o.logger.Warn("gdrive replacement splice is taking too long", "operation", "replace_session_files", "session_id", sessionID, "waited", time.Since(started).Round(time.Second), "warning_after", spliceWaitWarningAfter)
+		} else {
+			o.logger.Info("gdrive replacement waits for the splice", "operation", "replace_session_files", "session_id", sessionID)
+		}
+		return nil
+	}
+	if !replacementReady(&read) {
+		o.logger.Warn("gdrive replacement waits for refinement and summary", "operation", "replace_session_files", "session_id", sessionID)
+		return nil
+	}
+	folders, err := o.store.EnsureDriveReplacementFolders(sessionID, generation)
+	if err != nil {
+		return err
+	}
+	if len(folders) == 0 {
+		// The deletion owes Drive no folder: none held the session's
+		// files, its own or a merged source's, even rebuilt.
+		if err := o.store.ClearDriveReplacementPending(sessionID, generation); err != nil {
+			return err
+		}
+		o.logger.Info("gdrive replacement falls through to first sync", "operation", "replace_session_files", "session_id", sessionID)
+		return o.SyncSession(ctx, sessionID)
+	}
+	return o.replaceSessionFiles(ctx, &read, generation, folders, splicedRecording)
 }
 
-// ReplaceSessionFiles replaces, in every Drive folder that can hold a deleted
-// segment's words (the session's own, and each folder of a session merged
-// into it, as the deletion recorded them owed), transcript.md, summary.md and
-// each spliced recording that folder has. See replaceSessionFiles.
+// replaceSessionFiles replaces the Drive folders sess's segment deletion of
+// generation owes, holding the session's sync claim so that retry-sync, the
+// sync after a summary and the sweep do not start a second replacement.
 //
-//nolint:gocritic // The approved API accepts storage.Session by value.
-func (s *Syncer) ReplaceSessionFiles(ctx context.Context, sess storage.Session, splicedRecording string) error {
-	_, err := s.replaceSessionFiles(ctx, &sess, splicedRecording)
-	return err
+// It releases the claim, its retry count kept, by what it did to the
+// session's own Drive folder, never as synced: a replacement does not prove
+// that every other recording of the session is on Drive.
+//   - It replaced the session's own folder: PENDING, so the next sync checks
+//     Drive against the session and marks it synced. Round 5's rule for an
+//     owed session in FAILED or REMOTE_DELETED is this case.
+//   - It found the session's own folder in the trash or gone: REMOTE_DELETED,
+//     as a sync would leave it (the replacement, still owed for a folder in
+//     the trash, is swept until it is restored).
+//   - It did not reach the session's own folder (it has none, or an earlier
+//     attempt replaced it or found it gone): the state the claim came from,
+//     since nothing of the session's own Drive copy changed. A REMOTE_DELETED
+//     session stays REMOTE_DELETED.
+func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Session, generation int, folders []storage.DriveReplacementFolder, splicedRecording string) error {
+	sessionID := sess.ID
+	claim := uuid.NewString()
+	claimed, ok, err := o.store.ClaimSync(sessionID, sess.SyncState, claim, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("claim replacement sync of %s: %w", sessionID, err)
+	}
+	if !ok {
+		o.logger.Info("gdrive replacement was claimed by another sync first, skipping", "operation", "replace_session_files", "session_id", sessionID)
+		return nil
+	}
+	var outcome replacementOutcome
+	replaceErr := o.uploader.Serialize(func() error {
+		var err error
+		outcome, err = o.replaceOwedFolders(ctx, &claimed, generation, folders, splicedRecording)
+		return err
+	})
+	release := syncStateOf(sess)
+	switch {
+	case outcome.ownTrashed || outcome.ownGone:
+		release = storage.SyncStateRemoteDeleted
+	case outcome.ownReplaced, release == storage.SyncStateSynced:
+		release = storage.SyncStatePending
+	}
+	message := ""
+	if replaceErr != nil {
+		message = replaceErr.Error()
+	}
+	released, releaseErr := o.store.EndSync(sessionID, claim, release, claimed.GDriveFolderID, claimed.RetryCount, time.Now().UTC(), message)
+	switch {
+	case releaseErr != nil:
+		o.logger.Error("gdrive replacement could not release its sync claim; the session stays mid-sync until the app restarts", "operation", "replace_session_files", "session_id", sessionID, "error", releaseErr)
+		if replaceErr == nil {
+			replaceErr = fmt.Errorf("release replacement sync claim: %w", releaseErr)
+		}
+	case !released:
+		o.logger.Warn("gdrive replacement no longer holds its session; its state is left as it is", "operation", "replace_session_files", "session_id", sessionID)
+	}
+	if replaceErr != nil {
+		o.replacementFailed(sessionID, generation, replaceErr)
+		return fmt.Errorf("replace session files %s: %w", sessionID, replaceErr)
+	}
+	o.logger.Info("gdrive session files replaced", "operation", "replace_session_files", "session_id", sessionID, "drive_folder_id", claimed.GDriveFolderID, "sync_state", release)
+	return nil
 }
 
-// replaceSessionFiles replaces every Drive folder sess's segment deletion
-// still owes that Drive can reach now, one folder at a time: it uploads and
-// verifies the folder's replacements, recording each new id before it
-// deletes any old id there (so a retry resumes from the rows and never
-// deletes the replacement it chose), deletes the folder's old files, renames
-// the folder and records it replaced. A folder gone for good is recorded
-// gone, its old files gone with it. A folder in the trash stays owed: the
-// attempt fails, and the sweep comes back until the folder is restored. The
-// folders Drive can reach are replaced meanwhile, so one in the trash does not
-// keep the words in the others. The deletion finishes once no folder is owed.
-func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session, splicedRecording string) (replacementOutcome, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+// replaceOwedFolders replaces each of folders that current's segment
+// deletion of generation still owes and Drive can reach now, one folder at a
+// time: it uploads and verifies the folder's replacements, recording each new
+// id before it deletes any old id there (so a retry resumes from the rows and
+// never deletes the replacement it chose), deletes the folder's old files,
+// renames the folder and records it replaced. A folder gone for good is
+// recorded gone, its old files gone with it. A folder in the trash stays
+// owed: the attempt fails, and the sweep comes back until the folder is
+// restored. The folders Drive can reach are replaced meanwhile, so one in the
+// trash does not keep the words in the others. The deletion finishes once no
+// folder is owed. current is the session as the sync claim read it: a
+// replacement that finished, or a deletion not yet refined and summarized
+// again, since the checks before the claim, replaces nothing.
+func (o *Orchestrator) replaceOwedFolders(ctx context.Context, current *storage.Session, generation int, folders []storage.DriveReplacementFolder, splicedRecording string) (replacementOutcome, error) {
 	var outcome replacementOutcome
-	if s.replacements == nil {
-		return outcome, fmt.Errorf("replace session files %s: replacement store is required", sess.ID)
-	}
-	generation, err := s.replacements.DeletionGeneration(sess.ID)
-	if err != nil {
-		return outcome, fmt.Errorf("read deletion generation for session %s: %w", sess.ID, err)
-	}
-	current, err := s.replacements.GetSession(sess.ID)
-	if err != nil {
-		return outcome, fmt.Errorf("read replacement session %s: %w", sess.ID, err)
-	}
-	if !current.DriveReplacePending || !replacementReady(&current) {
+	if !current.DriveReplacePending || !replacementReady(current) {
 		return outcome, nil
 	}
-	recordings, err := s.replacements.PendingDriveReplacementRecordings(current.ID)
+	recordings, err := o.store.PendingDriveReplacementRecordings(current.ID)
 	if err != nil {
 		return outcome, fmt.Errorf("list replacement recordings for session %s: %w", current.ID, err)
 	}
 	if len(recordings) == 0 {
 		recordings = []string{splicedRecording}
-	}
-	folders, err := s.replacements.EnsureDriveReplacementFolders(current.ID, generation)
-	if err != nil {
-		return outcome, err
-	}
-	if len(folders) == 0 {
-		// The deletion owes no folder: none held the session's files.
-		return outcome, s.replacements.ClearDriveReplacementPending(current.ID, generation)
 	}
 
 	var failures []error
@@ -121,20 +188,20 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 			continue
 		}
 		own := folder.FolderSessionID == current.ID
-		folderSession := current
+		folderSession := *current
 		if !own {
-			if folderSession, err = s.replacements.GetSession(folder.FolderSessionID); err != nil {
+			if folderSession, err = o.store.GetSession(folder.FolderSessionID); err != nil {
 				failures = append(failures, fmt.Errorf("read merged session %s: %w", folder.FolderSessionID, err))
 				continue
 			}
 		}
-		if err := s.checkFolder(ctx, folderSession.GDriveFolderID); err != nil {
+		if err := o.uploader.CheckFolder(ctx, folderSession.GDriveFolderID); err != nil {
 			switch {
 			case errors.Is(err, ErrFolderTrashed):
 				outcome.ownTrashed = outcome.ownTrashed || own
 				failures = append(failures, fmt.Errorf("the Drive folder of session %s is in the trash, and its replacement runs once it is restored: %w", folderSession.ID, err))
 			case IsRemoteDeletedError(err):
-				if err := s.replacements.MarkDriveReplacementFolder(current.ID, generation, folderSession.ID, storage.DriveReplacementFolderGone); err != nil {
+				if err := o.store.MarkDriveReplacementFolder(current.ID, generation, folderSession.ID, storage.DriveReplacementFolderGone); err != nil {
 					failures = append(failures, err)
 					continue
 				}
@@ -144,7 +211,7 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 			}
 			continue
 		}
-		if err := s.replaceFolder(ctx, current.ID, generation, &folderSession, recordings, own); err != nil {
+		if err := o.replaceFolder(ctx, current.ID, generation, &folderSession, recordings, own); err != nil {
 			failures = append(failures, err)
 			continue
 		}
@@ -153,7 +220,7 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 	if len(failures) != 0 {
 		return outcome, errors.Join(failures...)
 	}
-	return outcome, s.replacements.FinishDriveReplacement(current.ID, generation)
+	return outcome, o.store.FinishDriveReplacement(current.ID, generation)
 }
 
 // replaceFolder replaces the Drive folder of folderSession, which ownerID's
@@ -161,44 +228,37 @@ func (s *Syncer) replaceSessionFiles(ctx context.Context, sess *storage.Session,
 // deletes its old files and duplicates, renames it and records it replaced.
 // A merged source's folder (own false) gets the spliced recordings it holds,
 // under their own names, and its scrubbed transcript and summary.
-func (s *Syncer) replaceFolder(ctx context.Context, ownerID string, generation int, folderSession *storage.Session, recordings []string, own bool) error {
+func (o *Orchestrator) replaceFolder(ctx context.Context, ownerID string, generation int, folderSession *storage.Session, recordings []string, own bool) error {
 	target := &replacementTarget{
 		session:    *folderSession,
 		folderName: folderSession.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(folderSession.Title),
 	}
 	var err error
-	if target.rows, err = s.replacements.DriveReplacements(target.session.ID, generation); err != nil {
+	if target.rows, err = o.store.DriveReplacements(target.session.ID, generation); err != nil {
 		return err
 	}
 	if !allDriveReplacementsDeleted(target.rows) {
-		if target.existing, err = s.ListFolderFiles(ctx, target.session.GDriveFolderID); err != nil {
+		if target.existing, err = o.uploader.ListFolderFiles(ctx, target.session.GDriveFolderID); err != nil {
 			return fmt.Errorf("list replacements for session %s: %w", target.session.ID, err)
 		}
 		folderRecordings := recordings
 		if !own {
 			folderRecordings = recordingsInFolder(recordings, target.existing, target.rows)
 		}
-		if target.files, _, err = replacementFiles(ownerID, &target.session, folderRecordings, s.replacements); err != nil {
+		if target.files, _, err = replacementFiles(ownerID, &target.session, folderRecordings, o.store); err != nil {
 			return fmt.Errorf("build replacements for session %s: %w", target.session.ID, err)
 		}
 	}
-	if err := s.uploadReplacements(ctx, target, generation); err != nil {
+	if err := o.uploadReplacements(ctx, target, generation); err != nil {
 		return err
 	}
-	deleteFile := func(fileID string) error {
-		err := s.service.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
-		if err != nil && !IsRemoteDeletedError(err) {
-			return err
-		}
-		return nil
-	}
-	if err := s.deleteReplacedFiles(ctx, ownerID, target, generation, deleteFile); err != nil {
+	if err := o.deleteReplacedFiles(ctx, ownerID, target, generation); err != nil {
 		return err
 	}
-	if err := s.renameSessionFolder(ctx, target.session.GDriveFolderID, target.folderName); err != nil {
+	if err := o.uploader.RenameFolder(ctx, target.session.GDriveFolderID, target.folderName); err != nil {
 		return err
 	}
-	return s.replacements.MarkDriveReplacementFolder(ownerID, generation, target.session.ID, storage.DriveReplacementFolderReplaced)
+	return o.store.MarkDriveReplacementFolder(ownerID, generation, target.session.ID, storage.DriveReplacementFolderReplaced)
 }
 
 // recordingsInFolder returns the recordings whose Drive copy (audio- and the
@@ -223,7 +283,7 @@ func recordingsInFolder(recordings []string, existing []*drive.File, rows []stor
 
 // uploadReplacements uploads and verifies target's replacement files and
 // records each new id, resuming from the rows of an earlier attempt.
-func (s *Syncer) uploadReplacements(ctx context.Context, target *replacementTarget, generation int) error {
+func (o *Orchestrator) uploadReplacements(ctx context.Context, target *replacementTarget, generation int) error {
 	if target.files == nil {
 		return nil
 	}
@@ -241,10 +301,10 @@ func (s *Syncer) uploadReplacements(ctx context.Context, target *replacementTarg
 		file := &target.files[i]
 		rows := driveReplacementsNamed(target.rows, file.Name)
 		if len(rows) == 0 {
-			if err := s.replacements.StartDriveReplacement(id, file.Name, generation, driveFileIDs(oldByName[file.Name])); err != nil {
+			if err := o.store.StartDriveReplacement(id, file.Name, generation, driveFileIDs(oldByName[file.Name])); err != nil {
 				return err
 			}
-			if target.rows, err = s.replacements.DriveReplacements(id, generation); err != nil {
+			if target.rows, err = o.store.DriveReplacements(id, generation); err != nil {
 				return err
 			}
 			rows = driveReplacementsNamed(target.rows, file.Name)
@@ -263,23 +323,23 @@ func (s *Syncer) uploadReplacements(ctx context.Context, target *replacementTarg
 		newID := ""
 		if newFile == nil {
 			file.AppProperties = map[string]string{replacementKeyProperty: key}
-			if newID, err = s.uploadFileID(ctx, folder, file); err != nil {
+			if newID, err = o.uploader.UploadFile(ctx, folder, file); err != nil {
 				return err
 			}
 		} else {
 			newID = newFile.Id
 		}
-		if err := s.verifyFile(ctx, newID, file); err != nil {
+		if err := o.uploader.VerifyFile(ctx, newID, file); err != nil {
 			return fmt.Errorf("verify replacement %s: %w", file.Name, err)
 		}
-		if err := s.replacements.MarkDriveReplacementUploaded(id, file.Name, generation, newID); err != nil {
+		if err := o.store.MarkDriveReplacementUploaded(id, file.Name, generation, newID); err != nil {
 			return err
 		}
-		if target.rows, err = s.replacements.DriveReplacements(id, generation); err != nil {
+		if target.rows, err = o.store.DriveReplacements(id, generation); err != nil {
 			return err
 		}
 	}
-	if target.rows, err = s.replacements.DriveReplacements(id, generation); err != nil {
+	if target.rows, err = o.store.DriveReplacements(id, generation); err != nil {
 		return err
 	}
 	if !hasReplacementForEveryFile(target.rows, target.files) {
@@ -288,11 +348,10 @@ func (s *Syncer) uploadReplacements(ctx context.Context, target *replacementTarg
 	return nil
 }
 
-// deleteReplacedFiles deletes, with deleteFile, target's duplicate replacement
-// uploads and then each old file its rows record, while the deletion
-// generation of ownerID (the session the segment was deleted from) is still
-// generation.
-func (s *Syncer) deleteReplacedFiles(ctx context.Context, ownerID string, target *replacementTarget, generation int, deleteFile func(fileID string) error) error {
+// deleteReplacedFiles deletes target's duplicate replacement uploads and
+// then each old file its rows record, while the deletion generation of
+// ownerID (the session the segment was deleted from) is still generation.
+func (o *Orchestrator) deleteReplacedFiles(ctx context.Context, ownerID string, target *replacementTarget, generation int) error {
 	if target.files == nil {
 		return nil
 	}
@@ -302,7 +361,7 @@ func (s *Syncer) deleteReplacedFiles(ctx context.Context, ownerID string, target
 	// a retried request's first response was lost, in an earlier attempt or
 	// in this one. The folder is listed again after the uploads, so a copy
 	// made in this attempt is found too.
-	uploaded, err := s.ListFolderFiles(ctx, target.session.GDriveFolderID)
+	uploaded, err := o.uploader.ListFolderFiles(ctx, target.session.GDriveFolderID)
 	if err != nil {
 		return fmt.Errorf("list replacements for session %s after uploading: %w", id, err)
 	}
@@ -313,7 +372,7 @@ func (s *Syncer) deleteReplacedFiles(ctx context.Context, ownerID string, target
 		}
 		key := replacementUploadKey(id, target.files[i].Name, rows)
 		for _, duplicateID := range extraReplacementFileIDs(uploaded, target.files[i].Name, key, rows[0].NewID) {
-			if err := deleteFile(duplicateID); err != nil {
+			if err := o.uploader.DeleteFile(ctx, duplicateID); err != nil {
 				return fmt.Errorf("delete duplicate replacement upload %s: %w", duplicateID, err)
 			}
 		}
@@ -323,7 +382,7 @@ func (s *Syncer) deleteReplacedFiles(ctx context.Context, ownerID string, target
 		case storage.DriveReplacementDeleted:
 			continue
 		case storage.DriveReplacementUploaded:
-			currentGeneration, err := s.replacements.DeletionGeneration(ownerID)
+			currentGeneration, err := o.store.DeletionGeneration(ownerID)
 			if err != nil {
 				return fmt.Errorf("read deletion generation for session %s: %w", ownerID, err)
 			}
@@ -331,11 +390,11 @@ func (s *Syncer) deleteReplacedFiles(ctx context.Context, ownerID string, target
 				return fmt.Errorf("replace session files %s: deletion generation changed from %d to %d", ownerID, generation, currentGeneration)
 			}
 			if replacement.OldID != "" {
-				if err := deleteFile(replacement.OldID); err != nil {
+				if err := o.uploader.DeleteFile(ctx, replacement.OldID); err != nil {
 					return fmt.Errorf("delete old %s: %w", replacement.Name, err)
 				}
 			}
-			if err := s.replacements.MarkDriveReplacementDeleted(id, replacement.Name, replacement.OldID, generation); err != nil {
+			if err := o.store.MarkDriveReplacementDeleted(id, replacement.Name, replacement.OldID, generation); err != nil {
 				return err
 			}
 		default:
@@ -378,7 +437,41 @@ func replacementFiles(ownerID string, sess *storage.Session, recordings []string
 	return files, sess.StartedAt.UTC().Format("2006-01-02") + "-" + slugify(sess.Title), nil
 }
 
-func (s *Syncer) verifyFile(ctx context.Context, fileID string, expected *SyncFile) error {
+// The Drive file operations a replacement runs (replacementDrive). The
+// Orchestrator runs them under Serialize, which holds the same lock as an
+// upload, so a replacement never runs beside an upload of this Syncer.
+
+// Serialize runs fn while no upload or other replacement of this Syncer
+// runs.
+func (s *Syncer) Serialize(fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn()
+}
+
+// CheckFolder returns nil while Drive has session folder folderID out of
+// the trash (checkFolder).
+func (s *Syncer) CheckFolder(ctx context.Context, folderID string) error {
+	return s.checkFolder(ctx, folderID)
+}
+
+// UploadFile uploads one file into Drive folder folderID and returns its id.
+func (s *Syncer) UploadFile(ctx context.Context, folderID string, file *SyncFile) (string, error) {
+	return s.uploadFileID(ctx, folderID, file)
+}
+
+// DeleteFile deletes Drive file fileID; one already gone is no error.
+func (s *Syncer) DeleteFile(ctx context.Context, fileID string) error {
+	err := s.service.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
+	if err != nil && !IsRemoteDeletedError(err) {
+		return err
+	}
+	return nil
+}
+
+// VerifyFile checks that Drive file fileID has expected's content hash and,
+// for a local file, its SHA-256 and size.
+func (s *Syncer) VerifyFile(ctx context.Context, fileID string, expected *SyncFile) error {
 	file, err := s.service.Files.Get(fileID).SupportsAllDrives(true).Context(ctx).
 		Fields("id, appProperties, sha256Checksum, size").Do()
 	if err != nil {
@@ -401,7 +494,9 @@ func (s *Syncer) verifyFile(ctx context.Context, fileID string, expected *SyncFi
 	return nil
 }
 
-func (s *Syncer) renameSessionFolder(ctx context.Context, folderID, name string) error {
+// RenameFolder renames Drive folder folderID to name; its id and the links
+// to its files stay.
+func (s *Syncer) RenameFolder(ctx context.Context, folderID, name string) error {
 	if _, err := s.service.Files.Update(folderID, &drive.File{Name: name}).SupportsAllDrives(true).Context(ctx).Fields("id").Do(); err != nil {
 		return fmt.Errorf("rename session folder %s: %w", folderID, err)
 	}
