@@ -108,7 +108,9 @@ the blink(1) reads back red. With the light missing, or not reading back red, it
 microphone and refuses a resume; if the light fails while it records, capture stops within one
 check (a second) without saving a pause. `/api/status` then names the cause in a warning and
 reports `capture_state` `light_unavailable`, and capture comes back once the light reads back red
-again, unless someone paused it meanwhile.
+again, unless someone paused it meanwhile. Any other value of `indicator_light` stops the
+recorder from starting, so a typo cannot turn the light check off; leave it unset for a recorder
+with no light.
 
 ## Deployment
 

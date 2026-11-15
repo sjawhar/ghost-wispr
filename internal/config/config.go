@@ -158,6 +158,12 @@ func Load(path string) (Config, []string, error) {
 	}
 
 	applyEnvOverrides(&cfg)
+	// An unknown light fails closed: dropping the setting would turn the light
+	// check off and let the recorder capture with no light on.
+	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
+	if cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
+		return cfg, warnings, fmt.Errorf("indicator_light %q is not a known light: set it to %q, or leave it unset for a recorder with no light", cfg.IndicatorLight, IndicatorLightBlink1)
+	}
 	credentialPath := cfg.GoogleCredentialsFile
 	if credentialPath == "" {
 		credentialPath = os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -424,12 +430,6 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 
 	if cfg.DeepgramAPIKey == "" {
 		warnings = append(warnings, "Deepgram API key not configured — live transcription is disabled. Set "+EnvPrefix+"DEEPGRAM_API_KEY.")
-	}
-
-	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
-	if cfg.IndicatorLight != "" && cfg.IndicatorLight != IndicatorLightBlink1 {
-		warnings = append(warnings, fmt.Sprintf("Invalid indicator_light %q — disabling the recording light.", cfg.IndicatorLight))
-		cfg.IndicatorLight = ""
 	}
 
 	if cfg.GenAIBackend != "" && genaiconfig.NormalizeBackend(cfg.GenAIBackend) == "" {
