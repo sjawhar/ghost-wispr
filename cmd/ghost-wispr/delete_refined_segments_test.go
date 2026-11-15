@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -135,15 +136,22 @@ func TestDeleteRefinedAudioSplicesWithFFmpegAndShiftsWords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(remaining) != 1 || remaining[0].Text != "Later." || remaining[0].Start != 0.25 || remaining[0].End != 0.75 {
-		t.Fatalf("remaining words = %#v, want later word shifted by the ffmpeg cut", remaining)
+	// The cut runs from 0 to 0.5 + deletionAudioPad, so "Later." moves back by
+	// that much.
+	cutEnd := 0.5 + deletionAudioPad
+	if len(remaining) != 1 || remaining[0].Text != "Later." || math.Abs(remaining[0].Start-(1-cutEnd)) > 1e-9 || math.Abs(remaining[0].End-(1.5-cutEnd)) > 1e-9 {
+		t.Fatalf("remaining words = %#v, want the later word shifted back by the padded cut, %.2f s", remaining, cutEnd)
 	}
 	if duration, err := audio.Duration(context.Background(), recording); err != nil || duration >= 2 {
 		t.Fatalf("spliced recording duration = %v, %v; want a shorter recording", duration, err)
 	}
 }
 
-func TestRefinedSpliceBoundsClampBothNeighbours(t *testing.T) {
+// TestRefinedSpliceBoundsPadIntoNeighbours fails if the cut stops at the
+// neighbouring words' times, where a transcription of the cut recording
+// still heard the deleted segment's onset or tail (#65 review, B1), rather
+// than reaching deletionAudioPad past the segment's words on each side.
+func TestRefinedSpliceBoundsPadIntoNeighbours(t *testing.T) {
 	selected := transcribe.Segment{RecordingPath: "recording.mp3", RecordingSHA256: "hash", StartTime: 1, EndTime: 2}
 	words := []storage.RefinedWord{
 		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 0, Start: 0.4, End: 0.9},
@@ -151,7 +159,12 @@ func TestRefinedSpliceBoundsClampBothNeighbours(t *testing.T) {
 		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 2, Start: 2.1, End: 2.5},
 	}
 	start, end := refinedSpliceBounds(words, &selected)
-	if start != 0.9 || end != 2.1 {
-		t.Fatalf("splice bounds = %v..%v, want both neighbouring word boundaries", start, end)
+	if math.Abs(start-(1-deletionAudioPad)) > 1e-9 || math.Abs(end-(2+deletionAudioPad)) > 1e-9 {
+		t.Fatalf("splice bounds = %v..%v, want %v past the segment's words on each side", start, end, deletionAudioPad)
+	}
+	// With no pad, the cut keeps the earlier bounds: the neighbouring words'
+	// edges, or 0.25 s past the segment where no neighbour is closer.
+	if start, end := refinedSpliceBoundsWithPad(words, &selected, 0); start != 0.9 || end != 2.1 {
+		t.Fatalf("unpadded splice bounds = %v..%v, want both neighbouring word boundaries", start, end)
 	}
 }

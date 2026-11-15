@@ -688,10 +688,10 @@ func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
 
 // deepgramWriteTimeout bounds one write to the Deepgram socket. A write that
 // takes longer fails, so the resilient client buffers and reconnects.
-var deepgramWriteTimeout = 5 * time.Second
+const deepgramWriteTimeout = 5 * time.Second
 
 // deepgramWriter is one Deepgram socket. Its writes, and its Finalize, run on
-// a goroutine of their own and are bounded by deepgramWriteTimeout: the SDK's
+// a goroutine of their own and are bounded by timeout: the SDK's
 // write has no deadline, a peer or path that stops taking data would
 // otherwise block it for as long as the kernel keeps retrying, and the SDK's
 // Finalize waits for that write's lock. A call past the bound breaks the
@@ -702,6 +702,7 @@ type deepgramWriter struct {
 		io.Writer
 		Finalize() error
 	}
+	timeout  time.Duration
 	mu       sync.Mutex
 	start    sync.Once
 	requests chan func() error
@@ -842,14 +843,14 @@ func (dw *deepgramWriter) bounded(op func() error) error {
 	dw.start.Do(func() {
 		dw.requests = make(chan func() error)
 		dw.results = make(chan error, 1)
-		dw.timer = time.NewTimer(deepgramWriteTimeout)
+		dw.timer = time.NewTimer(dw.timeout)
 		go func(requests <-chan func() error, results chan<- error) {
 			for op := range requests {
 				results <- op()
 			}
 		}(dw.requests, dw.results)
 	})
-	dw.timer.Reset(deepgramWriteTimeout)
+	dw.timer.Reset(dw.timeout)
 	select {
 	case dw.requests <- op:
 	case <-dw.timer.C:
@@ -868,7 +869,7 @@ func (dw *deepgramWriter) bounded(op func() error) error {
 // caller holds mu. The socket's goroutine ends once the stuck call returns,
 // and the socket is stopped then, since the SDK's Stop waits for that call.
 func (dw *deepgramWriter) breakOnTimeout() error {
-	dw.broken = fmt.Errorf("%w after %v", errDeepgramWriteTimeout, deepgramWriteTimeout)
+	dw.broken = fmt.Errorf("%w after %v", errDeepgramWriteTimeout, dw.timeout)
 	close(dw.requests)
 	if stopper, ok := dw.client.(interface{ Stop() }); ok {
 		go stopper.Stop()
@@ -895,7 +896,7 @@ func (dw *deepgramWriter) Finalize() error {
 	return dw.bounded(dw.client.Finalize)
 }
 
-func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback) transcribe.ClientFactory {
+func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
 	return func(factoryCtx context.Context) (io.WriteCloser, error) {
 		dgClient, err := client.NewWSUsingCallback(factoryCtx, apiKey, cOptions, tOptions, callback)
 		if err != nil {
@@ -904,7 +905,7 @@ func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *int
 		if !dgClient.Connect() {
 			return nil, fmt.Errorf("deepgram connect failed")
 		}
-		return &deepgramWriter{client: dgClient}, nil
+		return &deepgramWriter{client: dgClient, timeout: writeTimeout}, nil
 	}
 }
 
@@ -2083,7 +2084,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		candidateResilient := transcribe.NewResilientClient(ctx, nil, resilientConfig, log.Printf, resillientStateCallback)
 		callback := transcriptCallback{manager: manager, resilient: candidateResilient}
-		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback)
+		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback, deepgramWriteTimeout)
 		candidateResilient.Factory = factory
 
 		initialClient, err := factory(ctx)

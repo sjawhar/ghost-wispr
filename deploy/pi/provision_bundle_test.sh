@@ -178,6 +178,7 @@ case "$command" in
     find "$received" -mindepth 1 -printf '%P\n' | LC_ALL=C sort >"$TEST_PI/bundle.list"
     # Where the operator's machine keeps the secrets while provision.sh runs.
     find "$XDG_RUNTIME_DIR" -mindepth 1 -maxdepth 1 -name 'ghost-wispr-bundle.*' -printf '%m %P\n' >"$TEST_PI/stage.during"
+    [[ -z ${TEST_PROVISION_SAYS:-} ]] || printf '%s\n' "$TEST_PROVISION_SAYS"
     exit "${TEST_PROVISION_EXIT:-0}"
     ;;
   *'rm -rf --'*) printf '%s\n' "$command" >>"$TEST_PI/removed" ;;
@@ -245,6 +246,15 @@ fi
 [[ -s "$work_dir/failed/pi/stage.during" ]] || fail "the failure case never reached provision.sh"
 [[ -z $(find "$work_dir/failed/run" -mindepth 1 -print -quit) ]] || fail "a failed provisioning left the bundle directory in XDG_RUNTIME_DIR"
 grep -q 'rm -rf --' "$work_dir/failed/pi/removed" || fail "a failed provisioning left the sources directory on the Pi"
+
+# The SSH session ends (exit 255) as Tailscale re-authenticates, only after provision.sh says the
+# join started; an exit 255 before that is a failure.
+if TEST_PROVISION_EXIT=255 run_runbook "$work_dir/dropped-early" "" "" 2>/dev/null; then
+  fail "the runbook succeeded although the SSH session ended before the tailnet join started"
+fi
+TEST_PROVISION_EXIT=255 TEST_PROVISION_SAYS='ghost-wispr provision: starting the tagged tailnet join as ghost-wispr-tailnet-join-1' \
+  run_runbook "$work_dir/dropped-after-join" "" "" 2>/dev/null \
+  || fail "the runbook failed although the SSH session ended after the tailnet join started"
 
 # Slice 1 acceptance: the secret reaches the driver's environment alone, read under a grant.
 cat >"$work_dir/accept-driver" <<'EOF'
