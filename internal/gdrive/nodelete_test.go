@@ -688,7 +688,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	ctx := context.Background()
 
 	// The first sync lands both documents, then fails on the recording.

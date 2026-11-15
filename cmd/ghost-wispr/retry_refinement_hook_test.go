@@ -57,9 +57,7 @@ func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
 			refined <- struct{}{}
 		}
 		return err
-	}).retryRefinementHook(
-
-		registry)
+	}, registry).retryRefinement
 
 	deleted := make(chan struct{}, 1)
 	handler, err := server.Handler(fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok"), Mode: fs.ModePerm}}, server.NewHub(), store, &server.ControlHooks{
@@ -129,9 +127,7 @@ func TestRetryRefinementHookWarnsWhenRestoreFails(t *testing.T) {
 	}, func(context.Context, string, string, time.Time) error {
 		t.Fatal("refinement ran after the Drive restoration failed")
 		return nil
-	}).retryRefinementHook(
-
-		registry)
+	}, registry).retryRefinement
 
 	if err := hook(context.Background(), "restored"); err == nil {
 		t.Fatal("retry succeeded after the Drive restoration failed")

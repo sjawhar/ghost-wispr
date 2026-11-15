@@ -101,7 +101,7 @@ type replacementDrive interface {
 	// Drive runs.
 	Serialize(fn func() error) error
 	// CheckFolder returns nil while Drive has the folder out of the trash
-	// (Syncer.checkFolder).
+	// (Syncer.CheckFolder).
 	CheckFolder(ctx context.Context, folderID string) error
 	ListFolderFiles(ctx context.Context, folderID string) ([]*drive.File, error)
 	// UploadFile uploads one file into a folder and returns its id.
@@ -139,11 +139,9 @@ func (o *Orchestrator) replacementFailed(sessionID string, generation int, cause
 	}
 }
 
-func NewOrchestrator(syncer *Syncer, store OrchestratorStore, logger ...*slog.Logger) *Orchestrator {
-	return NewOrchestratorWithUploader(syncer, store, logger...)
-}
-
-func NewOrchestratorWithUploader(u driveClient, store OrchestratorStore, logger ...*slog.Logger) *Orchestrator {
+// NewOrchestrator syncs sessions of store to Drive u: a *Syncer, or a test
+// double.
+func NewOrchestrator(u driveClient, store OrchestratorStore, logger ...*slog.Logger) *Orchestrator {
 	l := logging.WithModule(slog.Default(), "gdrive")
 	if len(logger) > 0 && logger[0] != nil {
 		l = logging.WithModule(logger[0], "gdrive")

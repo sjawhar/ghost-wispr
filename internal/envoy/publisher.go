@@ -178,10 +178,10 @@ func (c *Client) signingKey(ctx context.Context, stale []byte) ([]byte, error) {
 	return key, nil
 }
 
-// Send posts ev to Envoy's webhook. It retries transient failures with the
-// event's stable delivery ID and returns immediately for a 4xx response, but
-// for a 401, which a rotated key gives: then it reads the key again, once,
-// and sends again with a new key. It sends nothing when it has no key.
+// Send posts ev to Envoy's webhook (sendWithRetries). A 401 is what a
+// rotated key gives: then Send reads the key again, once, and when it changed
+// sends again with it, with a new retry budget. It sends nothing when it has
+// no key.
 func (c *Client) Send(ctx context.Context, ev Event) error {
 	if c == nil {
 		return errors.New("envoy webhook client is nil")
@@ -203,28 +203,33 @@ func (c *Client) Send(ctx context.Context, ev Event) error {
 		return err
 	}
 
-	keyReread := false
+	err = c.sendWithRetries(ctx, ev.SessionID, eventType, delivery, body, key)
+	var status *webhookStatusError
+	if !errors.As(err, &status) || status.status != http.StatusUnauthorized {
+		return err
+	}
+	fresh, readErr := c.signingKey(ctx, key)
+	if readErr != nil {
+		return errors.Join(err, readErr)
+	}
+	if bytes.Equal(fresh, key) {
+		return err
+	}
+	return c.sendWithRetries(ctx, ev.SessionID, eventType, delivery, body, fresh)
+}
+
+// sendWithRetries posts body signed with key, retrying transient failures
+// after each of retryDelays with the event's stable delivery ID; a 4xx
+// response is returned at once.
+func (c *Client) sendWithRetries(ctx context.Context, sessionID string, eventType EventType, delivery string, body, key []byte) error {
+	signature := webhookSignature(key, body)
 	for attempt := 0; ; attempt++ {
-		retry, err := c.sendOnce(ctx, eventType, delivery, body, webhookSignature(key, body))
+		retry, err := c.sendOnce(ctx, eventType, delivery, body, signature)
 		if err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
-		}
-		var status *webhookStatusError
-		if !keyReread && errors.As(err, &status) && status.status == http.StatusUnauthorized {
-			keyReread = true
-			fresh, readErr := c.signingKey(ctx, key)
-			if readErr != nil {
-				return errors.Join(err, readErr)
-			}
-			if bytes.Equal(fresh, key) {
-				return err
-			}
-			key = fresh
-			attempt--
-			continue
 		}
 		if !retry || attempt == len(c.retryDelays) {
 			return err
@@ -233,7 +238,7 @@ func (c *Client) Send(ctx context.Context, ev Event) error {
 		delay := c.retryDelays[attempt]
 		c.logger.Warn("envoy webhook retry scheduled",
 			"event", eventType,
-			"session_id", ev.SessionID,
+			"session_id", sessionID,
 			"delivery", delivery,
 			"delay", delay.String(),
 			"error", err,

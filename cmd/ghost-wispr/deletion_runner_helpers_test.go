@@ -51,6 +51,9 @@ func withTestDefaults(r *segmentDeleteRunner) *segmentDeleteRunner {
 	if r.refused == nil {
 		r.refused = newRefusedCuts(r.store)
 	}
+	if r.warnings == nil {
+		r.warnings = newWarningsRegistry()
+	}
 	runner, err := newSegmentDeleteRunner(r)
 	if err != nil {
 		panic(err)
@@ -80,9 +83,10 @@ func recoveryRunner(store *storage.SQLiteStore, audioDir string, splice func(con
 }
 
 // retryRunner is a runner on store and audioDir that restores recordings
-// with ensure and refines with refine, for "Retry refinement".
-func retryRunner(store *storage.SQLiteStore, audioDir func() string, ensure func(context.Context, storage.Session) (deletionRecordingSet, error), refine func(context.Context, string, string, time.Time) error) *segmentDeleteRunner {
-	return withTestDefaults(&segmentDeleteRunner{store: store, audioDir: audioDir, ensureRecordings: ensure, refine: refine})
+// with ensure, refines with refine, and keeps a failed retry's warning in
+// warnings, for "Retry refinement".
+func retryRunner(store *storage.SQLiteStore, audioDir func() string, ensure func(context.Context, storage.Session) (deletionRecordingSet, error), refine func(context.Context, string, string, time.Time) error, warnings *warningsRegistry) *segmentDeleteRunner {
+	return withTestDefaults(&segmentDeleteRunner{store: store, audioDir: audioDir, ensureRecordings: ensure, refine: refine, warnings: warnings})
 }
 
 // noCutsGuard is a recording restore guard with no cuts and no sources: a

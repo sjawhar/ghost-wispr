@@ -82,7 +82,7 @@ func TestOrchestratorDoesNotMarkSyncedARecordingThatCameBackDuringTheUpload(t *t
 		t.Fatalf("summarize: %v", err)
 	}
 	uploader := &remountingUploader{recording: recording}
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 
 	if err := o.SyncSession(context.Background(), id); err == nil {
 		t.Errorf("sync succeeded; Drive got only %v", uploader.uploaded)
@@ -150,7 +150,7 @@ func TestGCNeverRemovesARecordingDriveSkippedOnARetry(t *testing.T) {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Sync on: the first sync stops after the summary, the transcript and
@@ -230,7 +230,7 @@ func TestOrchestratorRetryReplacesAChangedSummary(t *testing.T) {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 
 	drive.failAfter = 2 // the summary and the transcript, not the recording
 	if err := o.SyncSession(context.Background(), id); err == nil {
@@ -379,7 +379,7 @@ func TestOrchestratorDoesNotMarkSyncedARowGCPutAudioBackInDuringTheUpload(t *tes
 	store, id, stuck, content, finishGC := gcRestoreRace(t)
 	drive := newFakeDrive()
 	drive.onUpload = finishGC // GC puts the recording back during the upload
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 
 	syncErr := o.SyncSession(context.Background(), id)
 	sess, err := store.GetSession(id)
@@ -407,7 +407,7 @@ func TestOrchestratorDoesNotMarkSyncedARowGCPutAudioBackInDuringTheUpload(t *tes
 func TestGCReopensASyncThatRanWhileItHadTheRowMarked(t *testing.T) {
 	store, id, stuck, content, finishGC := gcRestoreRace(t)
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	if err := o.SyncSession(context.Background(), id); err != nil {
 		t.Fatalf("sync: %v", err)
 	}

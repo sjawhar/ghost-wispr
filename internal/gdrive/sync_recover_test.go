@@ -16,7 +16,7 @@ func TestAnInterruptedSyncIsRetriedInItsFolderAfterARestart(t *testing.T) {
 	const id = "20261106100000"
 	summarizedSession(t, store, t.TempDir(), id, time.Now().UTC().Add(-time.Hour), "A summary.")
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	ctx := context.Background()
 
 	// The first sync makes the folder and is cut off.
@@ -69,7 +69,7 @@ func TestFirstSyncCutOffAfterFolderCreationReusesTheFolderAndOwesIt(t *testing.T
 	const id = "20261106110000"
 	_, segments := round2Session(t, store, id, []string{"kept", "deleted"})
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 
 	drive.onFolderCreated = func() { panic("power loss") }
 	stopped := false
@@ -126,7 +126,7 @@ func TestASyncThatCannotRecordItsEndIsRetriedAfterARestart(t *testing.T) {
 	const id = "20261106100000"
 	summarizedSession(t, store, t.TempDir(), id, time.Now().UTC().Add(-time.Hour), "A summary.")
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	ctx := context.Background()
 
 	// The first sync makes the folder and is cut off.

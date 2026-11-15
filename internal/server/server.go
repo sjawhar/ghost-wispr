@@ -27,7 +27,23 @@ var (
 	ErrDriveUnavailable = errors.New("google drive did not answer")
 	// ErrSegmentRawAudioKept means a recoverable raw recording still holds the audio.
 	ErrSegmentRawAudioKept = errors.New("a kept raw recording prevents segment deletion")
+	// ErrSegmentRefinementFailed refuses a segment deletion in a session whose
+	// refinement failed; a retried refinement makes it deletable.
+	ErrSegmentRefinementFailed = errors.New("this conversation's refinement failed; retry refinement before deleting")
+	// ErrSegmentRecordingRestoring refuses a segment deletion in a session with
+	// no recording on this unit while its recording is restored from Drive and
+	// refined.
+	ErrSegmentRecordingRestoring = errors.New("no recording is on this unit; restoring it from Drive before deletion")
 )
+
+// SegmentRecordingUnavailableError refuses a segment deletion in a session
+// whose recording is neither on this unit nor restorable from Drive; Reason
+// says why, and is the answer's text.
+type SegmentRecordingUnavailableError struct{ Reason error }
+
+func (e *SegmentRecordingUnavailableError) Error() string { return e.Reason.Error() }
+
+func (e *SegmentRecordingUnavailableError) Unwrap() error { return e.Reason }
 
 // The modes a segment deletion takes (DELETE
 // /api/sessions/{id}/segments/{segmentID}?mode=): "Delete text" and "Delete

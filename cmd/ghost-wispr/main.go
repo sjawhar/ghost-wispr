@@ -1048,20 +1048,10 @@ func main() {
 	// the store, while its segment is there, naming the session and the
 	// segment's time.
 	refusedCuts := newRefusedCuts(store)
-	deletion, err := newAppDeleteRunner(store, cfgStore, manager.RefineSession, manager.SummarizeSession, refusedCuts, appLogger)
+	deletion, err := newAppDeleteRunner(store, cfgStore, manager.RefineSession, manager.SummarizeSession, refusedCuts, warningRegistry, appLogger)
 	if err != nil {
 		panic(fmt.Sprintf("segment deletion: %v", err))
 	}
-
-	checkRefinementRecording := func(_ context.Context, sessionID string) error {
-		sess, err := store.GetSession(sessionID)
-		if err != nil {
-			return err
-		}
-		return refinementRecordingAvailable(&sess, cfgStore.Get().AudioDir)
-	}
-
-	retryRefinement := deletion.retryRefinementHook(warningRegistry)
 	recordMergedRefinementFailure := newMergedRefinementFailureRecorder(store)
 
 	controlHooks := &server.ControlHooks{
@@ -1108,8 +1098,8 @@ func main() {
 		RetrySync: func(ctx context.Context, sessionID string) error {
 			return retrySync(ctx, drive.Get(), sessionID)
 		},
-		RefinementRecordingAvailable: checkRefinementRecording,
-		RetryRefinement:              retryRefinement,
+		RefinementRecordingAvailable: deletion.checkRefinementRecording,
+		RetryRefinement:              deletion.retryRefinement,
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			return repairStructuredSummaries(ctx, store, publishSummaryReady)
 		},
@@ -1137,7 +1127,7 @@ func main() {
 					summarizeMergedSession(ctx, store, summarizer, hub, publishSummaryReady, sessionID)
 					return nil
 				},
-				retryRefinement,
+				deletion.retryRefinement,
 				recordMergedRefinementFailure,
 				sessionID,
 			)

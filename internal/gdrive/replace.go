@@ -449,17 +449,6 @@ func (s *Syncer) Serialize(fn func() error) error {
 	return fn()
 }
 
-// CheckFolder returns nil while Drive has session folder folderID out of
-// the trash (checkFolder).
-func (s *Syncer) CheckFolder(ctx context.Context, folderID string) error {
-	return s.checkFolder(ctx, folderID)
-}
-
-// UploadFile uploads one file into Drive folder folderID and returns its id.
-func (s *Syncer) UploadFile(ctx context.Context, folderID string, file *SyncFile) (string, error) {
-	return s.uploadFileID(ctx, folderID, file)
-}
-
 // DeleteFile deletes Drive file fileID; one already gone is no error.
 func (s *Syncer) DeleteFile(ctx context.Context, fileID string) error {
 	err := s.service.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()

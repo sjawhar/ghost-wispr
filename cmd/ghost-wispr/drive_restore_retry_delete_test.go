@@ -17,6 +17,32 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
+// restoringRunnerServer is the HTTP handler main.go wires for segment
+// deletion and Retry refinement, over a deletion runner on store whose
+// restore from Drive reports each session it is asked for on retried and
+// then fails.
+func restoringRunnerServer(t *testing.T, store *storage.SQLiteStore, audioDir string, retried chan<- string) http.Handler {
+	t.Helper()
+	runner := testDeleteRunner(t, &segmentDeleteRunner{
+		store:    store,
+		audioDir: func() string { return audioDir },
+		ensureRecordings: func(_ context.Context, session storage.Session) (deletionRecordingSet, error) {
+			retried <- session.ID
+			return deletionRecordingSet{}, errors.New("this test's Drive has no recordings")
+		},
+	})
+	hooks := &server.ControlHooks{
+		RefinementRecordingAvailable: runner.checkRefinementRecording,
+		RetryRefinement:              runner.retryRefinement,
+	}
+	wireSegmentDeletion(hooks, newWarningsRegistry(), runner.refused, runner)
+	handler, err := server.Handler(fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok"), Mode: fs.ModePerm}}, server.NewHub(), store, hooks, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handler
+}
+
 func TestDriveRestoredSessionCanRetryBeforeDeletion(t *testing.T) {
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "restore.db"))
 	if err != nil {
@@ -49,22 +75,7 @@ func TestDriveRestoredSessionCanRetryBeforeDeletion(t *testing.T) {
 	}
 
 	retried := make(chan string, 2)
-	handler, err := server.Handler(fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok"), Mode: fs.ModePerm}}, server.NewHub(), store, &server.ControlHooks{
-		RefinementRecordingAvailable: func(context.Context, string) error {
-			current, err := store.GetSession("restored")
-			if err != nil {
-				return err
-			}
-			return refinementRecordingAvailable(&current, t.TempDir())
-		},
-		RetryRefinement: func(_ context.Context, id string) error {
-			retried <- id
-			return nil
-		},
-	}, "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler := restoringRunnerServer(t, store, t.TempDir(), retried)
 
 	retry := httptest.NewRecorder()
 	handler.ServeHTTP(retry, httptest.NewRequest(http.MethodPost, "/api/sessions/restored/retry-refinement", nil))
@@ -114,18 +125,7 @@ func TestDeleteNoAudioDoesNotPromiseUnavailableDriveRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	retried := make(chan string, 1)
-	handler, err := server.Handler(fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok"), Mode: fs.ModePerm}}, server.NewHub(), store, &server.ControlHooks{
-		RefinementRecordingAvailable: func(context.Context, string) error {
-			return errors.New("no recording is available on this unit or Drive")
-		},
-		RetryRefinement: func(_ context.Context, id string) error {
-			retried <- id
-			return nil
-		},
-	}, "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler := restoringRunnerServer(t, store, t.TempDir(), retried)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/sessions/unavailable/segments/1?mode=text&revision=1", nil))
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "no recording is available") {

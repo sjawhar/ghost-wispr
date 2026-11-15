@@ -408,10 +408,10 @@ func retryRefinementWithFailureWarning(ctx context.Context, registry *warningsRe
 	return err
 }
 
-// retryRefinementHook is the "Retry refinement" action: it restores the
+// retryRefinement is the "Retry refinement" action: it restores the
 // session's recordings this unit lacks (ensureRecordings), then refines it,
 // and keeps a status warning while the retry fails.
-func (d *segmentDeleteRunner) retryRefinementHook(registry *warningsRegistry) func(context.Context, string) error {
+func (d *segmentDeleteRunner) retryRefinement(ctx context.Context, sessionID string) error {
 	ensure := func(ctx context.Context, sessionID string) error {
 		session, err := d.store.GetSession(sessionID)
 		if err != nil {
@@ -419,11 +419,21 @@ func (d *segmentDeleteRunner) retryRefinementHook(registry *warningsRegistry) fu
 		}
 		return d.restoreRefinementRecording(ctx, d.store, &session, d.audioDir(), d.ensureRecordings)
 	}
-	return func(ctx context.Context, sessionID string) error {
-		return retryRefinementWithFailureWarning(ctx, registry, sessionID, func(ctx context.Context, sessionID string) error {
-			return retryRefinementAfterRestoringRecording(ctx, sessionID, ensure, func(ctx context.Context, sessionID string) error {
-				return retryRefinementWithWarningClear(ctx, registry, d.store, sessionID, d.refine)
-			})
+	return retryRefinementWithFailureWarning(ctx, d.warnings, sessionID, func(ctx context.Context, sessionID string) error {
+		return retryRefinementAfterRestoringRecording(ctx, sessionID, ensure, func(ctx context.Context, sessionID string) error {
+			return retryRefinementWithWarningClear(ctx, d.warnings, d.store, sessionID, d.refine)
 		})
+	})
+}
+
+// checkRefinementRecording returns why session sessionID has no recording a
+// refinement could use, on this unit or on Drive, or nil
+// (refinementRecordingAvailable): the check Retry refinement answers with
+// before it starts.
+func (d *segmentDeleteRunner) checkRefinementRecording(_ context.Context, sessionID string) error {
+	session, err := d.store.GetSession(sessionID)
+	if err != nil {
+		return err
 	}
+	return refinementRecordingAvailable(&session, d.audioDir())
 }

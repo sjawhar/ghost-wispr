@@ -100,7 +100,7 @@ func TestStatusWarnsWhileASessionIsKeptOnThisUnitOnly(t *testing.T) {
 		t.Errorf("kept on this unit only: unit_only_sessions %d, warnings %q; want 1 and %q", n, warnings, warning)
 	}
 
-	if err := gdrive.NewOrchestratorWithUploader(folderBackUploader{}, store, logger).SyncSession(context.Background(), id); err != nil {
+	if err := gdrive.NewOrchestrator(folderBackUploader{}, store, logger).SyncSession(context.Background(), id); err != nil {
 		t.Fatalf("retry with the folder back: %v", err)
 	}
 	if n, warnings := status(); n != 0 || slices.Contains(warnings, warning) {

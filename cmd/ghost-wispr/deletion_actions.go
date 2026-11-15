@@ -16,8 +16,14 @@ import (
 
 // DeleteRefinedText removes one selected batch-derived occurrence and then
 // regenerates its summary. The segment id and revision are the authority; no
-// text is aligned against another transcription.
+// text is aligned against another transcription. An untimed segment
+// (revision 0) needs no refinement.
 func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+	if revision != 0 {
+		if err := d.readyToDelete(sessionID); err != nil {
+			return err
+		}
+	}
 	if d.locks.isRecovering(sessionID) {
 		return recordingRestoreInProgress()
 	}
@@ -39,7 +45,7 @@ func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID s
 		}
 		return nil
 	}
-	if err := d.refinedSegmentsAvailable(sessionID, &session); err != nil {
+	if err := d.refinedSegmentsAvailable(&session); err != nil {
 		return err
 	}
 	if err := d.store.DeleteRefinedSegmentText(sessionID, segmentID, revision); err != nil {
@@ -51,25 +57,69 @@ func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID s
 	return nil
 }
 
-// refinedSegmentsAvailable returns storage.ErrRefinedSegmentsUnavailable
-// unless session has a completed refinement with timed words. An older
-// completed session has live-only segments: this starts the existing batch
-// refinement for it, and a deletion then selects from its new table.
-func (d *segmentDeleteRunner) refinedSegmentsAvailable(sessionID string, session *storage.Session) error {
-	if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision != 0 {
-		return nil
+// readyToDelete reads session sessionID and refuses a deletion from it while
+// it is recording or has no timed words to delete from
+// (refinedSegmentsAvailable). A deletion asks it before it checks for a
+// recovery under way, so a session both recovering and not refined is told
+// it is not refined, as the segment-delete route answered before the runner
+// made this decision.
+func (d *segmentDeleteRunner) readyToDelete(sessionID string) error {
+	session, err := d.store.GetSession(sessionID)
+	if err != nil {
+		return err
 	}
-	if session.RefinementStatus == storage.RefinementCompleted && strings.TrimSpace(session.AudioPath) != "" {
-		audioPath, startedAt := session.AudioPath, session.StartedAt
-		go func() { _ = d.refine(context.Background(), sessionID, audioPath, startedAt) }()
+	if session.Status == storage.SessionActive {
+		return storage.ErrSegmentSessionActive
 	}
-	return storage.ErrRefinedSegmentsUnavailable
+	return d.refinedSegmentsAvailable(&session)
+}
+
+// refinedSegmentsAvailable returns nil when session has a completed
+// refinement with timed words, which a deletion selects from. Otherwise it
+// refuses, and starts what makes the session deletable:
+//   - completed without timed words (an older session with live-only
+//     segments): it starts Retry refinement, which restores the recording
+//     from Drive first, and returns storage.ErrRefinedSegmentsUnavailable;
+//   - no recording on this unit: when one can be had
+//     (refinementRecordingAvailable) it starts Retry refinement and returns
+//     server.ErrSegmentRecordingRestoring, else a
+//     server.SegmentRecordingUnavailableError saying why;
+//   - failed: server.ErrSegmentRefinementFailed, for the user to retry;
+//   - pending or running: storage.ErrRefinedSegmentsUnavailable.
+func (d *segmentDeleteRunner) refinedSegmentsAvailable(session *storage.Session) error {
+	switch session.RefinementStatus {
+	case storage.RefinementCompleted:
+		if session.RefinedRevision != 0 {
+			return nil
+		}
+		d.startRetryRefinement(session.ID)
+		return storage.ErrRefinedSegmentsUnavailable
+	case storage.RefinementNoAudio:
+		if err := refinementRecordingAvailable(session, d.audioDir()); err != nil {
+			return &server.SegmentRecordingUnavailableError{Reason: err}
+		}
+		d.startRetryRefinement(session.ID)
+		return server.ErrSegmentRecordingRestoring
+	case storage.RefinementFailed:
+		return server.ErrSegmentRefinementFailed
+	default:
+		return storage.ErrRefinedSegmentsUnavailable
+	}
+}
+
+// startRetryRefinement starts Retry refinement of session sessionID in the
+// background; a failure is kept on /api/status (retryRefinement).
+func (d *segmentDeleteRunner) startRetryRefinement(sessionID string) {
+	go func() { _ = d.retryRefinement(context.Background(), sessionID) }()
 }
 
 // DeleteRefinedAudio removes the selected stored word span from its recording.
 // Its boundary comes from the persisted occurrence; a small margin is used
 // only when no neighbouring stored word occupies it.
 func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+	if err := d.readyToDelete(sessionID); err != nil {
+		return err
+	}
 	if d.locks.isRecovering(sessionID) {
 		return recordingRestoreInProgress()
 	}
@@ -82,7 +132,7 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	if session.Status == storage.SessionActive {
 		return storage.ErrSegmentSessionActive
 	}
-	if err := d.refinedSegmentsAvailable(sessionID, &session); err != nil {
+	if err := d.refinedSegmentsAvailable(&session); err != nil {
 		return err
 	}
 	if revision != session.RefinedRevision {

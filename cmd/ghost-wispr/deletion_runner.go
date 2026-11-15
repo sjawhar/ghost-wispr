@@ -43,6 +43,9 @@ type segmentDeleteRunner struct {
 	// refused keeps a refused cut's /api/status warning while its segment is
 	// there.
 	refused *refusedCuts
+	// warnings keeps a failed Retry refinement on /api/status
+	// (retryRefinement).
+	warnings *warningsRegistry
 
 	locks sessionDeletionLocks
 }
@@ -62,6 +65,7 @@ func newSegmentDeleteRunner(r *segmentDeleteRunner) (*segmentDeleteRunner, error
 		"summarize":        r.summarize == nil,
 		"transcribeCut":    r.transcribeCut == nil,
 		"refused":          r.refused == nil,
+		"warnings":         r.warnings == nil,
 	} {
 		if absent {
 			missing = append(missing, name)
@@ -78,7 +82,7 @@ func newSegmentDeleteRunner(r *segmentDeleteRunner) (*segmentDeleteRunner, error
 // configuration as it is then: its audio directory, its Drive folder and the
 // batch transcription that checks a cut. Batch transcription has already
 // persisted the exact word spans, so deleting never creates a locator.
-func newAppDeleteRunner(store *storage.SQLiteStore, cfgStore *config.Store, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, refused *refusedCuts, logger *slog.Logger) (*segmentDeleteRunner, error) {
+func newAppDeleteRunner(store *storage.SQLiteStore, cfgStore *config.Store, refine func(context.Context, string, string, time.Time) error, summarize func(context.Context, string, time.Time) error, refused *refusedCuts, warnings *warningsRegistry, logger *slog.Logger) (*segmentDeleteRunner, error) {
 	return newSegmentDeleteRunner(&segmentDeleteRunner{
 		store:    store,
 		audioDir: func() string { return cfgStore.Get().AudioDir },
@@ -114,7 +118,8 @@ func newAppDeleteRunner(store *storage.SQLiteStore, cfgStore *config.Store, refi
 			}
 			return result.Words, nil
 		},
-		refused: refused,
+		refused:  refused,
+		warnings: warnings,
 	})
 }
 

@@ -125,7 +125,7 @@ func TestASessionSyncedAfterTheUpgradeIsVerified(t *testing.T) {
 		t.Fatalf("edit title: %v", err)
 	}
 	drive := newFakeDrive()
-	sweep(t, store, NewOrchestratorWithUploader(drive, store))
+	sweep(t, store, NewOrchestrator(drive, store))
 	if state, folder := sessionState(t, store, id); state != storage.SyncStateSynced || folder != "folder-a" {
 		t.Fatalf("after the sweep: %q in folder %q, want synced in folder-a", state, folder)
 	}

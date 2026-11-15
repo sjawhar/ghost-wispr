@@ -79,9 +79,7 @@ func suiteProvenanceDelete(t *testing.T, refinedFirst bool) string {
 	refine := suiteTwoWordRefine(store)
 	retry := retryRunner(store, func() string { return dir }, func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &session, dir, source, "")
-	}, refine).retryRefinementHook(
-
-		newWarningsRegistry())
+	}, refine, newWarningsRegistry()).retryRefinement
 
 	onSessionMerged(context.Background(), store, refine, func(context.Context, string, time.Time) error { return nil }, retry,
 		func(_ context.Context, _ string, cause error) { t.Fatalf("hook failed: %v", cause) }, "merged")

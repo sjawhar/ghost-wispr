@@ -61,9 +61,7 @@ func TestMergeHookRecordsAnUnrestorableRefinementAsFailed(t *testing.T) {
 	refine := suiteTwoWordRefine(store)
 	retry := retryRunner(store, func() string { return dir }, func(ctx context.Context, s storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &s, dir, source, "")
-	}, refine).retryRefinementHook(
-
-		newWarningsRegistry())
+	}, refine, newWarningsRegistry()).retryRefinement
 
 	onSessionMerged(context.Background(), store, refine, func(context.Context, string, time.Time) error { return nil }, retry,
 		newMergedRefinementFailureRecorder(store), "merged")

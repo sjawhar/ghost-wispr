@@ -70,9 +70,7 @@ func reviewR19RestoredThenMergedDelete(t *testing.T, throughRestore bool) string
 	refine := suiteTwoWordRefine(store)
 	retry := retryRunner(store, func() string { return dir }, func(ctx context.Context, s storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &s, dir, source, "")
-	}, refine).retryRefinementHook(
-
-		newWarningsRegistry())
+	}, refine, newWarningsRegistry()).retryRefinement
 
 	onSessionMerged(context.Background(), store, refine, func(context.Context, string, time.Time) error { return nil }, retry,
 		func(_ context.Context, _ string, cause error) { t.Fatalf("hook failed: %v", cause) }, "merged")
