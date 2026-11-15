@@ -244,6 +244,14 @@ func refusedCutFixture(t *testing.T) (*storage.SQLiteStore, string, int64, int) 
 // closed, and returns its path.
 func refusedCutDatabase(t *testing.T) (dbPath, recording string, segmentID int64, revision int) {
 	t.Helper()
+	return refusedCutDatabaseThen(t, 66.5)
+}
+
+// refusedCutDatabaseThen is refusedCutDatabase with the next segment, "Then
+// left.", starting at then: at 64.6 s it touches the "tractor" segment, which
+// ends at 64.4 s, so a cut of either reaches into the other.
+func refusedCutDatabaseThen(t *testing.T, then float64) (dbPath, recording string, segmentID int64, revision int) {
+	t.Helper()
 	recording = filepath.Join(t.TempDir(), "recording.mp3")
 	if err := os.WriteFile(recording, []byte("original"), 0o600); err != nil {
 		t.Fatal(err)
@@ -271,7 +279,7 @@ func refusedCutDatabase(t *testing.T) (dbPath, recording string, segmentID int64
 	words := []storage.RefinedWord{
 		word(0, 0, "So", 0.2, 0.5), word(1, 0, "we", 0.6, 0.8), word(2, 0, "met.", 0.9, 1.2),
 		word(3, 1, "Orange", 63.0, 63.4), word(4, 1, "tractor", 63.5, 63.9), word(5, 1, "ninety.", 64.0, 64.4),
-		word(6, 0, "Then", 66.5, 66.8), word(7, 0, "left.", 66.9, 67.2),
+		word(6, 0, "Then", then, then+0.3), word(7, 0, "left.", then+0.4, then+0.7),
 	}
 	revision, err = store.PublishRefinementAtGeneration("s", storage.RefinedTranscript(words), "nova-3", words, storage.BuildRefinedSegments(words), 0)
 	if err != nil {

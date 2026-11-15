@@ -71,9 +71,6 @@ func (s *AsyncSender) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Dropped returns how many chunks were dropped because the queue was full.
-func (s *AsyncSender) Dropped() int64 { return s.dropped.Load() }
-
 // Finalize asks dst to finalize once every chunk queued before it is sent.
 // It waits up to finalizeQueueWait for its turn and the answer.
 func (s *AsyncSender) Finalize() error {

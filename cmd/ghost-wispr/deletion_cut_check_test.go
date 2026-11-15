@@ -9,6 +9,7 @@ package main
 // transcription replays them.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,6 +44,33 @@ func loadDeletionCutFixtures(t *testing.T) []deletionCutFixture {
 		all = append(all, fixtures...)
 	}
 	return all
+}
+
+// TestDeletionCutFixturesAreWhatTheMeasurementWrites fails if a checked-in
+// fixture differs from what TestMeasureDeletionAudioPad writes for its data,
+// such as one trimmed by hand.
+func TestDeletionCutFixturesAreWhatTheMeasurementWrites(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("testdata", "deletion_cut", "*.json"))
+	if err != nil || len(paths) != 2 {
+		t.Fatalf("deletion cut fixtures = %v (%v), want the two recordings'", paths, err)
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fixtures []deletionCutFixture
+		if err := json.Unmarshal(data, &fixtures); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		written, err := encodeDeletionCutFixtures(fixtures)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(written, data) {
+			t.Errorf("%s (%d bytes) is not what the measurement writes for its data (%d bytes)", path, len(data), len(written))
+		}
+	}
 }
 
 // heardAt reports whether the fixture's cut with pad leaves a word of its
@@ -132,19 +160,54 @@ func TestDeletionCutCheckHearsTheControls(t *testing.T) {
 	t.Logf("the check heard a deleted word in %d of %d middle-only control cuts", heard, controls)
 }
 
-// TestDeletionCutFixturesSummary logs, by the check's rule, how many recorded
-// cuts left a deleted word heard at each pad, and which segments.
-func TestDeletionCutFixturesSummary(t *testing.T) {
+// TestDeletionCutFixturesBackThePadComment fails if the recorded cuts no
+// longer show what deletionAudioPad's comment says of them: by the check's
+// rule, how many cuts of each recording left a deleted word heard with no pad
+// and with the pad, and how much neighbouring speech the pad cuts.
+func TestDeletionCutFixturesBackThePadComment(t *testing.T) {
+	type measure struct {
+		heard             int
+		meanCost, maxCost float64
+	}
+	byRecording := map[string]map[float64]*measure{}
 	fixtures := loadDeletionCutFixtures(t)
-	for _, pad := range measuredPads {
-		heard := 0
-		for i := range fixtures {
-			if heardAt(&fixtures[i], pad) {
-				heard++
-				t.Logf("pad %.2f: %s segment at %.3f s", pad, fixtures[i].Recording, fixtures[i].Segment.StartTime)
-			}
+	for i := range fixtures {
+		f := &fixtures[i]
+		if byRecording[f.Recording] == nil {
+			byRecording[f.Recording] = map[float64]*measure{0: {}, deletionAudioPad: {}}
 		}
-		t.Logf("pad %.2f: %d of %d recorded cuts left a deleted word heard within %.1f s", pad, heard, len(fixtures), deletionCutWindow)
+		for _, cut := range f.Cuts {
+			m := byRecording[f.Recording][cut.Pad]
+			if m == nil {
+				continue
+			}
+			if heardAt(f, cut.Pad) {
+				m.heard++
+			}
+			cost := 0.0
+			for _, word := range f.Words {
+				if word.Start >= f.Segment.StartTime && word.End <= f.Segment.EndTime {
+					continue
+				}
+				cost += max(0, min(word.End, cut.End)-max(word.Start, cut.Start))
+			}
+			m.meanCost += cost / 30
+			m.maxCost = max(m.maxCost, cost)
+		}
+	}
+	for recording, want := range map[string]struct {
+		noPad, pad int
+		meanCost   float64
+	}{"clean.mp3": {9, 1, 0.66}, "room.mp3": {6, 2, 0.72}} {
+		got := byRecording[recording]
+		if got[0].heard != want.noPad || got[deletionAudioPad].heard != want.pad {
+			t.Errorf("%s: cuts with a deleted word heard = %d with no pad and %d with %.2f s, the comment says %d and %d",
+				recording, got[0].heard, got[deletionAudioPad].heard, deletionAudioPad, want.noPad, want.pad)
+		}
+		if cost := got[deletionAudioPad]; math.Abs(cost.meanCost-want.meanCost) > 0.005 || cost.maxCost > 0.9+1e-9 {
+			t.Errorf("%s: neighbouring speech cut at %.2f s = mean %.3f s, max %.3f s; the comment says %.2f s, at most 0.90 s",
+				recording, deletionAudioPad, cost.meanCost, cost.maxCost, want.meanCost)
+		}
 	}
 }
 

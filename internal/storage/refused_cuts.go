@@ -59,18 +59,61 @@ func (s *SQLiteStore) ForgetRefusedCut(cut RefusedCut) error {
 }
 
 // moveRefusedCutsAfterSplice keeps the refused cuts of a spliced recording in
-// its new timeline, in the splice's transaction: a refused cut the splice
-// overlaps is gone with its words, and one after it moves back by its length.
-// A recording's file name is the session's id, so it names the recording in
-// whichever session the cut was refused in.
+// its new timeline, in the splice's transaction, as moveRefinedWordsAfterSplice
+// moves the words: a time before the splice stays, a time inside it goes to
+// its start, and a time after it moves back by its length. A refused cut the
+// splice covers is gone with its words; one it overlaps, such as one the pad
+// of a touching neighbour's cut reaches into, is trimmed to what is left. A
+// recording's file name is the session's id, so it names the recording in
+// whichever session the cut was refused in. The rows are rewritten together,
+// so two refused cuts that end up with one span keep one row.
 func moveRefusedCutsAfterSplice(tx *sql.Tx, span *DeletedSpan) error {
 	recording := filepath.Base(span.AudioPath)
-	if _, err := tx.Exec(`DELETE FROM refused_cuts WHERE recording = ? AND end > ? AND start < ?`, recording, span.Start, span.End); err != nil {
-		return fmt.Errorf("drop refused cuts a splice removed: %w", err)
+	rows, err := tx.Query(`SELECT session_id, start, end, refused_at FROM refused_cuts WHERE recording = ? ORDER BY refused_at, rowid`, recording)
+	if err != nil {
+		return fmt.Errorf("read refused cuts of %s for its splice: %w", recording, err)
 	}
-	if _, err := tx.Exec(`UPDATE refused_cuts SET start = start - ?1, end = end - ?1 WHERE recording = ?2 AND start >= ?3`,
-		span.End-span.Start, recording, span.End); err != nil {
-		return fmt.Errorf("move refused cuts after splice: %w", err)
+	type kept struct {
+		cut       RefusedCut
+		refusedAt string
+	}
+	var cuts []kept
+	for rows.Next() {
+		k := kept{cut: RefusedCut{Recording: recording}}
+		if err := rows.Scan(&k.cut.SessionID, &k.cut.Start, &k.cut.End, &k.refusedAt); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan refused cut of %s: %w", recording, err)
+		}
+		cuts = append(cuts, k)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("read refused cuts of %s for its splice: %w", recording, err)
+	}
+	if len(cuts) == 0 {
+		return nil
+	}
+	move := func(t float64) float64 {
+		switch {
+		case t <= span.Start:
+			return t
+		case t >= span.End:
+			return t - (span.End - span.Start)
+		default:
+			return span.Start
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM refused_cuts WHERE recording = ?`, recording); err != nil {
+		return fmt.Errorf("clear refused cuts of %s for its splice: %w", recording, err)
+	}
+	for _, k := range cuts {
+		start, end := move(k.cut.Start), move(k.cut.End)
+		if end <= start {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO refused_cuts(session_id, recording, start, end, refused_at) VALUES(?, ?, ?, ?, ?)`,
+			k.cut.SessionID, recording, start, end, k.refusedAt); err != nil {
+			return fmt.Errorf("move refused cut of %s past its splice: %w", recording, err)
+		}
 	}
 	return nil
 }

@@ -220,7 +220,7 @@ func TestMeasureDeletionAudioPad(t *testing.T) {
 			}
 			fixtures = append(fixtures, fixture)
 		}
-		data, err := json.MarshalIndent(fixtures, "", " ")
+		data, err := encodeDeletionCutFixtures(fixtures)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,4 +228,58 @@ func TestMeasureDeletionAudioPad(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// fixtureHeardWindow is how far either side of a cut point a fixture keeps
+// the words its transcription heard: more than any window the check uses.
+const fixtureHeardWindow = 1.5
+
+// encodeDeletionCutFixtures writes fixtures as testdata/deletion_cut holds
+// them: each word with only its recording, text and times, and each cut's
+// heard words with only their text and times, within fixtureHeardWindow of
+// the cut point.
+func encodeDeletionCutFixtures(fixtures []deletionCutFixture) ([]byte, error) {
+	type word struct {
+		RecordingPath, RecordingSHA256, Text string
+		Start, End                           float64
+	}
+	type heard struct {
+		Text       string
+		Start, End float64
+	}
+	type cut struct {
+		Pad   float64 `json:"pad"`
+		Start float64 `json:"start"`
+		End   float64 `json:"end"`
+		Heard []heard `json:"heard"`
+	}
+	type fixture struct {
+		Recording string             `json:"recording"`
+		Segment   transcribe.Segment `json:"segment"`
+		Words     []word             `json:"words"`
+		Cuts      []cut              `json:"cuts"`
+	}
+	out := make([]fixture, 0, len(fixtures))
+	for i := range fixtures {
+		f := &fixtures[i]
+		written := fixture{Recording: f.Recording, Segment: f.Segment, Words: []word{}, Cuts: []cut{}}
+		for _, w := range f.Words {
+			written.Words = append(written.Words, word{RecordingPath: w.RecordingPath, RecordingSHA256: w.RecordingSHA256, Text: w.Text, Start: w.Start, End: w.End})
+		}
+		for _, c := range f.Cuts {
+			kept := cut{Pad: c.Pad, Start: c.Start, End: c.End, Heard: []heard{}}
+			for _, h := range c.Heard {
+				if h.End >= c.Start-fixtureHeardWindow && h.Start <= c.Start+fixtureHeardWindow {
+					kept.Heard = append(kept.Heard, heard{Text: h.Text, Start: h.Start, End: h.End})
+				}
+			}
+			written.Cuts = append(written.Cuts, kept)
+		}
+		out = append(out, written)
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
 }

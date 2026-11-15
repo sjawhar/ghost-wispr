@@ -485,7 +485,7 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	}
 	tempPath, start, end, afterHash, err := d.cutAndCheck(ctx, session.RefinementModel, recording, words, selected, duration)
 	if err != nil {
-		if errors.Is(err, errDeletionCutHeard) && d.refused != nil {
+		if (errors.Is(err, errDeletionCutHeard) || errors.Is(err, errDeletionCutUnchecked)) && d.refused != nil {
 			cut := storage.RefusedCut{SessionID: sessionID, Recording: filepath.Base(selected.RecordingPath), Start: selected.StartTime, End: selected.EndTime}
 			if keepErr := d.refused.Refused(cut); keepErr != nil {
 				return fmt.Errorf("%w; its status warning could not be kept: %v", err, keepErr)
@@ -534,14 +534,11 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 // on the #65 review). Measured with TestMeasureDeletionAudioPad on the
 // review's two recordings, 30 cuts each, by the check's rule
 // (testdata/deletion_cut): with no pad 9 and 6 cuts left a deleted word heard
-// next to the cut; with 0.45 s, 1 and 2, for 0.67 to 0.72 s of neighbouring
-// speech per cut on average and at most 0.90 s. The check after each cut
-// handles what the pad leaves.
+// next to the cut; with 0.45 s, 1 and 2, for 0.66 and 0.72 s of neighbouring
+// speech per cut on average and at most 0.90 s
+// (TestDeletionCutFixturesBackThePadComment checks these). The check after
+// each cut handles what the pad leaves.
 const deletionAudioPad = 0.45
-
-func refinedSpliceBounds(words []storage.RefinedWord, selected *transcribe.Segment) (float64, float64) {
-	return refinedSpliceBoundsWithPad(words, selected, deletionAudioPad)
-}
 
 // refinedSpliceBoundsWithPad cuts pad seconds past the segment's words on
 // each side, and keeps the earlier 0.25 s margin where it cuts more: up to

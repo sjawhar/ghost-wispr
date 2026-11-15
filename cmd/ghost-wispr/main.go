@@ -2170,7 +2170,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if cfg.DeepgramAPIKey != "" {
 		deepgramHealth = &resilientClientProxy{ref: &resilientRef}
 	}
-	healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, capture, llmTracker)
+	healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, captureReadiness{capture: capture, mic: micStatus}, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))

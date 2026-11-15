@@ -158,7 +158,7 @@ func TestRefinedSpliceBoundsPadIntoNeighbours(t *testing.T) {
 		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 1, Start: 1, End: 2},
 		{RecordingPath: "recording.mp3", RecordingSHA256: "hash", Ordinal: 2, Start: 2.1, End: 2.5},
 	}
-	start, end := refinedSpliceBounds(words, &selected)
+	start, end := refinedSpliceBoundsWithPad(words, &selected, deletionAudioPad)
 	if math.Abs(start-(1-deletionAudioPad)) > 1e-9 || math.Abs(end-(2+deletionAudioPad)) > 1e-9 {
 		t.Fatalf("splice bounds = %v..%v, want %v past the segment's words on each side", start, end, deletionAudioPad)
 	}

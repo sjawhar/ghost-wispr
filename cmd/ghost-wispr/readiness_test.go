@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/server"
 )
@@ -68,4 +69,28 @@ func TestReadinessStaysReadyWhileAResumeBringsCaptureBack(t *testing.T) {
 	expect("the resume's start finished", http.StatusOK, "open", "connected")
 	deepgram.connected.Store(false)
 	expect("Deepgram lost after the resume", http.StatusServiceUnavailable, "open", "disconnected")
+}
+
+// TestReadinessFailsWhileNoAudioIsRecorded fails if readiness answers 200
+// while the microphone is open and the gate open but no audio reaches the
+// recording: the unit records nothing then, and /api/status says no_audio.
+func TestReadinessFailsWhileNoAudioIsRecorded(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	mic := &openMicFake{}
+	mic.open.Store(true)
+	deepgram := &deepgramFake{}
+	deepgram.connected.Store(true)
+	checker := server.NewDefaultHealthChecker(deepgram, pingOK{}, mic, captureReadiness{capture: capture, mic: mic}, nil)
+
+	capture.armAudio()
+	if code, ready := readiness(t, checker); code != http.StatusOK || ready.Mic != "open" {
+		t.Fatalf("readiness while audio is recorded = %d with mic %q, want 200 with open", code, ready.Mic)
+	}
+	capture.audioAt.Store(time.Now().Add(-time.Minute).UnixNano())
+	if got := capture.captureState(mic); got != captureNoAudio {
+		t.Fatalf("capture state = %q, want %q", got, captureNoAudio)
+	}
+	if code, ready := readiness(t, checker); code != http.StatusServiceUnavailable || ready.Mic != captureNoAudio {
+		t.Fatalf("readiness while no audio is recorded = %d with mic %q, want 503 with %q", code, ready.Mic, captureNoAudio)
+	}
 }

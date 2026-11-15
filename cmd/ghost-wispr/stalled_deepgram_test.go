@@ -66,13 +66,19 @@ func (m *deliveringMic) Stream(w io.Writer) error {
 }
 
 // recordedBytes counts what reaches the recording: the recorder's writer
-// wrapped by the test.
+// wrapped by the test. With dark set, it also counts the writes that reach
+// the recording while dark reports the light is not red.
 type recordedBytes struct {
-	dst   io.Writer
-	bytes atomic.Int64
+	dst        io.Writer
+	bytes      atomic.Int64
+	dark       func() bool
+	darkWrites atomic.Int64
 }
 
 func (r *recordedBytes) Write(p []byte) (int, error) {
+	if r.dark != nil && r.dark() {
+		r.darkWrites.Add(1)
+	}
 	n, err := r.dst.Write(p)
 	r.bytes.Add(int64(n))
 	return n, err
@@ -86,6 +92,28 @@ type micRig struct {
 	dials    *atomic.Int64
 	recorded *recordedBytes
 	port     int // the local Deepgram peer's port
+}
+
+// rigStopTimeout bounds each step of the rig's cleanup, so a failed test
+// reports its failure rather than hanging to go test's timeout.
+const rigStopTimeout = 10 * time.Second
+
+// stopWithin runs stop, and fails the test if it has not returned within
+// rigStopTimeout; it then leaves it running.
+func stopWithin(t *testing.T, what string, stop func()) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), rigStopTimeout)
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stop()
+	}()
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Errorf("%s did not stop within %v of the test's end", what, rigStopTimeout)
+	}
 }
 
 // startMicRig runs the production microphone chain against a local Deepgram
@@ -122,16 +150,22 @@ func startMicRig(t *testing.T, peerReads bool, writeLimit time.Duration) *micRig
 	}))
 	ctx, cancel := context.WithCancel(context.Background())
 	var loops sync.WaitGroup
+	mic := &deliveringMic{chunk: 64 << 10, interval: 2 * time.Millisecond}
 	t.Cleanup(func() {
 		cancel()
+		// A held microphone writes nothing, so only closing it ends its
+		// Stream, and with it the mic loop.
+		_ = mic.Stop()
 		stalledMu.Lock()
 		for _, c := range stalled {
 			_ = c.Close()
 		}
 		stalledMu.Unlock()
 		srv.CloseClientConnections()
-		srv.Close()
-		loops.Wait()
+		stopWithin(t, "the rig's microphone loop and peer", func() {
+			srv.Close()
+			loops.Wait()
+		})
 	})
 
 	cOptions := &interfaces.ClientOptions{Host: "ws://" + srv.Listener.Addr().String(), EnableKeepAlive: true}
@@ -146,17 +180,17 @@ func startMicRig(t *testing.T, peerReads bool, writeLimit time.Duration) *micRig
 	resilient := transcribe.NewResilientClient(ctx, nil, transcribe.ResilientConfig{BufferSize: 1 << 20, InitialReconnectDelay: 50 * time.Millisecond, MaxReconnectBackoff: 200 * time.Millisecond}, log.Printf, nil)
 	resilient.Factory = factory
 	resilient.Client = initial
-	t.Cleanup(func() { _ = resilient.Close() })
+	t.Cleanup(func() { stopWithin(t, "the Deepgram client", func() { _ = resilient.Close() }) })
 
 	rig := &micRig{
-		mic:      &deliveringMic{chunk: 64 << 10, interval: 2 * time.Millisecond},
+		mic:      mic,
 		capture:  newCaptureGate(nil, nil, nil),
 		device:   &pluggableLight{present: true},
 		warnings: newWarningsRegistry(),
 		dials:    &dials,
 		port:     srv.Listener.Addr().(*net.TCPAddr).Port,
 	}
-	rig.recorded = &recordedBytes{}
+	rig.recorded = &recordedBytes{dark: func() bool { return !rig.device.isRed() }}
 	startTestLight(t, rig.device, 100*time.Millisecond, rig.capture, rig.mic, rig.warnings)
 	recorder := audio.NewRecorder(t.TempDir())
 	originalStarter := streamMicLoopStarter
@@ -279,6 +313,27 @@ func TestLightGoesOffWhenNoAudioIsRecorded(t *testing.T) {
 	waitForHardwareWithin(t, 5*time.Second, "the light red again once audio is recorded", func() bool {
 		return rig.device.isRed() && rig.capture.captureState(rig.mic) == captureCapturing
 	})
+}
+
+// TestAudioAfterAStallIsRecordedOnlyWithTheLightRed fails if audio that
+// comes back after a stall turned the light off reaches the recording before
+// the light is red again: up to a light check's interval of it was recorded
+// with the light off.
+func TestAudioAfterAStallIsRecordedOnlyWithTheLightRed(t *testing.T) {
+	rig := startMicRig(t, true, 300*time.Millisecond)
+	rig.mic.held.Store(true)
+	waitForHardwareWithin(t, 5*time.Second, "the light off while no audio is recorded", func() bool {
+		return !rig.device.isRed() && rig.capture.captureState(rig.mic) == captureNoAudio
+	})
+	rig.recorded.darkWrites.Store(0)
+	before := rig.recorded.bytes.Load()
+	rig.mic.held.Store(false)
+	waitForHardwareWithin(t, 5*time.Second, "audio recorded again", func() bool {
+		return rig.recorded.bytes.Load() > before && rig.capture.captureState(rig.mic) == captureCapturing
+	})
+	if dark := rig.recorded.darkWrites.Load(); dark != 0 {
+		t.Fatalf("%d buffers of audio reached the recording with the light off after the stall ended", dark)
+	}
 }
 
 func waitForHardwareWithin(t *testing.T, within time.Duration, description string, predicate func() bool) {

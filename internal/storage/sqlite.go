@@ -1480,6 +1480,14 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("mark sources merged: %w", err)
 	}
 
+	// A refused cut follows its segment's recording into the merged session,
+	// where its words now are: the sources' refined words go with a later
+	// "Delete text" there, so a warning keyed to a source would go with them.
+	moveQuery := fmt.Sprintf(`UPDATE OR REPLACE refused_cuts SET session_id = ? WHERE session_id IN (%s)`, strings.Join(placeholders, ","))
+	if _, err := tx.Exec(moveQuery, markArgs...); err != nil {
+		return fmt.Errorf("move refused cuts to the merged session: %w", err)
+	}
+
 	return tx.Commit()
 }
 

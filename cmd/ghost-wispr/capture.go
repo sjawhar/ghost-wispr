@@ -488,6 +488,11 @@ type gatedWriter struct {
 	dst  io.Writer
 }
 
+// Write records p. Audio that comes back after a stall, which turned the
+// light off, is recorded only once the light is confirmed red again
+// (beforeMicStart, as for a microphone start): otherwise it would be recorded
+// with the light off until the light's next check. Audio the light cannot be
+// confirmed red for is dropped; the light guard then closes the gate.
 func (w *gatedWriter) Write(p []byte) (int, error) {
 	g := w.gate
 	g.mu.Lock()
@@ -498,11 +503,36 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 	g.writing++
 	g.mu.Unlock()
 	defer g.finishWrite()
+	if !g.audioFlowing() {
+		if err := g.confirmMicStart(); err != nil {
+			return len(p), nil
+		}
+		defer g.finishMicStart()
+	}
 	n, err := w.dst.Write(p)
 	if err == nil {
 		g.audioAt.Store(time.Now().UnixNano())
 	}
 	return n, err
+}
+
+// captureReadiness is what /healthz/ready reads of capture: the gate's
+// MicHold, and no_audio while the gate and the microphone are open but no
+// audio reaches the recording. The unit records nothing then, so readiness
+// fails, and reports no_audio for the microphone.
+type captureReadiness struct {
+	capture *captureGate
+	mic     interface{ IsOpen() bool }
+}
+
+func (r captureReadiness) MicHold() string {
+	if hold := r.capture.MicHold(); hold != "" {
+		return hold
+	}
+	if r.capture.captureState(r.mic) == captureNoAudio {
+		return captureNoAudio
+	}
+	return ""
 }
 
 // captureSessions is the part of *session.Manager a capture pause uses.

@@ -48,20 +48,22 @@ func (r *refusedCuts) Warnings() []string {
 			continue
 		}
 		warnings = append(warnings, fmt.Sprintf(
-			"\"Delete text and audio\" was refused for the segment %s–%s into recording %s of session %s: part of it was still heard after the cut, so the recording is unchanged. Use \"Delete text\" to remove its words.",
+			"\"Delete text and audio\" was refused for the segment %s–%s into recording %s of session %s: the check after the cut did not confirm its words were gone, so the recording is unchanged. Use \"Delete text\" to remove its words.",
 			clockOffset(cut.Start), clockOffset(cut.End), cut.Recording, cut.SessionID))
 	}
 	return warnings
 }
 
 // present reports whether the refused cut's segment still has words in the
-// session's refined transcript. When the store cannot say, the warning stays.
+// session's refined transcript. When the store cannot say, the warning stays,
+// also while the session has no completed refinement, as a merged session
+// before its first refinement.
 func (r *refusedCuts) present(cut storage.RefusedCut) bool {
 	session, err := r.store.GetSession(cut.SessionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false
 	}
-	if err != nil {
+	if err != nil || session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
 		return true
 	}
 	words, err := r.store.RefinedWords(cut.SessionID, session.RefinedRevision)
