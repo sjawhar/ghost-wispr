@@ -34,7 +34,7 @@ func refreshCertificateExpiryWarning(registry *warningsRegistry, configuredPath 
 	}
 	notAfter, ok, err := readExpiry(credentialPath)
 	if err != nil {
-		registry.Set(certificateExpiryWarningKey, fmt.Sprintf("Google credential certificate could not be read: %v; see the renewal runbook in docs/pi-setup.md.", err))
+		registry.Set(certificateExpiryWarningKey, fmt.Sprintf("Google credential certificate could not be read: %v; %s", err, googleauth.CertificateRenewal))
 		return
 	}
 	if warning := googleauth.CertificateExpiryWarning(now, notAfter, ok); warning != "" {

@@ -8,7 +8,10 @@ import (
 )
 
 // RefinedWord is one batch-transcribed occurrence. RecordingPath and
-// RecordingSHA256 identify the exact recording revision that supplied it.
+// RecordingSHA256 identify the exact recording revision that supplied it, and
+// Model the batch model that timed it: a "Delete text" of the word records
+// that model, so a refinement of the recording transcribes with it, since
+// another model's times for the same words can fall outside the deletion.
 type RefinedWord struct {
 	RecordingPath    string
 	RecordingSHA256  string
@@ -17,6 +20,7 @@ type RefinedWord struct {
 	Text             string
 	Speaker          int
 	Start, End       float64
+	Model            string
 }
 
 // RefinedSegment groups consecutive RefinedWords from one recording. The word
@@ -60,7 +64,8 @@ func transcriptWithUntimedSegments(q querier, sessionID, refined string) (string
 
 // PublishRefinementAtGeneration replaces live segments with a completed batch
 // refinement in one transaction. The generation fence rejects a result that
-// started before a deletion changed the session.
+// started before a deletion changed the session. model is the session's
+// refinement model, and the model of each word that names none.
 func (s *SQLiteStore) PublishRefinementAtGeneration(sessionID, transcript, model string, words []RefinedWord, segments []RefinedSegment, generation int) (int, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -95,9 +100,13 @@ func (s *SQLiteStore) PublishRefinementAtGeneration(sessionID, transcript, model
 		if strings.TrimSpace(word.RecordingPath) == "" || strings.TrimSpace(word.RecordingSHA256) == "" || word.Ordinal < 0 || word.End < word.Start {
 			return 0, fmt.Errorf("publish refinement for session %s: invalid word provenance", sessionID)
 		}
-		if _, err := tx.Exec(`INSERT INTO refined_words(session_id, transcript_revision, recording_path, recording_sha256, recording_ordinal, ordinal, text, speaker, start_time, end_time)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			sessionID, nextRevision, word.RecordingPath, word.RecordingSHA256, word.RecordingOrdinal, word.Ordinal, strings.TrimSpace(word.Text), word.Speaker, word.Start, word.End); err != nil {
+		wordModel := strings.TrimSpace(word.Model)
+		if wordModel == "" {
+			wordModel = model
+		}
+		if _, err := tx.Exec(`INSERT INTO refined_words(session_id, transcript_revision, recording_path, recording_sha256, recording_ordinal, ordinal, text, speaker, start_time, end_time, model)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			sessionID, nextRevision, word.RecordingPath, word.RecordingSHA256, word.RecordingOrdinal, word.Ordinal, strings.TrimSpace(word.Text), word.Speaker, word.Start, word.End, wordModel); err != nil {
 			return 0, fmt.Errorf("store refined word for session %s: %w", sessionID, err)
 		}
 	}
@@ -153,7 +162,7 @@ func (s *SQLiteStore) RefinedWords(sessionID string, revision int) ([]RefinedWor
 }
 
 func refinedWords(q querier, sessionID string, revision int) ([]RefinedWord, error) {
-	rows, err := q.Query(`SELECT recording_path, recording_sha256, recording_ordinal, ordinal, text, speaker, start_time, end_time
+	rows, err := q.Query(`SELECT recording_path, recording_sha256, recording_ordinal, ordinal, text, speaker, start_time, end_time, model
 		FROM refined_words WHERE session_id = ? AND transcript_revision = ?
 		ORDER BY recording_ordinal, ordinal`, sessionID, revision)
 	if err != nil {
@@ -163,7 +172,7 @@ func refinedWords(q querier, sessionID string, revision int) ([]RefinedWord, err
 	var words []RefinedWord
 	for rows.Next() {
 		var word RefinedWord
-		if err := rows.Scan(&word.RecordingPath, &word.RecordingSHA256, &word.RecordingOrdinal, &word.Ordinal, &word.Text, &word.Speaker, &word.Start, &word.End); err != nil {
+		if err := rows.Scan(&word.RecordingPath, &word.RecordingSHA256, &word.RecordingOrdinal, &word.Ordinal, &word.Text, &word.Speaker, &word.Start, &word.End, &word.Model); err != nil {
 			return nil, fmt.Errorf("scan refined word for session %s: %w", sessionID, err)
 		}
 		words = append(words, word)

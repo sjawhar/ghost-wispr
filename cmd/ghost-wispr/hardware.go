@@ -27,16 +27,23 @@ const (
 	lightShutdownWait = 2 * time.Second
 )
 
+// The recording light's warnings. The consent rule is "record only while the
+// light is on", so each says that the unit does not record.
 const (
-	recordingLightMissingWarning = "Recording light not found; the unit records without its light"
-	recordingLightFailedWarning  = "Recording light failed; the unit may be recording without its light"
+	recordingLightMissingWarning = "Recording light not found; the unit does not record until it is back"
+	recordingLightNotRedWarning  = "Recording light does not show red; the unit does not record until it does"
+	recordingLightFailedWarning  = "Recording light failed; the unit does not record until it shows red again"
 )
 
 func recordingLightWarning(err error) string {
-	if errors.Is(err, indicator.ErrNoBlink1) {
+	switch {
+	case errors.Is(err, indicator.ErrNoBlink1):
 		return recordingLightMissingWarning
+	case errors.Is(err, indicator.ErrNotRed):
+		return recordingLightNotRedWarning
+	default:
+		return recordingLightFailedWarning
 	}
-	return recordingLightFailedWarning
 }
 
 func listenAddress(address string) string {
@@ -49,6 +56,11 @@ func listenAddress(address string) string {
 var (
 	openBlink1    = indicator.OpenBlink1
 	errLightOther = errors.New("recording light is neither red nor off")
+	// lightCheckEvery is how often the controller checks the recording light;
+	// lightRetryEvery is how long it waits before it looks again for a light
+	// it lost. Tests shorten both.
+	lightCheckEvery = time.Second
+	lightRetryEvery = hardwareRetry
 )
 
 func runLightOff(stderr io.Writer) error {
@@ -144,6 +156,18 @@ type hardwareControl struct {
 	done       <-chan struct{}
 	redHolds   atomic.Int32
 	stopped    atomic.Bool
+	// reportLight hands a failed light check to the light guard; nil without
+	// a light.
+	reportLight func(error)
+}
+
+// LightUnconfirmed reports a red confirmation that failed outside the
+// controller's own checks, so the light guard holds capture for the light.
+// It never blocks.
+func (h *hardwareControl) LightUnconfirmed(err error) {
+	if h.reportLight != nil {
+		h.reportLight(err)
+	}
 }
 
 func (h *hardwareControl) Done() <-chan struct{} {
@@ -183,10 +207,10 @@ func (h *hardwareControl) Stop() {
 	h.stopped.Store(true)
 }
 
-// EnsureRed confirms the configured and connected indicator is red before a
-// microphone starts. Each successful check owns a temporary red hold until
-// that start attempt ends. A missing light preserves the approved
-// warning-and-record behavior.
+// EnsureRed confirms the configured indicator is red before a microphone
+// starts or capture opens. Each successful check owns a temporary red hold
+// until that start attempt ends. A missing light fails the check like any
+// other: the unit records only while its light is on.
 func (h *hardwareControl) EnsureRed() error {
 	if h.stopped.Load() {
 		return fmt.Errorf("recording light stopped")
@@ -198,9 +222,6 @@ func (h *hardwareControl) EnsureRed() error {
 	// write the controller decided before this confirmation.
 	h.redHolds.Add(1)
 	if err := h.light.ConfirmRed(); err != nil {
-		if errors.Is(err, indicator.ErrNoBlink1) {
-			return nil
-		}
 		h.ReleaseRedHold()
 		return err
 	}
@@ -215,7 +236,7 @@ func (h *hardwareControl) EnsureRed() error {
 func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, onResumeRefused func(error)) {
 	capture.beforeResumeRequest = func() error {
 		if err := capture.confirmMicStart(); err != nil {
-			warnings.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
+			warnings.Set("recording-light", recordingLightWarning(err))
 			return err
 		}
 		capture.finishMicStart()
@@ -223,7 +244,7 @@ func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, onRe
 	}
 	capture.beforeGateOpen = func() error {
 		if err := capture.confirmMicStart(); err != nil {
-			warnings.Set("recording-light", fmt.Sprintf("Recording light could not be confirmed red: %v", err))
+			warnings.Set("recording-light", recordingLightWarning(err))
 			return err
 		}
 		return nil
@@ -235,11 +256,13 @@ func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings 
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
+	capture.onLightUnconfirmed = hardware.LightUnconfirmed
 	guardResumeWithLight(capture, warnings, onResumeRefused)
 }
 
-// startHardware starts the configured recording light. The button starts only
-// after its durable controls are completely wired.
+// startHardware starts the configured recording light, and the guard that
+// keeps capture closed while the light cannot be confirmed red. The button
+// starts only after its durable controls are completely wired.
 func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate, mic interface{ IsOpen() bool }, warnings *warningsRegistry, hub *server.Hub) *hardwareControl {
 	done := make(chan struct{})
 	hardware := &hardwareControl{done: done}
@@ -248,10 +271,14 @@ func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate
 			return hardware.holdsRed() || recordingSignal(capture, mic)
 		}
 		hardware.light = &reconnectingLight{
-			warnings: warnings,
-			holdRed:  func() bool { return !hardware.stopped.Load() && wantRed() },
+			warnings:   warnings,
+			holdRed:    func() bool { return !hardware.stopped.Load() && wantRed() },
+			retryEvery: lightRetryEvery,
 		}
-		hardware.controller = indicator.NewController(hardware.light, wantRed, time.Second)
+		guard := newLightGuard(capture, warnings, lightRetryEvery)
+		hardware.reportLight = guard.report
+		hardware.controller = indicator.NewController(hardware.light, wantRed, lightCheckEvery, guard.report)
+		go guard.run(ctx)
 		go func() {
 			defer close(done)
 			hardware.controller.Run(ctx)
@@ -309,6 +336,16 @@ type reconnectingLight struct {
 	// deviceMu, so an off write decided before a red confirmation cannot land
 	// after it.
 	holdRed func() bool
+	// retryEvery is how long a failed discovery is remembered before the next
+	// one; zero means hardwareRetry.
+	retryEvery time.Duration
+}
+
+func (l *reconnectingLight) retryDelay() time.Duration {
+	if l.retryEvery > 0 {
+		return l.retryEvery
+	}
+	return hardwareRetry
 }
 
 func (l *reconnectingLight) current() (indicator.Light, error) {
@@ -331,14 +368,14 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 	light, err := openBlink1(blinkSysfsRoot, blinkDevRoot)
 	if err != nil {
 		l.lastErr = err
-		l.nextAttempt = time.Now().Add(hardwareRetry)
+		l.nextAttempt = time.Now().Add(l.retryDelay())
 		l.warnings.Set("recording-light", recordingLightWarning(err))
 		return nil, err
 	}
 	if err := light.BlackPattern(); err != nil {
 		_ = light.Close()
 		l.lastErr = err
-		l.nextAttempt = time.Now().Add(hardwareRetry)
+		l.nextAttempt = time.Now().Add(l.retryDelay())
 		l.warnings.Set("recording-light", recordingLightWarning(err))
 		return nil, err
 	}
@@ -432,7 +469,7 @@ func (l *reconnectingLight) ConfirmRed() error {
 		return l.failed(err)
 	}
 	if r != 255 || g != 0 || b != 0 {
-		return fmt.Errorf("recording light readback is %d,%d,%d, want red", r, g, b)
+		return fmt.Errorf("%w: it reads %d,%d,%d", indicator.ErrNotRed, r, g, b)
 	}
 	return nil
 }

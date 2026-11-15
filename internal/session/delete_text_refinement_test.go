@@ -77,12 +77,24 @@ func deleteRefinedAudioForTest(t *testing.T, store *storage.SQLiteStore, session
 
 func deleteRefinedTextForTest(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.TextDeletionSpan) error {
 	t.Helper()
+	return deleteRefinedTextWithModel(t, store, sessionID, liveSegmentID, span, "nova-3")
+}
+
+// deleteRefinedTextWithModel deletes a segment's text from a refinement
+// published as model's.
+func deleteRefinedTextWithModel(t *testing.T, store *storage.SQLiteStore, sessionID string, liveSegmentID int64, span storage.TextDeletionSpan, model string) error {
+	t.Helper()
 	index := liveSegmentIndex(t, store, sessionID, liveSegmentID)
-	revision, refined := publishRefinedSegmentsForTest(t, store, sessionID, span.AudioPath, span.SHA256)
+	revision, refined := publishRefinedSegmentsWithModel(t, store, sessionID, span.AudioPath, span.SHA256, model)
 	return store.DeleteRefinedSegmentText(sessionID, refined[index].ID, revision)
 }
 
 func publishRefinedSegmentsForTest(t *testing.T, store *storage.SQLiteStore, sessionID, recordingPath, recordingHash string) (int, []transcribe.Segment) {
+	t.Helper()
+	return publishRefinedSegmentsWithModel(t, store, sessionID, recordingPath, recordingHash, "nova-3")
+}
+
+func publishRefinedSegmentsWithModel(t *testing.T, store *storage.SQLiteStore, sessionID, recordingPath, recordingHash, model string) (int, []transcribe.Segment) {
 	t.Helper()
 	live, err := store.GetSegments(sessionID)
 	if err != nil {
@@ -105,7 +117,7 @@ func publishRefinedSegmentsForTest(t *testing.T, store *storage.SQLiteStore, ses
 	if err != nil {
 		t.Fatal(err)
 	}
-	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), "test", words, refined, generation)
+	revision, err := store.PublishRefinementAtGeneration(sessionID, storage.RefinedTranscript(words), model, words, refined, generation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +150,13 @@ func liveSegmentIndex(t *testing.T, store *storage.SQLiteStore, sessionID string
 // store and the recording.
 func deletedTextSession(t *testing.T, id, audio string) (*storage.SQLiteStore, string, time.Time) {
 	t.Helper()
+	return deletedTextSessionWithModel(t, id, audio, "nova-3")
+}
+
+// deletedTextSessionWithModel is deletedTextSession with the text deleted
+// from a refinement published as model's.
+func deletedTextSessionWithModel(t *testing.T, id, audio, model string) (*storage.SQLiteStore, string, time.Time) {
+	t.Helper()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -163,7 +182,7 @@ func deletedTextSession(t *testing.T, id, audio string) (*storage.SQLiteStore, s
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deleteRefinedTextForTest(t, store, id, segments[1].ID, storage.TextDeletionSpan{AudioPath: recording, Start: 1.0, End: 1.95, SHA256: fileHash(t, recording)}); err != nil {
+	if err := deleteRefinedTextWithModel(t, store, id, segments[1].ID, storage.TextDeletionSpan{AudioPath: recording, Start: 1.0, End: 1.95, SHA256: fileHash(t, recording)}, model); err != nil {
 		t.Fatalf("delete refined text: %v", err)
 	}
 	return store, recording, started

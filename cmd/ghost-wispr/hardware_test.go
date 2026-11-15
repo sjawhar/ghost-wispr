@@ -227,7 +227,7 @@ func TestControllerReopensAfterAWriteError(t *testing.T) {
 	t.Cleanup(func() { openBlink1 = original })
 
 	warnings := newWarningsRegistry()
-	controller := indicator.NewController(&reconnectingLight{warnings: warnings}, func() bool { return true }, time.Millisecond)
+	controller := indicator.NewController(&reconnectingLight{warnings: warnings}, func() bool { return true }, time.Millisecond, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -339,7 +339,7 @@ func TestEnsureRedSerializesControllerUpdate(t *testing.T) {
 	hardware := &hardwareControl{
 		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
 	}
-	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Hour)
+	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -566,7 +566,7 @@ func TestResumeClearsForcedRedWhenMicUnavailable(t *testing.T) {
 		light: &reconnectingLight{light: device, warnings: newWarningsRegistry()},
 	}
 	hardware.light.holdRed = hardware.holdsRed
-	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Millisecond)
+	hardware.controller = indicator.NewController(hardware.light, hardware.holdsRed, time.Millisecond, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -642,7 +642,7 @@ func TestEnsureRedOutlastsAStaleOffDecision(t *testing.T) {
 			<-releaseDecision
 		}
 		return want
-	}, time.Hour)
+	}, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -690,7 +690,7 @@ func TestResumeReleasesRedHoldAfterGateOpens(t *testing.T) {
 	hardware.light.holdRed = hardware.holdsRed
 	hardware.controller = indicator.NewController(hardware.light, func() bool {
 		return hardware.holdsRed() || recordingSignal(capture, mic)
-	}, time.Hour)
+	}, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -770,7 +770,7 @@ func TestReconnectingLightWarnsWhenPresentDeviceFails(t *testing.T) {
 	if err := light.SetRGB(255, 0, 0); err == nil {
 		t.Fatal("set red succeeded despite the device error")
 	}
-	if got, want := warnings.List(), []string{"Recording light failed; the unit may be recording without its light"}; !slices.Equal(got, want) {
+	if got, want := warnings.List(), []string{"Recording light failed; the unit does not record until it shows red again"}; !slices.Equal(got, want) {
 		t.Fatalf("warnings = %v, want %v", got, want)
 	}
 }
@@ -817,7 +817,7 @@ func TestResumeDoesNotLightBeforeGateOpens(t *testing.T) {
 	hardware.light.holdRed = hardware.holdsRed
 	hardware.controller = indicator.NewController(hardware.light, func() bool {
 		return hardware.holdsRed() || recordingSignal(capture, mic)
-	}, time.Millisecond)
+	}, time.Millisecond, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -826,6 +826,10 @@ func TestResumeDoesNotLightBeforeGateOpens(t *testing.T) {
 	}()
 	t.Cleanup(func() {
 		close(settled)
+		// The resume opens the gate once the pause settles; wait for it, so its
+		// red confirmation does not outlive the test and reopen the light
+		// through openBlink1 while a later test replaces it.
+		waitForHardware(t, "the gate to open once the pause settles", func() bool { return !capture.isClosed() })
 		cancel()
 		<-done
 	})

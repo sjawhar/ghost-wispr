@@ -16,6 +16,8 @@ type fakeLight struct {
 	colour      [3]uint8
 	calls       []string
 	setErr      error
+	readErr     error
+	stuckOff    bool // takes writes but always reads back off
 	serverDowns []time.Duration
 }
 
@@ -34,6 +36,12 @@ func (l *fakeLight) ReadRGB() (uint8, uint8, uint8, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.calls = append(l.calls, "read")
+	if l.readErr != nil {
+		return 0, 0, 0, l.readErr
+	}
+	if l.stuckOff {
+		return 0, 0, 0, nil
+	}
 	return l.colour[0], l.colour[1], l.colour[2], nil
 }
 
@@ -264,7 +272,7 @@ func TestBlink1BlackPatternAndWatchdogReports(t *testing.T) {
 
 func TestControllerWritesTheBlackPatternOnStart(t *testing.T) {
 	light := &fakeLight{}
-	controller := NewController(light, func() bool { return false }, time.Hour)
+	controller := NewController(light, func() bool { return false }, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
@@ -283,7 +291,7 @@ func TestControllerWritesTheBlackPatternOnStart(t *testing.T) {
 func TestControllerRedOnlyWhileRecording(t *testing.T) {
 	light := &fakeLight{}
 	var recording atomic.Bool
-	controller := NewController(light, recording.Load, time.Hour)
+	controller := NewController(light, recording.Load, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
@@ -328,7 +336,7 @@ func TestControllerRedOnlyWhileRecording(t *testing.T) {
 
 func TestControllerRewritesAWrongColour(t *testing.T) {
 	light := &fakeLight{}
-	controller := NewController(light, func() bool { return true }, time.Millisecond)
+	controller := NewController(light, func() bool { return true }, time.Millisecond, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
@@ -353,7 +361,7 @@ func TestControllerRewritesAWrongColour(t *testing.T) {
 
 func TestControllerTicklesBeforeTheTimeout(t *testing.T) {
 	light := &fakeLight{}
-	controller := NewController(light, func() bool { return false }, time.Millisecond)
+	controller := NewController(light, func() bool { return false }, time.Millisecond, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
@@ -371,7 +379,7 @@ func TestControllerTicklesBeforeTheTimeout(t *testing.T) {
 
 func TestControllerTurnsOffOnStop(t *testing.T) {
 	light := &fakeLight{}
-	controller := NewController(light, func() bool { return true }, time.Hour)
+	controller := NewController(light, func() bool { return true }, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
@@ -397,9 +405,11 @@ func TestControllerTurnsOffOnStop(t *testing.T) {
 	}
 }
 
-func TestControllerLightErrorsDoNotStopRecording(t *testing.T) {
+// TestControllerKeepsTickingAfterLightErrors fails if a light error ends the
+// controller's loop, which would let the device's watchdog decide alone.
+func TestControllerKeepsTickingAfterLightErrors(t *testing.T) {
 	light := &fakeLight{setErr: errors.New("disconnected")}
-	controller := NewController(light, func() bool { return true }, time.Millisecond)
+	controller := NewController(light, func() bool { return true }, time.Millisecond, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { controller.Run(ctx); close(done) }()
@@ -410,3 +420,48 @@ func TestControllerLightErrorsDoNotStopRecording(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestControllerReportsWhetherTheLightShowsRed fails if a check while
+// recording that cannot read, write or read back red goes unreported, since
+// the recorder must then stop capture; or if a light that shows what the
+// recording signal wants is reported as failed.
+func TestControllerReportsWhetherTheLightShowsRed(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		light     *fakeLight
+		recording bool
+		wantErr   error
+	}{
+		{name: "missing", light: &fakeLight{readErr: ErrNoBlink1}, recording: true, wantErr: ErrNoBlink1},
+		{name: "missing while not recording", light: &fakeLight{readErr: ErrNoBlink1}, wantErr: ErrNoBlink1},
+		{name: "write fails", light: &fakeLight{setErr: errDisconnected}, recording: true, wantErr: errDisconnected},
+		{name: "reads back off after a red write", light: &fakeLight{stuckOff: true}, recording: true, wantErr: ErrNotRed},
+		{name: "red while recording", light: &fakeLight{}, recording: true},
+		{name: "off while not recording", light: &fakeLight{colour: [3]uint8{255, 0, 0}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reports := make(chan error, 16)
+			controller := NewController(tc.light, func() bool { return tc.recording }, time.Hour, func(err error) { reports <- err })
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() { controller.Run(ctx); close(done) }()
+			defer func() {
+				cancel()
+				<-done
+			}()
+			select {
+			case err := <-reports:
+				if tc.wantErr == nil && err != nil {
+					t.Fatalf("check reported %v, want success", err)
+				}
+				if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+					t.Fatalf("check reported %v, want %v", err, tc.wantErr)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("the controller's first check reported nothing")
+			}
+		})
+	}
+}
+
+var errDisconnected = errors.New("disconnected")

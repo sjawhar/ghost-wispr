@@ -15,7 +15,7 @@ func TestWarningsRegistryIsRaceFree(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			for range 100 {
-				registry.Set("hardware", "Recording light not found; the unit records without its light")
+				registry.Set("hardware", "Recording light not found; the unit does not record until it is back")
 				_ = registry.List()
 				_ = registry.KeysWithPrefix("hardware")
 				registry.Clear("hardware")

@@ -101,7 +101,7 @@ func TestDeleteRefinedSegmentTextRemovesTextEverywhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TextDeletionSpans: %v", err)
 	}
-	if want := (TextDeletionSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256: "recording-sha"}); len(spans) != 1 || spans[0] != want {
+	if want := (TextDeletionSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256: "recording-sha", Model: "test"}); len(spans) != 1 || spans[0] != want {
 		t.Errorf("recorded spans = %+v, want [%+v]", spans, want)
 	}
 

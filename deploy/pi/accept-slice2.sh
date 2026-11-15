@@ -1090,7 +1090,7 @@ EOF
   if assert_certificate_warning '{"warnings":["Vertex unavailable"]}'; then
     fail 'Cert-warning self-test accepted a status with no certificate warning'
   fi
-  assert_certificate_warning '{"warnings":["Google credential certificate expires on 2026-11-21; renew it with the runbook in docs/pi-setup.md."]}' \
+  assert_certificate_warning '{"warnings":["Google credential certificate expires on 2026-11-21; install the latest version of Secret Manager secret ghost-wispr-device-certificate with the runbook in docs/pi-setup.md, \"Renew the X.509 certificate\"."]}' \
     || fail 'Cert-warning self-test rejected a certificate-expiry warning'
   printf 'Cert-warning self-test RAN: planted failure rejected\n'
 )

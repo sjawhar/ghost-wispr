@@ -48,7 +48,7 @@ type batchTranscriptionResult struct {
 	modelInfo  map[string]deepgramModelInfo
 }
 
-func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchWordsTranscriber {
+func NewDeepgramBatchTranscriber(cfg DeepgramBatchConfig) BatchTranscriber {
 	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if baseURL == "" {
 		baseURL = "https://api.deepgram.com"
@@ -80,12 +80,11 @@ func (d *deepgramBatchTranscriber) Transcribe(ctx context.Context, audioPath str
 	return BatchResult{Transcript: result.transcript, Model: model, Words: timestampedWords(result.words)}, nil
 }
 
-func (d *deepgramBatchTranscriber) Words(ctx context.Context, audioPath string) ([]TimestampedWord, error) {
-	result, err := d.transcribe(ctx, audioPath)
-	if err != nil {
-		return nil, err
-	}
-	return timestampedWords(result.words), nil
+// WithModel returns the transcriber with model in place of its configured one.
+func (d *deepgramBatchTranscriber) WithModel(model string) BatchTranscriber {
+	copied := *d
+	copied.model = strings.TrimSpace(model)
+	return &copied
 }
 
 // timestampedWords is Deepgram's words with their times, each as it is

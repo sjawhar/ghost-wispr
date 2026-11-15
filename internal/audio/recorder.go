@@ -416,15 +416,11 @@ type teeWriter struct {
 	dst      io.Writer
 }
 
+// Write records p, then hands it to dst, live transcription: the recording
+// never waits on it.
 func (w *teeWriter) Write(p []byte) (int, error) {
-	n, err := w.dst.Write(p)
-	if err != nil {
-		return n, err
+	if err := w.recorder.writePCM(p); err != nil {
+		return 0, err
 	}
-
-	if err := w.recorder.writePCM(p[:n]); err != nil {
-		return n, err
-	}
-
-	return n, nil
+	return w.dst.Write(p)
 }

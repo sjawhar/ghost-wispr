@@ -1457,9 +1457,12 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if controls.CaptureState != nil {
 			captureState = controls.CaptureState()
 		}
-		if captureState == storage.ComponentStatusStalled {
+		switch captureState {
+		case storage.ComponentStatusStalled:
 			// Clip first: the hook may hand out a slice it keeps.
 			warnings = append(slices.Clip(warnings), "Microphone capture has not resumed: the paused session is still being saved")
+		case "no_audio":
+			warnings = append(slices.Clip(warnings), "The microphone delivers no audio to the recording; the unit is not recording and its light is off")
 		}
 		var kept KeptRawRecordings
 		if controls.KeptRawRecordings != nil {

@@ -641,8 +641,7 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 }
 
 type transcriptCallback struct {
-	manager   session.LifecycleManager
-	resilient *transcribe.ResilientClient
+	manager session.LifecycleManager
 }
 
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
@@ -652,11 +651,12 @@ func (c transcriptCallback) Message(mr *api.MessageResponse) error {
 	return c.manager.Message(mr)
 }
 
+// Open logs the socket. It leaves the resilient client's state alone: the
+// app-owned socket reports Open while it dials, which during a reconnect is
+// before the new socket replaces the dead one, and the reconnect marks the
+// client connected itself once its buffered audio is sent.
 func (c transcriptCallback) Open(*api.OpenResponse) error {
 	log.Println("connected to Deepgram")
-	if c.resilient != nil {
-		c.resilient.SetConnected()
-	}
 	return nil
 }
 
@@ -686,26 +686,35 @@ func (c transcriptCallback) Error(er *api.ErrorResponse) error {
 
 func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
 
-type deepgramWriter struct {
-	client interface {
-		io.Writer
-		Finalize() error
-	}
-}
-
 // streamMicLoopStarter runs a mic loop in loops, the group shutdown waits for.
 var streamMicLoopStarter = func(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, writer io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
 	loops.Go(func() { streamMicWithRetry(ctx, capture, streamer, writer, wait, logf, hub) })
 }
 
-func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) {
+// deepgramSendChunks is how many microphone buffers (250 ms each) the
+// Deepgram send queues while a write waits: more than deepgramWriteTimeout.
+const deepgramSendChunks = 64
+
+// startMicMonitoring starts the mic loop. The recorder gets each buffer
+// first, and downstream, live transcription, gets it through a bounded queue
+// that never blocks the loop (transcribe.AsyncSender), so no Deepgram
+// trouble stops the recording. It returns that queue, whose Finalize the
+// capture pause uses, or nil without downstream.
+func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream interface {
+	io.Writer
+	Finalize() error
+}, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) *transcribe.AsyncSender {
 	if streamer == nil || recorder == nil {
-		return
+		return nil
 	}
-	if downstream == nil {
-		downstream = io.Discard
+	var sender *transcribe.AsyncSender
+	send := io.Discard
+	if downstream != nil {
+		sender = transcribe.NewAsyncSender(ctx, downstream, deepgramSendChunks, logf)
+		send = sender
 	}
-	streamMicLoopStarter(ctx, loops, capture, streamer, recorder.Writer(downstream), wait, logf, hub)
+	streamMicLoopStarter(ctx, loops, capture, streamer, recorder.Writer(send), wait, logf, hub)
+	return sender
 }
 
 // micShutdownWait is how long shutdown waits for the mic loops to end. A loop
@@ -784,29 +793,11 @@ func refreshKeptRawRecordings(ctx context.Context, recorder *audio.Recorder, bud
 	}
 }
 
-func (dw *deepgramWriter) Write(p []byte) (int, error) {
-	return dw.client.Write(p)
-}
-
-func (dw *deepgramWriter) Close() error {
-	return dw.client.Finalize()
-}
-
-// Finalize asks Deepgram to return final results for the audio it has.
-func (dw *deepgramWriter) Finalize() error {
-	return dw.client.Finalize()
-}
-
-func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback) transcribe.ClientFactory {
+// makeDeepgramClientFactory dials live-transcription sockets the app owns
+// (deepgramSocket), each write bounded by writeTimeout.
+func makeDeepgramClientFactory(_ context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback, writeTimeout time.Duration) transcribe.ClientFactory {
 	return func(factoryCtx context.Context) (io.WriteCloser, error) {
-		dgClient, err := client.NewWSUsingCallback(factoryCtx, apiKey, cOptions, tOptions, callback)
-		if err != nil {
-			return nil, err
-		}
-		if !dgClient.Connect() {
-			return nil, fmt.Errorf("deepgram connect failed")
-		}
-		return &deepgramWriter{client: dgClient}, nil
+		return dialDeepgramLive(factoryCtx, apiKey, cOptions, tOptions, callback, writeTimeout)
 	}
 }
 
@@ -1061,11 +1052,16 @@ func main() {
 	defer cancel()
 
 	var resilientRef atomic.Pointer[transcribe.ResilientClient]
+	var deepgramSendRef atomic.Pointer[transcribe.AsyncSender]
 	var micRef atomic.Pointer[audio.Mic]
 	micStatus := &micProxy{ref: &micRef}
 	// capture is the one pause switch: POST /api/pause and /api/resume (and any
 	// later hardware button) call its Pause and Resume.
 	capture := newSessionCaptureGate(ctx, manager, audioRecorder, func() deepgramFinalizer {
+		// The send queue first: its Finalize follows the audio queued before it.
+		if send := deepgramSendRef.Load(); send != nil {
+			return send
+		}
 		if dg := resilientRef.Load(); dg != nil {
 			return dg
 		}
@@ -1249,6 +1245,10 @@ func main() {
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
+	// refusedCuts keeps a refused "Delete text and audio" on /api/status, in
+	// the store, while its segment is there, naming the session and the
+	// segment's time.
+	refusedCuts := newRefusedCuts(store)
 	// deletionRunner makes the occurrence-based deletion actions use the
 	// configuration as it is now. Batch transcription has already persisted
 	// their exact word spans, so deleting never creates a locator.
@@ -1277,6 +1277,20 @@ func main() {
 			splice:    audio.Splice,
 			refine:    manager.RefineSession,
 			summarize: manager.SummarizeSession,
+			transcribeCut: func(ctx context.Context, model, path string) ([]transcribe.TimestampedWord, error) {
+				transcriber, err := makeBatchTranscriber(&latestCfg)
+				if err != nil {
+					return nil, fmt.Errorf("batch transcription, which checks the cut, is unavailable: %w", err)
+				}
+				if selector, ok := transcriber.(transcribe.ModelSelector); ok && model != "" {
+					transcriber = selector.WithModel(model)
+				}
+				result, err := transcriber.Transcribe(ctx, path)
+				if err != nil {
+					return nil, err
+				}
+				return result.Words, nil
+			},
 		}
 	}
 
@@ -1309,7 +1323,8 @@ func main() {
 		},
 		CaptureState:  func() string { return capture.captureState(micStatus) },
 		ActiveSession: manager.ActiveSession,
-		Warnings:      warningRegistry.List,
+		// Warnings, DeleteSegment and DeleteSegmentText: wireSegmentDeletion,
+		// below.
 		OnSessionDeleted: func(sessionID string) {
 			warningRegistry.WithRecordingMismatch(func() {
 				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
@@ -1344,12 +1359,6 @@ func main() {
 		},
 		RefinementRecordingAvailable: checkRefinementRecording,
 		RetryRefinement:              retryRefinement,
-		DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
-			return deletionRunner().DeleteRefinedAudio(ctx, sessionID, segmentID, revision)
-		},
-		DeleteSegmentText: func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
-			return deletionRunner().DeleteRefinedText(ctx, sessionID, segmentID, revision)
-		},
 		RepairSummaries: func(ctx context.Context) (int, error) {
 			return repairStructuredSummaries(ctx, store, publishSummaryReady)
 		},
@@ -1581,7 +1590,18 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			return pollSummaryBatch(ctx, batchName)
 		},
 	}
+	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletionRunner)
 
+	// A refinement that cannot use the model a "Delete text" was recorded
+	// under publishes nothing and says so here, until the session refines.
+	manager.SetRefinementWarningHook(func(sessionID, warning string) {
+		key := "refinement-model-" + sessionID
+		if warning == "" {
+			warningRegistry.Clear(key)
+			return
+		}
+		warningRegistry.Set(key, fmt.Sprintf("Session %s was not refined, and keeps its deleted text out: %s", sessionID, warning))
+	})
 	hardware := startHardware(ctx, &cfg, capture, micStatus, warningRegistry, hub)
 	pauseControls := newPersistentControls(
 		store,
@@ -1897,9 +1917,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
 		if err := startOpenedMic(capture, mic, func() { micRef.Store(nil) }, log.Printf); err != nil {
-			warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
+			warning, status := micStartFailureMessages(err)
+			if warning != "" {
+				warningRegistry.Set("microphone", warning)
+			}
 			if updateStartupState {
-				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
+				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: status}
 			}
 			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
 		}
@@ -1939,35 +1962,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
-		resillientStateCallback := func(state transcribe.ConnectionState) {
-			if hub != nil {
-				hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
-			}
-		}
-		candidateResilient := transcribe.NewResilientClient(ctx, nil, resilientConfig, log.Printf, resillientStateCallback)
-		callback := transcriptCallback{manager: manager, resilient: candidateResilient}
-		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback)
-		candidateResilient.Factory = factory
-
-		initialClient, err := factory(ctx)
-		if err != nil {
-			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
-			warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
-			if !updateStartupState && hub != nil {
-				hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusError, "Deepgram initialization failed")
-			}
-			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
-			return nil
-		}
-
-		candidateResilient.Client = initialClient
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub, !updateStartupState)
 		resilientRef.Store(candidateResilient)
-		if !updateStartupState && hub != nil {
-			// A resilient client starts connected and reports only changes.
-			hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusConnected, "Deepgram connected")
-		}
-
-		startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub)
+		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub))
 		return nil
 	}
 
@@ -2009,9 +2006,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// booted closes once start-up has sent its component statuses.
 	booted := make(chan struct{})
 	if startMicrophone(ctx, &micLoops, capture, booted, !paInitFailed, startMic, retryMic) {
-		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
-		if cfg.DeepgramAPIKey != "" {
-			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
+		switch {
+		case capture.isLightHeld() && !capture.IsPaused():
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: captureLightUnavailable, Message: "Microphone closed: the recording light is not confirmed red"}
+			if cfg.DeepgramAPIKey != "" {
+				startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: captureLightUnavailable, Message: "Deepgram connects once the recording light is confirmed red"}
+			}
+		default:
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
+			if cfg.DeepgramAPIKey != "" {
+				startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
+			}
 		}
 	}
 
@@ -2165,7 +2170,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if cfg.DeepgramAPIKey != "" {
 		deepgramHealth = &resilientClientProxy{ref: &resilientRef}
 	}
-	healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, capture, llmTracker)
+	healthChecker := server.NewDefaultHealthChecker(deepgramHealth, store, micStatus, captureReadiness{capture: capture, mic: micStatus}, llmTracker)
 	handler, err := server.HandlerWithLogger(assets, hub, store, controlHooks, authToken, healthChecker, appLogger, embeddingClient, cfgStore)
 	if err != nil {
 		panic(fmt.Sprintf("build http handler failed: %v", err))
@@ -2449,7 +2454,11 @@ func holdMicWhilePaused(ctx context.Context, capture *captureGate, streamer micS
 	}
 	logf("microphone stopped: capture paused")
 	if hub != nil {
-		hub.BroadcastComponentStatus("mic", storage.ComponentStatusPaused, "Microphone stopped while capture is paused")
+		if capture.isLightHeld() && !capture.IsPaused() {
+			hub.BroadcastComponentStatus("mic", captureLightUnavailable, "Microphone stopped: the recording light is not confirmed red")
+		} else {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusPaused, "Microphone stopped while capture is paused")
+		}
 	}
 	return capture.waitResumed(ctx)
 }

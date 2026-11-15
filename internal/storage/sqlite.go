@@ -715,11 +715,21 @@ func (s *SQLiteStore) init(dbPath string) error {
 			speaker INTEGER NOT NULL,
 			start_time REAL NOT NULL,
 			end_time REAL NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (session_id, transcript_revision, recording_path, recording_sha256, ordinal),
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
 		return fmt.Errorf("create refined words table: %w", err)
+	}
+	// model: the batch model that timed the word. Every word published before
+	// the column existed came from a refinement of its whole session with one
+	// model, its session's refinement model.
+	if _, err := s.db.Exec(`ALTER TABLE refined_words ADD COLUMN model TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate refined words model: %w", err)
+	}
+	if _, err := s.db.Exec(`UPDATE refined_words SET model = COALESCE((SELECT refinement_model FROM sessions WHERE sessions.id = refined_words.session_id), '') WHERE model = ''`); err != nil {
+		return fmt.Errorf("backfill refined words model: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -778,10 +788,37 @@ func (s *SQLiteStore) init(dbPath string) error {
 			start REAL NOT NULL,
 			end REAL NOT NULL,
 			sha256 TEXT NOT NULL,
-			deleted_at TEXT NOT NULL
+			deleted_at TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT ''
 		);
 	`); err != nil {
 		return fmt.Errorf("create deleted_text_spans table: %w", err)
+	}
+	// model: the batch model the span's word times came from. A span recorded
+	// before the column existed takes its session's refinement model.
+	if _, err := s.db.Exec(`ALTER TABLE deleted_text_spans ADD COLUMN model TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate deleted_text_spans model: %w", err)
+	}
+	if _, err := s.db.Exec(`UPDATE deleted_text_spans SET model = COALESCE((SELECT refinement_model FROM sessions WHERE sessions.id = deleted_text_spans.session_id), '') WHERE model = ''`); err != nil {
+		return fmt.Errorf("backfill deleted_text_spans model: %w", err)
+	}
+	// refused_cuts: a "Delete text and audio" the check after the cut refused
+	// (RecordRefusedCut), so the segment's words are still in its recording:
+	// the recording's file name and the segment's time, never the words. The
+	// status page warns of it until the words are gone; a splice of the
+	// recording moves or drops it (moveRefusedCutsAfterSplice). Like
+	// deleted_text_spans it belongs to the recording, so no foreign key.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS refused_cuts (
+			session_id TEXT NOT NULL,
+			recording TEXT NOT NULL,
+			start REAL NOT NULL,
+			end REAL NOT NULL,
+			refused_at TEXT NOT NULL,
+			UNIQUE(session_id, recording, start, end)
+		);
+	`); err != nil {
+		return fmt.Errorf("create refused_cuts table: %w", err)
 	}
 	// erase_directories: a directory a whole-file audio erase was started in
 	// (RecordEraseDirectory), and the file system it was on (device). An
@@ -1451,6 +1488,14 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 	markArgs = append(markArgs, args[1:]...)
 	if _, err := tx.Exec(markQuery, markArgs...); err != nil {
 		return fmt.Errorf("mark sources merged: %w", err)
+	}
+
+	// A refused cut follows its segment's recording into the merged session,
+	// where its words now are: the sources' refined words go with a later
+	// "Delete text" there, so a warning keyed to a source would go with them.
+	moveQuery := fmt.Sprintf(`UPDATE OR REPLACE refused_cuts SET session_id = ? WHERE session_id IN (%s)`, strings.Join(placeholders, ","))
+	if _, err := tx.Exec(moveQuery, markArgs...); err != nil {
+		return fmt.Errorf("move refused cuts to the merged session: %w", err)
 	}
 
 	return tx.Commit()

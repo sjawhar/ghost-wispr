@@ -125,6 +125,20 @@ func (c *persistentControls) RefuseResume() error {
 	return nil
 }
 
+// micStartFailureMessages returns the microphone warning and the start-up
+// status message for a failed microphone start. A start the recording light
+// refused adds no microphone warning: the light's own warning names the cause.
+func micStartFailureMessages(err error) (warning, status string) {
+	if errors.Is(err, errLightNotConfirmed) {
+		return "", "Recording light not confirmed red; the microphone does not start until it is"
+	}
+	return "Microphone failed to start — recording and live transcription are disabled", "Microphone failed to start"
+}
+
+// errLightNotConfirmed tags a microphone start refused because the recording
+// light could not be confirmed red; the light's own warning names the cause.
+var errLightNotConfirmed = errors.New("recording light not confirmed red")
+
 // startMicIfUnpaused starts the opened microphone unless capture is paused. A
 // paused instance opens no device (startMicrophone), but a pause that lands
 // after the device opened leaves it open and not started; the mic loop starts
@@ -135,7 +149,7 @@ func startMicIfUnpaused(capture *captureGate, start func() error) error {
 		return nil
 	}
 	if err := capture.confirmMicStart(); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
 	}
 	defer capture.finishMicStart()
 	return start()

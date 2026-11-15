@@ -686,9 +686,10 @@ var flushRecordingDirectory = func(recording string) error {
 // been atomically replaced with the span's expected post-splice bytes. In the
 // same transaction, the first time it marks the span, it moves the spans
 // "Delete text" recorded in the recording's pre-splice bytes to where their
-// words are in the spliced one (moveTextDeletionSpans), and it clears the
-// session's pending Drive replacement when the deletion owes Drive nothing
-// (settleUnownedDriveReplacement).
+// words are in the spliced one (moveTextDeletionSpans), moves or drops the
+// recording's refused cuts the same way (moveRefusedCutsAfterSplice), and it
+// clears the session's pending Drive replacement when the deletion owes Drive
+// nothing (settleUnownedDriveReplacement).
 func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -715,6 +716,9 @@ func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 		}
 	} else {
 		if err := moveTextDeletionSpans(tx, span); err != nil {
+			return err
+		}
+		if err := moveRefusedCutsAfterSplice(tx, span); err != nil {
 			return err
 		}
 		if err := moveRefinedWordsAfterSplice(tx, span); err != nil {

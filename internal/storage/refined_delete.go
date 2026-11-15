@@ -183,6 +183,16 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		}
 		span.SessionID = sessionID
 	}
+	// The deletion records the model that timed the words it deletes, so a
+	// refinement transcribes their recording with it. A merged session's
+	// recordings can come from two models.
+	wordsModel := session.RefinementModel
+	if err := tx.QueryRow(`SELECT model FROM refined_words
+		WHERE session_id = ? AND transcript_revision = ? AND recording_path = ? AND recording_sha256 = ?
+		  AND ordinal BETWEEN ? AND ? AND model != '' LIMIT 1`,
+		sessionID, revision, selected.RecordingPath, selected.RecordingSHA256, selected.FirstWordOrdinal, selected.LastWordOrdinal).Scan(&wordsModel); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read the model of the selected refined words: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM refined_words
 		WHERE session_id = ? AND transcript_revision = ? AND recording_path = ? AND recording_sha256 = ?
 		  AND ordinal BETWEEN ? AND ?`,
@@ -254,7 +264,7 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
 	}
 	if keepAudio {
-		if err := recordTextDeletionSpan(tx, sessionID, sources, span); err != nil {
+		if err := recordTextDeletionSpan(tx, sessionID, wordsModel, sources, span); err != nil {
 			return err
 		}
 	} else if err := recordSplice(tx, sessionID, owners, span, session.AudioPath); err != nil {

@@ -80,10 +80,11 @@ type TimestampedWord struct {
 	Speaker    int
 }
 
-// BatchWordsTranscriber transcribes a recording as text and timestamped words.
-type BatchWordsTranscriber interface {
-	BatchTranscriber
-	Words(ctx context.Context, audioPath string) ([]TimestampedWord, error)
+// ModelSelector is a BatchTranscriber that can transcribe with another
+// model. A refinement of a recording with "Delete text" spans uses the model
+// the spans were recorded under.
+type ModelSelector interface {
+	WithModel(model string) BatchTranscriber
 }
 
 // ResilientClient wraps an io.WriteCloser (Deepgram client) and buffers audio during disconnects.

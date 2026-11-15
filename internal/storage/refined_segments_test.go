@@ -135,7 +135,7 @@ func TestDeleteRefinedSegmentTextDeletesOnlyTheSelectedRepeatedWords(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(spans) != 1 || spans[0] != (TextDeletionSpan{AudioPath: "recording.mp3", Start: 0, End: 0.5, SHA256: "hash"}) {
+	if len(spans) != 1 || spans[0] != (TextDeletionSpan{AudioPath: "recording.mp3", Start: 0, End: 0.5, SHA256: "hash", Model: "nova-3"}) {
 		t.Fatalf("text spans = %#v, want selected word span", spans)
 	}
 }
