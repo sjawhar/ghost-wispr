@@ -16,13 +16,19 @@ The `bootstrap` identity apply signs that request, so it cannot run before those
 After the certificate-signing request exists, do these before provisioning:
 
 1. Apply the approved `agent-infra` changes for the Google X.509 identity, the
-   `tag:ghost-wispr` Tailscale identity, and the Envoy webhook. Record:
-   - the `ghostWisprCertificates` output from `bootstrap`;
-   - the service account unique ID from
-     `gcloud iam service-accounts describe ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com --format='value(uniqueId)'`;
-   - the Ghost Wispr Tailscale client ID from `root`'s `tailscaleIds` output;
-   - the `relayUrl` output from `envoy-cluster`.
-2. Ensure Secret Manager has `envoy-ghostwispr-signing-secret` and the operator can read it.
+   `tag:ghost-wispr` Tailscale identity, and the Envoy webhook. Each value the bundle needs is
+   then on `agent-infra` `main`:
+   - the device certificate: the `bootstrap` apply publishes it as the latest version of Secret
+     Manager secret `ghost-wispr-device-certificate` (`bootstrap/README.md`);
+   - the Ghost Wispr Tailscale client ID: `root`'s stack output `ghostWisprTailnetClientId`.
+     `root` creates that identity, so `tailscaleIds` has no entry for it;
+   - the service account's unique ID: `ghostWisprAccountUniqueId` in `root`'s prod
+     configuration (`root/Pulumi.prod.yaml`);
+   - the relay URL: the `relayUrl` output from `envoy-cluster`.
+2. Ensure Secret Manager has `envoy-ghostwispr-signing-secret`. Provisioning reads it only under
+   a secrets-broker grant of one hour that Sami approves, never as the devbox identity or an
+   agent box: dispatch://INFRA-3599 takes that read away from box identities, because a process
+   that holds the secret can sign events that Envoy accepts as the recorder's.
 3. Wait for the Ghost Wispr release workflow to publish `ghost-wispr-linux-arm64` and
    `ghost-wispr-linux-arm64.sha256`.
 
@@ -82,6 +88,7 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
 Give the resulting certificate-signing request to the `bootstrap` apply. After the apply,
 create the Google external-account credential files on a development machine, never on the Pi:
 
+<!-- provision_bundle_test.sh: credentials -->
 ```bash
 d=$(mktemp -d)
 gcloud iam workload-identity-pools create-cred-config \
@@ -109,87 +116,96 @@ join passes the same path with `ghost-wispr google-id-token --credentials`; it d
 
 ## Renew the X.509 certificate
 
-Ghost Wispr warns on its status page when the certificate has fewer than 30 days left. The
-certificate is renewed by the `bootstrap` apply, which issues a new value through
-`ghostWisprCertificates`; the Pi private key stays where it is. Apply `bootstrap` through its
-normal reviewed CI route, then install the refreshed public certificate and restart Ghost Wispr:
+Ghost Wispr warns on its status page when the certificate has fewer than 30 days left, or when it
+cannot read the certificate. The `bootstrap` apply renews the certificate and publishes it as the
+latest version of Secret Manager secret `ghost-wispr-device-certificate`; the Pi private key stays
+where it is. Apply `bootstrap` through its normal reviewed CI route. Then read the new certificate
+on a development machine whose `gcloud` is the devbox identity (the reader `bootstrap/README.md`
+names), check it, install it on the Pi and restart Ghost Wispr:
 
 ```bash
-cd ~/src/agent-infra/bootstrap
-pulumi stack output --stack prod ghostWisprCertificates --json | jq -r '."ghost-wispr"' \
-  | ssh ghost-wispr@ghost-wispr 'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service'
+crt=$(mktemp)
+gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$crt"
+openssl x509 -in "$crt" -noout -subject -enddate
+ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
+  'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service' <"$crt"
+rm -f -- "$crt"
 ```
 
-Confirm that `https://ghost-wispr.tail12ec1c.ts.net/api/status` no longer reports the
-certificate-expiry warning. Do not regenerate the Pi key or the Google credential configuration
-for a normal certificate renewal.
+`openssl` must print `subject=CN=ghost-wispr` and the new end date. The certificate is not a
+secret: if this machine cannot reach the Pi over SSH, copy `$crt` to one that can and run the
+`ssh` line there. Confirm that `https://ghost-wispr.tail12ec1c.ts.net/api/status` no longer
+reports the certificate warning. Do not regenerate the Pi key or the Google credential
+configuration for a normal certificate renewal.
 
-## Build the private credential bundle
+## Prepare the bundle's public files
 
-Create a mode-0700 directory on the operator machine. It exists only long enough to make the
-tar stream.
-
-```bash
-bundle_root="$HOME/.local/share/ghost-wispr-provision"
-mkdir -p -m 700 "$bundle_root"
-bundle_dir=$(mktemp -d "$bundle_root/bundle.XXXXXX")
-trap 'rm -rf -- "$bundle_dir"' EXIT
-```
-
-Put these files in it:
+The credential bundle holds six public files and two secrets:
 
 | File | Source |
 | --- | --- |
-| `device.crt` | `bootstrap` stack output `ghostWisprCertificates` |
+| `device.crt` | the latest version of Secret Manager secret `ghost-wispr-device-certificate` |
 | `google-credentials.json` and `certificate_config.json` | the rewritten files in `$d` from the `gcloud ... create-cred-config` command above |
-| `tailscale-client-id` | Ghost Wispr's Tailscale client ID from `root` output `tailscaleIds` |
-| `tailscale-subject` | `gcloud iam service-accounts describe ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com --format='value(uniqueId)'` |
-| `envoy-webhook-url` | `$(pulumi stack output relayUrl --stack prod)` from `envoy-cluster`, followed by `/webhook/ghostwispr` |
-| `envoy-webhook-secret` | `gcloud secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra` |
-| `deepgram-key` | `DEEPGRAM_API_KEY` from the operator's secrets broker |
+| `tailscale-client-id` | `root`'s stack output `ghostWisprTailnetClientId` |
+| `tailscale-subject` | `ghostWisprAccountUniqueId` in `root`'s prod configuration |
+| `envoy-webhook-url` | `envoy-cluster`'s stack output `relayUrl`, followed by `/webhook/ghostwispr` |
+| `envoy-webhook-secret` | Secret Manager `envoy-ghostwispr-signing-secret`, read by `deploy/pi/webhook-secret.sh` under a one-hour secrets-broker grant (below) |
+| `deepgram-key` | `DEEPGRAM_API_KEY` from the operator's `secrets` store |
 
+Make the six public files on the development machine where you ran `create-cred-config`. Its
+`gcloud` must be the devbox identity, and it needs `agent-infra` checked out at
+`~/src/agent-infra` with Pulumi signed in:
+
+<!-- provision_bundle_test.sh: prepare -->
 ```bash
-(cd ~/src/agent-infra/bootstrap && pulumi stack output --stack prod ghostWisprCertificates --json | jq -r '."ghost-wispr"') >"$bundle_dir/device.crt"
-cp "$d/certificate_config.json" "$d/google-credentials.json" "$bundle_dir/"
-(cd ~/src/agent-infra/root && pulumi config get --stack prod --path 'tailscaleIds["ghost-wispr-x509"]') >"$bundle_dir/tailscale-client-id"
-(cd ~/src/agent-infra/envoy-cluster && printf '%s/webhook/ghostwispr' "$(pulumi stack output relayUrl --stack prod)") >"$bundle_dir/envoy-webhook-url"
-gcloud secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra >"$bundle_dir/envoy-webhook-secret"
-gcloud iam service-accounts describe ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com --format='value(uniqueId)' >"$bundle_dir/tailscale-subject"
+prepared=$(mktemp -d)
+gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$prepared/device.crt"
+openssl x509 -in "$prepared/device.crt" -noout -subject -enddate
+cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
+(cd ~/src/agent-infra/root && pulumi stack output ghostWisprTailnetClientId --stack prod) >"$prepared/tailscale-client-id"
+(cd ~/src/agent-infra/root && pulumi config get ghostWisprAccountUniqueId --stack prod) >"$prepared/tailscale-subject"
+(cd ~/src/agent-infra/envoy-cluster && printf '%s/webhook/ghostwispr\n' "$(pulumi stack output relayUrl --stack prod)") >"$prepared/envoy-webhook-url"
 rm -rf -- "$d"
 ```
 
-The two secret files stay only in this private directory. Do not put either secret in an
-argument, commit, or persistent file. For Deepgram, inject the broker secret into a process
-that writes the private bundle file; do not print it:
-
-```bash
-secrets DEEPGRAM_API_KEY -- sh -c 'printf %s "$DEEPGRAM_API_KEY" > "$1/deepgram-key"' sh "$bundle_dir"
-```
+`openssl` must print `subject=CN=ghost-wispr`. None of these files is a secret: if another
+machine provisions the Pi, copy `$prepared` there.
 
 ## Provision
 
-Provisioning runs as `ghost-wispr` with passwordless sudo. It installs `libportaudio2`,
+`deploy/pi/provision-pi.sh` reads the two secrets, makes the bundle and runs
+`deploy/pi/provision.sh` on the Pi. Run it from a checkout of the release's commit, on the
+machine that reaches the Pi over SSH.
+
+- It reads `envoy-ghostwispr-signing-secret` with `deploy/pi/webhook-secret.sh`, under one
+  secrets-broker grant of one hour that Sami approves on the broker page:
+  `secret-run --register --ttl 1h GCLOUD_SAMI` runs `gcloud-broker`, so the read is the admin
+  login the broker mints, never the box identity. `--broker-key KEY` reads a broker key that
+  holds a copy of the secret instead. `--broker-host HOST` makes the read on `HOST` over SSH,
+  for a provisioning machine whose `secret-run` has no secrets-broker identity (Sami's laptop:
+  name the devbox). `secret-run` and `gcloud-broker` are Sami's dotfiles scripts.
+- It reads `DEEPGRAM_API_KEY` with `secrets` on the provisioning machine.
+- The two secrets reach disk only in a mode-0700 directory under `$XDG_RUNTIME_DIR` while it
+  makes the tar stream. It removes that directory as soon as `provision.sh` returns, also when
+  `provision.sh` fails, and on any exit. No secret goes in an argument.
+- It copies only the provisioning sources to a temporary directory on the Pi and removes it
+  afterwards, so the card keeps no source checkout.
+
+`provision.sh` runs as `ghost-wispr` with passwordless sudo. It installs `libportaudio2`,
 `ffmpeg`, `lame`, `jq`, and `curl`; copies the release runtime to `/opt/ghost-wispr`; installs
 the user services; verifies and installs the newest release; enables Tailscale Serve; and then
 starts the detached tagged-device join.
 
-Copy only the provisioning sources to a temporary directory on the Pi. The directory is
-removed after provisioning, so the card keeps no source checkout.
+Set `broker_host` first if this machine's `secret-run` has no broker identity, then run:
 
+<!-- provision_bundle_test.sh: provision -->
 ```bash
-remote_dir=$(ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
-  'umask 077; mkdir -p ~/.local/share/ghost-wispr-provision; chmod 700 ~/.local/share/ghost-wispr-provision; mktemp -d ~/.local/share/ghost-wispr-provision/sources.XXXXXX')
-tar -C . -cf - deploy/pi wait-for-network.sh \
-  | ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "tar -xf - -C '$remote_dir'"
-tar -C "$bundle_dir" -cf - \
-  device.crt google-credentials.json certificate_config.json \
-  tailscale-client-id tailscale-subject envoy-webhook-url envoy-webhook-secret deepgram-key \
-  | ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "$remote_dir/deploy/pi/provision.sh"
-ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
+deploy/pi/provision-pi.sh --prepared "$prepared" ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"}
 ```
 
-`provision.sh` can end the SSH session while Tailscale re-authenticates. If the final cleanup
-command fails, reconnect with Tailscale SSH and run it again. Then check the detached join:
+`provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says
+so (exit 255). If it could not remove the sources directory on the Pi, reconnect with Tailscale
+SSH and run the `rm` command it prints. Then check the detached join:
 
 ```bash
 ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
@@ -226,7 +242,8 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net "rm -rf -- '$remote_dir'"
 
 That YAML names Deepgram `nova-3` for live and batch transcription, Gemini 4 Carbon for
 summaries, Gemini Embedding 2 for search, and Gemini 3.8 Flash TTS with voice `Kore` for
-speech. Chirp 3: HD remains the Google Cloud Text-to-Speech fallback. Gemini calls use Vertex
+speech. Chirp 3: HD stays available as another setting (`tts_provider: google` with a Chirp 3: HD
+voice); Ghost Wispr does not switch to it by itself. Gemini calls use Vertex
 AI in `theorem-agent-infra`, location `global`; embeddings use the documented global endpoint
 through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing sets
 `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
@@ -337,11 +354,14 @@ The warning goes once no such session is left. The count is read again at each s
 ## Accept slice 1
 
 Run the acceptance driver from a tailnet member. Give it the relay URL. To run the signed
-Envoy control, inject the signing secret only for this process.
+Envoy control, inject the signing secret only into the driver's process: `webhook-secret.sh`
+reads it under a one-hour secrets-broker grant, with `--broker-host` and `--broker-key` as for
+provisioning.
 
+<!-- provision_bundle_test.sh: accept -->
 ```bash
 GHOST_WISPR_RELAY_URL="$(cd ~/src/agent-infra/envoy-cluster && pulumi stack output relayUrl --stack prod)/webhook/ghostwispr" \
-GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$(gcloud secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra)" \
+GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$(deploy/pi/webhook-secret.sh ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"})" \
 deploy/pi/accept-slice1.sh
 ```
 

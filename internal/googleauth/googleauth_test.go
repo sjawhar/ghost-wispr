@@ -149,6 +149,14 @@ func TestStatusWarnsWhenTheCertificateExpiresSoon(t *testing.T) {
 	if !strings.Contains(warning, "docs/pi-setup.md") {
 		t.Fatalf("warning %q does not name the renewal runbook", warning)
 	}
+	// The renewed certificate is the latest version of this Secret Manager
+	// secret; bootstrap's stack output that held it is gone.
+	if !strings.Contains(warning, "ghost-wispr-device-certificate") {
+		t.Fatalf("warning %q does not name the Secret Manager secret that holds the renewed certificate", warning)
+	}
+	if strings.HasPrefix(warning, "Google credential certificate expires on ") == false {
+		t.Fatalf("warning %q lost the prefix deploy/pi/accept-slice2.sh matches", warning)
+	}
 	if warning := CertificateExpiryWarning(now, now.AddDate(0, 0, 40), true); warning != "" {
 		t.Fatalf("warning for certificate expiring in 40 days = %q, want empty", warning)
 	}
@@ -157,7 +165,7 @@ func TestStatusWarnsWhenTheCertificateExpiresSoon(t *testing.T) {
 func TestCertificateExpiryWarningSaysExpired(t *testing.T) {
 	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	warning := CertificateExpiryWarning(now, now.AddDate(0, 0, -1), true)
-	if !strings.Contains(warning, "expired on 2026-11-09") {
+	if !strings.Contains(warning, "expired on 2026-11-09") || !strings.Contains(warning, "ghost-wispr-device-certificate") {
 		t.Fatalf("expired certificate warning = %q", warning)
 	}
 }

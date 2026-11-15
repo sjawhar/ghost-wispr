@@ -2,10 +2,12 @@
 # Provision the Ghost Wispr Raspberry Pi from a release binary and a credential bundle on stdin.
 set -euo pipefail
 
-readonly DEPLOY_DIR=/opt/ghost-wispr
+# GHOST_WISPR_DEPLOY_DIR and GHOST_WISPR_IDENTITY_KEY exist for provision_run_test.sh, as
+# update.sh's GHOST_WISPR_DEPLOY_DIR does for update_test.sh.
+readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly JOIN_DIR=/var/lib/ghost-wispr-join
 readonly JOIN_TOKEN="$JOIN_DIR/token"
-readonly IDENTITY_KEY=/home/ghost-wispr/.config/ghost-wispr-identity/key.pem
+readonly IDENTITY_KEY="${GHOST_WISPR_IDENTITY_KEY:-/home/ghost-wispr/.config/ghost-wispr-identity/key.pem}"
 readonly SERVICE_USER=ghost-wispr
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
@@ -236,7 +238,9 @@ sudo udevadm control --reload
 sudo udevadm trigger
 sudo systemctl restart systemd-logind
 
-for group in plugdev input; do
+# plugdev opens the blink(1), input the power button, and audio the microphone and speaker: a
+# lingering user service has no seat, so no seat rule gives it the ALSA devices.
+for group in plugdev input audio; do
   if ! id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -Fxq "$group"; then
     sudo usermod -aG "$group" "$SERVICE_USER"
     groups_changed=true
@@ -260,7 +264,8 @@ sudo systemctl start "user@$service_uid.service"
 run_user_systemctl daemon-reload
 run_user_systemctl enable ghost-wispr.service
 run_user_systemctl enable --now ghost-wispr-update.timer
-"$DEPLOY_DIR/update.sh"
+# update.sh runs systemctl --user, which needs the user's runtime directory.
+XDG_RUNTIME_DIR="$runtime_dir" "$DEPLOY_DIR/update.sh"
 sudo tailscale serve --bg --https 443 http://127.0.0.1:8080
 
 self_status=$(tailscale status --self --json)
@@ -297,6 +302,8 @@ fi
 sudo install -d -o root -g root -m 0700 "$JOIN_DIR"
 printf '%s' "$id_token" | sudo install -m 0600 /dev/stdin "$JOIN_TOKEN"
 join_unit="ghost-wispr-tailnet-join-$(date +%s)"
-join_command="tailscale up --force-reauth --client-id='$tailscale_client_id?ephemeral=false&preauthorized=true' --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh; rc=\$?; rm -f $JOIN_TOKEN; exit \$rc"
+# Serve is set above for a node that is joined already, and again after the re-authentication:
+# the join can start a new login profile, which would not carry the setting over.
+join_command="tailscale up --force-reauth --client-id='$tailscale_client_id?ephemeral=false&preauthorized=true' --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh; rc=\$?; rm -f $JOIN_TOKEN; if [ \$rc -eq 0 ]; then tailscale serve --bg --https 443 http://127.0.0.1:8080 || rc=\$?; fi; exit \$rc"
 sudo systemd-run --unit="$join_unit" /bin/sh -c "$join_command"
 printf 'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and journalctl -u %s.\n' "$join_unit"

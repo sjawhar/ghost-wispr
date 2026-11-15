@@ -204,13 +204,17 @@ func CertExpiry(credPath string) (notAfter time.Time, ok bool, err error) {
 }
 
 // CertificateExpiryWarning returns the status warning for certificates expiring
-// within 30 days. The warning points operators to the renewal instructions.
+// within 30 days. The warning names where the renewed certificate is published
+// and the renewal instructions.
 func CertificateExpiryWarning(now, notAfter time.Time, hasCertificate bool) string {
 	if !hasCertificate || notAfter.After(now.AddDate(0, 0, 30)) {
 		return ""
 	}
 	if !notAfter.After(now) {
-		return fmt.Sprintf("Google credential certificate expired on %s; renew it with the runbook in docs/pi-setup.md.", notAfter.UTC().Format("2006-01-02"))
+		return fmt.Sprintf("Google credential certificate expired on %s; %s", notAfter.UTC().Format("2006-01-02"), CertificateRenewal)
 	}
-	return fmt.Sprintf("Google credential certificate expires on %s; renew it with the runbook in docs/pi-setup.md.", notAfter.UTC().Format("2006-01-02"))
+	return fmt.Sprintf("Google credential certificate expires on %s; %s", notAfter.UTC().Format("2006-01-02"), CertificateRenewal)
 }
+
+// CertificateRenewal tells the operator how to renew the device certificate.
+const CertificateRenewal = `install the latest version of Secret Manager secret ghost-wispr-device-certificate with the runbook in docs/pi-setup.md, "Renew the X.509 certificate".`
