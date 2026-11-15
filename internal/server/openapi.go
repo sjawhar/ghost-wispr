@@ -35,7 +35,7 @@ func OpenAPISpec() map[string]any {
 		"openapi": "3.1.0",
 		"info": map[string]any{
 			"title":       "Ghost Wispr API",
-			"description": "REST API for Ghost Wispr meeting transcription and summarization",
+			"description": "REST API for Ghost Wispr meeting transcription and summarization. Every POST, PATCH, PUT and DELETE, and the /ws WebSocket handshake, whose Origin header names another site (or null) gets 403: only the host the request came to and the unit's public_url are accepted. A request with no Origin header, such as curl's, is accepted.",
 			"version":     "1.0.0",
 		},
 		"servers": []map[string]any{

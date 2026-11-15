@@ -11,8 +11,10 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/logging"
 )
 
+// upgrader accepts every origin: originPolicy.guard has already refused a
+// handshake from another site's page with 403 before this route runs.
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(*http.Request) bool { return true },
 }
 
 func registerWSRoute(mux *http.ServeMux, hub *Hub, logger *slog.Logger) {

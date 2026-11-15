@@ -77,6 +77,11 @@ for line in \
   assert_line "$line" "$template"
 done
 assert_count '^gdrive_folder_id:' 0 "$template"
+# The template's public_url is the address the tailnet join publishes.
+tailnet_host=$(provisioner_function eval 'printf %s "${TAILSCALE_HOSTNAME%.}"')
+[[ -n "$tailnet_host" ]] || fail 'could not read TAILSCALE_HOSTNAME from the provisioner'
+assert_line "public_url: https://$tailnet_host" "$template"
+assert_count '^public_url:' 1 "$template"
 
 # The full provisioner's configuration: the URL substituted literally, sync and GC off.
 base_config="$work_dir/base.yaml"

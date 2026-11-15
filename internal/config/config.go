@@ -53,6 +53,7 @@ type Config struct {
 	DBPath                        string             `yaml:"db_path"`
 	AudioDir                      string             `yaml:"audio_dir"`
 	LogLevel                      string             `yaml:"log_level"`
+	PublicURL                     string             `yaml:"public_url"` // the unit's own HTTPS address, its tailnet name
 	SilenceTimeout                string             `yaml:"silence_timeout"`
 	MinSessionSegments            int                `yaml:"min_session_segments"`
 	MicSampleRate                 int                `yaml:"mic_sample_rate"`
@@ -329,6 +330,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_URL"); v != "" {
 		cfg.EnvoyWebhookURL = strings.TrimSpace(v)
 	}
+	if v := os.Getenv(EnvPrefix + "PUBLIC_URL"); v != "" {
+		cfg.PublicURL = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "GC_ENABLED"); v != "" {
 		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
@@ -523,6 +527,16 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 		}
 		if cfg.EnvoyWebhookSecret == "" {
 			warnings = append(warnings, envoyWebhookSecretWarning)
+		}
+	}
+	if publicURL := strings.TrimSpace(cfg.PublicURL); publicURL != "" {
+		parsed, err := url.Parse(publicURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+			(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+			warnings = append(warnings, fmt.Sprintf("Invalid public_url %q — it must be the unit's HTTPS address with no path, such as https://ghost-wispr.example.ts.net; ignoring it.", cfg.PublicURL))
+			cfg.PublicURL = ""
+		} else {
+			cfg.PublicURL = parsed.Scheme + "://" + parsed.Host
 		}
 	}
 	if cfg.BatchTranscription.Model == "" {

@@ -18,6 +18,11 @@ db_path: data/ghost-wispr.db
 audio_dir: data/audio
 silence_timeout: 30s
 
+# The unit's own HTTPS address, such as the name tailscale serve publishes. The web UI accepts
+# requests from pages there as well as at the host a request came to, and Envoy events link to
+# sessions under it.
+# public_url: https://ghost-wispr.example.ts.net
+
 # Microphone — preferred sample rate tried first, then alternatives
 mic_sample_rate: 16000
 mic_sample_rates: [48000, 44100, 32000, 24000]

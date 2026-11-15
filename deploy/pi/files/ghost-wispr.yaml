@@ -1,6 +1,9 @@
 db_path: data/ghost-wispr.db
 audio_dir: data/audio
 silence_timeout: 300s
+# The address tailscale serve publishes (provision.sh TAILSCALE_HOSTNAME): the web UI accepts
+# requests from pages there, and Envoy events link to sessions under it.
+public_url: https://ghost-wispr.tail12ec1c.ts.net
 deepgram_model: nova-3
 batch_transcription:
   provider: deepgram

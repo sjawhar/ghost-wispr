@@ -94,6 +94,7 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_MIC_SAMPLE_RATE` | No | `16000` | Preferred microphone sample rate |
 | `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
+| `GHOST_WISPR_PUBLIC_URL` | No | — | The unit's own HTTPS address (`public_url`), such as its tailnet name: pages there may use the API, and Envoy events link to sessions under it |
 | `google_credentials_file` | No | — | Authoritative Google credential file; when empty, Application Default Credentials are used |
 
 `ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
@@ -130,6 +131,12 @@ outputs, credential bundle, provisioning command, tailnet join, and acceptance c
 | `POST` | `/api/resume` | Resume a persisted pause. With a configured light, it confirms red before returning, and a missing light refuses the resume. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone restarts. |
 | `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `light_unavailable` while the switch is on but the recording light is missing or does not read back red, `resuming` from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 s, `stalled`, `mic_unavailable`, `no_audio` while the microphone and the gate are open but no audio has reached the recording for 2 s, so nothing is recorded and the light is off, or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (raw `.pcm` recordings that could not be saved), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |
+
+With no `GHOST_WISPR_AUTH_TOKEN`, as on the Pi, tailnet membership is the only access control. So that a page on another site,
+open in a tailnet member's browser, cannot use it, the `/ws` handshake and every `POST`, `PATCH`,
+`PUT` and `DELETE` whose `Origin` header names another site (or `null`) get `403`. The accepted
+origins are the host the request came to and `public_url`. A client that sends no `Origin`, such
+as `curl` or an agent, is not affected.
 
 ## Development
 

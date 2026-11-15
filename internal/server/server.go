@@ -170,18 +170,19 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	}
 	mux := http.NewServeMux()
 
-	registerWSRoute(mux, hub, moduleLogger)
 	var cs *config.Store
 	if len(cfgStore) > 0 {
 		cs = cfgStore[0]
 	}
+	origins := originPolicy{cfg: cs, logger: moduleLogger}
+	registerWSRoute(mux, hub, moduleLogger)
 	registerAPIRoutes(mux, store, controls, healthChecker, cs, embeddingClient)
 
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))
 
 	withAuth := BasicAuthMiddleware(authToken)(mux)
-	withRequestID := logging.RequestIDMiddleware(moduleLogger, nil)(noStoreAPI(withAuth))
+	withRequestID := logging.RequestIDMiddleware(moduleLogger, nil)(noStoreAPI(origins.guard(withAuth)))
 	return withRequestID, nil
 }
 
