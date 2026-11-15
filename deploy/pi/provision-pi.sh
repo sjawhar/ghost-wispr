@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
 # Provision the office Pi from the operator's machine (docs/pi-setup.md, "Provision").
 #
-#   deploy/pi/provision-pi.sh --prepared DIR [--broker-host HOST] [--broker-key KEY]
+#   deploy/pi/provision-pi.sh --prepared DIR
 #
 #   --prepared DIR     the bundle's public files, made as docs/pi-setup.md says: device.crt,
 #                      google-credentials.json, certificate_config.json, tailscale-client-id,
 #                      tailscale-subject, envoy-webhook-url.
-#   --broker-host HOST, --broker-key KEY
-#                      passed to deploy/pi/webhook-secret.sh, which reads the webhook signing
-#                      secret under one secrets-broker grant of one hour that Sami approves.
 #
-# The Deepgram key comes from `secrets DEEPGRAM_API_KEY` on this machine. The two secrets reach
-# disk only in a mode-0700 directory under $XDG_RUNTIME_DIR, while the tar stream for provision.sh
-# is made. That directory is removed as soon as provision.sh returns, whether it worked or not,
-# and on any exit. No secret is put in an argument.
+# The Deepgram key comes from `secrets DEEPGRAM_API_KEY` on this machine. It reaches disk only in a
+# mode-0700 directory under $XDG_RUNTIME_DIR, while the tar stream for provision.sh is made. That
+# directory is removed as soon as provision.sh returns, whether it worked or not, and on any exit.
+# No secret is put in an argument. The Envoy webhook signing key is not in the bundle: the
+# recorder reads it from Secret Manager with its own Google identity.
 set -euo pipefail
 umask 077
 
 readonly PI=ghost-wispr@ghost-wispr.tail12ec1c.ts.net
 readonly PREPARED_FILES=(device.crt google-credentials.json certificate_config.json tailscale-client-id
   tailscale-subject envoy-webhook-url)
-readonly SECRET_FILES=(envoy-webhook-secret deepgram-key)
+readonly SECRET_FILES=(deepgram-key)
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
@@ -31,19 +29,14 @@ fail() {
   log "FAILED: $*"
   exit 1
 }
-usage() { sed -n '4,11p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '4,8p' "$0" | sed 's/^# \{0,1\}//'; }
 
 prepared=
-secret_options=()
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --prepared | --broker-host | --broker-key)
+    --prepared)
       [[ $# -ge 2 && -n $2 ]] || fail "$1 needs a value"
-      if [[ $1 == --prepared ]]; then
-        prepared=$2
-      else
-        secret_options+=("$1" "$2")
-      fi
+      prepared=$2
       shift 2
       ;;
     -h | --help)
@@ -83,10 +76,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
-webhook_secret=$("$script_dir/webhook-secret.sh" "${secret_options[@]}" \
-  --reason "Ghost Wispr provisioning (docs/pi-setup.md): read envoy-ghostwispr-signing-secret once for the office Pi's credential bundle, sent over SSH stdin and not stored") \
-  || fail "could not read the webhook signing secret; nothing went to the Pi"
-
 log "copying deploy/pi and wait-for-network.sh to the Pi"
 dir=$(ssh -n "$PI" 'umask 077 && mkdir -p ~/.local/share/ghost-wispr-provision && chmod 700 ~/.local/share/ghost-wispr-provision && mktemp -d ~/.local/share/ghost-wispr-provision/sources.XXXXXX') \
   || fail "cannot make the sources directory on the Pi"
@@ -100,8 +89,6 @@ stage=$(mktemp -d -p "$XDG_RUNTIME_DIR" ghost-wispr-bundle.XXXXXX)
 for f in "${PREPARED_FILES[@]}"; do
   cp -- "$prepared/$f" "$stage/$f"
 done
-printf '%s' "$webhook_secret" >"$stage/envoy-webhook-secret"
-unset webhook_secret
 # shellcheck disable=SC2016 # The child shell expands the key the secrets store gave it.
 secrets DEEPGRAM_API_KEY -- sh -c 'printf %s "$DEEPGRAM_API_KEY" >"$1"' sh "$stage/deepgram-key"
 [[ -s $stage/deepgram-key ]] || fail "DEEPGRAM_API_KEY came back empty"

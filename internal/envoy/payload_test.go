@@ -72,7 +72,7 @@ func privateSession() *storeStub {
 // removed the words it repeats.
 func TestEventsCarryNoSessionText(t *testing.T) {
 	server, bodies := rawWebhookServer(t)
-	publisher := NewPublisher(server.URL, "shared-secret", privateSession())
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), privateSession())
 	publisher.client.retryDelays = nil
 
 	ctx := context.Background()
@@ -116,7 +116,7 @@ func TestEventsCarryNoSessionText(t *testing.T) {
 func TestEventsLinkTheSessionAndItsTimes(t *testing.T) {
 	server, requests := newListenerTestServer(t, "shared-secret")
 	defer server.Close()
-	publisher := NewPublisher(server.URL, "shared-secret", privateSession(), WithPublicURL("https://ghost-wispr.example.ts.net/"))
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), privateSession(), WithPublicURL("https://ghost-wispr.example.ts.net/"))
 	publisher.client.retryDelays = nil
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
 		t.Fatalf("PublishSummaryReady: %v", err)
@@ -155,7 +155,7 @@ func TestEventsLinkTheSessionAndItsTimes(t *testing.T) {
 	store.sessions["session-1"] = session
 	server2, requests2 := newListenerTestServer(t, "shared-secret")
 	defer server2.Close()
-	publisher = NewPublisher(server2.URL, "shared-secret", store)
+	publisher = NewPublisher(server2.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = nil
 	if err := publisher.PublishSessionStarted(context.Background(), "session-1"); err != nil {
 		t.Fatalf("PublishSessionStarted: %v", err)

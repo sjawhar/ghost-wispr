@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
@@ -47,12 +48,30 @@ type Event struct {
 	Payload        map[string]any
 }
 
+// KeyReader reads Envoy's webhook signing key: on the unit, from Secret
+// Manager with the unit's Google credential.
+type KeyReader func(ctx context.Context) (string, error)
+
+// keyReadTimeout bounds one read of the signing key, so an event waits for a
+// read that does not answer no longer than this.
+const keyReadTimeout = 30 * time.Second
+
 // Option configures a Client or a Publisher.
 type Option func(*options)
 
 type options struct {
 	logger    *slog.Logger
 	publicURL string
+	keyStatus func(error)
+}
+
+// WithKeyStatus calls report after every read of the signing key, with nil
+// when it read a key and the read's error when it did not; the unit shows the
+// error in /api/status.
+func WithKeyStatus(report func(error)) Option {
+	return func(o *options) {
+		o.keyStatus = report
+	}
 }
 
 // WithLogger sets the logger used for webhook request failures and retries.
@@ -82,15 +101,20 @@ func collectOptions(opts []Option) options {
 	return collected
 }
 
-// Client sends Ghost Wispr events to Envoy's webhook.
+// Client sends Ghost Wispr events to Envoy's webhook, signed with a key it
+// reads once and keeps in memory.
 type Client struct {
 	url         string
-	secret      []byte
+	readKey     KeyReader
+	keyStatus   func(error)
 	httpClient  *http.Client
 	logger      *slog.Logger
 	now         func() time.Time
 	sleep       func(context.Context, time.Duration) error
 	retryDelays []time.Duration
+
+	keyMu sync.Mutex
+	key   []byte // the key read last; nil until a read works
 }
 type webhookStatusError struct {
 	status int
@@ -100,17 +124,17 @@ func (err *webhookStatusError) Error() string {
 	return fmt.Sprintf("envoy webhook responded with status %d", err.status)
 }
 
-// NewClient creates a webhook client. It does not contact the relay until Send.
-// It trims the URL and secret as Envoy trims ENVOY_GHOSTWISPR_SIGNING_SECRET,
-// so both sides sign with the same key.
-func NewClient(webhookURL, secret string, opts ...Option) *Client {
-	return newClient(webhookURL, secret, collectOptions(opts))
+// NewClient creates a webhook client. It reads the signing key with readKey
+// at the first Send, not before.
+func NewClient(webhookURL string, readKey KeyReader, opts ...Option) *Client {
+	return newClient(webhookURL, readKey, collectOptions(opts))
 }
 
-func newClient(webhookURL, secret string, opts options) *Client {
+func newClient(webhookURL string, readKey KeyReader, opts options) *Client {
 	return &Client{
-		url:    strings.TrimSpace(webhookURL),
-		secret: []byte(strings.TrimSpace(secret)),
+		url:       strings.TrimSpace(webhookURL),
+		readKey:   readKey,
+		keyStatus: opts.keyStatus,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -124,8 +148,40 @@ func newClient(webhookURL, secret string, opts options) *Client {
 	}
 }
 
+// signingKey returns the key the client keeps, reading it first when it has
+// none. With stale set it reads the key again, unless another send already
+// replaced stale. The key is trimmed as Envoy trims
+// ENVOY_GHOSTWISPR_SIGNING_SECRET, so both sides sign with the same bytes.
+func (c *Client) signingKey(ctx context.Context, stale []byte) ([]byte, error) {
+	c.keyMu.Lock()
+	kept := c.key
+	c.keyMu.Unlock()
+	if kept != nil && (stale == nil || !bytes.Equal(kept, stale)) {
+		return kept, nil
+	}
+	readCtx, cancel := context.WithTimeout(ctx, keyReadTimeout)
+	raw, err := c.readKey(readCtx)
+	cancel()
+	key := []byte(strings.TrimSpace(raw))
+	if err == nil && len(key) == 0 {
+		err = errors.New("the signing key is empty")
+	}
+	if c.keyStatus != nil {
+		c.keyStatus(err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read envoy webhook signing key: %w", err)
+	}
+	c.keyMu.Lock()
+	c.key = key
+	c.keyMu.Unlock()
+	return key, nil
+}
+
 // Send posts ev to Envoy's webhook. It retries transient failures with the
-// event's stable delivery ID and returns immediately for a 4xx response.
+// event's stable delivery ID and returns immediately for a 4xx response, but
+// for a 401, which a rotated key gives: then it reads the key again, once,
+// and sends again with a new key. It sends nothing when it has no key.
 func (c *Client) Send(ctx context.Context, ev Event) error {
 	if c == nil {
 		return errors.New("envoy webhook client is nil")
@@ -142,15 +198,33 @@ func (c *Client) Send(ctx context.Context, ev Event) error {
 	if err != nil {
 		return err
 	}
-	signature := webhookSignature(c.secret, body)
+	key, err := c.signingKey(ctx, nil)
+	if err != nil {
+		return err
+	}
 
+	keyReread := false
 	for attempt := 0; ; attempt++ {
-		retry, err := c.sendOnce(ctx, eventType, delivery, body, signature)
+		retry, err := c.sendOnce(ctx, eventType, delivery, body, webhookSignature(key, body))
 		if err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		var status *webhookStatusError
+		if !keyReread && errors.As(err, &status) && status.status == http.StatusUnauthorized {
+			keyReread = true
+			fresh, readErr := c.signingKey(ctx, key)
+			if readErr != nil {
+				return errors.Join(err, readErr)
+			}
+			if bytes.Equal(fresh, key) {
+				return err
+			}
+			key = fresh
+			attempt--
+			continue
 		}
 		if !retry || attempt == len(c.retryDelays) {
 			return err
@@ -212,14 +286,23 @@ type Publisher struct {
 	publicURL string
 }
 
-// NewPublisher creates a session-aware Envoy webhook publisher.
-func NewPublisher(webhookURL, secret string, store Store, opts ...Option) *Publisher {
+// NewPublisher creates a session-aware Envoy webhook publisher whose events
+// are signed with the key readKey reads.
+func NewPublisher(webhookURL string, readKey KeyReader, store Store, opts ...Option) *Publisher {
 	collected := collectOptions(opts)
 	return &Publisher{
 		store:     store,
-		client:    newClient(webhookURL, secret, collected),
+		client:    newClient(webhookURL, readKey, collected),
 		publicURL: collected.publicURL,
 	}
+}
+
+// CheckSigningKey reads the signing key when the publisher has none yet, so
+// a key that cannot be read is reported (WithKeyStatus) before the first
+// event needs it.
+func (p *Publisher) CheckSigningKey(ctx context.Context) error {
+	_, err := p.client.signingKey(ctx, nil)
+	return err
 }
 
 // PublishSessionStarted sends a session_started event.

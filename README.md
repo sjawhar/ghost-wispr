@@ -141,7 +141,7 @@ as `curl` or an agent, is not affected.
 ### Envoy events
 
 With `envoy_enabled`, Ghost Wispr posts `session_started`, `session_ended` and `summary_ready` to
-`envoy_webhook_url`, signed with `GHOST_WISPR_ENVOY_WEBHOOK_SECRET`; Envoy publishes them under
+`envoy_webhook_url`; Envoy publishes them under
 `notifications.ghostwispr.<session>.{session.started,session.ended,summary.ready}`. No event
 carries a session's title, summary or transcript, because Envoy keeps every event for 72 hours
 and a segment deletion cannot recall it. Each payload has `session_id`, `type`, `started_at`,
@@ -150,6 +150,15 @@ session has a Drive folder) and `session_url` (`public_url` + `/api/sessions/{id
 `public_url` is set). `summary_ready` adds `summary_preset`, `summary_model` and `version`. To
 read the text, fetch `session_url`, which returns what is left after any deletion.
 `GET /api/openapi.json` describes the payload under `webhooks`.
+
+Each event is signed with Envoy's webhook signing key, which Ghost Wispr reads from Google Secret
+Manager with its Google credential (`google_credentials_file`): the secret version
+`envoy_webhook_secret_name` (`GHOST_WISPR_ENVOY_WEBHOOK_SECRET_NAME`), by default
+`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`. It keeps
+the key in memory and reads it again once when Envoy answers 401, so a rotated key needs no
+change on the unit. While the key cannot be read, no event is sent, `/api/status` warns, and the
+unsent events go out from the five-minute sweep once it reads; recording does not depend on it.
+`GHOST_WISPR_ENVOY_WEBHOOK_SECRET` is no longer read, and a start that finds it warns.
 
 ## Development
 

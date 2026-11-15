@@ -46,21 +46,13 @@ func NewStoreWithEnv(yamlPath, envPath string) (*Store, []string, error) {
 	}
 
 	applyEnvFileSecrets(&cfg, envSecrets)
-	if cfg.EnvoyWebhookSecret != "" {
-		warnings = withoutWarning(warnings, envoyWebhookSecretWarning)
+	// Load warned about a leftover signing key in the environment; one left
+	// only in .env is warned about here.
+	if envSecrets[EnvPrefix+"ENVOY_WEBHOOK_SECRET"] != "" && os.Getenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET") == "" {
+		warnings = append(warnings, leftoverEnvoyWebhookSecretWarning)
 	}
 
 	return &Store{cfg: cfg, path: yamlPath, envPath: envPath}, warnings, nil
-}
-
-func withoutWarning(warnings []string, unwanted string) []string {
-	filtered := warnings[:0]
-	for _, warning := range warnings {
-		if warning != unwanted {
-			filtered = append(filtered, warning)
-		}
-	}
-	return filtered
 }
 
 // Get returns a snapshot copy of the current config.
@@ -222,7 +214,6 @@ var secretEnvKeys = []struct {
 	{EnvPrefix + "OPENAI_API_KEY", func(c *Config) string { return c.OpenAIAPIKey }, func(c *Config, v string) { c.OpenAIAPIKey = v }},
 	{EnvPrefix + "ANTHROPIC_API_KEY", func(c *Config) string { return c.AnthropicAPIKey }, func(c *Config, v string) { c.AnthropicAPIKey = v }},
 	{EnvPrefix + "GEMINI_API_KEY", func(c *Config) string { return c.GeminiAPIKey }, func(c *Config, v string) { c.GeminiAPIKey = v }},
-	{EnvPrefix + "ENVOY_WEBHOOK_SECRET", func(c *Config) string { return c.EnvoyWebhookSecret }, func(c *Config, v string) { c.EnvoyWebhookSecret = strings.TrimSpace(v) }},
 }
 
 // loadEnvFile reads KEY=VALUE pairs from a .env file.

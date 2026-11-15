@@ -3,8 +3,10 @@
 # provisioning call, read from the runbook between its provision_bundle_test.sh markers, against
 # fakes that answer only the sources agent-infra main has: Secret Manager
 # ghost-wispr-device-certificate, root's stack output ghostWisprTailnetClientId, root's prod config
-# ghostWisprAccountUniqueId and envoy-cluster's relayUrl. The webhook signing secret answers only
-# under a one-hour GCLOUD_SAMI broker grant (or a broker key), never to a plain gcloud read.
+# ghostWisprAccountUniqueId and envoy-cluster's relayUrl. Provisioning reads no Envoy signing key:
+# the recorder reads it from Secret Manager itself. The slice 1 acceptance block reads it, for its
+# signed probe, only under a one-hour GCLOUD_SAMI broker grant (or a broker key), never to a plain
+# gcloud read.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -193,9 +195,9 @@ esac
 EOF
 chmod +x "$work_dir/bin/"*
 
-# run_runbook runs the runbook's blocks in a fresh home with broker_host and broker_key as given.
+# run_runbook runs the runbook's blocks in a fresh home.
 run_runbook() {
-  local case_dir=$1 broker_host=$2 broker_key=$3
+  local case_dir=$1
   mkdir -p "$case_dir/home/src/agent-infra/bootstrap" "$case_dir/home/src/agent-infra/root" \
     "$case_dir/home/src/agent-infra/envoy-cluster" "$case_dir/tmp" "$case_dir/pi"
   mkdir -m 700 "$case_dir/run"
@@ -203,17 +205,16 @@ run_runbook() {
   (
     cd "$repo_root"
     HOME="$case_dir/home" TMPDIR="$case_dir/tmp" XDG_RUNTIME_DIR="$case_dir/run" TEST_PI="$case_dir/pi" \
-      TEST_GRANTS="$case_dir/grants" PATH="$work_dir/bin:$PATH" broker_host="$broker_host" broker_key="$broker_key" \
-      bash -euo pipefail "$runbook"
+      TEST_GRANTS="$case_dir/grants" PATH="$work_dir/bin:$PATH" bash -euo pipefail "$runbook"
   )
 }
 
 # check_case checks one finished run: the bundle the Pi received, where the secrets were kept,
 # and that no secret is left on disk or was ever an argument.
 check_case() {
-  local case_dir=$1 want_grant=$2
+  local case_dir=$1
   local received="$case_dir/pi/bundle"
-  printf '%s\n' certificate_config.json deepgram-key device.crt envoy-webhook-secret envoy-webhook-url \
+  printf '%s\n' certificate_config.json deepgram-key device.crt envoy-webhook-url \
     google-credentials.json tailscale-client-id tailscale-subject >"$case_dir/expected.list"
   cmp -s "$case_dir/expected.list" "$case_dir/pi/bundle.list" \
     || fail "$case_dir: the Pi received $(tr '\n' ' ' <"$case_dir/pi/bundle.list")"
@@ -221,11 +222,13 @@ check_case() {
   [[ $(<"$received/tailscale-client-id") == "$CLIENT_ID" ]] || fail "tailscale-client-id is not root's ghostWisprTailnetClientId"
   [[ $(<"$received/tailscale-subject") == "$SUBJECT" ]] || fail "tailscale-subject is not root's ghostWisprAccountUniqueId"
   [[ $(<"$received/envoy-webhook-url") == https://relay.example.test/webhook/ghostwispr ]] || fail "envoy-webhook-url is wrong"
-  [[ $(<"$received/envoy-webhook-secret") == "$WEBHOOK_SECRET" ]] || fail "envoy-webhook-secret is wrong"
   [[ $(<"$received/deepgram-key") == "$DEEPGRAM_SECRET" ]] || fail "deepgram-key is wrong"
   jq -e '.credential_source.certificate.certificate_config_location == "/opt/ghost-wispr/certificate_config.json"' \
     "$received/google-credentials.json" >/dev/null || fail "google-credentials.json does not name the Pi's certificate config"
-  [[ $(<"$case_dir/grants") == "$want_grant" ]] || fail "broker grants were $(tr '\n' ' ' <"$case_dir/grants"), want $want_grant"
+  [[ ! -s "$case_dir/grants" ]] || fail "provisioning asked for broker grants: $(tr '\n' ' ' <"$case_dir/grants")"
+  if grep -rqF "$WEBHOOK_SECRET" "$received"; then
+    fail "the Envoy signing key reached the Pi in the bundle"
+  fi
   [[ $(wc -l <"$case_dir/pi/stage.during") == 1 && $(cut -d' ' -f1 "$case_dir/pi/stage.during") == 700 ]] \
     || fail "while provision.sh ran, the secrets were not in one mode-0700 directory under XDG_RUNTIME_DIR: $(<"$case_dir/pi/stage.during")"
   [[ -z $(find "$case_dir/run" -mindepth 1 -print -quit) ]] || fail "the bundle directory is left in XDG_RUNTIME_DIR"
@@ -236,17 +239,10 @@ check_case() {
 }
 
 export TEST_ARGV_LOG
-run_runbook "$work_dir/local" "" "" || fail "the runbook's commands failed against agent-infra main's sources"
-check_case "$work_dir/local" GCLOUD_SAMI
+run_runbook "$work_dir/local" || fail "the runbook's commands failed against agent-infra main's sources"
+check_case "$work_dir/local"
 
-run_runbook "$work_dir/broker-host" broker.example "" || fail "the runbook's commands failed with --broker-host"
-check_case "$work_dir/broker-host" GCLOUD_SAMI
-grep -q '^ssh -n broker.example secret-run --register ' "$TEST_ARGV_LOG" || fail "--broker-host did not run secret-run on the broker host"
-
-run_runbook "$work_dir/broker-key" "" ENVOY_GHOSTWISPR_SIGNING_SECRET || fail "the runbook's commands failed with --broker-key"
-check_case "$work_dir/broker-key" ENVOY_GHOSTWISPR_SIGNING_SECRET
-
-if TEST_PROVISION_EXIT=1 run_runbook "$work_dir/failed" "" "" 2>/dev/null; then
+if TEST_PROVISION_EXIT=1 run_runbook "$work_dir/failed" 2>/dev/null; then
   fail "the runbook succeeded although provision.sh failed"
 fi
 [[ -s "$work_dir/failed/pi/stage.during" ]] || fail "the failure case never reached provision.sh"
@@ -255,11 +251,11 @@ grep -q 'rm -rf --' "$work_dir/failed/pi/removed" || fail "a failed provisioning
 
 # The SSH session ends (exit 255) as Tailscale re-authenticates, only after provision.sh says the
 # join started; an exit 255 before that is a failure.
-if TEST_PROVISION_EXIT=255 run_runbook "$work_dir/dropped-early" "" "" 2>/dev/null; then
+if TEST_PROVISION_EXIT=255 run_runbook "$work_dir/dropped-early" 2>/dev/null; then
   fail "the runbook succeeded although the SSH session ended before the tailnet join started"
 fi
 TEST_PROVISION_EXIT=255 TEST_PROVISION_SAYS='ghost-wispr provision: starting the tagged tailnet join as ghost-wispr-tailnet-join-1' \
-  run_runbook "$work_dir/dropped-after-join" "" "" 2>/dev/null \
+  run_runbook "$work_dir/dropped-after-join" 2>/dev/null \
   || fail "the runbook failed although the SSH session ended after the tailnet join started"
 
 # Slice 1 acceptance: the secret reaches the driver's environment alone, read under a grant.

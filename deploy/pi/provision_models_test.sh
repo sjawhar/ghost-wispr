@@ -184,13 +184,15 @@ drive_on_empty=$(provisioner_function deployed_drive_id "$empty_drive") \
   || fail 'a configuration the config API saved without a shared drive was treated as invalid'
 [[ -z "$drive_on_empty" ]] || fail "a configuration with an empty shared drive returned '$drive_on_empty'"
 
-# --models keeps every .env line and sets the Vertex embedding location exactly once.
+# --models keeps every .env line but the Envoy signing key an earlier provisioner wrote, which the
+# recorder now reads from Secret Manager, and sets the Vertex embedding location exactly once.
 deployed_env="$work_dir/env"
 models_env="$work_dir/models.env"
 cat >"$deployed_env" <<'EOF'
 GHOST_WISPR_ADDR=127.0.0.1:8080
 GHOST_WISPR_EMBEDDING_LOCATION=europe-west4
 GHOST_WISPR_DEEPGRAM_API_KEY=test-key
+GHOST_WISPR_ENVOY_WEBHOOK_SECRET=stale-signing-key
 EOF
 provisioner_function render_models_env "$deployed_env" >"$models_env" \
   || fail 'the .env renderer rejected a deployed .env'
@@ -198,6 +200,7 @@ assert_line 'GHOST_WISPR_ADDR=127.0.0.1:8080' "$models_env"
 assert_line 'GHOST_WISPR_DEEPGRAM_API_KEY=test-key' "$models_env"
 assert_line 'GHOST_WISPR_EMBEDDING_LOCATION=global' "$models_env"
 assert_count '^GHOST_WISPR_EMBEDDING_LOCATION=' 1 "$models_env"
+assert_count 'stale-signing-key' 0 "$models_env"
 if provisioner_function render_models_env "$work_dir/missing.env" >/dev/null 2>&1; then
   fail 'the .env renderer succeeded without a deployed .env'
 fi

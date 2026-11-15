@@ -19,8 +19,14 @@ import (
 const EnvPrefix = "GHOST_WISPR_"
 
 const (
-	IndicatorLightBlink1      = "blink1"
-	envoyWebhookSecretWarning = "Envoy enabled but webhook secret not configured — set " + EnvPrefix + "ENVOY_WEBHOOK_SECRET; Envoy rejects unsigned events."
+	IndicatorLightBlink1 = "blink1"
+	// DefaultEnvoyWebhookSecretName is the Secret Manager version the office
+	// recorder reads Envoy's webhook signing key from (dispatch://INFRA-3599
+	// gives its Google identity Secret Accessor on it).
+	DefaultEnvoyWebhookSecretName = "projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest"
+	// leftoverEnvoyWebhookSecretWarning names a signing key an earlier
+	// provisioner left in the environment or .env.
+	leftoverEnvoyWebhookSecretWarning = EnvPrefix + "ENVOY_WEBHOOK_SECRET is no longer read: Ghost Wispr reads the Envoy signing key from Secret Manager (envoy_webhook_secret_name). Remove it from the environment and .env."
 )
 
 // Config holds all application configuration. Secrets (API keys) are loaded
@@ -66,6 +72,7 @@ type Config struct {
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
 	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
 	EnvoyWebhookURL               string             `yaml:"envoy_webhook_url"`
+	EnvoyWebhookSecretName        string             `yaml:"envoy_webhook_secret_name"`
 	GCEnabled                     bool               `yaml:"gc_enabled"`
 	GCMaxAgeDays                  int                `yaml:"gc_max_age_days"`
 	GCMaxAudioSizeMB              int                `yaml:"gc_max_audio_size_mb"`
@@ -87,12 +94,11 @@ type Config struct {
 	TTSMaxLength                  int                `yaml:"tts_max_length"`
 
 	// Secrets — env vars only, never serialized to YAML.
-	DeepgramAPIKey     string `yaml:"-"`
-	OpenAIAPIKey       string `yaml:"-"`
-	AnthropicAPIKey    string `yaml:"-"`
-	GeminiAPIKey       string `yaml:"-"`
-	TTSAPIKey          string `yaml:"-"`
-	EnvoyWebhookSecret string `yaml:"-"`
+	DeepgramAPIKey  string `yaml:"-"`
+	OpenAIAPIKey    string `yaml:"-"`
+	AnthropicAPIKey string `yaml:"-"`
+	GeminiAPIKey    string `yaml:"-"`
+	TTSAPIKey       string `yaml:"-"`
 }
 
 func defaults() Config {
@@ -133,6 +139,7 @@ func defaults() Config {
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
 		TTSMaxLength:                  5000,
+		EnvoyWebhookSecretName:        DefaultEnvoyWebhookSecretName,
 	}
 }
 
@@ -198,6 +205,9 @@ func deprecatedEnvoyEnvironmentWarnings() []string {
 		if _, found := os.LookupEnv(EnvPrefix + key); found {
 			warnings = append(warnings, EnvPrefix+key+" has been removed; use "+EnvPrefix+"ENVOY_WEBHOOK_URL instead.")
 		}
+	}
+	if os.Getenv(EnvPrefix+"ENVOY_WEBHOOK_SECRET") != "" {
+		warnings = append(warnings, leftoverEnvoyWebhookSecretWarning)
 	}
 	return warnings
 }
@@ -330,6 +340,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_URL"); v != "" {
 		cfg.EnvoyWebhookURL = strings.TrimSpace(v)
 	}
+	if v := os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_SECRET_NAME"); v != "" {
+		cfg.EnvoyWebhookSecretName = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "PUBLIC_URL"); v != "" {
 		cfg.PublicURL = strings.TrimSpace(v)
 	}
@@ -393,7 +406,6 @@ func loadSecrets(cfg *Config) {
 	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
 	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
 	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
-	cfg.EnvoyWebhookSecret = strings.TrimSpace(os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_SECRET"))
 }
 
 type googleCredentialInfo struct {
@@ -525,9 +537,10 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 				warnings = append(warnings, "Envoy webhook URL must be an absolute HTTPS URL.")
 			}
 		}
-		if cfg.EnvoyWebhookSecret == "" {
-			warnings = append(warnings, envoyWebhookSecretWarning)
-		}
+	}
+	cfg.EnvoyWebhookSecretName = strings.TrimSpace(cfg.EnvoyWebhookSecretName)
+	if cfg.EnvoyWebhookSecretName == "" {
+		cfg.EnvoyWebhookSecretName = DefaultEnvoyWebhookSecretName
 	}
 	if publicURL := strings.TrimSpace(cfg.PublicURL); publicURL != "" {
 		parsed, err := url.Parse(publicURL)

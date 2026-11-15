@@ -1085,7 +1085,7 @@ func OpenAPISpec() map[string]any {
 			"envoyEvent": map[string]any{
 				"post": map[string]any{
 					"summary":     "Session event sent to Envoy's Ghost Wispr webhook",
-					"description": "With envoy_enabled, Ghost Wispr posts session_started, session_ended and summary_ready to envoy_webhook_url, signed with GHOST_WISPR_ENVOY_WEBHOOK_SECRET. No event carries a session's title, summary or transcript: Envoy keeps every event for 72 hours and no deletion can recall it. An event says which session it is, when it ran, and where to read its current text: session_url on this unit, and the session's Drive folder.",
+					"description": "With envoy_enabled, Ghost Wispr posts session_started, session_ended and summary_ready to envoy_webhook_url, signed with Envoy's webhook signing key, which it reads from Secret Manager (envoy_webhook_secret_name) and reads again once on a 401. No event carries a session's title, summary or transcript: Envoy keeps every event for 72 hours and no deletion can recall it. An event says which session it is, when it ran, and where to read its current text: session_url on this unit, and the session's Drive folder.",
 					"parameters": []map[string]any{
 						{"name": "X-GhostWispr-Event", "in": "header", "required": true, "description": "session.started, session.ended or summary.ready", "schema": map[string]any{"type": "string"}},
 						{"name": "X-GhostWispr-Delivery", "in": "header", "required": true, "description": "Stable delivery id: <session>.<event>, and .<version> for summary_ready; a retry repeats it", "schema": map[string]any{"type": "string"}},

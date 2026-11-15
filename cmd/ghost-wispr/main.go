@@ -29,7 +29,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
-	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
@@ -1141,18 +1140,8 @@ func main() {
 
 	server.SetVersionInfo(server.VersionInfo{Version: Version, Commit: Commit, BuildTime: BuildTime})
 	drive := &driveSync{}
-	var summaryPublisher atomic.Pointer[envoy.Publisher]
-	publishSummaryReady := func(sessionID string) {
-		pub := summaryPublisher.Load()
-		if pub == nil {
-			return
-		}
-		go func() {
-			if err := pub.PublishSummaryReady(context.Background(), sessionID); err != nil {
-				log.Printf("warning: envoy publish failed for %s: %v", sessionID, err)
-			}
-		}()
-	}
+	envoyEvents := &envoyPublishing{store: store, manager: manager, warnings: warningRegistry, openSecrets: openSecretManager}
+	publishSummaryReady := envoyEvents.publishSummaryReady
 	submitSummaryBatch := func(ctx context.Context, sessionIDs []string) (string, int, error) {
 		if summarizer == nil {
 			return "", 0, fmt.Errorf("summarization not configured")
@@ -1679,63 +1668,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 
-	setSummaryPublisher := func(next *envoy.Publisher) {
-		summaryPublisher.Store(next)
-		if next == nil {
-			// Avoid storing a typed nil *Publisher in EventPublisher.
-			manager.SetEventPublisher(nil)
-			return
-		}
-		manager.SetEventPublisher(next)
-	}
-	sweepEnvoy := func(pub *envoy.Publisher) {
-		if pub == nil {
-			return
-		}
-		if err := pub.PublishPendingLifecycleEvents(ctx); err != nil {
-			log.Printf("envoy lifecycle sweep error: %v", err)
-		}
-		ids, err := store.GetSessionsNeedingEnvoyPublish()
-		if err != nil {
-			log.Printf("envoy sweep error: %v", err)
-			return
-		}
-		for _, id := range ids {
-			if err := pub.PublishSummaryReady(ctx, id); err != nil {
-				log.Printf("envoy sweep: session %s: %v", id, err)
-			}
-		}
-	}
-	configureEnvoyPublisher := func(currentCfg config.Config) {
-		if !currentCfg.EnvoyEnabled || strings.TrimSpace(currentCfg.EnvoyWebhookURL) == "" {
-			warningRegistry.Clear("envoy")
-			setSummaryPublisher(nil)
-			return
-		}
-
-		pub := envoy.NewPublisher(
-			currentCfg.EnvoyWebhookURL,
-			currentCfg.EnvoyWebhookSecret,
-			store,
-			envoy.WithLogger(appLogger),
-			envoy.WithPublicURL(currentCfg.PublicURL),
-		)
-		warningRegistry.Clear("envoy")
-		setSummaryPublisher(pub)
-		log.Printf("envoy webhook publishing enabled")
-		go sweepEnvoy(pub)
-	}
-	configureEnvoyPublisher(cfg)
-	if pub := summaryPublisher.Load(); pub != nil && len(recoveredIDs) > 0 {
-		ids := append([]string(nil), recoveredIDs...)
-		go func() {
-			for _, sessionID := range ids {
-				if err := pub.PublishSessionEnded(context.Background(), sessionID); err != nil {
-					log.Printf("warning: failed to publish recovered session end for %s: %v", sessionID, err)
-				}
-			}
-		}()
-	}
+	envoyEvents.configure(ctx, &cfg, appLogger)
+	envoyEvents.publishRecoveredEnds(recoveredIDs)
 	if indexer != nil {
 		go func() {
 			if err := indexer.BackfillMissing(ctx); err != nil && ctx.Err() == nil {
@@ -1773,7 +1707,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("config: batch transcriber updated for provider %s", newCfg.BatchTranscription.Provider)
 		}
 
-		configureEnvoyPublisher(*newCfg)
+		envoyEvents.configure(ctx, newCfg, appLogger)
 	})
 	watchDriveSyncSettings(cfgStore, drive,
 		func(cfg *config.Config) (sessionSyncer, error) {
@@ -1886,7 +1820,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				sweepEnvoy(summaryPublisher.Load())
+				envoyEvents.sweep(ctx)
 			}
 		}
 	}()

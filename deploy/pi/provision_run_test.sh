@@ -39,7 +39,7 @@ cat >"$work_dir/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$TEST_LOG"
 if [[ " $* " == *' /dev/stdin '* ]]; then
-  cat >/dev/null
+  cat >"$TEST_LOG.installed-$(basename -- "${!#}")"
 fi
 if [[ $1 == systemd-run ]]; then
   printf '%s' "${!#}" >"$TEST_LOG.join"
@@ -74,14 +74,36 @@ printf '{}\n' >"$work_dir/bundle/certificate_config.json"
 printf '%s\n' "$CLIENT_ID" >"$work_dir/bundle/tailscale-client-id"
 printf '%s\n' "$SUBJECT" >"$work_dir/bundle/tailscale-subject"
 printf 'https://relay.example.test/webhook/ghostwispr\n' >"$work_dir/bundle/envoy-webhook-url"
-printf 'webhook-secret' >"$work_dir/bundle/envoy-webhook-secret"
 printf 'deepgram-key' >"$work_dir/bundle/deepgram-key"
 
-tar -C "$work_dir/bundle" -cf - device.crt google-credentials.json certificate_config.json tailscale-client-id \
-  tailscale-subject envoy-webhook-url envoy-webhook-secret deepgram-key \
-  | env -u XDG_RUNTIME_DIR PATH="$work_dir/bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$work_dir/deploy" \
-    GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1 \
-  || fail "provision.sh failed: $(<"$work_dir/out")"
+# run_provision runs provision.sh on a bundle of the named files.
+run_provision() {
+  tar -C "$work_dir/bundle" -cf - "$@" \
+    | env -u XDG_RUNTIME_DIR PATH="$work_dir/bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$work_dir/deploy" \
+      GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
+}
+readonly bundle_files=(device.crt google-credentials.json certificate_config.json tailscale-client-id
+  tailscale-subject envoy-webhook-url deepgram-key)
+
+# The Envoy signing key is no longer a bundle file: the recorder reads it from Secret Manager with
+# its Google identity. A bundle that still carries one is refused before anything is installed.
+printf 'webhook-secret' >"$work_dir/bundle/envoy-webhook-secret"
+if run_provision "${bundle_files[@]}" envoy-webhook-secret; then
+  fail "provision.sh accepted a bundle with envoy-webhook-secret"
+fi
+grep -Fq 'credential bundle contains unexpected path: envoy-webhook-secret' "$work_dir/out" \
+  || fail "provision.sh did not name envoy-webhook-secret when it refused the bundle: $(<"$work_dir/out")"
+[[ ! -e $TEST_LOG ]] || fail "provision.sh ran commands for a refused bundle: $(<"$TEST_LOG")"
+
+run_provision "${bundle_files[@]}" || fail "provision.sh failed: $(<"$work_dir/out")"
+
+# The .env the recorder runs with holds the Deepgram key and no Envoy signing key.
+env_file="$TEST_LOG.installed-.env"
+deepgram_key_name="DEEPGRAM""_API_KEY"
+grep -Fxq "GHOST_WISPR_$deepgram_key_name=deepgram-key" "$env_file" || fail "the installed .env has no Deepgram key"
+if grep -q 'ENVOY_WEBHOOK_SECRET' "$env_file"; then
+  fail "the installed .env still holds an Envoy webhook secret"
+fi
 
 # A lingering user service has no seat, so only the audio group opens the ALSA devices.
 grep -Fxq 'sudo usermod -aG audio ghost-wispr' "$TEST_LOG" || fail "provision.sh does not add ghost-wispr to the audio group"
