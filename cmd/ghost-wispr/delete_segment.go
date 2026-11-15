@@ -528,12 +528,27 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	return nil
 }
 
+// deletionAudioPad widens the cut of "Delete text and audio" past the
+// deleted segment's first and last word times on each side, also into
+// touching neighbours: Deepgram's word times are tighter than the spoken
+// words, so a cut at them leaves an onset or a tail a transcription still
+// hears. Losing a little neighbouring audio is accepted (Sami's decision on
+// the #65 review). Measured on the review's recordings with
+// TestMeasureDeletionAudioPad: 0.45 s left a deleted word heard in 2 and 4 of
+// 30 cuts, where no pad left 5 and 7, for about 0.7 s of neighbouring speech
+// per cut; the check after each cut handles what it leaves.
+const deletionAudioPad = 0.45
+
 func refinedSpliceBounds(words []storage.RefinedWord, selected *transcribe.Segment) (float64, float64) {
+	return refinedSpliceBoundsWithPad(words, selected, deletionAudioPad)
+}
+
+// refinedSpliceBoundsWithPad cuts pad seconds past the segment's words on
+// each side, and keeps the earlier 0.25 s margin where it cuts more: up to
+// 0.25 s into the silence before a neighbouring word.
+func refinedSpliceBoundsWithPad(words []storage.RefinedWord, selected *transcribe.Segment, pad float64) (float64, float64) {
 	const margin = 0.25
 	start, end := selected.StartTime-margin, selected.EndTime+margin
-	if start < 0 {
-		start = 0
-	}
 	for _, word := range words {
 		if word.RecordingPath != selected.RecordingPath || word.RecordingSHA256 != selected.RecordingSHA256 {
 			continue
@@ -544,6 +559,11 @@ func refinedSpliceBounds(words []storage.RefinedWord, selected *transcribe.Segme
 		if word.Start >= selected.EndTime && word.Start < end {
 			end = word.Start
 		}
+	}
+	start = min(start, selected.StartTime-pad)
+	end = max(end, selected.EndTime+pad)
+	if start < 0 {
+		start = 0
 	}
 	return start, end
 }

@@ -124,9 +124,9 @@ on a development machine whose `gcloud` is the devbox identity (the reader `boot
 names), check it, install it on the Pi and restart Ghost Wispr:
 
 ```bash
-crt=$(mktemp)
-gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$crt"
-openssl x509 -in "$crt" -noout -subject -enddate
+crt=$(mktemp) &&
+gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$crt" &&
+openssl x509 -in "$crt" -noout -subject -enddate &&
 ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
   'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service' <"$crt"
 rm -f -- "$crt"
@@ -360,9 +360,11 @@ provisioning.
 
 <!-- provision_bundle_test.sh: accept -->
 ```bash
+secret=$(deploy/pi/webhook-secret.sh ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"}) &&
 GHOST_WISPR_RELAY_URL="$(cd ~/src/agent-infra/envoy-cluster && pulumi stack output relayUrl --stack prod)/webhook/ghostwispr" \
-GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$(deploy/pi/webhook-secret.sh ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"})" \
+GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$secret" \
 deploy/pi/accept-slice1.sh
+unset secret
 ```
 
 The driver pauses and resumes the recorder, asks the operator to power-cycle it, checks the

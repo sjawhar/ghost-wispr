@@ -305,5 +305,6 @@ join_unit="ghost-wispr-tailnet-join-$(date +%s)"
 # Serve is set above for a node that is joined already, and again after the re-authentication:
 # the join can start a new login profile, which would not carry the setting over.
 join_command="tailscale up --force-reauth --client-id='$tailscale_client_id?ephemeral=false&preauthorized=true' --id-token=file:$JOIN_TOKEN --advertise-tags=tag:ghost-wispr --hostname=ghost-wispr --ssh; rc=\$?; rm -f $JOIN_TOKEN; if [ \$rc -eq 0 ]; then tailscale serve --bg --https 443 http://127.0.0.1:8080 || rc=\$?; fi; exit \$rc"
+printf 'ghost-wispr provision: starting the tagged tailnet join as %s\n' "$join_unit"
 sudo systemd-run --unit="$join_unit" /bin/sh -c "$join_command"
 printf 'ghost-wispr provision: reconnect with Tailscale SSH, then check tailscale status and journalctl -u %s.\n' "$join_unit"

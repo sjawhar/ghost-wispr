@@ -68,10 +68,12 @@ done
 
 stage=
 remote_dir=
+provision_log=
 cleanup() {
   local rc=$?
   trap - EXIT
   [[ -z $stage ]] || rm -rf -- "$stage"
+  [[ -z $provision_log ]] || rm -f -- "$provision_log"
   if [[ -n $remote_dir ]] && ! ssh -n "$PI" "rm -rf -- '$remote_dir'"; then
     log "could not remove $remote_dir on the Pi; reconnect with Tailscale SSH and run: ssh $PI \"rm -rf -- '$remote_dir'\""
   fi
@@ -105,15 +107,24 @@ secrets DEEPGRAM_API_KEY -- sh -c 'printf %s "$DEEPGRAM_API_KEY" >"$1"' sh "$sta
 [[ -s $stage/deepgram-key ]] || fail "DEEPGRAM_API_KEY came back empty"
 
 log "running provision.sh on the Pi"
+# provision.sh's output is kept to tell the expected drop from another one: Tailscale's
+# re-authentication ends the SSH session (exit 255) only after the join has started.
+provision_log=$(mktemp -p "$XDG_RUNTIME_DIR" ghost-wispr-provision-log.XXXXXX)
 set +e
 # shellcheck disable=SC2029 # remote_dir is the path the Pi printed; it expands here on purpose.
-tar -C "$stage" -cf - "${PREPARED_FILES[@]}" "${SECRET_FILES[@]}" | ssh "$PI" "$remote_dir/deploy/pi/provision.sh"
-provision_rc=$?
+tar -C "$stage" -cf - "${PREPARED_FILES[@]}" "${SECRET_FILES[@]}" | ssh "$PI" "$remote_dir/deploy/pi/provision.sh" | tee "$provision_log"
+provision_rc=${PIPESTATUS[1]}
 set -e
 rm -rf -- "$stage"
 stage=
+join_started=false
+grep -Eq '^ghost-wispr provision: (starting the tagged tailnet join|already joined)' "$provision_log" && join_started=true
 case $provision_rc in
   0) log "provision.sh finished; it started the tagged tailnet join as a detached unit" ;;
-  255) log "the SSH session ended (exit 255), as it can while Tailscale re-authenticates; check the join as docs/pi-setup.md says" ;;
+  255)
+    [[ $join_started == true ]] \
+      || fail "the SSH session ended (exit 255) before provision.sh started the tailnet join; read its output above and run this again"
+    log "the SSH session ended (exit 255) after the tailnet join started, as it does while Tailscale re-authenticates; check the join as docs/pi-setup.md says"
+    ;;
   *) fail "provision.sh failed (exit $provision_rc); read its output above" ;;
 esac

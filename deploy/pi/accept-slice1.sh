@@ -467,7 +467,7 @@ if [[ -n "$relay_url" ]]; then
     [[ "$signed_code" =~ ^2 ]] || fail "Envoy FAILED: signed probe returned HTTP $signed_code"
     printf 'Envoy RAN: signed probe accepted; verify its notification with nats sub '\''notifications.ghostwispr.>'\''.\n'
   else
-    printf 'Envoy NEEDS-PERSON: set GHOST_WISPR_ENVOY_WEBHOOK_SECRET through secrets to run the signed probe.\n'
+    printf 'Envoy NEEDS-PERSON: inject GHOST_WISPR_ENVOY_WEBHOOK_SECRET from deploy/pi/webhook-secret.sh to run the signed probe (docs/pi-setup.md, "Accept slice 1").\n'
   fi
   unsigned_code=$(remote_run "curl --silent --output /dev/null --write-out '%{http_code}' --request POST '$relay_url' --header 'X-GhostWispr-Delivery: unsigned-probe' --header 'X-GhostWispr-Event: session.ended' --data '{}'")
   [[ "$unsigned_code" == 401 ]] || fail "Envoy FAILED: unsigned Pi request returned HTTP $unsigned_code, expected 401"
