@@ -47,7 +47,9 @@ line_of() {
 }
 
 # A11 text only runs ahead of A11's audio deletion, in the same conversation.
+# shellcheck disable=SC2016 # The needle is the driver's source text.
 text_delete=$(line_of '"mode=text&revision=$text_only_revision"')
+# shellcheck disable=SC2016 # The needle is the driver's source text.
 audio_delete=$(line_of '"mode=text_and_audio&revision=$audio_revision"')
 (( text_delete < audio_delete )) || fail 'the driver sends mode=text_and_audio before mode=text'
 text_row=$(line_of "run_row 'A11 text only' run_a11_text_only")

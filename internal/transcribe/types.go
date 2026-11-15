@@ -80,12 +80,6 @@ type TimestampedWord struct {
 	Speaker    int
 }
 
-// BatchWordsTranscriber transcribes a recording as text and timestamped words.
-type BatchWordsTranscriber interface {
-	BatchTranscriber
-	Words(ctx context.Context, audioPath string) ([]TimestampedWord, error)
-}
-
 // ResilientClient wraps an io.WriteCloser (Deepgram client) and buffers audio during disconnects.
 // All fields are exported for testing purposes.
 type ResilientClient struct {

@@ -117,10 +117,11 @@ func TestBatchReturnsWordTimestamps(t *testing.T) {
 		Model:   "nova-3",
 		BaseURL: server.URL,
 	})
-	words, err := client.Words(context.Background(), audioPath)
+	transcribed, err := client.Transcribe(context.Background(), audioPath)
 	if err != nil {
-		t.Fatalf("Words returned error: %v", err)
+		t.Fatalf("Transcribe returned error: %v", err)
 	}
+	words := transcribed.Words
 
 	want := []TimestampedWord{
 		{Text: "Hello,", Start: 0.12, End: 0.48},
@@ -155,15 +156,16 @@ func TestBatchWordsFallsBackToRawWord(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"results":{"channels":[{"alternatives":[{"words":[{"word":"fallback","start":0.2,"end":0.8}]}]}]}}`))
+		_, _ = w.Write([]byte(`{"metadata":{"models":["nova-3"],"model_info":{"nova-3":{"name":"general-nova-3","arch":"nova-3"}}},"results":{"channels":[{"alternatives":[{"words":[{"word":"fallback","start":0.2,"end":0.8}]}]}]}}`))
 	}))
 	defer server.Close()
 
 	client := NewDeepgramBatchTranscriber(DeepgramBatchConfig{BaseURL: server.URL})
-	words, err := client.Words(context.Background(), audioPath)
+	result, err := client.Transcribe(context.Background(), audioPath)
 	if err != nil {
-		t.Fatalf("Words returned error: %v", err)
+		t.Fatalf("Transcribe returned error: %v", err)
 	}
+	words := result.Words
 	if len(words) != 1 || words[0] != (TimestampedWord{Text: "fallback", Start: 0.2, End: 0.8}) {
 		t.Fatalf("Words = %#v, want the raw-word fallback", words)
 	}

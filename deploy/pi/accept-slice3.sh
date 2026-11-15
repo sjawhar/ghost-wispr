@@ -2290,8 +2290,8 @@ $(session_field "$detail" summary)"
 
   (
     unit_url=https://unit.test
-    marker="$controls_dir/fast-refinement"
-    : >"$marker"
+    reads="$controls_dir/fast-refinement"
+    : >"$reads"
     retry_http_status=202
     curl() {
       [[ "$retry_http_status" == 202 ]] || return 1
@@ -2299,21 +2299,21 @@ $(session_field "$detail" summary)"
       printf '{"triggered":true}'
     }
     session_detail() {
-      printf 'read\n' >>"$marker"
-      if [[ "$(wc -l <"$marker")" == 1 ]]; then
+      printf 'read\n' >>"$reads"
+      if [[ "$(wc -l <"$reads")" == 1 ]]; then
         printf '{"session":{"refinement_status":"completed","refined_revision":1}}'
       else
         printf '{"session":{"refinement_status":"completed","refined_revision":2}}'
       fi
     }
     retry_refinement >/dev/null || fail 'self-test: a fast refinement did not accept the planted 202'
-    [[ "$(wc -l <"$marker")" == 2 ]] || fail 'self-test: a fast refinement did not read the newer revision'
+    [[ "$(wc -l <"$reads")" == 2 ]] || fail 'self-test: a fast refinement did not read the newer revision'
   ) || exit 1
   printf 'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes\n'
   (
     unit_url=https://unit.test
-    marker="$controls_dir/slow-refinement"
-    : >"$marker"
+    reads="$controls_dir/slow-refinement"
+    : >"$reads"
     retry_http_status=202
     curl() {
       [[ "$retry_http_status" == 202 ]] || return 1
@@ -2321,8 +2321,8 @@ $(session_field "$detail" summary)"
       printf '{"triggered":true}'
     }
     session_detail() {
-      printf 'read\n' >>"$marker"
-      case "$(wc -l <"$marker")" in
+      printf 'read\n' >>"$reads"
+      case "$(wc -l <"$reads")" in
         1) printf '{"session":{"refinement_status":"completed","refined_revision":1}}' ;;
         2) printf '{"session":{"refinement_status":"running","refined_revision":1}}' ;;
         *) printf '{"session":{"refinement_status":"completed","refined_revision":2}}' ;;
@@ -2330,13 +2330,13 @@ $(session_field "$detail" summary)"
     }
     sleep() { :; }
     retry_refinement >/dev/null || fail 'self-test: a slow refinement did not complete after the planted running state'
-    [[ "$(wc -l <"$marker")" == 3 ]] || fail 'self-test: a slow refinement did not wait for completion'
+    [[ "$(wc -l <"$reads")" == 3 ]] || fail 'self-test: a slow refinement did not wait for completion'
   ) || exit 1
   printf 'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes\n'
   (
     unit_url=https://unit.test
-    marker="$controls_dir/stale-refinement"
-    : >"$marker"
+    reads="$controls_dir/stale-refinement"
+    : >"$reads"
     retry_http_status=202
     curl() {
       [[ "$retry_http_status" == 202 ]] || return 1
@@ -2344,8 +2344,8 @@ $(session_field "$detail" summary)"
       printf '{"triggered":true}'
     }
     session_detail() {
-      printf 'read\n' >>"$marker"
-      case "$(wc -l <"$marker")" in
+      printf 'read\n' >>"$reads"
+      case "$(wc -l <"$reads")" in
         1|2) printf '{"session":{"refinement_status":"completed","refined_revision":1}}' ;;
         *) printf '{"session":{"refinement_status":"failed","refined_revision":1}}' ;;
       esac
@@ -2354,7 +2354,7 @@ $(session_field "$detail" summary)"
     if retry_refinement >/dev/null 2>&1; then
       fail 'self-test: a stale completed revision passed as the retry'
     fi
-    [[ "$(wc -l <"$marker")" == 3 ]] || fail 'self-test: a stale completed revision was not polled again'
+    [[ "$(wc -l <"$reads")" == 3 ]] || fail 'self-test: a stale completed revision was not polled again'
   ) || exit 1
   printf 'A11 text only self-test RAN: retry refinement waits for a newer revision\n'
   (
