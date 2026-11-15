@@ -1,5 +1,6 @@
-import { fireEvent, render, screen } from '@testing-library/svelte'
-import { describe, expect, it, vi } from 'vitest'
+import { fireEvent, render as renderSvelte, screen, waitFor } from '@testing-library/svelte'
+import type { ComponentProps } from 'svelte'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import SessionCard from '../SessionCard.svelte'
 import sessionCardSource from '../SessionCard.svelte?raw'
 import {
@@ -21,11 +22,31 @@ const baseSession: SessionSummary = {
   summary_status: SummaryStatus.Pending,
   summary_preset: 'default',
   audio_path: 'data/audio/s1.mp3',
+  refinement_status: RefinementStatus.Completed,
+  refined_revision: 1,
 }
+
+type SessionCardProps = ComponentProps<typeof SessionCard>
+
+function render(
+  props: Omit<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted'> &
+    Partial<Pick<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted'>>,
+) {
+  return renderSvelte(SessionCard, {
+    onRefreshSession: vi.fn().mockResolvedValue(undefined),
+    onSegmentDeleted: vi.fn(),
+    ...props,
+  })
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
 
 describe('SessionCard', () => {
   it('shows summary status', () => {
-    render(SessionCard, {
+    render({
       session: baseSession,
       detail: undefined,
       expanded: false,
@@ -40,10 +61,64 @@ describe('SessionCard', () => {
     expect(screen.getByText('Summarizing...')).toBeTruthy()
   })
 
+  it('labels whole-conversation removal as local-only once Drive has the session', () => {
+    const synced = {
+      ...baseSession,
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.Synced,
+    }
+    render({
+      session: synced,
+      detail: { session: synced, segments: [] },
+      expanded: true,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(
+      screen.getAllByRole('button', {
+        name: 'Remove from this unit; the shared drive keeps its copy',
+      }),
+    ).toHaveLength(2)
+  })
+
+  it.each([
+    ['never synced', {}],
+    ['still pending', { sync_status: SyncStatus.Pending, sync_state: SyncState.Pending }],
+    ['failed', { sync_status: SyncStatus.Failed, sync_state: SyncState.Failed }],
+    ['deleted on Drive', { sync_status: SyncStatus.Failed, sync_state: SyncState.RemoteDeleted }],
+  ])('says this unit holds the only copy when the session is %s', (_, sync) => {
+    const session = { ...baseSession, ...sync }
+    render({
+      session,
+      detail: { session, segments: [] },
+      expanded: true,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(
+      screen.getAllByRole('button', {
+        name: 'Delete from this unit; this unit holds the only copy',
+      }),
+    ).toHaveLength(2)
+    expect(
+      screen.queryByRole('button', {
+        name: 'Remove from this unit; the shared drive keeps its copy',
+      }),
+    ).toBeNull()
+  })
+
   it('loads details when opened', async () => {
     const onToggle = vi.fn()
     const onLoadDetail = vi.fn().mockResolvedValue(undefined)
-    render(SessionCard, {
+    render({
       session: baseSession,
       detail: undefined,
       expanded: false,
@@ -60,7 +135,7 @@ describe('SessionCard', () => {
   })
 
   it('shows resummarize trigger when completed and presets exist', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         summary_status: SummaryStatus.Completed,
@@ -79,7 +154,7 @@ describe('SessionCard', () => {
   })
 
   it('shows the summary a session keeps when making it again failed', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         summary_status: SummaryStatus.Failed,
@@ -100,7 +175,7 @@ describe('SessionCard', () => {
   })
 
   it('says the summary is unavailable when one failed and there is none from before', () => {
-    render(SessionCard, {
+    render({
       session: { ...baseSession, summary_status: SummaryStatus.Failed, summary: '' },
       detail: undefined,
       expanded: false,
@@ -115,7 +190,7 @@ describe('SessionCard', () => {
   })
 
   it('says a session with no saved recording cannot be refined, and offers no retry', () => {
-    render(SessionCard, {
+    render({
       session: { ...baseSession, audio_path: '', refinement_status: RefinementStatus.NoAudio },
       detail: undefined,
       expanded: false,
@@ -135,9 +210,111 @@ describe('SessionCard', () => {
     expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
   })
 
+  it.each([
+    [
+      'a listed Drive recording',
+      {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      } as SessionSummary & { gdrive_folder_id: string },
+      true,
+    ],
+    [
+      'a session without a listed Drive folder',
+      {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-07T09:30:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+      },
+      false,
+    ],
+    [
+      'a never-recorded session with a Drive folder',
+      {
+        ...baseSession,
+        audio_path: '',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      },
+      false,
+    ],
+  ])('offers Retry refinement only for %s', (_, session, wantsRetry) => {
+    render({
+      session,
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(Boolean(screen.queryByTestId('retry-refinement-btn'))).toBe(wantsRetry)
+  })
+
+  it('identifies a retryable session restored from Drive', () => {
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-13T09:01:00Z',
+        restored_at: '2026-11-13T09:01:00Z',
+        refinement_status: RefinementStatus.NoAudio,
+        sync_status: SyncStatus.Synced,
+        sync_state: SyncState.Synced,
+        gdrive_folder_id: 'folder-1',
+      } as SessionSummary & { restored_at: string },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('refinement-badge').getAttribute('title')).toBe(
+      'This conversation was restored from Drive; retry refinement to delete from it',
+    )
+    expect(screen.getByTestId('retry-refinement-btn')).toBeTruthy()
+    expect(screen.queryByTestId('audio-removed-badge')).toBeNull()
+  })
+
+  it('keeps the removal badge after a restored refinement fails', () => {
+    render({
+      session: {
+        ...baseSession,
+        audio_path: '',
+        audio_removed_at: '2026-11-13T09:01:00Z',
+        restored_at: '2026-11-13T09:01:00Z',
+        refinement_status: RefinementStatus.Failed,
+      } as SessionSummary & { restored_at: string },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('audio-removed-badge')).toBeTruthy()
+  })
+
   it('marks a session whose audio was removed to free space, refined or not', () => {
     for (const refinementStatus of [RefinementStatus.Completed, RefinementStatus.NoAudio]) {
-      const { unmount } = render(SessionCard, {
+      const { unmount } = render({
         session: {
           ...baseSession,
           audio_path: '',
@@ -169,7 +346,7 @@ describe('SessionCard', () => {
   })
 
   it('says only part of the audio was removed, and how much is left', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         audio_path: 'data/audio/b.mp3, data/audio/c.mp3',
@@ -193,7 +370,7 @@ describe('SessionCard', () => {
   })
 
   it('says the recording left was not on disk when GC found none, in the marker and the refinement badge', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         audio_path: 'mnt/b.mp3',
@@ -231,7 +408,7 @@ describe('SessionCard', () => {
       ),
     )
     try {
-      render(SessionCard, {
+      render({
         session: { ...baseSession, sync_status: SyncStatus.Failed },
         detail: undefined,
         expanded: false,
@@ -252,6 +429,96 @@ describe('SessionCard', () => {
     }
   })
 
+  it('shows why a refinement retry was refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'the recording was removed from this unit and its Drive folder is deleted',
+          }),
+          {
+            status: 409,
+          },
+        ),
+      ),
+    )
+    try {
+      render({
+        session: {
+          ...baseSession,
+          audio_path: '',
+          audio_removed_at: '2026-11-07T09:30:00Z',
+          refinement_status: RefinementStatus.NoAudio,
+          sync_status: SyncStatus.Synced,
+          sync_state: SyncState.Synced,
+          gdrive_folder_id: 'folder-1',
+        },
+        detail: undefined,
+        expanded: false,
+        presets: {},
+        onToggle: vi.fn(),
+        onLoadDetail: vi.fn(),
+        onResummarize: vi.fn(),
+        onDelete: vi.fn(),
+      })
+
+      await fireEvent.click(screen.getByTestId('retry-refinement-btn'))
+      expect(
+        await screen.findByText(
+          'the recording was removed from this unit and its Drive folder is deleted',
+        ),
+      ).toBeTruthy()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('refreshes Retry refinement and re-enables it when the status changes', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response('{}', { status: 202, headers: { 'Content-Type': 'application/json' } }),
+        ),
+    )
+    const session = {
+      ...baseSession,
+      audio_path: '',
+      audio_removed_at: '2026-11-07T09:30:00Z',
+      refinement_status: RefinementStatus.NoAudio,
+      sync_status: SyncStatus.Synced,
+      sync_state: SyncState.Synced,
+      gdrive_folder_id: 'folder-1',
+    }
+    const onRefreshSession = vi.fn().mockResolvedValue(undefined)
+    const props = {
+      session,
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+      onRefreshSession,
+    }
+    const view = render(props)
+
+    await fireEvent.click(screen.getByTestId('retry-refinement-btn'))
+    await waitFor(() => {
+      expect(onRefreshSession).toHaveBeenCalledExactlyOnceWith('s1')
+    })
+    await view.rerender({
+      ...props,
+      session: { ...session, refinement_status: RefinementStatus.Failed },
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('retry-refinement-btn').hasAttribute('disabled')).toBe(false)
+    })
+  })
+
   it('styles the audio-removed marker', () => {
     expect(sessionCardSource).toMatch(/\.status-badge\.audio-removed\b/)
   })
@@ -265,7 +532,7 @@ describe('SessionCard', () => {
   })
 
   it('says a session whose Drive folder was deleted is kept on the device, and offers a retry for a restored folder', () => {
-    render(SessionCard, {
+    render({
       session: {
         ...baseSession,
         sync_status: SyncStatus.Failed,
@@ -286,5 +553,54 @@ describe('SessionCard', () => {
       'Its Drive folder is in the trash or gone, so this device keeps the only copy. Restore the folder on Drive, then retry to sync it again.',
     )
     expect(screen.getByTestId('retry-sync-btn')).toBeTruthy()
+  })
+
+  it.each([
+    ['updates state and refreshes once after a successful deletion', 204, 1],
+    ['refreshes first when a segment is already gone', 404, 0],
+  ])('%s', async (_, status, deletedCalls) => {
+    const onSegmentDeleted = vi.fn()
+    const onRefreshSession = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status })))
+    render({
+      session: baseSession,
+      detail: {
+        session: baseSession,
+        segments: [
+          {
+            id: 42,
+            speaker: 0,
+            text: 'A stored segment',
+            start_time: 0,
+            end_time: 2,
+            timestamp: '2026-11-11T10:00:00Z',
+            transcript_revision: 1,
+          },
+        ],
+      },
+      expanded: true,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+      onSegmentDeleted,
+      onRefreshSession,
+      onSegmentNotFound: async (sessionID) => {
+        await onRefreshSession(sessionID)
+        return false
+      },
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete segment' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Delete text and audio' }))
+
+    await waitFor(() => {
+      expect(onRefreshSession).toHaveBeenCalledExactlyOnceWith('s1')
+    })
+    expect(onSegmentDeleted).toHaveBeenCalledTimes(deletedCalls)
+    if (deletedCalls === 1) {
+      expect(onSegmentDeleted).toHaveBeenCalledWith('s1', 42)
+    }
   })
 })

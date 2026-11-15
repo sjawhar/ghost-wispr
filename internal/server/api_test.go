@@ -20,9 +20,11 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
+	"github.com/sjawhar/ghost-wispr/internal/tts"
 )
 
 type apiStoreStub struct {
@@ -39,12 +41,18 @@ type apiStoreStub struct {
 	allEmbeddings      []storage.StoredEmbedding
 	allEmbeddingsErr   error
 	getEventsSinceFunc func(cursor int64, limit int) ([]storage.StoredEvent, error)
+	// deletedAudioPath, when set, is the audio_path DeleteSession reports the
+	// deleted row had, in place of the one GetSession showed.
+	deletedAudioPath string
+	// deleteAudioDir is the audio directory the last DeleteSession was given.
+	deleteAudioDir string
 }
 
 type embeddingClientStub struct {
-	vectors   [][]float32
-	err       error
-	taskTypes []embedding.TaskType
+	vectors       [][]float32
+	err           error
+	taskTypes     []embedding.TaskType
+	reportedModel string
 }
 
 func (s *embeddingClientStub) Embed(ctx context.Context, texts []string, taskType embedding.TaskType) ([][]float32, error) {
@@ -53,6 +61,10 @@ func (s *embeddingClientStub) Embed(ctx context.Context, texts []string, taskTyp
 	}
 	s.taskTypes = append(s.taskTypes, taskType)
 	return s.vectors, nil
+}
+
+func (s *embeddingClientStub) ReportedModel() string {
+	return s.reportedModel
 }
 
 var _ embedding.Client = (*embeddingClientStub)(nil)
@@ -92,9 +104,9 @@ func (s *apiStoreStub) GetSegments(sessionID string) ([]transcribe.Segment, erro
 func (s *apiStoreStub) GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error) {
 	all := s.segments[sessionID]
 	var result []transcribe.Segment
-	for _, seg := range all {
-		if seg.StartTime >= startTime && seg.EndTime <= endTime {
-			result = append(result, seg)
+	for i := range all {
+		if all[i].StartTime >= startTime && all[i].EndTime <= endTime {
+			result = append(result, all[i])
 		}
 	}
 	return result, nil
@@ -157,14 +169,33 @@ func (s *apiStoreStub) UpdateTitle(sessionID, title string) error {
 	return nil
 }
 
-func (s *apiStoreStub) DeleteSession(id string) error {
-	if _, ok := s.sessions[id]; !ok {
-		return os.ErrNotExist
+func (s *apiStoreStub) DeleteSession(id, audioDir string) (string, error) {
+	sess, ok := s.sessions[id]
+	if !ok {
+		return "", os.ErrNotExist
 	}
+	s.deleteAudioDir = audioDir
 	delete(s.sessions, id)
+	if s.deletedAudioPath != "" {
+		return s.deletedAudioPath, nil
+	}
+	return sess.AudioPath, nil
+}
+
+func (s *apiStoreStub) ReserveRawSessionErase(id, _, hiddenPath string) (string, error) {
+	if _, ok := s.sessions[id]; !ok {
+		return "", os.ErrNotExist
+	}
+	return hiddenPath, nil
+}
+
+func (*apiStoreStub) CancelRawSessionErase(string, string) error {
 	return nil
 }
 
+func (*apiStoreStub) SourceSessionIDs(string) ([]string, error) {
+	return nil, nil
+}
 func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	endedAtPtr := &endedAt
 	s.sessions[newID] = storage.Session{
@@ -191,6 +222,7 @@ func (s *apiStoreStub) GetSessionsForBackfill() ([]string, error) {
 
 type healthCheckerStub struct{}
 
+func (h *healthCheckerStub) IsDeepgramConfigured() bool           { return true }
 func (h *healthCheckerStub) IsDeepgramConnected() bool            { return true }
 func (h *healthCheckerStub) IsDBHealthy(ctx context.Context) bool { return true }
 func (h *healthCheckerStub) IsMicOpen() bool                      { return true }
@@ -209,7 +241,7 @@ func TestAPISessionsList(t *testing.T) {
 	started := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{
-			"2026-02-26": {{ID: "s1", StartedAt: started, SummaryStatus: storage.SummaryCompleted}},
+			"2026-02-26": {{ID: "s1", StartedAt: started, SummaryStatus: storage.SummaryCompleted, RefinedRevision: 7}},
 		},
 		sessions: map[string]storage.Session{},
 		segments: map[string][]transcribe.Segment{},
@@ -232,8 +264,12 @@ func TestAPISessionsList(t *testing.T) {
 	if got := rr.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
 		t.Fatalf("expected application/json content-type, got %q", got)
 	}
-	if !strings.Contains(rr.Body.String(), "s1") {
-		t.Fatalf("expected body to contain session id, got %s", rr.Body.String())
+	var sessions []storage.Session
+	if err := json.Unmarshal(rr.Body.Bytes(), &sessions); err != nil {
+		t.Fatalf("decode session list: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].RefinedRevision != 7 {
+		t.Fatalf("session list refined revision = %#v, want 7", sessions)
 	}
 }
 
@@ -417,6 +453,36 @@ func TestAPISessionDetail(t *testing.T) {
 	}
 }
 
+func TestAPISessionDetailCarriesStoredSegmentIDs(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded},
+		},
+		segments: map[string][]transcribe.Segment{
+			"s1": {{ID: 42, Text: "stored segment"}},
+		},
+	}
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/s1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Segments []transcribe.Segment `json:"segments"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode session detail: %v", err)
+	}
+	if len(payload.Segments) != 1 || payload.Segments[0].ID != 42 {
+		t.Fatalf("segment IDs = %+v, want stored ID 42", payload.Segments)
+	}
+}
+
 func TestDeleteSession_Success(t *testing.T) {
 	store := &apiStoreStub{
 		sessionsByDate: map[string][]storage.Session{},
@@ -427,7 +493,10 @@ func TestDeleteSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	var deletedSession string
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{OnSessionDeleted: func(sessionID string) {
+		deletedSession = sessionID
+	}}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -438,6 +507,348 @@ func TestDeleteSession_Success(t *testing.T) {
 
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected status 204, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if deletedSession != "s1" {
+		t.Errorf("deleted session callback = %q, want s1", deletedSession)
+	}
+}
+
+// deleteSessionWithRecording serves DELETE /api/sessions/s1 for a session
+// whose recording holds audio, with finish in place of finishErasing, and
+// returns the recording's path and a descriptor held on it.
+func deleteSessionWithRecording(t *testing.T, audio []byte, finish func(string, []erase.Pending)) (string, *os.File, <-chan *httptest.ResponseRecorder) {
+	t.Helper()
+	recording := filepath.Join(t.TempDir(), "s1.mp3")
+	if err := os.WriteFile(recording, audio, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	original := finishErasing
+	t.Cleanup(func() { finishErasing = original })
+	finishErasing = finish
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: recording}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answered := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+		answered <- rr
+	}()
+	return recording, held, answered
+}
+
+// TestDeleteSession_ErasesWhatTheDeletedRowNamed fails if the session delete
+// erases the recordings it read before the delete rather than those the row
+// named when it went. (DeleteSession records their directories before the
+// row goes: storage.TestDeleteSessionRecordsWhereItsRecordingsAreErasedFirst.)
+func TestDeleteSession_ErasesWhatTheDeletedRowNamed(t *testing.T) {
+	dir := t.TempDir()
+	read, deleted := filepath.Join(dir, "read.mp3"), filepath.Join(dir, "deleted.mp3")
+	for _, path := range []string{read, deleted} {
+		if err := os.WriteFile(path, []byte("audio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	store := &apiStoreStub{
+		sessionsByDate:   map[string][]storage.Session{},
+		sessions:         map[string]storage.Session{"s1": {ID: "s1", AudioPath: read}},
+		segments:         map[string][]transcribe.Segment{},
+		deletedAudioPath: deleted,
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(deleted); !os.IsNotExist(err) {
+		t.Errorf("the recording the deleted row named is still there: %v", err)
+	}
+	if _, err := os.Stat(read); err != nil {
+		t.Errorf("the recording read before the delete was erased: %v", err)
+	}
+}
+
+// configStoreWithAudioDir is a config store whose audio_dir is dir.
+func configStoreWithAudioDir(t *testing.T, dir string) *config.Store {
+	t.Helper()
+	cfgStore := newTestConfigStore(t)
+	if err := cfgStore.Update(func(c *config.Config) { c.AudioDir = dir }); err != nil {
+		t.Fatal(err)
+	}
+	return cfgStore
+}
+
+// TestDeleteSession_ErasesARecordingMovedWithTheAudioDir fails if the session
+// delete erases only the recording where the row's entry points: after
+// audio_dir changes and the recordings move with it, the recording is in the
+// new audio directory (recording.Resolve), and it would stay on the unit,
+// named by no row. It also fails if DeleteSession, which records the
+// directories it is erased in, is not given that audio directory.
+func TestDeleteSession_ErasesARecordingMovedWithTheAudioDir(t *testing.T) {
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	moved := filepath.Join(newDir, "s1.mp3")
+	if err := os.WriteFile(moved, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: filepath.Join(oldDir, "s1.mp3")}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, newDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(moved); !os.IsNotExist(err) {
+		t.Errorf("the recording moved with the audio directory is still there: %v", err)
+	}
+	if store.deleteAudioDir != newDir {
+		t.Errorf("DeleteSession was given audio directory %q, want %s", store.deleteAudioDir, newDir)
+	}
+}
+
+// TestAPIAudioServesARecordingMovedWithTheAudioDir fails if the audio route
+// looks for a recording only where the row's entry points: after audio_dir
+// changes and the recordings move with it, the recording is in the new audio
+// directory (recording.Resolve).
+func TestAPIAudioServesARecordingMovedWithTheAudioDir(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.Mkdir("new", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("new", "s1.mp3"), []byte("the moved recording"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: filepath.Join("old", "s1.mp3")}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, "new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/s1/audio", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "the moved recording" {
+		t.Errorf("GET audio = %d %q, want the recording in the new audio directory", rr.Code, rr.Body.String())
+	}
+}
+
+// TestDeleteSession_ZeroesItsAudio fails if deleting a session removes its
+// recordings without overwriting their bytes before the file system frees
+// them.
+func TestDeleteSession_ZeroesItsAudio(t *testing.T) {
+	audio := []byte("the session's audio")
+	finish := finishErasing
+	finished := make(chan struct{})
+	recording, held, answered := deleteSessionWithRecording(t, audio, func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	})
+	if rr := <-answered; rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	if _, err := os.Stat(recording); !os.IsNotExist(err) {
+		t.Fatalf("the recording is still there: %v", err)
+	}
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the removed recording still holds %q", got)
+	}
+}
+
+// TestDeleteSession_ZeroesItsRawPCM fails if a session delete leaves the raw
+// microphone capture beside the saved recording. Raw PCM is whole-session
+// audio, so it follows the same zero-before-unlink rule as the saved file.
+func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
+	dir := t.TempDir()
+	saved, raw := filepath.Join(dir, "s1.mp3"), filepath.Join(dir, "s1.pcm")
+	if err := os.WriteFile(saved, []byte("saved session audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rawBytes := []byte("raw microphone audio")
+	if err := os.WriteFile(raw, rawBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	rawFinish := finishRawErasing
+	t.Cleanup(func() { finishRawErasing = rawFinish })
+	rawFinished := make(chan struct{})
+	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+		defer close(rawFinished)
+		rawFinish(store, reservations)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: saved}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the erase after the response never finished")
+	}
+	select {
+	case <-rawFinished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the raw erase after the response never finished")
+	}
+	if _, err := os.Stat(raw); !os.IsNotExist(err) {
+		t.Fatalf("the raw PCM is still on disk: %v", err)
+	}
+	got := make([]byte, len(rawBytes))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the removed raw PCM still holds %q", got)
+	}
+}
+
+// TestDeleteSessionKeepsItsRowWhenRawPCMCannotBeHidden fails if a raw
+// microphone capture that cannot be renamed is left behind after the session
+// row has gone: the user then cannot retry its secure removal.
+func TestDeleteSessionKeepsItsRowWhenRawPCMCannotBeHidden(t *testing.T) {
+	dir := t.TempDir()
+	original := beginReservedErasing
+	t.Cleanup(func() { beginReservedErasing = original })
+	beginReservedErasing = func(reservation erase.Reservation) (erase.Pending, error) {
+		if reservation.OriginalPath() != filepath.Join(dir, "s1.pcm") {
+			t.Errorf("raw erase path = %q, want %q", reservation.OriginalPath(), filepath.Join(dir, "s1.pcm"))
+		}
+		return erase.Pending{}, errors.New("rename raw pcm: input/output error")
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: filepath.Join(dir, "s1.mp3")}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("delete = %d %s, want raw erase failure", rr.Code, rr.Body.String())
+	}
+	if _, found := store.sessions["s1"]; !found {
+		t.Fatal("session row was deleted after its raw PCM could not be hidden")
+	}
+}
+
+// TestDeleteSession_AnswersBeforeItZeroesTheAudio fails if deleting a session
+// holds the request until its recordings are overwritten, a write as large as
+// they are, or answers before they have left their names.
+func TestDeleteSession_AnswersBeforeItZeroesTheAudio(t *testing.T) {
+	audio := []byte("the session's audio")
+	finish := finishErasing
+	release, finished := make(chan struct{}), make(chan struct{})
+	recording, held, answered := deleteSessionWithRecording(t, audio, func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		<-release
+		finish(sessionID, pending)
+	})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	select {
+	case rr := <-answered:
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session delete waited for its recordings to be overwritten before it answered")
+	}
+	if _, err := os.Stat(recording); !os.IsNotExist(err) {
+		t.Fatalf("the recording still has its name when the delete answers: %v", err)
+	}
+	close(release)
+	<-finished
+	got := make([]byte, len(audio))
+	if _, err := held.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(got))) {
+		t.Errorf("the removed recording still holds %q", got)
 	}
 }
 
@@ -485,6 +896,93 @@ func TestDeleteSession_InvalidID(t *testing.T) {
 	}
 }
 
+func TestDeleteSegmentAPI(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		session   storage.Session
+		hook      func(context.Context, string, int64) error
+		wantCode  int
+		wantError string
+	}{
+		{
+			name:    "deleted",
+			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook: func(_ context.Context, sessionID string, segmentID int64) error {
+				if sessionID != "s1" || segmentID != 42 {
+					t.Fatalf("delete hook received session=%q segment=%d", sessionID, segmentID)
+				}
+				return nil
+			},
+			wantCode: http.StatusNoContent,
+		},
+		{
+			name:     "unknown segment",
+			session:  storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook:     func(context.Context, string, int64) error { return storage.ErrSegmentNotFound },
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name:    "kept raw recording",
+			session: storage.Session{ID: "s1", Status: storage.SessionEnded},
+			hook: func(context.Context, string, int64) error {
+				return fmt.Errorf("%w: /audio/s1.pcm", ErrSegmentRawAudioKept)
+			},
+			wantCode:  http.StatusUnprocessableEntity,
+			wantError: "s1.pcm",
+		},
+		{
+			name:    "active",
+			session: storage.Session{ID: "s1", Status: storage.SessionActive},
+			hook: func(context.Context, string, int64) error {
+				t.Fatal("delete hook called for active session")
+				return nil
+			},
+			wantCode:  http.StatusConflict,
+			wantError: "This conversation is still being recorded. Delete the segment after it ends.",
+		},
+		{
+			name:    "unknown session",
+			session: storage.Session{},
+			hook: func(context.Context, string, int64) error {
+				t.Fatal("delete hook called for unknown session")
+				return nil
+			},
+			wantCode:  http.StatusNotFound,
+			wantError: "get session",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := tc.session
+			if session.ID != "" && session.Status != storage.SessionActive {
+				session.RefinementStatus = storage.RefinementCompleted
+				session.RefinedRevision = 1
+			}
+			sessions := map[string]storage.Session{}
+			if session.ID != "" {
+				sessions[session.ID] = session
+			}
+			store := &apiStoreStub{sessionsByDate: map[string][]storage.Session{}, sessions: sessions, segments: map[string][]transcribe.Segment{}}
+			handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+				DeleteSegment: func(ctx context.Context, sessionID string, segmentID int64, _ int) error {
+					return tc.hook(ctx, sessionID, segmentID)
+				},
+			}, "", nil)
+			if err != nil {
+				t.Fatalf("handler: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodDelete, "/api/sessions/s1/segments/42?mode=text_and_audio&revision=1", nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != tc.wantCode {
+				t.Fatalf("status = %d body=%s, want %d", response.Code, response.Body.String(), tc.wantCode)
+			}
+			if tc.wantError != "" && !strings.Contains(response.Body.String(), tc.wantError) {
+				t.Fatalf("body = %q, want %q", response.Body.String(), tc.wantError)
+			}
+		})
+	}
+}
+
 func TestMergeSession_Success(t *testing.T) {
 	start1 := time.Date(2026, 2, 26, 10, 0, 0, 0, time.UTC)
 	end1 := start1.Add(10 * time.Minute)
@@ -501,7 +999,10 @@ func TestMergeSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	var mergedSessions []string
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{OnSessionsMerged: func(sessionIDs []string) {
+		mergedSessions = slices.Clone(sessionIDs)
+	}}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
 	}
@@ -528,6 +1029,9 @@ func TestMergeSession_Success(t *testing.T) {
 	}
 	if merged.SummaryStatus != storage.SummaryPending {
 		t.Fatalf("expected summary status pending, got %q", merged.SummaryStatus)
+	}
+	if !slices.Equal(mergedSessions, []string{"s1", "s2"}) {
+		t.Errorf("merged sessions callback = %v, want [s1 s2]", mergedSessions)
 	}
 }
 
@@ -587,6 +1091,83 @@ func TestMergeSession_SessionNotFound(t *testing.T) {
 	}
 }
 
+// TestMergeSession_RefusesASessionThatOwesADriveReplacement fails if the
+// merge route merges, or answers anything but 409 with the reason, while a
+// session to merge still has a deleted segment on Google Drive.
+func TestMergeSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"20261106100000", "20261106110000"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = '20261106110000'`); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/merge", strings.NewReader(`{"session_ids":["20261106100000","20261106110000"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "deleted segment on Google Drive") {
+		t.Fatalf("merge of a session owing a Drive replacement = %d %s, want 409 with the reason", rr.Code, rr.Body.String())
+	}
+	if sess, err := store.GetSession("20261106100000"); err != nil || sess.Status != storage.SessionEnded {
+		t.Fatalf("after the refused merge the other session is %q (%v), want it ended", sess.Status, err)
+	}
+}
+
+// TestDeleteSession_RefusesASessionThatOwesADriveReplacement fails if the
+// delete route removes a session whose deleted segment is still on Google
+// Drive: with its row go its replacement ledger and its status warning, and
+// the Drive folder keeps the words.
+func TestDeleteSession_RefusesASessionThatOwesADriveReplacement(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	const id = "20261106100000"
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET drive_replace_pending = 1 WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/"+id, nil))
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "deleted segment on Google Drive") {
+		t.Fatalf("delete of a session owing a Drive replacement = %d %s, want 409 with the reason", rr.Code, rr.Body.String())
+	}
+	if _, err := store.GetSession(id); err != nil {
+		t.Fatalf("the refused delete removed the session: %v", err)
+	}
+}
+
 func TestAPIAudioRange(t *testing.T) {
 	root := t.TempDir()
 	audioFile := "audio.mp3"
@@ -630,6 +1211,45 @@ func TestAPIAudioRange(t *testing.T) {
 	}
 	if rr.Header().Get("Content-Range") == "" {
 		t.Fatalf("expected Content-Range header")
+	}
+}
+
+// TestAPIResponsesAreNotKeptByBrowsers fails if a recording or a session's
+// transcript is served in a way a browser may keep in its disk cache: a
+// segment deleted on the unit would stay there, and a spliced recording is
+// served at the URL the unspliced one had.
+func TestAPIResponsesAreNotKeptByBrowsers(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "audio.mp3"), []byte(strings.Repeat("a", 4096)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", AudioPath: "audio.mp3"}},
+		segments:       map[string][]transcribe.Segment{"s1": {{ID: 1, Text: "words on the unit"}}},
+		dates:          []string{"2026-02-26"},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/sessions/s1/audio", "/api/sessions/s1", "/api/dates"} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code >= 400 {
+			t.Fatalf("GET %s = %d", path, rr.Code)
+		}
+		if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("GET %s Cache-Control = %q, want no-store", path, got)
+		}
 	}
 }
 
@@ -1798,7 +2418,7 @@ func TestFaultInjectionNoHandler(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when no handler configured, got %d", rr.Code)
+		t.Fatalf("expected 503 when Deepgram is not configured, got %d", rr.Code)
 	}
 }
 
@@ -2363,7 +2983,7 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 
 	cfgStore := newTestConfigStore(t)
-	client := &embeddingClientStub{vectors: [][]float32{{1, 0}}}
+	client := &embeddingClientStub{vectors: [][]float32{{1, 0}}, reportedModel: "provider-embedding-model"}
 	registerAPIRoutes(mux, store, &ControlHooks{}, &healthCheckerStub{}, cfgStore, client)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/search/semantic?q=planning&limit=1", nil)
@@ -2375,6 +2995,7 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 
 	var payload struct {
+		Model   string `json:"model"`
 		Results []struct {
 			SessionID  string  `json:"session_id"`
 			Title      string  `json:"title"`
@@ -2394,6 +3015,9 @@ func TestSemanticSearch_Success(t *testing.T) {
 	}
 	if payload.Results[0].Title != "Top Session" {
 		t.Fatalf("expected title Top Session, got %q", payload.Results[0].Title)
+	}
+	if payload.Model != client.reportedModel {
+		t.Fatalf("response model = %q, want provider value %q", payload.Model, client.reportedModel)
 	}
 	if len(client.taskTypes) != 1 || client.taskTypes[0] != embedding.TaskTypeQuery {
 		t.Fatalf("expected query task type, got %#v", client.taskTypes)
@@ -2821,6 +3445,7 @@ func TestOpenAPISpec(t *testing.T) {
 		"/api/sessions/aggregate",
 		"/api/sessions/{id}",
 		"/api/sessions/{id}/segments",
+		"/api/sessions/{id}/segments/{segmentID}",
 		"/api/sessions/{id}/context",
 	}
 	for _, path := range expectedPaths {
@@ -3239,8 +3864,9 @@ func testNonRegressionPause(t *testing.T) {
 	}
 
 	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
-		Pause: func() {
+		Pause: func() error {
 			called = true
+			return nil
 		},
 	}, "", nil)
 	if err != nil {
@@ -3268,8 +3894,9 @@ func testNonRegressionResume(t *testing.T) {
 	}
 
 	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
-		Resume: func() {
+		Resume: func() error {
 			called = true
+			return nil
 		},
 	}, "", nil)
 	if err != nil {
@@ -3572,5 +4199,357 @@ func TestRepairSummariesEndpointUnavailableWithoutHook(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestTTSSpeakReportsProviderModelAndVoiceInHeaders(t *testing.T) {
+	const (
+		configuredModel = "configured-tts-model"
+		providerModel   = "provider-tts-model"
+		providerVoice   = "provider-tts-voice"
+	)
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
+		TTSSpeak: func(text, voice, provider string) (string, error) {
+			if text == "" || voice != providerVoice || provider != "gemini" {
+				return "", errors.New("unexpected speech request")
+			}
+			return "speech-request", nil
+		},
+		TTSStatus: func(id string) (map[string]any, bool) {
+			if id != "speech-request" {
+				return nil, false
+			}
+			return map[string]any{
+				"id":     id,
+				"status": "queued",
+				"model":  providerModel,
+				"voice":  providerVoice,
+			}, true
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tts/speak", strings.NewReader(`{"text":"model acceptance","voice":"provider-tts-voice","provider":"gemini"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/tts/speak = %d, want 202: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("X-Ghost-Wispr-TTS-Model"); got != providerModel {
+		t.Fatalf("TTS model header = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
+	}
+	if got := rr.Header().Get("X-Ghost-Wispr-TTS-Voice"); got != providerVoice {
+		t.Fatalf("TTS voice header = %q, want provider value %q", got, providerVoice)
+	}
+}
+
+func TestSessionDetailReportsProviderModels(t *testing.T) {
+	store := &apiStoreStub{
+		sessions: map[string]storage.Session{
+			"provider-models": {
+				ID:              "provider-models",
+				SummaryModel:    "provider-summary-model",
+				RefinementModel: "provider-refinement-model",
+			},
+		},
+		segments: map[string][]transcribe.Segment{"provider-models": {}},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/sessions/provider-models", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET session = %d: %s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		Session struct {
+			SummaryModel    string `json:"summary_model"`
+			RefinementModel string `json:"refinement_model"`
+		} `json:"session"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.Session.SummaryModel != "provider-summary-model" {
+		t.Fatalf("summary_model = %q", payload.Session.SummaryModel)
+	}
+	if payload.Session.RefinementModel != "provider-refinement-model" {
+		t.Fatalf("refinement_model = %q", payload.Session.RefinementModel)
+	}
+}
+
+func TestTTSSpeakReturnsBadGatewayAfterSynthesisFailure(t *testing.T) {
+	h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{}, &ControlHooks{
+		TTSSpeak: func(string, string, string) (string, error) { return "failed-request", nil },
+		TTSWaitForSynthesis: func(context.Context, string) (map[string]any, error) {
+			return map[string]any{"status": tts.StatusFailed, "error": "provider refused synthesis"}, nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/tts/speak", strings.NewReader(`{"text":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("POST /api/tts/speak = %d, want 502: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "provider refused synthesis") {
+		t.Fatalf("failure response %q omits synthesis error", rr.Body.String())
+	}
+}
+
+type deleteSessionErrorStore struct {
+	*storage.SQLiteStore
+	err error
+}
+
+func (s *deleteSessionErrorStore) DeleteSession(string, string) (string, error) {
+	return "", s.err
+}
+
+type sourceRawPredeleteStore struct {
+	*storage.SQLiteStore
+	sourceRaw  []string
+	stillNamed []string
+}
+
+func (s *sourceRawPredeleteStore) DeleteSession(id, audioDir string) (string, error) {
+	for _, raw := range s.sourceRaw {
+		if _, err := os.Stat(raw); err == nil {
+			s.stillNamed = append(s.stillNamed, raw)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return s.SQLiteStore.DeleteSession(id, audioDir)
+}
+
+func newMergedDeleteStore(t *testing.T) (*storage.SQLiteStore, string, map[string][]byte) {
+	t.Helper()
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	started := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"source", "later-source"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), id+".mp3"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MergeSessions("merged", []string{"source", "later-source"}, started, started.Add(61*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	audioDir := t.TempDir()
+	raw := map[string][]byte{
+		"merged":       []byte("merged raw microphone capture"),
+		"source":       []byte("source raw microphone capture"),
+		"later-source": []byte("later source raw microphone capture"),
+	}
+	for id, contents := range raw {
+		if err := os.WriteFile(filepath.Join(audioDir, id+".pcm"), contents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return store, audioDir, raw
+}
+
+func TestDeleteSessionHidesEveryMergedSourceRawPCM(t *testing.T) {
+	store, audioDir, raw := newMergedDeleteStore(t)
+	finish := finishRawErasing
+	t.Cleanup(func() { finishRawErasing = finish })
+	entered, release := make(chan struct{}), make(chan struct{})
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+	})
+	finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+		close(entered)
+		<-release
+		finish(store, reservations)
+	}
+
+	checkedStore := &sourceRawPredeleteStore{
+		SQLiteStore: store,
+		sourceRaw: []string{
+			filepath.Join(audioDir, "source.pcm"),
+			filepath.Join(audioDir, "later-source.pcm"),
+		},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), checkedStore, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete merged session = %d %s", rr.Code, rr.Body.String())
+	}
+	if len(checkedStore.stillNamed) != 0 {
+		t.Errorf("merged source raw PCM still named when DeleteSession ran: %v", checkedStore.stillNamed)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the post-delete erasure did not begin")
+	}
+	for id := range raw {
+		if _, err := os.Stat(filepath.Join(audioDir, id+".pcm")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("raw PCM for %s after merged delete = %v, want hidden before the answer", id, err)
+		}
+	}
+	close(release)
+	released = true
+}
+
+func TestDeleteSessionRestoresMergedSourcesWhenRowDeleteFails(t *testing.T) {
+	store, audioDir, raw := newMergedDeleteStore(t)
+	h, err := Handler(testStaticFS(t), NewHub(), &deleteSessionErrorStore{SQLiteStore: store, err: errors.New("database unavailable")}, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("delete with database failure = %d %s, want 500", rr.Code, rr.Body.String())
+	}
+	for id, want := range raw {
+		if got, err := os.ReadFile(filepath.Join(audioDir, id+".pcm")); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("raw PCM for %s after failed row delete = %q (%v), want restored source bytes", id, got, err)
+		}
+	}
+}
+
+func TestDeleteSessionRestoresEarlierRawPCMWhenALaterHideFails(t *testing.T) {
+	store, audioDir, raw := newMergedDeleteStore(t)
+	original := beginReservedErasing
+	t.Cleanup(func() { beginReservedErasing = original })
+	failedPath := filepath.Join(audioDir, "source.pcm")
+	beginReservedErasing = func(reservation erase.Reservation) (erase.Pending, error) {
+		if reservation.OriginalPath() == failedPath {
+			return erase.Pending{}, errors.New("cannot hide source raw PCM")
+		}
+		return original(reservation)
+	}
+
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("delete with later raw hide failure = %d %s, want 500", rr.Code, rr.Body.String())
+	}
+	for id, want := range raw {
+		if got, err := os.ReadFile(filepath.Join(audioDir, id+".pcm")); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("raw PCM for %s after later hide failure = %q (%v), want restored bytes", id, got, err)
+		}
+	}
+}
+
+func TestDeleteSessionRefusesNestedMergeTarget(t *testing.T) {
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	for i, id := range []string{"source", "middle-sibling", "outer-sibling"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MergeSessions("middle", []string{"source", "middle-sibling"}, started, started.Add(61*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeSessions("outer", []string{"middle", "outer-sibling"}, started, started.Add(121*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/middle", nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete of nested merge target = %d %s, want 409", rr.Code, rr.Body.String())
+	}
+	for _, id := range []string{"source", "middle-sibling", "middle", "outer", "outer-sibling"} {
+		if _, err := store.GetSession(id); err != nil {
+			t.Errorf("nested delete refusal removed %s: %v", id, err)
+		}
+	}
+}
+
+func TestDeleteSessionRefusesAnActiveMergedSource(t *testing.T) {
+	store, audioDir, _ := newMergedDeleteStore(t)
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = ? WHERE id = 'source'`, storage.SessionActive); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, audioDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/merged", nil))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete of merged session with active source = %d %s, want 409", rr.Code, rr.Body.String())
+	}
+	if sess, err := store.GetSession("source"); err != nil || sess.Status != storage.SessionActive {
+		t.Fatalf("active source after refused delete = %+v (%v), want active", sess, err)
+	}
+}
+
+func TestRetryRefinementWithoutLocalAudioStartsRestore(t *testing.T) {
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1": {ID: "s1", Status: storage.SessionEnded, RefinementStatus: storage.RefinementNoAudio},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	started := make(chan string, 1)
+	handler, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		RetryRefinement: func(_ context.Context, sessionID string) error {
+			started <- sessionID
+			return nil
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/sessions/s1/retry-refinement", nil))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("retry refinement without local audio = %d %s, want 202", response.Code, response.Body.String())
+	}
+	select {
+	case sessionID := <-started:
+		if sessionID != "s1" {
+			t.Fatalf("restore refinement session = %q, want s1", sessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry refinement without local audio did not start restoration")
 	}
 }

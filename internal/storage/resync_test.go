@@ -16,11 +16,11 @@ func documentedSession(t *testing.T, store *SQLiteStore, id, summary string) {
 	if err := store.AppendSegment(id, transcribe.Segment{Text: "said", EndTime: 1, Timestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("AppendSegment %s: %v", id, err)
 	}
-	if err := store.Canonicalize(id); err != nil {
+	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatalf("Canonicalize %s: %v", id, err)
 	}
-	if err := store.UpdateSummary(id, "Standup", summary, SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary %s: %v", id, err)
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", summary, SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration %s: %v", id, err)
 	}
 }
 
@@ -46,7 +46,7 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 		resync bool
 	}{
 		{"summary made again", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateSummary(id, "Standup", "The summary, made again.", SummaryCompleted, "default", "{}")
+			return store.UpdateSummaryAtGeneration(id, "Standup", "The summary, made again.", SummaryCompleted, "default", "{}", "", 0)
 		}, true},
 		{"summary started again", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return store.StartSummary(id)
@@ -55,26 +55,27 @@ func TestADocumentChangeSendsASyncedSessionBackToSync(t *testing.T) {
 			if err := store.StartSummary(id); err != nil {
 				t.Fatalf("StartSummary: %v", err)
 			}
-			_, err := store.FailSummary(id, "summarization failed")
+			_, err := store.FailSummaryAtGeneration(id, "summarization failed", 0)
 			return err
 		}, false},
 		{"title edited", func(_ *testing.T, store *SQLiteStore, id string) error {
 			return store.UpdateTitle(id, "Planning")
 		}, true},
 		{"refinement retried", func(t *testing.T, store *SQLiteStore, id string) error {
-			if err := store.UpdateRefinement(id, "The refined transcript.", RefinementCompleted); err != nil {
-				t.Fatalf("UpdateRefinement: %v", err)
+			if err := store.UpdateRefinementAtGeneration(id, "The refined transcript.", RefinementCompleted, "", 0); err != nil {
+				t.Fatalf("UpdateRefinementAtGeneration: %v", err)
 			}
-			return store.Canonicalize(id)
+			_, _, err := store.Canonicalize(id)
+			return err
 		}, true},
 		{"same summary stored again", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateSummary(id, "Standup", "The first summary.", SummaryCompleted, "default", "{}")
+			return store.UpdateSummaryAtGeneration(id, "Standup", "The first summary.", SummaryCompleted, "default", "{}", "", 0)
 		}, false},
 		{"refined, not yet canonicalized", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateRefinement(id, "The refined transcript.", RefinementCompleted)
+			return store.UpdateRefinementAtGeneration(id, "The refined transcript.", RefinementCompleted, "", 0)
 		}, false},
 		{"published to Envoy", func(_ *testing.T, store *SQLiteStore, id string) error {
-			return store.UpdateEnvoyPublishStatus(id, EnvoyPublishPublished)
+			return setEnvoyPublishStatus(store, id, EnvoyPublishPublished)
 		}, false},
 		// Every other input of the documents, written directly: the app
 		// changes none of these on a synced session today.
@@ -130,7 +131,7 @@ func TestADocumentChangeSendsARestoredSessionBackToSync(t *testing.T) {
 	if err := store.ImportSession(&Session{
 		ID: "20260301100000", Title: "Standup", StartedAt: started, EndedAt: &ended, Status: SessionEnded,
 		Summary: "The summary.", SummaryStatus: SummaryCompleted, SyncStatus: SyncSynced, GDriveFolderID: "folder-restored",
-	}, []transcribe.Segment{{Text: "said", EndTime: 1, Timestamp: started}}); err != nil {
+	}, []transcribe.Segment{{Text: "said", EndTime: 1, Timestamp: started}}, nil); err != nil {
 		t.Fatalf("ImportSession: %v", err)
 	}
 	if session, _ := store.GetSession("20260301100000"); session.SyncStatus != SyncSynced {

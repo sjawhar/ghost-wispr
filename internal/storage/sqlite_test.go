@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 	"math"
 	"os"
@@ -27,6 +28,26 @@ func newTestSQLiteStore(t *testing.T) *SQLiteStore {
 	})
 
 	return store
+}
+
+func deleteAgeEligibleForTest(store *SQLiteStore, id, audioPath string) (bool, error) {
+	_, deleted, err := store.DeleteEndedSessionAndSources(id, audioPath, "")
+	return deleted, err
+}
+
+func setEnvoyPublishStatus(store *SQLiteStore, sessionID, status string) error {
+	session, err := store.GetSession(sessionID)
+	if err != nil {
+		return err
+	}
+	updated, err := store.UpdateEnvoyPublishStatusAtVersion(sessionID, session.SummaryVersion, status)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("session %s changed before envoy publish status update", sessionID)
+	}
+	return nil
 }
 
 func TestPreMigrationBackupCreated(t *testing.T) {
@@ -199,8 +220,8 @@ func TestSQLiteCRUD(t *testing.T) {
 		t.Fatalf("AppendSegment failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary failed: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Meeting Notes", "## Summary\n- done", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration failed: %v", err)
 	}
 
 	if err := store.EndSession(sessionID, startedAt.Add(30*time.Second), "data/audio/20260226100000.mp3"); err != nil {
@@ -258,8 +279,8 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 
-	if err := store.UpdateSummary(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise", "{}"); err != nil {
-		t.Fatalf("UpdateSummary failed: %v", err)
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Concise Notes", "## Summary\n- done", SummaryCompleted, "concise", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration failed: %v", err)
 	}
 
 	session, err := store.GetSession(sessionID)
@@ -272,6 +293,211 @@ func TestUpdateSummaryWithPreset(t *testing.T) {
 	}
 }
 
+func TestSummaryVersionIncrements(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "summary-version"
+	if err := store.CreateSession(sessionID, time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession(sessionID, time.Date(2026, 11, 10, 12, 31, 45, 0, time.UTC), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	version := func(step string) int {
+		t.Helper()
+		sess, err := store.GetSession(sessionID)
+		if err != nil {
+			t.Fatalf("GetSession %s: %v", step, err)
+		}
+		return sess.SummaryVersion
+	}
+	if got := version("before summary"); got != 1 {
+		t.Fatalf("initial summary version = %d, want 1", got)
+	}
+
+	// The first summary keeps version 1.
+	if err := store.StartSummary(sessionID); err != nil {
+		t.Fatalf("StartSummary first: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration(sessionID, "First", "First summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration first: %v", err)
+	}
+	if got := version("after first summary"); got != 1 {
+		t.Fatalf("first summary version = %d, want 1", got)
+	}
+
+	// A regeneration through StartSummary bumps it once.
+	if err := store.StartSummary(sessionID); err != nil {
+		t.Fatalf("StartSummary regenerated: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Corrected", "Corrected summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration regenerated: %v", err)
+	}
+	if got := version("after regenerated summary"); got != 2 {
+		t.Fatalf("regenerated summary version = %d, want 2", got)
+	}
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
+		t.Fatalf("mark regenerated summary published: %v", err)
+	}
+
+	// A completed summary rewritten without StartSummary (the batch path) bumps it too.
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration batched: %v", err)
+	}
+	if got := version("after batched summary"); got != 3 {
+		t.Fatalf("batched summary version = %d, want 3", got)
+	}
+	sess, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession after batched summary: %v", err)
+	}
+	if sess.EnvoyPublishStatus != EnvoyPublishPending {
+		t.Fatalf("batched summary publish status = %q, want %q", sess.EnvoyPublishStatus, EnvoyPublishPending)
+	}
+	ids, err := store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("GetSessionsNeedingEnvoyPublish after batched summary: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("sessions needing Envoy publish = %v, want [%s]", ids, sessionID)
+	}
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
+		t.Fatalf("mark batched summary published: %v", err)
+	}
+
+	// Re-reading the completed batch result is not a regeneration.
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Batched", "Batched summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration repeated batch result: %v", err)
+	}
+	if got := version("after repeated batch result"); got != 3 {
+		t.Fatalf("repeated batch summary version = %d, want 3", got)
+	}
+	sess, err = store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession after repeated batch result: %v", err)
+	}
+	if sess.EnvoyPublishStatus != EnvoyPublishPublished {
+		t.Fatalf("repeated batch publish status = %q, want %q", sess.EnvoyPublishStatus, EnvoyPublishPublished)
+	}
+
+	for _, change := range []struct {
+		name  string
+		apply func(*Session, *string, *string, *string)
+	}{
+		{"summary", func(_ *Session, summary, _ *string, _ *string) { *summary = "Summary text changed" }},
+		{"preset", func(_ *Session, _ *string, preset, _ *string) { *preset = "detailed" }},
+		{"speaker names", func(_ *Session, _ *string, _ *string, speakers *string) { *speakers = `{"0":{"name":"Sam"}}` }},
+	} {
+		t.Run("same title "+change.name, func(t *testing.T) {
+			current, err := store.GetSession(sessionID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
+				t.Fatalf("mark summary published: %v", err)
+			}
+			summary, preset, speakers := current.Summary, current.SummaryPreset, current.SpeakerNames
+			change.apply(&current, &summary, &preset, &speakers)
+			if err := store.UpdateSummaryAtGeneration(sessionID, current.Title, summary, SummaryCompleted, preset, speakers, "", 0); err != nil {
+				t.Fatalf("UpdateSummaryAtGeneration: %v", err)
+			}
+			updated, err := store.GetSession(sessionID)
+			if err != nil {
+				t.Fatalf("GetSession updated: %v", err)
+			}
+			if updated.SummaryVersion != current.SummaryVersion+1 {
+				t.Fatalf("summary version = %d, want %d", updated.SummaryVersion, current.SummaryVersion+1)
+			}
+			if updated.EnvoyPublishStatus != EnvoyPublishPending {
+				t.Fatalf("envoy publish status = %q, want %q", updated.EnvoyPublishStatus, EnvoyPublishPending)
+			}
+		})
+	}
+}
+
+func TestSummaryVersionMigratesExistingSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "summary-version.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	startedAt := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
+	if err := store.CreateSession("existing", startedAt); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession("existing", startedAt.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration("existing", "Existing", "Existing summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacy.Exec(`ALTER TABLE sessions DROP COLUMN summary_version`); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("remove summary_version from legacy database: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	migrated, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("migrate legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = migrated.Close() })
+
+	sess, err := migrated.GetSession("existing")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.SummaryVersion != 1 {
+		t.Fatalf("migrated summary version = %d, want 1", sess.SummaryVersion)
+	}
+	sessions, err := migrated.GetSessionsByDate("2026-11-10", false)
+	if err != nil {
+		t.Fatalf("GetSessionsByDate: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].SummaryVersion != 1 {
+		t.Fatalf("migrated date query = %#v, want one session at version 1", sessions)
+	}
+}
+
+func TestOpeningStoreMovesRejectedEnvoyPublishToPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	if err := store.CreateSession("session-1", time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET envoy_publish_status = 'rejected' WHERE id = ?`, "session-1"); err != nil {
+		t.Fatalf("mark rejected: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	session, err := reopened.GetSession("session-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.EnvoyPublishStatus != EnvoyPublishPending {
+		t.Fatalf("envoy publish status = %q, want %q", session.EnvoyPublishStatus, EnvoyPublishPending)
+	}
+}
+
 func TestSpeakerNames(t *testing.T) {
 	store := newTestSQLiteStore(t)
 
@@ -281,10 +507,10 @@ func TestSpeakerNames(t *testing.T) {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
 
-	t.Run("UpdateSummary persists speaker_names", func(t *testing.T) {
+	t.Run("UpdateSummaryAtGeneration persists speaker_names", func(t *testing.T) {
 		speakerNames := `{"1":{"name":"Ben","confidence":"mentioned"}}`
-		if err := store.UpdateSummary(sessionID, "Speaker notes", "## Summary\n- discussed", SummaryCompleted, "default", speakerNames); err != nil {
-			t.Fatalf("UpdateSummary failed: %v", err)
+		if err := store.UpdateSummaryAtGeneration(sessionID, "Speaker notes", "## Summary\n- discussed", SummaryCompleted, "default", speakerNames, "", 0); err != nil {
+			t.Fatalf("UpdateSummaryAtGeneration failed: %v", err)
 		}
 
 		session, err := store.GetSession(sessionID)
@@ -329,12 +555,12 @@ func TestBatchRefinement_StoreStatusAndTranscript(t *testing.T) {
 		t.Fatalf("expected default refinement_status pending, got %q", session.RefinementStatus)
 	}
 
-	if err := store.UpdateRefinement(sessionID, "", "running"); err != nil {
-		t.Fatalf("UpdateRefinement running failed: %v", err)
+	if err := store.UpdateRefinementAtGeneration(sessionID, "", "running", "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration running failed: %v", err)
 	}
 
-	if err := store.UpdateRefinement(sessionID, "refined canonical transcript", "completed"); err != nil {
-		t.Fatalf("UpdateRefinement completed failed: %v", err)
+	if err := store.UpdateRefinementAtGeneration(sessionID, "refined canonical transcript", "completed", "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration completed failed: %v", err)
 	}
 
 	session, err = store.GetSession(sessionID)
@@ -421,8 +647,8 @@ func TestOpeningTheStoreMarksEarlierSessionsWithoutRecordingNoAudio(t *testing.T
 	if _, err := store.DB().Exec(`UPDATE sessions SET refinement_status = 'pending'`); err != nil {
 		t.Fatalf("reset refinement status: %v", err)
 	}
-	if err := store.UpdateRefinement("20261106140200", "refined", RefinementCompleted); err != nil {
-		t.Fatalf("UpdateRefinement: %v", err)
+	if err := store.UpdateRefinementAtGeneration("20261106140200", "refined", RefinementCompleted, "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -456,9 +682,8 @@ func newStoreAt(t *testing.T, path string) *SQLiteStore {
 }
 
 // Recordings lists, oldest first, every session that names audio, and
-// whether disk pressure may remove its recording: ended, not being refined,
-// and synced when Drive sync gates GC. Any other sync state keeps the
-// recording.
+// whether disk pressure may remove its recording: ended, synced, and not
+// being refined. Any other sync state keeps the recording.
 func TestRecordings(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	started := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
@@ -484,41 +709,27 @@ func TestRecordings(t *testing.T) {
 		t.Fatalf("DiscardSession: %v", err)
 	}
 	end("20261106140600", 6*time.Minute, "/audio/refining.mp3", SyncStateSynced)
-	if err := store.UpdateRefinement("20261106140600", "", RefinementRunning); err != nil {
-		t.Fatalf("UpdateRefinement: %v", err)
+	if err := store.UpdateRefinementAtGeneration("20261106140600", "", RefinementRunning, "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration: %v", err)
 	}
 	if err := store.CreateSession("20261106140700", started.Add(7*time.Minute)); err != nil { // still recording
 		t.Fatalf("CreateSession: %v", err)
 	}
 
-	for _, tc := range []struct {
-		syncGated bool
-		want      []SessionRecording
-	}{
-		{syncGated: true, want: []SessionRecording{
-			{ID: "20261106140000", AudioPath: "/audio/a.mp3,/audio/b.mp3", Removable: true},
-			{ID: "20261106140100", AudioPath: "/audio/pending.mp3"},
-			{ID: "20261106140200", AudioPath: "/audio/failed.mp3"},
-			{ID: "20261106140300", AudioPath: "/audio/c.mp3", Removable: true},
-			{ID: "20261106140500", AudioPath: "/audio/discarded.mp3"},
-			{ID: "20261106140600", AudioPath: "/audio/refining.mp3"},
-		}},
-		{syncGated: false, want: []SessionRecording{
-			{ID: "20261106140000", AudioPath: "/audio/a.mp3,/audio/b.mp3", Removable: true},
-			{ID: "20261106140100", AudioPath: "/audio/pending.mp3", Removable: true},
-			{ID: "20261106140200", AudioPath: "/audio/failed.mp3", Removable: true},
-			{ID: "20261106140300", AudioPath: "/audio/c.mp3", Removable: true},
-			{ID: "20261106140500", AudioPath: "/audio/discarded.mp3"},
-			{ID: "20261106140600", AudioPath: "/audio/refining.mp3"},
-		}},
-	} {
-		got, err := store.Recordings(tc.syncGated)
-		if err != nil {
-			t.Fatalf("Recordings(%v): %v", tc.syncGated, err)
-		}
-		if !slices.Equal(got, tc.want) {
-			t.Errorf("Recordings(%v) = %v, want %v", tc.syncGated, got, tc.want)
-		}
+	want := []SessionRecording{
+		{ID: "20261106140000", AudioPath: "/audio/a.mp3,/audio/b.mp3", Removable: true},
+		{ID: "20261106140100", AudioPath: "/audio/pending.mp3"},
+		{ID: "20261106140200", AudioPath: "/audio/failed.mp3"},
+		{ID: "20261106140300", AudioPath: "/audio/c.mp3", Removable: true},
+		{ID: "20261106140500", AudioPath: "/audio/discarded.mp3"},
+		{ID: "20261106140600", AudioPath: "/audio/refining.mp3"},
+	}
+	got, err := store.Recordings()
+	if err != nil {
+		t.Fatalf("Recordings: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Recordings = %v, want %v", got, want)
 	}
 }
 
@@ -533,9 +744,18 @@ func endedWith(t *testing.T, store *SQLiteStore, id, audioPath, refinement strin
 	if err := store.EndSession(id, started.Add(time.Minute), audioPath); err != nil {
 		t.Fatalf("EndSession %s: %v", id, err)
 	}
-	if err := store.UpdateRefinement(id, "", refinement); err != nil {
-		t.Fatalf("UpdateRefinement %s: %v", id, err)
+	if err := store.UpdateRefinementAtGeneration(id, "", refinement, "", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration %s: %v", id, err)
 	}
+}
+
+// endedAndSynced ends a new session id with audioPath and refinement status
+// refinement, synced to Drive, as GC finds a session whose recording it may
+// remove.
+func endedAndSynced(t *testing.T, store *SQLiteStore, id, audioPath, refinement string) {
+	t.Helper()
+	endedWith(t, store, id, audioPath, refinement)
+	syncTo(t, store, id, SyncStateSynced, "folder", 0, "")
 }
 
 // expectAudio fails the test unless session id has this audio path, marker
@@ -576,12 +796,12 @@ func TestMarkAudioRemoved(t *testing.T) {
 		{id: "20261106140300", audioPath: "/audio/d1.mp3,/audio/d2.mp3", refinement: RefinementFailed, left: "/audio/d2.mp3", audioLeft: true, wantRefinement: RefinementFailed},
 		{id: "20261106140400", audioPath: "/audio/e1.mp3,/mnt/e2.mp3", refinement: RefinementPending, left: "/mnt/e2.mp3", wantRefinement: RefinementNoAudio},
 	} {
-		endedWith(t, store, tc.id, tc.audioPath, tc.refinement)
-		removal, ok, err := store.MarkAudioRemoved(tc.id, tc.audioPath, tc.left, tc.audioLeft, false, removedAt)
+		endedAndSynced(t, store, tc.id, tc.audioPath, tc.refinement)
+		removal, ok, err := store.MarkAudioRemoved(tc.id, tc.audioPath, tc.left, tc.audioLeft, removedAt)
 		if err != nil || !ok {
 			t.Fatalf("MarkAudioRemoved %s = %v, %v", tc.id, ok, err)
 		}
-		if want := (AudioRemoval{ID: tc.id, Before: tc.audioPath, Left: tc.left, RefinementBefore: tc.refinement, SyncStateBefore: SyncStatePending}); removal != want {
+		if want := (AudioRemoval{ID: tc.id, Before: tc.audioPath, Left: tc.left, RefinementBefore: tc.refinement}); removal != want {
 			t.Errorf("MarkAudioRemoved %s returned %+v, want %+v", tc.id, removal, want)
 		}
 		expectAudio(t, store, tc.id, tc.left, marker, tc.wantRefinement)
@@ -600,28 +820,32 @@ func TestMarkAudioRemoved(t *testing.T) {
 
 // MarkAudioRemoved changes nothing, and says so, unless the session may still
 // have this audio removed: its audio path is still the one GC listed, it is
-// ended, no refinement is reading it, and it is synced while sync gates GC.
+// ended, synced, and no refinement is reading it.
 func TestMarkAudioRemovedRefusesASessionThatChanged(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	removedAt := time.Date(2026, 11, 7, 9, 30, 0, 0, time.UTC)
 
-	endedWith(t, store, "20261106140000", "/audio/a.mp3", RefinementPending)
-	endedWith(t, store, "20261106140100", "/audio/b.mp3", RefinementRunning)
+	endedAndSynced(t, store, "20261106140000", "/audio/a.mp3", RefinementPending)
+	endedAndSynced(t, store, "20261106140100", "/audio/b.mp3", RefinementRunning)
 	endedWith(t, store, "20261106140200", "/audio/c.mp3", RefinementPending) // not synced
 	if err := store.CreateSession("20261106140300", time.Date(2026, 11, 6, 14, 3, 0, 0, time.UTC)); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
+	// A live session cannot normally be synced; set it so this case isolates
+	// the ended-status condition.
+	if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ? WHERE id = ?`, SyncStateSynced, SyncSynced, "20261106140300"); err != nil {
+		t.Fatalf("mark live session synced: %v", err)
+	}
 	for _, tc := range []struct {
 		name, id, before string
-		syncGated        bool
 	}{
 		{name: "audio path changed", id: "20261106140000", before: "/audio/other.mp3"},
 		{name: "refinement reading it", id: "20261106140100", before: "/audio/b.mp3"},
-		{name: "not synced while sync gates GC", id: "20261106140200", before: "/audio/c.mp3", syncGated: true},
+		{name: "not synced", id: "20261106140200", before: "/audio/c.mp3"},
 		{name: "still recording", id: "20261106140300", before: ""},
 		{name: "gone", id: "20261106990000", before: "/audio/z.mp3"},
 	} {
-		removal, ok, err := store.MarkAudioRemoved(tc.id, tc.before, "", false, tc.syncGated, removedAt)
+		removal, ok, err := store.MarkAudioRemoved(tc.id, tc.before, "", false, removedAt)
 		if err != nil || ok || removal != (AudioRemoval{}) {
 			t.Errorf("%s: MarkAudioRemoved = %+v, %v, %v; want nothing done", tc.name, removal, ok, err)
 		}
@@ -642,7 +866,8 @@ func TestRestoreAudio(t *testing.T) {
 	marker := removedAt.Format(time.RFC3339Nano)
 	mark := func(id, before, left string, at time.Time) *AudioRemoval {
 		t.Helper()
-		removal, ok, err := store.MarkAudioRemoved(id, before, left, left != "", false, at)
+		syncTo(t, store, id, SyncStateSynced, "folder", 0, "")
+		removal, ok, err := store.MarkAudioRemoved(id, before, left, left != "", at)
 		if err != nil || !ok {
 			t.Fatalf("MarkAudioRemoved %s = %v, %v", id, ok, err)
 		}
@@ -691,62 +916,85 @@ func TestClaimRefinement(t *testing.T) {
 	removedAt := time.Date(2026, 11, 7, 9, 30, 0, 0, time.UTC)
 
 	endedWith(t, store, "20261106140000", "/audio/a.mp3", RefinementFailed)
+	syncTo(t, store, "20261106140000", SyncStateSynced, "folder", 0, "")
 	if _, err := store.DB().Exec(`UPDATE sessions SET refined_transcript = 'stale' WHERE id = ?`, "20261106140000"); err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := store.ClaimRefinement("20261106140000", "/audio/a.mp3"); err != nil || !claimed {
+	if _, claimed, err := store.ClaimRefinement("20261106140000", "/audio/a.mp3"); err != nil || !claimed {
 		t.Fatalf("ClaimRefinement = %v, %v; want claimed", claimed, err)
 	}
 	if transcript, status, err := store.GetRefinement("20261106140000"); err != nil || transcript != "" || status != RefinementRunning {
 		t.Errorf("claimed refinement: %q, %q, %v; want no transcript and running", transcript, status, err)
 	}
-	if _, ok, err := store.MarkAudioRemoved("20261106140000", "/audio/a.mp3", "", false, false, removedAt); err != nil || ok {
+	if _, ok, err := store.MarkAudioRemoved("20261106140000", "/audio/a.mp3", "", false, removedAt); err != nil || ok {
 		t.Errorf("MarkAudioRemoved under a running refinement = %v, %v; want refused", ok, err)
 	}
 
-	endedWith(t, store, "20261106140100", "/audio/b.mp3", RefinementPending)
-	if _, ok, err := store.MarkAudioRemoved("20261106140100", "/audio/b.mp3", "", false, false, removedAt); err != nil || !ok {
+	endedAndSynced(t, store, "20261106140100", "/audio/b.mp3", RefinementPending)
+	if _, ok, err := store.MarkAudioRemoved("20261106140100", "/audio/b.mp3", "", false, removedAt); err != nil || !ok {
 		t.Fatalf("MarkAudioRemoved = %v, %v", ok, err)
 	}
 	for _, audioPath := range []string{"/audio/b.mp3", ""} {
-		if claimed, err := store.ClaimRefinement("20261106140100", audioPath); err != nil || claimed {
+		if _, claimed, err := store.ClaimRefinement("20261106140100", audioPath); err != nil || claimed {
 			t.Errorf("ClaimRefinement(%q) after GC removed the audio = %v, %v; want not claimed", audioPath, claimed, err)
 		}
 	}
 	expectAudio(t, store, "20261106140100", "", removedAt.Format(time.RFC3339Nano), RefinementNoAudio)
-	if claimed, err := store.ClaimRefinement("20261106990000", "/audio/z.mp3"); err != nil || claimed {
+	if _, claimed, err := store.ClaimRefinement("20261106990000", "/audio/z.mp3"); err != nil || claimed {
 		t.Errorf("ClaimRefinement of a missing session = %v, %v; want not claimed", claimed, err)
 	}
 }
 
-// DeleteEndedSession deletes a session for the age policy only while it is as
-// GC read it: ended, and naming that audio path. A session merged since gave
-// its recording to the merged session, which keeps both.
-func TestDeleteEndedSession(t *testing.T) {
+// A claimed refinement drops the refinement before it, its model included,
+// so a running, failed or refused refinement never carries the name of a
+// model whose text is gone.
+func TestClaimRefinementClearsTheRefinementModel(t *testing.T) {
 	store := newTestSQLiteStore(t)
-	endedWith(t, store, "20261106140000", "/audio/a.mp3", RefinementCompleted)
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/other.mp3", false); err != nil || deleted {
-		t.Errorf("DeleteEndedSession with another audio path = %v, %v; want kept", deleted, err)
+	const id = "20261106140000"
+	endedWith(t, store, id, "/audio/a.mp3", RefinementPending)
+	if err := store.UpdateRefinementAtGeneration(id, "The refined transcript.", RefinementCompleted, "nova-3", 0); err != nil {
+		t.Fatalf("store a refinement: %v", err)
+	}
+	if _, claimed, err := store.ClaimRefinement(id, "/audio/a.mp3"); err != nil || !claimed {
+		t.Fatalf("ClaimRefinement = %v, %v; want claimed", claimed, err)
+	}
+	sess, err := store.GetSession(id)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.RefinedTranscript != "" || sess.RefinementModel != "" {
+		t.Errorf("claimed refinement keeps transcript %q from model %q; want neither", sess.RefinedTranscript, sess.RefinementModel)
+	}
+}
+
+// Age deletion removes a session only while it remains ended, synced, and
+// names the recording GC checked. A merged source is held because the merged
+// session owns its recording.
+func TestAgeDelete(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	endedAndSynced(t, store, "20261106140000", "/audio/a.mp3", RefinementCompleted)
+	if deleted, err := deleteAgeEligibleForTest(store, "20261106140000", "/audio/other.mp3"); err != nil || deleted {
+		t.Errorf("age delete with another audio path = %v, %v; want kept", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err != nil {
 		t.Fatalf("session deleted: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140000", "/audio/a.mp3", false); err != nil || !deleted {
-		t.Errorf("DeleteEndedSession = %v, %v; want deleted", deleted, err)
+	if deleted, err := deleteAgeEligibleForTest(store, "20261106140000", "/audio/a.mp3"); err != nil || !deleted {
+		t.Errorf("age delete = %v, %v; want deleted", deleted, err)
 	}
 	if _, err := store.GetSession("20261106140000"); err == nil {
 		t.Error("session still there")
 	}
 
-	endedWith(t, store, "20261106140100", "/audio/b.mp3", RefinementCompleted)
+	endedAndSynced(t, store, "20261106140100", "/audio/b.mp3", RefinementCompleted)
 	if err := store.MergeSessions("20261106140100-merged", []string{"20261106140100"}, time.Date(2026, 11, 6, 14, 1, 0, 0, time.UTC), time.Date(2026, 11, 6, 14, 2, 0, 0, time.UTC)); err != nil {
 		t.Fatalf("MergeSessions: %v", err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106140100", "/audio/b.mp3", false); err != nil || deleted {
-		t.Errorf("DeleteEndedSession of a merged source = %v, %v; want kept", deleted, err)
+	if deleted, err := deleteAgeEligibleForTest(store, "20261106140100", "/audio/b.mp3"); err != nil || deleted {
+		t.Errorf("age delete of a merged source = %v, %v; want kept", deleted, err)
 	}
-	if deleted, err := store.DeleteEndedSession("20261106990000", "", false); err != nil || deleted {
-		t.Errorf("DeleteEndedSession of a missing session = %v, %v; want nothing", deleted, err)
+	if deleted, err := deleteAgeEligibleForTest(store, "20261106990000", ""); err != nil || deleted {
+		t.Errorf("age delete of a missing session = %v, %v; want nothing", deleted, err)
 	}
 }
 
@@ -758,8 +1006,8 @@ func TestDeleteEndedSession(t *testing.T) {
 func TestMarkSynced(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	endedWith(t, store, "20261106140000", "/audio/a.mp3,/mnt/b.mp3", RefinementPending)
-	if err := store.UpdateSummary("20261106140000", "", "The current summary.", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary: %v", err)
+	if err := store.UpdateSummaryAtGeneration("20261106140000", "", "The current summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
 	}
 	if err := store.AppendSegment("20261106140000", transcribe.Segment{Text: "said", EndTime: 1, Timestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("AppendSegment: %v", err)
@@ -797,40 +1045,41 @@ func TestMarkSynced(t *testing.T) {
 	}
 }
 
-// A sync that finished while GC had a session's row marked uploaded the row
-// as marked; when GC puts back a recording it could not remove, the session
-// names a recording Drive may not have, so RestoreAudio reopens the sync
-// (pending, its folder kept). A session synced before the mark, as GC gated
-// on sync finds them, stays synced: nothing synced it meanwhile.
-func TestRestoreAudioReopensASyncThatRanMeanwhile(t *testing.T) {
+// RestoreAudio reopens a synced session whose recording returns to the row.
+// If the session changed after the mark, its pending sync state stays pending.
+func TestRestoreAudioReopensSyncedSessionAndLeavesPendingSessionPending(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	removedAt := time.Date(2026, 11, 7, 9, 30, 0, 0, time.UTC)
 	mark := func(id string) *AudioRemoval {
 		t.Helper()
-		removal, ok, err := store.MarkAudioRemoved(id, "/audio/"+id+".mp3,/mnt/"+id+".mp3", "", false, false, removedAt)
+		removal, ok, err := store.MarkAudioRemoved(id, "/audio/"+id+".mp3,/mnt/"+id+".mp3", "", false, removedAt)
 		if err != nil || !ok {
 			t.Fatalf("MarkAudioRemoved %s = %v, %v", id, ok, err)
 		}
 		return &removal
 	}
 
-	endedWith(t, store, "20261106140000", "/audio/20261106140000.mp3,/mnt/20261106140000.mp3", RefinementPending)
+	endedAndSynced(t, store, "20261106140000", "/audio/20261106140000.mp3,/mnt/20261106140000.mp3", RefinementPending)
 	removal := mark("20261106140000")
-	syncTo(t, store, "20261106140000", SyncStateSynced, "folder-1", 0, "") // a sync ran meanwhile
-	if err := store.RestoreAudio(removal, "/mnt/20261106140000.mp3"); err != nil {
-		t.Fatalf("RestoreAudio: %v", err)
+	if err := store.UpdateTitle("20261106140000", "A changed title"); err != nil {
+		t.Fatalf("UpdateTitle: %v", err)
 	}
-	if session, _ := store.GetSession("20261106140000"); session.SyncState != SyncStatePending || session.SyncStatus != SyncPending || session.GDriveFolderID != "folder-1" {
-		t.Errorf("after the put-back: %q/%q in %q; want pending in folder-1", session.SyncState, session.SyncStatus, session.GDriveFolderID)
+	if session, _ := store.GetSession("20261106140000"); session.SyncState != SyncStatePending {
+		t.Fatalf("changed session state before put-back = %q, want %q", session.SyncState, SyncStatePending)
+	}
+	if err := store.RestoreAudio(removal, "/mnt/20261106140000.mp3"); err != nil {
+		t.Fatalf("RestoreAudio after a document change: %v", err)
+	}
+	if session, _ := store.GetSession("20261106140000"); session.SyncState != SyncStatePending || session.SyncStatus != SyncPending || session.GDriveFolderID != "folder" {
+		t.Errorf("changed session after a put-back: %q/%q in %q; want pending in folder", session.SyncState, session.SyncStatus, session.GDriveFolderID)
 	}
 
-	endedWith(t, store, "20261106140100", "/audio/20261106140100.mp3,/mnt/20261106140100.mp3", RefinementPending)
-	syncTo(t, store, "20261106140100", SyncStateSynced, "folder-2", 0, "") // synced before the mark
+	endedAndSynced(t, store, "20261106140100", "/audio/20261106140100.mp3,/mnt/20261106140100.mp3", RefinementPending)
 	if err := store.RestoreAudio(mark("20261106140100"), "/mnt/20261106140100.mp3"); err != nil {
-		t.Fatalf("RestoreAudio: %v", err)
+		t.Fatalf("RestoreAudio of a synced session: %v", err)
 	}
-	if session, _ := store.GetSession("20261106140100"); session.SyncState != SyncStateSynced {
-		t.Errorf("a session synced before the mark: %q after the put-back, want still synced", session.SyncState)
+	if session, _ := store.GetSession("20261106140100"); session.SyncState != SyncStatePending || session.GDriveFolderID != "folder" {
+		t.Errorf("synced session after a put-back: %q in %q; want pending in folder", session.SyncState, session.GDriveFolderID)
 	}
 }
 
@@ -838,8 +1087,8 @@ func TestRestoreAudioReopensASyncThatRanMeanwhile(t *testing.T) {
 // no audio, its merged session has it.
 func TestRestoreAudioRefusesAMergedSource(t *testing.T) {
 	store := newTestSQLiteStore(t)
-	endedWith(t, store, "20261106140000", "/audio/a.mp3", RefinementPending)
-	removal, ok, err := store.MarkAudioRemoved("20261106140000", "/audio/a.mp3", "", false, false, time.Date(2026, 11, 7, 9, 30, 0, 0, time.UTC))
+	endedAndSynced(t, store, "20261106140000", "/audio/a.mp3", RefinementPending)
+	removal, ok, err := store.MarkAudioRemoved("20261106140000", "/audio/a.mp3", "", false, time.Date(2026, 11, 7, 9, 30, 0, 0, time.UTC))
 	if err != nil || !ok {
 		t.Fatalf("MarkAudioRemoved = %v, %v", ok, err)
 	}
@@ -967,7 +1216,7 @@ func TestSyncStatusTracking(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/sync-test-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -1012,7 +1261,7 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-test-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Test Title", "Test summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -1024,7 +1273,7 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 		t.Fatalf("expected [%s], got %v", sessionID, ids)
 	}
 
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 
@@ -1043,6 +1292,47 @@ func TestEnvoyPublishStatusTracking(t *testing.T) {
 	if sess.EnvoyPublishStatus != EnvoyPublishPublished {
 		t.Fatalf("expected envoy_publish_status %q, got %q", EnvoyPublishPublished, sess.EnvoyPublishStatus)
 	}
+
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishFailed); err != nil {
+		t.Fatalf("mark envoy publish failed: %v", err)
+	}
+	ids, err = store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatalf("get sessions needing envoy publish after failure: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != sessionID {
+		t.Fatalf("failed summary should be swept again, got %v", ids)
+	}
+}
+
+func TestEnvoyPublishStatusIsVersionAware(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	sessionID := "envoy-version"
+	started := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
+	if err := store.CreateSession(sessionID, started); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession(sessionID, started.Add(time.Minute), ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Title", "Summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
+	}
+
+	updated, err := store.UpdateEnvoyPublishStatusAtVersion(sessionID, 2, EnvoyPublishPublished)
+	if err != nil {
+		t.Fatalf("UpdateEnvoyPublishStatusAtVersion stale: %v", err)
+	}
+	if updated {
+		t.Fatal("stale summary version updated the delivery status")
+	}
+	updated, err = store.UpdateEnvoyPublishStatusAtVersion(sessionID, 1, EnvoyPublishFailed)
+	if err != nil {
+		t.Fatalf("UpdateEnvoyPublishStatusAtVersion current: %v", err)
+	}
+	if !updated {
+		t.Fatal("current summary version did not update the delivery status")
+	}
 }
 
 func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
@@ -1056,10 +1346,10 @@ func TestStartSummaryResetsEnvoyPublishStatus(t *testing.T) {
 	if err := store.EndSession(sessionID, started.Add(30*time.Second), "data/audio/envoy-reset-1.mp3"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(sessionID, "Published Title", "Published summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary completed: %v", err)
 	}
-	if err := store.UpdateEnvoyPublishStatus(sessionID, EnvoyPublishPublished); err != nil {
+	if err := setEnvoyPublishStatus(store, sessionID, EnvoyPublishPublished); err != nil {
 		t.Fatalf("update envoy publish status: %v", err)
 	}
 
@@ -1089,7 +1379,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	}
 	// Summarized, then synced, as the app does it: a summary changed after
 	// the sync sends the session back to sync.
-	if err := store.UpdateSummary("gc-eligible", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("gc-eligible", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	syncTo(t, store, "gc-eligible", SyncStateSynced, "folder-1", 0, "")
@@ -1100,7 +1390,7 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-unsynced", old.Add(time.Minute), "data/audio/gc-unsynced.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-unsynced", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("gc-unsynced", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1110,12 +1400,12 @@ func TestGetGCEligibleSessions(t *testing.T) {
 	if err := store.EndSession("gc-recent", now.Add(-30*time.Minute), "data/audio/gc-recent.mp3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateSummary("gc-recent", "", "test summary", "completed", "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("gc-recent", "", "test summary", "completed", "default", "{}", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	syncTo(t, store, "gc-recent", SyncStateSynced, "folder-2", 0, "")
 
-	ids, err := store.GetGCEligibleSessions(30, true)
+	ids, err := store.GetGCEligibleSessions(30)
 	if err != nil {
 		t.Fatalf("get gc eligible: %v", err)
 	}
@@ -1123,13 +1413,6 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatalf("expected [gc-eligible], got %v", ids)
 	}
 
-	ids, err = store.GetGCEligibleSessions(30, false)
-	if err != nil {
-		t.Fatalf("get gc eligible no gate: %v", err)
-	}
-	if len(ids) != 2 {
-		t.Fatalf("expected 2 sessions, got %d: %v", len(ids), ids)
-	}
 }
 
 // summarizedSession ends session id, started at startedAt, with no recording
@@ -1143,8 +1426,8 @@ func summarizedSession(t *testing.T, store *SQLiteStore, id string, startedAt ti
 	if err := store.EndSession(id, startedAt.Add(time.Minute), ""); err != nil {
 		t.Fatalf("EndSession %s: %v", id, err)
 	}
-	if err := store.UpdateSummary(id, "", "A summary.", SummaryCompleted, "default", "{}"); err != nil {
-		t.Fatalf("UpdateSummary %s: %v", id, err)
+	if err := store.UpdateSummaryAtGeneration(id, "", "A summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration %s: %v", id, err)
 	}
 	syncTo(t, store, id, SyncStateSynced, "folder", 0, "")
 }
@@ -1159,11 +1442,11 @@ func TestGetGCEligibleSessionsNeverWrapsTheAgeLimit(t *testing.T) {
 	summarizedSession(t, store, "hour-old", now.Add(-time.Hour))
 	summarizedSession(t, store, "45-days-old", now.Add(-45*24*time.Hour))
 
-	if ids, err := store.GetGCEligibleSessions(30, true); err != nil || !slices.Equal(ids, []string{"45-days-old"}) {
+	if ids, err := store.GetGCEligibleSessions(30); err != nil || !slices.Equal(ids, []string{"45-days-old"}) {
 		t.Fatalf("GetGCEligibleSessions(30 days) = %v, %v; want [45-days-old]", ids, err)
 	}
 	for _, days := range []int{106751, 106752, 999999, 1000000, math.MaxInt32, math.MaxInt} {
-		ids, err := store.GetGCEligibleSessions(days, true)
+		ids, err := store.GetGCEligibleSessions(days)
 		if err != nil {
 			t.Fatalf("GetGCEligibleSessions(%d days): %v", days, err)
 		}
@@ -1181,7 +1464,7 @@ func TestGetGCEligibleSessionsWithNoAgeLimitReturnsNone(t *testing.T) {
 	summarizedSession(t, store, "20160101120000", time.Now().UTC().Add(-3650*24*time.Hour))
 
 	for _, days := range []int{0, -1} {
-		ids, err := store.GetGCEligibleSessions(days, true)
+		ids, err := store.GetGCEligibleSessions(days)
 		if err != nil {
 			t.Fatalf("GetGCEligibleSessions(%d days): %v", days, err)
 		}
@@ -1202,12 +1485,12 @@ func TestGetGCEligibleSessionsMeasuresARestoredSessionFromItsRestore(t *testing.
 		ID: "20251001120000", StartedAt: started, EndedAt: &ended, Status: SessionEnded,
 		Summary: "A summary.", SummaryStatus: SummaryCompleted, SyncStatus: SyncSynced,
 	}
-	if err := store.ImportSession(&restored, nil); err != nil {
+	if err := store.ImportSession(&restored, nil, nil); err != nil {
 		t.Fatalf("ImportSession: %v", err)
 	}
 	summarizedSession(t, store, "20251001130000", started.Add(time.Hour)) // recorded here, never restored
 
-	ids, err := store.GetGCEligibleSessions(30, true)
+	ids, err := store.GetGCEligibleSessions(30)
 	if err != nil {
 		t.Fatalf("GetGCEligibleSessions: %v", err)
 	}
@@ -1226,7 +1509,7 @@ func TestGetGCEligibleSessionsMeasuresARestoredSessionFromItsRestore(t *testing.
 		time.Now().UTC().Add(-31*24*time.Hour).Format(time.RFC3339Nano), restored.ID); err != nil {
 		t.Fatalf("age the restore: %v", err)
 	}
-	ids, err = store.GetGCEligibleSessions(30, true)
+	ids, err = store.GetGCEligibleSessions(30)
 	if err != nil {
 		t.Fatalf("GetGCEligibleSessions: %v", err)
 	}
@@ -1330,7 +1613,7 @@ func TestDeleteSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := store.DeleteSession(sessionID); err != nil {
+	if _, err := store.DeleteSession(sessionID, ""); err != nil {
 		t.Fatalf("delete session: %v", err)
 	}
 
@@ -1347,7 +1630,7 @@ func TestDeleteSession(t *testing.T) {
 		t.Fatalf("expected 0 segments, got %d", len(segs))
 	}
 
-	err = store.DeleteSession("nonexistent")
+	_, err = store.DeleteSession("nonexistent", "")
 	if err == nil {
 		t.Fatal("expected error deleting nonexistent session")
 	}
@@ -1586,16 +1869,16 @@ func TestCanonicalize_FromRefinedTranscript(t *testing.T) {
 	}
 
 	// Set refined transcript.
-	if err := store.UpdateRefinement(sessionID, "refined hello world. how are you doing?", "completed"); err != nil {
+	if err := store.UpdateRefinementAtGeneration(sessionID, "refined hello world. how are you doing?", "completed", "", 0); err != nil {
 		t.Fatalf("update refinement: %v", err)
 	}
 
 	// Canonicalize should use refined transcript.
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
-	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	transcript, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}
@@ -1639,11 +1922,11 @@ func TestCanonicalize_FallbackToStreaming(t *testing.T) {
 	}
 
 	// Refinement pending (default) — should fall back to streaming.
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
-	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	transcript, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}
@@ -1672,15 +1955,15 @@ func TestCanonicalize_RefinementFailed_FallsBackToStreaming(t *testing.T) {
 	}
 
 	// Mark refinement as failed.
-	if err := store.UpdateRefinement(sessionID, "", "failed"); err != nil {
+	if err := store.UpdateRefinementAtGeneration(sessionID, "", "failed", "", 0); err != nil {
 		t.Fatalf("update refinement: %v", err)
 	}
 
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
 
-	_, source, err := store.GetCanonicalTranscript(sessionID)
+	_, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}
@@ -1706,25 +1989,25 @@ func TestCanonicalize_RecanonicalizeAfterLateRefinement(t *testing.T) {
 	}
 
 	// First canonicalization — streaming (refinement pending).
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("first canonicalize: %v", err)
 	}
-	_, source, _ := store.GetCanonicalTranscript(sessionID)
+	_, source, _, _ := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if source != "streaming" {
 		t.Fatalf("expected initial source 'streaming', got %q", source)
 	}
 
 	// Late refinement completes.
-	if err := store.UpdateRefinement(sessionID, "late refined transcript", "completed"); err != nil {
+	if err := store.UpdateRefinementAtGeneration(sessionID, "late refined transcript", "completed", "", 0); err != nil {
 		t.Fatalf("update refinement: %v", err)
 	}
 
 	// Re-canonicalize — should now use refined.
-	if err := store.Canonicalize(sessionID); err != nil {
+	if _, _, err := store.Canonicalize(sessionID); err != nil {
 		t.Fatalf("re-canonicalize: %v", err)
 	}
 
-	transcript, source, err := store.GetCanonicalTranscript(sessionID)
+	transcript, source, _, err := store.GetCanonicalTranscriptWithGeneration(sessionID)
 	if err != nil {
 		t.Fatalf("get canonical: %v", err)
 	}
@@ -1770,7 +2053,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-1", started); err != nil {
 		t.Fatalf("create session fts-1: %v", err)
 	}
-	if err := store.UpdateSummary("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-1", "Alpha planning", "Discussed alpha rollout", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary fts-1: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha appears once in transcript", "fts-1"); err != nil {
@@ -1780,7 +2063,7 @@ func TestFTS5SearchReturnsRankedHighlightedResults(t *testing.T) {
 	if err := store.CreateSession("fts-2", started.Add(time.Minute)); err != nil {
 		t.Fatalf("create session fts-2: %v", err)
 	}
-	if err := store.UpdateSummary("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-2", "Alpha alpha alpha", "Alpha mentioned repeatedly", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary fts-2: %v", err)
 	}
 	if _, err := store.DB().Exec(`UPDATE sessions SET canonical_transcript = ? WHERE id = ?`, "alpha alpha alpha and alpha again", "fts-2"); err != nil {
@@ -1814,7 +2097,10 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 	if err := store.CreateSession("fts-sync", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.EndSession("fts-sync", started.Add(time.Minute), ""); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration("fts-sync", "Initial title", "Initial summary", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary initial: %v", err)
 	}
 
@@ -1826,7 +2112,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected no matches before update, got %d", len(results))
 	}
 
-	if err := store.UpdateSummary("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-sync", "Delta title", "Summary with delta keyword", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary delta: %v", err)
 	}
 
@@ -1838,7 +2124,7 @@ func TestFTS5TriggersStayInSyncOnUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected one updated match for fts-sync, got %+v", results)
 	}
 
-	if err := store.DeleteSession("fts-sync"); err != nil {
+	if _, err := store.DeleteSession("fts-sync", ""); err != nil {
 		t.Fatalf("delete session: %v", err)
 	}
 
@@ -1870,7 +2156,7 @@ func TestFTS5SearchEscapesSpecialCharacters(t *testing.T) {
 	if err := store.CreateSession("fts-escape", started); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if err := store.UpdateSummary("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration("fts-escape", "Alpha Operators", "Contains alpha keyword", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("update summary: %v", err)
 	}
 
@@ -1896,7 +2182,7 @@ func TestSearchWithDateFromFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, "default", "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -1926,7 +2212,7 @@ func TestSearchWithDateToFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, "default", "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, "default", "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -1954,7 +2240,7 @@ func TestSearchWithPresetFilter(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, preset, "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -1988,7 +2274,7 @@ func TestSearchWithMultipleFilters(t *testing.T) {
 		if err := store.CreateSession(id, date); err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		if err := store.UpdateSummary(id, "Test", "test content", SummaryCompleted, preset, "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "Test", "test content", SummaryCompleted, preset, "{}", "", 0); err != nil {
 			t.Fatalf("update summary: %v", err)
 		}
 	}
@@ -2100,7 +2386,7 @@ func TestAggregateSessions(t *testing.T) {
 		if err := store.EndSession(s.id, s.date.Add(30*time.Minute), ""); err != nil {
 			t.Fatalf("end session %s: %v", s.id, err)
 		}
-		if err := store.UpdateSummary(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset, "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(s.id, "Title "+s.id, "Summary", SummaryCompleted, s.preset, "{}", "", 0); err != nil {
 			t.Fatalf("update summary %s: %v", s.id, err)
 		}
 	}
@@ -2463,5 +2749,29 @@ func TestGetEventsSince_Pagination(t *testing.T) {
 	}
 	if len(events4) != 0 {
 		t.Fatalf("expected 0 events past end, got %d", len(events4))
+	}
+}
+
+func TestProviderModelsPersistWithSummaryAndRefinement(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	const id = "provider-models"
+	if err := store.CreateSession(id, time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.UpdateSummaryAtGeneration(id, "Model report", "Summary", SummaryCompleted, "default", "{}", "provider-summary-model", 0); err != nil {
+		t.Fatalf("UpdateSummaryAtGeneration: %v", err)
+	}
+	if err := store.UpdateRefinementAtGeneration(id, "Refined transcript", RefinementCompleted, "provider-refinement-model", 0); err != nil {
+		t.Fatalf("UpdateRefinementAtGeneration: %v", err)
+	}
+	sess, err := store.GetSession(id)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.SummaryModel != "provider-summary-model" {
+		t.Fatalf("summary model = %q", sess.SummaryModel)
+	}
+	if sess.RefinementModel != "provider-refinement-model" {
+		t.Fatalf("refinement model = %q", sess.RefinementModel)
 	}
 }

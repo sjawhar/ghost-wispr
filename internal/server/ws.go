@@ -47,6 +47,14 @@ func registerWSRoute(mux *http.ServeMux, hub *Hub, logger *slog.Logger) {
 				return
 			}
 		}
+		if statusEvent, ok := hub.SnapshotStatusChanged(); ok {
+			payload, err := json.Marshal(statusEvent)
+			if err == nil {
+				if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+					return
+				}
+			}
+		}
 
 		for msg := range ch {
 			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {

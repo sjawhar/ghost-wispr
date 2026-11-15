@@ -11,7 +11,7 @@
     type SessionSummary,
   } from '../lib/types'
   import { copyText } from '../lib/clipboard'
-  import { audioLeftNote, recordingsNamed } from '../lib/audio'
+  import { audioLeftNote, canRestoreRefinement, recordingsNamed } from '../lib/audio'
   import {
     updateSessionTitle,
     retrySummary,
@@ -29,6 +29,9 @@
     onLoadDetail,
     onResummarize,
     onDelete,
+    onRefreshSession,
+    onSegmentDeleted,
+    onSegmentNotFound = async () => false,
     selected = false,
     onToggleSelect = () => {},
   }: {
@@ -41,6 +44,9 @@
     onLoadDetail: (id: string) => Promise<void>
     onResummarize: (sessionId: string, preset: string) => Promise<void>
     onDelete: (id: string) => Promise<void>
+    onRefreshSession: (id: string) => Promise<void>
+    onSegmentDeleted: (sessionID: string, segmentID: number) => void
+    onSegmentNotFound?: (sessionID: string, segmentID: number) => Promise<boolean>
     onToggleSelect?: () => void
   } = $props()
 
@@ -53,6 +59,8 @@
   // Why the last sync retry was refused, if it was.
   let retrySyncError = $state('')
   let retryingRefinement = $state(false)
+  let retryingRefinementStatus = $state<RefinementStatus | null>(null)
+  let retryRefinementError = $state('')
 
   async function copySummary() {
     if (!session.summary) return
@@ -148,10 +156,52 @@
   async function handleRetryRefinement(e: Event) {
     e.stopPropagation()
     retryingRefinement = true
+    retryingRefinementStatus = session.refinement_status ?? null
+    retryRefinementError = ''
     try {
       await retryRefinement(session.id)
-    } finally {
-      setTimeout(() => (retryingRefinement = false), 1000)
+      await onRefreshSession(session.id)
+    } catch (error) {
+      retryRefinementError = requestErrorMessage(error)
+      retryingRefinement = false
+      retryingRefinementStatus = null
+    }
+  }
+
+  $effect(() => {
+    if (retryingRefinement && session.refinement_status !== retryingRefinementStatus) {
+      retryingRefinement = false
+      retryingRefinementStatus = null
+    }
+  })
+
+  // Drive holds a copy only once the session synced and its Drive folder was
+  // not deleted since; otherwise this unit holds the only copy.
+  const onDrive = $derived(
+    session.sync_status === SyncStatus.Synced && session.sync_state !== SyncState.RemoteDeleted,
+  )
+  const localRemovalLabel = $derived(
+    onDrive
+      ? 'Remove from this unit; the shared drive keeps its copy'
+      : 'Delete from this unit; this unit holds the only copy',
+  )
+
+  // Why the last delete was refused (the API's reason).
+  let deleteError = $state('')
+
+  async function handleDelete(event: MouseEvent) {
+    event.stopPropagation()
+    const question = onDrive
+      ? 'Remove this session from this unit? The shared drive keeps its copy.'
+      : 'Delete this session? This unit holds the only copy, so this cannot be undone.'
+    if (!confirm(question)) {
+      return
+    }
+    deleteError = ''
+    try {
+      await onDelete(session.id)
+    } catch (error) {
+      deleteError = requestErrorMessage(error)
     }
   }
 </script>
@@ -276,20 +326,27 @@
               class={`status-badge ${session.refinement_status}`}
               data-testid="refinement-badge"
               title={session.refinement_status === RefinementStatus.NoAudio
-                ? session.audio_removed_at
-                  ? recordingsNamed(session.audio_path) > 0
-                    ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
-                    : 'The audio was removed to free space, so it cannot be refined'
-                  : 'No recording was saved for this session, so it cannot be refined'
+                ? session.restored_at && session.sync_state === SyncState.RemoteDeleted
+                  ? "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined."
+                  : session.restored_at &&
+                      session.refinement_status === RefinementStatus.NoAudio &&
+                      canRestoreRefinement(session)
+                    ? 'This conversation was restored from Drive; retry refinement to delete from it'
+                    : session.audio_removed_at
+                      ? recordingsNamed(session.audio_path) > 0
+                        ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
+                        : 'The audio was removed to free space, so it cannot be refined'
+                      : 'No recording was saved for this session, so it cannot be refined'
                 : undefined}
             >
               Refine: {session.refinement_status === RefinementStatus.NoAudio
                 ? 'no recording'
                 : session.refinement_status}
             </span>
-            {#if session.refinement_status === RefinementStatus.Failed}
+            {#if session.refinement_status === RefinementStatus.Failed || (session.refinement_status === RefinementStatus.NoAudio && canRestoreRefinement(session)) || (session.refinement_status === RefinementStatus.Completed && !session.refined_revision)}
               <button
                 class="retry-btn"
+                aria-label="Retry refinement"
                 onclick={handleRetryRefinement}
                 disabled={retryingRefinement}
                 data-testid="retry-refinement-btn"
@@ -297,10 +354,13 @@
                 {retryingRefinement ? '...' : '↻'}
               </button>
             {/if}
+            {#if retryRefinementError}
+              <p class="retry-error">{retryRefinementError}</p>
+            {/if}
           </div>
         {/if}
 
-        {#if session.audio_removed_at}
+        {#if session.audio_removed_at && !(session.restored_at && session.refinement_status === RefinementStatus.NoAudio)}
           {@const partly = recordingsNamed(session.audio_path) > 0}
           <span
             class="status-badge audio-removed"
@@ -322,18 +382,17 @@
       <button
         type="button"
         class="quick-delete-btn"
-        title="Delete session"
-        onclick={async (e) => {
-          e.stopPropagation()
-          if (confirm('Delete this session? This cannot be undone.')) {
-            await onDelete(session.id)
-          }
-        }}
+        title={localRemovalLabel}
+        aria-label={localRemovalLabel}
+        onclick={handleDelete}
       >
         ×
       </button>
     </div>
   </div>
+  {#if deleteError}
+    <p class="delete-error" role="alert">Not deleted: {deleteError}</p>
+  {/if}
 
   {#if session.summary_status === SummaryStatus.Completed && session.summary}
     <div class="summary-preview-md prose">
@@ -389,7 +448,16 @@
   {#if expanded}
     <div class="session-details">
       {#if detail}
-        <AudioPlayer sessionId={session.id} segments={detail.segments} {session} />
+        <AudioPlayer
+          sessionId={session.id}
+          segments={detail.segments}
+          {session}
+          onDeleted={async (segmentID) => {
+            onSegmentDeleted(session.id, segmentID)
+            await onRefreshSession(session.id)
+          }}
+          onNotFound={(segmentID) => onSegmentNotFound(session.id, segmentID)}
+        />
 
         {#if (session.summary_status === SummaryStatus.Completed || session.summary_status === SummaryStatus.Failed) && session.summary}
           <div class="summary-section">
@@ -408,17 +476,8 @@
           </div>
         {/if}
         <div class="session-actions">
-          <button
-            type="button"
-            class="delete-btn"
-            onclick={async (e) => {
-              e.stopPropagation()
-              if (confirm('Delete this session? This cannot be undone.')) {
-                await onDelete(session.id)
-              }
-            }}
-          >
-            Delete session
+          <button type="button" class="delete-btn" onclick={handleDelete}>
+            {localRemovalLabel}
           </button>
         </div>
       {:else}
@@ -429,6 +488,12 @@
 </article>
 
 <style>
+  .delete-error {
+    margin: 0.25rem 0 0;
+    color: var(--danger, #dc2626);
+    font-size: 0.85rem;
+  }
+
   .session-card.selected {
     border-color: var(--accent);
     background: var(--accent-soft);

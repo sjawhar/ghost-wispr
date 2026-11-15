@@ -69,6 +69,14 @@ func NewElevenLabsProvider(apiKey, defaultVoice string, opts ...ElevenLabsOption
 
 func (p *ElevenLabsProvider) Name() string { return "elevenlabs" }
 
+func (p *ElevenLabsProvider) ReportedSpeech(req SpeechRequest) (model, voice string) {
+	voice = strings.TrimSpace(req.Voice)
+	if voice == "" {
+		voice = p.defaultVoice
+	}
+	return "eleven_multilingual_v2", voice
+}
+
 // elevenLabsRequest is the JSON body sent to the TTS endpoint.
 type elevenLabsRequest struct {
 	Text    string `json:"text"`
@@ -88,10 +96,7 @@ func (p *ElevenLabsProvider) Synthesize(ctx context.Context, req SpeechRequest) 
 		return nil, fmt.Errorf("elevenlabs: %w", err)
 	}
 
-	voice := req.Voice
-	if voice == "" {
-		voice = p.defaultVoice
-	}
+	_, voice := p.ReportedSpeech(req)
 
 	body := elevenLabsRequest{
 		Text:    req.Text,
@@ -116,6 +121,8 @@ func (p *ElevenLabsProvider) Synthesize(ctx context.Context, req SpeechRequest) 
 			Channels:   1,
 			Encoding:   audio.EncodingMP3,
 		},
+		Model: "eleven_multilingual_v2",
+		Voice: voice,
 	}, nil
 }
 

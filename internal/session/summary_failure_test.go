@@ -39,7 +39,7 @@ func TestAFailedSummaryAfterARefinementKeepsTheLastGoodSummary(t *testing.T) {
 		t.Fatalf("end session: %v", err)
 	}
 	const speakers = `{"0":{"name":"Sam","confidence":"high"}}`
-	if err := store.UpdateSummary(id, "Launch planning", "The last good summary.", storage.SummaryCompleted, "default", speakers); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Launch planning", "The last good summary.", storage.SummaryCompleted, "default", speakers, "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 

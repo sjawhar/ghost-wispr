@@ -18,6 +18,9 @@ const (
 	EnvoyPublishPending   = "pending"
 	EnvoyPublishPublished = "published"
 	EnvoyPublishFailed    = "failed"
+	// EnvoyPublishSkipped is a completed summary with no text: nothing is
+	// sent to Envoy, and the publish sweep does not select it again.
+	EnvoyPublishSkipped = "skipped"
 
 	SyncStatePending        = "PENDING"
 	SyncStateSyncing        = "SYNCING"

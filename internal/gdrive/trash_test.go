@@ -110,12 +110,12 @@ func TestGCKeepsASyncedSessionWhoseFolderIsInTheTrashOrGone(t *testing.T) {
 	}{
 		// No commas: a test's temporary directory is named after it, and an
 		// audio path is split on commas.
-		{"trash and age policy", (*wireDrive).trash, gc.Config{MaxAgeDays: 30, SyncGated: true}},
-		{"trash and audio budget", (*wireDrive).trash, gc.Config{MaxAudioSizeMB: 1, SyncGated: true}},
-		{"deleted for good and age policy", (*wireDrive).deleteByHand, gc.Config{MaxAgeDays: 30, SyncGated: true}},
-		{"deleted for good and audio budget", (*wireDrive).deleteByHand, gc.Config{MaxAudioSizeMB: 1, SyncGated: true}},
-		{"on Drive and age policy", nil, gc.Config{MaxAgeDays: 30, SyncGated: true}},
-		{"on Drive and audio budget", nil, gc.Config{MaxAudioSizeMB: 1, SyncGated: true}},
+		{"trash and age policy", (*wireDrive).trash, gc.Config{MaxAgeDays: 30}},
+		{"trash and audio budget", (*wireDrive).trash, gc.Config{MaxAudioSizeMB: 1}},
+		{"deleted for good and age policy", (*wireDrive).deleteByHand, gc.Config{MaxAgeDays: 30}},
+		{"deleted for good and audio budget", (*wireDrive).deleteByHand, gc.Config{MaxAudioSizeMB: 1}},
+		{"on Drive and age policy", nil, gc.Config{MaxAgeDays: 30}},
+		{"on Drive and audio budget", nil, gc.Config{MaxAudioSizeMB: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wire, syncer := newWireDrive(t)
@@ -193,7 +193,7 @@ func TestATrashedRootMarksNoSessionDeleted(t *testing.T) {
 	folders := len(wire.in("root"))
 
 	wire.trash("root")
-	collector := gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	collector := gc.New(store, gc.Config{MaxAgeDays: 30, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if deleted, err := collector.Run(); err != nil || len(deleted) != 0 {
 		t.Errorf("GC with the root in the trash: deleted %v (%v), want none", deleted, err)
 	}

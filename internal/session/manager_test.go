@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -23,41 +24,52 @@ import (
 )
 
 type storeMock struct {
-	mu       sync.Mutex
-	sessions map[string]time.Time
-	segments map[string][]transcribe.Segment
-	title    map[string]string
-	summary  map[string]string
-	status   map[string]string
-	preset   map[string]string
-	audio    map[string]string
+	mu            sync.Mutex
+	sessions      map[string]time.Time
+	segments      map[string][]transcribe.Segment
+	title         map[string]string
+	summary       map[string]string
+	status        map[string]string
+	summaryStatus map[string]string
+	preset        map[string]string
+	audio         map[string]string
 
-	refinementStatus    map[string]string
-	refinedTranscript   map[string]string
-	canonicalTranscript map[string]string
-	transcriptSource    map[string]string
-	errorMessage        map[string]string
+	summaryModel            map[string]string
+	refinementModel         map[string]string
+	refinementStatus        map[string]string
+	refinedTranscript       map[string]string
+	canonicalTranscript     map[string]string
+	transcriptSource        map[string]string
+	errorMessage            map[string]string
+	canonicalizeGeneration  map[string]int
+	summaryWriteGenerations []int
 
-	endSessionErr   error
-	endSessionCalls int
+	endSessionErr         error
+	endSessionCalls       int
+	canonicalizeErr       error
+	deletionGenerationErr error
 	// appendHook, when set, runs first in AppendSegment, outside the lock.
 	appendHook func()
 }
 
 func newStoreMock() *storeMock {
 	return &storeMock{
-		sessions:            map[string]time.Time{},
-		segments:            map[string][]transcribe.Segment{},
-		title:               map[string]string{},
-		summary:             map[string]string{},
-		status:              map[string]string{},
-		preset:              map[string]string{},
-		audio:               map[string]string{},
-		refinementStatus:    map[string]string{},
-		refinedTranscript:   map[string]string{},
-		canonicalTranscript: map[string]string{},
-		transcriptSource:    map[string]string{},
-		errorMessage:        map[string]string{},
+		sessions:               map[string]time.Time{},
+		segments:               map[string][]transcribe.Segment{},
+		title:                  map[string]string{},
+		summary:                map[string]string{},
+		status:                 map[string]string{},
+		summaryStatus:          map[string]string{},
+		preset:                 map[string]string{},
+		audio:                  map[string]string{},
+		summaryModel:           map[string]string{},
+		refinementModel:        map[string]string{},
+		refinementStatus:       map[string]string{},
+		refinedTranscript:      map[string]string{},
+		canonicalTranscript:    map[string]string{},
+		transcriptSource:       map[string]string{},
+		errorMessage:           map[string]string{},
+		canonicalizeGeneration: map[string]int{},
 	}
 }
 
@@ -82,6 +94,28 @@ func (s *storeMock) EndSession(id string, _ time.Time, audioPath string) error {
 	return nil
 }
 
+// TestStoreMockSeparatesSessionAndSummaryStatus fails if the test double lets
+// an asynchronous summary completion overwrite the session lifecycle state.
+func TestStoreMockSeparatesSessionAndSummaryStatus(t *testing.T) {
+	store := newStoreMock()
+	started := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	if err := store.CreateSession("session", started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("session", started.Add(time.Minute), "session.mp3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateSummaryAtGeneration("session", "title", "summary", storage.SummaryCompleted, "default", "{}", "model", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got := store.status["session"]; got != storage.SessionEnded {
+		t.Fatalf("session status = %q, want %q", got, storage.SessionEnded)
+	}
+}
+
+//nolint:gocritic // Test double matches the production Store contract.
 func (s *storeMock) AppendSegment(sessionID string, seg transcribe.Segment) error {
 	if s.appendHook != nil {
 		s.appendHook()
@@ -99,13 +133,18 @@ func (s *storeMock) GetSegments(sessionID string) ([]transcribe.Segment, error) 
 	return list, nil
 }
 
-func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ string) error {
+func (s *storeMock) UpdateSummaryAtGeneration(sessionID, title, summary, status, preset, _, model string, generation int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.summaryWriteGenerations = append(s.summaryWriteGenerations, generation)
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return sql.ErrNoRows
+	}
 	s.title[sessionID] = title
 	s.summary[sessionID] = summary
-	s.status[sessionID] = status
+	s.summaryStatus[sessionID] = status
 	s.preset[sessionID] = preset
+	s.summaryModel[sessionID] = model
 	return nil
 }
 
@@ -113,18 +152,37 @@ func (s *storeMock) UpdateSummary(sessionID, title, summary, status, preset, _ s
 func (s *storeMock) StartSummary(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.status[sessionID] = storage.SummaryRunning
+	s.summaryStatus[sessionID] = storage.SummaryRunning
 	return nil
 }
 
-// FailSummary keeps the title and summary, as the store does.
-func (s *storeMock) FailSummary(sessionID, errMsg string) (storage.Session, error) {
+// StartEmptySummary marks the summary running, as the store does.
+func (s *storeMock) StartEmptySummary(sessionID string) error {
+	return s.StartSummary(sessionID)
+}
+
+// FailSummaryAtGeneration keeps the title and summary, and fails the summary
+// only while generation is the session's transcript generation, as the store
+// does.
+func (s *storeMock) FailSummaryAtGeneration(sessionID, errMsg string, generation int) (storage.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.status[sessionID] = storage.SummaryFailed
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return storage.Session{}, sql.ErrNoRows
+	}
+	s.summaryStatus[sessionID] = storage.SummaryFailed
 	s.errorMessage[sessionID] = errMsg
 	return storage.Session{ID: sessionID, Title: s.title[sessionID], Summary: s.summary[sessionID],
 		SummaryStatus: storage.SummaryFailed, SummaryPreset: s.preset[sessionID], SummaryError: errMsg}, nil
+}
+
+func (s *storeMock) DeletionGeneration(sessionID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deletionGenerationErr != nil {
+		return 0, s.deletionGenerationErr
+	}
+	return s.canonicalizeGeneration[sessionID], nil
 }
 
 func (s *storeMock) UpdateTitle(sessionID, title string) error {
@@ -147,27 +205,50 @@ func (s *storeMock) CountSegments(sessionID string) (int, error) {
 	return len(s.segments[sessionID]), nil
 }
 
-func (s *storeMock) UpdateRefinement(sessionID, transcript, status string) error {
+func (s *storeMock) UpdateRefinementAtGeneration(sessionID, transcript, status, model string, _ int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refinementStatus[sessionID] = status
+	s.refinementModel[sessionID] = model
 	if transcript != "" {
 		s.refinedTranscript[sessionID] = transcript
 	}
 	return nil
 }
 
+func (s *storeMock) PublishRefinementAtGeneration(sessionID, transcript, model string, _ []storage.RefinedWord, segments []storage.RefinedSegment, generation int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generation != s.canonicalizeGeneration[sessionID] {
+		return 0, sql.ErrNoRows
+	}
+	s.refinementStatus[sessionID] = storage.RefinementCompleted
+	s.refinementModel[sessionID] = model
+	s.refinedTranscript[sessionID] = transcript
+	s.canonicalTranscript[sessionID] = transcript
+	s.transcriptSource[sessionID] = storage.TranscriptSourceRefined
+	s.segments[sessionID] = make([]transcribe.Segment, len(segments))
+	for i, segment := range segments {
+		s.segments[sessionID][i] = transcribe.Segment{
+			Speaker: segment.Speaker, Text: segment.Text, StartTime: segment.Start, EndTime: segment.End,
+			TranscriptRevision: 1, RecordingPath: segment.RecordingPath, RecordingSHA256: segment.RecordingSHA256,
+			RecordingOrdinal: segment.RecordingOrdinal, FirstWordOrdinal: segment.FirstWordOrdinal, LastWordOrdinal: segment.LastWordOrdinal,
+		}
+	}
+	return 1, nil
+}
+
 // ClaimRefinement claims the refinement only while the session still names
 // audioPath, as the real store does.
-func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (bool, error) {
+func (s *storeMock) ClaimRefinement(sessionID, audioPath string) (int, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if audioPath == "" || s.audio[sessionID] != audioPath {
-		return false, nil
+		return 0, false, nil
 	}
 	s.refinementStatus[sessionID] = "running"
 	delete(s.refinedTranscript, sessionID)
-	return true, nil
+	return s.canonicalizeGeneration[sessionID], true, nil
 }
 
 func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
@@ -176,17 +257,26 @@ func (s *storeMock) GetRefinement(sessionID string) (string, string, error) {
 	return s.refinedTranscript[sessionID], s.refinementStatus[sessionID], nil
 }
 
-func (s *storeMock) Canonicalize(sessionID string) error {
+// TextDeletionSpans reports no "Delete text" spans: the mock's sessions
+// have none.
+func (s *storeMock) TextDeletionSpans(string) ([]storage.TextDeletionSpan, error) {
+	return nil, nil
+}
+
+func (s *storeMock) Canonicalize(sessionID string) (string, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.canonicalizeErr != nil {
+		return "", 0, s.canonicalizeErr
+	}
 	status := s.refinementStatus[sessionID]
 	if status == "completed" && strings.TrimSpace(s.refinedTranscript[sessionID]) != "" {
-		s.canonicalTranscript[sessionID] = s.refinedTranscript[sessionID]
+		s.canonicalTranscript[sessionID] = strings.TrimSpace(s.refinedTranscript[sessionID])
 		s.transcriptSource[sessionID] = "refined"
 	} else {
 		var b strings.Builder
-		for _, seg := range s.segments[sessionID] {
-			text := strings.TrimSpace(seg.Text)
+		for i := range s.segments[sessionID] {
+			text := strings.TrimSpace(s.segments[sessionID][i].Text)
 			if text == "" {
 				continue
 			}
@@ -196,13 +286,7 @@ func (s *storeMock) Canonicalize(sessionID string) error {
 		s.canonicalTranscript[sessionID] = b.String()
 		s.transcriptSource[sessionID] = "streaming"
 	}
-	return nil
-}
-
-func (s *storeMock) GetCanonicalTranscript(sessionID string) (string, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.canonicalTranscript[sessionID], s.transcriptSource[sessionID], nil
+	return s.canonicalTranscript[sessionID], s.canonicalizeGeneration[sessionID], nil
 }
 
 type recorderMock struct {
@@ -214,9 +298,10 @@ type recorderMock struct {
 	startErr error
 	// endErr, when set, fails every EndSession; unsavedPath is the raw file
 	// DiscardUnsaved then reports, and discards counts its calls.
-	endErr      error
-	unsavedPath string
-	discards    int
+	endErr        error
+	unsavedPath   string
+	recordingPath string
+	discards      int
 	// startHook and endHook, when set, run first in StartSession and
 	// EndSession, outside the mock's lock, so a test can hold a call open.
 	startHook func()
@@ -252,6 +337,15 @@ func (r *recorderMock) EndSession(sessionID string) (string, error) {
 	}
 	if sessionID == "" || !slices.Contains(r.started, sessionID) {
 		return "", nil
+	}
+	if r.recordingPath != "" {
+		if err := os.MkdirAll(filepath.Dir(r.recordingPath), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(r.recordingPath, []byte("recorded audio"), 0o600); err != nil {
+			return "", err
+		}
+		return r.recordingPath, nil
 	}
 	return "data/audio/" + sessionID + ".mp3", nil
 }
@@ -290,12 +384,13 @@ func (s transcriptCapturingSummarizer) Summarize(_ context.Context, sessionID, t
 
 type batchTranscriberMock struct {
 	transcript string
+	model      string
 	err        error
 	delay      time.Duration
 	calledPath chan string
 }
 
-func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (string, error) {
+func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (transcribe.BatchResult, error) {
 	if b.calledPath != nil {
 		b.calledPath <- audioPath
 	}
@@ -303,9 +398,15 @@ func (b batchTranscriberMock) Transcribe(_ context.Context, audioPath string) (s
 		time.Sleep(b.delay)
 	}
 	if b.err != nil {
-		return "", b.err
+		return transcribe.BatchResult{}, b.err
 	}
-	return b.transcript, nil
+	var words []transcribe.TimestampedWord
+	start := 0.0
+	for _, text := range strings.Fields(b.transcript) {
+		words = append(words, transcribe.TimestampedWord{Text: text, Start: start, End: start + 0.3})
+		start += 0.35
+	}
+	return transcribe.BatchResult{Transcript: b.transcript, Model: b.model, Words: words}, nil
 }
 
 type syncerMock struct {
@@ -320,7 +421,9 @@ func (s syncerMock) SyncSession(_ context.Context, sessionID string) error {
 }
 
 type publisherMock struct {
-	called chan string
+	called  chan string
+	started chan string
+	ended   chan string
 }
 
 func (p publisherMock) PublishSummaryReady(_ context.Context, sessionID string) error {
@@ -330,11 +433,56 @@ func (p publisherMock) PublishSummaryReady(_ context.Context, sessionID string) 
 	return nil
 }
 
+func (p publisherMock) PublishSessionStarted(_ context.Context, sessionID string) error {
+	if p.started != nil {
+		p.started <- sessionID
+	}
+	return nil
+}
+
+func (p publisherMock) PublishSessionEnded(_ context.Context, sessionID string) error {
+	if p.ended != nil {
+		p.ended <- sessionID
+	}
+	return nil
+}
+
+type blockingPublisher struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (p blockingPublisher) PublishSessionStarted(_ context.Context, _ string) error {
+	p.entered <- struct{}{}
+	<-p.release
+	return nil
+}
+
+func (blockingPublisher) PublishSessionEnded(context.Context, string) error {
+	return nil
+}
+
+func (blockingPublisher) PublishSummaryReady(context.Context, string) error {
+	return nil
+}
+
 func (s summarizerMock) Summarize(_ context.Context, sessionID, transcript string) (string, string, string, string, error) {
 	if s.called != nil {
 		s.called <- sessionID
 	}
 	return "Auto title", "## Summary\n- " + transcript, "default", "{}", nil
+}
+
+type providerReportingSummarizer struct {
+	model string
+}
+
+func (s providerReportingSummarizer) Summarize(context.Context, string, string) (string, string, string, string, error) {
+	return "Provider title", "Provider summary", "default", "{}", nil
+}
+
+func (s providerReportingSummarizer) SummarizeReported(context.Context, string, string) (string, string, string, string, string, error) {
+	return "Provider title", "Provider summary", "default", "{}", s.model, nil
 }
 
 type contextProbeSummarizer struct {
@@ -382,13 +530,14 @@ type hubMock struct {
 	endedHook func(sessionID string)
 }
 
-func (h *hubMock) BroadcastLiveTranscript(_ transcribe.Segment) {
+//nolint:gocritic // Test double matches the Hub contract.
+func (h *hubMock) BroadcastLiveTranscript(_ string, _ transcribe.Segment) {
 	h.mu.Lock()
 	h.liveCount++
 	h.mu.Unlock()
 }
 
-func (h *hubMock) BroadcastLiveTranscriptInterim(_ int, _ string, _ float64) {
+func (h *hubMock) BroadcastLiveTranscriptInterim(_ string, _ int, _ string, _ float64) {
 	h.mu.Lock()
 	h.interimCount++
 	h.mu.Unlock()
@@ -570,7 +719,7 @@ func TestManager_ForceEndSession_SummaryCompletes(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		store.mu.Lock()
-		status := store.status[sessionID]
+		status := store.summaryStatus[sessionID]
 		store.mu.Unlock()
 		if status == storage.SummaryCompleted {
 			break
@@ -1047,6 +1196,13 @@ func TestManager_GenerateSummary_TriggersSyncWhenSummarizerMissing(t *testing.T)
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected sync to trigger when summarizer is nil")
 	}
+
+	store.mu.Lock()
+	status := store.summaryStatus["session-no-summarizer"]
+	store.mu.Unlock()
+	if status != storage.SummaryCompleted {
+		t.Errorf("summary status = %q, want %q", status, storage.SummaryCompleted)
+	}
 }
 
 func TestManager_GenerateSummary_TriggersSyncAfterSummaryCompleted(t *testing.T) {
@@ -1113,11 +1269,18 @@ func TestManager_GenerateSummary_TriggersPublisherAfterSummaryCompleted(t *testi
 	}
 }
 
-func TestManager_DiscardedShortSession_DoesNotTriggerPublisher(t *testing.T) {
+// A short session is discarded. Its session_started and session_ended still
+// go to Envoy, as they go to the hub, so a consumer that saw it start sees it
+// end; no summary_ready follows, since nothing is summarized.
+func TestManager_DiscardedShortSession_SendsLifecycleEventsButNoSummary(t *testing.T) {
 	store := newStoreMock()
-	publishCalled := make(chan string, 1)
+	publisher := publisherMock{
+		called:  make(chan string, 1),
+		started: make(chan string, 1),
+		ended:   make(chan string, 1),
+	}
 	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 2)
-	manager.SetEventPublisher(publisherMock{called: publishCalled})
+	manager.SetEventPublisher(publisher)
 
 	startedAt := time.Now().UTC()
 	if err := manager.ensureSessionStarted(startedAt); err != nil {
@@ -1132,9 +1295,19 @@ func TestManager_DiscardedShortSession_DoesNotTriggerPublisher(t *testing.T) {
 		t.Fatalf("endCurrentSession failed: %v", err)
 	}
 
+	for name, events := range map[string]chan string{"session_started": publisher.started, "session_ended": publisher.ended} {
+		select {
+		case got := <-events:
+			if got != sessionID {
+				t.Fatalf("%s session ID = %q, want %q", name, got, sessionID)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected %s event for the discarded session", name)
+		}
+	}
 	select {
-	case got := <-publishCalled:
-		t.Fatalf("expected no publish for discarded session, got %q", got)
+	case got := <-publisher.called:
+		t.Fatalf("expected no summary_ready publish for discarded session, got %q", got)
 	case <-time.After(200 * time.Millisecond):
 	}
 
@@ -1145,9 +1318,111 @@ func TestManager_DiscardedShortSession_DoesNotTriggerPublisher(t *testing.T) {
 	}
 }
 
+func TestSessionStartAndEndAreSent(t *testing.T) {
+	store := newStoreMock()
+	publisher := publisherMock{
+		started: make(chan string, 1),
+		ended:   make(chan string, 1),
+	}
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(publisher)
+
+	startedAt := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
+	if err := manager.ensureSessionStarted(startedAt); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	sessionID := manager.currentSession()
+	if sessionID == "" {
+		t.Fatal("expected session ID")
+	}
+
+	select {
+	case got := <-publisher.started:
+		if got != sessionID {
+			t.Fatalf("started event session ID = %q, want %q", got, sessionID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected session_started event")
+	}
+
+	if err := manager.endCurrentSession(context.Background()); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+	select {
+	case got := <-publisher.ended:
+		if got != sessionID {
+			t.Fatalf("ended event session ID = %q, want %q", got, sessionID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected session_ended event")
+	}
+}
+
+func TestManualSessionStartIsSent(t *testing.T) {
+	publisher := publisherMock{started: make(chan string, 1)}
+	manager := NewManager(newStoreMock(), nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(publisher)
+
+	sessionID, err := manager.ManualStartSession(context.Background(), "Manual topic")
+	if err != nil {
+		t.Fatalf("ManualStartSession: %v", err)
+	}
+	select {
+	case got := <-publisher.started:
+		if got != sessionID {
+			t.Fatalf("started event session ID = %q, want %q", got, sessionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected session_started event")
+	}
+}
+
+func TestStopSessionStartPublishesSuppressesNewStartEvents(t *testing.T) {
+	publisher := publisherMock{started: make(chan string, 1)}
+	manager := NewManager(newStoreMock(), nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(publisher)
+	manager.StopSessionStartPublishes()
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	select {
+	case got := <-publisher.started:
+		t.Fatalf("unexpected session_started event for %q after shutdown began", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWaitForLifecyclePublishesHonorsContext(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	manager := NewManager(newStoreMock(), nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetEventPublisher(blockingPublisher{entered: entered, release: release})
+
+	if err := manager.ensureSessionStarted(time.Now().UTC()); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected session_started publish")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := manager.WaitForLifecyclePublishes(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForLifecyclePublishes error = %v, want deadline exceeded", err)
+	}
+
+	close(release)
+	if err := manager.WaitForLifecyclePublishes(context.Background()); err != nil {
+		t.Fatalf("WaitForLifecyclePublishes after release: %v", err)
+	}
+}
+
 func TestManager_BatchRefinement_SubmitsAndStoresRefinedTranscript(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	calledPath := make(chan string, 1)
 	transcriptC := make(chan string, 1)
 
@@ -1200,7 +1475,7 @@ func TestManager_BatchRefinement_SubmitsAndStoresRefinedTranscript(t *testing.T)
 
 func TestManager_BatchRefinement_TimeoutFallsBackToStreamingTranscript(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1248,7 +1523,7 @@ func TestManager_BatchRefinement_TimeoutFallsBackToStreamingTranscript(t *testin
 
 func TestManager_Canonicalization_UsesCanonicalTranscriptForSummary(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1297,7 +1572,7 @@ func TestManager_Canonicalization_UsesCanonicalTranscriptForSummary(t *testing.T
 
 func TestManager_BatchRefinement_LateCompletionRecanonicalizes(t *testing.T) {
 	store := newStoreMock()
-	recorder := &recorderMock{}
+	recorder := &recorderMock{recordingPath: filepath.Join(t.TempDir(), "recording.mp3")}
 	transcriptC := make(chan string, 1)
 
 	manager := NewManager(store, recorder, transcriptCapturingSummarizer{transcriptC: transcriptC}, nil, NewDetector(time.Hour), 0)
@@ -1371,8 +1646,8 @@ func TestManager_GenerateSummary_StoresErrorOnFailure(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if store.status["sess-err"] != storage.SummaryFailed {
-		t.Fatalf("expected summary_status %q, got %q", storage.SummaryFailed, store.status["sess-err"])
+	if store.summaryStatus["sess-err"] != storage.SummaryFailed {
+		t.Fatalf("expected summary_status %q, got %q", storage.SummaryFailed, store.summaryStatus["sess-err"])
 	}
 	if store.errorMessage["sess-err"] == "" {
 		t.Fatal("expected error_message to be set, got empty string")
@@ -1424,7 +1699,11 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	if err := store.CreateSession("sess-refine", time.Now().UTC()); err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
-	if err := store.EndSession("sess-refine", time.Now().UTC(), "data/audio/sess-refine.mp3"); err != nil {
+	audioPath := filepath.Join(t.TempDir(), "sess-refine.mp3")
+	if err := os.WriteFile(audioPath, []byte("recorded audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession("sess-refine", time.Now().UTC(), audioPath); err != nil {
 		t.Fatalf("EndSession failed: %v", err)
 	}
 	hub := &hubMock{}
@@ -1432,7 +1711,7 @@ func TestManager_RefineSession_RefinesAndResummarizes(t *testing.T) {
 	manager := NewManager(store, nil, summarizerMock{called: summaryCalled}, hub, NewDetector(time.Hour), 0)
 	manager.SetBatchTranscriber(batchTranscriberMock{transcript: "refined transcript text"})
 
-	err := manager.RefineSession(context.Background(), "sess-refine", "data/audio/sess-refine.mp3", time.Time{})
+	err := manager.RefineSession(context.Background(), "sess-refine", audioPath, time.Time{})
 	if err != nil {
 		t.Fatalf("RefineSession: %v", err)
 	}
@@ -1477,12 +1756,12 @@ func TestManager_RefineSession_ErrorsWithoutAudio(t *testing.T) {
 // batch transcriber does, and counts its calls.
 type fileTranscriber struct{ calls atomic.Int32 }
 
-func (f *fileTranscriber) Transcribe(_ context.Context, audioPath string) (string, error) {
+func (f *fileTranscriber) Transcribe(_ context.Context, audioPath string) (transcribe.BatchResult, error) {
 	f.calls.Add(1)
 	if _, err := os.ReadFile(audioPath); err != nil {
-		return "", err
+		return transcribe.BatchResult{}, err
 	}
-	return "refined", nil
+	return transcribe.BatchResult{Transcript: "refined"}, nil
 }
 
 // Review note 5: a session's end saves its audio path, then its refinement
@@ -1561,8 +1840,8 @@ func segmentText(t *testing.T, store *storeMock, sessionID string) string {
 		t.Fatalf("GetSegments failed: %v", err)
 	}
 	var text []string
-	for _, seg := range segments {
-		text = append(text, seg.Text)
+	for i := range segments {
+		text = append(text, segments[i].Text)
 	}
 	return strings.Join(text, " ")
 }
@@ -2019,5 +2298,52 @@ func TestManager_ResumeCaptureDropsWordsBufferedWhilePaused(t *testing.T) {
 	}
 	if text := segmentText(t, store, sessionID); strings.Contains(text, "stale") {
 		t.Fatalf("session after resume has words from before the pause: %q", text)
+	}
+}
+
+func TestManagerStoresProviderReportedSummaryModel(t *testing.T) {
+	const (
+		configuredModel = "configured-summary-model"
+		providerModel   = "provider-summary-model"
+		sessionID       = "summary-model-session"
+	)
+	store := newStoreMock()
+	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.AppendSegment(sessionID, transcribe.Segment{Text: "enough transcript words to make a real summary request", Timestamp: time.Now().UTC()}); err != nil {
+		t.Fatalf("AppendSegment: %v", err)
+	}
+	manager := NewManager(store, nil, providerReportingSummarizer{model: providerModel}, nil, NewDetector(time.Hour), 0)
+	manager.generateSummary(context.Background(), sessionID, time.Now().UTC())
+
+	if got := store.summaryModel[sessionID]; got != providerModel {
+		t.Fatalf("stored summary model = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
+	}
+}
+
+func TestManagerStoresProviderReportedRefinementModel(t *testing.T) {
+	const (
+		configuredModel = "configured-refinement-model"
+		providerModel   = "provider-refinement-model"
+		sessionID       = "refinement-model-session"
+	)
+	store := newStoreMock()
+	audioPath := filepath.Join(t.TempDir(), "refinement-model-session.mp3")
+	if err := os.WriteFile(audioPath, []byte("recorded audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(sessionID, time.Now().UTC()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := store.EndSession(sessionID, time.Now().UTC(), audioPath); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	manager := NewManager(store, nil, nil, nil, NewDetector(time.Hour), 0)
+	manager.SetBatchTranscriber(batchTranscriberMock{transcript: "refined transcript", model: providerModel})
+	manager.runBatchRefinement(context.Background(), sessionID, audioPath)
+
+	if got := store.refinementModel[sessionID]; got != providerModel {
+		t.Fatalf("stored refinement model = %q, want provider value %q, not configured %q", got, providerModel, configuredModel)
 	}
 }

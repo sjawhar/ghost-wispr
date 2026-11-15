@@ -18,8 +18,10 @@ type EventStore interface {
 
 type Hub struct {
 	mu                sync.RWMutex
+	statusMu          sync.Mutex
 	clients           map[chan []byte]struct{}
 	componentStatuses map[string]ComponentStatusEvent
+	statusChanged     *StatusChangedEvent
 	logger            *slog.Logger
 	eventStore        EventStore
 }
@@ -67,6 +69,15 @@ func (h *Hub) SnapshotComponentStatuses() []ComponentStatusEvent {
 	return snapshot
 }
 
+func (h *Hub) SnapshotStatusChanged() (StatusChangedEvent, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.statusChanged == nil {
+		return StatusChangedEvent{}, false
+	}
+	return *h.statusChanged, true
+}
+
 func (h *Hub) Unsubscribe(ch chan []byte) {
 	h.mu.Lock()
 	delete(h.clients, ch)
@@ -86,9 +97,11 @@ func (h *Hub) Broadcast(msg []byte) {
 	}
 }
 
-func (h *Hub) BroadcastLiveTranscript(seg transcribe.Segment) {
+//nolint:gocritic // Hub's event API passes one immutable segment by value.
+func (h *Hub) BroadcastLiveTranscript(sessionID string, seg transcribe.Segment) {
 	h.broadcastEvent(LiveTranscriptEvent{
 		Event:     newEvent("live_transcript", seg.Timestamp),
+		SessionID: sessionID,
 		Speaker:   seg.Speaker,
 		Text:      seg.Text,
 		StartTime: seg.StartTime,
@@ -96,9 +109,10 @@ func (h *Hub) BroadcastLiveTranscript(seg transcribe.Segment) {
 	})
 }
 
-func (h *Hub) BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64) {
+func (h *Hub) BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64) {
 	h.broadcastEvent(LiveTranscriptInterimEvent{
 		Event:     newEvent("live_transcript_interim", time.Now().UTC()),
+		SessionID: sessionID,
 		Speaker:   speaker,
 		Text:      text,
 		StartTime: startTime,
@@ -132,10 +146,16 @@ func (h *Hub) BroadcastSummaryReady(sessionID, title, summary, status, preset st
 }
 
 func (h *Hub) BroadcastStatusChanged(paused bool) {
-	h.broadcastEvent(StatusChangedEvent{
+	h.statusMu.Lock()
+	defer h.statusMu.Unlock()
+	event := StatusChangedEvent{
 		Event:  newEvent("status_changed", time.Now().UTC()),
 		Paused: paused,
-	})
+	}
+	h.mu.Lock()
+	h.statusChanged = &event
+	h.mu.Unlock()
+	h.broadcastEvent(event)
 }
 
 func (h *Hub) BroadcastComponentStatus(component, status, message string) {

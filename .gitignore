@@ -291,3 +291,4 @@ web/dist/
 cmd/ghost-wispr/static/
 mise.toml
 ghost-wispr.yaml
+!deploy/pi/files/ghost-wispr.yaml

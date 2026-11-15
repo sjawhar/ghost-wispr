@@ -58,8 +58,32 @@ type ClientFactory func(ctx context.Context) (io.WriteCloser, error)
 // It's called whenever the connection state changes (e.g., for logging or metrics).
 type ConnectionCallback func(state ConnectionState)
 
+// BatchResult is a recording's batch transcription: its transcript, the
+// model the provider reported, and its words with their times when the
+// provider gives them. Refinement rebuilds the transcript from Words to drop
+// the words "Delete text" removed.
+type BatchResult struct {
+	Transcript string
+	Model      string
+	Words      []TimestampedWord
+}
+
 type BatchTranscriber interface {
-	Transcribe(ctx context.Context, audioPath string) (string, error)
+	Transcribe(ctx context.Context, audioPath string) (BatchResult, error)
+}
+
+// TimestampedWord is a word in a batch transcription with its recording span
+// in seconds and the diarized speaker Deepgram assigned to it.
+type TimestampedWord struct {
+	Text       string
+	Start, End float64
+	Speaker    int
+}
+
+// BatchWordsTranscriber transcribes a recording as text and timestamped words.
+type BatchWordsTranscriber interface {
+	BatchTranscriber
+	Words(ctx context.Context, audioPath string) ([]TimestampedWord, error)
 }
 
 // ResilientClient wraps an io.WriteCloser (Deepgram client) and buffers audio during disconnects.

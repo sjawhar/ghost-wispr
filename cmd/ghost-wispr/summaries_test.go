@@ -64,11 +64,11 @@ func TestAFailedResummarizeKeepsTheLastGoodSummaryAndTitle(t *testing.T) {
 			if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
 				t.Fatalf("end session: %v", err)
 			}
-			if err := store.Canonicalize(id); err != nil {
+			if _, _, err := store.Canonicalize(id); err != nil {
 				t.Fatalf("canonicalize: %v", err)
 			}
 			const speakers = `{"0":{"name":"Sam","confidence":"high"}}`
-			if err := store.UpdateSummary(id, "Launch planning", "The last good summary.", storage.SummaryCompleted, "default", speakers); err != nil {
+			if err := store.UpdateSummaryAtGeneration(id, "Launch planning", "The last good summary.", storage.SummaryCompleted, "default", speakers, "", 0); err != nil {
 				t.Fatalf("summarize: %v", err)
 			}
 			if err := store.UpdateTitle(id, "Launch planning, renamed"); err != nil {

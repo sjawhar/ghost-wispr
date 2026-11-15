@@ -61,11 +61,14 @@ func OpenAPISpec() map[string]any {
 			"/healthz/ready": map[string]any{
 				"get": map[string]any{
 					"summary":     "Readiness probe",
-					"description": "Check if the service is ready to handle requests",
+					"description": "Check if the service is ready to handle requests. While capture is paused or resuming, a microphone that is closed and a Deepgram connection that is not made yet are reported as paused or resuming, not as faults: a unit that starts paused connects to Deepgram only when it resumes. Resuming lasts from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 seconds. With no Deepgram API key, Deepgram is a fault whether paused or not.",
 					"tags":        []string{"health"},
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Service is ready",
+						},
+						"503": map[string]any{
+							"description": "A component is not ready; the body names each component's state",
 						},
 					},
 				},
@@ -154,7 +157,7 @@ func OpenAPISpec() map[string]any {
 			"/api/search/semantic": map[string]any{
 				"get": map[string]any{
 					"summary":     "Semantic search",
-					"description": "Search across sessions using semantic similarity (embedding-based)",
+					"description": "Search across sessions using semantic similarity (embedding-based). The response model is the model reported by the embedding provider for that query.",
 					"tags":        []string{"search"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{
@@ -444,6 +447,9 @@ func OpenAPISpec() map[string]any {
 						"204": map[string]any{
 							"description": "Session deleted",
 						},
+						"409": map[string]any{
+							"description": "The session is active, is part of another merge, or it or a merged source still has a deleted segment on Google Drive; delete it after its Drive files are replaced",
+						},
 					},
 				},
 			},
@@ -474,6 +480,9 @@ func OpenAPISpec() map[string]any {
 					"responses": map[string]any{
 						"200": map[string]any{
 							"description": "Merged session",
+						},
+						"409": map[string]any{
+							"description": "A session to merge is still recording, was already merged or discarded, or still has a deleted segment on Google Drive, or the merged session's id is already taken; the message names the session and the reason",
 						},
 					},
 				},
@@ -534,6 +543,50 @@ func OpenAPISpec() map[string]any {
 						"200": map[string]any{
 							"description": "Transcript segments",
 						},
+					},
+				},
+			},
+			"/api/sessions/{id}/segments/{segmentID}": map[string]any{
+				"delete": map[string]any{
+					"summary":     "Delete one session segment",
+					"description": "Permanently remove one ended session segment, by the action mode names. mode=text (\"Delete text\") removes the segment's words from the transcript, the refined transcript, the summary (made again), search, embeddings and stored events, on the session and every session merged into it, and records where the words are in the recording, which it leaves unchanged, so a later refinement leaves them out; the Drive transcript and summary are updated in place by the next sync, so their links stay and their version history keeps the old text. mode=text_and_audio (\"Delete text and audio\") also cuts the segment out of the recording and replaces the session's transcript, summary and recording files in Drive, deleting the old files with their version history, so their links change. Either refuses, changing nothing, a segment whose words cannot be found in the recording.",
+					"tags":        []string{"sessions"},
+					"security":    []map[string][]string{{"basicAuth": {}}},
+					"parameters": []map[string]any{
+						{
+							"name":        "id",
+							"in":          "path",
+							"description": "Session ID",
+							"required":    true,
+							"schema":      map[string]any{"type": "string"},
+						},
+						{
+							"name":        "segmentID",
+							"in":          "path",
+							"description": "Segment ID",
+							"required":    true,
+							"schema":      map[string]any{"type": "integer", "format": "int64"},
+						},
+						{
+							"name":        "mode",
+							"in":          "query",
+							"description": "The deletion action: text (\"Delete text\") or text_and_audio (\"Delete text and audio\"). There is no default.",
+							"required":    true,
+							"schema":      map[string]any{"type": "string", "enum": []string{"text", "text_and_audio"}},
+						},
+						{
+							"name":        "revision",
+							"in":          "query",
+							"description": "The transcript revision carried by the selected segment. Timed segments use a positive revision; an untimed segment from a source with no recording uses 0 with mode=text only. A changed revision returns 409; refresh and try again.",
+							"required":    true,
+							"schema":      map[string]any{"type": "integer", "minimum": 0},
+						},
+					},
+					"responses": map[string]any{
+						"204": map[string]any{"description": "Segment deleted"},
+						"400": map[string]any{"description": "Missing or invalid mode or transcript revision"},
+						"404": map[string]any{"description": "Session or segment not found"},
+						"409": map[string]any{"description": "Session is still recording or refining, an earlier deletion is recovering, the transcript changed (refresh and try again), or part of this conversation's merge history can't be traced, so nothing in it can be deleted safely"},
 					},
 				},
 			},
@@ -678,11 +731,11 @@ func OpenAPISpec() map[string]any {
 						},
 					},
 					"responses": map[string]any{
-						"200": map[string]any{
-							"description": "Retry triggered",
+						"202": map[string]any{
+							"description": "Retry started in the background",
 						},
 						"409": map[string]any{
-							"description": "The session has no saved recording to refine (refinement_status no_audio)",
+							"description": "No local recording or Drive copy can be restored for this session",
 						},
 					},
 				},
@@ -714,18 +767,24 @@ func OpenAPISpec() map[string]any {
 						"204": map[string]any{
 							"description": "Paused",
 						},
+						"500": map[string]any{
+							"description": "The pause was applied but its persistent state could not be saved",
+						},
 					},
 				},
 			},
 			"/api/resume": map[string]any{
 				"post": map[string]any{
 					"summary":     "Resume recording",
-					"description": "Restart microphone capture after a pause. Returns at once; audio flows again once the paused session has ended (with its recording, or without it if five attempts to save it failed) and the microphone restarts",
+					"description": "Resume a persisted pause. A configured, present recording light confirms red before the request returns, then confirms it again before the gate opens. A later failure keeps capture paused and sends status_changed to clients. Audio flows once the paused session has ended and the microphone restarts.",
 					"tags":        []string{"control"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{
 						"204": map[string]any{
-							"description": "Resumed",
+							"description": "Resume request accepted; clients receive status_changed if a later gate-open check refuses capture",
+						},
+						"500": map[string]any{
+							"description": "The recording light could not be confirmed at request time or persistent state could not be saved; capture stays paused",
 						},
 					},
 				},
@@ -748,7 +807,7 @@ func OpenAPISpec() map[string]any {
 			"/api/status": map[string]any{
 				"get": map[string]any{
 					"summary":     "Get system status",
-					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), and the active session",
+					"description": "Get current system status: paused (the pause switch), capturing (the microphone is capturing and audio is flowing), capture_state (paused, resuming from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 seconds, stalled, mic_unavailable or capturing), kept_raw_recordings and kept_raw_bytes (raw recordings in the audio directory that could not be saved and wait for recovery or deletion by hand; a warning once they take more than a tenth of the audio budget, or as soon as there is one when the budget is 0, no limit), gc_hold (null, or the last GC pass held back because it could not check that Drive still has the sessions: reason, since, disk_used_bytes and disk_total_bytes of the audio directory's filesystem; with a warning), unverified_sessions (sessions synced by an earlier version that GC keeps until a sync re-checks their documents on Drive; with a warning while there are any), unit_only_sessions (sessions marked REMOTE_DELETED whose audio is still on this unit: their Drive folder is gone or unreadable, so the unit holds the only copy; with a warning while there are any, until a retry syncs them), and the active session",
 					"tags":        []string{"system"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

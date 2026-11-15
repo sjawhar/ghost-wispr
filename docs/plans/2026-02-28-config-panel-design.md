@@ -201,7 +201,7 @@ Three collapsible sections:
 | Preset system_prompt | Required, non-empty |
 | Preset user_template | Required, non-empty |
 | API keys | Non-empty string |
-| GDrive credentials | Valid JSON with service account fields |
+| GDrive credentials | Valid Application Default Credentials JSON, including X.509 `external_account` files |
 
 ## Testing
 

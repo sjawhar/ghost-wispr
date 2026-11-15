@@ -6,10 +6,14 @@ import (
 	"os"
 	"strings"
 
+	"cloud.google.com/go/auth"
+
 	"github.com/sjawhar/ghost-wispr/internal/genaiconfig"
 )
 
 const envPrefix = "GHOST_WISPR_"
+
+const ModelNotReportedByProvider = "not reported by provider"
 
 type TaskType string
 
@@ -25,9 +29,10 @@ type Client interface {
 type Option func(*clientOptions)
 
 type GenAIConfig struct {
-	Backend  string
-	Project  string
-	Location string
+	Backend     string
+	Project     string
+	Location    string
+	Credentials *auth.Credentials
 }
 
 type clientOptions struct {

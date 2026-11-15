@@ -9,7 +9,7 @@ func TestAnEmptyCompletedSummaryKeepsTheOneTheSessionHas(t *testing.T) {
 	const id = "20261106090000"
 	summarizedSyncedSession(t, store, id)
 
-	if err := store.UpdateSummary(id, "", "", SummaryCompleted, "", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "", SummaryCompleted, "", "{}", "", 0); err != nil {
 		t.Fatalf("store empty summary: %v", err)
 	}
 
@@ -34,7 +34,7 @@ func TestASummaryFailureLeavesTheSyncErrorAlone(t *testing.T) {
 	}
 	syncTo(t, store, id, SyncStateRetryScheduled, "folder-1", 1, "upload: Drive answered 503")
 
-	if _, err := store.FailSummary(id, "summarization failed: model unavailable"); err != nil {
+	if _, err := store.FailSummaryAtGeneration(id, "summarization failed: model unavailable", 0); err != nil {
 		t.Fatalf("fail summary: %v", err)
 	}
 
@@ -50,7 +50,7 @@ func TestASummaryFailureLeavesTheSyncErrorAlone(t *testing.T) {
 	}
 
 	// A summary that completes clears the failure of the attempt before.
-	if err := store.UpdateSummary(id, "Launch planning", "A new summary.", SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Launch planning", "A new summary.", SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("store summary: %v", err)
 	}
 	if sess, err = store.GetSession(id); err != nil {

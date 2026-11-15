@@ -21,6 +21,7 @@ describe('LivePanel', () => {
           type: 'live_transcript',
           version: 1,
           timestamp: new Date().toISOString(),
+          session_id: 's1',
           speaker: 2,
           text: 'Ship it',
           start_time: 0,

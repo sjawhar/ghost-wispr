@@ -19,11 +19,16 @@ import (
 
 // MockHealthChecker implements HealthChecker for testing
 type MockHealthChecker struct {
-	deepgramConnected bool
-	dbHealthy         bool
-	micOpen           bool
-	micHold           string
-	llmStatus         string
+	deepgramConfigured bool
+	deepgramConnected  bool
+	dbHealthy          bool
+	micOpen            bool
+	micHold            string
+	llmStatus          string
+}
+
+func (m *MockHealthChecker) IsDeepgramConfigured() bool {
+	return m.deepgramConfigured
 }
 
 func (m *MockHealthChecker) IsDeepgramConnected() bool {
@@ -301,6 +306,44 @@ func TestHealthzReadyReportsAHeldMic(t *testing.T) {
 	}
 }
 
+// TestHealthzReadyExcusesDeepgramOnlyWhileCaptureIsHeld fails if readiness
+// answers 503 for a paused unit only because Deepgram is not connected: a unit
+// that starts paused connects to Deepgram only when it resumes, and a paused
+// unit sends Deepgram nothing. Deepgram then reports the hold and readiness
+// stays 200. Once audio flows (no hold), or past the stall limit, or with no
+// Deepgram configured at all, Deepgram not connected is a fault: 503.
+func TestHealthzReadyExcusesDeepgramOnlyWhileCaptureIsHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		configured   bool
+		connected    bool
+		hold         string
+		micOpen      bool
+		wantCode     int
+		wantDeepgram string
+	}{
+		{name: "paused start", configured: true, hold: "paused", wantCode: http.StatusOK, wantDeepgram: "paused"},
+		{name: "resuming", configured: true, hold: "resuming", wantCode: http.StatusOK, wantDeepgram: "resuming"},
+		{name: "paused and connected", configured: true, connected: true, hold: "paused", wantCode: http.StatusOK, wantDeepgram: "connected"},
+		{name: "after resume", configured: true, micOpen: true, wantCode: http.StatusServiceUnavailable, wantDeepgram: "disconnected"},
+		{name: "stalled", configured: true, hold: "stalled", wantCode: http.StatusServiceUnavailable, wantDeepgram: "disconnected"},
+		{name: "paused with no Deepgram", hold: "paused", wantCode: http.StatusServiceUnavailable, wantDeepgram: "disconnected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checker := &MockHealthChecker{deepgramConfigured: tc.configured, deepgramConnected: tc.connected, dbHealthy: true, micOpen: tc.micOpen, micHold: tc.hold}
+			w := httptest.NewRecorder()
+			handleHealthzReady(w, httptest.NewRequest("GET", "/healthz/ready", nil), checker)
+			var resp HealthzReadyResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("failed to unmarshal response: %v", err)
+			}
+			if w.Code != tc.wantCode || resp.Deepgram != tc.wantDeepgram {
+				t.Fatalf("readiness = %d with deepgram %q, want %d with %q (body %s)", w.Code, resp.Deepgram, tc.wantCode, tc.wantDeepgram, w.Body.String())
+			}
+		})
+	}
+}
+
 type holdState string
 
 func (h holdState) MicHold() string { return string(h) }
@@ -362,11 +405,31 @@ func TestDefaultHealthCheckerHandlesTypedNilPointers(t *testing.T) {
 	if checker.IsDeepgramConnected() {
 		t.Fatal("expected typed-nil resilient client to be treated as disconnected")
 	}
+	if checker.IsDeepgramConfigured() {
+		t.Fatal("expected typed-nil resilient client to be treated as no Deepgram configured")
+	}
 	if checker.IsMicOpen() {
 		t.Fatal("expected typed-nil mic to be treated as closed")
 	}
 	if checker.IsLLMHealthy() != llmStatusUnchecked {
 		t.Fatalf("expected unchecked llm status for nil tracker")
+	}
+}
+
+type connectedState bool
+
+func (c connectedState) IsConnected() bool { return bool(c) }
+
+// TestDefaultHealthCheckerReportsDeepgramConfigured fails if the checker does
+// not tell a Deepgram client source that is not connected (a paused start
+// connects only on resume) from none at all (no API key).
+func TestDefaultHealthCheckerReportsDeepgramConfigured(t *testing.T) {
+	checker := NewDefaultHealthChecker(connectedState(false), nil, nil, holdState("paused"), nil)
+	if !checker.IsDeepgramConfigured() || checker.IsDeepgramConnected() {
+		t.Fatalf("with a client source that is not connected: configured=%t connected=%t, want true and false", checker.IsDeepgramConfigured(), checker.IsDeepgramConnected())
+	}
+	if NewDefaultHealthChecker(nil, nil, nil, holdState("paused"), nil).IsDeepgramConfigured() {
+		t.Fatal("with no Deepgram client source: configured = true, want false")
 	}
 }
 

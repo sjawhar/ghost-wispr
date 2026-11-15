@@ -277,15 +277,17 @@ func TestNewStoreWithEnv_LoadsSecretsFromEnvFile(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	envPath := filepath.Join(dir, ".env")
-	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\n"), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte("silence_timeout: 30s\nenvoy_enabled: true\nenvoy_webhook_url: https://relay.example.test/webhook/ghostwispr\n"), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	envContent := "GHOST_WISPR_OPENAI_API_KEY=sk-from-env-file\nGHOST_WISPR_DEEPGRAM_API_KEY=dg-key\n"
+	envContent := envLine(EnvPrefix+"OPENAI_API_KEY", "sk-from-env-file") +
+		envLine(EnvPrefix+"DEEPGRAM_API_KEY", "dg-key") +
+		envLine(EnvPrefix+"ENVOY_WEBHOOK_SECRET", "webhook-secret")
 	if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
 
-	store, _, err := NewStoreWithEnv(configPath, envPath)
+	store, warnings, err := NewStoreWithEnv(configPath, envPath)
 	if err != nil {
 		t.Fatalf("NewStoreWithEnv failed: %v", err)
 	}
@@ -297,6 +299,16 @@ func TestNewStoreWithEnv_LoadsSecretsFromEnvFile(t *testing.T) {
 	if cfg.DeepgramAPIKey != "dg-key" {
 		t.Fatalf("expected deepgram key from .env file, got %q", cfg.DeepgramAPIKey)
 	}
+	if cfg.EnvoyWebhookSecret != "webhook-secret" {
+		t.Fatalf("expected Envoy webhook secret from .env file, got %q", cfg.EnvoyWebhookSecret)
+	}
+	if strings.Contains(strings.Join(warnings, "\n"), EnvPrefix+"ENVOY_WEBHOOK_SECRET") {
+		t.Fatalf("warnings retain a missing webhook secret after .env loading: %q", warnings)
+	}
+}
+
+func envLine(name, value string) string {
+	return name + "=" + value + "\n"
 }
 
 func TestNewStoreWithEnv_EnvVarOverridesEnvFile(t *testing.T) {

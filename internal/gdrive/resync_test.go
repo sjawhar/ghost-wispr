@@ -47,10 +47,10 @@ func summarizedSession(t *testing.T, store *storage.SQLiteStore, audioDir, id st
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.Canonicalize(id); err != nil {
+	if _, _, err := store.Canonicalize(id); err != nil {
 		t.Fatalf("canonicalize: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Standup", summary, storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", summary, storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 }
@@ -62,7 +62,7 @@ func resummarize(t *testing.T, store *storage.SQLiteStore, id, summary string) {
 	if err := store.StartSummary(id); err != nil {
 		t.Fatalf("start summary: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Standup", summary, storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Standup", summary, storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("store summary: %v", err)
 	}
 }
@@ -158,10 +158,10 @@ func TestAChangeAfterASyncReachesDrive(t *testing.T) {
 		{
 			name: "refinement retried",
 			change: func(t *testing.T, store *storage.SQLiteStore, id string) {
-				if err := store.UpdateRefinement(id, "The refined transcript.", storage.RefinementCompleted); err != nil {
+				if err := store.UpdateRefinementAtGeneration(id, "The refined transcript.", storage.RefinementCompleted, "", 0); err != nil {
 					t.Fatalf("refine: %v", err)
 				}
-				if err := store.Canonicalize(id); err != nil {
+				if _, _, err := store.Canonicalize(id); err != nil {
 					t.Fatalf("canonicalize: %v", err)
 				}
 			},
@@ -243,7 +243,7 @@ func TestAgeGCKeepsASessionUntilItsCurrentDocumentsAreOnDrive(t *testing.T) {
 	drive := newFakeDrive()
 	o := NewOrchestratorWithUploader(drive, store)
 	folder := syncedSession(t, store, o, id)
-	collector := gc.New(store, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	collector := gc.New(store, gc.Config{MaxAgeDays: 30, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	resummarize(t, store, id, "The summary, made again.")
 	deleted, err := collector.Run()
@@ -291,7 +291,7 @@ func TestAgeGCKeepsASessionThatChangesAfterGCListsIt(t *testing.T) {
 	syncedSession(t, store, o, id)
 
 	changing := &changingStore{SQLiteStore: store, change: func() { resummarize(t, store, id, "The summary, made again.") }}
-	deleted, err := gc.New(changing, gc.Config{MaxAgeDays: 30, SyncGated: true, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
+	deleted, err := gc.New(changing, gc.Config{MaxAgeDays: 30, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}

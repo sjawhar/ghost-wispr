@@ -32,28 +32,27 @@ func remoteDeletedSession(t *testing.T, wire *wireDrive, store *storage.SQLiteSt
 }
 
 // expectKeptAsRemoteDeleted fails the test unless session id is still
-// REMOTE_DELETED in folder, and GC with sync off (no sync gate) deletes
-// nothing: its folder is in the trash, so the device holds its only lasting
-// copy.
-func expectKeptAsRemoteDeleted(t *testing.T, store *storage.SQLiteStore, id, folder, audioDir string) {
+// REMOTE_DELETED in folder, and Drive confirms the folder remains in the
+// trash, so the device keeps its only lasting copy.
+func expectKeptAsRemoteDeleted(t *testing.T, store *storage.SQLiteStore, drive *Orchestrator, id, folder, audioDir string) {
 	t.Helper()
 	if state, kept := sessionState(t, store, id); state != storage.SyncStateRemoteDeleted || kept != folder {
 		t.Errorf("session %q in %q, want %q in %q: Drive never showed its folder back", state, kept, storage.SyncStateRemoteDeleted, folder)
 	}
-	deleted, err := gc.New(store, gc.Config{MaxAgeDays: 30, AudioDir: audioDir}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
+	deleted, err := gc.New(store, gc.Config{MaxAgeDays: 30, AudioDir: audioDir, Drive: drive}, slog.New(slog.NewTextHandler(io.Discard, nil))).Run()
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
 	if len(deleted) != 0 {
-		t.Errorf("GC with sync off deleted %v, whose Drive folder is in the trash", deleted)
+		t.Errorf("GC deleted %v, whose Drive folder is in the trash", deleted)
 	}
 }
 
 // Review of #39, blocker 1: a retry of a REMOTE_DELETED session claimed it
 // before it asked Drive. When Drive did not answer, the retry ended
-// RETRY_SCHEDULED, and with sync off GC then deleted the session, its folder
-// still in the trash. A retry now asks Drive first, and changes nothing until
-// Drive shows the folder back.
+// RETRY_SCHEDULED and GC then deleted the session, its folder still in the
+// trash. A retry now asks Drive first, and changes nothing until Drive shows
+// the folder back.
 func TestARetryDuringADriveOutageLeavesARemoteDeletedSessionAsItIs(t *testing.T) {
 	wire, syncer := newWireDrive(t)
 	store := openStore(t)
@@ -67,14 +66,14 @@ func TestARetryDuringADriveOutageLeavesARemoteDeletedSessionAsItIs(t *testing.T)
 		t.Error("retry during a Drive outage: no error")
 	}
 
-	expectKeptAsRemoteDeleted(t, store, id, folder, audioDir)
+	expectKeptAsRemoteDeleted(t, store, o, id, folder, audioDir)
 }
 
 // Review of #39, blocker 1: the app stopping during a retry of a
 // REMOTE_DELETED session left it SYNCING, and startup recovery moved it to
-// RETRY_SCHEDULED, which GC with sync off deletes. The retry now holds the
-// session only once Drive shows its folder back: stopped while it asks
-// Drive, it leaves the session REMOTE_DELETED.
+// RETRY_SCHEDULED. The retry now holds the session only once Drive shows its
+// folder back: stopped while it asks Drive, it leaves the session
+// REMOTE_DELETED.
 func TestTheAppStoppingDuringARetryLeavesARemoteDeletedSessionAsItIs(t *testing.T) {
 	wire, syncer := newWireDrive(t)
 	store := openStore(t)
@@ -100,13 +99,13 @@ func TestTheAppStoppingDuringARetryLeavesARemoteDeletedSessionAsItIs(t *testing.
 		t.Fatal("the retry never asked Drive about the folder")
 	}
 
-	expectKeptAsRemoteDeleted(t, store, id, folder, audioDir)
+	expectKeptAsRemoteDeleted(t, store, o, id, folder, audioDir)
 }
 
 // Review of #39, round 2, note 1: Drive shows the folder back, the retry
 // holds the session, and then the user moves the folder to the trash again
 // and the app stops during the sync. Startup recovery puts the session back
-// to REMOTE_DELETED, not to a retry, so GC with sync off keeps it.
+// to REMOTE_DELETED, not to a retry, so GC keeps it.
 func TestTheAppStoppingAfterARetryHeldTheSessionLeavesItRemoteDeleted(t *testing.T) {
 	wire, syncer := newWireDrive(t)
 	store := openStore(t)
@@ -136,7 +135,7 @@ func TestTheAppStoppingAfterARetryHeldTheSessionLeavesItRemoteDeleted(t *testing
 	if asked < 2 {
 		t.Fatalf("Drive was asked about the folder %d times, want the retry's and the upload's", asked)
 	}
-	expectKeptAsRemoteDeleted(t, store, id, folder, audioDir)
+	expectKeptAsRemoteDeleted(t, store, o, id, folder, audioDir)
 }
 
 // Review of #39, note 1: Drive answered 404 for a file of the session's

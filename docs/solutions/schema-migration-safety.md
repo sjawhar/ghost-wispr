@@ -54,7 +54,9 @@ The most likely explanation involves FTS5 interaction: the virtual table referen
 
 ### 1. Pre-Migration Backup
 
-Before `init()` runs any schema changes, `createPreMigrationBackup` (`internal/storage/sqlite.go`) writes `<db>.pre-migrate.bak` on every start. It copies with `VACUUM INTO` through the store's own connection, writes the copy beside the backup, flushes it and renames it over the old backup, so a backup cut off part way leaves the last one.
+Before `init()` runs any schema changes, `createPreMigrationBackup` (`internal/storage/sqlite.go`) writes `<db>.pre-migrate.bak` on every start. It copies with `VACUUM INTO` through the store's own connection, writes the copy beside the backup, flushes it and renames it over the old backup, so a backup cut off part way leaves the last one. A segment deletion erases itself from the backup too (`eraseFromBackup`, `internal/storage/backup_erase.go`): when no migration ran at this start the backup is taken again the same way; when one ran, the backup is scrubbed in place and keeps its old schema, so the previous build can still start from it.
+
+One case removes the backup instead. If a deletion's erase after its commit fails (for example `VACUUM INTO` on a full disk), it stays owed, and the retry (`RetryOwedErasure`, `internal/storage/owed_erase.go`) cannot scrub the backup, because the deleted text is not kept. So when the backup has an older schema than the database, which is true for the rest of any run that applied a migration, the retry erases it. A rollback after that has no pre-migration backup to restore. This is a deliberate choice: a backup that may hold deleted words is worse than none.
 
 This is the most important safety net. If migrations corrupt data, you can restore.
 

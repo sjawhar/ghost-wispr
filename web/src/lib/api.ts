@@ -6,11 +6,21 @@ import type {
   StatusResponse,
 } from './types'
 
+export class RequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'RequestError'
+  }
+}
+
 async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init)
   if (!response.ok) {
     const text = await response.text()
-    throw new Error(text || `request failed: ${response.status}`)
+    throw new RequestError(response.status, text || `request failed: ${response.status}`)
   }
 
   if (response.status === 204) {
@@ -92,6 +102,22 @@ export function updateSessionTitle(sessionId: string, title: string): Promise<Se
 
 export function deleteSession(id: string): Promise<void> {
   return request<void>(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+// The two segment deletion actions carry the timed transcript revision that
+// produced the selected segment, so the server can reject a stale selection.
+export type SegmentDeleteMode = 'text' | 'text_and_audio'
+
+export function deleteSessionSegment(
+  sessionID: string,
+  segmentID: number,
+  mode: SegmentDeleteMode,
+  revision: number,
+): Promise<void> {
+  return request<void>(
+    `/api/sessions/${encodeURIComponent(sessionID)}/segments/${encodeURIComponent(segmentID)}?mode=${mode}&revision=${encodeURIComponent(revision)}`,
+    { method: 'DELETE' },
+  )
 }
 
 export function mergeSessions(sessionIds: string[]): Promise<SessionSummary> {

@@ -3,6 +3,7 @@ package gdrive
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"os"
@@ -30,6 +31,9 @@ type fakeDrive struct {
 	// onUpload, when set, runs as an upload starts, outside the lock: what
 	// happens elsewhere while a sync uploads.
 	onUpload func()
+	// onFolderCreated runs after Upload creates a folder and before it puts
+	// the first file into it.
+	onFolderCreated func()
 }
 
 func newFakeDrive() *fakeDrive { return &fakeDrive{folders: map[string][]fakeDriveFile{}} }
@@ -77,15 +81,33 @@ func (d *fakeDrive) updateInPlace(folderID string, u *docUpdate) error {
 	return fmt.Errorf("update %s: no file %s", u.File.Name, u.ID)
 }
 
-func (d *fakeDrive) Upload(_ context.Context, _ string, files []SyncFile) (string, error) {
+func (d *fakeDrive) Upload(ctx context.Context, folderName string, files []SyncFile) (string, error) {
+	return d.upload(ctx, folderName, files, nil)
+}
+
+func (d *fakeDrive) UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
+	return d.upload(ctx, folderName, files, record)
+}
+
+func (d *fakeDrive) upload(_ context.Context, _ string, files []SyncFile, record func(folderID string) error) (string, error) {
 	if d.onUpload != nil {
 		d.onUpload()
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.nextID++
 	folderID := fmt.Sprintf("folder-%d", d.nextID)
 	d.folders[folderID] = nil
+	d.mu.Unlock()
+	if record != nil {
+		if err := record(folderID); err != nil {
+			return folderID, err
+		}
+	}
+	if d.onFolderCreated != nil {
+		d.onFolderCreated()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	for i := range files {
 		if err := d.put(folderID, &files[i]); err != nil {
 			return folderID, err
@@ -124,6 +146,28 @@ func (d *fakeDrive) FolderOnDrive(_ context.Context, folderID string) (bool, err
 	defer d.mu.Unlock()
 	_, ok := d.folders[folderID]
 	return ok, nil
+}
+
+func (d *fakeDrive) RecordingsMatch(_ context.Context, folderID string, checksums map[string]string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for name, checksum := range checksums {
+		matched := false
+		for _, f := range d.folders[folderID] {
+			if f.Name != name {
+				continue
+			}
+			sum := md5.Sum(f.content)
+			if fmt.Sprintf("%x", sum) == checksum {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // has reports whether folder folderID holds a file with this content.

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -172,7 +173,10 @@ func (r *Recorder) save(sessionID, rawPath string) (string, error) {
 		return "", err
 	}
 
-	_ = os.Remove(rawPath)
+	// Removing a whole audio file overwrites its bytes before the file system
+	// frees them (Sami, 2026-11-12, "Zero every audio removal",
+	// dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
+	_ = erase.Remove(rawPath)
 	return audioPath, nil
 }
 
@@ -285,7 +289,7 @@ func (r *Recorder) defaultEncode(rawPath, sessionID string) (string, error) {
 	if err := encodeWithLame(ctx, rawPath, mp3Path, sampleRate); err == nil {
 		return mp3Path, nil
 	}
-	_ = os.Remove(mp3Path) // a partial file from an encoder that failed or ran out of time
+	_ = erase.Remove(mp3Path) // a partial file from an encoder that failed or ran out of time
 
 	wavPath := filepath.Join(r.audioDir, sessionID+".wav")
 	if err := pcmToWav(rawPath, wavPath, sampleRate); err != nil {

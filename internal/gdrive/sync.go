@@ -9,64 +9,85 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/oauth2/google"
+	"cloud.google.com/go/auth"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 type Syncer struct {
-	service  *drive.Service
-	folderID string
-	logger   *slog.Logger
-	mu       sync.Mutex
+	service      *drive.Service
+	folderID     string
+	logger       *slog.Logger
+	mu           sync.Mutex
+	replacements replacementStore
 }
 
 const resumableUploadThresholdBytes int64 = 5 * 1024 * 1024
 
 type SyncFile struct {
-	Name        string
-	MimeType    string
-	Content     []byte
-	LocalPath   string
-	ContentType string
+	Name          string
+	MimeType      string
+	Content       []byte
+	LocalPath     string
+	ContentType   string
+	SHA256        string
+	AppProperties map[string]string
+	// UpdateOnly is a document a re-sync updates in place if the folder has
+	// one, and creates in no folder: the summary a segment deletion emptied
+	// (emptiedSummary), whose earlier copy would keep the deleted words.
+	UpdateOnly bool
 }
 
-func NewSyncer(ctx context.Context, credPath, folderID string, logger ...*slog.Logger) (*Syncer, error) {
-	creds, err := os.ReadFile(credPath)
-	if err != nil {
-		return nil, fmt.Errorf("read credentials: %w", err)
-	}
-
-	config, err := google.CredentialsFromJSONWithTypeAndParams(ctx, creds, google.ServiceAccount, google.CredentialsParams{Scopes: []string{drive.DriveFileScope}})
-	if err != nil {
-		return nil, fmt.Errorf("parse credentials: %w", err)
-	}
-
-	svc, err := drive.NewService(ctx, option.WithCredentials(config))
-	if err != nil {
-		return nil, fmt.Errorf("create drive service: %w", err)
-	}
-
+func NewSyncer(ctx context.Context, credentials *auth.Credentials, folderID string, logger ...*slog.Logger) (*Syncer, error) {
 	l := logging.WithModule(slog.Default(), "gdrive")
 	if len(logger) > 0 && logger[0] != nil {
 		l = logging.WithModule(logger[0], "gdrive")
+	}
+	return newSyncerWithLogger(ctx, credentials, folderID, l)
+}
+
+func newSyncerWithLogger(ctx context.Context, credentials *auth.Credentials, folderID string, logger *slog.Logger, options ...option.ClientOption) (*Syncer, error) {
+	if credentials == nil {
+		return nil, fmt.Errorf("google Drive credentials are required")
+	}
+	options = append([]option.ClientOption{option.WithAuthCredentials(credentials)}, options...)
+	svc, err := drive.NewService(ctx, options...)
+	if err != nil {
+		return nil, fmt.Errorf("create drive service: %w", err)
 	}
 
 	return &Syncer{
 		service:  svc,
 		folderID: folderID,
-		logger:   l,
+		logger:   logger,
 	}, nil
+}
+
+// BuildSyncFiles returns the files a sync uploads, or an error when a
+// recording could not be read. The orchestrator uses buildSyncFiles so it can
+// upload the readable files while it leaves a session pending for that
+// recording.
+func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
+	files, folderName, unreadable, err := buildSyncFiles(sess, segments, audioPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(unreadable) != 0 {
+		return nil, "", fmt.Errorf("read recordings: %s", strings.Join(unreadable, ", "))
+	}
+	return files, folderName, nil
 }
 
 // renderDocuments returns the documents a sync uploads for s: its summary
@@ -82,12 +103,13 @@ func renderDocuments(s *SyncSession, segments []transcribe.Segment) (summary, tr
 	return summary, RenderTranscriptMarkdown(s, segments)
 }
 
-func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, error) {
+func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath string) ([]SyncFile, string, []string, error) {
 	date := sess.StartedAt.UTC().Format("2006-01-02")
 	slug := slugify(sess.Title)
 	folderName := date + "-" + slug
 
 	var files []SyncFile
+	var unreadable []string
 
 	summaryMD, transcriptMD := renderDocuments(sess, segments)
 	if summaryMD != "" {
@@ -116,21 +138,27 @@ func BuildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		if _, err := os.Stat(recording); err != nil {
 			continue
 		}
+		hash, err := fileSHA256(recording)
+		if err != nil {
+			unreadable = append(unreadable, recording)
+			continue
+		}
 		ext := filepath.Ext(recording)
 		mimeType := "audio/mpeg"
 		if ext == ".wav" {
 			mimeType = "audio/wav"
 		}
-		name := "audio-" + filepath.Base(recording)
+		name := recordingname.FileName(recording)
 		files = append(files, SyncFile{
 			Name:        name,
 			MimeType:    mimeType,
 			LocalPath:   recording,
 			ContentType: mimeType,
+			SHA256:      hash,
 		})
 	}
 
-	return files, folderName, nil
+	return files, folderName, unreadable, nil
 }
 
 // recordingEntries returns the recordings an audio path names: a merged
@@ -143,6 +171,17 @@ func recordingEntries(audioPath string) []string {
 		}
 	}
 	return recordings
+}
+
+// resolvedAudioPath returns audioPath with each recording it names replaced
+// by where recording.Resolve finds it: as written, else its name in
+// audioDir.
+func resolvedAudioPath(audioPath, audioDir string) string {
+	entries := recordingEntries(audioPath)
+	for i, entry := range entries {
+		entries[i] = recordingname.Resolve(entry, audioDir)
+	}
+	return strings.Join(entries, ",")
 }
 
 // notUploaded returns the recordings an audio path names that files, the
@@ -162,11 +201,27 @@ func notUploaded(audioPath string, files []SyncFile) []string {
 	return missing
 }
 
+// Upload creates a session folder and puts files into it. Callers that need
+// the folder durable before the first upload use UploadWithFolderRecorded.
 func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile) (string, error) {
+	return s.upload(ctx, folderName, files, nil)
+}
+
+// UploadWithFolderRecorded creates a session folder, calls record with its id
+// before the first file upload, then uploads files into it.
+func (s *Syncer) UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
+	return s.upload(ctx, folderName, files, record)
+}
+
+func (s *Syncer) upload(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// A folder made inside a root in the trash would be in the trash too.
+	// Only a folder in My Drive can be: a shared drive's root cannot be
+	// trashed, and under the drive.file scope files.get answers 404 for it
+	// (rootReadable), which skips this check as any error does; the create
+	// below then answers for the root.
 	if root, err := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id, trashed").Context(ctx).Do(); err == nil && root.Trashed {
 		return "", errRootTrashed(s.folderID)
 	}
@@ -178,8 +233,15 @@ func (s *Syncer) Upload(ctx context.Context, folderName string, files []SyncFile
 	if err != nil {
 		return "", fmt.Errorf("create folder %s: %w", folderName, err)
 	}
-
+	if record != nil {
+		if err := record(folder.Id); err != nil {
+			return folder.Id, fmt.Errorf("record created folder %s: %w", folder.Id, err)
+		}
+	}
 	for i := range files {
+		if files[i].UpdateOnly {
+			continue
+		}
 		if err := s.uploadFile(ctx, folder.Id, &files[i]); err != nil {
 			return folder.Id, err
 		}
@@ -207,16 +269,17 @@ var ErrDriveDidNotAnswer = errors.New("drive did not answer")
 // of the trash: Drive's 404 for a folder gone (wrapped), ErrFolderTrashed
 // for one in the trash, or why Drive could not say. Drive answers 404 for a
 // file the app cannot read as well as for one that is gone, so a 404 counts
-// as the folder gone only while the folder the app syncs into still reads:
-// otherwise the app's access to Drive is lost (credentials, sharing), which
-// says nothing about the session, and the error is not a 404.
+// as the folder gone only while the folder the app syncs into still reads
+// (rootReadable): otherwise the app's access to Drive is lost (credentials,
+// sharing), which says nothing about the session, and the error is not a
+// 404.
 func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
 	folder, err := s.service.Files.Get(folderID).SupportsAllDrives(true).Fields("id, trashed, explicitlyTrashed").Context(ctx).Do()
 	if err != nil {
 		if !IsRemoteDeletedError(err) {
 			return fmt.Errorf("get folder %s: %w", folderID, err)
 		}
-		if _, rootErr := s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do(); rootErr != nil {
+		if _, rootErr := s.rootReadable(ctx); rootErr != nil {
 			return fmt.Errorf("get folder %s: not found, and the folder the app syncs into (%s) cannot be read either, so access to Drive may be lost: %v", folderID, s.folderID, rootErr)
 		}
 		return fmt.Errorf("get folder %s: %w", folderID, err)
@@ -231,6 +294,36 @@ func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
 		return fmt.Errorf("folder %s: %w", folderID, ErrFolderTrashed)
 	}
 	return nil
+}
+
+// rootReadable returns nil when Drive answers for the folder the app syncs
+// into, with whether it is a shared drive's root, and why not otherwise.
+// files.get reads a folder in My Drive the app can read (under the drive.file
+// scope, one it created). It answers 404 for a shared drive's root, as for an
+// id Drive does not have, since the app did not create the root. A list of
+// the shared drive's files (corpora "drive")
+// tells the two apart: it answers for a shared drive the app is a member of,
+// and 404 "Shared drive not found" for an id Drive does not have. A list
+// without corpora cannot: it answers 200, with no files, for an id Drive does
+// not have too. These three answers for a shared drive's root were measured
+// through the app on the office Pi on 2026-11-11. A shared drive the app is
+// no longer a member of is taken to answer as an id Drive does not have; that
+// was not measured. A shared drive reads through the app's membership, not
+// through the files the app made there: another account made a member would
+// read the drive and get 404 for the folders the first one made.
+func (s *Syncer) rootReadable(ctx context.Context) (sharedDrive bool, err error) {
+	_, err = s.service.Files.Get(s.folderID).SupportsAllDrives(true).Fields("id").Context(ctx).Do()
+	if err == nil || !IsRemoteDeletedError(err) {
+		return false, err
+	}
+	query := fmt.Sprintf("'%s' in parents and trashed = false", strings.ReplaceAll(s.folderID, "'", `\'`))
+	_, listErr := s.service.Files.List().Corpora("drive").DriveId(s.folderID).Q(query).PageSize(1).
+		SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+		Fields("files(id)").Context(ctx).Do()
+	if listErr != nil {
+		return false, fmt.Errorf("%v; nor does Drive list it as a shared drive the app is a member of: %v", err, listErr)
+	}
+	return true, nil
 }
 
 // errRootTrashed is the error for a session folder in the trash with a folder
@@ -255,12 +348,37 @@ func (s *Syncer) FolderOnDrive(ctx context.Context, folderID string) (bool, erro
 	}
 }
 
+// RecordingsMatch reports whether folderID has every requested recording
+// name with the specified Google Drive md5Checksum. Callers confirm the
+// folder itself separately: an empty or inaccessible listing does not prove
+// whether the folder was removed, but it never verifies a recording.
+func (s *Syncer) RecordingsMatch(ctx context.Context, folderID string, checksums map[string]string) (bool, error) {
+	if len(checksums) == 0 {
+		return true, nil
+	}
+	remaining := maps.Clone(checksums)
+	query := fmt.Sprintf("'%s' in parents and trashed = false", strings.ReplaceAll(folderID, "'", `\'`))
+	err := s.service.Files.List().Q(query).SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+		Fields("nextPageToken, files(name, md5Checksum)").Context(ctx).
+		Pages(ctx, func(page *drive.FileList) error {
+			for _, file := range page.Files {
+				if checksum, wanted := remaining[file.Name]; wanted && file.Md5Checksum == checksum {
+					delete(remaining, file.Name)
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return false, fmt.Errorf("list recordings in folder %s: %w", folderID, err)
+	}
+	return len(remaining) == 0, nil
+}
+
 // driveFile is a file in a session's Drive folder.
 type driveFile struct {
 	ID, Name string
-	// ContentHash is the hash of a document (summary, transcript) this app
-	// uploaded, kept in the file's appProperties; "" for audio, and for a
-	// document uploaded before hashes were kept.
+	// ContentHash is the hash this app uploaded in the file's appProperties;
+	// it is empty only for a file uploaded before hashes were kept.
 	ContentHash  string
 	ModifiedTime time.Time
 }
@@ -288,14 +406,30 @@ func toDriveFile(f *drive.File) driveFile {
 // contentHashProperty is the appProperties key a document's hash is kept in.
 const contentHashProperty = "ghostWisprSHA256"
 
-// contentHash returns the hash of a document's content, and "" for a
-// recording.
+// contentHash returns the content hash kept on Drive for f.
 func contentHash(f *SyncFile) string {
-	if f.LocalPath != "" || f.Content == nil {
+	if f.SHA256 != "" {
+		return f.SHA256
+	}
+	if f.Content == nil {
 		return ""
 	}
 	sum := sha256.Sum256(f.Content)
 	return hex.EncodeToString(sum[:])
+}
+
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // docUpdate is a document a re-sync updates in place: the file on Drive, and
@@ -323,7 +457,9 @@ func planUpload(existing []driveFile, files []SyncFile) (create []SyncFile, upda
 		have := byName[f.Name]
 		switch {
 		case len(have) == 0:
-			create = append(create, *f)
+			if !f.UpdateOnly {
+				create = append(create, *f)
+			}
 		case f.LocalPath != "":
 			// The recording is there.
 		default:
@@ -407,6 +543,11 @@ func (s *Syncer) updateDocument(ctx context.Context, u *docUpdate) error {
 
 // uploadFile uploads one file into a Drive folder.
 func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) error {
+	_, err := s.uploadFileID(ctx, folderID, f)
+	return err
+}
+
+func (s *Syncer) uploadFileID(ctx context.Context, folderID string, f *SyncFile) (string, error) {
 	var reader io.Reader
 	var file *os.File
 	var fileSize int64
@@ -418,21 +559,21 @@ func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) e
 	case f.LocalPath != "":
 		openedFile, err := os.Open(f.LocalPath)
 		if err != nil {
-			return fmt.Errorf("open %s: %w", f.LocalPath, err)
+			return "", fmt.Errorf("open %s: %w", f.LocalPath, err)
 		}
 		file = openedFile
 		reader = file
 		info, err := file.Stat()
 		if err != nil {
 			_ = file.Close()
-			return fmt.Errorf("stat %s: %w", f.LocalPath, err)
+			return "", fmt.Errorf("stat %s: %w", f.LocalPath, err)
 		}
 		fileSize = info.Size()
 		if shouldUseResumableUpload(fileSize) {
 			useResumable = true
 		}
 	default:
-		return nil
+		return "", fmt.Errorf("upload %s: no content", f.Name)
 	}
 
 	meta := &drive.File{
@@ -440,8 +581,14 @@ func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) e
 		MimeType: f.MimeType,
 		Parents:  []string{folderID},
 	}
-	if hash := contentHash(f); hash != "" {
-		meta.AppProperties = map[string]string{contentHashProperty: hash}
+	if hash, properties := contentHash(f), f.AppProperties; hash != "" || len(properties) != 0 {
+		meta.AppProperties = make(map[string]string, len(properties)+1)
+		for key, value := range properties {
+			meta.AppProperties[key] = value
+		}
+		if hash != "" {
+			meta.AppProperties[contentHashProperty] = hash
+		}
 	}
 	createCall := s.service.Files.Create(meta).SupportsAllDrives(true).Context(ctx).Fields("id")
 
@@ -452,14 +599,17 @@ func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) e
 		createCall = createCall.Media(reader, googleapi.ContentType(f.ContentType))
 	}
 
-	_, err := createCall.Do()
+	created, err := createCall.Do()
 	if file != nil {
 		_ = file.Close()
 	}
 	if err != nil {
-		return fmt.Errorf("upload %s: %w", f.Name, err)
+		return "", fmt.Errorf("upload %s: %w", f.Name, err)
 	}
-	return nil
+	if created.Id == "" {
+		return "", fmt.Errorf("upload %s: Drive returned no file id", f.Name)
+	}
+	return created.Id, nil
 }
 
 func shouldUseResumableUpload(fileSize int64) bool {

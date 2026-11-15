@@ -175,7 +175,7 @@ func TestARestoredSessionIsStoredSynced(t *testing.T) {
 	ended := started.Add(time.Minute)
 	for _, id := range []string{"20260901100000", "20260901110000"} {
 		if err := store.ImportSession(&Session{ID: id, Title: "Standup", StartedAt: started, EndedAt: &ended, Status: "ended",
-			Summary: "A summary.", SummaryStatus: SummaryCompleted, SyncStatus: SyncSynced, GDriveFolderID: "folder-" + id}, nil); err != nil {
+			Summary: "A summary.", SummaryStatus: SummaryCompleted, SyncStatus: SyncSynced, GDriveFolderID: "folder-" + id}, nil, nil); err != nil {
 			t.Fatalf("import %s: %v", id, err)
 		}
 	}

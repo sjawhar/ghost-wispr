@@ -1,0 +1,2 @@
+KERNEL=="hidraw*", ATTRS{idVendor}=="27b8", ATTRS{idProduct}=="01ed", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="input", ATTRS{name}=="pwr_button", MODE="0640", GROUP="input"

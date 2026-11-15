@@ -37,6 +37,10 @@ func (f *fakeUploader) UploadInto(_ context.Context, folderID string, _ []SyncFi
 // FolderOnDrive reports every folder as on Drive.
 func (f *fakeUploader) FolderOnDrive(context.Context, string) (bool, error) { return true, nil }
 
+func (*fakeUploader) RecordingsMatch(context.Context, string, map[string]string) (bool, error) {
+	return true, nil
+}
+
 // A session synced before has its Drive folder: syncing it again (after the
 // store reopened it to upload a merged session's audio) adds the missing
 // files to that folder instead of creating a second one.
@@ -104,6 +108,14 @@ func (f *fakeOrchestratorStore) MarkSynced(_, claim, driveFolderID string, uncha
 		return false, nil
 	}
 	f.record(storage.SyncStateSynced, driveFolderID, 0, nil, "")
+	return true, nil
+}
+
+func (f *fakeOrchestratorStore) RecordSyncFolder(_, claim, driveFolderID string) (bool, error) {
+	if f.session.SyncState != storage.SyncStateSyncing || claim != f.claim {
+		return false, nil
+	}
+	f.session.GDriveFolderID = driveFolderID
 	return true, nil
 }
 

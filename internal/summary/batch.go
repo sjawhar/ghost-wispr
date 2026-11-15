@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"google.golang.org/genai"
+
+	"github.com/sjawhar/ghost-wispr/internal/llm"
 )
 
 // BatchSession holds the data needed to build a batch request for one session.
@@ -15,13 +17,13 @@ type BatchSession struct {
 	Transcript string
 }
 
-// BatchResult holds the parsed result for a single session from a batch job.
 type BatchResult struct {
 	SessionID    string
 	Title        string
 	Summary      string
 	SpeakerNames string
 	PresetName   string
+	Model        string
 	Error        error
 }
 
@@ -114,6 +116,11 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 			result.Error = fmt.Errorf("nil response for session %s", result.SessionID)
 			results[i] = result
 			continue
+		}
+
+		result.Model = strings.TrimSpace(resp.Response.ModelVersion)
+		if result.Model == "" {
+			result.Model = llm.ModelNotReportedByProvider
 		}
 
 		text := strings.TrimSpace(resp.Response.Text())

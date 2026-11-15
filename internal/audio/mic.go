@@ -56,15 +56,26 @@ func (m *Mic) Stop() error {
 	return m.stream.Stop()
 }
 
+// Close stops and closes the capture stream, which releases the input device.
+// Start and Stream then fail until Reopen opens a fresh stream.
+func (m *Mic) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.active.Store(false)
+	if m.stream == nil {
+		return nil
+	}
+	stream := m.stream
+	m.stream = nil
+	_ = stream.Stop() // a stream that never started reports it is stopped
+	return stream.Close()
+}
+
 // Reopen closes the current PortAudio stream and opens a fresh one with the
 // same parameters. This picks up new device nodes after a USB reconnect.
 func (m *Mic) Reopen() error {
-	m.active.Store(false)
-	if m.stream != nil {
-		_ = m.stream.Stop()
-		_ = m.stream.Close()
-		m.stream = nil
-	}
+	_ = m.Close()
 	if err := ReinitPortAudio(); err != nil {
 		return fmt.Errorf("reinitialize portaudio: %w", err)
 	}

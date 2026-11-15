@@ -213,22 +213,13 @@ func TestGetGCEligibleSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Sync-gated: only old synced sessions.
-	ids, err := store.GetGCEligibleSessions(30, true)
+	// Only old synced sessions are eligible.
+	ids, err := store.GetGCEligibleSessions(30)
 	if err != nil {
 		t.Fatalf("get gc eligible: %v", err)
 	}
 	if len(ids) != 1 || ids[0] != "gc-eligible" {
 		t.Fatalf("expected [gc-eligible], got %v", ids)
-	}
-
-	// Non-sync-gated: old sessions regardless of sync status.
-	ids, err = store.GetGCEligibleSessions(30, false)
-	if err != nil {
-		t.Fatalf("get gc eligible no gate: %v", err)
-	}
-	if len(ids) != 2 {
-		t.Fatalf("expected 2 sessions, got %d: %v", len(ids), ids)
 	}
 }
 ```
@@ -242,20 +233,17 @@ Expected: FAIL — `GetGCEligibleSessions` doesn't exist.
 
 ```go
 // GetGCEligibleSessions returns session IDs eligible for garbage collection.
-// Sessions must be ended. If maxAgeDays > 0, only sessions older than that are returned.
+// Sessions must be ended and synced. If maxAgeDays > 0, only sessions older
+// than that are returned.
 // If maxAgeDays == 0, all ended sessions are eligible (used for disk-pressure GC).
-// If syncGated is true, only synced sessions are returned.
 // Results are ordered oldest first (for disk-pressure GC to delete oldest).
-func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
-	query := `SELECT id FROM sessions WHERE status = 'ended'`
+func (s *SQLiteStore) GetGCEligibleSessions(maxAgeDays int) ([]string, error) {
+	query := `SELECT id FROM sessions WHERE status = 'ended' AND sync_status = 'synced'`
 	var args []any
 	if maxAgeDays > 0 {
 		cutoff := time.Now().UTC().Add(-time.Duration(maxAgeDays) * 24 * time.Hour).Format(time.RFC3339Nano)
 		query += ` AND started_at < ?`
 		args = append(args, cutoff)
-	}
-	if syncGated {
-		query += ` AND sync_status = 'synced'`
 	}
 	query += ` ORDER BY started_at ASC`
 
@@ -802,8 +790,9 @@ In `ghost-wispr.yaml.example`, add after the existing gdrive section:
 
 ```yaml
 # Google Drive sync
+# google_credentials_file is authoritative; Google Application Default Credentials are the fallback.
 # gdrive_folder_id:
-# google_credentials_file: ./service-account.json
+# google_credentials_file: /opt/ghost-wispr/google-credentials.json
 # gdrive_sync_enabled: false
 
 # Garbage collection
@@ -850,7 +839,7 @@ type sessionInfo struct {
 	audioPath string
 }
 
-func (m *mockStore) GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error) {
+func (m *mockStore) GetGCEligibleSessions(maxAgeDays int) ([]string, error) {
 	ids := make([]string, len(m.gcEligible))
 	for i, s := range m.gcEligible {
 		ids[i] = s.id
@@ -891,7 +880,6 @@ func TestGCDeletesSyncedOldSessions(t *testing.T) {
 	collector := New(store, Config{
 		MaxAgeDays:     30,
 		MaxAudioSizeMB: 1024,
-		SyncGated:      true,
 	})
 
 	deleted, err := collector.Run()
@@ -934,7 +922,7 @@ import (
 )
 
 type Store interface {
-	GetGCEligibleSessions(maxAgeDays int, syncGated bool) ([]string, error)
+	GetGCEligibleSessions(maxAgeDays int) ([]string, error)
 	GetSession(id string) (storage.Session, error)
 	DeleteSession(id string) error
 }
@@ -942,7 +930,6 @@ type Store interface {
 type Config struct {
 	MaxAgeDays     int
 	MaxAudioSizeMB int
-	SyncGated      bool
 	AudioDir       string
 }
 
@@ -957,7 +944,7 @@ func New(store Store, config Config) *Collector {
 
 func (c *Collector) Run() ([]string, error) {
 	// Phase 1: age-based GC.
-	ids, err := c.store.GetGCEligibleSessions(c.config.MaxAgeDays, c.config.SyncGated)
+	ids, err := c.store.GetGCEligibleSessions(c.config.MaxAgeDays)
 	if err != nil {
 		return nil, fmt.Errorf("query gc eligible: %w", err)
 	}
@@ -976,7 +963,7 @@ func (c *Collector) Run() ([]string, error) {
 	// until we're under the limit.
 	if c.checkDiskPressure() {
 		// Query ALL synced ended sessions (maxAgeDays=0), oldest first.
-		allSynced, err := c.store.GetGCEligibleSessions(0, c.config.SyncGated)
+		allSynced, err := c.store.GetGCEligibleSessions(0)
 		if err != nil {
 			return deleted, fmt.Errorf("query disk-pressure gc: %w", err)
 		}
@@ -1187,7 +1174,13 @@ Replace the existing gdrive ticker block (lines 489-511) with:
 // Google Drive sync.
 var syncOrchestrator *gdrive.Orchestrator
 if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
-	syncer, syncErr := gdrive.NewSyncer(ctx, cfg.GoogleCredentialsFile, cfg.GDriveFolderID)
+	syncer, syncErr := func() (*gdrive.Syncer, error) {
+		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, "https://www.googleapis.com/auth/drive.file")
+		if err != nil {
+			return nil, err
+		}
+		return gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID)
+	}()
 	if syncErr != nil {
 		log.Printf("warning: gdrive sync disabled: %v", syncErr)
 		warnings = append(warnings, "Google Drive sync failed to initialize \u2014 backups are disabled")
@@ -1234,11 +1227,9 @@ if cfg.GCEnabled {
 				if !latestCfg.GCEnabled {
 					continue
 				}
-				syncGated := latestCfg.GDriveSyncEnabled && syncOrchestrator != nil
 				collector := gc.New(store, gc.Config{
 					MaxAgeDays:     latestCfg.GCMaxAgeDays,
 					MaxAudioSizeMB: latestCfg.GCMaxAudioSizeMB,
-					SyncGated:      syncGated,
 					AudioDir:       latestCfg.AudioDir,
 				})
 				deleted, err := collector.Run()
@@ -1260,10 +1251,13 @@ In the existing `cfgStore.OnChange` callback, add:
 ```go
 // Recreate sync orchestrator if gdrive config changed.
 if newCfg.GDriveSyncEnabled && newCfg.GDriveFolderID != "" && syncOrchestrator == nil {
-	if syncer, err := gdrive.NewSyncer(ctx, newCfg.GoogleCredentialsFile, newCfg.GDriveFolderID); err == nil {
-		syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
-		manager.SetSyncer(syncOrchestrator)
-		log.Printf("config: gdrive sync enabled")
+	credentials, err := googleauth.Detect(ctx, newCfg.GoogleCredentialsFile, "https://www.googleapis.com/auth/drive.file")
+	if err == nil {
+		if syncer, err := gdrive.NewSyncer(ctx, credentials, newCfg.GDriveFolderID); err == nil {
+			syncOrchestrator = gdrive.NewOrchestrator(syncer, store)
+			manager.SetSyncer(syncOrchestrator)
+			log.Printf("config: gdrive sync enabled")
+		}
 	}
 } else if !newCfg.GDriveSyncEnabled && syncOrchestrator != nil {
 	manager.SetSyncer(nil)
@@ -1511,7 +1505,7 @@ Add a new section (below GDrive) with:
 - Enable/disable toggle
 - Max age (days) number input
 - Max disk size (MB) number input
-- Warning banner when GC is enabled but GDrive sync is not
+- Status when GC holds local recordings until Drive can be checked
 
 Follow the `GeneralSettings.svelte` pattern: local state, `$effect` to sync with config, save function that builds a minimal patch.
 
@@ -1519,11 +1513,6 @@ Follow the `GeneralSettings.svelte` pattern: local state, `$effect` to sync with
 <section class="gc-section">
 	<h3>Garbage Collection</h3>
 
-	{#if gcEnabled && !config.gdrive.sync_enabled}
-		<div class="warning-banner">
-			⚠️ Garbage collection is deleting files without a Google Drive backup configured.
-		</div>
-	{/if}
 
 	<div class="field">
 		<label>
@@ -1588,6 +1577,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -1599,7 +1589,11 @@ func TestSyncToRealDrive(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	syncer, err := NewSyncer(ctx, credPath, folderID)
+	credentials, err := googleauth.Detect(ctx, credPath, "https://www.googleapis.com/auth/drive.file")
+	if err != nil {
+		t.Fatalf("detect credentials: %v", err)
+	}
+	syncer, err := NewSyncer(ctx, credentials, folderID)
 	if err != nil {
 		t.Fatalf("create syncer: %v", err)
 	}

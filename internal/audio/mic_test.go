@@ -91,6 +91,27 @@ func TestMicStopIsSafeWhenStreamUnavailable(t *testing.T) {
 	}
 }
 
+// TestMicCloseReleasesTheStream fails if Close leaves the mic holding its
+// capture stream, so the input device stays open, or reporting open.
+func TestMicCloseReleasesTheStream(t *testing.T) {
+	mic := &Mic{stream: &portaudio.Stream{}, sampleRate: 16000, framesPerBuffer: 4000, buf: make([]int16, 4000)}
+	mic.active.Store(true)
+
+	_ = mic.Close() // the stand-in stream has no PortAudio stream behind it
+	if mic.stream != nil {
+		t.Fatal("the mic still holds its capture stream after Close")
+	}
+	if mic.IsOpen() {
+		t.Fatal("the mic reports open after Close")
+	}
+	if err := mic.Start(); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("Start after Close = %v, want the stream unavailable until Reopen", err)
+	}
+	if err := mic.Close(); err != nil {
+		t.Fatalf("a second Close = %v, want nil", err)
+	}
+}
+
 // IsOpen is read from HTTP handlers (status "capturing", health) while the mic
 // loop reopens the stream; under -race this must not be a data race.
 func TestMicIsOpenIsSafeDuringReopen(t *testing.T) {

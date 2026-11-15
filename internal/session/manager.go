@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -33,19 +34,21 @@ type Manager struct {
 	batchTranscriber   transcribe.BatchTranscriber
 	refinementWait     time.Duration
 
-	mu               sync.Mutex
-	currentSessionID string
-	currentStartedAt time.Time
-	manualSession    bool
-	prevTimeout      time.Duration
-	capturePaused    bool          // no session may start while true
-	sessionStarts    int           // session starts under way
-	startsDone       *sync.Cond    // signalled (with mu) when a session start finishes
-	endingSession    bool          // an end of the current session is under way
-	endsDone         *sync.Cond    // signalled (with mu) when an end of the session finishes
-	failedEnd        sessionEnd    // how far an end of the current session that failed got
-	finalizeWaiter   chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
-	lastIDTime       time.Time     // the start second the latest session ID names
+	mu                             sync.Mutex
+	currentSessionID               string
+	currentStartedAt               time.Time
+	manualSession                  bool
+	prevTimeout                    time.Duration
+	capturePaused                  bool          // no session may start while true
+	sessionStarts                  int           // session starts under way
+	startsDone                     *sync.Cond    // signalled (with mu) when a session start finishes
+	endingSession                  bool          // an end of the current session is under way
+	endsDone                       *sync.Cond    // signalled (with mu) when an end of the session finishes
+	failedEnd                      sessionEnd    // how far an end of the current session that failed got
+	finalizeWaiter                 chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
+	lastIDTime                     time.Time     // the start second the latest session ID names
+	lifecyclePublishes             sync.WaitGroup
+	lifecycleStartPublishesStopped bool
 }
 
 // sessionEnd is how far an end of a session got. An end that fails leaves it
@@ -98,6 +101,12 @@ func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub Event
 	})
 
 	return m
+}
+
+func (m *Manager) sessionIDForBroadcast() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentSessionID
 }
 
 func (m *Manager) Message(mr *api.MessageResponse) error {
@@ -157,7 +166,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 				}
 				startTime = words[0].Start
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, broadcastText, startTime)
+			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, broadcastText, startTime)
 		}
 		return nil
 	}
@@ -188,7 +197,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 					startTime = w.Start
 				}
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, b.String(), startTime)
+			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, b.String(), startTime)
 		}
 	}
 
@@ -238,7 +247,7 @@ func (m *Manager) flushBuffer() error {
 		}
 
 		if m.hub != nil {
-			m.hub.BroadcastLiveTranscript(segments[i])
+			m.hub.BroadcastLiveTranscript(sessionID, segments[i])
 		}
 	}
 	return nil
@@ -310,8 +319,65 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	if m.hub != nil {
 		m.hub.BroadcastSessionStarted(sessionID)
 	}
+	m.publishSessionStarted(sessionID)
 
 	return sessionID, nil
+}
+
+// StopSessionStartPublishes prevents a shutdown from registering a new
+// session-started send while WaitForLifecyclePublishes is waiting.
+func (m *Manager) StopSessionStartPublishes() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lifecycleStartPublishesStopped = true
+}
+
+func (m *Manager) publishSessionStarted(sessionID string) {
+	m.publishLifecycle(sessionID, "session_started", true, EventPublisher.PublishSessionStarted)
+}
+
+func (m *Manager) publishSessionEnded(sessionID string) {
+	m.publishLifecycle(sessionID, "session_ended", false, EventPublisher.PublishSessionEnded)
+}
+
+func (m *Manager) publishLifecycle(sessionID, eventType string, isStart bool, send func(EventPublisher, context.Context, string) error) {
+	m.mu.Lock()
+	if isStart && m.lifecycleStartPublishesStopped {
+		m.mu.Unlock()
+		return
+	}
+	publisher := m.publisher
+	if publisher == nil {
+		m.mu.Unlock()
+		return
+	}
+	// Shutdown first prevents new start sends, then waits. Register the send
+	// while holding mu so that sequence cannot race with this Add.
+	m.lifecyclePublishes.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.lifecyclePublishes.Done()
+		if err := send(publisher, context.Background(), sessionID); err != nil {
+			m.logger.Error("envoy lifecycle publish failed", "operation", "publish_"+eventType, "session_id", sessionID, "error", err)
+		}
+	}()
+}
+
+// WaitForLifecyclePublishes waits for in-flight session-started and
+// session-ended sends, stopping when ctx is cancelled.
+func (m *Manager) WaitForLifecyclePublishes(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		m.lifecyclePublishes.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
 }
 
 func (m *Manager) endCurrentSession(ctx context.Context) error {
@@ -400,6 +466,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 			if m.hub != nil {
 				m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 			}
+			m.publishSessionEnded(sessionID)
 			if discardErr := m.store.DiscardSession(sessionID); discardErr != nil {
 				m.logger.Warn("failed to discard short session", "operation", "discard_short_session", "session_id", sessionID, "error", discardErr)
 			} else {
@@ -412,6 +479,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	if m.hub != nil {
 		m.hub.BroadcastSessionEnded(sessionID, endedAt.Sub(startedAt))
 	}
+	m.publishSessionEnded(sessionID)
 
 	m.mu.Lock()
 	batchTranscriber := m.batchTranscriber
@@ -435,8 +503,10 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 
 	// Claim the refinement only while the session still names the recording:
 	// disk pressure may have removed it since the session ended, and it
-	// removes nothing while the refinement runs.
-	claimed, err := m.store.ClaimRefinement(sessionID, audioPath)
+	// removes nothing while the refinement runs. The result is stored only at
+	// the transcript generation claimed here, so a refinement of the
+	// recording from before a segment deletion cannot be stored.
+	generation, claimed, err := m.store.ClaimRefinement(sessionID, audioPath)
 	if err != nil {
 		m.batchLogger.Error("failed to mark refinement running", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
@@ -447,9 +517,9 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 	}
 
 	m.batchLogger.Info("starting batch refinement", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath)
-	transcript, err := batchTranscriber.Transcribe(ctx, audioPath)
+	result, err := m.transcribeRecordings(ctx, batchTranscriber, audioPath)
 	if err != nil {
-		if updateErr := m.store.UpdateRefinement(sessionID, "", storage.RefinementFailed); updateErr != nil {
+		if updateErr := m.store.UpdateRefinementAtGeneration(sessionID, "", storage.RefinementFailed, "", generation); updateErr != nil {
 			m.batchLogger.Error("failed to mark refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", updateErr)
 		}
 		m.batchLogger.Error("batch refinement failed", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
@@ -459,19 +529,14 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 		return
 	}
 
-	if err := m.store.UpdateRefinement(sessionID, transcript, storage.RefinementCompleted); err != nil {
-		m.batchLogger.Error("failed to store refined transcript", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
+	if _, err := m.store.PublishRefinementAtGeneration(sessionID, result.Transcript, result.Model, result.Words, result.Segments, generation); err != nil {
+		m.batchLogger.Error("failed to publish refined words and segments", "operation", "batch_refinement", "session_id", sessionID, "audio_path", audioPath, "error", err)
 		return
 	}
 
-	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID)
+	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID, "model", result.Model)
 	if m.hub != nil {
 		m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
-	}
-
-	// Re-canonicalize now that refined transcript is available.
-	if err := m.store.Canonicalize(sessionID); err != nil {
-		m.batchLogger.Error("failed to re-canonicalize after batch refinement", "operation", "batch_refinement", "session_id", sessionID, "error", err)
 	}
 }
 
@@ -497,6 +562,15 @@ func (m *Manager) RefineSession(ctx context.Context, sessionID, audioPath string
 	return nil
 }
 
+// SummarizeSession makes session sessionID's summary again from its
+// transcript as it is, without refining it, then indexes and syncs it as a
+// refinement's summary is: "Delete text" of a session whose audio is gone,
+// so there is nothing to refine.
+func (m *Manager) SummarizeSession(ctx context.Context, sessionID string, startedAt time.Time) error {
+	m.generateSummary(ctx, sessionID, startedAt)
+	return nil
+}
+
 func (m *Manager) generateSummary(ctx context.Context, sessionID string, startedAt time.Time) {
 	m.mu.Lock()
 	summarizer := m.summarizer
@@ -504,28 +578,42 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	publisher := m.publisher
 	m.mu.Unlock()
 
+	// The transcript generation before the run starts. A failure before the
+	// run has read its text is recorded only at it, so once a segment
+	// deletion has changed the text, and its own run has started, this run
+	// records nothing over that one. It is read before the run starts, so a
+	// deletion between the two also makes such a failure refused.
+	startGeneration, err := m.store.DeletionGeneration(sessionID)
+	if err != nil {
+		m.logger.Error("failed to read the transcript generation", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		return
+	}
+
 	if summarizer == nil {
-		// Still canonicalize for GDrive sync even without summarizer.
-		if err := m.store.Canonicalize(sessionID); err != nil {
+		// Without a summarizer the summary completes empty, which keeps the
+		// session's summary as it is. StartEmptySummary binds it to the
+		// current deletion generation, so that completion passes the
+		// generation fence after a segment deletion, and leaves the summary
+		// version and Envoy delivery state alone, so a summary Envoy already
+		// has is not sent again.
+		if err := m.store.StartEmptySummary(sessionID); err != nil {
+			m.logger.Error("failed to start empty summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
+		}
+		transcript, generation, err := m.store.Canonicalize(sessionID)
+		if err != nil {
+			// Terminal, so a Drive replacement waiting for this session's
+			// summary stops waiting; the sync still runs, with the canonical
+			// transcript the session already has.
+			m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
 			m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
+			m.triggerDriveSync(syncer, sessionID)
+			return
 		}
-		if transcript, _, err := m.store.GetCanonicalTranscript(sessionID); err != nil {
-			m.logger.Error("failed to get canonical transcript for indexing", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		} else {
-			m.triggerEmbeddingIndex(sessionID, transcript)
+		if err := m.store.UpdateSummaryAtGeneration(sessionID, "", "", storage.SummaryCompleted, "", "{}", "", generation); err != nil {
+			m.logger.Error("failed to mark empty summary complete", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
-		if syncer != nil {
-			go func() {
-				if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-					m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
-					if m.hub != nil {
-						m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
-					}
-				} else if m.hub != nil {
-					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
-				}
-			}()
-		}
+		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
+		m.triggerDriveSync(syncer, sessionID)
 		return
 	}
 
@@ -540,17 +628,10 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	// Canonicalize the transcript (picks refined if available, else assembles streaming).
-	if err := m.store.Canonicalize(sessionID); err != nil {
-		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
-	}
-
-	transcript, _, err := m.store.GetCanonicalTranscript(sessionID)
+	transcript, generation, err := m.store.Canonicalize(sessionID)
 	if err != nil {
-		m.failSummary(sessionID, fmt.Sprintf("failed to get canonical transcript: %v", err))
-		m.logger.Error("failed to get canonical transcript for summarization", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to retrieve transcript for session %s", sessionID))
-		}
+		m.failSummary(sessionID, fmt.Sprintf("failed to canonicalize transcript: %v", err), startGeneration)
+		m.logger.Error("failed to canonicalize transcript", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		return
 	}
 
@@ -560,25 +641,36 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Warn("failed to get segments for title fallback", "operation", "generate_summary", "session_id", sessionID, "error", err)
 	}
 
-	title, summaryText, preset, speakerNames, err := summarizer.Summarize(ctx, sessionID, transcript)
+	var title, summaryText, preset, speakerNames, summaryModel string
+	if reporter, ok := summarizer.(ReportedSummarizer); ok {
+		title, summaryText, preset, speakerNames, summaryModel, err = reporter.SummarizeReported(ctx, sessionID, transcript)
+	} else {
+		title, summaryText, preset, speakerNames, err = summarizer.Summarize(ctx, sessionID, transcript)
+	}
 	// Safety net: ensure title is never empty using fallback chain.
 	if strings.TrimSpace(title) == "" {
 		title = summary.GenerateTitle("", transcript, segments, startedAt)
 	}
 	if err != nil {
 		m.logger.Error("summarization failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err))
-		m.triggerEmbeddingIndex(sessionID, transcript)
+		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
+		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
 		return
 	}
 
-	if err := m.store.UpdateSummary(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames); err != nil {
-		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", err)
-		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", err))
-		m.triggerEmbeddingIndex(sessionID, transcript)
+	storeErr := m.store.UpdateSummaryAtGeneration(sessionID, title, summaryText, storage.SummaryCompleted, preset, speakerNames, summaryModel, generation)
+	if errors.Is(storeErr, sql.ErrNoRows) {
+		// The text changed since it was read (a segment deletion): a newer
+		// run owns the summary, so this one records no failure.
+		m.logger.Warn("discarded a stale summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID)
+		return
+	}
+	if storeErr != nil {
+		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
+		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr), generation)
 		if m.hub != nil {
 			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
@@ -586,20 +678,9 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 
 	m.broadcastSummaryStatus(sessionID, title, summaryText, storage.SummaryCompleted, preset)
-	m.triggerEmbeddingIndex(sessionID, transcript)
+	m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 
-	if syncer != nil {
-		go func() {
-			if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
-				m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
-				if m.hub != nil {
-					m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
-				}
-			} else if m.hub != nil {
-				m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
-			}
-		}()
-	}
+	m.triggerDriveSync(syncer, sessionID)
 
 	if publisher != nil {
 		go func() {
@@ -610,17 +691,39 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 	}
 }
 
+func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
+	if syncer == nil {
+		return
+	}
+	go func() {
+		if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
+			m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
+			if m.hub != nil {
+				m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+			}
+		} else if m.hub != nil {
+			m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
+		}
+	}()
+}
+
 func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, preset string) {
 	if m.hub != nil {
 		m.hub.BroadcastSummaryReady(sessionID, title, summary, status, preset)
 	}
 }
 
-// failSummary records that making session sessionID's summary failed, and why
-// (reason), and announces the title and summary the session keeps: its last
-// good ones, if it has them.
-func (m *Manager) failSummary(sessionID, reason string) {
-	kept, err := m.store.FailSummary(sessionID, reason)
+// failSummary records that making session sessionID's summary from the text
+// of transcript generation generation failed, and why (reason), and announces
+// the title and summary the session keeps: its last good ones, if it has
+// them. Once the text has changed since (a segment deletion), it records
+// nothing: the newer run's status stays.
+func (m *Manager) failSummary(sessionID, reason string, generation int) {
+	kept, err := m.store.FailSummaryAtGeneration(sessionID, reason, generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		m.logger.Warn("discarded a stale failed summary: the session's transcript changed since it was read", "operation", "generate_summary", "session_id", sessionID, "reason", reason)
+		return
+	}
 	if err != nil {
 		m.logger.Error("failed to record the failed summary", "operation", "generate_summary", "session_id", sessionID, "reason", reason, "error", err)
 		return
@@ -722,7 +825,7 @@ func (m *Manager) waitForRefinedTranscript(ctx context.Context, sessionID string
 	}
 }
 
-func (m *Manager) triggerEmbeddingIndex(sessionID, transcript string) {
+func (m *Manager) triggerEmbeddingIndexAtGeneration(sessionID, transcript string, generation int) {
 	m.mu.Lock()
 	indexer := m.indexer
 	m.mu.Unlock()
@@ -734,7 +837,7 @@ func (m *Manager) triggerEmbeddingIndex(sessionID, transcript string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
-		if err := indexer.IndexSession(ctx, sessionID, transcript); err != nil {
+		if err := indexer.IndexSessionAtGeneration(ctx, sessionID, transcript, generation); err != nil {
 			m.logger.Error("embedding index failed", "operation", "generate_summary", "session_id", sessionID, "error", err)
 		}
 	}()
@@ -823,6 +926,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	if m.hub != nil {
 		m.hub.BroadcastSessionStarted(sessionID)
 	}
+	m.publishSessionStarted(sessionID)
 
 	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint", titleHint)
 	return sessionID, nil

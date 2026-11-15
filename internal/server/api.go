@@ -23,6 +23,8 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
+	"github.com/sjawhar/ghost-wispr/internal/erase"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -30,6 +32,15 @@ import (
 )
 
 var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+type recordingRestoreInProgress interface {
+	RecordingRestoreInProgress()
+}
+
+func isRecordingRestoreInProgress(err error) bool {
+	var restoring recordingRestoreInProgress
+	return errors.As(err, &restoring)
+}
 
 type SessionStore interface {
 	GetSessionsByDate(date string, includeDiscarded bool) ([]storage.Session, error)
@@ -39,7 +50,17 @@ type SessionStore interface {
 	GetSegmentsInTimeRange(sessionID string, startTime, endTime float64) ([]transcribe.Segment, error)
 	GetDates() ([]string, error)
 	UpdateTitle(sessionID, title string) error
-	DeleteSession(id string) error
+	// DeleteSession deletes the session and returns the audio_path its row
+	// had when it went. It first records the directory of each recording the
+	// row names, found as recording.Resolve finds it in audioDir, and
+	// deletes nothing if it cannot.
+	// ReserveRawSessionErase commits the raw microphone capture's original
+	// and hidden paths before the API hides it. It returns the persisted hidden
+	// path, reusing one a prior failed recovery reserved.
+	ReserveRawSessionErase(id, originalPath, hiddenPath string) (string, error)
+	CancelRawSessionErase(id, hiddenPath string) error
+	SourceSessionIDs(sessionID string) ([]string, error)
+	DeleteSession(id, audioDir string) (string, error)
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
 	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
@@ -70,8 +91,8 @@ func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speaker
 	// Try to parse as numeric index first
 	if idx, err := strconv.Atoi(speaker); err == nil {
 		// Numeric speaker index
-		for _, seg := range segments {
-			if seg.Speaker == idx {
+		for i := range segments {
+			if segments[i].Speaker == idx {
 				return true
 			}
 		}
@@ -84,8 +105,8 @@ func hasSegmentForSpeaker(segments []transcribe.Segment, speaker string, speaker
 		return false
 	}
 
-	for _, seg := range segments {
-		if seg.Speaker == speakerIndex {
+	for i := range segments {
+		if segments[i].Speaker == speakerIndex {
 			return true
 		}
 	}
@@ -120,6 +141,14 @@ func getSpeakerIndexByName(speakerNames string, name string) int {
 }
 
 func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
+	// audioDir is the audio directory a recording is read from when it is not
+	// where its entry points (recording.Resolve).
+	audioDir := func() string {
+		if cfgStore == nil {
+			return ""
+		}
+		return cfgStore.Get().AudioDir
+	}
 
 	// Health check endpoints
 	mux.HandleFunc("GET /healthz/live", func(w http.ResponseWriter, r *http.Request) {
@@ -225,6 +254,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
+		model := ""
+		if reporter, ok := embeddingClient.(interface{ ReportedModel() string }); ok {
+			model = reporter.ReportedModel()
+		}
+
 		allEmbeddings, err := store.GetAllEmbeddings()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load embeddings: %v", err))
@@ -289,7 +323,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			})
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{"results": results})
+		writeJSON(w, http.StatusOK, map[string]any{"model": model, "results": results})
 	})
 
 	// Full-text search endpoint
@@ -591,9 +625,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 			sinceTimeObj := time.Unix(0, sinceTime*int64(time.Millisecond))
 			filtered := make([]transcribe.Segment, 0, len(segments))
-			for _, seg := range segments {
-				if seg.Timestamp.After(sinceTimeObj) {
-					filtered = append(filtered, seg)
+			for i := range segments {
+				if segments[i].Timestamp.After(sinceTimeObj) {
+					filtered = append(filtered, segments[i])
 				}
 			}
 			segments = filtered
@@ -663,15 +697,132 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		speaker := strings.TrimSpace(r.URL.Query().Get("speaker"))
 		if speaker != "" {
 			filtered := make([]transcribe.Segment, 0, len(segments))
-			for _, seg := range segments {
-				if hasSegmentForSpeaker([]transcribe.Segment{seg}, speaker, sess.SpeakerNames) {
-					filtered = append(filtered, seg)
+			for i := range segments {
+				if hasSegmentForSpeaker(segments[i:i+1], speaker, sess.SpeakerNames) {
+					filtered = append(filtered, segments[i])
 				}
 			}
 			segments = filtered
 		}
 
 		writeJSON(w, http.StatusOK, segments)
+	})
+
+	mux.HandleFunc("DELETE /api/sessions/{id}/segments/{segmentID}", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !validSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+		// The two deletion actions (Sami, 2026-11-12,
+		// dispatch://INFRA-2961/ask/8dcb4d3f-a256-45dd-b0ac-ed4b06fe2a05): no
+		// client gets one by default.
+		var deleteSegment func(context.Context, string, int64, int) error
+		textOnly := false
+		switch modes := r.URL.Query()["mode"]; {
+		case len(modes) == 1 && modes[0] == segmentDeleteText:
+			deleteSegment = controls.DeleteSegmentText
+			textOnly = true
+		case len(modes) == 1 && modes[0] == segmentDeleteTextAndAudio:
+			deleteSegment = controls.DeleteSegment
+		default:
+			writeJSONError(w, http.StatusBadRequest, `mode must be "text" (Delete text: the words only; the recording and the Drive files stay) or "text_and_audio" (Delete text and audio: the words, their audio, and the Drive files replaced)`)
+			return
+		}
+		segmentID, err := strconv.ParseInt(r.PathValue("segmentID"), 10, 64)
+		if err != nil || segmentID <= 0 {
+			writeJSONError(w, http.StatusNotFound, "segment not found")
+			return
+		}
+		revisions := r.URL.Query()["revision"]
+		if len(revisions) != 1 {
+			writeJSONError(w, http.StatusBadRequest, "transcript revision is required")
+			return
+		}
+		revision, err := strconv.Atoi(revisions[0])
+		if err != nil || revision < 0 || (revision == 0 && !textOnly) {
+			writeJSONError(w, http.StatusBadRequest, "transcript revision must be a positive integer, except 0 for an untimed Delete text segment")
+			return
+		}
+		sessionData, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+		if sessionData.Status == storage.SessionActive {
+			writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
+			return
+		}
+		if !textOnly || revision != 0 {
+			if sessionData.RefinementStatus == storage.RefinementCompleted && sessionData.RefinedRevision == 0 {
+				if controls.RetryRefinement == nil {
+					writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+					return
+				}
+				go func() {
+					_ = controls.RetryRefinement(context.Background(), sessionID)
+				}()
+				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+				return
+			}
+			if sessionData.RefinementStatus == storage.RefinementNoAudio {
+				if controls.RefinementRecordingAvailable != nil {
+					if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
+						writeJSONError(w, http.StatusConflict, err.Error())
+						return
+					}
+				}
+				if controls.RetryRefinement == nil {
+					writeJSONError(w, http.StatusServiceUnavailable, "refinement retry is not configured")
+					return
+				}
+				go func() {
+					_ = controls.RetryRefinement(context.Background(), sessionID)
+				}()
+				writeJSONError(w, http.StatusConflict, "no recording is on this unit; restoring it from Drive before deletion")
+				return
+			}
+			if sessionData.RefinementStatus != storage.RefinementCompleted {
+				if sessionData.RefinementStatus == storage.RefinementFailed {
+					writeJSONError(w, http.StatusConflict, "this conversation's refinement failed; retry refinement before deleting")
+				} else {
+					writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+				}
+				return
+			}
+		}
+		if deleteSegment == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "segment deletion is not configured")
+			return
+		}
+		if err := deleteSegment(r.Context(), sessionID, segmentID, revision); err != nil {
+			switch {
+			case errors.Is(err, storage.ErrSegmentNotFound):
+				writeJSONError(w, http.StatusNotFound, "segment not found")
+			case errors.Is(err, storage.ErrSegmentSessionActive):
+				writeJSONError(w, http.StatusConflict, "This conversation is still being recorded. Delete the segment after it ends.")
+			case isRecordingRestoreInProgress(err):
+				writeJSONError(w, http.StatusConflict, "Restoring the recording; try again shortly.")
+			case errors.Is(err, storage.ErrSegmentSplicePending):
+				writeJSONError(w, http.StatusConflict, "A previous segment deletion is still being recovered. Try again after it completes.")
+			case errors.Is(err, storage.ErrStaleTranscriptRevision):
+				writeJSONError(w, http.StatusConflict, "the transcript changed; refresh and try again")
+			case errors.Is(err, storage.ErrMergeProvenanceUnavailable):
+				writeJSONError(w, http.StatusConflict, "part of this conversation's merge history can't be traced, so nothing in it can be deleted safely")
+			case errors.Is(err, storage.ErrRefinedSegmentsUnavailable):
+				writeJSONError(w, http.StatusConflict, "this conversation is still being refined; delete once it finishes")
+			case errors.Is(err, ErrSegmentRawAudioKept):
+				writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			default:
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete segment: %v", err))
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("PATCH /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -740,19 +891,108 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		if err := store.DeleteSession(sessionID); err != nil {
+		recordingDir := audioDir()
+		sourceIDs, err := store.SourceSessionIDs(sessionID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("list source sessions for raw erase: %v", err))
+			return
+		}
+		rawIDs := append([]string{sessionID}, sourceIDs...)
+		var rawReservations []rawEraseReservation
+		for _, rawID := range rawIDs {
+			rawPath, err := filepath.Abs(filepath.Join(recordingDir, rawID+".pcm"))
+			if err != nil {
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("find raw session recording: %v", err))
+				return
+			}
+			reservation, err := erase.Reserve(rawPath)
+			if err != nil {
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reserve raw session erase: %v", err))
+				return
+			}
+			persistedHiddenPath, err := store.ReserveRawSessionErase(rawID, reservation.OriginalPath(), reservation.HiddenPath())
+			if err != nil {
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reserve raw session erase: %v", err))
+				return
+			}
+			reusedReservation := persistedHiddenPath != reservation.HiddenPath()
+			reservation, err = erase.ReservationAt(rawPath, persistedHiddenPath)
+			if err != nil {
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
+				_ = store.CancelRawSessionErase(rawID, persistedHiddenPath)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reuse raw session erase reservation: %v", err))
+				return
+			}
+			rawReservation := rawEraseReservation{sessionID: rawID, originalPath: rawPath, hiddenPath: persistedHiddenPath}
+			rawReservations = append(rawReservations, rawReservation)
+			hidden, rawErr := beginReservedErasing(reservation)
+			rawReservations[len(rawReservations)-1].pending = hidden
+			rawReservations[len(rawReservations)-1].keepHidden = reusedReservation && rawErr != nil && !errors.Is(rawErr, erase.ErrLeftover)
+			switch {
+			case errors.Is(rawErr, erase.ErrLeftover):
+				slog.Warn("could not flush the removal of a deleted session's raw recording; it is erased after the answer", "session_id", rawID, "audio_path", rawPath, "error", rawErr)
+			case errors.Is(rawErr, os.ErrNotExist):
+			case rawErr != nil:
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("hide raw session recording: %v", rawErr))
+				return
+			}
+		}
+		audioPath, err := store.DeleteSession(sessionID, recordingDir)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				finishRawErasing(store, rawReservations)
+			} else {
+				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
+			}
+			if errors.Is(err, storage.ErrDeleteReplacementPending) || errors.Is(err, storage.ErrDeleteMergeActive) {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 			return
 		}
+		if controls.OnSessionDeleted != nil {
+			controls.OnSessionDeleted(sessionID)
+		}
 
-		// Clean up audio files after successful DB deletion.
-		if sessionData.AudioPath != "" {
-			for _, p := range strings.Split(sessionData.AudioPath, ",") {
-				p = strings.TrimSpace(p)
-				if p != "" {
-					_ = os.Remove(p)
-				}
+		// Erase the recordings the deleted row named after the database
+		// deletion. The raw microphone capture was hidden first, while its row
+		// still existed, so a failed rename leaves the session available to
+		// retry. Removing a whole audio file overwrites it with zeros before
+		// the file system frees its blocks (Sami, 2026-11-12, "Zero every
+		// audio removal", dispatch://INFRA-2961/ask/172349fa-0019-488c-9d3b-9d6b7af26a81).
+		// DeleteSession recorded every erase directory before the row went, so
+		// an erase cut off by a stop is finished as the app starts. The files
+		// leave their names before the answer; the zeros follow it.
+		pending := make([]erase.Pending, 0)
+		for _, p := range strings.Split(audioPath, ",") {
+			if p = strings.TrimSpace(p); p == "" {
+				continue
 			}
+			p = recordingname.Resolve(p, recordingDir)
+			hidden, err := beginErasing(p)
+			switch {
+			case errors.Is(err, erase.ErrLeftover):
+				// The file has its hidden name, but the rename may not be on
+				// disk yet; Finish flushes the directory again.
+				slog.Warn("could not flush the removal of a deleted session's recording; it is erased after the answer", "session_id", sessionID, "audio_path", p, "error", err)
+			case err != nil:
+				if !errors.Is(err, os.ErrNotExist) {
+					slog.Warn("could not remove a deleted session's recording", "session_id", sessionID, "audio_path", p, "error", err)
+				}
+				continue
+			}
+			pending = append(pending, hidden)
+		}
+		if len(rawReservations) > 0 {
+			go finishRawErasing(store, rawReservations)
+		}
+		if len(pending) > 0 {
+			go finishErasing(sessionID, pending)
 		}
 
 		w.WriteHeader(http.StatusNoContent)
@@ -794,10 +1034,21 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			}
 		}
 
-		newID := earliest.UTC().Format("20060102150405") + "-merged"
+		newID, err := nextMergedSessionID(store, earliest)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("choose merged session id: %v", err))
+			return
+		}
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
+			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) || errors.Is(err, storage.ErrMergeSessionExists) {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("merge sessions: %v", err))
 			return
+		}
+		if controls.OnSessionsMerged != nil {
+			controls.OnSessionsMerged(body.SessionIDs)
 		}
 
 		if controls.OnSessionMerged != nil {
@@ -847,7 +1098,16 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 		for i := range sessions {
 			sess := &sessions[i]
-			if sess.Status == "merged" {
+			if sess.Status == storage.SessionMerged {
+				if len(currentGroup) >= 2 {
+					groups = append(groups, currentGroup)
+				}
+				currentGroup = nil
+				prevEnded = nil
+				continue
+			}
+			if sess.Status == storage.SessionActive {
+				slog.Warn("auto-merge skipped recording session", "session_id", sess.ID)
 				if len(currentGroup) >= 2 {
 					groups = append(groups, currentGroup)
 				}
@@ -889,12 +1149,19 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 					latest = *sess.EndedAt
 				}
 			}
-			newID := earliest.UTC().Format("20060102150405") + "-merged"
+			newID, err := nextMergedSessionID(store, earliest)
+			if err != nil {
+				slog.Error("choose auto-merge session id", "group", group, "error", err)
+				continue
+			}
 			if err := store.MergeSessions(newID, group, earliest, latest); err != nil {
 				slog.Error("auto-merge failed", "group", group, "error", err)
 				continue
 			}
 			mergedIDs = append(mergedIDs, newID)
+			if controls.OnSessionsMerged != nil {
+				controls.OnSessionsMerged(group)
+			}
 			if controls.OnSessionMerged != nil {
 				go controls.OnSessionMerged(context.Background(), newID)
 			}
@@ -1016,8 +1283,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			writeJSONError(w, http.StatusForbidden, "invalid audio path")
 			return
 		}
+		// Read where every reader of a recording finds it: as written, else
+		// its name in the audio directory.
+		recordingPath := recordingname.Resolve(cleanPath, audioDir())
 
-		f, err := os.Open(cleanPath)
+		f, err := os.Open(recordingPath)
 		if err != nil {
 			writeJSONError(w, http.StatusNotFound, "audio file not found")
 			return
@@ -1031,9 +1301,11 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		w.Header().Set("Content-Type", contentTypeForAudio(cleanPath))
-		http.ServeContent(w, r, filepath.Base(cleanPath), info.ModTime(), f)
+		// No browser keeps a copy: a segment deletion splices this file, and
+		// the spliced recording is served at this same URL (noStoreAPI).
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", contentTypeForAudio(recordingPath))
+		http.ServeContent(w, r, filepath.Base(recordingPath), info.ModTime(), f)
 	})
 
 	mux.HandleFunc("GET /api/sessions/{id}/context", func(w http.ResponseWriter, r *http.Request) {
@@ -1079,9 +1351,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		qLower := strings.ToLower(q)
 		var matchTime float64
 		found := false
-		for _, seg := range segments {
-			if strings.Contains(strings.ToLower(seg.Text), qLower) {
-				matchTime = seg.StartTime
+		for i := range segments {
+			if strings.Contains(strings.ToLower(segments[i].Text), qLower) {
+				matchTime = segments[i].StartTime
 				found = true
 				break
 			}
@@ -1122,18 +1394,27 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 	})
 
 	mux.HandleFunc("POST /api/pause", func(w http.ResponseWriter, r *http.Request) {
+		var pauseErr error
 		if controls.Pause != nil {
-			controls.Pause()
+			pauseErr = controls.Pause()
 		}
+		// A Pause error still leaves capture paused, so clients must hear of it.
 		if controls.OnStatusChanged != nil {
 			controls.OnStatusChanged(true)
+		}
+		if pauseErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("pause capture: %v", pauseErr))
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("POST /api/resume", func(w http.ResponseWriter, r *http.Request) {
 		if controls.Resume != nil {
-			controls.Resume()
+			if err := controls.Resume(); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("resume capture: %v", err))
+				return
+			}
 		}
 		if controls.OnStatusChanged != nil {
 			controls.OnStatusChanged(false)
@@ -1206,6 +1487,13 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		if unverified > 0 {
 			warnings = append(slices.Clip(warnings), unverifiedWarning(unverified))
 		}
+		unitOnly := 0
+		if controls.UnitOnlySessions != nil {
+			unitOnly = controls.UnitOnlySessions()
+		}
+		if unitOnly > 0 {
+			warnings = append(slices.Clip(warnings), unitOnlyWarning(unitOnly))
+		}
 		if warnings == nil {
 			warnings = []string{}
 		}
@@ -1227,6 +1515,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"kept_raw_bytes":            kept.Bytes,
 			"gc_hold":                   gcHold,
 			"unverified_sessions":       unverified,
+			"unit_only_sessions":        unitOnly,
 			"active_session_id":         activeSessionID,
 			"active_session_started_at": activeSessionStartedAt,
 		})
@@ -1334,17 +1623,17 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		// Refinement transcribes the saved recording; without one it can only fail.
-		if sess, err := store.GetSession(sessionID); err == nil && sess.AudioPath == "" {
-			writeJSONError(w, http.StatusConflict, "session has no saved recording to refine")
-			return
+		if controls.RefinementRecordingAvailable != nil {
+			if err := controls.RefinementRecordingAvailable(r.Context(), sessionID); err != nil {
+				writeJSONError(w, http.StatusConflict, err.Error())
+				return
+			}
 		}
-
 		go func() {
 			_ = controls.RetryRefinement(context.Background(), sessionID)
 		}()
 
-		writeJSON(w, http.StatusOK, map[string]bool{"triggered": true})
+		writeJSON(w, http.StatusAccepted, map[string]bool{"triggered": true})
 	})
 
 	// Config endpoints — only registered if cfgStore is provided.
@@ -1409,7 +1698,30 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				return
 			}
 
-			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "queued"})
+			var speechStatus map[string]any
+			if controls.TTSWaitForSynthesis != nil {
+				var waitErr error
+				speechStatus, waitErr = controls.TTSWaitForSynthesis(r.Context(), id)
+				if waitErr != nil {
+					writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("TTS synthesis failed: %v", waitErr))
+					return
+				}
+			} else if controls.TTSStatus != nil {
+				speechStatus, _ = controls.TTSStatus(id)
+			}
+			if state, _ := speechStatus["status"].(string); state == tts.StatusFailed {
+				message, _ := speechStatus["error"].(string)
+				writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("TTS synthesis failed: %s", message))
+				return
+			}
+			if model, ok := speechStatus["model"].(string); ok && model != "" {
+				w.Header().Set("X-Ghost-Wispr-TTS-Model", model)
+			}
+			if voice, ok := speechStatus["voice"].(string); ok && voice != "" {
+				w.Header().Set("X-Ghost-Wispr-TTS-Voice", voice)
+			}
+
+			writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "synthesized"})
 		})
 
 		mux.HandleFunc("GET /api/tts/status/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -1453,6 +1765,95 @@ func cosineSimilarity(a, b []float32) float32 {
 	}
 
 	return float32(dot / (math.Sqrt(normA) * math.Sqrt(normB)))
+}
+
+// beginErasing hides a whole recording before it is zeroed. Tests replace it
+// to exercise failures before a session row is deleted.
+var beginErasing = erase.Begin
+
+// beginReservedErasing moves a raw file to the hidden name already persisted
+// by ReserveRawSessionErase. Tests replace it to stop after an earlier raw
+// file is hidden.
+var beginReservedErasing = func(reservation erase.Reservation) (erase.Pending, error) {
+	return reservation.Begin()
+}
+
+type rawEraseReservation struct {
+	sessionID, originalPath, hiddenPath string
+	pending                             erase.Pending
+	keepHidden                          bool
+}
+
+// restoreRawSessionErasures restores every hidden raw file after a delete
+// aborts. A failed restore stays reserved for startup recovery. Each error
+// names the raw file's own session, which can be a merged source rather than
+// the API target.
+func restoreRawSessionErasures(store SessionStore, reservations []rawEraseReservation, refreshWarning func()) {
+	for _, reservation := range reservations {
+		if reservation.keepHidden {
+			continue
+		}
+		if err := reservation.pending.Restore(); err != nil {
+			slog.Warn("could not restore a raw session recording after its delete failed", "session_id", reservation.sessionID, "error", err)
+			if refreshWarning != nil {
+				refreshWarning()
+			}
+			continue
+		}
+		if err := store.CancelRawSessionErase(reservation.sessionID, reservation.hiddenPath); err != nil {
+			slog.Error("could not cancel a restored raw session erase", "session_id", reservation.sessionID, "error", err)
+		}
+	}
+}
+
+// finishRawErasing zeroes hidden raw files after their session rows are gone.
+// It also reaches a persisted hidden name that a retry reuses but Begin cannot
+// return because its original name is already gone.
+var finishRawErasing = func(store SessionStore, reservations []rawEraseReservation) {
+	for _, reservation := range reservations {
+		var err error
+		if reservation.keepHidden {
+			err = erase.Finish(reservation.originalPath, reservation.hiddenPath)
+		} else {
+			err = reservation.pending.Finish()
+		}
+		if err != nil {
+			slog.Warn("could not overwrite a deleted raw session recording; it is erased as the app starts", "session_id", reservation.sessionID, "audio_path", reservation.originalPath, "error", err)
+			continue
+		}
+		if err := store.CancelRawSessionErase(reservation.sessionID, reservation.hiddenPath); err != nil {
+			slog.Warn("could not clear a completed raw erase reservation", "session_id", reservation.sessionID, "hidden_path", reservation.hiddenPath, "error", err)
+		}
+	}
+}
+
+// finishErasing overwrites with zeros and removes the recordings a session
+// delete moved to hidden names, after the response. One it cannot finish
+// stays under its hidden name for erase.Leftovers as the app starts. Tests
+// replace it to see the response come first.
+var finishErasing = func(sessionID string, pending []erase.Pending) {
+	for _, p := range pending {
+		if err := p.Finish(); err != nil {
+			slog.Warn("could not overwrite a deleted session's recording; it is erased as the app starts", "session_id", sessionID, "error", err)
+		}
+	}
+}
+
+func nextMergedSessionID(store SessionStore, earliest time.Time) (string, error) {
+	base := earliest.UTC().Format("20060102150405") + "-merged"
+	for suffix := 1; ; suffix++ {
+		id := base
+		if suffix > 1 {
+			id = fmt.Sprintf("%s-%d", base, suffix)
+		}
+		if _, err := store.GetSession(id); err == nil {
+			continue
+		} else if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+			return id, nil
+		} else {
+			return "", fmt.Errorf("check merged session id %s: %w", id, err)
+		}
+	}
 }
 
 func validSessionID(id string) bool {

@@ -60,7 +60,7 @@ func TestResyncOfAMainEraFolderUpdatesTheDocumentsInPlace(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "Merged", "The current summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "Merged", "The current summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	// As the re-sync migration leaves it: pending, its folder kept.
@@ -213,10 +213,10 @@ func listModule(root string) ([]goPackage, map[string]string, error) {
 
 // typeCheckModule type-checks each package of the module at root, its code
 // outside tests with overlay's files (path to content) added, and returns its
-// files and the objects each identifier there uses. Imports are read from the
-// export data go list builds, with the standard library's importer, which
-// reads the format of the toolchain running the test.
-func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*token.FileSet, []*ast.File, map[*ast.Ident]types.Object) {
+// files and type information. Imports are read from the export data go list
+// builds, with the standard library's importer, which reads the format of the
+// toolchain running the test.
+func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*token.FileSet, []*ast.File, *types.Info) {
 	t.Helper()
 	modulePackages, exports, err := listModule(root)
 	if err != nil {
@@ -230,7 +230,10 @@ func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*tok
 		return os.Open(exports[path])
 	})
 	var all []*ast.File
-	uses := map[*ast.Ident]types.Object{}
+	info := &types.Info{
+		Uses:  map[*ast.Ident]types.Object{},
+		Types: map[ast.Expr]types.TypeAndValue{},
+	}
 	for _, p := range modulePackages {
 		sources := map[string]any{}
 		for _, name := range p.CompiledGoFiles {
@@ -255,7 +258,7 @@ func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*tok
 		conf := types.Config{Importer: imports, Error: func(err error) {
 			t.Errorf("package %s does not type-check, so the check cannot see it: %v", p.ImportPath, err)
 		}}
-		_, _ = conf.Check(p.ImportPath, fset, files, &types.Info{Uses: uses})
+		_, _ = conf.Check(p.ImportPath, fset, files, info)
 		all = append(all, files...)
 	}
 	if t.Failed() {
@@ -264,7 +267,7 @@ func typeCheckModule(t *testing.T, root string, overlay map[string][]byte) (*tok
 	if len(all) < 20 {
 		t.Fatalf("type-checked %d Go files under %s; the check missed the code", len(all), root)
 	}
-	return fset, all, uses
+	return fset, all, info
 }
 
 // written returns the identifiers in files that a value is written through:
@@ -312,11 +315,11 @@ func written(files []*ast.File) map[*ast.Ident]bool {
 // HTTP, another API version) is not seen.
 func driveDeletions(t *testing.T, root string, overlay map[string][]byte) []string {
 	t.Helper()
-	fset, files, uses := typeCheckModule(t, root, overlay)
+	fset, files, info := typeCheckModule(t, root, overlay)
 	writes := written(files)
 	var found []string
 	driveUses := 0
-	for id, obj := range uses {
+	for id, obj := range info.Uses {
 		if obj.Pkg() == nil || obj.Pkg().Path() != drivePackage {
 			continue
 		}
@@ -376,12 +379,66 @@ func isDriveDeleteCall(name string) bool {
 	return strings.HasSuffix(name, "DeleteCall") || strings.HasSuffix(name, "EmptyTrashCall")
 }
 
-// Nothing in the app deletes or trashes a file on Google Drive: Drive holds
-// the user's backup, and a document there may hold their edits.
+// replacementDeleteFunction is the one function with a Drive delete call:
+// replaceFolder (replace.go), which a segment deletion's replacement runs for
+// each folder it owes.
+const replacementDeleteFunction = "replaceFolder"
+
+// No app code deletes or trashes a Drive file except replaceFolder, which
+// removes recorded old files and duplicate app-created replacement uploads
+// only after it stores the replacement to retain.
 func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
-	for _, f := range driveDeletions(t, moduleRoot(t), nil) {
-		t.Error(f)
+	root := moduleRoot(t)
+	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")
+	allowedLocations := map[string]bool{}
+	for _, finding := range driveDeletions(t, root, nil) {
+		path, line, ok := driveDeletionLocation(finding)
+		if ok && path == replacePath && functionAtLine(t, path, line) == replacementDeleteFunction {
+			allowedLocations[fmt.Sprintf("%s:%d", path, line)] = true
+			continue
+		}
+		t.Error(finding)
 	}
+	if len(allowedLocations) != 1 {
+		t.Errorf("found %d allowed Drive delete call sites in %s, want exactly one", len(allowedLocations), replacementDeleteFunction)
+	}
+}
+
+func driveDeletionLocation(finding string) (string, int, bool) {
+	path, rest, ok := strings.Cut(finding, ".go:")
+	if !ok {
+		return "", 0, false
+	}
+	lineText, _, ok := strings.Cut(rest, ":")
+	if !ok {
+		return "", 0, false
+	}
+	line, err := strconv.Atoi(lineText)
+	if err != nil {
+		return "", 0, false
+	}
+	return path + ".go", line, true
+}
+
+func functionAtLine(t *testing.T, path string, line int) string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		start := fset.Position(function.Pos()).Line
+		end := fset.Position(function.End()).Line
+		if start <= line && line <= end {
+			return function.Name.Name
+		}
+	}
+	return ""
 }
 
 // deletionProbe is code that deletes or trashes files on Drive in every form
@@ -475,15 +532,18 @@ func TestTheDriveDeletionCheckFindsEveryForm(t *testing.T) {
 		}
 	}
 	found := map[string]bool{}
-	for _, f := range driveDeletions(t, root, overlay) {
-		path, rest, _ := strings.Cut(f, ".go:")
-		lineText, _, _ := strings.Cut(rest, ":")
-		if _, err := strconv.Atoi(lineText); err != nil {
-			t.Fatalf("finding %q: %v", f, err)
+	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")
+	for _, finding := range driveDeletions(t, root, overlay) {
+		path, line, ok := driveDeletionLocation(finding)
+		if !ok {
+			t.Fatalf("finding %q has no source location", finding)
 		}
-		at := path + ".go:" + lineText
-		if _, ok := probes[path+".go"]; !ok {
-			t.Errorf("outside the probes: %s", f)
+		if path == replacePath && functionAtLine(t, path, line) == replacementDeleteFunction {
+			continue
+		}
+		at := fmt.Sprintf("%s:%d", path, line)
+		if _, ok := probes[path]; !ok {
+			t.Errorf("outside the probes: %s", finding)
 			continue
 		}
 		found[at] = true
@@ -533,7 +593,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 	if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
-	if err := store.UpdateSummary(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}"); err != nil {
+	if err := store.UpdateSummaryAtGeneration(id, "", "The first summary.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
@@ -554,7 +614,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 		if !fired.CompareAndSwap(false, true) {
 			return
 		}
-		if err := store.UpdateSummary(id, "", "The summary, made again.", storage.SummaryCompleted, "default", "{}"); err != nil {
+		if err := store.UpdateSummaryAtGeneration(id, "", "The summary, made again.", storage.SummaryCompleted, "default", "{}", "", 0); err != nil {
 			t.Errorf("summarize again: %v", err)
 		}
 		if err := o.SyncSession(ctx, id); err != nil {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import SessionCard from './SessionCard.svelte'
-  import { fetchSearch } from '../lib/api'
+  import { fetchSearch, requestErrorMessage } from '../lib/api'
   import {
     SessionStatus,
     SummaryStatus,
@@ -24,6 +24,8 @@
     onResummarize,
     onDelete,
     onMerge,
+    onRefreshSession,
+    onSegmentDeleted,
   }: {
     dates: string[]
     sessionsByDate: Map<string, SessionSummary[]>
@@ -36,11 +38,16 @@
     onResummarize: (sessionId: string, preset: string) => Promise<void>
     onDelete: (id: string) => Promise<void>
     onMerge: (sessionIds: string[]) => Promise<void>
+    onRefreshSession: (id: string) => Promise<void>
+    onSegmentDeleted: (sessionID: string, segmentID: number) => void
   } = $props()
 
   let loadedDates = $state(3)
   let showHidden = $state<Record<string, boolean>>({})
   let selectedIds = $state<Set<string>>(new Set())
+  // Why the last merge was refused (the API's reason), shown until the next
+  // merge or the selection ends.
+  let mergeError = $state('')
   let dateFilter = $state('all')
   let statusFilter = $state('all')
 
@@ -63,12 +70,43 @@
 
   function exitSelectMode() {
     selectedIds = new Set()
+    mergeError = ''
   }
 
   async function handleMerge() {
     if (selectedIds.size < 2) return
-    await onMerge([...selectedIds])
+    mergeError = ''
+    try {
+      await onMerge([...selectedIds])
+    } catch (error) {
+      mergeError = requestErrorMessage(error)
+      return
+    }
     exitSelectMode()
+  }
+
+  function handleSegmentDeleted(sessionID: string, segmentID: number): void {
+    onSegmentDeleted(sessionID, segmentID)
+    searchRequestID++
+    searchQuery = ''
+    searchResults = []
+    searchError = ''
+    isSearching = false
+  }
+
+  async function handleSegmentNotFound(sessionID: string, segmentID: number): Promise<boolean> {
+    searchRequestID++
+    searchQuery = ''
+    searchResults = []
+    searchError = ''
+    isSearching = false
+    try {
+      await onRefreshSession(sessionID)
+      return false
+    } catch {
+      onSegmentDeleted(sessionID, segmentID)
+      return true
+    }
   }
 
   function isShortSession(session: SessionSummary): boolean {
@@ -203,6 +241,9 @@
           <button type="button" class="merge-btn" onclick={handleMerge}>Merge</button>
         {/if}
         <button type="button" class="select-action-btn" onclick={exitSelectMode}>Cancel</button>
+        {#if mergeError}
+          <p class="merge-error" role="alert">Merge refused: {mergeError}</p>
+        {/if}
       </div>
     {/if}
   </header>
@@ -282,6 +323,9 @@
                 {onLoadDetail}
                 {onResummarize}
                 {onDelete}
+                {onRefreshSession}
+                onSegmentDeleted={handleSegmentDeleted}
+                onSegmentNotFound={handleSegmentNotFound}
               />
             {/each}
           </div>
@@ -396,7 +440,8 @@
     font-size: 0.86rem;
   }
 
-  .search-error {
+  .search-error,
+  .merge-error {
     color: var(--danger, #dc2626);
   }
 </style>

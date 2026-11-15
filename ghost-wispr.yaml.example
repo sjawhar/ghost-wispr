@@ -1,11 +1,15 @@
 # Ghost Wispr Configuration
 # Copy to ghost-wispr.yaml and customize as needed.
 #
+# Google authentication uses google_credentials_file in this YAML first.
+# GOOGLE_APPLICATION_CREDENTIALS is the fallback when that key is empty.
+# The fallback accepts any Application Default Credential type.
 # API keys are configured ONLY via environment variables:
 #   GHOST_WISPR_DEEPGRAM_API_KEY    (required for live transcription)
 #   GHOST_WISPR_OPENAI_API_KEY      (for OpenAI summarization)
 #   GHOST_WISPR_ANTHROPIC_API_KEY   (for Anthropic summarization)
 #   GHOST_WISPR_GEMINI_API_KEY      (for Gemini summarization)
+#   GHOST_WISPR_ENVOY_WEBHOOK_SECRET (signs posts to Envoy's webhook)
 
 # Database
 db_path: data/ghost-wispr.db
@@ -18,6 +22,10 @@ silence_timeout: 30s
 mic_sample_rate: 16000
 mic_sample_rates: [48000, 44100, 32000, 24000]
 
+# Office recorder hardware (both are disabled unless configured)
+# indicator_light: blink1
+# power_button: true
+
 # Summarization — model format is provider/model_name
 summarization:
   model: openai/gpt-4o-mini
@@ -29,22 +37,27 @@ summarization:
       system_prompt: "Summarize the following office conversation transcript concisely in markdown. Include key topics, decisions made, and action items if any."
       user_template: "{{transcript}}"
 
-# Google Drive sync (optional)
+# Google Drive, Vertex AI, text-to-speech, and ghost-wispr google-id-token use google_credentials_file.
+# When it is empty, Google Application Default Credentials are the fallback.
 # gdrive_folder_id:
-# google_credentials_file: ./service-account.json
+# google_credentials_file: /opt/ghost-wispr/google-credentials.json
 # gdrive_sync_enabled: false
+
+# Envoy webhook (optional). Posts are signed with GHOST_WISPR_ENVOY_WEBHOOK_SECRET.
+# envoy_enabled: false
+# envoy_webhook_url: https://relay.example.test/webhook/ghostwispr
 
 # Garbage collection
 # gc_enabled: false
 # Delete ended sessions that have a summary (rows, transcripts, audio) older
-# than this many days; synced ones only when Drive sync is on. A session
-# restored from Drive counts from its restore. 0 = never.
+# than this many days. GC is always Drive-gated: if Drive sync is off, lacks a
+# folder, or cannot verify a session, it removes no audio and reports a hold.
+# A session restored from Drive counts from its restore. 0 = never.
 # gc_max_age_days: 30
-# Budget for the audio GC may remove: saved recordings of ended sessions,
-# synced ones only when Drive sync is on. Past it, GC removes the oldest
+# Budget for audio GC. Past it, GC removes the oldest verified Drive-backed
 # sessions' audio files and keeps the sessions ("Audio removed to free space").
-# Raw recordings kept because they could not be saved, and unsynced audio, are
-# not counted or removed: GET /api/status reports kept raw recordings.
+# Raw recordings kept because they could not be saved, and unverified audio,
+# are not counted or removed: GET /api/status reports kept raw recordings.
 # 0 = no budget: GC removes no audio to free space.
 # A negative value for either is a mistake: the default is used, with a warning.
 # gc_max_audio_size_mb: 1024

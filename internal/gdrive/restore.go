@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,20 +15,22 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // RestoredSession holds all data parsed from a GDrive session folder.
 type RestoredSession struct {
-	ID            string
-	Title         string
-	StartedAt     time.Time
-	EndedAt       *time.Time
-	Summary       string
-	SummaryPreset string
-	Segments      []transcribe.Segment
-	DriveFolderID string
-	HasAudio      bool
+	ID             string
+	Title          string
+	StartedAt      time.Time
+	EndedAt        *time.Time
+	Summary        string
+	SummaryPreset  string
+	Segments       []transcribe.Segment
+	DriveFolderID  string
+	HasAudio       bool
+	RecordingPaths []string
 }
 
 // RestoreResult summarizes the outcome of a restore operation.
@@ -36,11 +41,18 @@ type RestoreResult struct {
 }
 
 // ListSessionFolders returns all subfolders in the configured root folder.
+// Drive lists no files, and no error, for a parent it does not have (and,
+// it is taken, for a shared drive the app is not a member of), so when it
+// lists none the root is asked for (rootReadable): a root that does not read
+// is an error, not an empty Drive. In a shared drive, the list without
+// corpora is taken to hold the folders the app made there (Drive documents
+// it; not measured), so when it lists none the drive's own list (corpora
+// "drive") is asked too: a folder there is an error, not an empty Drive.
 func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) {
 	var folders []*drive.File
 	pageToken := ""
+	q := fmt.Sprintf("'%s' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", strings.ReplaceAll(s.folderID, "'", `\'`))
 	for {
-		q := fmt.Sprintf("'%s' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", s.folderID)
 		call := s.service.Files.List().
 			Q(q).
 			Fields("nextPageToken, files(id, name, createdTime)").
@@ -62,7 +74,24 @@ func (s *Syncer) ListSessionFolders(ctx context.Context) ([]*drive.File, error) 
 		}
 		pageToken = resp.NextPageToken
 	}
-
+	if len(folders) > 0 {
+		return folders, nil
+	}
+	sharedDrive, err := s.rootReadable(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list session folders: none found, and the folder the app syncs into (%s) cannot be read, so access to Drive may be lost: %v", s.folderID, err)
+	}
+	if sharedDrive {
+		inDrive, err := s.service.Files.List().Corpora("drive").DriveId(s.folderID).Q(q).PageSize(1).
+			SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+			Fields("files(id)").Context(ctx).Do()
+		if err != nil {
+			return nil, fmt.Errorf("list session folders: none found, and shared drive %s could not be listed to check: %v", s.folderID, err)
+		}
+		if len(inDrive.Files) > 0 {
+			return nil, fmt.Errorf("list session folders: none found, though shared drive %s holds folder %s the app made: Drive's list of the drive's folders without corpora left it out, so a restore would miss sessions", s.folderID, inDrive.Files[0].Id)
+		}
+	}
 	return folders, nil
 }
 
@@ -74,7 +103,7 @@ func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive
 	for {
 		call := s.service.Files.List().
 			Q(q).
-			Fields("nextPageToken, files(id, name, mimeType, appProperties, modifiedTime)").
+			Fields("nextPageToken, files(id, name, mimeType, sha256Checksum, appProperties, modifiedTime)").
 			SupportsAllDrives(true).
 			IncludeItemsFromAllDrives(true).
 			PageSize(100).
@@ -93,6 +122,66 @@ func (s *Syncer) ListFolderFiles(ctx context.Context, folderID string) ([]*drive
 		pageToken = resp.NextPageToken
 	}
 	return files, nil
+}
+
+// DownloadRecording finds name in folderID and atomically writes it to destination.
+func (s *Syncer) DownloadRecording(ctx context.Context, folderID, name, destination string) error {
+	files, err := s.ListFolderFiles(ctx, folderID)
+	if err != nil {
+		return err
+	}
+	var recording *drive.File
+	for _, file := range files {
+		if file.Name == name && strings.HasPrefix(file.MimeType, "audio/") {
+			recording = file
+			break
+		}
+	}
+	if recording == nil {
+		return fmt.Errorf("%w: recording %s in folder %s", os.ErrNotExist, name, folderID)
+	}
+
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".download-*"+filepath.Ext(destination))
+	if err != nil {
+		return fmt.Errorf("create recording download beside %s: %w", destination, err)
+	}
+	tempPath := temp.Name()
+	keepTemp := false
+	defer func() {
+		if !keepTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	response, err := s.service.Files.Get(recording.Id).SupportsAllDrives(true).Context(ctx).Download()
+	if err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("download recording %s: %w", name, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if _, err := io.Copy(temp, response.Body); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write downloaded recording %s: %w", destination, err)
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("flush downloaded recording %s: %w", destination, err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close downloaded recording %s: %w", destination, err)
+	}
+	if err := os.Rename(tempPath, destination); err != nil {
+		return fmt.Errorf("replace recording %s: %w", destination, err)
+	}
+	keepTemp = true
+	directory, err := os.Open(filepath.Dir(destination))
+	if err != nil {
+		return fmt.Errorf("open recording directory %s: %w", filepath.Dir(destination), err)
+	}
+	defer func() { _ = directory.Close() }()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("flush recording directory %s: %w", filepath.Dir(destination), err)
+	}
+	return nil
 }
 
 // ExportGoogleDoc exports a Google Docs file as plain text.
@@ -197,6 +286,7 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 	// re-sync updates it.
 	docs := map[string][]driveFile{}
 	hasAudio := false
+	var recordingPaths []string
 	for _, f := range files {
 		switch f.Name {
 		case "transcript.md", "summary.md":
@@ -204,9 +294,13 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 		default:
 			if strings.HasPrefix(f.MimeType, "audio/") {
 				hasAudio = true
+				if path, ok := recordingname.LocalName(f.Name); ok {
+					recordingPaths = append(recordingPaths, path)
+				}
 			}
 		}
 	}
+	sort.Strings(recordingPaths)
 	var transcriptFileID, summaryFileID string
 	if copies := docs["transcript.md"]; len(copies) > 0 {
 		transcriptFileID = newestFile(copies).ID
@@ -230,12 +324,13 @@ func (s *Syncer) restoreFolder(ctx context.Context, folder *drive.File) (*Restor
 	}
 
 	sess := &RestoredSession{
-		ID:            meta.ID,
-		StartedAt:     meta.StartedAt,
-		EndedAt:       meta.EndedAt,
-		Segments:      segments,
-		DriveFolderID: folder.Id,
-		HasAudio:      hasAudio,
+		ID:             meta.ID,
+		StartedAt:      meta.StartedAt,
+		EndedAt:        meta.EndedAt,
+		Segments:       segments,
+		DriveFolderID:  folder.Id,
+		HasAudio:       hasAudio,
+		RecordingPaths: recordingPaths,
 	}
 
 	if summaryFileID != "" {

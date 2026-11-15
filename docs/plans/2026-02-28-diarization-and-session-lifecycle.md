@@ -239,6 +239,7 @@ jj describe -m "feat: add transcription config section with endpointing and utte
 ```go
 type LiveTranscriptInterimEvent struct {
 	Event
+	SessionID string  `json:"session_id,omitempty"`
 	Speaker   int     `json:"speaker"`
 	Text      string  `json:"text"`
 	StartTime float64 `json:"start_time"`
@@ -248,9 +249,10 @@ type LiveTranscriptInterimEvent struct {
 **Step 2: Add BroadcastLiveTranscriptInterim to hub.go**
 
 ```go
-func (h *Hub) BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64) {
+func (h *Hub) BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64) {
 	h.broadcastEvent(LiveTranscriptInterimEvent{
 		Event:     newEvent("live_transcript_interim", time.Now().UTC()),
+		SessionID: sessionID,
 		Speaker:   speaker,
 		Text:      text,
 		StartTime: startTime,
@@ -260,7 +262,7 @@ func (h *Hub) BroadcastLiveTranscriptInterim(speaker int, text string, startTime
 
 **Step 3: Update EventBroadcaster interface in types.go**
 
-Add `BroadcastLiveTranscriptInterim(speaker int, text string, startTime float64)` to the `EventBroadcaster` interface.
+Add `BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64)` to the `EventBroadcaster` interface.
 
 **Step 4: Update hubMock in manager_test.go**
 
@@ -404,7 +406,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 				}
 				startTime = words[0].Start
 			}
-			m.hub.BroadcastLiveTranscriptInterim(speaker, sentence, startTime)
+			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, sentence, startTime)
 		}
 		return nil
 	}
@@ -448,7 +450,7 @@ func (m *Manager) flushBuffer() error {
 		}
 
 		if m.hub != nil {
-			m.hub.BroadcastLiveTranscript(segments[i])
+			m.hub.BroadcastLiveTranscript(sessionID, segments[i])
 		}
 	}
 	return nil

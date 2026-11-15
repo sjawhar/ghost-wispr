@@ -113,3 +113,39 @@ func TestAPIStatusReportsUnverifiedSessions(t *testing.T) {
 		}
 	}
 }
+
+// The sessions kept on this unit only (their Drive folder gone or
+// unreadable) show in GET /api/status as unit_only_sessions and, when there
+// are any, as a warning the web UI's banner shows.
+func TestAPIStatusReportsSessionsKeptOnThisUnitOnly(t *testing.T) {
+	for n, warning := range map[int]string{
+		0: "",
+		1: "1 session is kept on this unit only, because its Drive folder is gone or unreadable; retry sync once the folder is back, or, if its Drive folder was deleted on purpose, remove the session from this unit",
+		3: "3 sessions are kept on this unit only, because their Drive folder is gone or unreadable; retry sync once the folder is back, or, if a session's Drive folder was deleted on purpose, remove the session from this unit",
+	} {
+		h, err := Handler(testStaticFS(t), NewHub(), &apiStoreStub{
+			sessionsByDate: map[string][]storage.Session{},
+			sessions:       map[string]storage.Session{},
+			segments:       map[string][]transcribe.Segment{},
+		}, &ControlHooks{UnitOnlySessions: func() int { return n }}, "", nil)
+		if err != nil {
+			t.Fatalf("Handler failed: %v", err)
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+		var resp struct {
+			Warnings []string `json:"warnings"`
+			UnitOnly int      `json:"unit_only_sessions"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode status: %v", err)
+		}
+		var want []string
+		if warning != "" {
+			want = []string{warning}
+		}
+		if resp.UnitOnly != n || !slices.Equal(resp.Warnings, want) {
+			t.Errorf("%d kept on this unit only: unit_only_sessions %d, warnings %q; want %d, %q", n, resp.UnitOnly, resp.Warnings, n, want)
+		}
+	}
+}
