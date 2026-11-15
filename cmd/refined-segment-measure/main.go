@@ -5,8 +5,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -31,12 +30,10 @@ func main() {
 		os.Exit(2)
 	}
 	recording := os.Args[1]
-	contents, err := os.ReadFile(recording)
+	hash, err := recordingname.SHA256(recording)
 	if err != nil {
 		panic(err)
 	}
-	sum := sha256.Sum256(contents)
-	hash := hex.EncodeToString(sum[:])
 	result, err := transcribe.NewDeepgramBatchTranscriber(transcribe.DeepgramBatchConfig{APIKey: key, Model: "nova-3"}).Transcribe(context.Background(), recording)
 	if err != nil {
 		panic(err)
@@ -49,7 +46,7 @@ func main() {
 	segments := storage.BuildRefinedSegments(words)
 	refusals := map[string]int{}
 	for index := range segments {
-		if reason := measureOne(recording, hash, words, segments, index); reason != "" {
+		if reason := measureOne(recording, words, segments, index); reason != "" {
 			refusals[reason]++
 		}
 	}
@@ -66,7 +63,7 @@ func main() {
 	}
 }
 
-func measureOne(recording, hash string, words []storage.RefinedWord, segments []storage.RefinedSegment, index int) string {
+func measureOne(recording string, words []storage.RefinedWord, segments []storage.RefinedSegment, index int) string {
 	dir, err := os.MkdirTemp("", "ghost-wispr-refusal-")
 	if err != nil {
 		return "make scratch store"

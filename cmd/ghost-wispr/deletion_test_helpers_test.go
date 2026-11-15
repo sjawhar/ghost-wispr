@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -101,6 +102,9 @@ func hashBytesForDeleteTest(value []byte) string {
 	hash := sha256.Sum256(value)
 	return hex.EncodeToString(hash[:])
 }
+
+// fileSHA256 hashes a recording as the deletion does (recording.SHA256).
+var fileSHA256 = recordingname.SHA256
 
 func r4PendingStore(t *testing.T) (*storage.SQLiteStore, string, []int64) {
 	t.Helper()

@@ -28,6 +28,19 @@ func LocalName(name string) (string, bool) {
 	return base, true
 }
 
+// Key identifies the recording a path names whether it is saved as MP3 or as
+// WAV (the recorder's fallback when no MP3 encoder works): the file name
+// without a .mp3 or .wav extension. Any other file name is its own key.
+func Key(path string) string {
+	name := filepath.Base(strings.TrimSpace(path))
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp3", ".wav":
+		return strings.TrimSuffix(name, filepath.Ext(name))
+	default:
+		return name
+	}
+}
+
 // Resolve returns the file one entry of a session's audio path names: the
 // entry as written, when a file is there, else the file of the entry's name
 // in audioDir, the audio directory now. The recorder writes

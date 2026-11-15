@@ -190,11 +190,9 @@ func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) (err erro
 		query := `DELETE FROM segments`
 		var args []any
 		if segments["session_id"] {
-			query += ` WHERE session_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",") + `)`
-			args = make([]any, len(affected))
-			for i, id := range affected {
-				args[i] = id
-			}
+			var placeholders string
+			placeholders, args = placeholderList(affected)
+			query += ` WHERE session_id IN (` + placeholders + `)`
 		}
 		if _, err := tx.Exec(query, args...); err != nil {
 			return fmt.Errorf("delete affected segments from the older backup: %w", err)
@@ -225,11 +223,7 @@ func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) (err erro
 			return err
 		}
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(affected)), ",")
-	args := make([]any, len(affected))
-	for i, id := range affected {
-		args[i] = id
-	}
+	placeholders, args := placeholderList(affected)
 	sessions, err := columns("sessions")
 	if err != nil {
 		return err

@@ -49,15 +49,6 @@ type Event struct {
 // Option configures a Client.
 type Option func(*Client)
 
-// WithHTTPClient sets the HTTP client used for webhook requests.
-func WithHTTPClient(client *http.Client) Option {
-	return func(c *Client) {
-		if client != nil {
-			c.httpClient = client
-		}
-	}
-}
-
 // WithLogger sets the logger used for webhook request failures and retries.
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *Client) {

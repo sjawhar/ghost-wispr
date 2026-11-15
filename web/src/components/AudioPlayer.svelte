@@ -158,6 +158,11 @@
     audioEl?.load()
   }
 
+  async function removeSegmentLocally(segmentID: number): Promise<void> {
+    visibleSegments = visibleSegments.filter((candidate) => candidate.id !== segmentID)
+    await reloadAudio()
+  }
+
   async function handleDeleteSegment(
     segment: Segment,
     action: (typeof deleteActions)[number],
@@ -182,25 +187,20 @@
       try {
         await deleteSessionSegment(sessionId, segmentID, action.mode, revision)
       } catch (error) {
-        const message = requestErrorMessage(error)
+        segmentDeleteError = requestErrorMessage(error)
         if (error instanceof RequestError && [403, 409, 422, 503].includes(error.status)) {
-          segmentDeleteError = message
           return
         }
-        segmentDeleteError = message
         try {
-          const clearLocally = await onNotFound(segmentID)
-          if (clearLocally) {
-            visibleSegments = visibleSegments.filter((candidate) => candidate.id !== segmentID)
-            await reloadAudio()
+          if (await onNotFound(segmentID)) {
+            await removeSegmentLocally(segmentID)
           }
         } catch {
           // Keep the delete response visible when the reconciliation request fails.
         }
         return
       }
-      visibleSegments = visibleSegments.filter((candidate) => candidate.id !== segmentID)
-      await reloadAudio()
+      await removeSegmentLocally(segmentID)
       await onDeleted(segmentID)
     } catch (error) {
       segmentDeleteError = `The session could not be reloaded: ${requestErrorMessage(error)}`

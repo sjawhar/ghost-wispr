@@ -127,6 +127,13 @@ export function setLiveSegmentsForSession(
   appState.liveSegments = segments
 }
 
+// clearLiveSegmentsOf empties the live pane when it shows session sessionID.
+function clearLiveSegmentsOf(sessionID: string): void {
+  if (appState.liveSegmentsSessionId === sessionID) {
+    setLiveSegmentsForSession('', [])
+  }
+}
+
 // The server has removed the selected timed occurrence and queued a fresh
 // summary. Keep the completed-refinement state so the remaining timed
 // segments remain the default view until the detail refresh arrives.
@@ -147,10 +154,7 @@ export function applySegmentDeletion(sessionID: string, segmentID: number): void
   invalidateSessionDetailRequest(sessionID)
   summaryDeletionTimes.set(sessionID, Date.now())
 
-  if (appState.liveSegmentsSessionId === sessionID) {
-    appState.liveSegmentsSessionId = ''
-    appState.liveSegments = []
-  }
+  clearLiveSegmentsOf(sessionID)
 
   const nextByDate = new Map(appState.sessionsByDate)
   for (const [date, sessions] of nextByDate) {
@@ -324,10 +328,7 @@ export function resetState(): void {
 
 export function removeSession(sessionId: string): void {
   invalidateSessionDetailRequest(sessionId)
-  if (appState.liveSegmentsSessionId === sessionId) {
-    appState.liveSegments = []
-    appState.liveSegmentsSessionId = ''
-  }
+  clearLiveSegmentsOf(sessionId)
   const nextByDate = new Map(appState.sessionsByDate)
   for (const [date, sessions] of nextByDate) {
     const filtered = sessions.filter((s) => s.id !== sessionId)

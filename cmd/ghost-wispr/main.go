@@ -56,6 +56,10 @@ var (
 
 const defaultListenAddress = "127.0.0.1:8080"
 
+// captureStateWarningKey keys the /api/status warning that capture's saved
+// pause switch is not what a restart would restore.
+const captureStateWarningKey = "capture-state"
+
 var vertexCredentialCache sync.Map
 
 //go:embed static/*
@@ -121,20 +125,10 @@ func refinementRecordingAvailable(session *storage.Session, audioDir string) err
 	return nil
 }
 
-func recordingRequirementKey(path string) string {
-	name := filepath.Base(strings.TrimSpace(path))
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".mp3", ".wav":
-		return strings.TrimSuffix(name, filepath.Ext(name))
-	default:
-		return name
-	}
-}
-
 func missingRefinementRecordings(required, restored []string) []string {
 	available := make(map[string]struct{}, len(restored))
 	for _, path := range restored {
-		if key := recordingRequirementKey(path); key != "" && key != "." {
+		if key := recording.Key(path); key != "" && key != "." {
 			available[key] = struct{}{}
 		}
 	}
@@ -142,7 +136,7 @@ func missingRefinementRecordings(required, restored []string) []string {
 	seen := make(map[string]struct{}, len(required))
 	for _, path := range required {
 		name := filepath.Base(strings.TrimSpace(path))
-		key := recordingRequirementKey(path)
+		key := recording.Key(path)
 		if key == "" || key == "." {
 			continue
 		}
@@ -398,6 +392,20 @@ func addVertexCredentials(ctx context.Context, cfg *config.Config, options *gena
 	cached, _ := vertexCredentialCache.LoadOrStore(credentialPath, credentials)
 	options.Credentials = cached.(*auth.Credentials)
 	return nil
+}
+
+// batchClientConfig is the genai client configuration the summary batch
+// operations use: cfg's Gemini settings, with Vertex AI credentials.
+func batchClientConfig(ctx context.Context, cfg *config.Config) (*genai.ClientConfig, error) {
+	options := genAIOptions(cfg, cfg.GeminiAPIKey)
+	if err := addVertexCredentials(ctx, cfg, options); err != nil {
+		return nil, err
+	}
+	clientConfig, err := genaiconfig.BuildClientConfig(options)
+	if err != nil {
+		return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
+	}
+	return clientConfig, nil
 }
 
 func providerConfigured(cfg *config.Config, provider string) bool {
@@ -832,6 +840,47 @@ func onSessionMerged(ctx context.Context, store mergedSessionHookStore, refine f
 	}
 }
 
+// ttsStatusResponse is a TTS request's status as the TTS routes return it.
+func ttsStatusResponse(status *tts.SpeakStatus) map[string]any {
+	return map[string]any{
+		"id":            status.ID,
+		"status":        status.Status,
+		"bytes_written": status.BytesWritten,
+		"duration_ms":   status.DurationMs,
+		"model":         status.Model,
+		"voice":         status.Voice,
+		"error":         status.Error,
+	}
+}
+
+// newTTSProvider builds the TTS provider cfg names.
+func newTTSProvider(ctx context.Context, cfg *config.Config) (tts.Provider, error) {
+	switch cfg.TTSProvider {
+	case "elevenlabs":
+		if cfg.TTSAPIKey == "" {
+			return nil, fmt.Errorf("ElevenLabs requires GHOST_WISPR_TTS_API_KEY")
+		}
+		return tts.NewElevenLabsProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+	case "google":
+		if cfg.TTSAPIKey != "" {
+			return tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
+		}
+		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+		if err != nil {
+			return nil, fmt.Errorf("detect Google credentials: %w", err)
+		}
+		return tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
+	case "gemini":
+		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
+		if err != nil {
+			return nil, fmt.Errorf("detect Google credentials: %w", err)
+		}
+		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, tts.WithGeminiAuthCredentials(credentials))
+	default:
+		return nil, fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
+	}
+}
+
 func main() {
 	configPath := configPathFromEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "google-id-token" {
@@ -1087,7 +1136,7 @@ func main() {
 	}
 	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
 	if restorePauseErr != nil {
-		warningRegistry.Set("capture-state", "Capture pause state could not be restored; the recorder started paused")
+		warningRegistry.Set(captureStateWarningKey, "Capture pause state could not be restored; the recorder started paused")
 	}
 	if batchTranscriber, err := makeBatchTranscriber(&cfg); err != nil {
 		log.Printf("warning: batch transcription disabled: %v", err)
@@ -1117,13 +1166,9 @@ func main() {
 			return "", 0, fmt.Errorf("summarization not configured")
 		}
 		latestCfg := cfgStore.Get()
-		genOptions := genAIOptions(&latestCfg, latestCfg.GeminiAPIKey)
-		if err := addVertexCredentials(ctx, &latestCfg, genOptions); err != nil {
-			return "", 0, err
-		}
-		clientConfig, err := genaiconfig.BuildClientConfig(genOptions)
+		clientConfig, err := batchClientConfig(ctx, &latestCfg)
 		if err != nil {
-			return "", 0, fmt.Errorf("genai backend not configured for batch operations: %w", err)
+			return "", 0, err
 		}
 
 		sessions, generations, emptyTranscripts, err := readBatchSummarySessions(store, sessionIDs)
@@ -1169,13 +1214,9 @@ func main() {
 	}
 	pollSummaryBatch := func(ctx context.Context, batchName string) (map[string]any, error) {
 		latestCfg := cfgStore.Get()
-		genOptions := genAIOptions(&latestCfg, latestCfg.GeminiAPIKey)
-		if err := addVertexCredentials(ctx, &latestCfg, genOptions); err != nil {
-			return nil, err
-		}
-		clientConfig, err := genaiconfig.BuildClientConfig(genOptions)
+		clientConfig, err := batchClientConfig(ctx, &latestCfg)
 		if err != nil {
-			return nil, fmt.Errorf("genai backend not configured for batch operations: %w", err)
+			return nil, err
 		}
 
 		genaiClient, err := genai.NewClient(ctx, clientConfig)
@@ -1612,12 +1653,16 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		capture.RequestResume,
 		hub.BroadcastStatusChanged,
 	)
+	// pauseNotSaved warns that the durable pause switch could not be saved.
+	pauseNotSaved := func() {
+		warningRegistry.Set(captureStateWarningKey, "Pause not saved; a restart will resume recording")
+	}
 	controlHooks.Pause = func() error {
 		err := pauseControls.Pause()
 		if err != nil {
-			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+			pauseNotSaved()
 		} else {
-			warningRegistry.Clear("capture-state")
+			warningRegistry.Clear(captureStateWarningKey)
 		}
 		return err
 	}
@@ -1625,16 +1670,16 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		err := pauseControls.Resume()
 		if err != nil {
 			if errors.Is(err, errRefusedResumeNotPersisted) {
-				warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+				pauseNotSaved()
 			}
 		} else {
-			warningRegistry.Clear("capture-state")
+			warningRegistry.Clear(captureStateWarningKey)
 		}
 		return err
 	}
 	wireLightConsent(capture, hardware, warningRegistry, func(error) {
 		if err := pauseControls.RefuseResume(); err != nil {
-			warningRegistry.Set("capture-state", "Pause not saved; a restart will resume recording")
+			pauseNotSaved()
 		}
 	})
 	if restoredPause {
@@ -2040,41 +2085,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// Initialize TTS orchestrator if both speaker and provider are configured.
 	var ttsOrchestrator *tts.Orchestrator
 	if speaker != nil && cfg.TTSProvider != "" {
-		var ttsProvider tts.Provider
-		var ttsErr error
-		switch cfg.TTSProvider {
-		case "elevenlabs":
-			if cfg.TTSAPIKey == "" {
-				ttsErr = fmt.Errorf("ElevenLabs requires GHOST_WISPR_TTS_API_KEY")
-			} else {
-				ttsProvider, ttsErr = tts.NewElevenLabsProvider(cfg.TTSAPIKey, cfg.TTSVoice)
-			}
-		case "google":
-			if cfg.TTSAPIKey != "" {
-				ttsProvider, ttsErr = tts.NewGoogleProvider(cfg.TTSAPIKey, cfg.TTSVoice)
-			} else {
-				credentials, credentialErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
-				if credentialErr != nil {
-					ttsErr = fmt.Errorf("detect Google credentials: %w", credentialErr)
-				} else {
-					ttsProvider, ttsErr = tts.NewGoogleProvider("", cfg.TTSVoice, tts.WithAuthCredentials(credentials))
-				}
-			}
-		case "gemini":
-			credentials, credentialErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
-			if credentialErr != nil {
-				ttsErr = fmt.Errorf("detect Google credentials: %w", credentialErr)
-			} else {
-				ttsProvider, ttsErr = tts.NewGeminiProvider(
-					cfg.GCPProject,
-					cfg.TTSModel,
-					cfg.TTSVoice,
-					tts.WithGeminiAuthCredentials(credentials),
-				)
-			}
-		default:
-			ttsErr = fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
-		}
+		ttsProvider, ttsErr := newTTSProvider(ctx, &cfg)
 		if ttsErr != nil {
 			log.Printf("warning: TTS disabled: %v", ttsErr)
 			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
@@ -2092,30 +2103,14 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if !ok {
 				return nil, false
 			}
-			return map[string]any{
-				"id":            status.ID,
-				"status":        status.Status,
-				"bytes_written": status.BytesWritten,
-				"duration_ms":   status.DurationMs,
-				"model":         status.Model,
-				"voice":         status.Voice,
-				"error":         status.Error,
-			}, true
+			return ttsStatusResponse(&status), true
 		}
 		controlHooks.TTSWaitForSynthesis = func(ctx context.Context, id string) (map[string]any, error) {
 			status, err := ttsOrchestrator.WaitForSynthesis(ctx, id)
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{
-				"id":            status.ID,
-				"status":        status.Status,
-				"bytes_written": status.BytesWritten,
-				"duration_ms":   status.DurationMs,
-				"model":         status.Model,
-				"voice":         status.Voice,
-				"error":         status.Error,
-			}, nil
+			return ttsStatusResponse(&status), nil
 		}
 		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
@@ -2370,27 +2365,8 @@ func streamMicWithRetry(
 			if capture.isClosed() {
 				continue
 			}
-			if hub != nil {
-				hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
-			}
-			if err := capture.confirmMicStart(); err != nil {
-				logf("recording light unavailable before microphone reconnect: %v", err)
-				closeMic(streamer, "without a red recording light", logf)
-				continue
-			}
-			reopenErr := streamer.Reopen()
-			capture.finishMicStart()
-			if reopenErr != nil {
-				logf("mic reopen failed: %v", reopenErr)
-				if hub != nil {
-					hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
-				}
-				continue
-			}
-			logf("mic reopened successfully")
-			if hub != nil {
-				hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
-			}
+			// The loop top streams again, whatever the reopen did.
+			_, _ = reopenMic(capture, streamer, logf, hub)
 			continue
 		}
 
@@ -2406,32 +2382,43 @@ func streamMicWithRetry(
 		if capture.isClosed() {
 			continue // never reopen the mic while paused; the loop top stops it
 		}
-		if hub != nil {
-			hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
-		}
-
-		if err := capture.confirmMicStart(); err != nil {
-			logf("recording light unavailable before microphone reconnect: %v", err)
-			closeMic(streamer, "without a red recording light", logf)
-			continue
-		}
-		reopenErr := streamer.Reopen()
-		capture.finishMicStart()
-		if reopenErr != nil {
-			logf("mic reopen failed: %v", reopenErr)
-			if hub != nil {
-				hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, reopenErr.Error())
-			}
+		switch confirmed, reopenErr := reopenMic(capture, streamer, logf, hub); {
+		case !confirmed:
+		case reopenErr != nil:
 			backoff = min(backoff*2, maxBackoff)
-			continue
+		default:
+			backoff = baseBackoff
 		}
-
-		logf("mic reopened successfully")
-		if hub != nil {
-			hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
-		}
-		backoff = baseBackoff
 	}
+}
+
+// reopenMic reopens the device once the recording light is confirmed red, and
+// reports each step on hub. It returns false, having closed the device and
+// reopened nothing, when the light cannot be confirmed red; otherwise true
+// and the reopen's error.
+func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) (bool, error) {
+	if hub != nil {
+		hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
+	}
+	if err := capture.confirmMicStart(); err != nil {
+		logf("recording light unavailable before microphone reconnect: %v", err)
+		closeMic(streamer, "without a red recording light", logf)
+		return false, nil
+	}
+	err := streamer.Reopen()
+	capture.finishMicStart()
+	if err != nil {
+		logf("mic reopen failed: %v", err)
+		if hub != nil {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
+		}
+		return true, err
+	}
+	logf("mic reopened successfully")
+	if hub != nil {
+		hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
+	}
+	return true, nil
 }
 
 // closeMic closes a device that failed to start, or that the light could not

@@ -1,9 +1,7 @@
 package storage
 
 import (
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -12,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/recording"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -151,15 +149,6 @@ var postDeleteMaintenance = func(db *sql.DB, walPath string) error {
 	return truncateWriteAheadLog(db)
 }
 
-func recordingProvenanceKey(recording string) string {
-	name := filepath.Base(strings.TrimSpace(recording))
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".mp3", ".wav":
-		return strings.TrimSuffix(name, filepath.Ext(name))
-	default:
-		return name
-	}
-}
 func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
@@ -208,7 +197,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			owners[merged] = make(map[string]string)
 		}
 		owners[merged][recording] = source
-		owners[merged][recordingProvenanceKey(recording)] = source
+		owners[merged][recordingname.Key(recording)] = source
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate merged recording sources: %w", err)
@@ -217,7 +206,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 	recordingChain := func(recording string) []string {
 		owner := owners[sessionID][recording]
 		if owner == "" {
-			owner = owners[sessionID][recordingProvenanceKey(recording)]
+			owner = owners[sessionID][recordingname.Key(recording)]
 		}
 		seen := make(map[string]struct{})
 		for owner != "" {
@@ -227,7 +216,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			seen[owner] = struct{}{}
 			nestedOwner := owners[owner][recording]
 			if nestedOwner == "" {
-				nestedOwner = owners[owner][recordingProvenanceKey(recording)]
+				nestedOwner = owners[owner][recordingname.Key(recording)]
 			}
 			// A session that names itself as its recording's owner is the
 			// leaf: the chain ends there rather than looping.
@@ -577,7 +566,7 @@ func (s *SQLiteStore) MissingCompletedSplices(audioDir string) ([]DeletedSpan, e
 		if err := rows.Scan(&span.SessionID, &span.AudioPath, &span.Start, &span.End, &span.SHA256Before, &span.SHA256After); err != nil {
 			return nil, fmt.Errorf("scan missing completed deleted span: %w", err)
 		}
-		if _, err := os.Stat(recording.Resolve(span.AudioPath, audioDir)); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(recordingname.Resolve(span.AudioPath, audioDir)); errors.Is(err, os.ErrNotExist) {
 			spans = append(spans, span)
 		} else if err != nil {
 			return nil, fmt.Errorf("stat completed deleted recording %s: %w", span.AudioPath, err)
@@ -638,8 +627,8 @@ func (s *SQLiteStore) PendingSplices(audioDir string) ([]DeletedSpan, error) {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan deleted span: %w", err)
 		}
-		path := recording.Resolve(span.AudioPath, audioDir)
-		hash, err := sha256ForFile(path)
+		path := recordingname.Resolve(span.AudioPath, audioDir)
+		hash, err := recordingname.SHA256(path)
 		switch {
 		case errors.Is(err, os.ErrNotExist), hash == span.SHA256Before:
 			pending = append(pending, span)
@@ -732,13 +721,4 @@ func (s *SQLiteStore) MarkSpliceComplete(span *DeletedSpan) error {
 		return fmt.Errorf("commit marking deleted span complete: %w", err)
 	}
 	return nil
-}
-
-func sha256ForFile(path string) (string, error) {
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(contents)
-	return hex.EncodeToString(sum[:]), nil
 }

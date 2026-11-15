@@ -138,7 +138,7 @@ func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 		if _, err := os.Stat(recording); err != nil {
 			continue
 		}
-		hash, err := fileSHA256(recording)
+		hash, err := recordingname.SHA256(recording)
 		if err != nil {
 			unreadable = append(unreadable, recording)
 			continue
@@ -416,20 +416,6 @@ func contentHash(f *SyncFile) string {
 	}
 	sum := sha256.Sum256(f.Content)
 	return hex.EncodeToString(sum[:])
-}
-
-func fileSHA256(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = file.Close() }()
-
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // docUpdate is a document a re-sync updates in place: the file on Drive, and

@@ -24,6 +24,22 @@ func TestLocalNameIsTheInverseOfFileName(t *testing.T) {
 	}
 }
 
+// TestKeyNamesARecordingAsMP3OrWAV fails if Key gives a recording's MP3 and
+// WAV forms different keys, or drops an extension that is not one of them.
+func TestKeyNamesARecordingAsMP3OrWAV(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"data/audio/20261106100000.mp3", "20261106100000"},
+		{" /var/audio/20261106100000.WAV ", "20261106100000"},
+		{"20261106100000.pcm", "20261106100000.pcm"},
+		{"20261106100000", "20261106100000"},
+		{"", "."},
+	} {
+		if got := Key(tc.path); got != tc.want {
+			t.Errorf("Key(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
 // TestResolveReadsTheEntryAsWrittenThenTheAudioDirectory fails if Resolve
 // does not return a recording where its entry points (relative to the
 // working directory, as the recorder writes it, or absolute) while a file is
