@@ -129,6 +129,7 @@ func TestDeletionCutCheckHearsTheControls(t *testing.T) {
 	if controls != 10 || heard < controls/2 {
 		t.Fatalf("the check heard a deleted word in %d of %d middle-only control cuts, want most of 10", heard, controls)
 	}
+	t.Logf("the check heard a deleted word in %d of %d middle-only control cuts", heard, controls)
 }
 
 // TestDeletionCutFixturesSummary logs, by the check's rule, how many recorded
