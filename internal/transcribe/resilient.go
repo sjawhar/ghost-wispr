@@ -112,6 +112,25 @@ func (rc *ResilientClient) setStateLocked(newState ConnectionState) {
 	}
 }
 
+// Connect dials the first socket and returns the dial's error. A failed dial
+// leaves the client disconnected and redialling with backoff, buffering the
+// audio written meanwhile, so one failed dial never turns live transcription
+// off.
+func (rc *ResilientClient) Connect() error {
+	client, err := rc.Factory(rc.ctx)
+	if err != nil {
+		rc.Mu.Lock()
+		rc.setStateLocked(StateDisconnected)
+		rc.Mu.Unlock()
+		rc.startReconnect()
+		return err
+	}
+	rc.Mu.Lock()
+	rc.Client = client
+	rc.Mu.Unlock()
+	return nil
+}
+
 // startReconnect starts a background reconnect goroutine (safe to call multiple times).
 func (rc *ResilientClient) startReconnect() {
 	rc.Mu.Lock()

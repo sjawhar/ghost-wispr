@@ -267,6 +267,46 @@ func TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining(t *testing
 	}
 }
 
+// TestResilientClient_ConnectRedialsAfterAFailedFirstDial fails if one failed
+// first dial leaves the client with no socket for good, as a single dial did:
+// live transcription then stayed off until a restart. The audio written while
+// it redials must reach the socket it gets.
+func TestResilientClient_ConnectRedialsAfterAFailedFirstDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	live := &mockWriter{}
+	var dials atomic.Int32
+	factory := func(context.Context) (io.WriteCloser, error) {
+		if dials.Add(1) == 1 {
+			return nil, errors.New("websocket: bad handshake (503)")
+		}
+		return live, nil
+	}
+	rc := NewResilientClient(ctx, factory, ResilientConfig{
+		BufferSize:            1024,
+		InitialReconnectDelay: 10 * time.Millisecond,
+		MaxReconnectBackoff:   10 * time.Millisecond,
+	}, nil, nil)
+	if err := rc.Connect(); err == nil {
+		t.Fatal("Connect reported success for a failed dial")
+	}
+	if _, err := rc.Write([]byte("while redialling")); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (!rc.IsConnected() || len(live.getData()) == 0) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !rc.IsConnected() || dials.Load() < 2 {
+		t.Fatalf("after a failed first dial: connected=%t, dials=%d; want it to redial and connect", rc.IsConnected(), dials.Load())
+	}
+	if got := string(live.getData()); got != "while redialling" {
+		t.Fatalf("the socket got %q, want the audio written while redialling", got)
+	}
+}
+
 func TestResilientClient_ReconnectBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

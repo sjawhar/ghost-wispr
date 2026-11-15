@@ -584,10 +584,12 @@ const deletionCutWindow = 0.5
 // ones the person asked to delete.
 var errDeletionCutHeard = errors.New("part of the deleted segment is still heard next to the cut")
 
-// errDeletionCutUnchecked refuses a "Delete text and audio" whose cut
-// recording the check heard no words in, twice: a transcription that hears
-// nothing cannot say the deleted words are gone.
-var errDeletionCutUnchecked = errors.New("a transcription of the cut recording heard no words, so the cut could not be checked")
+// errDeletionCutUnchecked refuses a "Delete text and audio" whose check could
+// not hear the cut, twice: its transcription of the cut recording held no
+// words, or none within the listening window when the recording has
+// neighbour words there. A check that heard nothing where the deleted words
+// would be cannot say they are gone.
+var errDeletionCutUnchecked = errors.New("a transcription of the cut recording heard nothing next to the cut, so the cut could not be checked")
 
 // cutAndCheck cuts the selected segment out of a copy of recording, with each
 // of deletionCutPads in turn, until a transcription of the copy hears no word
@@ -620,7 +622,9 @@ func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording 
 		if d.transcribeCut == nil {
 			return tempPath, start, end, afterHash, nil
 		}
-		heard, err := d.transcribeCutHearingWords(ctx, model, tempPath)
+		heard, err := d.transcribeCutHearingTheCut(ctx, model, tempPath, func(heard []transcribe.TimestampedWord) bool {
+			return hearsTheCut(words, selected, start, end, heard, deletionCutWindow)
+		})
 		if err != nil {
 			_ = os.Remove(tempPath)
 			if errors.Is(err, errDeletionCutUnchecked) {
@@ -637,30 +641,28 @@ func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording 
 		errDeletionCutHeard, deletionCutPads[len(deletionCutPads)-1])
 }
 
-// transcribeCutHearingWords transcribes a cut recording, once more when the
-// first transcription holds no words, and fails with errDeletionCutUnchecked
-// when neither does.
-func (d *segmentDeleteRunner) transcribeCutHearingWords(ctx context.Context, model, path string) ([]transcribe.TimestampedWord, error) {
+// transcribeCutHearingTheCut transcribes a cut recording, once more when the
+// first transcription does not hear the cut, and fails with
+// errDeletionCutUnchecked when neither does.
+func (d *segmentDeleteRunner) transcribeCutHearingTheCut(ctx context.Context, model, path string, hears func([]transcribe.TimestampedWord) bool) ([]transcribe.TimestampedWord, error) {
 	for range 2 {
 		heard, err := d.transcribeCut(ctx, model, path)
 		if err != nil {
 			return nil, err
 		}
-		if len(heard) > 0 {
+		if hears(heard) {
 			return heard, nil
 		}
 	}
 	return nil, errDeletionCutUnchecked
 }
 
-// leftoverWords returns the words of the selected segment that heard, a
-// transcription of the recording cut from start to end, holds within window
-// seconds of the cut point beyond the neighbours' own words there. A
-// neighbour word counts only where the listening window can hold it: within
-// window of the cut's edges, or cut into or out by the pad. A neighbour
-// further away saying the same word does not explain it.
-func leftoverWords(words []storage.RefinedWord, selected *transcribe.Segment, start, end float64, heard []transcribe.TimestampedWord, window float64) []string {
-	segment, near := map[string]int{}, map[string]int{}
+// cutWords counts, by spoken form, the selected segment's words and its
+// neighbours' words the listening window can hold: within window of the
+// cut's edges, or cut into or out by the pad. A neighbour further away does
+// not count.
+func cutWords(words []storage.RefinedWord, selected *transcribe.Segment, start, end, window float64) (segment, near map[string]int) {
+	segment, near = map[string]int{}, map[string]int{}
 	for _, word := range words {
 		if word.RecordingPath != selected.RecordingPath || word.RecordingSHA256 != selected.RecordingSHA256 {
 			continue
@@ -674,6 +676,12 @@ func leftoverWords(words []storage.RefinedWord, selected *transcribe.Segment, st
 			near[text]++
 		}
 	}
+	return segment, near
+}
+
+// heardAtTheCut counts, by spoken form, the words heard, a transcription of
+// the recording cut from start, holds within window seconds of the cut point.
+func heardAtTheCut(heard []transcribe.TimestampedWord, start, window float64) map[string]int {
 	around := map[string]int{}
 	for _, word := range heard {
 		if word.End >= start-window && word.Start <= start+window {
@@ -682,8 +690,47 @@ func leftoverWords(words []storage.RefinedWord, selected *transcribe.Segment, st
 			}
 		}
 	}
+	return around
+}
+
+// hearsTheCut reports whether heard, a transcription of the recording cut
+// from start to end, can check the cut: it holds words, and when the
+// recording has neighbour words the listening window can hold and the cut
+// leaves at least partly in place, it heard a word within window of the cut
+// point. A first or last segment, or one with silence around it, has no such
+// neighbour, and then any words will do. Any word at the cut counts, not
+// only the neighbours' own: on the review's recordings Deepgram heard a
+// neighbour word the pad cut into as another word ("she goes" as "no") in 1
+// of 60 clean cuts at 0.45 s, and requiring the neighbours' words would have
+// refused it; any word at the cut flagged none of the 60.
+func hearsTheCut(words []storage.RefinedWord, selected *transcribe.Segment, start, end float64, heard []transcribe.TimestampedWord, window float64) bool {
+	if len(heard) == 0 {
+		return false
+	}
+	audible := false
+	for _, word := range words {
+		if word.RecordingPath != selected.RecordingPath || word.RecordingSHA256 != selected.RecordingSHA256 || spokenWord(word.Text) == "" ||
+			(word.Start >= selected.StartTime && word.End <= selected.EndTime) {
+			continue
+		}
+		inWindow := word.End > start-window && word.Start < end+window
+		cutOut := word.Start >= start && word.End <= end
+		if inWindow && !cutOut {
+			audible = true
+			break
+		}
+	}
+	return !audible || len(heardAtTheCut(heard, start, window)) > 0
+}
+
+// leftoverWords returns the words of the selected segment that heard, a
+// transcription of the recording cut from start to end, holds within window
+// seconds of the cut point beyond the neighbours' own words there
+// (cutWords).
+func leftoverWords(words []storage.RefinedWord, selected *transcribe.Segment, start, end float64, heard []transcribe.TimestampedWord, window float64) []string {
+	segment, near := cutWords(words, selected, start, end, window)
 	var left []string
-	for text, count := range around {
+	for text, count := range heardAtTheCut(heard, start, window) {
 		if segment[text] > 0 && count > near[text] {
 			left = append(left, text)
 		}

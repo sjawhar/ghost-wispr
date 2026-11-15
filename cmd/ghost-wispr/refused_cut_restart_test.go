@@ -112,3 +112,28 @@ func TestRefusedCutWarningSurvivesARestart(t *testing.T) {
 		t.Fatalf("status warnings after Delete text and a restart = %q, want none", warnings)
 	}
 }
+
+// TestRefusedCutWarningClearsWhenItsSessionIsDeleted fails if a refused
+// cut's status warning stays after its session is deleted: the recording and
+// the words in it are gone with the session.
+func TestRefusedCutWarningClearsWhenItsSessionIsDeleted(t *testing.T) {
+	dbPath, recording, segmentID, revision := refusedCutDatabase(t)
+	store := openTestStore(t, dbPath)
+	handler := unitServer(t, store, recording)
+	cut := fmt.Sprintf("/api/sessions/s/segments/%d?mode=text_and_audio&revision=%d", segmentID, revision)
+	if recorder := serve(handler, http.MethodDelete, cut); recorder.Code == http.StatusNoContent {
+		t.Fatal("the server accepted a cut its check refuses")
+	}
+	if warnings := apiWarnings(t, handler); !slices.ContainsFunc(warnings, isRefusedCutWarning) {
+		t.Fatalf("status warnings after the refused cut = %q, want the refused cut's", warnings)
+	}
+	if _, err := store.DeleteSession("s", t.TempDir()); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+	if warnings := apiWarnings(t, handler); len(warnings) != 0 {
+		t.Fatalf("status warnings after the session was deleted = %q, want none", warnings)
+	}
+	if cuts, err := store.RefusedCuts(); err != nil || len(cuts) != 0 {
+		t.Fatalf("refused cuts kept after the session was deleted = %+v (%v), want none", cuts, err)
+	}
+}

@@ -141,6 +141,96 @@ func TestCutCheckRetriesAnEmptyTranscription(t *testing.T) {
 	}
 }
 
+// windowNeighbourWords is a recording whose segment "Orange tractor ninety."
+// (3.0 to 4.4 s) has neighbour words within 0.5 s of the cut on both sides:
+// "we" before it, "Then left." after it. The 0.45 s cut runs from 2.55 to
+// 4.85 s, so in the cut recording "Then" starts at 2.6 s, next to the cut.
+func windowNeighbourWords() ([]storage.RefinedWord, transcribe.Segment) {
+	word := func(ordinal int, text string, start, end float64) storage.RefinedWord {
+		return storage.RefinedWord{RecordingPath: "rec.mp3", RecordingSHA256: "sha", Ordinal: ordinal, Text: text, Start: start, End: end}
+	}
+	words := []storage.RefinedWord{
+		word(0, "So", 1.8, 2.1), word(1, "we", 2.15, 2.4),
+		word(2, "Orange", 3.0, 3.4), word(3, "tractor", 3.5, 3.9), word(4, "ninety.", 4.0, 4.4),
+		word(5, "Then", 4.9, 5.2), word(6, "left.", 5.25, 5.5),
+	}
+	return words, transcribe.Segment{RecordingPath: "rec.mp3", RecordingSHA256: "sha", StartTime: 3.0, EndTime: 4.4}
+}
+
+// farFromTheCut is a transcription of the cut recording that heard words, but
+// none within 0.5 s of the cut at 2.55 s.
+var farFromTheCut = []transcribe.TimestampedWord{{Text: "Hello", Start: 0.1, End: 0.3}, {Text: "Goodbye", Start: 6.0, End: 6.3}}
+
+// TestCutCheckRefusesATranscriptionDeafAtTheCut fails if a check that heard
+// no word next to the cut passes it while the recording has neighbour words
+// there: it looked where the deleted words would be and heard nothing, so it
+// cannot say they are gone. Such a check is retried once, then the deletion
+// is refused.
+func TestCutCheckRefusesATranscriptionDeafAtTheCut(t *testing.T) {
+	for name, heard := range map[string][]transcribe.TimestampedWord{
+		"words only far from the cut":          farFromTheCut,
+		"a word just outside the 0.5 s window": append(slices.Clone(farFromTheCut), transcribe.TimestampedWord{Text: "Then", Start: 3.1, End: 3.4}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			words, selected := windowNeighbourWords()
+			a := &answers{heard: [][]transcribe.TimestampedWord{heard, heard}}
+			runner, recording := cutCheckRunner(t, a)
+			_, _, _, _, err := runner.cutAndCheck(context.Background(), "nova-3", recording, words, &selected, -1)
+			if !errors.Is(err, errDeletionCutUnchecked) {
+				t.Fatalf("cut whose check heard nothing at the cut = %v, want refused as unchecked", err)
+			}
+			if a.asked != 2 {
+				t.Fatalf("transcriptions asked = %d, want the deaf one retried once", a.asked)
+			}
+			if left := filesBeside(t, recording); len(left) != 0 {
+				t.Fatalf("a refused cut left %v beside the recording", left)
+			}
+		})
+	}
+}
+
+// TestCutCheckRetriesATranscriptionDeafAtTheCut fails if one check deaf at
+// the cut refuses a cut that a second check hears clean.
+func TestCutCheckRetriesATranscriptionDeafAtTheCut(t *testing.T) {
+	words, selected := windowNeighbourWords()
+	a := &answers{heard: [][]transcribe.TimestampedWord{farFromTheCut, {{Text: "we", Start: 2.15, End: 2.4}, {Text: "Then", Start: 2.6, End: 2.9}}}}
+	runner, recording := cutCheckRunner(t, a)
+	path, _, _, _, err := runner.cutAndCheck(context.Background(), "nova-3", recording, words, &selected, -1)
+	if err != nil {
+		t.Fatalf("cut after a deaf, then a clean check = %v, want accepted", err)
+	}
+	_ = os.Remove(path)
+	if a.asked != 2 {
+		t.Fatalf("transcriptions asked = %d, want 2", a.asked)
+	}
+}
+
+// TestCutCheckWithNoNeighbourAtTheCutAcceptsWordsElsewhere fails if the
+// deafness rule refuses the cut of a segment with no neighbour word the cut
+// leaves within 0.5 s of it, such as a recording's first segment: there is
+// nothing there for the check to hear. The "um" right after the segment is
+// inside the cut, so it is not there either.
+func TestCutCheckWithNoNeighbourAtTheCutAcceptsWordsElsewhere(t *testing.T) {
+	word := func(ordinal int, text string, start, end float64) storage.RefinedWord {
+		return storage.RefinedWord{RecordingPath: "rec.mp3", RecordingSHA256: "sha", Ordinal: ordinal, Text: text, Start: start, End: end}
+	}
+	words := []storage.RefinedWord{
+		word(0, "Orange", 0.1, 0.5), word(1, "tractor.", 0.6, 1.0), word(2, "um", 1.1, 1.3),
+		word(3, "Much", 4.0, 4.3), word(4, "later.", 4.4, 4.8),
+	}
+	selected := transcribe.Segment{RecordingPath: "rec.mp3", RecordingSHA256: "sha", StartTime: 0.1, EndTime: 1.0}
+	a := &answers{heard: [][]transcribe.TimestampedWord{{{Text: "Much", Start: 2.55, End: 2.85}, {Text: "later.", Start: 2.95, End: 3.35}}}}
+	runner, recording := cutCheckRunner(t, a)
+	path, _, _, _, err := runner.cutAndCheck(context.Background(), "nova-3", recording, words, &selected, -1)
+	if err != nil {
+		t.Fatalf("cut of a first segment with no neighbour at the cut = %v, want accepted", err)
+	}
+	_ = os.Remove(path)
+	if a.asked != 1 {
+		t.Fatalf("transcriptions asked = %d, want 1", a.asked)
+	}
+}
+
 // refusedCutFixture is an ended session whose second refined segment, by
 // another speaker, says "Orange tractor ninety." from 3 to 4.4 s, in an open
 // store.

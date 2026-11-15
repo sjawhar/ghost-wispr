@@ -1962,34 +1962,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
-		resillientStateCallback := func(state transcribe.ConnectionState) {
-			if hub != nil {
-				hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
-			}
-		}
-		candidateResilient := transcribe.NewResilientClient(ctx, nil, resilientConfig, log.Printf, resillientStateCallback)
-		callback := transcriptCallback{manager: manager, resilient: candidateResilient}
-		factory := makeDeepgramClientFactory(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, callback, deepgramWriteTimeout)
-		candidateResilient.Factory = factory
-
-		initialClient, err := factory(ctx)
-		if err != nil {
-			log.Printf("warning: deepgram client unavailable, running API/UI only: %v", err)
-			warningRegistry.Set("deepgram", "Deepgram initialization failed — live transcription is disabled")
-			if !updateStartupState && hub != nil {
-				hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusError, "Deepgram initialization failed")
-			}
-			startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, nil, micWait, log.Printf, hub)
-			return nil
-		}
-
-		candidateResilient.Client = initialClient
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub, !updateStartupState)
 		resilientRef.Store(candidateResilient)
-		if !updateStartupState && hub != nil {
-			// A resilient client starts connected and reports only changes.
-			hub.BroadcastComponentStatus("deepgram", storage.ComponentStatusConnected, "Deepgram connected")
-		}
-
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, mic, audioRecorder, candidateResilient, micWait, log.Printf, hub))
 		return nil
 	}
