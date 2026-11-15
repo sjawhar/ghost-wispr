@@ -39,9 +39,10 @@ var ErrRefinementModel = errors.New("refinement refused")
 // together recordings whose text was deleted under two models. The result is
 // refused (ErrRefinementModel) when a recording's model cannot be used: its
 // spans name no model or two, the transcription with it fails, as for a model
-// Deepgram no longer serves, or the transcription reports another model. The
-// session's model is that of its recordings without spans, which a later
-// "Delete text" in them records; a recording with spans keeps its own.
+// Deepgram no longer serves, or the transcription reports another model. Each
+// refined word keeps the model that timed it (storage.RefinedWord.Model), so a
+// later "Delete text" records its words' own model; the session's model is
+// that of its recordings without spans.
 func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTranscriber, audioPath string) (batchRefinementResult, error) {
 	type planned struct {
 		recording string
@@ -119,6 +120,7 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 			kept = append(kept, storage.RefinedWord{
 				RecordingPath: recording, RecordingSHA256: recordingHash, RecordingOrdinal: recordingOrdinal,
 				Ordinal: ordinal, Text: word.Text, Speaker: word.Speaker, Start: word.Start, End: word.End,
+				Model: batch.Model,
 			})
 		}
 		result.Words = append(result.Words, kept...)

@@ -107,7 +107,8 @@ func filesBeside(t *testing.T, recording string) []string {
 
 // TestCutCheckRefusesAnEmptyTranscription fails if a transcription of the cut
 // recording that holds no words passes the check: it heard nothing, so it
-// cannot say the deleted words are gone.
+// cannot say the deleted words are gone. Each pad's check is retried once,
+// and the deletion is refused after the widest.
 func TestCutCheckRefusesAnEmptyTranscription(t *testing.T) {
 	words, selected := cutRuleWords()
 	a := &answers{}
@@ -116,8 +117,8 @@ func TestCutCheckRefusesAnEmptyTranscription(t *testing.T) {
 	if !errors.Is(err, errDeletionCutUnchecked) {
 		t.Fatalf("cut with empty transcriptions = %v, want refused as unchecked", err)
 	}
-	if a.asked != 2 {
-		t.Fatalf("transcriptions asked = %d, want the empty one retried once", a.asked)
+	if a.asked != 2*len(deletionCutPads) {
+		t.Fatalf("transcriptions asked = %d, want each of the %d pads' retried once", a.asked, len(deletionCutPads))
 	}
 	if left := filesBeside(t, recording); len(left) != 0 {
 		t.Fatalf("a refused cut left %v beside the recording", left)
@@ -164,8 +165,8 @@ var farFromTheCut = []transcribe.TimestampedWord{{Text: "Hello", Start: 0.1, End
 // TestCutCheckRefusesATranscriptionDeafAtTheCut fails if a check that heard
 // no word next to the cut passes it while the recording has neighbour words
 // there: it looked where the deleted words would be and heard nothing, so it
-// cannot say they are gone. Such a check is retried once, then the deletion
-// is refused.
+// cannot say they are gone. Each pad's check is retried once, and the
+// deletion is refused after the widest.
 func TestCutCheckRefusesATranscriptionDeafAtTheCut(t *testing.T) {
 	for name, heard := range map[string][]transcribe.TimestampedWord{
 		"words only far from the cut":          farFromTheCut,
@@ -173,14 +174,14 @@ func TestCutCheckRefusesATranscriptionDeafAtTheCut(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			words, selected := windowNeighbourWords()
-			a := &answers{heard: [][]transcribe.TimestampedWord{heard, heard}}
+			a := &answers{heard: slices.Repeat([][]transcribe.TimestampedWord{heard}, 2*len(deletionCutPads))}
 			runner, recording := cutCheckRunner(t, a)
 			_, _, _, _, err := runner.cutAndCheck(context.Background(), "nova-3", recording, words, &selected, -1)
 			if !errors.Is(err, errDeletionCutUnchecked) {
 				t.Fatalf("cut whose check heard nothing at the cut = %v, want refused as unchecked", err)
 			}
-			if a.asked != 2 {
-				t.Fatalf("transcriptions asked = %d, want the deaf one retried once", a.asked)
+			if a.asked != 2*len(deletionCutPads) {
+				t.Fatalf("transcriptions asked = %d, want each of the %d pads' retried once", a.asked, len(deletionCutPads))
 			}
 			if left := filesBeside(t, recording); len(left) != 0 {
 				t.Fatalf("a refused cut left %v beside the recording", left)
@@ -202,6 +203,30 @@ func TestCutCheckRetriesATranscriptionDeafAtTheCut(t *testing.T) {
 	_ = os.Remove(path)
 	if a.asked != 2 {
 		t.Fatalf("transcriptions asked = %d, want 2", a.asked)
+	}
+}
+
+// TestCutCheckWidensACutItCouldNotConfirm fails if a cut whose check is deaf
+// at the cut, twice, is refused at once rather than widened to the next pad,
+// as a cut with a heard word is: the deletion is refused only after the
+// widest pad.
+func TestCutCheckWidensACutItCouldNotConfirm(t *testing.T) {
+	words, selected := windowNeighbourWords()
+	wideStart, wideEnd := refinedSpliceBoundsWithPad(words, &selected, deletionCutPads[1])
+	// Deaf twice at the 0.45 s cut; at the 0.6 s cut it hears "we", the
+	// neighbour word that ends where the wider cut starts.
+	a := &answers{heard: [][]transcribe.TimestampedWord{farFromTheCut, farFromTheCut, {{Text: "we", Start: wideStart - 0.25, End: wideStart}, {Text: "left.", Start: wideStart + 0.3, End: wideStart + 0.5}}}}
+	runner, recording := cutCheckRunner(t, a)
+	path, start, end, _, err := runner.cutAndCheck(context.Background(), "nova-3", recording, words, &selected, -1)
+	if err != nil {
+		t.Fatalf("cut deaf at 0.45 s and clean at 0.6 s = %v, want accepted at 0.6 s", err)
+	}
+	_ = os.Remove(path)
+	if start != wideStart || end != wideEnd || a.asked != 3 {
+		t.Fatalf("accepted the cut %.2f to %.2f after %d transcriptions, want the 0.6 s cut %.2f to %.2f after 3", start, end, a.asked, wideStart, wideEnd)
+	}
+	if left := filesBeside(t, recording); len(left) != 0 {
+		t.Fatalf("the cuts tried left %v beside the recording", left)
 	}
 }
 

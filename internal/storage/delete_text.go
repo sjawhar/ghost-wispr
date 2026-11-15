@@ -50,10 +50,9 @@ func markDriveDocumentsPending(tx *sql.Tx, sessionID string, sources []string) e
 
 // recordTextDeletionSpan records, in tx, the span of sessionID's recording
 // that a "Delete text" deletion's words are in: the recording's file name,
-// the times, the recording's SHA-256 and the model of its word times, never
-// the words. A refinement transcribes a recording that has spans with their
-// model, so a recording with spans keeps theirs; any other has the session's
-// model, sessionModel. And sessionID and
+// the times, the recording's SHA-256 and model, the batch model that timed
+// the deleted words (RefinedWord.Model), never the words. A refinement
+// transcribes the recording with that model. And sessionID and
 // each of sources (the sessions merged into it) that has a Drive folder of
 // its own, whose documents the deletion changed, owes that folder a refresh
 // of them in place (drive_documents_pending): the session's own sync does it
@@ -61,17 +60,9 @@ func markDriveDocumentsPending(tx *sql.Tx, sessionID string, sources []string) e
 // own reaches, is refreshed by every sync of the session it was merged into
 // and by the sweep (DriveDocumentsOwed), also when the session the deletion
 // was made in is merged before its sync ran.
-func recordTextDeletionSpan(tx *sql.Tx, sessionID, sessionModel string, sources []string, span *DeletedSpan) error {
-	recording := filepath.Base(strings.TrimSpace(span.AudioPath))
-	model := sessionModel
-	switch err := tx.QueryRow(`SELECT model FROM deleted_text_spans WHERE recording = ? AND model != '' ORDER BY rowid LIMIT 1`, recording).Scan(&model); {
-	case errors.Is(err, sql.ErrNoRows):
-		model = sessionModel
-	case err != nil:
-		return fmt.Errorf("read the model of %s's deleted text spans: %w", recording, err)
-	}
+func recordTextDeletionSpan(tx *sql.Tx, sessionID, model string, sources []string, span *DeletedSpan) error {
 	if _, err := tx.Exec(`INSERT INTO deleted_text_spans(session_id, recording, start, end, sha256, deleted_at, model) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, recording, span.Start, span.End, span.SHA256Before, time.Now().UTC().Format(time.RFC3339Nano), model); err != nil {
+		sessionID, filepath.Base(strings.TrimSpace(span.AudioPath)), span.Start, span.End, span.SHA256Before, time.Now().UTC().Format(time.RFC3339Nano), model); err != nil {
 		return fmt.Errorf("record deleted text span for session %s: %w", sessionID, err)
 	}
 	return markDriveDocumentsPending(tx, sessionID, sources)

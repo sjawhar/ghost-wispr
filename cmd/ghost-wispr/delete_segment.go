@@ -483,7 +483,17 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 			return fmt.Errorf("probe recording %s: %w", recording, err)
 		}
 	}
-	tempPath, start, end, afterHash, err := d.cutAndCheck(ctx, session.RefinementModel, recording, words, selected, duration)
+	// The check hears the cut with the model that timed the segment's words:
+	// a merged session's recordings can come from two models.
+	checkModel := session.RefinementModel
+	for _, word := range words {
+		if word.RecordingPath == selected.RecordingPath && word.RecordingSHA256 == selected.RecordingSHA256 &&
+			word.Start >= selected.StartTime && word.End <= selected.EndTime && word.Model != "" {
+			checkModel = word.Model
+			break
+		}
+	}
+	tempPath, start, end, afterHash, err := d.cutAndCheck(ctx, checkModel, recording, words, selected, duration)
 	if err != nil {
 		if (errors.Is(err, errDeletionCutHeard) || errors.Is(err, errDeletionCutUnchecked)) && d.refused != nil {
 			cut := storage.RefusedCut{SessionID: sessionID, Recording: filepath.Base(selected.RecordingPath), Start: selected.StartTime, End: selected.EndTime}
@@ -581,18 +591,25 @@ const deletionCutWindow = 0.5
 // ones the person asked to delete.
 var errDeletionCutHeard = errors.New("part of the deleted segment is still heard next to the cut")
 
-// errDeletionCutUnchecked refuses a "Delete text and audio" whose check could
-// not hear the cut, twice: its transcription of the cut recording held no
-// words, or none within the listening window when the recording has
-// neighbour words there. A check that heard nothing where the deleted words
-// would be cannot say they are gone.
+// errDeletionCutUnchecked refuses a "Delete text and audio" whose check at the
+// widest pad could not hear the cut, twice: its transcription of the cut
+// recording held no words, or none within the listening window when the
+// recording has neighbour words there. A check that heard nothing where the
+// deleted words would be cannot say they are gone.
 var errDeletionCutUnchecked = errors.New("a transcription of the cut recording heard nothing next to the cut, so the cut could not be checked")
 
 // cutAndCheck cuts the selected segment out of a copy of recording, with each
-// of deletionCutPads in turn, until a transcription of the copy hears no word
-// of the segment next to the cut. It returns the accepted copy, its bounds and
-// its hash; it removes every copy it does not return. duration < 0 is unknown.
+// of deletionCutPads in turn, until a transcription of the copy hears the cut
+// and no word of the segment next to it. A cut with a word heard, or with a
+// check that could not hear the cut, is widened to the next pad; past the
+// widest the deletion is refused, with that cut's reason. It returns the
+// accepted copy, its bounds and its hash; it removes every copy it does not
+// return. duration < 0 is unknown.
 func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording string, words []storage.RefinedWord, selected *transcribe.Segment, duration float64) (string, float64, float64, string, error) {
+	// refusal is why the last cut tried was not accepted: a word of the
+	// segment heard next to it, or a check that could not hear the cut. Either
+	// widens the cut to the next pad; only the widest pad's refuses.
+	refusal := errDeletionCutHeard
 	for _, pad := range deletionCutPads {
 		start, end := refinedSpliceBoundsWithPad(words, selected, pad)
 		if duration >= 0 && end > duration {
@@ -622,20 +639,21 @@ func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording 
 		heard, err := d.transcribeCutHearingTheCut(ctx, model, tempPath, func(heard []transcribe.TimestampedWord) bool {
 			return hearsTheCut(words, selected, start, end, heard, deletionCutWindow)
 		})
-		if err != nil {
+		switch {
+		case errors.Is(err, errDeletionCutUnchecked):
+			refusal = errDeletionCutUnchecked
+		case err != nil:
 			_ = os.Remove(tempPath)
-			if errors.Is(err, errDeletionCutUnchecked) {
-				return "", 0, 0, "", fmt.Errorf("%w; the recording is unchanged", err)
-			}
 			return "", 0, 0, "", fmt.Errorf("check the cut recording %s: %w", recording, err)
-		}
-		if len(leftoverWords(words, selected, start, end, heard, deletionCutWindow)) == 0 {
+		case len(leftoverWords(words, selected, start, end, heard, deletionCutWindow)) == 0:
 			return tempPath, start, end, afterHash, nil
+		default:
+			refusal = errDeletionCutHeard
 		}
 		_ = os.Remove(tempPath)
 	}
 	return "", 0, 0, "", fmt.Errorf("%w, even cutting %.2f s past its words on each side; the recording is unchanged",
-		errDeletionCutHeard, deletionCutPads[len(deletionCutPads)-1])
+		refusal, deletionCutPads[len(deletionCutPads)-1])
 }
 
 // transcribeCutHearingTheCut transcribes a cut recording, once more when the

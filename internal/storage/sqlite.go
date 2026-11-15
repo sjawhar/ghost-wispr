@@ -715,11 +715,21 @@ func (s *SQLiteStore) init(dbPath string) error {
 			speaker INTEGER NOT NULL,
 			start_time REAL NOT NULL,
 			end_time REAL NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (session_id, transcript_revision, recording_path, recording_sha256, ordinal),
 			FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 		);
 	`); err != nil {
 		return fmt.Errorf("create refined words table: %w", err)
+	}
+	// model: the batch model that timed the word. Every word published before
+	// the column existed came from a refinement of its whole session with one
+	// model, its session's refinement model.
+	if _, err := s.db.Exec(`ALTER TABLE refined_words ADD COLUMN model TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate refined words model: %w", err)
+	}
+	if _, err := s.db.Exec(`UPDATE refined_words SET model = COALESCE((SELECT refinement_model FROM sessions WHERE sessions.id = refined_words.session_id), '') WHERE model = ''`); err != nil {
+		return fmt.Errorf("backfill refined words model: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
