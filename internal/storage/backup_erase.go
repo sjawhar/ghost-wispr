@@ -7,8 +7,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-
-	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // preMigrationBackupPath is the backup createPreMigrationBackup keeps beside
@@ -301,9 +299,9 @@ func rebuildBackupCanonical(tx *sql.Tx, segmentColumns map[string]bool, sessionI
 			if err != nil {
 				return fmt.Errorf("read backup segments of session %s: %w", id, err)
 			}
-			var remaining []transcribe.Segment
+			var remaining []StoredSegment
 			for rows.Next() {
-				var segment transcribe.Segment
+				var segment StoredSegment
 				if err := rows.Scan(&segment.Text); err != nil {
 					_ = rows.Close()
 					return fmt.Errorf("scan backup segment of session %s: %w", id, err)

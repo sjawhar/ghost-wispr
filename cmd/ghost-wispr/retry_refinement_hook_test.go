@@ -41,9 +41,9 @@ func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
 	}
 	registry := newWarningsRegistry()
 	refined := make(chan struct{}, 1)
-	hook := newRetryRefinementHook(store, func() string { return dir }, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	hook := retryRunner(store, func() string { return dir }, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, drive, "")
-	}, registry, func(_ context.Context, id, audioPath string, at time.Time) error {
+	}, func(_ context.Context, id, audioPath string, at time.Time) error {
 		generation, claimed, err := store.ClaimRefinement(id, audioPath)
 		if err != nil {
 			return err
@@ -57,7 +57,8 @@ func TestRetryRefinementHookRestoresThenEnablesDeletion(t *testing.T) {
 			refined <- struct{}{}
 		}
 		return err
-	})
+	}, registry).retryRefinement
+
 	deleted := make(chan struct{}, 1)
 	handler, err := server.Handler(fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok"), Mode: fs.ModePerm}}, server.NewHub(), store, &server.ControlHooks{
 		RefinementRecordingAvailable: func(context.Context, string) error {
@@ -121,12 +122,13 @@ func TestRetryRefinementHookWarnsWhenRestoreFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	registry := newWarningsRegistry()
-	hook := newRetryRefinementHook(store, t.TempDir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
+	hook := retryRunner(store, t.TempDir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
 		return deletionRecordingSet{}, errors.New("Drive listing timed out")
-	}, registry, func(context.Context, string, string, time.Time) error {
+	}, func(context.Context, string, string, time.Time) error {
 		t.Fatal("refinement ran after the Drive restoration failed")
 		return nil
-	})
+	}, registry).retryRefinement
+
 	if err := hook(context.Background(), "restored"); err == nil {
 		t.Fatal("retry succeeded after the Drive restoration failed")
 	}

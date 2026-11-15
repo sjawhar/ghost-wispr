@@ -218,7 +218,7 @@ func TestRefinementDropsTheWordsOfDeletedText(t *testing.T) {
 	if strings.Contains(sess.CanonicalTranscript, "tractor") || !strings.Contains(sess.CanonicalTranscript, "And then left.") {
 		t.Errorf("canonical transcript = %q, want the refined transcript without the deleted words", sess.CanonicalTranscript)
 	}
-	segments, err := store.GetSegments("20261112100000")
+	segments, err := store.StoredSegments("20261112100000")
 	if err != nil {
 		t.Fatal(err)
 	}

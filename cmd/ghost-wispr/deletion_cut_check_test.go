@@ -103,7 +103,7 @@ func replayCut(t *testing.T, f *deletionCutFixture) replayedCut {
 	}
 	bounds := map[string][2]float64{}
 	var result replayedCut
-	runner := &segmentDeleteRunner{
+	runner := testDeleteRunner(t, &segmentDeleteRunner{
 		splice: func(_ context.Context, path string, start, end float64) (string, error) {
 			bounds[path] = [2]float64{start, end}
 			return "cut-hash", nil
@@ -122,7 +122,7 @@ func replayCut(t *testing.T, f *deletionCutFixture) replayedCut {
 			t.Fatalf("%s segment at %.3f s: no recorded cut at [%.3f, %.3f]", f.Recording, f.Segment.StartTime, b[0], b[1])
 			return nil, nil
 		},
-	}
+	})
 	path, start, end, _, err := runner.cutAndCheck(context.Background(), "nova-3", recording, f.Words, &f.Segment, -1)
 	result.err = err
 	if err == nil {

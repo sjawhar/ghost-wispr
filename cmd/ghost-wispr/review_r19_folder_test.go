@@ -71,7 +71,7 @@ func TestReviewR19FolderTwoLevelsUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	}); err != nil {
 		t.Fatalf("retry fails when the folder is two merges above the leaves: %v (downloads %v)", err, source.downloaded)

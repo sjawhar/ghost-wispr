@@ -32,20 +32,19 @@ var heardTractor = []transcribe.TimestampedWord{{Text: "So", Start: 0.2, End: 0.
 
 // refusingRunner makes the deletion runner main.go makes, over store, for
 // refusedCutFixture's recording, with a check after each cut that hears
-// heard.
-func refusingRunner(store *storage.SQLiteStore, recording string, heard []transcribe.TimestampedWord) func() *segmentDeleteRunner {
-	return func() *segmentDeleteRunner {
-		return &segmentDeleteRunner{
-			store: store,
-			ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
-				return deletionRecordingSet{Paths: []string{recording}}, nil
-			},
-			splice: func(context.Context, string, float64, float64) (string, error) { return "after", nil },
-			transcribeCut: func(context.Context, string, string) ([]transcribe.TimestampedWord, error) {
-				return heard, nil
-			},
-		}
-	}
+// heard and the refused-cut record refused.
+func refusingRunner(store *storage.SQLiteStore, recording string, heard []transcribe.TimestampedWord, refused *refusedCuts) *segmentDeleteRunner {
+	return withTestDefaults(&segmentDeleteRunner{
+		store: store,
+		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			return deletionRecordingSet{Paths: []string{recording}}, nil
+		},
+		splice: func(context.Context, string, float64, float64) (string, error) { return "after", nil },
+		transcribeCut: func(context.Context, string, string) ([]transcribe.TimestampedWord, error) {
+			return heard, nil
+		},
+		refused: refused,
+	})
 }
 
 // unitServer is the HTTP handler a unit starting on store serves, as far as
@@ -61,7 +60,8 @@ func unitServer(t *testing.T, store *storage.SQLiteStore, recording string) http
 func unitServerHearing(t *testing.T, store *storage.SQLiteStore, recording string, heard []transcribe.TimestampedWord) http.Handler {
 	t.Helper()
 	hooks := &server.ControlHooks{}
-	wireSegmentDeletion(hooks, newWarningsRegistry(), newRefusedCuts(store), refusingRunner(store, recording, heard))
+	refused := newRefusedCuts(store)
+	wireSegmentDeletion(hooks, newWarningsRegistry(), refused, refusingRunner(store, recording, heard, refused))
 	handler, err := server.Handler(fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok"), Mode: fs.ModePerm}}, server.NewHub(), store, hooks, "", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -202,8 +202,7 @@ func TestTouchingNeighbourCutTrimsARefusedCut(t *testing.T) {
 		t.Fatal(err)
 	}
 	then := segments[len(segments)-1]
-	runner := refusingRunner(store, recording, []transcribe.TimestampedWord{{Text: "ninety", Start: 63.9, End: 64.1}})()
-	runner.refused = newRefusedCuts(store)
+	runner := refusingRunner(store, recording, []transcribe.TimestampedWord{{Text: "ninety", Start: 63.9, End: 64.1}}, newRefusedCuts(store))
 	runner.splice = func(_ context.Context, path string, start, end float64) (string, error) {
 		if err := os.WriteFile(path, fmt.Appendf(nil, "cut %.3f-%.3f", start, end), 0o600); err != nil {
 			return "", err

@@ -40,7 +40,7 @@ func TestASecondSyncOfASessionStartsNothingWhileOneRuns(t *testing.T) {
 	const id = "20261106100000"
 	summarizedSession(t, store, t.TempDir(), id, time.Now().UTC().Add(-time.Hour), "A summary.")
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	ctx := context.Background()
 
 	var canSync, second error
@@ -72,7 +72,7 @@ func TestConcurrentSyncsOfOneSessionUploadItOnce(t *testing.T) {
 	summarizedSession(t, store, t.TempDir(), id, time.Now().UTC().Add(-time.Hour), "A summary.")
 	drive := newFakeDrive()
 	drive.onUpload = func() { time.Sleep(20 * time.Millisecond) } // a slow upload
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -118,7 +118,7 @@ func TestASyncMarksSyncedOnlyASessionItStillHolds(t *testing.T) {
 		syncTo(t, store, id, storage.SyncStateRemoteDeleted, "", 0, "the Drive folder was deleted by hand")
 	})
 
-	syncErr := NewOrchestratorWithUploader(drive, store).SyncSession(context.Background(), id)
+	syncErr := NewOrchestrator(drive, store).SyncSession(context.Background(), id)
 	if state, _ := sessionState(t, store, id); state != storage.SyncStateRemoteDeleted {
 		t.Errorf("after the sync (%v): %q, want %q left as it was", syncErr, state, storage.SyncStateRemoteDeleted)
 	}
@@ -143,7 +143,7 @@ func TestAFailedSyncNeverReplacesTheStateItNoLongerHolds(t *testing.T) {
 		syncTo(t, store, id, storage.SyncStateSynced, "folder-of-the-other-sync", 0, "")
 	})
 
-	syncErr := NewOrchestratorWithUploader(drive, store).SyncSession(context.Background(), id)
+	syncErr := NewOrchestrator(drive, store).SyncSession(context.Background(), id)
 	if syncErr == nil {
 		t.Fatal("the cut-off sync succeeded")
 	}
@@ -166,7 +166,7 @@ func TestAnErrorWhileMarkingSyncedSchedulesARetry(t *testing.T) {
 		t.Fatalf("create trigger: %v", err)
 	}
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 
 	if err := o.SyncSession(context.Background(), id); err == nil {
 		t.Fatal("the sync succeeded though marking it synced failed")

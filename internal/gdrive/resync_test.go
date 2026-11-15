@@ -174,7 +174,7 @@ func TestAChangeAfterASyncReachesDrive(t *testing.T) {
 			const id = "20261106100000"
 			summarizedSession(t, store, t.TempDir(), id, time.Now().UTC().Add(-time.Hour), "The first summary.")
 			drive := newFakeDrive()
-			o := NewOrchestratorWithUploader(drive, store)
+			o := NewOrchestrator(drive, store)
 			folder := syncedSession(t, store, o, id)
 			before, _ := document(t, drive, folder, tc.document)
 
@@ -209,7 +209,7 @@ func TestAChangeDuringASyncSendsTheSessionBackToPending(t *testing.T) {
 	summarizedSession(t, store, t.TempDir(), id, time.Now().UTC().Add(-time.Hour), "The first summary.")
 	drive := newFakeDrive()
 	onFirstUpload(drive, func() { resummarize(t, store, id, "The summary, made again.") })
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 
 	if err := o.SyncSession(context.Background(), id); err == nil {
 		t.Fatal("the sync whose session changed during the upload reported success")
@@ -241,7 +241,7 @@ func TestAgeGCKeepsASessionUntilItsCurrentDocumentsAreOnDrive(t *testing.T) {
 	const id = "20260901100000"
 	summarizedSession(t, store, audioDir, id, time.Now().UTC().AddDate(0, 0, -40), "The first summary.")
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	folder := syncedSession(t, store, o, id)
 	collector := gc.New(store, gc.Config{MaxAgeDays: 30, AudioDir: audioDir, Drive: o}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
@@ -287,7 +287,7 @@ func TestAgeGCKeepsASessionThatChangesAfterGCListsIt(t *testing.T) {
 	audioDir := t.TempDir()
 	const id = "20260901100000"
 	summarizedSession(t, store, audioDir, id, time.Now().UTC().AddDate(0, 0, -40), "The first summary.")
-	o := NewOrchestratorWithUploader(newFakeDrive(), store)
+	o := NewOrchestrator(newFakeDrive(), store)
 	syncedSession(t, store, o, id)
 
 	changing := &changingStore{SQLiteStore: store, change: func() { resummarize(t, store, id, "The summary, made again.") }}

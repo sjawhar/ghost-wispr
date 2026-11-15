@@ -77,9 +77,10 @@ func suiteProvenanceDelete(t *testing.T, refinedFirst bool) string {
 	}
 	source := &r11FolderDrive{files: map[string][]*drive.File{"folder-s": {{Name: recordingname.FileName(sPath), MimeType: "audio/mpeg"}}}, downloads: map[string][]byte{"folder-s/" + recordingname.FileName(sPath): []byte("s")}}
 	refine := suiteTwoWordRefine(store)
-	retry := newRetryRefinementHook(store, func() string { return dir }, func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
+	retry := retryRunner(store, func() string { return dir }, func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &session, dir, source, "")
-	}, newWarningsRegistry(), refine)
+	}, refine, newWarningsRegistry()).retryRefinement
+
 	onSessionMerged(context.Background(), store, refine, func(context.Context, string, time.Time) error { return nil }, retry,
 		func(_ context.Context, _ string, cause error) { t.Fatalf("hook failed: %v", cause) }, "merged")
 	merged, err := store.GetSession("merged")

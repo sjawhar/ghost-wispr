@@ -25,10 +25,11 @@ After the certificate-signing request exists, do these before provisioning:
    - the service account's unique ID: `ghostWisprAccountUniqueId` in `root`'s prod
      configuration (`root/Pulumi.prod.yaml`);
    - the relay URL: the `relayUrl` output from `envoy-cluster`.
-2. Ensure Secret Manager has `envoy-ghostwispr-signing-secret`. Provisioning reads it only under
-   a secrets-broker grant of one hour that Sami approves, never as the devbox identity or an
-   agent box: dispatch://INFRA-3599 takes that read away from box identities, because a process
-   that holds the secret can sign events that Envoy accepts as the recorder's.
+2. Ensure Secret Manager has `envoy-ghostwispr-signing-secret` and that `ghost-wispr@` has
+   Secret Accessor on it (dispatch://INFRA-3599). Ghost Wispr reads the key itself at runtime,
+   with the same Google identity it uses for Drive and Gemini, so no person or bundle carries
+   it to the Pi. Box identities cannot read it: a process that holds the secret can sign events
+   that Envoy accepts as the recorder's.
 3. Wait for the Ghost Wispr release workflow to publish `ghost-wispr-linux-arm64` and
    `ghost-wispr-linux-arm64.sha256`.
 
@@ -141,7 +142,7 @@ configuration for a normal certificate renewal.
 
 ## Prepare the bundle's public files
 
-The credential bundle holds six public files and two secrets:
+The credential bundle holds six public files and one secret:
 
 | File | Source |
 | --- | --- |
@@ -150,8 +151,14 @@ The credential bundle holds six public files and two secrets:
 | `tailscale-client-id` | `root`'s stack output `ghostWisprTailnetClientId` |
 | `tailscale-subject` | `ghostWisprAccountUniqueId` in `root`'s prod configuration |
 | `envoy-webhook-url` | `envoy-cluster`'s stack output `relayUrl`, followed by `/webhook/ghostwispr` |
-| `envoy-webhook-secret` | Secret Manager `envoy-ghostwispr-signing-secret`, read by `deploy/pi/webhook-secret.sh` under a one-hour secrets-broker grant (below) |
 | `deepgram-key` | `DEEPGRAM_API_KEY` from the operator's `secrets` store |
+
+The Envoy webhook signing key is not in the bundle, and `provision.sh` refuses a bundle that
+holds an `envoy-webhook-secret` file. Ghost Wispr reads the key from Secret Manager
+(`envoy_webhook_secret_name`, by default
+`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`) and keeps
+it in memory. When Envoy answers 401 it reads the key again once, so a rotation needs no change on
+the Pi. When it cannot read the key it sends no events and `/api/status` says so; recording goes on.
 
 Make the six public files on the development machine where you ran `create-cred-config`. Its
 `gcloud` must be the devbox identity, and it needs `agent-infra` checked out at
@@ -174,20 +181,13 @@ machine provisions the Pi, copy `$prepared` there.
 
 ## Provision
 
-`deploy/pi/provision-pi.sh` reads the two secrets, makes the bundle and runs
+`deploy/pi/provision-pi.sh` reads the Deepgram key, makes the bundle and runs
 `deploy/pi/provision.sh` on the Pi. Run it from a checkout of the release's commit, on the
 machine that reaches the Pi over SSH.
 
-- It reads `envoy-ghostwispr-signing-secret` with `deploy/pi/webhook-secret.sh`, under one
-  secrets-broker grant of one hour that Sami approves on the broker page:
-  `secret-run --register --ttl 1h GCLOUD_SAMI` runs `gcloud-broker`, so the read is the admin
-  login the broker mints, never the box identity. `--broker-key KEY` reads a broker key that
-  holds a copy of the secret instead. `--broker-host HOST` makes the read on `HOST` over SSH,
-  for a provisioning machine whose `secret-run` has no secrets-broker identity (Sami's laptop:
-  name the devbox). `secret-run` and `gcloud-broker` are Sami's dotfiles scripts.
 - It reads `DEEPGRAM_API_KEY` with `secrets` on the provisioning machine.
-- The two secrets reach disk only in a mode-0700 directory under `$XDG_RUNTIME_DIR` while it
-  makes the tar stream. It removes that directory as soon as `provision.sh` returns, also when
+- The key reaches disk only in a mode-0700 directory under `$XDG_RUNTIME_DIR` while it makes
+  the tar stream. It removes that directory as soon as `provision.sh` returns, also when
   `provision.sh` fails, and on any exit. No secret goes in an argument.
 - It copies only the provisioning sources to a temporary directory on the Pi and removes it
   afterwards, so the card keeps no source checkout.
@@ -197,11 +197,11 @@ machine that reaches the Pi over SSH.
 the user services; verifies and installs the newest release; enables Tailscale Serve; and then
 starts the detached tagged-device join.
 
-Set `broker_host` first if this machine's `secret-run` has no broker identity, then run:
+Then run:
 
 <!-- provision_bundle_test.sh: provision -->
 ```bash
-deploy/pi/provision-pi.sh --prepared "$prepared" ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"}
+deploy/pi/provision-pi.sh --prepared "$prepared"
 ```
 
 `provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says
@@ -356,8 +356,10 @@ The warning goes once no such session is left. The count is read again at each s
 
 Run the acceptance driver from a tailnet member. Give it the relay URL. To run the signed
 Envoy control, inject the signing secret only into the driver's process: `webhook-secret.sh`
-reads it under a one-hour secrets-broker grant, with `--broker-host` and `--broker-key` as for
-provisioning.
+reads it under a one-hour secrets-broker grant that Sami approves, as the admin login
+`secret-run --register --ttl 1h GCLOUD_SAMI` mints through `gcloud-broker`. Set `broker_host`
+to run the read on a machine whose `secret-run` has a broker identity when this one has none
+(Sami's laptop: name the devbox), or `broker_key` to read a broker key that holds a copy.
 
 <!-- provision_bundle_test.sh: accept -->
 ```bash

@@ -41,6 +41,25 @@ func Key(path string) string {
 	}
 }
 
+// Entries returns the recordings a session's audio path names, in order: a
+// merged session's audio path names several, separated by commas. Each entry
+// is trimmed, and empty ones are dropped.
+func Entries(audioPath string) []string {
+	var entries []string
+	for entry := range strings.SplitSeq(audioPath, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// RawPath is the raw capture the recorder writes for a session while it
+// records, and keeps when the recording cannot be saved: <audioDir>/<id>.pcm.
+func RawPath(audioDir, sessionID string) string {
+	return filepath.Join(audioDir, sessionID+".pcm")
+}
+
 // Resolve returns the file one entry of a session's audio path names: the
 // entry as written, when a file is there, else the file of the entry's name
 // in audioDir, the audio directory now. The recorder writes

@@ -7,6 +7,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/deepgram/deepgram-go-sdk/v3 v3.5.0
+	github.com/dvonthenen/websocket v1.5.1-dyv.2
 	github.com/google/uuid v1.6.0
 	github.com/gordonklaus/portaudio v0.0.0-20230709114228-aafa478834f5
 	github.com/gorilla/websocket v1.5.3
@@ -26,7 +27,6 @@ require (
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/dvonthenen/websocket v1.5.1-dyv.2 // indirect
 	github.com/fatih/color v1.15.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect

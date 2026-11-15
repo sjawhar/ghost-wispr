@@ -79,7 +79,7 @@ func TestSendSignsTheBody(t *testing.T) {
 	server, requests := newListenerTestServer(t, "shared-secret")
 	defer server.Close()
 
-	client := NewClient(server.URL, "shared-secret")
+	client := NewClient(server.URL, staticKey("shared-secret"))
 	client.retryDelays = nil
 
 	if err := client.Send(context.Background(), Event{
@@ -96,7 +96,7 @@ func TestSendSignsTheBody(t *testing.T) {
 }
 
 func TestNewClientSetsRequestTimeout(t *testing.T) {
-	client := NewClient("https://relay.example.test/webhook/ghostwispr", "shared-secret")
+	client := NewClient("https://relay.example.test/webhook/ghostwispr", staticKey("shared-secret"))
 	if client.httpClient.Timeout != 10*time.Second {
 		t.Fatalf("default HTTP timeout = %s, want 10s", client.httpClient.Timeout)
 	}
@@ -109,7 +109,7 @@ func TestNewClientTrimsTheSecretLikeEnvoy(t *testing.T) {
 	server, requests := newListenerTestServer(t, "shared-secret")
 	defer server.Close()
 
-	client := NewClient(server.URL, "  shared-secret\n\n")
+	client := NewClient(server.URL, staticKey("  shared-secret\n\n"))
 	client.retryDelays = nil
 
 	if err := client.Send(context.Background(), Event{
@@ -127,7 +127,7 @@ func TestSendStopsWaitingWhenTheContextEnds(t *testing.T) {
 	server, requests := newListenerTestServer(t, "shared-secret", http.StatusServiceUnavailable)
 	defer server.Close()
 
-	client := NewClient(server.URL, "shared-secret")
+	client := NewClient(server.URL, staticKey("shared-secret"))
 	client.retryDelays = []time.Duration{time.Hour}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -149,7 +149,7 @@ func TestSendCarriesTheHeadersAndBodyTheListenerNeeds(t *testing.T) {
 	defer server.Close()
 
 	now := time.Date(2026, 11, 10, 12, 30, 45, 0, time.UTC)
-	client := NewClient(server.URL, "shared-secret")
+	client := NewClient(server.URL, staticKey("shared-secret"))
 	client.now = func() time.Time { return now }
 	client.retryDelays = nil
 
@@ -214,7 +214,7 @@ func TestSendRetriesWithTheSameDelivery(t *testing.T) {
 	server, requests := newListenerTestServer(t, "shared-secret", http.StatusServiceUnavailable, http.StatusOK)
 	defer server.Close()
 
-	client := NewClient(server.URL, "shared-secret")
+	client := NewClient(server.URL, staticKey("shared-secret"))
 	client.retryDelays = []time.Duration{0}
 
 	if err := client.Send(context.Background(), Event{
@@ -244,7 +244,7 @@ func TestSendGivesUpOnA4xx(t *testing.T) {
 	defer server.Close()
 
 	var logs bytes.Buffer
-	client := NewClient(server.URL, "shared-secret", WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	client := NewClient(server.URL, staticKey("shared-secret"), WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
 	client.retryDelays = []time.Duration{0, 0, 0}
 
 	err := client.Send(context.Background(), Event{
@@ -281,7 +281,7 @@ func TestPublishSummaryReadyUsesSummaryVersionAndMarksStatus(t *testing.T) {
 			SummaryVersion: 3,
 		},
 	}}
-	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = nil
 
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
@@ -329,7 +329,7 @@ func TestPublishSummaryReadyLeavesANewerSummaryAlone(t *testing.T) {
 		sess.SummaryVersion = 2
 		store.sessions["session-1"] = sess
 	}
-	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = nil
 
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
@@ -360,7 +360,7 @@ func TestPublishSummaryReadyRecordsFailed4xx(t *testing.T) {
 			SummaryVersion: 1,
 		},
 	}}
-	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = []time.Duration{0, 0}
 
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err == nil {
@@ -390,7 +390,7 @@ func TestPublishSummaryReadyRecordsFailed5xx(t *testing.T) {
 			SummaryVersion: 1,
 		},
 	}}
-	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = []time.Duration{0, 0}
 
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err == nil {
@@ -416,7 +416,7 @@ func TestLifecycleEventsSurviveRestart(t *testing.T) {
 	}
 
 	down, _ := newListenerTestServer(t, "shared-secret", http.StatusServiceUnavailable, http.StatusServiceUnavailable)
-	publisher := NewPublisher(down.URL, "shared-secret", store)
+	publisher := NewPublisher(down.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = nil
 	if err := publisher.PublishSessionStarted(context.Background(), "session-1"); err == nil {
 		t.Fatal("PublishSessionStarted succeeded while relay was down")
@@ -439,7 +439,7 @@ func TestLifecycleEventsSurviveRestart(t *testing.T) {
 	defer func() { _ = reopened.Close() }()
 	up, requests := newListenerTestServer(t, "shared-secret")
 	defer up.Close()
-	publisher = NewPublisher(up.URL, "shared-secret", reopened)
+	publisher = NewPublisher(up.URL, staticKey("shared-secret"), reopened)
 	publisher.client.retryDelays = nil
 	if err := publisher.PublishPendingLifecycleEvents(context.Background()); err != nil {
 		t.Fatalf("PublishPendingLifecycleEvents: %v", err)
@@ -483,7 +483,7 @@ func TestPendingLifecycleEventsContinueAfterFailure(t *testing.T) {
 
 	server, requests := newListenerTestServer(t, "shared-secret", http.StatusServiceUnavailable, http.StatusOK)
 	defer server.Close()
-	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = nil
 	if err := publisher.PublishPendingLifecycleEvents(context.Background()); err == nil {
 		t.Fatal("PublishPendingLifecycleEvents succeeded, want the first event error")
@@ -515,7 +515,7 @@ func TestSummaryReadyRetries429(t *testing.T) {
 			SummaryVersion: 1,
 		},
 	}}
-	publisher := NewPublisher(server.URL, "shared-secret", store)
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = []time.Duration{0}
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
 		t.Fatalf("PublishSummaryReady: %v", err)
@@ -548,7 +548,7 @@ func TestFailedSummaryDeliversAfterSecretIsFixed(t *testing.T) {
 
 	listener, requests := newListenerTestServer(t, "fixed-secret")
 	defer listener.Close()
-	publisher := NewPublisher(listener.URL, "wrong-secret", store)
+	publisher := NewPublisher(listener.URL, staticKey("wrong-secret"), store)
 	publisher.client.retryDelays = nil
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err == nil {
 		t.Fatal("PublishSummaryReady succeeded with the wrong secret")
@@ -561,7 +561,7 @@ func TestFailedSummaryDeliversAfterSecretIsFixed(t *testing.T) {
 		t.Fatalf("failed summary candidates = %v, want [session-1]", ids)
 	}
 
-	publisher = NewPublisher(listener.URL, "fixed-secret", store)
+	publisher = NewPublisher(listener.URL, staticKey("fixed-secret"), store)
 	publisher.client.retryDelays = nil
 	if err := publisher.PublishSummaryReady(context.Background(), "session-1"); err != nil {
 		t.Fatalf("PublishSummaryReady after secret fix: %v", err)
@@ -602,7 +602,7 @@ func TestEmptySummaryIsNotPublished(t *testing.T) {
 
 	listener, requests := newListenerTestServer(t, "shared-secret")
 	defer listener.Close()
-	publisher := NewPublisher(listener.URL, "shared-secret", store)
+	publisher := NewPublisher(listener.URL, staticKey("shared-secret"), store)
 	publisher.client.retryDelays = nil
 	ids, err := store.GetSessionsNeedingEnvoyPublish()
 	if err != nil {

@@ -3,6 +3,7 @@ package recording
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -37,6 +38,30 @@ func TestKeyNamesARecordingAsMP3OrWAV(t *testing.T) {
 		if got := Key(tc.path); got != tc.want {
 			t.Errorf("Key(%q) = %q, want %q", tc.path, got, tc.want)
 		}
+	}
+}
+
+// TestEntriesSplitsAMergedAudioPath fails if Entries does not return each
+// recording of an audio path, trimmed and in order, without empty entries.
+func TestEntriesSplitsAMergedAudioPath(t *testing.T) {
+	for _, tc := range []struct {
+		audioPath string
+		want      []string
+	}{
+		{"", nil},
+		{" , ,", nil},
+		{"a.mp3", []string{"a.mp3"}},
+		{"data/a.mp3, data/b.wav,,c.mp3 ", []string{"data/a.mp3", "data/b.wav", "c.mp3"}},
+	} {
+		if got := Entries(tc.audioPath); !slices.Equal(got, tc.want) {
+			t.Errorf("Entries(%q) = %q, want %q", tc.audioPath, got, tc.want)
+		}
+	}
+}
+
+func TestRawPathIsTheSessionsPCMInTheAudioDirectory(t *testing.T) {
+	if got, want := RawPath("data/audio", "20261106100000"), filepath.Join("data", "audio", "20261106100000.pcm"); got != want {
+		t.Fatalf("RawPath = %q, want %q", got, want)
 	}
 }
 

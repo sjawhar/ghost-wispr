@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -94,7 +95,7 @@ func (r *Recorder) StartSession(sessionID string) error {
 		_ = r.rawFile.Close()
 	}
 
-	rawPath := filepath.Join(r.audioDir, sessionID+".pcm")
+	rawPath := recording.RawPath(r.audioDir, sessionID)
 	rawFile, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open raw pcm file: %w", err)

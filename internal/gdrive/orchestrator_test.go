@@ -16,6 +16,7 @@ import (
 )
 
 type fakeUploader struct {
+	syncOnlyDrive
 	folderID string
 	err      error
 	uploads  int      // new folders created
@@ -27,6 +28,15 @@ type fakeUploader struct {
 func (f *fakeUploader) Upload(_ context.Context, _ string, _ []SyncFile) (string, error) {
 	f.uploads++
 	return f.folderID, f.err
+}
+
+// UploadWithFolderRecorded records the folder it makes, then uploads, as the
+// real Syncer does.
+func (f *fakeUploader) UploadWithFolderRecorded(ctx context.Context, folderName string, files []SyncFile, record func(folderID string) error) (string, error) {
+	if err := record(f.folderID); err != nil {
+		return f.folderID, err
+	}
+	return f.Upload(ctx, folderName, files)
 }
 
 func (f *fakeUploader) UploadInto(_ context.Context, folderID string, _ []SyncFile) error {
@@ -52,7 +62,7 @@ func TestOrchestratorResyncsIntoTheSessionsFolder(t *testing.T) {
 	}}
 	uploader := &fakeUploader{folderID: "folder-new"}
 
-	if err := NewOrchestratorWithUploader(uploader, store).SyncSession(context.Background(), "session-1-merged"); err != nil {
+	if err := NewOrchestrator(uploader, store).SyncSession(context.Background(), "session-1-merged"); err != nil {
 		t.Fatalf("sync session: %v", err)
 	}
 	if uploader.uploads != 0 || len(uploader.into) != 1 || uploader.into[0] != "folder-1" {
@@ -71,13 +81,24 @@ type syncStateUpdate struct {
 	hasAttempt    bool
 }
 
+// fakeOrchestratorStore is a store of one session that owes Drive no
+// replacement and no documents; a test that reaches the rest of the
+// replacement and documents ledger (the embedded nil interfaces) fails.
 type fakeOrchestratorStore struct {
+	replacementStore
+	documentsStore
 	session storage.Session
 
 	segments []transcribe.Segment
 	updates  []syncStateUpdate
 	claim    string
 }
+
+func (*fakeOrchestratorStore) DriveReplacementInput(string) (bool, string, error) {
+	return false, "", nil
+}
+
+func (*fakeOrchestratorStore) DriveDocumentsOwed(string) ([]string, error) { return nil, nil }
 
 func (f *fakeOrchestratorStore) GetSession(id string) (storage.Session, error) {
 	if id != f.session.ID {
@@ -167,7 +188,7 @@ func TestOrchestratorSyncSessionSuccessTransitions(t *testing.T) {
 	}
 	uploader := &fakeUploader{folderID: "folder-123"}
 
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 	if err := o.SyncSession(context.Background(), "session-1"); err != nil {
 		t.Fatalf("sync session: %v", err)
 	}
@@ -201,7 +222,7 @@ func TestOrchestratorSyncSessionSchedulesRetryOnFailure(t *testing.T) {
 	}
 	uploader := &fakeUploader{err: errors.New("temporary upload error")}
 
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 	err := o.SyncSession(context.Background(), "session-2")
 	if err == nil {
 		t.Fatal("expected sync session to return retryable error")
@@ -236,7 +257,7 @@ func TestOrchestratorSyncSessionFailsPermanentlyAfterRetryExhaustion(t *testing.
 	}
 	uploader := &fakeUploader{err: errors.New("persistent upload error")}
 
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 	err := o.SyncSession(context.Background(), "session-3")
 	if err == nil {
 		t.Fatal("expected sync session to fail")
@@ -271,7 +292,7 @@ func TestOrchestratorSyncSessionSoftDeletesRemoteDeletion(t *testing.T) {
 	}
 	uploader := &fakeUploader{err: fmt.Errorf("list folder folder-4: %w", &googleapi.Error{Code: 404})}
 
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 	err := o.SyncSession(context.Background(), "session-4")
 	if err == nil {
 		t.Fatal("expected sync session to return remote deletion error")
@@ -297,7 +318,7 @@ func TestOrchestratorSyncSessionAlreadySyncedIsNoop(t *testing.T) {
 	}
 	uploader := &fakeUploader{folderID: "folder-xyz"}
 
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 	if err := o.SyncSession(context.Background(), "session-already-synced"); err != nil {
 		t.Fatalf("expected re-syncing an already-synced session to be a no-op, got error: %v", err)
 	}
@@ -324,7 +345,7 @@ func TestOrchestratorDoesNotMarkSyncedWhileARecordingIsMissing(t *testing.T) {
 		Summary: "summary", SyncState: storage.SyncStatePending, AudioPath: present + "," + missing,
 	}}
 	uploader := &fakeUploader{folderID: "folder-1"}
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 
 	if err := o.SyncSession(context.Background(), "session-merged"); err == nil {
 		t.Error("synced a session with a recording missing from disk")
@@ -356,7 +377,7 @@ func TestOrchestratorRetryReusesTheFolderAFailedSyncCreated(t *testing.T) {
 		Summary: "summary", SyncState: storage.SyncStatePending,
 	}}
 	uploader := &fakeUploader{folderID: "folder-1", err: errors.New("upload transcript.md: connection reset")}
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 
 	if err := o.SyncSession(context.Background(), "session-1"); err == nil {
 		t.Fatal("expected the sync to fail")
@@ -385,7 +406,7 @@ func TestOrchestratorManualRetryStartsFromFailed(t *testing.T) {
 		Summary: "summary", SyncState: storage.SyncStateFailed, RetryCount: MaxSyncRetries, GDriveFolderID: "folder-1",
 	}}
 	uploader := &fakeUploader{folderID: "folder-new"}
-	o := NewOrchestratorWithUploader(uploader, store)
+	o := NewOrchestrator(uploader, store)
 
 	if err := o.CanSync(context.Background(), "session-1"); err != nil {
 		t.Errorf("CanSync of a FAILED session: %v", err)

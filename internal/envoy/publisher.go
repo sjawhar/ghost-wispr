@@ -12,8 +12,10 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
@@ -46,27 +48,73 @@ type Event struct {
 	Payload        map[string]any
 }
 
-// Option configures a Client.
-type Option func(*Client)
+// KeyReader reads Envoy's webhook signing key: on the unit, from Secret
+// Manager with the unit's Google credential.
+type KeyReader func(ctx context.Context) (string, error)
+
+// keyReadTimeout bounds one read of the signing key, so an event waits for a
+// read that does not answer no longer than this.
+const keyReadTimeout = 30 * time.Second
+
+// Option configures a Client or a Publisher.
+type Option func(*options)
+
+type options struct {
+	logger    *slog.Logger
+	publicURL string
+	keyStatus func(error)
+}
+
+// WithKeyStatus calls report after every read of the signing key, with nil
+// when it read a key and the read's error when it did not; the unit shows the
+// error in /api/status.
+func WithKeyStatus(report func(error)) Option {
+	return func(o *options) {
+		o.keyStatus = report
+	}
+}
 
 // WithLogger sets the logger used for webhook request failures and retries.
 func WithLogger(logger *slog.Logger) Option {
-	return func(c *Client) {
+	return func(o *options) {
 		if logger != nil {
-			c.logger = logging.WithModule(logger, "envoy")
+			o.logger = logging.WithModule(logger, "envoy")
 		}
 	}
 }
 
-// Client sends Ghost Wispr events to Envoy's webhook.
+// WithPublicURL sets the unit's own HTTPS address (config public_url): a
+// Publisher's events link to each session's API resource under it.
+func WithPublicURL(publicURL string) Option {
+	return func(o *options) {
+		o.publicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
+	}
+}
+
+func collectOptions(opts []Option) options {
+	collected := options{logger: logging.WithModule(slog.Default(), "envoy")}
+	for _, option := range opts {
+		if option != nil {
+			option(&collected)
+		}
+	}
+	return collected
+}
+
+// Client sends Ghost Wispr events to Envoy's webhook, signed with a key it
+// reads once and keeps in memory.
 type Client struct {
 	url         string
-	secret      []byte
+	readKey     KeyReader
+	keyStatus   func(error)
 	httpClient  *http.Client
 	logger      *slog.Logger
 	now         func() time.Time
 	sleep       func(context.Context, time.Duration) error
 	retryDelays []time.Duration
+
+	keyMu sync.Mutex
+	key   []byte // the key read last; nil until a read works
 }
 type webhookStatusError struct {
 	status int
@@ -76,34 +124,64 @@ func (err *webhookStatusError) Error() string {
 	return fmt.Sprintf("envoy webhook responded with status %d", err.status)
 }
 
-// NewClient creates a webhook client. It does not contact the relay until Send.
-// It trims the URL and secret as Envoy trims ENVOY_GHOSTWISPR_SIGNING_SECRET,
-// so both sides sign with the same key.
-func NewClient(url, secret string, opts ...Option) *Client {
-	client := &Client{
-		url:    strings.TrimSpace(url),
-		secret: []byte(strings.TrimSpace(secret)),
+// NewClient creates a webhook client. It reads the signing key with readKey
+// at the first Send, not before.
+func NewClient(webhookURL string, readKey KeyReader, opts ...Option) *Client {
+	return newClient(webhookURL, readKey, collectOptions(opts))
+}
+
+func newClient(webhookURL string, readKey KeyReader, opts options) *Client {
+	return &Client{
+		url:       strings.TrimSpace(webhookURL),
+		readKey:   readKey,
+		keyStatus: opts.keyStatus,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
-		logger:      logging.WithModule(slog.Default(), "envoy"),
+		logger:      opts.logger,
 		now:         func() time.Time { return time.Now().UTC() },
 		sleep:       sleepWithContext,
 		retryDelays: append([]time.Duration(nil), defaultRetryDelays...),
 	}
-	for _, option := range opts {
-		if option != nil {
-			option(client)
-		}
-	}
-	return client
 }
 
-// Send posts ev to Envoy's webhook. It retries transient failures with the
-// event's stable delivery ID and returns immediately for a 4xx response.
+// signingKey returns the key the client keeps, reading it first when it has
+// none. With stale set it reads the key again, unless another send already
+// replaced stale. The key is trimmed as Envoy trims
+// ENVOY_GHOSTWISPR_SIGNING_SECRET, so both sides sign with the same bytes.
+func (c *Client) signingKey(ctx context.Context, stale []byte) ([]byte, error) {
+	c.keyMu.Lock()
+	kept := c.key
+	c.keyMu.Unlock()
+	if kept != nil && (stale == nil || !bytes.Equal(kept, stale)) {
+		return kept, nil
+	}
+	readCtx, cancel := context.WithTimeout(ctx, keyReadTimeout)
+	raw, err := c.readKey(readCtx)
+	cancel()
+	key := []byte(strings.TrimSpace(raw))
+	if err == nil && len(key) == 0 {
+		err = errors.New("the signing key is empty")
+	}
+	if c.keyStatus != nil {
+		c.keyStatus(err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read envoy webhook signing key: %w", err)
+	}
+	c.keyMu.Lock()
+	c.key = key
+	c.keyMu.Unlock()
+	return key, nil
+}
+
+// Send posts ev to Envoy's webhook (sendWithRetries). A 401 is what a
+// rotated key gives: then Send reads the key again, once, and when it changed
+// sends again with it, with a new retry budget. It sends nothing when it has
+// no key.
 func (c *Client) Send(ctx context.Context, ev Event) error {
 	if c == nil {
 		return errors.New("envoy webhook client is nil")
@@ -120,8 +198,31 @@ func (c *Client) Send(ctx context.Context, ev Event) error {
 	if err != nil {
 		return err
 	}
-	signature := webhookSignature(c.secret, body)
+	key, err := c.signingKey(ctx, nil)
+	if err != nil {
+		return err
+	}
 
+	err = c.sendWithRetries(ctx, ev.SessionID, eventType, delivery, body, key)
+	var status *webhookStatusError
+	if !errors.As(err, &status) || status.status != http.StatusUnauthorized {
+		return err
+	}
+	fresh, readErr := c.signingKey(ctx, key)
+	if readErr != nil {
+		return errors.Join(err, readErr)
+	}
+	if bytes.Equal(fresh, key) {
+		return err
+	}
+	return c.sendWithRetries(ctx, ev.SessionID, eventType, delivery, body, fresh)
+}
+
+// sendWithRetries posts body signed with key, retrying transient failures
+// after each of retryDelays with the event's stable delivery ID; a 4xx
+// response is returned at once.
+func (c *Client) sendWithRetries(ctx context.Context, sessionID string, eventType EventType, delivery string, body, key []byte) error {
+	signature := webhookSignature(key, body)
 	for attempt := 0; ; attempt++ {
 		retry, err := c.sendOnce(ctx, eventType, delivery, body, signature)
 		if err == nil {
@@ -137,7 +238,7 @@ func (c *Client) Send(ctx context.Context, ev Event) error {
 		delay := c.retryDelays[attempt]
 		c.logger.Warn("envoy webhook retry scheduled",
 			"event", eventType,
-			"session_id", ev.SessionID,
+			"session_id", sessionID,
 			"delivery", delivery,
 			"delay", delay.String(),
 			"error", err,
@@ -185,17 +286,28 @@ func (c *Client) sendOnce(ctx context.Context, eventType EventType, delivery str
 
 // Publisher builds Ghost Wispr event payloads from stored sessions.
 type Publisher struct {
-	store  Store
-	client *Client
+	store     Store
+	client    *Client
+	publicURL string
 }
 
-// NewPublisher creates a session-aware Envoy webhook publisher.
-func NewPublisher(url, secret string, store Store, opts ...Option) *Publisher {
-	client := NewClient(url, secret, opts...)
+// NewPublisher creates a session-aware Envoy webhook publisher whose events
+// are signed with the key readKey reads.
+func NewPublisher(webhookURL string, readKey KeyReader, store Store, opts ...Option) *Publisher {
+	collected := collectOptions(opts)
 	return &Publisher{
-		store:  store,
-		client: client,
+		store:     store,
+		client:    newClient(webhookURL, readKey, collected),
+		publicURL: collected.publicURL,
 	}
+}
+
+// CheckSigningKey reads the signing key when the publisher has none yet, so
+// a key that cannot be read is reported (WithKeyStatus) before the first
+// event needs it.
+func (p *Publisher) CheckSigningKey(ctx context.Context) error {
+	_, err := p.client.signingKey(ctx, nil)
+	return err
 }
 
 // PublishSessionStarted sends a session_started event.
@@ -301,11 +413,25 @@ func (p *Publisher) PublishPendingLifecycleEvents(ctx context.Context) error {
 	return firstErr
 }
 
+// sendSession sends an event about sess that carries no text of the session:
+// no title and no summary. Envoy keeps every event for 72 hours and no
+// deletion can recall it, so text sent there would outlive a segment
+// deletion that removed the words it repeats. The event says which session
+// it is, when it ran, and where an agent reads its current text: the
+// session's API resource on the unit (session_url) and its Drive folder.
 func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *storage.Session) error {
 	payload := map[string]any{
-		"title":    sess.Title,
-		"summary":  sess.Summary,
-		"duration": sessionDuration(sess),
+		"started_at": sess.StartedAt.UTC().Format(time.RFC3339),
+		"duration":   sessionDuration(sess),
+	}
+	if sess.EndedAt != nil {
+		payload["ended_at"] = sess.EndedAt.UTC().Format(time.RFC3339)
+	}
+	if sess.GDriveFolderID != "" {
+		payload["drive_folder_url"] = driveFolderURL + url.PathEscape(sess.GDriveFolderID)
+	}
+	if p.publicURL != "" {
+		payload["session_url"] = p.publicURL + "/api/sessions/" + url.PathEscape(sess.ID)
 	}
 	event := Event{Type: eventType, SessionID: sess.ID, Payload: payload}
 	if eventType == eventSummaryReady {
@@ -315,6 +441,9 @@ func (p *Publisher) sendSession(ctx context.Context, eventType EventType, sess *
 	}
 	return p.client.Send(ctx, event)
 }
+
+// driveFolderURL is where Google Drive shows a folder, by its id.
+const driveFolderURL = "https://drive.google.com/drive/folders/"
 
 // summaryCompleted reports whether sess is an ended session whose summary
 // completed. Only one with summary text is announced to Envoy.

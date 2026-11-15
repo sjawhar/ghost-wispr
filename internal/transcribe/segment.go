@@ -13,6 +13,9 @@ type Word struct {
 	End            float64
 }
 
+// Segment is one speaker's run of transcribed words, as live transcription,
+// the API and the Drive documents carry it. Where its words are among a
+// session's refined words is storage's (storage.StoredSegment).
 type Segment struct {
 	ID                 int64     `json:"id,omitempty"`
 	Speaker            int       `json:"speaker"`
@@ -23,12 +26,7 @@ type Segment struct {
 	TranscriptRevision int       `json:"transcript_revision"`
 	RecordingPath      string    `json:"recording_path,omitempty"`
 	RecordingSHA256    string    `json:"recording_sha256,omitempty"`
-	RecordingOrdinal   int       `json:"recording_ordinal,omitempty"`
-	FirstWordOrdinal   int       `json:"first_word_ordinal,omitempty"`
-	LastWordOrdinal    int       `json:"last_word_ordinal,omitempty"`
 	Untimed            bool      `json:"untimed,omitempty"`
-	UntimedSourceID    string    `json:"-"`
-	SourceSessionID    string    `json:"-"`
 }
 
 func GroupWordsBySpeaker(words []Word) []Segment {

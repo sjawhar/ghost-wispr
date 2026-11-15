@@ -56,14 +56,14 @@ func newRefinedRunnerFixture(t *testing.T) refinedRunnerFixture {
 	return refinedRunnerFixture{store: store, recording: recording, segmentID: segments[0].ID, revision: revision}
 }
 
-func (f refinedRunnerFixture) runner() segmentDeleteRunner {
-	return segmentDeleteRunner{
+func (f refinedRunnerFixture) runner() *segmentDeleteRunner {
+	return withTestDefaults(&segmentDeleteRunner{
 		store: f.store,
 		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
 			return deletionRecordingSet{Paths: []string{f.recording}}, nil
 		},
 		splice: func(context.Context, string, float64, float64) (string, error) { return "after", nil },
-	}
+	})
 }
 
 func TestDeleteRefinedAudioRefusesPendingSplice(t *testing.T) {
@@ -107,9 +107,8 @@ func TestDeleteRefinedAudioChecksHashBeforeSplice(t *testing.T) {
 
 func TestDeleteRefinedTextRefusesRecovery(t *testing.T) {
 	fixture := newRefinedRunnerFixture(t)
-	deleteLocks.setRecovering("s", true)
-	t.Cleanup(func() { deleteLocks.setRecovering("s", false) })
 	runner := fixture.runner()
+	runner.locks.setRecovering("s", true)
 	if err := runner.DeleteRefinedText(context.Background(), "s", fixture.segmentID, fixture.revision); !errors.Is(err, storage.ErrSegmentSplicePending) {
 		t.Fatalf("text delete during recovery = %v, want %v", err, storage.ErrSegmentSplicePending)
 	}
@@ -117,11 +116,10 @@ func TestDeleteRefinedTextRefusesRecovery(t *testing.T) {
 
 func TestDeleteRefinedTextRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *testing.T) {
 	fixture := newRefinedRunnerFixture(t)
-	deleteLocks.setRecovering("s", true)
-	t.Cleanup(func() { deleteLocks.setRecovering("s", false) })
-	unlock := deleteLocks.lock("s")
-	t.Cleanup(unlock)
 	runner := fixture.runner()
+	runner.locks.setRecovering("s", true)
+	unlock := runner.locks.lock("s")
+	t.Cleanup(unlock)
 	result := make(chan error, 1)
 	go func() {
 		result <- runner.DeleteRefinedText(context.Background(), "s", fixture.segmentID, fixture.revision)
@@ -138,11 +136,10 @@ func TestDeleteRefinedTextRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *tes
 
 func TestDeleteRefinedAudioRefusesRecoveryWithoutWaitingForTheRecoveryLock(t *testing.T) {
 	fixture := newRefinedRunnerFixture(t)
-	deleteLocks.setRecovering("s", true)
-	t.Cleanup(func() { deleteLocks.setRecovering("s", false) })
-	unlock := deleteLocks.lock("s")
-	t.Cleanup(unlock)
 	runner := fixture.runner()
+	runner.locks.setRecovering("s", true)
+	unlock := runner.locks.lock("s")
+	t.Cleanup(unlock)
 	result := make(chan error, 1)
 	go func() {
 		result <- runner.DeleteRefinedAudio(context.Background(), "s", fixture.segmentID, fixture.revision)
@@ -168,7 +165,7 @@ func TestDeleteRefinedAudioRefusesKeptRawRecording(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := fixture.runner()
-	runner.audioDir = audioDir
+	runner.audioDir = func() string { return audioDir }
 	if err := runner.DeleteRefinedAudio(context.Background(), "s", fixture.segmentID, fixture.revision); !errors.Is(err, server.ErrSegmentRawAudioKept) {
 		t.Fatalf("delete with kept raw recording = %v, want %v", err, server.ErrSegmentRawAudioKept)
 	}

@@ -9,7 +9,13 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-type partialRestoreStore struct{ called bool }
+// partialRestoreStore holds one session, as the caller passes it.
+type partialRestoreStore struct {
+	session storage.Session
+	called  bool
+}
+
+func (s *partialRestoreStore) GetSession(string) (storage.Session, error) { return s.session, nil }
 
 func (s *partialRestoreStore) RestoreAudioForRefinement(_, _, _ string) (bool, error) {
 	s.called = true
@@ -35,12 +41,13 @@ func TestPartlyRemovedSessionRestoresBeforeRefining(t *testing.T) {
 		SyncState:      storage.SyncStateSynced,
 	}
 	restoreCalled := false
-	store := &partialRestoreStore{}
-	err := restoreRefinementRecording(context.Background(), store, &session, dir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
+	store := &partialRestoreStore{session: session}
+	err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
 		restoreCalled = true
 		removed := filepath.Join(dir, "20261106100000.mp3")
 		return deletionRecordingSet{Paths: []string{removed, remaining}, Downloaded: []string{removed}}, nil
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}

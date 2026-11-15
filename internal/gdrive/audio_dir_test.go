@@ -27,7 +27,7 @@ func TestSyncUploadsARecordingMovedWithTheAudioDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	o.SetAudioDir(newDir)
 
 	if err := o.SyncSession(context.Background(), id); err != nil {

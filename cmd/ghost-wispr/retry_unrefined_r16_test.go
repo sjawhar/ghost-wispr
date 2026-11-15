@@ -62,7 +62,7 @@ func TestRetryRestoresAnUnrefinedRemovedSourceFromItsOwnFolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	}); err != nil {
 		t.Fatalf("restore unrefined source: %v", err)
@@ -134,7 +134,7 @@ func TestRetryRestoresPartlyRemovedMergedSourceFromItsFolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	}); err != nil {
 		t.Fatalf("restore partly removed merge: %v", err)

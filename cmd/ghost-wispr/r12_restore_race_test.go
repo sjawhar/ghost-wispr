@@ -79,12 +79,15 @@ func TestR12ConcurrentRestoresKeepTheRecordings(t *testing.T) {
 	for _, id := range ids {
 		source.files[recordingname.FileName(filepath.Join(dir, id+".mp3"))] = []byte("audio " + id)
 	}
+	// Both restores run through the app's one runner, whose lock serializes
+	// them.
+	runner := &segmentDeleteRunner{}
 	restore := func() error {
 		session, err := store.GetSession("merged")
 		if err != nil {
 			return err
 		}
-		return restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+		return runner.restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 			return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 		})
 	}
@@ -141,7 +144,7 @@ func TestR12SamePathRestoreKeepsTheRecording(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	}); err != nil {
 		t.Fatal(err)

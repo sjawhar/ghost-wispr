@@ -10,7 +10,7 @@ import (
 
 // documentsStore is what a sync reads and writes to bring the Drive folders
 // of merged sources up to date after refined "Delete text" changed their
-// documents.
+// documents (part of OrchestratorStore).
 type documentsStore interface {
 	DriveDocumentsOwed(sessionID string) ([]string, error)
 	ClearDriveDocumentsPending(sessionID string, unchanged func(storage.Session) bool) (bool, error)
@@ -42,24 +42,20 @@ func withEmptiedSummary(files []SyncFile) []SyncFile {
 // source has them now. A folder in the trash stays owed, and the sweep comes
 // back once it is restored; a folder gone for good owes nothing.
 func (o *Orchestrator) refreshOwedDocuments(ctx context.Context, sessionID string) error {
-	docs, ok := o.store.(documentsStore)
-	if !ok {
-		return nil
-	}
-	owed, err := docs.DriveDocumentsOwed(sessionID)
+	owed, err := o.store.DriveDocumentsOwed(sessionID)
 	if err != nil {
 		return err
 	}
 	var failures []error
 	for _, id := range owed {
-		if err := o.refreshDocuments(ctx, docs, id); err != nil {
+		if err := o.refreshDocuments(ctx, id); err != nil {
 			failures = append(failures, err)
 		}
 	}
 	return errors.Join(failures...)
 }
 
-func (o *Orchestrator) refreshDocuments(ctx context.Context, docs documentsStore, id string) error {
+func (o *Orchestrator) refreshDocuments(ctx context.Context, id string) error {
 	sess, err := o.store.GetSession(id)
 	if err != nil {
 		return fmt.Errorf("get merged session %s: %w", id, err)
@@ -76,9 +72,7 @@ func (o *Orchestrator) refreshDocuments(ctx context.Context, docs documentsStore
 	summary, transcript := renderDocuments(&syncSess, segments)
 	err = o.uploader.UploadInto(ctx, sess.GDriveFolderID, withEmptiedSummary(files))
 	if err == nil {
-		if syncer, ok := o.uploader.(*Syncer); ok {
-			err = syncer.renameSessionFolder(ctx, sess.GDriveFolderID, folderName)
-		}
+		err = o.uploader.RenameFolder(ctx, sess.GDriveFolderID, folderName)
 	}
 	switch {
 	case err == nil:
@@ -90,7 +84,7 @@ func (o *Orchestrator) refreshDocuments(ctx context.Context, docs documentsStore
 	default:
 		return fmt.Errorf("update the documents of merged session %s in Drive folder %s: %w", id, sess.GDriveFolderID, err)
 	}
-	cleared, err := docs.ClearDriveDocumentsPending(id, func(now storage.Session) bool {
+	cleared, err := o.store.ClearDriveDocumentsPending(id, func(now storage.Session) bool {
 		nowSync := toSyncSession(&now)
 		nowSummary, nowTranscript := renderDocuments(&nowSync, segments)
 		return now.GDriveFolderID == sess.GDriveFolderID &&

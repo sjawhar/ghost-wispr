@@ -283,7 +283,7 @@ func (c *Collector) folderGone(sess *storage.Session) error {
 // other failure keeps the session's local audio.
 func (c *Collector) recordingChecksums(audioPath string) (map[string]string, error) {
 	checksums := map[string]string{}
-	for _, entry := range splitAudioPath(audioPath) {
+	for _, entry := range recording.Entries(audioPath) {
 		path := c.resolve(entry)
 		info, err := os.Stat(path)
 		switch {
@@ -328,18 +328,6 @@ type recordingFile struct {
 	size  int64
 }
 
-// splitAudioPath returns the entries of an audio path, which may name several
-// files (a merged session).
-func splitAudioPath(audioPath string) []string {
-	var entries []string
-	for _, entry := range strings.Split(audioPath, ",") {
-		if entry = strings.TrimSpace(entry); entry != "" {
-			entries = append(entries, entry)
-		}
-	}
-	return entries
-}
-
 // resolve returns the file an audio path entry names, as an absolute path so
 // two spellings of one file compare equal: where recording.Resolve finds it,
 // the entry as written if a file is there, else its name in the audio
@@ -349,9 +337,9 @@ func (c *Collector) resolve(entry string) string {
 }
 
 // rawPath returns, as an absolute path, where the recorder keeps session
-// id's raw recording: in the audio directory.
+// id's raw recording (recording.RawPath).
 func (c *Collector) rawPath(id string) string {
-	return absolute(filepath.Join(c.config.AudioDir, id+".pcm"))
+	return absolute(recording.RawPath(c.config.AudioDir, id))
 }
 
 func absolute(path string) string {
@@ -379,7 +367,7 @@ type names map[string]map[string]bool
 func (c *Collector) namesOf(recordings []storage.SessionRecording) names {
 	n := names{}
 	for _, rec := range recordings {
-		for _, entry := range splitAudioPath(rec.AudioPath) {
+		for _, entry := range recording.Entries(rec.AudioPath) {
 			path := c.resolve(entry)
 			if n[path] == nil {
 				n[path] = map[string]bool{}
@@ -454,7 +442,7 @@ func (c *Collector) deleteSession(id string, names names) error {
 		}
 	}
 	var files []recordingFile
-	for _, entry := range splitAudioPath(sess.AudioPath) {
+	for _, entry := range recording.Entries(sess.AudioPath) {
 		f, ok := c.audioFile(entry)
 		if !ok {
 			continue
@@ -680,7 +668,7 @@ func (c *Collector) removableAudio() ([]sessionAudio, int64, error) {
 		if !rec.Removable {
 			continue
 		}
-		a := sessionAudio{id: rec.ID, audioPath: rec.AudioPath, entries: splitAudioPath(rec.AudioPath), dead: map[string]bool{}}
+		a := sessionAudio{id: rec.ID, audioPath: rec.AudioPath, entries: recording.Entries(rec.AudioPath), dead: map[string]bool{}}
 		seen := map[string]bool{}
 		saved := false
 		for _, entry := range a.entries {

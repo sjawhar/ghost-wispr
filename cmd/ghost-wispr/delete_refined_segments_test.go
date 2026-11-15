@@ -50,10 +50,10 @@ func TestDeleteRefinedTextUsesStoredWordOccurrence(t *testing.T) {
 		t.Fatalf("control: got %d segments, want two repeated occurrences", len(segments))
 	}
 	summarized := false
-	runner := segmentDeleteRunner{store: store, summarize: func(context.Context, string, time.Time) error {
+	runner := testDeleteRunner(t, &segmentDeleteRunner{store: store, summarize: func(context.Context, string, time.Time) error {
 		summarized = true
 		return nil
-	}}
+	}})
 	if err := runner.DeleteRefinedText(context.Background(), "s1", segments[0].ID, revision); err != nil {
 		t.Fatalf("DeleteRefinedText: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestDeleteRefinedAudioSplicesWithFFmpegAndShiftsWords(t *testing.T) {
 		t.Fatal(err)
 	}
 	summarized := false
-	runner := segmentDeleteRunner{
+	runner := testDeleteRunner(t, &segmentDeleteRunner{
 		store: store,
 		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
 			return deletionRecordingSet{Paths: []string{recording}}, nil
@@ -121,7 +121,7 @@ func TestDeleteRefinedAudioSplicesWithFFmpegAndShiftsWords(t *testing.T) {
 			summarized = true
 			return nil
 		},
-	}
+	})
 	if err := runner.DeleteRefinedAudio(context.Background(), "s1", segments[0].ID, revision); err != nil {
 		t.Fatalf("DeleteRefinedAudio: %v", err)
 	}

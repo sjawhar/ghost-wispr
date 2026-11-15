@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -47,11 +46,7 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 		model     string // the spans' model, "" without spans
 	}
 	var plan []planned
-	for _, recording := range strings.Split(audioPath, ",") {
-		recording = strings.TrimSpace(recording)
-		if recording == "" {
-			continue
-		}
+	for _, recording := range recordingname.Entries(audioPath) {
 		spans, err := m.store.TextDeletionSpans(recording)
 		if err != nil {
 			return batchRefinementResult{}, err

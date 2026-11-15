@@ -27,11 +27,11 @@ import (
 )
 
 type Syncer struct {
-	service      *drive.Service
-	folderID     string
-	logger       *slog.Logger
-	mu           sync.Mutex
-	replacements replacementStore
+	service  *drive.Service
+	folderID string
+	logger   *slog.Logger
+	// mu keeps one upload or replacement (Serialize) at a time.
+	mu sync.Mutex
 }
 
 const resumableUploadThresholdBytes int64 = 5 * 1024 * 1024
@@ -134,7 +134,7 @@ func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 	// only find the recording it uploaded before. One missing from disk is
 	// left out here; notUploaded names it, and the sync does not count as
 	// done without it.
-	for _, recording := range recordingEntries(audioPath) {
+	for _, recording := range recordingname.Entries(audioPath) {
 		if _, err := os.Stat(recording); err != nil {
 			continue
 		}
@@ -161,23 +161,11 @@ func buildSyncFiles(sess *SyncSession, segments []transcribe.Segment, audioPath 
 	return files, folderName, unreadable, nil
 }
 
-// recordingEntries returns the recordings an audio path names: a merged
-// session's names several, separated by commas.
-func recordingEntries(audioPath string) []string {
-	var recordings []string
-	for _, entry := range strings.Split(audioPath, ",") {
-		if entry = strings.TrimSpace(entry); entry != "" {
-			recordings = append(recordings, entry)
-		}
-	}
-	return recordings
-}
-
 // resolvedAudioPath returns audioPath with each recording it names replaced
 // by where recording.Resolve finds it: as written, else its name in
 // audioDir.
 func resolvedAudioPath(audioPath, audioDir string) string {
-	entries := recordingEntries(audioPath)
+	entries := recordingname.Entries(audioPath)
 	for i, entry := range entries {
 		entries[i] = recordingname.Resolve(entry, audioDir)
 	}
@@ -193,7 +181,7 @@ func notUploaded(audioPath string, files []SyncFile) []string {
 		uploaded[files[i].LocalPath] = true
 	}
 	var missing []string
-	for _, recording := range recordingEntries(audioPath) {
+	for _, recording := range recordingname.Entries(audioPath) {
 		if !uploaded[recording] {
 			missing = append(missing, recording)
 		}
@@ -247,7 +235,7 @@ func (s *Syncer) upload(ctx context.Context, folderName string, files []SyncFile
 		}
 	}
 	// The folder may have gone to the trash during the upload.
-	if err := s.checkFolder(ctx, folder.Id); err != nil {
+	if err := s.CheckFolder(ctx, folder.Id); err != nil {
 		return folder.Id, err
 	}
 
@@ -265,7 +253,7 @@ var ErrFolderTrashed = errors.New("the session's Drive folder is in the trash")
 // may work once Drive answers.
 var ErrDriveDidNotAnswer = errors.New("drive did not answer")
 
-// checkFolder returns an error unless Drive has session folder folderID out
+// CheckFolder returns an error unless Drive has session folder folderID out
 // of the trash: Drive's 404 for a folder gone (wrapped), ErrFolderTrashed
 // for one in the trash, or why Drive could not say. Drive answers 404 for a
 // file the app cannot read as well as for one that is gone, so a 404 counts
@@ -273,7 +261,7 @@ var ErrDriveDidNotAnswer = errors.New("drive did not answer")
 // (rootReadable): otherwise the app's access to Drive is lost (credentials,
 // sharing), which says nothing about the session, and the error is not a
 // 404.
-func (s *Syncer) checkFolder(ctx context.Context, folderID string) error {
+func (s *Syncer) CheckFolder(ctx context.Context, folderID string) error {
 	folder, err := s.service.Files.Get(folderID).SupportsAllDrives(true).Fields("id, trashed, explicitlyTrashed").Context(ctx).Do()
 	if err != nil {
 		if !IsRemoteDeletedError(err) {
@@ -337,7 +325,7 @@ func errRootTrashed(root string) error {
 // trash, and an error when Drive cannot say (it is unreachable, say). GC asks
 // it before it deletes a synced session or removes its audio.
 func (s *Syncer) FolderOnDrive(ctx context.Context, folderID string) (bool, error) {
-	err := s.checkFolder(ctx, folderID)
+	err := s.CheckFolder(ctx, folderID)
 	switch {
 	case err == nil:
 		return true, nil
@@ -461,13 +449,13 @@ func planUpload(existing []driveFile, files []SyncFile) (create []SyncFile, upda
 // a session synced before, or whose first sync created its folder and then
 // failed, keeps its one folder when it is synced again. It uploads nothing
 // into a folder in the trash or gone, and fails if the folder went to the
-// trash during the upload (checkFolder), so such a session is never marked
+// trash during the upload (CheckFolder), so such a session is never marked
 // synced.
 func (s *Syncer) UploadInto(ctx context.Context, folderID string, files []SyncFile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.checkFolder(ctx, folderID); err != nil {
+	if err := s.CheckFolder(ctx, folderID); err != nil {
 		return err
 	}
 	var existing []driveFile
@@ -494,20 +482,20 @@ func (s *Syncer) UploadInto(ctx context.Context, folderID string, files []SyncFi
 			return s.folderOr(ctx, folderID, err)
 		}
 	}
-	return s.checkFolder(ctx, folderID)
+	return s.CheckFolder(ctx, folderID)
 }
 
 // folderOr returns err, a failure while syncing into session folder
 // folderID, unless it is Drive's 404: then a file (or the folder, or access
 // to the folder the app syncs into) went since the sync checked the folder,
-// and checkFolder, asked again, says which. With the folder still there, the
+// and CheckFolder, asked again, says which. With the folder still there, the
 // 404 was about a file alone: the error is kept but is no 404, so the sync is
 // retried rather than the folder taken for deleted.
 func (s *Syncer) folderOr(ctx context.Context, folderID string, err error) error {
 	if !IsRemoteDeletedError(err) {
 		return err
 	}
-	if folderErr := s.checkFolder(ctx, folderID); folderErr != nil {
+	if folderErr := s.CheckFolder(ctx, folderID); folderErr != nil {
 		return folderErr
 	}
 	return fmt.Errorf("%v (the session's folder %s is still on Drive)", err, folderID)
@@ -529,11 +517,12 @@ func (s *Syncer) updateDocument(ctx context.Context, u *docUpdate) error {
 
 // uploadFile uploads one file into a Drive folder.
 func (s *Syncer) uploadFile(ctx context.Context, folderID string, f *SyncFile) error {
-	_, err := s.uploadFileID(ctx, folderID, f)
+	_, err := s.UploadFile(ctx, folderID, f)
 	return err
 }
 
-func (s *Syncer) uploadFileID(ctx context.Context, folderID string, f *SyncFile) (string, error) {
+// UploadFile uploads one file into Drive folder folderID and returns its id.
+func (s *Syncer) UploadFile(ctx context.Context, folderID string, f *SyncFile) (string, error) {
 	var reader io.Reader
 	var file *os.File
 	var fileSize int64

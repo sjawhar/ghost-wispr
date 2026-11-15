@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Print Envoy's Ghost Wispr webhook signing secret on stdout, for a caller that puts it straight
-# into a process's environment or the provisioning bundle (docs/pi-setup.md).
+# into a process's environment: the slice 1 acceptance driver's signed probe (docs/pi-setup.md,
+# "Accept slice 1"). The recorder reads the key from Secret Manager itself.
 #
 #   deploy/pi/webhook-secret.sh [--broker-host HOST] [--broker-key KEY] [--reason TEXT]
 #
@@ -25,7 +26,7 @@ fail() {
   printf 'webhook-secret: %s\n' "$*" >&2
   exit 1
 }
-usage() { sed -n '5,12p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '6,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
 broker_host=
 broker_key=

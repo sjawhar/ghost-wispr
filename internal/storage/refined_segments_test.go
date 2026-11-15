@@ -52,7 +52,7 @@ func TestPublishRefinementReplacesLiveSegmentsWithTimedWords(t *testing.T) {
 	if session.RefinedRevision != revision || session.RefinedTranscript != "Um hello. Goodbye." || session.CanonicalTranscript != "Um hello. Goodbye." || session.TranscriptSource != TranscriptSourceRefined {
 		t.Errorf("published session = %#v, want revision %d and refined canonical transcript", session, revision)
 	}
-	gotSegments, err := store.GetSegments("s1")
+	gotSegments, err := store.StoredSegments("s1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestDeleteRefinedSegmentTextDeletesOnlyTheSelectedRepeatedWords(t *testing.
 	if err := store.DeleteRefinedSegmentText("s1", before[0].ID, revision); err != nil {
 		t.Fatalf("DeleteRefinedSegmentText: %v", err)
 	}
-	after, err := store.GetSegments("s1")
+	after, err := store.StoredSegments("s1")
 	if err != nil {
 		t.Fatal(err)
 	}

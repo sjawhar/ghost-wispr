@@ -47,9 +47,10 @@ func TestR11RefusedRestoreRemovesDownloads(t *testing.T) {
 		source.files = append(source.files, &drive.File{Name: driveName, MimeType: "audio/mpeg"})
 		source.downloads[driveName] = []byte(name)
 	}
-	err = restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	err = (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	})
+
 	if err == nil {
 		t.Fatal("control: subset restore succeeded")
 	}
@@ -73,7 +74,7 @@ func TestRestoreDeletionRecordingsCleansEarlierDownloadsOnALaterFailure(t *testi
 		failName: recordingname.FileName(second),
 	}
 	session := storage.Session{ID: "s1", GDriveFolderID: "folder"}
-	if _, err := restoreDeletionRecordings(context.Background(), nil, &session, dir, source, ""); err == nil {
+	if _, err := restoreDeletionRecordings(context.Background(), noCutsGuard{}, &session, dir, source, ""); err == nil {
 		t.Fatal("restore unexpectedly succeeded after a Drive download failed")
 	}
 	if _, err := os.Stat(first); !os.IsNotExist(err) {

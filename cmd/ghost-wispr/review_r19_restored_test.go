@@ -68,9 +68,10 @@ func reviewR19RestoredThenMergedDelete(t *testing.T, throughRestore bool) string
 		downloads: map[string][]byte{"folder-r/" + recordingname.FileName(rPath): []byte("r")},
 	}
 	refine := suiteTwoWordRefine(store)
-	retry := newRetryRefinementHook(store, func() string { return dir }, func(ctx context.Context, s storage.Session) (deletionRecordingSet, error) {
+	retry := retryRunner(store, func() string { return dir }, func(ctx context.Context, s storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &s, dir, source, "")
-	}, newWarningsRegistry(), refine)
+	}, refine, newWarningsRegistry()).retryRefinement
+
 	onSessionMerged(context.Background(), store, refine, func(context.Context, string, time.Time) error { return nil }, retry,
 		func(_ context.Context, _ string, cause error) { t.Fatalf("hook failed: %v", cause) }, "merged")
 	merged, err := store.GetSession("merged")
@@ -173,7 +174,7 @@ func TestReviewR19RestoredMergeThenMergedAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	}); err != nil {
 		t.Fatalf("retry fails for a restored merge merged again: %v (downloads %v)", err, source.downloaded)
@@ -217,9 +218,10 @@ func TestReviewR19RestoredMergeRetryNamesAMissingRecording(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	err = (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	})
+
 	if err == nil || !strings.Contains(err.Error(), b+".mp3") {
 		t.Fatalf("retry with a recording missing from Drive = %v, want a refusal naming %s.mp3", err, b)
 	}

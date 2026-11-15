@@ -380,13 +380,15 @@ func isDriveDeleteCall(name string) bool {
 }
 
 // replacementDeleteFunction is the one function with a Drive delete call:
-// replaceFolder (replace.go), which a segment deletion's replacement runs for
-// each folder it owes.
-const replacementDeleteFunction = "replaceFolder"
+// Syncer.DeleteFile (replace.go), which only a segment deletion's
+// replacement calls (Orchestrator.deleteReplacedFiles) for each folder it
+// owes.
+const replacementDeleteFunction = "DeleteFile"
 
-// No app code deletes or trashes a Drive file except replaceFolder, which
-// removes recorded old files and duplicate app-created replacement uploads
-// only after it stores the replacement to retain.
+// No app code deletes or trashes a Drive file except Syncer.DeleteFile,
+// which the replacement calls to remove recorded old files and duplicate
+// app-created replacement uploads only after it stores the replacement to
+// retain.
 func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
 	root := moduleRoot(t)
 	replacePath := filepath.Join(root, "internal", "gdrive", "replace.go")
@@ -401,6 +403,95 @@ func TestNoCodeDeletesOrTrashesDriveFiles(t *testing.T) {
 	}
 	if len(allowedLocations) != 1 {
 		t.Errorf("found %d allowed Drive delete call sites in %s, want exactly one", len(allowedLocations), replacementDeleteFunction)
+	}
+}
+
+// deleteFileUse is a use, outside tests, of a method named DeleteFile: a
+// call or a method value, through *Syncer or any interface.
+type deleteFileUse struct {
+	path     string
+	line     int
+	function string // the function the use is in
+}
+
+func (u deleteFileUse) String() string {
+	return fmt.Sprintf("%s:%d in %s", u.path, u.line, u.function)
+}
+
+// deleteFileUses returns every use of a method named DeleteFile in the
+// module's Go code outside tests, with overlay's files (path to content)
+// added.
+func deleteFileUses(t *testing.T, root string, overlay map[string][]byte) []deleteFileUse {
+	t.Helper()
+	fset, files, info := typeCheckModule(t, root, overlay)
+	var uses []deleteFileUse
+	for id, obj := range info.Uses {
+		method, ok := obj.(*types.Func)
+		if !ok || method.Name() != "DeleteFile" || method.Signature().Recv() == nil {
+			continue
+		}
+		pos := fset.Position(id.Pos())
+		use := deleteFileUse{path: pos.Filename, line: pos.Line}
+		for _, file := range files {
+			if file.Pos() > id.Pos() || id.Pos() > file.End() {
+				continue
+			}
+			for _, declaration := range file.Decls {
+				if function, ok := declaration.(*ast.FuncDecl); ok && function.Pos() <= id.Pos() && id.Pos() <= function.End() {
+					use.function = function.Name.Name
+				}
+			}
+		}
+		uses = append(uses, use)
+	}
+	return uses
+}
+
+// Syncer.DeleteFile is the app's one Drive delete
+// (TestNoCodeDeletesOrTrashesDriveFiles). Only the replacement, after it has
+// stored the replacement it keeps, calls it: deleteReplacedFiles. Any other
+// caller fails here, through *Syncer, driveClient or any other interface.
+func TestOnlyTheReplacementCallsDeleteFile(t *testing.T) {
+	uses := deleteFileUses(t, moduleRoot(t), nil)
+	if len(uses) == 0 {
+		t.Fatal("found no use of DeleteFile: the check sees none of the code")
+	}
+	for _, use := range uses {
+		if use.function != "deleteReplacedFiles" {
+			t.Errorf("%s uses DeleteFile; only deleteReplacedFiles may", use)
+		}
+	}
+}
+
+// The check above finds a second caller, called directly or as a method
+// value through an interface.
+func TestTheDeleteFileCallerCheckFindsASecondCaller(t *testing.T) {
+	root := moduleRoot(t)
+	probe := filepath.Join(root, "internal", "gdrive", "zz_delete_file_probe.go")
+	overlay := map[string][]byte{probe: []byte(`package gdrive
+
+import "context"
+
+func probeCleanUpFolder(ctx context.Context, s *Syncer, d driveClient, id string) error {
+	if err := s.DeleteFile(ctx, id); err != nil {
+		return err
+	}
+	deleteFile := d.DeleteFile
+	return deleteFile(ctx, id)
+}
+`)}
+	found := 0
+	for _, use := range deleteFileUses(t, root, overlay) {
+		if use.path != probe {
+			continue
+		}
+		if use.function != "probeCleanUpFolder" {
+			t.Errorf("probe use %s is placed in the wrong function", use)
+		}
+		found++
+	}
+	if found != 2 {
+		t.Fatalf("the check found %d of the probe's 2 uses of DeleteFile", found)
 	}
 }
 
@@ -597,7 +688,7 @@ func TestAStaleSyncNeverLeavesAnOldSummarySynced(t *testing.T) {
 		t.Fatalf("summarize: %v", err)
 	}
 	drive := newFakeDrive()
-	o := NewOrchestratorWithUploader(drive, store)
+	o := NewOrchestrator(drive, store)
 	ctx := context.Background()
 
 	// The first sync lands both documents, then fails on the recording.

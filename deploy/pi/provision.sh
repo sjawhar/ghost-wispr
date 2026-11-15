@@ -86,9 +86,11 @@ deployed_relay_url() {
   printf '%s' "$url"
 }
 
+# render_models_env keeps the deployed .env but the Envoy signing key an earlier provisioner wrote:
+# the recorder reads that key from Secret Manager now, so it is not left on disk.
 render_models_env() {
   local env_file=$1
-  awk '!/^GHOST_WISPR_EMBEDDING_LOCATION=/' "$env_file" || return 1
+  awk '!/^GHOST_WISPR_(EMBEDDING_LOCATION|ENVOY_WEBHOOK_SECRET)=/' "$env_file" || return 1
   printf '%s\n' "$EMBEDDING_LOCATION_SETTING"
 }
 
@@ -159,6 +161,8 @@ archive="$staging_dir/credentials.tar"
 cat >"$archive"
 
 mapfile -t archive_entries < <(tar --list --file="$archive")
+# The Envoy webhook signing key is not in the bundle: the recorder reads it from Secret Manager
+# with its Google identity, so a bundle that carries one is refused.
 readonly required_entries=(
   device.crt
   google-credentials.json
@@ -166,12 +170,11 @@ readonly required_entries=(
   tailscale-client-id
   tailscale-subject
   envoy-webhook-url
-  envoy-webhook-secret
   deepgram-key
 )
 for entry in "${archive_entries[@]}"; do
   case "$entry" in
-    device.crt|google-credentials.json|certificate_config.json|tailscale-client-id|tailscale-subject|envoy-webhook-url|envoy-webhook-secret|deepgram-key) ;;
+    device.crt|google-credentials.json|certificate_config.json|tailscale-client-id|tailscale-subject|envoy-webhook-url|deepgram-key) ;;
     *) fail "credential bundle contains unexpected path: $entry" ;;
   esac
 done
@@ -189,8 +192,6 @@ tailscale_subject=$(require_single_line_file tailscale-subject)
 readonly tailscale_subject
 deepgram_key=$(require_single_line_file deepgram-key)
 readonly deepgram_key
-webhook_secret=$(require_single_line_file envoy-webhook-secret)
-readonly webhook_secret
 valid_relay_url "$relay_url" || fail "envoy-webhook-url must be an HTTPS Ghost Wispr webhook URL"
 [[ -n "$tailscale_client_id" && "$tailscale_client_id" != null && "$tailscale_client_id" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "tailscale-client-id is empty or invalid"
 [[ "$tailscale_subject" =~ ^[0-9]+$ ]] || fail "tailscale-subject must be the service account unique ID"
@@ -229,7 +230,6 @@ sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0640 "$staging_dir/ghost-w
   printf '%s\n' 'GOOGLE_API_USE_CLIENT_CERTIFICATE=false'
   printf '%s\n' "$EMBEDDING_LOCATION_SETTING"
   printf 'GHOST_WISPR_DEEPGRAM_API_KEY=%s\n' "$deepgram_key"
-  printf 'GHOST_WISPR_ENVOY_WEBHOOK_SECRET=%s\n' "$webhook_secret"
 } | sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 /dev/stdin "$DEPLOY_DIR/.env"
 
 sudo install -m 0644 "$repo_root/deploy/pi/files/99-ghost-wispr.rules" /etc/udev/rules.d/99-ghost-wispr.rules

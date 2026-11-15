@@ -23,9 +23,10 @@ func TestR10OldMergeSubsetRestoreKeepsMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored := []string{filepath.Join(dir, strings.TrimSuffix(names[0], ".mp3")+".wav"), filepath.Join(dir, names[2])}
-	err = restoreRefinementRecording(context.Background(), store, &session, dir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
+	err = (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
 		return deletionRecordingSet{Paths: restored, Downloaded: restored}, nil
 	})
+
 	if err == nil {
 		t.Fatal("old merged session accepted a restore without provenance")
 	}
@@ -68,9 +69,10 @@ func TestR10RecordingSourcesPrecedeLegacyNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = restoreRefinementRecording(context.Background(), store, &session, filepath.Dir(custom), func(context.Context, storage.Session) (deletionRecordingSet, error) {
+	err = (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, filepath.Dir(custom), func(context.Context, storage.Session) (deletionRecordingSet, error) {
 		return deletionRecordingSet{Paths: []string{custom}, Downloaded: []string{custom}}, nil
 	})
+
 	if err != nil {
 		t.Fatalf("restore through stored source recording = %v", err)
 	}

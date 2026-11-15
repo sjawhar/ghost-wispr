@@ -146,7 +146,7 @@ func TestDeletedWordsStayGoneAfterAModelChangeMergeAndCut(t *testing.T) {
 	// 3. "Delete text and audio" of the touching neighbour: its 0.45 s pad
 	// reaches back over "Okay.", so the cut drops that deletion's record.
 	var checkModels []string
-	runner := segmentDeleteRunner{
+	runner := testDeleteRunner(t, &segmentDeleteRunner{
 		store: store,
 		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
 			return deletionRecordingSet{Paths: []string{recordings["s1"], recordings["s2"]}}, nil
@@ -161,7 +161,7 @@ func TestDeletedWordsStayGoneAfterAModelChangeMergeAndCut(t *testing.T) {
 			checkModels = append(checkModels, model)
 			return []transcribe.TimestampedWord{spoken(0, "So", 0.2, 0.5), spoken(1, "Purple", 2.9, 3.2)}, nil
 		},
-	}
+	})
 	tractor, revision := segmentSaying(t, store, "m", "tractor")
 	if err := runner.DeleteRefinedAudio(ctx, "m", tractor, revision); err != nil {
 		t.Fatalf("Delete text and audio of the tractor segment: %v", err)

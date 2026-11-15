@@ -43,12 +43,15 @@ func TestRefineUnfinishedDeletionRestoresPartialAudio(t *testing.T) {
 		},
 		downloads: map[string][]byte{recordingname.FileName(removed): []byte("removed")},
 	}
-	outcome := refineUnfinishedDeletion(context.Background(), store, dir, drive, func(_ context.Context, id, audioPath string, gotStarted time.Time) error {
+	outcome := recoveryRunner(store, dir, nil, func(_ context.Context, id, audioPath string, gotStarted time.Time) error {
 		if id != "session" || gotStarted != started || !strings.Contains(audioPath, removed) || !strings.Contains(audioPath, remaining) {
 			t.Fatalf("refine session=%q audio=%q started=%s", id, audioPath, gotStarted)
 		}
 		return nil
-	}, "session")
+	}).refineUnfinishedDeletion(context.Background(), drive, dir,
+
+		"session")
+
 	if outcome.Err != nil {
 		t.Fatal(outcome.Err)
 	}
@@ -77,10 +80,13 @@ func TestRefineUnfinishedDeletionKeepsMarkerWhenDriveLacksRemovedAudio(t *testin
 		t.Fatal(err)
 	}
 	drive := &deletionDriveFake{files: []*drive.File{{Name: recordingname.FileName(remaining), MimeType: "audio/mpeg"}}}
-	outcome := refineUnfinishedDeletion(context.Background(), store, dir, drive, func(context.Context, string, string, time.Time) error {
+	outcome := recoveryRunner(store, dir, nil, func(context.Context, string, string, time.Time) error {
 		t.Fatal("refined from survivors after Drive omitted a removed recording")
 		return nil
-	}, "session")
+	}).refineUnfinishedDeletion(context.Background(), drive, dir,
+
+		"session")
+
 	if outcome.Err == nil {
 		t.Fatal("startup refinement succeeded without restoring every recording")
 	}
