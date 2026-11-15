@@ -76,7 +76,7 @@ func TestR11RestoreFindsPreMergeSourceFolder(t *testing.T) {
 			"source-folder/" + unrelated: []byte("unrelated recording"),
 		},
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, drive, "")
 	}); err != nil {
 		t.Fatalf("restore source-folder recording = %v", err)
@@ -149,7 +149,7 @@ func TestR14NestedRestoreUsesOriginalSourceFolders(t *testing.T) {
 		},
 		calls: map[string]int{},
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, drive, "")
 	}); err != nil {
 		t.Fatalf("restore nested source recordings: %v", err)
@@ -200,7 +200,7 @@ func TestR12RestoreSkipsLeafFolderWhenMergedFolderHasRecording(t *testing.T) {
 		downloads: map[string][]byte{"merged-folder/" + name: []byte("source recording")},
 		calls:     map[string]int{},
 	}
-	if err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	if err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, dir, source, "")
 	}); err != nil {
 		t.Fatal(err)

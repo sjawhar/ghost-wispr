@@ -84,10 +84,10 @@ func cutCheckRunner(t *testing.T, a *answers) (*segmentDeleteRunner, string) {
 	if err := os.WriteFile(recording, []byte("audio"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return &segmentDeleteRunner{
+	return testDeleteRunner(t, &segmentDeleteRunner{
 		splice:        func(context.Context, string, float64, float64) (string, error) { return "cut", nil },
 		transcribeCut: a.transcribe,
-	}, recording
+	}), recording
 }
 
 func filesBeside(t *testing.T, recording string) []string {
@@ -344,7 +344,7 @@ func TestRefusedCutShowsOnTheStatusPageWithoutItsWords(t *testing.T) {
 	registry := newWarningsRegistry()
 	registry.Set("other", "Another warning")
 	status := apiStatusWarnings(registry, refused)
-	runner := segmentDeleteRunner{
+	runner := testDeleteRunner(t, &segmentDeleteRunner{
 		store: store,
 		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
 			return deletionRecordingSet{Paths: []string{recording}}, nil
@@ -355,7 +355,7 @@ func TestRefusedCutShowsOnTheStatusPageWithoutItsWords(t *testing.T) {
 			return []transcribe.TimestampedWord{{Text: "So", Start: 0.2, End: 0.5}, {Text: "tractor", Start: 62.4, End: 62.7}}, nil
 		},
 		refused: refused,
-	}
+	})
 	if err := runner.DeleteRefinedAudio(context.Background(), "s", segmentID, revision); !errors.Is(err, errDeletionCutHeard) {
 		t.Fatalf("delete = %v, want refused", err)
 	}
@@ -391,7 +391,7 @@ func TestRefusedCutWarningMovesWithALaterCut(t *testing.T) {
 	store, recording, segmentID, revision := refusedCutFixture(t)
 	refused := newRefusedCuts(store)
 	heard := []transcribe.TimestampedWord{{Text: "tractor", Start: 62.4, End: 62.7}}
-	runner := segmentDeleteRunner{
+	runner := testDeleteRunner(t, &segmentDeleteRunner{
 		store: store,
 		ensureRecordings: func(context.Context, storage.Session) (deletionRecordingSet, error) {
 			return deletionRecordingSet{Paths: []string{recording}}, nil
@@ -405,7 +405,7 @@ func TestRefusedCutWarningMovesWithALaterCut(t *testing.T) {
 		},
 		transcribeCut: func(context.Context, string, string) ([]transcribe.TimestampedWord, error) { return heard, nil },
 		refused:       refused,
-	}
+	})
 	if err := runner.DeleteRefinedAudio(context.Background(), "s", segmentID, revision); !errors.Is(err, errDeletionCutHeard) {
 		t.Fatalf("delete = %v, want refused", err)
 	}

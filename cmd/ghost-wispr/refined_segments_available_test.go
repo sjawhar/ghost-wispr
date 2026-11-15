@@ -30,10 +30,10 @@ func TestRefinedSegmentsAvailableRefinesAnOldCompletedSession(t *testing.T) {
 		tc := &cases[i]
 		t.Run(tc.name, func(t *testing.T) {
 			refined := make(chan string, 1)
-			runner := &segmentDeleteRunner{refine: func(_ context.Context, sessionID, audioPath string, startedAt time.Time) error {
+			runner := testDeleteRunner(t, &segmentDeleteRunner{refine: func(_ context.Context, sessionID, audioPath string, startedAt time.Time) error {
 				refined <- sessionID + " " + audioPath + " " + startedAt.Format(time.RFC3339)
 				return nil
-			}}
+			}})
 			err := runner.refinedSegmentsAvailable("s1", &tc.session)
 			if refused := errors.Is(err, storage.ErrRefinedSegmentsUnavailable); refused != tc.refused || (err != nil && !refused) {
 				t.Fatalf("refinedSegmentsAvailable = %v, want refused %v", err, tc.refused)

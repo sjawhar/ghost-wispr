@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
@@ -29,6 +30,42 @@ func restorePause(store pauseStore, gate interface{ Pause() }) (bool, error) {
 	}
 	gate.Pause()
 	return true, nil
+}
+
+// wirePauseControls serves the API's Pause and Resume with controls, and the
+// light's consent check with them: each keeps the warning that the saved
+// pause switch is not what a restart would restore (captureStateWarningKey)
+// while that is so.
+func wirePauseControls(hooks *server.ControlHooks, controls *persistentControls, capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry) {
+	// pauseNotSaved warns that the durable pause switch could not be saved.
+	pauseNotSaved := func() {
+		warnings.Set(captureStateWarningKey, "Pause not saved; a restart will resume recording")
+	}
+	hooks.Pause = func() error {
+		err := controls.Pause()
+		if err != nil {
+			pauseNotSaved()
+		} else {
+			warnings.Clear(captureStateWarningKey)
+		}
+		return err
+	}
+	hooks.Resume = func() error {
+		err := controls.Resume()
+		if err != nil {
+			if errors.Is(err, errRefusedResumeNotPersisted) {
+				pauseNotSaved()
+			}
+		} else {
+			warnings.Clear(captureStateWarningKey)
+		}
+		return err
+	}
+	wireLightConsent(capture, hardware, warnings, func(error) {
+		if err := controls.RefuseResume(); err != nil {
+			pauseNotSaved()
+		}
+	})
 }
 
 // seedPausedState writes the durable pause before a test instance starts, so

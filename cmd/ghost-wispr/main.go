@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,7 +34,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/llm"
 	"github.com/sjawhar/ghost-wispr/internal/logging"
-	"github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -63,209 +61,6 @@ var vertexCredentialCache sync.Map
 //go:embed static/*
 var staticFiles embed.FS
 
-func retryRefinementAfterRestoringRecording(ctx context.Context, sessionID string, restore func(context.Context, string) error, refine func(context.Context, string) error) error {
-	if err := restore(ctx, sessionID); err != nil {
-		return err
-	}
-	return refine(ctx, sessionID)
-}
-
-type refinementAudioRestoreStore interface {
-	RestoreAudioForRefinement(id, beforeAudioPath, restoredAudioPath string) (bool, error)
-	DriveRestoreAllowed(sessionID string) (bool, error)
-	RefinementRecordingPaths(sessionID string) ([]string, error)
-}
-
-func hasLocalRefinementRecording(session *storage.Session, audioDir string) (bool, error) {
-	if session.AudioRemovedAt != "" {
-		return false, nil
-	}
-	entries := 0
-	for _, entry := range recording.Entries(session.AudioPath) {
-		entries++
-		path := recording.Resolve(entry, audioDir)
-		info, err := os.Stat(path)
-		switch {
-		case err == nil && !info.IsDir():
-		case err != nil && !errors.Is(err, os.ErrNotExist):
-			return false, fmt.Errorf("check recording %s: %w", path, err)
-		default:
-			return false, nil
-		}
-	}
-	return entries > 0, nil
-}
-
-func refinementRecordingAvailable(session *storage.Session, audioDir string) error {
-	local, err := hasLocalRefinementRecording(session, audioDir)
-	if err != nil {
-		return err
-	}
-	if local {
-		return nil
-	}
-	if session.AudioRemovedAt == "" {
-		return errors.New("no recording is available on this unit or Drive")
-	}
-	if strings.TrimSpace(session.GDriveFolderID) == "" {
-		return errors.New("the recording was removed from this unit, but no Drive folder is listed")
-	}
-	if session.SyncState == storage.SyncStateRemoteDeleted {
-		return errors.New("the recording was removed from this unit and its Drive folder is deleted")
-	}
-	if session.SyncStatus != storage.SyncSynced {
-		return errors.New("the recording was removed from this unit and its Drive copy is not synced")
-	}
-	return nil
-}
-
-func missingRefinementRecordings(required, restored []string) []string {
-	available := make(map[string]struct{}, len(restored))
-	for _, path := range restored {
-		if key := recording.Key(path); key != "" && key != "." {
-			available[key] = struct{}{}
-		}
-	}
-	missing := make([]string, 0, len(required))
-	seen := make(map[string]struct{}, len(required))
-	for _, path := range required {
-		name := filepath.Base(strings.TrimSpace(path))
-		key := recording.Key(path)
-		if key == "" || key == "." {
-			continue
-		}
-		if _, duplicate := seen[key]; duplicate {
-			continue
-		}
-		seen[key] = struct{}{}
-		if _, found := available[key]; !found {
-			missing = append(missing, name)
-		}
-	}
-	return missing
-}
-
-func restoreRefinementRecording(ctx context.Context, store refinementAudioRestoreStore, session *storage.Session, audioDir string, restore func(context.Context, storage.Session) (deletionRecordingSet, error)) error {
-	unlock := deleteLocks.lock(session.ID)
-	defer unlock()
-	if reader, ok := store.(interface {
-		GetSession(string) (storage.Session, error)
-	}); ok {
-		current, err := reader.GetSession(session.ID)
-		if err != nil {
-			return fmt.Errorf("read session %s before restoring its recording: %w", session.ID, err)
-		}
-		*session = current
-	}
-
-	local, err := hasLocalRefinementRecording(session, audioDir)
-	if err != nil {
-		return err
-	}
-	if local {
-		return nil
-	}
-	allowed, err := store.DriveRestoreAllowed(session.ID)
-	if err != nil {
-		return fmt.Errorf("check whether Drive restoration is allowed for session %s: %w", session.ID, err)
-	}
-	if !allowed {
-		return fmt.Errorf("drive restoration is blocked while session %s owes a replacement", session.ID)
-	}
-	recordings, err := restore(ctx, *session)
-	if err != nil {
-		return fmt.Errorf("restore recording for refinement: %w", err)
-	}
-	cleanupDownloads := recordings.Downloaded
-	defer func() { removeFiles(cleanupDownloads) }()
-	if len(recordings.Paths) == 0 {
-		return errors.New("no recording is available on this unit or Drive")
-	}
-	if session.AudioRemovedAt != "" {
-		required, err := store.RefinementRecordingPaths(session.ID)
-		if err != nil {
-			return fmt.Errorf("list recordings known to session %s: %w", session.ID, err)
-		}
-		if len(required) == 0 {
-			required = recording.Entries(session.AudioPath)
-		}
-		if missing := missingRefinementRecordings(required, recordings.Paths); len(missing) > 0 {
-			return fmt.Errorf("drive did not restore recording %s for session %s; restore it from Drive's trash, then retry refinement", strings.Join(missing, ", "), session.ID)
-		}
-	}
-	restoredAudioPath := strings.Join(recordings.Paths, ",")
-	if restoredAudioPath == session.AudioPath {
-		if session.AudioRemovedAt == "" {
-			cleanupDownloads = nil
-			return nil
-		}
-		return errors.New("drive did not restore every recording removed from this unit")
-	}
-	restored, err := store.RestoreAudioForRefinement(session.ID, session.AudioPath, restoredAudioPath)
-	if err != nil {
-		return fmt.Errorf("record restored audio for refinement: %w", err)
-	}
-	if !restored {
-		if reader, ok := store.(interface {
-			GetSession(string) (storage.Session, error)
-		}); ok {
-			if current, err := reader.GetSession(session.ID); err == nil {
-				cleanupDownloads = downloadsNotNamedBy(current.AudioPath, recordings.Downloaded)
-			}
-		}
-		return fmt.Errorf("recording changed while restoring it for refinement")
-	}
-	cleanupDownloads = nil
-	return nil
-}
-
-func downloadsNotNamedBy(audioPath string, downloads []string) []string {
-	named := make(map[string]struct{})
-	for _, path := range recording.Entries(audioPath) {
-		if name := filepath.Base(path); name != "." {
-			named[name] = struct{}{}
-		}
-	}
-	unclaimed := make([]string, 0, len(downloads))
-	for _, path := range downloads {
-		if _, found := named[filepath.Base(path)]; !found {
-			unclaimed = append(unclaimed, path)
-		}
-	}
-	return unclaimed
-}
-
-const refinementRetryWarningKeyPrefix = "retry-refinement-"
-
-func retryRefinementWithFailureWarning(ctx context.Context, registry *warningsRegistry, sessionID string, retry func(context.Context, string) error) error {
-	err := retry(ctx, sessionID)
-	if err == nil {
-		registry.Clear(refinementRetryWarningKeyPrefix + sessionID)
-		return nil
-	}
-	warning := fmt.Sprintf("Retry refinement failed for session %s: %v", sessionID, err)
-	log.Printf("warning: %s", warning)
-	registry.Set(refinementRetryWarningKeyPrefix+sessionID, warning)
-	return err
-}
-
-func newRetryRefinementHook(store *storage.SQLiteStore, audioDir func() string, restore func(context.Context, storage.Session) (deletionRecordingSet, error), registry *warningsRegistry, refine func(context.Context, string, string, time.Time) error) func(context.Context, string) error {
-	ensure := func(ctx context.Context, sessionID string) error {
-		session, err := store.GetSession(sessionID)
-		if err != nil {
-			return err
-		}
-		return restoreRefinementRecording(ctx, store, &session, audioDir(), restore)
-	}
-	return func(ctx context.Context, sessionID string) error {
-		return retryRefinementWithFailureWarning(ctx, registry, sessionID, func(ctx context.Context, sessionID string) error {
-			return retryRefinementAfterRestoringRecording(ctx, sessionID, ensure, func(ctx context.Context, sessionID string) error {
-				return retryRefinementWithWarningClear(ctx, registry, store, sessionID, refine)
-			})
-		})
-	}
-}
-
 // importRestoredDriveSession returns the Drive restore callback: it imports
 // one restored session with the recording file names its folder holds, in
 // one transaction.
@@ -274,23 +69,6 @@ func importRestoredDriveSession(store *storage.SQLiteStore, restoredAt func() ti
 		sess := restoredDriveSession(&rs, restoredAt())
 		return store.ImportSession(&sess, rs.Segments, rs.RecordingPaths)
 	}
-}
-
-// ensureDeletionRecordings finds or restores a session's recordings before a
-// deletion or a refinement. Drive is opened only for a session that has a
-// folder there or whose audio was removed from this unit: a merge whose audio
-// was removed before it had a folder of its own restores from its sources'
-// folders.
-func ensureDeletionRecordings(ctx context.Context, store *storage.SQLiteStore, session *storage.Session, audioDir string, openDrive func(context.Context) (deletionRecordingSource, error)) (deletionRecordingSet, error) {
-	var source deletionRecordingSource
-	if session.GDriveFolderID != "" || session.AudioRemovedAt != "" {
-		opened, err := openDrive(ctx)
-		if err != nil {
-			return deletionRecordingSet{}, err
-		}
-		source = opened
-	}
-	return restoreDeletionRecordings(ctx, store, session, audioDir, source, "")
 }
 
 // newMergedRefinementFailureRecorder returns the merge hook's failure
@@ -1270,45 +1048,9 @@ func main() {
 	// the store, while its segment is there, naming the session and the
 	// segment's time.
 	refusedCuts := newRefusedCuts(store)
-	// deletionRunner makes the occurrence-based deletion actions use the
-	// configuration as it is now. Batch transcription has already persisted
-	// their exact word spans, so deleting never creates a locator.
-	deletionRunner := func() *segmentDeleteRunner {
-		latestCfg := cfgStore.Get()
-		return &segmentDeleteRunner{
-			store:    store,
-			audioDir: latestCfg.AudioDir,
-			ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
-				return ensureDeletionRecordings(ctx, store, &session, latestCfg.AudioDir, func(ctx context.Context) (deletionRecordingSource, error) {
-					if latestCfg.GDriveFolderID == "" {
-						return nil, fmt.Errorf("google Drive root folder is not configured")
-					}
-					syncer, err := newDriveSyncer(ctx, &latestCfg, appLogger)
-					if err != nil {
-						return nil, err
-					}
-					return syncer, nil
-				})
-			},
-			duration:  audio.Duration,
-			splice:    audio.Splice,
-			refine:    manager.RefineSession,
-			summarize: manager.SummarizeSession,
-			transcribeCut: func(ctx context.Context, model, path string) ([]transcribe.TimestampedWord, error) {
-				transcriber, err := makeBatchTranscriber(&latestCfg)
-				if err != nil {
-					return nil, fmt.Errorf("batch transcription, which checks the cut, is unavailable: %w", err)
-				}
-				if selector, ok := transcriber.(transcribe.ModelSelector); ok && model != "" {
-					transcriber = selector.WithModel(model)
-				}
-				result, err := transcriber.Transcribe(ctx, path)
-				if err != nil {
-					return nil, err
-				}
-				return result.Words, nil
-			},
-		}
+	deletion, err := newAppDeleteRunner(store, cfgStore, manager.RefineSession, manager.SummarizeSession, refusedCuts, appLogger)
+	if err != nil {
+		panic(fmt.Sprintf("segment deletion: %v", err))
 	}
 
 	checkRefinementRecording := func(_ context.Context, sessionID string) error {
@@ -1319,15 +1061,7 @@ func main() {
 		return refinementRecordingAvailable(&sess, cfgStore.Get().AudioDir)
 	}
 
-	retryRefinement := newRetryRefinementHook(
-		store,
-		func() string { return cfgStore.Get().AudioDir },
-		func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
-			return deletionRunner().ensureRecordings(ctx, session)
-		},
-		warningRegistry,
-		manager.RefineSession,
-	)
+	retryRefinement := deletion.retryRefinementHook(warningRegistry)
 	recordMergedRefinementFailure := newMergedRefinementFailureRecorder(store)
 
 	controlHooks := &server.ControlHooks{
@@ -1603,7 +1337,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			return pollSummaryBatch(ctx, batchName)
 		},
 	}
-	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletionRunner)
+	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletion)
 
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.
@@ -1625,35 +1359,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		capture.RequestResume,
 		hub.BroadcastStatusChanged,
 	)
-	// pauseNotSaved warns that the durable pause switch could not be saved.
-	pauseNotSaved := func() {
-		warningRegistry.Set(captureStateWarningKey, "Pause not saved; a restart will resume recording")
-	}
-	controlHooks.Pause = func() error {
-		err := pauseControls.Pause()
-		if err != nil {
-			pauseNotSaved()
-		} else {
-			warningRegistry.Clear(captureStateWarningKey)
-		}
-		return err
-	}
-	controlHooks.Resume = func() error {
-		err := pauseControls.Resume()
-		if err != nil {
-			if errors.Is(err, errRefusedResumeNotPersisted) {
-				pauseNotSaved()
-			}
-		} else {
-			warningRegistry.Clear(captureStateWarningKey)
-		}
-		return err
-	}
-	wireLightConsent(capture, hardware, warningRegistry, func(error) {
-		if err := pauseControls.RefuseResume(); err != nil {
-			pauseNotSaved()
-		}
-	})
+	wirePauseControls(controlHooks, pauseControls, capture, hardware, warningRegistry)
 	if restoredPause {
 		hub.BroadcastStatusChanged(true)
 	}
@@ -2089,24 +1795,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}()
 
-	go func() {
-		outcomes, err := recoverPendingSplices(ctx, store, cfg.AudioDir, deletionDrive, audio.Splice, manager.RefineSession)
-		applyPendingSpliceRecoveryWarnings(warningRegistry, outcomes)
-		if err != nil {
-			log.Printf("warning: failed to recover pending segment splices: %v", err)
-			recordPendingSpliceRecoveryWarning(warningRegistry, err)
-		} else {
-			recovered := 0
-			for i := range outcomes {
-				if outcomes[i].Recovered {
-					recovered++
-				}
-			}
-			if recovered > 0 {
-				log.Printf("recovered %d pending segment splices", recovered)
-			}
-		}
-	}()
+	go deletion.recoverAtStart(ctx, deletionDrive, warningRegistry)
 
 	// Log structured startup banner.
 	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)

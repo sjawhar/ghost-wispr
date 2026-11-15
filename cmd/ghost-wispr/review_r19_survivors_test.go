@@ -59,9 +59,12 @@ func TestMergeHookRecordsAnUnrestorableRefinementAsFailed(t *testing.T) {
 	store, dir, _ := survivorRemovedSourceMerge(t)
 	source := &r11FolderDrive{files: map[string][]*drive.File{"folder-s": {}}}
 	refine := suiteTwoWordRefine(store)
-	retry := newRetryRefinementHook(store, func() string { return dir }, func(ctx context.Context, s storage.Session) (deletionRecordingSet, error) {
+	retry := retryRunner(store, func() string { return dir }, func(ctx context.Context, s storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &s, dir, source, "")
-	}, newWarningsRegistry(), refine)
+	}, refine).retryRefinementHook(
+
+		newWarningsRegistry())
+
 	onSessionMerged(context.Background(), store, refine, func(context.Context, string, time.Time) error { return nil }, retry,
 		newMergedRefinementFailureRecorder(store), "merged")
 	merged, err := store.GetSession("merged")

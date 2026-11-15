@@ -24,7 +24,7 @@ func TestR7PendingSpliceRecoveryUsesEachSpansWarningKeyThroughStatus(t *testing.
 		return "", errors.New("splicer unavailable")
 	}
 
-	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(first), nil, failSplice, nil)
+	outcomes, err := recoveryRunner(store, filepath.Dir(first), failSplice, nil).recoverPendingSplices(context.Background(), nil)
 	if err != nil || len(outcomes) != 2 || outcomes[0].Recovered || outcomes[0].Err == nil || outcomes[1].Recovered || outcomes[1].Err == nil {
 		t.Fatalf("outcomes=%v err=%v, want two failed spans", outcomes, err)
 	}

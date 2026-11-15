@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -95,14 +94,8 @@ func apiStatusWarnings(registry *warningsRegistry, refused *refusedCuts) func() 
 // wireSegmentDeletion hands the server the two segment deletion actions and
 // GET /api/status's warnings, which list the cuts "Delete text and audio"
 // refused: one refused-cut record serves both.
-func wireSegmentDeletion(hooks *server.ControlHooks, registry *warningsRegistry, refused *refusedCuts, runner func() *segmentDeleteRunner) {
+func wireSegmentDeletion(hooks *server.ControlHooks, registry *warningsRegistry, refused *refusedCuts, runner *segmentDeleteRunner) {
 	hooks.Warnings = apiStatusWarnings(registry, refused)
-	hooks.DeleteSegment = func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
-		deletion := runner()
-		deletion.refused = refused
-		return deletion.DeleteRefinedAudio(ctx, sessionID, segmentID, revision)
-	}
-	hooks.DeleteSegmentText = func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
-		return runner().DeleteRefinedText(ctx, sessionID, segmentID, revision)
-	}
+	hooks.DeleteSegment = runner.DeleteRefinedAudio
+	hooks.DeleteSegmentText = runner.DeleteRefinedText
 }

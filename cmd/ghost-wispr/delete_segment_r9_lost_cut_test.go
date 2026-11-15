@@ -18,7 +18,7 @@ func TestR9RecoversLostSplicedRecordingForPendingReplacement(t *testing.T) {
 	fixture := newR9MergedCutFixture(t)
 	after := []byte("recording C after cut")
 	refined := false
-	outcomes, err := recoverPendingSplices(context.Background(), fixture.store, fixture.dir, fixture.drive, func(_ context.Context, path string, _, _ float64) (string, error) {
+	outcomes, err := recoveryRunner(fixture.store, fixture.dir, func(_ context.Context, path string, _, _ float64) (string, error) {
 		if path == fixture.audioC {
 			t.Fatalf("splicer edited the restored recording instead of its temporary copy: %s", path)
 		}
@@ -32,7 +32,8 @@ func TestR9RecoversLostSplicedRecordingForPendingReplacement(t *testing.T) {
 		}
 		refined = true
 		return nil
-	})
+	}).recoverPendingSplices(context.Background(), fixture.drive)
+
 	if err != nil || len(outcomes) != 1 || !outcomes[0].Recovered || outcomes[0].Err != nil {
 		t.Fatalf("lost-cut recovery = outcomes:%+v err:%v, want one recovered splice", outcomes, err)
 	}
@@ -60,7 +61,7 @@ func TestR9RecoversLostSplicedRecordingForPendingReplacement(t *testing.T) {
 // disk, clears the Drive replacement debt, or omits the session from status.
 func TestR9LostCutRecoveryWarnsAndKeepsReplacementOwed(t *testing.T) {
 	fixture := newR9MergedCutFixture(t)
-	outcomes, err := recoverPendingSplices(context.Background(), fixture.store, fixture.dir, fixture.drive, func(_ context.Context, path string, _, _ float64) (string, error) {
+	outcomes, err := recoveryRunner(fixture.store, fixture.dir, func(_ context.Context, path string, _, _ float64) (string, error) {
 		if err := os.WriteFile(path, []byte("wrong cut"), 0o600); err != nil {
 			return "", err
 		}
@@ -68,7 +69,8 @@ func TestR9LostCutRecoveryWarnsAndKeepsReplacementOwed(t *testing.T) {
 	}, func(context.Context, string, string, time.Time) error {
 		t.Fatal("failed cut recovery ran refinement")
 		return nil
-	})
+	}).recoverPendingSplices(context.Background(), fixture.drive)
+
 	if err != nil || len(outcomes) != 1 || outcomes[0].Err == nil {
 		t.Fatalf("failed lost-cut recovery = outcomes:%+v err:%v, want one failed splice", outcomes, err)
 	}

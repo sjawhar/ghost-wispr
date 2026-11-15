@@ -43,10 +43,11 @@ func TestRestoreRefinementRefusesWhileDriveReplacementIsOwed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = restoreRefinementRecording(context.Background(), store, &session, t.TempDir(), func(context.Context, storage.Session) (deletionRecordingSet, error) {
+			err = (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, t.TempDir(), func(context.Context, storage.Session) (deletionRecordingSet, error) {
 				t.Fatal("attempted to restore a pre-replacement Drive recording")
 				return deletionRecordingSet{}, nil
 			})
+
 			if err == nil {
 				t.Fatal("restored audio while a Drive replacement was owed")
 			}

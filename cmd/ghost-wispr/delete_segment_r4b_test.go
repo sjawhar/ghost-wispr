@@ -19,7 +19,7 @@ func TestR4RecoveryKeepsRecordingWhenResplicedHashDiffers(t *testing.T) {
 		}
 		return hashBytesForDeleteTest([]byte("different-cut")), nil
 	}
-	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, wrongSplice, nil)
+	outcomes, err := recoveryRunner(store, filepath.Dir(recording), wrongSplice, nil).recoverPendingSplices(context.Background(), nil)
 	if err != nil || len(outcomes) != 1 || outcomes[0].Recovered || outcomes[0].Err == nil {
 		t.Fatalf("outcomes=%v err=%v, want one failed, unrecovered row", outcomes, err)
 	}
@@ -55,7 +55,7 @@ func TestR4RecoveryRemovesItsDownloadWhenResplicedHashDiffers(t *testing.T) {
 		return hashBytesForDeleteTest([]byte("different-cut")), nil
 	}
 
-	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), drive, wrongSplice, nil)
+	outcomes, err := recoveryRunner(store, filepath.Dir(recording), wrongSplice, nil).recoverPendingSplices(context.Background(), drive)
 	if err != nil || len(outcomes) != 1 || outcomes[0].Recovered || outcomes[0].Err == nil {
 		t.Fatalf("outcomes=%v err=%v, want one failed, unrecovered row", outcomes, err)
 	}

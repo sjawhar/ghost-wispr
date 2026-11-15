@@ -12,9 +12,15 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
+// resolvedPathsRestoreStore holds one session, as the caller passes it.
 type resolvedPathsRestoreStore struct {
+	session          storage.Session
 	called           bool
 	before, restored string
+}
+
+func (s *resolvedPathsRestoreStore) GetSession(string) (storage.Session, error) {
+	return s.session, nil
 }
 
 func (s *resolvedPathsRestoreStore) RestoreAudioForRefinement(_, before, restored string) (bool, error) {
@@ -40,10 +46,11 @@ func TestRestoreRefinementNamesRecordingsAlreadyOnDisk(t *testing.T) {
 		{Name: recordingname.FileName(remaining), MimeType: "audio/mpeg"},
 	}}
 	session := storage.Session{ID: "merged", AudioPath: remaining, AudioRemovedAt: "2026-11-13T12:00:00Z", GDriveFolderID: "folder", SyncStatus: storage.SyncSynced, SyncState: storage.SyncStateSynced}
-	store := &resolvedPathsRestoreStore{}
-	err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-		return restoreDeletionRecordings(ctx, nil, &current, dir, drive, "")
+	store := &resolvedPathsRestoreStore{session: session}
+	err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+		return restoreDeletionRecordings(ctx, noCutsGuard{}, &current, dir, drive, "")
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,10 +68,11 @@ func TestRestoreRefinementRefusesWhenDriveLacksARemovedRecording(t *testing.T) {
 	}
 	drive := &deletionDriveFake{files: []*drive.File{{Name: recordingname.FileName(remaining), MimeType: "audio/mpeg"}}}
 	session := storage.Session{ID: "merged", AudioPath: remaining, AudioRemovedAt: "2026-11-13T12:00:00Z", GDriveFolderID: "folder", SyncStatus: storage.SyncSynced, SyncState: storage.SyncStateSynced}
-	store := &resolvedPathsRestoreStore{}
-	err := restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
-		return restoreDeletionRecordings(ctx, nil, &current, dir, drive, "")
+	store := &resolvedPathsRestoreStore{session: session}
+	err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+		return restoreDeletionRecordings(ctx, noCutsGuard{}, &current, dir, drive, "")
 	})
+
 	if err == nil {
 		t.Fatal("restore succeeded after Drive omitted a removed recording")
 	}

@@ -15,13 +15,14 @@ func TestR10LostCutKeepsPrecutBytesOffTheRecordingPath(t *testing.T) {
 	precut := []byte("recording C before cut")
 	after := []byte("recording C after cut")
 	var during []byte
-	outcomes, err := recoverPendingSplices(context.Background(), fixture.store, fixture.dir, fixture.drive, func(_ context.Context, path string, _, _ float64) (string, error) {
+	outcomes, err := recoveryRunner(fixture.store, fixture.dir, func(_ context.Context, path string, _, _ float64) (string, error) {
 		during, _ = os.ReadFile(fixture.audioC)
 		if err := os.WriteFile(path, after, 0o600); err != nil {
 			return "", err
 		}
 		return hashBytesForDeleteTest(after), nil
-	}, nil)
+	}, nil).recoverPendingSplices(context.Background(), fixture.drive)
+
 	if err != nil || len(outcomes) != 1 || !outcomes[0].Recovered || outcomes[0].Err != nil {
 		t.Fatalf("lost-cut recovery = outcomes:%+v err:%v", outcomes, err)
 	}

@@ -57,9 +57,10 @@ func TestR9SubsetRestoreDoesNotClearTheMarker(t *testing.T) {
 	store, session, names := r9MergedRestoreSession(t, "")
 	restored := []string{filepath.Join(dir, names[0]), filepath.Join(dir, names[2])}
 
-	err := restoreRefinementRecording(context.Background(), store, &session, dir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
+	err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, dir, func(context.Context, storage.Session) (deletionRecordingSet, error) {
 		return deletionRecordingSet{Paths: restored, Downloaded: restored}, nil
 	})
+
 	if err == nil {
 		t.Fatal("restored a subset of merged recordings")
 	}
@@ -86,9 +87,10 @@ func TestR9MovedAudioDirDoesNotClearTheMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := restoreRefinementRecording(context.Background(), store, &session, newDir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
+	err := (&segmentDeleteRunner{}).restoreRefinementRecording(context.Background(), store, &session, newDir, func(ctx context.Context, current storage.Session) (deletionRecordingSet, error) {
 		return restoreDeletionRecordings(ctx, store, &current, newDir, nil, "")
 	})
+
 	if err == nil {
 		t.Fatal("restored only the moved survivor")
 	}

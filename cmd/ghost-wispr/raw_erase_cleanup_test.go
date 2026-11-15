@@ -333,13 +333,14 @@ func TestStartupResplicesAnInterruptedDeletion(t *testing.T) {
 		t.Fatalf("record interrupted refined delete: %v", err)
 	}
 	var refined bool
-	outcomes, err := recoverPendingSplices(context.Background(), store, filepath.Dir(recording), nil, fakeSplice, func(_ context.Context, sessionID, audioPath string, gotStarted time.Time) error {
+	outcomes, err := recoveryRunner(store, filepath.Dir(recording), fakeSplice, func(_ context.Context, sessionID, audioPath string, gotStarted time.Time) error {
 		if sessionID != "session" || audioPath != recording || gotStarted != started {
 			t.Fatalf("refine recovered splice session=%q audio=%q started=%s", sessionID, audioPath, gotStarted)
 		}
 		refined = true
 		return nil
-	})
+	}).recoverPendingSplices(context.Background(), nil)
+
 	if err != nil {
 		t.Fatalf("recover pending splice: %v", err)
 	}

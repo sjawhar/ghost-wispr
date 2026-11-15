@@ -110,15 +110,15 @@ func newR9MergedCutFixture(t *testing.T) r9MergedCutFixture {
 // segment from A downloads Drive's pre-cut C while C's replacement is owed.
 func TestR9DeleteAudioDoesNotRestorePrecutMergedRecording(t *testing.T) {
 	fixture := newR9MergedCutFixture(t)
-	runner := &segmentDeleteRunner{
+	runner := testDeleteRunner(t, &segmentDeleteRunner{
 		store:    fixture.store,
-		audioDir: fixture.dir,
+		audioDir: func() string { return fixture.dir },
 		ensureRecordings: func(ctx context.Context, session storage.Session) (deletionRecordingSet, error) {
 			return restoreDeletionRecordings(ctx, fixture.store, &session, fixture.dir, fixture.drive, "")
 		},
 		duration: func(context.Context, string) (float64, error) { return 10, nil },
 		splice:   fakeSplice,
-	}
+	})
 
 	err := runner.DeleteRefinedAudio(context.Background(), "merged", fixture.segmentA, fixture.revision)
 	if err == nil {
@@ -149,7 +149,7 @@ func TestR9PendingSpliceDoesNotRestorePrecutMergedRecording(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := recoverPendingSplice(context.Background(), fixture.store, fixture.dir, fixture.drive, fakeSplice, nil, &pending)
+	recovered, err := recoveryRunner(fixture.store, fixture.dir, fakeSplice, nil).recoverPendingSplice(context.Background(), fixture.drive, fixture.dir, &pending)
 	if err == nil || recovered {
 		t.Fatalf("pending splice recovery = recovered:%t err:%v, want refusal", recovered, err)
 	}
