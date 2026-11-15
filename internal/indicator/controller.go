@@ -3,6 +3,7 @@ package indicator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -10,6 +11,9 @@ import (
 const serverDownTimeout = 3 * time.Second
 
 var ErrNoBlink1 = errors.New("blink(1) indicator not found")
+
+// ErrNotRed reports a light that does not read back red after a red write.
+var ErrNotRed = errors.New("recording light does not read back red")
 
 // Blink1Report builds an eight-byte blink(1) feature report.
 func Blink1Report(command byte, args [6]byte) [8]byte {
@@ -30,10 +34,13 @@ type Controller struct {
 	light     Light
 	recording func() bool
 	interval  time.Duration
+	checked   func(error)
 	wake      chan struct{}
 }
 
-func NewController(light Light, recording func() bool, interval time.Duration) *Controller {
+// NewController returns a controller for light. checked, when not nil, gets
+// each check's result.
+func NewController(light Light, recording func() bool, interval time.Duration, checked func(error)) *Controller {
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -41,6 +48,7 @@ func NewController(light Light, recording func() bool, interval time.Duration) *
 		light:     light,
 		recording: recording,
 		interval:  interval,
+		checked:   checked,
 		wake:      make(chan struct{}, 1),
 	}
 }
@@ -86,6 +94,8 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
+// update tickles the watchdog, sets the colour the recording signal wants and
+// reports the check to checked.
 func (c *Controller) update() {
 	_ = c.light.ServerDown(serverDownTimeout)
 
@@ -93,12 +103,36 @@ func (c *Controller) update() {
 	if c.recording() {
 		wantRed = 255
 	}
+	err := c.apply(wantRed)
+	if c.checked != nil {
+		c.checked(err)
+	}
+}
+
+// apply makes the light show wantRed. It fails when the light cannot be read
+// or written, or, while recording, does not read back red after a red write:
+// the recorder then may not capture. An off write that does not read back
+// off is not a failure, since a red confirmation can hold the light red.
+func (c *Controller) apply(wantRed uint8) error {
 	red, green, blue, err := c.light.ReadRGB()
 	if err != nil {
-		return
+		return err
 	}
 	if red == wantRed && green == 0 && blue == 0 {
-		return
+		return nil
 	}
-	_ = c.light.SetRGB(wantRed, 0, 0)
+	if err := c.light.SetRGB(wantRed, 0, 0); err != nil {
+		return err
+	}
+	if wantRed == 0 {
+		return nil
+	}
+	red, green, blue, err = c.light.ReadRGB()
+	if err != nil {
+		return err
+	}
+	if red != 255 || green != 0 || blue != 0 {
+		return fmt.Errorf("%w: it reads %d,%d,%d", ErrNotRed, red, green, blue)
+	}
+	return nil
 }

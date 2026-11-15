@@ -96,12 +96,20 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
 | `google_credentials_file` | No | — | Authoritative Google credential file; when empty, Application Default Credentials are used |
 
+`ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
+
 ## Consent rule
 
 Record only while the light is on. Anyone may pause it at any time without a reason.
 Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
 
-`ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
+With `indicator_light: blink1` the recorder keeps the first rule itself: it captures only while
+the blink(1) reads back red. With the light missing, or not reading back red, it starts no
+microphone and refuses a resume; if the light fails while it records, capture stops within one
+check (a second) without saving a pause. `/api/status` then names the cause in a warning and
+reports `capture_state` `light_unavailable`, and capture comes back once the light reads back red
+again, unless someone paused it meanwhile.
+
 ## Deployment
 
 The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is
@@ -117,8 +125,8 @@ outputs, credential bundle, provisioning command, tailnet join, and acceptance c
 | `GET` | `/api/sessions/{id}` | Get session details with transcript segments |
 | `GET` | `/api/sessions/{id}/audio` | Stream session audio (supports range requests) |
 | `POST` | `/api/pause` | Pause capture. The pause persists through restarts; the active session ends and nothing is recorded or sent to Deepgram until resume. A unit that starts paused opens the microphone, and connects to Deepgram, only when it resumes. When enabled, the Pi power button toggles the same control. |
-| `POST` | `/api/resume` | Resume a persisted pause. When a configured light is present, it confirms red before returning. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone restarts. |
-| `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `resuming` from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 s, `stalled`, `mic_unavailable` or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (raw `.pcm` recordings that could not be saved), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
+| `POST` | `/api/resume` | Resume a persisted pause. With a configured light, it confirms red before returning, and a missing light refuses the resume. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone restarts. |
+| `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `light_unavailable` while the switch is on but the recording light is missing or does not read back red, `resuming` from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 s, `stalled`, `mic_unavailable` or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (raw `.pcm` recordings that could not be saved), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |
 
 ## Development

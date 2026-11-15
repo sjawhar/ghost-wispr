@@ -1897,9 +1897,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
 		if err := startOpenedMic(capture, mic, func() { micRef.Store(nil) }, log.Printf); err != nil {
-			warningRegistry.Set("microphone", "Microphone failed to start — recording and live transcription are disabled")
+			warning, status := micStartFailureMessages(err)
+			if warning != "" {
+				warningRegistry.Set("microphone", warning)
+			}
 			if updateStartupState {
-				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone failed to start"}
+				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: status}
 			}
 			return fmt.Errorf("microphone start failed at %d Hz: %w", sampleRate, err)
 		}

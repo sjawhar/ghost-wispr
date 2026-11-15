@@ -37,11 +37,12 @@ const (
 
 // Capture states, as GET /api/status reports them.
 const (
-	capturePaused         = storage.ComponentStatusPaused   // the switch is off
-	captureResuming       = storage.ComponentStatusResuming // switch on, gate still closed
-	captureStalled        = storage.ComponentStatusStalled  // as resuming, past captureStallAfter
-	captureMicUnavailable = "mic_unavailable"               // gate open, microphone not capturing
-	captureCapturing      = "capturing"                     // gate open, microphone capturing
+	capturePaused           = storage.ComponentStatusPaused   // the switch is off
+	captureResuming         = storage.ComponentStatusResuming // switch on, gate still closed
+	captureStalled          = storage.ComponentStatusStalled  // as resuming, past captureStallAfter
+	captureLightUnavailable = "light_unavailable"             // switch on, gate held closed until the light is confirmed red
+	captureMicUnavailable   = "mic_unavailable"               // gate open, microphone not capturing
+	captureCapturing        = "capturing"                     // gate open, microphone capturing
 )
 
 // errGateClosed is what a captureGate writer returns while capture is paused.
@@ -62,6 +63,10 @@ var errGateClosed = errors.New("microphone capture gate closed")
 // Pause and Resume never wait for settle (it ends the session, which can take
 // as long as encoding its recording). Resume moves the switch at once; the gate
 // opens once the pause has settled, unless a Pause comes first.
+//
+// HoldForLight closes the gate as Pause does, without moving the switch, when
+// the recording light cannot be confirmed red. The gate then opens only after
+// ReleaseLightHold, through the same settle and checks as a Resume.
 type captureGate struct {
 	onPause             func()
 	settle              func()
@@ -77,6 +82,7 @@ type captureGate struct {
 	control             sync.Mutex    // serializes closing and opening the gate, with their steps
 	mu                  sync.Mutex    // guards the fields below
 	switchOff           bool          // Pause was called and Resume has not been since
+	lightHeld           bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
 	resumedAt           time.Time     // when Resume last moved the switch on
 	starting            bool          // that Resume's start of the microphone, and Deepgram, has not finished (finishResume)
 	closed              bool          // no audio passes the gate
@@ -115,6 +121,54 @@ func (g *captureGate) Pause() {
 
 	g.mu.Lock()
 	g.switchOff = true
+	g.mu.Unlock()
+	g.closeGate()
+}
+
+// HoldForLight closes the gate because the recording light cannot be
+// confirmed red, leaving the switch as it is: the gate stays closed until
+// ReleaseLightHold, and no pause is saved.
+func (g *captureGate) HoldForLight() {
+	g.control.Lock()
+	defer g.control.Unlock()
+
+	g.mu.Lock()
+	g.lightHeld = true
+	g.mu.Unlock()
+	g.closeGate()
+}
+
+// ReleaseLightHold lets a gate HoldForLight closed open again, once its
+// closing has settled, if the switch is on. The gate opens only after
+// beforeGateOpen confirms the light red; if it cannot, the hold comes back.
+func (g *captureGate) ReleaseLightHold() {
+	g.control.Lock()
+	defer g.control.Unlock()
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.lightHeld {
+		return
+	}
+	g.lightHeld = false
+	if g.closed && !g.switchOff {
+		g.resumedAt = time.Now()
+		g.starting = true
+		go g.openAfter(g.closings, g.settled, true)
+	}
+}
+
+// isLightHeld reports whether HoldForLight holds the gate.
+func (g *captureGate) isLightHeld() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lightHeld
+}
+
+// closeGate runs onPause, closes the gate, then settles the closing in the
+// background. The caller holds control. Closing a closed gate does nothing.
+func (g *captureGate) closeGate() {
+	g.mu.Lock()
 	alreadyClosed := g.closed
 	g.mu.Unlock()
 	if alreadyClosed {
@@ -180,15 +234,19 @@ func (g *captureGate) RequestResume() error {
 		return nil
 	}
 	g.switchOff = false
+	if g.beforeResumeRequest != nil {
+		// It has just confirmed the light red.
+		g.lightHeld = false
+	}
 	g.resumedAt = time.Now()
 	g.starting = true
-	go g.openAfter(g.closings, g.settled)
+	go g.openAfter(g.closings, g.settled, false)
 	return nil
 }
 
-// captureState reports what capture is doing: paused, resuming or stalled
-// while the gate is closed, resuming until the resume's start has finished
-// (MicHold), then capturing or mic_unavailable.
+// captureState reports what capture is doing: paused, light_unavailable,
+// resuming or stalled while the gate is closed, resuming until the resume's
+// start has finished (MicHold), then capturing or mic_unavailable.
 func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 	if hold := g.MicHold(); hold != "" {
 		return hold
@@ -202,11 +260,11 @@ func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 	return captureCapturing
 }
 
-// MicHold reports why capture is not up on purpose: paused, or stalled or
-// resuming while the gate is closed; and resuming after the gate opens, until
-// the start that brings the microphone and Deepgram back has finished
-// (finishResume) or the stall limit has passed. It is "" otherwise.
-// Readiness checks read it.
+// MicHold reports why capture is not up on purpose: paused, held for the
+// light, or stalled or resuming while the gate is closed; and resuming after
+// the gate opens, until the start that brings the microphone and Deepgram
+// back has finished (finishResume) or the stall limit has passed. It is ""
+// otherwise. Readiness checks read it.
 func (g *captureGate) MicHold() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -218,6 +276,8 @@ func (g *captureGate) MicHold() string {
 		return ""
 	case g.switchOff:
 		return capturePaused
+	case g.lightHeld:
+		return captureLightUnavailable
 	case time.Since(g.resumedAt) > g.stallAfter:
 		return captureStalled
 	default:
@@ -226,13 +286,16 @@ func (g *captureGate) MicHold() string {
 }
 
 // openAfter opens the gate once closing number closing has settled, if the
-// switch is still on and no later closing has happened.
-func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
+// switch is still on, the light does not hold it, and no later closing has
+// happened. forLight says ReleaseLightHold asked: a refusal from
+// beforeGateOpen then holds the gate for the light again, where a person's
+// resume is refused and the switch goes off.
+func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight bool) {
 	<-settled
 	g.control.Lock()
 
 	g.mu.Lock()
-	open := g.closed && !g.switchOff && g.closings == closing
+	open := g.closed && !g.switchOff && !g.lightHeld && g.closings == closing
 	g.mu.Unlock()
 	if !open {
 		g.control.Unlock()
@@ -242,12 +305,16 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 		if err := g.beforeGateOpen(); err != nil {
 			g.mu.Lock()
 			if g.closed && g.closings == closing {
-				g.switchOff = true
+				if forLight {
+					g.lightHeld = true
+				} else {
+					g.switchOff = true
+				}
 			}
 			g.mu.Unlock()
 			onResumeRefused := g.onResumeRefused
 			g.control.Unlock()
-			if onResumeRefused != nil {
+			if onResumeRefused != nil && !forLight {
 				onResumeRefused(err)
 			}
 			return
@@ -258,7 +325,7 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}) {
 	}
 
 	g.mu.Lock()
-	if !g.closed || g.switchOff || g.closings != closing {
+	if !g.closed || g.switchOff || g.lightHeld || g.closings != closing {
 		g.mu.Unlock()
 		g.control.Unlock()
 		return
