@@ -228,3 +228,24 @@ func TestLightRefusedStartBlamesTheLight(t *testing.T) {
 		t.Fatalf("warning for a device failure = %q, want the microphone warning", warning)
 	}
 }
+
+// TestMicRowNamesTheLightHold fails if the microphone's status row says the
+// unit is paused while the light, not a person, holds capture.
+func TestMicRowNamesTheLightHold(t *testing.T) {
+	hub := server.NewHub()
+	events := hub.Subscribe()
+	defer hub.Unsubscribe(events)
+	capture := newCaptureGate(nil, nil, nil)
+	capture.HoldForLight()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go holdMicWhilePaused(ctx, capture, &deliveringMic{}, func(string, ...any) {}, hub)
+	select {
+	case raw := <-events:
+		if !strings.Contains(string(raw), "light_unavailable") || strings.Contains(string(raw), "paused") {
+			t.Fatalf("microphone row during a light hold = %s, want light_unavailable", raw)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no microphone row was broadcast")
+	}
+}

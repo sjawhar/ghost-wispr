@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -128,7 +129,9 @@ func startMicRig(t *testing.T, peerReads bool) *micRig {
 	if err != nil {
 		t.Fatalf("connect the Deepgram client to the local peer: %v", err)
 	}
-	resilient := transcribe.NewResilientClient(ctx, nil, transcribe.ResilientConfig{BufferSize: 1 << 20, InitialReconnectDelay: 50 * time.Millisecond, MaxReconnectBackoff: 200 * time.Millisecond}, t.Logf, nil)
+	// log.Printf, not t.Logf: the resilient client's reconnect and the send
+	// queue can log after the test ends.
+	resilient := transcribe.NewResilientClient(ctx, nil, transcribe.ResilientConfig{BufferSize: 1 << 20, InitialReconnectDelay: 50 * time.Millisecond, MaxReconnectBackoff: 200 * time.Millisecond}, log.Printf, nil)
 	resilient.Factory = factory
 	resilient.Client = initial
 	t.Cleanup(func() { _ = resilient.Close() })
@@ -152,7 +155,7 @@ func startMicRig(t *testing.T, peerReads bool) *micRig {
 	if err := startMicIfUnpaused(rig.capture, rig.mic.Start); err != nil {
 		t.Fatalf("start the microphone: %v", err)
 	}
-	startMicMonitoring(ctx, &loops, rig.capture, rig.mic, recorder, resilient, func(d time.Duration) { time.Sleep(d) }, t.Logf, nil)
+	startMicMonitoring(ctx, &loops, rig.capture, rig.mic, recorder, resilient, func(d time.Duration) { time.Sleep(d) }, log.Printf, nil)
 	waitForHardware(t, "the light red while capturing", rig.device.isRed)
 	return rig
 }

@@ -690,12 +690,13 @@ func (c transcriptCallback) UnhandledEvent([]byte) error { return nil }
 // takes longer fails, so the resilient client buffers and reconnects.
 var deepgramWriteTimeout = 5 * time.Second
 
-// deepgramWriter is one Deepgram socket. Its writes run on a goroutine of
-// their own and are bounded by deepgramWriteTimeout: the SDK's write has no
-// deadline, and a peer or path that stops taking data would otherwise block
-// it for as long as the kernel keeps retrying. A write past the bound breaks
-// the writer, so the resilient client buffers and dials a new socket; the
-// stuck write is left to end with the old socket, which is then stopped.
+// deepgramWriter is one Deepgram socket. Its writes, and its Finalize, run on
+// a goroutine of their own and are bounded by deepgramWriteTimeout: the SDK's
+// write has no deadline, a peer or path that stops taking data would
+// otherwise block it for as long as the kernel keeps retrying, and the SDK's
+// Finalize waits for that write's lock. A call past the bound breaks the
+// writer, so the resilient client buffers and dials a new socket; the stuck
+// call is left to end with the old socket, which is then stopped.
 type deepgramWriter struct {
 	client interface {
 		io.Writer
@@ -703,7 +704,7 @@ type deepgramWriter struct {
 	}
 	mu       sync.Mutex
 	start    sync.Once
-	requests chan []byte
+	requests chan func() error
 	results  chan error
 	timer    *time.Timer
 	buf      []byte
@@ -734,7 +735,7 @@ func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *cap
 		return nil
 	}
 	var sender *transcribe.AsyncSender
-	var send io.Writer = io.Discard
+	send := io.Discard
 	if downstream != nil {
 		sender = transcribe.NewAsyncSender(ctx, downstream, deepgramSendChunks, logf)
 		send = sender
@@ -825,39 +826,47 @@ func (dw *deepgramWriter) Write(p []byte) (int, error) {
 	if dw.broken != nil {
 		return 0, dw.broken
 	}
+	dw.buf = append(dw.buf[:0], p...)
+	if err := dw.bounded(func() error {
+		_, err := dw.client.Write(dw.buf)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// bounded runs op on the socket's goroutine and waits for it up to
+// deepgramWriteTimeout. The caller holds mu, and has checked broken.
+func (dw *deepgramWriter) bounded(op func() error) error {
 	dw.start.Do(func() {
-		dw.requests = make(chan []byte)
+		dw.requests = make(chan func() error)
 		dw.results = make(chan error, 1)
 		dw.timer = time.NewTimer(deepgramWriteTimeout)
-		go func(requests <-chan []byte, results chan<- error) {
-			for chunk := range requests {
-				_, err := dw.client.Write(chunk)
-				results <- err
+		go func(requests <-chan func() error, results chan<- error) {
+			for op := range requests {
+				results <- op()
 			}
 		}(dw.requests, dw.results)
 	})
-	dw.buf = append(dw.buf[:0], p...)
 	dw.timer.Reset(deepgramWriteTimeout)
 	select {
-	case dw.requests <- dw.buf:
+	case dw.requests <- op:
 	case <-dw.timer.C:
-		return 0, dw.breakOnTimeout()
+		return dw.breakOnTimeout()
 	}
 	select {
 	case err := <-dw.results:
 		dw.timer.Stop()
-		if err != nil {
-			return 0, err
-		}
-		return len(p), nil
+		return err
 	case <-dw.timer.C:
-		return 0, dw.breakOnTimeout()
+		return dw.breakOnTimeout()
 	}
 }
 
-// breakOnTimeout marks the socket dead after a write passed its bound. The
-// caller holds mu. The write goroutine ends once the stuck write returns, and
-// the socket is stopped then, since the SDK's Stop waits for that write.
+// breakOnTimeout marks the socket dead after a call passed its bound. The
+// caller holds mu. The socket's goroutine ends once the stuck call returns,
+// and the socket is stopped then, since the SDK's Stop waits for that call.
 func (dw *deepgramWriter) breakOnTimeout() error {
 	dw.broken = fmt.Errorf("%w after %v", errDeepgramWriteTimeout, deepgramWriteTimeout)
 	close(dw.requests)
@@ -867,13 +876,23 @@ func (dw *deepgramWriter) breakOnTimeout() error {
 	return dw.broken
 }
 
+// Close finalizes the socket, as Finalize does; a broken socket is being
+// stopped already.
 func (dw *deepgramWriter) Close() error {
-	return dw.client.Finalize()
+	if err := dw.Finalize(); err != nil && !errors.Is(err, errDeepgramWriteTimeout) {
+		return err
+	}
+	return nil
 }
 
 // Finalize asks Deepgram to return final results for the audio it has.
 func (dw *deepgramWriter) Finalize() error {
-	return dw.client.Finalize()
+	dw.mu.Lock()
+	defer dw.mu.Unlock()
+	if dw.broken != nil {
+		return dw.broken
+	}
+	return dw.bounded(dw.client.Finalize)
 }
 
 func makeDeepgramClientFactory(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback transcriptCallback) transcribe.ClientFactory {
@@ -1361,6 +1380,27 @@ func main() {
 			splice:    audio.Splice,
 			refine:    manager.RefineSession,
 			summarize: manager.SummarizeSession,
+			transcribeCut: func(ctx context.Context, model, path string) ([]transcribe.TimestampedWord, error) {
+				transcriber, err := makeBatchTranscriber(&latestCfg)
+				if err != nil {
+					return nil, fmt.Errorf("batch transcription, which checks the cut, is unavailable: %w", err)
+				}
+				if selector, ok := transcriber.(transcribe.ModelSelector); ok && model != "" {
+					transcriber = selector.WithModel(model)
+				}
+				result, err := transcriber.Transcribe(ctx, path)
+				if err != nil {
+					return nil, err
+				}
+				return result.Words, nil
+			},
+			warn: func(sessionID, warning string) {
+				if warning == "" {
+					warningRegistry.Clear("deletion-cut-" + sessionID)
+					return
+				}
+				warningRegistry.Set("deletion-cut-"+sessionID, warning)
+			},
 		}
 	}
 
@@ -2106,9 +2146,17 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// booted closes once start-up has sent its component statuses.
 	booted := make(chan struct{})
 	if startMicrophone(ctx, &micLoops, capture, booted, !paInitFailed, startMic, retryMic) {
-		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
-		if cfg.DeepgramAPIKey != "" {
-			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
+		switch {
+		case capture.isLightHeld() && !capture.IsPaused():
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: captureLightUnavailable, Message: "Microphone closed: the recording light is not confirmed red"}
+			if cfg.DeepgramAPIKey != "" {
+				startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: captureLightUnavailable, Message: "Deepgram connects once the recording light is confirmed red"}
+			}
+		default:
+			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
+			if cfg.DeepgramAPIKey != "" {
+				startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
+			}
 		}
 	}
 

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"google.golang.org/api/drive/v3"
 
@@ -33,6 +34,12 @@ type segmentDeleteRunner struct {
 	splice           func(context.Context, string, float64, float64) (string, error)
 	refine           func(context.Context, string, string, time.Time) error
 	summarize        func(context.Context, string, time.Time) error
+	// transcribeCut transcribes a cut copy of a recording with the model the
+	// session was refined with, for the check after each cut of "Delete text
+	// and audio". Production always sets it; nil skips the check.
+	transcribeCut func(ctx context.Context, model, path string) ([]transcribe.TimestampedWord, error)
+	// warn puts a refused deletion on /api/status.
+	warn func(sessionID, warning string)
 }
 
 type deletionRecordingSet struct {
@@ -469,22 +476,21 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	if err != nil {
 		return err
 	}
-	start, end := refinedSpliceBounds(words, selected)
+	duration := -1.0
 	if d.duration != nil {
-		duration, err := d.duration(ctx, recording)
-		if err != nil {
+		if duration, err = d.duration(ctx, recording); err != nil {
 			return fmt.Errorf("probe recording %s: %w", recording, err)
 		}
-		if end > duration {
-			end = duration
-		}
 	}
-	if end <= start {
-		return fmt.Errorf("stored word span for segment %d has no removable audio", segmentID)
-	}
-	tempPath, err := copyForSplice(recording)
+	tempPath, start, end, afterHash, err := d.cutAndCheck(ctx, session.RefinementModel, recording, words, selected, duration)
 	if err != nil {
+		if errors.Is(err, errDeletionCutHeard) && d.warn != nil {
+			d.warn(sessionID, fmt.Sprintf("\"Delete text and audio\" was refused for session %s: %v", sessionID, err))
+		}
 		return err
+	}
+	if d.warn != nil {
+		d.warn(sessionID, "")
 	}
 	keepTemp := false
 	defer func() {
@@ -492,16 +498,6 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 			_ = os.Remove(tempPath)
 		}
 	}()
-	afterHash, err := d.splice(ctx, tempPath, start, end)
-	if err != nil {
-		return fmt.Errorf("splice recording %s: %w", recording, err)
-	}
-	if afterHash == "" {
-		afterHash, err = fileSHA256(tempPath)
-		if err != nil {
-			return fmt.Errorf("hash spliced recording %s: %w", tempPath, err)
-		}
-	}
 	span := storage.DeletedSpan{
 		SessionID: sessionID, AudioPath: recording, SessionAudioPath: strings.Join(recordingSet.Paths, ","),
 		Start: start, End: end, SHA256Before: beforeHash, SHA256After: afterHash,
@@ -566,6 +562,121 @@ func refinedSpliceBoundsWithPad(words []storage.RefinedWord, selected *transcrib
 		start = 0
 	}
 	return start, end
+}
+
+// deletionCutPads are the pads a cut is tried with, in order: the check after
+// each cut widens to the next when it still hears a deleted word, and refuses
+// past the last.
+var deletionCutPads = []float64{deletionAudioPad, 0.6, 0.8}
+
+// deletionCutWindow is how near the cut point, in the cut recording, the check
+// counts a deleted word it hears: further away, a word the segment shares
+// with its neighbours is most likely theirs. Measured with
+// TestMeasureDeletionAudioPad.
+const deletionCutWindow = 0.5
+
+// deletionNeighbourWindow is how far before and after the cut the
+// neighbours' own words are counted, to explain a heard word as theirs.
+const deletionNeighbourWindow = 3.5
+
+// errDeletionCutHeard refuses a "Delete text and audio" whose every cut
+// still left a deleted word heard next to it.
+var errDeletionCutHeard = errors.New("a word of the deleted segment is still heard next to the cut")
+
+// cutAndCheck cuts the selected segment out of a copy of recording, with each
+// of deletionCutPads in turn, until a transcription of the copy hears no word
+// of the segment next to the cut. It returns the accepted copy, its bounds and
+// its hash; it removes every copy it does not return. duration < 0 is unknown.
+func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording string, words []storage.RefinedWord, selected *transcribe.Segment, duration float64) (string, float64, float64, string, error) {
+	var heardLast []string
+	for _, pad := range deletionCutPads {
+		start, end := refinedSpliceBoundsWithPad(words, selected, pad)
+		if duration >= 0 && end > duration {
+			end = duration
+		}
+		if end <= start {
+			return "", 0, 0, "", fmt.Errorf("stored word span for segment %d has no removable audio", selected.ID)
+		}
+		tempPath, err := copyForSplice(recording)
+		if err != nil {
+			return "", 0, 0, "", err
+		}
+		afterHash, err := d.splice(ctx, tempPath, start, end)
+		if err != nil {
+			_ = os.Remove(tempPath)
+			return "", 0, 0, "", fmt.Errorf("splice recording %s: %w", recording, err)
+		}
+		if afterHash == "" {
+			if afterHash, err = fileSHA256(tempPath); err != nil {
+				_ = os.Remove(tempPath)
+				return "", 0, 0, "", fmt.Errorf("hash spliced recording %s: %w", tempPath, err)
+			}
+		}
+		if d.transcribeCut == nil {
+			return tempPath, start, end, afterHash, nil
+		}
+		heard, err := d.transcribeCut(ctx, model, tempPath)
+		if err != nil {
+			_ = os.Remove(tempPath)
+			return "", 0, 0, "", fmt.Errorf("check the cut recording %s: %w", recording, err)
+		}
+		heardLast = leftoverWords(words, selected, start, end, heard, deletionCutWindow)
+		if len(heardLast) == 0 {
+			return tempPath, start, end, afterHash, nil
+		}
+		_ = os.Remove(tempPath)
+	}
+	return "", 0, 0, "", fmt.Errorf("%w: %q, even cutting %.2f s past its words on each side; the recording is unchanged",
+		errDeletionCutHeard, heardLast, deletionCutPads[len(deletionCutPads)-1])
+}
+
+// leftoverWords returns the words of the selected segment that heard, a
+// transcription of the recording cut from start to end, holds within window
+// seconds of the cut point beyond the neighbours' own words around the cut.
+// A neighbour's word the pad cut into, or cut out, counts as the neighbours':
+// a transcription of the cut recording can hear what is left of it.
+func leftoverWords(words []storage.RefinedWord, selected *transcribe.Segment, start, end float64, heard []transcribe.TimestampedWord, window float64) []string {
+	segment, near := map[string]int{}, map[string]int{}
+	for _, word := range words {
+		if word.RecordingPath != selected.RecordingPath || word.RecordingSHA256 != selected.RecordingSHA256 {
+			continue
+		}
+		text := spokenWord(word.Text)
+		switch {
+		case text == "":
+		case word.Start >= selected.StartTime && word.End <= selected.EndTime:
+			segment[text]++
+		case word.End > start-deletionNeighbourWindow && word.Start < end+deletionNeighbourWindow:
+			near[text]++
+		}
+	}
+	around := map[string]int{}
+	for _, word := range heard {
+		if word.End >= start-window && word.Start <= start+window {
+			if text := spokenWord(word.Text); text != "" {
+				around[text]++
+			}
+		}
+	}
+	var left []string
+	for text, count := range around {
+		if segment[text] > 0 && count > near[text] {
+			left = append(left, text)
+		}
+	}
+	slices.Sort(left)
+	return left
+}
+
+// spokenWord is a word's letters and digits, lower case.
+func spokenWord(text string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 type pendingSpliceOutcome struct {
