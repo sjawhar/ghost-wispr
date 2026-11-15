@@ -11,7 +11,6 @@ import (
 	"time"
 
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
-	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 var (
@@ -149,7 +148,7 @@ var postDeleteMaintenance = func(db *sql.DB, walPath string) error {
 	return truncateWriteAheadLog(db)
 }
 
-func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []transcribe.Segment) (sources []string, err error) {
+func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, untimedHolder string, remaining []StoredSegment) (sources []string, err error) {
 	sources, err = mergedSourceIDs(tx, sessionID)
 	if err != nil {
 		return nil, err
@@ -234,7 +233,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 		return chain
 	}
 
-	own := make(map[string][]transcribe.Segment, len(sources))
+	own := make(map[string][]StoredSegment, len(sources))
 	for i := range remaining {
 		source := remaining[i].SourceSessionID
 		if source == "" {
@@ -282,7 +281,7 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 	return sources, nil
 }
 
-func canonicalTranscript(segments []transcribe.Segment) string {
+func canonicalTranscript(segments []StoredSegment) string {
 	var builder strings.Builder
 	for i := range segments {
 		text := strings.TrimSpace(segments[i].Text)

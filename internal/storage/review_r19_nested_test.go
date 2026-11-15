@@ -35,7 +35,7 @@ func TestReviewR19NestedUntimedDeleteKeepsRepeatedPhrase(t *testing.T) {
 	if err := store.MergeSessions("m2", []string{"m1", "t"}, start, start.Add(4*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	segs, _ := store.GetSegments("m2")
+	segs, _ := store.StoredSegments("m2")
 	deleted := false
 	for _, s := range segs {
 		if s.Text == "okay" && s.Untimed && s.UntimedSourceID == "n" && !deleted {

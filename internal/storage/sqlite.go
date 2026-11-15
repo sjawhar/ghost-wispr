@@ -1666,58 +1666,90 @@ func getSession(q querier, id string) (Session, error) {
 	return sess, nil
 }
 
+// StoredSegment is a segment as the segments table holds it: the transcript
+// segment every reader sees, where its words are among the session's refined
+// words, and which merged source recorded it. Only storage, and tools that
+// measure deletions, read the rest.
+type StoredSegment struct {
+	transcribe.Segment
+	RecordingOrdinal int
+	FirstWordOrdinal int
+	LastWordOrdinal  int
+	// UntimedSourceID names the merged source an untimed segment came from.
+	UntimedSourceID string
+	// SourceSessionID names the merged source that recorded the segment.
+	SourceSessionID string
+}
+
 func (s *SQLiteStore) GetSegments(sessionID string) ([]transcribe.Segment, error) {
+	stored, err := s.StoredSegments(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return transcriptSegments(stored), nil
+}
+
+// StoredSegments returns the session's segments with their storage
+// bookkeeping; a merged-away session has none.
+func (s *SQLiteStore) StoredSegments(sessionID string) ([]StoredSegment, error) {
 	session, err := s.GetSession(sessionID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return []transcribe.Segment{}, nil
+		return []StoredSegment{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	if session.Status == SessionMerged {
-		return []transcribe.Segment{}, nil
+		return []StoredSegment{}, nil
 	}
 	return getSegments(s.db, sessionID)
 }
 
-func getSegments(q querier, sessionID string) ([]transcribe.Segment, error) {
-	rows, err := q.Query(
-		`SELECT id, speaker, text, start_time, end_time, timestamp,
+// transcriptSegments drops the storage bookkeeping from stored segments.
+func transcriptSegments(stored []StoredSegment) []transcribe.Segment {
+	segments := make([]transcribe.Segment, len(stored))
+	for i := range stored {
+		segments[i] = stored[i].Segment
+	}
+	return segments
+}
+
+// segmentColumns are the segments columns scanSegments reads, in its order.
+const segmentColumns = `id, speaker, text, start_time, end_time, timestamp,
 		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
-		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id, source_session_id
-		 FROM segments
-		 WHERE session_id = ?
-		 ORDER BY id ASC`,
-		sessionID,
-	)
+		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id, source_session_id`
+
+func getSegments(q querier, sessionID string) ([]StoredSegment, error) {
+	rows, err := q.Query(`SELECT `+segmentColumns+` FROM segments WHERE session_id = ? ORDER BY id ASC`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("query segments for session %s: %w", sessionID, err)
 	}
-	defer func() { _ = rows.Close() }()
+	return scanSegments(rows, "for session "+sessionID)
+}
 
-	segments := make([]transcribe.Segment, 0, 32)
+// scanSegments reads segmentColumns rows and closes them; what names the
+// rows in an error.
+func scanSegments(rows *sql.Rows, what string) ([]StoredSegment, error) {
+	defer func() { _ = rows.Close() }()
+	segments := make([]StoredSegment, 0, 32)
 	for rows.Next() {
-		var seg transcribe.Segment
+		var seg StoredSegment
 		var ts string
 		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
 			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
 			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID, &seg.SourceSessionID); err != nil {
-			return nil, fmt.Errorf("scan segment for session %s: %w", sessionID, err)
+			return nil, fmt.Errorf("scan segment %s: %w", what, err)
 		}
-
 		parsedTS, err := time.Parse(time.RFC3339Nano, ts)
 		if err != nil {
-			return nil, fmt.Errorf("parse segment timestamp for session %s: %w", sessionID, err)
+			return nil, fmt.Errorf("parse segment timestamp %s: %w", what, err)
 		}
 		seg.Timestamp = parsedTS
-
 		segments = append(segments, seg)
 	}
-
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate segment rows for session %s: %w", sessionID, err)
+		return nil, fmt.Errorf("iterate segment rows %s: %w", what, err)
 	}
-
 	return segments, nil
 }
 
@@ -1729,11 +1761,7 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	if session.Status == SessionMerged {
 		return []transcribe.Segment{}, nil
 	}
-	rows, err := s.db.Query(
-		`SELECT id, speaker, text, start_time, end_time, timestamp,
-		        transcript_revision, recording_path, recording_sha256, recording_ordinal,
-		        first_word_ordinal, last_word_ordinal, untimed, untimed_source_id, source_session_id
-		 FROM segments
+	rows, err := s.db.Query(`SELECT `+segmentColumns+` FROM segments
 		 WHERE session_id = ? AND start_time >= ? AND end_time <= ? AND untimed = 0
 		 ORDER BY start_time`,
 		sessionID, startTime, endTime,
@@ -1741,32 +1769,11 @@ func (s *SQLiteStore) GetSegmentsInTimeRange(sessionID string, startTime, endTim
 	if err != nil {
 		return nil, fmt.Errorf("query segments in time range for session %s: %w", sessionID, err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	segments := make([]transcribe.Segment, 0, 32)
-	for rows.Next() {
-		var seg transcribe.Segment
-		var ts string
-		if err := rows.Scan(&seg.ID, &seg.Speaker, &seg.Text, &seg.StartTime, &seg.EndTime, &ts,
-			&seg.TranscriptRevision, &seg.RecordingPath, &seg.RecordingSHA256, &seg.RecordingOrdinal,
-			&seg.FirstWordOrdinal, &seg.LastWordOrdinal, &seg.Untimed, &seg.UntimedSourceID, &seg.SourceSessionID); err != nil {
-			return nil, fmt.Errorf("scan segment in time range for session %s: %w", sessionID, err)
-		}
-
-		parsedTS, err := time.Parse(time.RFC3339Nano, ts)
-		if err != nil {
-			return nil, fmt.Errorf("parse segment timestamp in time range for session %s: %w", sessionID, err)
-		}
-		seg.Timestamp = parsedTS
-
-		segments = append(segments, seg)
+	stored, err := scanSegments(rows, "in time range for session "+sessionID)
+	if err != nil {
+		return nil, err
 	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate segment rows in time range for session %s: %w", sessionID, err)
-	}
-
-	return segments, nil
+	return transcriptSegments(stored), nil
 }
 
 // UpdateSummaryAtGeneration stores session id's summary, its status, preset,
@@ -2199,7 +2206,7 @@ func (s *SQLiteStore) MarkSynced(id, claim, driveFolderID string, unchanged func
 	if err != nil {
 		return false, err
 	}
-	if !unchanged(sess, segments) {
+	if !unchanged(sess, transcriptSegments(segments)) {
 		return false, nil
 	}
 	res, err := tx.Exec(

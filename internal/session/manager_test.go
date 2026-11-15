@@ -232,7 +232,6 @@ func (s *storeMock) PublishRefinementAtGeneration(sessionID, transcript, model s
 		s.segments[sessionID][i] = transcribe.Segment{
 			Speaker: segment.Speaker, Text: segment.Text, StartTime: segment.Start, EndTime: segment.End,
 			TranscriptRevision: 1, RecordingPath: segment.RecordingPath, RecordingSHA256: segment.RecordingSHA256,
-			RecordingOrdinal: segment.RecordingOrdinal, FirstWordOrdinal: segment.FirstWordOrdinal, LastWordOrdinal: segment.LastWordOrdinal,
 		}
 	}
 	return 1, nil

@@ -93,7 +93,7 @@ func measureOne(recording string, words []storage.RefinedWord, segments []storag
 		return "publish refinement"
 	}
 	// Read the current ids and revision immediately before every deletion.
-	current, err := store.GetSegments("measurement")
+	current, err := store.StoredSegments("measurement")
 	if err != nil || len(current) != len(segments) {
 		return "read refined segments"
 	}
