@@ -85,8 +85,9 @@
     exitSelectMode()
   }
 
-  function handleSegmentDeleted(sessionID: string, segmentID: number): void {
-    onSegmentDeleted(sessionID, segmentID)
+  // A deleted segment's words may be in the search results: drop them, and any
+  // search still in flight.
+  function clearSearch(): void {
     searchRequestID++
     searchQuery = ''
     searchResults = []
@@ -94,12 +95,13 @@
     isSearching = false
   }
 
+  function handleSegmentDeleted(sessionID: string, segmentID: number): void {
+    onSegmentDeleted(sessionID, segmentID)
+    clearSearch()
+  }
+
   async function handleSegmentNotFound(sessionID: string, segmentID: number): Promise<boolean> {
-    searchRequestID++
-    searchQuery = ''
-    searchResults = []
-    searchError = ''
-    isSearching = false
+    clearSearch()
     try {
       await onRefreshSession(sessionID)
       return false

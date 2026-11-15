@@ -2,15 +2,14 @@ package audio
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/sjawhar/ghost-wispr/internal/recording"
 )
 
 var ffmpegBinary = "ffmpeg"
@@ -71,7 +70,7 @@ func Splice(ctx context.Context, path string, start, end float64) (string, error
 	if err := syncDirectory(dir); err != nil {
 		return "", fmt.Errorf("flush recording directory %s: %w", dir, err)
 	}
-	return fileSHA256(path)
+	return recording.SHA256(path)
 }
 
 // syncFile flushes the file at path to disk. Splice flushes its output with
@@ -94,18 +93,4 @@ func syncDirectory(path string) error {
 	}
 	defer func() { _ = dir.Close() }()
 	return dir.Sync()
-}
-
-func fileSHA256(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = file.Close() }()
-
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
 }

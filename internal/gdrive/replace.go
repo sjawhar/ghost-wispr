@@ -358,7 +358,7 @@ func replacementFiles(ownerID string, sess *storage.Session, recordings []string
 		{Name: "transcript.md", MimeType: "application/vnd.google-apps.document", Content: []byte(transcript), ContentType: "text/plain"},
 	}
 	for _, recording := range recordings {
-		hash, err := fileSHA256(recording)
+		hash, err := recordingname.SHA256(recording)
 		if err != nil {
 			return nil, "", fmt.Errorf("hash spliced recording %s: %w", recording, err)
 		}

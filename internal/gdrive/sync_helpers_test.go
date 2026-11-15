@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -13,6 +14,9 @@ import (
 // syncClaims names each test claim apart, so two sessions claimed at once
 // never share one claim.
 var syncClaims atomic.Int64
+
+// fileSHA256 hashes a recording as a sync does (recording.SHA256).
+var fileSHA256 = recordingname.SHA256
 
 // syncTo moves session id to sync state state the way a sync does: it claims
 // the session, then marks it synced into folder or ends it in state with

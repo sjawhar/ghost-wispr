@@ -2,15 +2,12 @@ package session
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
@@ -97,7 +94,7 @@ func (m *Manager) transcribeRecordings(ctx context.Context, t transcribe.BatchTr
 			return batchRefinementResult{}, fmt.Errorf("%w: text was deleted under model %q, and the transcription reports model %q, whose word times could bring the deleted words back", ErrRefinementModel, p.model, batch.Model)
 		}
 		transcribedWords += len(batch.Words)
-		recordingHash, err := recordingSHA256(recording)
+		recordingHash, err := recordingname.SHA256(recording)
 		if err != nil {
 			return batchRefinementResult{}, fmt.Errorf("hash recording %s: %w", recording, err)
 		}
@@ -144,7 +141,7 @@ func spansDescribe(recording string, spans []storage.TextDeletionSpan) error {
 	if len(spans) == 0 {
 		return nil
 	}
-	hash, err := recordingSHA256(recording)
+	hash, err := recordingname.SHA256(recording)
 	if err != nil {
 		return fmt.Errorf("hash %s to check its deleted text spans: %w", recording, err)
 	}
@@ -154,17 +151,4 @@ func spansDescribe(recording string, spans []storage.TextDeletionSpan) error {
 		}
 	}
 	return nil
-}
-
-func recordingSHA256(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = file.Close() }()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
 }

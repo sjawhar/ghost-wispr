@@ -186,6 +186,22 @@
       : 'Delete from this unit; this unit holds the only copy',
   )
 
+  // Why a session with no recording cannot be refined, for its refinement badge.
+  const noRecordingReason = $derived.by(() => {
+    if (session.restored_at && session.sync_state === SyncState.RemoteDeleted) {
+      return "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined."
+    }
+    if (session.restored_at && canRestoreRefinement(session)) {
+      return 'This conversation was restored from Drive; retry refinement to delete from it'
+    }
+    if (session.audio_removed_at) {
+      return recordingsNamed(session.audio_path) > 0
+        ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
+        : 'The audio was removed to free space, so it cannot be refined'
+    }
+    return 'No recording was saved for this session, so it cannot be refined'
+  })
+
   // Why the last delete was refused (the API's reason).
   let deleteError = $state('')
 
@@ -326,17 +342,7 @@
               class={`status-badge ${session.refinement_status}`}
               data-testid="refinement-badge"
               title={session.refinement_status === RefinementStatus.NoAudio
-                ? session.restored_at && session.sync_state === SyncState.RemoteDeleted
-                  ? "This conversation's Drive folder is unavailable or in the trash, so its recording cannot be restored or refined."
-                  : session.restored_at &&
-                      session.refinement_status === RefinementStatus.NoAudio &&
-                      canRestoreRefinement(session)
-                    ? 'This conversation was restored from Drive; retry refinement to delete from it'
-                    : session.audio_removed_at
-                      ? recordingsNamed(session.audio_path) > 0
-                        ? 'Part of the audio was removed to free space, and the recording left was not on disk, so it cannot be refined'
-                        : 'The audio was removed to free space, so it cannot be refined'
-                      : 'No recording was saved for this session, so it cannot be refined'
+                ? noRecordingReason
                 : undefined}
             >
               Refine: {session.refinement_status === RefinementStatus.NoAudio

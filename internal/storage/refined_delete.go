@@ -97,28 +97,9 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 	if err := markDriveDocumentsPending(tx, sessionID, sources); err != nil {
 		return err
 	}
-	if len(sources) > 0 {
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sources)), ",")
-		args := make([]any, len(sources))
-		for i, sourceID := range sources {
-			args[i] = sourceID
-		}
-		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
-			return fmt.Errorf("drop source refined words after untimed deletion: %w", err)
-		}
-	}
-	owners := append([]string{sessionID}, sources...)
-	if err := dropSupersededEvents(tx, owners); err != nil {
+	owners, err := dropDerivedText(tx, sessionID, sources, "untimed deletion")
+	if err != nil {
 		return err
-	}
-	for _, owner := range owners {
-		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
-			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
-		}
-	}
-	if _, err := tx.Exec(`INSERT INTO summary_requests(session_id, prompt_hash) VALUES(?, 'segment-delete')
-		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
-		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
 	}
 	owed, earlierOwed, err := recordOwedErase(tx)
 	if err != nil {
@@ -240,28 +221,9 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 	if err != nil {
 		return err
 	}
-	if len(sources) > 0 {
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sources)), ",")
-		args := make([]any, len(sources))
-		for i, source := range sources {
-			args[i] = source
-		}
-		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
-			return fmt.Errorf("drop source refined words after merged deletion: %w", err)
-		}
-	}
-	owners := append([]string{sessionID}, sources...)
-	if err := dropSupersededEvents(tx, owners); err != nil {
+	owners, err := dropDerivedText(tx, sessionID, sources, "merged deletion")
+	if err != nil {
 		return err
-	}
-	for _, owner := range owners {
-		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
-			return fmt.Errorf("clear embeddings for session %s: %w", owner, err)
-		}
-	}
-	if _, err := tx.Exec(`INSERT INTO summary_requests(session_id, prompt_hash) VALUES(?, 'segment-delete')
-		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
-		return fmt.Errorf("queue summary for session %s: %w", sessionID, err)
 	}
 	if keepAudio {
 		if err := recordTextDeletionSpan(tx, sessionID, wordsModel, sources, span); err != nil {
@@ -281,6 +243,44 @@ func (s *SQLiteStore) deleteRefinedSegment(sessionID string, segmentID int64, re
 		return fmt.Errorf("commit refined text deletion: %w", err)
 	}
 	return s.eraseAfterDeletion(owed, earlierOwed, segmentID, owners)
+}
+
+// dropDerivedText drops what a segment deletion leaves derived from the
+// deleted words in session sessionID and its merged sources (sources): the
+// sources' refined words, the superseded events and every owner's
+// embeddings, and it queues the session's summary again. deletion names the
+// deletion in an error. It returns the owners: the session, then its sources.
+func dropDerivedText(tx *sql.Tx, sessionID string, sources []string, deletion string) ([]string, error) {
+	if len(sources) > 0 {
+		placeholders, args := placeholderList(sources)
+		if _, err := tx.Exec(`DELETE FROM refined_words WHERE session_id IN (`+placeholders+`)`, args...); err != nil {
+			return nil, fmt.Errorf("drop source refined words after %s: %w", deletion, err)
+		}
+	}
+	owners := append([]string{sessionID}, sources...)
+	if err := dropSupersededEvents(tx, owners); err != nil {
+		return nil, err
+	}
+	for _, owner := range owners {
+		if _, err := tx.Exec(`DELETE FROM embeddings WHERE session_id = ?`, owner); err != nil {
+			return nil, fmt.Errorf("clear embeddings for session %s: %w", owner, err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO summary_requests(session_id, prompt_hash) VALUES(?, 'segment-delete')
+		ON CONFLICT(session_id, prompt_hash) DO UPDATE SET created_at = CURRENT_TIMESTAMP`, sessionID); err != nil {
+		return nil, fmt.Errorf("queue summary for session %s: %w", sessionID, err)
+	}
+	return owners, nil
+}
+
+// placeholderList returns one placeholder per id, comma-separated for an IN
+// list, and the ids as the query's arguments.
+func placeholderList(ids []string) (string, []any) {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", len(ids)), ","), args
 }
 
 func refinedSegment(q querier, sessionID string, segmentID int64, revision int) (RefinedSegment, error) {

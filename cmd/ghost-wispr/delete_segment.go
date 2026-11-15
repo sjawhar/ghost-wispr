@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -160,7 +158,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 				continue
 			}
 			if len(expected) != 0 {
-				if _, matches := expected[recordingRequirementKey(name)]; !matches {
+				if _, matches := expected[recordingname.Key(name)]; !matches {
 					continue
 				}
 			}
@@ -177,6 +175,23 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 			}
 		}
 		return nil
+	}
+	// allKnown reports whether byName names a recording for every key in
+	// expected.
+	allKnown := func(expected map[string]struct{}) bool {
+		for key := range expected {
+			found := false
+			for name := range byName {
+				if recordingname.Key(name) == key {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
 	}
 	if usableRecordingSource(source) {
 		if session.GDriveFolderID != "" {
@@ -195,28 +210,14 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 				}
 				expected := make(map[string]struct{}, len(sourceSession.RecordingPaths))
 				for _, path := range sourceSession.RecordingPaths {
-					if key := recordingRequirementKey(path); key != "" && key != "." {
+					if key := recordingname.Key(path); key != "" && key != "." {
 						expected[key] = struct{}{}
 					}
 				}
 				if len(expected) == 0 {
 					expected[sourceSession.ID] = struct{}{}
 				}
-				allKnown := true
-				for key := range expected {
-					found := false
-					for name := range byName {
-						if recordingRequirementKey(name) == key {
-							found = true
-							break
-						}
-					}
-					if !found {
-						allKnown = false
-						break
-					}
-				}
-				if allKnown {
+				if allKnown(expected) {
 					continue
 				}
 				if sourceSession.FallbackGDriveFolderID != "" && sourceSession.FallbackGDriveFolderID != sourceSession.GDriveFolderID {
@@ -224,21 +225,7 @@ func restoreDeletionRecordings(ctx context.Context, guard recordingRestoreGuard,
 						return deletionRecordingSet{}, err
 					}
 				}
-				allKnown = true
-				for key := range expected {
-					found := false
-					for name := range byName {
-						if recordingRequirementKey(name) == key {
-							found = true
-							break
-						}
-					}
-					if !found {
-						allKnown = false
-						break
-					}
-				}
-				if !allKnown && sourceSession.GDriveFolderID != "" {
+				if !allKnown(expected) && sourceSession.GDriveFolderID != "" {
 					if err := addDriveFiles(sourceSession.GDriveFolderID, expected, sourceSession.ID); err != nil {
 						return deletionRecordingSet{}, err
 					}
@@ -316,7 +303,7 @@ func downloadDriveRecording(ctx context.Context, guard recordingRestoreGuard, se
 		return fmt.Errorf("restore recording %s: %w", filepath.Base(destination), err)
 	}
 	if cut && !allowPrecut {
-		hash, err := fileSHA256(destination)
+		hash, err := recordingname.SHA256(destination)
 		if err != nil {
 			_ = os.Remove(destination)
 			return fmt.Errorf("hash restored recording %s: %w", destination, err)
@@ -359,14 +346,8 @@ func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID s
 		}
 		return nil
 	}
-	if session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
-		// Old completed sessions have live-only segments. Start the existing
-		// batch refinement path, then require selection from its new table.
-		if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision == 0 &&
-			d.refine != nil && strings.TrimSpace(session.AudioPath) != "" {
-			go func() { _ = d.refine(context.Background(), sessionID, session.AudioPath, session.StartedAt) }()
-		}
-		return storage.ErrRefinedSegmentsUnavailable
+	if err := d.refinedSegmentsAvailable(sessionID, &session); err != nil {
+		return err
 	}
 	if err := d.store.DeleteRefinedSegmentText(sessionID, segmentID, revision); err != nil {
 		return err
@@ -377,6 +358,21 @@ func (d *segmentDeleteRunner) DeleteRefinedText(ctx context.Context, sessionID s
 		}
 	}
 	return nil
+}
+
+// refinedSegmentsAvailable returns storage.ErrRefinedSegmentsUnavailable
+// unless session has a completed refinement with timed words. An older
+// completed session has live-only segments: this starts the existing batch
+// refinement for it, and a deletion then selects from its new table.
+func (d *segmentDeleteRunner) refinedSegmentsAvailable(sessionID string, session *storage.Session) error {
+	if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision != 0 {
+		return nil
+	}
+	if session.RefinementStatus == storage.RefinementCompleted && d.refine != nil && strings.TrimSpace(session.AudioPath) != "" {
+		audioPath, startedAt := session.AudioPath, session.StartedAt
+		go func() { _ = d.refine(context.Background(), sessionID, audioPath, startedAt) }()
+	}
+	return storage.ErrRefinedSegmentsUnavailable
 }
 
 // DeleteRefinedAudio removes the selected stored word span from its recording.
@@ -398,12 +394,8 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	if session.Status == storage.SessionActive {
 		return storage.ErrSegmentSessionActive
 	}
-	if session.RefinementStatus != storage.RefinementCompleted || session.RefinedRevision == 0 {
-		if session.RefinementStatus == storage.RefinementCompleted && session.RefinedRevision == 0 &&
-			d.refine != nil && strings.TrimSpace(session.AudioPath) != "" {
-			go func() { _ = d.refine(context.Background(), sessionID, session.AudioPath, session.StartedAt) }()
-		}
-		return storage.ErrRefinedSegmentsUnavailable
+	if err := d.refinedSegmentsAvailable(sessionID, &session); err != nil {
+		return err
 	}
 	if revision != session.RefinedRevision {
 		return storage.ErrStaleTranscriptRevision
@@ -466,7 +458,7 @@ func (d *segmentDeleteRunner) DeleteRefinedAudio(ctx context.Context, sessionID 
 	if recording == "" {
 		return fmt.Errorf("recording %s is unavailable", selected.RecordingPath)
 	}
-	beforeHash, err := fileSHA256(recording)
+	beforeHash, err := recordingname.SHA256(recording)
 	if err != nil {
 		return fmt.Errorf("hash recording %s before splice: %w", recording, err)
 	}
@@ -628,7 +620,7 @@ func (d *segmentDeleteRunner) cutAndCheck(ctx context.Context, model, recording 
 			return "", 0, 0, "", fmt.Errorf("splice recording %s: %w", recording, err)
 		}
 		if afterHash == "" {
-			if afterHash, err = fileSHA256(tempPath); err != nil {
+			if afterHash, err = recordingname.SHA256(tempPath); err != nil {
 				_ = os.Remove(tempPath)
 				return "", 0, 0, "", fmt.Errorf("hash spliced recording %s: %w", tempPath, err)
 			}
@@ -893,7 +885,7 @@ func recoverLostSplicedRecording(ctx context.Context, store *storage.SQLiteStore
 	if len(spans) == 0 {
 		return false, fmt.Errorf("recover lost cut recording %s: no completed cut is recorded", recording)
 	}
-	hash, err := fileSHA256(downloaded)
+	hash, err := recordingname.SHA256(downloaded)
 	if err != nil {
 		return false, fmt.Errorf("hash restored pre-cut recording %s: %w", downloaded, err)
 	}
@@ -1005,7 +997,7 @@ func recoverPendingSplice(ctx context.Context, store *storage.SQLiteStore, audio
 		removeFiles(recordingSet.Downloaded)
 		return false, fmt.Errorf("pending splice recording %s is unavailable", span.AudioPath)
 	}
-	hash, err := fileSHA256(recording)
+	hash, err := recordingname.SHA256(recording)
 	if err != nil {
 		removeFiles(recordingSet.Downloaded)
 		return false, fmt.Errorf("hash pending splice recording %s: %w", recording, err)
@@ -1209,17 +1201,4 @@ func copyForSplice(source string) (string, error) {
 		return "", fmt.Errorf("close splice copy %s: %w", path, err)
 	}
 	return path, nil
-}
-
-func fileSHA256(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = file.Close() }()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
 }

@@ -45,16 +45,6 @@ func WithGeminiBaseURL(url string) GeminiOption {
 	return func(p *GeminiProvider) { p.baseURL = url }
 }
 
-// WithGeminiHTTPClient overrides the default HTTP client.
-func WithGeminiHTTPClient(c *http.Client) GeminiOption {
-	return func(p *GeminiProvider) { p.httpClient = c }
-}
-
-// WithGeminiMaxTextLength overrides the maximum text length.
-func WithGeminiMaxTextLength(n int) GeminiOption {
-	return func(p *GeminiProvider) { p.maxTextLen = n }
-}
-
 // WithGeminiAuthCredentials sets the Google credentials used to authorize Vertex AI requests.
 func WithGeminiAuthCredentials(credentials *auth.Credentials) GeminiOption {
 	return func(p *GeminiProvider) { p.authCredentials = credentials }
