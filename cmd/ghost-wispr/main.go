@@ -43,7 +43,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 
-	driveapi "google.golang.org/api/drive/v3"
 	"google.golang.org/genai"
 )
 
@@ -1284,13 +1283,9 @@ func main() {
 					if latestCfg.GDriveFolderID == "" {
 						return nil, fmt.Errorf("google Drive root folder is not configured")
 					}
-					credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+					syncer, err := newDriveSyncer(ctx, &latestCfg, appLogger)
 					if err != nil {
-						return nil, fmt.Errorf("detect Google credentials: %w", err)
-					}
-					syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID, appLogger)
-					if err != nil {
-						return nil, fmt.Errorf("create Drive syncer: %w", err)
+						return nil, err
 					}
 					return syncer, nil
 				})
@@ -1580,13 +1575,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			if latestCfg.GDriveFolderID == "" {
 				return nil, fmt.Errorf("google drive folder ID not configured")
 			}
-			credentials, err := googleauth.Detect(ctx, latestCfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+			syncer, err := newDriveSyncer(ctx, &latestCfg, appLogger)
 			if err != nil {
-				return nil, fmt.Errorf("detect Google credentials: %w", err)
-			}
-			syncer, err := gdrive.NewSyncer(ctx, credentials, latestCfg.GDriveFolderID)
-			if err != nil {
-				return nil, fmt.Errorf("create syncer: %w", err)
+				return nil, err
 			}
 			result, err := syncer.RestoreFromDrive(ctx, importRestoredDriveSession(store, func() time.Time { return time.Now().UTC() }))
 			if err != nil {
@@ -1711,11 +1702,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	})
 	watchDriveSyncSettings(cfgStore, drive,
 		func(cfg *config.Config) (sessionSyncer, error) {
-			credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
-			if err != nil {
-				return nil, fmt.Errorf("detect Google credentials: %w", err)
-			}
-			syncer, err := gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID, appLogger)
+			syncer, err := newDriveSyncer(ctx, cfg, appLogger)
 			if err != nil {
 				return nil, err
 			}
@@ -1792,11 +1779,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	var deletionDrive deletionRecordingSource
 	if cfg.GDriveFolderID != "" && cfg.GDriveSyncEnabled {
-		credentials, syncErr := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
-		var syncer *gdrive.Syncer
-		if syncErr == nil {
-			syncer, syncErr = gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID, appLogger)
-		}
+		syncer, syncErr := newDriveSyncer(ctx, &cfg, appLogger)
 		if syncErr != nil {
 			log.Printf("warning: gdrive sync disabled: %v", syncErr)
 			warningRegistry.Set("gdrive", "Google Drive sync failed to initialize — backups are disabled")

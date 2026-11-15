@@ -5,14 +5,34 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	driveapi "google.golang.org/api/drive/v3"
+
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
+	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
+
+// newDriveSyncer finds the Google credential Drive uses
+// (google_credentials_file, else Application Default Credentials) and builds
+// a Drive syncer on cfg's root folder. Its error says which step failed; each
+// caller adds its own context.
+func newDriveSyncer(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*gdrive.Syncer, error) {
+	credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, driveapi.DriveFileScope)
+	if err != nil {
+		return nil, fmt.Errorf("detect Google credentials: %w", err)
+	}
+	syncer, err := gdrive.NewSyncer(ctx, credentials, cfg.GDriveFolderID, logger)
+	if err != nil {
+		return nil, fmt.Errorf("create Drive syncer: %w", err)
+	}
+	return syncer, nil
+}
 
 // sessionSyncer syncs one session to Google Drive.
 type sessionSyncer interface {
