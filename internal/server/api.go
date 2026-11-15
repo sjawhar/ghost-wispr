@@ -892,54 +892,10 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		recordingDir := audioDir()
-		sourceIDs, err := store.SourceSessionIDs(sessionID)
+		rawReservations, err := hideRawCaptures(store, sessionID, recordingDir, controls.RefreshRawEraseWarnings)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("list source sessions for raw erase: %v", err))
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
-		}
-		rawIDs := append([]string{sessionID}, sourceIDs...)
-		var rawReservations []rawEraseReservation
-		for _, rawID := range rawIDs {
-			rawPath, err := filepath.Abs(recordingname.RawPath(recordingDir, rawID))
-			if err != nil {
-				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("find raw session recording: %v", err))
-				return
-			}
-			reservation, err := erase.Reserve(rawPath)
-			if err != nil {
-				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reserve raw session erase: %v", err))
-				return
-			}
-			persistedHiddenPath, err := store.ReserveRawSessionErase(rawID, reservation.OriginalPath(), reservation.HiddenPath())
-			if err != nil {
-				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reserve raw session erase: %v", err))
-				return
-			}
-			reusedReservation := persistedHiddenPath != reservation.HiddenPath()
-			reservation, err = erase.ReservationAt(rawPath, persistedHiddenPath)
-			if err != nil {
-				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
-				_ = store.CancelRawSessionErase(rawID, persistedHiddenPath)
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("reuse raw session erase reservation: %v", err))
-				return
-			}
-			rawReservation := rawEraseReservation{sessionID: rawID, originalPath: rawPath, hiddenPath: persistedHiddenPath}
-			rawReservations = append(rawReservations, rawReservation)
-			hidden, rawErr := beginReservedErasing(reservation)
-			rawReservations[len(rawReservations)-1].pending = hidden
-			rawReservations[len(rawReservations)-1].keepHidden = reusedReservation && rawErr != nil && !errors.Is(rawErr, erase.ErrLeftover)
-			switch {
-			case errors.Is(rawErr, erase.ErrLeftover):
-				slog.Warn("could not flush the removal of a deleted session's raw recording; it is erased after the answer", "session_id", rawID, "audio_path", rawPath, "error", rawErr)
-			case errors.Is(rawErr, os.ErrNotExist):
-			case rawErr != nil:
-				restoreRawSessionErasures(store, rawReservations, controls.RefreshRawEraseWarnings)
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("hide raw session recording: %v", rawErr))
-				return
-			}
 		}
 		audioPath, err := store.DeleteSession(sessionID, recordingDir)
 		if err != nil {
@@ -1782,6 +1738,57 @@ type rawEraseReservation struct {
 	sessionID, originalPath, hiddenPath string
 	pending                             erase.Pending
 	keepHidden                          bool
+}
+
+// hideRawCaptures reserves, then hides, the raw microphone capture of session
+// sessionID and of each session merged into it, in recordingDir, while their
+// rows still exist: each reservation commits before its rename, so a delete
+// that does not commit leaves the capture to restore. When one capture
+// cannot be hidden it restores every capture it hid (restoreRawSessionErasures)
+// and returns why.
+func hideRawCaptures(store SessionStore, sessionID, recordingDir string, refreshWarning func()) (reservations []rawEraseReservation, err error) {
+	sourceIDs, err := store.SourceSessionIDs(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list source sessions for raw erase: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			restoreRawSessionErasures(store, reservations, refreshWarning)
+			reservations = nil
+		}
+	}()
+	for _, rawID := range append([]string{sessionID}, sourceIDs...) {
+		rawPath, pathErr := filepath.Abs(recordingname.RawPath(recordingDir, rawID))
+		if pathErr != nil {
+			return reservations, fmt.Errorf("find raw session recording: %w", pathErr)
+		}
+		reservation, reserveErr := erase.Reserve(rawPath)
+		if reserveErr != nil {
+			return reservations, fmt.Errorf("reserve raw session erase: %w", reserveErr)
+		}
+		persistedHiddenPath, reserveErr := store.ReserveRawSessionErase(rawID, reservation.OriginalPath(), reservation.HiddenPath())
+		if reserveErr != nil {
+			return reservations, fmt.Errorf("reserve raw session erase: %w", reserveErr)
+		}
+		reusedReservation := persistedHiddenPath != reservation.HiddenPath()
+		if reservation, reserveErr = erase.ReservationAt(rawPath, persistedHiddenPath); reserveErr != nil {
+			_ = store.CancelRawSessionErase(rawID, persistedHiddenPath)
+			return reservations, fmt.Errorf("reuse raw session erase reservation: %w", reserveErr)
+		}
+		hidden, rawErr := beginReservedErasing(reservation)
+		reservations = append(reservations, rawEraseReservation{
+			sessionID: rawID, originalPath: rawPath, hiddenPath: persistedHiddenPath, pending: hidden,
+			keepHidden: reusedReservation && rawErr != nil && !errors.Is(rawErr, erase.ErrLeftover),
+		})
+		switch {
+		case errors.Is(rawErr, erase.ErrLeftover):
+			slog.Warn("could not flush the removal of a deleted session's raw recording; it is erased after the answer", "session_id", rawID, "audio_path", rawPath, "error", rawErr)
+		case errors.Is(rawErr, os.ErrNotExist):
+		case rawErr != nil:
+			return reservations, fmt.Errorf("hide raw session recording: %w", rawErr)
+		}
+	}
+	return reservations, nil
 }
 
 // restoreRawSessionErasures restores every hidden raw file after a delete
