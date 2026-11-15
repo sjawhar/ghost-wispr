@@ -69,10 +69,12 @@ func privateSession() *storeStub {
 // TestEventsCarryNoSessionText fails if any event sends a session's title or
 // summary to Envoy. Envoy keeps every event for 72 hours and no deletion can
 // recall it, so a summary sent there would outlive a segment deletion that
-// removed the words it repeats.
+// removed the words it repeats. It also fails unless the links and times an
+// agent reads instead are in the body's payload object, beside session_id,
+// where Envoy's listener reads them (cybermonklabs/legion#4111).
 func TestEventsCarryNoSessionText(t *testing.T) {
 	server, bodies := rawWebhookServer(t)
-	publisher := NewPublisher(server.URL, staticKey("shared-secret"), privateSession())
+	publisher := NewPublisher(server.URL, staticKey("shared-secret"), privateSession(), WithPublicURL("https://ghost-wispr.example.ts.net"))
 	publisher.client.retryDelays = nil
 
 	ctx := context.Background()
@@ -104,6 +106,17 @@ func TestEventsCarryNoSessionText(t *testing.T) {
 		for _, key := range []string{"title", "summary"} {
 			if _, ok := decoded.Payload[key]; ok {
 				t.Errorf("%s payload has a %q field: %s", event, key, body)
+			}
+		}
+		for key, want := range map[string]string{
+			"session_id":       "session-1",
+			"started_at":       "2026-11-10T11:45:45Z",
+			"ended_at":         "2026-11-10T12:30:45Z",
+			"drive_folder_url": "https://drive.google.com/drive/folders/folder-1",
+			"session_url":      "https://ghost-wispr.example.ts.net/api/sessions/session-1",
+		} {
+			if got := decoded.Payload[key]; got != want {
+				t.Errorf("%s payload %s = %#v, want %q: %s", event, key, got, want, body)
 			}
 		}
 	}
