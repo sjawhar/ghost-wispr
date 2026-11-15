@@ -184,3 +184,81 @@ func TestAReadyDeletionDuringTheDriveLockWaitIsReplacedAtOnce(t *testing.T) {
 			uploads, deletes, held, owed, err)
 	}
 }
+
+// TestAFailedReplacementForANewerDeletionIsCounted fails if an attempt that
+// replaced for a deletion committed and made ready during its Drive-lock
+// wait, and failed, is not counted on the session: /api/status warns from
+// that count (storage.OwedDriveReplacements). The failure belongs to the
+// generation the attempt replaced for, not the one it read before its claim.
+func TestAFailedReplacementForANewerDeletionIsCounted(t *testing.T) {
+	f := newLockWaitFixture(t)
+	_, _, err := f.attempt(t, func() {
+		f.refinedAndSummarized(t, "clean", "Clean")
+		f.wire.mu.Lock()
+		f.wire.failUploadAt = f.wire.uploads + 1
+		f.wire.mu.Unlock()
+	})
+	if err == nil {
+		t.Fatal("the replacement whose first upload failed reported success")
+	}
+	owed, ownErr := f.store.OwedDriveReplacements()
+	if ownErr != nil {
+		t.Fatal(ownErr)
+	}
+	if len(owed) != 1 || owed[0].SessionID != f.id || owed[0].Failures != 1 || owed[0].LastError == "" {
+		t.Fatalf("owed replacements after the failed attempt = %+v, want the session with 1 failure and its error", owed)
+	}
+}
+
+// ledgerChangingStore runs change once, as the sync claims the session:
+// between the checks a replacement makes before its claim and the claim.
+type ledgerChangingStore struct {
+	*storage.SQLiteStore
+	change func()
+}
+
+func (s *ledgerChangingStore) ClaimSync(id, from, claim string, at time.Time) (storage.Session, bool, error) {
+	if s.change != nil {
+		change := s.change
+		s.change = nil
+		change()
+	}
+	return s.SQLiteStore.ClaimSync(id, from, claim, at)
+}
+
+// TestTheReplacementReadsTheFolderLedgerUnderTheDriveLock fails if a
+// replacement uses the folder ledger it read before its claim rather than
+// reading it again under the Drive lock, as the replacement did before the
+// gdrive refactor. Here the session's only owed folder is finished (recorded
+// gone, as an attempt that found it gone records it) between those checks
+// and the claim: read again, the ledger owes nothing, so the replacement
+// uploads nothing and finishes; the stale ledger would replace the folder,
+// uploading its files again.
+func TestTheReplacementReadsTheFolderLedgerUnderTheDriveLock(t *testing.T) {
+	f := newLockWaitFixture(t)
+	generation, err := f.store.DeletionGeneration(f.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.EnsureDriveReplacementFolders(f.id, generation); err != nil {
+		t.Fatal(err)
+	}
+	hooked := &ledgerChangingStore{SQLiteStore: f.store}
+	hooked.change = func() {
+		if err := f.store.MarkDriveReplacementFolder(f.id, generation, f.id, storage.DriveReplacementFolderGone); err != nil {
+			t.Errorf("finish the session's own folder: %v", err)
+		}
+	}
+	uploadsBefore, deletesBefore := f.counts()
+	syncErr := NewOrchestrator(f.syncer, hooked).SyncSession(context.Background(), f.id)
+	uploadsAfter, deletesAfter := f.counts()
+	if hooked.change != nil {
+		t.Fatal("control: the replacement never claimed the session, so the ledger never changed")
+	}
+	if uploads, deletes := uploadsAfter-uploadsBefore, deletesAfter-deletesBefore; uploads != 0 || deletes != 0 || syncErr != nil {
+		t.Fatalf("replacement of a folder finished since its checks: %d uploads, %d deletes, err %v; want none and no error", uploads, deletes, syncErr)
+	}
+	if f.pending(t) {
+		t.Fatal("the replacement is still owed though its only folder is finished")
+	}
+}

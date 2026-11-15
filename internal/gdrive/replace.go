@@ -90,12 +90,13 @@ func (o *Orchestrator) replaceOwedFiles(ctx context.Context, sessionID, splicedR
 		o.logger.Info("gdrive replacement falls through to first sync", "operation", "replace_session_files", "session_id", sessionID)
 		return o.SyncSession(ctx, sessionID)
 	}
-	return o.replaceSessionFiles(ctx, &read, generation, folders, splicedRecording)
+	return o.replaceSessionFiles(ctx, &read, generation, splicedRecording)
 }
 
-// replaceSessionFiles replaces the Drive folders sess's segment deletion of
-// generation owes, holding the session's sync claim so that retry-sync, the
-// sync after a summary and the sweep do not start a second replacement.
+// replaceSessionFiles replaces the Drive folders sess's segment deletion
+// owes, holding the session's sync claim so that retry-sync, the sync after
+// a summary and the sweep do not start a second replacement. generation is
+// the deletion generation the checks before the claim read.
 //
 // It releases the claim, its retry count kept, by what it did to the
 // session's own Drive folder, never as synced: a replacement does not prove
@@ -110,7 +111,7 @@ func (o *Orchestrator) replaceOwedFiles(ctx context.Context, sessionID, splicedR
 //     attempt replaced it or found it gone): the state the claim came from,
 //     since nothing of the session's own Drive copy changed. A REMOTE_DELETED
 //     session stays REMOTE_DELETED.
-func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Session, generation int, folders []storage.DriveReplacementFolder, splicedRecording string) error {
+func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Session, generation int, splicedRecording string) error {
 	sessionID := sess.ID
 	claim := uuid.NewString()
 	claimed, ok, err := o.store.ClaimSync(sessionID, sess.SyncState, claim, time.Now().UTC())
@@ -122,12 +123,16 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 		return nil
 	}
 	var outcome replacementOutcome
+	// replacing is the generation the attempt replaces for, read under the
+	// Drive lock: a failure is recorded under it, so /api/status counts it.
+	replacing := generation
 	replaceErr := o.uploader.Serialize(func() error {
-		current, replacing, owed, err := o.replacementUnderLock(sessionID, generation, folders)
+		current, now, folders, err := o.replacementUnderLock(sessionID, generation)
+		replacing = now
 		if err != nil || current == nil {
 			return err
 		}
-		outcome, err = o.replaceOwedFolders(ctx, current, replacing, owed, splicedRecording)
+		outcome, err = o.replaceOwedFolders(ctx, current, now, folders, splicedRecording)
 		return err
 	})
 	release := syncStateOf(sess)
@@ -152,46 +157,46 @@ func (o *Orchestrator) replaceSessionFiles(ctx context.Context, sess *storage.Se
 		o.logger.Warn("gdrive replacement no longer holds its session; its state is left as it is", "operation", "replace_session_files", "session_id", sessionID)
 	}
 	if replaceErr != nil {
-		o.replacementFailed(sessionID, generation, replaceErr)
+		o.replacementFailed(sessionID, replacing, replaceErr)
 		return fmt.Errorf("replace session files %s: %w", sessionID, replaceErr)
 	}
 	o.logger.Info("gdrive session files replaced", "operation", "replace_session_files", "session_id", sessionID, "drive_folder_id", claimed.GDriveFolderID, "sync_state", release)
 	return nil
 }
 
-// replacementUnderLock reads session sessionID's deletion generation and the
-// session again once the replacement has the Drive lock, which it can wait
-// for as long as an upload of another session takes, and returns the
-// session, generation and folders to replace, or a nil session when there is
-// nothing to replace now. When no deletion committed during the wait, that is
-// the fresh session with generation and folders, as the checks before the
-// claim read them. When one did, it replaces for that newer deletion, as the
-// replacement did before the gdrive refactor: if the fresh session is pending
-// and ready (refined and summarized again), it ensures the newer
-// generation's folders, clearing the pending flag when the deletion owes
-// none; otherwise it replaces nothing, and a later sync does.
-func (o *Orchestrator) replacementUnderLock(sessionID string, generation int, folders []storage.DriveReplacementFolder) (*storage.Session, int, []storage.DriveReplacementFolder, error) {
+// replacementUnderLock reads, once the replacement has the Drive lock (which
+// it can wait for as long as an upload of another session takes), session
+// sessionID's deletion generation, the session and the deletion's folder
+// ledger again, as the replacement did before the gdrive refactor, and
+// returns the session and the folders to replace, with the generation it
+// read (before, the one read before the claim, when it could not read one).
+// A session not pending and ready (refined and summarized again since its
+// latest deletion) replaces nothing now, and a later sync does; a deletion
+// that owes no folder has its pending flag cleared. When a deletion committed
+// during the wait the generation read is the newer one, and the replacement
+// is for it.
+func (o *Orchestrator) replacementUnderLock(sessionID string, before int) (*storage.Session, int, []storage.DriveReplacementFolder, error) {
 	now, err := o.store.DeletionGeneration(sessionID)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
+		return nil, before, nil, fmt.Errorf("read deletion generation for session %s: %w", sessionID, err)
 	}
 	current, err := o.store.GetSession(sessionID)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("read replacement session %s: %w", sessionID, err)
-	}
-	if now == generation {
-		return &current, generation, folders, nil
+		return nil, now, nil, fmt.Errorf("read replacement session %s: %w", sessionID, err)
 	}
 	if !current.DriveReplacePending || !replacementReady(&current) {
-		o.logger.Info("gdrive replacement waits for a newer deletion's refinement and summary", "operation", "replace_session_files", "session_id", sessionID, "generation", generation, "newer_generation", now)
-		return nil, 0, nil, nil
+		if now != before {
+			o.logger.Info("gdrive replacement waits for a newer deletion's refinement and summary", "operation", "replace_session_files", "session_id", sessionID, "generation", before, "newer_generation", now)
+		}
+		return nil, now, nil, nil
 	}
-	if folders, err = o.store.EnsureDriveReplacementFolders(sessionID, now); err != nil {
-		return nil, 0, nil, err
+	folders, err := o.store.EnsureDriveReplacementFolders(sessionID, now)
+	if err != nil {
+		return nil, now, nil, err
 	}
 	if len(folders) == 0 {
-		// The newer deletion owes Drive no folder.
-		return nil, 0, nil, o.store.ClearDriveReplacementPending(sessionID, now)
+		// The deletion owes Drive no folder.
+		return nil, now, nil, o.store.ClearDriveReplacementPending(sessionID, now)
 	}
 	return &current, now, folders, nil
 }
@@ -206,14 +211,10 @@ func (o *Orchestrator) replacementUnderLock(sessionID string, generation int, fo
 // owed: the attempt fails, and the sweep comes back until the folder is
 // restored. The folders Drive can reach are replaced meanwhile, so one in the
 // trash does not keep the words in the others. The deletion finishes once no
-// folder is owed. current is the session read under the Drive lock
-// (replacementUnderLock): one whose replacement finished, or whose
-// deletion is not yet refined and summarized again, replaces nothing.
+// folder is owed. current is the session as replacementUnderLock read it,
+// pending and ready.
 func (o *Orchestrator) replaceOwedFolders(ctx context.Context, current *storage.Session, generation int, folders []storage.DriveReplacementFolder, splicedRecording string) (replacementOutcome, error) {
 	var outcome replacementOutcome
-	if !current.DriveReplacePending || !replacementReady(current) {
-		return outcome, nil
-	}
 	recordings, err := o.store.PendingDriveReplacementRecordings(current.ID)
 	if err != nil {
 		return outcome, fmt.Errorf("list replacement recordings for session %s: %w", current.ID, err)
