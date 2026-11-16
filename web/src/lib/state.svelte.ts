@@ -198,6 +198,9 @@ export function appendLiveSegment(event: LiveTranscriptEvent): void {
   }
 }
 
+// applySummaryUpdate applies a summary event to the session's list entry and
+// detail. A failed summary carries why it failed; any other status clears the
+// reason, because the attempt it described is over.
 export function applySummaryUpdate(event: SummaryReadyEvent): void {
   const deletedAt = summaryDeletionTimes.get(event.session_id)
   if (deletedAt !== undefined && Date.parse(event.timestamp) <= deletedAt) {
@@ -222,6 +225,7 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
               summary: event.summary,
               summary_status: event.status,
               summary_preset: event.summary_preset ?? session.summary_preset,
+              summary_error: event.summary_error ?? '',
             }
           : session,
       ),
@@ -240,6 +244,7 @@ export function applySummaryUpdate(event: SummaryReadyEvent): void {
         summary: event.summary,
         summary_status: event.status,
         summary_preset: event.summary_preset ?? detail.session.summary_preset,
+        summary_error: event.summary_error ?? '',
       },
     })
     appState.sessionDetails = nextDetails

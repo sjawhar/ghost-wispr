@@ -159,6 +159,49 @@ describe('deletion state fences', () => {
     })
   })
 
+  it('keeps the reason a summary failed, and drops it once a new summary runs', () => {
+    const session = makeSession('s1')
+    setDates(['2026-11-11'])
+    setSessionsForDate('2026-11-11', [session])
+    setSessionDetail({ session, segments: [] })
+
+    applySummaryUpdate({
+      type: 'summary_ready',
+      version: 1,
+      timestamp: '2026-11-11T10:00:01Z',
+      session_id: 's1',
+      title: 'Kept title',
+      summary: 'Kept summary',
+      status: SummaryStatus.Failed,
+      summary_error: 'summarization failed: the model answered with no summary text',
+    })
+    for (const shown of [
+      appState.sessionsByDate.get('2026-11-11')?.[0],
+      appState.sessionDetails.get('s1')?.session,
+    ]) {
+      expect(shown).toMatchObject({
+        summary_status: SummaryStatus.Failed,
+        summary_error: 'summarization failed: the model answered with no summary text',
+      })
+    }
+
+    applySummaryUpdate({
+      type: 'summary_ready',
+      version: 1,
+      timestamp: '2026-11-11T10:00:02Z',
+      session_id: 's1',
+      title: '',
+      summary: '',
+      status: SummaryStatus.Running,
+    })
+    for (const shown of [
+      appState.sessionsByDate.get('2026-11-11')?.[0],
+      appState.sessionDetails.get('s1')?.session,
+    ]) {
+      expect(shown).toMatchObject({ summary_status: SummaryStatus.Running, summary_error: '' })
+    }
+  })
+
   it('clears live segments only for the session whose segment was deleted', () => {
     applyEvent({
       type: 'session_started',

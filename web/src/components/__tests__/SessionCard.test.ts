@@ -189,6 +189,48 @@ describe('SessionCard', () => {
     expect(screen.getByText('Summary unavailable')).toBeTruthy()
   })
 
+  it('shows why a summary failed, with a retry, whether or not one is kept from before', () => {
+    const reason = 'summarization failed: the model answered with no summary text'
+    for (const summary of ['', 'The last good summary.']) {
+      const { unmount } = render({
+        session: {
+          ...baseSession,
+          summary_status: SummaryStatus.Failed,
+          summary,
+          summary_error: reason,
+        },
+        detail: undefined,
+        expanded: false,
+        presets: {},
+        onToggle: vi.fn(),
+        onLoadDetail: vi.fn(),
+        onResummarize: vi.fn(),
+        onDelete: vi.fn(),
+      })
+
+      expect(screen.getByText(`Why: ${reason}`)).toBeTruthy()
+      expect(screen.getByRole('button', { name: 'Retry summary' })).toBeTruthy()
+      unmount()
+    }
+  })
+
+  it('says a summary is being made again while it runs, with no title of its own yet', () => {
+    render({
+      session: { ...baseSession, title: '', summary: '', summary_status: SummaryStatus.Running },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByText('Summarizing...')).toBeTruthy()
+    expect(screen.getByText('Title pending: the summary is still being made')).toBeTruthy()
+    expect(screen.queryByText('Untitled Session')).toBeNull()
+  })
+
   it('says a session with no saved recording cannot be refined, and offers no retry', () => {
     render({
       session: { ...baseSession, audio_path: '', refinement_status: RefinementStatus.NoAudio },

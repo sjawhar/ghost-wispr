@@ -12,6 +12,8 @@ When a session ends, it optionally generates a summary via OpenAI and can sync a
 
 The web UI shows live transcription on the left and session history on the right. Click any past session to expand its full transcript and play back audio.
 
+A summary whose model answers with no words (an empty summary, or only punctuation such as `...`) is not stored: Ghost Wispr asks again, and if every attempt answers so, the summary fails. The session keeps its last good summary, and its card shows why the summary failed and a "Retry summary" button. While a summary is being made, the card says so.
+
 ![Expanded session with transcript and audio](docs/screenshots/session-expanded.png)
 
 ## Architecture
