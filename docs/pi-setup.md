@@ -20,11 +20,13 @@ After the certificate-signing request exists, do these before provisioning:
    then on `agent-infra` `main`:
    - the device certificate: the `bootstrap` apply publishes it as the latest version of Secret
      Manager secret `ghost-wispr-device-certificate` (`bootstrap/README.md`);
-   - the Ghost Wispr Tailscale client ID: `root`'s stack output `ghostWisprTailnetClientId`.
-     `root` creates that identity, so `tailscaleIds` has no entry for it;
+   - the Ghost Wispr Tailscale client ID: `root` creates the Tailscale identity `ghost-wispr-x509`
+     and prints its client ID as `ghostWisprTailnetClientId` in the log of the `seed` workflow's
+     `root` job that creates it. `tailscaleIds` has no entry for it;
    - the service account's unique ID: `ghostWisprAccountUniqueId` in `root`'s prod
      configuration (`root/Pulumi.prod.yaml`);
-   - the relay URL: the `relayUrl` output from `envoy-cluster`.
+   - the relay URL: the URL of `envoy-cluster`'s webhook relay, the Cloud Run service
+     `envoy-webhook-relay-*` in `theorem-agent-infra`.
 2. Ensure Secret Manager has `envoy-ghostwispr-signing-secret` and that `ghost-wispr@` has
    Secret Accessor on it (dispatch://INFRA-3599). Ghost Wispr reads the key itself at runtime,
    with the same Google identity it uses for Drive and Gemini, so no person or bundle carries
@@ -148,9 +150,9 @@ The credential bundle holds six public files and one secret:
 | --- | --- |
 | `device.crt` | the latest version of Secret Manager secret `ghost-wispr-device-certificate` |
 | `google-credentials.json` and `certificate_config.json` | the rewritten files in `$d` from the `gcloud ... create-cred-config` command above |
-| `tailscale-client-id` | `root`'s stack output `ghostWisprTailnetClientId` |
-| `tailscale-subject` | `ghostWisprAccountUniqueId` in `root`'s prod configuration |
-| `envoy-webhook-url` | `envoy-cluster`'s stack output `relayUrl`, followed by `/webhook/ghostwispr` |
+| `tailscale-client-id` | `ghostWisprTailnetClientId`, which `agent-infra`'s `seed` workflow printed in the log of the `root` job that created the Tailscale identity `ghost-wispr-x509` |
+| `tailscale-subject` | `ghostWisprAccountUniqueId` in `root/Pulumi.prod.yaml` on `agent-infra` `main` |
+| `envoy-webhook-url` | the URL of the Cloud Run service `envoy-webhook-relay-*` in `theorem-agent-infra` (`envoy-cluster`'s relay), followed by `/webhook/ghostwispr` |
 | `deepgram-key` | `DEEPGRAM_API_KEY` from the operator's `secrets` store |
 
 The Envoy webhook signing key is not in the bundle, and `provision.sh` refuses a bundle that
@@ -160,9 +162,29 @@ holds an `envoy-webhook-secret` file. Ghost Wispr reads the key from Secret Mana
 it in memory. When Envoy answers 401 it reads the key again once, so a rotation needs no change on
 the Pi. When it cannot read the key it sends no events and `/api/status` says so; recording goes on.
 
-Make the six public files on the development machine where you ran `create-cred-config`. Its
-`gcloud` must be the devbox identity, and it needs `agent-infra` checked out at
-`~/src/agent-infra` with Pulumi signed in:
+Make the six public files on the development machine where you ran `create-cred-config`, from a
+Ghost Wispr checkout. Its `gcloud` must be the devbox identity, its `gh` must read
+`theorem-labs/agent-infra`'s Actions logs, and it needs `agent-infra` checked out at
+`~/src/agent-infra`. The block reads no Pulumi state: the devbox identity cannot list the `root`
+and `envoy-cluster` state buckets (403). Each value comes from a source that identity reads, at
+the time you run the block:
+
+- `tailscale-subject` from `root/Pulumi.prod.yaml` on `agent-infra`'s `origin/main`.
+- `tailscale-client-id` from a `seed` run's log, with `deploy/pi/tailnet-client-id.sh`. It reads
+  the `seed` workflow's runs from the newest, and every attempt of a re-run run, and takes the
+  first `root` job whose log says that `ghost-wispr-x509` was created or replaced, so the newest
+  creation wins. It prints that job's link. It stops with an error, and writes no ID, when a
+  `root` job that ran is still running or its log cannot be read, because that job can hold a
+  newer ID; run it again. It reads the log with `gh api .../actions/jobs/<id>/logs`, because
+  `gh run view --job <id> --log` refuses while another job of the same run still waits for its
+  approval. It reads the runs of the last 90 days: `agent-infra` keeps run logs for 90 days
+  (`root/retention.json`). It makes one API call for each run it reads, so it takes about 15
+  minutes for each 1000 runs before the creation. When no run of the last 90 days made the
+  identity, it says so; then read the ID from `/opt/ghost-wispr/tailscale-client-id` on a Pi
+  provisioned before, or ask someone who can read `root`'s Pulumi state for
+  `pulumi stack output ghostWisprTailnetClientId --stack prod`.
+- `envoy-webhook-url` from the Cloud Run service list: `envoy-cluster` gives the relay's service
+  name a suffix, so the block matches its prefix `envoy-webhook-relay-`.
 
 <!-- provision_bundle_test.sh: prepare -->
 ```bash
@@ -170,14 +192,21 @@ prepared=$(mktemp -d)
 gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$prepared/device.crt"
 openssl x509 -in "$prepared/device.crt" -noout -subject -enddate
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
-(cd ~/src/agent-infra/root && pulumi stack output ghostWisprTailnetClientId --stack prod) >"$prepared/tailscale-client-id"
-(cd ~/src/agent-infra/root && pulumi config get ghostWisprAccountUniqueId --stack prod) >"$prepared/tailscale-subject"
-(cd ~/src/agent-infra/envoy-cluster && printf '%s/webhook/ghostwispr\n' "$(pulumi stack output relayUrl --stack prod)") >"$prepared/envoy-webhook-url"
+git -C ~/src/agent-infra fetch --quiet origin main
+git -C ~/src/agent-infra show origin/main:root/Pulumi.prod.yaml \
+  | sed -n 's/^  agent-infra-root:ghostWisprAccountUniqueId: "\{0,1\}\([0-9][0-9]*\)"\{0,1\}$/\1/p' >"$prepared/tailscale-subject"
+deploy/pi/tailnet-client-id.sh >"$prepared/tailscale-client-id"
+relay=$(gcloud run services list --project=theorem-agent-infra --filter='metadata.name ~ ^envoy-webhook-relay-' --format='value(status.url)')
+printf '%s/webhook/ghostwispr\n' "$relay" >"$prepared/envoy-webhook-url"
+head "$prepared/tailscale-subject" "$prepared/tailscale-client-id" "$prepared/envoy-webhook-url"
 rm -rf -- "$d"
 ```
 
-`openssl` must print `subject=CN=ghost-wispr`. None of these files is a secret: if another
-machine provisions the Pi, copy `$prepared` there.
+`openssl` must print `subject=CN=ghost-wispr`, and `head` one line for each of the three files:
+the subject is digits, the client ID one token, and the URL an `https://...run.app` address
+ending in `/webhook/ghostwispr`. `provision-pi.sh` refuses an empty file, and `provision.sh` a
+file of another form. None of these files is a secret: if another machine provisions the Pi, copy
+`$prepared` there.
 
 ## Provision
 
@@ -404,7 +433,9 @@ to run the read on a machine whose `secret-run` has a broker identity when this 
 <!-- provision_bundle_test.sh: accept -->
 ```bash
 secret=$(deploy/pi/webhook-secret.sh ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"}) &&
-GHOST_WISPR_RELAY_URL="$(cd ~/src/agent-infra/envoy-cluster && pulumi stack output relayUrl --stack prod)/webhook/ghostwispr" \
+relay=$(gcloud run services list --project=theorem-agent-infra --filter='metadata.name ~ ^envoy-webhook-relay-' --format='value(status.url)') &&
+[[ $relay =~ ^https://[^[:space:]]+$ ]] &&
+GHOST_WISPR_RELAY_URL="$relay/webhook/ghostwispr" \
 GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$secret" \
 deploy/pi/accept-slice1.sh
 unset secret
@@ -413,7 +444,15 @@ unset secret
 The driver pauses and resumes the recorder, asks the operator to power-cycle it, checks the
 light state, verifies the tagged identity and loopback listeners, and tests the signed and
 unsigned webhook paths. Before the pause it requires the Ghost Wispr Deepgram socket to grow by
-at least 32 kB/s; during the 60-second pause it permits at most 4096 bytes. It compares package
+at least 32 kB/s over 60 s, between two readings that one command on the Pi takes 60 s apart: the
+stream runs less than 1 % above 32 kB/s in 8060-byte chunks, so a 5-second window can hold one
+chunk fewer and fail. When a socket to `api.deepgram.com` opens or closes between the two readings
+(the stream reconnects, or a batch upload starts), it measures once more; a stream that is too slow
+keeps its socket and fails at once. During the 60-second pause it permits at most 4096 bytes on
+that same socket.
+It finds the socket among Ghost Wispr's sockets by its peer's certificate for `api.deepgram.com`,
+checked from the Pi, and does not resolve the name: the name has several addresses, and a new
+lookup often misses the one the recorder is connected to. It compares package
 and running-service inventories against `deploy/pi/baseline.txt`, allowing only
 `libportaudio2`, `ffmpeg`, `lame`, `jq`, their package dependencies, and Ghost Wispr's user
 services. An empty inventory is UNKNOWN, not a pass. While it runs, a member device must also
