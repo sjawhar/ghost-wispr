@@ -563,10 +563,11 @@ One run records one conversation for both rows:
    audio", so the driver stops here, before it records anything.
 2. The precheck requires that no conversation and no file in the database's directory already
    holds "orange tractor ninety" or "purple elephant seventeen" as adjacent words. If one does,
-   delete that conversation from the unit and run again. It also notes which of "orange" and
-   "tractor" no file holds yet: only those are counted on their own after "Delete text" (see the
-   database check below), so another conversation that says "orange juice" neither stops the run
-   nor fails it.
+   delete that conversation from the unit and run again. It also notes which of "orange",
+   "tractor", "purple" and "elephant" no file holds yet: only those are counted on their own
+   after each delete (see the database check below), so another conversation that says "orange
+   juice" neither stops the run nor fails it. Record no other conversation until the run ends:
+   a counted word said in one reads as a word the delete left.
 3. The driver starts a conversation and prints its script (`Setup NEEDS-PERSON`). Two people
    read it: "purple elephant seventeen", the topic, and "orange tractor ninety" are each said
    alone in their own turn, and the control phrase "blue harbor lantern" in another. Press Enter
@@ -593,7 +594,8 @@ row and for the run.
 - Before each delete, each check must find the phrase (A11's title and Drive folder name only
   note it). That finding is the control for the same check after the delete. If a check cannot
   find the phrase, the row is UNKNOWN and nothing is deleted; record a new conversation and run
-  again.
+  again. A `NOTE` line says what a round did not check and why (for example, no word to count on
+  its own with `--session`); it changes no verdict and is never counted as a check that passed.
 - After a delete, a read that is empty, that failed, or that does not hold "blue harbor
   lantern" is UNKNOWN, not PASS.
 - A11 text only checks the segments, the transcript, the refined transcript, the summary, the
@@ -602,21 +604,22 @@ row and for the run.
   `transcript.md` and `summary.md` as text, and requires the recording's sha256 on the unit and
   every Drive file id to stay the same, each id still answering 200.
 - A11 checks the segments, the transcript, the refined transcript, the summary, the title, the
-  UI search, a Deepgram transcription of the unit's recording and the Drive folder name. It
-  exports the new `transcript.md` and `summary.md`, and downloads and transcribes the new
-  recording. Each old file id must answer 404 to `files.get` and `revisions.list`, and each new
-  file must hold one revision. It also checks that "orange tractor ninety" stays gone.
+  UI search, the same database files as A11 text only, a Deepgram transcription of the unit's
+  recording and the Drive folder name. It exports the new `transcript.md` and `summary.md`, and
+  downloads and transcribes the new recording. Each old file id must answer 404 to `files.get`
+  and `revisions.list`, and each new file must hold one revision. It also checks that "orange
+  tractor ninety" stays gone, the database files included.
 - The database check counts each phrase twice in every file: as adjacent words, as a
-  conversation's rows hold it, and each distinctive word on its own ("orange" and "tractor";
-  the number is left out, because live transcription may write it as digits), as SQLite's search
-  index holds it: each word as its own term, in sorted order, never next to its neighbour. A
-  word matches only where a word starts, so "contractor" is not "tractor". Only the words the
-  precheck found in no file are counted on their own, because `grep` cannot tell which
-  conversation a word in a binary file belongs to; with `--session` the precheck does not run,
-  and no word is. On an index page each term after the first is stored as the part that differs
-  from the term before it, so a word that shares its first letters with its neighbour can still
-  escape `grep`. The UI search cannot see what is left in the index either: it joins the live
-  rows, and a deleted row has none. So an A11 PASS does not show that the index is clean. What
-  shows it is the delete's rebuild of the index and its Go tests
+  conversation's rows hold it, and each distinctive word on its own ("orange" and "tractor",
+  "purple" and "elephant"; the number is left out, because live transcription may write it as
+  digits), as SQLite's search index holds it: each word as its own term, in sorted order, never
+  next to its neighbour. A word matches only where a word starts, so "contractor" is not
+  "tractor". Only the words the precheck found in no file are counted on their own, because
+  `grep` cannot tell which conversation a word in a binary file belongs to; with `--session` the
+  precheck does not run, and no word is. On an index page each term after the first is stored as
+  the part that differs from the term before it, so a word that shares its first letters with
+  its neighbour can still escape `grep`. The UI search cannot see what is left in the index
+  either: it joins the live rows, and a deleted row has none. So an A11 PASS does not show that
+  the index is clean. What shows it is the delete's rebuild of the index and its Go tests
   (`internal/storage/search_index_erase_test.go`), which read the database, its log and the
   backup for a one-word secret.
