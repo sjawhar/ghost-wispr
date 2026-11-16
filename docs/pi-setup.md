@@ -161,6 +161,8 @@ holds an `envoy-webhook-secret` file. Ghost Wispr reads the key from Secret Mana
 `projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`) and keeps
 it in memory. When Envoy answers 401 it reads the key again once, so a rotation needs no change on
 the Pi. When it cannot read the key it sends no events and `/api/status` says so; recording goes on.
+It reads the key again every five minutes, so the warning clears within five minutes of the key
+becoming readable, and the held events go out then.
 
 Make the six public files on the development machine where you ran `create-cred-config`, from a
 Ghost Wispr checkout. Its `gcloud` must be the devbox identity, its `gh` must read

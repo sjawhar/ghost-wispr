@@ -158,8 +158,9 @@ Manager with its Google credential (`google_credentials_file`): the secret versi
 `envoy_webhook_secret_name` (`GHOST_WISPR_ENVOY_WEBHOOK_SECRET_NAME`), by default
 `projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`. It keeps
 the key in memory and reads it again once when Envoy answers 401, so a rotated key needs no
-change on the unit. While the key cannot be read, no event is sent, `/api/status` warns, and the
-unsent events go out from the five-minute sweep once it reads; recording does not depend on it.
+change on the unit. While the key cannot be read, no event is sent and `/api/status` warns. The
+five-minute sweep reads the key again, so the warning clears within five minutes of the key
+becoming readable, and the unsent events go out then. Recording does not depend on it.
 `GHOST_WISPR_ENVOY_WEBHOOK_SECRET` is no longer read, and a start that finds it warns.
 
 ## Development

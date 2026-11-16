@@ -5,10 +5,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // staticKey is a signing key reader that always reads key.
@@ -143,6 +145,112 @@ func TestAFailedKeyReadSendsNothingAndIsReported(t *testing.T) {
 	defer mu.Unlock()
 	if len(reported) != 3 || reported[0] == nil || reported[1] == nil || reported[2] != nil {
 		t.Fatalf("reported key reads = %v, want two failures then a success", reported)
+	}
+}
+
+// TestCheckSigningKeyReadsAgainOnlyWhileTheLastReadFailed fails if
+// CheckSigningKey leaves a failed read unretried because the client still
+// keeps an older key, which would leave the report in /api/status until an
+// event is due, or if it reads the key once a read has worked: the unit's
+// sweep calls it every five minutes.
+func TestCheckSigningKeyReadsAgainOnlyWhileTheLastReadFailed(t *testing.T) {
+	server, requests := newListenerTestServer(t, "rotated-key")
+	defer server.Close()
+	readErr := errors.New("PERMISSION_DENIED")
+	keys := &keySequence{keys: []string{"old-key", "", "rotated-key"}, errs: []error{nil, readErr}}
+	var mu sync.Mutex
+	var reported []error
+	publisher := NewPublisher(server.URL, keys.read, nil, WithKeyStatus(func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, err)
+	}))
+	publisher.client.retryDelays = nil
+	ctx := context.Background()
+	check := func(stage string, wantReads int) {
+		t.Helper()
+		for range 2 {
+			if err := publisher.CheckSigningKey(ctx); err != nil {
+				t.Fatalf("CheckSigningKey %s: %v", stage, err)
+			}
+		}
+		if keys.count() != wantReads {
+			t.Fatalf("key reads after two checks %s = %d, want %d", stage, keys.count(), wantReads)
+		}
+	}
+
+	check("with the key read", 1)
+
+	// Envoy refuses old-key with 401, and the read after it fails: the client
+	// keeps old-key, and the failure is reported.
+	err := publisher.client.Send(ctx, Event{Type: eventSessionStarted, SessionID: "session-1"})
+	if err == nil || !errorsContains(err, "PERMISSION_DENIED") {
+		t.Fatalf("Send when the read after a 401 fails: err = %v, want the read's error", err)
+	}
+	if keys.count() != 2 {
+		t.Fatalf("key reads after the 401 = %d, want 2", keys.count())
+	}
+
+	check("after the failed read", 3)
+	mu.Lock()
+	got := slices.Clone(reported)
+	mu.Unlock()
+	if len(got) != 3 || got[0] != nil || got[1] == nil || got[2] != nil {
+		t.Fatalf("reported key reads = %v, want a success, a failure, then a success", got)
+	}
+	if err := publisher.client.Send(ctx, Event{Type: eventSessionStarted, SessionID: "session-1"}); err != nil {
+		t.Fatalf("Send with the key the check read: %v", err)
+	}
+	if keys.count() != 3 || len(requests()) != 1 {
+		t.Fatalf("key reads = %d, accepted events = %d after a send with the checked key, want 3 and 1", keys.count(), len(requests()))
+	}
+}
+
+// TestAStaleFailureReportDoesNotOutliveAWorkingRead: read A (a sweep's
+// check) fails; read B (a concurrent send or check) works. B reports and
+// stalls before its state write; A reports and writes its state; then B
+// writes its state. Three later sweeps must leave no failure report.
+func TestAStaleFailureReportDoesNotOutliveAWorkingRead(t *testing.T) {
+	aInRead, failA := make(chan struct{}), make(chan struct{})
+	var reads atomic.Int32
+	read := func(context.Context) (string, error) {
+		if reads.Add(1) == 1 {
+			close(aInRead)
+			<-failA
+			return "", errors.New("PERMISSION_DENIED")
+		}
+		return "granted-key", nil
+	}
+	var mu sync.Mutex
+	var last error
+	bReported, releaseB := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	p := NewPublisher("http://127.0.0.1:1", read, nil, WithKeyStatus(func(err error) {
+		mu.Lock()
+		last = err
+		mu.Unlock()
+		if err == nil {
+			once.Do(func() { close(bReported); <-releaseB })
+		}
+	}))
+	ctx := context.Background()
+	aDone, bDone := make(chan error, 1), make(chan error, 1)
+	go func() { aDone <- p.CheckSigningKey(ctx) }()
+	<-aInRead
+	go func() { bDone <- p.CheckSigningKey(ctx) }()
+	<-bReported
+	close(failA)
+	time.Sleep(100 * time.Millisecond)
+	close(releaseB)
+	<-aDone
+	<-bDone
+	for range 3 {
+		_ = p.CheckSigningKey(ctx)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if last != nil {
+		t.Fatalf("last report %v after 3 sweeps with the key read (%d reads)", last, reads.Load())
 	}
 }
 

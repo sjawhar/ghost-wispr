@@ -67,7 +67,9 @@ type options struct {
 
 // WithKeyStatus calls report after every read of the signing key, with nil
 // when it read a key and the read's error when it did not; the unit shows the
-// error in /api/status.
+// error in /api/status. report runs with the client's key lock held, so the
+// last report always describes the read whose result the client keeps; it
+// must not call the client.
 func WithKeyStatus(report func(error)) Option {
 	return func(o *options) {
 		o.keyStatus = report
@@ -113,8 +115,9 @@ type Client struct {
 	sleep       func(context.Context, time.Duration) error
 	retryDelays []time.Duration
 
-	keyMu sync.Mutex
-	key   []byte // the key read last; nil until a read works
+	keyMu         sync.Mutex
+	key           []byte // the key the last working read returned; nil until a read works
+	keyReadFailed bool   // the last read failed; key still holds the one before it, if any
 }
 type webhookStatusError struct {
 	status int
@@ -166,15 +169,20 @@ func (c *Client) signingKey(ctx context.Context, stale []byte) ([]byte, error) {
 	if err == nil && len(key) == 0 {
 		err = errors.New("the signing key is empty")
 	}
+	// Reported under keyMu, so the last report always describes the read
+	// whose result keyReadFailed holds.
+	c.keyMu.Lock()
+	c.keyReadFailed = err != nil
+	if err == nil {
+		c.key = key
+	}
 	if c.keyStatus != nil {
 		c.keyStatus(err)
 	}
+	c.keyMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("read envoy webhook signing key: %w", err)
 	}
-	c.keyMu.Lock()
-	c.key = key
-	c.keyMu.Unlock()
 	return key, nil
 }
 
@@ -302,11 +310,22 @@ func NewPublisher(webhookURL string, readKey KeyReader, store Store, opts ...Opt
 	}
 }
 
-// CheckSigningKey reads the signing key when the publisher has none yet, so
-// a key that cannot be read is reported (WithKeyStatus) before the first
-// event needs it.
+// CheckSigningKey reads the signing key when the publisher has none yet or
+// its last read failed, so a key that cannot be read is reported
+// (WithKeyStatus) before an event needs it, and a key that reads again clears
+// the report without waiting for an event. While the last read worked it
+// reads nothing.
 func (p *Publisher) CheckSigningKey(ctx context.Context) error {
-	_, err := p.client.signingKey(ctx, nil)
+	c := p.client
+	c.keyMu.Lock()
+	kept, failed := c.key, c.keyReadFailed
+	c.keyMu.Unlock()
+	if kept != nil && !failed {
+		return nil
+	}
+	// With kept as stale, signingKey reads again unless a send's read has
+	// replaced kept meanwhile.
+	_, err := c.signingKey(ctx, kept)
 	return err
 }
 

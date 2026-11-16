@@ -27,7 +27,8 @@ const envoyWarningKey = "envoy"
 // change builds a new one, or none, and hands it to the session manager. Its
 // signing key is read from Secret Manager in the background, so neither the
 // settings change nor recording waits on Secret Manager; a key that cannot be
-// read stops the events and shows in /api/status, nothing else.
+// read stops the events and shows in /api/status, nothing else, and each sweep
+// reads it again until it reads.
 type envoyPublishing struct {
 	store    *storage.SQLiteStore
 	manager  *session.Manager
@@ -73,12 +74,7 @@ func (e *envoyPublishing) configure(ctx context.Context, cfg *config.Config, log
 	e.warnings.Clear(envoyWarningKey)
 	e.set(pub)
 	log.Printf("envoy webhook publishing enabled")
-	go func() {
-		if err := pub.CheckSigningKey(ctx); err != nil {
-			log.Printf("warning: %v", err)
-		}
-		e.sweepWith(ctx, pub)
-	}()
+	go e.sweepWith(ctx, pub)
 }
 
 // reportKey shows in /api/status whether pub's signing key reads, while pub
@@ -104,8 +100,10 @@ func (e *envoyPublishing) set(pub *envoy.Publisher) {
 	e.manager.SetEventPublisher(pub)
 }
 
-// sweep sends what Envoy has not received: lifecycle events and completed
-// summaries, from before an outage or a key that could not be read.
+// sweep reads the signing key again while its last read failed, so
+// /api/status shows within one sweep whether it reads, and then sends what
+// Envoy has not received: lifecycle events and completed summaries, from
+// before an outage or a key that could not be read.
 func (e *envoyPublishing) sweep(ctx context.Context) {
 	if pub := e.current.Load(); pub != nil {
 		e.sweepWith(ctx, pub)
@@ -113,6 +111,9 @@ func (e *envoyPublishing) sweep(ctx context.Context) {
 }
 
 func (e *envoyPublishing) sweepWith(ctx context.Context, pub *envoy.Publisher) {
+	if err := pub.CheckSigningKey(ctx); err != nil {
+		log.Printf("warning: %v", err)
+	}
 	if err := pub.PublishPendingLifecycleEvents(ctx); err != nil {
 		log.Printf("envoy lifecycle sweep error: %v", err)
 	}

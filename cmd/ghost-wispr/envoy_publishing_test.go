@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,10 @@ import (
 )
 
 const testSigningSecret = "projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest"
+
+// secretManagerDenial is Secret Manager's answer to an identity that has no
+// Secret Accessor role on the secret.
+const secretManagerDenial = `{"error":{"code":403,"message":"Permission denied on secret","status":"PERMISSION_DENIED"}}`
 
 // fakeSecretManager answers Secret Manager's access call for
 // testSigningSecret with key, or with status when it is not 200; block, when
@@ -41,21 +46,47 @@ func fakeSecretManager(t *testing.T, key string, status int, block bool) *httpte
 			return
 		}
 		if status != http.StatusOK {
-			http.Error(w, `{"error":{"code":403,"message":"Permission denied on secret","status":"PERMISSION_DENIED"}}`, status)
+			http.Error(w, secretManagerDenial, status)
 			return
 		}
-		if r.URL.Path != "/v1/"+testSigningSecret+":access" {
-			http.Error(w, `{"error":{"code":404,"message":"not found"}}`, http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"payload": map[string]any{
-			"data":       base64.StdEncoding.EncodeToString([]byte(key)),
-			"dataCrc32c": strconv.FormatInt(int64(crc32.Checksum([]byte(key), crc32.MakeTable(crc32.Castagnoli))), 10),
-		}})
+		writeSecretVersion(w, r, key)
 	}))
 	t.Cleanup(func() { close(release); server.Close() })
 	return server
+}
+
+// secretManagerToGrant answers Secret Manager's access call for
+// testSigningSecret with 403 until grant is called and with key after it, as
+// Secret Manager does when the unit's identity is given Secret Accessor on
+// the secret. reads counts the access calls.
+func secretManagerToGrant(t *testing.T, key string) (server *httptest.Server, grant func(), reads func() int32) {
+	t.Helper()
+	var granted atomic.Bool
+	var calls atomic.Int32
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if !granted.Load() {
+			http.Error(w, secretManagerDenial, http.StatusForbidden)
+			return
+		}
+		writeSecretVersion(w, r, key)
+	}))
+	t.Cleanup(server.Close)
+	return server, func() { granted.Store(true) }, calls.Load
+}
+
+// writeSecretVersion answers Secret Manager's access call for
+// testSigningSecret with key, and any other path with 404.
+func writeSecretVersion(w http.ResponseWriter, r *http.Request, key string) {
+	if r.URL.Path != "/v1/"+testSigningSecret+":access" {
+		http.Error(w, `{"error":{"code":404,"message":"not found"}}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"payload": map[string]any{
+		"data":       base64.StdEncoding.EncodeToString([]byte(key)),
+		"dataCrc32c": strconv.FormatInt(int64(crc32.Checksum([]byte(key), crc32.MakeTable(crc32.Castagnoli))), 10),
+	}})
 }
 
 // signedListener stands in for Envoy's webhook: it accepts a post signed
@@ -170,5 +201,61 @@ func TestAnUnreadableEnvoyKeyWarnsAndHoldsNothingUp(t *testing.T) {
 	publishing.configure(ctx, &config.Config{}, discardLogger)
 	if list := warnings.List(); len(list) != 0 {
 		t.Fatalf("warnings after turning Envoy off = %q, want none", list)
+	}
+}
+
+// TestAGrantedEnvoyKeyClearsItsWarningWithinOneSweep fails if a signing key
+// that could not be read is read again only when an event is due: a unit with
+// nothing to send would keep the /api/status warning after Secret Accessor is
+// granted. Once the key reads, a sweep makes no Secret Manager call.
+func TestAGrantedEnvoyKeyClearsItsWarningWithinOneSweep(t *testing.T) {
+	listener, accepted := signedListener(t, "granted-key")
+	secretManager, grant, reads := secretManagerToGrant(t, "granted-key")
+	publishing, warnings := testEnvoyPublishing(t, secretManager)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	publishing.configure(ctx, envoyConfig(listener.URL), discardLogger)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		list := warnings.List()
+		if len(list) == 1 && strings.Contains(list[0], testSigningSecret) && strings.Contains(list[0], "403") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("warnings = %q, want one naming the 403", list)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := reads(); got != 1 {
+		t.Fatalf("Secret Manager reads at start = %d, want 1", got)
+	}
+
+	// Nothing is due: no session waits for an event, so no send reads the key.
+	pendingLifecycle, err := publishing.store.PendingEnvoyLifecycleEvents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingSummaries, err := publishing.store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingLifecycle) != 0 || len(pendingSummaries) != 0 {
+		t.Fatalf("pending lifecycle events = %v, summaries = %v, want none", pendingLifecycle, pendingSummaries)
+	}
+
+	grant()
+	publishing.sweep(ctx)
+	if list := warnings.List(); len(list) != 0 {
+		t.Fatalf("warnings one sweep after the grant = %q, want none", list)
+	}
+	if got := reads(); got != 2 {
+		t.Fatalf("Secret Manager reads after the grant's sweep = %d, want 2", got)
+	}
+	publishing.sweep(ctx)
+	if got := reads(); got != 2 {
+		t.Fatalf("Secret Manager reads after a sweep with the key read = %d, want still 2", got)
+	}
+	if accepted() != 0 {
+		t.Fatalf("listener accepted %d events with none due, want none", accepted())
 	}
 }
