@@ -2936,10 +2936,19 @@ func (s *SQLiteStore) DeleteEmbeddings(sessionID string) error {
 	return nil
 }
 
-// StoreEvent inserts an event into the mcp_events table.
+// StoreEvent inserts an event into the mcp_events table. An event that names
+// a session is stored only while that session exists, checked in the insert
+// itself: a summary is committed before the hub stores its event, and a
+// whole-conversation delete that commits between the two must not leave the
+// summary behind in an event (DeleteSession deletes the events it finds). An
+// event that names no session, or is not JSON, is stored.
 func (s *SQLiteStore) StoreEvent(eventType, payload string) error {
 	_, err := s.db.Exec(
-		`INSERT INTO mcp_events(event_type, payload) VALUES(?, ?)`,
+		`INSERT INTO mcp_events(event_type, payload) SELECT ?1, ?2
+		WHERE CASE WHEN json_valid(?2) THEN
+			COALESCE(json_extract(?2, '$.session_id'), '') = ''
+			OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = json_extract(?2, '$.session_id'))
+		ELSE 1 END`,
 		eventType, payload,
 	)
 	if err != nil {

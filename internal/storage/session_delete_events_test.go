@@ -290,3 +290,34 @@ func TestTheFirstStartRemovesEventsOfSessionsThatNoLongerExist(t *testing.T) {
 	assertBackupOmits(t, path, secret)
 	assertDatabaseFilesLack(t, path, secret, "summary of kept")
 }
+
+// TestStoreEventKeepsNoEventOfASessionThatIsGone: a summary is committed
+// first and broadcast after, and the broadcast stores its event. A delete
+// that commits between the two must not leave that event behind, with the
+// summary in it. An event of a session that exists, and an event that names
+// no session (or that is not JSON), are stored.
+func TestStoreEventKeepsNoEventOfASessionThatIsGone(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	endedWith(t, store, "kept", "/audio/kept.mp3", RefinementCompleted)
+	for _, payload := range []string{
+		`{"type":"summary_ready","session_id":"gone","summary":"The deleted conversation's summary."}`,
+		`{"type":"summary_ready","session_id":"kept","summary":"summary of kept"}`,
+		`{"type":"status_changed","paused":true}`,
+		`not valid JSON`,
+	} {
+		if err := store.StoreEvent("summary_ready", payload); err != nil {
+			t.Fatalf("StoreEvent(%s): %v", payload, err)
+		}
+	}
+	payloads := storedEventPayloads(t, store)
+	assertEventsOf(t, store, []string{"gone"}, []string{"kept"})
+	for _, want := range []string{`"paused":true`, `not valid JSON`} {
+		found := false
+		for _, payload := range payloads {
+			found = found || strings.Contains(payload, want)
+		}
+		if !found {
+			t.Errorf("the event %s, which names no session, was not stored", want)
+		}
+	}
+}
