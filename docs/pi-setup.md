@@ -475,6 +475,30 @@ ssh ghost-wispr@ghost-wispr 'curl -fsS http://127.0.0.1:8080/api/version'
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user list-timers ghost-wispr-update.timer'
 ```
 
+## Roll out a release that adds a config key
+
+Follow this order for every release whose code reads a new key from
+`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules`. The nightly update replaces only
+the binary: `update.sh` never writes the config, so a new binary that the timer installs starts
+on a config without the new key. The other order fails too: while the old binary runs on a config
+that has the key, a settings save drops the key, because the old binary writes back only the keys
+it knows.
+
+1. Before you merge, run the models step ("Enable models and Drive sync") from a checkout of the
+   pull request's head, with the shared-drive ID the Pi has now (`provision.sh --models
+   <shared-drive-id>`). The running binary ignores the new key, and the models step restarts it.
+2. Merge the pull request. The release workflow publishes a release for the merge commit.
+3. As soon as that release is published, run `update.sh` by hand ("Update and inspect"). Do not
+   wait for the timer: until the new binary runs, a settings save drops the new key.
+4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
+   come back:
+
+   ```bash
+   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/config | jq .recording_rules
+   ```
+
+   Then run A2 of "Accept slice 1".
+
 ## Recover a pending segment deletion
 
 If `/api/status` names a recording with a pending segment deletion, do not issue another

@@ -42,3 +42,27 @@ func TestRunbookSaysWhatToDoWhenDeleteWaitsForDrive(t *testing.T) {
 		}
 	}
 }
+
+// TestRunbookOrdersARolloutThatAddsAConfigKey fails if the runbook does not
+// give the order for a release that reads a new key from the Pi's config:
+// install the template with the models step before the merge, merge, run
+// update.sh by hand once the release is published, then check GET
+// /api/config. It also fails if the runbook does not say why: the nightly
+// update replaces only the binary, and a settings save of the old binary
+// drops a key that binary does not know.
+func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
+	section := runbookSection(t, "## Roll out a release that adds a config key")
+	rest := section
+	for _, step := range []string{"1. Before you merge", "provision.sh --models", "2. Merge", "3. As soon as", "update.sh", "4. Check", "/api/config"} {
+		_, after, found := strings.Cut(rest, step)
+		if !found {
+			t.Fatalf("the runbook's rollout order is missing %q, or has it out of order: %s", step, section)
+		}
+		rest = after
+	}
+	for _, why := range []string{"replaces only the binary", "drops"} {
+		if !strings.Contains(section, why) {
+			t.Errorf("the runbook's rollout order does not say why: no %q", why)
+		}
+	}
+}
