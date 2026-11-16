@@ -272,8 +272,9 @@ func scrubMergedSourcesByRecording(tx *sql.Tx, sessionID, deletedRecording, unti
 			continue
 		}
 		canonical := canonicalTranscript(own[source])
+		// summary_error goes with the summary it was about.
 		if _, err := tx.Exec(`UPDATE sessions
-			SET title = '', summary = '', summary_model = '', speaker_names = '{}',
+			SET title = '', summary = '', summary_model = '', speaker_names = '{}', summary_error = '',
 			    refined_transcript = '', refinement_model = '',
 			    canonical_transcript = ?, transcript_source = ?, deletion_generation = deletion_generation + 1
 			WHERE id = ?`, canonical, TranscriptSourceStreaming, source); err != nil {

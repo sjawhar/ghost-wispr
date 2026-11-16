@@ -220,7 +220,7 @@ func (c *Collector) onDrive(sess *storage.Session) error {
 	defer cancel()
 	present, err := c.config.Drive.FolderOnDrive(ctx, sess.GDriveFolderID)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrDriveCannotSay, err)
+		return fmt.Errorf("%w: %w", ErrDriveCannotSay, withoutFolder(err, sess.GDriveFolderID))
 	}
 	if !present {
 		return c.folderGone(sess)
@@ -243,11 +243,11 @@ func (c *Collector) onDrive(sess *storage.Session) error {
 		present, folderErr := c.config.Drive.FolderOnDrive(ctx, sess.GDriveFolderID)
 		switch {
 		case folderErr != nil:
-			return fmt.Errorf("%w: %w", ErrDriveCannotSay, errors.Join(err, folderErr))
+			return fmt.Errorf("%w: %w", ErrDriveCannotSay, withoutFolder(errors.Join(err, folderErr), sess.GDriveFolderID))
 		case !present:
 			return c.folderGone(sess)
 		default:
-			return fmt.Errorf("%w: %w", ErrDriveCannotSay, err)
+			return fmt.Errorf("%w: %w", ErrDriveCannotSay, withoutFolder(err, sess.GDriveFolderID))
 		}
 	}
 	if !matches {
@@ -262,6 +262,32 @@ func (c *Collector) recordingMismatch(sessionID string, mismatch bool) {
 	if c.config.OnRecordingMismatch != nil {
 		c.config.OnRecordingMismatch(sessionID, mismatch)
 	}
+}
+
+// folderLeftOut is a Drive error with the Drive folder id it names left out
+// of its text (withoutFolder); errors.Is and errors.As still see what it
+// wraps.
+type folderLeftOut struct {
+	err    error
+	folder string
+}
+
+func (e folderLeftOut) Error() string {
+	return strings.ReplaceAll(e.err.Error(), e.folder, "<the session's Drive folder>")
+}
+
+func (e folderLeftOut) Unwrap() error { return e.err }
+
+// withoutFolder returns err, an answer from Drive about a session's folder,
+// with the folder's id (folderID) left out of its text. A pass that cannot
+// ask Drive holds back, and GET /api/status shows that hold until the next
+// pass, an hour later, also once the session is deleted: the hold says why,
+// and names no session's Drive folder.
+func withoutFolder(err error, folderID string) error {
+	if folderID == "" {
+		return err
+	}
+	return folderLeftOut{err: err, folder: folderID}
 }
 
 func (c *Collector) folderGone(sess *storage.Session) error {
@@ -435,7 +461,11 @@ func (c *Collector) deleteSession(id string, names names) error {
 		present, folderErr := c.config.Drive.FolderOnDrive(ctx, source.GDriveFolderID)
 		cancel()
 		if folderErr != nil {
-			return fmt.Errorf("check Drive folder of merged source %s: %w: %w", sourceID, ErrDriveCannotSay, folderErr)
+			// This error is the pass's hold, which GET /api/status shows
+			// until the next pass, also once the source is deleted: it
+			// names no session and no Drive folder, and the log says which.
+			c.logger.Warn("gc could not check the Drive folder of a merged source", "operation", "delete_session", "session_id", id, "source_session_id", sourceID, "error", folderErr)
+			return fmt.Errorf("check the Drive folder of a merged source: %w: %w", ErrDriveCannotSay, withoutFolder(folderErr, source.GDriveFolderID))
 		}
 		if !present {
 			return fmt.Errorf("merged source %s has a Drive folder that is in the trash or gone", sourceID)

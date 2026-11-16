@@ -475,7 +475,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 			warn(sessionID, err.Error())
 		}
 		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusError, fmt.Sprintf("Batch refinement failed for session %s", sessionID))
+			m.hub.BroadcastSessionComponentStatus(sessionID, "refinement", storage.ComponentStatusError, fmt.Sprintf("Batch refinement failed for session %s", sessionID))
 		}
 		return
 	}
@@ -490,7 +490,7 @@ func (m *Manager) runBatchRefinement(ctx context.Context, sessionID, audioPath s
 
 	m.batchLogger.Info("batch refinement completed", "operation", "batch_refinement", "session_id", sessionID, "model", result.Model)
 	if m.hub != nil {
-		m.hub.BroadcastComponentStatus("refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
+		m.hub.BroadcastSessionComponentStatus(sessionID, "refinement", storage.ComponentStatusConnected, fmt.Sprintf("Batch refinement completed for session %s", sessionID))
 	}
 }
 
@@ -610,7 +610,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.failSummary(sessionID, fmt.Sprintf("summarization failed: %v", err), generation)
 		m.triggerEmbeddingIndexAtGeneration(sessionID, transcript, generation)
 		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
+			m.hub.BroadcastSessionComponentStatus(sessionID, "summary", storage.ComponentStatusError, fmt.Sprintf("Summarization failed for session %s", sessionID))
 		}
 		return
 	}
@@ -626,7 +626,7 @@ func (m *Manager) generateSummary(ctx context.Context, sessionID string, started
 		m.logger.Error("failed to store summary", "operation", "generate_summary", "session_id", sessionID, "error", storeErr)
 		m.failSummary(sessionID, fmt.Sprintf("failed to store summary: %v", storeErr), generation)
 		if m.hub != nil {
-			m.hub.BroadcastComponentStatus("summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
+			m.hub.BroadcastSessionComponentStatus(sessionID, "summary", storage.ComponentStatusError, fmt.Sprintf("Failed to store summary for session %s", sessionID))
 		}
 		return
 	}
@@ -653,10 +653,10 @@ func (m *Manager) triggerDriveSync(syncer SessionSyncer, sessionID string) {
 		if err := syncer.SyncSession(context.Background(), sessionID); err != nil {
 			m.logger.Error("gdrive sync failed", "operation", "sync_session", "session_id", sessionID, "error", err)
 			if m.hub != nil {
-				m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
+				m.hub.BroadcastSessionComponentStatus(sessionID, "sync", storage.ComponentStatusError, fmt.Sprintf("Google Drive sync failed for session %s", sessionID))
 			}
 		} else if m.hub != nil {
-			m.hub.BroadcastComponentStatus("sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
+			m.hub.BroadcastSessionComponentStatus(sessionID, "sync", storage.ComponentStatusConnected, fmt.Sprintf("Google Drive synced for session %s", sessionID))
 		}
 	}()
 }
@@ -893,7 +893,9 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	}
 	m.publishSessionStarted(sessionID)
 
-	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint", titleHint)
+	// The title hint is the session's title, which names its topic: the log
+	// keeps the session's id, never its words.
+	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint_set", titleHint != "")
 	return sessionID, nil
 }
 

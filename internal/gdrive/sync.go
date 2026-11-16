@@ -219,7 +219,9 @@ func (s *Syncer) upload(ctx context.Context, folderName string, files []SyncFile
 		Parents:  []string{s.folderID},
 	}).SupportsAllDrives(true).Context(ctx).Fields("id").Do()
 	if err != nil {
-		return "", fmt.Errorf("create folder %s: %w", folderName, err)
+		// folderName holds the session's title, which names its topic; this
+		// error is logged and kept as the session's sync error.
+		return "", fmt.Errorf("create a session folder in Drive folder %s: %w", s.folderID, err)
 	}
 	if record != nil {
 		if err := record(folder.Id); err != nil {

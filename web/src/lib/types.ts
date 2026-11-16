@@ -116,9 +116,19 @@ export interface ConnectionEvent extends BaseEvent {
 
 export interface ComponentStatusEvent extends BaseEvent {
   type: 'component_status'
-  component: 'deepgram' | 'summary' | 'sync' | 'mic'
+  component: 'deepgram' | 'summary' | 'sync' | 'mic' | 'refinement'
   status: ComponentStatus
   message: string
+  // The session the status is about (its refinement, summary or sync);
+  // absent for a status of the whole unit.
+  session_id?: string
+}
+
+// A session was deleted, with the sessions merged into it: their ids only.
+export interface SessionDeletedEvent extends BaseEvent {
+  type: 'session_deleted'
+  session_id: string
+  source_session_ids: string[]
 }
 
 export type WebSocketEvent =
@@ -130,6 +140,7 @@ export type WebSocketEvent =
   | StatusChangedEvent
   | ConnectionEvent
   | ComponentStatusEvent
+  | SessionDeletedEvent
 
 export interface Segment {
   // Set only after the recorder persists the segment. Live segments cannot be deleted.

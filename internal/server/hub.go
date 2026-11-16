@@ -12,9 +12,12 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
-// EventStore is the interface for persisting broadcast events.
+// EventStore persists broadcast events, and says whether a session still
+// exists (HasSession), so the hub sends no status about a deleted session to
+// a client that connects.
 type EventStore interface {
 	StoreEvent(eventType, payload string) error
+	HasSession(id string) (bool, error)
 }
 
 type Hub struct {
@@ -53,10 +56,13 @@ func (h *Hub) Subscribe() chan []byte {
 	return ch
 }
 
+// SnapshotComponentStatuses returns each component's last status, for a
+// client that connects. It leaves out, and forgets, a status about a session
+// the event store no longer has: one announced before the session was
+// deleted, or after (a refinement that ends after the delete). When the store
+// cannot say, it leaves the status out and keeps it.
 func (h *Hub) SnapshotComponentStatuses() []ComponentStatusEvent {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-
 	keys := make([]string, 0, len(h.componentStatuses))
 	for key := range h.componentStatuses {
 		keys = append(keys, key)
@@ -67,7 +73,32 @@ func (h *Hub) SnapshotComponentStatuses() []ComponentStatusEvent {
 	for _, key := range keys {
 		snapshot = append(snapshot, h.componentStatuses[key])
 	}
-	return snapshot
+	h.mu.RUnlock()
+	if h.eventStore == nil {
+		return snapshot
+	}
+
+	kept := snapshot[:0]
+	for _, event := range snapshot {
+		if event.SessionID == "" {
+			kept = append(kept, event)
+			continue
+		}
+		exists, err := h.eventStore.HasSession(event.SessionID)
+		switch {
+		case err != nil:
+			h.logger.Warn("could not check whether a status's session exists; the status is not sent", "operation", "snapshot_component_statuses", "session_id", event.SessionID, "component", event.Component, "error", err)
+		case exists:
+			kept = append(kept, event)
+		default:
+			h.mu.Lock()
+			if h.componentStatuses[event.Component] == event {
+				delete(h.componentStatuses, event.Component)
+			}
+			h.mu.Unlock()
+		}
+	}
+	return kept
 }
 
 func (h *Hub) SnapshotStatusChanged() (StatusChangedEvent, bool) {
@@ -173,9 +204,36 @@ func (h *Hub) BroadcastStatusChanged(paused bool) {
 	h.broadcastEvent(event)
 }
 
+// BroadcastComponentStatus announces the status of a part of the unit (the
+// microphone, Deepgram): a status about no session.
 func (h *Hub) BroadcastComponentStatus(component, status, message string) {
+	h.broadcastComponentStatus("", component, status, message)
+}
+
+// BroadcastSessionComponentStatus announces a component's status about
+// session sessionID (its refinement, summary or sync). The event names the
+// session in session_id, so deleting the session deletes the stored event.
+// Work running at a delete reports on a session that is gone; no client is
+// sent that status, and a client that connects in the moment between this
+// check and the delete is not sent it either (SnapshotComponentStatuses).
+func (h *Hub) BroadcastSessionComponentStatus(sessionID, component, status, message string) {
+	if h.eventStore != nil {
+		exists, err := h.eventStore.HasSession(sessionID)
+		if err != nil {
+			h.logger.Warn("could not check whether a status's session exists; the status is not sent", "operation", "broadcast_component_status", "session_id", sessionID, "component", component, "error", err)
+			return
+		}
+		if !exists {
+			return
+		}
+	}
+	h.broadcastComponentStatus(sessionID, component, status, message)
+}
+
+func (h *Hub) broadcastComponentStatus(sessionID, component, status, message string) {
 	event := ComponentStatusEvent{
 		Event:     newEvent("component_status", time.Now().UTC()),
+		SessionID: sessionID,
 		Component: component,
 		Status:    status,
 		Message:   message,
@@ -186,6 +244,30 @@ func (h *Hub) BroadcastComponentStatus(component, status, message string) {
 	h.mu.Unlock()
 
 	h.broadcastEvent(event)
+}
+
+// BroadcastSessionDeleted tells every connected client that session
+// sessionID was deleted, with sourceIDs, the sessions merged into it, so each
+// tab drops their title, summary, segments and statuses. The event carries
+// their ids only and is not stored. The hub forgets its last status of each.
+func (h *Hub) BroadcastSessionDeleted(sessionID string, sourceIDs []string) {
+	deleted := make(map[string]bool, len(sourceIDs)+1)
+	deleted[sessionID] = true
+	for _, id := range sourceIDs {
+		deleted[id] = true
+	}
+	h.mu.Lock()
+	for component, status := range h.componentStatuses {
+		if deleted[status.SessionID] {
+			delete(h.componentStatuses, component)
+		}
+	}
+	h.mu.Unlock()
+	h.broadcastEvent(SessionDeletedEvent{
+		Event:            newEvent("session_deleted", time.Now().UTC()),
+		SessionID:        sessionID,
+		SourceSessionIDs: append([]string{}, sourceIDs...),
+	})
 }
 
 // storedEventTypes is the set of event types persisted to the event queue.

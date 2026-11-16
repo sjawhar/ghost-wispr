@@ -493,9 +493,9 @@ func TestDeleteSession_Success(t *testing.T) {
 		dates:    nil,
 	}
 
-	var deletedSession string
-	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{OnSessionDeleted: func(sessionID string) {
-		deletedSession = sessionID
+	var deletedSessions []string
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{OnSessionDeleted: func(sessionIDs []string) {
+		deletedSessions = sessionIDs
 	}}, "", nil)
 	if err != nil {
 		t.Fatalf("Handler failed: %v", err)
@@ -508,8 +508,8 @@ func TestDeleteSession_Success(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("expected status 204, got %d body=%s", rr.Code, rr.Body.String())
 	}
-	if deletedSession != "s1" {
-		t.Errorf("deleted session callback = %q, want s1", deletedSession)
+	if !slices.Equal(deletedSessions, []string{"s1"}) {
+		t.Errorf("deleted sessions callback = %q, want [s1]", deletedSessions)
 	}
 }
 

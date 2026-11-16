@@ -506,6 +506,7 @@ func (s contextProbeSummarizer) Summarize(ctx context.Context, _ string, transcr
 }
 
 type componentStatusEvent struct {
+	sessionID string
 	component string
 	status    string
 	message   string
@@ -584,9 +585,9 @@ func (h *hubMock) BroadcastSummaryFailed(sessionID, title, summary, preset, reas
 	h.mu.Unlock()
 }
 
-func (h *hubMock) BroadcastComponentStatus(component, status, message string) {
+func (h *hubMock) BroadcastSessionComponentStatus(sessionID, component, status, message string) {
 	h.mu.Lock()
-	h.componentStatuses = append(h.componentStatuses, componentStatusEvent{component: component, status: status, message: message})
+	h.componentStatuses = append(h.componentStatuses, componentStatusEvent{sessionID: sessionID, component: component, status: status, message: message})
 	h.mu.Unlock()
 }
 
@@ -1690,7 +1691,7 @@ func TestManager_GenerateSummary_BroadcastsSyncConnectedOnSuccess(t *testing.T) 
 		hub.mu.Lock()
 		found := false
 		for _, e := range hub.componentStatuses {
-			if e.component == "sync" && e.status == storage.ComponentStatusConnected {
+			if e.component == "sync" && e.status == storage.ComponentStatusConnected && e.sessionID == "session-sync-connected" {
 				found = true
 				break
 			}

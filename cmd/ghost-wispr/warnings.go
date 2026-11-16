@@ -46,6 +46,17 @@ func (r *warningsRegistry) ReplacePrefix(prefix string, entries map[string]strin
 	}
 }
 
+// ClearWhere clears every warning whose key matches.
+func (r *warningsRegistry) ClearWhere(match func(key string) bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key := range r.entries {
+		if match(key) {
+			delete(r.entries, key)
+		}
+	}
+}
+
 // KeysWithPrefix returns a sorted snapshot of keys beginning with prefix.
 func (r *warningsRegistry) KeysWithPrefix(prefix string) []string {
 	r.mu.RLock()

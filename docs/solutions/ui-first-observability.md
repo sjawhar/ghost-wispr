@@ -40,7 +40,7 @@ This means:
 On mount, it fetches from `/healthz/ready` to populate initial state (don't wait for WebSocket events).
 
 ### Error Propagation
-Backend errors are broadcast via WebSocket `component_status` events. The hub has `BroadcastComponentStatus(component, status, message)` which pushes to all connected clients. The UI shows these in the status header AND on individual session cards.
+Backend errors are broadcast via WebSocket `component_status` events. The hub has `BroadcastComponentStatus(component, status, message)` for a status of the whole unit (the microphone, Deepgram) and `BroadcastSessionComponentStatus(sessionID, component, status, message)` for a status about one session (its refinement, summary or sync), which names the session in the event's `session_id` so that deleting the session deletes the stored event. Both push to all connected clients. The UI shows these in the status header AND on individual session cards.
 
 ### Log Viewer
 `LogViewer.svelte` reads from `GET /api/logs?level=error&limit=100`. Logs are captured in-memory by `logging.NewLogSink(1000)` which tees slog output to both stdout and a ring buffer. The UI can filter by level and auto-scrolls.

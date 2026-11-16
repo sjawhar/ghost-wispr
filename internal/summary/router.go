@@ -76,7 +76,9 @@ Reply with ONLY the preset name, nothing else.`, sampled, presetList.String())
 		return chosen, nil
 	}
 
-	slog.Warn("router: falling back to default preset", "reason", "chosen preset not found", "chosen", chosen)
+	// The reply can quote the conversation it was sent: the log keeps its
+	// length, never its text.
+	slog.Warn("router: falling back to default preset", "reason", "reply is no preset name", "reply_chars", len(chosen))
 	return r.fallbackPreset(), nil
 }
 

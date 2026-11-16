@@ -84,9 +84,14 @@ func clockOffset(seconds float64) string {
 }
 
 // apiStatusWarnings is what GET /api/status lists: the registry's warnings
-// and the refused cuts'.
+// and the refused cuts'. It first clears the registry's warnings about a
+// session the store no longer has (forgetWarningsOfGoneSessions): a delete
+// clears them, but work that was running then can set one after.
 func apiStatusWarnings(registry *warningsRegistry, refused *refusedCuts) func() []string {
 	return func() []string {
+		if refused.store != nil {
+			forgetWarningsOfGoneSessions(registry, refused.store)
+		}
 		return append(registry.List(), refused.Warnings()...)
 	}
 }

@@ -5,6 +5,7 @@ import {
   applySegmentDeletion,
   applySummaryUpdate,
   beginSessionDetailRequest,
+  removeSession,
   resetState,
   setDates,
   setSessionDetail,
@@ -12,6 +13,7 @@ import {
   setSessionsForDate,
 } from '../state.svelte'
 import {
+  ComponentStatus,
   RefinementStatus,
   SummaryStatus,
   type SessionDetailResponse,
@@ -275,5 +277,77 @@ describe('deletion state fences', () => {
 
     expect(appState.liveSegmentsSessionId).toBe('s1')
     expect(appState.liveSegments).toEqual([])
+  })
+})
+
+describe('removeSession', () => {
+  it('drops the component statuses about the removed session, and keeps the others', () => {
+    for (const [component, sessionId, message] of [
+      ['refinement', 's1', 'Batch refinement failed for session s1'],
+      ['sync', 's2', 'Google Drive sync failed for session s2'],
+      ['mic', undefined, 'Microphone reconnected'],
+    ] as const) {
+      applyEvent({
+        type: 'component_status',
+        version: 1,
+        timestamp: '2026-11-11T10:00:00Z',
+        component,
+        status: ComponentStatus.Error,
+        message,
+        ...(sessionId ? { session_id: sessionId } : {}),
+      })
+    }
+    expect(Object.keys(appState.componentStatuses).sort()).toEqual(['mic', 'refinement', 'sync'])
+
+    removeSession('s1')
+
+    expect(Object.keys(appState.componentStatuses).sort()).toEqual(['mic', 'sync'])
+  })
+})
+
+describe('a deleted session', () => {
+  const status = (component: 'refinement' | 'sync' | 'summary', sessionId: string) =>
+    applyEvent({
+      type: 'component_status',
+      version: 1,
+      timestamp: '2026-11-11T10:00:00Z',
+      component,
+      status: ComponentStatus.Error,
+      message: `${component} failed for session ${sessionId}`,
+      session_id: sessionId,
+    })
+
+  it('never shows a status of a removed session again', () => {
+    removeSession('s1')
+    status('refinement', 's1')
+    status('sync', 's2')
+
+    expect(Object.keys(appState.componentStatuses).sort()).toEqual(['sync'])
+  })
+
+  it('is dropped from every tab, with the sessions merged into it, when the server says so', () => {
+    const merged = makeSession('m')
+    const kept = makeSession('k')
+    setSessionsForDate('2026-11-11', [merged, kept])
+    setSessionDetail({ session: merged, segments: [] })
+    status('refinement', 'm')
+    status('sync', 'a')
+    status('summary', 'k')
+
+    applyEvent({
+      type: 'session_deleted',
+      version: 1,
+      timestamp: '2026-11-11T10:01:00Z',
+      session_id: 'm',
+      source_session_ids: ['a', 'b'],
+    } as never)
+
+    expect(appState.sessionsByDate.get('2026-11-11')?.map((s) => s.id)).toEqual(['k'])
+    expect(appState.sessionDetails.has('m')).toBe(false)
+    expect(Object.keys(appState.componentStatuses).sort()).toEqual(['summary'])
+
+    status('sync', 'b')
+    status('refinement', 'm')
+    expect(Object.keys(appState.componentStatuses).sort()).toEqual(['summary'])
   })
 })

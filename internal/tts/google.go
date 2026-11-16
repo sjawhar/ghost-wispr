@@ -161,7 +161,7 @@ func (p *GoogleProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 
 	url := fmt.Sprintf("%s/v1/text:synthesize", p.baseURL)
 
-	respBody, err := p.doWithRetry(ctx, url, bodyJSON)
+	respBody, err := p.doWithRetry(ctx, url, bodyJSON, req.Text)
 	if err != nil {
 		return nil, err
 	}
@@ -191,8 +191,9 @@ func (p *GoogleProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 	}, nil
 }
 
-// doWithRetry executes the HTTP request, retrying once on 429.
-func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON []byte) ([]byte, error) {
+// doWithRetry executes the HTTP request, retrying once on 429. text is what
+// it asks to speak, which an error leaves out (providerMessage).
+func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON []byte, text string) ([]byte, error) {
 	const maxAttempts = 2
 
 	for attempt := range maxAttempts {
@@ -228,7 +229,7 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 		}
 
 		// Successful response or non-retryable error
-		result, err := p.processResponse(resp)
+		result, err := p.processResponse(resp, text)
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, err
@@ -240,7 +241,7 @@ func (p *GoogleProvider) doWithRetry(ctx context.Context, url string, bodyJSON [
 	return nil, fmt.Errorf("google tts: exhausted retries")
 }
 
-func (p *GoogleProvider) processResponse(resp *http.Response) ([]byte, error) {
+func (p *GoogleProvider) processResponse(resp *http.Response, text string) ([]byte, error) {
 	respBodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("google tts: read response body: %w", err)
@@ -249,9 +250,9 @@ func (p *GoogleProvider) processResponse(resp *http.Response) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		var apiErr googleTTSErrorResponse
 		if json.Unmarshal(respBodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
-			return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, apiErr.Error.Message)
+			return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, providerMessage(apiErr.Error.Message, text))
 		}
-		return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, string(respBodyBytes))
+		return nil, fmt.Errorf("google tts: api error (status %d): %s", resp.StatusCode, providerMessage(string(respBodyBytes), text))
 	}
 
 	return respBodyBytes, nil

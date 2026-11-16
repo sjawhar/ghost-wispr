@@ -22,10 +22,6 @@ func segmentDeletionWarningKey(prefix, sessionID, recording string) string {
 	return prefix + sessionID + "\x00" + recording
 }
 
-func pendingSpliceWarningText(recoveryErr error) string {
-	return fmt.Sprintf("A segment deletion needs audio recovery: %v", recoveryErr)
-}
-
 func setPendingSpliceWarning(registry *warningsRegistry, sessionID, recording string, recoveryErr error) {
 	registry.Set(segmentDeletionWarningKey(pendingSpliceWarningKeyPrefix, sessionID, recording),
 		fmt.Sprintf("A segment deletion for session %s needs audio recovery: %v", sessionID, recoveryErr))
@@ -94,10 +90,17 @@ func retryRefinementWithWarningClear(ctx context.Context, registry *warningsRegi
 	return nil
 }
 
-func recordPendingSpliceCleanupWarning(registry *warningsRegistry, recoveryErr error) {
-	registry.Set(pendingSpliceCleanupWarningKey, pendingSpliceWarningText(recoveryErr))
+// recordPendingSpliceCleanupWarning and recordPendingSpliceRecoveryWarning
+// put on GET /api/status that a start-up step of segment deletions failed,
+// and log why (err). They are warnings of the whole unit, which no delete
+// clears, and err can name a recording, which is named for its session: the
+// warning says which step failed, and only the log line holds err.
+func recordPendingSpliceCleanupWarning(registry *warningsRegistry, err error) {
+	log.Printf("warning: failed to clean leftover splice copies: %v", err)
+	registry.Set(pendingSpliceCleanupWarningKey, "Leftover copies of a segment deletion's recording could not be cleaned up at startup; the app's log says why.")
 }
 
-func recordPendingSpliceRecoveryWarning(registry *warningsRegistry, recoveryErr error) {
-	registry.Set(pendingSpliceRecoveryWarningKey, pendingSpliceWarningText(recoveryErr))
+func recordPendingSpliceRecoveryWarning(registry *warningsRegistry, err error) {
+	log.Printf("warning: failed to recover pending segment splices: %v", err)
+	registry.Set(pendingSpliceRecoveryWarningKey, "A segment deletion's audio recovery failed at startup; the app's log says why.")
 }

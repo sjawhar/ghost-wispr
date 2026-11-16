@@ -217,7 +217,11 @@ func runGCPass(store gcStore, cfg *config.Config, drive sessionSyncer, health *g
 		}
 	}
 	clearStaleRecordingMismatchWarnings(store, warnings, logger)
-	collector := gc.New(store, gcConfig, logger)
+	var collectorStore gc.Store = store
+	if warnings != nil {
+		collectorStore = forgettingGCStore{Store: store, warnings: warnings}
+	}
+	collector := gc.New(collectorStore, gcConfig, logger)
 	deleted, err := collector.Run()
 	if err != nil {
 		return nil, err
@@ -232,4 +236,43 @@ func runGCPass(store gcStore, cfg *config.Config, drive sessionSyncer, health *g
 		}
 	}
 	return deleted, nil
+}
+
+// forgettingGCStore is the store a GC pass deletes through: once the age
+// policy has deleted a session and those merged into it, it clears every
+// warning that names one of them (forgetSessionWarnings).
+type forgettingGCStore struct {
+	gc.Store
+	warnings *warningsRegistry
+}
+
+func (s forgettingGCStore) DeleteEndedSessionAndSources(id, audioPath, audioDir string) ([]string, bool, error) {
+	deletedIDs, deleted, err := s.Store.DeleteEndedSessionAndSources(id, audioPath, audioDir)
+	if err == nil && deleted {
+		forgetSessionWarnings(s.warnings, deletedIDs)
+	}
+	return deletedIDs, deleted, err
+}
+
+// deletionNoticeGCStore is the store the app's GC passes delete through:
+// once the age policy has deleted a session and those merged into it, it
+// tells every connected web client (Hub.BroadcastSessionDeleted), as
+// DELETE /api/sessions/{id} does.
+type deletionNoticeGCStore struct {
+	*storage.SQLiteStore
+	hub *server.Hub
+}
+
+func (s deletionNoticeGCStore) DeleteEndedSessionAndSources(id, audioPath, audioDir string) ([]string, bool, error) {
+	deletedIDs, deleted, err := s.SQLiteStore.DeleteEndedSessionAndSources(id, audioPath, audioDir)
+	if err == nil && deleted && s.hub != nil {
+		sources := make([]string, 0, len(deletedIDs))
+		for _, deletedID := range deletedIDs {
+			if deletedID != id {
+				sources = append(sources, deletedID)
+			}
+		}
+		s.hub.BroadcastSessionDeleted(id, sources)
+	}
+	return deletedIDs, deleted, err
 }

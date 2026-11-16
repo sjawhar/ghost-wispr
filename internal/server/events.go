@@ -62,11 +62,24 @@ type ConnectionEvent struct {
 	Connected bool `json:"connected"`
 }
 
+// ComponentStatusEvent is a component's status. A status about one session
+// (its refinement, summary or sync) names it in SessionID; a status of the
+// whole unit (the microphone, Deepgram) has none.
 type ComponentStatusEvent struct {
 	Event
+	SessionID string `json:"session_id,omitempty"`
 	Component string `json:"component"`
 	Status    string `json:"status"`
 	Message   string `json:"message"`
+}
+
+// SessionDeletedEvent tells a web client that a session was deleted, with
+// the sessions merged into it, so it drops them: their ids only. It is never
+// stored.
+type SessionDeletedEvent struct {
+	Event
+	SessionID        string   `json:"session_id"`
+	SourceSessionIDs []string `json:"source_session_ids"`
 }
 
 func newEvent(eventType string, now time.Time) Event {

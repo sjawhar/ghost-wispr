@@ -140,7 +140,7 @@ type ControlHooks struct {
 	ActiveSession           func() (string, time.Time)
 	Presets                 func() map[string]config.Preset
 	Resummarize             func(ctx context.Context, sessionID, preset string) error
-	OnSessionDeleted        func(sessionID string)
+	OnSessionDeleted        func(sessionIDs []string) // the deleted session, then those merged into it
 	OnSessionsMerged        func(sessionIDs []string)
 	OnSessionMerged         func(ctx context.Context, sessionID string)
 	EndSession              func(ctx context.Context) error
@@ -193,6 +193,7 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	origins := originPolicy{cfg: cs, logger: moduleLogger}
 	registerWSRoute(mux, hub, moduleLogger)
 	registerAPIRoutes(mux, store, controls, healthChecker, cs, embeddingClient)
+	registerSessionDeleteRoute(mux, store, controls, hub, configuredAudioDir(cs))
 
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))

@@ -199,9 +199,9 @@ func (p *GeminiProvider) Synthesize(ctx context.Context, req SpeechRequest) (*Sp
 	if httpResp.StatusCode != http.StatusOK {
 		var apiErr geminiTTSErrorResponse
 		if json.Unmarshal(responseBody, &apiErr) == nil && apiErr.Error.Message != "" {
-			return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, apiErr.Error.Message)
+			return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, providerMessage(apiErr.Error.Message, req.Text))
 		}
-		return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, string(responseBody))
+		return nil, fmt.Errorf("gemini tts: api error (status %d): %s", httpResp.StatusCode, providerMessage(string(responseBody), req.Text))
 	}
 
 	var ttsResponse geminiTTSResponse
