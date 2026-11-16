@@ -262,7 +262,7 @@
             {#if session.title}
               <span>{session.title}</span>
               <span class="session-time-sub">{timeRange}</span>
-            {:else if session.summary_status === SummaryStatus.Running || session.summary_status === SummaryStatus.Pending}
+            {:else if session.ended_at && (session.summary_status === SummaryStatus.Running || session.summary_status === SummaryStatus.Pending)}
               <span>Title pending: the summary is still being made</span>
               <span class="session-time-sub">{timeRange}</span>
             {:else}

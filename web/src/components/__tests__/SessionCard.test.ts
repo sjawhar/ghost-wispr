@@ -231,6 +231,23 @@ describe('SessionCard', () => {
     expect(screen.queryByText('Untitled Session')).toBeNull()
   })
 
+  it('shows a recording conversation as recording, not as a summary being made', () => {
+    render({
+      session: { ...baseSession, title: '', summary: '', ended_at: undefined },
+      detail: undefined,
+      expanded: false,
+      presets: {},
+      onToggle: vi.fn(),
+      onLoadDetail: vi.fn(),
+      onResummarize: vi.fn(),
+      onDelete: vi.fn(),
+    })
+
+    expect(screen.getByTestId('recording-dot')).toBeTruthy()
+    expect(screen.getByText('Untitled Session')).toBeTruthy()
+    expect(screen.queryByText('Title pending: the summary is still being made')).toBeNull()
+  })
+
   it('says a session with no saved recording cannot be refined, and offers no retry', () => {
     render({
       session: { ...baseSession, audio_path: '', refinement_status: RefinementStatus.NoAudio },
