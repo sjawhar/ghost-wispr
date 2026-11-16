@@ -513,14 +513,17 @@ The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
 - A6 requires `/api/config` to show Drive sync on, a folder ID, credentials present, and GC
   enabled with no age limit and the 20000 MB audio budget. After the real session ends, it
   requires `summary.ready`, a synced Drive folder, and a keyword-search result for that session.
-- A8 requires `/api/status` to report no warnings, then starts one real session and calls
-  summary, semantic search, speech, and batch refinement. It compares the summary's
-  `summary_model`, semantic-search `model`, speech response headers and status model/voice,
-  and refinement `refinement_model` with the configured roles. A provider that does not report
-  its model produces `not reported by provider` (Vertex AI's embeddings never report one). The
-  spec asks that the unit run the plan's models, so A8 passes that role on the configuration the
-  unit runs, which it checks before any provider call: the deployed YAML names the plan's model
-  and no environment variable overrides it.
+- A8 requires `/api/status` to report no warnings, and the running process's `/api/config`
+  `models` to name the plan's model for every role (live and batch transcription, summaries,
+  embeddings, the voice and its Google settings): a YAML edited after the service started does
+  not change what runs. It also requires the deployed YAML to name them and no environment
+  variable to override them, which is what the next start runs. It then starts one real session
+  and calls summary, semantic search, speech, and batch refinement, and compares the summary's
+  `summary_model`, semantic-search `model`, speech response headers and status model/voice, and
+  refinement `refinement_model` with the configured roles. A provider that does not report its
+  model produces `not reported by provider` (Vertex AI's embeddings never report one). The spec
+  asks that the unit run the plan's models, so A8 passes that role on the model the running
+  process reports for it.
 - A10 checks the member list: the only organizers are the service account and Sami, and the
   approved readers group is the only reader.
 
@@ -600,5 +603,10 @@ row and for the run.
   exports the new `transcript.md` and `summary.md`, and downloads and transcribes the new
   recording. Each old file id must answer 404 to `files.get` and `revisions.list`, and each new
   file must hold one revision. It also checks that "orange tractor ninety" stays gone.
-- The database check finds the phrase where SQLite keeps it as text. The search index keeps
-  its words in a compressed form that `grep` cannot read; the UI search check covers the index.
+- The database check looks for each word of a phrase on its own ("orange" and "tractor",
+  "purple" and "elephant"; the number is left out, because live transcription may write it as
+  digits). SQLite's search index stores each word as its own term, in sorted order, so it never
+  holds a phrase as adjacent words. On an index page the first term is whole and each later
+  term is stored as the part that differs from the term before it, so a word that shares its
+  first letters with its neighbour can still escape `grep`: a delete rebuilds the index, and the
+  UI search check covers it.

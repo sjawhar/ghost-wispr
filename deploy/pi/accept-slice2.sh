@@ -199,8 +199,36 @@ assert_expected_config() {
   done
 }
 
-assert_running_summarization_model() {
-  jq -e --arg model "$summarization_model" '.summarization.model == $model' >/dev/null <<<"$1"
+# The model, provider or Google setting of each role that /api/config reports under "models", as
+# the running process resolved its configuration, and the value the plan names.
+expected_running_models=(
+  "live_transcription=$batch_refinement_model"
+  'batch_transcription_provider=deepgram'
+  "batch_transcription=$batch_refinement_model"
+  "summarization=$summarization_model"
+  "embedding=gemini/$embedding_model"
+  'genai_backend=vertex'
+  'gcp_project=theorem-agent-infra'
+  'gcp_location=global'
+  'tts_provider=gemini'
+  "tts=$tts_model"
+  "tts_voice=$tts_voice"
+)
+
+# assert_running_models CONFIG: the running process (its /api/config response, CONFIG) runs the
+# plan's model for every role. The deployed YAML says what the next start runs; a YAML edited
+# after the service started does not change what runs now.
+assert_running_models() {
+  local config=$1 entry role want got
+  for entry in "${expected_running_models[@]}"; do
+    role=${entry%%=*}
+    want=${entry#*=}
+    got=$(jq -r --arg role "$role" '.models[$role] // ""' <<<"$config" 2>/dev/null)
+    if [[ "$got" != "$want" ]]; then
+      printf 'the running process reports %s %q, want %q\n' "$role" "$got" "$want" >&2
+      return 1
+    fi
+  done
 }
 
 assert_no_config_overrides() {
@@ -224,13 +252,13 @@ assert_embedding_location() {
 # assert_provider_model ROLE ACTUAL EXPECTED: the model the provider reported for ROLE is the
 # plan's (EXPECTED). The spec's A8 asks that the unit run the plan's models, and the plan reads
 # each one "from the provider's response or the app's log". A provider that reports none (Vertex
-# AI's embeddings never do) answers "not reported by provider"; that passes on the configuration
-# the unit runs, which run_a8 checks before any provider call: the deployed YAML names the
-# plan's model for every role and no environment variable overrides it.
+# AI's embeddings never do) answers "not reported by provider"; that passes on the model the
+# running process reports for the role, which run_a8 checks before any provider call
+# (assert_running_models).
 assert_provider_model() {
   local role=$1 actual=$2 expected=$3
   if [[ "$actual" == "$model_not_reported" ]]; then
-    printf 'A8 RAN: the provider did not report the %s model; the configuration the unit runs names %s.\n' "$role" "$expected"
+    printf 'A8 RAN: the provider did not report the %s model; the running process runs %s.\n' "$role" "$expected"
     return 0
   fi
   if [[ -z "$actual" || "$actual" != "$expected" ]]; then
@@ -636,8 +664,8 @@ run_a8() {
     printf 'A8 FAILED: the Pi configuration does not name the accepted models\n' >&2
     return 1
   }
-  assert_running_summarization_model "$current_config" || {
-    printf 'A8 FAILED: the running summarization model is not the accepted one\n' >&2
+  assert_running_models "$current_config" || {
+    printf 'A8 FAILED: the running process does not run the accepted model for every role\n' >&2
     return 1
   }
   environment_names=$(service_environment_names) || {
@@ -855,11 +883,16 @@ EOF
   if assert_expected_config "$swapped_config" 2>/dev/null; then
     fail 'A8 self-test accepted swapped batch and summarization models'
   fi
-  if assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-2.5-flash"}}'; then
-    fail 'A8 self-test accepted a running summarization model that differs from the YAML'
-  fi
-  assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-4-carbon"}}' \
-    || fail 'A8 self-test rejected the running summarization model'
+  local good_running_config
+  good_running_config='{"summarization":{"model":"gemini/gemini-4-carbon"},"models":{"live_transcription":"nova-3","batch_transcription_provider":"deepgram","batch_transcription":"nova-3","summarization":"gemini/gemini-4-carbon","embedding":"gemini/gemini-embedding-2","genai_backend":"vertex","gcp_project":"theorem-agent-infra","gcp_location":"global","tts_provider":"gemini","tts":"gemini-3.8-flash-tts","tts_voice":"Kore"}}'
+  assert_running_models "$good_running_config" || fail 'A8 self-test rejected the running models of the plan'
+  for drift in '.models.summarization = "gemini/gemini-2.5-flash"' '.models.embedding = "gemini/gemini-embedding-001"' \
+    '.models.live_transcription = "nova-2"' '.models.batch_transcription = "whisper-1"' '.models.tts_voice = "Charon"' \
+    '.models.gcp_location = "us-central1"' 'del(.models.tts)' 'del(.models)'; do
+    if assert_running_models "$(jq -c "$drift" <<<"$good_running_config")" 2>/dev/null; then
+      fail "A8 self-test accepted a running process with $drift"
+    fi
+  done
   if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_TTS_VOICE' 2>/dev/null; then
     fail 'A8 self-test accepted an environment override of the TTS voice'
   fi
@@ -945,7 +978,7 @@ EOF
   local summary_reported=$summary_provider_model refinement_reported=$batch_refinement_model
   local search_reported=$embedding_model speech_reported=$tts_model
   status() { printf '%s\n' '{"warnings":[]}'; }
-  running_config() { printf '%s\n' '{"summarization":{"model":"gemini/gemini-4-carbon"}}'; }
+  running_config() { printf '%s\n' "$good_running_config"; }
   remote_run() { printf '%s\n' "$good_config"; }
   service_environment_names() { printf '%s\n' $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION'; }
   service_embedding_location() { printf '%s\n' 'GHOST_WISPR_EMBEDDING_LOCATION=global'; }
@@ -1007,6 +1040,13 @@ EOF
     fail 'A8 self-test accepted an unreported search model when the configuration names another'
   fi
   remote_run() { printf '%s\n' "$good_config"; }
+  rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
+  running_config() { jq -c '.models.embedding = "gemini/gemini-embedding-001"' <<<"$good_running_config"; }
+  if run_a8 >/dev/null 2>&1; then
+    fail 'A8 self-test accepted a running process whose embedding model is not the plan'"'"'s while the YAML names it'
+  fi
+  running_config() { printf '%s\n' "$good_running_config"; }
+  printf 'A8 self-test RAN: every role is compared with the model the running process reports\n'
   printf 'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run\n'
 
   if assert_drive_members $'sami@theorem.dev|organizer\nreaders@theorem.dev|reader' readers@theorem.dev 2>/dev/null; then

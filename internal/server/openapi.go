@@ -3,7 +3,8 @@ package server
 import "encoding/json"
 
 // configSchema documents the GC settings of GET and PATCH /api/config (a
-// JSON merge patch has the same shape); the other settings are untyped.
+// JSON merge patch has the same shape) and the read-only models GET reports;
+// the other settings are untyped.
 var configSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
@@ -25,6 +26,12 @@ var configSchema = map[string]any{
 					"description": "Audio budget: past it, GC removes the oldest sessions' audio files and keeps the sessions. 0 means no limit: no audio is removed to free space.",
 				},
 			},
+		},
+		"models": map[string]any{
+			"type":                 "object",
+			"readOnly":             true,
+			"description":          "GET only: the model, provider or Google setting of each role as the running process resolved its configuration, environment overrides included: live_transcription, batch_transcription_provider, batch_transcription, summarization, embedding, genai_backend, gcp_project, gcp_location, tts_provider, tts and tts_voice. A PATCH cannot set it.",
+			"additionalProperties": map[string]any{"type": "string"},
 		},
 	},
 }

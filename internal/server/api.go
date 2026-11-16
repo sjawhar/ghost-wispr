@@ -1695,6 +1695,10 @@ type configResponse struct {
 	GDrive             configGDriveResponse        `json:"gdrive"`
 	GC                 configGCResponse            `json:"gc"`
 	APIKeys            map[string]bool             `json:"api_keys"`
+	// Models is the model, provider or Google setting of each role as the
+	// running process resolved its configuration (environment overrides
+	// included). Read-only.
+	Models map[string]string `json:"models"`
 }
 
 type configSummarizationResponse struct {
@@ -1750,6 +1754,19 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 				"openai":    cfg.OpenAIAPIKey != "",
 				"anthropic": cfg.AnthropicAPIKey != "",
 				"gemini":    cfg.GeminiAPIKey != "",
+			},
+			Models: map[string]string{
+				"live_transcription":           cfg.DeepgramModel,
+				"batch_transcription_provider": cfg.BatchTranscription.Provider,
+				"batch_transcription":          cfg.BatchTranscription.Model,
+				"summarization":                cfg.Summarization.Model,
+				"embedding":                    cfg.EmbeddingModel,
+				"genai_backend":                cfg.GenAIBackend,
+				"gcp_project":                  cfg.GCPProject,
+				"gcp_location":                 cfg.GCPLocation,
+				"tts_provider":                 cfg.TTSProvider,
+				"tts":                          cfg.TTSModel,
+				"tts_voice":                    cfg.TTSVoice,
 			},
 		}
 		if resp.Summarization.Presets == nil {

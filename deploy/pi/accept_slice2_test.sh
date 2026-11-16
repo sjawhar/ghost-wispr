@@ -20,10 +20,11 @@ for row in A9 A6 A8 A10 Cert-warning; do
     || fail "self-test did not prove the $row check can fail"
 done
 # The spec's A8 asks that the unit run the plan's models, and the plan reads each model "from the
-# provider's response or the app's log": a provider that reports none passes on the configuration.
+# provider's response or the app's log": a provider that reports none passes on the model the
+# running process reports for the role.
 for role in summary search speech refinement; do
-  [[ "$output" == *"A8 RAN: the provider did not report the $role model; the configuration the unit runs names "* ]] \
-    || fail "self-test did not pass an unreported $role model on the configured one"
+  [[ "$output" == *"A8 RAN: the provider did not report the $role model; the running process runs "* ]] \
+    || fail "self-test did not pass an unreported $role model on the running one"
 done
 [[ "$output" == *'A6 self-test RAN: canonical transcript supplied the search word'* ]] \
   || fail 'self-test did not prove A6 searches canonical_transcript'
@@ -31,6 +32,8 @@ done
   || fail 'self-test did not prove run_a8 returns PASS when every role reports its model'
 [[ "$output" == *'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run'* ]] \
   || fail 'self-test did not prove run_a8 passes, and runs every role, when no provider reports its model'
+[[ "$output" == *'A8 self-test RAN: every role is compared with the model the running process reports'* ]] \
+  || fail 'self-test did not prove A8 compares every role with the running process'
 
 
 assert_source_contains() {
@@ -59,6 +62,8 @@ fi
 
 assert_source_contains 'assert_provider_model'
 assert_source_contains 'provider model mismatch'
+# shellcheck disable=SC2016 # The needle is the driver's source text.
+assert_source_contains 'assert_running_models "$current_config"'
 
 mutation_dir=$(mktemp -d)
 trap 'rm -rf -- "$mutation_dir"' EXIT
@@ -94,5 +99,14 @@ run_row_output=$(
   || fail "run_row did not report a row that returned 1 as FAIL: $run_row_output"
 [[ "$run_row_output" == *'row_failures=1'* ]] \
   || fail "run_row counted the wrong number of failures: $run_row_output"
+
+# A check of the running models that always passes must fail the self-test.
+source_text=$(<"$driver")
+needle=$'\nassert_running_models() {\n'
+[[ "$source_text" == *"$needle"* ]] || fail 'could not plant the running-models mutation'
+printf '%s' "${source_text/"$needle"/"$needle  return 0"$'\n'}" >"$mutated_driver"
+if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
+  fail 'self-test accepted a running-models check that always passes'
+fi
 
 printf 'slice 2 acceptance test passed\n'
