@@ -22,6 +22,7 @@ for line in \
   'A11 text only self-test RAN: planted failure rejected' \
   'A11 text only self-test RAN: the database scan sees a planted phrase in binary data in the database, its log and its backup' \
   'A11 self-test RAN: the database scan finds each word of a phrase that a search index stores apart from the other, where adjacent words see nothing' \
+  'A11 self-test RAN: other conversations that say "contractor" or "orange" pass the precheck and the check after the delete' \
   'A11 text only self-test RAN: a failed control stops the row before "Delete text"' \
   'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement' \
   'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes' \
@@ -85,7 +86,7 @@ assert_mutation_caught() {
 
 # A checker that always passes must fail the self-test: each one is load-bearing.
 for checker in check_absent check_noted check_ids_unchanged check_ids_replaced check_answers_200 check_answers_404 \
-  check_one_revision check_hashes_unchanged check_same_md5 check_search_absent check_db_scan \
+  check_one_revision check_hashes_unchanged check_same_md5 check_search_absent check_db_scan check_db_words \
   check_mode_required check_doc_holds_summary check_session_settled; do
   needle=$'\n'"$checker() {"$'\n'
   assert_mutation_caught "a $checker that always passes" "$needle" "$needle  return 0"$'\n'
@@ -128,6 +129,16 @@ assert_mutation_caught 'A11 accepting part of the phrase in the Drive documents 
 assert_mutation_caught 'a database scan for adjacent words' \
   'audio) printf '"'"'%s\n'"'"' "${audio_tokens[@]}" ;;' \
   'audio) printf '"'"'%s\n'"'"' "$audio_pair" ;;'
+
+# Other conversations on the unit hold common words. A word must match only where it starts a word
+# ("contractor" is not "tractor"), and a word another conversation held before this one was
+# recorded must not be counted on its own.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'a word that matches inside another word' \
+  'printf '"'"'%s.%s=(^|[^[:alpha:]])%s\n'"'"' "$name" "$token" "$token"' \
+  'printf '"'"'%s.%s=%s\n'"'"' "$name" "$token" "$token"'
+assert_mutation_caught 'counting a word another conversation holds' \
+  'END { exit !(seen && !held) }' 'END { exit 0 }'
 
 # The Drive token and the Deepgram key stay out of curl's arguments, and the Drive token is read-only.
 # shellcheck disable=SC2016 # The needles are the driver's source text.

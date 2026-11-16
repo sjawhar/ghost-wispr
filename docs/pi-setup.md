@@ -562,8 +562,11 @@ One run records one conversation for both rows:
    `text_and_audio`. A build without the modes would read `mode=text` as "Delete text and
    audio", so the driver stops here, before it records anything.
 2. The precheck requires that no conversation and no file in the database's directory already
-   holds "orange tractor ninety" or "purple elephant seventeen". If one does, delete that
-   conversation from the unit and run again.
+   holds "orange tractor ninety" or "purple elephant seventeen" as adjacent words. If one does,
+   delete that conversation from the unit and run again. It also notes which of "orange" and
+   "tractor" no file holds yet: only those are counted on their own after "Delete text" (see the
+   database check below), so another conversation that says "orange juice" neither stops the run
+   nor fails it.
 3. The driver starts a conversation and prints its script (`Setup NEEDS-PERSON`). Two people
    read it: "purple elephant seventeen", the topic, and "orange tractor ninety" are each said
    alone in their own turn, and the control phrase "blue harbor lantern" in another. Press Enter
@@ -603,10 +606,17 @@ row and for the run.
   exports the new `transcript.md` and `summary.md`, and downloads and transcribes the new
   recording. Each old file id must answer 404 to `files.get` and `revisions.list`, and each new
   file must hold one revision. It also checks that "orange tractor ninety" stays gone.
-- The database check looks for each word of a phrase on its own ("orange" and "tractor",
-  "purple" and "elephant"; the number is left out, because live transcription may write it as
-  digits). SQLite's search index stores each word as its own term, in sorted order, so it never
-  holds a phrase as adjacent words. On an index page the first term is whole and each later
-  term is stored as the part that differs from the term before it, so a word that shares its
-  first letters with its neighbour can still escape `grep`: a delete rebuilds the index, and the
-  UI search check covers it.
+- The database check counts each phrase twice in every file: as adjacent words, as a
+  conversation's rows hold it, and each distinctive word on its own ("orange" and "tractor";
+  the number is left out, because live transcription may write it as digits), as SQLite's search
+  index holds it: each word as its own term, in sorted order, never next to its neighbour. A
+  word matches only where a word starts, so "contractor" is not "tractor". Only the words the
+  precheck found in no file are counted on their own, because `grep` cannot tell which
+  conversation a word in a binary file belongs to; with `--session` the precheck does not run,
+  and no word is. On an index page each term after the first is stored as the part that differs
+  from the term before it, so a word that shares its first letters with its neighbour can still
+  escape `grep`. The UI search cannot see what is left in the index either: it joins the live
+  rows, and a deleted row has none. So an A11 PASS does not show that the index is clean. What
+  shows it is the delete's rebuild of the index and its Go tests
+  (`internal/storage/search_index_erase_test.go`), which read the database, its log and the
+  backup for a one-word secret.

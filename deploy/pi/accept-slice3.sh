@@ -71,6 +71,9 @@ reason=
 round_lines=()
 round_failed=0
 round_unknown=0
+# The words of the "Delete text" phrase the database check counts on their own (precheck); none
+# when the precheck did not run (--session).
+text_only_db_words=()
 
 round_reset() {
   round_lines=()
@@ -602,20 +605,14 @@ check_search_empty() {
 }
 
 # check_db_scan REPORT MODE NAME [CONTROL]: read a database scan from the Pi (db_scan in
-# remote_script), which counts each word of NAME's phrase (scan_tokens) on its own, because the
-# search index stores the words apart. MODE present (a control before a delete) needs every word
-# in the database or its write-ahead log, and in the pre-migration backup. MODE absent needs no
-# word in any file, and CONTROL in the database or its log and in the backup, which shows that the
-# same reads see conversation text.
+# remote_script) for one pattern, NAME: a phrase's adjacent words, as a conversation's rows hold
+# it, or one word (NAME.WORD, check_db_words). MODE present (a control before a delete) needs NAME
+# in the database or its write-ahead log, and in the pre-migration backup. MODE absent needs NAME
+# in no file, and CONTROL in the database or its log and in the backup, which shows that the same
+# reads see conversation text.
 check_db_scan() {
-  local report=$1 mode=$2 name=$3 control=${4:-} kind role pattern count path token
-  local roles=' ' files=0 name_counts=0 live_control=0 backup_control=0 holders='' missing=''
-  local -a tokens
-  mapfile -t tokens < <(scan_tokens "$name")
-  if (( ${#tokens[@]} == 0 )); then
-    reason="the scan has no words for $name"
-    return 2
-  fi
+  local report=$1 mode=$2 name=$3 control=${4:-} kind role pattern count path
+  local roles=' ' files=0 name_counts=0 live=0 backup=0 live_control=0 backup_control=0 holders=''
   if blank "$report"; then
     reason='the database scan returned nothing'
     return 2
@@ -635,11 +632,15 @@ check_db_scan() {
           reason="grep could not read $path"
           return 2
         fi
-        if [[ "$pattern" == "$name".* ]]; then
+        if [[ "$pattern" == "$name" ]]; then
           name_counts=$((name_counts + 1))
           if (( count > 0 )); then
-            holders+="$role $path (\"${pattern#"$name".}\", $count lines); "
+            holders+="$role $path ($count lines); "
           fi
+          case "$role" in
+            db|wal) live=$((live + count)) ;;
+            backup) backup=$((backup + count)) ;;
+          esac
         elif [[ -n "$control" && "$pattern" == "$control" ]]; then
           case "$role" in
             db|wal) live_control=$((live_control + count)) ;;
@@ -655,45 +656,67 @@ check_db_scan() {
       return 2
     fi
   done
-  if (( name_counts != files * ${#tokens[@]} )); then
-    reason="the scan read $name_counts of $((files * ${#tokens[@]})) word counts"
+  if (( name_counts != files )); then
+    reason="the scan read $name_counts of $files files"
     return 2
   fi
   if [[ "$mode" == present ]]; then
-    for token in "${tokens[@]}"; do
-      if (( $(scan_count "$report" "$name.$token" db wal) == 0 )); then
-        missing+="\"$token\" is in neither the database nor its write-ahead log; "
-      fi
-      if (( $(scan_count "$report" "$name.$token" backup) == 0 )); then
-        missing+="\"$token\" is not in the pre-migration backup; "
-      fi
-    done
-    if [[ -z "$missing" ]]; then
-      reason="every word of the phrase is in $holders"
+    if (( live > 0 && backup > 0 )); then
+      reason="the phrase is in $holders"
       return 0
     fi
-    reason=$missing
+    if (( live == 0 )); then
+      reason='the phrase is in neither the database nor its write-ahead log'
+    else
+      reason='the phrase is not in the pre-migration backup'
+    fi
     return 1
   fi
   if [[ -n "$holders" ]]; then
-    reason="a word of the phrase is still in $holders"
+    reason="the phrase is still in $holders"
     return 1
   fi
   if [[ -n "$control" ]] && (( live_control == 0 || backup_control == 0 )); then
     reason="the control phrase is not in both the database (or its log) and the backup, so the scan may be blind"
     return 2
   fi
-  reason="no file of the $files in the database directory holds a word of the phrase"
+  reason="no file of the $files in the database directory holds the phrase"
   return 0
 }
 
-# scan_count REPORT PATTERN ROLE...: the lines of the files with one of ROLE that a database scan
-# counted for PATTERN.
-scan_count() {
-  local report=$1 pattern=$2
-  shift 2
-  awk -F '\t' -v pattern="$pattern" -v roles=" $* " \
-    '$1 == "count" && $3 == pattern && index(roles, " " $2 " ") { sum += $4 } END { print sum + 0 }' <<<"$report"
+# check_db_words REPORT MODE NAME [WORD...]: check_db_scan for each WORD of NAME's phrase on its
+# own. SQLite's search index keeps each word as its own term, apart from its neighbours, so the
+# adjacent-word check cannot see a phrase left there. The words are the ones no other conversation
+# held before this one was recorded (attributable_words); with none, there is nothing to count.
+check_db_words() {
+  local report=$1 mode=$2 name=$3 word status result=0 reasons=''
+  shift 3
+  if (( $# == 0 )); then
+    reason='no word of the phrase is counted on its own: the precheck did not run, or another conversation holds each word'
+    return 0
+  fi
+  for word in "$@"; do
+    check_db_scan "$report" "$mode" "$name.$word"
+    status=$?
+    reasons+="\"$word\": $reason; "
+    result=$(worse "$result" "$status")
+  done
+  reason=$reasons
+  return "$result"
+}
+
+# attributable_words REPORT NAME: the words of NAME's phrase (scan_tokens) that no file of a
+# database scan (REPORT) holds, one per line. Read before the conversation is recorded, these are
+# the words a later scan can attribute to it; a word another conversation holds is left out.
+attributable_words() {
+  local report=$1 name=$2 word
+  while IFS= read -r word; do
+    if awk -F '\t' -v pattern="$name.$word" \
+      '$1 == "count" && $3 == pattern { seen = 1; if ($4 !~ /^[0-9]+$/ || $4 > 0) held = 1 }
+       END { exit !(seen && !held) }' <<<"$report"; then
+      printf '%s\n' "$word"
+    fi
+  done < <(scan_tokens "$name")
 }
 
 backup_mtime() {
@@ -907,6 +930,8 @@ evaluate_text_only_before() {
   check "UI search for \"$text_only_query\"" check_search_finds "$phrase_search" "$acceptance_session_id"
   check "UI search for \"$control_query\"" check_search_finds "$control_search" "$acceptance_session_id"
   check 'database files and pre-migration backup' check_db_scan "$(result "$dir" db.report)" present text_only
+  check 'database files and pre-migration backup, each word on its own' \
+    check_db_words "$(result "$dir" db.report)" present text_only "${text_only_db_words[@]}"
   listing=$(result "$dir" folder.list.body)
   check 'Drive folder' check_listing "$(response_code "$dir" folder.list code)" "$listing"
   while IFS=$'\t' read -r name id; do
@@ -937,6 +962,8 @@ evaluate_text_only_after() {
   check "UI search for \"$text_only_query\"" check_search_absent "$phrase_search" "$acceptance_session_id"
   check "UI search for \"$control_query\" (control)" check_search_finds "$control_search" "$acceptance_session_id"
   check 'database files and pre-migration backup' check_db_scan "$(result "$dir" db.report)" absent text_only control
+  check 'database files and pre-migration backup, each word on its own' \
+    check_db_words "$(result "$dir" db.report)" absent text_only "${text_only_db_words[@]}"
   check 'recording path' check_same_text "$text_only_audio_path_before" "$(session_field "$detail" audio_path)"
   check 'recording sha256 on the unit' check_hashes_unchanged "$text_only_hashes_before" "$(recording_hashes "$dir" "$detail")"
   listing=$(result "$dir" folder.list.body)
@@ -1055,13 +1082,17 @@ scan_tokens() {
   esac
 }
 
-# scan_patterns: the patterns db_scan counts, one line each, NAME=PATTERN. A phrase's words are
-# NAME.WORD; the control phrase, which the rows still hold as text, is one pattern.
+# scan_patterns: the patterns db_scan counts, one line each, NAME=PATTERN. Each phrase is counted
+# twice: as adjacent words (NAME), as a conversation's rows hold it, and each of its words on its
+# own (NAME.WORD), as the search index holds it. A word matches only where it starts a word, so
+# "contractor" is not "tractor". The control phrase, which the rows still hold as text, is one
+# pattern.
 scan_patterns() {
   local name token
+  printf 'text_only=%s\naudio=%s\n' "$text_only_pair" "$audio_pair"
   for name in text_only audio; do
     while IFS= read -r token; do
-      printf '%s.%s=%s\n' "$name" "$token" "$token"
+      printf '%s.%s=(^|[^[:alpha:]])%s\n' "$name" "$token" "$token"
     done < <(scan_tokens "$name")
   done
   printf 'control=%s\n' "$control_pair"
@@ -1620,7 +1651,9 @@ EOF
 }
 
 # precheck: before the conversation, no copy of either phrase is on the unit, so whatever the
-# checks find is this conversation's.
+# checks find is this conversation's. It also reads which words of the "Delete text" phrase no
+# file holds yet (text_only_db_words): only those can be counted on their own later, because a
+# word another conversation says would read as this one's.
 precheck() {
   local dir
   round_reset
@@ -1633,11 +1666,26 @@ precheck() {
     check_db_scan "$(result "$dir" db.report)" absent audio
   check "UI search for \"$text_only_query\" before the conversation" check_search_empty "$(search_ui "$text_only_query")"
   check "UI search for \"$audio_query\" before the conversation" check_search_empty "$(search_ui "$audio_query")"
+  mapfile -t text_only_db_words < <(attributable_words "$(result "$dir" db.report)" text_only)
+  check "words of \"$text_only_phrase\" the database check counts on their own" note_db_words text_only "${text_only_db_words[@]}"
   print_round Precheck
   if ! round_result; then
     conversation_problem='a copy of a phrase is already on the unit, so the checks could not tell it from this conversation; delete that conversation from the unit, then run again'
     return 2
   fi
+}
+
+# note_db_words NAME [WORD...]: a note, always PASS, of the words of NAME's phrase that the
+# database check counts on their own, and of those it leaves out because another conversation
+# holds them.
+note_db_words() {
+  local name=$1 word left_out=''
+  shift
+  while IFS= read -r word; do
+    [[ " $* " == *" $word "* ]] || left_out+="\"$word\" "
+  done < <(scan_tokens "$name")
+  reason="counted on their own: ${*:-none}; left out, because another conversation holds them: ${left_out:-none}"
+  return 0
 }
 
 record_conversation() {
@@ -1989,37 +2037,52 @@ run_self_test() (
   report=$(printf '%s\n' \
     $'db\t/u/data/ghost-wispr.db' \
     $'file\tdb\t4096\t100\t/u/data/ghost-wispr.db' \
+    $'count\tdb\ttext_only\t0\t/u/data/ghost-wispr.db' \
     $'count\tdb\ttext_only.orange\t0\t/u/data/ghost-wispr.db' \
     $'count\tdb\ttext_only.tractor\t0\t/u/data/ghost-wispr.db' \
     $'count\tdb\tcontrol\t2\t/u/data/ghost-wispr.db' \
     $'file\twal\t4096\t100\t/u/data/ghost-wispr.db-wal' \
+    $'count\twal\ttext_only\t0\t/u/data/ghost-wispr.db-wal' \
     $'count\twal\ttext_only.orange\t0\t/u/data/ghost-wispr.db-wal' \
     $'count\twal\ttext_only.tractor\t0\t/u/data/ghost-wispr.db-wal' \
     $'count\twal\tcontrol\t0\t/u/data/ghost-wispr.db-wal' \
     $'file\tbackup\t4096\t90\t/u/data/ghost-wispr.db.pre-migrate.bak' \
+    $'count\tbackup\ttext_only\t0\t/u/data/ghost-wispr.db.pre-migrate.bak' \
     $'count\tbackup\ttext_only.orange\t0\t/u/data/ghost-wispr.db.pre-migrate.bak' \
     $'count\tbackup\ttext_only.tractor\t0\t/u/data/ghost-wispr.db.pre-migrate.bak' \
     $'count\tbackup\tcontrol\t1\t/u/data/ghost-wispr.db.pre-migrate.bak')
   expect 0 'a clean database scan with the control phrase passes' check_db_scan "$report" absent text_only control
   expect 1 'a log that still holds the phrase fails' check_db_scan \
-    "${report/$'wal\ttext_only.tractor\t0'/$'wal\ttext_only.tractor\t3'}" absent text_only control
+    "${report/$'wal\ttext_only\t0'/$'wal\ttext_only\t3'}" absent text_only control
   expect 1 'a backup that still holds the phrase fails' check_db_scan \
-    "${report/$'backup\ttext_only.orange\t0'/$'backup\ttext_only.orange\t1'}" absent text_only control
+    "${report/$'backup\ttext_only\t0'/$'backup\ttext_only\t1'}" absent text_only control
   expect 2 'a backup without the control phrase is UNKNOWN' check_db_scan \
     "${report/$'backup\tcontrol\t1'/$'backup\tcontrol\t0'}" absent text_only control
   expect 2 'a scan without the backup is UNKNOWN' check_db_scan \
     "$(grep -v 'pre-migrate' <<<"$report")" absent text_only control
   expect 2 'a scan grep could not read is UNKNOWN' check_db_scan \
-    "${report/$'wal\ttext_only.orange\t0'/$'wal\ttext_only.orange\terror'}" absent text_only control
-  expect 2 'a scan that did not count one of the words is UNKNOWN' check_db_scan \
-    "$(grep -v $'backup\ttext_only.tractor' <<<"$report")" absent text_only control
+    "${report/$'wal\ttext_only\t0'/$'wal\ttext_only\terror'}" absent text_only control
   expect 2 'a failed scan is UNKNOWN' check_db_scan $'error\tghost-wispr.service has no running process' absent text_only control
   expect 2 'an empty scan is UNKNOWN' check_db_scan '' absent text_only control
   expect 1 'a scan before the delete without the phrase fails the control' check_db_scan "$report" present text_only
-  expect 0 'a scan before the delete with every word in the log and the backup passes the control' check_db_scan \
-    "$(sed $'s/wal\ttext_only\\.\\([a-z]*\\)\t0/wal\ttext_only.\\1\t2/; s/backup\ttext_only\\.\\([a-z]*\\)\t0/backup\ttext_only.\\1\t1/' <<<"$report")" present text_only
-  expect 1 'a scan before the delete with one word missing from the backup fails the control' check_db_scan \
-    "$(sed $'s/wal\ttext_only\\.\\([a-z]*\\)\t0/wal\ttext_only.\\1\t2/; s/backup\ttext_only\\.orange\t0/backup\ttext_only.orange\t1/' <<<"$report")" present text_only
+  expect 0 'a scan before the delete with the phrase in the log and the backup passes the control' check_db_scan \
+    "$(sed $'s/wal\ttext_only\t0/wal\ttext_only\t2/; s/backup\ttext_only\t0/backup\ttext_only\t1/' <<<"$report")" present text_only
+  # Each word on its own, for the words the precheck found nowhere.
+  expect 0 'no word left on its own passes' check_db_words "$report" absent text_only orange tractor
+  expect 1 'a word left on its own in the log fails' check_db_words \
+    "${report/$'wal\ttext_only.tractor\t0'/$'wal\ttext_only.tractor\t3'}" absent text_only orange tractor
+  expect 1 'a word left on its own in the backup fails' check_db_words \
+    "${report/$'backup\ttext_only.orange\t0'/$'backup\ttext_only.orange\t1'}" absent text_only orange tractor
+  expect 2 'a scan that did not count one of the words is UNKNOWN' check_db_words \
+    "$(grep -v $'backup\ttext_only.tractor' <<<"$report")" absent text_only orange tractor
+  expect 0 'every word in the log and the backup before the delete passes the control' check_db_words \
+    "$(sed $'s/wal\ttext_only\\.\\([a-z]*\\)\t0/wal\ttext_only.\\1\t2/; s/backup\ttext_only\\.\\([a-z]*\\)\t0/backup\ttext_only.\\1\t1/' <<<"$report")" present text_only orange tractor
+  expect 1 'a word missing from the backup before the delete fails the control' check_db_words \
+    "$(sed $'s/wal\ttext_only\\.\\([a-z]*\\)\t0/wal\ttext_only.\\1\t2/; s/backup\ttext_only\\.orange\t0/backup\ttext_only.orange\t1/' <<<"$report")" present text_only orange tractor
+  [[ "$(attributable_words "$report" text_only | tr '\n' ' ')" == 'orange tractor ' ]] \
+    || fail 'self-test: a precheck that found no word did not count both words on their own'
+  [[ -z "$(attributable_words "${report/$'backup\ttext_only.orange\t0'/$'backup\ttext_only.orange\terror'}" text_only | grep -Fx orange)" ]] \
+    || fail 'self-test: a word the precheck could not read was counted on its own'
   expect 0 'a newer backup after the restart passes' check_backup_retaken "$report" \
     "${report/$'backup\t4096\t90'/$'backup\t4096\t200'}"
   expect 2 'a backup the restart did not rewrite is UNKNOWN' check_backup_retaken "$report" "$report"
@@ -2071,6 +2134,7 @@ run_self_test() (
 
   # The whole text only evaluation after "Delete text", on planted evidence from the Pi.
   text_only_ids_before=$(drive_file_ids "$listing")
+  text_only_db_words=(orange tractor)
   text_only_hashes_before="$sha_before data/audio/rec.mp3"
   text_only_audio_path_before=data/audio/rec.mp3
   dir="$controls_dir/text-only-after"
@@ -2106,8 +2170,13 @@ $(session_field "$detail" summary)"
   expect 1 'a recording whose sha256 changed fails' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
   plant_variant file.S1.get.code 404
   expect 1 'a Drive file id answering 404 fails' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
-  plant_variant db.report "${report/$'backup\ttext_only.tractor\t0'/$'backup\ttext_only.tractor\t1'}"
+  plant_variant db.report "${report/$'backup\ttext_only\t0'/$'backup\ttext_only\t1'}"
   expect 1 'a pre-migration backup that still holds the phrase fails' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
+  plant_variant db.report "${report/$'backup\ttext_only.tractor\t0'/$'backup\ttext_only.tractor\t1'}"
+  text_only_db_words=(orange)
+  expect 0 'a word the precheck did not count on its own does not fail' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
+  text_only_db_words=(orange tractor)
+  expect 1 'a word counted on its own that the backup still holds fails' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
   plant_variant file.T1.export.body ''
   expect 2 'an empty Drive transcript download is UNKNOWN' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
   plant_variant file.S1.export.body '# Purple elephant seventeen naming. An older summary.'
@@ -2164,11 +2233,30 @@ $(session_field "$detail" summary)"
   scan_dir=$(mktemp -d "$controls_dir/scan.XXXXXX")
   bash -s <<<"$(remote_script $'db_scan\tdb\t-\t-' "$db_root" "$database")" | tar -x -C "$scan_dir" -f - \
     || fail 'self-test: the database scan did not run'
-  expect 0 'the scan finds each word of a phrase that only a search index holds' check_db_scan \
-    "$(result "$scan_dir" db.report)" present audio
-  expect 1 'the scan reports a phrase that only a search index holds as still there' check_db_scan \
-    "$(result "$scan_dir" db.report)" absent audio control
+  expect 0 'the scan finds each word of a phrase that only a search index holds' check_db_words \
+    "$(result "$scan_dir" db.report)" present audio purple elephant
+  expect 1 'the scan reports a phrase that only a search index holds as still there' check_db_words \
+    "$(result "$scan_dir" db.report)" absent audio purple elephant
   printf 'A11 self-test RAN: the database scan finds each word of a phrase that a search index stores apart from the other, where adjacent words see nothing\n'
+
+  # The unit records the room all day, so other conversations hold common words: "contractor"
+  # (which holds "tractor") and "orange juice". They must not read as the phrase still being
+  # there: the adjacent-word check does not see them, a word is matched only at its start, and a
+  # word another conversation holds before this one is recorded is not counted on its own.
+  printf 'SQLite format 3\000\001\002A: The contractor sends the invoice.\000\377B: I brought orange juice.\000blue harbor lantern\000' >"$database"
+  printf 'WAL\000\377A: The contractor sends the invoice.\000' >"$database-wal"
+  printf 'SQLite format 3\000\003I brought orange juice.\000blue harbor lantern\000' >"$database.pre-migrate.bak"
+  scan_dir=$(mktemp -d "$controls_dir/scan.XXXXXX")
+  bash -s <<<"$(remote_script $'db_scan\tdb\t-\t-' "$db_root" "$database")" | tar -x -C "$scan_dir" -f - \
+    || fail 'self-test: the database scan did not run'
+  report=$(result "$scan_dir" db.report)
+  expect 0 'other conversations that say "contractor" and "orange juice" pass the precheck' check_db_scan "$report" absent text_only
+  [[ "$(attributable_words "$report" text_only)" == tractor ]] \
+    || fail "self-test: the words counted on their own are \"$(one_line "$(attributable_words "$report" text_only)")\", want only \"tractor\""
+  expect 0 'other conversations that say "contractor" and "orange juice" pass after the delete' check_db_scan "$report" absent text_only control
+  expect 0 'the word other conversations do not hold is absent after the delete' check_db_words "$report" absent text_only tractor
+  expect 0 'no word to count on its own is a note, not a failure' check_db_words "$report" absent text_only
+  printf 'A11 self-test RAN: other conversations that say "contractor" or "orange" pass the precheck and the check after the delete\n'
 
   # A11: each pure check against a planted failure and a planted pass.
   expect 1 'an old file id answering 200 after the audio delete fails' check_answers_404 200
