@@ -143,6 +143,8 @@ assert_mutation_caught 'a word that matches inside another word' \
   'printf '"'"'%s.%s=%s\n'"'"' "$name" "$token" "$token"'
 assert_mutation_caught 'counting a word another conversation holds' \
   'END { exit !(seen && !held) }' 'END { exit 0 }'
+assert_mutation_caught 'counting a word the precheck scan did not count' \
+  'END { exit !(seen && !held) }' 'END { exit held }'
 
 # A per-word check with no word to count reads nothing, so it must be a NOTE line, never a PASS.
 assert_mutation_caught 'a per-word check with no word to count that runs anyway' \

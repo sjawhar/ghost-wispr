@@ -2149,6 +2149,9 @@ run_self_test() (
   if attributable_words "${report/$'backup\ttext_only.orange\t0'/$'backup\ttext_only.orange\terror'}" text_only | grep -Fxq orange; then
     fail 'self-test: a word the precheck could not read was counted on its own'
   fi
+  if attributable_words "$(grep -v $'\ttext_only.tractor\t' <<<"$report")" text_only | grep -Fxq tractor; then
+    fail 'self-test: a word the precheck scan did not count was counted on its own'
+  fi
   expect 0 'a newer backup after the restart passes' check_backup_retaken "$report" \
     "${report/$'backup\t4096\t90'/$'backup\t4096\t200'}"
   expect 2 'a backup the restart did not rewrite is UNKNOWN' check_backup_retaken "$report" "$report"
@@ -2225,12 +2228,16 @@ run_self_test() (
   choose_db_words "$(scan_report db:control=2 backup:control=1)"
   [[ "${text_only_db_words[*]}" == 'orange tractor' && "${audio_db_words[*]}" == 'purple elephant' ]] \
     || fail "self-test: a precheck that found no word counts \"${text_only_db_words[*]}\" and \"${audio_db_words[*]}\", want every word"
+  [[ "${round_lines[0]}" == 'NOTE: '*'counted on their own: orange tractor; left out, because another conversation holds them: none' ]] \
+    || fail "self-test: the precheck noted \"${round_lines[0]}\""
   [[ "${round_lines[1]}" == 'NOTE: '*'counted on their own: purple elephant; left out, because another conversation holds them: none' ]] \
     || fail "self-test: the precheck noted \"${round_lines[1]}\""
   round_reset
   choose_db_words "$(scan_report db:text_only.orange=1 backup:audio.elephant=1 db:control=2 backup:control=1)"
   [[ "${text_only_db_words[*]}" == tractor && "${audio_db_words[*]}" == purple ]] \
     || fail "self-test: a precheck that found \"orange\" and \"elephant\" counts \"${text_only_db_words[*]}\" and \"${audio_db_words[*]}\""
+  [[ "${round_lines[0]}" == 'NOTE: '*'counted on their own: tractor; left out, because another conversation holds them: "orange" ' ]] \
+    || fail "self-test: the precheck noted \"${round_lines[0]}\""
   [[ "${round_lines[1]}" == 'NOTE: '*'counted on their own: purple; left out, because another conversation holds them: "elephant" ' ]] \
     || fail "self-test: the precheck noted \"${round_lines[1]}\""
   printf 'A11 self-test RAN: the precheck counts on their own only the words of each phrase that no file holds yet\n'
@@ -2399,7 +2406,6 @@ $(session_field "$detail" summary)"
     || fail "self-test: the words counted on their own are \"$(one_line "$(attributable_words "$report" text_only)")\", want only \"tractor\""
   expect 0 'other conversations that say "contractor" and "orange juice" pass after the delete' check_db_scan "$report" absent text_only control
   expect 0 'the word other conversations do not hold is absent after the delete' check_db_words "$report" absent text_only tractor
-  expect 0 'no word to count on its own leaves the precheck nothing to fail' check_db_scan "$report" absent text_only control
   printf 'A11 self-test RAN: other conversations that say "contractor" or "orange" pass the precheck and the check after the delete\n'
 
   # A11: each pure check against a planted failure and a planted pass.
