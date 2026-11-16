@@ -15,20 +15,18 @@ fail() {
   exit 1
 }
 
-# The office Pi's recording rules, which its web UI shows under Recording rules, each as written
-# and in this order (docs/pi-setup.md, "Accept slice 1", A2).
-readonly recording_rules_block='recording_rules:
-  - Record only while the light is on.
-  - Anyone may pause it at any time without a reason.
-  - Transcripts are readable by Theorem staff only.
-  - A person can ask for a segment to be deleted.'
+# The sha256 of the office Pi's recording_rules block in deploy/pi/files/ghost-wispr.yaml, which
+# its web UI shows under Recording rules, each as written and in this order (docs/pi-setup.md,
+# "Accept slice 1", A2). The test holds the hash, not the text, because the repository is public.
+# After a rule change, set it to the awk below run over the template, piped to sha256sum.
+readonly recording_rules_sha256=f4868276b26c15d966d3d28fa74b3242fb9f55c7f90cec2aba5c3932d05c8d33
 
 # assert_recording_rules fails unless the configuration provision.sh installed holds exactly the
 # office Pi's recording rules, once.
 assert_recording_rules() {
   local config=$TEST_LOG.installed-ghost-wispr.yaml rules
-  rules=$(awk '/^recording_rules:/ { print; inside = 1; next } inside && /^  - / { print; next } { inside = 0 }' "$config")
-  [[ $rules == "$recording_rules_block" ]] \
+  rules=$(awk '/^recording_rules:/ { print; inside = 1; next } inside && /^  - / { print; next } { inside = 0 }' "$config" | sha256sum)
+  [[ $rules == "$recording_rules_sha256  -" ]] \
     || fail "the $1 configuration does not hold the office Pi's four recording rules: $(<"$config")"
 }
 
