@@ -73,10 +73,16 @@ case $1 in
 esac
 EOF
 
-# The release's update.sh and binary, as provision.sh runs them from the deploy directory.
+# The release's update.sh and binary, as provision.sh runs them from the deploy directory. The real
+# update.sh reads /api/status once, and fails when the recorder runs but does not answer yet, as
+# it does right after a restart: so does this one when the recorder was restarted before it.
 cat >"$work_dir/deploy/update.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'update.sh XDG_RUNTIME_DIR=%s\n' "${XDG_RUNTIME_DIR:-}" >>"$TEST_LOG"
+if grep -q 'systemctl --user try-restart ghost-wispr.service$' "$TEST_LOG"; then
+  printf 'ghost-wispr update: ghost-wispr is active but /api/status did not answer\n' >&2
+  exit 1
+fi
 EOF
 cat >"$work_dir/deploy/ghost-wispr" <<'EOF'
 #!/usr/bin/env bash

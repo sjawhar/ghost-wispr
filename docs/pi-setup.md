@@ -232,9 +232,10 @@ machine that reaches the Pi over SSH.
 
 `provision.sh` runs as `ghost-wispr` with passwordless sudo. It installs `libportaudio2`,
 `ffmpeg`, `lame`, `jq`, and `curl`; copies the release runtime to `/opt/ghost-wispr`; installs
-the user services; restarts a running recorder so it reads the configuration it installed;
-verifies and installs the newest release; enables Tailscale Serve; and then starts the detached
-tagged-device join.
+the user services; verifies and installs the newest release; restarts a running recorder so it
+reads the configuration it installed; enables Tailscale Serve; and then starts the detached
+tagged-device join. The restart ends a conversation that is being recorded, so provision outside
+meetings.
 
 The Ghost Wispr user service starts only once the Pi's clock is synchronized. The Pi has no
 battery-backed clock, so at boot its clock is behind until a time server sets it, and a session

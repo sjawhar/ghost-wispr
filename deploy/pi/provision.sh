@@ -272,13 +272,14 @@ sudo loginctl enable-linger "$SERVICE_USER"
 sudo systemctl start "user@$service_uid.service"
 run_user_systemctl daemon-reload
 run_user_systemctl enable ghost-wispr.service
-# The recorder reads its configuration only when it starts, and update.sh restarts nothing when the
-# Pi already runs the newest release: restart a running recorder so it reads the configuration
-# installed above. try-restart starts no recorder that is stopped, as on a first provision.
-run_user_systemctl try-restart ghost-wispr.service
 run_user_systemctl enable --now ghost-wispr-update.timer
 # update.sh runs systemctl --user, which needs the user's runtime directory.
 XDG_RUNTIME_DIR="$runtime_dir" "$DEPLOY_DIR/update.sh"
+# The recorder reads its configuration only when it starts, and update.sh restarts nothing when the
+# Pi already runs the newest release: restart a running recorder so it reads the configuration
+# installed above. The restart follows update.sh, which fails when the recorder runs but does not
+# answer /api/status yet. try-restart starts no recorder that is stopped, as on a first provision.
+run_user_systemctl try-restart ghost-wispr.service
 sudo tailscale serve --bg --https 443 http://127.0.0.1:8080
 
 self_status=$(tailscale status --self --json)
