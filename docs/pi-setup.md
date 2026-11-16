@@ -205,8 +205,7 @@ deploy/pi/provision-pi.sh --prepared "$prepared"
 ```
 
 `provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says
-so (exit 255). If it could not remove the sources directory on the Pi, reconnect with Tailscale
-SSH and run the `rm` command it prints.
+so (exit 255).
 
 The tagged join makes a new Tailscale device. The temporary device you joined as your own still
 holds the name `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
@@ -221,10 +220,16 @@ secret-run --register --wait 12h \
   TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
 ```
 
-It removes the temporary device only when that device holds the name, has the hostname
-`ghost-wispr`, has a user owner and no tag, and is offline. Then it renames the tagged device and
-reads the name back. It refuses any other holder and changes nothing. When the tagged device has
-the name already, it does nothing. The key reaches `curl` on stdin, never as an argument.
+It removes the temporary device only when that device is the one device other than the tagged
+one that holds the name, has an id that is a string of digits, has the hostname `ghost-wispr`,
+has a user owner and no tag, and is offline. Then it renames the tagged device and reads the name
+back. It refuses any other holder, or more than one, before it changes anything. When the tagged
+device has the name already, it does nothing. The key reaches `curl` on stdin, never as an
+argument, and goes only to `https://api.tailscale.com`.
+
+If `provision-pi.sh` could not remove the sources directory on the Pi, run the `rm` command it
+printed now. That command reaches the Pi as `ghost-wispr.tail12ec1c.ts.net`, and before this step
+that name is the temporary device's, or no device's.
 
 Then check the join and the name:
 

@@ -6,13 +6,15 @@
 # The tagged join makes a new device. While the temporary device the operator joined as their own
 # still holds the name, Tailscale names the tagged one ghost-wispr-1, and the recorder is not at
 # https://ghost-wispr.tail12ec1c.ts.net. This script removes that temporary device and renames the
-# tagged one. It removes a device only when that device holds the name, has the hostname
-# ghost-wispr, has a user owner and no tag, and is not connected; any other holder is refused and
-# nothing changes. It prints device ids and names only. TAILSCALE_API_KEY comes from the
-# environment and reaches curl on stdin (curl -K -), never as an argument.
+# tagged one. It removes a device only when that device is the one device other than the tagged one
+# that holds the name, has an id that is a string of digits, has the hostname ghost-wispr, has a
+# user owner and no tag, and is not connected. It refuses any other holder, or more than one, before
+# it changes anything. It prints device ids and names only. TAILSCALE_API_KEY comes from the
+# environment and reaches curl on stdin (curl -K -), never as an argument, and goes only to the
+# Tailscale API host below.
 set -euo pipefail
 
-readonly API="${GHOST_WISPR_TAILSCALE_API:-https://api.tailscale.com/api/v2}"
+readonly API=https://api.tailscale.com/api/v2
 readonly HOSTNAME_WANTED=ghost-wispr
 readonly NAME_WANTED=ghost-wispr.tail12ec1c.ts.net
 readonly TAG=tag:ghost-wispr
@@ -62,16 +64,18 @@ fi
 
 holders=$(jq -c --arg name "$NAME_WANTED" --arg id "$tagged_id" \
   '[.devices[] | select(.name == $name and .id != $id)]' <<<"$devices")
+# \A and \z, not ^ and $: jq's $ also matches before a final newline, and the shell drops that
+# newline, so an id "222\n" would pass as 222.
 if ! jq -e --arg host "$HOSTNAME_WANTED" \
-  'all(.[]; .hostname == $host and .tags == null and (.user // "") != "" and .connectedToControl == false)' \
+  'length <= 1 and all(.[]; (.id | type == "string" and test("\\A[0-9]+\\z")) and .hostname == $host and .tags == null and (.user // "") != "" and .connectedToControl == false)' \
   >/dev/null <<<"$holders"; then
-  fail "the name $NAME_WANTED is held by a device that is not the temporary operator-owned one (tagged, connected, or another host): $(jq -c '[.[] | {id, name, hostname, user, tags, connectedToControl}]' <<<"$holders"); nothing was changed"
+  fail "the name $NAME_WANTED is held by a device that is not the temporary operator-owned one (tagged, connected, another host, an id that is not a string of digits, or more than one holder): $(jq -c '[.[] | {id, name, hostname, user, tags, connectedToControl}]' <<<"$holders"); nothing was changed"
 fi
-for holder_id in $(jq -r '.[].id' <<<"$holders"); do
-  [[ $holder_id =~ ^[0-9]+$ ]] || fail "a device holding $NAME_WANTED has no numeric id"
+holder_id=$(jq -r '.[0].id // empty' <<<"$holders")
+if [[ -n $holder_id ]]; then
   log "removing the temporary operator-owned device $holder_id, which holds $NAME_WANTED"
   api DELETE "/device/$holder_id" >/dev/null
-done
+fi
 
 log "renaming device $tagged_id from $tagged_name to $HOSTNAME_WANTED"
 api POST "/device/$tagged_id/name" "{\"name\":\"$HOSTNAME_WANTED\"}" >/dev/null
