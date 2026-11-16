@@ -233,13 +233,22 @@ func parseStructuredSummary(raw json.RawMessage) (parsedSummary, error) {
 }
 
 // summaryAnswer reads a model's structured answer (raw) as a title, a summary
-// and speaker names. An answer that is not the structured JSON is taken
-// whole as the summary. A title that holds no word (meaningfulText), such as
-// "...", is made from the transcript instead (guaranteedTitle).
+// and speaker names. An answer that is not a JSON object is the summary as
+// written. In a JSON object, the title and the summary are its "title" and
+// "summary" strings, also when another field (such as "speakers") does not
+// have the schema's type; a field that is not a string reads as empty, so an
+// answer such as {"title":"...","summary":["..."]} has no summary text, and
+// the raw JSON, whose keys hold letters, is never taken for one. A title that
+// holds no word (meaningfulText), such as "...", is made from the transcript
+// instead (guaranteedTitle).
 func summaryAnswer(raw json.RawMessage, transcript string) parsedSummary {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return parsedSummary{Title: guaranteedTitle(transcript), Summary: strings.TrimSpace(string(raw))}
+	}
 	parsed, err := parseStructuredSummary(raw)
 	if err != nil {
-		parsed = parsedSummary{Summary: string(raw)}
+		parsed = parsedSummary{Title: jsonString(fields["title"]), Summary: jsonString(fields["summary"])}
 	}
 	parsed.Title = strings.TrimSpace(parsed.Title)
 	parsed.Summary = strings.TrimSpace(parsed.Summary)
@@ -247,6 +256,16 @@ func summaryAnswer(raw json.RawMessage, transcript string) parsedSummary {
 		parsed.Title = guaranteedTitle(transcript)
 	}
 	return parsed
+}
+
+// jsonString returns the JSON string raw holds, or "" when it holds another
+// value or nothing.
+func jsonString(raw json.RawMessage) string {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return value
 }
 
 // meaningfulText reports whether text holds a letter or a digit.
@@ -459,15 +478,25 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 	return merged.Title, merged.Summary, merged.speakerNamesJSON(), nil
 }
 
+// completeTextWithRetry asks client for the summary of one chunk of a long
+// transcript, retrying a transient failure. An answer that holds no word
+// (errNoSummaryText) would drop that part of the conversation from the merged
+// summary without an error, so it is asked again in the same way, and when
+// every attempt answers so the summary fails with that reason.
 func (s *Summarizer) completeTextWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, logger *slog.Logger) (string, error) {
 	var result string
 	err := retry.Do(ctx, func() error {
 		var callErr error
 		result, callErr = client.Complete(ctx, messages)
-		if callErr == nil {
-			result = strings.TrimSpace(result)
+		if callErr != nil {
+			return callErr
 		}
-		return callErr
+		result = strings.TrimSpace(result)
+		if !meaningfulText(result) {
+			logger.Warn("the model answered a chunk with no summary text; asking again", "summary", result)
+			return fmt.Errorf("%w: %q", errNoSummaryText, result)
+		}
+		return nil
 	}, retry.DefaultMaxRetries)
 	if err != nil {
 		return "", fmt.Errorf("chunk summarize failed after retries: %w", err)

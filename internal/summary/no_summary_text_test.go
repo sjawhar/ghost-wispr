@@ -3,6 +3,7 @@ package summary
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"google.golang.org/genai"
@@ -116,5 +117,110 @@ func TestABatchAnswerWithNoSummaryTextFails(t *testing.T) {
 	}
 	if !errors.Is(results[0].Error, errNoSummaryText) || results[0].Summary != "" || results[0].Title != "" {
 		t.Errorf("result = %+v; want the error %v and no title or summary", results[0], errNoSummaryText)
+	}
+}
+
+// TestAChunkSummaryWithNoTextIsAskedAgain: a long transcript is summarized
+// chunk by chunk, and a chunk answered with no text would drop that part of
+// the conversation from the merged summary without an error. Such a chunk
+// is asked again, as the merge is.
+func TestAChunkSummaryWithNoTextIsAskedAgain(t *testing.T) {
+	client := &mockLLMClient{
+		textQueue: []mockTextResult{{response: "..."}, {response: "chunk one summary"}, {response: "chunk two summary"}},
+		jsonQueue: []mockJSONResult{{response: `{"title":"Merged Title","summary":"Merged summary"}`}},
+	}
+	s := summarizerFor(client)
+	s.chunkTokenThreshold = 20
+	s.chunkSizeTokens = 80
+	s.chunkOverlapTokens = 20
+	if _, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", buildTranscript(120), "default"); err != nil {
+		t.Fatalf("SummarizeWithPreset: %v", err)
+	}
+	if client.calls != 4 {
+		t.Errorf("the summarizer asked %d times, want 4 (the empty chunk again, then the second chunk and the merge)", client.calls)
+	}
+	for _, message := range client.lastMessages {
+		if strings.Contains(message.Content, "chunk one summary") && strings.Contains(message.Content, "\n...\n") {
+			t.Errorf("the merge was given the chunk answered with no text: %q", message.Content)
+		}
+	}
+}
+
+// TestAChunkThatAlwaysAnswersWithNoTextFailsTheSummary: when every attempt
+// at a chunk answers with no text, the summary fails with that reason, even
+// though the merge would answer.
+func TestAChunkThatAlwaysAnswersWithNoTextFailsTheSummary(t *testing.T) {
+	client := &mockLLMClient{
+		response:  "...",
+		jsonQueue: []mockJSONResult{{response: `{"title":"Merged Title","summary":"Merged summary"}`}},
+	}
+	s := summarizerFor(client)
+	s.chunkTokenThreshold = 20
+	s.chunkSizeTokens = 80
+	s.chunkOverlapTokens = 20
+	if _, _, _, err := s.SummarizeWithPreset(context.Background(), "session-1", buildTranscript(120), "default"); !errors.Is(err, errNoSummaryText) {
+		t.Fatalf("SummarizeWithPreset = %v, want %v", err, errNoSummaryText)
+	}
+}
+
+// answersThatDoNotParse are structured answers whose title and summary hold
+// no text, with a field that does not have the schema's type. The rule is
+// for the title and the summary as the model wrote them, never for the raw
+// answer, whose JSON keys hold letters.
+var answersThatDoNotParse = []string{
+	`{"title":"...","summary":"...","speakers":[]}`,
+	`{"title":"...","summary":["..."]}`,
+}
+
+// TestAnAnswerWhoseFieldsHoldNoTextFailsEvenWhenItDoesNotParse: on the
+// direct path.
+func TestAnAnswerWhoseFieldsHoldNoTextFailsEvenWhenItDoesNotParse(t *testing.T) {
+	for _, answer := range answersThatDoNotParse {
+		client := &mockLLMClient{response: answer}
+		title, summaryText, _, err := summarizerFor(client).SummarizeWithPreset(context.Background(), "session-1", buildTranscript(25), "default")
+		if !errors.Is(err, errNoSummaryText) {
+			t.Errorf("answer %s: SummarizeWithPreset = %q, %q, %v; want %v", answer, title, summaryText, err, errNoSummaryText)
+		}
+	}
+}
+
+// TestABatchAnswerWhoseFieldsHoldNoTextFailsEvenWhenItDoesNotParse: on the
+// batch path.
+func TestABatchAnswerWhoseFieldsHoldNoTextFailsEvenWhenItDoesNotParse(t *testing.T) {
+	s := New(config.Summarization{Model: "gemini/gemini-4-carbon"}, nil)
+	for _, answer := range answersThatDoNotParse {
+		job := &genai.BatchJob{Dest: &genai.BatchJobDestination{InlinedResponses: []*genai.InlinedResponse{{
+			Metadata: map[string]string{"session_id": "session-1", "preset": "default"},
+			Response: &genai.GenerateContentResponse{Candidates: []*genai.Candidate{{
+				Content: &genai.Content{Parts: []*genai.Part{{Text: answer}}},
+			}}},
+		}}}}
+		results := s.ProcessBatchResults(job, []BatchSession{{ID: "session-1", Transcript: buildTranscript(25)}})
+		if len(results) != 1 || !errors.Is(results[0].Error, errNoSummaryText) || results[0].Summary != "" {
+			t.Errorf("answer %s: results = %+v; want one, failed with %v and no summary", answer, results, errNoSummaryText)
+		}
+	}
+}
+
+// TestAnAnswerWithAMalformedSpeakersFieldKeepsItsTitleAndSummary: a speakers
+// field of the wrong type does not throw away a real title and summary.
+func TestAnAnswerWithAMalformedSpeakersFieldKeepsItsTitleAndSummary(t *testing.T) {
+	client := &mockLLMClient{response: `{"title":"Warehouse robot naming","summary":"The team named the project.","speakers":[]}`}
+	title, summaryText, speakerNames, err := summarizerFor(client).SummarizeWithPreset(context.Background(), "session-1", buildTranscript(25), "default")
+	if err != nil {
+		t.Fatalf("SummarizeWithPreset: %v", err)
+	}
+	if title != "Warehouse robot naming" || summaryText != "The team named the project." || speakerNames != "{}" {
+		t.Errorf("title %q, summary %q, speakers %s; want the answer's title and summary and no speakers", title, summaryText, speakerNames)
+	}
+}
+
+// TestAPlainTextAnswerIsTheSummary: an answer that is not a JSON object is
+// the summary as written.
+func TestAPlainTextAnswerIsTheSummary(t *testing.T) {
+	client := &mockLLMClient{response: "The team named the warehouse robot project."}
+	_, summaryText, _, err := summarizerFor(client).SummarizeWithPreset(context.Background(), "session-1", buildTranscript(25), "default")
+	if err != nil || summaryText != "The team named the warehouse robot project." {
+		t.Errorf("SummarizeWithPreset = %q, %v; want the answer as the summary", summaryText, err)
 	}
 }
