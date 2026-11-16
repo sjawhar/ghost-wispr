@@ -31,6 +31,9 @@ readonly text_only_query='orange tractor'
 readonly audio_phrase='purple elephant seventeen'
 readonly audio_pair="purple${separator}elephant"
 readonly audio_trace='(^|[^[:alnum:]])(purple|elephant|seventeen)([^[:alnum:]]|$)'
+# The whole phrase as a transcript, a summary or a document writes it: in any case, with its
+# number as digits or as words.
+readonly audio_phrase_pattern="purple${separator}elephant${separator}(seventeen|17)"
 readonly audio_query='purple elephant'
 # The control phrase is never deleted: every read after a delete must still hold it.
 readonly control_phrase='blue harbor lantern'
@@ -220,6 +223,23 @@ check_present() {
   fi
   reason='the phrase is not there'
   return 1
+}
+
+# check_noted TEXT TRACE: before a delete, a read that holds the phrase only if the summarizer
+# chose to write it there (the title, and the Drive folder name made from it). Either answer
+# passes, and the reason says which; the check after the delete requires no trace either way.
+check_noted() {
+  local text=$1 trace=$2
+  if blank "$text"; then
+    reason='nothing was read'
+    return 2
+  fi
+  if matches "$text" "$trace"; then
+    reason='the phrase is there, so the check after the delete must find it gone'
+    return 0
+  fi
+  reason='the phrase is not there; the summarizer did not write it here'
+  return 0
 }
 
 # check_absent TEXT TRACE [CONTROL]: after a delete, no trace of the phrase, and the same read
@@ -912,20 +932,24 @@ evaluate_text_only_after() {
 }
 
 # evaluate_audio_before DIR DETAIL PHRASE_SEARCH CONTROL_SEARCH: before "Delete text and audio",
-# every check must find "purple elephant seventeen".
+# every read the deletion clears must find "purple elephant seventeen", in any case and with its
+# number as digits or words: the segments, the transcript, the refined transcript, the summary,
+# search, the Drive documents and the recording. The title and the Drive folder name hold it only
+# if the summarizer wrote it there, so they are noted, and evaluate_audio_after requires no
+# trace in them either way.
 evaluate_audio_before() {
   local dir=$1 detail=$2 phrase_search=$3 control_search=$4 listing name id index=0 recording
   check_pi_evidence "$dir"
   check 'session' check_session_settled "$detail"
-  check 'segments' check_present "$(segment_texts "$detail")" "$audio_pair"
-  check 'transcript' check_present "$(session_field "$detail" canonical_transcript)" "$audio_pair"
-  check 'refined transcript' check_present "$(session_field "$detail" refined_transcript)" "$audio_pair"
-  check 'summary' check_present "$(session_field "$detail" summary)" "$audio_pair"
-  check 'title' check_present "$(session_field "$detail" title)" "$audio_pair"
+  check 'segments' check_present "$(segment_texts "$detail")" "$audio_phrase_pattern"
+  check 'transcript' check_present "$(session_field "$detail" canonical_transcript)" "$audio_phrase_pattern"
+  check 'refined transcript' check_present "$(session_field "$detail" refined_transcript)" "$audio_phrase_pattern"
+  check 'summary' check_present "$(session_field "$detail" summary)" "$audio_phrase_pattern"
+  check 'title' check_noted "$(session_field "$detail" title)" "$audio_trace"
   check "UI search for \"$audio_query\"" check_search_finds "$phrase_search" "$acceptance_session_id"
   check "UI search for \"$control_query\"" check_search_finds "$control_search" "$acceptance_session_id"
   check 'Drive folder name' answered "$(response_code "$dir" folder.get code)" \
-    check_present "$(drive_name "$(result "$dir" folder.get.body)")" "$audio_pair"
+    check_noted "$(drive_name "$(result "$dir" folder.get.body)")" "$audio_trace"
   listing=$(result "$dir" folder.list.body)
   check 'Drive folder' check_listing "$(response_code "$dir" folder.list code)" "$listing"
   while IFS=$'\t' read -r name id; do
@@ -934,12 +958,12 @@ evaluate_audio_before() {
     check "Drive $name ($id) revisions.list" check_revisions_listed \
       "$(response_code "$dir" "file.$id.revisions" code)" "$(result "$dir" "file.$id.revisions.body")"
   done <<<"$(drive_file_ids "$listing")"
-  check_drive_documents "$dir" "$listing" present "$audio_pair" ''
+  check_drive_documents "$dir" "$listing" present "$audio_phrase_pattern" ''
   check 'recordings' check_has_recording "$(recording_paths "$detail")"
   while IFS= read -r recording; do
     [[ -n "$recording" ]] || continue
     check "Deepgram transcription of $recording on the unit" answered "$(response_code "$dir" "unit.$index" dg_code)" \
-      check_present "$(deepgram_transcript "$(result "$dir" "unit.$index.dg_body")")" "$audio_pair"
+      check_present "$(deepgram_transcript "$(result "$dir" "unit.$index.dg_body")")" "$audio_phrase_pattern"
     index=$((index + 1))
   done <<<"$(recording_paths "$detail")"
 }
@@ -2111,6 +2135,65 @@ $(session_field "$detail" summary)"
   expect 1 'a folder name that still holds the slug of the phrase fails' check_absent \
     2026-11-12-purple-elephant-seventeen-naming "$audio_trace"
   expect 0 'a folder name without the phrase passes' check_absent 2026-11-12-warehouse-robot-project-naming "$audio_trace"
+
+  # The checks before "Delete text and audio": the whole phrase, in any case and with its number
+  # as digits or words, in every read the deletion clears; the title and the Drive folder name,
+  # which the summarizer writes as it likes, are only noted.
+  expect 0 'a summary that writes the phrase in capitals with its number as digits holds it' check_present \
+    'The team named the warehouse robot project "Purple Elephant 17".' "$audio_phrase_pattern"
+  expect 0 'a transcript that writes the phrase in words holds it' check_present \
+    'B: purple elephant seventeen.' "$audio_phrase_pattern"
+  expect 1 'a summary with only part of the phrase does not hold it' check_present \
+    'The team named the project Purple Elephant.' "$audio_phrase_pattern"
+  expect 0 'a title without the phrase is noted before the delete' check_noted 'Warehouse robot project naming' "$audio_trace"
+  expect 0 'a title with the phrase is noted before the delete' check_noted 'Purple Elephant 17 naming' "$audio_trace"
+  expect 2 'an empty title is UNKNOWN before the delete' check_noted '' "$audio_trace"
+
+  # The whole A11 evaluation before "Delete text and audio", on planted evidence written as Gemini
+  # wrote it on the office Pi (2026-11-16): the title and the Drive folder name name the project,
+  # and the summary writes the phrase as "Purple Elephant 17".
+  detail=$(jq -n --arg summary 'The team named the warehouse robot project "Purple Elephant 17" and agreed to order a machine for the yard.' '{session: {
+    id: "20261112100000", status: "ended", title: "Warehouse robot project naming", summary: $summary,
+    summary_status: "completed", refinement_status: "completed", sync_state: "SYNCED", gdrive_folder_id: "F1",
+    drive_replace_pending: false, audio_path: "data/audio/rec.mp3",
+    canonical_transcript: "B: Purple elephant seventeen. A: Which machine do we order? B: the code word is blue harbor lantern.",
+    refined_transcript: "B: Purple elephant 17. A: Which machine do we order? B: the code word is blue harbor lantern."},
+    segments: [{id: 2, text: "B: Purple elephant 17."}, {id: 5, text: "B: the code word is blue harbor lantern."}]}')
+  listing=$(drive_listing transcript.md T1 summary.md S1 audio-rec.mp3 A1)
+  dir="$controls_dir/audio-before"
+  mkdir "$dir"
+  plant "$dir" remote.ok 'done'
+  plant "$dir" token.state ready
+  plant "$dir" unit.0.dg_code 200
+  plant "$dir" unit.0.dg_body "$(deepgram_body 'Purple elephant 17. Which machine do we order? The code word is blue harbor lantern.')"
+  plant "$dir" folder.get.code 200
+  plant "$dir" folder.get.body '{"id":"F1","name":"2026-11-12-warehouse-robot-project-naming"}'
+  plant "$dir" folder.list.code 200
+  plant "$dir" folder.list.body "$listing"
+  for index in T1 S1 A1; do
+    plant "$dir" "file.$index.get.code" 200
+    plant "$dir" "file.$index.revisions.code" 200
+    plant "$dir" "file.$index.revisions.body" '{"revisions":[{"id":"1"},{"id":"2"}]}'
+  done
+  plant "$dir" file.T1.export.code 200
+  plant "$dir" file.T1.export.body $'B: Purple elephant seventeen.\nA: Which machine do we order?\nB: the code word is blue harbor lantern.\n'
+  plant "$dir" file.S1.export.code 200
+  plant "$dir" file.S1.export.body "# Warehouse robot project naming
+
+$(session_field "$detail" summary)"
+  expect 0 'planted evidence whose title and folder name lack the phrase passes before "Delete text and audio"' \
+    evaluated evaluate_audio_before "$dir" "$detail" "$found" "$found"
+  variant="$controls_dir/audio-before-variant"
+  plant_variant file.T1.export.body $'B: Purple elephant.\nB: the code word is blue harbor lantern.\n'
+  expect 1 'a Drive transcript with only part of the phrase fails before the delete' \
+    evaluated evaluate_audio_before "$variant" "$detail" "$found" "$found"
+  expect 1 'a summary without the phrase fails before the delete' evaluated evaluate_audio_before "$dir" \
+    "$(jq '.session.summary = "The team named the warehouse robot project."' <<<"$detail")" "$found" "$found"
+  expect 1 'a refined transcript without the number fails before the delete' evaluated evaluate_audio_before "$dir" \
+    "$(jq '.session.refined_transcript = "B: Purple elephant. B: the code word is blue harbor lantern."' <<<"$detail")" "$found" "$found"
+  expect 1 'a search that does not find the conversation fails before the delete' \
+    evaluated evaluate_audio_before "$dir" "$detail" '[]' "$found"
+  printf 'A11 self-test RAN: before "Delete text and audio", every read the deletion clears needs the whole phrase, in any case and with its number as digits or words, and the title and the Drive folder name are only noted\n'
 
   # The whole A11 evaluation after "Delete text and audio", on planted evidence from the Pi.
   audio_ids_before=$(drive_file_ids "$listing")

@@ -27,6 +27,7 @@ for line in \
   'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes' \
   'A11 text only self-test RAN: retry refinement waits for a newer revision' \
   'A11 self-test RAN: planted failure rejected' \
+  'A11 self-test RAN: before "Delete text and audio", every read the deletion clears needs the whole phrase, in any case and with its number as digits or words, and the title and the Drive folder name are only noted' \
   'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence' \
   'A11 self-test RAN: a failed control stops the row before "Delete text and audio"' \
   'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio and its revision on its segment' \
@@ -82,7 +83,7 @@ assert_mutation_caught() {
 }
 
 # A checker that always passes must fail the self-test: each one is load-bearing.
-for checker in check_absent check_ids_unchanged check_ids_replaced check_answers_200 check_answers_404 \
+for checker in check_absent check_noted check_ids_unchanged check_ids_replaced check_answers_200 check_answers_404 \
   check_one_revision check_hashes_unchanged check_same_md5 check_search_absent check_db_scan \
   check_mode_required check_doc_holds_summary check_session_settled; do
   needle=$'\n'"$checker() {"$'\n'
@@ -107,6 +108,18 @@ assert_mutation_caught 'A11 text only deleting after a failed control' \
 assert_mutation_caught 'A11 deleting after a failed control' \
   $'print_round A11\n  if ! round_result; then' \
   $'print_round A11\n  if false; then'
+
+# Before "Delete text and audio", the summarizer chooses whether the title and the Drive folder
+# name hold the phrase, so requiring it there would stop a run on a unit that deletes correctly;
+# every read the deletion clears needs the whole phrase, its number included.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'A11 requiring the phrase in the title' \
+  $'check \'title\' check_noted "$(session_field "$detail" title)" "$audio_trace"' \
+  $'check \'title\' check_present "$(session_field "$detail" title)" "$audio_trace"'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'A11 accepting part of the phrase in the Drive documents before the delete' \
+  'check_drive_documents "$dir" "$listing" present "$audio_phrase_pattern"' \
+  'check_drive_documents "$dir" "$listing" present "$audio_pair"'
 
 # The Drive token and the Deepgram key stay out of curl's arguments, and the Drive token is read-only.
 # shellcheck disable=SC2016 # The needles are the driver's source text.
