@@ -100,6 +100,22 @@ func recordOwedErase(tx *sql.Tx) (owed string, earlier bool, err error) {
 	return owed, earlier, nil
 }
 
+// markEraseOwed records, in tx, that an erase of the write-ahead log and the
+// backup is owed for a change that is not a numbered deletion (the one-time
+// sweep of deleted sessions' events and index entries as the app starts). It
+// takes no deletion number: an owed marker already there stays, since the
+// erase is store-wide and covers both, and otherwise the marker is the last
+// number taken, which any later deletion's exceeds, so an erase that read it
+// never clears a later deletion's marker.
+func markEraseOwed(tx *sql.Tx) error {
+	if _, err := tx.Exec(`INSERT INTO app_state(key, value)
+		VALUES(?, COALESCE((SELECT value FROM app_state WHERE key = ?), '0'))
+		ON CONFLICT(key) DO NOTHING`, owedEraseKey, owedEraseSeqKey); err != nil {
+		return fmt.Errorf("record owed erase: %w", err)
+	}
+	return nil
+}
+
 // clearOwedErase records the owed erase done, unless a later deletion has
 // recorded one since the erase read the number owed.
 func clearOwedErase(db *sql.DB, owed string) error {

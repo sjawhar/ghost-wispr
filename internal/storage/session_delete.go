@@ -145,11 +145,27 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		) DELETE FROM sessions WHERE id IN (SELECT id FROM doomed)`, id); err != nil {
 		return "", fmt.Errorf("delete session %s and its merged sources: %w", id, err)
 	}
+	if err := rebuildSearchIndex(tx); err != nil {
+		return "", fmt.Errorf("delete session %s: %w", id, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("commit deleting session %s: %w", id, err)
 	}
 	s.eraseAfterSessionDeletion(owed, earlierOwed, deletedIDs)
 	return audioPath, nil
+}
+
+// rebuildSearchIndex rebuilds the search index (sessions_fts) in tx from the
+// rows that are left. A row's delete only marks its terms deleted in the
+// index, which keeps the old entries, and so the row's words, in the file
+// (FTS5's secure-delete is off); a delete that takes a conversation's words
+// off the unit rebuilds the index, and the pages that frees are zeroed
+// (secure_delete), as a segment deletion does.
+func rebuildSearchIndex(tx *sql.Tx) error {
+	if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("rebuild the search index: %w", err)
+	}
+	return nil
 }
 
 // dropSessionSetEvents deletes, in tx, every stored event that names session
@@ -184,15 +200,17 @@ func dropEventsOfDeletedSessions(tx *sql.Tx) (int64, error) {
 	return removed, nil
 }
 
-// dropEventsOfDeletedSessionsOnce deletes, once per database
-// (deletedSessionEventsMigration), the stored events of sessions deleted
-// before a session delete deleted its events (dropEventsOfDeletedSessions):
-// /api/events served them for up to seven days. The app runs it as it starts,
-// before it takes the pre-migration backup, so the backup holds none of them,
-// and records their erase from the write-ahead log owed (recordOwedErase),
-// which the start then finishes (retryOwedErasure). A database that does not
-// yet have every table this needs is left for a later start, so nothing is
-// created before the backup is taken.
+// dropEventsOfDeletedSessionsOnce takes off the unit, once per database
+// (deletedSessionEventsMigration), what sessions deleted before this version
+// left: their stored events (dropEventsOfDeletedSessions), which /api/events
+// served for up to seven days, and their words in the search index, which it
+// rebuilds (rebuildSearchIndex). The app runs it as it starts, before it takes
+// the pre-migration backup, so the backup holds none of them, and records
+// their erase from the write-ahead log owed (markEraseOwed), which the start
+// then finishes (retryOwedErasure): that also writes the rebuilt pages into
+// the database file. A database that does not yet have every table this needs
+// is left for a later start, so nothing is created before the backup is
+// taken.
 func (s *SQLiteStore) dropEventsOfDeletedSessionsOnce() error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -217,15 +235,20 @@ func (s *SQLiteStore) dropEventsOfDeletedSessionsOnce() error {
 	if err != nil {
 		return err
 	}
-	if removed > 0 {
-		if _, _, err := recordOwedErase(tx); err != nil {
-			return fmt.Errorf("delete the events of deleted sessions: %w", err)
+	if exists, err := tableExists(tx, "sessions_fts"); err != nil {
+		return fmt.Errorf("check the search index before rebuilding it: %w", err)
+	} else if exists {
+		if err := rebuildSearchIndex(tx); err != nil {
+			return err
 		}
-		slog.Info("deleted the stored events of deleted sessions", "events", removed)
+	}
+	if err := markEraseOwed(tx); err != nil {
+		return fmt.Errorf("delete the events of deleted sessions: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit deleting the events of deleted sessions: %w", err)
 	}
+	slog.Info("deleted the stored events of deleted sessions and rebuilt the search index", "events", removed)
 	return nil
 }
 
@@ -257,10 +280,13 @@ func (s *SQLiteStore) eraseAfterSessionDeletion(owed string, earlierOwed bool, s
 
 // DeleteEndedSessionAndSources deletes an age-eligible merged session and its
 // source rows in one transaction, with every stored event that names one of
-// them (dropSessionSetEvents). It records every raw capture directory
+// them (dropSessionSetEvents), and rebuilds the search index so their words
+// leave it (rebuildSearchIndex). It records every raw capture directory
 // before the rows go. It refuses when a session in that deletion set is
 // active, remote-deleted, refining, owes a Drive replacement, has an owed
-// Drive folder, or has a folder whose documents still need refresh. It returns
+// Drive folder, or has a folder whose documents still need refresh. Once the
+// delete commits, it is erased from the write-ahead log and the pre-migration
+// backup, as a person's delete is (eraseAfterSessionDeletion). It returns
 // the deleted session IDs so GC can erase each now-redundant raw capture.
 func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir string) ([]string, bool, error) {
 	tx, err := s.db.Begin()
@@ -347,14 +373,22 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 	if err := dropSessionSetEvents(tx, id); err != nil {
 		return nil, false, err
 	}
+	owed, earlierOwed, err := recordOwedErase(tx)
+	if err != nil {
+		return nil, false, fmt.Errorf("GC deletion of session %s: %w", id, err)
+	}
 	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
 			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
 		) DELETE FROM sessions WHERE id IN (SELECT id FROM doomed)`, id); err != nil {
 		return nil, false, fmt.Errorf("delete session %s and its sources for GC: %w", id, err)
 	}
+	if err := rebuildSearchIndex(tx); err != nil {
+		return nil, false, fmt.Errorf("GC deletion of session %s: %w", id, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, false, fmt.Errorf("commit GC deletion of session %s and its sources: %w", id, err)
 	}
+	s.eraseAfterSessionDeletion(owed, earlierOwed, deletedIDs)
 	return deletedIDs, true, nil
 }
