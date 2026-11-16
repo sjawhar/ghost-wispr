@@ -199,8 +199,36 @@ assert_expected_config() {
   done
 }
 
-assert_running_summarization_model() {
-  jq -e --arg model "$summarization_model" '.summarization.model == $model' >/dev/null <<<"$1"
+# The model, provider or Google setting of each role that /api/config reports under "models", as
+# the running process resolved its configuration, and the value the plan names.
+expected_running_models=(
+  "live_transcription=$batch_refinement_model"
+  'batch_transcription_provider=deepgram'
+  "batch_transcription=$batch_refinement_model"
+  "summarization=$summarization_model"
+  "embedding=gemini/$embedding_model"
+  'genai_backend=vertex'
+  'gcp_project=theorem-agent-infra'
+  'gcp_location=global'
+  'tts_provider=gemini'
+  "tts=$tts_model"
+  "tts_voice=$tts_voice"
+)
+
+# assert_running_models CONFIG: the running process (its /api/config response, CONFIG) runs the
+# plan's model for every role. The deployed YAML says what the next start runs; a YAML edited
+# after the service started does not change what runs now.
+assert_running_models() {
+  local config=$1 entry role want got
+  for entry in "${expected_running_models[@]}"; do
+    role=${entry%%=*}
+    want=${entry#*=}
+    got=$(jq -r --arg role "$role" '.models[$role] // ""' <<<"$config" 2>/dev/null)
+    if [[ "$got" != "$want" ]]; then
+      printf 'the running process reports %s %q, want %q\n' "$role" "$got" "$want" >&2
+      return 1
+    fi
+  done
 }
 
 assert_no_config_overrides() {
@@ -221,11 +249,17 @@ assert_embedding_location() {
   [[ $1 == GHOST_WISPR_EMBEDDING_LOCATION=global ]]
 }
 
+# assert_provider_model ROLE ACTUAL EXPECTED: the model the provider reported for ROLE is the
+# plan's (EXPECTED). The spec's A8 asks that the unit run the plan's models, and the plan reads
+# each one "from the provider's response or the app's log". A provider that reports none (Vertex
+# AI's embeddings never do) answers "not reported by provider"; that passes on the model the
+# running process reports for the role, which run_a8 checks before any provider call
+# (assert_running_models).
 assert_provider_model() {
   local role=$1 actual=$2 expected=$3
   if [[ "$actual" == "$model_not_reported" ]]; then
-    printf 'A8 PRECHECK: %s model was not reported by provider\n' "$role"
-    return 2
+    printf 'A8 RAN: the provider did not report the %s model; the running process runs %s.\n' "$role" "$expected"
+    return 0
   fi
   if [[ -z "$actual" || "$actual" != "$expected" ]]; then
     printf '%s provider model mismatch: got %q, want %q\n' "$role" "$actual" "$expected" >&2
@@ -433,7 +467,7 @@ wait_for_summary_ready() {
 }
 
 wait_for_summary() {
-  local session_id=$1 before_version=$2 detail model version model_status
+  local session_id=$1 before_version=$2 detail model version
   for _ in {1..120}; do
     if detail=$(session_detail "$session_id"); then
       if jq -e '.session.summary_status == "completed" and (.session.summary | type == "string" and length > 0)' \
@@ -442,11 +476,7 @@ wait_for_summary() {
         if (( version > before_version )); then
           model=$(jq -r '.session.summary_model // ""' <<<"$detail")
           assert_provider_model summary "$model" "$summary_provider_model"
-          model_status=$?
-          if (( model_status != 0 )); then
-            return "$model_status"
-          fi
-          return 0
+          return
         fi
       fi
       if jq -e '.session.summary_status == "failed"' >/dev/null <<<"$detail"; then
@@ -483,17 +513,13 @@ session_search_word() {
 }
 
 wait_for_tts() {
-  local request_id=$1 speech_status model voice model_status
+  local request_id=$1 speech_status model voice
   for _ in {1..60}; do
     if speech_status=$(curl --fail --silent --show-error "$unit_url/api/tts/status/$request_id"); then
       if jq -e '.status == "completed" and (.bytes_written | type == "number" and . > 0)' >/dev/null <<<"$speech_status"; then
         model=$(jq -r '.model // ""' <<<"$speech_status")
         voice=$(jq -r '.voice // ""' <<<"$speech_status")
-        assert_provider_model speech "$model" "$tts_model"
-        model_status=$?
-        if (( model_status != 0 )); then
-          return "$model_status"
-        fi
+        assert_provider_model speech "$model" "$tts_model" || return 1
         [[ "$voice" == "$tts_voice" ]] || {
           printf 'speech provider voice mismatch: got %q, want %q\n' "$voice" "$tts_voice" >&2
           return 1
@@ -512,7 +538,7 @@ wait_for_tts() {
 }
 
 wait_for_refinement() {
-  local session_id=$1 detail saw_running=false model model_status
+  local session_id=$1 detail saw_running=false model
   for _ in {1..120}; do
     if detail=$(session_detail "$session_id"); then
       case "$(jq -r '.session.refinement_status' <<<"$detail")" in
@@ -521,11 +547,7 @@ wait_for_refinement() {
           if [[ "$saw_running" == true ]]; then
             model=$(jq -r '.session.refinement_model // ""' <<<"$detail")
             assert_provider_model refinement "$model" "$batch_refinement_model"
-            model_status=$?
-            if (( model_status != 0 )); then
-              return "$model_status"
-            fi
-            return 0
+            return
           fi
           ;;
         failed|no_audio)
@@ -619,7 +641,7 @@ run_a6() {
 }
 
 run_a8() {
-  local current_status current_config deployed_yaml environment_names embedding_location before_summary_version a8_precheck=false
+  local current_status current_config deployed_yaml environment_names embedding_location before_summary_version
   local summary_response semantic_response semantic_model speech_response speech_headers speech_model speech_voice speech_request_id refinement_response
   printf 'A8 PRECHECK: read status, running configuration, deployed YAML, and service environment before provider calls.\n'
   current_status=$(status) || {
@@ -642,8 +664,8 @@ run_a8() {
     printf 'A8 FAILED: the Pi configuration does not name the accepted models\n' >&2
     return 1
   }
-  assert_running_summarization_model "$current_config" || {
-    printf 'A8 FAILED: the running summarization model is not the accepted one\n' >&2
+  assert_running_models "$current_config" || {
+    printf 'A8 FAILED: the running process does not run the accepted model for every role\n' >&2
     return 1
   }
   environment_names=$(service_environment_names) || {
@@ -680,16 +702,7 @@ run_a8() {
     printf 'A8 FAILED: summary route returned an unexpected body\n' >&2
     return 1
   }
-  if wait_for_summary "$acceptance_session_id" "$before_summary_version"; then
-    :
-  else
-    result=$?
-    if (( result == 2 )); then
-      a8_precheck=true
-    else
-      return 1
-    fi
-  fi
+  wait_for_summary "$acceptance_session_id" "$before_summary_version" || return 1
 
   semantic_response=$(semantic_search) || {
     printf 'A8 FAILED: semantic-search route did not answer\n' >&2
@@ -700,16 +713,7 @@ run_a8() {
     return 1
   }
   semantic_model=$(jq -r '.model // ""' <<<"$semantic_response")
-  if assert_provider_model search "$semantic_model" "$embedding_model"; then
-    :
-  else
-    result=$?
-    if [[ $result -eq 2 ]]; then
-      a8_precheck=true
-    else
-      return 1
-    fi
-  fi
+  assert_provider_model search "$semantic_model" "$embedding_model" || return 1
 
   speech_headers="$scratch_dir/a8-tts.headers"
   speech_response=$(speak "$speech_headers") || {
@@ -718,16 +722,7 @@ run_a8() {
   }
   speech_model=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Model)
   speech_voice=$(response_header "$speech_headers" X-Ghost-Wispr-TTS-Voice)
-  if assert_provider_model speech "$speech_model" "$tts_model"; then
-    :
-  else
-    result=$?
-    if (( result == 2 )); then
-      a8_precheck=true
-    else
-      return 1
-    fi
-  fi
+  assert_provider_model speech "$speech_model" "$tts_model" || return 1
   [[ "$speech_voice" == "$tts_voice" ]] || {
     printf 'speech provider voice mismatch: got %q, want %q\n' "$speech_voice" "$tts_voice" >&2
     return 1
@@ -736,16 +731,7 @@ run_a8() {
     printf 'A8 FAILED: speech route did not return a request ID\n' >&2
     return 1
   }
-  if wait_for_tts "$speech_request_id"; then
-    :
-  else
-    result=$?
-    if (( result == 2 )); then
-      a8_precheck=true
-    else
-      return 1
-    fi
-  fi
+  wait_for_tts "$speech_request_id" || return 1
 
   refinement_response=$(post_json "/api/sessions/${acceptance_session_id}/retry-refinement" '{}') || {
     printf 'A8 FAILED: batch-refinement route did not accept real session %s\n' "$acceptance_session_id" >&2
@@ -755,22 +741,9 @@ run_a8() {
     printf 'A8 FAILED: batch-refinement route did not confirm its request\n' >&2
     return 1
   }
-  if wait_for_refinement "$acceptance_session_id"; then
-    :
-  else
-    result=$?
-    if (( result == 2 )); then
-      a8_precheck=true
-    else
-      return 1
-    fi
-  fi
-  printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with provider-reported models: %s, %s, %s, and %s/%s.\n' \
+  wait_for_refinement "$acceptance_session_id" || return 1
+  printf 'A8 RAN: summary, semantic-search, speech, and batch-refinement routes completed for real session %s with the planned models: %s, %s, %s, and %s/%s.\n' \
     "$acceptance_session_id" "$batch_refinement_model" "$summarization_model" "$embedding_model" "$tts_model" "$tts_voice"
-  if [[ "$a8_precheck" == true ]]; then
-    return 2
-  fi
-  return 0
 }
 
 run_a10() {
@@ -910,11 +883,16 @@ EOF
   if assert_expected_config "$swapped_config" 2>/dev/null; then
     fail 'A8 self-test accepted swapped batch and summarization models'
   fi
-  if assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-2.5-flash"}}'; then
-    fail 'A8 self-test accepted a running summarization model that differs from the YAML'
-  fi
-  assert_running_summarization_model '{"summarization":{"model":"gemini/gemini-4-carbon"}}' \
-    || fail 'A8 self-test rejected the running summarization model'
+  local good_running_config
+  good_running_config='{"summarization":{"model":"gemini/gemini-4-carbon"},"models":{"live_transcription":"nova-3","batch_transcription_provider":"deepgram","batch_transcription":"nova-3","summarization":"gemini/gemini-4-carbon","embedding":"gemini/gemini-embedding-2","genai_backend":"vertex","gcp_project":"theorem-agent-infra","gcp_location":"global","tts_provider":"gemini","tts":"gemini-3.8-flash-tts","tts_voice":"Kore"}}'
+  assert_running_models "$good_running_config" || fail 'A8 self-test rejected the running models of the plan'
+  for drift in '.models.summarization = "gemini/gemini-2.5-flash"' '.models.embedding = "gemini/gemini-embedding-001"' \
+    '.models.live_transcription = "nova-2"' '.models.batch_transcription = "whisper-1"' '.models.tts_voice = "Charon"' \
+    '.models.gcp_location = "us-central1"' 'del(.models.tts)' 'del(.models)'; do
+    if assert_running_models "$(jq -c "$drift" <<<"$good_running_config")" 2>/dev/null; then
+      fail "A8 self-test accepted a running process with $drift"
+    fi
+  done
   if assert_no_config_overrides $'GHOST_WISPR_ADDR\nGHOST_WISPR_TTS_VOICE' 2>/dev/null; then
     fail 'A8 self-test accepted an environment override of the TTS voice'
   fi
@@ -951,13 +929,17 @@ EOF
     || fail 'A8 self-test rejected the provider speech model'
   assert_provider_model refinement "$batch_refinement_model" "$batch_refinement_model" \
     || fail 'A8 self-test rejected the provider refinement model'
-  assert_provider_model search "$model_not_reported" "$embedding_model" >/dev/null
-  if [[ $? -ne 2 ]]; then
-    fail 'A8 self-test did not classify an unreported provider model as PRECHECK'
-  fi
+  assert_provider_model summary "$model_not_reported" "$summary_provider_model" \
+    || fail 'A8 self-test rejected a summary model the provider did not report'
+  assert_provider_model search "$model_not_reported" "$embedding_model" \
+    || fail 'A8 self-test rejected a search model the provider did not report'
+  assert_provider_model speech "$model_not_reported" "$tts_model" \
+    || fail 'A8 self-test rejected a speech model the provider did not report'
+  assert_provider_model refinement "$model_not_reported" "$batch_refinement_model" \
+    || fail 'A8 self-test rejected a refinement model the provider did not report'
   printf 'A8 self-test RAN: planted failure rejected\n'
 
-  local search_word model_result scratch_dir acceptance_session_id unit_url=http://self-test
+  local search_word scratch_dir acceptance_session_id unit_url=http://self-test
   search_word=$(session_search_word '{"session":{"canonical_transcript":"canonicaltoken"},"segments":[{"text":"segmenttoken"}]}')
   [[ "$search_word" == canonicaltoken ]] || fail 'A6 self-test did not use canonical_transcript for the search word'
   printf 'A6 self-test RAN: canonical transcript supplied the search word\n'
@@ -965,22 +947,12 @@ EOF
   session_detail() {
     printf '%s\n' '{"session":{"summary_status":"completed","summary":"summary","summary_version":1,"summary_model":"not reported by provider"}}'
   }
-  if wait_for_summary self-test 0; then
-    fail 'A8 self-test accepted an unreported summary model'
-  else
-    model_result=$?
-  fi
-  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported summary model as PRECHECK'
+  wait_for_summary self-test 0 || fail 'A8 self-test rejected a summary whose model the provider did not report'
 
   curl() {
     printf '%s\n' '{"status":"completed","bytes_written":1,"model":"not reported by provider","voice":"Kore"}'
   }
-  if wait_for_tts self-test; then
-    fail 'A8 self-test accepted an unreported speech model'
-  else
-    model_result=$?
-  fi
-  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported speech model as PRECHECK'
+  wait_for_tts self-test || fail 'A8 self-test rejected speech whose model the provider did not report'
 
   local refinement_marker="$controls_dir/refinement-running"
   session_detail() {
@@ -991,12 +963,7 @@ EOF
     fi
     printf '%s\n' '{"session":{"refinement_status":"completed","refinement_model":"not reported by provider"}}'
   }
-  if wait_for_refinement self-test; then
-    fail 'A8 self-test accepted an unreported refinement model'
-  else
-    model_result=$?
-  fi
-  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported refinement model as PRECHECK'
+  wait_for_refinement self-test || fail 'A8 self-test rejected a refinement whose model the provider did not report'
 
   scratch_dir="$controls_dir/a8"
   mkdir "$scratch_dir"
@@ -1007,8 +974,11 @@ EOF
   local summary_requested="$controls_dir/summary-requested"
   local refinement_requested="$controls_dir/refinement-requested"
   local refinement_seen_running="$controls_dir/refinement-seen-running"
+  # The model each fake provider reports.
+  local summary_reported=$summary_provider_model refinement_reported=$batch_refinement_model
+  local search_reported=$embedding_model speech_reported=$tts_model
   status() { printf '%s\n' '{"warnings":[]}'; }
-  running_config() { printf '%s\n' '{"summarization":{"model":"gemini/gemini-4-carbon"}}'; }
+  running_config() { printf '%s\n' "$good_running_config"; }
   remote_run() { printf '%s\n' "$good_config"; }
   service_environment_names() { printf '%s\n' $'GHOST_WISPR_ADDR\nGHOST_WISPR_EMBEDDING_LOCATION'; }
   service_embedding_location() { printf '%s\n' 'GHOST_WISPR_EMBEDDING_LOCATION=global'; }
@@ -1020,12 +990,12 @@ EOF
         return
       fi
       : >"$refinement_called"
-      printf '%s\n' "{\"session\":{\"refinement_status\":\"completed\",\"refinement_model\":\"$batch_refinement_model\"}}"
+      printf '%s\n' "{\"session\":{\"refinement_status\":\"completed\",\"refinement_model\":\"$refinement_reported\"}}"
       return
     fi
     if [[ -e "$summary_requested" ]]; then
       : >"$summary_called"
-      printf '%s\n' "{\"session\":{\"summary_status\":\"completed\",\"summary\":\"summary\",\"summary_version\":2,\"summary_model\":\"$summary_provider_model\"}}"
+      printf '%s\n' "{\"session\":{\"summary_status\":\"completed\",\"summary\":\"summary\",\"summary_version\":2,\"summary_model\":\"$summary_reported\"}}"
       return
     fi
     printf '%s\n' '{"session":{"summary_version":1}}'
@@ -1040,14 +1010,14 @@ EOF
       *) return 1 ;;
     esac
   }
-  semantic_search() { printf '%s\n' '{"results":[{}],"model":"gemini-embedding-2"}'; }
+  semantic_search() { printf '%s\n' "{\"results\":[{}],\"model\":\"$search_reported\"}"; }
   speak() {
-    printf '%s\n' "X-Ghost-Wispr-TTS-Model: $tts_model" "X-Ghost-Wispr-TTS-Voice: $tts_voice" >"$1"
+    printf '%s\n' "X-Ghost-Wispr-TTS-Model: $speech_reported" "X-Ghost-Wispr-TTS-Voice: $tts_voice" >"$1"
     printf '%s\n' '{"id":"self-test"}'
   }
   curl() {
     : >"$speech_called"
-    printf '%s\n' "{\"status\":\"completed\",\"bytes_written\":1,\"model\":\"$tts_model\",\"voice\":\"$tts_voice\"}"
+    printf '%s\n' "{\"status\":\"completed\",\"bytes_written\":1,\"model\":\"$speech_reported\",\"voice\":\"$tts_voice\"}"
   }
   if ! run_a8; then
     fail 'A8 self-test did not pass when every role reported its model'
@@ -1056,19 +1026,28 @@ EOF
     || fail 'A8 self-test did not run every provider role'
   printf 'A8 self-test RAN: every reported model returns PASS\n'
 
+  # A provider that reports no model: A8 passes that role on the model the unit's configuration
+  # names, which its precheck read, and runs every later role.
   rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
-  speak() {
-    printf '%s\n' "X-Ghost-Wispr-TTS-Model: $model_not_reported" "X-Ghost-Wispr-TTS-Voice: $tts_voice" >"$1"
-    printf '%s\n' '{"id":"self-test"}'
-  }
-  if run_a8; then
-    fail 'A8 self-test accepted an unreported speech-header model'
-  else
-    model_result=$?
+  summary_reported=$model_not_reported refinement_reported=$model_not_reported
+  search_reported=$model_not_reported speech_reported=$model_not_reported
+  run_a8 || fail 'A8 self-test rejected models no provider reported'
+  [[ -e "$summary_called" && -e "$speech_called" && -e "$refinement_called" ]] \
+    || fail 'A8 self-test stopped before every provider role ran when no provider reported its model'
+  rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
+  remote_run() { printf '%s\n' "${good_config/embedding_model: gemini\/gemini-embedding-2/embedding_model: gemini/gemini-embedding-001}"; }
+  if run_a8 >/dev/null 2>&1; then
+    fail 'A8 self-test accepted an unreported search model when the configuration names another'
   fi
-  (( model_result == 2 )) || fail 'A8 self-test did not classify an unreported speech-header model as PRECHECK'
-  [[ -e "$refinement_called" ]] || fail 'A8 self-test stopped before batch refinement after a speech-header PRECHECK'
-  printf 'A8 self-test RAN: unreported speech header is PRECHECK and later roles still run\n'
+  remote_run() { printf '%s\n' "$good_config"; }
+  rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
+  running_config() { jq -c '.models.embedding = "gemini/gemini-embedding-001"' <<<"$good_running_config"; }
+  if run_a8 >/dev/null 2>&1; then
+    fail 'A8 self-test accepted a running process whose embedding model is not the plan'"'"'s while the YAML names it'
+  fi
+  running_config() { printf '%s\n' "$good_running_config"; }
+  printf 'A8 self-test RAN: every role is compared with the model the running process reports\n'
+  printf 'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run\n'
 
   if assert_drive_members $'sami@theorem.dev|organizer\nreaders@theorem.dev|reader' readers@theorem.dev 2>/dev/null; then
     fail 'A10 self-test accepted a member list without the service account as organizer'

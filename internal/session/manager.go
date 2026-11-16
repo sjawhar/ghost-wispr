@@ -669,9 +669,9 @@ func (m *Manager) broadcastSummaryStatus(sessionID, title, summary, status, pres
 
 // failSummary records that making session sessionID's summary from the text
 // of transcript generation generation failed, and why (reason), and announces
-// the title and summary the session keeps: its last good ones, if it has
-// them. Once the text has changed since (a segment deletion), it records
-// nothing: the newer run's status stays.
+// the title and summary the session keeps, its last good ones if it has
+// them, with the reason. Once the text has changed since (a segment
+// deletion), it records nothing: the newer run's status stays.
 func (m *Manager) failSummary(sessionID, reason string, generation int) {
 	kept, err := m.store.FailSummaryAtGeneration(sessionID, reason, generation)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -682,7 +682,9 @@ func (m *Manager) failSummary(sessionID, reason string, generation int) {
 		m.logger.Error("failed to record the failed summary", "operation", "generate_summary", "session_id", sessionID, "reason", reason, "error", err)
 		return
 	}
-	m.broadcastSummaryStatus(sessionID, kept.Title, kept.Summary, storage.SummaryFailed, kept.SummaryPreset)
+	if m.hub != nil {
+		m.hub.BroadcastSummaryFailed(sessionID, kept.Title, kept.Summary, kept.SummaryPreset, kept.SummaryError)
+	}
 }
 
 func (m *Manager) ActiveSession() (string, time.Time) {

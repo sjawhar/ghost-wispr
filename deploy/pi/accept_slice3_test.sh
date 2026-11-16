@@ -21,12 +21,19 @@ fi
 for line in \
   'A11 text only self-test RAN: planted failure rejected' \
   'A11 text only self-test RAN: the database scan sees a planted phrase in binary data in the database, its log and its backup' \
+  'A11 self-test RAN: the database scan finds each word of a phrase that a search index stores apart from the other, where adjacent words see nothing' \
+  'A11 self-test RAN: other conversations that say "contractor" or "orange" pass the precheck and the check after the delete' \
+  'A11 self-test RAN: a per-word check with no word to count is a NOTE line, never a PASS line' \
+  'A11 self-test RAN: the precheck counts on their own only the words of each phrase that no file holds yet' \
+  'A11 text only self-test RAN: before "Delete text", the database check needs the phrase, and each counted word, in the database or its log and in the backup' \
+  'A11 self-test RAN: after "Delete text and audio", the database files, the log and the backup hold neither phrase' \
   'A11 text only self-test RAN: a failed control stops the row before "Delete text"' \
   'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement' \
   'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes' \
   'A11 text only self-test RAN: a slow refinement accepts a 202 response, stays running, then completes' \
   'A11 text only self-test RAN: retry refinement waits for a newer revision' \
   'A11 self-test RAN: planted failure rejected' \
+  'A11 self-test RAN: before "Delete text and audio", every read the deletion clears needs the whole phrase, in any case and with its number as digits or words, and the title and the Drive folder name are only noted' \
   'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence' \
   'A11 self-test RAN: a failed control stops the row before "Delete text and audio"' \
   'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio and its revision on its segment' \
@@ -82,8 +89,8 @@ assert_mutation_caught() {
 }
 
 # A checker that always passes must fail the self-test: each one is load-bearing.
-for checker in check_absent check_ids_unchanged check_ids_replaced check_answers_200 check_answers_404 \
-  check_one_revision check_hashes_unchanged check_same_md5 check_search_absent check_db_scan \
+for checker in check_absent check_noted check_ids_unchanged check_ids_replaced check_answers_200 check_answers_404 \
+  check_one_revision check_hashes_unchanged check_same_md5 check_search_absent check_db_scan check_db_words \
   check_mode_required check_doc_holds_summary check_session_settled; do
   needle=$'\n'"$checker() {"$'\n'
   assert_mutation_caught "a $checker that always passes" "$needle" "$needle  return 0"$'\n'
@@ -107,6 +114,66 @@ assert_mutation_caught 'A11 text only deleting after a failed control' \
 assert_mutation_caught 'A11 deleting after a failed control' \
   $'print_round A11\n  if ! round_result; then' \
   $'print_round A11\n  if false; then'
+
+# Before "Delete text and audio", the summarizer chooses whether the title and the Drive folder
+# name hold the phrase, so requiring it there would stop a run on a unit that deletes correctly;
+# every read the deletion clears needs the whole phrase, its number included.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'A11 requiring the phrase in the title' \
+  $'check \'title\' check_noted "$(session_field "$detail" title)" "$audio_trace"' \
+  $'check \'title\' check_present "$(session_field "$detail" title)" "$audio_trace"'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'A11 accepting part of the phrase in the Drive documents before the delete' \
+  'check_drive_documents "$dir" "$listing" present "$audio_phrase_pattern"' \
+  'check_drive_documents "$dir" "$listing" present "$audio_pair"'
+
+# The search index keeps each word of a phrase as its own term, in sorted order, so a scan for
+# two adjacent words cannot see it; the scan looks for each word on its own.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'a database scan for adjacent words' \
+  'audio) printf '"'"'%s\n'"'"' "${audio_tokens[@]}" ;;' \
+  'audio) printf '"'"'%s\n'"'"' "$audio_pair" ;;'
+
+# Other conversations on the unit hold common words. A word must match only where it starts a word
+# ("contractor" is not "tractor"), and a word another conversation held before this one was
+# recorded must not be counted on its own.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'a word that matches inside another word' \
+  'printf '"'"'%s.%s=(^|[^[:alpha:]])%s\n'"'"' "$name" "$token" "$token"' \
+  'printf '"'"'%s.%s=%s\n'"'"' "$name" "$token" "$token"'
+assert_mutation_caught 'counting a word another conversation holds' \
+  'END { exit !(seen && !held) }' 'END { exit 0 }'
+assert_mutation_caught 'counting a word the precheck scan did not count' \
+  'END { exit !(seen && !held) }' 'END { exit held }'
+
+# A per-word check with no word to count reads nothing, so it must be a NOTE line, never a PASS.
+assert_mutation_caught 'a per-word check with no word to count that runs anyway' \
+  $'  if (( $# == 0 )); then\n    note "$name"' $'  if false; then\n    note "$name"'
+# The per-word controls before each delete, and A11's database checks after "Delete text and
+# audio", must each be able to fail.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'no per-word control before "Delete text"' \
+  '"$(result "$dir" db.report)" present text_only "${text_only_db_words[@]}"' '"$(result "$dir" db.report)" present text_only'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'no per-word control before "Delete text and audio"' \
+  '"$(result "$dir" db.report)" present audio "${audio_db_words[@]}"' '"$(result "$dir" db.report)" present audio'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'no database check after "Delete text and audio"' \
+  $'check \'database files and pre-migration backup\' check_db_scan "$(result "$dir" db.report)" absent audio control' \
+  ':'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'no database scan in the evidence A11 reads' \
+  $'  local detail=$1 phase=$2\n  printf \'db_scan\\tdb\\t-\\t-\\n\'' $'  local detail=$1 phase=$2'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'no check that "orange tractor ninety" stays gone from the database files' \
+  $'  check "\\"$text_only_phrase\\" stays gone from the database files and pre-migration backup" \\\n    check_db_scan "$(result "$dir" db.report)" absent text_only control' \
+  '  :'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'a precheck that counts no word of "purple elephant seventeen" on its own' \
+  '  mapfile -t audio_db_words < <(attributable_words "$1" audio)' '  audio_db_words=()'
+# The precheck makes that choice.
+# shellcheck disable=SC2016 # The needle is the driver's source text.
+line_of '  choose_db_words "$(result "$dir" db.report)"' >/dev/null
 
 # The Drive token and the Deepgram key stay out of curl's arguments, and the Drive token is read-only.
 # shellcheck disable=SC2016 # The needles are the driver's source text.

@@ -336,6 +336,14 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + walScratchTable); err != nil {
 		return fmt.Errorf("drop the write-ahead log scratch table: %w", err)
 	}
+	// What a delete outside this build left (a deleted session's events and
+	// index entries) goes before the backup is taken, at the first start after
+	// such a delete, so the backup holds none of it; its erase from the
+	// write-ahead log is finished with the owed erases below
+	// (retryOwedErasure).
+	if err := s.dropWhatDeletedSessionsLeft(); err != nil {
+		return err
+	}
 
 	// Create pre-migration backup after pragmas are set (which creates the DB file)
 	backupTaken := true
@@ -613,6 +621,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
 			INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, canonical_transcript)
 			VALUES('delete', old.rowid, old.title, old.summary, old.canonical_transcript);
+		END;`,
+		// A session row's delete, by any build, is recorded, so the next
+		// start clears what it left (dropWhatDeletedSessionsLeft) and a start
+		// with nothing deleted does not.
+		`CREATE TRIGGER IF NOT EXISTS ` + sessionsDeletedTrigger + ` AFTER DELETE ON sessions BEGIN
+			INSERT OR IGNORE INTO app_state(key, value) VALUES('` + sessionsDeletedKey + `', '1');
 		END;`,
 		// The index follows only the columns it holds, so the update of other
 		// columns that sessions_documents_changed (below) makes inside its
@@ -2929,10 +2943,19 @@ func (s *SQLiteStore) DeleteEmbeddings(sessionID string) error {
 	return nil
 }
 
-// StoreEvent inserts an event into the mcp_events table.
+// StoreEvent inserts an event into the mcp_events table. An event that names
+// a session is stored only while that session exists, checked in the insert
+// itself: a summary is committed before the hub stores its event, and a
+// whole-conversation delete that commits between the two must not leave the
+// summary behind in an event (DeleteSession deletes the events it finds). An
+// event that names no session, or is not JSON, is stored.
 func (s *SQLiteStore) StoreEvent(eventType, payload string) error {
 	_, err := s.db.Exec(
-		`INSERT INTO mcp_events(event_type, payload) VALUES(?, ?)`,
+		`INSERT INTO mcp_events(event_type, payload) SELECT ?1, ?2
+		WHERE CASE WHEN json_valid(?2) THEN
+			COALESCE(json_extract(?2, '$.session_id'), '') = ''
+			OR EXISTS (SELECT 1 FROM sessions WHERE sessions.id = json_extract(?2, '$.session_id'))
+		ELSE 1 END`,
 		eventType, payload,
 	)
 	if err != nil {

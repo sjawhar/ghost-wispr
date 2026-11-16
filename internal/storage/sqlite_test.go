@@ -2621,6 +2621,10 @@ func TestGetAllEmbeddings(t *testing.T) {
 
 func TestStoreEvent(t *testing.T) {
 	store := newTestSQLiteStore(t)
+	// A session's event is stored only while the session exists.
+	if err := store.CreateSession("s1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 
 	// Store events
 	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {
@@ -2664,6 +2668,12 @@ func TestStoreEvent(t *testing.T) {
 
 func TestPurgeOldEvents(t *testing.T) {
 	store := newTestSQLiteStore(t)
+	// A session's event is stored only while the session exists.
+	for _, id := range []string{"s1", "s2"} {
+		if err := store.CreateSession(id, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// Store an event
 	if err := store.StoreEvent("session_started", `{"session_id":"s1"}`); err != nil {

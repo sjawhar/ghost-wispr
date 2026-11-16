@@ -60,19 +60,26 @@ func (s *SQLiteStore) retryOwedErasure(backupTaken bool) error {
 	return clearOwedErase(s.db, owed)
 }
 
-// eraseEveryOwed erases every committed deletion from the write-ahead log and,
-// unless the backup was taken at this start (backupTaken), from the
-// pre-migration backup, and finishes any backup erase left part way.
+// eraseEveryOwed erases every committed deletion, unless the backup was taken
+// at this start (backupTaken), from the pre-migration backup, then from the
+// write-ahead log, and finishes any backup erase left part way. Each step
+// runs whether or not the one before it failed, and the backup goes first: on
+// a full disk the log cannot be overwritten, and the backup must not keep the
+// deleted words until space comes back; erasing it, when it cannot be taken
+// again, also frees the space the overwrite needs. (A deletion's own first
+// erase, eraseDeletion, still overwrites the log first and leaves the erase
+// owed when that fails, so on a full disk the backup goes at this retry, on
+// the next sync sweep or start.)
 func (s *SQLiteStore) eraseEveryOwed(backupTaken bool) error {
-	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
-		return fmt.Errorf("overwrite the write-ahead log: %w", err)
-	}
+	var backupErr error
 	if !backupTaken {
-		if err := s.refreshOrRemoveBackup(); err != nil {
-			return err
-		}
+		backupErr = s.refreshOrRemoveBackup()
 	}
-	return s.eraseOrphans()
+	var walErr error
+	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
+		walErr = fmt.Errorf("overwrite the write-ahead log: %w", err)
+	}
+	return errors.Join(backupErr, walErr, s.eraseOrphans())
 }
 
 // recordOwedErase records a deletion's owed erase, in its transaction: it
@@ -98,6 +105,22 @@ func recordOwedErase(tx *sql.Tx) (owed string, earlier bool, err error) {
 		return "", false, fmt.Errorf("record owed erase: %w", err)
 	}
 	return owed, earlier, nil
+}
+
+// markEraseOwed records, in tx, that an erase of the write-ahead log and the
+// backup is owed for a change that is not a numbered deletion (the one-time
+// sweep of deleted sessions' events and index entries as the app starts). It
+// takes no deletion number: an owed marker already there stays, since the
+// erase is store-wide and covers both, and otherwise the marker is the last
+// number taken, which any later deletion's exceeds, so an erase that read it
+// never clears a later deletion's marker.
+func markEraseOwed(tx *sql.Tx) error {
+	if _, err := tx.Exec(`INSERT INTO app_state(key, value)
+		VALUES(?, COALESCE((SELECT value FROM app_state WHERE key = ?), '0'))
+		ON CONFLICT(key) DO NOTHING`, owedEraseKey, owedEraseSeqKey); err != nil {
+		return fmt.Errorf("record owed erase: %w", err)
+	}
+	return nil
 }
 
 // clearOwedErase records the owed erase done, unless a later deletion has
@@ -137,9 +160,14 @@ func (s *SQLiteStore) refreshOrRemoveBackup() error {
 	default:
 		slog.Warn("the pre-migration backup has an older schema and cannot be scrubbed without the deleted text; erasing it", "path", backupPath)
 	}
+	return removeBackup(backupPath)
+}
+
+// removeBackup erases the pre-migration backup at backupPath and its log
+// files. A file gone from its name whose bytes are not overwritten yet is
+// finished by eraseOrphans.
+func removeBackup(backupPath string) error {
 	for _, file := range []string{backupPath + "-wal", backupPath + "-shm", backupPath} {
-		// A file gone from its name whose bytes are not overwritten yet is
-		// finished by eraseOrphans.
 		if err := erase.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, erase.ErrLeftover) {
 			return fmt.Errorf("erase backup %s: %w", file, err)
 		}

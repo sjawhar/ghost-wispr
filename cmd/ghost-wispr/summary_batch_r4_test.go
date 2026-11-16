@@ -16,6 +16,10 @@ func (h *r4BatchHub) BroadcastSummaryReady(sessionID, _, _, _, _ string) {
 	h.ready = append(h.ready, sessionID)
 }
 
+func (h *r4BatchHub) BroadcastSummaryFailed(sessionID, _, _, _, _ string) {
+	h.ready = append(h.ready, sessionID)
+}
+
 func r4BatchStore(t *testing.T, ids ...string) (*storage.SQLiteStore, string, string, map[string]int) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "batch.db")

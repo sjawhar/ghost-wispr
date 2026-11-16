@@ -48,6 +48,8 @@ type SummaryReadyEvent struct {
 	Summary   string `json:"summary"`
 	Status    string `json:"status"`
 	Preset    string `json:"summary_preset"`
+	// Error says why making the summary failed, on a failed status.
+	Error string `json:"summary_error,omitempty"`
 }
 
 type StatusChangedEvent struct {

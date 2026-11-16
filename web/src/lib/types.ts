@@ -100,6 +100,8 @@ export interface SummaryReadyEvent extends BaseEvent {
   summary: string
   status: SummaryStatus
   summary_preset?: string
+  // Why making the summary failed, on a failed status.
+  summary_error?: string
 }
 
 export interface StatusChangedEvent extends BaseEvent {

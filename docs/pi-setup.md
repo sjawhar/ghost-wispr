@@ -513,11 +513,17 @@ The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
 - A6 requires `/api/config` to show Drive sync on, a folder ID, credentials present, and GC
   enabled with no age limit and the 20000 MB audio budget. After the real session ends, it
   requires `summary.ready`, a synced Drive folder, and a keyword-search result for that session.
-- A8 requires `/api/status` to report no warnings, then starts one real session and calls
-  summary, semantic search, speech, and batch refinement. It compares the summary's
-  `summary_model`, semantic-search `model`, speech response headers and status model/voice,
-  and refinement `refinement_model` with the configured roles. A provider that does not report
-  its model produces `not reported by provider`; A8 marks that role PRECHECK and does not pass it.
+- A8 requires `/api/status` to report no warnings, and the running process's `/api/config`
+  `models` to name the plan's model for every role (live and batch transcription, summaries,
+  embeddings, the voice and its Google settings): a YAML edited after the service started does
+  not change what runs. It also requires the deployed YAML to name them and no environment
+  variable to override them, which is what the next start runs. It then starts one real session
+  and calls summary, semantic search, speech, and batch refinement, and compares the summary's
+  `summary_model`, semantic-search `model`, speech response headers and status model/voice, and
+  refinement `refinement_model` with the configured roles. A provider that does not report its
+  model produces `not reported by provider` (Vertex AI's embeddings never report one). The spec
+  asks that the unit run the plan's models, so A8 passes that role on the model the running
+  process reports for it.
 - A10 checks the member list: the only organizers are the service account and Sami, and the
   approved readers group is the only reader.
 
@@ -556,8 +562,12 @@ One run records one conversation for both rows:
    `text_and_audio`. A build without the modes would read `mode=text` as "Delete text and
    audio", so the driver stops here, before it records anything.
 2. The precheck requires that no conversation and no file in the database's directory already
-   holds "orange tractor ninety" or "purple elephant seventeen". If one does, delete that
-   conversation from the unit and run again.
+   holds "orange tractor ninety" or "purple elephant seventeen" as adjacent words. If one does,
+   delete that conversation from the unit and run again. It also notes which of "orange",
+   "tractor", "purple" and "elephant" no file holds yet: only those are counted on their own
+   after each delete (see the database check below), so another conversation that says "orange
+   juice" neither stops the run nor fails it. Record no other conversation until the run ends:
+   a counted word said in one reads as a word the delete left.
 3. The driver starts a conversation and prints its script (`Setup NEEDS-PERSON`). Two people
    read it: "purple elephant seventeen", the topic, and "orange tractor ninety" are each said
    alone in their own turn, and the control phrase "blue harbor lantern" in another. Press Enter
@@ -570,18 +580,22 @@ One run records one conversation for both rows:
    chooses "Delete text" on that timed segment with its revision
    (`?mode=text&revision=N`) and checks again until the phrase is gone or 15 minutes pass. It
    then chooses "retry refinement" and checks once more.
-6. A11: every check runs once and must find "purple elephant seventeen". The driver then chooses
-   "Delete text and audio" on that timed segment with its revision
-   (`?mode=text_and_audio&revision=N`) and checks again.
+6. A11: every check runs once and must find "purple elephant seventeen", in any case and with
+   its number as digits or words, except the title and the Drive folder name: the summarizer
+   chooses whether to name the phrase there, so those two are noted, and after the delete they
+   must hold no trace of it either way. The driver then chooses "Delete text and audio" on that
+   timed segment with its revision (`?mode=text_and_audio&revision=N`) and checks again.
 
 `--session ID` uses a conversation already recorded from the script, and skips the precheck.
 
 The live driver reports `PASS`, `FAILED` or `UNKNOWN` for each check, and a verdict for each
 row and for the run.
 
-- Before each delete, each check must find the phrase. That finding is the control for the
-  same check after the delete. If a check cannot find the phrase, the row is UNKNOWN and
-  nothing is deleted; record a new conversation and run again.
+- Before each delete, each check must find the phrase (A11's title and Drive folder name only
+  note it). That finding is the control for the same check after the delete. If a check cannot
+  find the phrase, the row is UNKNOWN and nothing is deleted; record a new conversation and run
+  again. A `NOTE` line says what a round did not check and why (for example, no word to count on
+  its own with `--session`); it changes no verdict and is never counted as a check that passed.
 - After a delete, a read that is empty, that failed, or that does not hold "blue harbor
   lantern" is UNKNOWN, not PASS.
 - A11 text only checks the segments, the transcript, the refined transcript, the summary, the
@@ -590,9 +604,22 @@ row and for the run.
   `transcript.md` and `summary.md` as text, and requires the recording's sha256 on the unit and
   every Drive file id to stay the same, each id still answering 200.
 - A11 checks the segments, the transcript, the refined transcript, the summary, the title, the
-  UI search, a Deepgram transcription of the unit's recording and the Drive folder name. It
-  exports the new `transcript.md` and `summary.md`, and downloads and transcribes the new
-  recording. Each old file id must answer 404 to `files.get` and `revisions.list`, and each new
-  file must hold one revision. It also checks that "orange tractor ninety" stays gone.
-- The database check finds the phrase where SQLite keeps it as text. The search index keeps
-  its words in a compressed form that `grep` cannot read; the UI search check covers the index.
+  UI search, the same database files as A11 text only, a Deepgram transcription of the unit's
+  recording and the Drive folder name. It exports the new `transcript.md` and `summary.md`, and
+  downloads and transcribes the new recording. Each old file id must answer 404 to `files.get`
+  and `revisions.list`, and each new file must hold one revision. It also checks that "orange
+  tractor ninety" stays gone, the database files included.
+- The database check counts each phrase twice in every file: as adjacent words, as a
+  conversation's rows hold it, and each distinctive word on its own ("orange" and "tractor",
+  "purple" and "elephant"; the number is left out, because live transcription may write it as
+  digits), as SQLite's search index holds it: each word as its own term, in sorted order, never
+  next to its neighbour. A word matches only where a word starts, so "contractor" is not
+  "tractor". Only the words the precheck found in no file are counted on their own, because
+  `grep` cannot tell which conversation a word in a binary file belongs to; with `--session` the
+  precheck does not run, and no word is. On an index page each term after the first is stored as
+  the part that differs from the term before it, so a word that shares its first letters with
+  its neighbour can still escape `grep`. The UI search cannot see what is left in the index
+  either: it joins the live rows, and a deleted row has none. So an A11 PASS does not show that
+  the index is clean. What shows it is the delete's rebuild of the index and its Go tests
+  (`internal/storage/search_index_erase_test.go`), which read the database, its log and the
+  backup for a one-word secret.

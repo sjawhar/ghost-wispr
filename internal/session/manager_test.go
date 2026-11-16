@@ -522,6 +522,7 @@ type hubMock struct {
 	latestSummary     string
 	latestStatus      string
 	latestPreset      string
+	latestError       string
 	interimCount      int
 	componentStatuses []componentStatusEvent
 	// endedHook, when set, runs first in BroadcastSessionEnded, outside the
@@ -567,6 +568,19 @@ func (h *hubMock) BroadcastSummaryReady(sessionID, title, summary, status, prese
 	h.latestSummary = summary
 	h.latestStatus = status
 	h.latestPreset = preset
+	h.latestError = ""
+	h.mu.Unlock()
+}
+
+func (h *hubMock) BroadcastSummaryFailed(sessionID, title, summary, preset, reason string) {
+	h.mu.Lock()
+	h.summaryReady++
+	h.latestSession = sessionID
+	h.latestTitle = title
+	h.latestSummary = summary
+	h.latestStatus = storage.SummaryFailed
+	h.latestPreset = preset
+	h.latestError = reason
 	h.mu.Unlock()
 }
 

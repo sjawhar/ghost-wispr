@@ -262,6 +262,9 @@
             {#if session.title}
               <span>{session.title}</span>
               <span class="session-time-sub">{timeRange}</span>
+            {:else if session.ended_at && (session.summary_status === SummaryStatus.Running || session.summary_status === SummaryStatus.Pending)}
+              <span>Title pending: the summary is still being made</span>
+              <span class="session-time-sub">{timeRange}</span>
             {:else}
               <span>Untitled Session</span>
               <span class="session-time-sub">{timeRange}</span>
@@ -298,6 +301,7 @@
           {#if session.summary_status === SummaryStatus.Failed}
             <button
               class="retry-btn"
+              aria-label="Retry summary"
               onclick={handleRetrySummary}
               disabled={retryingSummary}
               data-testid="retry-summary-btn"
@@ -413,6 +417,9 @@
     </div>
   {:else if session.summary_status === SummaryStatus.Failed}
     <p class="summary-preview">Summary unavailable</p>
+  {/if}
+  {#if session.summary_status === SummaryStatus.Failed && session.summary_error}
+    <p class="summary-preview summary-error" role="status">Why: {session.summary_error}</p>
   {/if}
 
   {#if (session.summary_status === SummaryStatus.Completed || session.summary_status === SummaryStatus.Failed) && Object.keys(presets).length > 0}
@@ -583,6 +590,10 @@
 
   .retry-error {
     font-size: 0.75rem;
+    color: var(--danger);
+  }
+
+  .summary-error {
     color: var(--danger);
   }
 

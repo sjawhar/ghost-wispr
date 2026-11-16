@@ -3,11 +3,13 @@ package summary
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/cenkalti/backoff/v5"
@@ -36,6 +38,12 @@ const (
 	defaultMinSummaryWords = 20
 	tokenPerCharEstimate   = 4
 )
+
+// errNoSummaryText is a model's answer whose summary holds no letter or
+// digit: an empty summary, or "..." as Gemini once answered on the office Pi.
+// It is not a summary, so the summarizer asks again, and fails with it when
+// every attempt answers so.
+var errNoSummaryText = errors.New("the model answered with no summary text")
 
 func New(cfg config.Summarization, factory ClientFactory) *Summarizer {
 	var router *Router
@@ -145,42 +153,27 @@ func (s *Summarizer) SummarizeWithPresetResult(ctx context.Context, _ string, tr
 		if err != nil {
 			return SummaryResult{}, err
 		}
-		if strings.TrimSpace(title) == "" {
-			title = guaranteedTitle(transcript)
-		}
-		return SummaryResult{Title: title, Summary: strings.TrimSpace(summaryText), Preset: presetName, SpeakerNames: speakerNames, Model: reportedModel(client)}, nil
+		return SummaryResult{Title: title, Summary: summaryText, Preset: presetName, SpeakerNames: speakerNames, Model: reportedModel(client)}, nil
 	}
 
 	messages := s.BuildPromptMessages(preset, transcript)
-	raw, err := s.completeJSONWithRetry(ctx, client, messages, StructuredSchema(), logger)
+	parsed, err := s.completeSummaryWithRetry(ctx, client, messages, transcript, logger)
 	if err != nil {
 		if isContextOverflow(err) {
 			title, summaryText, speakerNames, chunkErr := s.summarizeChunked(ctx, client, preset, transcript, logger)
 			if chunkErr == nil {
-				if strings.TrimSpace(title) == "" {
-					title = guaranteedTitle(transcript)
-				}
-				return SummaryResult{Title: title, Summary: strings.TrimSpace(summaryText), Preset: presetName, SpeakerNames: speakerNames, Model: reportedModel(client)}, nil
+				return SummaryResult{Title: title, Summary: summaryText, Preset: presetName, SpeakerNames: speakerNames, Model: reportedModel(client)}, nil
 			}
 			return SummaryResult{}, fmt.Errorf("summarize chunked after overflow: %w", chunkErr)
 		}
 		return SummaryResult{}, err
 	}
-
-	providerModel := reportedModel(client)
-	parsed, parseErr := parseStructuredSummary(raw)
-	if parseErr != nil {
-		return SummaryResult{Title: guaranteedTitle(transcript), Summary: strings.TrimSpace(string(raw)), Preset: presetName, SpeakerNames: "{}", Model: providerModel}, nil
-	}
-	if strings.TrimSpace(parsed.Title) == "" {
-		parsed.Title = guaranteedTitle(transcript)
-	}
 	return SummaryResult{
-		Title:        strings.TrimSpace(parsed.Title),
-		Summary:      strings.TrimSpace(parsed.Summary),
+		Title:        parsed.Title,
+		Summary:      parsed.Summary,
 		Preset:       presetName,
 		SpeakerNames: parsed.speakerNamesJSON(),
-		Model:        providerModel,
+		Model:        reportedModel(client),
 	}, nil
 }
 
@@ -237,6 +230,47 @@ func parseStructuredSummary(raw json.RawMessage) (parsedSummary, error) {
 		parsed.Speakers[speakerID] = meta
 	}
 	return parsed, nil
+}
+
+// summaryAnswer reads a model's structured answer (raw) as a title, a summary
+// and speaker names. An answer that is not a JSON object is the summary as
+// written. In a JSON object, the title and the summary are its "title" and
+// "summary" strings, also when another field (such as "speakers") does not
+// have the schema's type; a field that is not a string reads as empty, so an
+// answer such as {"title":"...","summary":["..."]} has no summary text, and
+// the raw JSON, whose keys hold letters, is never taken for one. A title that
+// holds no word (meaningfulText), such as "...", is made from the transcript
+// instead (guaranteedTitle).
+func summaryAnswer(raw json.RawMessage, transcript string) parsedSummary {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return parsedSummary{Title: guaranteedTitle(transcript), Summary: strings.TrimSpace(string(raw))}
+	}
+	parsed, err := parseStructuredSummary(raw)
+	if err != nil {
+		parsed = parsedSummary{Title: jsonString(fields["title"]), Summary: jsonString(fields["summary"])}
+	}
+	parsed.Title = strings.TrimSpace(parsed.Title)
+	parsed.Summary = strings.TrimSpace(parsed.Summary)
+	if !meaningfulText(parsed.Title) {
+		parsed.Title = guaranteedTitle(transcript)
+	}
+	return parsed
+}
+
+// jsonString returns the JSON string raw holds, or "" when it holds another
+// value or nothing.
+func jsonString(raw json.RawMessage) string {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return value
+}
+
+// meaningfulText reports whether text holds a letter or a digit.
+func meaningfulText(text string) bool {
+	return strings.IndexFunc(text, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) >= 0
 }
 
 func parseSpeakersField(raw json.RawMessage) (map[string]speakerNameMetadata, error) {
@@ -369,19 +403,32 @@ func StructuredSchema() map[string]any {
 	}
 }
 
-func (s *Summarizer) completeJSONWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, schema map[string]any, logger *slog.Logger) (json.RawMessage, error) {
-	var result json.RawMessage
+// completeSummaryWithRetry asks client for the structured summary messages
+// ask for, retrying a transient failure, and reads the answer (summaryAnswer;
+// transcript gives the title an answer lacks). An answer whose summary holds
+// no word (errNoSummaryText) is asked again in the same way, and when every
+// attempt answers so the summary fails with that reason rather than storing
+// it.
+func (s *Summarizer) completeSummaryWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, transcript string, logger *slog.Logger) (parsedSummary, error) {
+	var result parsedSummary
 	err := retry.Do(ctx, func() error {
-		var callErr error
-		result, callErr = client.CompleteJSON(ctx, messages, schema)
-		if callErr != nil && isContextOverflow(callErr) {
-			logger.Warn("structured summarize context overflow", "error", callErr)
-			return backoff.Permanent(callErr)
+		raw, callErr := client.CompleteJSON(ctx, messages, StructuredSchema())
+		if callErr != nil {
+			if isContextOverflow(callErr) {
+				logger.Warn("structured summarize context overflow", "error", callErr)
+				return backoff.Permanent(callErr)
+			}
+			return callErr
 		}
-		return callErr
+		result = summaryAnswer(raw, transcript)
+		if !meaningfulText(result.Summary) {
+			logger.Warn("the model answered with no summary text; asking again", "summary", result.Summary)
+			return fmt.Errorf("%w: %q", errNoSummaryText, result.Summary)
+		}
+		return nil
 	}, retry.DefaultMaxRetries)
 	if err != nil {
-		return nil, fmt.Errorf("summarize failed after retries: %w", err)
+		return parsedSummary{}, fmt.Errorf("summarize failed after retries: %w", err)
 	}
 	return result, nil
 }
@@ -424,29 +471,32 @@ func (s *Summarizer) summarizeChunked(ctx context.Context, client llm.Client, pr
 
 	mergeTranscript := strings.Join(chunkSummaries, "\n\n")
 	mergeMessages := s.BuildPromptMessages(preset, mergeTranscript)
-	mergeRaw, err := s.completeJSONWithRetry(ctx, client, mergeMessages, StructuredSchema(), logger)
+	merged, err := s.completeSummaryWithRetry(ctx, client, mergeMessages, transcript, logger)
 	if err != nil {
 		return "", "", "{}", fmt.Errorf("merge chunk summaries: %w", err)
 	}
-	merged, parseErr := parseStructuredSummary(mergeRaw)
-	if parseErr != nil {
-		return guaranteedTitle(transcript), strings.TrimSpace(string(mergeRaw)), "{}", nil
-	}
-	if strings.TrimSpace(merged.Title) == "" {
-		merged.Title = guaranteedTitle(transcript)
-	}
-	return strings.TrimSpace(merged.Title), strings.TrimSpace(merged.Summary), merged.speakerNamesJSON(), nil
+	return merged.Title, merged.Summary, merged.speakerNamesJSON(), nil
 }
 
+// completeTextWithRetry asks client for the summary of one chunk of a long
+// transcript, retrying a transient failure. An answer that holds no word
+// (errNoSummaryText) would drop that part of the conversation from the merged
+// summary without an error, so it is asked again in the same way, and when
+// every attempt answers so the summary fails with that reason.
 func (s *Summarizer) completeTextWithRetry(ctx context.Context, client llm.Client, messages []llm.Message, logger *slog.Logger) (string, error) {
 	var result string
 	err := retry.Do(ctx, func() error {
 		var callErr error
 		result, callErr = client.Complete(ctx, messages)
-		if callErr == nil {
-			result = strings.TrimSpace(result)
+		if callErr != nil {
+			return callErr
 		}
-		return callErr
+		result = strings.TrimSpace(result)
+		if !meaningfulText(result) {
+			logger.Warn("the model answered a chunk with no summary text; asking again", "summary", result)
+			return fmt.Errorf("%w: %q", errNoSummaryText, result)
+		}
+		return nil
 	}, retry.DefaultMaxRetries)
 	if err != nil {
 		return "", fmt.Errorf("chunk summarize failed after retries: %w", err)
