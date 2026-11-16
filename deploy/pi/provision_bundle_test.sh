@@ -71,7 +71,8 @@ EOF
 
 # gh answers as GitHub does for agent-infra's seed workflow: the runs newest first, two to a page
 # here, and the jobs of each attempt.
-# - 905, attempt 2: root was cancelled before it started (no steps, no log); attempt 1: skipped.
+# - 905, attempt 3: root waits for its approval (no steps, no log); attempt 2: root was cancelled
+#   before it started (no steps, no log); attempt 1: skipped.
 # - 904: root ran a preview, which prints the client id as [unknown].
 # - 903, re-run twice: attempt 3 ran a preview again; attempt 2 replaced ghost-wispr-x509, so the
 #   client id changed from the stale one to CLIENT_ID (with TEST_CREATION_FORM=create it created
@@ -118,7 +119,7 @@ replaced_id='2026-11-16T06:29:36.3829213Z   ~ ghostWisprTailnetClientId         
 case "${args[*]}" in
   "api $api/workflows/seed.yaml/runs?per_page=100&page="*)
     case ${args[1]##*page=} in
-      1) runs="$(run_json 905 2 "$recent"),$(run_json 904 1 "$recent")" ;;
+      1) runs="$(run_json 905 3 "$recent"),$(run_json 904 1 "$recent")" ;;
       2) runs="$(run_json 903 3 "$recent"),$(run_json 902 1 "$recent")" ;;
       3) runs=$(run_json 901 1 "$expired") ;;
       *) runs= ;;
@@ -132,6 +133,7 @@ case "${args[*]}" in
     attempt=${attempt%%/*}
     job="$run${attempt}1"
     case $run/$attempt in
+      905/3) root_job "$job" waiting null '' ;;
       905/2) root_job "$job" completed '"cancelled"' '' ;;
       905/1) root_job "$job" completed '"skipped"' '' ;;
       904/1)
