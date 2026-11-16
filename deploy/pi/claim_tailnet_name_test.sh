@@ -183,6 +183,22 @@ if run_case two-tagged "$tagged" "$(jq -c '.id = "444" | .name = "ghost-wispr-2.
 fi
 unchanged || fail "two-tagged: the tailnet changed"
 
+# The tagged device's id is not a string of digits: refused before any DELETE or POST. With the
+# id "333\n" read as 333, the script would delete the temporary device and rename the bystander,
+# whose id is 333.
+for refused in 'newline:"333\n"' 'numeric:333'; do
+  label=tagged-id-${refused%%:*}
+  if run_case "$label" "$(jq -c --argjson id "${refused#*:}" '.id = $id' <<<"$tagged")" "$temporary" "$bystander"; then
+    fail "$label: the script ran with a tagged id that is not a string of digits"
+  fi
+  unchanged || fail "$label: the tailnet changed to $(names)"
+  if grep -Eq -- '-X (DELETE|POST)' "$case_dir/argv"; then
+    fail "$label: the script deleted or renamed before it refused"
+  fi
+  [[ $(<"$case_dir/out") == "claim-tailnet-name: the tagged device has an id that is not a string of digits: ${refused#*:}; nothing was changed" ]] \
+    || fail "$label: the output is not the refusal alone: $(<"$case_dir/out")"
+done
+
 # The rename answers 200 but the name does not change: the read-back refuses.
 if TEST_RENAME_NOOP=1 run_case rename-not-taken "$tagged" "$temporary"; then
   fail "rename-not-taken: the script passed a rename that did not take"

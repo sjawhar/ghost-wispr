@@ -54,9 +54,12 @@ case $(jq length <<<"$tagged") in
   0) fail "no device with hostname $HOSTNAME_WANTED holds $TAG; run provision.sh's tagged join first" ;;
   *) fail "more than one device with hostname $HOSTNAME_WANTED holds $TAG: $(jq -c '[.[] | {id, name}]' <<<"$tagged"); remove the stale ones by hand" ;;
 esac
+# Ids are checked in jq with \A and \z, not ^ and $: jq's $ also matches before a final newline,
+# and $(…) drops that newline, so an id "222\n" would pass as 222.
+jq -e '.[0].id | type == "string" and test("\\A[0-9]+\\z")' >/dev/null <<<"$tagged" \
+  || fail "the tagged device has an id that is not a string of digits: $(jq -c '.[0].id' <<<"$tagged"); nothing was changed"
 tagged_id=$(jq -r '.[0].id' <<<"$tagged")
 tagged_name=$(jq -r '.[0].name' <<<"$tagged")
-[[ $tagged_id =~ ^[0-9]+$ ]] || fail "the tagged device has no numeric id"
 if [[ $tagged_name == "$NAME_WANTED" ]]; then
   log "device $tagged_id is $NAME_WANTED already; nothing to do"
   exit 0
@@ -64,8 +67,7 @@ fi
 
 holders=$(jq -c --arg name "$NAME_WANTED" --arg id "$tagged_id" \
   '[.devices[] | select(.name == $name and .id != $id)]' <<<"$devices")
-# \A and \z, not ^ and $: jq's $ also matches before a final newline, and the shell drops that
-# newline, so an id "222\n" would pass as 222.
+# The holder's id is checked as the tagged device's id is, before any DELETE.
 if ! jq -e --arg host "$HOSTNAME_WANTED" \
   'length <= 1 and all(.[]; (.id | type == "string" and test("\\A[0-9]+\\z")) and .hostname == $host and .tags == null and (.user // "") != "" and .connectedToControl == false)' \
   >/dev/null <<<"$holders"; then
