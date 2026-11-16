@@ -24,6 +24,7 @@ for line in \
   'A11 self-test RAN: the database scan finds each word of a phrase that a search index stores apart from the other, where adjacent words see nothing' \
   'A11 self-test RAN: other conversations that say "contractor" or "orange" pass the precheck and the check after the delete' \
   'A11 self-test RAN: a per-word check with no word to count is a NOTE line, never a PASS line' \
+  'A11 self-test RAN: the precheck counts on their own only the words of each phrase that no file holds yet' \
   'A11 text only self-test RAN: before "Delete text", the database check needs the phrase, and each counted word, in the database or its log and in the backup' \
   'A11 self-test RAN: after "Delete text and audio", the database files, the log and the backup hold neither phrase' \
   'A11 text only self-test RAN: a failed control stops the row before "Delete text"' \
@@ -161,6 +162,16 @@ assert_mutation_caught 'no database check after "Delete text and audio"' \
 # shellcheck disable=SC2016 # The needles are the driver's source text.
 assert_mutation_caught 'no database scan in the evidence A11 reads' \
   $'  local detail=$1 phase=$2\n  printf \'db_scan\\tdb\\t-\\t-\\n\'' $'  local detail=$1 phase=$2'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'no check that "orange tractor ninety" stays gone from the database files' \
+  $'  check "\\"$text_only_phrase\\" stays gone from the database files and pre-migration backup" \\\n    check_db_scan "$(result "$dir" db.report)" absent text_only control' \
+  '  :'
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'a precheck that counts no word of "purple elephant seventeen" on its own' \
+  '  mapfile -t audio_db_words < <(attributable_words "$1" audio)' '  audio_db_words=()'
+# The precheck makes that choice.
+# shellcheck disable=SC2016 # The needle is the driver's source text.
+line_of '  choose_db_words "$(result "$dir" db.report)"' >/dev/null
 
 # The Drive token and the Deepgram key stay out of curl's arguments, and the Drive token is read-only.
 # shellcheck disable=SC2016 # The needles are the driver's source text.

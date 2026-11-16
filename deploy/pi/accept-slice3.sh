@@ -1701,16 +1701,23 @@ precheck() {
     check_db_scan "$(result "$dir" db.report)" absent audio
   check "UI search for \"$text_only_query\" before the conversation" check_search_empty "$(search_ui "$text_only_query")"
   check "UI search for \"$audio_query\" before the conversation" check_search_empty "$(search_ui "$audio_query")"
-  mapfile -t text_only_db_words < <(attributable_words "$(result "$dir" db.report)" text_only)
-  mapfile -t audio_db_words < <(attributable_words "$(result "$dir" db.report)" audio)
-  note "words of \"$text_only_phrase\" the database check counts on their own" \
-    "$(db_words_note text_only "${text_only_db_words[@]}")"
-  note "words of \"$audio_phrase\" the database check counts on their own" "$(db_words_note audio "${audio_db_words[@]}")"
+  choose_db_words "$(result "$dir" db.report)"
   print_round Precheck
   if ! round_result; then
     conversation_problem='a copy of a phrase is already on the unit, so the checks could not tell it from this conversation; delete that conversation from the unit, then run again'
     return 2
   fi
+}
+
+# choose_db_words REPORT: from the precheck's database scan (REPORT), the words of each phrase that
+# the database check counts on their own later (text_only_db_words, audio_db_words): the ones no
+# file holds yet. It notes each choice in the current round.
+choose_db_words() {
+  mapfile -t text_only_db_words < <(attributable_words "$1" text_only)
+  mapfile -t audio_db_words < <(attributable_words "$1" audio)
+  note "words of \"$text_only_phrase\" the database check counts on their own" \
+    "$(db_words_note text_only "${text_only_db_words[@]}")"
+  note "words of \"$audio_phrase\" the database check counts on their own" "$(db_words_note audio "${audio_db_words[@]}")"
 }
 
 # db_words_note NAME [WORD...]: which words of NAME's phrase the database check counts on their
@@ -2213,6 +2220,21 @@ run_self_test() (
   expect 2 'a per-word check given no word is UNKNOWN' check_db_words "$words_report" absent text_only
   printf 'A11 self-test RAN: a per-word check with no word to count is a NOTE line, never a PASS line\n'
 
+  # The precheck counts on their own only the words of each phrase that no file holds yet.
+  round_reset
+  choose_db_words "$(scan_report db:control=2 backup:control=1)"
+  [[ "${text_only_db_words[*]}" == 'orange tractor' && "${audio_db_words[*]}" == 'purple elephant' ]] \
+    || fail "self-test: a precheck that found no word counts \"${text_only_db_words[*]}\" and \"${audio_db_words[*]}\", want every word"
+  [[ "${round_lines[1]}" == 'NOTE: '*'counted on their own: purple elephant; left out, because another conversation holds them: none' ]] \
+    || fail "self-test: the precheck noted \"${round_lines[1]}\""
+  round_reset
+  choose_db_words "$(scan_report db:text_only.orange=1 backup:audio.elephant=1 db:control=2 backup:control=1)"
+  [[ "${text_only_db_words[*]}" == tractor && "${audio_db_words[*]}" == purple ]] \
+    || fail "self-test: a precheck that found \"orange\" and \"elephant\" counts \"${text_only_db_words[*]}\" and \"${audio_db_words[*]}\""
+  [[ "${round_lines[1]}" == 'NOTE: '*'counted on their own: purple; left out, because another conversation holds them: "elephant" ' ]] \
+    || fail "self-test: the precheck noted \"${round_lines[1]}\""
+  printf 'A11 self-test RAN: the precheck counts on their own only the words of each phrase that no file holds yet\n'
+
   # The whole text only evaluation before "Delete text", on planted evidence from the Pi: every
   # check must find "orange tractor ninety"; that finding is the control for the check after.
   local found="[{\"session_id\":\"$acceptance_session_id\"}]"
@@ -2531,6 +2553,9 @@ $(session_field "$detail" summary)"
     evaluated evaluate_audio_after "$variant" "$detail" '[]' "$found"
   plant_variant db.report "$(scan_report wal:text_only.tractor=1 db:control=2 backup:control=1)"
   expect 1 'a word of "orange tractor ninety" back in the log fails after "Delete text and audio"' \
+    evaluated evaluate_audio_after "$variant" "$detail" '[]' "$found"
+  plant_variant db.report "$(scan_report backup:text_only=1 db:control=2 backup:control=1)"
+  expect 1 '"orange tractor ninety" back in the backup fails after "Delete text and audio"' \
     evaluated evaluate_audio_after "$variant" "$detail" '[]' "$found"
   plant_variant db.report "$(scan_report)"
   expect 2 'a scan without the control phrase is UNKNOWN after "Delete text and audio"' \
