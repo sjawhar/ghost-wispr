@@ -43,12 +43,12 @@ trap 'rm -rf -- "$state_dir"' EXIT
 
 # remote_run runs the command the driver sends, as the Pi's shell would, with the Pi's tools stubbed:
 # ss prints the Pi's counters, sleep moves them on by its argument and returns at once, and curl
-# verifies api.deepgram.com only at Deepgram's address. Real curl does the same: exit 0 at
+# verifies api.deepgram.com only at Deepgram's addresses. Real curl does the same: exit 0 at
 # Deepgram's addresses and exit 60 at a Google address, where the name does not match. Over a sleep
 # of S seconds the Deepgram socket sends deepgram_rate B/s (the stream's 32249 unless set) less one
 # 8060 B chunk, as one window on the office Pi did, and the Google socket 40000 B/s of a Drive
 # upload. In the first `reconnects` windows (0 unless set) the stream reconnects halfway: the later
-# reading has a new Deepgram socket, which has sent half a window.
+# reading has a new Deepgram socket, to Deepgram's other address, which has sent half a window.
 # shellcheck disable=SC2329 # The driver's functions, eval'd below, call remote_run, and eval calls the stubs.
 remote_run() (
   slept=0
@@ -75,9 +75,13 @@ remote_run() (
     fi
     reading=${ss_output/bytes_sent:3410 /bytes_sent:$google }
     reading=${reading/192.0.2.10:34474 /192.0.2.10:$port }
+    # A reconnect resolves api.deepgram.com again, and gets another of its addresses.
+    [[ $port == 34474 ]] || reading=${reading/216.200.21.203:443/208.185.49.101:443}
     printf '%s\n' "${reading/bytes_sent:9378691 /bytes_sent:$deepgram }"
   }
-  curl() { [[ $* == *'api.deepgram.com:443:216.200.21.203:443'* ]] || return 60; }
+  curl() {
+    [[ $* == *'api.deepgram.com:443:216.200.21.203:443'* || $* == *'api.deepgram.com:443:208.185.49.101:443'* ]] || return 60
+  }
   eval "$*"
 )
 
@@ -107,11 +111,11 @@ if result=$(deepgram_rate=31680 on_pi deepgram_recording_socket "$window"); then
 fi
 [[ $result != *'measuring once more'* ]] || fail "deepgram_recording_socket measured a slow stream twice: $result"
 
-# A reconnect in the window: the control measures once more, and follows the new socket. A second
-# reconnect fails it.
+# A reconnect in the window: the control measures once more, checks the new socket's peer, and
+# follows the new socket. A second reconnect fails it.
 result=$(reconnects=1 on_pi deepgram_recording_socket "$window") \
   || fail "deepgram_recording_socket failed when the stream reconnected once during the window: $result"
-[[ $result == *'measuring once more'*$'\n''192.0.2.10:34476 216.200.21.203:443' ]] \
+[[ $result == *'measuring once more'*$'\n''192.0.2.10:34476 208.185.49.101:443' ]] \
   || fail "after a reconnect deepgram_recording_socket did not measure again and follow the new socket: $result"
 if result=$(reconnects=2 on_pi deepgram_recording_socket "$window"); then
   fail "deepgram_recording_socket passed when the stream reconnected in both windows: $result"
