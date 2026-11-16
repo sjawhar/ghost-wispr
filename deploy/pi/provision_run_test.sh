@@ -186,6 +186,7 @@ grep -q '^tailscale serve' "$TEST_LOG" && fail "the join set Serve although tail
 # A rerun on a Pi that has a shared drive renders through render_models_config, which takes the
 # webhook URL as an argument too: it must keep the drive and say no bash error either.
 printf 'gdrive_folder_id: "drive-0123"\n' >"$work_dir/deploy/ghost-wispr.yaml"
+: >"$TEST_LOG"
 run_provision "${bundle_files[@]}" || fail "provision.sh failed on a rerun: $(<"$work_dir/out")"
 if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error on a rerun with a shared drive (above)"
@@ -196,4 +197,13 @@ for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' \
     || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
 done
 assert_recording_rules "rerun's"
+# The recorder reads its configuration only when it starts, and update.sh restarts nothing when the
+# Pi already runs the newest release: a rerun restarts a running recorder once the configuration is
+# installed, and try-restart starts none that is stopped.
+# grep finding no line is a failure this check reports, not one that stops the test silently.
+config_at=$(grep -n -E '^sudo install .*/ghost-wispr\.yaml$' "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+restart_at=$(grep -n -F -x -- "sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir systemctl --user try-restart ghost-wispr.service" \
+  "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+[[ -n $config_at && -n $restart_at && $restart_at -gt $config_at ]] \
+  || fail "the rerun did not restart a running recorder after it installed the configuration: $(<"$TEST_LOG")"
 printf 'provision run test passed\n'
