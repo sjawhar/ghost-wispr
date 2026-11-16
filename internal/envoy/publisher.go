@@ -67,7 +67,9 @@ type options struct {
 
 // WithKeyStatus calls report after every read of the signing key, with nil
 // when it read a key and the read's error when it did not; the unit shows the
-// error in /api/status.
+// error in /api/status. report runs with the client's key lock held, so the
+// last report always describes the read whose result the client keeps; it
+// must not call the client.
 func WithKeyStatus(report func(error)) Option {
 	return func(o *options) {
 		o.keyStatus = report
@@ -167,13 +169,15 @@ func (c *Client) signingKey(ctx context.Context, stale []byte) ([]byte, error) {
 	if err == nil && len(key) == 0 {
 		err = errors.New("the signing key is empty")
 	}
-	if c.keyStatus != nil {
-		c.keyStatus(err)
-	}
+	// Reported under keyMu, so the last report always describes the read
+	// whose result keyReadFailed holds.
 	c.keyMu.Lock()
 	c.keyReadFailed = err != nil
 	if err == nil {
 		c.key = key
+	}
+	if c.keyStatus != nil {
+		c.keyStatus(err)
 	}
 	c.keyMu.Unlock()
 	if err != nil {
