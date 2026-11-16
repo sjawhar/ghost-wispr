@@ -241,14 +241,16 @@ func TestDeleteSessionErasesItFromThePreMigrationBackup(t *testing.T) {
 	}
 }
 
-// TestTheFirstStartRemovesEventsOfSessionsThatNoLongerExist: before this
-// version a whole-conversation delete left the conversation's events, which
+// TestEveryStartRemovesEventsOfSessionsThatNoLongerExist: a whole-conversation
+// delete by a build before this one left the conversation's events, which
 // /api/events served for up to 7 days (the office Pi held them after its
-// acceptance run). The first start of this version removes every event that
-// names a session the database no longer has, before it takes the
-// pre-migration backup, and erases them from the write-ahead log. Events of a
-// session that exists, and events that name no session, stay.
-func TestTheFirstStartRemovesEventsOfSessionsThatNoLongerExist(t *testing.T) {
+// acceptance run). So does a delete under the old build after an update rolls
+// back (deploy/pi/update.sh), after this build has already started once. Every
+// start removes every event that names a session the database no longer has,
+// before it takes the pre-migration backup, and erases them from the
+// write-ahead log. Events of a session that exists, and events that name no
+// session, stay.
+func TestEveryStartRemovesEventsOfSessionsThatNoLongerExist(t *testing.T) {
 	const secret = "orphaned-event-phrase-0c4d"
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
 	store, err := NewSQLiteStore(path)
@@ -256,6 +258,7 @@ func TestTheFirstStartRemovesEventsOfSessionsThatNoLongerExist(t *testing.T) {
 		t.Fatal(err)
 	}
 	endedWith(t, store, "kept", "/audio/kept.mp3", RefinementCompleted)
+	endedWith(t, store, "deleted-before", "/audio/deleted-before.mp3", RefinementCompleted)
 	storeSessionEvents(t, store, "kept")
 	for _, e := range []struct{ eventType, payload string }{
 		{"summary_ready", `{"type":"summary_ready","session_id":"deleted-before","summary":"` + secret + `"}`},
@@ -266,9 +269,26 @@ func TestTheFirstStartRemovesEventsOfSessionsThatNoLongerExist(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The version before this one ran no sweep.
-	if _, err := store.DB().Exec(`DELETE FROM migrations WHERE name = ?`, deletedSessionEventsMigration); err != nil {
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
+	}
+	// This build has started once; the update then rolls back, and the old
+	// build's delete removes the rows and keeps the events.
+	store, err = NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`DELETE FROM sessions WHERE id = 'deleted-before'`); err != nil {
+		t.Fatal(err)
+	}
+	orphans := 0
+	for _, payload := range storedEventPayloads(t, store) {
+		if strings.Contains(payload, secret) {
+			orphans++
+		}
+	}
+	if orphans != 2 {
+		t.Fatalf("control: %d events of the deleted session are stored before the next start, want 2", orphans)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

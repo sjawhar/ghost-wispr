@@ -336,11 +336,11 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + walScratchTable); err != nil {
 		return fmt.Errorf("drop the write-ahead log scratch table: %w", err)
 	}
-	// The events of sessions deleted before a session delete deleted its
-	// events go before the backup is taken, so the backup holds none of them;
-	// their erase from the write-ahead log is finished with the owed erases
-	// below (retryOwedErasure).
-	if err := s.dropEventsOfDeletedSessionsOnce(); err != nil {
+	// What a delete by an older build left (a deleted session's events and
+	// index entries) goes before the backup is taken, at every start, so the
+	// backup holds none of it; its erase from the write-ahead log is finished
+	// with the owed erases below (retryOwedErasure).
+	if err := s.dropWhatDeletedSessionsLeft(); err != nil {
 		return err
 	}
 

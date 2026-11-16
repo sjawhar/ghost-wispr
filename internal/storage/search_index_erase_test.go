@@ -133,19 +133,23 @@ func TestAgeDeleteErasesTheSessionFromTheIndexTheLogAndTheBackup(t *testing.T) {
 	assertSecretErased(t, path)
 }
 
-// TestTheFirstStartErasesDeletedSessionsFromTheSearchIndex: the sessions
-// deleted before this version left their words in the search index. The
-// first start rebuilds it before it takes the pre-migration backup, so
-// neither the database nor the backup keeps them.
-func TestTheFirstStartErasesDeletedSessionsFromTheSearchIndex(t *testing.T) {
+// TestEveryStartErasesDeletedSessionsFromTheSearchIndex: a delete by a build
+// before this one left the conversation's words in the search index, and so
+// does a delete under the old build after an update rolls back, after this
+// build has already started once (openWithIndexedSecret starts it). Every
+// start rebuilds the index, and removes the deleted session's events, before
+// it takes the pre-migration backup, so neither the database nor the backup
+// keeps them.
+func TestEveryStartErasesDeletedSessionsFromTheSearchIndex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
-	store := openWithIndexedSecret(t, path, nil)
-	// A delete as the version before this one made it: the rows go, and the
-	// index keeps the words.
+	store := openWithIndexedSecret(t, path, func(store *SQLiteStore, id string) {
+		if err := store.StoreEvent("summary_ready", `{"type":"summary_ready","session_id":"`+id+`","summary":"summary of `+id+`"}`); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// The old build's delete: the rows go, and the index and the events keep
+	// the conversation.
 	if _, err := store.DB().Exec(`DELETE FROM sessions WHERE id = 'gone'`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.DB().Exec(`DELETE FROM migrations WHERE name = ?`, deletedSessionEventsMigration); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -160,5 +164,6 @@ func TestTheFirstStartErasesDeletedSessionsFromTheSearchIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	assertEventsOf(t, store, []string{"gone"}, []string{"kept"})
 	assertSecretErased(t, path)
 }

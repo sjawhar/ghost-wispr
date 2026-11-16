@@ -1,21 +1,17 @@
 package storage
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/recording"
 )
-
-// deletedSessionEventsMigration names the one-time removal, as the app
-// starts, of the stored events of sessions deleted before a session delete
-// removed its events (dropEventsOfDeletedSessions).
-const deletedSessionEventsMigration = "drop-events-of-deleted-sessions"
 
 // DeleteSession deletes session id and its merged-source set, refusing a target
 // that feeds another merge (ErrDeleteMergeActive), any active member, or any
@@ -200,56 +196,93 @@ func dropEventsOfDeletedSessions(tx *sql.Tx) (int64, error) {
 	return removed, nil
 }
 
-// dropEventsOfDeletedSessionsOnce takes off the unit, once per database
-// (deletedSessionEventsMigration), what sessions deleted before this version
-// left: their stored events (dropEventsOfDeletedSessions), which /api/events
-// served for up to seven days, and their words in the search index, which it
-// rebuilds (rebuildSearchIndex). The app runs it as it starts, before it takes
-// the pre-migration backup, so the backup holds none of them, and records
-// their erase from the write-ahead log owed (markEraseOwed), which the start
-// then finishes (retryOwedErasure): that also writes the rebuilt pages into
-// the database file. A database that does not yet have every table this needs
-// is left for a later start, so nothing is created before the backup is
-// taken.
-func (s *SQLiteStore) dropEventsOfDeletedSessionsOnce() error {
+// dropWhatDeletedSessionsLeft takes off the unit what a delete that did not
+// remove a session's events and index entries left: a delete by a build
+// before this one, or by the old build after an update rolled back
+// (deploy/pi/update.sh) once this one had started. It deletes the stored
+// events that name a session the database does not have
+// (dropEventsOfDeletedSessions), which /api/events would serve for seven
+// days, and rebuilds the search index (rebuildSearchIndex), which keeps a
+// deleted row's words. The app runs it at every start, before it takes the
+// pre-migration backup, so the backup holds none of them. When that changed
+// anything it commits and records the erase from the write-ahead log owed
+// (markEraseOwed), which the start then finishes (retryOwedErasure), which
+// also writes the rebuilt pages into the database file; otherwise it writes
+// nothing. A database that does not yet have every table this needs is left
+// as it is, so nothing is created before the backup is taken.
+func (s *SQLiteStore) dropWhatDeletedSessionsLeft() error {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin deleting the events of deleted sessions: %w", err)
+		return fmt.Errorf("begin deleting what deleted sessions left: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, table := range []string{"mcp_events", "sessions", "migrations", "app_state"} {
+	for _, table := range []string{"mcp_events", "sessions", "app_state"} {
 		if exists, err := tableExists(tx, table); err != nil {
-			return fmt.Errorf("check table %s before deleting the events of deleted sessions: %w", table, err)
+			return fmt.Errorf("check table %s before deleting what deleted sessions left: %w", table, err)
 		} else if !exists {
 			return nil
 		}
-	}
-	res, err := tx.Exec(`INSERT OR IGNORE INTO migrations(name, applied_at) VALUES(?, ?)`, deletedSessionEventsMigration, time.Now().UTC().Format(time.RFC3339Nano))
-	if err != nil {
-		return fmt.Errorf("record migration %s: %w", deletedSessionEventsMigration, err)
-	}
-	if added, err := res.RowsAffected(); err != nil || added == 0 {
-		return err
 	}
 	removed, err := dropEventsOfDeletedSessions(tx)
 	if err != nil {
 		return err
 	}
+	rebuilt := false
 	if exists, err := tableExists(tx, "sessions_fts"); err != nil {
 		return fmt.Errorf("check the search index before rebuilding it: %w", err)
 	} else if exists {
+		before, err := searchIndexDigest(tx)
+		if err != nil {
+			return err
+		}
 		if err := rebuildSearchIndex(tx); err != nil {
 			return err
 		}
+		after, err := searchIndexDigest(tx)
+		if err != nil {
+			return err
+		}
+		rebuilt = before != after
+	}
+	if removed == 0 && !rebuilt {
+		return nil
 	}
 	if err := markEraseOwed(tx); err != nil {
-		return fmt.Errorf("delete the events of deleted sessions: %w", err)
+		return fmt.Errorf("delete what deleted sessions left: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit deleting the events of deleted sessions: %w", err)
+		return fmt.Errorf("commit deleting what deleted sessions left: %w", err)
 	}
-	slog.Info("deleted the stored events of deleted sessions and rebuilt the search index", "events", removed)
+	slog.Info("deleted what deleted sessions left", "events", removed, "search_index_rebuilt", rebuilt)
 	return nil
+}
+
+// searchIndexDigest returns a digest of the search index's stored blocks
+// (sessions_fts_data), so a rebuild that changed nothing can be told from one
+// that took entries out.
+func searchIndexDigest(tx *sql.Tx) ([sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	rows, err := tx.Query(`SELECT id, block FROM sessions_fts_data ORDER BY id`)
+	if err != nil {
+		return digest, fmt.Errorf("read the search index: %w", err)
+	}
+	hash := sha256.New()
+	for rows.Next() {
+		var id int64
+		var block []byte
+		if err := rows.Scan(&id, &block); err != nil {
+			_ = rows.Close()
+			return digest, fmt.Errorf("scan the search index: %w", err)
+		}
+		_ = binary.Write(hash, binary.BigEndian, id)
+		_ = binary.Write(hash, binary.BigEndian, int64(len(block)))
+		_, _ = hash.Write(block)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return digest, fmt.Errorf("read the search index: %w", err)
+	}
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
 }
 
 // eraseAfterSessionDeletion erases a committed session delete (sessionIDs:
