@@ -38,21 +38,23 @@ valid_relay_url() {
 }
 
 # render_base_config writes the template with the Envoy webhook URL: Drive sync and GC stay off.
+# Its URL argument is not named relay_url: the full provisioner's relay_url is readonly, and bash
+# refuses a local of that name, so the function would render the global and ignore its argument.
 render_base_config() {
-  local template=$1 relay_url=$2 escaped_relay_url
-  valid_relay_url "$relay_url" || return 1
-  escaped_relay_url=${relay_url//\\/\\\\}
-  escaped_relay_url=${escaped_relay_url//&/\\&}
-  escaped_relay_url=${escaped_relay_url//|/\\|}
-  sed "s|__ENVOY_WEBHOOK_URL__|$escaped_relay_url|" "$template"
+  local template=$1 webhook_url=$2 escaped_webhook_url
+  valid_relay_url "$webhook_url" || return 1
+  escaped_webhook_url=${webhook_url//\\/\\\\}
+  escaped_webhook_url=${escaped_webhook_url//&/\\&}
+  escaped_webhook_url=${escaped_webhook_url//|/\\|}
+  sed "s|__ENVOY_WEBHOOK_URL__|$escaped_webhook_url|" "$template"
 }
 
 # render_models_config also syncs to the shared drive and turns GC on. GC
 # removes audio only after Drive confirms a durable copy.
 render_models_config() {
-  local template=$1 relay_url=$2 drive_id=$3
+  local template=$1 webhook_url=$2 drive_id=$3
   valid_drive_id "$drive_id" || return 1
-  render_base_config "$template" "$relay_url" \
+  render_base_config "$template" "$webhook_url" \
     | awk '!/^(gdrive_folder_id|gdrive_sync_enabled|gc_enabled):/' || return 1
   printf 'gdrive_folder_id: "%s"\n' "$drive_id"
   printf '%s\n' 'gdrive_sync_enabled: true' 'gc_enabled: true'

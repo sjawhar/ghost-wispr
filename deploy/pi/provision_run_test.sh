@@ -34,12 +34,15 @@ case "$*" in
 esac
 EOF
 
-# sudo records each command and runs none, but systemd-run's command is kept to run below.
+# sudo records each command and runs none, but systemd-run's command is kept to run below, and the
+# configuration provision.sh installs is kept to read.
 cat >"$work_dir/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$TEST_LOG"
 if [[ " $* " == *' /dev/stdin '* ]]; then
   cat >"$TEST_LOG.installed-$(basename -- "${!#}")"
+elif [[ $1 == install && ${!#} == */ghost-wispr.yaml ]]; then
+  cp -- "${@:$#-1:1}" "$TEST_LOG.installed-ghost-wispr.yaml"
 fi
 if [[ $1 == systemd-run ]]; then
   printf '%s' "${!#}" >"$TEST_LOG.join"
@@ -134,4 +137,17 @@ if TEST_UP_EXIT=1 run_join; then
   fail "the join succeeded although tailscale up failed"
 fi
 grep -q '^tailscale serve' "$TEST_LOG" && fail "the join set Serve although tailscale up failed"
+
+# A rerun on a Pi that has a shared drive renders through render_models_config, which takes the
+# webhook URL as an argument too: it must keep the drive and say no bash error either.
+printf 'gdrive_folder_id: "drive-0123"\n' >"$work_dir/deploy/ghost-wispr.yaml"
+run_provision "${bundle_files[@]}" || fail "provision.sh failed on a rerun: $(<"$work_dir/out")"
+if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
+  fail "provision.sh printed a bash error on a rerun with a shared drive (above)"
+fi
+for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' \
+  'envoy_webhook_url: https://relay.example.test/webhook/ghostwispr'; do
+  grep -Fxq "$line" "$TEST_LOG.installed-ghost-wispr.yaml" \
+    || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
+done
 printf 'provision run test passed\n'
