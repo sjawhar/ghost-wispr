@@ -494,12 +494,28 @@ on a config without the new key. The other order fails too: while the old binary
 that has the key, a settings save drops the key, because the old binary writes back only the keys
 it knows.
 
-1. Before you merge, run the models step ("Enable models and Drive sync") from a checkout of the
-   pull request's head, with the shared-drive ID the Pi has now (`provision.sh --models
-   <shared-drive-id>`). The running binary ignores the new key, and the models step restarts it.
+The models step restarts the recorder, and so does `update.sh` when it installs a release: a
+restart ends a conversation that is being recorded and turns the light off, so run these steps
+outside meetings. Save no settings in the web UI from step 1 until step 4 passes.
+
+1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
+   the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
+   one the Pi has now, on the `gdrive_folder_id:` line of its config:
+
+   ```bash
+   ssh ghost-wispr@ghost-wispr "grep '^gdrive_folder_id:' /opt/ghost-wispr/ghost-wispr.yaml"
+   ```
+
+   When that line is missing or empty, the Pi never ran the models step, and `--models` would
+   turn Drive sync and GC on: run the full provisioner ("Provision") from the head instead. The
+   running binary ignores the new key, and either step restarts it on the new config.
 2. Merge the pull request. The release workflow publishes a release for the merge commit.
 3. As soon as that release is published, run `update.sh` by hand ("Update and inspect"). Do not
-   wait for the timer: until the new binary runs, a settings save drops the new key.
+   wait for the timer: until the new binary runs, a settings save drops the new key. The step is
+   done only when `update.sh` prints `installed commit <merge commit>` (or `already on commit
+   <merge commit>`, when the timer was first). During an active session it prints `active
+   session; leaving the current binary in place` and changes nothing: run it again once the
+   session has ended.
 4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
    come back, and for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning:
 
@@ -508,7 +524,9 @@ it knows.
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq .warnings
    ```
 
-   Then run A2 of "Accept slice 1".
+   When they do not, the config lacks the key: step 1 was skipped, or a settings save dropped the
+   key before step 3. Run the models step again (or the full provisioner, as in step 1), from the
+   merge commit; the new binary keeps the key on a save. Then run A2 of "Accept slice 1".
 
 ## Recover a pending segment deletion
 

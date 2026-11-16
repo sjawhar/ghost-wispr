@@ -45,15 +45,19 @@ func TestRunbookSaysWhatToDoWhenDeleteWaitsForDrive(t *testing.T) {
 
 // TestRunbookOrdersARolloutThatAddsAConfigKey fails if the runbook does not
 // give the order for a release that reads a new key from the Pi's config:
-// install the template with the models step before the merge, merge, run
-// update.sh by hand once the release is published, then check GET
+// install the template with the models step just before the merge, merge,
+// run update.sh by hand once the release is published, then check GET
 // /api/config. It also fails if the runbook does not say why: the nightly
 // update replaces only the binary, and a settings save of the old binary
-// drops a key that binary does not know.
+// drops a key that binary does not know. And it fails if a step can fail
+// without anyone noticing: the runbook must say where the shared-drive ID
+// comes from, to save no settings until the check, that update.sh is done
+// only when it says it installed the commit and does nothing during an active
+// session, what to do when the check fails, and that restarts end a meeting.
 func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
 	section := runbookSection(t, "## Roll out a release that adds a config key")
 	rest := section
-	for _, step := range []string{"1. Before you merge", "provision.sh --models", "2. Merge", "3. As soon as", "update.sh", "4. Check", "/api/config"} {
+	for _, step := range []string{"1. Just before you merge", "provision.sh --models", "2. Merge", "3. As soon as", "update.sh", "4. Check", "/api/config"} {
 		_, after, found := strings.Cut(rest, step)
 		if !found {
 			t.Fatalf("the runbook's rollout order is missing %q, or has it out of order: %s", step, section)
@@ -63,6 +67,11 @@ func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
 	for _, why := range []string{"replaces only the binary", "drops"} {
 		if !strings.Contains(section, why) {
 			t.Errorf("the runbook's rollout order does not say why: no %q", why)
+		}
+	}
+	for _, safeguard := range []string{"gdrive_folder_id", "Save no settings", "installed commit", "active session", "models step again", "outside meetings"} {
+		if !strings.Contains(section, safeguard) {
+			t.Errorf("the runbook's rollout order does not say %q", safeguard)
 		}
 	}
 }
