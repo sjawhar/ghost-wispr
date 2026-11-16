@@ -96,6 +96,13 @@ grep -Fq 'credential bundle contains unexpected path: envoy-webhook-secret' "$wo
 [[ ! -e $TEST_LOG ]] || fail "provision.sh ran commands for a refused bundle: $(<"$TEST_LOG")"
 
 run_provision "${bundle_files[@]}" || fail "provision.sh failed: $(<"$work_dir/out")"
+# A run that works says no bash error. On the office Pi (2026-11-16) every full run printed
+# "provision.sh: line 42: local: relay_url: readonly variable": render_base_config declares a local
+# relay_url while the main flow's relay_url is readonly, so the function renders the global value
+# and ignores the URL it is given.
+if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
+  fail "provision.sh printed a bash error (above)"
+fi
 
 # The .env the recorder runs with holds the Deepgram key and no Envoy signing key.
 env_file="$TEST_LOG.installed-.env"
