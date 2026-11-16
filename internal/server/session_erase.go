@@ -22,7 +22,8 @@ import (
 //     for a session already gone, finishes erasing them) and returns why:
 //     storage.ErrDeleteReplacementPending or storage.ErrDeleteMergeActive as
 //     DeleteSession returned it, any other error prefixed "delete session";
-//   - it calls onDeleted;
+//   - it calls onDeleted with the deleted sessions: sessionID, then the
+//     sessions merged into it;
 //   - it hides each recording the deleted row named, and zeroes the hidden
 //     raw captures and recordings in the background.
 //
@@ -32,8 +33,13 @@ import (
 // DeleteSession records every erase directory before the row goes, so an
 // erase cut off by a stop is finished as the app starts. The files leave
 // their names before this returns; the zeros follow.
-func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir string, refreshWarning, onDeleted func()) error {
-	rawReservations, err := hideRawCaptures(store, sessionID, recordingDir, refreshWarning)
+func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir string, refreshWarning func(), onDeleted func(sessionIDs []string)) error {
+	sourceIDs, err := store.SourceSessionIDs(sessionID)
+	if err != nil {
+		return fmt.Errorf("list source sessions for raw erase: %w", err)
+	}
+	sessionIDs := append([]string{sessionID}, sourceIDs...)
+	rawReservations, err := hideRawCaptures(store, sessionIDs, recordingDir, refreshWarning)
 	if err != nil {
 		return err
 	}
@@ -49,7 +55,7 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 		}
 		return fmt.Errorf("delete session: %w", err)
 	}
-	onDeleted()
+	onDeleted(sessionIDs)
 
 	pending := make([]erase.Pending, 0)
 	for _, p := range recordingname.Entries(audioPath) {
@@ -94,24 +100,20 @@ type rawEraseReservation struct {
 	keepHidden                          bool
 }
 
-// hideRawCaptures reserves, then hides, the raw microphone capture of session
-// sessionID and of each session merged into it, in recordingDir, while their
-// rows still exist: each reservation commits before its rename, so a delete
-// that does not commit leaves the capture to restore. When one capture
-// cannot be hidden it restores every capture it hid (restoreRawSessionErasures)
-// and returns why.
-func hideRawCaptures(store SessionStore, sessionID, recordingDir string, refreshWarning func()) (reservations []rawEraseReservation, err error) {
-	sourceIDs, err := store.SourceSessionIDs(sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("list source sessions for raw erase: %w", err)
-	}
+// hideRawCaptures reserves, then hides, the raw microphone capture of each
+// session in sessionIDs (a session and those merged into it), in
+// recordingDir, while their rows still exist: each reservation commits before
+// its rename, so a delete that does not commit leaves the capture to restore.
+// When one capture cannot be hidden it restores every capture it hid
+// (restoreRawSessionErasures) and returns why.
+func hideRawCaptures(store SessionStore, sessionIDs []string, recordingDir string, refreshWarning func()) (reservations []rawEraseReservation, err error) {
 	defer func() {
 		if err != nil {
 			restoreRawSessionErasures(store, reservations, refreshWarning)
 			reservations = nil
 		}
 	}()
-	for _, rawID := range append([]string{sessionID}, sourceIDs...) {
+	for _, rawID := range sessionIDs {
 		rawPath, pathErr := filepath.Abs(recordingname.RawPath(recordingDir, rawID))
 		if pathErr != nil {
 			return reservations, fmt.Errorf("find raw session recording: %w", pathErr)

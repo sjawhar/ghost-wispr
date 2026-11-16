@@ -435,7 +435,11 @@ func (c *Collector) deleteSession(id string, names names) error {
 		present, folderErr := c.config.Drive.FolderOnDrive(ctx, source.GDriveFolderID)
 		cancel()
 		if folderErr != nil {
-			return fmt.Errorf("check Drive folder of merged source %s: %w: %w", sourceID, ErrDriveCannotSay, folderErr)
+			// This error is the pass's hold, which GET /api/status shows
+			// until the next pass, also once the source is deleted: it
+			// names no session, and the log says which.
+			c.logger.Warn("gc could not check the Drive folder of a merged source", "operation", "delete_session", "session_id", id, "source_session_id", sourceID, "error", folderErr)
+			return fmt.Errorf("check the Drive folder of a merged source: %w: %w", ErrDriveCannotSay, folderErr)
 		}
 		if !present {
 			return fmt.Errorf("merged source %s has a Drive folder that is in the trash or gone", sourceID)

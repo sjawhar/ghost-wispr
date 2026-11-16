@@ -1458,6 +1458,15 @@ func (s *SQLiteStore) GetSession(id string) (Session, error) {
 	return getSession(s.db, id)
 }
 
+// HasSession reports whether the database has session id.
+func (s *SQLiteStore) HasSession(id string) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?)`, id).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check whether session %s exists: %w", id, err)
+	}
+	return exists, nil
+}
+
 func getSession(q querier, id string) (Session, error) {
 	row := q.QueryRow(
 		`SELECT id, title, started_at, ended_at, status, summary, summary_model, summary_version, summary_status, summary_preset, speaker_names, refined_transcript, refinement_status, refinement_model, refined_revision, audio_path, sync_status, envoy_publish_status, sync_state, retry_count, last_sync_attempt, error_message, gdrive_folder_id, merged_into, canonical_transcript, transcript_source, audio_removed_at, restored_at, summary_error, drive_replace_pending FROM sessions WHERE id = ?`,

@@ -91,7 +91,10 @@ type EventBroadcaster interface {
 	// (reason), and the title, summary and preset the session keeps.
 	BroadcastSummaryFailed(sessionID, title, summary, preset, reason string)
 	BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64)
-	BroadcastComponentStatus(component, status, message string)
+	// BroadcastSessionComponentStatus announces a component's status about
+	// session sessionID (its refinement, summary or sync), naming the session
+	// in the event's session_id, so deleting the session deletes the event.
+	BroadcastSessionComponentStatus(sessionID, component, status, message string)
 }
 
 type LifecycleManager interface {

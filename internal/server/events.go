@@ -62,8 +62,12 @@ type ConnectionEvent struct {
 	Connected bool `json:"connected"`
 }
 
+// ComponentStatusEvent is a component's status. A status about one session
+// (its refinement, summary or sync) names it in SessionID; a status of the
+// whole unit (the microphone, Deepgram) has none.
 type ComponentStatusEvent struct {
 	Event
+	SessionID string `json:"session_id,omitempty"`
 	Component string `json:"component"`
 	Status    string `json:"status"`
 	Message   string `json:"message"`

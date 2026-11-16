@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -29,8 +28,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
 )
-
-var sessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 type recordingRestoreInProgress interface {
 	RecordingRestoreInProgress()
@@ -529,7 +526,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("POST /api/sessions/{id}/stop", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -640,7 +637,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("GET /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -669,7 +666,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("GET /api/sessions/{id}/segments", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -709,7 +706,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("DELETE /api/sessions/{id}/segments/{segmentID}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -792,7 +789,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("PATCH /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -837,7 +834,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -856,9 +853,9 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 
-		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, func() {
+		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, func(sessionIDs []string) {
 			if controls.OnSessionDeleted != nil {
-				controls.OnSessionDeleted(sessionID)
+				controls.OnSessionDeleted(sessionIDs)
 			}
 		})
 		switch {
@@ -888,7 +885,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		var earliest time.Time
 		var latest time.Time
 		for _, id := range body.SessionIDs {
-			if !validSessionID(id) {
+			if !storage.ValidSessionID(id) {
 				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid session id: %s", id))
 				return
 			}
@@ -1131,7 +1128,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("GET /api/sessions/{id}/audio", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -1183,7 +1180,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("GET /api/sessions/{id}/context", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -1412,7 +1409,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("POST /api/sessions/{id}/resummarize", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -1441,7 +1438,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("POST /api/sessions/{id}/retry-summary", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -1460,7 +1457,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("POST /api/sessions/{id}/retry-sync", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -1489,7 +1486,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 
 	mux.HandleFunc("POST /api/sessions/{id}/retry-refinement", func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("id")
-		if !validSessionID(sessionID) {
+		if !storage.ValidSessionID(sessionID) {
 			writeJSONError(w, http.StatusForbidden, "invalid session id")
 			return
 		}
@@ -1658,10 +1655,6 @@ func nextMergedSessionID(store SessionStore, earliest time.Time) (string, error)
 			return "", fmt.Errorf("check merged session id %s: %w", id, err)
 		}
 	}
-}
-
-func validSessionID(id string) bool {
-	return sessionIDPattern.MatchString(id)
 }
 
 func contentTypeForAudio(path string) string {

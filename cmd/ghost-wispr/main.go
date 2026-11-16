@@ -1066,14 +1066,7 @@ func main() {
 		ActiveSession: manager.ActiveSession,
 		// Warnings, DeleteSegment and DeleteSegmentText: wireSegmentDeletion,
 		// below.
-		OnSessionDeleted: func(sessionID string) {
-			warningRegistry.WithRecordingMismatch(func() {
-				warningRegistry.Clear(recordingMismatchWarningPrefix + sessionID)
-			})
-			if err := refreshRawEraseReservationWarnings(store, warningRegistry); err != nil {
-				log.Printf("warning: raw erase reservations after deleting session %s: %v", sessionID, err)
-			}
-		},
+		OnSessionDeleted: sessionsDeletedHook(store, warningRegistry),
 		OnSessionsMerged: func(sessionIDs []string) {
 			warningRegistry.WithRecordingMismatch(func() {
 				for _, sessionID := range sessionIDs {
@@ -1331,14 +1324,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.
-	manager.SetRefinementWarningHook(func(sessionID, warning string) {
-		key := "refinement-model-" + sessionID
-		if warning == "" {
-			warningRegistry.Clear(key)
-			return
-		}
-		warningRegistry.Set(key, fmt.Sprintf("Session %s was not refined, and keeps its deleted text out: %s", sessionID, warning))
-	})
+	manager.SetRefinementWarningHook(refinementModelWarningHook(warningRegistry))
 	hardware := startHardware(ctx, &cfg, capture, micStatus, warningRegistry, hub)
 	pauseControls := newPersistentControls(
 		store,

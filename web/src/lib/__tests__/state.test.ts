@@ -5,6 +5,7 @@ import {
   applySegmentDeletion,
   applySummaryUpdate,
   beginSessionDetailRequest,
+  removeSession,
   resetState,
   setDates,
   setSessionDetail,
@@ -12,6 +13,7 @@ import {
   setSessionsForDate,
 } from '../state.svelte'
 import {
+  ComponentStatus,
   RefinementStatus,
   SummaryStatus,
   type SessionDetailResponse,
@@ -275,5 +277,30 @@ describe('deletion state fences', () => {
 
     expect(appState.liveSegmentsSessionId).toBe('s1')
     expect(appState.liveSegments).toEqual([])
+  })
+})
+
+describe('removeSession', () => {
+  it('drops the component statuses about the removed session, and keeps the others', () => {
+    for (const [component, sessionId, message] of [
+      ['refinement', 's1', 'Batch refinement failed for session s1'],
+      ['sync', 's2', 'Google Drive sync failed for session s2'],
+      ['mic', undefined, 'Microphone reconnected'],
+    ] as const) {
+      applyEvent({
+        type: 'component_status',
+        version: 1,
+        timestamp: '2026-11-11T10:00:00Z',
+        component,
+        status: ComponentStatus.Error,
+        message,
+        ...(sessionId ? { session_id: sessionId } : {}),
+      })
+    }
+    expect(Object.keys(appState.componentStatuses).sort()).toEqual(['mic', 'refinement', 'sync'])
+
+    removeSession('s1')
+
+    expect(Object.keys(appState.componentStatuses).sort()).toEqual(['mic', 'sync'])
   })
 })

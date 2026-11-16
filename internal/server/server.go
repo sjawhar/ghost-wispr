@@ -140,7 +140,7 @@ type ControlHooks struct {
 	ActiveSession           func() (string, time.Time)
 	Presets                 func() map[string]config.Preset
 	Resummarize             func(ctx context.Context, sessionID, preset string) error
-	OnSessionDeleted        func(sessionID string)
+	OnSessionDeleted        func(sessionIDs []string) // the deleted session, then those merged into it
 	OnSessionsMerged        func(sessionIDs []string)
 	OnSessionMerged         func(ctx context.Context, sessionID string)
 	EndSession              func(ctx context.Context) error

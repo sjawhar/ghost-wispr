@@ -34,10 +34,14 @@ const sessionsDeletedKey = "sessions_deleted_unswept"
 // recording.Resolve finds it in audioDir (the one the caller then erases), so
 // an erase a stop cuts off is finished as the app starts; it deletes nothing
 // if it cannot record one. In that transaction too it deletes every stored
-// event that names a session it deletes (dropSessionSetEvents): a live
-// transcript event holds the conversation's words and a summary event its
-// summary. Once the delete commits, it erases it from the write-ahead log and
-// the pre-migration backup, as a segment deletion does
+// event that names a session it deletes: a live transcript event holds the
+// conversation's words, a summary event its summary, and a component status
+// event that it existed and was refined and synced. It deletes the events
+// that name one in session_id before the rows go (dropSessionSetEvents), and
+// those an older build stored with the session only in a status message, and
+// the refused cuts and summary requests that name one, once they have gone
+// (clearSessionsDeleted). Once the delete commits, it erases it from the
+// write-ahead log and the pre-migration backup, as a segment deletion does
 // (eraseAfterSessionDeletion).
 func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	tx, err := s.db.Begin()
@@ -179,9 +183,10 @@ func rebuildSearchIndex(tx *sql.Tx) error {
 }
 
 // clearSessionsDeleted deletes, in tx, the stored events of every session the
-// database no longer has (dropEventsOfDeletedSessions), and records that
-// nothing a deleted session left remains (sessionsDeletedKey); tx has rebuilt
-// the search index. It sweeps every deleted session, not only the ones tx
+// database no longer has (dropEventsOfDeletedSessions) and the other rows
+// that name one (dropRowsOfDeletedSessions), and records that nothing a
+// deleted session left remains (sessionsDeletedKey); tx has rebuilt the
+// search index. It sweeps every deleted session, not only the ones tx
 // deleted: the record may stand for a delete made outside the app (with
 // sqlite3), which nothing else would sweep once the record is gone. It returns
 // how many events it deleted.
@@ -190,10 +195,39 @@ func clearSessionsDeleted(tx *sql.Tx) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if err := dropRowsOfDeletedSessions(tx); err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(`DELETE FROM app_state WHERE key = ?`, sessionsDeletedKey); err != nil {
 		return 0, fmt.Errorf("record that the deleted sessions left nothing: %w", err)
 	}
 	return removed, nil
+}
+
+// dropRowsOfDeletedSessions deletes, in tx, the rows besides stored events
+// that name a session the database does not have and that no foreign key
+// deletes with it: a cut "Delete text and audio" refused (refused_cuts),
+// which the status page forgets once its session is gone anyway, and a
+// claimed summary request (summary_requests), which would also keep a
+// session made later with the same id from claiming one. A table the
+// database does not have yet is left alone.
+//
+// A deleted text span (deleted_text_spans) stays: it belongs to its
+// recording, not to the session the text was deleted in, and keeps the
+// deleted words out of a later refinement of any session that still has or
+// restores that recording.
+func dropRowsOfDeletedSessions(tx *sql.Tx) error {
+	for _, table := range []string{"refused_cuts", "summary_requests"} {
+		if exists, err := tableExists(tx, table); err != nil {
+			return fmt.Errorf("check table %s before deleting the rows of deleted sessions: %w", table, err)
+		} else if !exists {
+			continue
+		}
+		if _, err := tx.Exec(`DELETE FROM ` + table + ` WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.id = ` + table + `.session_id)`); err != nil {
+			return fmt.Errorf("delete the %s rows of deleted sessions: %w", table, err)
+		}
+	}
+	return nil
 }
 
 // dropSessionSetEvents deletes, in tx, every stored event that names session
@@ -211,8 +245,11 @@ func dropSessionSetEvents(tx *sql.Tx, id string) error {
 }
 
 // dropEventsOfDeletedSessions deletes, in tx, every stored event that names a
-// session the database does not have, and returns how many it deleted. Events
-// that name no session (a pause, a component's status) stay.
+// session the database does not have, and returns how many it deleted: an
+// event that names it in session_id, and a component_status event an older
+// build stored with the session only in its message
+// (dropLegacyStatusEventsOfDeletedSessions). Events that name no session (a
+// pause, the microphone's status) stay.
 func dropEventsOfDeletedSessions(tx *sql.Tx) (int64, error) {
 	res, err := tx.Exec(`DELETE FROM mcp_events
 		WHERE json_valid(payload)
@@ -225,7 +262,11 @@ func dropEventsOfDeletedSessions(tx *sql.Tx) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("count the stored events of deleted sessions: %w", err)
 	}
-	return removed, nil
+	legacy, err := dropLegacyStatusEventsOfDeletedSessions(tx)
+	if err != nil {
+		return 0, err
+	}
+	return removed + legacy, nil
 }
 
 // dropWhatDeletedSessionsLeft takes off the unit what a delete that did not
@@ -234,7 +275,8 @@ func dropEventsOfDeletedSessions(tx *sql.Tx) (int64, error) {
 // (deploy/pi/update.sh) once this one had started. It deletes the stored
 // events that name a session the database does not have
 // (dropEventsOfDeletedSessions), which /api/events would serve for seven
-// days, and rebuilds the search index (rebuildSearchIndex), which keeps a
+// days, and the other rows that name one (dropRowsOfDeletedSessions), and
+// rebuilds the search index (rebuildSearchIndex), which keeps a
 // deleted row's words. The app runs it at every start, before it takes the
 // pre-migration backup, so the backup holds none of them, and records the
 // erase from the write-ahead log owed (markEraseOwed), which the start then

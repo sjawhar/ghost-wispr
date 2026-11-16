@@ -116,9 +116,12 @@ export interface ConnectionEvent extends BaseEvent {
 
 export interface ComponentStatusEvent extends BaseEvent {
   type: 'component_status'
-  component: 'deepgram' | 'summary' | 'sync' | 'mic'
+  component: 'deepgram' | 'summary' | 'sync' | 'mic' | 'refinement'
   status: ComponentStatus
   message: string
+  // The session the status is about (its refinement, summary or sync);
+  // absent for a status of the whole unit.
+  session_id?: string
 }
 
 export type WebSocketEvent =

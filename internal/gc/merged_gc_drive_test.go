@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +158,11 @@ func TestGCStopsWhenASourceFolderCheckErrors(t *testing.T) {
 	}
 	if !errors.Is(collector.Held(), ErrDriveCannotSay) {
 		t.Fatalf("GC hold after source Drive error = %v, want %v", collector.Held(), ErrDriveCannotSay)
+	}
+	// GET /api/status shows the hold until the next pass, also once the
+	// session it names is deleted.
+	if held := collector.Held().Error(); strings.Contains(held, "source-a") {
+		t.Fatalf("GC hold %q names merged source source-a", held)
 	}
 }
 

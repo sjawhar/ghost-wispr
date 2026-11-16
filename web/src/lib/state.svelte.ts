@@ -13,6 +13,8 @@ export type ComponentStatus = {
   status: ComponentStatusValue
   message: string
   timestamp: string
+  // The session the status is about, from the event's session_id.
+  sessionId?: string
 }
 
 type AppState = {
@@ -301,6 +303,7 @@ export function applyComponentStatus(event: ComponentStatusEvent): void {
       status: event.status,
       message: event.message,
       timestamp: event.timestamp,
+      sessionId: event.session_id,
     },
   }
   if (event.component === 'mic') {
@@ -348,4 +351,7 @@ export function removeSession(sessionId: string): void {
     nextDetails.delete(sessionId)
     appState.sessionDetails = nextDetails
   }
+  appState.componentStatuses = Object.fromEntries(
+    Object.entries(appState.componentStatuses).filter(([, s]) => s.sessionId !== sessionId),
+  )
 }
