@@ -422,6 +422,9 @@ func (s *Summarizer) completeSummaryWithRetry(ctx context.Context, client llm.Cl
 		}
 		result = summaryAnswer(raw, transcript)
 		if !meaningfulText(result.Summary) {
+			// Safe to log and keep in the error: a summary that holds no
+			// letter or digit (meaningfulText), such as "...", holds none
+			// of the conversation's words.
 			logger.Warn("the model answered with no summary text; asking again", "summary", result.Summary)
 			return fmt.Errorf("%w: %q", errNoSummaryText, result.Summary)
 		}
@@ -493,6 +496,7 @@ func (s *Summarizer) completeTextWithRetry(ctx context.Context, client llm.Clien
 		}
 		result = strings.TrimSpace(result)
 		if !meaningfulText(result) {
+			// Safe to log: it holds no letter or digit, so no words.
 			logger.Warn("the model answered a chunk with no summary text; asking again", "summary", result)
 			return fmt.Errorf("%w: %q", errNoSummaryText, result)
 		}

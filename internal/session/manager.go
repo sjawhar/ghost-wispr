@@ -893,7 +893,9 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	}
 	m.publishSessionStarted(sessionID)
 
-	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint", titleHint)
+	// The title hint is the session's title, which names its topic: the log
+	// keeps the session's id, never its words.
+	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint_set", titleHint != "")
 	return sessionID, nil
 }
 

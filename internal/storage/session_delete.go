@@ -212,10 +212,13 @@ func clearSessionsDeleted(tx *sql.Tx) (int64, error) {
 // session made later with the same id from claiming one. A table the
 // database does not have yet is left alone.
 //
-// A deleted text span (deleted_text_spans) stays: it belongs to its
-// recording, not to the session the text was deleted in, and keeps the
-// deleted words out of a later refinement of any session that still has or
-// restores that recording.
+// A deleted text span (deleted_text_spans) stays. It holds no words: the
+// recording's file name, the span's times and the recording's SHA-256. It is
+// what keeps the deleted words out if the recording comes back: a delete on
+// the unit keeps the session's Drive copy, so a later restore from Drive can
+// bring the recording back, and the unit cannot know that a recording is gone
+// for good. It belongs to its recording, not to the session the text was
+// deleted in, and is read by the recording's name (TextDeletionSpans).
 func dropRowsOfDeletedSessions(tx *sql.Tx) error {
 	for _, table := range []string{"refused_cuts", "summary_requests"} {
 		if exists, err := tableExists(tx, table); err != nil {

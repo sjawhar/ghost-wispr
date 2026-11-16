@@ -109,7 +109,7 @@ func (p *ElevenLabsProvider) Synthesize(ctx context.Context, req SpeechRequest) 
 
 	url := fmt.Sprintf("%s/v1/text-to-speech/%s", p.baseURL, voice)
 
-	audioBytes, err := p.doWithRetry(ctx, url, bodyJSON)
+	audioBytes, err := p.doWithRetry(ctx, url, bodyJSON, req.Text)
 	if err != nil {
 		return nil, err
 	}
@@ -126,8 +126,9 @@ func (p *ElevenLabsProvider) Synthesize(ctx context.Context, req SpeechRequest) 
 	}, nil
 }
 
-// doWithRetry executes the HTTP request, retrying once on 429.
-func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJSON []byte) ([]byte, error) {
+// doWithRetry executes the HTTP request, retrying once on 429. text is what
+// it asks to speak, which an error leaves out (providerMessage).
+func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJSON []byte, text string) ([]byte, error) {
 	const maxAttempts = 2
 
 	for attempt := range maxAttempts {
@@ -156,7 +157,7 @@ func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJS
 		}
 
 		// Successful response or non-retryable error
-		result, err := p.processResponse(resp)
+		result, err := p.processResponse(resp, text)
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, err
@@ -168,14 +169,14 @@ func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJS
 	return nil, fmt.Errorf("elevenlabs: exhausted retries")
 }
 
-func (p *ElevenLabsProvider) processResponse(resp *http.Response) ([]byte, error) {
+func (p *ElevenLabsProvider) processResponse(resp *http.Response, text string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
 		var apiErr elevenLabsErrorResponse
 		if json.Unmarshal(errBody, &apiErr) == nil && apiErr.Detail.Message != "" {
-			return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, apiErr.Detail.Message)
+			return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, providerMessage(apiErr.Detail.Message, text))
 		}
-		return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, string(errBody))
+		return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, providerMessage(string(errBody), text))
 	}
 
 	audioBytes, err := io.ReadAll(resp.Body)
