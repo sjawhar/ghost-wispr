@@ -229,7 +229,10 @@ func TestAGCAgeDeleteLeavesNoStatusWarningNamingTheSession(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if _, err := runGCPass(store, &cfg, &recordingMismatchSyncer{matches: true}, &gcHealth{}, registry, logger); err != nil {
+	hub := server.NewHub()
+	connected := hub.Subscribe()
+	defer hub.Unsubscribe(connected)
+	if _, err := runGCPass(deletionNoticeGCStore{SQLiteStore: store, hub: hub}, &cfg, &recordingMismatchSyncer{matches: true}, &gcHealth{}, registry, logger); err != nil {
 		t.Fatalf("GC pass: %v", err)
 	}
 	if _, err := store.GetSession(id); err == nil {
@@ -237,5 +240,14 @@ func TestAGCAgeDeleteLeavesNoStatusWarningNamingTheSession(t *testing.T) {
 	}
 	for _, warning := range naming(statusWarnings(t, registry), id) {
 		t.Errorf("after GC deleted session %s a warning names it: %q", id, warning)
+	}
+	// Every connected web client is told, as an API delete tells it.
+	select {
+	case msg := <-connected:
+		if want := `"type":"session_deleted"`; !strings.Contains(string(msg), want) || !strings.Contains(string(msg), `"session_id":"`+id+`"`) {
+			t.Errorf("a connected client is sent %s, want session_deleted of %s", msg, id)
+		}
+	case <-time.After(time.Second):
+		t.Errorf("no connected client is told GC deleted session %s", id)
 	}
 }

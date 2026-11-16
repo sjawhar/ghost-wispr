@@ -1743,11 +1743,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// (RecordEraseDirectory), so an erase the recorder cuts off there is
 	// still finished at a start with another audio_dir.
 	if err := cleanupRecordingDirectories(store, cfg.AudioDir); err != nil {
-		log.Printf("warning: failed to clean leftover splice copies: %v", err)
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
 	}
 	if cfg.GCEnabled {
-		go collectGarbage(ctx, cfgStore, store, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
+		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
 
 	// Create health checker with actual component references. With no Deepgram
@@ -1947,7 +1946,10 @@ func streamMicWithRetry(
 
 		logf("mic stream error (retrying in %v): %v", backoff, err)
 		if hub != nil {
-			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, err.Error())
+			// The error can be the write to the session's raw file, which
+			// names it; this status names no session and is stored, so it
+			// says only that the stream failed. The log line says why.
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, "Microphone stream error; retrying")
 		}
 		wait(backoff)
 

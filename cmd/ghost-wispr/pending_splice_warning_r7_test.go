@@ -40,8 +40,8 @@ func TestR7StartupPendingSpliceWarningsHaveDistinctStatusKeys(t *testing.T) {
 	registry := newWarningsRegistry()
 	recordPendingSpliceCleanupWarning(registry, errors.New("cleanup failed"))
 	recordPendingSpliceRecoveryWarning(registry, errors.New("recovery failed"))
-	warnings := statusWarnings(t, registry)
-	if len(warnings) != 2 || !strings.Contains(strings.Join(warnings, "\n"), "cleanup failed") || !strings.Contains(strings.Join(warnings, "\n"), "recovery failed") {
+	warnings := strings.Join(statusWarnings(t, registry), "\n")
+	if strings.Count(warnings, "\n") != 1 || !strings.Contains(warnings, "cleaned up") || !strings.Contains(warnings, "recovery failed") {
 		t.Fatalf("status warnings = %q, want distinct cleanup and recovery warnings", warnings)
 	}
 }

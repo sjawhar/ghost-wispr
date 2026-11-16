@@ -38,7 +38,6 @@ func (d *segmentDeleteRunner) recoverAtStart(ctx context.Context, source deletio
 	outcomes, err := d.recoverPendingSplices(ctx, source)
 	applyPendingSpliceRecoveryWarnings(registry, outcomes)
 	if err != nil {
-		log.Printf("warning: failed to recover pending segment splices: %v", err)
 		recordPendingSpliceRecoveryWarning(registry, err)
 		return
 	}
