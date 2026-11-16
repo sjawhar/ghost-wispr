@@ -139,17 +139,29 @@
     await refreshSessionList(sessionIds)
   }
 
+  // The configuration, with the recording rules, loads apart from the page's
+  // other requests, and a failed load is tried again with each status poll,
+  // so one request that fails while the unit restarts does not hide the rules
+  // until a reload.
+  async function loadConfig(): Promise<void> {
+    try {
+      setConfig(await fetchConfig())
+    } catch {
+      // The next status poll tries again.
+    }
+  }
+
   onMount(() => {
     connect()
 
     let mounted = true
+    void loadConfig()
     const bootstrap = async () => {
       try {
-        const [status, dates, presets, config] = await Promise.all([
+        const [status, dates, presets] = await Promise.all([
           fetchStatus(),
           fetchDates(),
           fetchPresets(),
-          fetchConfig(),
         ])
         if (!mounted) {
           return
@@ -160,7 +172,6 @@
         setWarnings(status.warnings)
         setDates(dates)
         setPresets(presets)
-        setConfig(config)
 
         // Restore active session's live transcript if one exists
         if (status.active_session_id) {
@@ -202,6 +213,9 @@
     void bootstrap()
 
     const refreshTimer = setInterval(() => {
+      if (configState.config === null) {
+        void loadConfig()
+      }
       void fetchStatus()
         .then((status) => {
           setPaused(status.paused)
