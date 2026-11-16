@@ -71,4 +71,26 @@ if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
   fail 'self-test accepted a provider-model checker that accepts planted mismatches'
 fi
 
+# run_row must report a row that returns 2 as NEEDS-PERSON and not count it as a failure; a row
+# that returns 1 is a FAIL. On the office Pi (2026-11-16) the live driver would call A10 without
+# --drive-members and Cert-warning without --cert-test FAIL: after `if "$@"; then ...; fi` with no
+# else branch, $? is the if statement's own 0, not the row's status.
+run_row_source=$(awk '/^run_row\(\) \{$/ { found = 1 } found { print } found && /^\}$/ { exit }' "$driver")
+[[ -n "$run_row_source" ]] || fail 'could not read run_row from the driver'
+run_row_output=$(
+  row_failures=0
+  eval "$run_row_source"
+  needs_person() { return 2; }
+  fails() { return 1; }
+  run_row Person-row needs_person 2>&1
+  run_row Failing-row fails 2>&1
+  printf 'row_failures=%s\n' "$row_failures"
+)
+[[ "$run_row_output" == *'Person-row verdict: NEEDS-PERSON'* ]] \
+  || fail "run_row did not report a row that returned 2 as NEEDS-PERSON: $run_row_output"
+[[ "$run_row_output" == *'Failing-row verdict: FAIL'* ]] \
+  || fail "run_row did not report a row that returned 1 as FAIL: $run_row_output"
+[[ "$run_row_output" == *'row_failures=1'* ]] \
+  || fail "run_row counted the wrong number of failures: $run_row_output"
+
 printf 'slice 2 acceptance test passed\n'
