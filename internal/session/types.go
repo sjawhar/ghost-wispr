@@ -87,6 +87,9 @@ type EventBroadcaster interface {
 	BroadcastSessionStarted(sessionID string)
 	BroadcastSessionEnded(sessionID string, duration time.Duration)
 	BroadcastSummaryReady(sessionID, title, summary, status, preset string)
+	// BroadcastSummaryFailed announces a failed summary, why it failed
+	// (reason), and the title, summary and preset the session keeps.
+	BroadcastSummaryFailed(sessionID, title, summary, preset, reason string)
 	BroadcastLiveTranscriptInterim(sessionID string, speaker int, text string, startTime float64)
 	BroadcastComponentStatus(component, status, message string)
 }

@@ -130,24 +130,14 @@ func (s *Summarizer) ProcessBatchResults(job *genai.BatchJob, sessions []BatchSe
 			continue
 		}
 
-		parsed, err := parseStructuredSummary(json.RawMessage(text))
-		if err != nil {
-			// Fall back to raw text as summary.
-			sess := sessionByID[result.SessionID]
-			result.Title = guaranteedTitle(sess.Transcript)
-			result.Summary = text
-			result.SpeakerNames = "{}"
+		parsed := summaryAnswer(json.RawMessage(text), sessionByID[result.SessionID].Transcript)
+		if !meaningfulText(parsed.Summary) {
+			result.Error = fmt.Errorf("%w for session %s: %q", errNoSummaryText, result.SessionID, parsed.Summary)
 			results[i] = result
 			continue
 		}
-
-		if strings.TrimSpace(parsed.Title) == "" {
-			sess := sessionByID[result.SessionID]
-			parsed.Title = guaranteedTitle(sess.Transcript)
-		}
-
-		result.Title = strings.TrimSpace(parsed.Title)
-		result.Summary = strings.TrimSpace(parsed.Summary)
+		result.Title = parsed.Title
+		result.Summary = parsed.Summary
 		result.SpeakerNames = parsed.speakerNamesJSON()
 		results[i] = result
 	}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/logging"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -142,6 +143,20 @@ func (h *Hub) BroadcastSummaryReady(sessionID, title, summary, status, preset st
 		Summary:   summary,
 		Status:    status,
 		Preset:    preset,
+	})
+}
+
+// BroadcastSummaryFailed announces that making session sessionID's summary
+// failed, and why (reason), with the title, summary and preset it keeps.
+func (h *Hub) BroadcastSummaryFailed(sessionID, title, summary, preset, reason string) {
+	h.broadcastEvent(SummaryReadyEvent{
+		Event:     newEvent("summary_ready", time.Now().UTC()),
+		SessionID: sessionID,
+		Title:     title,
+		Summary:   summary,
+		Status:    storage.SummaryFailed,
+		Preset:    preset,
+		Error:     reason,
 	})
 }
 

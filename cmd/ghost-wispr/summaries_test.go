@@ -25,8 +25,9 @@ func (f failingSummarizer) SummarizeWithPreset(context.Context, string, string, 
 	return "We agreed to move the launch", "", "{}", f.err
 }
 
-// summaryEvent is one announcement of a session's summary.
-type summaryEvent struct{ sessionID, title, summary, status, preset string }
+// summaryEvent is one announcement of a session's summary, with the reason
+// a failed one gives.
+type summaryEvent struct{ sessionID, title, summary, status, preset, reason string }
 
 // recordingBroadcaster keeps every summary announcement.
 type recordingBroadcaster struct {
@@ -37,7 +38,13 @@ type recordingBroadcaster struct {
 func (r *recordingBroadcaster) BroadcastSummaryReady(sessionID, title, summary, status, preset string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.events = append(r.events, summaryEvent{sessionID, title, summary, status, preset})
+	r.events = append(r.events, summaryEvent{sessionID, title, summary, status, preset, ""})
+}
+
+func (r *recordingBroadcaster) BroadcastSummaryFailed(sessionID, title, summary, preset, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, summaryEvent{sessionID, title, summary, storage.SummaryFailed, preset, reason})
 }
 
 // A summary made again that fails takes nothing away: the session keeps its
@@ -105,7 +112,7 @@ func TestAFailedResummarizeKeepsTheLastGoodSummaryAndTitle(t *testing.T) {
 			hub.mu.Lock()
 			defer hub.mu.Unlock()
 			last := hub.events[len(hub.events)-1]
-			if want := (summaryEvent{id, "Launch planning, renamed", "The last good summary.", storage.SummaryFailed, "default"}); last != want {
+			if want := (summaryEvent{id, "Launch planning, renamed", "The last good summary.", storage.SummaryFailed, "default", "summarization failed: " + cause.Error()}); last != want {
 				t.Errorf("last announcement %+v, want %+v", last, want)
 			}
 		})

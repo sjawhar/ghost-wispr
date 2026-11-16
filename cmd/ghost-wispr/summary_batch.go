@@ -118,7 +118,7 @@ func failBatchSummary(store *storage.SQLiteStore, hub summaryBroadcaster, batchN
 		return err
 	}
 	if hub != nil {
-		hub.BroadcastSummaryReady(sessionID, kept.Title, kept.Summary, storage.SummaryFailed, kept.SummaryPreset)
+		hub.BroadcastSummaryFailed(sessionID, kept.Title, kept.Summary, kept.SummaryPreset, kept.SummaryError)
 	}
 	return nil
 }

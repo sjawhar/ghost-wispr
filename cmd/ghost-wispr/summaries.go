@@ -26,6 +26,9 @@ type reportedPresetSummarizer interface {
 // summaryBroadcaster announces the progress of a session's summary.
 type summaryBroadcaster interface {
 	BroadcastSummaryReady(sessionID, title, summary, status, preset string)
+	// BroadcastSummaryFailed announces a failed summary, why it failed
+	// (reason), and the title, summary and preset the session keeps.
+	BroadcastSummaryFailed(sessionID, title, summary, preset, reason string)
 }
 
 // resummarize makes session sessionID's summary again, with preset if one is
@@ -252,10 +255,10 @@ func repairStructuredSummaries(ctx context.Context, store summaryRepairStore, pu
 
 // failSummary records that making session sessionID's summary from the text
 // of transcript generation generation failed, and why (cause), and announces
-// on hub (when not nil) the title and summary the session keeps: its last
-// good ones, if it has them. A failed summary takes nothing away. Once the
-// text has changed since (a segment deletion), it records nothing: the newer
-// run's status stays.
+// on hub (when not nil) the title and summary the session keeps, its last
+// good ones if it has them, with the reason. A failed summary takes nothing
+// away. Once the text has changed since (a segment deletion), it records
+// nothing: the newer run's status stays.
 func failSummary(store *storage.SQLiteStore, hub summaryBroadcaster, sessionID string, generation int, cause error) {
 	kept, err := store.FailSummaryAtGeneration(sessionID, fmt.Sprintf("summarization failed: %v", cause), generation)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -267,6 +270,6 @@ func failSummary(store *storage.SQLiteStore, hub summaryBroadcaster, sessionID s
 		return
 	}
 	if hub != nil {
-		hub.BroadcastSummaryReady(sessionID, kept.Title, kept.Summary, storage.SummaryFailed, kept.SummaryPreset)
+		hub.BroadcastSummaryFailed(sessionID, kept.Title, kept.Summary, kept.SummaryPreset, kept.SummaryError)
 	}
 }
