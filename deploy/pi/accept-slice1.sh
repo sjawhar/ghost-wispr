@@ -5,7 +5,12 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 readonly baseline_file="$script_dir/baseline.txt"
-host=${GHOST_WISPR_HOST:-ghost-wispr.tail12ec1c.ts.net}
+# The office Pi's deployment settings (PI_HOST, PI_DENIED_TAG); GHOST_WISPR_PI_ENV names another
+# file, as the tests do.
+pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
+# shellcheck source=files/pi.env
+source "$pi_env" || { printf 'cannot read the Pi deployment settings in %s\n' "$pi_env" >&2; exit 1; }
+host=${GHOST_WISPR_HOST:-$PI_HOST}
 relay_url=${GHOST_WISPR_RELAY_URL:-}
 self_test=false
 
@@ -568,7 +573,7 @@ done <<<"$app_listeners"
 assert_listener_boundary
 status >/dev/null
 check_sshd_loopback
-printf 'A5 RAN: local listener boundary passed. A5 NEEDS-PERSON: test a phone off-tailnet and tag:envoy-host; both must fail.\n'
+printf 'A5 RAN: local listener boundary passed. A5 NEEDS-PERSON: test a phone off-tailnet and %s; both must fail.\n' "$PI_DENIED_TAG"
 
 if [[ -n "$relay_url" ]]; then
   printf 'Envoy RAN: check a signed probe and an unsigned Pi request.\n'
@@ -595,7 +600,7 @@ if [[ -n "$relay_url" ]]; then
   [[ "$unsigned_code" == 401 ]] || fail "Envoy FAILED: unsigned Pi request returned HTTP $unsigned_code, expected 401"
   printf 'Envoy RAN: unsigned Pi request was refused.\n'
 else
-  printf 'Envoy NEEDS-PERSON: rerun with --relay-url from envoy-cluster Pulumi output.\n'
+  printf 'Envoy NEEDS-PERSON: rerun with --relay-url, the relay URL docs/pi-setup.md, "Accept slice 1", reads.\n'
 fi
 
 printf 'A2 NEEDS-PERSON: open %s and choose Recording rules; each rule under recording_rules in the Pi'\''s config, /opt/ghost-wispr/ghost-wispr.yaml (rendered from deploy/pi/files/ghost-wispr.yaml), must appear verbatim and in order.\n' "$unit_url"

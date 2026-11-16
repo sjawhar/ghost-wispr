@@ -21,6 +21,8 @@ export TEST_KEY=$KEY
 # An API override left in the environment must not send the key elsewhere: the script has none,
 # and the fake curl refuses every URL that is not the Tailscale API.
 export GHOST_WISPR_TAILSCALE_API=http://127.0.0.1:9/not-the-tailscale-api
+# The script reads neutral deployment settings: the Pi is ghost-wispr.example-tailnet.ts.net.
+export GHOST_WISPR_PI_ENV="$script_dir/test-pi.env"
 mkdir -p "$work_dir/bin"
 
 # The fake curl takes its Authorization header only from a curl config on stdin, records every
@@ -71,10 +73,10 @@ case "$method $path" in
     # asked for is taken.
     if [[ -n ${TEST_RENAME_NOOP:-} ]]; then
       name=$(jq -r --arg id "$id" '.devices[] | select(.id == $id) | .name' "$TEST_STATE")
-    elif jq -e '.devices[] | select(.name == "ghost-wispr.tail12ec1c.ts.net")' "$TEST_STATE" >/dev/null; then
-      name=ghost-wispr-2.tail12ec1c.ts.net
+    elif jq -e '.devices[] | select(.name == "ghost-wispr.example-tailnet.ts.net")' "$TEST_STATE" >/dev/null; then
+      name=ghost-wispr-2.example-tailnet.ts.net
     else
-      name=ghost-wispr.tail12ec1c.ts.net
+      name=ghost-wispr.example-tailnet.ts.net
     fi
     jq --arg id "$id" --arg name "$name" '.devices |= map(if .id == $id then .name = $name else . end)' \
       "$TEST_STATE" >"$TEST_STATE.new"
@@ -87,11 +89,11 @@ printf '%s' "$body"
 EOF
 chmod +x "$work_dir/bin/curl"
 
-readonly tagged='{"id":"222","name":"ghost-wispr-1.tail12ec1c.ts.net","hostname":"ghost-wispr","user":"","tags":["tag:ghost-wispr"],"connectedToControl":true}'
-readonly temporary='{"id":"111","name":"ghost-wispr.tail12ec1c.ts.net","hostname":"ghost-wispr","user":"operator@example.test","tags":null,"connectedToControl":false}'
+readonly tagged='{"id":"222","name":"ghost-wispr-1.example-tailnet.ts.net","hostname":"ghost-wispr","user":"","tags":["tag:ghost-wispr"],"connectedToControl":true}'
+readonly temporary='{"id":"111","name":"ghost-wispr.example-tailnet.ts.net","hostname":"ghost-wispr","user":"operator@example.test","tags":null,"connectedToControl":false}'
 # Passes every holder clause but does not hold the name, so it must stay.
-readonly namesake='{"id":"555","name":"ghost-wispr-2.tail12ec1c.ts.net","hostname":"ghost-wispr","user":"operator@example.test","tags":null,"connectedToControl":false}'
-readonly bystander='{"id":"333","name":"laptop.tail12ec1c.ts.net","hostname":"laptop","user":"operator@example.test","tags":null,"connectedToControl":false}'
+readonly namesake='{"id":"555","name":"ghost-wispr-2.example-tailnet.ts.net","hostname":"ghost-wispr","user":"operator@example.test","tags":null,"connectedToControl":false}'
+readonly bystander='{"id":"333","name":"laptop.example-tailnet.ts.net","hostname":"laptop","user":"operator@example.test","tags":null,"connectedToControl":false}'
 
 # run_case NAME DEVICES... runs the script on a tailnet holding DEVICES, fails the test if the key
 # is in its stdout or stderr, and returns the script's exit status.
@@ -124,14 +126,14 @@ no_key_in_output() {
 
 # The temporary device holds the name: it goes, and the tagged one takes the name.
 run_case temporary-holder "$tagged" "$temporary" "$bystander" "$namesake" || fail "temporary-holder: $(<"$case_dir/out")"
-[[ $(names) == '[{"id":"222","name":"ghost-wispr.tail12ec1c.ts.net"},{"id":"333","name":"laptop.tail12ec1c.ts.net"},{"id":"555","name":"ghost-wispr-2.tail12ec1c.ts.net"}]' ]] \
+[[ $(names) == '[{"id":"222","name":"ghost-wispr.example-tailnet.ts.net"},{"id":"333","name":"laptop.example-tailnet.ts.net"},{"id":"555","name":"ghost-wispr-2.example-tailnet.ts.net"}]' ]] \
   || fail "temporary-holder: the tailnet is $(names)"
 no_key_in_argv temporary-holder
-grep -Fxq 'claim-tailnet-name: device 222 is ghost-wispr.tail12ec1c.ts.net' "$case_dir/out" \
+grep -Fxq 'claim-tailnet-name: device 222 is ghost-wispr.example-tailnet.ts.net' "$case_dir/out" \
   || fail "temporary-holder: no closing line: $(<"$case_dir/out")"
 
 # The tagged device has the name: no call changes anything.
-run_case already-named "$(jq -c '.name = "ghost-wispr.tail12ec1c.ts.net"' <<<"$tagged")" "$bystander" \
+run_case already-named "$(jq -c '.name = "ghost-wispr.example-tailnet.ts.net"' <<<"$tagged")" "$bystander" \
   || fail "already-named: $(<"$case_dir/out")"
 unchanged || fail "already-named: the tailnet changed to $(names)"
 if grep -Eq -- '-X (DELETE|POST)' "$case_dir/argv"; then
@@ -140,7 +142,7 @@ fi
 
 # Nobody holds the name: rename only.
 run_case free-name "$tagged" "$bystander" || fail "free-name: $(<"$case_dir/out")"
-[[ $(names) == '[{"id":"222","name":"ghost-wispr.tail12ec1c.ts.net"},{"id":"333","name":"laptop.tail12ec1c.ts.net"}]' ]] \
+[[ $(names) == '[{"id":"222","name":"ghost-wispr.example-tailnet.ts.net"},{"id":"333","name":"laptop.example-tailnet.ts.net"}]' ]] \
   || fail "free-name: the tailnet is $(names)"
 grep -q -- '-X DELETE' "$case_dir/argv" && fail "free-name: the script deleted a device"
 
@@ -169,7 +171,7 @@ for refused in \
   if grep -Eq -- '-X (DELETE|POST)' "$case_dir/argv"; then
     fail "refuse-$label: the script deleted or renamed before it refused"
   fi
-  [[ $(<"$case_dir/out") == 'claim-tailnet-name: the name ghost-wispr.tail12ec1c.ts.net is held by '*'; nothing was changed' ]] \
+  [[ $(<"$case_dir/out") == 'claim-tailnet-name: the name ghost-wispr.example-tailnet.ts.net is held by '*'; nothing was changed' ]] \
     || fail "refuse-$label: the output is not the guard's refusal alone: $(<"$case_dir/out")"
 done
 
@@ -178,7 +180,7 @@ if run_case no-tagged "$temporary"; then
   fail "no-tagged: the script ran with no tagged device"
 fi
 unchanged || fail "no-tagged: the tailnet changed"
-if run_case two-tagged "$tagged" "$(jq -c '.id = "444" | .name = "ghost-wispr-2.tail12ec1c.ts.net"' <<<"$tagged")" "$temporary"; then
+if run_case two-tagged "$tagged" "$(jq -c '.id = "444" | .name = "ghost-wispr-2.example-tailnet.ts.net"' <<<"$tagged")" "$temporary"; then
   fail "two-tagged: the script ran with two tagged devices"
 fi
 unchanged || fail "two-tagged: the tailnet changed"
@@ -203,7 +205,7 @@ done
 if TEST_RENAME_NOOP=1 run_case rename-not-taken "$tagged" "$temporary"; then
   fail "rename-not-taken: the script passed a rename that did not take"
 fi
-grep -Fxq 'claim-tailnet-name: device 222 is named ghost-wispr-1.tail12ec1c.ts.net after the rename, not ghost-wispr.tail12ec1c.ts.net' \
+grep -Fxq 'claim-tailnet-name: device 222 is named ghost-wispr-1.example-tailnet.ts.net after the rename, not ghost-wispr.example-tailnet.ts.net' \
   "$case_dir/out" || fail "rename-not-taken: no read-back failure: $(<"$case_dir/out")"
 
 # The API refuses a call: the script names the call and stops. After a refused list nothing

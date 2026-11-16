@@ -4,19 +4,26 @@
 #   secret-run --register --wait 12h --reason TEXT TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
 #
 # The tagged join makes a new device. While the temporary device the operator joined as their own
-# still holds the name, Tailscale names the tagged one ghost-wispr-1, and the recorder is not at
-# https://ghost-wispr.tail12ec1c.ts.net. This script removes that temporary device and renames the
-# tagged one. It removes a device only when that device is the one device other than the tagged one
-# that holds the name, has an id that is a string of digits, has the hostname ghost-wispr, has a
-# user owner and no tag, and is not connected. It refuses any other holder, or more than one, before
-# it changes anything. It prints device ids and names only. TAILSCALE_API_KEY comes from the
-# environment and reaches curl on stdin (curl -K -), never as an argument, and goes only to the
-# Tailscale API host below.
+# still holds the name, Tailscale names the tagged one ghost-wispr-1, and the recorder is not at its
+# tailnet name (PI_HOST in deploy/pi/files/pi.env). This script removes that temporary device and
+# renames the tagged one. It removes a device only when that device is the one device other than
+# the tagged one that holds the name, has an id that is a string of digits, has the hostname
+# ghost-wispr, has a user owner and no tag, and is not connected. It refuses any other holder, or
+# more than one, before it changes anything. It prints device ids and names only. TAILSCALE_API_KEY
+# comes from the environment and reaches curl on stdin (curl -K -), never as an argument, and goes
+# only to the Tailscale API host below.
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# The office Pi's deployment settings (PI_HOST); GHOST_WISPR_PI_ENV names another file, as the
+# tests do.
+pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
+# shellcheck source=files/pi.env
+source "$pi_env" || { printf 'claim-tailnet-name: cannot read the Pi deployment settings in %s\n' "$pi_env" >&2; exit 1; }
 readonly API=https://api.tailscale.com/api/v2
 readonly HOSTNAME_WANTED=ghost-wispr
-readonly NAME_WANTED=ghost-wispr.tail12ec1c.ts.net
+readonly NAME_WANTED=$PI_HOST
 readonly TAG=tag:ghost-wispr
 
 fail() {

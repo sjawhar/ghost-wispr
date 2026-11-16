@@ -52,7 +52,7 @@ func TestCertificateExpiryWarningRegistry(t *testing.T) {
 	}
 
 	refreshCertificateExpiryWarning(registry, "unreadable", now, reader)
-	if warnings := statusWarnings(t, registry); len(warnings) != 1 || !strings.Contains(warnings[0], "could not be read") || !strings.Contains(warnings[0], "docs/pi-setup.md") || !strings.Contains(warnings[0], "ghost-wispr-device-certificate") {
+	if warnings := statusWarnings(t, registry); len(warnings) != 1 || !strings.Contains(warnings[0], "could not be read") || !strings.Contains(warnings[0], `docs/pi-setup.md, "Renew the X.509 certificate"`) {
 		t.Fatalf("unreadable certificate warnings = %q", warnings)
 	}
 }

@@ -37,3 +37,5 @@ power_button: true
 jabra_mute_button: true
 envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__
+# The Secret Manager version of Envoy's webhook signing key; Ghost Wispr has no default for it.
+envoy_webhook_secret_name: projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest

@@ -167,8 +167,9 @@ read the text, fetch `session_url`, which returns what is left after any deletio
 
 Each event is signed with Envoy's webhook signing key, which Ghost Wispr reads from Google Secret
 Manager with its Google credential (`google_credentials_file`): the secret version
-`envoy_webhook_secret_name` (`GHOST_WISPR_ENVOY_WEBHOOK_SECRET_NAME`), by default
-`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`. It keeps
+`envoy_webhook_secret_name` (`GHOST_WISPR_ENVOY_WEBHOOK_SECRET_NAME`), such as
+`projects/example-project/secrets/example-signing-secret/versions/latest`. It has no default:
+with Envoy enabled and no secret named, Ghost Wispr sends no event and warns at startup. It keeps
 the key in memory and reads it again once when Envoy answers 401, so a rotated key needs no
 change on the unit. While the key cannot be read, no event is sent and `/api/status` warns. The
 five-minute sweep reads the key again, so the warning clears within five minutes of the key

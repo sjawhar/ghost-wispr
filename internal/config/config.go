@@ -21,10 +21,6 @@ const EnvPrefix = "GHOST_WISPR_"
 
 const (
 	IndicatorLightBlink1 = "blink1"
-	// DefaultEnvoyWebhookSecretName is the Secret Manager version the office
-	// recorder reads Envoy's webhook signing key from (dispatch://INFRA-3599
-	// gives its Google identity Secret Accessor on it).
-	DefaultEnvoyWebhookSecretName = "projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest"
 	// leftoverEnvoyWebhookSecretWarning names a signing key an earlier
 	// provisioner left in the environment or .env.
 	leftoverEnvoyWebhookSecretWarning = EnvPrefix + "ENVOY_WEBHOOK_SECRET is no longer read: Ghost Wispr reads the Envoy signing key from Secret Manager (envoy_webhook_secret_name). Remove it from the environment and .env."
@@ -142,7 +138,6 @@ func defaults() Config {
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
 		TTSMaxLength:                  5000,
-		EnvoyWebhookSecretName:        DefaultEnvoyWebhookSecretName,
 	}
 }
 
@@ -544,6 +539,7 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 	if cfg.BatchTranscription.Provider == "" {
 		cfg.BatchTranscription.Provider = "deepgram"
 	}
+	cfg.EnvoyWebhookSecretName = strings.TrimSpace(cfg.EnvoyWebhookSecretName)
 	if cfg.EnvoyEnabled {
 		webhookURL := strings.TrimSpace(cfg.EnvoyWebhookURL)
 		switch webhookURL {
@@ -555,10 +551,10 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 				warnings = append(warnings, "Envoy webhook URL must be an absolute HTTPS URL.")
 			}
 		}
-	}
-	cfg.EnvoyWebhookSecretName = strings.TrimSpace(cfg.EnvoyWebhookSecretName)
-	if cfg.EnvoyWebhookSecretName == "" {
-		cfg.EnvoyWebhookSecretName = DefaultEnvoyWebhookSecretName
+		// No signing key secret is a default: each deployment names its own.
+		if cfg.EnvoyWebhookSecretName == "" {
+			warnings = append(warnings, "Envoy enabled but its signing key secret is not named — set envoy_webhook_secret_name ("+EnvPrefix+"ENVOY_WEBHOOK_SECRET_NAME) to its Secret Manager version, or disable Envoy publishing.")
+		}
 	}
 	if publicURL := strings.TrimSpace(cfg.PublicURL); publicURL != "" {
 		parsed, err := url.Parse(publicURL)

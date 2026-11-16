@@ -2,8 +2,8 @@
 # Provision the Ghost Wispr Raspberry Pi from a release binary and a credential bundle on stdin.
 set -euo pipefail
 
-# GHOST_WISPR_DEPLOY_DIR and GHOST_WISPR_IDENTITY_KEY exist for provision_run_test.sh, as
-# update.sh's GHOST_WISPR_DEPLOY_DIR does for update_test.sh.
+# GHOST_WISPR_DEPLOY_DIR, GHOST_WISPR_IDENTITY_KEY and GHOST_WISPR_PI_ENV exist for
+# provision_run_test.sh, as update.sh's GHOST_WISPR_DEPLOY_DIR does for update_test.sh.
 readonly DEPLOY_DIR="${GHOST_WISPR_DEPLOY_DIR:-/opt/ghost-wispr}"
 readonly JOIN_DIR=/var/lib/ghost-wispr-join
 readonly JOIN_TOKEN="$JOIN_DIR/token"
@@ -13,7 +13,6 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 readonly repo_root
-readonly TAILSCALE_HOSTNAME=ghost-wispr.tail12ec1c.ts.net.
 readonly CONFIG_TEMPLATE="$repo_root/deploy/pi/files/ghost-wispr.yaml"
 readonly EMBEDDING_LOCATION_SETTING=GHOST_WISPR_EMBEDDING_LOCATION=global
 
@@ -148,6 +147,12 @@ fi
 if [[ $# -ne 0 ]]; then
   fail "usage: deploy/pi/provision.sh < credential-bundle.tar"
 fi
+# The office Pi's deployment settings, which provision-pi.sh copies with the rest of deploy/pi; the
+# models step above needs none of them.
+pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
+# shellcheck source=files/pi.env
+source "$pi_env" || fail "cannot read the Pi's deployment settings in $pi_env"
+readonly TAILSCALE_HOSTNAME="$PI_HOST."
 
 service_uid=$(id -u "$SERVICE_USER")
 readonly service_uid

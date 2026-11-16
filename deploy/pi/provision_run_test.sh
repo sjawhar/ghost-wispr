@@ -68,7 +68,7 @@ cat >"$work_dir/bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
 printf 'tailscale %s\n' "$*" >>"$TEST_LOG"
 case $1 in
-  status) printf '{"Self":{"Tags":null,"DNSName":"ghost-wispr.tail12ec1c.ts.net."}}\n' ;;
+  status) printf '{"Self":{"Tags":null,"DNSName":"ghost-wispr.example-tailnet.ts.net."}}\n' ;;
   up) exit "${TEST_UP_EXIT:-0}" ;;
 esac
 EOF
@@ -94,11 +94,12 @@ printf '%s\n' "$SUBJECT" >"$work_dir/bundle/tailscale-subject"
 printf 'https://relay.example.test/webhook/ghostwispr\n' >"$work_dir/bundle/envoy-webhook-url"
 printf 'deepgram-key' >"$work_dir/bundle/deepgram-key"
 
-# run_provision runs provision.sh on a bundle of the named files.
+# run_provision runs provision.sh on a bundle of the named files, with neutral deployment settings.
 run_provision() {
   tar -C "$work_dir/bundle" -cf - "$@" \
     | env -u XDG_RUNTIME_DIR PATH="$work_dir/bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$work_dir/deploy" \
-      GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
+      GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" GHOST_WISPR_PI_ENV="$repo_root/deploy/pi/test-pi.env" \
+      bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
 }
 readonly bundle_files=(device.crt google-credentials.json certificate_config.json tailscale-client-id
   tailscale-subject envoy-webhook-url deepgram-key)

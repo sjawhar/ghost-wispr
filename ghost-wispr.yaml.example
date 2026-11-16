@@ -59,10 +59,11 @@ summarization:
 # gdrive_sync_enabled: false
 
 # Envoy webhook (optional). Posts are signed with the key Ghost Wispr reads from Secret Manager,
-# the secret version below, with google_credentials_file; it reads the key again on a 401.
+# the secret version below, with google_credentials_file; it reads the key again on a 401. The
+# secret version has no default: with Envoy enabled and none named, no event is sent.
 # envoy_enabled: false
 # envoy_webhook_url: https://relay.example.test/webhook/ghostwispr
-# envoy_webhook_secret_name: projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest
+# envoy_webhook_secret_name: projects/example-project/secrets/example-signing-secret/versions/latest
 
 # Garbage collection
 # gc_enabled: false

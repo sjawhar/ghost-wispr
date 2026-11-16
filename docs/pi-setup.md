@@ -89,14 +89,17 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
 ```
 
 Give the resulting certificate-signing request to the `bootstrap` apply. After the apply,
-create the Google external-account credential files on a development machine, never on the Pi:
+create the Google external-account credential files on a development machine, never on the Pi,
+from a Ghost Wispr checkout. This block and the others the test `provision_bundle_test.sh` runs
+read the Pi's project, identities and resource names from `deploy/pi/files/pi.env`:
 
 <!-- provision_bundle_test.sh: credentials -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
 d=$(mktemp -d)
 gcloud iam workload-identity-pools create-cred-config \
-  projects/805240912354/locations/global/workloadIdentityPools/ghost-wispr/providers/ghost-wispr \
-  --service-account=ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com \
+  "$PI_WORKLOAD_PROVIDER" \
+  --service-account="$PI_SERVICE_ACCOUNT" \
   --credential-cert-path=/opt/ghost-wispr/device.crt \
   --credential-cert-private-key-path=/home/ghost-wispr/.config/ghost-wispr-identity/key.pem \
   --credential-cert-configuration-output-file="$d/certificate_config.json" \
@@ -122,16 +125,18 @@ join passes the same path with `ghost-wispr google-id-token --credentials`; it d
 Ghost Wispr warns on its status page when the certificate has fewer than 30 days left, or when it
 cannot read the certificate. The `bootstrap` apply renews the certificate and publishes it as the
 latest version of Secret Manager secret `ghost-wispr-device-certificate`; the Pi private key stays
-where it is. Apply `bootstrap` through its normal reviewed CI route. Then read the new certificate
-on a development machine whose `gcloud` is the devbox identity (the reader `bootstrap/README.md`
-names), check it, install it on the Pi and restart Ghost Wispr:
+where it is. Apply `bootstrap` through its normal reviewed CI route. Then, from a Ghost Wispr
+checkout on a development machine whose `gcloud` is the devbox identity (the reader
+`bootstrap/README.md` names), read the new certificate, check it, install it on the Pi and restart
+Ghost Wispr:
 
 <!-- provision_bundle_test.sh: renew -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
 crt=$(mktemp) &&
-gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$crt" &&
+gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$crt" &&
 openssl x509 -in "$crt" -noout -subject -enddate &&
-ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
+ssh "ghost-wispr@$PI_HOST" \
   'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service' <"$crt"
 rm -f -- "$crt"
 ```
@@ -157,8 +162,9 @@ The credential bundle holds six public files and one secret:
 
 The Envoy webhook signing key is not in the bundle, and `provision.sh` refuses a bundle that
 holds an `envoy-webhook-secret` file. Ghost Wispr reads the key from Secret Manager
-(`envoy_webhook_secret_name`, by default
-`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`) and keeps
+(`envoy_webhook_secret_name`, which `deploy/pi/files/ghost-wispr.yaml` sets to
+`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`; Ghost
+Wispr has no default for it) and keeps
 it in memory. When Envoy answers 401 it reads the key again once, so a rotation needs no change on
 the Pi. When it cannot read the key it sends no events and `/api/status` says so; recording goes on.
 It reads the key again every five minutes, so the warning clears within five minutes of the key
@@ -190,15 +196,16 @@ the time you run the block:
 
 <!-- provision_bundle_test.sh: prepare -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
 prepared=$(mktemp -d)
-gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$prepared/device.crt"
+gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$prepared/device.crt"
 openssl x509 -in "$prepared/device.crt" -noout -subject -enddate
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
-git -C ~/src/agent-infra fetch --quiet origin main
-git -C ~/src/agent-infra show origin/main:root/Pulumi.prod.yaml \
-  | sed -n 's/^  agent-infra-root:ghostWisprAccountUniqueId: "\{0,1\}\([0-9][0-9]*\)"\{0,1\}$/\1/p' >"$prepared/tailscale-subject"
+git -C "$PI_INFRA_CHECKOUT" fetch --quiet origin main
+git -C "$PI_INFRA_CHECKOUT" show "origin/main:$PI_SUBJECT_FILE" \
+  | sed -n "s/^  $PI_SUBJECT_KEY: \"\{0,1\}\([0-9][0-9]*\)\"\{0,1\}\$/\1/p" >"$prepared/tailscale-subject"
 deploy/pi/tailnet-client-id.sh >"$prepared/tailscale-client-id"
-relay=$(gcloud run services list --project=theorem-agent-infra --filter='metadata.name ~ ^envoy-webhook-relay-' --format='value(status.url)')
+relay=$(gcloud run services list --project="$PI_GCP_PROJECT" --filter="metadata.name ~ ^$PI_RELAY_SERVICE_PREFIX" --format='value(status.url)')
 printf '%s/webhook/ghostwispr\n' "$relay" >"$prepared/envoy-webhook-url"
 head "$prepared/tailscale-subject" "$prepared/tailscale-client-id" "$prepared/envoy-webhook-url"
 rm -rf -- "$d"
@@ -479,7 +486,8 @@ ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user
 ## Roll out a release that adds a config key
 
 Follow this order for every release whose code reads a new key from
-`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules`. The nightly update replaces only
+`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules`, or needs a key that used to have a
+default, such as `envoy_webhook_secret_name`. The nightly update replaces only
 the binary: `update.sh` never writes the config, so a new binary that the timer installs starts
 on a config without the new key. The other order fails too: while the old binary runs on a config
 that has the key, a settings save drops the key, because the old binary writes back only the keys
@@ -492,10 +500,11 @@ it knows.
 3. As soon as that release is published, run `update.sh` by hand ("Update and inspect"). Do not
    wait for the timer: until the new binary runs, a settings save drops the new key.
 4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
-   come back:
+   come back, and for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning:
 
    ```bash
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/config | jq .recording_rules
+   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq .warnings
    ```
 
    Then run A2 of "Accept slice 1".
@@ -568,8 +577,9 @@ to run the read on a machine whose `secret-run` has a broker identity when this 
 
 <!-- provision_bundle_test.sh: accept -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
 secret=$(deploy/pi/webhook-secret.sh ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"}) &&
-relay=$(gcloud run services list --project=theorem-agent-infra --filter='metadata.name ~ ^envoy-webhook-relay-' --format='value(status.url)') &&
+relay=$(gcloud run services list --project="$PI_GCP_PROJECT" --filter="metadata.name ~ ^$PI_RELAY_SERVICE_PREFIX" --format='value(status.url)') &&
 [[ $relay =~ ^https://[^[:space:]]+$ ]] &&
 GHOST_WISPR_RELAY_URL="$relay/webhook/ghostwispr" \
 GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$secret" \

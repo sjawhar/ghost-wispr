@@ -49,9 +49,11 @@ func openSecretManager(ctx context.Context, cfg *config.Config) (*secrets.Reader
 	return secrets.NewReader(ctx, option.WithAuthCredentials(credentials))
 }
 
-// configure builds the publisher cfg asks for, or turns Envoy off.
+// configure builds the publisher cfg asks for, or turns Envoy off. A config
+// with no webhook URL, or no signing key secret to read, sends nothing; the
+// startup warning names the missing setting.
 func (e *envoyPublishing) configure(ctx context.Context, cfg *config.Config, logger *slog.Logger) {
-	if !cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyWebhookURL) == "" {
+	if !cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyWebhookURL) == "" || strings.TrimSpace(cfg.EnvoyWebhookSecretName) == "" {
 		e.warnings.Clear(envoyWarningKey)
 		e.set(nil)
 		return

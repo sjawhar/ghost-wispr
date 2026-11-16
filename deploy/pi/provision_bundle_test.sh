@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Runs docs/pi-setup.md's own commands for the credential files, the bundle sources and the
 # provisioning call, read from the runbook between its provision_bundle_test.sh markers, against
-# fakes that answer only the sources the devbox identity can read: Secret Manager
-# ghost-wispr-device-certificate, root/Pulumi.prod.yaml's ghostWisprAccountUniqueId on agent-infra
-# main, the ghostWisprTailnetClientId the seed workflow's root job printed when it created
-# ghost-wispr-x509, and the URL of the Cloud Run service envoy-webhook-relay-*. Pulumi answers
-# 403, as root's and envoy-cluster's state buckets do for that identity. Provisioning reads no
-# Envoy signing key: the recorder reads it from Secret Manager itself. The slice 1 acceptance
-# block reads it, for its signed probe, only under a one-hour GCLOUD_SAMI broker grant (or a broker
-# key), never to a plain gcloud read.
+# fakes that answer only the sources the devbox identity can read: the device certificate's Secret
+# Manager secret, the service account's unique ID in the infrastructure repository's root stack
+# configuration on its main, the Tailscale client ID the seed workflow's root job printed when it
+# created the identity, and the URL of the relay's Cloud Run service. Pulumi answers 403, as the
+# infrastructure stacks' state buckets do for that identity. Provisioning reads no Envoy signing
+# key: the recorder reads it from Secret Manager itself. The slice 1 acceptance block reads it, for
+# its signed probe, only under a one-hour GCLOUD_SAMI broker grant (or a broker key), never to a
+# plain gcloud read. The runbook and the scripts read the neutral deployment settings in
+# deploy/pi/test-pi.env, not the office Pi's.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo_root
+export GHOST_WISPR_PI_ENV="$repo_root/deploy/pi/test-pi.env"
 # PROVISION_BUNDLE_TEST_DOC names another copy of the runbook, to show the test fails on it.
 readonly doc="${PROVISION_BUNDLE_TEST_DOC:-$repo_root/docs/pi-setup.md}"
 work_dir=$(mktemp -d)
@@ -61,7 +63,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=g
   -keyout "$work_dir/device.key" -out "$work_dir/device.pem" 2>/dev/null
 export TEST_CERTIFICATE="$work_dir/device.pem" TEST_ARGV_LOG="$work_dir/argv.log"
 
-# The devbox identity cannot list root's or envoy-cluster's Pulumi state bucket.
+# The devbox identity cannot list the infrastructure stacks' Pulumi state buckets.
 cat >"$work_dir/bin/pulumi" <<'EOF'
 #!/usr/bin/env bash
 printf 'pulumi %s\n' "$*" >>"$TEST_ARGV_LOG"
@@ -69,12 +71,12 @@ printf 'fake pulumi: 403: the devbox identity does not have storage.objects.list
 exit 1
 EOF
 
-# gh answers as GitHub does for agent-infra's seed workflow: the runs newest first, two to a page
-# here, and the jobs of each attempt.
+# gh answers as GitHub does for the infrastructure repository's seed workflow: the runs newest
+# first, two to a page here, and the jobs of each attempt.
 # - 905, attempt 3: root waits for its approval (no steps, no log); attempt 2: root was cancelled
 #   before it started (no steps, no log); attempt 1: skipped.
 # - 904: root ran a preview, which prints the client id as [unknown].
-# - 903, re-run twice: attempt 3 ran a preview again; attempt 2 replaced ghost-wispr-x509, so the
+# - 903, re-run twice: attempt 3 ran a preview again; attempt 2 replaced example-x509, so the
 #   client id changed from the stale one to CLIENT_ID (with TEST_CREATION_FORM=create it created
 #   it); attempt 1 created the earlier identity, whose client id is stale.
 # - 902: created the earlier identity too.
@@ -100,7 +102,7 @@ not_found() {
   printf 'fake gh: HTTP 404 for "%s"\n' "${args[*]}" >&2
   exit 1
 }
-readonly api=repos/theorem-labs/agent-infra/actions
+readonly api=repos/example-org/example-infra/actions
 recent=$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)
 expired=$(date -u -d '100 days ago' +%Y-%m-%dT%H:%M:%SZ)
 run_json() { printf '{"id":%s,"run_attempt":%s,"created_at":"%s"}' "$@"; }
@@ -110,12 +112,12 @@ root_job() {
   printf '{"id":%s,"name":"root","status":"%s","conclusion":%s,"steps":[%s]}]}\n' "$1" "$2" "$3" "$4"
 }
 step=$(printf '{"started_at":"%s"}' "$recent")
-preview='2026-11-16T06:20:21.4658172Z   + ghostWisprTailnetClientId                   : [unknown]'
-created='2026-11-16T06:25:09.3203883Z  +  tailscale:index:FederatedIdentity ghost-wispr-x509 created (1s) '
-created_id() { printf '2026-11-16T06:29:36.3829213Z   + ghostWisprTailnetClientId                   : "%s"\n' "$1"; }
-preview_replace='2026-11-16T06:20:21.4658172Z   ~ ghostWisprTailnetClientId                   : "k-stale-client-id" => [unknown]'
-replaced='2026-11-16T06:25:09.3203883Z  +-  tailscale:index:FederatedIdentity ghost-wispr-x509 replaced (1s) [diff: ~audience]'
-replaced_id='2026-11-16T06:29:36.3829213Z   ~ ghostWisprTailnetClientId                   : "k-stale-client-id" => "'"$CLIENT_ID"'"'
+preview='2026-11-16T06:20:21.4658172Z   + exampleTailnetClientId                   : [unknown]'
+created='2026-11-16T06:25:09.3203883Z  +  tailscale:index:FederatedIdentity example-x509 created (1s) '
+created_id() { printf '2026-11-16T06:29:36.3829213Z   + exampleTailnetClientId                   : "%s"\n' "$1"; }
+preview_replace='2026-11-16T06:20:21.4658172Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => [unknown]'
+replaced='2026-11-16T06:25:09.3203883Z  +-  tailscale:index:FederatedIdentity example-x509 replaced (1s) [diff: ~audience]'
+replaced_id='2026-11-16T06:29:36.3829213Z   ~ exampleTailnetClientId                   : "k-stale-client-id" => "'"$CLIENT_ID"'"'
 case "${args[*]}" in
   "api $api/workflows/seed.yaml/runs?per_page=100&page="*)
     case ${args[1]##*page=} in
@@ -190,22 +192,22 @@ if [[ $1 == iam && $2 == workload-identity-pools && $3 == create-cred-config && 
   exit 0
 fi
 case "$*" in
-  'run services list --project=theorem-agent-infra --filter=metadata.name ~ ^envoy-webhook-relay- --format=value(status.url)')
+  'run services list --project=example-project --filter=metadata.name ~ ^example-relay- --format=value(status.url)')
     # gcloud lists no service and exits 0 when the filter matches none.
     [[ -n ${TEST_RELAY_MISSING:-} ]] || printf 'https://relay.example.test\n'
     ;;
-  'secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra')
+  'secrets versions access latest --secret=example-device-certificate --project=example-project')
     if [[ -n ${TEST_CERT_READ_FAIL:-} ]]; then
-      printf 'fake gcloud: PERMISSION_DENIED reading ghost-wispr-device-certificate\n' >&2
+      printf 'fake gcloud: PERMISSION_DENIED reading example-device-certificate\n' >&2
       exit 1
     fi
     cat "$TEST_CERTIFICATE"
     ;;
-  'secrets versions access latest --secret=envoy-ghostwispr-signing-secret --project=theorem-agent-infra')
+  'secrets versions access latest --secret=example-signing-secret --project=example-project')
     if [[ -n ${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-} && $(<"$CLOUDSDK_AUTH_ACCESS_TOKEN_FILE") == broker-minted-token ]]; then
       printf '%s' "$WEBHOOK_SECRET"
     else
-      printf 'fake gcloud: PERMISSION_DENIED: only a broker-granted login reads envoy-ghostwispr-signing-secret (dispatch://INFRA-3599)\n' >&2
+      printf 'fake gcloud: PERMISSION_DENIED: only a broker-granted login reads example-signing-secret\n' >&2
       exit 1
     fi
     ;;
@@ -277,7 +279,7 @@ host=$1 command=$2
 if [[ $host == broker.example ]]; then
   exec bash -c "$command"
 fi
-[[ $host == ghost-wispr@ghost-wispr.tail12ec1c.ts.net ]] || { printf 'fake ssh: unknown host %s\n' "$host" >&2; exit 255; }
+[[ $host == ghost-wispr@ghost-wispr.example-tailnet.ts.net ]] || { printf 'fake ssh: unknown host %s\n' "$host" >&2; exit 255; }
 case "$command" in
   *'mktemp -d'*) printf '%s\n' "$TEST_PI/sources.abc123" ; mkdir -p "$TEST_PI/sources.abc123" ;;
   *'tar -xf - -C'*) tar -xf - -C "$TEST_PI/sources.abc123" ;;
@@ -298,29 +300,29 @@ esac
 EOF
 chmod +x "$work_dir/bin/"*
 
-# agent-infra as the runbook reads it: its origin's main holds root/Pulumi.prod.yaml with the
-# service account's unique id. The commit before it held another id, and each case's checkout is
-# left at that commit, so only a read of the fetched origin/main gives the right one.
-agent_infra_origin="$work_dir/agent-infra.git"
-agent_infra_seed="$work_dir/agent-infra-seed"
-git init --quiet --bare --initial-branch=main "$agent_infra_origin"
-git init --quiet --initial-branch=main "$agent_infra_seed"
-mkdir "$agent_infra_seed/root"
+# The infrastructure repository as the runbook reads it: its origin's main holds root/stack.yaml
+# with the service account's unique id. The commit before it held another id, and each case's
+# checkout is left at that commit, so only a read of the fetched origin/main gives the right one.
+infra_origin="$work_dir/example-infra.git"
+infra_seed="$work_dir/example-infra-seed"
+git init --quiet --bare --initial-branch=main "$infra_origin"
+git init --quiet --initial-branch=main "$infra_seed"
+mkdir "$infra_seed/root"
 for subject in 987654321098765432109 "$SUBJECT"; do
-  printf 'config:\n  agent-infra-root:answerLoopProofTailnetIdentity: "true"\n  agent-infra-root:ghostWisprAccountUniqueId: "%s"\n' \
-    "$subject" >"$agent_infra_seed/root/Pulumi.prod.yaml"
-  git -C "$agent_infra_seed" add root/Pulumi.prod.yaml
-  git -C "$agent_infra_seed" -c user.name=test -c user.email=test@example.invalid commit --quiet -m "root: subject $subject"
+  printf 'config:\n  example-root:otherSetting: "true"\n  example-root:accountUniqueId: "%s"\n' \
+    "$subject" >"$infra_seed/root/stack.yaml"
+  git -C "$infra_seed" add root/stack.yaml
+  git -C "$infra_seed" -c user.name=test -c user.email=test@example.invalid commit --quiet -m "root: subject $subject"
 done
-git -C "$agent_infra_seed" push --quiet "$agent_infra_origin" main
+git -C "$infra_seed" push --quiet "$infra_origin" main
 
 # run_runbook runs the runbook's blocks in a fresh home.
 run_runbook() {
   local case_dir=$1
   mkdir -p "$case_dir/home/src" "$case_dir/tmp" "$case_dir/pi"
-  git clone --quiet "$agent_infra_origin" "$case_dir/home/src/agent-infra"
-  git -C "$case_dir/home/src/agent-infra" reset --quiet --hard HEAD~1
-  git -C "$case_dir/home/src/agent-infra" update-ref refs/remotes/origin/main HEAD
+  git clone --quiet "$infra_origin" "$case_dir/home/src/example-infra"
+  git -C "$case_dir/home/src/example-infra" reset --quiet --hard HEAD~1
+  git -C "$case_dir/home/src/example-infra" update-ref refs/remotes/origin/main HEAD
   mkdir -m 700 "$case_dir/run"
   : >"$case_dir/grants"
   (
@@ -339,11 +341,11 @@ check_case() {
     google-credentials.json tailscale-client-id tailscale-subject >"$case_dir/expected.list"
   cmp -s "$case_dir/expected.list" "$case_dir/pi/bundle.list" \
     || fail "$case_dir: the Pi received $(tr '\n' ' ' <"$case_dir/pi/bundle.list")"
-  cmp -s "$received/device.crt" "$TEST_CERTIFICATE" || fail "device.crt is not Secret Manager's ghost-wispr-device-certificate"
+  cmp -s "$received/device.crt" "$TEST_CERTIFICATE" || fail "device.crt is not the latest version of the certificate secret"
   [[ $(<"$received/tailscale-client-id") == "$CLIENT_ID" ]] \
-    || fail "tailscale-client-id is not the ghostWisprTailnetClientId of the newest ghost-wispr-x509 creation: $(<"$received/tailscale-client-id")"
+    || fail "tailscale-client-id is not the client ID of the identity's newest creation: $(<"$received/tailscale-client-id")"
   [[ $(<"$received/tailscale-subject") == "$SUBJECT" ]] \
-    || fail "tailscale-subject is not ghostWisprAccountUniqueId on agent-infra's origin/main: $(<"$received/tailscale-subject")"
+    || fail "tailscale-subject is not the unique ID on the infrastructure repository's origin/main: $(<"$received/tailscale-subject")"
   [[ $(<"$received/envoy-webhook-url") == https://relay.example.test/webhook/ghostwispr ]] \
     || fail "envoy-webhook-url is not the relay service's URL: $(<"$received/envoy-webhook-url")"
   [[ $(<"$received/deepgram-key") == "$DEEPGRAM_SECRET" ]] || fail "deepgram-key is wrong"
@@ -384,7 +386,7 @@ TEST_PROVISION_EXIT=255 TEST_PROVISION_SAYS='ghost-wispr provision: starting the
 
 # A creation prints the client id as `+ … : "ID"`; the default case's replacement prints `~ … : "OLD" => "ID"`.
 TEST_CREATION_FORM=create run_runbook "$work_dir/create-form" >/dev/null 2>&1 \
-  || fail "the runbook failed when the newest seed run created ghost-wispr-x509"
+  || fail "the runbook failed when the newest seed run created the identity"
 [[ $(<"$work_dir/create-form/pi/bundle/tailscale-client-id") == "$CLIENT_ID" ]] \
   || fail "tailscale-client-id is not the id the creation printed: $(<"$work_dir/create-form/pi/bundle/tailscale-client-id")"
 
@@ -393,8 +395,8 @@ TEST_CREATION_FORM=create run_runbook "$work_dir/create-form" >/dev/null 2>&1 \
 for case_name in TEST_JOB_RUNNING TEST_LOG_READ_FAIL TEST_CREATION_EXPIRED; do
   case $case_name in
     TEST_JOB_RUNNING) reason='/job/90411 is in_progress: run this again once it has finished' ;;
-    TEST_LOG_READ_FAIL) reason='could not read the log of the root job https://github.com/theorem-labs/agent-infra/actions/runs/904/job/90411' ;;
-    TEST_CREATION_EXPIRED) reason='no seed run of the last 90 days made ghost-wispr-x509' ;;
+    TEST_LOG_READ_FAIL) reason='could not read the log of the root job https://github.com/example-org/example-infra/actions/runs/904/job/90411' ;;
+    TEST_CREATION_EXPIRED) reason='no seed run of the last 90 days made example-x509' ;;
   esac
   if (export "$case_name=1" && run_runbook "$work_dir/$case_name") >"$work_dir/$case_name.out" 2>&1; then
     fail "the runbook succeeded with $case_name: $(grep -h . "$work_dir/$case_name/pi/bundle/tailscale-client-id" 2>/dev/null)"
@@ -475,7 +477,7 @@ if grep -F -e "$WEBHOOK_SECRET" -e "$DEEPGRAM_SECRET" "$TEST_ARGV_LOG" >/dev/nul
   fail "a secret was passed as a command argument"
 fi
 if grep -E 'ghostWisprCertificates|tailscaleIds|service-accounts describe' "$TEST_ARGV_LOG" >/dev/null; then
-  fail "the runbook still reads a source agent-infra main does not have, or the devbox identity cannot read"
+  fail "the runbook still reads a source the infrastructure repository's main does not have, or the devbox identity cannot read"
 fi
 if grep -E '^pulumi ' "$TEST_ARGV_LOG" >/dev/null; then
   fail "the runbook still reads Pulumi state, which the devbox identity cannot read: $(grep -E '^pulumi ' "$TEST_ARGV_LOG")"

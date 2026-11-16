@@ -15,7 +15,6 @@
 set -euo pipefail
 umask 077
 
-readonly PI=ghost-wispr@ghost-wispr.tail12ec1c.ts.net
 readonly PREPARED_FILES=(device.crt google-credentials.json certificate_config.json tailscale-client-id
   tailscale-subject envoy-webhook-url)
 readonly SECRET_FILES=(deepgram-key)
@@ -23,6 +22,12 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 readonly repo_root
+# The office Pi's deployment settings (PI_HOST); GHOST_WISPR_PI_ENV names another file, as the
+# tests do.
+pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
+# shellcheck source=files/pi.env
+source "$pi_env" || { printf 'provision-pi: cannot read the Pi deployment settings in %s\n' "$pi_env" >&2; exit 1; }
+readonly PI="ghost-wispr@$PI_HOST"
 
 log() { printf 'provision-pi: %s\n' "$*" >&2; }
 fail() {
