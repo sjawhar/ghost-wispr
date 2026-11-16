@@ -446,7 +446,10 @@ light state, verifies the tagged identity and loopback listeners, and tests the 
 unsigned webhook paths. Before the pause it requires the Ghost Wispr Deepgram socket to grow by
 at least 32 kB/s over 60 s, between two readings that one command on the Pi takes 60 s apart: the
 stream runs less than 1 % above 32 kB/s in 8060-byte chunks, so a 5-second window can hold one
-chunk fewer and fail. During the 60-second pause it permits at most 4096 bytes on that same socket.
+chunk fewer and fail. When a socket to `api.deepgram.com` opens or closes between the two readings
+(the stream reconnects, or a batch upload starts), it measures once more; a stream that is too slow
+keeps its socket and fails at once. During the 60-second pause it permits at most 4096 bytes on
+that same socket.
 It finds the socket among Ghost Wispr's sockets by its peer's certificate for `api.deepgram.com`,
 checked from the Pi, and does not resolve the name: the name has several addresses, and a new
 lookup often misses the one the recorder is connected to. It compares package

@@ -36,33 +36,54 @@ readonly ss_output=$'ESTAB 0      0       192.0.2.10:57538 142.251.218.234:443  
 window=$(sed -n 's/^readonly deepgram_control_seconds=\([0-9][0-9]*\)$/\1/p' "$driver")
 [[ $window =~ ^[1-9][0-9]*$ ]] || fail "could not read deepgram_control_seconds from the driver"
 
+# The fake Pi's state across remote_run calls: the Deepgram socket's local port, which a reconnect
+# changes, and the number of windows (sleeps) so far.
+state_dir=$(mktemp -d)
+trap 'rm -rf -- "$state_dir"' EXIT
+
 # remote_run runs the command the driver sends, as the Pi's shell would, with the Pi's tools stubbed:
 # ss prints the Pi's counters, sleep moves them on by its argument and returns at once, and curl
 # verifies api.deepgram.com only at Deepgram's address. Real curl does the same: exit 0 at
 # Deepgram's addresses and exit 60 at a Google address, where the name does not match. Over a sleep
-# of S seconds the Deepgram socket sends the stream's 32249 B/s less one 8060 B chunk, as one window
-# on the office Pi did, and the Google socket 40000 B/s of a Drive upload.
+# of S seconds the Deepgram socket sends deepgram_rate B/s (the stream's 32249 unless set) less one
+# 8060 B chunk, as one window on the office Pi did, and the Google socket 40000 B/s of a Drive
+# upload. In the first `reconnects` windows (0 unless set) the stream reconnects halfway: the later
+# reading has a new Deepgram socket, which has sent half a window.
 # shellcheck disable=SC2329 # The driver's functions, eval'd below, call remote_run, and eval calls the stubs.
 remote_run() (
   slept=0
-  sleep() { slept=$((slept + $1)); }
+  windows=0
+  port=$(cat "$state_dir/port" 2>/dev/null || printf 34474)
+  sleep() {
+    slept=$((slept + $1))
+    windows=$(($(cat "$state_dir/windows" 2>/dev/null || printf 0) + 1))
+    printf '%s\n' "$windows" >"$state_dir/windows"
+  }
   ss() {
     # `ss dst HOST` resolves HOST now, and api.deepgram.com resolves to another address.
     [[ " $* " != *' dst '* ]] || return 0
     local deepgram=9378691 google=3410 reading
     if ((slept > 0)); then
-      deepgram=$((deepgram + 32249 * slept - 8060))
       google=$((google + 40000 * slept))
+      if ((windows <= ${reconnects:-0})); then
+        port=$((port + 2))
+        printf '%s\n' "$port" >"$state_dir/port"
+        deepgram=$((${deepgram_rate:-32249} * slept / 2))
+      else
+        deepgram=$((deepgram + ${deepgram_rate:-32249} * slept - 8060))
+      fi
     fi
     reading=${ss_output/bytes_sent:3410 /bytes_sent:$google }
+    reading=${reading/192.0.2.10:34474 /192.0.2.10:$port }
     printf '%s\n' "${reading/bytes_sent:9378691 /bytes_sent:$deepgram }"
   }
   curl() { [[ $* == *'api.deepgram.com:443:216.200.21.203:443'* ]] || return 60; }
   eval "$*"
 )
 
-# on_pi FUNCTION ARGS... runs the driver's FUNCTION against that Pi.
+# on_pi FUNCTION ARGS... runs the driver's FUNCTION against that Pi, from its first state.
 on_pi() (
+  rm -f -- "$state_dir/port" "$state_dir/windows"
   for name in "${driver_functions[@]}"; do
     eval "$(function_source "$name")"
   done
@@ -78,6 +99,23 @@ result=$(on_pi deepgram_bytes_sent) \
 result=$(on_pi deepgram_recording_socket "$window") \
   || fail "deepgram_recording_socket found no live Deepgram socket over the driver's ${window} s window: $result"
 [[ $result == '192.0.2.10:34474 216.200.21.203:443' ]] || fail "deepgram_recording_socket chose $result, want the socket to 216.200.21.203"
+
+# A stream 1 % below 32 kB/s fails, at once: a shorter sleep than the window, a longer one, or a
+# lower bar would pass it.
+if result=$(deepgram_rate=31680 on_pi deepgram_recording_socket "$window"); then
+  fail "deepgram_recording_socket passed a stream of 31680 B/s: $result"
+fi
+[[ $result != *'measuring once more'* ]] || fail "deepgram_recording_socket measured a slow stream twice: $result"
+
+# A reconnect in the window: the control measures once more, and follows the new socket. A second
+# reconnect fails it.
+result=$(reconnects=1 on_pi deepgram_recording_socket "$window") \
+  || fail "deepgram_recording_socket failed when the stream reconnected once during the window: $result"
+[[ $result == *'measuring once more'*$'\n''192.0.2.10:34476 216.200.21.203:443' ]] \
+  || fail "after a reconnect deepgram_recording_socket did not measure again and follow the new socket: $result"
+if result=$(reconnects=2 on_pi deepgram_recording_socket "$window"); then
+  fail "deepgram_recording_socket passed when the stream reconnected in both windows: $result"
+fi
 
 # The pause control follows the live socket by its local address and peer.
 result=$(on_pi deepgram_bytes_sent 192.0.2.10:34474 216.200.21.203:443) || fail "deepgram_bytes_sent did not follow the live socket: $result"

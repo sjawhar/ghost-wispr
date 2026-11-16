@@ -355,20 +355,28 @@ deepgram_live_socket() {
 # by at least 32 kB/s over SECONDS. It checks the peers' certificates first. Then one remote command
 # reads `ss`, sleeps SECONDS and reads `ss` again, so only the sleep lies between the two readings:
 # no SSH session and no certificate check, either of which would lower the bar below 32 kB/s.
+# A socket to api.deepgram.com that opened or closed between the two readings (a reconnect of the
+# stream, or a batch upload) leaves no socket, or two, that grew over the whole window; then it
+# measures once more. A stream that is too slow keeps its socket, and fails at once.
 deepgram_recording_socket() {
-  local seconds=$1 peers readings before after live
+  local seconds=$1 attempt peers readings before after live
   [[ $seconds =~ ^[1-9][0-9]*$ ]] || fail "the Deepgram recording window must be whole seconds: $seconds"
-  peers=$(deepgram_sockets | awk '{ print $2 }' | LC_ALL=C sort -u) || return 1
-  readings=$(remote_run "ss -tinpH && printf '%s\\n' '==' && sleep $seconds && ss -tinpH") \
-    || fail "could not read the Pi's TCP sockets"
-  before=$(sed '/^==$/,$d' <<<"$readings" | deepgram_sockets_to "$peers")
-  after=$(sed '1,/^==$/d' <<<"$readings" | deepgram_sockets_to "$peers")
-  if ! live=$(deepgram_live_socket "$before" "$after" "$seconds"); then
+  for attempt in 1 2; do
+    peers=$(deepgram_sockets | awk '{ print $2 }' | LC_ALL=C sort -u) || return 1
+    readings=$(remote_run "ss -tinpH && printf '%s\\n' '==' && sleep $seconds && ss -tinpH") \
+      || fail "could not read the Pi's TCP sockets"
+    before=$(sed '/^==$/,$d' <<<"$readings" | deepgram_sockets_to "$peers")
+    after=$(sed '1,/^==$/d' <<<"$readings" | deepgram_sockets_to "$peers")
+    if live=$(deepgram_live_socket "$before" "$after" "$seconds"); then
+      printf '%s\n' "$live"
+      return 0
+    fi
     printf 'not exactly one socket to api.deepgram.com grew by 32 kB/s over %s s (local, peer, bytes_sent before: %s; after: %s)\n' \
       "$seconds" "$(tr '\n' ' ' <<<"$before")" "$(tr '\n' ' ' <<<"$after")" >&2
-    return 1
-  fi
-  printf '%s\n' "$live"
+    [[ $attempt == 1 && $(awk '{ print $1, $2 }' <<<"$before" | LC_ALL=C sort) != "$(awk '{ print $1, $2 }' <<<"$after" | LC_ALL=C sort)" ]] \
+      || return 1
+    printf 'a socket to api.deepgram.com opened or closed during the window; measuring once more\n' >&2
+  done
 }
 
 assert_minimum_growth() {
