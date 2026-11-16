@@ -23,23 +23,18 @@ func backupDSN(backupPath string) string {
 	return backupPath + "?_pragma=secure_delete(1)&_pragma=temp_store(2)&_pragma=busy_timeout(5000)"
 }
 
-// eraseFromBackup removes a committed segment deletion from the pre-migration
-// backup (createPreMigrationBackup), which holds the database as this start
-// found it, the deleted words included.
+// eraseFromBackup removes a committed deletion from the pre-migration backup
+// (createPreMigrationBackup), which holds the database as this start found
+// it, the deleted text included.
 //
 // The backup exists so the previous build can start again after a rollback.
 // If no migration ran at this start, the backup and the database have the
 // same schema, and the backup is taken again from the database through the
-// same VACUUM INTO path: the words are not in it. If a migration ran, the
-// backup is the only copy in the old schema, so it is kept and scrubbed in
-// place instead: opened with secure_delete on, the deleted segment's row
-// removed, the words taken out of the rows, events and search index that hold
-// them in whatever of those tables and columns its schema has, and its
-// write-ahead log checkpointed away.
-//
-// segmentID names the deleted segment; sessionIDs are the sessions it was
-// deleted from or merged into it that held it (see dropSupersededEvents).
-func (s *SQLiteStore) eraseFromBackup(segmentID int64, sessionIDs []string) error {
+// same VACUUM INTO path: the text is not in it. If a migration ran, the
+// backup is the only copy in the old schema, so it is kept and scrub takes the
+// deletion out of it in place (scrubBackup for a segment, scrubBackupSessions
+// for a session).
+func (s *SQLiteStore) eraseFromBackup(scrub func(backup *sql.DB) error) error {
 	if s.path == "" {
 		return nil
 	}
@@ -65,7 +60,7 @@ func (s *SQLiteStore) eraseFromBackup(segmentID int64, sessionIDs []string) erro
 		}
 		return createPreMigrationBackup(s.db, s.path)
 	}
-	scrubErr := scrubBackup(backup, segmentID, sessionIDs)
+	scrubErr := scrub(backup)
 	if err := backup.Close(); err != nil && scrubErr == nil {
 		return fmt.Errorf("close backup: %w", err)
 	}
@@ -129,14 +124,16 @@ func sameSchema(a, b *sql.DB) (bool, error) {
 	return current == backup, nil
 }
 
-// scrubBackup removes the deleted segment from the backup at backup, in its
-// own schema. It works through a write-ahead log, not the rollback journal a
-// backup made by VACUUM INTO has: a rollback journal holds each page as it
-// was before the change, the deleted words included, and is unlinked at the
-// commit, leaving them in blocks the file system frees; a write-ahead log
-// holds only the pages as they are after it, with secure_delete's zeros. The
-// backup is left in the journal mode it had, with no log beside it.
-func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) (err error) {
+// scrubBackupInPlace runs scrub on the backup in one transaction, in the
+// backup's own schema; columns reads the columns a table of the backup has
+// (none when it has no such table). It works through a write-ahead log, not
+// the rollback journal a backup made by VACUUM INTO has: a rollback journal
+// holds each page as it was before the change, the deleted text included,
+// and is unlinked at the commit, leaving it in blocks the file system frees;
+// a write-ahead log holds only the pages as they are after it, with
+// secure_delete's zeros. The backup is left in the journal mode it had, with
+// no log beside it.
+func scrubBackupInPlace(backup *sql.DB, scrub func(tx *sql.Tx, columns func(table string) (map[string]bool, error)) error) (err error) {
 	var mode string
 	if err := backup.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
 		return fmt.Errorf("read backup journal mode: %w", err)
@@ -171,7 +168,41 @@ func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) (err erro
 		}
 		return found, rows.Err()
 	}
+	if err := scrub(tx, columns); err != nil {
+		return err
+	}
+	if err := commitBackupScrub(tx); err != nil {
+		return fmt.Errorf("commit backup scrub: %w", err)
+	}
+	return nil
+}
 
+// rebuildBackupSearch rebuilds the backup's search index from the rows the
+// scrub left, when its schema has one.
+func rebuildBackupSearch(tx *sql.Tx, columns func(table string) (map[string]bool, error)) error {
+	if search, err := columns("sessions_fts"); err != nil {
+		return err
+	} else if len(search) != 0 {
+		if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("rebuild backup search index: %w", err)
+		}
+	}
+	return nil
+}
+
+// scrubBackup removes the deleted segment from the backup, in its own schema
+// (scrubBackupInPlace): the segment's row, and the words in the rows, events
+// and search index that hold them, in whatever of those tables and columns
+// the schema has. segmentID names the deleted segment; sessionIDs are the
+// sessions it was deleted from or merged into it that held it (see
+// dropSupersededEvents).
+func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) error {
+	return scrubBackupInPlace(backup, func(tx *sql.Tx, columns func(table string) (map[string]bool, error)) error {
+		return scrubBackupSegment(tx, columns, segmentID, sessionIDs)
+	})
+}
+
+func scrubBackupSegment(tx *sql.Tx, columns func(table string) (map[string]bool, error), segmentID int64, sessionIDs []string) error {
 	// The backup may predate a merge: the session that held the segment then
 	// is the one its row still names there.
 	affected := slices.Clone(sessionIDs)
@@ -269,17 +300,67 @@ func scrubBackup(backup *sql.DB, segmentID int64, sessionIDs []string) (err erro
 			return fmt.Errorf("drop backup superseded events: %w", err)
 		}
 	}
-	if search, err := columns("sessions_fts"); err != nil {
-		return err
-	} else if len(search) != 0 {
-		if _, err := tx.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`); err != nil {
-			return fmt.Errorf("rebuild backup search index: %w", err)
+	return rebuildBackupSearch(tx, columns)
+}
+
+// scrubBackupSessions removes deleted sessions (sessionIDs: a session and its
+// merged sources) from the backup, in its own schema (scrubBackupInPlace):
+// their rows in sessions and in every table with a session_id column, and
+// every stored event that names a session the backup no longer has
+// (dropEventsOfDeletedSessions), then rebuilds the search index.
+func scrubBackupSessions(backup *sql.DB, sessionIDs []string) error {
+	return scrubBackupInPlace(backup, func(tx *sql.Tx, columns func(table string) (map[string]bool, error)) error {
+		rows, err := tx.Query(`SELECT name FROM sqlite_master
+			WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'
+			ORDER BY name`)
+		if err != nil {
+			return fmt.Errorf("list backup tables: %w", err)
 		}
-	}
-	if err := commitBackupScrub(tx); err != nil {
-		return fmt.Errorf("commit backup scrub: %w", err)
-	}
-	return nil
+		var tables []string
+		for rows.Next() {
+			var table string
+			if err := rows.Scan(&table); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan backup table: %w", err)
+			}
+			tables = append(tables, table)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return fmt.Errorf("list backup tables: %w", err)
+		}
+		placeholders, args := placeholderList(sessionIDs)
+		for _, table := range tables {
+			found, err := columns(table)
+			if err != nil {
+				return err
+			}
+			column := "session_id"
+			if table == "sessions" {
+				column = "id"
+			}
+			if !found[column] {
+				continue
+			}
+			quoted := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
+			if _, err := tx.Exec(`DELETE FROM `+quoted+` WHERE `+column+` IN (`+placeholders+`)`, args...); err != nil {
+				return fmt.Errorf("delete the deleted sessions from backup table %s: %w", table, err)
+			}
+		}
+		events, err := columns("mcp_events")
+		if err != nil {
+			return err
+		}
+		sessions, err := columns("sessions")
+		if err != nil {
+			return err
+		}
+		if events["payload"] && sessions["id"] {
+			if _, err := dropEventsOfDeletedSessions(tx); err != nil {
+				return fmt.Errorf("backup: %w", err)
+			}
+		}
+		return rebuildBackupSearch(tx, columns)
+	})
 }
 
 // rebuildBackupCanonical sets the canonical transcript of each session in

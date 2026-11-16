@@ -110,7 +110,7 @@ func (s *SQLiteStore) eraseAfterDeletion(owed string, earlierOwed bool, segmentI
 	if earlierOwed {
 		err = s.eraseEveryOwed(false)
 	} else {
-		err = s.eraseDeletion(segmentID, owners)
+		err = s.eraseDeletion(func(backup *sql.DB) error { return scrubBackup(backup, segmentID, owners) })
 	}
 	if err == nil {
 		err = clearOwedErase(s.db, owed)
@@ -121,13 +121,14 @@ func (s *SQLiteStore) eraseAfterDeletion(owed string, earlierOwed bool, segmentI
 	return nil
 }
 
-// eraseDeletion erases one deletion's words from the write-ahead log and the
-// pre-migration backup, and finishes any backup erase left part way.
-func (s *SQLiteStore) eraseDeletion(segmentID int64, owners []string) error {
+// eraseDeletion erases one committed deletion from the write-ahead log and the
+// pre-migration backup, which scrub takes it out of when the backup has an
+// older schema (eraseFromBackup), and finishes any backup erase left part way.
+func (s *SQLiteStore) eraseDeletion(scrub func(backup *sql.DB) error) error {
 	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
 		return err
 	}
-	if err := s.eraseFromBackup(segmentID, owners); err != nil {
+	if err := s.eraseFromBackup(scrub); err != nil {
 		return fmt.Errorf("pre-migration backup: %w", err)
 	}
 	return s.eraseOrphans()

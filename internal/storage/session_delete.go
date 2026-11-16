@@ -4,11 +4,18 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/recording"
 )
+
+// deletedSessionEventsMigration names the one-time removal, as the app
+// starts, of the stored events of sessions deleted before a session delete
+// removed its events (dropEventsOfDeletedSessions).
+const deletedSessionEventsMigration = "drop-events-of-deleted-sessions"
 
 // DeleteSession deletes session id and its merged-source set, refusing a target
 // that feeds another merge (ErrDeleteMergeActive), any active member, or any
@@ -19,7 +26,12 @@ import (
 // records the directory of each of those recordings, found where
 // recording.Resolve finds it in audioDir (the one the caller then erases), so
 // an erase a stop cuts off is finished as the app starts; it deletes nothing
-// if it cannot record one.
+// if it cannot record one. In that transaction too it deletes every stored
+// event that names a session it deletes (dropSessionSetEvents): a live
+// transcript event holds the conversation's words and a summary event its
+// summary. Once the delete commits, it erases it from the write-ahead log and
+// the pre-migration backup, as a segment deletion does
+// (eraseAfterSessionDeletion).
 func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -92,6 +104,7 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		return "", fmt.Errorf("list merged sources of session %s: %w", id, err)
 	}
 	paths := []string{audioPath}
+	deletedIDs := []string{id}
 	for rows.Next() {
 		var sourceID, sourceAudioPath string
 		if err := rows.Scan(&sourceID, &sourceAudioPath); err != nil {
@@ -101,6 +114,7 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		if sourceID == id {
 			continue
 		}
+		deletedIDs = append(deletedIDs, sourceID)
 		paths = append(paths, sourceAudioPath, recording.RawPath(audioDir, sourceID))
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
@@ -118,6 +132,13 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		) DELETE FROM raw_erase_reservations WHERE session_id IN (SELECT id FROM doomed)`, id); err != nil {
 		return "", fmt.Errorf("clear raw erase reservations for session %s: %w", id, err)
 	}
+	if err := dropSessionSetEvents(tx, id); err != nil {
+		return "", err
+	}
+	owed, earlierOwed, err := recordOwedErase(tx)
+	if err != nil {
+		return "", fmt.Errorf("delete session %s: %w", id, err)
+	}
 	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
 			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
@@ -127,11 +148,116 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("commit deleting session %s: %w", id, err)
 	}
+	s.eraseAfterSessionDeletion(owed, earlierOwed, deletedIDs)
 	return audioPath, nil
 }
 
+// dropSessionSetEvents deletes, in tx, every stored event that names session
+// id or a session merged into it. It runs before their rows go, while the
+// merged sources can still be found.
+func dropSessionSetEvents(tx *sql.Tx, id string) error {
+	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
+			SELECT ?
+			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
+		) DELETE FROM mcp_events
+		WHERE json_valid(payload) AND json_extract(payload, '$.session_id') IN (SELECT id FROM doomed)`, id); err != nil {
+		return fmt.Errorf("delete the stored events of session %s and its merged sources: %w", id, err)
+	}
+	return nil
+}
+
+// dropEventsOfDeletedSessions deletes, in tx, every stored event that names a
+// session the database does not have, and returns how many it deleted. Events
+// that name no session (a pause, a component's status) stay.
+func dropEventsOfDeletedSessions(tx *sql.Tx) (int64, error) {
+	res, err := tx.Exec(`DELETE FROM mcp_events
+		WHERE json_valid(payload)
+		  AND COALESCE(json_extract(payload, '$.session_id'), '') != ''
+		  AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.id = json_extract(mcp_events.payload, '$.session_id'))`)
+	if err != nil {
+		return 0, fmt.Errorf("delete the stored events of deleted sessions: %w", err)
+	}
+	removed, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count the stored events of deleted sessions: %w", err)
+	}
+	return removed, nil
+}
+
+// dropEventsOfDeletedSessionsOnce deletes, once per database
+// (deletedSessionEventsMigration), the stored events of sessions deleted
+// before a session delete deleted its events (dropEventsOfDeletedSessions):
+// /api/events served them for up to seven days. The app runs it as it starts,
+// before it takes the pre-migration backup, so the backup holds none of them,
+// and records their erase from the write-ahead log owed (recordOwedErase),
+// which the start then finishes (retryOwedErasure). A database that does not
+// yet have every table this needs is left for a later start, so nothing is
+// created before the backup is taken.
+func (s *SQLiteStore) dropEventsOfDeletedSessionsOnce() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin deleting the events of deleted sessions: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, table := range []string{"mcp_events", "sessions", "migrations", "app_state"} {
+		if exists, err := tableExists(tx, table); err != nil {
+			return fmt.Errorf("check table %s before deleting the events of deleted sessions: %w", table, err)
+		} else if !exists {
+			return nil
+		}
+	}
+	res, err := tx.Exec(`INSERT OR IGNORE INTO migrations(name, applied_at) VALUES(?, ?)`, deletedSessionEventsMigration, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("record migration %s: %w", deletedSessionEventsMigration, err)
+	}
+	if added, err := res.RowsAffected(); err != nil || added == 0 {
+		return err
+	}
+	removed, err := dropEventsOfDeletedSessions(tx)
+	if err != nil {
+		return err
+	}
+	if removed > 0 {
+		if _, _, err := recordOwedErase(tx); err != nil {
+			return fmt.Errorf("delete the events of deleted sessions: %w", err)
+		}
+		slog.Info("deleted the stored events of deleted sessions", "events", removed)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit deleting the events of deleted sessions: %w", err)
+	}
+	return nil
+}
+
+// eraseAfterSessionDeletion erases a committed session delete (sessionIDs:
+// the session and its merged sources) from the write-ahead log and the
+// pre-migration backup (scrubBackupSessions when the backup has an older
+// schema), as eraseAfterDeletion does a segment deletion, and clears the owed
+// erase its transaction recorded (owed) unless a later deletion has recorded
+// one since. When an earlier deletion's erase was owed too (earlierOwed), it
+// runs the erase a retry runs, which covers both. The delete itself is done,
+// so a failure is logged, not returned: the erase stays owed, and
+// RetryOwedErasure finishes it at the next start or sync sweep.
+func (s *SQLiteStore) eraseAfterSessionDeletion(owed string, earlierOwed bool, sessionIDs []string) {
+	s.eraseMu.Lock()
+	defer s.eraseMu.Unlock()
+	var err error
+	if earlierOwed {
+		err = s.eraseEveryOwed(false)
+	} else {
+		err = s.eraseDeletion(func(backup *sql.DB) error { return scrubBackupSessions(backup, sessionIDs) })
+	}
+	if err == nil {
+		err = clearOwedErase(s.db, owed)
+	}
+	if err != nil {
+		slog.Warn("a deleted session's erase from the database log or backup is still owed", "sessions", sessionIDs, "error", err)
+	}
+}
+
 // DeleteEndedSessionAndSources deletes an age-eligible merged session and its
-// source rows in one transaction. It records every raw capture directory
+// source rows in one transaction, with every stored event that names one of
+// them (dropSessionSetEvents). It records every raw capture directory
 // before the rows go. It refuses when a session in that deletion set is
 // active, remote-deleted, refining, owes a Drive replacement, has an owed
 // Drive folder, or has a folder whose documents still need refresh. It returns
@@ -217,6 +343,9 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 				return nil, false, fmt.Errorf("record raw erase directory for session %s: %w", deletedID, err)
 			}
 		}
+	}
+	if err := dropSessionSetEvents(tx, id); err != nil {
+		return nil, false, err
 	}
 	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
