@@ -205,17 +205,57 @@ deploy/pi/provision-pi.sh --prepared "$prepared"
 ```
 
 `provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says
-so (exit 255). If it could not remove the sources directory on the Pi, reconnect with Tailscale
-SSH and run the `rm` command it prints. Then check the detached join:
+so (exit 255).
+
+The tagged join makes a new Tailscale device. The temporary device you joined as your own still
+holds the name `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
+`ghost-wispr.tail12ec1c.ts.net` does not reach the recorder. Provisioning again does not fix
+that: `provision-pi.sh` reaches the Pi by that name. Give the tagged device its name with
+`deploy/pi/claim-tailnet-name.sh`, under a secrets-broker grant of `TAILSCALE_API_KEY` that Sami
+approves on the broker page:
+
+```bash
+secret-run --register --wait 12h \
+  --reason 'Ghost Wispr (docs/pi-setup.md): give the tagged recorder the tailnet name ghost-wispr' \
+  TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
+```
+
+It removes the temporary device only when that device is the one device other than the tagged
+one that holds the name, has an id that is a string of digits, has the hostname `ghost-wispr`,
+has a user owner and no tag, and is offline. Then it renames the tagged device and reads the name
+back. It refuses any other holder, or more than one, before it changes anything. When the tagged
+device has the name already, it does nothing. The key reaches `curl` on stdin, never as an
+argument, and goes only to `https://api.tailscale.com`.
+
+If `provision-pi.sh` could not remove the sources directory on the Pi, run the `rm` command it
+printed now. That command reaches the Pi as `ghost-wispr.tail12ec1c.ts.net`, and before this step
+that name is the temporary device's, or no device's.
+
+Then check the join and the name:
 
 ```bash
 ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
 ssh ghost-wispr@ghost-wispr 'journalctl -u "ghost-wispr-tailnet-join-*"'
+curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/version
 ```
 
 The status must show exactly `Tags: ["tag:ghost-wispr"]` and
-`DNSName: "ghost-wispr.tail12ec1c.ts.net."`. If Tailscale names it `ghost-wispr-1`, remove
-the stale Tailscale device and provision again.
+`DNSName: "ghost-wispr.tail12ec1c.ts.net."`, and `curl` must print the release's commit over a
+valid certificate. If the certificate check fails, set Serve again
+(`ssh ghost-wispr@ghost-wispr 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080'`) and
+run `curl` again.
+
+Then reboot the Pi once and wait until `curl` above answers again:
+
+```bash
+ssh ghost-wispr@ghost-wispr 'sudo systemctl reboot'
+```
+
+The reboot is needed because tailscaled keeps a Serve listener after the re-authentication. It
+keeps the listener it opened on the temporary device's tailnet address, `<old 100.x
+address>%tailscale0:443`, although that address is no longer on the interface. On the office Pi
+on 2026-11-16 this listener stayed until the reboot. The listener check of slice 1's A5 fails on
+it, because it is a listener outside loopback and Tailscale.
 
 ## Enable models and Drive sync
 
