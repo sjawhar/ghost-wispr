@@ -240,6 +240,18 @@ valid certificate. If the certificate check fails, set Serve again
 (`ssh ghost-wispr@ghost-wispr 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080'`) and
 run `curl` again.
 
+Then reboot the Pi once and wait until `curl` above answers again:
+
+```bash
+ssh ghost-wispr@ghost-wispr 'sudo systemctl reboot'
+```
+
+The reboot is needed because tailscaled keeps a Serve listener after the re-authentication. It
+keeps the listener it opened on the temporary device's tailnet address, `<old 100.x
+address>%tailscale0:443`, although that address is no longer on the interface. On the office Pi
+on 2026-11-16 this listener stayed until the reboot. The listener check of slice 1's A5 fails on
+it, because it is a listener outside loopback and Tailscale.
+
 ## Enable models and Drive sync
 
 Run the models step after the shared drive exists and its members are added. It takes the
