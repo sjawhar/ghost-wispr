@@ -60,19 +60,20 @@ func (s *SQLiteStore) retryOwedErasure(backupTaken bool) error {
 	return clearOwedErase(s.db, owed)
 }
 
-// eraseEveryOwed erases every committed deletion from the write-ahead log and,
-// unless the backup was taken at this start (backupTaken), from the
-// pre-migration backup, and finishes any backup erase left part way.
+// eraseEveryOwed erases every committed deletion, unless the backup was taken
+// at this start (backupTaken), from the pre-migration backup, then from the
+// write-ahead log, and finishes any backup erase left part way. Each step
+// runs whether or not the one before it failed (see eraseDeletion).
 func (s *SQLiteStore) eraseEveryOwed(backupTaken bool) error {
-	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
-		return fmt.Errorf("overwrite the write-ahead log: %w", err)
-	}
+	var backupErr error
 	if !backupTaken {
-		if err := s.refreshOrRemoveBackup(); err != nil {
-			return err
-		}
+		backupErr = s.refreshOrRemoveBackup()
 	}
-	return s.eraseOrphans()
+	var walErr error
+	if err := postDeleteMaintenance(s.db, s.path+"-wal"); err != nil {
+		walErr = fmt.Errorf("overwrite the write-ahead log: %w", err)
+	}
+	return errors.Join(backupErr, walErr, s.eraseOrphans())
 }
 
 // recordOwedErase records a deletion's owed erase, in its transaction: it
@@ -153,9 +154,14 @@ func (s *SQLiteStore) refreshOrRemoveBackup() error {
 	default:
 		slog.Warn("the pre-migration backup has an older schema and cannot be scrubbed without the deleted text; erasing it", "path", backupPath)
 	}
+	return removeBackup(backupPath)
+}
+
+// removeBackup erases the pre-migration backup at backupPath and its log
+// files. A file gone from its name whose bytes are not overwritten yet is
+// finished by eraseOrphans.
+func removeBackup(backupPath string) error {
 	for _, file := range []string{backupPath + "-wal", backupPath + "-shm", backupPath} {
-		// A file gone from its name whose bytes are not overwritten yet is
-		// finished by eraseOrphans.
 		if err := erase.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, erase.ErrLeftover) {
 			return fmt.Errorf("erase backup %s: %w", file, err)
 		}

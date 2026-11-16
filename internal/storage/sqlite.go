@@ -336,10 +336,11 @@ func (s *SQLiteStore) init(dbPath string) error {
 	if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + walScratchTable); err != nil {
 		return fmt.Errorf("drop the write-ahead log scratch table: %w", err)
 	}
-	// What a delete by an older build left (a deleted session's events and
-	// index entries) goes before the backup is taken, at every start, so the
-	// backup holds none of it; its erase from the write-ahead log is finished
-	// with the owed erases below (retryOwedErasure).
+	// What a delete outside this build left (a deleted session's events and
+	// index entries) goes before the backup is taken, at the first start after
+	// such a delete, so the backup holds none of it; its erase from the
+	// write-ahead log is finished with the owed erases below
+	// (retryOwedErasure).
 	if err := s.dropWhatDeletedSessionsLeft(); err != nil {
 		return err
 	}
@@ -620,6 +621,12 @@ func (s *SQLiteStore) init(dbPath string) error {
 		`CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
 			INSERT INTO sessions_fts(sessions_fts, rowid, title, summary, canonical_transcript)
 			VALUES('delete', old.rowid, old.title, old.summary, old.canonical_transcript);
+		END;`,
+		// A session row's delete, by any build, is recorded, so the next
+		// start clears what it left (dropWhatDeletedSessionsLeft) and a start
+		// with nothing deleted does not.
+		`CREATE TRIGGER IF NOT EXISTS ` + sessionsDeletedTrigger + ` AFTER DELETE ON sessions BEGIN
+			INSERT OR IGNORE INTO app_state(key, value) VALUES('` + sessionsDeletedKey + `', '1');
 		END;`,
 		// The index follows only the columns it holds, so the update of other
 		// columns that sessions_documents_changed (below) makes inside its
