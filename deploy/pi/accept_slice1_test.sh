@@ -22,44 +22,60 @@ fail() {
 function_source() {
   awk -v start="$1() {" '$0 == start { found = 1 } found { print } found && /^}$/ { exit }' "$driver"
 }
-# Every deepgram_* function of the driver, so the test runs the driver's own helpers.
-mapfile -t deepgram_functions < <(awk '/^deepgram_[a-z_]+\(\) \{$/ { sub(/\(\) \{$/, ""); print }' "$driver")
-[[ " ${deepgram_functions[*]} " == *' deepgram_bytes_sent '* ]] || fail "could not read deepgram_bytes_sent from the driver"
+# The driver's own functions: every deepgram_* one and the growth check they use.
+mapfile -t driver_functions < <(awk '/^deepgram_[a-z_]+\(\) \{$/ { sub(/\(\) \{$/, ""); print }' "$driver")
+[[ " ${driver_functions[*]} " == *' deepgram_bytes_sent '* ]] || fail "could not read deepgram_bytes_sent from the driver"
+driver_functions+=(assert_minimum_growth)
 
 # The Pi's ss: the Deepgram socket is to an address api.deepgram.com no longer resolves to, so a
 # `dst api.deepgram.com` filter matches nothing. Ghost Wispr also holds a socket to Google and the
-# Serve proxy's loopback socket, and neither is Deepgram's.
+# Serve proxy's loopback socket, and neither is Deepgram's. After 5 s the Deepgram socket has sent
+# 5 s of audio at the stream's 32249 B/s, and the Google socket 200000 B of a Drive upload.
 readonly ss_output=$'ESTAB 0      0       192.0.2.10:57538 142.251.218.234:443  users:(("ghost-wispr",pid=17259,fd=13))\n\t cubic wscale:8,10 rto:204 bytes_sent:3410 bytes_acked:3411 bytes_received:5763\nESTAB 0      0       192.0.2.10:34474  216.200.21.203:443   users:(("ghost-wispr",pid=17259,fd=15))\n\t cubic wscale:10,10 rto:212 bytes_sent:9378691 bytes_acked:9378692 bytes_received:186209\nESTAB 0      0           127.0.0.1:8080        127.0.0.1:39406 users:(("ghost-wispr",pid=17259,fd=10))\n\t cubic wscale:10,10 rto:204 bytes_sent:5312 bytes_acked:5312 bytes_received:4144'
+ss_later=${ss_output/bytes_sent:3410 /bytes_sent:203410 }
+ss_later=${ss_later/bytes_sent:9378691 /bytes_sent:9539936 }
+readonly ss_later
+[[ $ss_later == *bytes_sent:203410* && $ss_later == *bytes_sent:9539936* ]] || fail "could not make the later ss reading"
 
-# deepgram_bytes_sent_on_pi [LOCAL] runs the driver's deepgram_bytes_sent against that Pi.
-deepgram_bytes_sent_on_pi() (
-  for name in "${deepgram_functions[@]}"; do
-    eval "$(function_source "$name")"
-  done
-  # shellcheck disable=SC2329 # deepgram_bytes_sent, eval'd above, calls it.
-  remote_run() {
-    case $* in
-      *'dst api.deepgram.com'*) return 0 ;;
-      *--connect-to*)
-        # The Pi's curl: only Deepgram's address serves a certificate for api.deepgram.com.
-        if [[ $* == *"'api.deepgram.com:443:216.200.21.203:443'"* ]]; then
-          printf '216.200.21.203:443\n'
-        fi
-        ;;
-      *) printf '%s\n' "$ss_output" ;;
-    esac
+# remote_run runs the command the driver sends, as the Pi's shell would, with the Pi's tools stubbed:
+# ss prints the reading from before or after a sleep, sleep moves the Pi's counters on and returns
+# at once, and curl verifies api.deepgram.com only at Deepgram's address. Real curl does the same:
+# exit 0 at Deepgram's addresses and exit 60 at a Google address, where the name does not match.
+# shellcheck disable=SC2329 # The driver's functions, eval'd below, call remote_run, and eval calls the stubs.
+remote_run() (
+  slept=false
+  sleep() { slept=true; }
+  ss() {
+    # `ss dst HOST` resolves HOST now, and api.deepgram.com resolves to another address.
+    [[ " $* " != *' dst '* ]] || return 0
+    if [[ $slept == true ]]; then printf '%s\n' "$ss_later"; else printf '%s\n' "$ss_output"; fi
   }
-  deepgram_bytes_sent "$@" 2>&1
+  curl() { [[ $* == *'api.deepgram.com:443:216.200.21.203:443'* ]] || return 60; }
+  eval "$*"
 )
 
-result=$(deepgram_bytes_sent_on_pi) \
+# on_pi FUNCTION ARGS... runs the driver's FUNCTION against that Pi.
+on_pi() (
+  for name in "${driver_functions[@]}"; do
+    eval "$(function_source "$name")"
+  done
+  "$@" 2>&1
+)
+
+result=$(on_pi deepgram_bytes_sent) \
   || fail "deepgram_bytes_sent found no socket when api.deepgram.com resolves to another address than the one connected: $result"
 [[ $result == 9378691 ]] || fail "deepgram_bytes_sent read $result, want 9378691"
-# The pause control follows the live socket by its local address.
-result=$(deepgram_bytes_sent_on_pi 192.0.2.10:34474) || fail "deepgram_bytes_sent did not follow the live socket: $result"
+
+# The recording control picks the Deepgram socket alone, from two readings 5 s apart on the Pi: the
+# Google socket grew more, but its peer has no certificate for api.deepgram.com.
+result=$(on_pi deepgram_recording_socket 5) || fail "deepgram_recording_socket found no live Deepgram socket: $result"
+[[ $result == '192.0.2.10:34474 216.200.21.203:443' ]] || fail "deepgram_recording_socket chose $result, want the socket to 216.200.21.203"
+
+# The pause control follows the live socket by its local address and peer.
+result=$(on_pi deepgram_bytes_sent 192.0.2.10:34474 216.200.21.203:443) || fail "deepgram_bytes_sent did not follow the live socket: $result"
 [[ $result == 9378691 ]] || fail "deepgram_bytes_sent read $result for the live socket, want 9378691"
-if result=$(deepgram_bytes_sent_on_pi 192.0.2.10:57538); then
-  fail "deepgram_bytes_sent read $result from the socket to Google"
+if result=$(on_pi deepgram_bytes_sent 192.0.2.10:40000 216.200.21.203:443); then
+  fail "deepgram_bytes_sent read $result from a socket the Pi does not hold"
 fi
 
 bash "$driver" --self-test >/dev/null 2>&1 || fail "accept-slice1.sh --self-test failed: $(bash "$driver" --self-test 2>&1)"
