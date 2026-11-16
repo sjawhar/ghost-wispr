@@ -148,6 +148,81 @@ func TestEveryStartRemovesTheStatusEventsAnOlderBuildStoredAboutADeletedSession(
 	}
 }
 
+// a867073DeletedSessionsTrigger is sessionsDeletedTrigger as the build before
+// this one (a867073, #70) made it: it records a delete in sessionsDeletedKey
+// only.
+const a867073DeletedSessionsTrigger = `CREATE TRIGGER ` + sessionsDeletedTrigger + ` AFTER DELETE ON sessions BEGIN
+	INSERT OR IGNORE INTO app_state(key, value) VALUES('` + sessionsDeletedKey + `', '1');
+END;`
+
+// TestTheFirstStartAfterTheBuildBeforeRemovesWhatItsDeletesLeft: the build
+// before this one (a867073) deleted a session's events by session_id only, in
+// the delete's transaction, and cleared its record of the delete there, so its
+// status events, with the id only in their message, stay while nothing records
+// that anything is left. Its start-up sweep cleared the record the same way.
+// That is what the office Pi held on 2026-11-16: 28 such events of seven
+// deleted sessions. The first start of this build, after an update from it or
+// after a rollback to it and back, removes them and the deleted session's
+// refused cuts and summary requests, before it takes the pre-migration backup.
+func TestTheFirstStartAfterTheBuildBeforeRemovesWhatItsDeletesLeft(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// trigger, when set, replaces this build's record of a delete with
+		// the one the build before made.
+		trigger string
+	}{
+		{"an update from the build before", a867073DeletedSessionsTrigger},
+		{"a rollback to the build before and back", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+			store, err := NewSQLiteStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endedWith(t, store, statusGone, "/audio/gone.mp3", RefinementCompleted)
+			endedWith(t, store, statusKept, "/audio/kept.mp3", RefinementCompleted)
+			gone, kept := storeLegacyStatusEvents(t, store)
+			recordSessionRows(t, store, statusGone, statusKept)
+			if tc.trigger != "" {
+				if _, err := store.DB().Exec(`DROP TRIGGER ` + sessionsDeletedTrigger + `; ` + tc.trigger); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The build before deletes the row and the events with its
+			// session_id, and clears its record of the delete.
+			if _, err := store.DB().Exec(`DELETE FROM sessions WHERE id = ?`, statusGone); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.DB().Exec(`DELETE FROM app_state WHERE key = ?`, sessionsDeletedKey); err != nil {
+				t.Fatal(err)
+			}
+			assertStoredEventsAre(t, store, append(slices.Clone(gone), kept...))
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err = NewSQLiteStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			assertStoredEventsAre(t, store, kept)
+			assertSessionRowsOf(t, store, statusKept)
+			backup, err := os.ReadFile(preMigrationBackupPath(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(backup), `"Batch refinement completed for session `+statusKept+`"`) {
+				t.Fatal("control: the pre-migration backup does not hold the kept status event, so its absence of the deleted one proves nothing")
+			}
+			if strings.Contains(string(backup), `"Batch refinement completed for session `+statusGone+`"`) {
+				t.Error("the pre-migration backup still holds a status event of the deleted session")
+			}
+		})
+	}
+}
+
 // TestStoredEventSessionReadsOnlyTheShapesTheManagerWrote: the session an
 // older build's status event names is the id that ends its message, in a
 // shape the session manager wrote for that component, as a whole session id.

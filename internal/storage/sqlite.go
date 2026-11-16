@@ -624,9 +624,14 @@ func (s *SQLiteStore) init(dbPath string) error {
 		END;`,
 		// A session row's delete, by any build, is recorded, so the next
 		// start clears what it left (dropWhatDeletedSessionsLeft) and a start
-		// with nothing deleted does not.
-		`CREATE TRIGGER IF NOT EXISTS ` + sessionsDeletedTrigger + ` AFTER DELETE ON sessions BEGIN
+		// with nothing deleted does not. It is made again, so a database the
+		// build before made it on records the delete in
+		// sessionsDeletedUnsweptKey too; that build makes it only if it is
+		// missing, so it keeps this one after a rollback.
+		`DROP TRIGGER IF EXISTS ` + sessionsDeletedTrigger,
+		`CREATE TRIGGER ` + sessionsDeletedTrigger + ` AFTER DELETE ON sessions BEGIN
 			INSERT OR IGNORE INTO app_state(key, value) VALUES('` + sessionsDeletedKey + `', '1');
+			INSERT OR IGNORE INTO app_state(key, value) VALUES('` + sessionsDeletedUnsweptKey + `', '1');
 		END;`,
 		// The index follows only the columns it holds, so the update of other
 		// columns that sessions_documents_changed (below) makes inside its

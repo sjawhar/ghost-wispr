@@ -12,17 +12,29 @@ import (
 )
 
 // sessionsDeletedTrigger names the trigger that records, in app_state
-// (sessionsDeletedKey), that a session row was deleted. It lives in the
-// database, so it records a delete by any build, an older one after an
-// update rolled back included.
+// (sessionsDeletedKey and sessionsDeletedUnsweptKey), that a session row was
+// deleted. It lives in the database, so it records a delete by any build, an
+// older one after an update rolled back included.
 const sessionsDeletedTrigger = "sessions_deleted_mark"
 
-// sessionsDeletedKey is the app_state key sessionsDeletedTrigger writes: a
-// session row was deleted, and what it left (its events, its words in the
-// search index) may not be cleared yet. A delete by this build clears it in
-// its own transaction (clearSessionsDeleted); the next start clears what any
-// other delete left (dropWhatDeletedSessionsLeft).
+// sessionsDeletedKey is the app_state key the build before this one
+// (a867073) reads and clears: a session row was deleted, and what it left may
+// not be cleared yet. sessionsDeletedTrigger still writes it, for that build
+// after a rollback.
 const sessionsDeletedKey = "sessions_deleted_unswept"
+
+// sessionsDeletedUnsweptKey is the app_state key sessionsDeletedTrigger
+// writes with sessionsDeletedKey, and that only this build clears: a session
+// row was deleted, and what it left (its events, the status events an older
+// build stored with its id only in their message, its refused cuts and
+// summary requests, its words in the search index) may not be cleared yet.
+// The build before this one cleared sessionsDeletedKey in its delete's
+// transaction after deleting only the events that name the session in
+// session_id, so that key alone does not say its delete left nothing. A
+// delete by this build clears both in its own transaction
+// (clearSessionsDeleted); the next start clears what any other delete left
+// (dropWhatDeletedSessionsLeft).
+const sessionsDeletedUnsweptKey = "sessions_deleted_unswept_v2"
 
 // DeleteSession deletes session id and its merged-source set, refusing a target
 // that feeds another merge (ErrDeleteMergeActive), any active member, or any
@@ -185,11 +197,11 @@ func rebuildSearchIndex(tx *sql.Tx) error {
 // clearSessionsDeleted deletes, in tx, the stored events of every session the
 // database no longer has (dropEventsOfDeletedSessions) and the other rows
 // that name one (dropRowsOfDeletedSessions), and records that nothing a
-// deleted session left remains (sessionsDeletedKey); tx has rebuilt the
-// search index. It sweeps every deleted session, not only the ones tx
-// deleted: the record may stand for a delete made outside the app (with
-// sqlite3), which nothing else would sweep once the record is gone. It returns
-// how many events it deleted.
+// deleted session left remains (sessionsDeletedKey and
+// sessionsDeletedUnsweptKey); tx has rebuilt the search index. It sweeps
+// every deleted session, not only the ones tx deleted: the record may stand
+// for a delete made outside the app (with sqlite3), which nothing else would
+// sweep once the record is gone. It returns how many events it deleted.
 func clearSessionsDeleted(tx *sql.Tx) (int64, error) {
 	removed, err := dropEventsOfDeletedSessions(tx)
 	if err != nil {
@@ -198,7 +210,7 @@ func clearSessionsDeleted(tx *sql.Tx) (int64, error) {
 	if err := dropRowsOfDeletedSessions(tx); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(`DELETE FROM app_state WHERE key = ?`, sessionsDeletedKey); err != nil {
+	if _, err := tx.Exec(`DELETE FROM app_state WHERE key IN (?, ?)`, sessionsDeletedKey, sessionsDeletedUnsweptKey); err != nil {
 		return 0, fmt.Errorf("record that the deleted sessions left nothing: %w", err)
 	}
 	return removed, nil
@@ -284,9 +296,12 @@ func dropEventsOfDeletedSessions(tx *sql.Tx) (int64, error) {
 // pre-migration backup, so the backup holds none of them, and records the
 // erase from the write-ahead log owed (markEraseOwed), which the start then
 // finishes (retryOwedErasure). It runs only when a session row was deleted
-// since (sessionsDeletedKey), or when the database has no
-// sessionsDeletedTrigger yet and so no record of what was deleted on it;
-// otherwise it writes nothing, and a start costs what it did before. A
+// since (sessionsDeletedUnsweptKey), or when the database has no
+// sessionsDeletedTrigger that records it yet (none, or the one the build
+// before made, which records only sessionsDeletedKey) and so no record of
+// what was deleted on it: a delete by the build before left status events
+// with the session only in their message and cleared sessionsDeletedKey.
+// Otherwise it writes nothing, and a start costs what it did before. A
 // database that does not yet have every table this needs is left as it is,
 // so nothing is created before the backup is taken.
 func (s *SQLiteStore) dropWhatDeletedSessionsLeft() error {
@@ -304,8 +319,9 @@ func (s *SQLiteStore) dropWhatDeletedSessionsLeft() error {
 	}
 	var recorded, deleted int
 	if err := tx.QueryRow(`SELECT
-			(SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?),
-			(SELECT count(*) FROM app_state WHERE key = ?)`, sessionsDeletedTrigger, sessionsDeletedKey).Scan(&recorded, &deleted); err != nil {
+			(SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ? AND instr(sql, ?) > 0),
+			(SELECT count(*) FROM app_state WHERE key = ?)`,
+		sessionsDeletedTrigger, sessionsDeletedUnsweptKey, sessionsDeletedUnsweptKey).Scan(&recorded, &deleted); err != nil {
 		return fmt.Errorf("read whether a session was deleted since the last start: %w", err)
 	}
 	if recorded > 0 && deleted == 0 {
