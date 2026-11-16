@@ -63,7 +63,13 @@ func (s *SQLiteStore) retryOwedErasure(backupTaken bool) error {
 // eraseEveryOwed erases every committed deletion, unless the backup was taken
 // at this start (backupTaken), from the pre-migration backup, then from the
 // write-ahead log, and finishes any backup erase left part way. Each step
-// runs whether or not the one before it failed (see eraseDeletion).
+// runs whether or not the one before it failed, and the backup goes first: on
+// a full disk the log cannot be overwritten, and the backup must not keep the
+// deleted words until space comes back; erasing it, when it cannot be taken
+// again, also frees the space the overwrite needs. (A deletion's own first
+// erase, eraseDeletion, still overwrites the log first and leaves the erase
+// owed when that fails, so on a full disk the backup goes at this retry, on
+// the next sync sweep or start.)
 func (s *SQLiteStore) eraseEveryOwed(backupTaken bool) error {
 	var backupErr error
 	if !backupTaken {

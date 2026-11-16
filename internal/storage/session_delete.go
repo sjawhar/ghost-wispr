@@ -155,7 +155,7 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	if err := rebuildSearchIndex(tx); err != nil {
 		return "", fmt.Errorf("delete session %s: %w", id, err)
 	}
-	if err := clearSessionsDeleted(tx); err != nil {
+	if _, err := clearSessionsDeleted(tx); err != nil {
 		return "", fmt.Errorf("delete session %s: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -178,14 +178,22 @@ func rebuildSearchIndex(tx *sql.Tx) error {
 	return nil
 }
 
-// clearSessionsDeleted records, in tx, that nothing a deleted session left
-// remains (sessionsDeletedKey): tx deleted its events and rebuilt the search
-// index.
-func clearSessionsDeleted(tx *sql.Tx) error {
-	if _, err := tx.Exec(`DELETE FROM app_state WHERE key = ?`, sessionsDeletedKey); err != nil {
-		return fmt.Errorf("record that the deleted sessions left nothing: %w", err)
+// clearSessionsDeleted deletes, in tx, the stored events of every session the
+// database no longer has (dropEventsOfDeletedSessions), and records that
+// nothing a deleted session left remains (sessionsDeletedKey); tx has rebuilt
+// the search index. It sweeps every deleted session, not only the ones tx
+// deleted: the record may stand for a delete made outside the app (with
+// sqlite3), which nothing else would sweep once the record is gone. It returns
+// how many events it deleted.
+func clearSessionsDeleted(tx *sql.Tx) (int64, error) {
+	removed, err := dropEventsOfDeletedSessions(tx)
+	if err != nil {
+		return 0, err
 	}
-	return nil
+	if _, err := tx.Exec(`DELETE FROM app_state WHERE key = ?`, sessionsDeletedKey); err != nil {
+		return 0, fmt.Errorf("record that the deleted sessions left nothing: %w", err)
+	}
+	return removed, nil
 }
 
 // dropSessionSetEvents deletes, in tx, every stored event that names session
@@ -258,10 +266,6 @@ func (s *SQLiteStore) dropWhatDeletedSessionsLeft() error {
 	if recorded > 0 && deleted == 0 {
 		return nil
 	}
-	removed, err := dropEventsOfDeletedSessions(tx)
-	if err != nil {
-		return err
-	}
 	if exists, err := tableExists(tx, "sessions_fts"); err != nil {
 		return fmt.Errorf("check the search index before rebuilding it: %w", err)
 	} else if exists {
@@ -272,7 +276,8 @@ func (s *SQLiteStore) dropWhatDeletedSessionsLeft() error {
 	if err := markEraseOwed(tx); err != nil {
 		return fmt.Errorf("delete what deleted sessions left: %w", err)
 	}
-	if err := clearSessionsDeleted(tx); err != nil {
+	removed, err := clearSessionsDeleted(tx)
+	if err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -416,7 +421,7 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 	if err := rebuildSearchIndex(tx); err != nil {
 		return nil, false, fmt.Errorf("GC deletion of session %s: %w", id, err)
 	}
-	if err := clearSessionsDeleted(tx); err != nil {
+	if _, err := clearSessionsDeleted(tx); err != nil {
 		return nil, false, fmt.Errorf("GC deletion of session %s: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {

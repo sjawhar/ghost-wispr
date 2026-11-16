@@ -108,6 +108,27 @@ func TestTheFirstStartClearsWhatAnOlderBuildAloneLeft(t *testing.T) {
 	assertSecretErased(t, path)
 }
 
+// TestAnInAppDeleteClearsWhatAnOutsideDeleteLeftBeforeItClearsTheRecord: a
+// session deleted outside the app (with sqlite3, while the app runs) leaves
+// its events, and the trigger records the delete. A later delete in the app
+// clears that record, so it must also clear what the outside delete left;
+// the next start no longer would.
+func TestAnInAppDeleteClearsWhatAnOutsideDeleteLeftBeforeItClearsTheRecord(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	for i, id := range []string{"outside", "in-app", "kept"} {
+		recordedSession(t, store, id, started.Add(time.Duration(i)*time.Hour), started.Add(time.Duration(i)*time.Hour+time.Minute), map[float64]string{1: "words of " + id})
+	}
+	storeSessionEvents(t, store, "outside", "in-app", "kept")
+	if _, err := store.DB().Exec(`DELETE FROM sessions WHERE id = 'outside'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DeleteSession("in-app", t.TempDir()); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+	assertEventsOf(t, store, []string{"outside", "in-app"}, []string{"kept"})
+}
+
 // failWriteAheadLogOverwrite makes every overwrite of the write-ahead log
 // fail as a full disk does.
 func failWriteAheadLogOverwrite(t *testing.T) {
