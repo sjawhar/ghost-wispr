@@ -492,7 +492,10 @@ printf 'Light power-cycle NEEDS-PERSON: confirm the light stayed dark until Ghos
 
 printf 'A1 RAN: check the red light, Deepgram control, and pause button.\n'
 [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == red ]] || fail "A1 FAILED: light is not red while capturing"
-readonly deepgram_control_seconds=5
+# 60 s, not 5 s: the stream sends one 250 ms chunk (8060 B on the wire) at a time, and it runs only
+# 0.8 % above 32 kB/s. A 5 s window can hold one chunk fewer; on the office Pi 1 of 24 grew by
+# 153188 B, below the 160000 B bar. Over 60 s one chunk is 0.4 % of the bar.
+readonly deepgram_control_seconds=60
 deepgram_socket=$(deepgram_recording_socket "$deepgram_control_seconds") \
   || fail "A1 FAILED: Deepgram recording control grew by less than 32 kB/s"
 read -r deepgram_local deepgram_peer <<<"$deepgram_socket"
