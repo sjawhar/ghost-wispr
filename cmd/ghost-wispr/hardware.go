@@ -27,8 +27,8 @@ const (
 	lightShutdownWait = 2 * time.Second
 )
 
-// The recording light's warnings. The consent rule is "record only while the
-// light is on", so each says that the unit does not record.
+// The recording light's warnings. A unit with a light records only while it
+// is on, so each says that the unit does not record.
 const (
 	recordingLightMissingWarning = "Recording light not found; the unit does not record until it is back"
 	recordingLightNotRedWarning  = "Recording light does not show red; the unit does not record until it does"

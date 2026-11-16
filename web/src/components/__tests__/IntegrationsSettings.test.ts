@@ -10,6 +10,7 @@ const config: ConfigResponse = {
   gdrive: { folder_id: '', has_credentials: false, sync_enabled: true },
   gc: { enabled: true, max_age_days: 30, max_audio_size_mb: 1024 },
   api_keys: {},
+  recording_rules: [],
 }
 
 describe('IntegrationsSettings', () => {

@@ -4,6 +4,12 @@ silence_timeout: 300s
 # The address tailscale serve publishes (provision.sh TAILSCALE_HOSTNAME): the web UI accepts
 # requests from pages there, and Envoy events link to sessions under it.
 public_url: https://ghost-wispr.tail12ec1c.ts.net
+# The office's recording rules: the web UI shows each under Recording rules, as written here.
+recording_rules:
+  - Record only while the light is on.
+  - Anyone may pause it at any time without a reason.
+  - Transcripts are readable by Theorem staff only.
+  - A person can ask for a segment to be deleted.
 deepgram_model: nova-3
 batch_transcription:
   provider: deepgram

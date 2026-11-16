@@ -3,8 +3,8 @@ package server
 import "encoding/json"
 
 // configSchema documents the GC settings of GET and PATCH /api/config (a
-// JSON merge patch has the same shape) and the read-only models GET reports;
-// the other settings are untyped.
+// JSON merge patch has the same shape) and the read-only models and recording
+// rules GET reports; the other settings are untyped.
 var configSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
@@ -32,6 +32,12 @@ var configSchema = map[string]any{
 			"readOnly":             true,
 			"description":          "GET only: the model, provider or Google setting of each role as the running process resolved its configuration, environment overrides included: live_transcription, batch_transcription_provider, batch_transcription, summarization, embedding, genai_backend, gcp_project, gcp_location, tts_provider, tts and tts_voice. A PATCH cannot set it.",
 			"additionalProperties": map[string]any{"type": "string"},
+		},
+		"recording_rules": map[string]any{
+			"type":        "array",
+			"readOnly":    true,
+			"items":       map[string]any{"type": "string"},
+			"description": "GET only: the rules the web UI shows under Recording rules, each as written in recording_rules (GHOST_WISPR_RECORDING_RULES overrides it with a JSON list of strings). Empty when none are set; the page then shows no Recording rules button. A PATCH cannot set it.",
 		},
 	},
 }

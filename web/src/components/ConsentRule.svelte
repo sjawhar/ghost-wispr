@@ -1,4 +1,8 @@
 <script lang="ts">
+  // The unit's recording_rules, each shown as written. With none, there is no
+  // Recording rules button.
+  let { rules }: { rules: readonly string[] } = $props()
+
   let open = $state(false)
 
   function close(): void {
@@ -14,36 +18,44 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<button
-  class="recording-rules-button"
-  type="button"
-  aria-haspopup="dialog"
-  aria-expanded={open}
-  onclick={() => {
-    open = true
-  }}
->
-  Recording rules
-</button>
+{#if rules.length > 0}
+  <button
+    class="recording-rules-button"
+    type="button"
+    aria-haspopup="dialog"
+    aria-expanded={open}
+    onclick={() => {
+      open = true
+    }}
+  >
+    Recording rules
+  </button>
 
-{#if open}
-  <dialog class="consent-dialog" open aria-labelledby="recording-rules-title">
-    <div class="dialog-heading">
-      <h2 id="recording-rules-title">Recording rules</h2>
-      <button class="close-button" type="button" aria-label="Close recording rules" onclick={close}>
-        ×
-      </button>
-    </div>
-    <p>
-      Record only while the light is on. Anyone may pause it at any time without a reason.
-      Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
-    </p>
-    <p>
-      Tap the button on the recorder to pause or resume. To have a segment’s text and audio removed,
-      open the conversation once it has been refined, choose Delete on that segment, then choose
-      Delete text and audio.
-    </p>
-  </dialog>
+  {#if open}
+    <dialog class="consent-dialog" open aria-labelledby="recording-rules-title">
+      <div class="dialog-heading">
+        <h2 id="recording-rules-title">Recording rules</h2>
+        <button
+          class="close-button"
+          type="button"
+          aria-label="Close recording rules"
+          onclick={close}
+        >
+          ×
+        </button>
+      </div>
+      <ul class="rules">
+        {#each rules as rule, index (index)}
+          <li>{rule}</li>
+        {/each}
+      </ul>
+      <p>
+        Tap the button on the recorder to pause or resume. To have a segment’s text and audio
+        removed, open the conversation once it has been refined, choose Delete on that segment, then
+        choose Delete text and audio.
+      </p>
+    </dialog>
+  {/if}
 {/if}
 
 <style>
@@ -94,7 +106,8 @@
   }
 
   h2,
-  p {
+  p,
+  .rules {
     margin: 0;
   }
 
@@ -102,9 +115,15 @@
     font-size: 1rem;
   }
 
-  p {
+  p,
+  .rules {
     margin-top: 0.75rem;
     color: var(--ink);
+  }
+
+  .rules {
+    padding-left: 1.25rem;
+    list-style: disc;
   }
 
   .close-button {

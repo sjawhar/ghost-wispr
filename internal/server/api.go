@@ -1673,6 +1673,9 @@ type configResponse struct {
 	// running process resolved its configuration (environment overrides
 	// included). Read-only.
 	Models map[string]string `json:"models"`
+	// RecordingRules are the rules the page shows under Recording rules, each
+	// as written in recording_rules; empty when there are none. Read-only.
+	RecordingRules []string `json:"recording_rules"`
 }
 
 type configSummarizationResponse struct {
@@ -1742,9 +1745,13 @@ func handleGetConfig(cfgStore *config.Store) http.HandlerFunc {
 				"tts":                          cfg.TTSModel,
 				"tts_voice":                    cfg.TTSVoice,
 			},
+			RecordingRules: cfg.RecordingRules,
 		}
 		if resp.Summarization.Presets == nil {
 			resp.Summarization.Presets = map[string]config.Preset{}
+		}
+		if resp.RecordingRules == nil {
+			resp.RecordingRules = []string{}
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}

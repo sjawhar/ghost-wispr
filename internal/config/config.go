@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -59,7 +60,8 @@ type Config struct {
 	DBPath                        string             `yaml:"db_path"`
 	AudioDir                      string             `yaml:"audio_dir"`
 	LogLevel                      string             `yaml:"log_level"`
-	PublicURL                     string             `yaml:"public_url"` // the unit's own HTTPS address, its tailnet name
+	PublicURL                     string             `yaml:"public_url"`      // the unit's own HTTPS address, its tailnet name
+	RecordingRules                []string           `yaml:"recording_rules"` // the rules the web UI shows under Recording rules, as written; with none, it shows no button
 	SilenceTimeout                string             `yaml:"silence_timeout"`
 	MinSessionSegments            int                `yaml:"min_session_segments"`
 	MicSampleRate                 int                `yaml:"mic_sample_rate"`
@@ -166,7 +168,7 @@ func Load(path string) (Config, []string, error) {
 		}
 	}
 
-	applyEnvOverrides(&cfg)
+	warnings = append(warnings, applyEnvOverrides(&cfg)...)
 	// An unknown light fails closed: dropping the setting would turn the light
 	// check off and let the recorder capture with no light on.
 	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
@@ -264,7 +266,10 @@ func (c *Config) SampleRateCandidates() []int {
 	return result
 }
 
-func applyEnvOverrides(cfg *Config) {
+// applyEnvOverrides sets each setting its environment variable names, and
+// returns a warning for an override it cannot read.
+func applyEnvOverrides(cfg *Config) []string {
+	var warnings []string
 	if v := os.Getenv(EnvPrefix + "DB_PATH"); v != "" {
 		cfg.DBPath = v
 	}
@@ -347,6 +352,14 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "PUBLIC_URL"); v != "" {
 		cfg.PublicURL = strings.TrimSpace(v)
 	}
+	if v := os.Getenv(EnvPrefix + "RECORDING_RULES"); v != "" {
+		var rules []string
+		if err := json.Unmarshal([]byte(v), &rules); err != nil {
+			warnings = append(warnings, "Invalid "+EnvPrefix+`RECORDING_RULES — it must be a JSON list of strings, such as ["First rule.", "Second rule."]; using recording_rules from the config file.`)
+		} else {
+			cfg.RecordingRules = rules
+		}
+	}
 	if v := os.Getenv(EnvPrefix + "GC_ENABLED"); v != "" {
 		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
@@ -389,6 +402,7 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.TTSMaxLength = n
 		}
 	}
+	return warnings
 }
 
 func applyGenAIConfigDefaults(cfg *Config, serviceAccountProject string) {
@@ -559,6 +573,8 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 	if cfg.BatchTranscription.Model == "" {
 		cfg.BatchTranscription.Model = cfg.DeepgramModel
 	}
+	// A blank rule would show as an empty line under Recording rules.
+	cfg.RecordingRules = slices.DeleteFunc(cfg.RecordingRules, func(rule string) bool { return strings.TrimSpace(rule) == "" })
 	switch cfg.BatchTranscription.Provider {
 	case "deepgram", "groq", "openai":
 	default:

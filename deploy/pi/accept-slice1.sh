@@ -598,7 +598,7 @@ else
   printf 'Envoy NEEDS-PERSON: rerun with --relay-url from envoy-cluster Pulumi output.\n'
 fi
 
-printf 'A2 NEEDS-PERSON: open %s and choose Recording rules; the four rules must appear verbatim.\n' "$unit_url"
+printf 'A2 NEEDS-PERSON: open %s and choose Recording rules; each rule under recording_rules in the Pi'\''s config, /opt/ghost-wispr/ghost-wispr.yaml (rendered from deploy/pi/files/ghost-wispr.yaml), must appear verbatim and in order.\n' "$unit_url"
 printf 'A7 RAN: compare the Pi inventory with deploy/pi/baseline.txt.\n'
 readonly expected_package_roots=(libportaudio2 ffmpeg lame jq)
 {

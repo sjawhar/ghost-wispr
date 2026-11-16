@@ -27,6 +27,9 @@ export interface ConfigResponse {
     max_audio_size_mb: number
   }
   api_keys: Record<string, boolean>
+  // The rules the page shows under Recording rules, each as written in the
+  // unit's recording_rules; empty when it has none. Read-only.
+  recording_rules: string[]
 }
 
 export interface TestPresetResponse {

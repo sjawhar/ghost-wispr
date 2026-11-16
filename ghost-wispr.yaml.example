@@ -22,6 +22,14 @@ silence_timeout: 30s
 # sessions under it.
 # public_url: https://ghost-wispr.example.ts.net
 
+# The rules people in the room agree to. The web UI shows a Recording rules button when there is
+# at least one, and its dialog shows each rule as written, as plain text. With none, there is no
+# button. GHOST_WISPR_RECORDING_RULES overrides the list with a JSON list of strings.
+# recording_rules:
+#   - Say so before the meeting if you do not want it recorded.
+#   - Anyone can pause the recorder, at any time.
+#   - Ask the office manager to delete a segment.
+
 # Microphone — preferred sample rate tried first, then alternatives
 mic_sample_rate: 16000
 mic_sample_rates: [48000, 44100, 32000, 24000]

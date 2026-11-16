@@ -15,6 +15,23 @@ fail() {
   exit 1
 }
 
+# The office Pi's recording rules, which its web UI shows under Recording rules, each as written
+# and in this order (docs/pi-setup.md, "Accept slice 1", A2).
+readonly recording_rules_block='recording_rules:
+  - Record only while the light is on.
+  - Anyone may pause it at any time without a reason.
+  - Transcripts are readable by Theorem staff only.
+  - A person can ask for a segment to be deleted.'
+
+# assert_recording_rules fails unless the configuration provision.sh installed holds exactly the
+# office Pi's recording rules, once.
+assert_recording_rules() {
+  local config=$TEST_LOG.installed-ghost-wispr.yaml rules
+  rules=$(awk '/^recording_rules:/ { print; inside = 1; next } inside && /^  - / { print; next } { inside = 0 }' "$config")
+  [[ $rules == "$recording_rules_block" ]] \
+    || fail "the $1 configuration does not hold the office Pi's four recording rules: $(<"$config")"
+}
+
 uid=$(id -u)
 readonly uid runtime_dir="/run/user/$uid"
 [[ -d $runtime_dir ]] || fail "this test needs $runtime_dir, where provision.sh stages the bundle"
@@ -106,6 +123,7 @@ run_provision "${bundle_files[@]}" || fail "provision.sh failed: $(<"$work_dir/o
 if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error (above)"
 fi
+assert_recording_rules 'installed'
 
 # The .env the recorder runs with holds the Deepgram key and no Envoy signing key.
 env_file="$TEST_LOG.installed-.env"
@@ -177,4 +195,5 @@ for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' \
   grep -Fxq "$line" "$TEST_LOG.installed-ghost-wispr.yaml" \
     || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
 done
+assert_recording_rules "rerun's"
 printf 'provision run test passed\n'

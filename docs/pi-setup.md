@@ -334,7 +334,9 @@ through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing set
 `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
 (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
-ships GC off so it never runs before sync is on.
+ships GC off so it never runs before sync is on. It also holds the office's four recording rules
+(`recording_rules`), which the web UI shows under Recording rules; both the full provisioner and
+the models step install them with the rest of the template.
 
 ## Pause and resume at the unit
 
@@ -568,6 +570,11 @@ services. An empty inventory is UNKNOWN, not a pass. While it runs, a member dev
 subscribe with `nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222`
 and confirm the signed probe plus a real
 `session.started` and `session.ended` notification.
+
+A2 asks a person to open the unit's page and choose Recording rules. The page shows the rules
+under `recording_rules` in the Pi's config, `/opt/ghost-wispr/ghost-wispr.yaml`, which
+`provision.sh` renders from `deploy/pi/files/ghost-wispr.yaml`: each must appear verbatim and in
+order. A unit whose config has no rules shows no Recording rules button.
 
 ## Accept slice 2
 

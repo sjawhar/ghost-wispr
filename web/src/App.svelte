@@ -39,6 +39,8 @@
     startSession,
     stopCurrentSession,
   } from './lib/api'
+  import { fetchConfig } from './lib/config-api'
+  import { configState, setConfig } from './lib/config.svelte'
   import { connect, disconnect } from './lib/ws.svelte'
 
   let expandedSessionId = $state('')
@@ -143,10 +145,11 @@
     let mounted = true
     const bootstrap = async () => {
       try {
-        const [status, dates, presets] = await Promise.all([
+        const [status, dates, presets, config] = await Promise.all([
           fetchStatus(),
           fetchDates(),
           fetchPresets(),
+          fetchConfig(),
         ])
         if (!mounted) {
           return
@@ -157,6 +160,7 @@
         setWarnings(status.warnings)
         setDates(dates)
         setPresets(presets)
+        setConfig(config)
 
         // Restore active session's live transcript if one exists
         if (status.active_session_id) {
@@ -230,7 +234,7 @@
       <p class="subtitle">Live capture first, session memory second.</p>
     </div>
     <div class="header-actions">
-      <ConsentRule />
+      <ConsentRule rules={configState.config?.recording_rules ?? []} />
       <Controls
         connected={appState.connected}
         paused={appState.paused}
