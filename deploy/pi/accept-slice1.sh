@@ -251,29 +251,91 @@ dependency_packages_from_apt_cache() {
   sed -nE '/^[^[:space:]<]/p' | sed -E 's/:[[:alnum:]]+$//' | LC_ALL=C sort -u
 }
 
-deepgram_bytes_from_ss() {
+# deepgram_sockets_from_ss reads `ss -tinpH` and prints "LOCAL PEER BYTES_SENT" for each socket
+# held by ghost-wispr that reports bytes_sent. It fails when there is none.
+deepgram_sockets_from_ss() {
   awk '
-    /^[A-Z][A-Z0-9-]*[[:space:]]/ { held_by_ghost_wispr = /users:\(\("ghost-wispr"/ }
-    held_by_ghost_wispr && match($0, /bytes_sent:[0-9]+/) {
-      total += substr($0, RSTART + 11, RLENGTH - 11)
-      found = 1
+    function flush() {
+      if (held_by_ghost_wispr && bytes != "") {
+        print local_address, peer, bytes
+        found = 1
+      }
     }
+    /^[A-Z][A-Z0-9-]*[[:space:]]/ {
+      flush()
+      held_by_ghost_wispr = /users:\(\("ghost-wispr"/
+      local_address = $4
+      peer = $5
+      bytes = ""
+    }
+    held_by_ghost_wispr && match($0, /bytes_sent:[0-9]+/) { bytes = substr($0, RSTART + 11, RLENGTH - 11) }
     END {
+      flush()
       if (!found) exit 1
-      print total
     }
   '
 }
 
+# deepgram_peers PEER... prints each PEER (an address:443 from ss) that serves a valid certificate
+# for api.deepgram.com, checked from the Pi. The name is not resolved to find the socket: it has
+# several addresses, and a new lookup often returns none of the one the recorder is connected to.
+# On the office Pi on 2026-11-16 the recorder's socket was to 216.200.21.203 while the name
+# resolved to 208.185.49.101, and a later read found the reverse.
+deepgram_peers() {
+  local peer check=''
+  for peer in "$@"; do
+    [[ $peer =~ ^(\[[0-9A-Fa-f:.]+\]|[0-9.]+):443$ ]] || fail "unexpected peer address from ss: $peer"
+    check+="curl --silent --output /dev/null --max-time 10 --connect-to 'api.deepgram.com:443:$peer' https://api.deepgram.com/ && printf '%s\\n' '$peer'; "
+  done
+  remote_run "${check}true"
+}
+
+# deepgram_sockets prints "LOCAL BYTES_SENT" for each socket ghost-wispr holds to api.deepgram.com.
+deepgram_sockets() {
+  local socket_state sockets verified_peers
+  local -a peers
+  socket_state=$(remote_run 'ss -tinpH') || fail "could not read the Pi's TCP sockets"
+  sockets=$(printf '%s\n' "$socket_state" | deepgram_sockets_from_ss | awk '$2 ~ /:443$/') \
+    || fail "no socket held by ghost-wispr with bytes_sent was found"
+  [[ -n "$sockets" ]] || fail "no socket held by ghost-wispr to port 443 was found"
+  mapfile -t peers < <(awk '{ print $2 }' <<<"$sockets" | LC_ALL=C sort -u)
+  verified_peers=$(deepgram_peers "${peers[@]}") || fail "could not check the peers' certificates on the Pi"
+  sockets=$(awk 'NR == FNR { deepgram[$1]; next } $2 in deepgram { print $1, $3 }' \
+    <(printf '%s\n' "$verified_peers") <(printf '%s\n' "$sockets"))
+  [[ -n "$sockets" ]] || fail "no socket held by ghost-wispr to api.deepgram.com was found"
+  printf '%s\n' "$sockets"
+}
+
+# deepgram_bytes_sent [LOCAL] prints bytes_sent of ghost-wispr's socket to api.deepgram.com from the
+# local address LOCAL or, with no LOCAL, the sum over all its sockets to api.deepgram.com.
 deepgram_bytes_sent() {
-  local socket_state bytes
-  socket_state=$(remote_run 'ss -tinpH dst api.deepgram.com') \
-    || fail "could not read the Deepgram socket"
-  if ! bytes=$(printf '%s\n' "$socket_state" | deepgram_bytes_from_ss); then
-    fail "no Deepgram socket held by ghost-wispr with bytes_sent was found"
+  local sockets bytes
+  sockets=$(deepgram_sockets) || return 1
+  if ! bytes=$(awk -v local_address="${1:-}" '
+    local_address == "" || $1 == local_address { total += $2; found = 1 }
+    END { if (!found) exit 1; print total }
+  ' <<<"$sockets"); then
+    fail "the Deepgram socket from ${1:-} is gone"
   fi
   [[ "$bytes" =~ ^[0-9]+$ ]] || fail "Deepgram bytes_sent is not numeric"
   printf '%s\n' "$bytes"
+}
+
+# deepgram_live_socket BEFORE AFTER SECONDS prints the local address of the one Deepgram socket that
+# grew by at least 32 kB/s between two deepgram_sockets readings SECONDS apart: the live stream. A
+# batch transcription upload opens another socket to api.deepgram.com, so the pause control follows
+# this one socket. It fails when no socket, or more than one, grew that much.
+deepgram_live_socket() {
+  local before=$1 after=$2 seconds=$3 local_address bytes start
+  local -a live=()
+  while read -r local_address bytes; do
+    start=$(awk -v local_address="$local_address" '$1 == local_address { print $2 }' <<<"$before")
+    if [[ -n "$start" ]] && assert_minimum_growth "$start" "$bytes" "$seconds"; then
+      live+=("$local_address")
+    fi
+  done <<<"$after"
+  (( ${#live[@]} == 1 )) || return 1
+  printf '%s\n' "${live[0]}"
 }
 
 assert_minimum_growth() {
@@ -313,14 +375,30 @@ run_control_tests() {
   fi
   printf 'self-test: service control rejected an unexpected service\n'
 
-  if printf '%s\n' 'ESTAB 0 0 10.0.0.2:12345 34.120.1.2:443 users:(("ghost-wispr",pid=7,fd=9))' | deepgram_bytes_from_ss; then
+  if printf '%s\n' 'ESTAB 0 0 10.0.0.2:12345 34.120.1.2:443 users:(("ghost-wispr",pid=7,fd=9))' | deepgram_sockets_from_ss; then
     fail "self-test expected the Deepgram socket control to reject fake ss output without bytes_sent"
   fi
   printf 'self-test: Deepgram socket control rejected fake ss output\n'
 
-  parsed_bytes=$(printf '%s\n' 'ESTAB 0 0 10.0.0.2:12345 34.120.1.2:443 users:(("ghost-wispr",pid=7,fd=9))' ' bbr bytes_sent:160000' | deepgram_bytes_from_ss)
-  [[ "$parsed_bytes" == 160000 ]] || fail "self-test expected the Deepgram parser to accept a ghost-wispr socket"
+  parsed_sockets=$(printf '%s\n' 'ESTAB 0 0 10.0.0.2:12345 34.120.1.2:443 users:(("ghost-wispr",pid=7,fd=9))' ' bbr bytes_sent:160000' \
+    'ESTAB 0 0 10.0.0.2:23456 34.120.1.3:443 users:(("other",pid=8,fd=9))' ' bbr bytes_sent:7' | deepgram_sockets_from_ss)
+  [[ "$parsed_sockets" == '10.0.0.2:12345 34.120.1.2:443 160000' ]] \
+    || fail "self-test expected the Deepgram parser to accept a ghost-wispr socket alone"
   printf 'self-test: Deepgram socket control accepted valid fake ss output\n'
+
+  # remote_run is a stub here: a peer that slipped through would run nothing on the Pi.
+  if (remote_run() { :; }; deepgram_peers "34.120.1.2:443';reboot;'") >/dev/null 2>&1; then
+    fail "self-test expected the Deepgram certificate check to refuse a peer that is not an address"
+  fi
+  printf 'self-test: Deepgram certificate check refused a peer that is not an address\n'
+
+  live_socket=$(deepgram_live_socket $'10.0.0.2:1 100\n10.0.0.2:2 100' $'10.0.0.2:1 200000\n10.0.0.2:2 150' 5) \
+    || fail "self-test expected the live Deepgram socket to be the one that grew by 32 kB/s"
+  [[ "$live_socket" == 10.0.0.2:1 ]] || fail "self-test chose $live_socket as the live Deepgram socket"
+  if deepgram_live_socket $'10.0.0.2:1 100\n10.0.0.2:2 100' $'10.0.0.2:1 200000\n10.0.0.2:2 200000' 5 >/dev/null; then
+    fail "self-test expected two Deepgram sockets that grew by 32 kB/s to be refused"
+  fi
+  printf 'self-test: Deepgram live socket control followed the one socket that carried audio\n'
 
   if assert_minimum_growth 100 101 5; then
     fail "self-test expected the Deepgram recording control to reject low growth"
@@ -379,20 +457,20 @@ printf 'Light power-cycle NEEDS-PERSON: confirm the light stayed dark until Ghos
 
 printf 'A1 RAN: check the red light, Deepgram control, and pause button.\n'
 [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == red ]] || fail "A1 FAILED: light is not red while capturing"
-recording_bytes_before=$(deepgram_bytes_sent)
+recording_sockets_before=$(deepgram_sockets)
 readonly deepgram_control_seconds=5
 sleep "$deepgram_control_seconds"
-recording_bytes_after=$(deepgram_bytes_sent)
-assert_minimum_growth "$recording_bytes_before" "$recording_bytes_after" "$deepgram_control_seconds" \
-  || fail "A1 FAILED: Deepgram recording control grew by less than 32 kB/s"
+recording_sockets_after=$(deepgram_sockets)
+deepgram_socket=$(deepgram_live_socket "$recording_sockets_before" "$recording_sockets_after" "$deepgram_control_seconds") \
+  || fail "A1 FAILED: Deepgram recording control: not exactly one socket to api.deepgram.com grew by 32 kB/s (local address and bytes_sent before: $(tr '\n' ' ' <<<"$recording_sockets_before")after: $(tr '\n' ' ' <<<"$recording_sockets_after"))"
 audio_before=$(remote_run 'du -sb /opt/ghost-wispr/data/audio 2>/dev/null | cut -f1 || printf 0')
 printf 'A1 NEEDS-PERSON: tap the Pi power button once to pause, then press Enter. '
 read -r _
 assert_paused
 [[ $(remote_run '/opt/ghost-wispr/ghost-wispr light-state') == off ]] || fail "A1 FAILED: light stays on after pause"
-paused_bytes_before=$(deepgram_bytes_sent)
+paused_bytes_before=$(deepgram_bytes_sent "$deepgram_socket")
 sleep 60
-paused_bytes_after=$(deepgram_bytes_sent)
+paused_bytes_after=$(deepgram_bytes_sent "$deepgram_socket")
 readonly deepgram_paused_max_bytes=4096
 assert_maximum_growth "$paused_bytes_before" "$paused_bytes_after" "$deepgram_paused_max_bytes" \
   || fail "A1 FAILED: Deepgram bytes_sent grew by more than ${deepgram_paused_max_bytes} bytes while paused"

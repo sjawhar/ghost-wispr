@@ -413,7 +413,10 @@ unset secret
 The driver pauses and resumes the recorder, asks the operator to power-cycle it, checks the
 light state, verifies the tagged identity and loopback listeners, and tests the signed and
 unsigned webhook paths. Before the pause it requires the Ghost Wispr Deepgram socket to grow by
-at least 32 kB/s; during the 60-second pause it permits at most 4096 bytes. It compares package
+at least 32 kB/s; during the 60-second pause it permits at most 4096 bytes on that same socket.
+It finds the socket among Ghost Wispr's sockets by its peer's certificate for `api.deepgram.com`,
+checked from the Pi, and does not resolve the name: the name has several addresses, and a new
+lookup often misses the one the recorder is connected to. It compares package
 and running-service inventories against `deploy/pi/baseline.txt`, allowing only
 `libportaudio2`, `ffmpeg`, `lame`, `jq`, their package dependencies, and Ghost Wispr's user
 services. An empty inventory is UNKNOWN, not a pass. While it runs, a member device must also
