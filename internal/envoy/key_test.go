@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // staticKey is a signing key reader that always reads key.
@@ -202,6 +203,54 @@ func TestCheckSigningKeyReadsAgainOnlyWhileTheLastReadFailed(t *testing.T) {
 	}
 	if keys.count() != 3 || len(requests()) != 1 {
 		t.Fatalf("key reads = %d, accepted events = %d after a send with the checked key, want 3 and 1", keys.count(), len(requests()))
+	}
+}
+
+// TestAStaleFailureReportDoesNotOutliveAWorkingRead: read A (a sweep's
+// check) fails; read B (a concurrent send or check) works. B reports and
+// stalls before its state write; A reports and writes its state; then B
+// writes its state. Three later sweeps must leave no failure report.
+func TestAStaleFailureReportDoesNotOutliveAWorkingRead(t *testing.T) {
+	aInRead, failA := make(chan struct{}), make(chan struct{})
+	var reads atomic.Int32
+	read := func(context.Context) (string, error) {
+		if reads.Add(1) == 1 {
+			close(aInRead)
+			<-failA
+			return "", errors.New("PERMISSION_DENIED")
+		}
+		return "granted-key", nil
+	}
+	var mu sync.Mutex
+	var last error
+	bReported, releaseB := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	p := NewPublisher("http://127.0.0.1:1", read, nil, WithKeyStatus(func(err error) {
+		mu.Lock()
+		last = err
+		mu.Unlock()
+		if err == nil {
+			once.Do(func() { close(bReported); <-releaseB })
+		}
+	}))
+	ctx := context.Background()
+	aDone, bDone := make(chan error, 1), make(chan error, 1)
+	go func() { aDone <- p.CheckSigningKey(ctx) }()
+	<-aInRead
+	go func() { bDone <- p.CheckSigningKey(ctx) }()
+	<-bReported
+	close(failA)
+	time.Sleep(100 * time.Millisecond)
+	close(releaseB)
+	<-aDone
+	<-bDone
+	for range 3 {
+		_ = p.CheckSigningKey(ctx)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if last != nil {
+		t.Fatalf("last report %v after 3 sweeps with the key read (%d reads)", last, reads.Load())
 	}
 }
 
