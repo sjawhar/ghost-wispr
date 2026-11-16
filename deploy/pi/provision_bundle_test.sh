@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Runs docs/pi-setup.md's own commands for the credential files, the bundle sources and the
 # provisioning call, read from the runbook between its provision_bundle_test.sh markers, against
-# fakes that answer only the sources agent-infra main has: Secret Manager
-# ghost-wispr-device-certificate, root's stack output ghostWisprTailnetClientId, root's prod config
-# ghostWisprAccountUniqueId and envoy-cluster's relayUrl. Provisioning reads no Envoy signing key:
-# the recorder reads it from Secret Manager itself. The slice 1 acceptance block reads it, for its
-# signed probe, only under a one-hour GCLOUD_SAMI broker grant (or a broker key), never to a plain
-# gcloud read.
+# fakes that answer only the sources the devbox identity can read: Secret Manager
+# ghost-wispr-device-certificate, root/Pulumi.prod.yaml's ghostWisprAccountUniqueId on agent-infra
+# main, the ghostWisprTailnetClientId the seed workflow's root job printed when it created
+# ghost-wispr-x509, and the URL of the Cloud Run service envoy-webhook-relay-*. Pulumi answers
+# 403, as root's and envoy-cluster's state buckets do for that identity. Provisioning reads no
+# Envoy signing key: the recorder reads it from Secret Manager itself. The slice 1 acceptance
+# block reads it, for its signed probe, only under a one-hour GCLOUD_SAMI broker grant (or a broker
+# key), never to a plain gcloud read.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -59,15 +61,53 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=g
   -keyout "$work_dir/device.key" -out "$work_dir/device.pem" 2>/dev/null
 export TEST_CERTIFICATE="$work_dir/device.pem" TEST_ARGV_LOG="$work_dir/argv.log"
 
+# The devbox identity cannot list root's or envoy-cluster's Pulumi state bucket.
 cat >"$work_dir/bin/pulumi" <<'EOF'
 #!/usr/bin/env bash
 printf 'pulumi %s\n' "$*" >>"$TEST_ARGV_LOG"
-case "$PWD:$*" in
-  */agent-infra/root:'stack output ghostWisprTailnetClientId --stack prod') printf '%s\n' "$CLIENT_ID" ;;
-  */agent-infra/root:'config get ghostWisprAccountUniqueId --stack prod') printf '%s\n' "$SUBJECT" ;;
-  */agent-infra/envoy-cluster:'stack output relayUrl --stack prod') printf 'https://relay.example.test\n' ;;
+printf 'fake pulumi: 403: the devbox identity does not have storage.objects.list access to the Pulumi state bucket\n' >&2
+exit 1
+EOF
+
+# gh answers as GitHub does for agent-infra's seed workflow, newest run first: run 904's root job
+# was skipped; 903's ran a preview, which prints the client id as [unknown]; 902's created
+# ghost-wispr-x509 and printed its client id; 901's created an earlier identity, whose client id
+# is stale.
+cat >"$work_dir/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'gh %s\n' "$*" >>"$TEST_ARGV_LOG"
+jq_filter=
+args=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --jq) jq_filter=$2; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+answer() {
+  if [[ -n $jq_filter ]]; then jq -r "$jq_filter"; else cat; fi
+}
+readonly api=repos/theorem-labs/agent-infra/actions
+preview='2026-11-16T06:20:21.4658172Z   + ghostWisprTailnetClientId                   : [unknown]'
+created='2026-11-16T06:25:09.3203883Z  +  tailscale:index:FederatedIdentity ghost-wispr-x509 created (1s) '
+client_id_line() { printf '2026-11-16T06:29:36.3829213Z   + ghostWisprTailnetClientId                   : "%s"\n' "$1"; }
+case "${args[*]}" in
+  'run list -R theorem-labs/agent-infra --workflow seed.yaml --limit 1000 --json databaseId')
+    printf '[{"databaseId":904},{"databaseId":903},{"databaseId":902},{"databaseId":901}]\n' | answer ;;
+  "api $api/runs/904/jobs")
+    printf '{"jobs":[{"id":9040,"name":"select","conclusion":"success"},{"id":9041,"name":"root","conclusion":"skipped"}]}\n' | answer ;;
+  "api $api/runs/90"[1-3]"/jobs")
+    run=${args[1]#"$api/runs/"}
+    run=${run%/jobs}
+    printf '{"jobs":[{"id":%s0,"name":"select","conclusion":"success"},{"id":%s1,"name":"root","conclusion":"failure"}]}\n' "$run" "$run" | answer ;;
+  "api $api/jobs/9031/logs") printf '%s\n' "$preview" ;;
+  # TEST_NO_CREATION_LOG: GitHub deleted the logs of the runs that created the identity.
+  "api $api/jobs/90"[12]"1/logs") [[ -z ${TEST_NO_CREATION_LOG:-} ]] || exit 1 ;;&
+  "api $api/jobs/9021/logs") printf '%s\n' "$preview" "$created" "$(client_id_line "$CLIENT_ID")" ;;
+  "api $api/jobs/9011/logs") printf '%s\n' "$preview" "$created" "$(client_id_line k-stale-client-id)" ;;
   *)
-    printf 'fake pulumi: agent-infra main has no source for "%s" in %s\n' "$*" "$PWD" >&2
+    printf 'fake gh: HTTP 404 for "%s"\n' "${args[*]}" >&2
     exit 1
     ;;
 esac
@@ -91,6 +131,10 @@ if [[ $1 == iam && $2 == workload-identity-pools && $3 == create-cred-config && 
   exit 0
 fi
 case "$*" in
+  'run services list --project=theorem-agent-infra --filter=metadata.name ~ ^envoy-webhook-relay- --format=value(status.url)')
+    # gcloud lists no service and exits 0 when the filter matches none.
+    [[ -n ${TEST_RELAY_MISSING:-} ]] || printf 'https://relay.example.test\n'
+    ;;
   'secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra')
     if [[ -n ${TEST_CERT_READ_FAIL:-} ]]; then
       printf 'fake gcloud: PERMISSION_DENIED reading ghost-wispr-device-certificate\n' >&2
@@ -195,11 +239,29 @@ esac
 EOF
 chmod +x "$work_dir/bin/"*
 
+# agent-infra as the runbook reads it: its origin's main holds root/Pulumi.prod.yaml with the
+# service account's unique id. The commit before it held another id, and each case's checkout is
+# left at that commit, so only a read of the fetched origin/main gives the right one.
+agent_infra_origin="$work_dir/agent-infra.git"
+agent_infra_seed="$work_dir/agent-infra-seed"
+git init --quiet --bare --initial-branch=main "$agent_infra_origin"
+git init --quiet --initial-branch=main "$agent_infra_seed"
+mkdir "$agent_infra_seed/root"
+for subject in 987654321098765432109 "$SUBJECT"; do
+  printf 'config:\n  agent-infra-root:answerLoopProofTailnetIdentity: "true"\n  agent-infra-root:ghostWisprAccountUniqueId: "%s"\n' \
+    "$subject" >"$agent_infra_seed/root/Pulumi.prod.yaml"
+  git -C "$agent_infra_seed" add root/Pulumi.prod.yaml
+  git -C "$agent_infra_seed" -c user.name=test -c user.email=test@example.invalid commit --quiet -m "root: subject $subject"
+done
+git -C "$agent_infra_seed" push --quiet "$agent_infra_origin" main
+
 # run_runbook runs the runbook's blocks in a fresh home.
 run_runbook() {
   local case_dir=$1
-  mkdir -p "$case_dir/home/src/agent-infra/bootstrap" "$case_dir/home/src/agent-infra/root" \
-    "$case_dir/home/src/agent-infra/envoy-cluster" "$case_dir/tmp" "$case_dir/pi"
+  mkdir -p "$case_dir/home/src" "$case_dir/tmp" "$case_dir/pi"
+  git clone --quiet "$agent_infra_origin" "$case_dir/home/src/agent-infra"
+  git -C "$case_dir/home/src/agent-infra" reset --quiet --hard HEAD~1
+  git -C "$case_dir/home/src/agent-infra" update-ref refs/remotes/origin/main HEAD
   mkdir -m 700 "$case_dir/run"
   : >"$case_dir/grants"
   (
@@ -219,9 +281,12 @@ check_case() {
   cmp -s "$case_dir/expected.list" "$case_dir/pi/bundle.list" \
     || fail "$case_dir: the Pi received $(tr '\n' ' ' <"$case_dir/pi/bundle.list")"
   cmp -s "$received/device.crt" "$TEST_CERTIFICATE" || fail "device.crt is not Secret Manager's ghost-wispr-device-certificate"
-  [[ $(<"$received/tailscale-client-id") == "$CLIENT_ID" ]] || fail "tailscale-client-id is not root's ghostWisprTailnetClientId"
-  [[ $(<"$received/tailscale-subject") == "$SUBJECT" ]] || fail "tailscale-subject is not root's ghostWisprAccountUniqueId"
-  [[ $(<"$received/envoy-webhook-url") == https://relay.example.test/webhook/ghostwispr ]] || fail "envoy-webhook-url is wrong"
+  [[ $(<"$received/tailscale-client-id") == "$CLIENT_ID" ]] \
+    || fail "tailscale-client-id is not the ghostWisprTailnetClientId of the newest ghost-wispr-x509 creation: $(<"$received/tailscale-client-id")"
+  [[ $(<"$received/tailscale-subject") == "$SUBJECT" ]] \
+    || fail "tailscale-subject is not ghostWisprAccountUniqueId on agent-infra's origin/main: $(<"$received/tailscale-subject")"
+  [[ $(<"$received/envoy-webhook-url") == https://relay.example.test/webhook/ghostwispr ]] \
+    || fail "envoy-webhook-url is not the relay service's URL: $(<"$received/envoy-webhook-url")"
   [[ $(<"$received/deepgram-key") == "$DEEPGRAM_SECRET" ]] || fail "deepgram-key is wrong"
   jq -e '.credential_source.certificate.certificate_config_location == "/opt/ghost-wispr/certificate_config.json"' \
     "$received/google-credentials.json" >/dev/null || fail "google-credentials.json does not name the Pi's certificate config"
@@ -239,7 +304,7 @@ check_case() {
 }
 
 export TEST_ARGV_LOG
-run_runbook "$work_dir/local" || fail "the runbook's commands failed against agent-infra main's sources"
+run_runbook "$work_dir/local" || fail "the runbook's commands failed against the sources the devbox identity reads"
 check_case "$work_dir/local"
 
 if TEST_PROVISION_EXIT=1 run_runbook "$work_dir/failed" 2>/dev/null; then
@@ -258,6 +323,12 @@ TEST_PROVISION_EXIT=255 TEST_PROVISION_SAYS='ghost-wispr provision: starting the
   run_runbook "$work_dir/dropped-after-join" 2>/dev/null \
   || fail "the runbook failed although the SSH session ended after the tailnet join started"
 
+# No seed run's log holds the creation (the logs expired): the runbook stops before provisioning.
+if TEST_NO_CREATION_LOG=1 run_runbook "$work_dir/no-client-id" >/dev/null 2>&1; then
+  fail "the runbook succeeded although no seed run's log holds ghostWisprTailnetClientId"
+fi
+[[ ! -e $work_dir/no-client-id/pi/bundle.list ]] || fail "the runbook provisioned the Pi without a tailscale-client-id"
+
 # Slice 1 acceptance: the secret reaches the driver's environment alone, read under a grant.
 cat >"$work_dir/accept-driver" <<'EOF'
 #!/usr/bin/env bash
@@ -269,7 +340,7 @@ EOF
 chmod +x "$work_dir/accept-driver"
 for broker_host in "" broker.example; do
   accept_dir="$work_dir/accept${broker_host:+-host}"
-  mkdir -p "$accept_dir/home/src/agent-infra/envoy-cluster"
+  mkdir -p "$accept_dir/home"
   : >"$accept_dir/grants"
   (
     cd "$repo_root"
@@ -284,7 +355,7 @@ done
 # A person pastes the block into a shell without set -e: a failed secret read must run no
 # acceptance, which would otherwise sign nothing and report the signed probe as skipped.
 accept_dir="$work_dir/accept-failed-read"
-mkdir -p "$accept_dir/home/src/agent-infra/envoy-cluster"
+mkdir -p "$accept_dir/home"
 : >"$accept_dir/grants"
 (
   cd "$repo_root"
@@ -293,6 +364,18 @@ mkdir -p "$accept_dir/home/src/agent-infra/envoy-cluster"
     PATH="$work_dir/bin:$PATH" broker_host="" broker_key="" bash "$accept"
 ) >/dev/null 2>&1 || true
 [[ ! -e $accept_dir/invoked ]] || fail "slice 1 acceptance ran although the secret read failed"
+
+# The same with no relay service found: gcloud prints nothing and exits 0.
+accept_dir="$work_dir/accept-no-relay"
+mkdir -p "$accept_dir/home"
+: >"$accept_dir/grants"
+(
+  cd "$repo_root"
+  HOME="$accept_dir/home" TEST_GRANTS="$accept_dir/grants" TEST_ACCEPT_DRIVER="$work_dir/accept-driver" \
+    TEST_ACCEPT_RAN="$accept_dir/ran" TEST_ACCEPT_INVOKED="$accept_dir/invoked" TEST_RELAY_MISSING=1 \
+    PATH="$work_dir/bin:$PATH" broker_host="" broker_key="" bash "$accept"
+) >/dev/null 2>&1 || true
+[[ ! -e $accept_dir/invoked ]] || fail "slice 1 acceptance ran although no relay service was found"
 
 # Certificate renewal, pasted the same way: the Pi gets the certificate Secret Manager holds,
 # and nothing at all when the read fails.
@@ -317,6 +400,9 @@ if grep -F -e "$WEBHOOK_SECRET" -e "$DEEPGRAM_SECRET" "$TEST_ARGV_LOG" >/dev/nul
   fail "a secret was passed as a command argument"
 fi
 if grep -E 'ghostWisprCertificates|tailscaleIds|service-accounts describe' "$TEST_ARGV_LOG" >/dev/null; then
-  fail "the runbook still reads a source agent-infra main does not have"
+  fail "the runbook still reads a source agent-infra main does not have, or the devbox identity cannot read"
+fi
+if grep -E '^pulumi ' "$TEST_ARGV_LOG" >/dev/null; then
+  fail "the runbook still reads Pulumi state, which the devbox identity cannot read: $(grep -E '^pulumi ' "$TEST_ARGV_LOG")"
 fi
 printf 'provision bundle test passed\n'
