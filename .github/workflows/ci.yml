@@ -100,6 +100,7 @@ jobs:
           sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "/run/user/$(id -u)"
           for test in deploy/pi/provision_bundle_test.sh deploy/pi/provision_run_test.sh \
             deploy/pi/provision_models_test.sh deploy/pi/update_test.sh deploy/pi/release_publish_test.sh \
-            deploy/pi/accept_slice2_test.sh deploy/pi/workflow_pins_test.sh deploy/pi/claim_tailnet_name_test.sh; do
+            deploy/pi/accept_slice2_test.sh deploy/pi/workflow_pins_test.sh deploy/pi/claim_tailnet_name_test.sh \
+            deploy/pi/accept_slice1_test.sh; do
             bash "$test"
           done
