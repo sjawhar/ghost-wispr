@@ -91,3 +91,29 @@ func TestASavedConfigKeepsItsRecordingRules(t *testing.T) {
 		t.Fatalf("after a save the file holds recording_rules %q, want %q", reloaded.RecordingRules, want)
 	}
 }
+
+// TestASaveWritesTheRulesOverrideIntoTheFile fails if a config API save does
+// not write the rules GHOST_WISPR_RECORDING_RULES gives into the file, where
+// they stay once the variable is removed, as the README, the examples and the
+// OpenAPI spec say: every override is written back the same way.
+func TestASaveWritesTheRulesOverrideIntoTheFile(t *testing.T) {
+	clearEnv(t)
+	path := writeConfig(t, "recording_rules:\n  - File rule.\n")
+	t.Setenv(EnvPrefix+"RECORDING_RULES", `["Override rule."]`)
+	store, _, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *Config) { c.GCMaxAgeDays = 7 }); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(EnvPrefix+"RECORDING_RULES", "")
+	reloaded, _, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"Override rule."}; !slices.Equal(reloaded.RecordingRules, want) {
+		t.Fatalf("after a save with the override set, the file holds recording_rules %q, want %q", reloaded.RecordingRules, want)
+	}
+}

@@ -24,7 +24,9 @@ silence_timeout: 30s
 
 # The rules people in the room agree to. The web UI shows a Recording rules button when there is
 # at least one, and its dialog shows each rule as written, as plain text. With none, there is no
-# button. GHOST_WISPR_RECORDING_RULES overrides the list with a JSON list of strings.
+# button. GHOST_WISPR_RECORDING_RULES overrides the list with a JSON list of strings; a settings
+# save in the web UI then writes the override's rules into this file, where they stay after the
+# variable is removed.
 # recording_rules:
 #   - Say so before the meeting if you do not want it recorded.
 #   - Anyone can pause the recorder, at any time.
