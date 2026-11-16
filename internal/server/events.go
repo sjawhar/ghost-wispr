@@ -73,6 +73,15 @@ type ComponentStatusEvent struct {
 	Message   string `json:"message"`
 }
 
+// SessionDeletedEvent tells a web client that a session was deleted, with
+// the sessions merged into it, so it drops them: their ids only. It is never
+// stored.
+type SessionDeletedEvent struct {
+	Event
+	SessionID        string   `json:"session_id"`
+	SourceSessionIDs []string `json:"source_session_ids"`
+}
+
 func newEvent(eventType string, now time.Time) Event {
 	if now.IsZero() {
 		now = time.Now().UTC()

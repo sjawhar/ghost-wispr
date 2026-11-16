@@ -193,6 +193,7 @@ func HandlerWithLogger(staticFS fs.FS, hub *Hub, store SessionStore, controls *C
 	origins := originPolicy{cfg: cs, logger: moduleLogger}
 	registerWSRoute(mux, hub, moduleLogger)
 	registerAPIRoutes(mux, store, controls, healthChecker, cs, embeddingClient)
+	registerSessionDeleteRoute(mux, store, controls, hub, configuredAudioDir(cs))
 
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.HandleFunc("/", serveSPA(staticFS, fileServer, moduleLogger))

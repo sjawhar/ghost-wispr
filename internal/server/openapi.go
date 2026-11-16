@@ -458,7 +458,7 @@ func OpenAPISpec() map[string]any {
 				},
 				"delete": map[string]any{
 					"summary":     "Delete session",
-					"description": "Delete a session, the sessions merged into it, every stored event that names one of them (so /api/events no longer serves their transcript, summary, or refinement, summary and sync statuses), every GET /api/status warning that names one of them, their words in the search index, and their audio files. The deleted rows and events are then erased from the database's write-ahead log and the pre-migration backup.",
+					"description": "Delete a session, the sessions merged into it, every stored event that names one of them (so /api/events no longer serves their transcript, summary, or refinement, summary and sync statuses), every GET /api/status warning that names one of them, their words in the search index, and their audio files. Every connected web client is sent a session_deleted websocket event with their ids only. The deleted rows and events are then erased from the database's write-ahead log and the pre-migration backup.",
 					"tags":        []string{"sessions"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"parameters": []map[string]any{

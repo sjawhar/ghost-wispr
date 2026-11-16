@@ -212,10 +212,21 @@ func (h *Hub) BroadcastComponentStatus(component, status, message string) {
 
 // BroadcastSessionComponentStatus announces a component's status about
 // session sessionID (its refinement, summary or sync). The event names the
-// session in session_id, so deleting the session deletes the stored event,
-// and a client that connects after the delete is not sent it
-// (SnapshotComponentStatuses).
+// session in session_id, so deleting the session deletes the stored event.
+// Work running at a delete reports on a session that is gone; no client is
+// sent that status, and a client that connects in the moment between this
+// check and the delete is not sent it either (SnapshotComponentStatuses).
 func (h *Hub) BroadcastSessionComponentStatus(sessionID, component, status, message string) {
+	if h.eventStore != nil {
+		exists, err := h.eventStore.HasSession(sessionID)
+		if err != nil {
+			h.logger.Warn("could not check whether a status's session exists; the status is not sent", "operation", "broadcast_component_status", "session_id", sessionID, "component", component, "error", err)
+			return
+		}
+		if !exists {
+			return
+		}
+	}
 	h.broadcastComponentStatus(sessionID, component, status, message)
 }
 
@@ -233,6 +244,30 @@ func (h *Hub) broadcastComponentStatus(sessionID, component, status, message str
 	h.mu.Unlock()
 
 	h.broadcastEvent(event)
+}
+
+// BroadcastSessionDeleted tells every connected client that session
+// sessionID was deleted, with sourceIDs, the sessions merged into it, so each
+// tab drops their title, summary, segments and statuses. The event carries
+// their ids only and is not stored. The hub forgets its last status of each.
+func (h *Hub) BroadcastSessionDeleted(sessionID string, sourceIDs []string) {
+	deleted := make(map[string]bool, len(sourceIDs)+1)
+	deleted[sessionID] = true
+	for _, id := range sourceIDs {
+		deleted[id] = true
+	}
+	h.mu.Lock()
+	for component, status := range h.componentStatuses {
+		if deleted[status.SessionID] {
+			delete(h.componentStatuses, component)
+		}
+	}
+	h.mu.Unlock()
+	h.broadcastEvent(SessionDeletedEvent{
+		Event:            newEvent("session_deleted", time.Now().UTC()),
+		SessionID:        sessionID,
+		SourceSessionIDs: append([]string{}, sourceIDs...),
+	})
 }
 
 // storedEventTypes is the set of event types persisted to the event queue.

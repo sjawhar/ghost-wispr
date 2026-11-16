@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -12,6 +13,52 @@ import (
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
+
+// registerSessionDeleteRoute registers DELETE /api/sessions/{id}: it deletes
+// the session and the sessions merged into it, with their audio
+// (deleteSessionErasingAudio), then tells every connected web client which
+// sessions are gone (Hub.BroadcastSessionDeleted) and runs
+// controls.OnSessionDeleted. It refuses an active session.
+func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls *ControlHooks, hub *Hub, audioDir func() string) {
+	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.PathValue("id")
+		if !storage.ValidSessionID(sessionID) {
+			writeJSONError(w, http.StatusForbidden, "invalid session id")
+			return
+		}
+
+		sessionData, err := store.GetSession(sessionID)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+				status = http.StatusNotFound
+			}
+			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
+			return
+		}
+		if sessionData.Status == storage.SessionActive {
+			writeJSONError(w, http.StatusConflict, "cannot delete active session")
+			return
+		}
+
+		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, func(sessionIDs []string) {
+			if hub != nil {
+				hub.BroadcastSessionDeleted(sessionIDs[0], sessionIDs[1:])
+			}
+			if controls.OnSessionDeleted != nil {
+				controls.OnSessionDeleted(sessionIDs)
+			}
+		})
+		switch {
+		case err == nil:
+			w.WriteHeader(http.StatusNoContent)
+		case errors.Is(err, storage.ErrDeleteReplacementPending), errors.Is(err, storage.ErrDeleteMergeActive):
+			writeJSONError(w, http.StatusConflict, err.Error())
+		default:
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
+	})
+}
 
 // deleteSessionErasingAudio deletes session sessionID and its merged sources
 // and erases their audio in recordingDir, in this order:

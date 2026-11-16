@@ -291,12 +291,24 @@ export function applyEvent(event: WebSocketEvent): void {
     case 'component_status':
       applyComponentStatus(event)
       return
+    case 'session_deleted':
+      for (const id of [event.session_id, ...(event.source_session_ids ?? [])]) {
+        removeSession(id)
+      }
+      return
     default:
       return
   }
 }
 
+// The sessions this tab removed: a status about one of them is never shown
+// again, also one the server sent before it learnt of the delete.
+const removedSessions = new Set<string>()
+
 export function applyComponentStatus(event: ComponentStatusEvent): void {
+  if (event.session_id && removedSessions.has(event.session_id)) {
+    return
+  }
   appState.componentStatuses = {
     ...appState.componentStatuses,
     [event.component]: {
@@ -321,6 +333,7 @@ export function resetState(): void {
   appState.liveSegmentsSessionId = ''
   detailRequestVersions.clear()
   summaryDeletionTimes.clear()
+  removedSessions.clear()
   appState.sessionsByDate = new Map()
   appState.sessionDetails = new Map()
   appState.dates = []
@@ -334,9 +347,16 @@ export function resetState(): void {
   appState.componentStatuses = {}
 }
 
+// removeSession drops a deleted session from this tab: its list entry, its
+// detail (title, summary, segments), its live segments and its statuses,
+// and keeps any later status about it out.
 export function removeSession(sessionId: string): void {
+  removedSessions.add(sessionId)
   invalidateSessionDetailRequest(sessionId)
   clearLiveSegmentsOf(sessionId)
+  if (appState.activeAudioSessionId === sessionId) {
+    appState.activeAudioSessionId = ''
+  }
   const nextByDate = new Map(appState.sessionsByDate)
   for (const [date, sessions] of nextByDate) {
     const filtered = sessions.filter((s) => s.id !== sessionId)

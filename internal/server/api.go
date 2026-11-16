@@ -136,15 +136,20 @@ func getSpeakerIndexByName(speakerNames string, name string) int {
 	return -1
 }
 
-func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
-	// audioDir is the audio directory a recording is read from when it is not
-	// where its entry points (recording.Resolve).
-	audioDir := func() string {
+// configuredAudioDir returns the audio directory a recording is read from
+// when it is not where its entry points (recording.Resolve), as configured
+// now.
+func configuredAudioDir(cfgStore *config.Store) func() string {
+	return func() string {
 		if cfgStore == nil {
 			return ""
 		}
 		return cfgStore.Get().AudioDir
 	}
+}
+
+func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *ControlHooks, healthChecker HealthChecker, cfgStore *config.Store, embeddingClient embedding.Client) {
+	audioDir := configuredAudioDir(cfgStore)
 
 	// Health check endpoints
 	mux.HandleFunc("GET /healthz/live", func(w http.ResponseWriter, r *http.Request) {
@@ -830,42 +835,6 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 		}
 
 		writeJSON(w, http.StatusOK, sessionData)
-	})
-
-	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
-		sessionID := r.PathValue("id")
-		if !storage.ValidSessionID(sessionID) {
-			writeJSONError(w, http.StatusForbidden, "invalid session id")
-			return
-		}
-
-		sessionData, err := store.GetSession(sessionID)
-		if err != nil {
-			status := http.StatusInternalServerError
-			if errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
-				status = http.StatusNotFound
-			}
-			writeJSONError(w, status, fmt.Sprintf("get session: %v", err))
-			return
-		}
-		if sessionData.Status == storage.SessionActive {
-			writeJSONError(w, http.StatusConflict, "cannot delete active session")
-			return
-		}
-
-		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, func(sessionIDs []string) {
-			if controls.OnSessionDeleted != nil {
-				controls.OnSessionDeleted(sessionIDs)
-			}
-		})
-		switch {
-		case err == nil:
-			w.WriteHeader(http.StatusNoContent)
-		case errors.Is(err, storage.ErrDeleteReplacementPending), errors.Is(err, storage.ErrDeleteMergeActive):
-			writeJSONError(w, http.StatusConflict, err.Error())
-		default:
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
-		}
 	})
 
 	mux.HandleFunc("POST /api/sessions/merge", func(w http.ResponseWriter, r *http.Request) {
