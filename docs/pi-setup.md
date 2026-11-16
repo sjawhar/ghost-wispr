@@ -162,21 +162,27 @@ holds an `envoy-webhook-secret` file. Ghost Wispr reads the key from Secret Mana
 it in memory. When Envoy answers 401 it reads the key again once, so a rotation needs no change on
 the Pi. When it cannot read the key it sends no events and `/api/status` says so; recording goes on.
 
-Make the six public files on the development machine where you ran `create-cred-config`. Its
-`gcloud` must be the devbox identity, its `gh` must read `theorem-labs/agent-infra`'s Actions
-logs, and it needs `agent-infra` checked out at `~/src/agent-infra`. The block reads no Pulumi
-state: the devbox identity cannot list the `root` and `envoy-cluster` state buckets (403). Each
-value comes from a source that identity reads, at the time you run the block:
+Make the six public files on the development machine where you ran `create-cred-config`, from a
+Ghost Wispr checkout. Its `gcloud` must be the devbox identity, its `gh` must read
+`theorem-labs/agent-infra`'s Actions logs, and it needs `agent-infra` checked out at
+`~/src/agent-infra`. The block reads no Pulumi state: the devbox identity cannot list the `root`
+and `envoy-cluster` state buckets (403). Each value comes from a source that identity reads, at
+the time you run the block:
 
 - `tailscale-subject` from `root/Pulumi.prod.yaml` on `agent-infra`'s `origin/main`.
-- `tailscale-client-id` from a `seed` run's log. The block walks the `seed` workflow's runs from
-  the newest and takes the first `root` job whose log says that `ghost-wispr-x509` was created
-  (or replaced), so a later re-creation wins. It prints that job's link. It reads the log with
-  `gh api .../actions/jobs/<id>/logs`, because `gh run view --job <id> --log` refuses while
-  another job of the same run still waits for its approval. GitHub deletes run logs after the
-  repository's retention period. When the block finds no such job, read the ID from
-  `/opt/ghost-wispr/tailscale-client-id` on a Pi provisioned before, or ask someone who can read
-  `root`'s Pulumi state for `pulumi stack output ghostWisprTailnetClientId --stack prod`.
+- `tailscale-client-id` from a `seed` run's log, with `deploy/pi/tailnet-client-id.sh`. It reads
+  the `seed` workflow's runs from the newest, and every attempt of a re-run run, and takes the
+  first `root` job whose log says that `ghost-wispr-x509` was created or replaced, so the newest
+  creation wins. It prints that job's link. It stops with an error, and writes no ID, when a
+  `root` job that ran is still running or its log cannot be read, because that job can hold a
+  newer ID; run it again. It reads the log with `gh api .../actions/jobs/<id>/logs`, because
+  `gh run view --job <id> --log` refuses while another job of the same run still waits for its
+  approval. It reads the runs of the last 90 days: `agent-infra` keeps run logs for 90 days
+  (`root/retention.json`). It makes one API call for each run it reads, so it takes about 15
+  minutes for each 1000 runs before the creation. When no run of the last 90 days made the
+  identity, it says so; then read the ID from `/opt/ghost-wispr/tailscale-client-id` on a Pi
+  provisioned before, or ask someone who can read `root`'s Pulumi state for
+  `pulumi stack output ghostWisprTailnetClientId --stack prod`.
 - `envoy-webhook-url` from the Cloud Run service list: `envoy-cluster` gives the relay's service
   name a suffix, so the block matches its prefix `envoy-webhook-relay-`.
 
@@ -189,15 +195,7 @@ cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
 git -C ~/src/agent-infra fetch --quiet origin main
 git -C ~/src/agent-infra show origin/main:root/Pulumi.prod.yaml \
   | sed -n 's/^  agent-infra-root:ghostWisprAccountUniqueId: "\{0,1\}\([0-9][0-9]*\)"\{0,1\}$/\1/p' >"$prepared/tailscale-subject"
-for run in $(gh run list -R theorem-labs/agent-infra --workflow seed.yaml --limit 1000 --json databaseId --jq '.[].databaseId'); do
-  for job in $(gh api "repos/theorem-labs/agent-infra/actions/runs/$run/jobs" --jq '.jobs[] | select(.name == "root" and .conclusion != "skipped") | .id'); do
-    log=$(gh api "repos/theorem-labs/agent-infra/actions/jobs/$job/logs" 2>/dev/null) || continue
-    grep -Eq 'FederatedIdentity ghost-wispr-x509 (created|replaced)' <<<"$log" || continue
-    printf 'tailscale-client-id: https://github.com/theorem-labs/agent-infra/actions/runs/%s/job/%s\n' "$run" "$job"
-    sed -n 's/^.* + ghostWisprTailnetClientId *: "\([A-Za-z0-9._:-]*\)"$/\1/p' <<<"$log" | sort -u >"$prepared/tailscale-client-id"
-    break 2
-  done
-done
+deploy/pi/tailnet-client-id.sh >"$prepared/tailscale-client-id"
 relay=$(gcloud run services list --project=theorem-agent-infra --filter='metadata.name ~ ^envoy-webhook-relay-' --format='value(status.url)')
 printf '%s/webhook/ghostwispr\n' "$relay" >"$prepared/envoy-webhook-url"
 head "$prepared/tailscale-subject" "$prepared/tailscale-client-id" "$prepared/envoy-webhook-url"

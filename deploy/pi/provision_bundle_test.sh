@@ -69,10 +69,16 @@ printf 'fake pulumi: 403: the devbox identity does not have storage.objects.list
 exit 1
 EOF
 
-# gh answers as GitHub does for agent-infra's seed workflow, newest run first: run 904's root job
-# was skipped; 903's ran a preview, which prints the client id as [unknown]; 902's created
-# ghost-wispr-x509 and printed its client id; 901's created an earlier identity, whose client id
-# is stale.
+# gh answers as GitHub does for agent-infra's seed workflow: the runs newest first, two to a page
+# here, and the jobs of each attempt.
+# - 905, attempt 2: root was cancelled before it started (no steps, no log); attempt 1: skipped.
+# - 904: root ran a preview, which prints the client id as [unknown].
+# - 903, attempt 2 (a re-run): a preview again; attempt 1 replaced ghost-wispr-x509, so the
+#   client id changed from the stale one to CLIENT_ID (with TEST_CREATION_FORM=create it created it).
+# - 902: created the earlier identity, whose client id is stale.
+# - 901: older than the 90-day log retention; it created another identity.
+# TEST_JOB_RUNNING: 904's root job is still running. TEST_LOG_READ_FAIL: GitHub does not serve
+# 904's log. TEST_CREATION_EXPIRED: 903 and 902 made no identity, so only 901 did.
 cat >"$work_dir/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -88,28 +94,78 @@ done
 answer() {
   if [[ -n $jq_filter ]]; then jq -r "$jq_filter"; else cat; fi
 }
+not_found() {
+  printf 'fake gh: HTTP 404 for "%s"\n' "${args[*]}" >&2
+  exit 1
+}
 readonly api=repos/theorem-labs/agent-infra/actions
+recent=$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)
+expired=$(date -u -d '100 days ago' +%Y-%m-%dT%H:%M:%SZ)
+run_json() { printf '{"id":%s,"run_attempt":%s,"created_at":"%s"}' "$@"; }
+# root_job ID STATUS CONCLUSION STEPS: one attempt's jobs, a select job and the root job.
+root_job() {
+  printf '{"total_count":2,"jobs":[{"id":%s0,"name":"select","status":"completed","conclusion":"success","steps":[{"started_at":"%s"}]},' "${1%1}" "$recent"
+  printf '{"id":%s,"name":"root","status":"%s","conclusion":%s,"steps":[%s]}]}\n' "$1" "$2" "$3" "$4"
+}
+step=$(printf '{"started_at":"%s"}' "$recent")
 preview='2026-11-16T06:20:21.4658172Z   + ghostWisprTailnetClientId                   : [unknown]'
 created='2026-11-16T06:25:09.3203883Z  +  tailscale:index:FederatedIdentity ghost-wispr-x509 created (1s) '
-client_id_line() { printf '2026-11-16T06:29:36.3829213Z   + ghostWisprTailnetClientId                   : "%s"\n' "$1"; }
+created_id() { printf '2026-11-16T06:29:36.3829213Z   + ghostWisprTailnetClientId                   : "%s"\n' "$1"; }
+preview_replace='2026-11-16T06:20:21.4658172Z   ~ ghostWisprTailnetClientId                   : "k-stale-client-id" => [unknown]'
+replaced='2026-11-16T06:25:09.3203883Z  +-  tailscale:index:FederatedIdentity ghost-wispr-x509 replaced (1s) [diff: ~audience]'
+replaced_id='2026-11-16T06:29:36.3829213Z   ~ ghostWisprTailnetClientId                   : "k-stale-client-id" => "'"$CLIENT_ID"'"'
 case "${args[*]}" in
-  'run list -R theorem-labs/agent-infra --workflow seed.yaml --limit 1000 --json databaseId')
-    printf '[{"databaseId":904},{"databaseId":903},{"databaseId":902},{"databaseId":901}]\n' | answer ;;
-  "api $api/runs/904/jobs")
-    printf '{"jobs":[{"id":9040,"name":"select","conclusion":"success"},{"id":9041,"name":"root","conclusion":"skipped"}]}\n' | answer ;;
-  "api $api/runs/90"[1-3]"/jobs")
-    run=${args[1]#"$api/runs/"}
-    run=${run%/jobs}
-    printf '{"jobs":[{"id":%s0,"name":"select","conclusion":"success"},{"id":%s1,"name":"root","conclusion":"failure"}]}\n' "$run" "$run" | answer ;;
-  "api $api/jobs/9031/logs") printf '%s\n' "$preview" ;;
-  # TEST_NO_CREATION_LOG: GitHub deleted the logs of the runs that created the identity.
-  "api $api/jobs/90"[12]"1/logs") [[ -z ${TEST_NO_CREATION_LOG:-} ]] || exit 1 ;;&
-  "api $api/jobs/9021/logs") printf '%s\n' "$preview" "$created" "$(client_id_line "$CLIENT_ID")" ;;
-  "api $api/jobs/9011/logs") printf '%s\n' "$preview" "$created" "$(client_id_line k-stale-client-id)" ;;
-  *)
-    printf 'fake gh: HTTP 404 for "%s"\n' "${args[*]}" >&2
-    exit 1
+  "api $api/workflows/seed.yaml/runs?per_page=100&page="*)
+    case ${args[1]##*page=} in
+      1) runs="$(run_json 905 2 "$recent"),$(run_json 904 1 "$recent")" ;;
+      2) runs="$(run_json 903 2 "$recent"),$(run_json 902 1 "$recent")" ;;
+      3) runs=$(run_json 901 1 "$expired") ;;
+      *) runs= ;;
+    esac
+    printf '{"total_count":5,"workflow_runs":[%s]}\n' "$runs" | answer
     ;;
+  "api $api/runs/"*"/attempts/"*"/jobs?per_page=100")
+    attempt=${args[1]#"$api/runs/"}
+    run=${attempt%%/*}
+    attempt=${attempt#*/attempts/}
+    attempt=${attempt%%/*}
+    job="$run${attempt}1"
+    case $run/$attempt in
+      905/2) root_job "$job" completed '"cancelled"' '' ;;
+      905/1) root_job "$job" completed '"skipped"' '' ;;
+      904/1)
+        if [[ -n ${TEST_JOB_RUNNING:-} ]]; then root_job "$job" in_progress null "$step"; else root_job "$job" completed '"failure"' "$step"; fi
+        ;;
+      903/[12] | 902/1 | 901/1) root_job "$job" completed '"success"' "$step" ;;
+      *) not_found ;;
+    esac | answer
+    ;;
+  "api $api/jobs/90411/logs")
+    if [[ -n ${TEST_LOG_READ_FAIL:-} ]]; then
+      printf 'fake gh: HTTP 502: Server Error\n' >&2
+      exit 1
+    fi
+    printf '%s\n' "$preview"
+    ;;
+  "api $api/jobs/90321/logs") printf '%s\n' "$preview_replace" ;;
+  "api $api/jobs/90311/logs")
+    if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
+      printf '%s\n' "$preview"
+    elif [[ ${TEST_CREATION_FORM:-} == create ]]; then
+      printf '%s\n' "$preview" "$created" "$(created_id "$CLIENT_ID")"
+    else
+      printf '%s\n' "$preview_replace" "$replaced" "$replaced_id"
+    fi
+    ;;
+  "api $api/jobs/90211/logs")
+    if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
+      printf '%s\n' "$preview"
+    else
+      printf '%s\n' "$preview" "$created" "$(created_id k-stale-client-id)"
+    fi
+    ;;
+  "api $api/jobs/90111/logs") printf '%s\n' "$preview" "$created" "$(created_id k-expired-client-id)" ;;
+  *) not_found ;;
 esac
 EOF
 
@@ -323,11 +379,27 @@ TEST_PROVISION_EXIT=255 TEST_PROVISION_SAYS='ghost-wispr provision: starting the
   run_runbook "$work_dir/dropped-after-join" 2>/dev/null \
   || fail "the runbook failed although the SSH session ended after the tailnet join started"
 
-# No seed run's log holds the creation (the logs expired): the runbook stops before provisioning.
-if TEST_NO_CREATION_LOG=1 run_runbook "$work_dir/no-client-id" >/dev/null 2>&1; then
-  fail "the runbook succeeded although no seed run's log holds ghostWisprTailnetClientId"
-fi
-[[ ! -e $work_dir/no-client-id/pi/bundle.list ]] || fail "the runbook provisioned the Pi without a tailscale-client-id"
+# A creation prints the client id as `+ … : "ID"`; the default case's replacement prints `~ … : "OLD" => "ID"`.
+TEST_CREATION_FORM=create run_runbook "$work_dir/create-form" >/dev/null 2>&1 \
+  || fail "the runbook failed when the newest seed run created ghost-wispr-x509"
+[[ $(<"$work_dir/create-form/pi/bundle/tailscale-client-id") == "$CLIENT_ID" ]] \
+  || fail "tailscale-client-id is not the id the creation printed: $(<"$work_dir/create-form/pi/bundle/tailscale-client-id")"
+
+# The search never reads past a root job it could not read, and never past 90 days: each case
+# stops before provisioning, with its reason, although an older run's log holds a client id.
+for case_name in TEST_JOB_RUNNING TEST_LOG_READ_FAIL TEST_CREATION_EXPIRED; do
+  case $case_name in
+    TEST_JOB_RUNNING) reason='/job/90411 is in_progress: run this again once it has finished' ;;
+    TEST_LOG_READ_FAIL) reason='could not read the log of the root job https://github.com/theorem-labs/agent-infra/actions/runs/904/job/90411' ;;
+    TEST_CREATION_EXPIRED) reason='no seed run of the last 90 days made ghost-wispr-x509' ;;
+  esac
+  if (export "$case_name=1" && run_runbook "$work_dir/$case_name") >"$work_dir/$case_name.out" 2>&1; then
+    fail "the runbook succeeded with $case_name: $(grep -h . "$work_dir/$case_name/pi/bundle/tailscale-client-id" 2>/dev/null)"
+  fi
+  grep -Fq "$reason" "$work_dir/$case_name.out" \
+    || fail "with $case_name the runbook did not stop with '$reason': $(<"$work_dir/$case_name.out")"
+  [[ ! -e $work_dir/$case_name/pi/bundle.list ]] || fail "with $case_name the runbook provisioned the Pi"
+done
 
 # Slice 1 acceptance: the secret reaches the driver's environment alone, read under a grant.
 cat >"$work_dir/accept-driver" <<'EOF'
