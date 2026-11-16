@@ -206,16 +206,39 @@ deploy/pi/provision-pi.sh --prepared "$prepared"
 
 `provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says
 so (exit 255). If it could not remove the sources directory on the Pi, reconnect with Tailscale
-SSH and run the `rm` command it prints. Then check the detached join:
+SSH and run the `rm` command it prints.
+
+The tagged join makes a new Tailscale device. The temporary device you joined as your own still
+holds the name `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
+`ghost-wispr.tail12ec1c.ts.net` does not reach the recorder. Provisioning again does not fix
+that: `provision-pi.sh` reaches the Pi by that name. Give the tagged device its name with
+`deploy/pi/claim-tailnet-name.sh`, under a secrets-broker grant of `TAILSCALE_API_KEY` that Sami
+approves on the broker page:
+
+```bash
+secret-run --register --wait 12h \
+  --reason 'Ghost Wispr (docs/pi-setup.md): give the tagged recorder the tailnet name ghost-wispr' \
+  TAILSCALE_API_KEY -- deploy/pi/claim-tailnet-name.sh
+```
+
+It removes the temporary device only when that device holds the name, has the hostname
+`ghost-wispr`, has a user owner and no tag, and is offline. Then it renames the tagged device and
+reads the name back. It refuses any other holder and changes nothing. When the tagged device has
+the name already, it does nothing. The key reaches `curl` on stdin, never as an argument.
+
+Then check the join and the name:
 
 ```bash
 ssh ghost-wispr@ghost-wispr 'tailscale status --self --json'
 ssh ghost-wispr@ghost-wispr 'journalctl -u "ghost-wispr-tailnet-join-*"'
+curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/version
 ```
 
 The status must show exactly `Tags: ["tag:ghost-wispr"]` and
-`DNSName: "ghost-wispr.tail12ec1c.ts.net."`. If Tailscale names it `ghost-wispr-1`, remove
-the stale Tailscale device and provision again.
+`DNSName: "ghost-wispr.tail12ec1c.ts.net."`, and `curl` must print the release's commit over a
+valid certificate. If the certificate check fails, set Serve again
+(`ssh ghost-wispr@ghost-wispr 'sudo tailscale serve --bg --https 443 http://127.0.0.1:8080'`) and
+run `curl` again.
 
 ## Enable models and Drive sync
 
