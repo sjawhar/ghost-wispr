@@ -28,6 +28,7 @@ readonly text_only_phrase='orange tractor ninety'
 readonly text_only_pair="orange${separator}tractor"
 readonly text_only_trace='(^|[^[:alnum:]])(orange|tractor|ninety)([^[:alnum:]]|$)'
 readonly text_only_query='orange tractor'
+readonly text_only_tokens=(orange tractor)
 readonly audio_phrase='purple elephant seventeen'
 readonly audio_pair="purple${separator}elephant"
 readonly audio_trace='(^|[^[:alnum:]])(purple|elephant|seventeen)([^[:alnum:]]|$)'
@@ -35,6 +36,7 @@ readonly audio_trace='(^|[^[:alnum:]])(purple|elephant|seventeen)([^[:alnum:]]|$
 # number as digits or as words.
 readonly audio_phrase_pattern="purple${separator}elephant${separator}(seventeen|17)"
 readonly audio_query='purple elephant'
+readonly audio_tokens=(purple elephant)
 # The control phrase is never deleted: every read after a delete must still hold it.
 readonly control_phrase='blue harbor lantern'
 readonly control_pair="blue${separator}harbou?r${separator}lantern"
@@ -600,13 +602,20 @@ check_search_empty() {
 }
 
 # check_db_scan REPORT MODE NAME [CONTROL]: read a database scan from the Pi (db_scan in
-# remote_script). MODE present (a control before a delete) needs the NAME pattern in the
-# database or its write-ahead log, and in the pre-migration backup. MODE absent needs NAME in no
-# file, and CONTROL in the database or its log and in the backup, which shows that the same
-# reads see conversation text.
+# remote_script), which counts each word of NAME's phrase (scan_tokens) on its own, because the
+# search index stores the words apart. MODE present (a control before a delete) needs every word
+# in the database or its write-ahead log, and in the pre-migration backup. MODE absent needs no
+# word in any file, and CONTROL in the database or its log and in the backup, which shows that the
+# same reads see conversation text.
 check_db_scan() {
-  local report=$1 mode=$2 name=$3 control=${4:-} kind role pattern count path
-  local roles=' ' files=0 name_counts=0 live=0 backup=0 live_control=0 backup_control=0 holders=''
+  local report=$1 mode=$2 name=$3 control=${4:-} kind role pattern count path token
+  local roles=' ' files=0 name_counts=0 live_control=0 backup_control=0 holders='' missing=''
+  local -a tokens
+  mapfile -t tokens < <(scan_tokens "$name")
+  if (( ${#tokens[@]} == 0 )); then
+    reason="the scan has no words for $name"
+    return 2
+  fi
   if blank "$report"; then
     reason='the database scan returned nothing'
     return 2
@@ -626,15 +635,11 @@ check_db_scan() {
           reason="grep could not read $path"
           return 2
         fi
-        if [[ "$pattern" == "$name" ]]; then
+        if [[ "$pattern" == "$name".* ]]; then
           name_counts=$((name_counts + 1))
           if (( count > 0 )); then
-            holders+="$role $path ($count lines); "
+            holders+="$role $path (\"${pattern#"$name".}\", $count lines); "
           fi
-          case "$role" in
-            db|wal) live=$((live + count)) ;;
-            backup) backup=$((backup + count)) ;;
-          esac
         elif [[ -n "$control" && "$pattern" == "$control" ]]; then
           case "$role" in
             db|wal) live_control=$((live_control + count)) ;;
@@ -650,32 +655,45 @@ check_db_scan() {
       return 2
     fi
   done
-  if (( name_counts != files )); then
-    reason="the scan read $name_counts of $files files"
+  if (( name_counts != files * ${#tokens[@]} )); then
+    reason="the scan read $name_counts of $((files * ${#tokens[@]})) word counts"
     return 2
   fi
   if [[ "$mode" == present ]]; then
-    if (( live > 0 && backup > 0 )); then
-      reason="the phrase is in $holders"
+    for token in "${tokens[@]}"; do
+      if (( $(scan_count "$report" "$name.$token" db wal) == 0 )); then
+        missing+="\"$token\" is in neither the database nor its write-ahead log; "
+      fi
+      if (( $(scan_count "$report" "$name.$token" backup) == 0 )); then
+        missing+="\"$token\" is not in the pre-migration backup; "
+      fi
+    done
+    if [[ -z "$missing" ]]; then
+      reason="every word of the phrase is in $holders"
       return 0
     fi
-    if (( live == 0 )); then
-      reason='the phrase is in neither the database nor its write-ahead log'
-    else
-      reason='the phrase is not in the pre-migration backup'
-    fi
+    reason=$missing
     return 1
   fi
   if [[ -n "$holders" ]]; then
-    reason="the phrase is still in $holders"
+    reason="a word of the phrase is still in $holders"
     return 1
   fi
   if [[ -n "$control" ]] && (( live_control == 0 || backup_control == 0 )); then
     reason="the control phrase is not in both the database (or its log) and the backup, so the scan may be blind"
     return 2
   fi
-  reason="no file of the $files in the database directory holds the phrase"
+  reason="no file of the $files in the database directory holds a word of the phrase"
   return 0
+}
+
+# scan_count REPORT PATTERN ROLE...: the lines of the files with one of ROLE that a database scan
+# counted for PATTERN.
+scan_count() {
+  local report=$1 pattern=$2
+  shift 2
+  awk -F '\t' -v pattern="$pattern" -v roles=" $* " \
+    '$1 == "count" && $3 == pattern && index(roles, " " $2 " ") { sum += $4 } END { print sum + 0 }' <<<"$report"
 }
 
 backup_mtime() {
@@ -1026,8 +1044,27 @@ evaluate_audio_after() {
   done <<<"$recordings"
 }
 
+# scan_tokens NAME: the words of NAME's phrase that the database scan looks for, each on its own.
+# SQLite's search index stores each word of a row as its own term, in sorted order, apart from its
+# neighbours, so it never holds the phrase as adjacent words. The number word is left out: live
+# transcription may write it as digits, and two digits are in every database.
+scan_tokens() {
+  case "$1" in
+    text_only) printf '%s\n' "${text_only_tokens[@]}" ;;
+    audio) printf '%s\n' "${audio_tokens[@]}" ;;
+  esac
+}
+
+# scan_patterns: the patterns db_scan counts, one line each, NAME=PATTERN. A phrase's words are
+# NAME.WORD; the control phrase, which the rows still hold as text, is one pattern.
 scan_patterns() {
-  printf 'text_only=%s\naudio=%s\ncontrol=%s\n' "$text_only_pair" "$audio_pair" "$control_pair"
+  local name token
+  for name in text_only audio; do
+    while IFS= read -r token; do
+      printf '%s.%s=%s\n' "$name" "$token" "$token"
+    done < <(scan_tokens "$name")
+  done
+  printf 'control=%s\n' "$control_pair"
 }
 
 # remote_script REQUESTS [DEPLOY_DIR DATABASE]: a bash script for the Pi that runs each request
@@ -1952,30 +1989,37 @@ run_self_test() (
   report=$(printf '%s\n' \
     $'db\t/u/data/ghost-wispr.db' \
     $'file\tdb\t4096\t100\t/u/data/ghost-wispr.db' \
-    $'count\tdb\ttext_only\t0\t/u/data/ghost-wispr.db' \
+    $'count\tdb\ttext_only.orange\t0\t/u/data/ghost-wispr.db' \
+    $'count\tdb\ttext_only.tractor\t0\t/u/data/ghost-wispr.db' \
     $'count\tdb\tcontrol\t2\t/u/data/ghost-wispr.db' \
     $'file\twal\t4096\t100\t/u/data/ghost-wispr.db-wal' \
-    $'count\twal\ttext_only\t0\t/u/data/ghost-wispr.db-wal' \
+    $'count\twal\ttext_only.orange\t0\t/u/data/ghost-wispr.db-wal' \
+    $'count\twal\ttext_only.tractor\t0\t/u/data/ghost-wispr.db-wal' \
     $'count\twal\tcontrol\t0\t/u/data/ghost-wispr.db-wal' \
     $'file\tbackup\t4096\t90\t/u/data/ghost-wispr.db.pre-migrate.bak' \
-    $'count\tbackup\ttext_only\t0\t/u/data/ghost-wispr.db.pre-migrate.bak' \
+    $'count\tbackup\ttext_only.orange\t0\t/u/data/ghost-wispr.db.pre-migrate.bak' \
+    $'count\tbackup\ttext_only.tractor\t0\t/u/data/ghost-wispr.db.pre-migrate.bak' \
     $'count\tbackup\tcontrol\t1\t/u/data/ghost-wispr.db.pre-migrate.bak')
   expect 0 'a clean database scan with the control phrase passes' check_db_scan "$report" absent text_only control
   expect 1 'a log that still holds the phrase fails' check_db_scan \
-    "${report/$'wal\ttext_only\t0'/$'wal\ttext_only\t3'}" absent text_only control
+    "${report/$'wal\ttext_only.tractor\t0'/$'wal\ttext_only.tractor\t3'}" absent text_only control
   expect 1 'a backup that still holds the phrase fails' check_db_scan \
-    "${report/$'backup\ttext_only\t0'/$'backup\ttext_only\t1'}" absent text_only control
+    "${report/$'backup\ttext_only.orange\t0'/$'backup\ttext_only.orange\t1'}" absent text_only control
   expect 2 'a backup without the control phrase is UNKNOWN' check_db_scan \
     "${report/$'backup\tcontrol\t1'/$'backup\tcontrol\t0'}" absent text_only control
   expect 2 'a scan without the backup is UNKNOWN' check_db_scan \
     "$(grep -v 'pre-migrate' <<<"$report")" absent text_only control
   expect 2 'a scan grep could not read is UNKNOWN' check_db_scan \
-    "${report/$'wal\ttext_only\t0'/$'wal\ttext_only\terror'}" absent text_only control
+    "${report/$'wal\ttext_only.orange\t0'/$'wal\ttext_only.orange\terror'}" absent text_only control
+  expect 2 'a scan that did not count one of the words is UNKNOWN' check_db_scan \
+    "$(grep -v $'backup\ttext_only.tractor' <<<"$report")" absent text_only control
   expect 2 'a failed scan is UNKNOWN' check_db_scan $'error\tghost-wispr.service has no running process' absent text_only control
   expect 2 'an empty scan is UNKNOWN' check_db_scan '' absent text_only control
   expect 1 'a scan before the delete without the phrase fails the control' check_db_scan "$report" present text_only
-  expect 0 'a scan before the delete with the phrase in the log and the backup passes the control' check_db_scan \
-    "$(sed $'s/wal\ttext_only\t0/wal\ttext_only\t2/; s/backup\ttext_only\t0/backup\ttext_only\t1/' <<<"$report")" present text_only
+  expect 0 'a scan before the delete with every word in the log and the backup passes the control' check_db_scan \
+    "$(sed $'s/wal\ttext_only\\.\\([a-z]*\\)\t0/wal\ttext_only.\\1\t2/; s/backup\ttext_only\\.\\([a-z]*\\)\t0/backup\ttext_only.\\1\t1/' <<<"$report")" present text_only
+  expect 1 'a scan before the delete with one word missing from the backup fails the control' check_db_scan \
+    "$(sed $'s/wal\ttext_only\\.\\([a-z]*\\)\t0/wal\ttext_only.\\1\t2/; s/backup\ttext_only\\.orange\t0/backup\ttext_only.orange\t1/' <<<"$report")" present text_only
   expect 0 'a newer backup after the restart passes' check_backup_retaken "$report" \
     "${report/$'backup\t4096\t90'/$'backup\t4096\t200'}"
   expect 2 'a backup the restart did not rewrite is UNKNOWN' check_backup_retaken "$report" "$report"
@@ -2062,7 +2106,7 @@ $(session_field "$detail" summary)"
   expect 1 'a recording whose sha256 changed fails' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
   plant_variant file.S1.get.code 404
   expect 1 'a Drive file id answering 404 fails' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
-  plant_variant db.report "${report/$'backup\ttext_only\t0'/$'backup\ttext_only\t1'}"
+  plant_variant db.report "${report/$'backup\ttext_only.tractor\t0'/$'backup\ttext_only.tractor\t1'}"
   expect 1 'a pre-migration backup that still holds the phrase fails' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
   plant_variant file.T1.export.body ''
   expect 2 'an empty Drive transcript download is UNKNOWN' evaluated evaluate_text_only_after "$variant" "$detail" '[]' "$found"
@@ -2108,6 +2152,23 @@ $(session_field "$detail" summary)"
   expect 2 'the scan without a pre-migration backup is UNKNOWN' check_db_scan "$(result "$scan_dir" db.report)" absent text_only control
   printf 'A11 text only self-test RAN: planted failure rejected\n'
   printf 'A11 text only self-test RAN: the database scan sees a planted phrase in binary data in the database, its log and its backup\n'
+
+  # SQLite's search index keeps each word of a row as its own term, in sorted order, with other
+  # terms between them, so it never holds "purple elephant" as adjacent words. The scan must
+  # still see a phrase that is left only there, in the database, its log and its backup.
+  printf 'SQLite format 3\000\010elephant\000\004harbor\000\007lantern\000\006purple\000\005blue harbor lantern\000' >"$database"
+  printf 'WAL\000\377\010elephant\000\004noon\000\006purple\000' >"$database-wal"
+  printf 'SQLite format 3\000\010elephant\000\006purple\000\003blue harbor lantern\000' >"$database.pre-migrate.bak"
+  expect 1 'adjacent words do not see the words of a phrase that a search index stores apart' \
+    check_present "$(tr '\000' ' ' <"$database")" "$audio_pair"
+  scan_dir=$(mktemp -d "$controls_dir/scan.XXXXXX")
+  bash -s <<<"$(remote_script $'db_scan\tdb\t-\t-' "$db_root" "$database")" | tar -x -C "$scan_dir" -f - \
+    || fail 'self-test: the database scan did not run'
+  expect 0 'the scan finds each word of a phrase that only a search index holds' check_db_scan \
+    "$(result "$scan_dir" db.report)" present audio
+  expect 1 'the scan reports a phrase that only a search index holds as still there' check_db_scan \
+    "$(result "$scan_dir" db.report)" absent audio control
+  printf 'A11 self-test RAN: the database scan finds each word of a phrase that a search index stores apart from the other, where adjacent words see nothing\n'
 
   # A11: each pure check against a planted failure and a planted pass.
   expect 1 'an old file id answering 200 after the audio delete fails' check_answers_404 200

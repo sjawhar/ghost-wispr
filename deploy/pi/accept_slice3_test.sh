@@ -21,6 +21,7 @@ fi
 for line in \
   'A11 text only self-test RAN: planted failure rejected' \
   'A11 text only self-test RAN: the database scan sees a planted phrase in binary data in the database, its log and its backup' \
+  'A11 self-test RAN: the database scan finds each word of a phrase that a search index stores apart from the other, where adjacent words see nothing' \
   'A11 text only self-test RAN: a failed control stops the row before "Delete text"' \
   'A11 text only self-test RAN: "Delete text" sends mode=text and its revision on its segment, then retries refinement' \
   'A11 text only self-test RAN: a fast refinement accepts a 202 response and completes' \
@@ -120,6 +121,13 @@ assert_mutation_caught 'A11 requiring the phrase in the title' \
 assert_mutation_caught 'A11 accepting part of the phrase in the Drive documents before the delete' \
   'check_drive_documents "$dir" "$listing" present "$audio_phrase_pattern"' \
   'check_drive_documents "$dir" "$listing" present "$audio_pair"'
+
+# The search index keeps each word of a phrase as its own term, in sorted order, so a scan for
+# two adjacent words cannot see it; the scan looks for each word on its own.
+# shellcheck disable=SC2016 # The needles are the driver's source text.
+assert_mutation_caught 'a database scan for adjacent words' \
+  'audio) printf '"'"'%s\n'"'"' "${audio_tokens[@]}" ;;' \
+  'audio) printf '"'"'%s\n'"'"' "$audio_pair" ;;'
 
 # The Drive token and the Deepgram key stay out of curl's arguments, and the Drive token is read-only.
 # shellcheck disable=SC2016 # The needles are the driver's source text.
