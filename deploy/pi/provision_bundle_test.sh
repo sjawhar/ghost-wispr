@@ -73,9 +73,10 @@ EOF
 # here, and the jobs of each attempt.
 # - 905, attempt 2: root was cancelled before it started (no steps, no log); attempt 1: skipped.
 # - 904: root ran a preview, which prints the client id as [unknown].
-# - 903, attempt 2 (a re-run): a preview again; attempt 1 replaced ghost-wispr-x509, so the
-#   client id changed from the stale one to CLIENT_ID (with TEST_CREATION_FORM=create it created it).
-# - 902: created the earlier identity, whose client id is stale.
+# - 903, re-run twice: attempt 3 ran a preview again; attempt 2 replaced ghost-wispr-x509, so the
+#   client id changed from the stale one to CLIENT_ID (with TEST_CREATION_FORM=create it created
+#   it); attempt 1 created the earlier identity, whose client id is stale.
+# - 902: created the earlier identity too.
 # - 901: older than the 90-day log retention; it created another identity.
 # TEST_JOB_RUNNING: 904's root job is still running. TEST_LOG_READ_FAIL: GitHub does not serve
 # 904's log. TEST_CREATION_EXPIRED: 903 and 902 made no identity, so only 901 did.
@@ -118,7 +119,7 @@ case "${args[*]}" in
   "api $api/workflows/seed.yaml/runs?per_page=100&page="*)
     case ${args[1]##*page=} in
       1) runs="$(run_json 905 2 "$recent"),$(run_json 904 1 "$recent")" ;;
-      2) runs="$(run_json 903 2 "$recent"),$(run_json 902 1 "$recent")" ;;
+      2) runs="$(run_json 903 3 "$recent"),$(run_json 902 1 "$recent")" ;;
       3) runs=$(run_json 901 1 "$expired") ;;
       *) runs= ;;
     esac
@@ -136,7 +137,7 @@ case "${args[*]}" in
       904/1)
         if [[ -n ${TEST_JOB_RUNNING:-} ]]; then root_job "$job" in_progress null "$step"; else root_job "$job" completed '"failure"' "$step"; fi
         ;;
-      903/[12] | 902/1 | 901/1) root_job "$job" completed '"success"' "$step" ;;
+      903/[123] | 902/1 | 901/1) root_job "$job" completed '"success"' "$step" ;;
       *) not_found ;;
     esac | answer
     ;;
@@ -147,8 +148,8 @@ case "${args[*]}" in
     fi
     printf '%s\n' "$preview"
     ;;
-  "api $api/jobs/90321/logs") printf '%s\n' "$preview_replace" ;;
-  "api $api/jobs/90311/logs")
+  "api $api/jobs/90331/logs") printf '%s\n' "$preview_replace" ;;
+  "api $api/jobs/90321/logs")
     if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
       printf '%s\n' "$preview"
     elif [[ ${TEST_CREATION_FORM:-} == create ]]; then
@@ -157,7 +158,7 @@ case "${args[*]}" in
       printf '%s\n' "$preview_replace" "$replaced" "$replaced_id"
     fi
     ;;
-  "api $api/jobs/90211/logs")
+  "api $api/jobs/90311/logs" | "api $api/jobs/90211/logs")
     if [[ -n ${TEST_CREATION_EXPIRED:-} ]]; then
       printf '%s\n' "$preview"
     else
