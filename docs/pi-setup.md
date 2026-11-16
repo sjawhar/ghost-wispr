@@ -517,7 +517,10 @@ The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
   summary, semantic search, speech, and batch refinement. It compares the summary's
   `summary_model`, semantic-search `model`, speech response headers and status model/voice,
   and refinement `refinement_model` with the configured roles. A provider that does not report
-  its model produces `not reported by provider`; A8 marks that role PRECHECK and does not pass it.
+  its model produces `not reported by provider` (Vertex AI's embeddings never report one). The
+  spec asks that the unit run the plan's models, so A8 passes that role on the configuration the
+  unit runs, which it checks before any provider call: the deployed YAML names the plan's model
+  and no environment variable overrides it.
 - A10 checks the member list: the only organizers are the service account and Sami, and the
   approved readers group is the only reader.
 
@@ -570,18 +573,21 @@ One run records one conversation for both rows:
    chooses "Delete text" on that timed segment with its revision
    (`?mode=text&revision=N`) and checks again until the phrase is gone or 15 minutes pass. It
    then chooses "retry refinement" and checks once more.
-6. A11: every check runs once and must find "purple elephant seventeen". The driver then chooses
-   "Delete text and audio" on that timed segment with its revision
-   (`?mode=text_and_audio&revision=N`) and checks again.
+6. A11: every check runs once and must find "purple elephant seventeen", in any case and with
+   its number as digits or words, except the title and the Drive folder name: the summarizer
+   chooses whether to name the phrase there, so those two are noted, and after the delete they
+   must hold no trace of it either way. The driver then chooses "Delete text and audio" on that
+   timed segment with its revision (`?mode=text_and_audio&revision=N`) and checks again.
 
 `--session ID` uses a conversation already recorded from the script, and skips the precheck.
 
 The live driver reports `PASS`, `FAILED` or `UNKNOWN` for each check, and a verdict for each
 row and for the run.
 
-- Before each delete, each check must find the phrase. That finding is the control for the
-  same check after the delete. If a check cannot find the phrase, the row is UNKNOWN and
-  nothing is deleted; record a new conversation and run again.
+- Before each delete, each check must find the phrase (A11's title and Drive folder name only
+  note it). That finding is the control for the same check after the delete. If a check cannot
+  find the phrase, the row is UNKNOWN and nothing is deleted; record a new conversation and run
+  again.
 - After a delete, a read that is empty, that failed, or that does not hold "blue harbor
   lantern" is UNKNOWN, not PASS.
 - A11 text only checks the segments, the transcript, the refined transcript, the summary, the

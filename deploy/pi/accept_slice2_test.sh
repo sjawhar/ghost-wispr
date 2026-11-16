@@ -19,16 +19,18 @@ for row in A9 A6 A8 A10 Cert-warning; do
   [[ "$output" == *"$row self-test RAN: planted failure rejected"* ]] \
     || fail "self-test did not prove the $row check can fail"
 done
-for role in summary speech refinement; do
-  [[ "$output" == *"A8 PRECHECK: $role model was not reported by provider"* ]] \
-    || fail "self-test did not classify an unreported $role model as PRECHECK"
+# The spec's A8 asks that the unit run the plan's models, and the plan reads each model "from the
+# provider's response or the app's log": a provider that reports none passes on the configuration.
+for role in summary search speech refinement; do
+  [[ "$output" == *"A8 RAN: the provider did not report the $role model; the configuration the unit runs names "* ]] \
+    || fail "self-test did not pass an unreported $role model on the configured one"
 done
 [[ "$output" == *'A6 self-test RAN: canonical transcript supplied the search word'* ]] \
   || fail 'self-test did not prove A6 searches canonical_transcript'
 [[ "$output" == *'A8 self-test RAN: every reported model returns PASS'* ]] \
   || fail 'self-test did not prove run_a8 returns PASS when every role reports its model'
-[[ "$output" == *'A8 self-test RAN: unreported speech header is PRECHECK and later roles still run'* ]] \
-  || fail 'self-test did not prove the run_a8 speech header PRECHECK'
+[[ "$output" == *'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run'* ]] \
+  || fail 'self-test did not prove run_a8 passes, and runs every role, when no provider reports its model'
 
 
 assert_source_contains() {
