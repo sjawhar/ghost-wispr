@@ -334,15 +334,25 @@ func scrubBackupSessions(backup *sql.DB, sessionIDs []string) error {
 			if err != nil {
 				return err
 			}
-			column := "session_id"
+			// A row names a session in session_id, or, in recording_sources,
+			// in merged_session_id and source_session_id.
+			sessionColumns := []string{"session_id", "merged_session_id", "source_session_id"}
 			if table == "sessions" {
-				column = "id"
+				sessionColumns = []string{"id"}
 			}
-			if !found[column] {
+			var where []string
+			var whereArgs []any
+			for _, column := range sessionColumns {
+				if found[column] {
+					where = append(where, column+` IN (`+placeholders+`)`)
+					whereArgs = append(whereArgs, args...)
+				}
+			}
+			if len(where) == 0 {
 				continue
 			}
 			quoted := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
-			if _, err := tx.Exec(`DELETE FROM `+quoted+` WHERE `+column+` IN (`+placeholders+`)`, args...); err != nil {
+			if _, err := tx.Exec(`DELETE FROM `+quoted+` WHERE `+strings.Join(where, " OR "), whereArgs...); err != nil {
 				return fmt.Errorf("delete the deleted sessions from backup table %s: %w", table, err)
 			}
 		}
