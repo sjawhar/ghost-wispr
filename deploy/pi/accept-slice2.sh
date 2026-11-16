@@ -805,20 +805,19 @@ run_certificate_warning() {
   printf 'Cert-warning RAN: the test instance warns that its certificate expires.\n'
 }
 
+# run_row keeps the row's own status: 0 PASS, 2 NEEDS-PERSON, anything else FAIL.
 run_row() {
-  local row=$1 result
+  local row=$1 result=0
   shift
-  if "$@"; then
-    printf '%s verdict: PASS\n' "$row"
-    return
-  fi
-  result=$?
-  if (( result == 2 )); then
-    printf '%s verdict: NEEDS-PERSON\n' "$row"
-  else
-    printf '%s verdict: FAIL\n' "$row" >&2
-    row_failures=$((row_failures + 1))
-  fi
+  "$@" || result=$?
+  case $result in
+    0) printf '%s verdict: PASS\n' "$row" ;;
+    2) printf '%s verdict: NEEDS-PERSON\n' "$row" ;;
+    *)
+      printf '%s verdict: FAIL\n' "$row" >&2
+      row_failures=$((row_failures + 1))
+      ;;
+  esac
 }
 
 run_self_test() (
