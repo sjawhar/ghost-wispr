@@ -18,7 +18,13 @@ func TestLocalNameIsTheInverseOfFileName(t *testing.T) {
 			t.Errorf("LocalName(FileName(%q)) = %q, %v; want the recording's file name", path, name, ok)
 		}
 	}
-	for _, driveName := range []string{"transcript.md", "audio-", "audio-.", "audio-..", "audio-/", "audio-../escape.mp3", "audio-dir/x.mp3", "recording-audio-x.mp3"} {
+	// Review 5937373764 of #76: a Drive file name a recording's local name
+	// can not be: one with a comma (an audio path is a comma list, so it
+	// would split into another path), a hidden one, or one that is not an
+	// MP3 or WAV (".env", the binary), which recording.Resolve would try as
+	// a path from the working directory.
+	for _, driveName := range []string{"transcript.md", "audio-", "audio-.", "audio-..", "audio-/", "audio-../escape.mp3", "audio-dir/x.mp3", "recording-audio-x.mp3",
+		"audio-x,.env", "audio-x,y.mp3", "audio-.env", "audio-.hidden.mp3", "audio-x.env", "audio-ghost-wispr", "audio-x.pcm"} {
 		if name, ok := LocalName(driveName); ok {
 			t.Errorf("LocalName(%q) = %q, true; want no recording", driveName, name)
 		}

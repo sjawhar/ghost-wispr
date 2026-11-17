@@ -17,15 +17,31 @@ func FileName(path string) string {
 
 // LocalName returns the file name of the saved recording that the Drive file
 // name names, the inverse of FileName, and false for a name FileName does not
-// make: another file of the folder, or one whose rest is not a plain file
-// name (empty, "." or "..", or holding a separator), which joined to a
-// directory would name a path outside it.
+// make: another file of the folder, or one whose rest is not a recording's
+// plain file name (PlainName).
 func LocalName(name string) (string, bool) {
 	base, ok := strings.CutPrefix(name, driveNamePrefix)
-	if !ok || base == "" || base == "." || base == ".." || strings.ContainsRune(base, '/') || filepath.Base(base) != base {
+	if !ok || !PlainName(base) {
 		return "", false
 	}
 	return base, true
+}
+
+// PlainName reports whether name is the plain file name of a saved
+// recording: an .mp3 or .wav with no separator, not "." or "..", not hidden,
+// and with no comma. Joined to a directory it names a file in it; it never
+// names a file outside it, nor a file Resolve would find from the working
+// directory that is not a recording (such as .env or the binary), and an
+// audio path, a comma list, cannot split it into another path.
+func PlainName(name string) bool {
+	if name == "" || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/,`) || filepath.Base(name) != name {
+		return false
+	}
+	switch filepath.Ext(name) {
+	case ".mp3", ".wav":
+		return true
+	}
+	return false
 }
 
 // Key identifies the recording a path names whether it is saved as MP3 or as
