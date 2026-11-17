@@ -44,8 +44,11 @@ const sessionsDeletedUnsweptKey = "sessions_deleted_unswept_v2"
 // not ones it read before. In the same transaction, before the rows go, it
 // records the directory of each of those recordings, found where
 // recording.Resolve finds it in audioDir (the one the caller then erases), so
-// an erase a stop cuts off is finished as the app starts; it deletes nothing
-// if it cannot record one. In that transaction too it deletes every stored
+// an erase a stop cuts off is finished as the app starts, and it records each
+// session it deletes with the audio path its row names
+// (recordDeletedSessionAudio), so the kept recordings pass erases the audio
+// files a stop left under their names; it deletes nothing if it cannot record
+// one. In that transaction too it deletes every stored
 // event that names a session it deletes: a live transcript event holds the
 // conversation's words, a summary event its summary, and a component status
 // event that it existed and was refined and synced. It deletes the events
@@ -148,6 +151,9 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {
 			return "", fmt.Errorf("delete session %s: %w", id, err)
 		}
+	}
+	if err := recordDeletedSessionAudio(tx, deletedIDs); err != nil {
+		return "", fmt.Errorf("delete session %s: %w", id, err)
 	}
 	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
@@ -378,9 +384,11 @@ func (s *SQLiteStore) eraseAfterSessionDeletion(owed string, earlierOwed bool, s
 // source rows in one transaction, with every stored event that names one of
 // them (dropSessionSetEvents), and rebuilds the search index so their words
 // leave it (rebuildSearchIndex). It records every raw capture directory
-// before the rows go. It refuses when a session in that deletion set is
-// active, remote-deleted, refining, owes a Drive replacement, has an owed
-// Drive folder, or has a folder whose documents still need refresh. Once the
+// before the rows go, and each session it deletes for the kept recordings
+// pass (recordDeletedSessionAudio). It refuses when a session in that
+// deletion set is active, remote-deleted, refining, owes a Drive
+// replacement, has an owed Drive folder, or has a folder whose documents
+// still need refresh. Once the
 // delete commits, it is erased from the write-ahead log and the pre-migration
 // backup, as a person's delete is (eraseAfterSessionDeletion). It returns
 // the deleted session IDs so GC can erase each now-redundant raw capture.
@@ -465,6 +473,9 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 				return nil, false, fmt.Errorf("record raw erase directory for session %s: %w", deletedID, err)
 			}
 		}
+	}
+	if err := recordDeletedSessionAudio(tx, deletedIDs); err != nil {
+		return nil, false, fmt.Errorf("GC deletion of session %s: %w", id, err)
 	}
 	if err := dropSessionSetEvents(tx, id); err != nil {
 		return nil, false, err

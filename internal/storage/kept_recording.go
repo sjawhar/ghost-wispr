@@ -5,29 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 )
-
-// audioOwnedSinceKey is the app_state key that records from when the audio
-// directory's files belong to this database (AudioOwnedSince).
-const audioOwnedSinceKey = "audio_owned_since"
-
-// AudioOwnedSince returns from when the files in the audio directory belong
-// to this database: the first time a build that records it opened it. A file
-// last written before then may be a recording of a database that was lost
-// and made again, or one an earlier build left, so the absence of its
-// session's row does not mean the session was deleted.
-func (s *SQLiteStore) AudioOwnedSince() (time.Time, error) {
-	var value string
-	if err := s.db.QueryRow(`SELECT value FROM app_state WHERE key = ?`, audioOwnedSinceKey).Scan(&value); err != nil {
-		return time.Time{}, fmt.Errorf("read from when the audio belongs to this database: %w", err)
-	}
-	since, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("read from when the audio belongs to this database: %w", err)
-	}
-	return since, nil
-}
 
 // RecordKeptRecording records audioPath, saved from the raw recording kept
 // for session id, as the session's recording, and reports whether it did. It

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,21 +19,20 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// keptRecordingStore reads a session and gives it the recording saved from
-// its kept raw recording, and says what an audio file with no session row
-// may still belong to (storage.SQLiteStore).
+// keptRecordingStore reads a session, gives it the recording saved from its
+// kept raw recording, and lists the files sessions name and the deleted
+// sessions whose audio is left to erase (storage.SQLiteStore).
 type keptRecordingStore interface {
 	GetSession(id string) (storage.Session, error)
 	RecordKeptRecording(id, audioPath string, place func() error) (bool, error)
 	// Recordings lists every session that names audio, so a file another
-	// session names is never taken for a deleted session's.
+	// session names is never erased with a deleted session's.
 	Recordings() ([]storage.SessionRecording, error)
-	// RawEraseReservations lists the raw captures a session delete under way
-	// holds.
-	RawEraseReservations() ([]storage.RawEraseReservation, error)
-	// AudioOwnedSince is from when the audio directory's files belong to
-	// this database.
-	AudioOwnedSince() (time.Time, error)
+	// DeletedSessionAudio lists the sessions a delete recorded, whose audio
+	// files a stop may have left; ClearDeletedSessionAudio forgets one once
+	// none is left.
+	DeletedSessionAudio() ([]storage.DeletedSessionAudio, error)
+	ClearDeletedSessionAudio(id string) error
 }
 
 // keptRecordingSaver lists the raw recordings the recorder is not using and
@@ -78,6 +78,14 @@ type keptRecordingSaver interface {
 // session delete holds the session (Hold), which stops a save of it under
 // way. A temporary file found as a pass starts is a save a stop cut off, and
 // is erased.
+//
+// A pass first erases, with zeros, the audio files a stop left of each
+// session a person's delete or GC's age delete recorded in the transaction
+// that deleted its row (storage.DeletedSessionAudio), then clears the
+// record (eraseDeleted). It erases no other file of a session with no row,
+// and saves or gives none: a restored database backup has no row for the
+// sessions recorded since it, and nobody deleted those. The status names
+// their raw recordings for a person (rawByHand).
 type keptRecordings struct {
 	store    keptRecordingStore
 	recorder keptRecordingSaver
@@ -113,18 +121,18 @@ func newKeptRecordings(store keptRecordingStore, recorder keptRecordingSaver, au
 type rawAction int
 
 const (
-	rawSkip        rawAction = iota // a delete holds it, or its row could not be read: this pass leaves it
-	rawSave                         // the session ended with no recording: save it
-	rawAwaitDrive                   // saved, and Drive will take the saved recording: keep it until Drive has it
-	rawErase                        // saved, and Drive has the saved recording or cannot take it: erase it
-	rawEraseOrphan                  // its session has no row: erase it
-	rawByHand                       // the app neither saves nor erases it: it waits for a person
+	rawSkip       rawAction = iota // a delete holds it or recorded its session, or its row could not be read: this pass leaves it
+	rawSave                        // the session ended with no recording: save it
+	rawAwaitDrive                  // saved, and Drive will take the saved recording: keep it until Drive has it
+	rawErase                       // saved, and Drive has the saved recording or cannot take it: erase it
+	rawByHand                      // the app neither saves nor erases it: it waits for a person
 )
 
 // decide says what a pass does with session id's kept raw recording, and
-// returns the session as read.
-func (k *keptRecordings) decide(id string, orphans *orphanGuard) (storage.Session, rawAction) {
-	if k.isHeld(id) {
+// returns the session as read. deleted is the sessions a delete recorded
+// whose audio is still to erase (eraseDeleted).
+func (k *keptRecordings) decide(id string, deleted map[string]bool) (storage.Session, rawAction) {
+	if k.isHeld(id) || deleted[id] {
 		return storage.Session{}, rawSkip
 	}
 	sess, row := k.lookup(id)
@@ -132,14 +140,7 @@ func (k *keptRecordings) decide(id string, orphans *orphanGuard) (storage.Sessio
 	case rowUnreadable:
 		return sess, rawSkip
 	case rowMissing:
-		switch {
-		case orphans.erasable(id, recordingname.RawPath(k.audioDir, id)):
-			return sess, rawEraseOrphan
-		case orphans.reserved[id]:
-			return sess, rawSkip // a session delete under way erases it
-		default:
-			return sess, rawByHand
-		}
+		return sess, rawByHand
 	}
 	switch {
 	case sess.Status != storage.SessionEnded:
@@ -168,14 +169,21 @@ func (k *keptRecordings) driveWillTake(sess *storage.Session) bool {
 // census counts the raw recordings the app keeps, for GET /api/status, by
 // what the next pass does with them (decide): Unsaved it tries again to save,
 // AwaitingDrive it erases once Drive has their saved recording, and ByHand,
-// by session, it neither saves nor erases. One the next pass erases, one a
+// by session, it neither saves nor erases. One of a recorded delete, one a
 // delete holds, and the recording under way or being saved at a session end
 // are not counted. WarnBytes is left to the caller.
 func (k *keptRecordings) census() server.KeptRawRecordings {
 	var c server.KeptRawRecordings
-	orphans := k.orphanGuard()
+	deleted := map[string]bool{}
+	records, err := k.store.DeletedSessionAudio()
+	if err != nil {
+		log.Printf("warning: kept raw recordings: list deleted sessions: %v", err)
+	}
+	for _, record := range records {
+		deleted[record.SessionID] = true
+	}
 	for _, id := range k.recorder.KeptRawSessions() {
-		_, action := k.decide(id, &orphans)
+		_, action := k.decide(id, deleted)
 		switch action {
 		case rawSave:
 			c.Unsaved++
@@ -215,119 +223,136 @@ func (k *keptRecordings) run(ctx context.Context) {
 	}
 	defer k.running.Unlock()
 	k.eraseCutOffSaves()
-	orphans := k.orphanGuard()
+	deleted := k.eraseDeleted()
 	for _, id := range k.recorder.KeptRawSessions() {
 		if ctx.Err() != nil {
 			return
 		}
-		sess, action := k.decide(id, &orphans)
+		sess, action := k.decide(id, deleted)
 		switch action {
 		case rawSave:
 			// Once the saved recording is the session's, its raw recording
 			// goes at once where Drive cannot take the saved one.
 			if k.save(ctx, &sess) {
-				if _, after := k.decide(id, &orphans); after == rawErase {
+				if _, after := k.decide(id, deleted); after == rawErase {
 					k.eraseRaw(id)
 				}
 			}
 		case rawErase:
 			k.eraseRaw(id)
-		case rawEraseOrphan:
-			orphans.eraseAll(k, id, recordingname.RawPath(k.audioDir, id))
 		}
 	}
 	for id, saved := range k.savedWithoutRaw() {
 		if ctx.Err() != nil {
 			return
 		}
-		sess, row := k.lookup(id)
-		if row == rowUnreadable || k.isHeld(id) {
+		if deleted[id] || k.isHeld(id) {
 			continue
 		}
-		if row == rowMissing {
-			orphans.eraseAll(k, id, saved...)
-			continue
-		}
-		if sess.Status == storage.SessionEnded && sess.AudioPath == "" && sess.AudioRemovedAt == "" {
+		if sess, row := k.lookup(id); row == rowFound && sess.Status == storage.SessionEnded && sess.AudioPath == "" && sess.AudioRemovedAt == "" {
 			k.adopt(&sess, saved[len(saved)-1])
 		}
 	}
 }
 
-// orphanGuard is what a pass reads once, as it starts, to tell an audio file
-// of a session with no row that is a deleted session's from one it cannot
-// know to be: the files every session names (named, absolute), the sessions
-// whose raw capture a session delete under way holds (reserved), and from
-// when the audio directory's files belong to this database (since). ok is
-// false when any of these could not be read: the pass then erases no such
-// file.
-type orphanGuard struct {
-	named    map[string]bool
-	reserved map[string]bool
-	since    time.Time
-	ok       bool
+// eraseDeleted erases, with zeros, the audio files a stop left of each
+// session a delete recorded (storage.DeletedSessionAudio): its raw capture,
+// saved MP3 and WAV, a save's temporary files, and the recordings its row
+// named, except a file another session names now. Once none of them is left
+// it clears the record. It returns the recorded sessions it leaves for a
+// later pass (a delete holds it, a file could not be erased, or the store
+// could not be read), whose files the rest of the pass leaves alone.
+func (k *keptRecordings) eraseDeleted() map[string]bool {
+	left := map[string]bool{}
+	records, err := k.store.DeletedSessionAudio()
+	if err != nil {
+		log.Printf("warning: the audio of deleted sessions is not erased this pass: list them: %v", err)
+		return left
+	}
+	if len(records) == 0 {
+		return left
+	}
+	named, err := k.namedFiles()
+	if err != nil {
+		log.Printf("warning: the audio of deleted sessions is not erased this pass: %v", err)
+		for _, record := range records {
+			left[record.SessionID] = true
+		}
+		return left
+	}
+	for _, record := range records {
+		id := record.SessionID
+		if k.isHeld(id) {
+			left[id] = true
+			continue
+		}
+		remaining := false
+		for _, path := range k.deletedAudioFiles(&record) {
+			if named[path] {
+				continue
+			}
+			if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err := erase.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Printf("warning: %s of deleted session %s could not be erased; the next pass tries again: %v", path, id, err)
+				remaining = true
+				continue
+			}
+			log.Printf("erased %s of deleted session %s", filepath.Base(path), id)
+		}
+		if remaining {
+			left[id] = true
+			continue
+		}
+		if err := k.store.ClearDeletedSessionAudio(id); err != nil {
+			log.Printf("warning: %v", err)
+			left[id] = true
+		}
+	}
+	return left
 }
 
-func (k *keptRecordings) orphanGuard() orphanGuard {
-	g := orphanGuard{named: map[string]bool{}, reserved: map[string]bool{}}
+// deletedAudioFiles returns, absolute and once each, the files of deleted
+// session record in the audio directory: its raw capture, <id>.mp3 and
+// <id>.wav, a save's temporary files, and each recording its row named.
+func (k *keptRecordings) deletedAudioFiles(record *storage.DeletedSessionAudio) []string {
+	paths := append([]string{
+		recordingname.RawPath(k.audioDir, record.SessionID),
+		filepath.Join(k.audioDir, record.SessionID+".mp3"),
+		filepath.Join(k.audioDir, record.SessionID+".wav"),
+	}, recordingname.KeptTempPaths(k.audioDir, record.SessionID)...)
+	for _, entry := range recordingname.Entries(record.AudioPath) {
+		paths = append(paths, recordingname.Resolve(entry, k.audioDir))
+	}
+	var files []string
+	seen := map[string]bool{}
+	for _, path := range paths {
+		abs, err := filepath.Abs(path)
+		if err != nil || seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		files = append(files, abs)
+	}
+	return files
+}
+
+// namedFiles returns, absolute, every file a session names.
+func (k *keptRecordings) namedFiles() (map[string]bool, error) {
 	recordings, err := k.store.Recordings()
 	if err != nil {
-		log.Printf("warning: the audio of sessions with no row is kept this pass: list recordings: %v", err)
-		return g
+		return nil, fmt.Errorf("list recordings: %w", err)
 	}
+	named := map[string]bool{}
 	for _, rec := range recordings {
 		for _, entry := range recordingname.Entries(rec.AudioPath) {
 			if abs, err := filepath.Abs(recordingname.Resolve(entry, k.audioDir)); err == nil {
-				g.named[abs] = true
+				named[abs] = true
 			}
 		}
 	}
-	reservations, err := k.store.RawEraseReservations()
-	if err != nil {
-		log.Printf("warning: the audio of sessions with no row is kept this pass: list raw erase reservations: %v", err)
-		return g
-	}
-	for _, reservation := range reservations {
-		g.reserved[reservation.SessionID] = true
-	}
-	if g.since, err = k.store.AudioOwnedSince(); err != nil {
-		log.Printf("warning: the audio of sessions with no row is kept this pass: %v", err)
-		return g
-	}
-	g.ok = true
-	return g
-}
-
-// erasable reports whether the pass may erase the file at path of session
-// id, which has no row: a session deleted while a stop cut its erase short,
-// or a GC deletion cut off after its row went. Left, a Restore from Drive
-// that brings the session back would get it. It may not erase a file it
-// cannot know to be a deleted session's: one another session names, one of a
-// session whose delete is under way, and one last written before this
-// database owned the audio directory, which a database lost and made again
-// would otherwise erase with every other recording on the unit.
-func (g *orphanGuard) erasable(id, path string) bool {
-	if !g.ok || g.reserved[id] {
-		return false
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil || g.named[abs] {
-		return false
-	}
-	info, err := os.Lstat(abs)
-	return err == nil && info.Mode().IsRegular() && info.ModTime().After(g.since)
-}
-
-// eraseAll erases, with zeros, each file in paths of session id, which has
-// no row, that the pass may erase (erasable).
-func (g *orphanGuard) eraseAll(k *keptRecordings, id string, paths ...string) {
-	for _, path := range paths {
-		if !g.erasable(id, path) {
-			continue
-		}
-		k.eraseFile(path, "audio of session "+id+", which has no row")
-		log.Printf("erased %s: its session %s has no row", filepath.Base(path), id)
-	}
+	return named, nil
 }
 
 // Hold keeps the pass off the files of sessionIDs until release is called:

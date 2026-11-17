@@ -415,12 +415,21 @@ func (s *SQLiteStore) init(dbPath string) error {
 	`); err != nil {
 		return fmt.Errorf("create app_state table: %w", err)
 	}
-	// audioOwnedSinceKey: from when the audio directory's files belong to
-	// this database (AudioOwnedSince), set once, the first time a build that
-	// reads it opens the database.
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO app_state(key, value) VALUES(?, ?)`,
-		audioOwnedSinceKey, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-		return fmt.Errorf("record from when the audio belongs to this database: %w", err)
+
+	// deleted_session_audio records each session a person's delete or GC's
+	// age delete took, with the audio path its row named, in the transaction
+	// that deletes the rows (recordDeletedSessionAudio). The kept recordings
+	// pass erases the audio files of a recorded session that a stop left
+	// behind, then clears the record (DeletedSessionAudio,
+	// ClearDeletedSessionAudio). It erases no other file of a session with no
+	// row: a restored backup has no row for the sessions recorded since it.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS deleted_session_audio (
+			session_id TEXT PRIMARY KEY,
+			audio_path TEXT NOT NULL DEFAULT ''
+		);
+	`); err != nil {
+		return fmt.Errorf("create deleted session audio table: %w", err)
 	}
 
 	if _, err := s.db.Exec(`
@@ -1000,24 +1009,29 @@ func (s *SQLiteStore) runOnce(name, stmt string) error {
 }
 
 // ErrSessionExists is the error CreateSession returns, creating nothing, for
-// an id a session already has.
+// an id a session already has, or a deleted session still recorded in
+// deleted_session_audio.
 var ErrSessionExists = errors.New("a session with this id exists")
 
 // CreateSession creates session id, active since startedAt. An id a session
 // already has is refused with ErrSessionExists, and that session is left as
-// it is.
+// it is. So is the id of a deleted session whose audio the kept recordings
+// pass has not cleared yet: that pass erases the audio files of the id.
 func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 	if strings.TrimSpace(id) == "" {
 		return errors.New("session id is required")
 	}
 
 	res, err := s.db.Exec(
-		`INSERT INTO sessions(id, started_at, status, summary_status, envoy_publish_status) VALUES(?, ?, 'active', ?, ?)
+		`INSERT INTO sessions(id, started_at, status, summary_status, envoy_publish_status)
+		 SELECT ?, ?, 'active', ?, ?
+		 WHERE NOT EXISTS (SELECT 1 FROM deleted_session_audio WHERE session_id = ?)
 		 ON CONFLICT(id) DO NOTHING`,
 		id,
 		startedAt.UTC().Format(time.RFC3339Nano),
 		SummaryPending,
 		EnvoyPublishPending,
+		id,
 	)
 	if err != nil {
 		return fmt.Errorf("create session %s: %w", id, err)
