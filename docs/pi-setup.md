@@ -234,8 +234,10 @@ started before then is named and stamped with the wrong time. A user service can
 after the system's `time-sync.target`, so the service's start runs
 `/opt/ghost-wispr/wait-for-time-sync.sh` after the network wait: it waits for the mark
 `systemd-timesyncd` leaves once it synchronizes the clock, and after 120 s starts the service
-anyway, so a Pi that reaches no time server still records, its times possibly wrong. While it
-waits nothing records and the light is off. A Pi with no network at all does not start: the network
+anyway, so a Pi that reaches no time server still records, its times possibly wrong. It waits
+those 120 s once per boot: once it gives up it leaves a mark in `/run/user/<uid>`, so a restart of
+the service in the same boot starts at once. While it waits nothing records and the light is off.
+A Pi with no network at all does not start: the network
 wait before it fails and systemd tries again. A unit change reaches a Pi only when `provision.sh`
 runs again; the nightly update replaces the binary alone.
 

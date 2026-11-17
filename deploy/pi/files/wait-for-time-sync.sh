@@ -15,13 +15,22 @@
 # running: nothing is recorded, and the light is off. After
 # GHOST_WISPR_TIMESYNC_TIMEOUT seconds (120) it lets Ghost Wispr start all the
 # same, so a Pi that reaches no time server still records, with the light red
-# while it does, and with times from a clock that may be wrong. A Pi with no
-# network at all does not get this far: wait-for-network.sh, which runs
-# before, fails and systemd starts the service again.
+# while it does, and with times from a clock that may be wrong. It waits that
+# long once per boot: once it gives up it leaves a mark in the user's runtime
+# directory under /run, which a reboot empties, so a restart of Ghost Wispr in
+# the same boot starts at once. A Pi with no network at all does not get this
+# far: wait-for-network.sh, which runs before, fails and systemd starts the
+# service again.
 set -u
 
 readonly TIMEOUT_SECONDS="${GHOST_WISPR_TIMESYNC_TIMEOUT:-120}"
 readonly SYNCHRONIZED="${GHOST_WISPR_TIMESYNC_MARK:-/run/systemd/timesync/synchronized}"
+readonly GAVE_UP="${GHOST_WISPR_TIMESYNC_WAITED:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ghost-wispr-time-sync-gave-up}"
+
+if [[ ! -e $SYNCHRONIZED && -e $GAVE_UP ]]; then
+  echo "ghost-wispr: the wait for the clock gave up earlier this boot; starting with the clock as it is, so session times may be wrong" >&2
+  exit 0
+fi
 
 # Count the wait in sleeps, not in clock readings: the clock this waits for
 # can jump forward by minutes in the middle of the wait.
@@ -37,4 +46,5 @@ if [[ -e $SYNCHRONIZED ]]; then
   exit 0
 fi
 echo "ghost-wispr: clock not synchronized after ${TIMEOUT_SECONDS}s; starting with it as it is, so session times may be wrong" >&2
+touch "$GAVE_UP" 2>/dev/null || echo "ghost-wispr: could not leave the mark $GAVE_UP; a restart this boot waits again" >&2
 exit 0
