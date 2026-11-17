@@ -63,14 +63,15 @@ type KeptRawRecordings struct {
 	WarnBytes int64 // GET /api/status warns once Bytes exceeds this
 }
 
-// keptRawWarning tells the user in GET /api/status that recordings could not
-// be saved and their raw audio is waiting in the audio directory.
+// keptRawWarning tells the user in GET /api/status that recordings are not
+// saved yet, that their raw audio is in the audio directory, and that the app
+// saves them: it tries again after every Drive sync sweep.
 func keptRawWarning(kept KeptRawRecordings) string {
 	mb := float64(kept.Bytes) / (1024 * 1024)
 	if kept.Count == 1 {
-		return fmt.Sprintf("1 recording could not be saved: its raw audio (%.1f MB) is kept in the audio directory. Recover or delete it by hand.", mb)
+		return fmt.Sprintf("1 recording is not saved yet: its raw audio (%.1f MB) is kept in the audio directory, and the app tries again to save it after every Drive sync sweep.", mb)
 	}
-	return fmt.Sprintf("%d recordings could not be saved: their raw audio (%.1f MB) is kept in the audio directory. Recover or delete them by hand.", kept.Count, mb)
+	return fmt.Sprintf("%d recordings are not saved yet: their raw audio (%.1f MB) is kept in the audio directory, and the app tries again to save them after every Drive sync sweep.", kept.Count, mb)
 }
 
 // GCHold is a GC pass that held back, deleting and removing nothing more,

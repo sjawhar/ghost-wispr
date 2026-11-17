@@ -1517,9 +1517,10 @@ func TestAPIStatusReportsAStalledCapture(t *testing.T) {
 	}
 }
 
-// Raw recordings kept because they could not be saved are reported in the
+// Raw recordings kept because they could not be saved yet are reported in the
 // status, with a warning the UI shows once they take more than the warning
-// size, so the user recovers or deletes them by hand: nothing removes them.
+// size, which says the app saves them: it tries again after every Drive sync
+// sweep.
 func TestAPIStatusReportsKeptRawRecordings(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -1531,12 +1532,12 @@ func TestAPIStatusReportsKeptRawRecordings(t *testing.T) {
 		{
 			name:    "one over the warning size",
 			kept:    KeptRawRecordings{Count: 1, Bytes: 1001, WarnBytes: 1000},
-			warning: "1 recording could not be saved: its raw audio (0.0 MB) is kept in the audio directory. Recover or delete it by hand.",
+			warning: "1 recording is not saved yet: its raw audio (0.0 MB) is kept in the audio directory, and the app tries again to save it after every Drive sync sweep.",
 		},
 		{
 			name:    "several over the warning size",
 			kept:    KeptRawRecordings{Count: 3, Bytes: 432537600, WarnBytes: 107374182},
-			warning: "3 recordings could not be saved: their raw audio (412.5 MB) is kept in the audio directory. Recover or delete them by hand.",
+			warning: "3 recordings are not saved yet: their raw audio (412.5 MB) is kept in the audio directory, and the app tries again to save them after every Drive sync sweep.",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
