@@ -719,8 +719,9 @@ func main() {
 		log.Fatalf("storage init failed: %v", err)
 	}
 
-	// Recover any sessions left as 'active' from a previous crash/restart.
-	recoveredIDs, err := store.RecoverStaleSessions()
+	// Recover any sessions left as 'active' from a previous crash/restart:
+	// each ends when its raw recording was last written.
+	recoveredIDs, err := store.RecoverStaleSessions(cfg.AudioDir)
 	if err != nil {
 		log.Printf("warning: failed to recover stale sessions: %v", err)
 	} else if len(recoveredIDs) > 0 {

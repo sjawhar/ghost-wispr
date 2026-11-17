@@ -17,7 +17,7 @@ func TestRecordKeptRecording(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.RecoverStaleSessions(); err != nil {
+	if _, err := store.RecoverStaleSessions(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	syncTo(t, store, synced, SyncStateSynced, "folder-1", 0, "")

@@ -440,7 +440,7 @@ func crashRecovered(t *testing.T, store *storage.SQLiteStore, dir, id string, st
 	t.Helper()
 	createSession(t, store, id, startedAt)
 	raw := writeRaw(t, dir, id, size, startedAt)
-	if _, err := store.RecoverStaleSessions(); err != nil {
+	if _, err := store.RecoverStaleSessions(dir); err != nil {
 		t.Fatalf("recover stale sessions: %v", err)
 	}
 	return raw

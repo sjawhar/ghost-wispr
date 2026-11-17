@@ -2029,41 +2029,78 @@ func (s *SQLiteStore) RecoverStaleRefinements() error {
 	return nil
 }
 
-// RecoverStaleSessions ends any sessions still marked as 'active' and returns their IDs.
-// This handles the case where the app was restarted while a session was in progress.
-func (s *SQLiteStore) RecoverStaleSessions() ([]string, error) {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+// RecoverStaleSessions ends every session still marked active, which the app
+// stopped inside (a power cut, a crash), and returns their ids. Each ends when
+// its audio stopped: the last write of its raw recording in audioDir, not now,
+// which can be long after. That time is kept between the session's start and
+// now, the restart, since a clock set back or ahead while it recorded can
+// stamp the file outside them. A session with no raw recording ends now. Each
+// ends with no saved recording, so it cannot be refined (no_audio) until the
+// app saves its raw recording as its recording.
+func (s *SQLiteStore) RecoverStaleSessions(audioDir string) ([]string, error) {
+	now := time.Now().UTC()
 
-	rows, err := s.db.Query(`SELECT id FROM sessions WHERE status = 'active'`)
+	rows, err := s.db.Query(`SELECT id, started_at FROM sessions WHERE status = 'active'`)
 	if err != nil {
 		return nil, fmt.Errorf("query active sessions: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var ids []string
+	type staleSession struct {
+		id        string
+		startedAt string
+	}
+	var stale []staleSession
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var sess staleSession
+		if err := rows.Scan(&sess.id, &sess.startedAt); err != nil {
 			return nil, fmt.Errorf("scan active session: %w", err)
 		}
-		ids = append(ids, id)
+		stale = append(stale, sess)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate active sessions: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("iterate active sessions: %w", err)
+	}
 
-	for _, id := range ids {
+	ids := make([]string, 0, len(stale))
+	for _, sess := range stale {
+		endedAt := now
+		if lastAudio, ok := lastRawWrite(audioDir, sess.id); ok {
+			endedAt = lastAudio
+			if startedAt, err := time.Parse(time.RFC3339Nano, sess.startedAt); err == nil && endedAt.Before(startedAt) {
+				endedAt = startedAt.UTC()
+			}
+			if endedAt.After(now) {
+				endedAt = now
+			}
+		}
 		_, err := s.db.Exec(
-			// Ended with no saved recording, so it can never be refined.
 			`UPDATE sessions SET ended_at = ?, status = 'ended', refinement_status = ? WHERE id = ? AND status = 'active'`,
-			now, RefinementNoAudio, id,
+			endedAt.Format(time.RFC3339Nano), RefinementNoAudio, sess.id,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("end stale session %s: %w", id, err)
+			return nil, fmt.Errorf("end stale session %s: %w", sess.id, err)
 		}
+		ids = append(ids, sess.id)
 	}
 
 	return ids, nil
+}
+
+// lastRawWrite returns when session sessionID's raw recording in audioDir was
+// last written, and false if it has none there.
+func lastRawWrite(audioDir, sessionID string) (time.Time, bool) {
+	if strings.TrimSpace(audioDir) == "" {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(recording.RawPath(audioDir, sessionID))
+	if err != nil || !info.Mode().IsRegular() {
+		return time.Time{}, false
+	}
+	return info.ModTime().UTC(), true
 }
 
 // GetSessionsNeedingSummary returns IDs of ended sessions with pending or empty summaries.
