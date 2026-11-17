@@ -89,13 +89,24 @@ func writeSecretVersion(w http.ResponseWriter, r *http.Request, key string) {
 	}})
 }
 
-// signedListener stands in for Envoy's webhook: it accepts a post signed
-// with key and refuses any other with 401.
-func signedListener(t *testing.T, key string) (*httptest.Server, func() int) {
+// envoyListener stands in for Envoy's webhook: it accepts a post signed with
+// key and refuses any other with 401. Like Envoy, which publishes a Ghost
+// Wispr event under its X-GhostWispr-Delivery id and stores a repeat of it
+// once (legion packages/envoy/internal/integration/webhook_redelivery_test.go),
+// it counts each delivery once: Ghost Wispr sends an event at least once, and
+// every post of one event carries the same delivery id.
+type envoyListener struct {
+	*httptest.Server
+	mu         sync.Mutex
+	posted     int
+	deliveries map[string]bool
+	hold, held chan struct{} // see holdFirstPost
+}
+
+func signedListener(t *testing.T, key string) *envoyListener {
 	t.Helper()
-	var mu sync.Mutex
-	accepted := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	l := &envoyListener{deliveries: map[string]bool{}}
+	l.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		mac := hmac.New(sha256.New, []byte(key))
 		_, _ = mac.Write(body)
@@ -103,16 +114,48 @@ func signedListener(t *testing.T, key string) (*httptest.Server, func() int) {
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
 			return
 		}
-		mu.Lock()
-		accepted++
-		mu.Unlock()
+		l.mu.Lock()
+		l.posted++
+		first := l.posted == 1
+		l.deliveries[r.Header.Get("X-GhostWispr-Delivery")] = true
+		hold, held := l.hold, l.held
+		l.mu.Unlock()
+		if first && hold != nil {
+			close(held)
+			<-hold
+		}
 	}))
-	t.Cleanup(server.Close)
-	return server, func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		return accepted
-	}
+	t.Cleanup(l.Close)
+	return l
+}
+
+// accepted is the number of events the listener stored: one per delivery id.
+func (l *envoyListener) accepted() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.deliveries)
+}
+
+// posts is the number of signed posts the listener answered.
+func (l *envoyListener) posts() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.posted
+}
+
+// holdFirstPost makes the listener hold the first signed post, unanswered,
+// until release runs. arrived is closed once that post has come. Call it
+// before anything posts.
+func (l *envoyListener) holdFirstPost(t *testing.T) (arrived <-chan struct{}, release func()) {
+	t.Helper()
+	l.mu.Lock()
+	l.hold, l.held = make(chan struct{}), make(chan struct{})
+	hold, held := l.hold, l.held
+	l.mu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release) // before the server's Close, which waits for the held post
+	return held, release
 }
 
 func testEnvoyPublishing(t *testing.T, secretManager *httptest.Server) (*envoyPublishing, *warningsRegistry) {
@@ -138,7 +181,7 @@ func envoyConfig(listenerURL string) *config.Config {
 // TestEnvoyEventsAreSignedWithTheKeyInSecretManager fails if the recorder
 // signs with anything but the key Secret Manager holds for it.
 func TestEnvoyEventsAreSignedWithTheKeyInSecretManager(t *testing.T) {
-	listener, accepted := signedListener(t, "key-in-secret-manager")
+	listener := signedListener(t, "key-in-secret-manager")
 	publishing, warnings := testEnvoyPublishing(t, fakeSecretManager(t, "key-in-secret-manager\n", http.StatusOK, false))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -149,11 +192,46 @@ func TestEnvoyEventsAreSignedWithTheKeyInSecretManager(t *testing.T) {
 	if err := publishing.current.Load().PublishSessionStarted(ctx, "session-1"); err != nil {
 		t.Fatalf("PublishSessionStarted: %v", err)
 	}
-	if accepted() != 1 {
-		t.Fatalf("listener accepted %d events, want 1", accepted())
+	if listener.accepted() != 1 {
+		t.Fatalf("listener accepted %d events, want 1", listener.accepted())
 	}
 	if list := warnings.List(); len(list) != 0 {
 		t.Fatalf("warnings = %q, want none", list)
+	}
+}
+
+// TestASweepDuringAPublishSendsTheEventOnce fails if a session_started that a
+// sweep posts while the direct publish of it is still posting reaches Envoy as
+// two events. The event stays pending until its post returns, so a sweep in
+// between, such as the one configure starts, posts it again. The control
+// checks that the sweep did post it a second time.
+func TestASweepDuringAPublishSendsTheEventOnce(t *testing.T) {
+	listener := signedListener(t, "key-in-secret-manager")
+	arrived, release := listener.holdFirstPost(t)
+	publishing, _ := testEnvoyPublishing(t, fakeSecretManager(t, "key-in-secret-manager\n", http.StatusOK, false))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	publishing.configure(ctx, envoyConfig(listener.URL), discardLogger)
+	if err := publishing.store.CreateSession("session-1", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan error, 1)
+	go func() { published <- publishing.current.Load().PublishSessionStarted(ctx, "session-1") }()
+	select {
+	case <-arrived:
+	case <-time.After(testWait):
+		t.Fatal("control: no session_started post came")
+	}
+	publishing.sweep(ctx) // the event is still pending: its first post has not returned
+	release()
+	if err := <-published; err != nil {
+		t.Fatalf("PublishSessionStarted: %v", err)
+	}
+	if posts := listener.posts(); posts < 2 {
+		t.Fatalf("control: the session_started was posted %d times, want a second post from the sweep", posts)
+	}
+	if got := listener.accepted(); got != 1 {
+		t.Fatalf("listener accepted %d events, want 1", got)
 	}
 }
 
@@ -162,7 +240,7 @@ func TestEnvoyEventsAreSignedWithTheKeyInSecretManager(t *testing.T) {
 // holds up the settings change or a session's start: recording must not
 // depend on Envoy.
 func TestAnUnreadableEnvoyKeyWarnsAndHoldsNothingUp(t *testing.T) {
-	listener, accepted := signedListener(t, "unused")
+	listener := signedListener(t, "unused")
 	publishing, warnings := testEnvoyPublishing(t, fakeSecretManager(t, "", http.StatusForbidden, false))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -190,8 +268,8 @@ func TestAnUnreadableEnvoyKeyWarnsAndHoldsNothingUp(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("configuring Envoy and starting a session took %s while the key read hung, want well under a second", elapsed)
 	}
-	if accepted() != 0 {
-		t.Fatalf("listener accepted %d events with no key, want none", accepted())
+	if listener.accepted() != 0 {
+		t.Fatalf("listener accepted %d events with no key, want none", listener.accepted())
 	}
 	if list := hungWarnings.List(); len(list) != 0 {
 		t.Fatalf("warnings while the read is still waiting = %q, want none yet", list)
@@ -209,7 +287,7 @@ func TestAnUnreadableEnvoyKeyWarnsAndHoldsNothingUp(t *testing.T) {
 // nothing to send would keep the /api/status warning after Secret Accessor is
 // granted. Once the key reads, a sweep makes no Secret Manager call.
 func TestAGrantedEnvoyKeyClearsItsWarningWithinOneSweep(t *testing.T) {
-	listener, accepted := signedListener(t, "granted-key")
+	listener := signedListener(t, "granted-key")
 	secretManager, grant, reads := secretManagerToGrant(t, "granted-key")
 	publishing, warnings := testEnvoyPublishing(t, secretManager)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -255,7 +333,7 @@ func TestAGrantedEnvoyKeyClearsItsWarningWithinOneSweep(t *testing.T) {
 	if got := reads(); got != 2 {
 		t.Fatalf("Secret Manager reads after a sweep with the key read = %d, want still 2", got)
 	}
-	if accepted() != 0 {
-		t.Fatalf("listener accepted %d events with none due, want none", accepted())
+	if listener.accepted() != 0 {
+		t.Fatalf("listener accepted %d events with none due, want none", listener.accepted())
 	}
 }
