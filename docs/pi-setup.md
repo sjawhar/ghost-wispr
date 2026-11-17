@@ -357,9 +357,9 @@ While the Jabra is missing or not accessible, `/api/status` warns, and Ghost Wis
 again every 10 seconds; the other controls still work.
 
 Answering each tap with the light is what a Microsoft Teams client does: in the
-[Teams devices general specification](https://learn.microsoft.com/en-us/microsoftteams/devices/certification-specifications),
-the device mutes its own microphone on a tap, sends Phone Mute, and takes LED Mute from the
-client. Jabra's
+[Teams devices general specification](https://learn.microsoft.com/en-us/microsoftteams/devices/certification-specifications)
+(V5, section 5.3 "Mute Button and LED"), the device mutes its own microphone on a tap, sends Phone
+Mute, and takes LED Mute from the client. Jabra's
 [call-control SDK](https://sdk.jabra.com/javascript/docs/jabra-js/4.4.1/interfaces/ICallControl.html)
 says its `mute` "Mutes or unmutes the microphone of the Jabra device", and that it "Should only be
 used during a call". Ghost Wispr uses the Jabra outside a call, so what the Jabra does with the
@@ -370,7 +370,10 @@ light is checked on the unit. After a deploy that changes these controls, with t
    shows Muted. Ghost Wispr closes the microphone while paused; the Jabra's manual shows the Mute
    button "only visible when the microphone is active", and its buttons fade after a minute.
 2. Tap Mute again. The blink(1) turns red, the ring goes off, and the page shows recording. Say
-   a sentence: it appears in the live transcript.
+   a sentence at once: it appears in the live transcript. If the buttons have faded, the first tap
+   may only light them; if it did not resume, tap Mute once more. A resume on the second tap
+   passes; none after two taps fails. Ghost Wispr sends the light again when the microphone
+   starts, so the ring may flash red for a moment as recording resumes.
 3. Press the power button briefly, twice. The blink(1) and the ring change as in steps 1 and 2.
 4. Pause on the web page: the ring shows Muted. Tap the Jabra's Mute button: recording resumes,
    the ring goes off, and a sentence you say appears in the transcript, so the Jabra did not keep

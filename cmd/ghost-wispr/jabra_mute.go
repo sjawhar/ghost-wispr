@@ -43,7 +43,7 @@ func newJabraMuteButton(capture *captureGate, mic interface{ IsOpen() bool }, co
 		mic:        mic,
 		controls:   controls,
 		warnings:   warnings,
-		connect:    connectJabra,
+		connect:    func() (io.ReadWriteCloser, error) { return connectJabra(inputDevices, inputDevRoot) },
 		retryEvery: hardwareRetry,
 		checkEvery: jabraLightCheckEvery,
 	}
@@ -57,8 +57,8 @@ func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *capt
 
 // connectJabra opens the Jabra's evdev node to read and write: the press is
 // read and the light written on one node.
-func connectJabra() (io.ReadWriteCloser, error) {
-	path, err := jabra.FindDevice(inputDevices, inputDevRoot)
+func connectJabra(procDevices, devRoot string) (io.ReadWriteCloser, error) {
+	path, err := jabra.FindDevice(procDevices, devRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +100,9 @@ func (b *jabraMuteButton) run(ctx context.Context) {
 // a light to the device only when it differs from the kernel's own copy.
 func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) error {
 	// Ending deviceCtx frees a reader that holds a press nobody takes, and
-	// closing the device ends a reader blocked in Read.
+	// closing the device ends a reader blocked in Read. Close ends that Read
+	// only while the file stays non-blocking: never call Fd() on it (an ioctl
+	// goes through SyscallConn), or an unplug or shutdown waits forever.
 	deviceCtx, cancelDevice := context.WithCancel(ctx)
 	presses := make(chan struct{})
 	readDone := make(chan error, 1)

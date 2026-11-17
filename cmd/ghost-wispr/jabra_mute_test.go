@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -338,4 +339,27 @@ func TestJabraPermissionWarningNamesTheUdevRule(t *testing.T) {
 	waitForHardware(t, "a permission warning", func() bool {
 		return strings.Contains(rig.warning(), "not accessible") && strings.Contains(rig.warning(), "udev rule")
 	})
+}
+
+// TestConnectJabraOpensTheNodeToWrite fails if the Jabra's node is opened
+// read-only: the light write would then fail on the unit, and the button
+// would never toggle.
+func TestConnectJabraOpensTheNodeToWrite(t *testing.T) {
+	dir := t.TempDir()
+	devices := filepath.Join(dir, "devices")
+	block := "N: Name=\"Jabra Speak2 75\"\nH: Handlers=kbd leds event1\nB: KEY=fff 0 0 0 40 100000000000000 0 0 0\nB: LED=80\n"
+	if err := os.WriteFile(devices, []byte(block), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "event1"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	device, err := connectJabra(devices, dir)
+	if err != nil {
+		t.Fatalf("connect the Jabra: %v", err)
+	}
+	t.Cleanup(func() { _ = device.Close() })
+	if _, err := device.Write(make([]byte, fakeEventSize)); err != nil {
+		t.Fatalf("write to the Jabra's node: %v", err)
+	}
 }
