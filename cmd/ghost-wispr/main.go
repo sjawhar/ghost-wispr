@@ -1913,6 +1913,9 @@ func streamMicWithRetry(
 
 	backoff := baseBackoff
 	gated := shutdownWriter{ctx: ctx, dst: capture.Writer(writer)}
+	// ringShowsPause is set when the Jabra's ring may show the pause while
+	// capture is on, so no audio passed (orderedMic).
+	ringShowsPause := false
 
 	for {
 		if ctx.Err() != nil {
@@ -1920,12 +1923,19 @@ func streamMicWithRetry(
 		}
 
 		var err error
-		if capture.isClosed() {
-			// holdMicWhilePaused closes the device: none is held while the
-			// gate is closed.
-			if !holdMicWhilePaused(ctx, capture, streamer, logf, hub) || ctx.Err() != nil {
-				return
+		if capture.isClosed() || ringShowsPause {
+			if capture.isClosed() {
+				// holdMicWhilePaused closes the device: none is held while
+				// the gate is closed.
+				if !holdMicWhilePaused(ctx, capture, streamer, logf, hub) || ctx.Err() != nil {
+					return
+				}
+			} else {
+				// The light cannot change while the microphone is open: close
+				// it, so the ring can be darkened, and open it again below.
+				closeMic(streamer, "while the Jabra's ring may show the pause", logf)
 			}
+			ringShowsPause = false
 			// Before red: a resume during speech on the Jabra waits for it to
 			// end, then lights the Jabra, so its ring reads right while the
 			// microphone is open. A pause meanwhile cancels the resume, and
@@ -1964,6 +1974,11 @@ func streamMicWithRetry(
 			// A pause, or a device error that coincides with one: close the
 			// device at the loop top instead of reporting a failure.
 			if errors.Is(err, errGateClosed) || capture.isClosed() {
+				continue
+			}
+			if errors.Is(err, errRingShowsPause) {
+				logf("the Jabra's ring may show the pause while capture is on; reopening the microphone")
+				ringShowsPause = true
 				continue
 			}
 		}

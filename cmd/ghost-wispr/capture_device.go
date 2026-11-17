@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"sync"
 	"time"
 
@@ -323,12 +325,47 @@ func (d *captureDevice) setOpen(open bool) {
 	d.open = open
 }
 
+// errRingShowsPause is the error orderedMic's Stream returns when audio comes
+// while the Jabra's ring may show the pause: no audio passes then.
+var errRingShowsPause = errors.New("the Jabra's ring may show the pause")
+
+// ringMayShowPause reports whether the attached Jabra's ring may show Muted:
+// its light was last written to show the pause, or its state is not known, as
+// when the Jabra connected or a press came while a stream was open, or a light
+// write failed.
+func (d *captureDevice) ringMayShowPause() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.light != nil && (!d.written || d.shown)
+}
+
 // orderedMic runs each operation of a microphone that opens or closes its
-// capture stream through a captureDevice. Stream reads the open stream and
-// passes straight through.
+// capture stream through a captureDevice. Stream reads the open stream, and
+// refuses each buffer while the Jabra's ring may show the pause
+// (ringMayShowPause), with errRingShowsPause: the light cannot change while
+// the stream is open, so the mic loop closes the microphone, darkens the ring
+// and opens it again before any audio passes.
 type orderedMic struct {
 	micStreamer
 	device *captureDevice
+}
+
+func (m orderedMic) Stream(w io.Writer) error {
+	return m.micStreamer.Stream(ringGuard{dst: w, device: m.device})
+}
+
+// ringGuard passes audio to dst only while the Jabra's ring cannot show the
+// pause.
+type ringGuard struct {
+	dst    io.Writer
+	device *captureDevice
+}
+
+func (g ringGuard) Write(p []byte) (int, error) {
+	if g.device.ringMayShowPause() {
+		return 0, errRingShowsPause
+	}
+	return g.dst.Write(p)
 }
 
 // Start starts a stream the microphone already holds, which stays open if the

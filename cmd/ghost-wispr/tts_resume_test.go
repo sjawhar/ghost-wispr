@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,7 +42,7 @@ func newSpeechResumeRig(t *testing.T) *speechResumeRig {
 func (r *speechResumeRig) startMicLoop(t *testing.T) *scriptedMic {
 	t.Helper()
 	mic := newScriptedMic()
-	runMicLoopOn(t, r.capture, orderedMic{micStreamer: mic, device: r.device}, mic, (&recordedWaits{}).wait)
+	runMicLoopOn(t, r.capture, orderedMic{micStreamer: mic, device: r.device}, mic, io.Discard, (&recordedWaits{}).wait)
 	mic.expectEvents(t, "close")
 	return mic
 }
@@ -329,5 +330,125 @@ speech:
 		case <-time.After(testWait):
 			t.Fatalf("the microphone did not open once the speech ended: device calls %v", calls)
 		}
+	}
+}
+
+// ringCheckingRecording stands for the recording and Deepgram: it counts the
+// bytes that reach it, and those that reach it while the Jabra's ring shows
+// Muted.
+type ringCheckingRecording struct {
+	ring         *atomic.Bool
+	bytes, muted atomic.Int64
+}
+
+func (w *ringCheckingRecording) Write(p []byte) (int, error) {
+	if w.ring.Load() {
+		w.muted.Add(int64(len(p)))
+	}
+	w.bytes.Add(int64(len(p)))
+	return len(p), nil
+}
+
+// TestNoAudioPassesWhileTheJabraRingShowsMuted fails if audio reaches the
+// recording while the Jabra's ring shows Muted, when a pause and a resume land
+// while the mic loop opens the microphone: the pause lights the Jabra just
+// before the open, the resume opens the gate during the open's light settle,
+// and the light cannot change once the microphone is open. The microphone must
+// be closed, the Jabra darkened and the microphone opened again before audio
+// passes. The control has no pause during the open.
+func TestNoAudioPassesWhileTheJabraRingShowsMuted(t *testing.T) {
+	for _, race := range []bool{false, true} {
+		name := "control, no pause during the open"
+		if race {
+			name = "a pause and a resume during the open"
+		}
+		t.Run(name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			capture.Pause()
+			device := newCaptureDevice(capture.IsPaused)
+			capture.beforeMicOpen = device.prepareLightForOpen
+			var ring, armed, paused atomic.Bool
+			detach := device.attach(func(on bool) error {
+				ring.Store(on)
+				if on && armed.CompareAndSwap(true, false) {
+					go capture.Resume() // during the open's light settle
+				}
+				return nil
+			})
+			t.Cleanup(detach)
+			capture.beforeMicStart = func() error {
+				if race && paused.CompareAndSwap(false, true) {
+					armed.Store(true)
+					capture.Pause() // after the resume darkened the Jabra, before the open
+				}
+				return nil
+			}
+			mic := newScriptedMic()
+			recording := &ringCheckingRecording{ring: &ring}
+			runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, recording, (&recordedWaits{}).wait)
+			mic.expectEvents(t, "close")
+
+			capture.Resume()
+			mic.expectEvents(t, "open")
+			if race && !ring.Load() {
+				t.Fatal("control: the microphone opened with the ring dark; the pause did not land before the open")
+			}
+			mic.expectEvents(t, "stream")
+			mic.capture(t, make([]byte, 320))
+			if got := recording.muted.Load(); got > 0 {
+				t.Fatalf("%d bytes reached the recording while the Jabra's ring showed Muted", got)
+			}
+			if race {
+				mic.expectEvents(t, "close", "open", "stream")
+				if ring.Load() {
+					t.Fatal("the microphone opened again with the Jabra's ring showing Muted")
+				}
+				mic.capture(t, make([]byte, 320))
+			}
+			if got := recording.bytes.Load(); got != 320 {
+				t.Fatalf("the recording got %d bytes once the ring was dark, want 320", got)
+			}
+		})
+	}
+}
+
+// TestAJabraThatConnectsWhileRecordingIsLitBeforeAudioPasses fails if audio
+// reaches the recording while a Jabra that connected with the microphone open
+// may show Muted: its light cannot be written until the microphone closes, and
+// its ring keeps whatever it showed before it connected.
+func TestAJabraThatConnectsWhileRecordingIsLitBeforeAudioPasses(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	device := newCaptureDevice(capture.IsPaused)
+	capture.beforeMicOpen = device.prepareLightForOpen
+	var ring atomic.Bool
+	if err := device.openStream(func() (bool, error) { return true, nil }); err != nil {
+		t.Fatal(err) // the microphone opened at start-up, before the Jabra connected
+	}
+	mic := newScriptedMic()
+	recording := &ringCheckingRecording{ring: &ring}
+	runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, recording, (&recordedWaits{}).wait)
+	mic.expectEvents(t, "stream")
+	mic.capture(t, make([]byte, 320))
+	if got := recording.bytes.Load(); got != 320 {
+		t.Fatalf("control: with no Jabra the recording got %d bytes, want 320", got)
+	}
+
+	ring.Store(true) // the Jabra shows Muted from before it connected
+	detach := device.attach(func(on bool) error { ring.Store(on); return nil })
+	t.Cleanup(detach)
+	if !ring.Load() {
+		t.Fatal("control: the Jabra's light was written while the microphone was open")
+	}
+	mic.capture(t, make([]byte, 320))
+	if got := recording.muted.Load(); got > 0 {
+		t.Fatalf("%d bytes reached the recording while the Jabra's ring showed Muted", got)
+	}
+	mic.expectEvents(t, "close", "open", "stream")
+	if ring.Load() {
+		t.Fatal("the microphone opened again with the Jabra's ring showing Muted")
+	}
+	mic.capture(t, make([]byte, 320))
+	if got := recording.bytes.Load(); got != 640 {
+		t.Fatalf("the recording got %d bytes, want 640: 320 before the Jabra connected and 320 once its ring was dark", got)
 	}
 }

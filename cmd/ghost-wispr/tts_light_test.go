@@ -185,7 +185,7 @@ func TestNoJabraLightWriteDuringTTSOnAnyMicrophonePath(t *testing.T) {
 			if err := device.openStream(func() (bool, error) { return true, nil }); err != nil {
 				t.Fatal(err)
 			}
-			runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, (&recordedWaits{}).wait)
+			runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, io.Discard, (&recordedWaits{}).wait)
 			mic.expectEvents(t, tc.events...)
 			if tc.then != nil {
 				tc.then(t, capture, mic)
@@ -201,14 +201,14 @@ func TestNoJabraLightWriteDuringTTSOnAnyMicrophonePath(t *testing.T) {
 }
 
 // runMicLoopOn runs streamMicWithRetry on streamer, whose device calls mic
-// reports, until the test ends.
-func runMicLoopOn(t *testing.T, capture *captureGate, streamer micStreamer, mic *scriptedMic, wait func(time.Duration)) {
+// reports, into recording, until the test ends.
+func runMicLoopOn(t *testing.T, capture *captureGate, streamer micStreamer, mic *scriptedMic, recording io.Writer, wait func(time.Duration)) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		streamMicWithRetry(ctx, capture, streamer, io.Discard, wait, nopLogf, nil)
+		streamMicWithRetry(ctx, capture, streamer, recording, wait, nopLogf, nil)
 	}()
 	t.Cleanup(func() { cancel(); close(mic.chunks); <-done })
 }
