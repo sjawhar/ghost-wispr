@@ -132,16 +132,21 @@ func (d *captureDevice) playbackOpening() {
 // playbackClosing closes a speaker playback stream with closeStream, as an
 // operation ownOperationAt covers, then writes the light if it may not show
 // the pause and no stream is open. The speaker calls it once it is done with
-// the stream.
+// the stream. A closeStream that panics still ends the operation and stops
+// counting the stream, so nothing waits for that playback for good.
 func (d *captureDevice) playbackClosing(closeStream func()) {
-	d.begin()
-	closeStream()
-	d.mu.Lock()
-	d.playing--
-	close(d.silent)
-	d.silent = make(chan struct{})
-	d.mu.Unlock()
-	d.end()
+	func() {
+		d.begin()
+		defer func() {
+			d.mu.Lock()
+			d.playing--
+			close(d.silent)
+			d.silent = make(chan struct{})
+			d.mu.Unlock()
+			d.end()
+		}()
+		closeStream()
+	}()
 	d.syncLight()
 }
 

@@ -112,8 +112,9 @@ func handleHealthzReady(w http.ResponseWriter, r *http.Request, checker HealthCh
 
 	// A paused capture stops the mic on purpose, and a resume takes a moment:
 	// to save the paused session first, then to start the mic and connect to
-	// Deepgram. Neither is an outage. A resume that has not brought the mic
-	// back past its stall limit is.
+	// Deepgram, and as long as speech on the Jabra plays, since the mic opens
+	// only once its light can show the resume. None is an outage. A resume that
+	// has not brought the mic back past its stall limit, with no such wait, is.
 	hold := checker.MicHold()
 	held := hold == storage.ComponentStatusPaused || hold == storage.ComponentStatusResuming
 

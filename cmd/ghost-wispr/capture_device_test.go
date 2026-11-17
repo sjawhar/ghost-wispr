@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,4 +168,37 @@ func TestMicLoopOrdersTheJabraLightAroundTheCaptureStream(t *testing.T) {
 
 	capture.Resume()
 	mic.expectEvents(t, "light off", "open", "stream")
+}
+
+// TestAPlaybackThatPanicsOnCloseHoldsNothingBack fails if a playback stream
+// whose close panics (Speaker.Play recovers from it) stays counted open, or
+// its close stays an operation under way: every later resume would then wait
+// for that playback for good, with readiness reporting resuming, and every
+// Jabra tap that would resume would be taken for the Jabra's own report.
+func TestAPlaybackThatPanicsOnCloseHoldsNothingBack(t *testing.T) {
+	d := newCaptureDevice(func() bool { return false })
+	d.playbackOpening()
+	var ring atomic.Bool
+	ring.Store(true) // the Jabra shows Muted; the light cannot be written during the playback
+	detach := d.attach(func(on bool) error { ring.Store(on); return nil })
+	t.Cleanup(detach)
+	if !ring.Load() {
+		t.Fatal("control: the light was written while a playback stream was open")
+	}
+	func() {
+		defer func() { _ = recover() }()
+		d.playbackClosing(func() { panic("output stream close failed") })
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+	if !d.prepareLightForOpen(ctx, nil) {
+		t.Fatal("a resume waited for a playback whose close panicked")
+	}
+	if ring.Load() {
+		t.Fatal("the light was not written once the playback was gone")
+	}
+	if d.ownOperationAt(jabra.MonotonicNow() + time.Second) {
+		t.Fatal("a tap a second from now is taken for the Jabra's own report: the panicked close is still under way")
+	}
 }
