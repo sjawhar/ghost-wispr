@@ -647,6 +647,46 @@ func TestThePassErasesTheAudioOfARecordedDelete(t *testing.T) {
 	}
 }
 
+// Review 5936938542 of #76, P3: the pass erases only the files a delete
+// listed, fixed at the delete. GC's age delete lists only the recording it
+// checked on Drive and the raw capture, so a <id>.wav beside them that Drive
+// was never asked about stays (with no row and no record: accepted, the safe
+// direction for an age delete).
+func TestThePassErasesOnlyTheFilesAnAgeDeleteListed(t *testing.T) {
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const id = "20261001110000"
+	saved, unchecked := filepath.Join(audioDir, id+".mp3"), filepath.Join(audioDir, id+".wav")
+	for _, path := range []string{saved, unchecked} {
+		if err := os.WriteFile(path, []byte("conversation "+filepath.Base(path)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)
+	if err := store.CreateSession(id, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(id, started.Add(time.Hour), saved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ?, sync_status = ?, gdrive_folder_id = 'folder' WHERE id = ?`, storage.SyncStateSynced, storage.SyncSynced, id); err != nil {
+		t.Fatal(err)
+	}
+	// The age delete commits, then a stop cuts GC's own erase short.
+	if _, removed, err := store.DeleteEndedSessionAndSources(id, saved, audioDir); err != nil || !removed {
+		t.Fatalf("age delete = %v, %v; want deleted", removed, err)
+	}
+
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil).run(context.Background())
+
+	if _, err := os.Lstat(saved); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("control: %s, which the age delete listed, is still on disk (%v)", filepath.Base(saved), err)
+	}
+	if got, err := os.ReadFile(unchecked); err != nil || string(got) != "conversation "+id+".wav" {
+		t.Errorf("%s, which the age delete did not list, holds %q (%v), want it as it was", filepath.Base(unchecked), got, err)
+	}
+}
+
 // laterNamingStore is a store in which session "merged" starts to name the
 // file at path once the record of deleted session after is cleared, as a
 // Retry refinement of a restored merged session names and downloads its
@@ -667,8 +707,8 @@ func (s *laterNamingStore) ClearDeletedSessionAudio(id string) error {
 	return nil
 }
 
-func (s *laterNamingStore) NamedAudio() ([]string, error) {
-	named, err := s.SQLiteStore.NamedAudio()
+func (s *laterNamingStore) NamedAudio(audioDir string) ([]string, error) {
+	named, err := s.SQLiteStore.NamedAudio(audioDir)
 	if s.naming {
 		named = append(named, s.path)
 	}

@@ -417,16 +417,16 @@ func (s *SQLiteStore) init(dbPath string) error {
 	}
 
 	// deleted_session_audio records each session a person's delete or GC's
-	// age delete took, with the audio path its row named, in the transaction
-	// that deletes the rows (recordDeletedSessionAudio). The kept recordings
-	// pass erases the audio files of a recorded session that a stop left
-	// behind, then clears the record (DeletedSessionAudio,
+	// age delete took, with the files of it to erase (absolute paths, as a
+	// JSON array), in the transaction that deletes the rows
+	// (recordDeletedSessionAudio). The kept recordings pass erases those
+	// files a stop left behind, then clears the record (DeletedSessionAudio,
 	// ClearDeletedSessionAudio). It erases no other file of a session with no
 	// row: a restored backup has no row for the sessions recorded since it.
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS deleted_session_audio (
 			session_id TEXT PRIMARY KEY,
-			audio_path TEXT NOT NULL DEFAULT ''
+			files TEXT NOT NULL DEFAULT '[]'
 		);
 	`); err != nil {
 		return fmt.Errorf("create deleted session audio table: %w", err)

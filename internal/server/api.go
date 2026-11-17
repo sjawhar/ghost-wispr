@@ -56,12 +56,15 @@ type SessionStore interface {
 	ReserveRawSessionErase(id, originalPath, hiddenPath string) (string, error)
 	CancelRawSessionErase(id, hiddenPath string) error
 	SourceSessionIDs(sessionID string) ([]string, error)
-	// NamedAudio lists every audio file a session names, the recordings a
-	// restored session's Drive folder holds included: a session delete
-	// leaves those files.
-	NamedAudio() ([]string, error)
-	// ClearDeletedSessionAudio forgets a delete record once a session delete
-	// has every file of the session off its name.
+	// NamedAudio lists, absolute, every audio file a session names, the
+	// recordings a restored session's Drive folder holds in the audio
+	// directory included: a session delete leaves those files.
+	NamedAudio(audioDir string) ([]string, error)
+	// DeletedSessionAudio lists the delete records: a session delete erases
+	// the files its records list, the recordings a restored folder held
+	// included. ClearDeletedSessionAudio forgets one once every file of the
+	// session is off its name.
+	DeletedSessionAudio() ([]storage.DeletedSessionAudio, error)
 	ClearDeletedSessionAudio(id string) error
 	DeleteSession(id, audioDir string) (string, error)
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error

@@ -41,17 +41,17 @@ const sessionsDeletedUnsweptKey = "sessions_deleted_unswept_v2"
 // that feeds another merge (ErrDeleteMergeActive), any active member, or any
 // member that owes Google Drive a replacement
 // (ErrDeleteReplacementPending). It returns the audio paths the deleted rows
-// name and the recordings their restored Drive folders hold
-// (restored_recordings, which the rows' delete drops with them): the
-// recordings the caller then erases are the ones the rows named when they
-// went, not ones it read before. In the same transaction, before the rows
-// go, it records the directory of each of those recordings, found where
-// recording.Resolve finds it in audioDir (the one the caller then erases), so
-// an erase a stop cuts off is finished as the app starts, and it records each
-// session it deletes with the audio its row names
-// (recordDeletedSessionAudio), so the kept recordings pass erases the audio
-// files a stop left under their names; it deletes nothing if it cannot record
-// one. In that transaction too it deletes every stored
+// name: the recordings the caller then erases are the ones the rows named
+// when they went, not ones it read before. In the same transaction, before
+// the rows go, it records the directory of each of those recordings, found
+// where recording.Resolve finds it in audioDir (the one the caller then
+// erases), so an erase a stop cuts off is finished as the app starts, and it
+// records each session it deletes with every audio file of it in audioDir
+// (deleteFiles: the recordings its row names and its restored Drive folder
+// holds, its raw capture, <id>.mp3, <id>.wav and a save's temporary files),
+// so the caller and, after a stop, the kept recordings pass erase them; it
+// deletes nothing if it cannot record one. In that transaction too it
+// deletes every stored
 // event that names a session it deletes: a live transcript event holds the
 // conversation's words, a summary event its summary, and a component status
 // event that it existed and was refined and synced. It deletes the events
@@ -149,18 +149,15 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return "", fmt.Errorf("list merged sources of session %s: %w", id, err)
 	}
-	restored, err := restoredRecordingNames(tx, deletedIDs)
-	if err != nil {
-		return "", fmt.Errorf("delete session %s: %w", id, err)
-	}
-	paths = append(paths, restored...)
 	audioPath = strings.Join(paths, ",")
 	for _, entry := range append(recording.Entries(audioPath), recording.RawPath(audioDir, id)) {
 		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {
 			return "", fmt.Errorf("delete session %s: %w", id, err)
 		}
 	}
-	if err := recordDeletedSessionAudio(tx, deletedIDs); err != nil {
+	if err := recordDeletedSessionAudio(tx, deletedIDs, func(sessionID, sessionAudioPath string) ([]string, error) {
+		return deleteFiles(tx, sessionID, sessionAudioPath, audioDir)
+	}); err != nil {
 		return "", fmt.Errorf("delete session %s: %w", id, err)
 	}
 	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
@@ -489,7 +486,9 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 			}
 		}
 	}
-	if err := recordDeletedSessionAudio(tx, deletedIDs); err != nil {
+	if err := recordDeletedSessionAudio(tx, deletedIDs, func(sessionID, sessionAudioPath string) ([]string, error) {
+		return ageDeleteFiles(sessionID, sessionAudioPath, audioDir), nil
+	}); err != nil {
 		return nil, false, fmt.Errorf("GC deletion of session %s: %w", id, err)
 	}
 	if err := dropSessionSetEvents(tx, id); err != nil {

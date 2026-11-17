@@ -28,7 +28,7 @@ type keptRecordingStore interface {
 	// NamedAudio lists every audio file a session names, the recordings a
 	// restored session's Drive folder holds included, so a file a session
 	// names is never erased with a deleted session's nor given to another.
-	NamedAudio() ([]string, error)
+	NamedAudio(audioDir string) ([]string, error)
 	// DeletedSessionAudio lists the sessions a delete recorded, whose audio
 	// files a stop may have left; ClearDeletedSessionAudio forgets one once
 	// none is left.
@@ -288,16 +288,15 @@ func (k *keptRecordings) run(ctx context.Context) {
 	}
 }
 
-// eraseDeleted erases, with zeros, the audio files a stop left of each
-// session a delete recorded (storage.DeletedSessionAudio): its raw capture,
-// saved MP3 and WAV, a save's temporary files, and the recordings its row
-// named, except a file a session names, read just before that session's
-// files go, so a session that starts to name one meanwhile (a Retry
-// refinement downloading a restored merged session's sources) keeps it. Once
-// none of them is left it clears the record. It returns the recorded
-// sessions it leaves for a later pass (a delete holds it, a file could not
-// be erased, or the store could not be read), whose files the rest of the
-// pass leaves alone.
+// eraseDeleted erases, with zeros, the files a stop left of each session a
+// delete recorded (storage.DeletedSessionAudio): exactly the files the
+// delete listed, absolute paths fixed at the delete, except a file a session
+// names, read just before that session's files go, so a session that starts
+// to name one meanwhile (a Retry refinement downloading a restored merged
+// session's sources) keeps it. Once none of them is left it clears the
+// record. It returns the recorded sessions it leaves for a later pass (a
+// delete holds it, a file could not be erased, or the store could not be
+// read), whose files the rest of the pass leaves alone.
 func (k *keptRecordings) eraseDeleted() map[string]bool {
 	left := map[string]bool{}
 	records, err := k.store.DeletedSessionAudio()
@@ -318,7 +317,7 @@ func (k *keptRecordings) eraseDeleted() map[string]bool {
 			continue
 		}
 		remaining := false
-		for _, path := range k.deletedAudioFiles(&record) {
+		for _, path := range record.Files {
 			if named[path] {
 				continue
 			}
@@ -344,44 +343,16 @@ func (k *keptRecordings) eraseDeleted() map[string]bool {
 	return left
 }
 
-// deletedAudioFiles returns, absolute and once each, the files of deleted
-// session record in the audio directory: its raw capture, <id>.mp3 and
-// <id>.wav, a save's temporary files, and each recording its row named.
-func (k *keptRecordings) deletedAudioFiles(record *storage.DeletedSessionAudio) []string {
-	paths := append([]string{
-		recordingname.RawPath(k.audioDir, record.SessionID),
-		filepath.Join(k.audioDir, record.SessionID+".mp3"),
-		filepath.Join(k.audioDir, record.SessionID+".wav"),
-	}, recordingname.KeptTempPaths(k.audioDir, record.SessionID)...)
-	for _, entry := range recordingname.Entries(record.AudioPath) {
-		paths = append(paths, recordingname.Resolve(entry, k.audioDir))
-	}
-	var files []string
-	seen := map[string]bool{}
-	for _, path := range paths {
-		abs, err := filepath.Abs(path)
-		if err != nil || seen[abs] {
-			continue
-		}
-		seen[abs] = true
-		files = append(files, abs)
-	}
-	return files
-}
-
 // namedFiles returns, absolute, every file a session names
-// (storage.SQLiteStore.NamedAudio), each found where recording.Resolve finds
-// it in the audio directory.
+// (storage.SQLiteStore.NamedAudio).
 func (k *keptRecordings) namedFiles() (map[string]bool, error) {
-	entries, err := k.store.NamedAudio()
+	paths, err := k.store.NamedAudio(k.audioDir)
 	if err != nil {
 		return nil, fmt.Errorf("list the audio sessions name: %w", err)
 	}
 	named := map[string]bool{}
-	for _, entry := range entries {
-		if abs, err := filepath.Abs(recordingname.Resolve(entry, k.audioDir)); err == nil {
-			named[abs] = true
-		}
+	for _, path := range paths {
+		named[path] = true
 	}
 	return named, nil
 }

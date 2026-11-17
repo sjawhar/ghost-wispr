@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/sjawhar/ghost-wispr/internal/erase"
 	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
@@ -119,20 +120,27 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 	onDeleted(sessionIDs)
 
 	files := sessionAudioFiles(audioPath, recordingDir, sessionIDs)
+	recorded, recordsErr := recordedFiles(store, sessionIDs)
+	files = append(files, recorded...)
 	named, namedErr := remainingNamed(store, recordingDir)
 	if namedErr != nil {
 		slog.Warn("could not read what remaining sessions name; erasing only the recordings the deleted row named", "session_id", sessionID, "error", namedErr)
 		files, named = sessionAudioFiles(audioPath, recordingDir, nil), nil
 	}
+	if recordsErr != nil {
+		slog.Warn("could not read the delete records; the kept recordings pass erases what they list", "session_id", sessionID, "error", recordsErr)
+	}
 	// Every file is off its name once each is hidden, the rename flushed, or
 	// already gone; then the delete records (storage.DeletedSessionAudio) have
 	// done their work.
-	allOff := namedErr == nil
+	allOff := namedErr == nil && recordsErr == nil
 	pending := make([]erase.Pending, 0)
+	seen := map[string]bool{}
 	for _, p := range files {
-		if named[p] {
+		if named[p] || seen[p] {
 			continue
 		}
+		seen[p] = true
 		hidden, err := beginErasing(p)
 		switch {
 		case errors.Is(err, erase.ErrLeftover):
@@ -201,20 +209,35 @@ func sessionAudioFiles(audioPath, recordingDir string, sessionIDs []string) []st
 	return files
 }
 
-// remainingNamed returns, absolute, every file a session the store still has
-// names, the recordings a restored session's Drive folder holds included
-// (storage.SQLiteStore.NamedAudio), each found where recording.Resolve finds
-// it in recordingDir.
+// recordedFiles returns the files the delete records of sessionIDs list
+// (storage.DeletedSessionAudio): every audio file of each deleted session in
+// the audio directory, fixed in the delete's transaction, the recordings its
+// restored Drive folder held included.
+func recordedFiles(store SessionStore, sessionIDs []string) ([]string, error) {
+	records, err := store.DeletedSessionAudio()
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, record := range records {
+		if slices.Contains(sessionIDs, record.SessionID) {
+			files = append(files, record.Files...)
+		}
+	}
+	return files, nil
+}
+
+// remainingNamed returns every file a session the store still has names,
+// absolute: the recordings its audio path names and those its restored Drive
+// folder holds (storage.SQLiteStore.NamedAudio).
 func remainingNamed(store SessionStore, recordingDir string) (map[string]bool, error) {
-	entries, err := store.NamedAudio()
+	paths, err := store.NamedAudio(recordingDir)
 	if err != nil {
 		return nil, err
 	}
 	named := map[string]bool{}
-	for _, entry := range entries {
-		if abs, err := filepath.Abs(recordingname.Resolve(entry, recordingDir)); err == nil {
-			named[abs] = true
-		}
+	for _, path := range paths {
+		named[path] = true
 	}
 	return named, nil
 }

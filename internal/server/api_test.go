@@ -200,12 +200,20 @@ func (*apiStoreStub) SourceSessionIDs(string) ([]string, error) {
 	return nil, nil
 }
 
-func (s *apiStoreStub) NamedAudio() ([]string, error) {
+func (s *apiStoreStub) NamedAudio(audioDir string) ([]string, error) {
 	var named []string
 	for id := range s.sessions {
-		named = append(named, recordingname.Entries(s.sessions[id].AudioPath)...)
+		for _, entry := range recordingname.Entries(s.sessions[id].AudioPath) {
+			if abs, err := filepath.Abs(recordingname.Resolve(entry, audioDir)); err == nil {
+				named = append(named, abs)
+			}
+		}
 	}
 	return named, nil
+}
+
+func (*apiStoreStub) DeletedSessionAudio() ([]storage.DeletedSessionAudio, error) {
+	return nil, nil
 }
 
 func (s *apiStoreStub) ClearDeletedSessionAudio(id string) error {
