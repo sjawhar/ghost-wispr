@@ -204,6 +204,14 @@ func startMicRig(t *testing.T, peerReads bool, writeLimit time.Duration) *micRig
 		t.Fatalf("start the microphone: %v", err)
 	}
 	startMicMonitoring(ctx, &loops, rig.capture, rig.mic, recorder, resilient, func(d time.Duration) { time.Sleep(d) }, log.Printf, nil)
+	// Cleanups run last first: this one, registered after startTestLight's,
+	// stops the mic loop before the light's cleanup closes the light and
+	// restores openBlink1, which the loop's writer reads back for each buffer.
+	t.Cleanup(func() {
+		cancel()
+		_ = mic.Stop()
+		stopWithin(t, "the rig's microphone loop", loops.Wait)
+	})
 	waitForHardware(t, "the light red while capturing", rig.device.isRed)
 	return rig
 }
