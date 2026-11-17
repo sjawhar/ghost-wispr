@@ -31,9 +31,10 @@ assert_recording_rules() {
 }
 
 # assert_jabra_button_off fails unless the configuration and the .env provision.sh installed leave
-# the Jabra's Mute button off. It stays off until the fix of defect D9 ships: a restart of a paused
-# unit can resume recording, because the Jabra sends a mute-key press as the old process closes
-# its microphone (docs/pi-setup.md, "Pause and resume at the unit").
+# the Jabra's Mute button off. It stays off until a person's real taps pass the checks of
+# docs/pi-setup.md, "Pause and resume at the unit", on the office Pi (their step 6 checks the fix
+# of defect D9, #75), and until the follow-up fix for a microphone that opens before the recording
+# light reads red has merged.
 assert_jabra_button_off() {
   local config=$TEST_LOG.installed-ghost-wispr.yaml env=$TEST_LOG.installed-.env settings
   settings=$(grep -E '^jabra_mute_button:' "$config") || true

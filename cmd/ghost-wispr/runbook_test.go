@@ -69,7 +69,7 @@ func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
 			t.Errorf("the runbook's rollout order does not say why: no %q", why)
 		}
 	}
-	for _, safeguard := range []string{"gdrive_folder_id", "Save no settings", "installed commit", "active session", "models step again", "outside meetings"} {
+	for _, safeguard := range []string{"gdrive_folder_id", "Save no settings", "installed commit", "active session", "models step again", "outside meetings", "only the full provisioner installs"} {
 		if !strings.Contains(section, safeguard) {
 			t.Errorf("the runbook's rollout order does not say %q", safeguard)
 		}
@@ -81,12 +81,14 @@ func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
 // in its YAML, the Jabra Mute button (GHOST_WISPR_JABRA_MUTE_BUTTON): the
 // models step keeps that line as it is, the full provisioner rewrites .env and
 // the template's jabra_mute_button: false applies, and the button stays off
-// until the fix of defect D9 ships ("Pause and resume at the unit"). It also
-// fails if the rollout writes or checks for the button turned on: a restart of
-// a paused unit with the button on can resume recording by itself.
+// until a person's real taps pass the checks of "Pause and resume at the unit"
+// on the office Pi, whose step 6 checks the fix of defect D9, and until the
+// follow-up fix for a microphone that opens before the recording light reads
+// red has merged. It also fails if the rollout writes or checks for the button
+// turned on: these steps restart the recorder.
 func TestRunbookRolloutKeepsTheJabraOverride(t *testing.T) {
 	section := runbookSection(t, "## Roll out a release that adds a config key")
-	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "jabra_mute_button: false", "keeps every `.env` line", "rewrites `.env`", "D9", `"Pause and resume at the unit"`} {
+	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "jabra_mute_button: false", "keeps every `.env` line", "rewrites `.env`", "D9", `"Pause and resume at the unit"`, "real taps", "before the recording light reads red"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's rollout order does not say %q", words)
 		}
@@ -94,6 +96,37 @@ func TestRunbookRolloutKeepsTheJabraOverride(t *testing.T) {
 	for _, on := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON=true", "jabra_mute_button: true"} {
 		if strings.Contains(section, on) {
 			t.Errorf("the runbook's rollout order turns the Jabra's Mute button on: %q", on)
+		}
+	}
+}
+
+// TestTheJabraButtonStaysOffUntilTheTapChecksPass fails if the rollout order,
+// "Pause and resume at the unit" or the office Pi's template keeps the Jabra's
+// Mute button off "until the D9 fix ships": #75, the fix, is in the tree, so a
+// reader would take that as met and turn the button on. Each must name the two
+// conditions a reader can check: a person's real taps passing the checks of
+// "Pause and resume at the unit" on the office Pi, and the merge of the fix
+// for the microphone that opens before the recording light reads red.
+func TestTheJabraButtonStaysOffUntilTheTapChecksPass(t *testing.T) {
+	template, err := os.ReadFile(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
+	if err != nil {
+		t.Fatalf("read the Pi's config template: %v", err)
+	}
+	for name, text := range map[string]string{
+		"the rollout order":              runbookSection(t, "## Roll out a release that adds a config key"),
+		`"Pause and resume at the unit"`: runbookSection(t, "## Pause and resume at the unit"),
+		"the Pi's config template":       strings.Join(strings.Fields(string(template)), " "),
+	} {
+		text = strings.ReplaceAll(text, "# ", "")
+		for _, condition := range []string{"real taps", "before the recording light reads red"} {
+			if !strings.Contains(text, condition) {
+				t.Errorf("%s does not keep the Jabra's button off until %q is dealt with", name, condition)
+			}
+		}
+		for _, stale := range []string{"D9 fix ships", "fix of defect D9 ships", "D9 fix has shipped", "before the D9 fix"} {
+			if strings.Contains(text, stale) {
+				t.Errorf("%s still waits for %q, which #75 already is", name, stale)
+			}
 		}
 	}
 }
