@@ -348,9 +348,10 @@ sends Phone Mute by itself 12-15 ms after its microphone stream next closes, whi
 So a pause closes the microphone, then lights the Jabra, and a resume darkens the Jabra, then
 opens the microphone. Ghost Wispr also sets the light when the Jabra connects or is plugged in
 again, after each tap, and within a quarter of a second after any other pause or resume, each
-time only while no stream is open; a change during speech waits for the speech to end. If a
-resume comes during speech, the microphone opens before the speech ends, so the ring keeps
-showing Muted while the unit records, until the next pause; the blink(1) is red throughout.
+time only while no stream is open; a change during speech waits for the speech to end. A resume
+during speech waits for the speech to end, with capture shown as resuming and the blink(1) off,
+then darkens the Jabra, turns the blink(1) red and opens the microphone, so the ring never reads
+Muted while the unit records. A pause during that wait cancels the resume.
 
 A Mute press that would resume recording is ignored when the kernel stamped it during Ghost
 Wispr's own open, close or PortAudio device scan of the microphone, or the close of a speech

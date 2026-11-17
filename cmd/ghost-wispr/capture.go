@@ -77,6 +77,7 @@ type captureGate struct {
 	beforeGateOpen      func() error
 	onResumeRefused     func(error)
 	beforeMicStart      func() error
+	beforeMicOpen       func(ctx context.Context, closing <-chan struct{}) bool // readies the hardware before a resume's red confirmation; false once closing closes or ctx ends (prepareMicOpen)
 	afterMicStart       func()
 	afterGateOpen       func()
 	onLightUnconfirmed  func(error)   // a red confirmation for audio after a stall failed; must not block
@@ -88,6 +89,7 @@ type captureGate struct {
 	lightHeld           bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
 	resumedAt           time.Time     // when Resume last moved the switch on
 	starting            bool          // that Resume's start of the microphone, and Deepgram, has not finished (finishResume)
+	preparing           bool          // a start waits in beforeMicOpen (prepareMicOpen)
 	closed              bool          // no audio passes the gate
 	closings            int           // counts closings, so a Resume left from an earlier one does nothing
 	resumed             chan struct{} // closed while the gate is open
@@ -290,14 +292,15 @@ func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 // MicHold reports why capture is not up on purpose: paused, held for the
 // light, or stalled or resuming while the gate is closed; and resuming after
 // the gate opens, until the start that brings the microphone and Deepgram
-// back has finished (finishResume) or the stall limit has passed. It is ""
+// back has finished (finishResume) or the stall limit has passed, and for as
+// long as that start waits for the hardware (prepareMicOpen). It is ""
 // otherwise. Readiness checks read it.
 func (g *captureGate) MicHold() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	switch {
 	case !g.closed:
-		if g.starting && !g.switchOff && time.Since(g.resumedAt) <= g.stallAfter {
+		if g.starting && !g.switchOff && (g.preparing || time.Since(g.resumedAt) <= g.stallAfter) {
 			return captureResuming
 		}
 		return ""
@@ -476,6 +479,27 @@ func (g *captureGate) waitResumed(ctx context.Context) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// prepareMicOpen runs beforeMicOpen before a resume opens the microphone, and
+// before its red confirmation, so the recording light does not turn red while
+// it waits. Capture reports resuming meanwhile. It reports false if the gate
+// closes (a pause, or a hold for the light) or ctx ends first; the start then
+// opens nothing.
+func (g *captureGate) prepareMicOpen(ctx context.Context) bool {
+	if g.beforeMicOpen == nil {
+		return true
+	}
+	g.mu.Lock()
+	closing := g.closing
+	g.preparing = true
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.preparing = false
+		g.mu.Unlock()
+	}()
+	return g.beforeMicOpen(ctx, closing)
 }
 
 // Writer returns a writer that forwards audio to dst only while the gate is

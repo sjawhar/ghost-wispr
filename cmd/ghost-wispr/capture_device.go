@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -61,10 +62,14 @@ type captureDevice struct {
 	light   func(on bool) error
 	written bool // light has written shown since it was attached or refreshed
 	shown   bool
+	// silent is closed, and replaced, each time a playback stream closes, so
+	// a microphone open waiting for the speech to end (prepareLightForOpen)
+	// looks again.
+	silent chan struct{}
 }
 
 func newCaptureDevice(paused func() bool) *captureDevice {
-	return &captureDevice{paused: paused}
+	return &captureDevice{paused: paused, silent: make(chan struct{})}
 }
 
 // openStream runs open, which opens a capture stream, as one operation, and
@@ -130,9 +135,51 @@ func (d *captureDevice) playbackClosing(closeStream func()) {
 	closeStream()
 	d.mu.Lock()
 	d.playing--
+	close(d.silent)
+	d.silent = make(chan struct{})
 	d.mu.Unlock()
 	d.end()
 	d.syncLight()
+}
+
+// prepareLightForOpen makes the light show the pause before a microphone
+// opens, so the Jabra's ring never reads Muted while the unit records: the
+// light cannot change once the microphone is open. While the light may not
+// show the pause and a playback stream is open, it waits for the playback to
+// close, then writes the light. It returns false, having written nothing, if
+// cancel closes (a pause) or ctx ends first. A Jabra light that fails to write
+// does not hold the microphone back: the button reconnects the Jabra.
+func (d *captureDevice) prepareLightForOpen(ctx context.Context, cancel <-chan struct{}) bool {
+	for {
+		select {
+		case <-cancel:
+			return false
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		paused := d.paused()
+		d.op.Lock()
+		d.mu.Lock()
+		stale := d.light != nil && (!d.written || d.shown != paused)
+		playing, silent := d.playing > 0, d.silent
+		d.mu.Unlock()
+		if !stale || !playing {
+			if stale {
+				d.writeLight()
+			}
+			d.op.Unlock()
+			return true
+		}
+		d.op.Unlock()
+		select {
+		case <-silent:
+		case <-cancel:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
 }
 
 // attach makes write the light of the Jabra just connected, which may show

@@ -310,10 +310,13 @@ func (p *resilientClientProxy) IsConnected() bool {
 const micRetryEvery = 15 * time.Second
 
 // resumeWaiter is the part of the capture gate a microphone start waits on:
-// waitResumed blocks until the gate is open, and finishResume ends a resume's
-// "resuming" state once the start that brings capture back has finished.
+// waitResumed blocks until the gate is open, prepareMicOpen readies the
+// hardware before the start opens the microphone, and finishResume ends a
+// resume's "resuming" state once the start that brings capture back has
+// finished.
 type resumeWaiter interface {
 	waitResumed(ctx context.Context) bool
+	prepareMicOpen(ctx context.Context) bool
 	finishResume()
 }
 
@@ -342,6 +345,11 @@ func retryMicStartup(
 		}
 		if !capture.waitResumed(ctx) {
 			return
+		}
+		// A pause while it waits for the Jabra (prepareMicOpen) cancels the
+		// attempt; the next comes once capture resumes.
+		if !capture.prepareMicOpen(ctx) {
+			continue
 		}
 
 		if onRetry != nil {
@@ -375,10 +383,12 @@ func retryMicStartup(
 // startMicrophone opens the input device and starts capture with start, and
 // runs retry in loops if start fails or PortAudio is not ready. A paused
 // instance opens no input device until it resumes: while the capture gate is
-// closed, start runs in loops once the gate opens, with atBoot false, and
-// startMicrophone returns deferred true; that start, whether it works or not,
-// ends the resume's "resuming" state (finishResume). Otherwise start runs at
-// once with atBoot true, so it can write the start-up status.
+// closed, start runs in loops once the gate opens and the hardware is ready
+// for it (prepareMicOpen), with atBoot false, and startMicrophone returns
+// deferred true; that start, whether it works or not, ends the resume's
+// "resuming" state (finishResume). A pause while it waits for the hardware
+// cancels that resume, and the next resume starts the microphone. Otherwise
+// start runs at once with atBoot true, so it can write the start-up status.
 //
 // Nothing runs in loops before booted closes, once start-up has sent its
 // component statuses: a power-button resume can come during start-up, and
@@ -397,8 +407,13 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 	}
 	if capture.isClosed() {
 		afterBoot(func() {
-			if !capture.waitResumed(ctx) {
-				return
+			for {
+				if !capture.waitResumed(ctx) {
+					return
+				}
+				if capture.prepareMicOpen(ctx) {
+					break
+				}
 			}
 			started := portAudioReady && start(false) == nil
 			capture.finishResume()
@@ -1340,8 +1355,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		hub.BroadcastStatusChanged(true)
 	}
 	// micDevice orders the Jabra's mute light against every open, close and
-	// probe of the capture device.
+	// probe of the capture device. A resume waits, before it confirms red,
+	// until the light can show it (prepareLightForOpen).
 	micDevice := newCaptureDevice(capture.IsPaused)
+	capture.beforeMicOpen = micDevice.prepareLightForOpen
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry)
 
@@ -1908,6 +1925,12 @@ func streamMicWithRetry(
 			// gate is closed.
 			if !holdMicWhilePaused(ctx, capture, streamer, logf, hub) || ctx.Err() != nil {
 				return
+			}
+			// Before red: a resume during speech on the Jabra waits for it to
+			// end, then lights the Jabra, so its ring reads right while the
+			// microphone is open. A pause meanwhile cancels the resume.
+			if !capture.prepareMicOpen(ctx) {
+				continue
 			}
 			if err = capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone restart: %v", err)
