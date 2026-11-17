@@ -89,12 +89,14 @@ func writeSecretVersion(w http.ResponseWriter, r *http.Request, key string) {
 	}})
 }
 
-// envoyListener stands in for Envoy's webhook: it accepts a post signed with
-// key and refuses any other with 401. Like Envoy, which publishes a Ghost
-// Wispr event under its X-GhostWispr-Delivery id and stores a repeat of it
-// once (legion packages/envoy/internal/integration/webhook_redelivery_test.go),
-// it counts each delivery once: Ghost Wispr sends an event at least once, and
-// every post of one event carries the same delivery id.
+// envoyListener stands in for Envoy's webhook: as Envoy does
+// (legion packages/envoy/internal/webhook/ghostwispr.go), it refuses a post
+// without a delivery id or an event type with 400, and one not signed with key
+// with 401. Like Envoy, which publishes a Ghost Wispr event under its
+// X-GhostWispr-Delivery id and stores a repeat of it once (legion
+// packages/envoy/internal/integration/webhook_redelivery_test.go), it counts
+// each delivery once: Ghost Wispr sends an event at least once, and every post
+// of one event carries the same delivery id.
 type envoyListener struct {
 	*httptest.Server
 	mu         sync.Mutex
@@ -108,6 +110,11 @@ func signedListener(t *testing.T, key string) *envoyListener {
 	l := &envoyListener{deliveries: map[string]bool{}}
 	l.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		delivery := strings.TrimSpace(r.Header.Get("X-GhostWispr-Delivery"))
+		if delivery == "" || strings.TrimSpace(r.Header.Get("X-GhostWispr-Event")) == "" {
+			http.Error(w, "missing ghostwispr headers", http.StatusBadRequest)
+			return
+		}
 		mac := hmac.New(sha256.New, []byte(key))
 		_, _ = mac.Write(body)
 		if !hmac.Equal([]byte("sha256="+hex.EncodeToString(mac.Sum(nil))), []byte(r.Header.Get("X-GhostWispr-Signature"))) {
@@ -117,7 +124,7 @@ func signedListener(t *testing.T, key string) *envoyListener {
 		l.mu.Lock()
 		l.posted++
 		first := l.posted == 1
-		l.deliveries[r.Header.Get("X-GhostWispr-Delivery")] = true
+		l.deliveries[delivery] = true
 		hold, held := l.hold, l.held
 		l.mu.Unlock()
 		if first && hold != nil {
@@ -232,6 +239,49 @@ func TestASweepDuringAPublishSendsTheEventOnce(t *testing.T) {
 	}
 	if got := listener.accepted(); got != 1 {
 		t.Fatalf("listener accepted %d events, want 1", got)
+	}
+}
+
+// TestTheEnvoyFakeRefusesAPostWithoutGhostWisprHeaders fails if the fake
+// listener stores a signed post that lacks a delivery id or an event type,
+// which Envoy refuses with 400: the fake would count an empty delivery as an
+// event, so the Envoy tests would pass for a recorder that sent none. The
+// control is the same signed post with both headers.
+func TestTheEnvoyFakeRefusesAPostWithoutGhostWisprHeaders(t *testing.T) {
+	const key = "key-in-secret-manager"
+	body := []byte(`{"event_type":"session_started","payload":{"session_id":"session-1"}}`)
+	mac := hmac.New(sha256.New, []byte(key))
+	_, _ = mac.Write(body)
+	signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	for _, tc := range []struct {
+		name, delivery, event string
+		want                  int
+	}{
+		{name: "control, both headers", delivery: "session-1.session_started", event: "session.started", want: http.StatusOK},
+		{name: "no delivery id", delivery: " ", event: "session.started", want: http.StatusBadRequest},
+		{name: "no event type", delivery: "session-1.session_started", want: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener := signedListener(t, key)
+			request, err := http.NewRequest(http.MethodPost, listener.URL, strings.NewReader(string(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("X-GhostWispr-Delivery", tc.delivery)
+			request.Header.Set("X-GhostWispr-Event", tc.event)
+			request.Header.Set("X-GhostWispr-Signature", signature)
+			response, err := listener.Client().Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = response.Body.Close()
+			if response.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", response.StatusCode, tc.want)
+			}
+			if wantStored := map[bool]int{true: 1, false: 0}[tc.want == http.StatusOK]; listener.accepted() != wantStored {
+				t.Fatalf("listener stored %d events, want %d", listener.accepted(), wantStored)
+			}
+		})
 	}
 }
 
