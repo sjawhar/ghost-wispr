@@ -19,9 +19,13 @@ func TestHardwareConfigDefaultsAndOverrides(t *testing.T) {
 	if cfg.PowerButton {
 		t.Fatal("power button defaults enabled")
 	}
+	if cfg.JabraMuteButton {
+		t.Fatal("Jabra mute button defaults enabled")
+	}
 
 	t.Setenv(EnvPrefix+"INDICATOR_LIGHT", "blink1")
 	t.Setenv(EnvPrefix+"POWER_BUTTON", "true")
+	t.Setenv(EnvPrefix+"JABRA_MUTE_BUTTON", "1")
 	cfg, _, err = Load("")
 	if err != nil {
 		t.Fatalf("load overrides: %v", err)
@@ -32,14 +36,26 @@ func TestHardwareConfigDefaultsAndOverrides(t *testing.T) {
 	if !cfg.PowerButton {
 		t.Fatal("power button override was ignored")
 	}
+	if !cfg.JabraMuteButton {
+		t.Fatal("Jabra mute button override was ignored")
+	}
 
 	clearEnv(t)
-	cfg, _, err = Load(writeConfig(t, "indicator_light: Blink1\npower_button: true\n"))
+	cfg, _, err = Load(writeConfig(t, "indicator_light: Blink1\npower_button: true\njabra_mute_button: true\n"))
 	if err != nil {
 		t.Fatalf("load YAML hardware settings: %v", err)
 	}
-	if cfg.IndicatorLight != IndicatorLightBlink1 || !cfg.PowerButton {
-		t.Fatalf("YAML hardware settings = (%q, %t), want (blink1, true)", cfg.IndicatorLight, cfg.PowerButton)
+	if cfg.IndicatorLight != IndicatorLightBlink1 || !cfg.PowerButton || !cfg.JabraMuteButton {
+		t.Fatalf("YAML hardware settings = (%q, %t, %t), want (blink1, true, true)", cfg.IndicatorLight, cfg.PowerButton, cfg.JabraMuteButton)
+	}
+
+	t.Setenv(EnvPrefix+"JABRA_MUTE_BUTTON", "false")
+	cfg, _, err = Load(writeConfig(t, "jabra_mute_button: true\n"))
+	if err != nil {
+		t.Fatalf("load YAML Jabra mute button: %v", err)
+	}
+	if cfg.JabraMuteButton {
+		t.Fatal("Jabra mute button environment override false was ignored")
 	}
 }
 

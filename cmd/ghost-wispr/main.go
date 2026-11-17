@@ -1340,6 +1340,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		hub.BroadcastStatusChanged(true)
 	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
+	startJabraMuteButton(ctx, &cfg, capture, micStatus, controlHooks, warningRegistry)
 
 	envoyEvents.configure(ctx, &cfg, appLogger)
 	envoyEvents.publishRecoveredEnds(recoveredIDs)

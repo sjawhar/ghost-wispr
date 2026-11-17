@@ -533,7 +533,7 @@ func runPowerButton(ctx context.Context, capture *captureGate, controls *server.
 				if err != nil {
 					log.Printf("warning: read power button: %v", err)
 				}
-				warnings.Set("power-button", "Power button not found; recording can be paused from the web page")
+				warnings.Set("power-button", powerButtonWarning(err))
 				waitForHardwareRetry(ctx)
 				break readLoop
 			}

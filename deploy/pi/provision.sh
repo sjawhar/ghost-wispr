@@ -240,8 +240,9 @@ sudo udevadm control --reload
 sudo udevadm trigger
 sudo systemctl restart systemd-logind
 
-# plugdev opens the blink(1), input the power button, and audio the microphone and speaker: a
-# lingering user service has no seat, so no seat rule gives it the ALSA devices.
+# plugdev opens the blink(1), input the power button and the Jabra's mute button and light, and
+# audio the microphone and speaker: a lingering user service has no seat, so no seat rule gives it
+# the ALSA devices.
 for group in plugdev input audio; do
   if ! id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -Fxq "$group"; then
     sudo usermod -aG "$group" "$SERVICE_USER"

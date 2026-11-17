@@ -88,6 +88,7 @@ type Config struct {
 	SpeakerDevice                 string             `yaml:"speaker_device"`
 	IndicatorLight                string             `yaml:"indicator_light"`
 	PowerButton                   bool               `yaml:"power_button"`
+	JabraMuteButton               bool               `yaml:"jabra_mute_button"`
 	TTSProvider                   string             `yaml:"tts_provider"`
 	TTSModel                      string             `yaml:"tts_model"`
 	TTSVoice                      string             `yaml:"tts_voice"`
@@ -370,6 +371,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv(EnvPrefix + "POWER_BUTTON"); v != "" {
 		cfg.PowerButton = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv(EnvPrefix + "JABRA_MUTE_BUTTON"); v != "" {
+		cfg.JabraMuteButton = strings.EqualFold(v, "true") || v == "1"
 	}
 	if v := os.Getenv(EnvPrefix + "TTS_PROVIDER"); v != "" {
 		cfg.TTSProvider = strings.ToLower(strings.TrimSpace(v))

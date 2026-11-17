@@ -28,5 +28,6 @@ tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
 indicator_light: blink1
 power_button: true
+jabra_mute_button: true
 envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__
