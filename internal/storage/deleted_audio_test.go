@@ -82,6 +82,42 @@ func TestDeletesRecordTheSessionsWhoseAudioThePassErases(t *testing.T) {
 	}
 }
 
+// Review 5937373764 of #76, P3: a database an earlier head of #76 opened
+// has the delete records table with an audio_path column. Opening it with
+// this build and deleting a session works, and the delete lists its files.
+func TestADeleteWorksOnADatabaseAnEarlierHeadOpened(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost-wispr.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The table as the earlier head made it.
+	if _, err := store.DB().Exec(`DROP TABLE IF EXISTS deleted_session_audio`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE TABLE deleted_session_audio (session_id TEXT PRIMARY KEY, audio_path TEXT NOT NULL DEFAULT '')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+	store, err = NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	audioDir := t.TempDir()
+	const id = "20261106140000"
+	recordingPath := filepath.Join(audioDir, id+".mp3")
+	endedWith(t, store, id, recordingPath, RefinementCompleted)
+
+	if _, err := store.DeleteSession(id, audioDir); err != nil {
+		t.Fatalf("delete on a database an earlier head opened = %v, want it deleted", err)
+	}
+	records, err := store.DeletedSessionAudio()
+	if err != nil || len(records) != 1 || !slices.Contains(records[0].Files, recordingPath) {
+		t.Errorf("DeletedSessionAudio = %+v (%v), want %s listing %s", records, err, id, recordingPath)
+	}
+}
+
 // Review 5936222350 of #76, P2 (the reviewer's repro): GC's age delete keeps
 // a session whose only audio is its raw capture, rather than deleting the row
 // and recording the delete, after which the kept recordings pass would zero

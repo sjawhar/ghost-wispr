@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"github.com/sjawhar/ghost-wispr/internal/recording"
 )
@@ -41,7 +40,7 @@ type queryRower interface {
 // waiting for the kept recordings pass.
 func deletedAudioPending(q queryRower, id string) (bool, error) {
 	var pending int
-	switch err := q.QueryRow(`SELECT 1 FROM deleted_session_audio WHERE session_id = ?`, id).Scan(&pending); {
+	switch err := q.QueryRow(`SELECT 1 FROM deleted_session_files WHERE session_id = ?`, id).Scan(&pending); {
 	case errors.Is(err, sql.ErrNoRows):
 		return false, nil
 	case err != nil:
@@ -53,17 +52,10 @@ func deletedAudioPending(q queryRower, id string) (bool, error) {
 // restoredRecordingFile returns the file in audioDir that name, a recording
 // a restored session's Drive folder holds (restored_recordings), names, and
 // whether it names one. Such a name comes from Drive: it names a file only
-// when it is the plain name of a recording (an .mp3 or .wav, with no
-// directory, not hidden, and no comma, which an audio path would split), and
-// it is always taken in audioDir, never resolved against the working
-// directory.
+// when it is a recording's plain file name (recording.PlainName), and it is
+// always taken in audioDir, never resolved against the working directory.
 func restoredRecordingFile(audioDir, name string) (string, bool) {
-	if audioDir == "" || name == "" || filepath.Base(name) != name || strings.HasPrefix(name, ".") || strings.ContainsRune(name, ',') {
-		return "", false
-	}
-	switch filepath.Ext(name) {
-	case ".mp3", ".wav":
-	default:
+	if audioDir == "" || !recording.PlainName(name) {
 		return "", false
 	}
 	return filepath.Join(audioDir, name), true
@@ -200,7 +192,7 @@ func recordDeletedSessionAudio(tx *sql.Tx, sessionIDs []string, files func(id, a
 		if err != nil {
 			return fmt.Errorf("record the audio of deleted session %s: %w", id, err)
 		}
-		if _, err := tx.Exec(`INSERT INTO deleted_session_audio(session_id, files) VALUES(?, ?)
+		if _, err := tx.Exec(`INSERT INTO deleted_session_files(session_id, files) VALUES(?, ?)
 			ON CONFLICT(session_id) DO UPDATE SET files = excluded.files`, id, string(encoded)); err != nil {
 			return fmt.Errorf("record the audio of deleted session %s: %w", id, err)
 		}
@@ -233,7 +225,7 @@ func restoredRecordingNames(tx *sql.Tx, id string) ([]string, error) {
 // DeletedSessionAudio lists, by session id, the recorded deleted sessions
 // whose audio the kept recordings pass has not cleared yet.
 func (s *SQLiteStore) DeletedSessionAudio() ([]DeletedSessionAudio, error) {
-	rows, err := s.db.Query(`SELECT session_id, files FROM deleted_session_audio ORDER BY session_id`)
+	rows, err := s.db.Query(`SELECT session_id, files FROM deleted_session_files ORDER BY session_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list deleted session audio: %w", err)
 	}
@@ -260,7 +252,7 @@ func (s *SQLiteStore) DeletedSessionAudio() ([]DeletedSessionAudio, error) {
 // ClearDeletedSessionAudio forgets the record of deleted session id, once
 // none of its audio files is left.
 func (s *SQLiteStore) ClearDeletedSessionAudio(id string) error {
-	if _, err := s.db.Exec(`DELETE FROM deleted_session_audio WHERE session_id = ?`, id); err != nil {
+	if _, err := s.db.Exec(`DELETE FROM deleted_session_files WHERE session_id = ?`, id); err != nil {
 		return fmt.Errorf("clear the audio record of deleted session %s: %w", id, err)
 	}
 	return nil

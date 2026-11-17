@@ -416,15 +416,19 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create app_state table: %w", err)
 	}
 
-	// deleted_session_audio records each session a person's delete or GC's
+	// deleted_session_files records each session a person's delete or GC's
 	// age delete took, with the files of it to erase (absolute paths, as a
 	// JSON array), in the transaction that deletes the rows
 	// (recordDeletedSessionAudio). The kept recordings pass erases those
 	// files a stop left behind, then clears the record (DeletedSessionAudio,
 	// ClearDeletedSessionAudio). It erases no other file of a session with no
 	// row: a restored backup has no row for the sessions recorded since it.
+	// Earlier heads of the change that added it (#76) made it as
+	// deleted_session_audio, with an audio_path column; no release carried
+	// that table, so it is dropped rather than read.
 	if _, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS deleted_session_audio (
+		DROP TABLE IF EXISTS deleted_session_audio;
+		CREATE TABLE IF NOT EXISTS deleted_session_files (
 			session_id TEXT PRIMARY KEY,
 			files TEXT NOT NULL DEFAULT '[]'
 		);
@@ -1010,7 +1014,7 @@ func (s *SQLiteStore) runOnce(name, stmt string) error {
 
 // ErrSessionExists is the error CreateSession returns, creating nothing, for
 // an id a session already has, or a deleted session still recorded in
-// deleted_session_audio.
+// deleted_session_files.
 var ErrSessionExists = errors.New("a session with this id exists")
 
 // CreateSession creates session id, active since startedAt. An id a session
@@ -1025,7 +1029,7 @@ func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 	res, err := s.db.Exec(
 		`INSERT INTO sessions(id, started_at, status, summary_status, envoy_publish_status)
 		 SELECT ?, ?, 'active', ?, ?
-		 WHERE NOT EXISTS (SELECT 1 FROM deleted_session_audio WHERE session_id = ?)
+		 WHERE NOT EXISTS (SELECT 1 FROM deleted_session_files WHERE session_id = ?)
 		 ON CONFLICT(id) DO NOTHING`,
 		id,
 		startedAt.UTC().Format(time.RFC3339Nano),
