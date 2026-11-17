@@ -397,6 +397,22 @@ of the Pi's time does not move the stamps. The log says
 A press that would pause always pauses. The blink(1) stays the recording light: the Jabra's light
 only shows the pause switch.
 
+The blink(1) reads back red before the microphone opens, and stays red until it is open: every
+start, resume and reconnect of the microphone, and PortAudio's device scan, waits for that check.
+While the microphone is missing, the start-up retry tries again every 15 seconds, and the blink(1)
+shows red for as long as each try takes: red only while an open is being attempted. A unit that
+starts paused scans only at its first resume, so it speaks only from then on: meanwhile
+`/api/status` warns `Speaker unavailable until the microphone starts`, and `POST /api/tts/speak`
+answers `409` with that reason. A pause during an open keeps the blink(1) red until that open has
+finished. A pause closes the
+microphone at once, also while its read waits on a device that delivers no frame. If it still
+cannot be closed, `/api/status` warns
+`Microphone still open after a pause: its read does not stop` until it is, and nothing is
+recorded meanwhile. Once the blink(1) was off while the microphone was open, as when no audio
+reached the recording, Ghost Wispr drops what the microphone holds and opens it again under a new
+check; the log says `the recording light was not red while the microphone was open; reopening the
+microphone`.
+
 Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
 a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
 program's stream, so it may change the light while the stream is open, and the Jabra's own Phone
@@ -683,10 +699,11 @@ Envoy, speaker, indicator light, power button, and Jabra mute button. Before sta
 separate database as paused, and do not resume it: a paused instance opens the microphone, and
 connects to Deepgram, only when someone resumes it.
 
-The test instance must not open the Jabra at all. PortAudio opens every audio device once as an
-instance starts, and the recorder, running beside it with the Jabra button on, cannot see that
-stream: a light change while it is open makes the Jabra send Phone Mute when it closes, which the
-recorder reads as a tap. So start it with no supplementary groups: the Pi's sound devices are
+The test instance must not open the Jabra at all. PortAudio opens every audio device once when an
+instance first starts its microphone: at start-up, or, for an instance seeded paused, at its
+first resume. The recorder, running beside it with the Jabra button on, cannot see that stream: a
+light change while it is open makes the Jabra send Phone Mute when it closes, which the recorder
+reads as a tap. So start it with no supplementary groups: the Pi's sound devices are
 `root:audio` and its input nodes `root:input`, both mode 0660, so it can open neither. Also set
 `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, which overrides the YAML. Seed and start it like this:
 

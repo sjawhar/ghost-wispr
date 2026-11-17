@@ -188,9 +188,13 @@ func (h *hardwareControl) CaptureStarted() {
 	h.Wake()
 }
 
-func (h *hardwareControl) CaptureStopped() {
-	h.redHolds.Store(0)
-	h.Wake()
+// lightOffs counts the times the recording light was written, or read back,
+// as anything but red, or failed; 0 without a light.
+func (h *hardwareControl) lightOffs() uint64 {
+	if h.light == nil {
+		return 0
+	}
+	return h.light.offs.Load()
 }
 
 func (h *hardwareControl) ReleaseRedHold() {
@@ -252,12 +256,28 @@ func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, onRe
 	capture.onResumeRefused = onResumeRefused
 }
 
+// wireLightConsent makes every microphone open, start and gate opening wait
+// for the light to be confirmed red, and hold it red until it is done; and
+// lets audio pass only while the light has stayed red since the microphone
+// opened. A pause takes no hold away: the light goes off once the gate is
+// closed and every open under way has ended, never while one may still open a
+// device.
 func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry, onResumeRefused func(error)) {
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
 	capture.onLightUnconfirmed = hardware.LightUnconfirmed
+	capture.lightOffs = hardware.lightOffs
 	guardResumeWithLight(capture, warnings, onResumeRefused)
+}
+
+// pauseCapture closes the capture gate and wakes the light controller. It
+// takes no red hold away: a microphone open under way holds the light red
+// until it ends, so the light goes off once no device may still open, never
+// while one may.
+func pauseCapture(capture *captureGate, hardware *hardwareControl) {
+	capture.Pause()
+	hardware.Wake()
 }
 
 // startHardware starts the configured recording light, and the guard that
@@ -339,6 +359,10 @@ type reconnectingLight struct {
 	// retryEvery is how long a failed discovery is remembered before the next
 	// one; zero means hardwareRetry.
 	retryEvery time.Duration
+	// offs counts, under deviceMu, each write of a colour other than red, each
+	// read-back of one, each light just found (it shows what it showed before)
+	// and each failure: each time the light may have stopped showing red.
+	offs atomic.Uint64
 }
 
 func (l *reconnectingLight) retryDelay() time.Duration {
@@ -380,12 +404,14 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 		return nil, err
 	}
 	l.light = light
+	l.offs.Add(1)
 	l.lastErr = nil
 	l.warnings.Clear("recording-light")
 	return light, nil
 }
 
 func (l *reconnectingLight) failed(err error) error {
+	l.offs.Add(1)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.light != nil {
@@ -401,12 +427,16 @@ func (l *reconnectingLight) failed(err error) error {
 func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
 	l.deviceMu.Lock()
 	defer l.deviceMu.Unlock()
-	if (r != 255 || g != 0 || b != 0) && l.holdRed != nil && l.holdRed() {
+	red := r == 255 && g == 0 && b == 0
+	if !red && l.holdRed != nil && l.holdRed() {
 		return nil
 	}
 	light, err := l.current()
 	if err != nil {
 		return err
+	}
+	if !red {
+		l.offs.Add(1)
 	}
 	if err := light.SetRGB(r, g, b); err != nil {
 		return l.failed(err)
@@ -424,6 +454,9 @@ func (l *reconnectingLight) ReadRGB() (uint8, uint8, uint8, error) {
 	r, g, b, err := light.ReadRGB()
 	if err != nil {
 		return 0, 0, 0, l.failed(err)
+	}
+	if r != 255 || g != 0 || b != 0 {
+		l.offs.Add(1)
 	}
 	return r, g, b, nil
 }
@@ -469,6 +502,7 @@ func (l *reconnectingLight) ConfirmRed() error {
 		return l.failed(err)
 	}
 	if r != 255 || g != 0 || b != 0 {
+		l.offs.Add(1)
 		return fmt.Errorf("%w: it reads %d,%d,%d", indicator.ErrNotRed, r, g, b)
 	}
 	return nil

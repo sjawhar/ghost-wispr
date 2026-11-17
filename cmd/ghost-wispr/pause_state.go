@@ -180,16 +180,12 @@ var errLightNotConfirmed = errors.New("recording light not confirmed red")
 // paused instance opens no device (startMicrophone), but a pause that lands
 // after the device opened leaves it open and not started; the mic loop closes
 // it, and opens it again on resume. Each start attempt confirms red first and
-// clears any forced-red hold afterward.
+// holds it red until the start returns (openUnderRed).
 func startMicIfUnpaused(capture *captureGate, start func() error) error {
 	if capture.IsPaused() {
 		return nil
 	}
-	if err := capture.confirmMicStart(); err != nil {
-		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
-	}
-	defer capture.finishMicStart()
-	return start()
+	return capture.openUnderRed(start)
 }
 
 // startOpenedMic starts mic, which the caller has opened and published,

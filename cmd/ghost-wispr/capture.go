@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -51,6 +52,14 @@ const (
 // It ends Mic.Stream, so streamMicWithRetry can close the device.
 var errGateClosed = errors.New("microphone capture gate closed")
 
+// errLightWentOff is what a captureGate writer returns for audio the recording
+// light may not have been red for: since the microphone opened under a red
+// confirmation (confirmMicOpen), the light was written, or read back, as
+// anything but red. The audio is dropped, and streamMicWithRetry closes the
+// microphone, which drops what its stream still holds, and opens it again
+// under a fresh confirmation.
+var errLightWentOff = errors.New("the recording light was not red while the microphone was open")
+
 // captureGate is the pause switch for microphone capture. Pause closes the gate
 // before it returns, so no audio the microphone captures after that passes the
 // gate's writer to the recorder or Deepgram, and streamMicWithRetry closes the
@@ -81,6 +90,8 @@ type captureGate struct {
 	afterMicStart       func()
 	afterGateOpen       func()
 	onLightUnconfirmed  func(error)   // a red confirmation for audio after a stall failed; must not block
+	lightOffs           func() uint64 // counts the times the recording light was written, or read back, as anything but red; nil without a light
+	onMicHeld           func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
 	stallAfter          time.Duration // see captureStallAfter
 	writeWait           time.Duration // see captureWriteWait
 	control             sync.Mutex    // serializes closing and opening the gate, with their steps
@@ -103,6 +114,10 @@ type captureGate struct {
 	// than audioStallAfter, the unit is not recording: the light goes off and
 	// the status says no_audio.
 	audioAt atomic.Int64
+	// redMark is lightOffs as the last red confirmation for a microphone open
+	// or start left it (confirmMicOpen). While lightOffs still reads it, the
+	// light has been red since that microphone opened.
+	redMark atomic.Uint64
 }
 
 // audioStallAfter is how long the microphone may deliver nothing to the
@@ -386,6 +401,56 @@ func (g *captureGate) finishMicStart() {
 	}
 }
 
+// confirmMicOpen confirms the light red for a microphone open or start, as
+// confirmMicStart does, holding it red until finishMicStart, and marks the
+// light as red from then on: audio passes the gate only while the light has
+// stayed red since (lightWentOff).
+func (g *captureGate) confirmMicOpen() error {
+	if err := g.confirmMicStart(); err != nil {
+		return err
+	}
+	if g.lightOffs != nil {
+		g.redMark.Store(g.lightOffs())
+	}
+	return nil
+}
+
+// openUnderRed runs open, which opens or starts a capture device, only once the
+// light is confirmed red (confirmMicOpen), and holds the light red until open
+// returns: the light controller cannot turn it off meanwhile, so no device
+// opens, and no PortAudio scan runs, while the light last showed anything but
+// red. A light that cannot be confirmed red runs nothing and returns
+// errLightNotConfirmed.
+func (g *captureGate) openUnderRed(open func() error) error {
+	if err := g.confirmMicOpen(); err != nil {
+		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
+	}
+	defer g.finishMicStart()
+	return open()
+}
+
+// lightWentOff reports whether the light was written, or read back, as
+// anything but red since the microphone last opened under confirmMicOpen.
+func (g *captureGate) lightWentOff() bool {
+	return g.lightOffs != nil && g.lightOffs() != g.redMark.Load()
+}
+
+// closingSignal returns a channel that is closed once the gate is closed: at
+// once if it is closed now, else at its next closing.
+func (g *captureGate) closingSignal() <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closing
+}
+
+// micHeld reports to onMicHeld that a pause could not release the microphone
+// (true), or that it is released after all (false).
+func (g *captureGate) micHeld(held bool) {
+	if g.onMicHeld != nil {
+		g.onMicHeld(held)
+	}
+}
+
 // waitForInflightWrites waits, up to writeWait, until no write that passed the
 // gate before it closed is still running. It reports false if one still is.
 func (g *captureGate) waitForInflightWrites() bool {
@@ -514,14 +579,18 @@ type gatedWriter struct {
 	dst  io.Writer
 }
 
-// Write records p. Audio that comes back after a stall, which turned the
-// light off, is recorded only once the light is confirmed red again
-// (beforeMicStart, as for a microphone start): otherwise it would be recorded
-// with the light off until the light's next check. Audio the light cannot be
-// confirmed red for is dropped, and the failure goes to the light guard
-// (onLightUnconfirmed), which holds the gate for the light: the light can read
-// back off, as its controller wants while nothing is recorded, so only this
-// confirmation finds it broken.
+// Write records p, only while the light has stayed red since the microphone
+// opened under a red confirmation (lightWentOff). Audio that comes after a
+// stall, which may have turned the light off, is first confirmed red
+// (beforeMicStart, as for a microphone start), so the light stays red if it
+// never went off. If it went off, as the controller turns it off once no
+// audio reaches the recording (no_audio), the audio is dropped with
+// errLightWentOff: some of it, and whatever the microphone still holds, was
+// captured with the light off. Audio the light cannot be confirmed red for is
+// dropped, and the failure goes to the light guard (onLightUnconfirmed), which
+// holds the gate for the light: the light can read back off, as its
+// controller wants while nothing is recorded, so only this confirmation finds
+// it broken.
 func (w *gatedWriter) Write(p []byte) (int, error) {
 	g := w.gate
 	g.mu.Lock()
@@ -540,6 +609,9 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 			return len(p), nil
 		}
 		defer g.finishMicStart()
+	}
+	if g.lightWentOff() {
+		return 0, errLightWentOff
 	}
 	n, err := w.dst.Write(p)
 	if err == nil {

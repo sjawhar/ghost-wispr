@@ -117,8 +117,9 @@ if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
   fail 'self-test accepted a running-models check that always passes'
 fi
 
-# The cert-warning test instance runs beside the recorder, on the same Pi. Its PortAudio start-up
-# opens the Jabra's microphone, and with its Jabra button on it would also write the Jabra's light.
+# The cert-warning test instance runs beside the recorder, on the same Pi. Its PortAudio scan, the
+# first time it starts its microphone, opens the Jabra's microphone, and with its Jabra button on it
+# would also write the Jabra's light.
 # The recorder, running with its own Jabra button on, cannot see either: the Jabra then sends its
 # own Phone Mute, and the recorder reads it as a tap (docs/pi-setup.md, "Pause and resume at the
 # unit"). The runbook starts it with no supplementary groups, so it can open no sound device

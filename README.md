@@ -127,6 +127,17 @@ pause. `/api/status` then names the cause in a warning and reports `capture_stat
 paused it meanwhile. Any other value of `indicator_light` stops the recorder from starting, so a
 typo cannot turn the light check off; leave it unset for a recorder with no light.
 
+Every microphone open, and PortAudio's device scan, which opens the microphone too, waits for
+the blink(1) to read back red and keeps it red until the open has finished, so no microphone opens
+while the light is off. While the microphone is missing, the start-up retry tries again every 15
+seconds, and the blink(1) shows red for as long as each try takes. A unit that starts paused scans
+only at its first resume, so its speaker plays only from then on: until then `/api/status` warns
+`Speaker unavailable until the microphone starts`, and `POST /api/tts/speak` answers `409` with
+that reason. Audio passes only while the light has stayed red since the microphone opened: once
+the light went off while the microphone was open, as when no audio reached the recording
+(`no_audio`), the recorder drops what the microphone holds, closes it and opens it again under a
+new red check.
+
 ## Deployment
 
 The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is
@@ -141,7 +152,7 @@ outputs, credential bundle, provisioning command, tailnet join, and acceptance c
 | `GET` | `/api/sessions?date=YYYY-MM-DD` | List sessions for a date (defaults to today) |
 | `GET` | `/api/sessions/{id}` | Get session details with transcript segments |
 | `GET` | `/api/sessions/{id}/audio` | Stream session audio (supports range requests) |
-| `POST` | `/api/pause` | Pause capture. The pause persists through restarts; the active session ends, the microphone closes, and nothing is recorded or sent to Deepgram until resume. A unit that starts paused opens the microphone, and connects to Deepgram, only when it resumes. When enabled, the Pi power button and the Jabra's Mute button toggle the same control, and the Jabra's mute light is on while capture is paused. |
+| `POST` | `/api/pause` | Pause capture. The pause persists through restarts; the active session ends, the microphone closes at once, even while its read waits for a device that delivers nothing, and nothing is recorded or sent to Deepgram until resume. If the microphone cannot be closed, `/api/status` warns until it is. A unit that starts paused opens the microphone, and connects to Deepgram, only when it resumes. When enabled, the Pi power button and the Jabra's Mute button toggle the same control, and the Jabra's mute light is on while capture is paused. |
 | `POST` | `/api/resume` | Resume a persisted pause. With a configured light, it confirms red before returning, and a missing light refuses the resume. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone reopens; while the unit speaks through the Jabra, the microphone reopens once the speech ends, and a pause meanwhile cancels the resume. |
 | `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `light_unavailable` while the switch is on but the recording light is missing or does not read back red, `resuming` from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 s, or for as long as the microphone waits for speech on the Jabra to end before it opens, `stalled`, `mic_unavailable`, `no_audio` while the microphone and the gate are open but no audio has reached the recording for 2 s, so nothing is recorded and the light is off, or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (every raw `.pcm` recording the app keeps: those of sessions that ended without a recording, which it tries again to save after every Drive sync sweep, those beside a saved recording, which it erases once Drive has it, and those it neither saves nor erases), `kept_raw_by_hand` (the sessions of those last ones, which wait for a person), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |

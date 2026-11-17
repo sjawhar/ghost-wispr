@@ -204,7 +204,7 @@ func TestAResumedMicrophoneOpensOnlyAfterTheLightReadsRed(t *testing.T) {
 	})
 	// start stands in for startMicPipeline: PortAudio opens the device, which
 	// takes portAudioOpenTook, then startOpenedMic confirms red and starts it.
-	startMicrophone(ctx, &loops, capture, alreadyBooted(), true, func(bool) error {
+	_, _ = startMicrophone(ctx, &loops, capture, alreadyBooted(), func(bool) error {
 		time.Sleep(portAudioOpenTook)
 		opened <- device.snapshot()
 		mic.open.Store(true)

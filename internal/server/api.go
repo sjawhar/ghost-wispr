@@ -1518,6 +1518,13 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				writeJSONError(w, http.StatusServiceUnavailable, "speaker not available")
 				return
 			}
+			// The speaker exists but cannot play in the unit's present state.
+			if controls.TTSSpeakerWaits != nil {
+				if reason := controls.TTSSpeakerWaits(); reason != "" {
+					writeJSONError(w, http.StatusConflict, reason)
+					return
+				}
+			}
 			// Pre-flight: check TTS provider availability.
 			if controls.TTSHasProvider != nil && !controls.TTSHasProvider() {
 				writeJSONError(w, http.StatusNotImplemented, "no TTS provider configured")

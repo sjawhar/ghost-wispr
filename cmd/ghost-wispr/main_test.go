@@ -404,7 +404,7 @@ func TestPausedStartOpensNoInputDeviceUntilResume(t *testing.T) {
 		}
 	})
 
-	deferred := startMicrophone(ctx, &loops, capture, alreadyBooted(), true, func(atBoot bool) error {
+	deferred, _ := startMicrophone(ctx, &loops, capture, alreadyBooted(), func(atBoot bool) error {
 		opened <- atBoot
 		return nil
 	}, func() { t.Error("the start-up retried, but no attempt failed") })
@@ -434,12 +434,12 @@ func TestPausedStartOpensNoInputDeviceUntilResume(t *testing.T) {
 func TestUnpausedStartOpensTheInputDeviceAtOnce(t *testing.T) {
 	var loops sync.WaitGroup
 	var attempts []bool
-	deferred := startMicrophone(context.Background(), &loops, newCaptureGate(nil, nil, nil), alreadyBooted(), true, func(atBoot bool) error {
+	deferred, err := startMicrophone(context.Background(), &loops, newCaptureGate(nil, nil, nil), alreadyBooted(), func(atBoot bool) error {
 		attempts = append(attempts, atBoot)
 		return nil
 	}, func() { t.Error("the start-up retried, but no attempt failed") })
-	if deferred || len(attempts) != 1 || !attempts[0] {
-		t.Fatalf("unpaused start: deferred=%t attempts(atBoot)=%v, want deferred=false and one boot attempt", deferred, attempts)
+	if deferred || err != nil || len(attempts) != 1 || !attempts[0] {
+		t.Fatalf("unpaused start: deferred=%t err=%v attempts(atBoot)=%v, want deferred=false, no error and one boot attempt", deferred, err, attempts)
 	}
 	if !joinMicLoops(&loops, testWait) {
 		t.Fatal("a start that succeeded left a start-up goroutine running")
@@ -454,12 +454,12 @@ func TestUnpausedStartOpensTheInputDeviceAtOnce(t *testing.T) {
 // connects later, while the unit records.
 func TestDeferredMicStartWaitsForTheStartUpStatus(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		paused         bool
-		portAudioReady bool
+		name     string
+		paused   bool
+		startErr error
 	}{
-		{name: "resume during start-up", paused: true, portAudioReady: true},
-		{name: "retry after PortAudio failed", portAudioReady: false},
+		{name: "resume during start-up", paused: true},
+		{name: "retry after the boot start failed", startErr: errors.New("initialize portaudio: no device")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -476,7 +476,10 @@ func TestDeferredMicStartWaitsForTheStartUpStatus(t *testing.T) {
 					t.Error("microphone start-up still running after shutdown")
 				}
 			})
-			startMicrophone(ctx, &loops, capture, booted, tc.portAudioReady, func(bool) error {
+			_, _ = startMicrophone(ctx, &loops, capture, booted, func(atBoot bool) error {
+				if atBoot {
+					return tc.startErr
+				}
 				ran <- "start"
 				return nil
 			}, func() { ran <- "retry" })
@@ -500,17 +503,14 @@ func TestDeferredMicStartWaitsForTheStartUpStatus(t *testing.T) {
 
 // TestDeferredMicStartEndsTheResumeWindow fails if a paused start, run on
 // resume, does not end the resume's resuming state once it has finished,
-// whether it opened the microphone and connected Deepgram, failed, or could
-// not run because PortAudio was not ready.
+// whether it opened the microphone and connected Deepgram, or failed.
 func TestDeferredMicStartEndsTheResumeWindow(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		startErr       error
-		portAudioReady bool
+		name     string
+		startErr error
 	}{
-		{name: "started", portAudioReady: true},
-		{name: "start failed", startErr: errors.New("microphone unavailable"), portAudioReady: true},
-		{name: "PortAudio not ready"},
+		{name: "started"},
+		{name: "start failed", startErr: errors.New("microphone unavailable")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -523,7 +523,7 @@ func TestDeferredMicStartEndsTheResumeWindow(t *testing.T) {
 					t.Error("microphone start-up still running after shutdown")
 				}
 			})
-			startMicrophone(ctx, &loops, capture, alreadyBooted(), tc.portAudioReady, func(bool) error { return tc.startErr }, func() {})
+			_, _ = startMicrophone(ctx, &loops, capture, alreadyBooted(), func(bool) error { return tc.startErr }, func() {})
 			capture.Resume()
 			waitOpen(t, capture)
 			waitMicHold(t, capture, "")
