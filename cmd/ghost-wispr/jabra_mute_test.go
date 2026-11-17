@@ -403,6 +403,33 @@ func TestJabraPermissionWarningNamesTheUdevRule(t *testing.T) {
 	})
 }
 
+// TestJabraClockRefusalWarningNamesTheClock fails if a Jabra node that is
+// found and opened, but refuses the monotonic clock the press guard needs, is
+// reported as a missing Jabra. The button stays off then, which is right, but
+// the page must name the cause the log names.
+func TestJabraClockRefusalWarningNamesTheClock(t *testing.T) {
+	dir := t.TempDir()
+	devices := filepath.Join(dir, "devices")
+	block := "N: Name=\"Jabra Speak2 75\"\nH: Handlers=kbd leds event1\nB: KEY=fff 0 0 0 40 100000000000000 0 0 0\nB: LED=80\n"
+	if err := os.WriteFile(devices, []byte(block), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file is no evdev node: it refuses the clock request.
+	if err := os.WriteFile(filepath.Join(dir, "event1"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, clockErr := connectJabra(devices, dir)
+	if clockErr == nil {
+		t.Fatal("control: a regular file took the evdev clock request")
+	}
+	rig := newJabraRig(false)
+	rig.connectErr = clockErr
+	rig.start(t)
+	waitForHardware(t, "a warning that names the clock", func() bool {
+		return strings.Contains(rig.warning(), "clock") && !strings.Contains(rig.warning(), "not found")
+	})
+}
+
 // TestOpenJabraOpensTheNodeToWrite fails if the Jabra's node is opened
 // read-only: the light write would then fail on the unit, and the button
 // would never toggle. It also fails if connectJabra uses a node that refuses

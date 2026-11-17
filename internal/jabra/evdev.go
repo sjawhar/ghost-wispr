@@ -25,6 +25,10 @@ import (
 
 var ErrNoMuteButton = errors.New("jabra mute button not found")
 
+// ErrNoMonotonicClock is StampWithMonotonicClock's error: the node did not
+// take the monotonic clock.
+var ErrNoMonotonicClock = errors.New("the input node refused the monotonic clock")
+
 var eventHandler = regexp.MustCompile(`\bevent\d+\b`)
 
 // Linux input-event-codes.h values, and the size of a 64-bit input_event.
@@ -49,16 +53,16 @@ const evIocSClockID = 0x400445a0
 func StampWithMonotonicClock(f *os.File) error {
 	raw, err := f.SyscallConn()
 	if err != nil {
-		return fmt.Errorf("stamp input events with the monotonic clock: %w", err)
+		return fmt.Errorf("%w: %w", ErrNoMonotonicClock, err)
 	}
 	var ioctlErr error
 	if err := raw.Control(func(fd uintptr) {
 		ioctlErr = unix.IoctlSetPointerInt(int(fd), evIocSClockID, unix.CLOCK_MONOTONIC)
 	}); err != nil {
-		return fmt.Errorf("stamp input events with the monotonic clock: %w", err)
+		return fmt.Errorf("%w: %w", ErrNoMonotonicClock, err)
 	}
 	if ioctlErr != nil {
-		return fmt.Errorf("stamp input events with the monotonic clock: %w", ioctlErr)
+		return fmt.Errorf("%w: %w", ErrNoMonotonicClock, ioctlErr)
 	}
 	return nil
 }

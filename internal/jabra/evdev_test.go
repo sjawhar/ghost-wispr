@@ -154,16 +154,17 @@ func TestReadPressesReportsATruncatedEvent(t *testing.T) {
 }
 
 // TestStampWithMonotonicClockRefusesANonEvdevFile fails if the clock request
-// on a file that is not an evdev node reports success: the button would then
-// compare wall-clock stamps with the monotonic clock.
+// on a file that is not an evdev node reports success, or reports a failure
+// that is not ErrNoMonotonicClock: the button would then compare wall-clock
+// stamps with the monotonic clock, or name the wrong cause.
 func TestStampWithMonotonicClockRefusesANonEvdevFile(t *testing.T) {
 	f, err := os.Create(filepath.Join(t.TempDir(), "event1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = f.Close() })
-	if err := StampWithMonotonicClock(f); err == nil {
-		t.Fatal("a regular file took the evdev clock request")
+	if err := StampWithMonotonicClock(f); !errors.Is(err, ErrNoMonotonicClock) {
+		t.Fatalf("a regular file's clock request = %v, want ErrNoMonotonicClock", err)
 	}
 }
 

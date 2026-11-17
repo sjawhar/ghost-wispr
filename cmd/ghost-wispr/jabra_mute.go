@@ -190,6 +190,9 @@ func (b *jabraMuteButton) waitForRetry(ctx context.Context) {
 }
 
 func jabraMuteButtonWarning(err error) string {
+	if errors.Is(err, jabra.ErrNoMonotonicClock) {
+		return "Jabra mute button is off: its input node refused the monotonic clock that tells its own mute reports from taps; recording can be paused from the web page"
+	}
 	if errors.Is(err, os.ErrPermission) {
 		return "Jabra mute button is not accessible; check the input group and udev rule"
 	}

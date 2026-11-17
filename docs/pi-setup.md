@@ -367,8 +367,9 @@ Ghost Wispr finds the input device whose name starts with `Jabra ` and which has
 office Pi, `/dev/input/event1`), reads the key there and writes the light there. With two such
 Jabras plugged in, it uses the first one the kernel lists. The service user is in the `input`
 group, and `99-ghost-wispr.rules` gives the Jabra's input nodes mode 0660 and group `input`.
-While the Jabra is missing or not accessible, `/api/status` warns, and Ghost Wispr looks for it
-again every 10 seconds; the other controls still work.
+While the Jabra is missing or not accessible, or its input node refuses the monotonic clock, the
+button is off, `/api/status` warns and names which, and Ghost Wispr looks for it again every 10
+seconds; the other controls still work.
 
 Answering each tap with the light is what a Microsoft Teams client does: in the
 [Teams devices general specification](https://learn.microsoft.com/en-us/microsoftteams/devices/certification-specifications)
