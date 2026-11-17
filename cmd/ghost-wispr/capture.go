@@ -48,12 +48,12 @@ const (
 )
 
 // errGateClosed is what a captureGate writer returns while capture is paused.
-// It ends Mic.Stream, so streamMicWithRetry can stop the device.
+// It ends Mic.Stream, so streamMicWithRetry can close the device.
 var errGateClosed = errors.New("microphone capture gate closed")
 
 // captureGate is the pause switch for microphone capture. Pause closes the gate
 // before it returns, so no audio the microphone captures after that passes the
-// gate's writer to the recorder or Deepgram, and streamMicWithRetry stops the
+// gate's writer to the recorder or Deepgram, and streamMicWithRetry closes the
 // capture device until the gate opens again.
 //
 // A transition runs up to three steps. onPause runs inside Pause, just before
@@ -447,7 +447,7 @@ func (g *captureGate) capturing(mic interface{ IsOpen() bool }) bool {
 }
 
 // sleepUnlessPaused sleeps for d, or until the gate closes or ctx ends. The mic
-// loop backs off with it, so a pause stops the device at once, and shutdown
+// loop backs off with it, so a pause closes the device at once, and shutdown
 // ends the loop at once, not after the backoff.
 func (g *captureGate) sleepUnlessPaused(ctx context.Context, d time.Duration) {
 	g.mu.Lock()

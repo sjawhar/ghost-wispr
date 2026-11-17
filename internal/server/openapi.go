@@ -787,7 +787,7 @@ func OpenAPISpec() map[string]any {
 			"/api/pause": map[string]any{
 				"post": map[string]any{
 					"summary":     "Pause recording",
-					"description": "Stop microphone capture: no audio reaches the recording or Deepgram, the microphone stops, the active session ends, and no session starts until resume",
+					"description": "Stop microphone capture: no audio reaches the recording or Deepgram, the microphone closes, the active session ends, and no session starts until resume",
 					"tags":        []string{"control"},
 					"security":    []map[string][]string{{"basicAuth": {}}},
 					"responses": map[string]any{

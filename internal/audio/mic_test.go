@@ -105,7 +105,7 @@ func TestMicCloseReleasesTheStream(t *testing.T) {
 		t.Fatal("the mic reports open after Close")
 	}
 	if err := mic.Start(); err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("Start after Close = %v, want the stream unavailable until Reopen", err)
+		t.Fatalf("Start after Close = %v, want the stream unavailable until Open or Reopen", err)
 	}
 	if err := mic.Close(); err != nil {
 		t.Fatalf("a second Close = %v, want nil", err)
@@ -141,5 +141,34 @@ func TestMicIsOpenIsSafeDuringReopen(t *testing.T) {
 
 	if mic.IsOpen() {
 		t.Fatal("expected a mic whose reopen failed to report closed")
+	}
+}
+
+// TestMicOpenDoesNotReinitializePortAudio fails if Open, which a resume uses
+// after a pause closed the stream, tears PortAudio down and initializes it
+// again, which lists every device, or keeps a stream that did not start.
+func TestMicOpenDoesNotReinitializePortAudio(t *testing.T) {
+	originalOpen, originalInitialize, originalTerminate := openInputStreamFn, paInitialize, paTerminate
+	t.Cleanup(func() {
+		openInputStreamFn, paInitialize, paTerminate = originalOpen, originalInitialize, originalTerminate
+	})
+	opens := 0
+	// A stand-in stream opens but cannot start.
+	openInputStreamFn = func(sampleRate, framesPerBuffer int, buf []int16) (*portaudio.Stream, error) {
+		opens++
+		return &portaudio.Stream{}, nil
+	}
+	paInitialize = func() error { t.Error("Open initialized PortAudio"); return nil }
+	paTerminate = func() error { t.Error("Open terminated PortAudio"); return nil }
+
+	mic := &Mic{sampleRate: 16000, framesPerBuffer: 4000, buf: make([]int16, 4000)}
+	if err := mic.Open(); err == nil {
+		t.Fatal("Open of a stream that cannot start succeeded")
+	}
+	if opens != 1 {
+		t.Fatalf("Open opened %d streams, want 1", opens)
+	}
+	if mic.stream != nil || mic.IsOpen() {
+		t.Fatal("a failed Open left the mic holding its stream")
 	}
 }

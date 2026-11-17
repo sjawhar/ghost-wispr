@@ -24,7 +24,6 @@ type fakeStreamer struct {
 	reopenErrs []error
 	calls      int
 	reopens    int
-	stops      int
 	closes     int
 	stopped    bool
 }
@@ -54,11 +53,7 @@ func (f *fakeStreamer) Reopen() error {
 
 func (f *fakeStreamer) Start() error { return nil }
 
-func (f *fakeStreamer) Stop() error {
-	f.stops++
-	f.stopped = true
-	return nil
-}
+func (f *fakeStreamer) Open() error { return nil }
 
 func (f *fakeStreamer) Close() error {
 	f.closes++
@@ -149,7 +144,7 @@ func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
 }
 
 // TestStreamMicWithRetryDoesNotStartWithoutRed fails if a resumed microphone
-// starts after its red confirmation refuses capture.
+// opens after its red confirmation refuses capture.
 func TestStreamMicWithRetryDoesNotStartWithoutRed(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
@@ -173,7 +168,7 @@ func TestStreamMicWithRetryDoesNotStartWithoutRed(t *testing.T) {
 		<-done
 	})
 
-	mic.expectEvents(t, "stop")
+	mic.expectEvents(t, "close")
 	capture.Resume()
 	select {
 	case <-confirmed:
@@ -185,14 +180,13 @@ func TestStreamMicWithRetryDoesNotStartWithoutRed(t *testing.T) {
 	case <-time.After(testWait):
 		t.Fatal("mic loop did not stop after refused red confirmation")
 	}
-	mic.expectEvents(t, "close")
 	mic.expectNoEvents(t)
 }
 
 // TestStreamMicWithRetryReleasesRedHoldAfterEveryStart fails if successful
-// Start or Reopen paths leave the matching confirmation hold set.
+// Open or Reopen paths leave the matching confirmation hold set.
 func TestStreamMicWithRetryReleasesRedHoldAfterEveryStart(t *testing.T) {
-	t.Run("resume start", func(t *testing.T) {
+	t.Run("resume open", func(t *testing.T) {
 		capture := newCaptureGate(nil, nil, nil)
 		capture.Pause()
 		mic := newScriptedMic()
@@ -215,12 +209,12 @@ func TestStreamMicWithRetryReleasesRedHoldAfterEveryStart(t *testing.T) {
 			<-done
 		})
 
-		mic.expectEvents(t, "stop")
+		mic.expectEvents(t, "close")
 		capture.Resume()
-		mic.expectEvents(t, "start")
+		mic.expectEvents(t, "open")
 		<-done
 		if afterCalls != 1 {
-			t.Fatalf("red-hold releases after Start = %d, want 1", afterCalls)
+			t.Fatalf("red-hold releases after Open = %d, want 1", afterCalls)
 		}
 	})
 

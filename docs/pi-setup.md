@@ -342,10 +342,21 @@ recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leav
 light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
-paused it. Ghost Wispr sets it when it starts, after each tap, when the microphone stops or
-starts, within a quarter of a second after any other pause or resume, and when the Jabra is
-plugged in again. The blink(1) stays the recording light: the Jabra's light only shows the pause
-switch.
+paused it. Ghost Wispr never changes it while the Jabra's microphone stream is open: a Jabra
+Speak2 75 whose light changed while its microphone stream was open sends Phone Mute by itself
+12-15 ms after that stream closes, which reads as a tap. So a pause closes the microphone, then
+lights the Jabra, and a resume darkens the Jabra, then opens the microphone. Ghost Wispr also sets
+the light when the Jabra connects or is plugged in again, after each tap, and within a quarter of
+a second after any other pause or resume, each time only while the microphone is closed.
+
+A Mute press that would resume recording is ignored when the kernel stamped it during Ghost
+Wispr's own open, close or PortAudio device scan of the microphone, or within 100 ms after one:
+that is the Jabra's own report, and recording stays paused. Ghost Wispr has the kernel stamp the
+Jabra's events with the monotonic clock, so a change of the Pi's time does not move the stamps.
+The log says
+`Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused`.
+A press that would pause always pauses. The blink(1) stays the recording light: the Jabra's light
+only shows the pause switch.
 
 The kernel's HID driver gives the Jabra's input device the HID Telephony usage Phone Mute as the
 key `KEY_MICMUTE`, and the HID LED usage Mute (page 0x08, usage 0x09) as the light `LED_MUTE`.
@@ -372,14 +383,16 @@ light is checked on the unit. After a deploy that changes these controls, with t
 2. Tap Mute again. The blink(1) turns red, the ring goes off, and the page shows recording. Say
    a sentence at once: it appears in the live transcript. If the buttons have faded, the first tap
    may only light them; if it did not resume, tap Mute once more. A resume on the second tap
-   passes; none after two taps fails. Ghost Wispr sends the light again when the microphone
-   starts, so the ring may flash red for a moment as recording resumes.
+   passes; none after two taps fails. Ghost Wispr sends the light again just before the microphone
+   opens, so the ring may flash red for a moment as recording resumes.
 3. Press the power button briefly, twice. The blink(1) and the ring change as in steps 1 and 2.
 4. Pause on the web page: the ring shows Muted. Tap the Jabra's Mute button: recording resumes,
    the ring goes off, and a sentence you say appears in the transcript, so the Jabra did not keep
    its microphone muted.
 5. While paused, unplug the Jabra and plug it in again. Within about 10 seconds the ring shows
    Muted again, and recording stays paused.
+6. While paused, restart Ghost Wispr with `systemctl --user restart ghost-wispr` as the
+   `ghost-wispr` user. Recording stays paused, the blink(1) stays off, and the ring shows Muted.
 
 After each step the state stays as it is: nothing pauses or resumes by itself. If any step fails,
 turn the Jabra's button off with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above, and set

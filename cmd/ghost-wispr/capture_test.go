@@ -33,8 +33,8 @@ const testEndRetry = time.Millisecond
 // scriptedMic is a fake capture device for streamMicWithRetry. Stream calls
 // onStream once if it is set, returns the next scripted error if any, and
 // otherwise writes each chunk the test sends on chunks and reports the write's
-// result on written. Every call to Stream, Start, Stop and Reopen is reported
-// on events, in order.
+// result on written. Every call to Stream, Start, Open, Close and Reopen is
+// reported on events, in order.
 type scriptedMic struct {
 	chunks     chan []byte
 	written    chan error
@@ -42,6 +42,7 @@ type scriptedMic struct {
 	onStream   func()
 	streamErrs []error
 	startErrs  []error
+	openErrs   []error
 }
 
 func newScriptedMic() *scriptedMic {
@@ -84,8 +85,13 @@ func (m *scriptedMic) Start() error {
 	return nil
 }
 
-func (m *scriptedMic) Stop() error {
-	m.events <- "stop"
+func (m *scriptedMic) Open() error {
+	m.events <- "open"
+	if len(m.openErrs) > 0 {
+		err := m.openErrs[0]
+		m.openErrs = m.openErrs[1:]
+		return err
+	}
 	return nil
 }
 
@@ -257,10 +263,10 @@ func TestPausedMicSendsNoAudioToRecorderOrDeepgram(t *testing.T) {
 		t.Fatalf("while paused: recording has %d bytes, want 100 (audio still recorded while paused)", got)
 	}
 
-	mic.expectEvents(t, "stop")
+	mic.expectEvents(t, "close")
 
 	capture.Resume()
-	mic.expectEvents(t, "start", "stream")
+	mic.expectEvents(t, "open", "stream")
 	mic.capture(t, make([]byte, 50))
 	if got := deepgram.Len(); got != 150 {
 		t.Fatalf("after resume: Deepgram got %d bytes in total, want 150", got)
@@ -270,9 +276,9 @@ func TestPausedMicSendsNoAudioToRecorderOrDeepgram(t *testing.T) {
 	}
 }
 
-// Pause stops the capture device itself, not only the audio after it, without
-// treating the pause as a device error; resume starts the device again.
-func TestPauseStopsMicDeviceUntilResume(t *testing.T) {
+// Pause closes the capture device itself, not only the audio after it,
+// without treating the pause as a device error; resume opens the device again.
+func TestPauseClosesMicDeviceUntilResume(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	mic := newScriptedMic()
 	deepgram := &lockedBuffer{}
@@ -283,11 +289,11 @@ func TestPauseStopsMicDeviceUntilResume(t *testing.T) {
 
 	capture.Pause()
 	mic.capture(t, []byte{1, 2, 3, 4})
-	mic.expectEvents(t, "stop")
+	mic.expectEvents(t, "close")
 	mic.expectNoEvents(t)
 
 	capture.Resume()
-	mic.expectEvents(t, "start", "stream")
+	mic.expectEvents(t, "open", "stream")
 	mic.capture(t, []byte{5, 6})
 	if got := deepgram.Len(); got != 2 {
 		t.Fatalf("Deepgram got %d bytes, want only the 2 written after resume", got)
@@ -309,9 +315,9 @@ func TestPauseBroadcastsMicPausedThenResumed(t *testing.T) {
 	mic.expectEvents(t, "stream")
 	capture.Pause()
 	mic.capture(t, []byte{1})
-	mic.expectEvents(t, "stop")
+	mic.expectEvents(t, "close")
 	capture.Resume()
-	mic.expectEvents(t, "start", "stream")
+	mic.expectEvents(t, "open", "stream")
 
 	var statuses []string
 	deadline := time.After(testWait)
@@ -335,17 +341,17 @@ func TestPauseBroadcastsMicPausedThenResumed(t *testing.T) {
 }
 
 // A mic that comes up while capture is paused (the startup retry path) is
-// stopped before any audio is read.
-func TestMicStartedWhilePausedIsStoppedBeforeStreaming(t *testing.T) {
+// closed before any audio is read.
+func TestMicStartedWhilePausedIsClosedBeforeStreaming(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
 	mic := newScriptedMic()
 
 	runMicLoop(t, capture, mic, io.Discard, func(time.Duration) {}, nil)
-	mic.expectEvents(t, "stop")
+	mic.expectEvents(t, "close")
 
 	capture.Resume()
-	mic.expectEvents(t, "start", "stream")
+	mic.expectEvents(t, "open", "stream")
 }
 
 // Shutting down while paused ends the mic loop instead of leaving it waiting.
@@ -355,7 +361,7 @@ func TestPausedMicLoopStopsOnShutdown(t *testing.T) {
 	mic := newScriptedMic()
 
 	stop := runMicLoop(t, capture, mic, io.Discard, func(time.Duration) {}, nil)
-	mic.expectEvents(t, "stop")
+	mic.expectEvents(t, "close")
 	if !stop() {
 		t.Fatal("mic loop did not exit on shutdown while paused")
 	}
@@ -363,8 +369,8 @@ func TestPausedMicLoopStopsOnShutdown(t *testing.T) {
 }
 
 // A device error that coincides with a pause is not reported as a mic failure:
-// the loop stops the device at once, with no backoff.
-func TestDeviceErrorDuringPauseStopsMicWithoutBackoff(t *testing.T) {
+// the loop closes the device at once, with no backoff.
+func TestDeviceErrorDuringPauseClosesMicWithoutBackoff(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	mic := newScriptedMic()
 	mic.onStream = capture.Pause
@@ -372,9 +378,9 @@ func TestDeviceErrorDuringPauseStopsMicWithoutBackoff(t *testing.T) {
 	waits := &recordedWaits{}
 
 	runMicLoop(t, capture, mic, io.Discard, waits.wait, nil)
-	mic.expectEvents(t, "stream", "stop")
+	mic.expectEvents(t, "stream", "close")
 	if got := waits.get(); len(got) != 0 {
-		t.Fatalf("waits = %v, want none: a paused mic is stopped at once", got)
+		t.Fatalf("waits = %v, want none: a paused mic is closed at once", got)
 	}
 }
 
@@ -388,11 +394,11 @@ func TestPausedMicIsNotReopenedAfterDeviceError(t *testing.T) {
 	deepgram := &lockedBuffer{}
 
 	runMicLoop(t, capture, mic, deepgram, waits.wait, nil)
-	mic.expectEvents(t, "stream", "stop")
+	mic.expectEvents(t, "stream", "close")
 	mic.expectNoEvents(t)
 
 	capture.Resume()
-	mic.expectEvents(t, "start", "stream")
+	mic.expectEvents(t, "open", "stream")
 	mic.capture(t, []byte{1, 2, 3})
 	if got := deepgram.Len(); got != 3 {
 		t.Fatalf("Deepgram got %d bytes after resume, want 3", got)
@@ -411,35 +417,35 @@ func TestPausedMicIsNotReopenedAfterOverflow(t *testing.T) {
 	waits := &recordedWaits{then: capture.Pause}
 
 	runMicLoop(t, capture, mic, io.Discard, waits.wait, nil)
-	mic.expectEvents(t, "stream", "stop")
+	mic.expectEvents(t, "stream", "close")
 
 	capture.Resume()
-	mic.expectEvents(t, "start", "stream")
+	mic.expectEvents(t, "open", "stream")
 }
 
-// If the device cannot restart on resume (unplugged during the pause), the mic
-// loop closes it, so it holds no input device through the backoff, and falls
-// back to the reconnect path.
-func TestResumeFallsBackToReopenWhenMicCannotRestart(t *testing.T) {
+// If the device cannot open on resume (unplugged during the pause), the mic
+// loop holds no input device through the backoff, and falls back to the
+// reconnect path, which re-initializes PortAudio.
+func TestResumeFallsBackToReopenWhenMicCannotOpen(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
 	mic := newScriptedMic()
-	mic.startErrs = []error{errors.New("microphone stream unavailable")}
+	mic.openErrs = []error{errors.New("microphone stream unavailable")}
 	waits := &recordedWaits{}
 
 	runMicLoop(t, capture, mic, io.Discard, waits.wait, nil)
-	mic.expectEvents(t, "stop")
+	mic.expectEvents(t, "close")
 
 	capture.Resume()
-	mic.expectEvents(t, "start", "close", "reopen", "stream")
+	mic.expectEvents(t, "open", "reopen", "stream")
 	if got := waits.get(); len(got) != 1 || got[0] != time.Second {
 		t.Fatalf("backoff waits = %v, want [1s]", got)
 	}
 }
 
-// TestMicLoopEndsTheResumeWindowWithItsStart fails if the mic loop, starting
+// TestMicLoopEndsTheResumeWindowWithItsStart fails if the mic loop, opening
 // the device again on resume, does not end the resume's resuming state once
-// that start has finished, whether it started the device or the light refused
+// that start has finished, whether it opened the device or the light refused
 // it: readiness and capture_state would say resuming until the stall limit.
 func TestMicLoopEndsTheResumeWindowWithItsStart(t *testing.T) {
 	for _, tc := range []struct {
@@ -447,8 +453,8 @@ func TestMicLoopEndsTheResumeWindowWithItsStart(t *testing.T) {
 		lightErr error
 		want     []string
 	}{
-		{name: "started", want: []string{"start", "stream"}},
-		{name: "light refused", lightErr: errors.New("light stayed off"), want: []string{"close"}},
+		{name: "started", want: []string{"open", "stream"}},
+		{name: "light refused", lightErr: errors.New("light stayed off")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -456,7 +462,7 @@ func TestMicLoopEndsTheResumeWindowWithItsStart(t *testing.T) {
 			capture.beforeMicStart = func() error { return tc.lightErr }
 			mic := newScriptedMic()
 			runMicLoop(t, capture, mic, io.Discard, (&recordedWaits{}).wait, nil)
-			mic.expectEvents(t, "stop")
+			mic.expectEvents(t, "close")
 
 			capture.Resume()
 			mic.expectEvents(t, tc.want...)
@@ -802,7 +808,7 @@ func TestCaptureGateConcurrentPauseResume(t *testing.T) {
 }
 
 // The mic loop's reconnect backoff (up to 30 s) ends when the gate closes, so
-// a pause stops the device at once instead of after the backoff.
+// a pause closes the device at once instead of after the backoff.
 func TestSleepUnlessPausedEndsWhenTheGateCloses(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	slept := make(chan struct{})

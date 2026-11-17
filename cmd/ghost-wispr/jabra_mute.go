@@ -25,10 +25,11 @@ const (
 
 // jabraMuteButton toggles capture on each press of the Jabra's mute button,
 // as the power button does, and keeps the Jabra's mute light on while capture
-// is paused, whichever control paused it.
+// is paused, whichever control paused it. The light is written through device,
+// so it never changes while a capture stream is open.
 type jabraMuteButton struct {
 	capture  *captureGate
-	mic      interface{ IsOpen() bool }
+	device   *captureDevice
 	controls *server.ControlHooks
 	warnings *warningsRegistry
 	// connect finds and opens the Jabra's evdev node; tests replace it.
@@ -37,10 +38,10 @@ type jabraMuteButton struct {
 	checkEvery time.Duration
 }
 
-func newJabraMuteButton(capture *captureGate, mic interface{ IsOpen() bool }, controls *server.ControlHooks, warnings *warningsRegistry) *jabraMuteButton {
+func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) *jabraMuteButton {
 	return &jabraMuteButton{
 		capture:    capture,
-		mic:        mic,
+		device:     device,
 		controls:   controls,
 		warnings:   warnings,
 		connect:    func() (io.ReadWriteCloser, error) { return connectJabra(inputDevices, inputDevRoot) },
@@ -49,15 +50,31 @@ func newJabraMuteButton(capture *captureGate, mic interface{ IsOpen() bool }, co
 	}
 }
 
-func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, mic interface{ IsOpen() bool }, controls *server.ControlHooks, warnings *warningsRegistry) {
+func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) {
 	if cfg.JabraMuteButton {
-		go newJabraMuteButton(capture, mic, controls, warnings).run(ctx)
+		go newJabraMuteButton(capture, device, controls, warnings).run(ctx)
 	}
 }
 
-// connectJabra opens the Jabra's evdev node to read and write: the press is
-// read and the light written on one node.
+// connectJabra opens the Jabra's evdev node (openJabra) and has the kernel
+// stamp its events with the monotonic clock, which the press guard compares
+// with its own operations (captureDevice.ownOperationAt). A node that refuses
+// the clock is not used.
 func connectJabra(procDevices, devRoot string) (io.ReadWriteCloser, error) {
+	device, err := openJabra(procDevices, devRoot)
+	if err != nil {
+		return nil, err
+	}
+	if err := jabra.StampWithMonotonicClock(device); err != nil {
+		_ = device.Close()
+		return nil, err
+	}
+	return device, nil
+}
+
+// openJabra opens the Jabra's evdev node to read and write: the press is read
+// and the light written on one node.
+func openJabra(procDevices, devRoot string) (*os.File, error) {
 	path, err := jabra.FindDevice(procDevices, devRoot)
 	if err != nil {
 		return nil, err
@@ -93,58 +110,55 @@ func (b *jabraMuteButton) run(ctx context.Context) {
 // is paused, until ctx ends or the device fails. It closes the device, and
 // returns only once the device's reader has ended.
 //
-// The light is sent again, even when the kernel holds the wanted state, when
-// the device connects, after a press, and when the microphone opens or closes:
-// a Jabra may change its own light on a press, when its microphone stream
-// starts or stops, or while Ghost Wispr was not running, and the kernel passes
-// a light to the device only when it differs from the kernel's own copy.
+// The light is written through b.device: at connect, after a press, and
+// within checkEvery of any other pause or resume, but only while no capture
+// stream is open, and otherwise when the microphone closes or before it
+// opens. A Jabra whose light changes while its microphone stream is open
+// reports Phone Mute by itself as that stream closes. The light is sent again,
+// even when the kernel holds the wanted state, at connect and after a press: a
+// Jabra may change its own light on a press, or while Ghost Wispr was not
+// running, and the kernel passes a light to the device only when it differs
+// from the kernel's own copy.
 func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) error {
 	// Ending deviceCtx frees a reader that holds a press nobody takes, and
 	// closing the device ends a reader blocked in Read. Close ends that Read
 	// only while the file stays non-blocking: never call Fd() on it (an ioctl
 	// goes through SyscallConn), or an unplug or shutdown waits forever.
 	deviceCtx, cancelDevice := context.WithCancel(ctx)
-	presses := make(chan struct{})
+	presses := make(chan time.Duration)
 	readDone := make(chan error, 1)
+	lightFailed := make(chan error, 1)
 	var reader sync.WaitGroup
 	reader.Go(func() { readDone <- jabra.ReadPresses(deviceCtx, device, presses) })
+	detach := b.device.attach(func(on bool) error {
+		err := jabra.ResendMuteLight(device, on)
+		if err != nil {
+			select {
+			case lightFailed <- err:
+			default:
+			}
+		}
+		return err
+	})
 	defer func() {
+		detach()
 		cancelDevice()
 		_ = device.Close()
 		reader.Wait()
 	}()
 
-	shown, micOpen := b.capture.IsPaused(), b.mic.IsOpen()
-	if err := jabra.ResendMuteLight(device, shown); err != nil {
-		return err
-	}
 	ticker := time.NewTicker(b.checkEvery)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-presses:
-			if err := toggleCapture(b.capture.IsPaused, b.controls.Pause, b.controls.Resume, b.controls.OnStatusChanged); err != nil {
-				log.Printf("warning: Jabra mute toggle: %v", err)
-			}
-			shown = b.capture.IsPaused()
-			if err := jabra.ResendMuteLight(device, shown); err != nil {
-				return err
-			}
+		case at := <-presses:
+			b.press(at)
 		case <-ticker.C:
-			paused, open := b.capture.IsPaused(), b.mic.IsOpen()
-			var err error
-			switch {
-			case open != micOpen:
-				err = jabra.ResendMuteLight(device, paused)
-			case paused != shown:
-				err = jabra.ShowMuteLight(device, paused)
-			}
-			if err != nil {
-				return err
-			}
-			shown, micOpen = paused, open
+			b.device.syncLight()
+		case err := <-lightFailed:
+			return err
 		case err := <-readDone:
 			if err == nil {
 				err = io.EOF
@@ -152,6 +166,20 @@ func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) 
 			return err
 		}
 	}
+}
+
+// press toggles capture for a press of the mute button the kernel stamped at,
+// a CLOCK_MONOTONIC reading, except one that would resume capture and came
+// during an operation on the capture device or within jabraOwnMuteWindow after
+// one: the Jabra sends that report by itself as its microphone stream closes,
+// and capture stays paused. A press that would pause always pauses.
+func (b *jabraMuteButton) press(at time.Duration) {
+	if b.capture.IsPaused() && b.device.ownOperationAt(at) {
+		log.Printf("Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused")
+	} else if err := toggleCapture(b.capture.IsPaused, b.controls.Pause, b.controls.Resume, b.controls.OnStatusChanged); err != nil {
+		log.Printf("warning: Jabra mute toggle: %v", err)
+	}
+	b.device.refreshLight()
 }
 
 func (b *jabraMuteButton) waitForRetry(ctx context.Context) {

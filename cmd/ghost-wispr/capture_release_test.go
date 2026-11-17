@@ -1,16 +1,22 @@
 package main
 
 import (
+	"context"
 	"io"
+	"path/filepath"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
 // TestAPauseReleasesTheCaptureDevice fails if a pause leaves the capture
-// device open. docs/pi-setup.md says "Ghost Wispr closes the microphone while
-// paused", and POST /api/pause says the microphone stops. But
-// holdMicWhilePaused only calls Stop (Pa_StopStream), which keeps the PortAudio
-// stream, and with it the ALSA capture device, open. On the office Pi
+// device open. docs/pi-setup.md says Ghost Wispr closes the microphone while
+// paused, and POST /api/pause says the microphone closes. a889869's
+// holdMicWhilePaused called only Stop (Pa_StopStream), which keeps the
+// PortAudio stream, and with it the ALSA capture device, open. On the office Pi
 // (a889869, 2026-11-17) after a resume and a pause through the API:
 //
 //	06:03:37.493Z pause HTTP 204
@@ -41,7 +47,7 @@ func TestAPauseReleasesTheCaptureDevice(t *testing.T) {
 			if call == "close" {
 				return
 			}
-			if call == "start" || call == "reopen" || call == "stream" {
+			if call == "start" || call == "open" || call == "reopen" || call == "stream" {
 				t.Fatalf("the device was used again while paused before it was released: %v", calls)
 			}
 			continue
@@ -50,4 +56,66 @@ func TestAPauseReleasesTheCaptureDevice(t *testing.T) {
 		break
 	}
 	t.Fatalf("a pause left the capture device open: device calls while paused %v, want a close", calls)
+}
+
+// TestAPauseSendsNoAudioFrameToDeepgramOrTheRecording fails if, after a pause,
+// an audio frame reaches the Deepgram socket or a byte reaches the session's
+// recording. The chain is the production one from the mic loop on: the
+// capture gate, the recorder's writer, the bounded send queue and the
+// app-owned Deepgram socket, against a fake Deepgram that counts the binary
+// frames, which carry audio. The socket itself may stay connected: its
+// KeepAlive and Finalize are text frames.
+func TestAPauseSendsNoAudioFrameToDeepgramOrTheRecording(t *testing.T) {
+	fake, host := startDeepgramEndpoint(t)
+	socket := dialDeepgramEndpoint(t, host, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sender := transcribe.NewAsyncSender(ctx, socket, deepgramSendChunks, nopLogf)
+	dir := t.TempDir()
+	recorder := audio.NewRecorder(dir)
+	if err := recorder.StartSession("meeting"); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	t.Cleanup(func() { _, _ = recorder.EndSession("meeting") })
+	recording := filepath.Join(dir, "meeting.pcm")
+	sessions := &fakeSessions{log: newCallLog(), active: "meeting"}
+	capture := newSessionCaptureGate(ctx, sessions, fakePreroll{sessions.log}, func() deepgramFinalizer { return sender }, 50*time.Millisecond, testEndRetry, nopLogf)
+	mic := newScriptedMic()
+	runMicLoop(t, capture, mic, recorder.Writer(sender), (&recordedWaits{}).wait, nil)
+	mic.expectEvents(t, "stream")
+
+	// Control: a buffer before the pause reaches Deepgram and the recording.
+	mic.capture(t, make([]byte, 3200))
+	for deadline := time.Now().Add(testWait); fake.audioFrames() != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("control: Deepgram got %d audio frames before the pause, want 1", fake.audioFrames())
+		}
+	}
+	if got := fileSize(t, recording); got != 3200 {
+		t.Fatalf("control: the recording has %d bytes before the pause, want 3200", got)
+	}
+
+	capture.Pause()
+	mic.capture(t, make([]byte, 3200)) // the device's next buffer
+	mic.expectEvents(t, "close")
+	sessions.log.waitFor(t, "end-session")
+	// A Finalize queued now follows every buffer queued before it, so once
+	// Deepgram has it, any audio the pause let through has arrived too.
+	if err := sender.Finalize(); err != nil {
+		t.Fatalf("Finalize after the pause: %v", err)
+	}
+	finalizes := func() int {
+		return len(slices.DeleteFunc(fake.received(), func(frame string) bool { return frame != "Finalize" }))
+	}
+	for deadline := time.Now().Add(testWait); finalizes() < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("Deepgram got %q, want the pause's Finalize and the test's", fake.received())
+		}
+	}
+	if got := fake.audioFrames(); got != 1 {
+		t.Fatalf("Deepgram got %d audio frames, %d of them after the pause, want none after it", got, got-1)
+	}
+	if got := fileSize(t, recording); got != 3200 {
+		t.Fatalf("the recording has %d bytes after the pause, want the 3200 from before it", got)
+	}
 }
