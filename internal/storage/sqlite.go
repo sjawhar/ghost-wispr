@@ -415,6 +415,13 @@ func (s *SQLiteStore) init(dbPath string) error {
 	`); err != nil {
 		return fmt.Errorf("create app_state table: %w", err)
 	}
+	// audioOwnedSinceKey: from when the audio directory's files belong to
+	// this database (AudioOwnedSince), set once, the first time a build that
+	// reads it opens the database.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO app_state(key, value) VALUES(?, ?)`,
+		audioOwnedSinceKey, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("record from when the audio belongs to this database: %w", err)
+	}
 
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS drive_replacements (

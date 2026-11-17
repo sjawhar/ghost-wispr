@@ -272,8 +272,9 @@ func TestARecordingSavedForASessionThatChangedIsErased(t *testing.T) {
 	}
 }
 
-// The recording under way, and a raw recording no session row names, are
-// not saved.
+// The recording under way is neither saved nor erased. A raw recording no
+// session row names is not saved: it is a deleted session's, and is erased
+// (TestThePassErasesTheAudioOfASessionWithNoRow).
 func TestOnlyTheRecordingsOfEndedSessionsAreSaved(t *testing.T) {
 	requireMP3Encoder(t)
 	store := openKeptStore(t)
@@ -299,9 +300,12 @@ func TestOnlyTheRecordingsOfEndedSessionsAreSaved(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(audioDir, id+".mp3")); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("a recording was saved for %s (%v)", id, err)
 		}
-		if _, err := os.Stat(filepath.Join(audioDir, id+".pcm")); err != nil {
-			t.Errorf("the raw recording of %s is gone: %v", id, err)
-		}
+	}
+	if _, err := os.Stat(filepath.Join(audioDir, live+".pcm")); err != nil {
+		t.Errorf("the raw recording under way is gone: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(audioDir, orphan+".pcm")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the raw recording no session row names is still on disk (%v)", err)
 	}
 }
 
@@ -504,4 +508,65 @@ func TestAHoldStopsASaveOfTheSessionAndNothingIsRecorded(t *testing.T) {
 		t.Fatal("the pass did not end after the hold stopped its save")
 	}
 	release()
+}
+
+// Review of #76, P1: an audio file of a session that has no row (a session
+// deleted while a stop cut its erase short, or a GC deletion cut off after
+// its row went) is erased by the pass, with zeros, instead of left for a
+// later Restore from Drive to bring back. A file the pass cannot know to be
+// a deleted session's is left: one last written before this database came
+// to own the audio directory (a database that was lost and made again would
+// otherwise erase every recording), one another session names, and the
+// files of a session that has a row.
+func TestThePassErasesTheAudioOfASessionWithNoRow(t *testing.T) {
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const deleted, older, namedByMerge, merged, kept = "20261106140930", "20261106150000", "20261106160000", "20261106170000", "20261106180000"
+	write := func(name string) string {
+		t.Helper()
+		path := filepath.Join(audioDir, name)
+		if err := os.WriteFile(path, []byte("conversation "+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	gone := []string{write(deleted + ".pcm"), write(deleted + ".mp3"), write(deleted + ".wav")}
+	held, err := os.Open(gone[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	before := write(older + ".mp3")
+	longAgo := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(before, longAgo, longAgo); err != nil {
+		t.Fatal(err)
+	}
+	named := write(namedByMerge + ".mp3")
+	own := write(kept + ".mp3")
+	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
+	for id, recording := range map[string]string{merged: named, kept: filepath.Join(audioDir, "elsewhere.mp3")} {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, started.Add(time.Minute), recording); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil).run(context.Background())
+
+	for _, path := range gone {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s of a session with no row is still on disk (%v)", filepath.Base(path), err)
+		}
+	}
+	got := make([]byte, len("conversation "+deleted+".mp3"))
+	if _, err := held.ReadAt(got, 0); err == nil && strings.Contains(string(got), "conversation") {
+		t.Errorf("the erased %s.mp3 still holds %q", deleted, got)
+	}
+	for _, path := range []string{before, named, own} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s is gone: %v", filepath.Base(path), err)
+		}
+	}
 }
