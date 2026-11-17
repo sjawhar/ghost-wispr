@@ -301,3 +301,83 @@ func TestOnlyTheRecordingsOfEndedSessionsAreSaved(t *testing.T) {
 		}
 	}
 }
+
+// A stop after a session end saved its recording and erased its raw
+// recording, but before the session named the saved one, leaves that
+// recording named by no session, and the next start ends the session with
+// none. The start-up pass gives the session that recording, and starts its
+// refinement; where the save left a WAV beside a failed MP3, the WAV is the
+// recording. A saved recording of a session that has one, or of a session
+// still recording, is left as it is.
+func TestASavedRecordingNoSessionNamesIsGivenToItsSession(t *testing.T) {
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
+	const mp3Only, wavBeside, named, live = "20261106140930", "20261106141000", "20261106142000", "20261106143000"
+	files := map[string][]string{mp3Only: {".mp3"}, wavBeside: {".mp3", ".wav"}, named: {".mp3"}, live: {".mp3"}}
+	for id, exts := range files {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+		for _, ext := range exts {
+			if err := os.WriteFile(filepath.Join(audioDir, id+ext), []byte(id+ext), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := store.EndSession(named, started.Add(time.Minute), filepath.Join(audioDir, "elsewhere.mp3")); err != nil {
+		t.Fatal(err)
+	}
+	// The stop: the next start ends every session still recording with no
+	// recording; one more session has started since.
+	if _, err := store.RecoverStaleSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = ? WHERE id = ?`, storage.SessionActive, live); err != nil {
+		t.Fatal(err)
+	}
+	finished := map[string]string{}
+	var mu sync.Mutex
+	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, func(_ context.Context, id, audioPath string, _ time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		finished[id] = audioPath
+	})
+
+	kept.run(context.Background())
+
+	for id, want := range map[string]string{
+		mp3Only:   filepath.Join(audioDir, mp3Only+".mp3"),
+		wavBeside: filepath.Join(audioDir, wavBeside+".wav"),
+		named:     filepath.Join(audioDir, "elsewhere.mp3"),
+		live:      "",
+	} {
+		sess, err := store.GetSession(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sess.AudioPath != want {
+			t.Errorf("session %s names recording %q, want %q", id, sess.AudioPath, want)
+		}
+	}
+	for deadline := time.Now().Add(testWait); ; time.Sleep(time.Millisecond) {
+		mu.Lock()
+		n := len(finished)
+		mu.Unlock()
+		if n >= 2 || time.Now().After(deadline) {
+			break
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if finished[mp3Only] != filepath.Join(audioDir, mp3Only+".mp3") || finished[wavBeside] != filepath.Join(audioDir, wavBeside+".wav") || len(finished) != 2 {
+		t.Errorf("refinements started = %v, want one for each recording given to its session", finished)
+	}
+	for id, exts := range files {
+		for _, ext := range exts {
+			if got, err := os.ReadFile(filepath.Join(audioDir, id+ext)); err != nil || string(got) != id+ext {
+				t.Errorf("%s%s after the pass = %q (%v), want it as it was", id, ext, got, err)
+			}
+		}
+	}
+}
