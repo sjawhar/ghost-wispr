@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
+	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
@@ -156,7 +159,7 @@ func TestARecordingTheAppStoppedInsideIsSavedSyncedThenErased(t *testing.T) {
 	syncer := &driveSync{}
 	syncer.Set(orchestrator)
 	manager := session.NewManager(store, recorder, nil, nil, session.NewDetector(time.Hour), 0)
-	kept := newKeptRecordings(store, recorder, audioDir, refineRecoveredRecording(manager))
+	kept := newKeptRecordings(store, recorder, audioDir, syncer, refineRecoveredRecording(manager))
 
 	// As the app starts: the recording is saved and becomes the session's,
 	// which goes back to sync in its folder. Drive does not have it yet, so
@@ -216,25 +219,90 @@ func TestARecordingTheAppStoppedInsideIsSavedSyncedThenErased(t *testing.T) {
 	}
 }
 
-// While Drive does not have the saved recording (sync off, or each upload
-// failing), the raw recording stays beside it.
-func TestAKeptRecordingStaysRawUntilDriveHasIt(t *testing.T) {
+// syncingDrive returns a Drive sync that is on, with a Drive that takes every
+// upload.
+func syncingDrive(t *testing.T, store *storage.SQLiteStore, audioDir, raw string) *driveSync {
+	t.Helper()
+	orchestrator := gdrive.NewOrchestrator(&keptDrive{raw: raw, uploads: map[string]bool{}}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	orchestrator.SetAudioDir(audioDir)
+	drive := &driveSync{}
+	drive.Set(orchestrator)
+	return drive
+}
+
+// While Drive will take the saved recording (sync on, the session waiting
+// for its sync or its retry), the raw recording stays beside it until Drive
+// has it.
+func TestAKeptRecordingStaysRawWhileDriveWillTakeIt(t *testing.T) {
 	requireMP3Encoder(t)
-	store := openKeptStore(t)
-	audioDir := t.TempDir()
-	const id = "20261106140930"
-	raw := keptSession(t, store, audioDir, id, 1)
-	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil)
+	for _, state := range []string{storage.SyncStateSynced, storage.SyncStatePending, storage.SyncStateRetryScheduled} {
+		t.Run(state, func(t *testing.T) {
+			store := openKeptStore(t)
+			audioDir := t.TempDir()
+			const id = "20261106140930"
+			raw := keptSession(t, store, audioDir, id, 1)
+			if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ? WHERE id = ?`, state, id); err != nil {
+				t.Fatal(err)
+			}
+			kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, syncingDrive(t, store, audioDir, raw), nil)
 
-	kept.run(context.Background())
-	syncSweep(context.Background(), store, &driveSync{}) // sync off
-	kept.run(context.Background())
+			kept.run(context.Background())
+			kept.run(context.Background())
 
-	if _, err := os.Stat(filepath.Join(audioDir, id+".mp3")); err != nil {
-		t.Fatalf("the recording was not saved: %v", err)
+			if sess, err := store.GetSession(id); err != nil || sess.AudioPath != filepath.Join(audioDir, id+".mp3") {
+				t.Fatalf("the session names %q (%v), want the saved recording", sess.AudioPath, err)
+			}
+			if _, err := os.Stat(raw); err != nil {
+				t.Errorf("the raw recording is gone though Drive will take the saved one and does not have it: %v", err)
+			}
+		})
 	}
-	if _, err := os.Stat(raw); err != nil {
-		t.Errorf("the raw recording is gone though Drive never got the saved one: %v", err)
+}
+
+// Review of #76, P2: where Drive cannot take the saved recording (sync off,
+// or the session FAILED or REMOTE_DELETED), the raw recording is erased as
+// soon as the saved recording is the session's, as a session end erases it:
+// the saved recording is on disk, so the raw one is never the last copy, and
+// a raw recording kept beside it would refuse "Delete text and audio" for
+// good. Drive can still get the saved recording later.
+func TestAKeptRecordingIsErasedOnceSavedWhenDriveCannotTakeIt(t *testing.T) {
+	requireMP3Encoder(t)
+	for _, tc := range []struct {
+		name   string
+		state  string
+		syncOn bool
+	}{
+		{name: "sync off", state: storage.SyncStateSynced},
+		{name: "failed", state: storage.SyncStateFailed, syncOn: true},
+		{name: "remote deleted", state: storage.SyncStateRemoteDeleted, syncOn: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openKeptStore(t)
+			audioDir := t.TempDir()
+			const id = "20261106140930"
+			raw := keptSession(t, store, audioDir, id, 1)
+			if _, err := store.DB().Exec(`UPDATE sessions SET sync_state = ? WHERE id = ?`, tc.state, id); err != nil {
+				t.Fatal(err)
+			}
+			drive := &driveSync{}
+			if tc.syncOn {
+				drive = syncingDrive(t, store, audioDir, raw)
+			}
+			kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, drive, nil)
+
+			kept.run(context.Background())
+
+			saved := filepath.Join(audioDir, id+".mp3")
+			if sess, err := store.GetSession(id); err != nil || sess.AudioPath != saved {
+				t.Fatalf("the session names %q (%v), want %s", sess.AudioPath, err, saved)
+			}
+			if _, err := os.Stat(saved); err != nil {
+				t.Fatalf("the saved recording is not on disk: %v", err)
+			}
+			if _, err := os.Stat(raw); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the raw recording is still on disk after the pass saved it, and Drive cannot take it (%v)", err)
+			}
+		})
 	}
 }
 
@@ -256,7 +324,7 @@ func TestARecordingSavedForASessionThatChangedIsErased(t *testing.T) {
 	const id = "20261106140930"
 	raw := keptSession(t, store, audioDir, id, 1)
 	finished := false
-	kept := newKeptRecordings(refusingKeptStore{store}, audio.NewRecorder(audioDir), audioDir,
+	kept := newKeptRecordings(refusingKeptStore{store}, audio.NewRecorder(audioDir), audioDir, nil,
 		func(context.Context, string, string, time.Time) { finished = true })
 
 	kept.run(context.Background())
@@ -294,7 +362,7 @@ func TestOnlyTheRecordingsOfEndedSessionsAreSaved(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newKeptRecordings(store, recorder, audioDir, nil).run(context.Background())
+	newKeptRecordings(store, recorder, audioDir, nil, nil).run(context.Background())
 
 	for _, id := range []string{live, orphan} {
 		if _, err := os.Stat(filepath.Join(audioDir, id+".mp3")); !errors.Is(err, os.ErrNotExist) {
@@ -345,7 +413,7 @@ func TestASavedRecordingNoSessionNamesIsGivenToItsSession(t *testing.T) {
 	}
 	finished := map[string]string{}
 	var mu sync.Mutex
-	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, func(_ context.Context, id, audioPath string, _ time.Time) {
+	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, func(_ context.Context, id, audioPath string, _ time.Time) {
 		mu.Lock()
 		defer mu.Unlock()
 		finished[id] = audioPath
@@ -435,7 +503,7 @@ func TestADeletedSessionLeavesNoSavedRecordingToRestore(t *testing.T) {
 	}
 
 	// The next start.
-	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil).run(context.Background())
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil).run(context.Background())
 	entries, err := os.ReadDir(audioDir)
 	if err != nil {
 		t.Fatal(err)
@@ -449,7 +517,7 @@ func TestADeletedSessionLeavesNoSavedRecordingToRestore(t *testing.T) {
 	for id := range raws {
 		restoreFromDrive(t, store, id)
 	}
-	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil).run(context.Background())
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil).run(context.Background())
 	for id := range raws {
 		sess, err := store.GetSession(id)
 		if err != nil {
@@ -477,7 +545,7 @@ func TestAHoldStopsASaveOfTheSessionAndNothingIsRecorded(t *testing.T) {
 	audioDir := t.TempDir()
 	const id = "20261106140930"
 	keptSession(t, store, audioDir, id, 1)
-	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil)
+	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil)
 
 	passed := goDone(func() { kept.run(context.Background()) })
 	temp := filepath.Join(audioDir, ".kept-"+id+".mp3")
@@ -553,7 +621,7 @@ func TestThePassErasesTheAudioOfASessionWithNoRow(t *testing.T) {
 		}
 	}
 
-	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil).run(context.Background())
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil).run(context.Background())
 
 	for _, path := range gone {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
@@ -568,5 +636,70 @@ func TestThePassErasesTheAudioOfASessionWithNoRow(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("%s is gone: %v", filepath.Base(path), err)
 		}
+	}
+}
+
+// Review of #76, P2 and P3: the status counts every raw recording the app
+// keeps, those beside a saved recording waiting for Drive too, and tells them
+// apart: the ones the app tries again to save, the ones it erases once Drive
+// has the saved recording, and, by session, the ones it neither saves nor
+// erases, which wait for a person. A raw recording the next pass erases, and
+// the one under way, are not counted.
+func TestKeptRawCensusTellsTheKindsApart(t *testing.T) {
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	recorder := audio.NewRecorder(audioDir)
+	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
+	const unsaved, awaiting, merged, beforeOwned, noRow, live = "20261106100000", "20261106110000", "20261106120000", "20261106130000", "20261106140000", "20261106150000"
+	raw := func(id string, size int) string {
+		t.Helper()
+		path := filepath.Join(audioDir, id+".pcm")
+		if err := os.WriteFile(path, make([]byte, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, id := range []string{unsaved, awaiting, merged} {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+		t.Fatal(err)
+	}
+	raw(unsaved, 1000)
+	awaitingRaw := raw(awaiting, 2000)
+	if err := os.WriteFile(filepath.Join(audioDir, awaiting+".mp3"), []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET audio_path = ?, sync_state = ? WHERE id = ?`, filepath.Join(audioDir, awaiting+".mp3"), storage.SyncStatePending, awaiting); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE sessions SET status = ?, merged_into = 'elsewhere' WHERE id = ?`, storage.SessionMerged, merged); err != nil {
+		t.Fatal(err)
+	}
+	raw(merged, 4000)
+	old := raw(beforeOwned, 8000)
+	longAgo := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(old, longAgo, longAgo); err != nil {
+		t.Fatal(err)
+	}
+	raw(noRow, 16000) // the next pass erases it
+	if err := store.CreateSession(live, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.StartSession(live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recorder.Writer(io.Discard).Write(make([]byte, 32000)); err != nil {
+		t.Fatal(err)
+	}
+	kept := newKeptRecordings(store, recorder, audioDir, syncingDrive(t, store, audioDir, awaitingRaw), nil)
+
+	got := kept.census()
+	slices.Sort(got.ByHand)
+	want := server.KeptRawRecordings{Count: 4, Bytes: 1000 + 2000 + 4000 + 8000, Unsaved: 1, AwaitingDrive: 1, ByHand: []string{merged, beforeOwned}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("census = %+v, want %+v", got, want)
 	}
 }

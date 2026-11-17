@@ -1637,10 +1637,12 @@ func TestAPIStatusReportsAStalledCapture(t *testing.T) {
 	}
 }
 
-// Raw recordings kept because they could not be saved yet are reported in the
-// status, with a warning the UI shows once they take more than the warning
-// size, which says the app saves them: it tries again after every Drive sync
-// sweep.
+// Review of #76, P3: the raw recordings the app keeps are reported in the
+// status, every one of them, and the warning the UI shows once they take more
+// than the warning size tells each kind true: the ones the app tries again to
+// save after every Drive sync sweep, the ones it erases once Drive has their
+// saved recording, and, by session, the ones it does not save or erase,
+// which wait for a person. kept_raw_by_hand names those sessions.
 func TestAPIStatusReportsKeptRawRecordings(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -1648,16 +1650,21 @@ func TestAPIStatusReportsKeptRawRecordings(t *testing.T) {
 		warning string // "" for no warning
 	}{
 		{name: "none", kept: KeptRawRecordings{WarnBytes: 1000}},
-		{name: "under the warning size", kept: KeptRawRecordings{Count: 1, Bytes: 1000, WarnBytes: 1000}},
+		{name: "under the warning size", kept: KeptRawRecordings{Count: 1, Bytes: 1000, Unsaved: 1, WarnBytes: 1000}},
 		{
 			name:    "one over the warning size",
-			kept:    KeptRawRecordings{Count: 1, Bytes: 1001, WarnBytes: 1000},
-			warning: "1 recording is not saved yet: its raw audio (0.0 MB) is kept in the audio directory, and the app tries again to save it after every Drive sync sweep.",
+			kept:    KeptRawRecordings{Count: 1, Bytes: 1001, Unsaved: 1, WarnBytes: 1000},
+			warning: "1 raw recording (0.0 MB) is kept in the audio directory: 1 is not saved yet, and the app tries again to save it after every Drive sync sweep.",
 		},
 		{
-			name:    "several over the warning size",
-			kept:    KeptRawRecordings{Count: 3, Bytes: 432537600, WarnBytes: 107374182},
-			warning: "3 recordings are not saved yet: their raw audio (412.5 MB) is kept in the audio directory, and the app tries again to save them after every Drive sync sweep.",
+			name:    "each kind over the warning size",
+			kept:    KeptRawRecordings{Count: 4, Bytes: 432537600, Unsaved: 1, AwaitingDrive: 1, ByHand: []string{"20261106120000", "20261106130000"}, WarnBytes: 107374182},
+			warning: "4 raw recordings (412.5 MB) are kept in the audio directory: 1 is not saved yet, and the app tries again to save it after every Drive sync sweep; 1 is saved, and is erased once Drive has its saved recording; 2 the app does not save or erase, of sessions 20261106120000, 20261106130000: recover or delete them by hand.",
+		},
+		{
+			name:    "several of each kind over the warning size",
+			kept:    KeptRawRecordings{Count: 5, Bytes: 2048000, Unsaved: 2, AwaitingDrive: 2, ByHand: []string{"20261106120000"}, WarnBytes: 0},
+			warning: "5 raw recordings (2.0 MB) are kept in the audio directory: 2 are not saved yet, and the app tries again to save them after every Drive sync sweep; 2 are saved, and are erased once Drive has their saved recordings; 1 the app does not save or erase, of session 20261106120000: recover or delete it by hand.",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1679,6 +1686,7 @@ func TestAPIStatusReportsKeptRawRecordings(t *testing.T) {
 			var resp struct {
 				KeptRawRecordings int      `json:"kept_raw_recordings"`
 				KeptRawBytes      int64    `json:"kept_raw_bytes"`
+				KeptRawByHand     []string `json:"kept_raw_by_hand"`
 				Warnings          []string `json:"warnings"`
 			}
 			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
@@ -1686,6 +1694,9 @@ func TestAPIStatusReportsKeptRawRecordings(t *testing.T) {
 			}
 			if resp.KeptRawRecordings != kept.Count || resp.KeptRawBytes != kept.Bytes {
 				t.Errorf("kept_raw_recordings=%d kept_raw_bytes=%d, want %d and %d", resp.KeptRawRecordings, resp.KeptRawBytes, kept.Count, kept.Bytes)
+			}
+			if resp.KeptRawByHand == nil || !slices.Equal(resp.KeptRawByHand, append([]string{}, kept.ByHand...)) {
+				t.Errorf("kept_raw_by_hand = %#v, want %q", resp.KeptRawByHand, kept.ByHand)
 			}
 			var want []string
 			if tc.warning != "" {

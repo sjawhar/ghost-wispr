@@ -225,51 +225,6 @@ func (r *Recorder) writePCM(data []byte) error {
 	return nil
 }
 
-// KeptRawRecordings counts the raw recordings kept in the audio directory
-// because they could not be saved, and their total size: every .pcm there
-// except the recording under way, one being saved or waiting for its retry,
-// and one left beside its saved recording (<id>.mp3 or <id>.wav). The app
-// saves the one of a session that ended without a recording (SaveKept); one
-// no session names is for recovery or deletion by hand.
-func (r *Recorder) KeptRawRecordings() (count int, size int64) {
-	entries, err := os.ReadDir(r.audioDir)
-	if err != nil {
-		return 0, 0
-	}
-	// Read after listing, so a session that started or ended meanwhile is
-	// still recognised.
-	r.mu.Lock()
-	live, saving, unsaved := r.rawPath, r.savingPath, r.unsavedPath
-	r.mu.Unlock()
-
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || filepath.Ext(name) != ".pcm" {
-			continue
-		}
-		path := filepath.Join(r.audioDir, name)
-		if path == live || path == saving || path == unsaved {
-			continue
-		}
-		id := strings.TrimSuffix(name, ".pcm")
-		if isFile(filepath.Join(r.audioDir, id+".mp3")) || isFile(filepath.Join(r.audioDir, id+".wav")) {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		count++
-		size += info.Size()
-	}
-	return count, size
-}
-
-func isFile(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
-}
-
 // KeptRawSessions returns the sessions whose raw recordings are in the audio
 // directory and that the recorder is not using: not the recording under way,
 // not one being saved, and not one waiting for its retry. A raw recording

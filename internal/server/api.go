@@ -1348,6 +1348,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				activeSessionStartedAt = startedAt.UTC().Format(time.RFC3339Nano)
 			}
 		}
+		keptByHand := append([]string{}, kept.ByHand...)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"paused":                    paused,
 			"capturing":                 capturing,
@@ -1355,6 +1356,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"warnings":                  warnings,
 			"kept_raw_recordings":       kept.Count,
 			"kept_raw_bytes":            kept.Bytes,
+			"kept_raw_by_hand":          keptByHand,
 			"gc_hold":                   gcHold,
 			"unverified_sessions":       unverified,
 			"unit_only_sessions":        unitOnly,

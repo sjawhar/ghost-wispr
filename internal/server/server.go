@@ -53,25 +53,50 @@ const (
 	segmentDeleteTextAndAudio = "text_and_audio"
 )
 
-// KeptRawRecordings are the raw recordings kept in the audio directory because
-// they could not be saved yet: the app saves the one of a session that ended
-// without a recording, and one no session names is for recovery or deletion
-// by hand.
+// KeptRawRecordings are the raw recordings the app keeps in the audio
+// directory: Count of them, Bytes in all, of three kinds. Unsaved are of
+// sessions that ended without a recording, which the app tries again to save
+// after every Drive sync sweep. AwaitingDrive are saved, and the app erases
+// each once Drive has its saved recording. ByHand names the sessions of the
+// ones the app neither saves nor erases, which wait for a person.
 type KeptRawRecordings struct {
-	Count     int
-	Bytes     int64
-	WarnBytes int64 // GET /api/status warns once Bytes exceeds this
+	Count         int
+	Bytes         int64
+	WarnBytes     int64 // GET /api/status warns once Bytes exceeds this
+	Unsaved       int
+	AwaitingDrive int
+	ByHand        []string
 }
 
-// keptRawWarning tells the user in GET /api/status that recordings are not
-// saved yet, that their raw audio is in the audio directory, and that the app
-// saves them: it tries again after every Drive sync sweep.
+// keptRawWarning tells the user in GET /api/status how many raw recordings
+// the app keeps and what happens to each kind: the ones it tries again to
+// save, the ones it erases once Drive has their saved recording, and, by
+// session, the ones it leaves for a person to recover or delete.
 func keptRawWarning(kept KeptRawRecordings) string {
-	mb := float64(kept.Bytes) / (1024 * 1024)
-	if kept.Count == 1 {
-		return fmt.Sprintf("1 recording is not saved yet: its raw audio (%.1f MB) is kept in the audio directory, and the app tries again to save it after every Drive sync sweep.", mb)
+	plural := func(n int, one, many string) string {
+		if n == 1 {
+			return one
+		}
+		return many
 	}
-	return fmt.Sprintf("%d recordings are not saved yet: their raw audio (%.1f MB) is kept in the audio directory, and the app tries again to save them after every Drive sync sweep.", kept.Count, mb)
+	var parts []string
+	if n := kept.Unsaved; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", n, plural(n,
+			"is not saved yet, and the app tries again to save it after every Drive sync sweep",
+			"are not saved yet, and the app tries again to save them after every Drive sync sweep")))
+	}
+	if n := kept.AwaitingDrive; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", n, plural(n,
+			"is saved, and is erased once Drive has its saved recording",
+			"are saved, and are erased once Drive has their saved recordings")))
+	}
+	if n := len(kept.ByHand); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d the app does not save or erase, of %s %s: recover or delete %s by hand",
+			n, plural(n, "session", "sessions"), strings.Join(kept.ByHand, ", "), plural(n, "it", "them")))
+	}
+	return fmt.Sprintf("%d raw %s (%.1f MB) %s kept in the audio directory: %s.",
+		kept.Count, plural(kept.Count, "recording", "recordings"), float64(kept.Bytes)/(1024*1024),
+		plural(kept.Count, "is", "are"), strings.Join(parts, "; "))
 }
 
 // GCHold is a GC pass that held back, deleting and removing nothing more,

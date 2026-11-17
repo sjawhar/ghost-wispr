@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -513,31 +514,24 @@ func TestRecorderEndSessionNeverReturnsAnotherSessionsRecording(t *testing.T) {
 	}
 }
 
-// KeptRawRecordings counts the raw recordings kept in the audio directory
-// because they could not be saved, with their total size: not the recording
-// under way, not one being saved or waiting for its retry, and not one left
-// beside its saved recording. One given up after failed saves counts.
-func TestRecorderKeptRawRecordings(t *testing.T) {
+// KeptRawSessions lists the sessions of the raw recordings in the audio
+// directory the recorder is not using: not the recording under way, not one
+// being saved or waiting for its retry. One beside its saved recording is
+// listed, and one given up after failed saves is listed once given up.
+func TestRecorderKeptRawSessionsWhileSaving(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	for name, size := range map[string]int{
-		"20261106100000.pcm": 1000, // kept: no saved recording
-		"20261106110000.pcm": 2000, // kept
-		"20261106120000.pcm": 4000, // left beside its saved recording
-		"20261106120000.mp3": 10,
-		"notes.txt":          50,
-	} {
-		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+	for _, name := range []string{"20261106100000.pcm", "20261106120000.pcm", "20261106120000.mp3", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte{1, 2}, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.Mkdir(filepath.Join(dir, "copies.pcm"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	expect := func(when string, wantCount int, wantBytes int64) {
+	expect := func(when string, want ...string) {
 		t.Helper()
-		if count, size := recorder.KeptRawRecordings(); count != wantCount || size != wantBytes {
-			t.Errorf("%s: KeptRawRecordings = (%d, %d), want (%d, %d)", when, count, size, wantCount, wantBytes)
+		got := recorder.KeptRawSessions()
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: KeptRawSessions = %v, want %v", when, got, want)
 		}
 	}
 
@@ -547,17 +541,17 @@ func TestRecorderKeptRawRecordings(t *testing.T) {
 	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 8000)); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
-	expect("while recording", 2, 3000)
+	expect("while recording", "20261106100000", "20261106120000")
 
 	recorder.encode = func(context.Context, string, string) (string, error) {
-		expect("while saving", 2, 3000)
+		expect("while saving", "20261106100000", "20261106120000")
 		return "", errors.New("no space left on device")
 	}
 	if _, err := recorder.EndSession("20261106130000"); err == nil {
 		t.Fatal("EndSession saved a recording no encoder could write")
 	}
-	expect("waiting for its retry", 2, 3000)
+	expect("waiting for its retry", "20261106100000", "20261106120000")
 
 	recorder.DiscardUnsaved()
-	expect("given up", 3, 11000)
+	expect("given up", "20261106100000", "20261106120000", "20261106130000")
 }
