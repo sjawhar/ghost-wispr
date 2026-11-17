@@ -181,6 +181,11 @@ var errLightNotConfirmed = errors.New("recording light not confirmed red")
 // the light stays off while the microphone is missing.
 var errNoCaptureDevice = errors.New("no capture device present")
 
+// errMicStartPaused is what a microphone start returns when a pause came
+// before it opened a device: it opened nothing, and the next resume starts
+// the microphone.
+var errMicStartPaused = errors.New("microphone start cancelled by a pause")
+
 // startMicIfUnpaused starts the opened microphone unless capture is paused. A
 // paused instance opens no device (startMicrophone), but a pause that lands
 // after the device opened leaves it open and not started; the mic loop closes

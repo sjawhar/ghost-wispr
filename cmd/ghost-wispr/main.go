@@ -342,12 +342,16 @@ func retryMicStartup(
 		after = time.After
 	}
 
+	wait := true
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-after(retryInterval):
+		if wait {
+			select {
+			case <-ctx.Done():
+				return
+			case <-after(retryInterval):
+			}
 		}
+		wait = true
 		if !capture.waitResumed(ctx) {
 			return
 		}
@@ -371,6 +375,11 @@ func retryMicStartup(
 		// state: readiness then reports what came back.
 		err := capture.openUnderRed(start)
 		capture.finishResume()
+		if errors.Is(err, errMicStartPaused) {
+			// A pause cancelled the attempt: the next resume tries again.
+			wait = false
+			continue
+		}
 		if err != nil {
 			if onError != nil {
 				onError(err)
@@ -394,11 +403,12 @@ func retryMicStartup(
 // the gate opens and the hardware is ready for it (prepareMicOpen), with atBoot
 // false, and startMicrophone returns deferred true; that start, whether it
 // works or not, ends the resume's "resuming" state (finishResume). A pause
-// while it waits for the hardware cancels that resume, and the next resume
-// starts the microphone. Otherwise start runs at once with atBoot true, so it
-// can write the start-up status, and startMicrophone returns its error: one
-// that wraps errLightNotConfirmed if the light refused it, and start did not
-// run.
+// while it waits for the hardware, or one that cancels the start before it
+// opens a device (errMicStartPaused), cancels that resume, and the next
+// resume starts the microphone. Otherwise start runs at once with atBoot true,
+// so it can write the start-up status, and startMicrophone returns its error:
+// one that wraps errLightNotConfirmed if the light refused it, or
+// errNoCaptureDevice, and start did not run.
 //
 // Nothing runs in loops before booted closes, once start-up has sent its
 // component statuses: a power-button resume can come during start-up, and
@@ -415,8 +425,8 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 			}
 		})
 	}
-	if capture.isClosed() {
-		afterBoot(func() {
+	startOnResume := func() {
+		for {
 			for {
 				if !capture.waitResumed(ctx) {
 					return
@@ -425,20 +435,32 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 					break
 				}
 			}
-			started := capture.openUnderRed(func() error { return start(false) }) == nil
+			err := capture.openUnderRed(func() error { return start(false) })
 			capture.finishResume()
-			if started {
+			switch {
+			case err == nil:
 				return
+			case errors.Is(err, errMicStartPaused):
+				continue
 			}
 			retry()
-		})
+			return
+		}
+	}
+	if capture.isClosed() {
+		afterBoot(startOnResume)
 		return true, nil
 	}
-	if err := capture.openUnderRed(func() error { return start(true) }); err != nil {
-		afterBoot(retry)
-		return false, err
+	err = capture.openUnderRed(func() error { return start(true) })
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, errMicStartPaused):
+		afterBoot(startOnResume)
+		return true, nil
 	}
-	return false, nil
+	afterBoot(retry)
+	return false, err
 }
 
 type transcriptCallback struct {
@@ -1584,6 +1606,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			sampleRate int
 		)
 
+		// A pause during the scan cancels the start before any device opens:
+		// the light then goes off at once, and the next resume starts again.
+		if capture.isClosed() {
+			return errMicStartPaused
+		}
 		for _, rate := range cfg.SampleRateCandidates() {
 			var candidate *audio.Mic
 			openErr := micDevice.openStream(func() (bool, error) {
@@ -1659,7 +1686,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
-		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub, !updateStartupState)
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, micWait, log.Printf, hub))
 		return nil

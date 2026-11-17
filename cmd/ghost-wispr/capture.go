@@ -100,7 +100,7 @@ type captureGate struct {
 	switchOff           bool          // Pause was called and Resume has not been since
 	lightHeld           bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
 	resumedAt           time.Time     // when Resume last moved the switch on
-	starting            bool          // that Resume's start of the microphone, and Deepgram, has not finished (finishResume)
+	starting            bool          // that Resume's start of the microphone has not finished (finishResume)
 	preparing           bool          // a start waits in beforeMicOpen (prepareMicOpen)
 	closed              bool          // no audio passes the gate
 	closings            int           // counts closings, so a Resume left from an earlier one does nothing
@@ -497,7 +497,8 @@ func (g *captureGate) IsPaused() bool {
 }
 
 // finishResume ends the resuming state of the latest Resume once its start of
-// the microphone, and Deepgram, has finished, whether it worked or failed:
+// the microphone has finished, whether it worked or failed (Deepgram then
+// connects in the background):
 // readiness then reports what is up and what is not. A start that finishes
 // while the gate is closed again does not end the next Resume's state; that
 // Resume's own start does.
@@ -591,8 +592,11 @@ type gatedWriter struct {
 // opened under a red confirmation (lightWentOff). Audio that comes after a
 // stall, which may have turned the light off, is first confirmed red
 // (beforeMicStart, as for a microphone start), so the light stays red if it
-// never went off. If it went off, as the controller turns it off once no
-// audio reaches the recording (no_audio), the audio is dropped with
+// never went off. The confirmation's hold ends before the audio is written:
+// it marks the audio as flowing, which keeps the light red without a hold, so
+// a pause during a write that does not return, as to a stuck recording file,
+// still turns the light off. If it went off, as the controller turns it off
+// once no audio reaches the recording (no_audio), the audio is dropped with
 // errLightWentOff: some of it, and whatever the microphone still holds, was
 // captured with the light off. Audio the light cannot be confirmed red for is
 // dropped, and the failure goes to the light guard (onLightUnconfirmed), which
@@ -616,7 +620,7 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 			}
 			return len(p), nil
 		}
-		defer g.finishMicStart()
+		g.finishMicStart()
 	}
 	if g.lightWentOff() {
 		return 0, errLightWentOff
