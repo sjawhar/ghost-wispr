@@ -363,17 +363,14 @@ func TestAPauseDuringAMicrophoneStartKeepsTheLightRedUntilTheStartEnds(t *testin
 // the microphone was open: what the microphone holds then may have been
 // captured with the light off. The loop must drop it, close the microphone,
 // which drops the rest, and open it again under a red confirmation. The light
-// goes off on purpose once no audio reaches the recording (no_audio), and can
-// read back off by itself, as when its watchdog fires.
+// can read back off by itself, as when its watchdog fires. (No audio no
+// longer turns the light off with the microphone open: the loop closes the
+// microphone first, TestNoAudioClosesTheMicrophoneBeforeTheLightGoesOff.)
 func TestNoAudioPassesOnceTheLightWasNotRedWhileTheMicrophoneWasOpen(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		lightOff func(t *testing.T, r *lightRig)
 	}{
-		{name: "no audio reached the recording", lightOff: func(t *testing.T, r *lightRig) {
-			r.capture.audioAt.Store(time.Now().Add(-2 * audioStallAfter).UnixNano())
-			r.waitOff(t)
-		}},
 		{name: "the light read back off by itself", lightOff: func(t *testing.T, r *lightRig) {
 			r.device.mu.Lock()
 			r.device.colour = [3]uint8{}

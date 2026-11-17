@@ -409,14 +409,21 @@ seconds) and the reconnect (backing off to every 30 seconds) look again without 
 starts paused scans only at its first resume, so it speaks only from then on: meanwhile
 `/api/status` warns `Speaker unavailable until the microphone starts`, and `POST /api/tts/speak`
 answers `409` with that reason. A pause during an open keeps the blink(1) red until that open has
-finished. A pause closes the
-microphone at once, also while its read waits on a device that delivers no frame. If it still
-cannot be closed, `/api/status` warns
-`Microphone still open after a pause: its read does not stop` until it is, and nothing is
-recorded meanwhile. Once the blink(1) was off while the microphone was open, as when no audio
-reached the recording, Ghost Wispr drops what the microphone holds and opens it again under a new
-check; the log says `the recording light was not red while the microphone was open; reopening the
-microphone`.
+finished.
+
+The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
+is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
+its read waits on a device that delivers no frame or its audio waits on a stuck recording file;
+then the blink(1) goes off. If a call into PortAudio does not return, the microphone cannot be
+closed: the blink(1) stays red, `/api/status` warns `Microphone still open after a pause` until it
+closes, and nothing is recorded meanwhile. Once no audio has reached the recording for 2 seconds,
+Ghost Wispr closes the microphone, and the blink(1) goes off, with `capture_state` `no_audio`; it
+opens it again under a new check after a wait that doubles up to 30 seconds. After a stream error
+it closes the microphone before it waits to reconnect. It reads the blink(1) back for each buffer
+of audio: once the blink(1) was not red while the microphone was open, as when it was unplugged or
+its watchdog turned it off, Ghost Wispr drops what the microphone holds and opens it again under a
+new check; the log says `the recording light was not red while the microphone was open; reopening
+the microphone`. At shutdown the blink(1) goes off once the microphone is closed.
 
 Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
 a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that

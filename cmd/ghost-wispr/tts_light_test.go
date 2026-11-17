@@ -144,7 +144,8 @@ func TestNoJabraLightWriteDuringTTSOnAnyMicrophonePath(t *testing.T) {
 			setup: func(_ *captureGate, mic *scriptedMic) {
 				mic.streamErrs = []error{errors.New("Input overflowed")}
 			},
-			events: []string{"stream", "reopen", "stream"},
+			// The loop closes the device before it waits to reconnect.
+			events: []string{"stream", "close", "reopen", "stream"},
 		},
 		{
 			name: "close when red cannot be confirmed before a reconnect",
@@ -152,7 +153,9 @@ func TestNoJabraLightWriteDuringTTSOnAnyMicrophonePath(t *testing.T) {
 				capture.beforeMicStart = func() error { return errors.New("recording light stayed off") }
 				mic.streamErrs = []error{errors.New("device disconnected")}
 			},
-			events: []string{"stream", "close", "stream"},
+			// The device closes before the wait, and again when the light
+			// refuses the reconnect; the loop then waits for the light.
+			events: []string{"stream", "close", "close"},
 		},
 		{
 			name:   "close when the light guard holds capture",

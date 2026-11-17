@@ -197,6 +197,23 @@ func (h *hardwareControl) lightOffs() uint64 {
 	return h.light.offs.Load()
 }
 
+// lightRedMark is lightOffs as the light's last red confirmation left it.
+func (h *hardwareControl) lightRedMark() uint64 {
+	if h.light == nil {
+		return 0
+	}
+	return h.light.redMark.Load()
+}
+
+// checkLight reads the light back, which counts it in lightOffs unless it is
+// red, so the gate's writer stops audio as soon as the light is off, whoever
+// turned it off.
+func (h *hardwareControl) checkLight() {
+	if h.light != nil {
+		_, _, _, _ = h.light.ReadRGB()
+	}
+}
+
 func (h *hardwareControl) ReleaseRedHold() {
 	for {
 		holds := h.redHolds.Load()
@@ -259,36 +276,42 @@ func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, onRe
 // wireLightConsent makes every microphone open, start and gate opening wait
 // for the light to be confirmed red, and hold it red until it is done; and
 // lets audio pass only while the light has stayed red since the microphone
-// opened. A pause takes no hold away: the light goes off once the gate is
-// closed and every open under way has ended, never while one may still open a
-// device.
+// opened, which the gate's writer reads back for each buffer. The light stays
+// red while a microphone is open (startHardware), so it goes off only once the
+// mic loop has closed it, which wakes it.
 func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry, onResumeRefused func(error)) {
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
 	capture.onLightUnconfirmed = hardware.LightUnconfirmed
 	capture.lightOffs = hardware.lightOffs
+	capture.lightRedMark = hardware.lightRedMark
+	capture.checkLight = hardware.checkLight
+	capture.afterMicClose = hardware.Wake
 	guardResumeWithLight(capture, warnings, onResumeRefused)
 }
 
 // pauseCapture closes the capture gate and wakes the light controller. It
 // takes no red hold away: a microphone open under way holds the light red
-// until it ends, so the light goes off once no device may still open, never
-// while one may.
+// until it ends, and the light stays red while a microphone is open, so it
+// goes off once the mic loop has closed it, never before.
 func pauseCapture(capture *captureGate, hardware *hardwareControl) {
 	capture.Pause()
 	hardware.Wake()
 }
 
 // startHardware starts the configured recording light, and the guard that
-// keeps capture closed while the light cannot be confirmed red. The button
-// starts only after its durable controls are completely wired.
+// keeps capture closed while the light cannot be confirmed red. The light is
+// red while a red confirmation holds it, and while a microphone is open, so
+// it is never off while the microphone is open: a pause, no audio or a stream
+// error turns it off only once the mic loop has closed the microphone. The
+// button starts only after its durable controls are completely wired.
 func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate, mic interface{ IsOpen() bool }, warnings *warningsRegistry, hub *server.Hub) *hardwareControl {
 	done := make(chan struct{})
 	hardware := &hardwareControl{done: done}
 	if cfg.IndicatorLight == config.IndicatorLightBlink1 {
 		wantRed := func() bool {
-			return hardware.holdsRed() || recordingSignal(capture, mic)
+			return hardware.holdsRed() || mic.IsOpen()
 		}
 		hardware.light = &reconnectingLight{
 			warnings:   warnings,
@@ -363,6 +386,9 @@ type reconnectingLight struct {
 	// read-back of one, each light just found (it shows what it showed before)
 	// and each failure: each time the light may have stopped showing red.
 	offs atomic.Uint64
+	// redMark is offs as the last red confirmation left it, set under
+	// deviceMu, so no failure counted after the confirmation is in it.
+	redMark atomic.Uint64
 }
 
 func (l *reconnectingLight) retryDelay() time.Duration {
@@ -505,6 +531,7 @@ func (l *reconnectingLight) ConfirmRed() error {
 		l.offs.Add(1)
 		return fmt.Errorf("%w: it reads %d,%d,%d", indicator.ErrNotRed, r, g, b)
 	}
+	l.redMark.Store(l.offs.Load())
 	return nil
 }
 

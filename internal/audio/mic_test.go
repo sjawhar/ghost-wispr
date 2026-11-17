@@ -32,6 +32,8 @@ type heldStream struct {
 	stopped bool
 	closed  bool
 	misuse  []string
+	stall   chan struct{} // while set, AvailableToRead does not return until it is closed
+	failErr error         // AvailableToRead returns it once
 }
 
 func newHeldStream() *heldStream {
@@ -93,7 +95,40 @@ func (s *heldStream) AvailableToRead() (int, error) {
 	defer s.mu.Unlock()
 	s.use("AvailableToRead")
 	s.polls++
+	if stall := s.stall; stall != nil {
+		s.mu.Unlock()
+		<-stall
+		s.mu.Lock()
+	}
+	if err := s.failErr; err != nil {
+		s.failErr = nil
+		return 0, err
+	}
 	return len(s.frames), nil
+}
+
+// stallCalls makes the next AvailableToRead calls not return, as a PortAudio
+// call that hangs, until the returned func is called.
+func (s *heldStream) stallCalls() (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stall := make(chan struct{})
+	s.stall = stall
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.stall == stall {
+			s.stall = nil
+		}
+		close(stall)
+	}
+}
+
+// failNext makes the next AvailableToRead call return err.
+func (s *heldStream) failNext(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failErr = err
 }
 
 func (s *heldStream) Read() error {
@@ -261,50 +296,6 @@ func (w *blockedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestMicCloseLeavesTheStreamToItsReaderWhileAWriteDoesNotReturn fails if
-// Close, while Stream is inside a write that does not return, closes the
-// capture stream under it, or waits for it without a bound, or does not report
-// that the stream stays open; or if a Close once the write has returned does
-// not close it.
-func TestMicCloseLeavesTheStreamToItsReaderWhileAWriteDoesNotReturn(t *testing.T) {
-	originalWait := micCloseWait
-	micCloseWait = 50 * time.Millisecond
-	t.Cleanup(func() { micCloseWait = originalWait })
-	writer := &blockedWriter{writing: make(chan struct{}), release: make(chan struct{})}
-	stream, mic, streamed := openHeldMic(t, 4, writer)
-	release := sync.OnceFunc(func() { close(writer.release) })
-	t.Cleanup(release) // before openHeldMic's, which waits for Stream
-	stream.deliver(1, 2, 3, 4)
-	select {
-	case <-writer.writing:
-	case <-time.After(time.Second):
-		t.Fatal("Stream did not write the buffer")
-	}
-
-	if err := mic.Close(); !errors.Is(err, ErrMicStillReading) {
-		t.Fatalf("Close during a write that does not return = %v, want ErrMicStillReading", err)
-	}
-	if _, _, closedStream, _ := stream.snapshot(); closedStream {
-		t.Fatal("Close closed the capture stream while Stream was still using it")
-	}
-
-	release()
-	select {
-	case err := <-streamed:
-		if !errors.Is(err, errMicClosed) {
-			t.Fatalf("Stream = %v, want it ended by the earlier Close", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Stream still running once its write returned")
-	}
-	if err := mic.Close(); err != nil {
-		t.Fatalf("Close once Stream returned = %v, want nil", err)
-	}
-	if _, _, closedStream, misuse := stream.snapshot(); !closedStream || len(misuse) > 0 {
-		t.Fatalf("after the second Close: stream closed=%t, misuse %v; want closed, none", closedStream, misuse)
-	}
-}
-
 func TestNewMicUsesOpenInputStreamFn(t *testing.T) {
 	original := openInputStreamFn
 	t.Cleanup(func() {
@@ -355,7 +346,7 @@ func TestMicReopenFailureClearsStreamAndMarksInactive(t *testing.T) {
 		framesPerBuffer: 4000,
 		buf:             make([]int16, 4000),
 	}
-	mic.active.Store(true)
+	mic.held.Store(true)
 
 	err := mic.Reopen()
 	if err == nil {
@@ -367,8 +358,8 @@ func TestMicReopenFailureClearsStreamAndMarksInactive(t *testing.T) {
 	if mic.stream != nil {
 		t.Fatal("expected nil stream after failed reopen")
 	}
-	if mic.active.Load() {
-		t.Fatal("expected inactive mic after failed reopen")
+	if mic.IsOpen() {
+		t.Fatal("expected a closed mic after failed reopen")
 	}
 }
 
@@ -386,13 +377,11 @@ func TestMicStreamReturnsErrorWhenStreamUnavailable(t *testing.T) {
 
 func TestMicStopIsSafeWhenStreamUnavailable(t *testing.T) {
 	mic := &Mic{}
-	mic.active.Store(true)
-
 	if err := mic.Stop(); err != nil {
 		t.Fatalf("expected nil stop error, got %v", err)
 	}
-	if mic.active.Load() {
-		t.Fatal("expected inactive mic after stop")
+	if mic.IsOpen() {
+		t.Fatal("a mic with no stream reports open")
 	}
 }
 
@@ -400,7 +389,7 @@ func TestMicStopIsSafeWhenStreamUnavailable(t *testing.T) {
 // capture stream, so the input device stays open, or reporting open.
 func TestMicCloseReleasesTheStream(t *testing.T) {
 	mic := &Mic{stream: &portaudio.Stream{}, sampleRate: 16000, framesPerBuffer: 4000, buf: make([]int16, 4000)}
-	mic.active.Store(true)
+	mic.held.Store(true)
 
 	_ = mic.Close() // the stand-in stream has no PortAudio stream behind it
 	if mic.stream != nil {
@@ -430,7 +419,7 @@ func TestMicIsOpenIsSafeDuringReopen(t *testing.T) {
 	}
 
 	mic := &Mic{sampleRate: 16000, framesPerBuffer: 4000, buf: make([]int16, 4000)}
-	mic.active.Store(true)
+	mic.held.Store(true)
 
 	done := make(chan struct{})
 	go func() {

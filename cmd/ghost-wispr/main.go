@@ -1373,7 +1373,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.
 	manager.SetRefinementWarningHook(refinementModelWarningHook(warningRegistry))
-	hardware := startHardware(ctx, &cfg, capture, micStatus, warningRegistry, hub)
+	// The light has a context of its own, which shutdown ends only once the
+	// mic loops have closed every microphone: the light is never off while
+	// one is open.
+	lightCtx, stopLight := context.WithCancel(context.Background())
+	defer stopLight()
+	hardware := startHardware(lightCtx, &cfg, capture, micStatus, warningRegistry, hub)
 	pauseControls := newPersistentControls(
 		store,
 		func() { pauseCapture(capture, hardware) },
@@ -1888,7 +1893,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	<-sig
 
 	log.Println("ghost-wispr: shutting down")
-	hardware.Stop()
 	cancel()
 	manager.StopSessionStartPublishes()
 	// Each mic loop closes its microphone and ends, even if its device
@@ -1900,6 +1904,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if !micLoopsEnded {
 		log.Printf("warning: microphone still reading %v after shutdown began; leaving the device and PortAudio to the process exit", micShutdownWait)
 	}
+	// Only now, with the microphones closed, does the light go off. Stop
+	// refuses any further red confirmation, and lets the off write through
+	// even if a microphone is stuck open, since the process is exiting.
+	hardware.Stop()
+	stopLight()
 	select {
 	case <-lightOff:
 	case <-time.After(lightShutdownWait):
@@ -1982,6 +1991,10 @@ func streamMicWithRetry(
 	)
 
 	backoff := baseBackoff
+	// stallWait is how long the loop holds the microphone closed after no
+	// audio reached the recording; it doubles while it opens to no audio, and
+	// starts again once audio passes.
+	stallWait := baseBackoff
 	gated := shutdownWriter{ctx: ctx, dst: capture.Writer(writer)}
 	// reopen is set when the microphone must close, and open again under a
 	// fresh red confirmation, before more audio passes; reopenWhy says why.
@@ -1991,8 +2004,8 @@ func streamMicWithRetry(
 	// (errLightWentOff), so what the microphone still holds may have been
 	// captured with the light off.
 	reopen, reopenWhy := false, ""
-	// released is set once a pause closed the microphone while it streamed
-	// (streamUntilClosed); the loop top then closes nothing more.
+	// released is set once the microphone is closed already, as by
+	// streamUntilClosed; the loop top then closes nothing more.
 	released := false
 	// held is set while a pause could not release the microphone
 	// (audio.ErrMicStillReading); the close that releases it clears the
@@ -2012,7 +2025,7 @@ func streamMicWithRetry(
 				why = "for capture pause"
 			}
 			if !released {
-				closeMic(streamer, why, logf)
+				closeMic(capture, streamer, why, logf)
 			}
 			if held {
 				held = false
@@ -2037,6 +2050,7 @@ func streamMicWithRetry(
 					logf("no capture device present; the microphone opens once one is")
 				} else {
 					logf("recording light unavailable before microphone restart: %v", err)
+					capture.lightUnconfirmed(err)
 				}
 				capture.finishResume()
 				wait(backoff)
@@ -2053,6 +2067,7 @@ func streamMicWithRetry(
 			capture.finishResume()
 			if err == nil {
 				backoff = baseBackoff
+				capture.stalled.Store(false)
 				logf("microphone reopened: capture resumed")
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone capture resumed")
@@ -2061,15 +2076,31 @@ func streamMicWithRetry(
 			}
 			// The device did not come back (unplugged during the pause). A
 			// failed Open holds no device; reconnect below.
+			released = true
 		} else {
-			var stillHeld bool
-			released, stillHeld, err = streamUntilClosed(ctx, capture, streamer, gated, logf)
-			if stillHeld {
+			armed := capture.audioAt.Load()
+			var closed micClose
+			closed, err = streamUntilClosed(ctx, capture, streamer, gated, logf)
+			if capture.audioAt.Load() != armed {
+				stallWait = baseBackoff // audio passed
+			}
+			if closed.held {
 				// Once Stream has returned, the loop top closes the device.
 				held, reopen, reopenWhy = true, true, "once its read returned"
 			}
+			released = closed.released
 			if err == nil || ctx.Err() != nil {
 				return
+			}
+			if closed.stalled && !capture.isClosed() {
+				// The microphone is closed, and the light off, until the wait
+				// is over; then the loop top opens it again under red.
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", captureNoAudio, "No audio reached the recording; the microphone is closed and opens again")
+				}
+				wait(stallWait)
+				stallWait = min(stallWait*2, maxBackoff)
+				continue
 			}
 			// A pause, or a device error that coincides with one: close the
 			// device at the loop top instead of reporting a failure.
@@ -2088,7 +2119,19 @@ func streamMicWithRetry(
 			}
 		}
 
-		if strings.Contains(strings.ToLower(err.Error()), "overflow") {
+		// The stream failed, or did not open, and the loop waits before it
+		// reconnects: the microphone is closed first, so the light, which goes
+		// off with it, is never off while it is open. A failed Open holds no
+		// device, so it needs no close.
+		if !released {
+			why := "after a stream error"
+			if isOverflow(err) {
+				why = "after an overflow"
+			}
+			closeMic(capture, streamer, why, logf)
+		}
+		released = true // the loop top, after a pause, closes nothing more
+		if isOverflow(err) {
 			logf("warning: mic input overflow, restarting stream")
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", "warning", "Mic input overflow, restarting stream")
@@ -2100,8 +2143,11 @@ func streamMicWithRetry(
 			if capture.isClosed() {
 				continue
 			}
-			// The loop top streams again, whatever the reopen did.
-			_, _ = reopenMic(capture, streamer, logf, hub)
+			// The loop top streams again, whatever the reopen did, unless the
+			// light refused it: the device is closed then, and the loop top
+			// opens it again under a new confirmation.
+			confirmed, _ := reopenMic(capture, streamer, logf, hub)
+			released = !confirmed
 			continue
 		}
 
@@ -2118,56 +2164,96 @@ func streamMicWithRetry(
 			return
 		}
 		if capture.isClosed() {
-			continue // never reopen the mic while paused; the loop top stops it
+			continue // never reopen the mic while paused; the loop top waits
 		}
-		switch confirmed, reopenErr := reopenMic(capture, streamer, logf, hub); {
+		confirmed, reopenErr := reopenMic(capture, streamer, logf, hub)
+		switch {
 		case !confirmed:
 		case reopenErr != nil:
 			backoff = min(backoff*2, maxBackoff)
 		default:
 			backoff = baseBackoff
 		}
+		released = !confirmed
 	}
 }
 
-// streamUntilClosed runs streamer's Stream into w and, as soon as the gate
-// closes (a pause, or a hold for the light) or shutdown begins (ctx ends),
-// closes streamer from another goroutine. A Stream whose read blocks, on a
-// device that delivers no frame, writes nothing, so neither errGateClosed nor
-// shutdownWriter reaches it: without that close, the device would stay open,
-// with the light off, until the read returned or the process exited. It
-// reports whether that close released the device, and whether it could not
-// (audio.ErrMicStillReading): the microphone is then reported held
-// (captureGate.micHeld) until the mic loop closes it once Stream has returned.
-func streamUntilClosed(ctx context.Context, capture *captureGate, streamer micStreamer, w io.Writer, logf func(string, ...any)) (released, held bool, err error) {
-	type closed struct{ released, held bool }
+// isOverflow reports whether err is PortAudio's input overflow.
+func isOverflow(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "overflow")
+}
+
+// micClose is how streamUntilClosed closed the microphone while it streamed:
+// released when the close released it, held when it could not
+// (audio.ErrMicStillReading), and stalled when it closed it because no audio
+// reached the recording.
+type micClose struct{ released, held, stalled bool }
+
+// streamUntilClosed runs streamer's Stream into w and closes streamer from
+// another goroutine as soon as the gate closes (a pause, or a hold for the
+// light), shutdown begins (ctx ends), or no audio has reached the recording
+// for the gate's audioStall since it last did, or since the start armed it.
+// A Stream whose read blocks, on a device that delivers no frame, writes
+// nothing, so neither errGateClosed nor shutdownWriter reaches it: without
+// that close, the device would stay open until the read returned or the
+// process exited, and the light, which stays red while it is open, with it.
+// A close that cannot release the device (audio.ErrMicStillReading) reports
+// the microphone held (captureGate.micHeld) until the mic loop closes it once
+// Stream has returned. After a close, the light is woken, so it goes off.
+func streamUntilClosed(ctx context.Context, capture *captureGate, streamer micStreamer, w io.Writer, logf func(string, ...any)) (micClose, error) {
 	closing := capture.closingSignal()
 	streamed := make(chan struct{})
-	result := make(chan closed, 1)
+	result := make(chan micClose, 1)
 	go func() {
-		select {
-		case <-streamed:
-			result <- closed{}
-			return
-		case <-closing:
-		case <-ctx.Done():
+		timer := time.NewTimer(time.Hour)
+		defer timer.Stop()
+		var closed micClose
+	watch:
+		for {
+			var stall <-chan time.Time
+			if at := capture.audioAt.Load(); at != 0 {
+				left := time.Until(time.Unix(0, at).Add(capture.audioStall))
+				if left <= 0 {
+					closed.stalled = true
+					break
+				}
+				timer.Reset(left)
+				stall = timer.C
+			}
+			select {
+			case <-streamed:
+				result <- closed
+				return
+			case <-closing:
+				break watch
+			case <-ctx.Done():
+				break watch
+			case <-stall:
+			}
+		}
+		why := "for capture pause"
+		if closed.stalled {
+			why = fmt.Sprintf("after no audio reached the recording for %v", capture.audioStall)
+			logf("no audio reached the recording for %v; closing the microphone", capture.audioStall)
+			capture.stalled.Store(true)
 		}
 		switch err := streamer.Close(); {
 		case errors.Is(err, audio.ErrMicStillReading):
-			logf("warning: the microphone is still reading after the capture pause; it stays open until its read returns")
+			logf("warning: the microphone is still reading; it stays open, with the light red, until its read returns")
 			capture.micHeld(true)
-			result <- closed{held: true}
+			closed.held = true
 		case err != nil:
-			logf("warning: close microphone for capture pause: %v", err)
-			result <- closed{released: true}
+			logf("warning: close microphone %s: %v", why, err)
+			closed.released = true
 		default:
-			result <- closed{released: true}
+			closed.released = true
 		}
+		capture.micClosed()
+		result <- closed
 	}()
-	err = streamer.Stream(w)
+	err := streamer.Stream(w)
 	close(streamed)
-	r := <-result
-	return r.released, r.held, err
+	return <-result, err
 }
 
 // The speaker's warnings, which GET /api/status lists, and the reasons POST
@@ -2238,7 +2324,7 @@ const micHeldWarningKey = "microphone-held"
 func micHeldWarning(warnings *warningsRegistry) func(held bool) {
 	return func(held bool) {
 		if held {
-			warnings.Set(micHeldWarningKey, "Microphone still open after a pause: its read does not stop. Nothing is recorded; restart the unit to close it")
+			warnings.Set(micHeldWarningKey, "Microphone still open after a pause: a call into PortAudio does not return. The light stays red while it is open, and nothing is recorded; restart the unit to close it")
 			return
 		}
 		warnings.Clear(micHeldWarningKey)
@@ -2257,14 +2343,15 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 	}
 	if err := capture.confirmMicOpen(); errors.Is(err, errNoCaptureDevice) {
 		logf("no capture device present; the microphone reconnects once one is")
-		closeMic(streamer, "with no capture device present", logf)
+		closeMic(capture, streamer, "with no capture device present", logf)
 		if hub != nil {
 			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, "No microphone found")
 		}
 		return true, err
 	} else if err != nil {
 		logf("recording light unavailable before microphone reconnect: %v", err)
-		closeMic(streamer, "without a red recording light", logf)
+		capture.lightUnconfirmed(err)
+		closeMic(capture, streamer, "without a red recording light", logf)
 		return false, nil
 	}
 	err := streamer.Reopen()
@@ -2276,6 +2363,7 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 		}
 		return true, err
 	}
+	capture.stalled.Store(false)
 	logf("mic reopened successfully")
 	if hub != nil {
 		hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
@@ -2283,22 +2371,21 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 	return true, nil
 }
 
-// closeMic closes the capture device, so it holds no input device: while
-// capture is paused, and when the light cannot be confirmed red before a
-// reconnect. An overflow, or a transient read error, leaves the device
-// capturing with IsOpen false, so the light goes dark while audio still flows;
-// after a refused reconnect the next Stream fails on the closed device, and
-// the error path backs off and confirms red again before it reopens.
-func closeMic(streamer micStreamer, which string, logf func(string, ...any)) {
+// closeMic closes the capture device, so it holds no input device, and wakes
+// the light, which stays red while the device is open: while capture is
+// paused, before the loop waits after a stream error, and when the light
+// cannot be confirmed red before a reconnect.
+func closeMic(capture *captureGate, streamer micStreamer, which string, logf func(string, ...any)) {
 	if err := streamer.Close(); err != nil {
 		logf("warning: close microphone %s: %v", which, err)
 	}
+	capture.micClosed()
 }
 
 // holdMicWhilePaused closes the capture device, which releases it, and blocks
 // until capture resumes (waitWhilePaused). It reports false if ctx ends first.
 func holdMicWhilePaused(ctx context.Context, capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) bool {
-	closeMic(streamer, "for capture pause", logf)
+	closeMic(capture, streamer, "for capture pause", logf)
 	return waitWhilePaused(ctx, capture, logf, hub)
 }
 

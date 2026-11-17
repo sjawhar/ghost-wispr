@@ -45,16 +45,20 @@ func (f *fakeStreamer) Stream(_ io.Writer) error {
 func (f *fakeStreamer) Reopen() error {
 	f.reopens++
 	if len(f.reopenErrs) == 0 {
+		f.stopped = false
 		return nil
 	}
 	err := f.reopenErrs[0]
 	f.reopenErrs = f.reopenErrs[1:]
+	if err == nil {
+		f.stopped = false
+	}
 	return err
 }
 
 func (f *fakeStreamer) Start() error { return nil }
 
-func (f *fakeStreamer) Open() error { return nil }
+func (f *fakeStreamer) Open() error { f.stopped = false; return nil }
 
 func (f *fakeStreamer) Close() error {
 	f.closes++
@@ -97,7 +101,9 @@ func TestStreamMicWithRetryOverflowReopens(t *testing.T) {
 
 // TestStreamMicWithRetryRequiresRedBeforeEachReopen fails if either reconnect
 // path starts microphone capture after the light refuses confirmation, or
-// retries a stopped device without another confirmation.
+// opens the closed device again without another confirmation. The device is
+// closed before the wait and again when the light refuses; the loop then opens
+// it again under a new confirmation instead of streaming the closed device.
 func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -135,10 +141,10 @@ func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
 				t.Fatalf("red confirmations = %d, want 2", confirmations)
 			}
 			if streamer.closes != 2 {
-				t.Fatalf("microphone closes after red confirmation failed = %d, want 2: a refused reconnect must release the input device", streamer.closes)
+				t.Fatalf("microphone closes after red confirmation failed = %d, want 2: the stream error and the refused reconnect each release the input device", streamer.closes)
 			}
-			if streamer.calls != 2 {
-				t.Fatalf("stream calls = %d, want first error and stopped retry", streamer.calls)
+			if streamer.calls != 1 {
+				t.Fatalf("stream calls = %d, want 1: a refused reconnect leaves the device closed, and the loop opens it again rather than stream it", streamer.calls)
 			}
 		})
 	}
@@ -305,9 +311,12 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 		waits = append(waits, d)
 	}, func(string, ...any) {}, nil)
 
-	// err1 → 1s wait, reopen fails → err2 (still in loop) → 2s wait, reopen succeeds (reset) → err3 → 1s wait, reopen succeeds → nil
-	if len(waits) != 3 {
-		t.Fatalf("expected 3 waits, got %d: %v", len(waits), waits)
+	// err1 → close, 1s wait, reopen fails → the closed device fails its stream
+	// → close, 2s wait, reopen succeeds (reset) → err2 → 1s wait, reopen
+	// succeeds → err3 → 1s wait, reopen succeeds → nil. The loop closes the
+	// device before each wait, so a failed reopen leaves it closed.
+	if len(waits) != 4 {
+		t.Fatalf("expected 4 waits, got %d: %v", len(waits), waits)
 	}
 	if waits[0] != time.Second {
 		t.Fatalf("expected first wait 1s, got %v", waits[0])
@@ -315,8 +324,8 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 	if waits[1] != 2*time.Second {
 		t.Fatalf("expected second wait 2s, got %v", waits[1])
 	}
-	if waits[2] != time.Second {
-		t.Fatalf("expected third wait 1s (reset), got %v", waits[2])
+	if waits[2] != time.Second || waits[3] != time.Second {
+		t.Fatalf("expected the waits after a reopen that worked to be 1s (reset), got %v", waits[2:])
 	}
 }
 

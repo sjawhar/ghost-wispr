@@ -16,14 +16,17 @@ import (
 // stream has no frame for it.
 const micReadPoll = 10 * time.Millisecond
 
-// micCloseWait is how long Close waits for a Stream under way to return
-// before it closes the capture stream. Stream returns within micReadPoll of
-// the Close unless a write of its audio, or a PortAudio call, does not return.
+// micCloseWait is how long Close waits for a PortAudio call Stream is making
+// to return before it gives up on closing the capture stream. Stream's calls
+// do not wait for frames (it reads only what the stream holds), so they
+// return at once unless PortAudio itself hangs.
 var micCloseWait = 2 * time.Second
 
-// ErrMicStillReading is what Close returns when the Stream under way did not
-// return within micCloseWait: the capture stream, and the input device with
-// it, stay open. A Close once that Stream has returned closes them.
+// ErrMicStillReading is what Close returns when a PortAudio call of the
+// Stream under way did not return within micCloseWait: the capture stream, and
+// the input device with it, stay open, since closing it under the call would
+// free memory the call still uses. A Close once the call has returned closes
+// them.
 var ErrMicStillReading = errors.New("microphone still reading: its capture stream stays open")
 
 // errMicClosed is what Stream returns when Close ends it.
@@ -50,12 +53,18 @@ var openInputStreamFn = openInputStream
 // PortAudio call from another thread can end it: after Pa_AbortStream, ALSA's
 // blocking read polls an error, takes it for an overrun and polls again
 // (PortAudio 19.6, pa_linux_alsa.c, ReadStream and PaAlsaStream_WaitForFrames),
-// and Pa_CloseStream frees the stream the read still uses.
+// and Pa_CloseStream frees the stream the read still uses. Close closes the
+// stream between two of Stream's PortAudio calls, also while Stream waits on
+// a write of its audio, so a write that does not return keeps no device open.
 type Mic struct {
 	mu       sync.Mutex
 	stream   inputStream   // nil while closed
 	reading  chan struct{} // closed once the Stream under way returns; nil while none runs
 	stopping chan struct{} // closed by Close to end the Stream under way; nil once closed
+	// pa is held, as a one-slot channel, through each PortAudio call on the
+	// stream: by Stream around each AvailableToRead and Read, and by Close
+	// around Stop and Close. Stream takes it only while Close has not begun.
+	pa chan struct{}
 	// buf is one buffer of framesPerBuffer frames, which Stream fills and
 	// writes. window is the part of it the next Read fills: the stream reads
 	// through a pointer to window, so each Read reads len(window) frames.
@@ -63,7 +72,7 @@ type Mic struct {
 	window          []int16
 	sampleRate      int
 	framesPerBuffer int
-	active          atomic.Bool
+	held            atomic.Bool // a capture stream is open: from the open until Close closes it
 }
 
 // NewMic opens a PortAudio capture stream with the given sample rate and buffer size (in frames).
@@ -74,6 +83,7 @@ func NewMic(sampleRate, framesPerBuffer int) (*Mic, error) {
 		return nil, err
 	}
 	m.stream = stream
+	m.held.Store(true)
 	return m, nil
 }
 
@@ -83,27 +93,33 @@ func (m *Mic) current() inputStream {
 	return m.stream
 }
 
+// paLock returns the one-slot channel held through each PortAudio call.
+func (m *Mic) paLock() chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pa == nil {
+		m.pa = make(chan struct{}, 1)
+	}
+	return m.pa
+}
+
 func (m *Mic) Start() error {
 	if m == nil {
 		return fmt.Errorf("microphone stream unavailable")
 	}
 	stream := m.current()
 	if stream == nil {
-		m.active.Store(false)
 		return fmt.Errorf("microphone stream unavailable")
 	}
-	err := stream.Start()
-	if err == nil {
-		m.active.Store(true)
-	}
-	return err
+	return stream.Start()
 }
 
+// Stop stops the capture stream and keeps it open. Shutdown calls it once no
+// Stream runs.
 func (m *Mic) Stop() error {
 	if m == nil {
 		return nil
 	}
-	m.active.Store(false)
 	stream := m.current()
 	if stream == nil {
 		return nil
@@ -113,35 +129,35 @@ func (m *Mic) Stop() error {
 
 // Close stops and closes the capture stream, which releases the input device.
 // Start and Stream then fail until Open or Reopen opens a fresh stream. Close
-// may be called from any goroutine while Stream runs: it ends that Stream, and
-// waits up to micCloseWait for it to return before it closes the stream. If it
-// has not returned by then, Close closes nothing and returns
-// ErrMicStillReading.
+// may be called from any goroutine while Stream runs: it ends that Stream and
+// closes the stream as soon as no PortAudio call of Stream's runs, without
+// waiting for Stream to return, which a write of its audio can keep it from.
+// If a PortAudio call has not returned within micCloseWait, Close closes
+// nothing and returns ErrMicStillReading.
 func (m *Mic) Close() error {
 	if m == nil {
 		return nil
 	}
-	m.active.Store(false)
+	pa := m.paLock()
 	m.mu.Lock()
-	for m.reading != nil {
-		reading := m.reading
-		if m.stopping != nil {
-			close(m.stopping)
-			m.stopping = nil
-		}
-		m.mu.Unlock()
-		wait := time.NewTimer(micCloseWait)
-		select {
-		case <-reading:
-			wait.Stop()
-		case <-wait.C:
-			return ErrMicStillReading
-		}
-		m.mu.Lock()
+	if m.stopping != nil {
+		close(m.stopping)
+		m.stopping = nil
 	}
+	m.mu.Unlock()
+	wait := time.NewTimer(micCloseWait)
+	defer wait.Stop()
+	select {
+	case pa <- struct{}{}:
+	case <-wait.C:
+		return ErrMicStillReading
+	}
+	defer func() { <-pa }()
+	m.mu.Lock()
 	stream := m.stream
 	m.stream = nil
 	m.mu.Unlock()
+	m.held.Store(false)
 	if stream == nil {
 		return nil
 	}
@@ -171,7 +187,7 @@ func (m *Mic) Open() error {
 	m.mu.Lock()
 	m.stream = stream
 	m.mu.Unlock()
-	m.active.Store(true)
+	m.held.Store(true)
 	return nil
 }
 
@@ -192,17 +208,20 @@ func (m *Mic) Reopen() error {
 // as PCM16-LE, to w until an error, or until Close ends it. It reads only the
 // frames the capture stream already holds: while it holds none, it waits
 // micReadPoll and looks again, so a device that delivers no frame keeps no
-// PortAudio call waiting, and a Close ends the Stream within micReadPoll.
+// PortAudio call waiting. Each PortAudio call holds pa and runs only while
+// Close has not begun, so once Close has closed the stream, Stream makes no
+// call on it: it returns errMicClosed at its next step, a write of its audio
+// included once that returns.
 func (m *Mic) Stream(w io.Writer) error {
 	if m == nil {
 		return fmt.Errorf("microphone stream unavailable")
 	}
+	pa := m.paLock()
 	m.mu.Lock()
 	stream := m.stream
 	if stream == nil || m.reading != nil {
 		m.mu.Unlock()
 		if stream == nil {
-			m.active.Store(false)
 			return fmt.Errorf("microphone stream unavailable")
 		}
 		return fmt.Errorf("microphone already streaming")
@@ -217,22 +236,41 @@ func (m *Mic) Stream(w io.Writer) error {
 		close(reading)
 	}()
 
+	// read makes one PortAudio step under pa: it reports how many frames it
+	// read into the buffer from filled on, and false once Close has begun.
+	read := func(filled int) (int, bool, error) {
+		select {
+		case pa <- struct{}{}:
+		case <-stopping:
+			return 0, false, nil
+		}
+		defer func() { <-pa }()
+		select {
+		case <-stopping:
+			return 0, false, nil
+		default:
+		}
+		available, err := stream.AvailableToRead()
+		if err != nil || available == 0 {
+			return 0, true, err
+		}
+		n := min(available, len(m.buf)-filled)
+		m.window = m.buf[filled : filled+n]
+		return n, true, stream.Read()
+	}
+
 	out := make([]byte, 2*len(m.buf))
 	poll := time.NewTimer(micReadPoll)
 	defer poll.Stop()
 	filled := 0
 	for {
-		select {
-		case <-stopping:
+		n, open, err := read(filled)
+		switch {
+		case !open:
 			return errMicClosed
-		default:
-		}
-		available, err := stream.AvailableToRead()
-		if err != nil {
-			m.active.Store(false)
+		case err != nil:
 			return err
-		}
-		if available == 0 {
+		case n == 0:
 			poll.Reset(micReadPoll)
 			select {
 			case <-stopping:
@@ -240,12 +278,6 @@ func (m *Mic) Stream(w io.Writer) error {
 			case <-poll.C:
 			}
 			continue
-		}
-		n := min(available, len(m.buf)-filled)
-		m.window = m.buf[filled : filled+n]
-		if err := stream.Read(); err != nil {
-			m.active.Store(false)
-			return err
 		}
 		filled += n
 		if filled < len(m.buf) {
@@ -261,11 +293,12 @@ func (m *Mic) Stream(w io.Writer) error {
 	}
 }
 
-// IsOpen returns true if the mic stream is currently active. It reads only the
-// atomic flag, so HTTP handlers may call it while the mic loop reopens the
-// stream; the flag is set only while a started stream exists.
+// IsOpen reports whether the mic holds an open capture stream, and with it the
+// input device: from the open until Close closes it, also after a read error.
+// It reads only an atomic flag, so HTTP handlers and the light controller may
+// call it while the mic loop reopens the stream.
 func (m *Mic) IsOpen() bool {
-	return m != nil && m.active.Load()
+	return m != nil && m.held.Load()
 }
 
 func (m *Mic) SampleRate() int {
