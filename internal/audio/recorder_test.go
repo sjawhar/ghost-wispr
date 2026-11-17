@@ -326,9 +326,17 @@ func TestRecorderZeroesAPartialEncoderOutput(t *testing.T) {
 	t.Setenv("PATH", bin)
 
 	dir := t.TempDir()
+	recorder := NewRecorder(dir)
+	if err := recorder.StartSession("meeting"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 3200)); err != nil {
+		t.Fatal(err)
+	}
 	// The fake encoders write into this file in place (a shell redirection
 	// keeps its inode), so a descriptor held on it reads what the removal
-	// leaves in the blocks.
+	// leaves in the blocks. It is made once the session has started: a
+	// session never starts over a recording on disk.
 	mp3Path := filepath.Join(dir, "meeting.mp3")
 	if err := os.WriteFile(mp3Path, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -339,13 +347,6 @@ func TestRecorderZeroesAPartialEncoderOutput(t *testing.T) {
 	}
 	defer func() { _ = held.Close() }()
 
-	recorder := NewRecorder(dir)
-	if err := recorder.StartSession("meeting"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 3200)); err != nil {
-		t.Fatal(err)
-	}
 	path, err := recorder.EndSession("meeting")
 	if err != nil || !strings.HasSuffix(path, ".wav") {
 		t.Fatalf("EndSession = (%q, %v), want the WAV fallback", path, err)
@@ -425,10 +426,8 @@ func TestRecorderStartSessionLeavesNoSessionOpenWhenThePrerollCannotBeWritten(t 
 		t.Skip("needs /dev/full to make the preroll write fail")
 	}
 	dir := t.TempDir()
-	if err := os.Symlink("/dev/full", filepath.Join(dir, "meeting.pcm")); err != nil {
-		t.Fatal(err)
-	}
 	recorder := NewRecorder(dir)
+	recorder.createRaw = func(string) (*os.File, error) { return os.OpenFile("/dev/full", os.O_WRONLY, 0) }
 	writer := recorder.Writer(bytes.NewBuffer(nil))
 	if _, err := writer.Write([]byte{1, 2, 3, 4}); err != nil {
 		t.Fatalf("Write before the session: %v", err)
@@ -487,8 +486,11 @@ func TestRecorderEndSessionNeverReturnsAnotherSessionsRecording(t *testing.T) {
 		t.Fatal("EndSession(earlier) saved a recording no encoder could write")
 	}
 
-	if err := os.Symlink("/dev/full", filepath.Join(dir, "later.pcm")); err != nil {
-		t.Fatal(err)
+	recorder.createRaw = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "later.pcm" {
+			return os.OpenFile("/dev/full", os.O_WRONLY, 0)
+		}
+		return createRawFile(path)
 	}
 	if _, err := writer.Write([]byte{5, 6}); err != nil {
 		t.Fatalf("Write before the later session: %v", err)

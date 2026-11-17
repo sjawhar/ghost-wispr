@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -54,6 +55,9 @@ type Recorder struct {
 	savingPath string
 
 	encode func(rawPath, sessionID string) (string, error)
+	// createRaw creates a session's raw recording, refusing one that exists
+	// (createRawFile).
+	createRaw func(path string) (*os.File, error)
 }
 
 func NewRecorder(audioDir string) *Recorder {
@@ -67,6 +71,7 @@ func NewRecorder(audioDir string) *Recorder {
 		preroll:    transcribe.NewRingBuf(5 * defaultSampleRate * pcmBitDepth / 8 * pcmChannels),
 	}
 	r.encode = r.defaultEncode
+	r.createRaw = createRawFile
 	return r
 }
 
@@ -83,6 +88,17 @@ func (r *Recorder) Writer(dst io.Writer) io.Writer {
 	return &teeWriter{recorder: r, dst: dst}
 }
 
+// createRawFile creates the raw recording at path, and refuses, with an
+// error that wraps os.ErrExist, a file that is already there.
+func createRawFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+}
+
+// StartSession starts recording session sessionID into its raw recording. It
+// never reuses the id of a recording on disk, raw or saved as MP3 or WAV:
+// that is another session's audio (a clock set back can name a new session
+// as an earlier one), so it refuses with an error that wraps os.ErrExist,
+// leaving the file as it is and starting nothing.
 func (r *Recorder) StartSession(sessionID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -91,12 +107,22 @@ func (r *Recorder) StartSession(sessionID string) error {
 		return fmt.Errorf("create audio directory: %w", err)
 	}
 
+	for _, ext := range []string{".mp3", ".wav"} {
+		saved := filepath.Join(r.audioDir, sessionID+ext)
+		if _, err := os.Lstat(saved); err == nil {
+			return fmt.Errorf("the recording of session %s is on disk (%s): %w", sessionID, saved, os.ErrExist)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check for a recording of session %s: %w", sessionID, err)
+		}
+	}
+
 	if r.rawFile != nil {
 		_ = r.rawFile.Close()
+		r.sessionID, r.rawPath, r.rawFile = "", "", nil
 	}
 
 	rawPath := recording.RawPath(r.audioDir, sessionID)
-	rawFile, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	rawFile, err := r.createRaw(rawPath)
 	if err != nil {
 		return fmt.Errorf("open raw pcm file: %w", err)
 	}

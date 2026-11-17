@@ -992,13 +992,21 @@ func (s *SQLiteStore) runOnce(name, stmt string) error {
 	return nil
 }
 
+// ErrSessionExists is the error CreateSession returns, creating nothing, for
+// an id a session already has.
+var ErrSessionExists = errors.New("a session with this id exists")
+
+// CreateSession creates session id, active since startedAt. An id a session
+// already has is refused with ErrSessionExists, and that session is left as
+// it is.
 func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 	if strings.TrimSpace(id) == "" {
 		return errors.New("session id is required")
 	}
 
-	_, err := s.db.Exec(
-		`INSERT INTO sessions(id, started_at, status, summary_status, envoy_publish_status) VALUES(?, ?, 'active', ?, ?)`,
+	res, err := s.db.Exec(
+		`INSERT INTO sessions(id, started_at, status, summary_status, envoy_publish_status) VALUES(?, ?, 'active', ?, ?)
+		 ON CONFLICT(id) DO NOTHING`,
 		id,
 		startedAt.UTC().Format(time.RFC3339Nano),
 		SummaryPending,
@@ -1006,6 +1014,13 @@ func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 	)
 	if err != nil {
 		return fmt.Errorf("create session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("create session %s: %w", id, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("create session %s: %w", id, ErrSessionExists)
 	}
 	return nil
 }

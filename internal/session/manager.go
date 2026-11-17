@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +68,10 @@ type sessionEnd struct {
 // the card stays full) is given up and the session ends without it, so a
 // capture pause waiting for the end does not keep the microphone off for good.
 const maxRecordingSaveAttempts = 5
+
+// maxSessionIDAttempts is how many ids in a row a session start tries before
+// it gives up: each id it finds taken moves it to the next second.
+const maxSessionIDAttempts = 100
 
 func NewManager(store Store, recorder Recorder, summarizer Summarizer, hub EventBroadcaster, detector *Detector, minSessionSegments int, logger ...*slog.Logger) *Manager {
 	if detector == nil {
@@ -280,6 +285,11 @@ func (m *Manager) newSessionIDLocked(now time.Time) string {
 // there is none, or ErrCapturePaused while capture is paused. It must be called
 // with m.mu held and returns with it released.
 func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
+	// A session start under way settles which session is current: it may find
+	// the id it claimed taken and move past it, so words never go to that id.
+	for m.sessionStarts > 0 {
+		m.startsDone.Wait()
+	}
 	if m.currentSessionID != "" {
 		sessionID := m.currentSessionID
 		m.mu.Unlock()
@@ -298,23 +308,13 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	m.mu.Unlock()
 	defer m.finishSessionStart()
 
-	if err := m.store.CreateSession(sessionID, startedAt); err != nil {
+	sessionID, err := m.startSession(sessionID, startedAt)
+	if err != nil {
 		m.mu.Lock()
 		m.currentSessionID = ""
 		m.currentStartedAt = time.Time{}
 		m.mu.Unlock()
-		return "", fmt.Errorf("create session: %w", err)
-	}
-
-	if m.recorder != nil {
-		if err := m.recorder.StartSession(sessionID); err != nil {
-			m.mu.Lock()
-			m.currentSessionID = ""
-			m.currentStartedAt = time.Time{}
-			m.mu.Unlock()
-			_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
-			return "", fmt.Errorf("start audio recorder session: %w", err)
-		}
+		return "", err
 	}
 
 	if m.hub != nil {
@@ -323,6 +323,55 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	m.publishSessionStarted(sessionID)
 
 	return sessionID, nil
+}
+
+// startSession creates session sessionID, started at startedAt, in the store,
+// starts its recording, and returns the id it started. It never reuses an id
+// a session has in the store (storage.ErrSessionExists) or a recording has on
+// disk (os.ErrExist from the recorder): a clock set back, as a Pi's is before
+// its clock is synchronized, can name a new session as an earlier one. It
+// takes the next id instead (nextSessionID), up to maxSessionIDAttempts in
+// a row. Any other failure starts no session.
+func (m *Manager) startSession(sessionID string, startedAt time.Time) (string, error) {
+	for attempt := 1; ; attempt++ {
+		err := m.store.CreateSession(sessionID, startedAt)
+		if err != nil && !errors.Is(err, storage.ErrSessionExists) {
+			return "", fmt.Errorf("create session: %w", err)
+		}
+		if err == nil && m.recorder != nil {
+			if err = m.recorder.StartSession(sessionID); err != nil && !errors.Is(err, os.ErrExist) {
+				_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
+				return "", fmt.Errorf("start audio recorder session: %w", err)
+			}
+			if err != nil {
+				// The row just made names a recording no session has:
+				// retire it, so that recording stays nobody's.
+				if discardErr := m.store.DiscardSession(sessionID); discardErr != nil {
+					m.logger.Warn("could not retire a session whose id a recording on disk has", "operation", "start_session", "session_id", sessionID, "error", discardErr)
+				}
+			}
+		}
+		if err == nil {
+			return sessionID, nil
+		}
+		if attempt == maxSessionIDAttempts {
+			return "", fmt.Errorf("create session: %d ids in a row are taken, up to %s: %w", attempt, sessionID, err)
+		}
+		m.logger.Warn("session id is taken; the session starts as the next one", "operation", "start_session", "session_id", sessionID, "error", err)
+		sessionID = m.nextSessionID(sessionID, startedAt)
+	}
+}
+
+// nextSessionID returns the id after taken, which a session start found
+// taken, and makes it the current session's in its place.
+func (m *Manager) nextSessionID(taken string, startedAt time.Time) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sessionID := m.newSessionIDLocked(startedAt)
+	if m.currentSessionID == taken {
+		m.currentSessionID = sessionID
+	}
+	return sessionID
 }
 
 func (m *Manager) endCurrentSession(ctx context.Context) error {
@@ -860,31 +909,20 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	m.mu.Unlock()
 	defer m.finishSessionStart()
 
-	if err := m.store.CreateSession(sessionID, now); err != nil {
+	sessionID, err := m.startSession(sessionID, now)
+	if err != nil {
 		m.mu.Lock()
 		m.currentSessionID = ""
 		m.currentStartedAt = time.Time{}
 		m.endManualLocked()
 		m.mu.Unlock()
-		return "", fmt.Errorf("create session: %w", err)
+		return "", err
 	}
 
 	// Set title hint if provided.
 	if titleHint != "" {
 		if err := m.store.UpdateTitle(sessionID, titleHint); err != nil {
 			m.logger.Warn("failed to set title hint on manual session", "operation", "manual_start", "session_id", sessionID, "error", err)
-		}
-	}
-
-	if m.recorder != nil {
-		if err := m.recorder.StartSession(sessionID); err != nil {
-			m.mu.Lock()
-			m.currentSessionID = ""
-			m.currentStartedAt = time.Time{}
-			m.endManualLocked()
-			m.mu.Unlock()
-			_ = m.store.EndSession(sessionID, time.Now().UTC(), "")
-			return "", fmt.Errorf("start audio recorder session: %w", err)
 		}
 	}
 

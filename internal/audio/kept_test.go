@@ -109,3 +109,33 @@ func TestRecorderSaveKeptRefusesARecordingInUse(t *testing.T) {
 		t.Errorf("SaveKept with no raw recording = %v after %d encodes, want os.ErrNotExist and none", err, encodes)
 	}
 }
+
+// StartSession never reuses the id of a recording on disk: a raw recording,
+// or one saved as MP3 or WAV, is left as it is, and no session starts.
+func TestRecorderStartSessionRefusesARecordingOnDisk(t *testing.T) {
+	for _, ext := range []string{".pcm", ".mp3", ".wav"} {
+		t.Run(ext, func(t *testing.T) {
+			dir := t.TempDir()
+			recorder := NewRecorder(dir)
+			path := filepath.Join(dir, "20261106140930"+ext)
+			if err := os.WriteFile(path, []byte{1, 2, 3, 4}, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write([]byte{9, 9}); err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.StartSession("20261106140930"); !errors.Is(err, os.ErrExist) {
+				t.Errorf("StartSession with %s on disk = %v, want os.ErrExist", filepath.Base(path), err)
+			}
+			if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, []byte{1, 2, 3, 4}) {
+				t.Errorf("%s after StartSession = %v (%v), want it as it was", filepath.Base(path), got, err)
+			}
+			recorder.mu.Lock()
+			sessionID := recorder.sessionID
+			recorder.mu.Unlock()
+			if sessionID != "" {
+				t.Errorf("StartSession refused but left session %q started", sessionID)
+			}
+		})
+	}
+}
