@@ -34,6 +34,9 @@ tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
 indicator_light: blink1
 power_button: true
+# The Jabra's Mute button pauses and resumes (docs/pi-setup.md, "Pause and resume at the unit"). The
+# office Pi's .env also sets GHOST_WISPR_JABRA_MUTE_BUTTON=true, which overrides this line; keep the
+# two the same, because a full provisioner run rewrites .env and leaves only this one.
 jabra_mute_button: true
 envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__

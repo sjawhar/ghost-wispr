@@ -79,7 +79,8 @@ for line in \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
   'envoy_webhook_url: __ENVOY_WEBHOOK_URL__' \
-  "envoy_webhook_secret_name: projects/$PI_GCP_PROJECT/secrets/$PI_WEBHOOK_SECRET/versions/latest"; do
+  "envoy_webhook_secret_name: projects/$PI_GCP_PROJECT/secrets/$PI_WEBHOOK_SECRET/versions/latest" \
+  'jabra_mute_button: true'; do
   assert_line "$line" "$template"
 done
 assert_count '^gdrive_folder_id:' 0 "$template"
@@ -190,7 +191,9 @@ drive_on_empty=$(provisioner_function deployed_drive_id "$empty_drive") \
 [[ -z "$drive_on_empty" ]] || fail "a configuration with an empty shared drive returned '$drive_on_empty'"
 
 # --models keeps every .env line but the Envoy signing key an earlier provisioner wrote, which the
-# recorder now reads from Secret Manager, and sets the Vertex embedding location exactly once.
+# recorder now reads from Secret Manager, and sets the Vertex embedding location exactly once. The
+# office Pi's Jabra Mute button is on through such a line (docs/pi-setup.md, "Pause and resume at
+# the unit"); it stays, and agrees with the template's jabra_mute_button.
 deployed_env="$work_dir/env"
 models_env="$work_dir/models.env"
 cat >"$deployed_env" <<'EOF'
@@ -198,11 +201,13 @@ GHOST_WISPR_ADDR=127.0.0.1:8080
 GHOST_WISPR_EMBEDDING_LOCATION=europe-west4
 GHOST_WISPR_DEEPGRAM_API_KEY=test-key
 GHOST_WISPR_ENVOY_WEBHOOK_SECRET=stale-signing-key
+GHOST_WISPR_JABRA_MUTE_BUTTON=true
 EOF
 provisioner_function render_models_env "$deployed_env" >"$models_env" \
   || fail 'the .env renderer rejected a deployed .env'
 assert_line 'GHOST_WISPR_ADDR=127.0.0.1:8080' "$models_env"
 assert_line 'GHOST_WISPR_DEEPGRAM_API_KEY=test-key' "$models_env"
+assert_line 'GHOST_WISPR_JABRA_MUTE_BUTTON=true' "$models_env"
 assert_line 'GHOST_WISPR_EMBEDDING_LOCATION=global' "$models_env"
 assert_count '^GHOST_WISPR_EMBEDDING_LOCATION=' 1 "$models_env"
 assert_count 'stale-signing-key' 0 "$models_env"

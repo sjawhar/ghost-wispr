@@ -75,3 +75,18 @@ func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
 		}
 	}
 }
+
+// TestRunbookRolloutKeepsTheJabraOverride fails if the rollout order does not
+// say what its steps do to a setting the office Pi holds in .env rather than
+// in its YAML: its Jabra Mute button is on through GHOST_WISPR_JABRA_MUTE_BUTTON,
+// the models step keeps .env and the full provisioner rewrites it, so the
+// template's jabra_mute_button must agree, and step 4 checks the Jabra's
+// warning ("Pause and resume at the unit").
+func TestRunbookRolloutKeepsTheJabraOverride(t *testing.T) {
+	section := runbookSection(t, "## Roll out a release that adds a config key")
+	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON=true", "jabra_mute_button: true", "keeps every `.env` line", "rewrites `.env`", "Jabra mute button", `"Pause and resume at the unit"`} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's rollout order does not say %q", words)
+		}
+	}
+}

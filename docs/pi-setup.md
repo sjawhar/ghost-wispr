@@ -498,6 +498,15 @@ The models step restarts the recorder, and so does `update.sh` when it installs 
 restart ends a conversation that is being recorded and turns the light off, so run these steps
 outside meetings. Save no settings in the web UI from step 1 until step 4 passes.
 
+A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
+files differently. The office Pi turns the Jabra's Mute button on there, with
+`GHOST_WISPR_JABRA_MUTE_BUTTON=true` ("Pause and resume at the unit"). The models step keeps every
+`.env` line but an old Envoy signing key and the embedding location, which it writes again, so
+that line stays. The full provisioner rewrites `.env` without it, and the template's
+`jabra_mute_button: true` applies. The button stays on either way, because the two agree. Leave
+the `.env` line as it is during the rollout, and keep the template's line the same as it: a later
+change to the button changes both.
+
 1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
    the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
    one the Pi has now, on the `gdrive_folder_id:` line of its config:
@@ -517,7 +526,8 @@ outside meetings. Save no settings in the web UI from step 1 until step 4 passes
    session; leaving the current binary in place` and changes nothing: run it again once the
    session has ended.
 4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
-   come back, and for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning:
+   come back, and `/api/status` must hold no Envoy warning (for `envoy_webhook_secret_name`) and no
+   "Jabra mute button" warning (the button is still on and found):
 
    ```bash
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/config | jq .recording_rules
