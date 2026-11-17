@@ -64,6 +64,42 @@ func TestOwnOperationCoversTheJabraReportWindow(t *testing.T) {
 	}
 }
 
+// TestJabraStreamsOpenOnlyOnceTheLightHasSettled fails if a microphone or a
+// playback stream opens less than jabraLightSettle after a light write. The
+// kernel sends the light to the Jabra after the write returns, from a work
+// queue, so a stream opened at once can be open when the light changes, and
+// its next close would set off the Jabra's own Phone Mute.
+func TestJabraStreamsOpenOnlyOnceTheLightHasSettled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		open func(d *captureDevice) time.Duration
+	}{
+		{name: "microphone", open: func(d *captureDevice) (openedAt time.Duration) {
+			if err := d.openStream(func() (bool, error) { openedAt = jabra.MonotonicNow(); return true, nil }); err != nil {
+				t.Fatal(err)
+			}
+			return openedAt
+		}},
+		{name: "TTS playback", open: func(d *captureDevice) time.Duration {
+			d.playbackOpening()
+			return jabra.MonotonicNow()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newCaptureDevice(func() bool { return true })
+			var writtenAt time.Duration
+			detach := d.attach(func(bool) error { writtenAt = jabra.MonotonicNow(); return nil })
+			t.Cleanup(detach)
+			if writtenAt == 0 {
+				t.Fatal("control: attaching the Jabra wrote no light")
+			}
+			if gap := tc.open(d) - writtenAt; gap < jabraLightSettle {
+				t.Fatalf("the %s stream opened %v after a light write, want at least %v", tc.name, gap, jabraLightSettle)
+			}
+		})
+	}
+}
+
 // TestMicLoopOrdersTheJabraLightAroundTheCaptureStream fails if the mic loop,
 // through the capture device, changes the Jabra's light while the capture
 // stream is open: on a pause it must close the stream, then light the Jabra;

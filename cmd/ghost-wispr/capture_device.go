@@ -18,6 +18,16 @@ import (
 // takes to see the unit pause and tap again.
 const jabraOwnMuteWindow = 100 * time.Millisecond
 
+// jabraLightSettle is how long after a light write no stream opens on the
+// Jabra. The write returns before the light reaches the device: the kernel
+// sends it from a work queue (drivers/hid/hid-input.c, hidinput_input_event
+// schedules hid->led_work), and the office Pi's Jabra is a full-speed USB
+// device whose HID interface has no OUT endpoint, so usbhid sends the report as
+// a control transfer, in a 1 ms frame. A stream opened before the report
+// arrives is open while the light changes. 20 ms is ten times a work-queue run
+// and a control frame; it was not measured on the unit.
+const jabraLightSettle = 20 * time.Millisecond
+
 // captureDevice orders the Jabra's mute light against every audio stream on
 // the Jabra: the microphone's capture stream and the speaker's playback
 // streams. A Jabra whose mute light changes while one of its streams is open
@@ -45,6 +55,7 @@ type captureDevice struct {
 	busy    int           // operations under way
 	since   time.Duration // CLOCK_MONOTONIC when the operations ownOperationAt covers began; 0 before any
 	until   time.Duration // CLOCK_MONOTONIC when that cover ends, once no operation runs
+	lightAt time.Duration // CLOCK_MONOTONIC of the last light write; 0 before any
 	// light writes the connected Jabra's light, on while capture is paused;
 	// nil without a Jabra.
 	light   func(on bool) error
@@ -57,13 +68,15 @@ func newCaptureDevice(paused func() bool) *captureDevice {
 }
 
 // openStream runs open, which opens a capture stream, as one operation, and
-// writes the light first. open reports whether a stream exists afterwards.
+// writes the light first, then waits for it to settle (jabraLightSettle). open
+// reports whether a stream exists afterwards.
 func (d *captureDevice) openStream(open func() (holds bool, err error)) error {
 	d.op.Lock()
 	defer d.op.Unlock()
 	d.begin()
 	defer d.end()
 	d.writeLight()
+	d.settleLight()
 	holds, err := open()
 	d.setOpen(holds)
 	return err
@@ -96,12 +109,13 @@ func (d *captureDevice) probe(fn func() error) error {
 }
 
 // playbackOpening counts a speaker playback stream as open, once any light
-// write under way has finished, so that no light is written until the stream
-// closes (playbackClosing). The speaker calls it just before it opens the
-// stream.
+// write under way has finished and settled (jabraLightSettle), so that no
+// light is written until the stream closes (playbackClosing). The speaker calls
+// it just before it opens the stream.
 func (d *captureDevice) playbackOpening() {
 	d.lightMu.Lock()
 	defer d.lightMu.Unlock()
+	d.settleLight()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.playing++
@@ -179,6 +193,21 @@ func (d *captureDevice) writeLight() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.written, d.shown = err == nil, on
+	d.lightAt = jabra.MonotonicNow()
+}
+
+// settleLight waits until jabraLightSettle has passed since the last light
+// write. The caller holds op or lightMu, so no light write comes meanwhile.
+func (d *captureDevice) settleLight() {
+	d.mu.Lock()
+	at := d.lightAt
+	d.mu.Unlock()
+	if at == 0 {
+		return
+	}
+	if wait := at + jabraLightSettle - jabra.MonotonicNow(); wait > 0 {
+		time.Sleep(wait)
+	}
 }
 
 // ownOperationAt reports whether at, a CLOCK_MONOTONIC reading, falls within
