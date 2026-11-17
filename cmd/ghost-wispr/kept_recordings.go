@@ -130,8 +130,9 @@ const (
 
 // decide says what a pass does with session id's kept raw recording, and
 // returns the session as read. deleted is the sessions a delete recorded
-// whose audio is still to erase (eraseDeleted).
-func (k *keptRecordings) decide(id string, deleted map[string]bool) (storage.Session, rawAction) {
+// whose audio is still to erase (eraseDeleted); named is every file a session
+// names (namedFiles), nil if it could not be read.
+func (k *keptRecordings) decide(id string, deleted, named map[string]bool) (storage.Session, rawAction) {
 	if k.isHeld(id) || deleted[id] {
 		return storage.Session{}, rawSkip
 	}
@@ -145,6 +146,10 @@ func (k *keptRecordings) decide(id string, deleted map[string]bool) (storage.Ses
 	switch {
 	case sess.Status != storage.SessionEnded:
 		return sess, rawByHand
+	case sess.AudioPath == "" && sess.AudioRemovedAt == "" && named == nil:
+		return sess, rawSkip
+	case sess.AudioPath == "" && sess.AudioRemovedAt == "" && k.claimedElsewhere(id, named):
+		return sess, rawByHand
 	case sess.AudioPath == "" && sess.AudioRemovedAt == "":
 		return sess, rawSave
 	case !k.savedBeside(sess.AudioPath, id):
@@ -154,6 +159,20 @@ func (k *keptRecordings) decide(id string, deleted map[string]bool) (storage.Ses
 	default:
 		return sess, rawAwaitDrive
 	}
+}
+
+// claimedElsewhere reports whether a session names session id's <id>.mp3 or
+// <id>.wav in named, when id names neither: on a restored unit a merged
+// session names its sources' recordings, and a save must not overwrite one,
+// nor an adoption give it to the source, whose Drive folder would then keep
+// a copy a later cut on the merged session never replaces.
+func (k *keptRecordings) claimedElsewhere(id string, named map[string]bool) bool {
+	for _, ext := range []string{".mp3", ".wav"} {
+		if abs, err := filepath.Abs(filepath.Join(k.audioDir, id+ext)); err == nil && named[abs] {
+			return true
+		}
+	}
+	return false
 }
 
 // driveWillTake reports whether Drive sync will upload sess's recording: sync
@@ -182,8 +201,12 @@ func (k *keptRecordings) census() server.KeptRawRecordings {
 	for _, record := range records {
 		deleted[record.SessionID] = true
 	}
+	named, err := k.namedFiles()
+	if err != nil {
+		log.Printf("warning: kept raw recordings: %v", err)
+	}
 	for _, id := range k.recorder.KeptRawSessions() {
-		_, action := k.decide(id, deleted)
+		_, action := k.decide(id, deleted, named)
 		switch action {
 		case rawSave:
 			c.Unsaved++
@@ -224,17 +247,23 @@ func (k *keptRecordings) run(ctx context.Context) {
 	defer k.running.Unlock()
 	k.eraseCutOffSaves()
 	deleted := k.eraseDeleted()
+	// A save and an adoption read what sessions name again just before they
+	// act (save, adopt); this read sorts the raw recordings.
+	named, err := k.namedFiles()
+	if err != nil {
+		log.Printf("warning: no kept raw recording is saved or given this pass: %v", err)
+	}
 	for _, id := range k.recorder.KeptRawSessions() {
 		if ctx.Err() != nil {
 			return
 		}
-		sess, action := k.decide(id, deleted)
+		sess, action := k.decide(id, deleted, named)
 		switch action {
 		case rawSave:
 			// Once the saved recording is the session's, its raw recording
 			// goes at once where Drive cannot take the saved one.
 			if k.save(ctx, &sess) {
-				if _, after := k.decide(id, deleted); after == rawErase {
+				if _, after := k.decide(id, deleted, map[string]bool{}); after == rawErase {
 					k.eraseRaw(id)
 				}
 			}
@@ -242,11 +271,14 @@ func (k *keptRecordings) run(ctx context.Context) {
 			k.eraseRaw(id)
 		}
 	}
+	if named == nil {
+		return
+	}
 	for id, saved := range k.savedWithoutRaw() {
 		if ctx.Err() != nil {
 			return
 		}
-		if deleted[id] || k.isHeld(id) {
+		if deleted[id] || k.isHeld(id) || k.claimedElsewhere(id, named) {
 			continue
 		}
 		if sess, row := k.lookup(id); row == rowFound && sess.Status == storage.SessionEnded && sess.AudioPath == "" && sess.AudioRemovedAt == "" {
@@ -258,10 +290,13 @@ func (k *keptRecordings) run(ctx context.Context) {
 // eraseDeleted erases, with zeros, the audio files a stop left of each
 // session a delete recorded (storage.DeletedSessionAudio): its raw capture,
 // saved MP3 and WAV, a save's temporary files, and the recordings its row
-// named, except a file another session names now. Once none of them is left
-// it clears the record. It returns the recorded sessions it leaves for a
-// later pass (a delete holds it, a file could not be erased, or the store
-// could not be read), whose files the rest of the pass leaves alone.
+// named, except a file a session names, read just before that session's
+// files go, so a session that starts to name one meanwhile (a Retry
+// refinement downloading a restored merged session's sources) keeps it. Once
+// none of them is left it clears the record. It returns the recorded
+// sessions it leaves for a later pass (a delete holds it, a file could not
+// be erased, or the store could not be read), whose files the rest of the
+// pass leaves alone.
 func (k *keptRecordings) eraseDeleted() map[string]bool {
 	left := map[string]bool{}
 	records, err := k.store.DeletedSessionAudio()
@@ -269,20 +304,15 @@ func (k *keptRecordings) eraseDeleted() map[string]bool {
 		log.Printf("warning: the audio of deleted sessions is not erased this pass: list them: %v", err)
 		return left
 	}
-	if len(records) == 0 {
-		return left
-	}
-	named, err := k.namedFiles()
-	if err != nil {
-		log.Printf("warning: the audio of deleted sessions is not erased this pass: %v", err)
-		for _, record := range records {
-			left[record.SessionID] = true
-		}
-		return left
-	}
 	for _, record := range records {
 		id := record.SessionID
 		if k.isHeld(id) {
+			left[id] = true
+			continue
+		}
+		named, err := k.namedFiles()
+		if err != nil {
+			log.Printf("warning: the audio of deleted session %s is not erased this pass: %v", id, err)
 			left[id] = true
 			continue
 		}
@@ -496,8 +526,13 @@ func (k *keptRecordings) savedWithoutRaw() map[string][]string {
 }
 
 // adopt makes saved, the recording a session end saved for sess, the
-// session's recording, and starts what a session end starts after saving.
+// session's recording, and starts what a session end starts after saving. It
+// reads what sessions name just before, and gives no file another session
+// names (claimedElsewhere).
 func (k *keptRecordings) adopt(sess *storage.Session, saved string) {
+	if named, err := k.namedFiles(); err != nil || k.claimedElsewhere(sess.ID, named) {
+		return
+	}
 	recorded, err := k.store.RecordKeptRecording(sess.ID, saved, nil)
 	if err != nil {
 		log.Printf("warning: session %s ended without naming its saved recording %s, and it could not be given it; the next pass tries again: %v", sess.ID, saved, err)
@@ -512,13 +547,15 @@ func (k *keptRecordings) adopt(sess *storage.Session, saved string) {
 	}
 }
 
-// save saves the raw recording kept for sess under a temporary name, then,
-// in the transaction that finds the session still takes it, renames it to
-// <id>.mp3 or <id>.wav and makes it the session's recording. A save a delete
-// stops (Hold), or one the session no longer takes (deleted, merged or given
-// a recording meanwhile), records nothing and erases what it wrote; the raw
-// recording is left for the next pass. It reports whether the session took
-// the saved recording.
+// save saves the raw recording kept for sess under a temporary name, flushes
+// it to the disk (the raw recording can be zeroed in the same pass), then, in
+// the transaction that finds the session still takes it, renames it to
+// <id>.mp3 or <id>.wav and makes it the session's recording. Just before, it
+// reads what sessions name, and overwrites no file another session names
+// (claimedElsewhere). A save a delete stops (Hold), or one the session no
+// longer takes (deleted, merged or given a recording meanwhile), records
+// nothing and erases what it wrote; the raw recording is left for the next
+// pass. It reports whether the session took the saved recording.
 func (k *keptRecordings) save(parent context.Context, sess *storage.Session) bool {
 	ctx, ok := k.startSave(parent, sess.ID)
 	if !ok {
@@ -534,6 +571,16 @@ func (k *keptRecordings) save(parent context.Context, sess *storage.Session) boo
 			k.eraseFile(path, "a save that did not finish")
 		}
 		log.Printf("warning: the raw recording kept for session %s was not saved; the next pass tries again: %v", sess.ID, err)
+		return false
+	}
+	if named, err := k.namedFiles(); err != nil || k.claimedElsewhere(sess.ID, named) {
+		k.eraseFile(temp, "a recording saved for a session whose file another session names")
+		log.Printf("the recording saved for session %s is erased: another session names its file, or what sessions name could not be read (%v)", sess.ID, err)
+		return false
+	}
+	if err := syncKeptFile(temp); err != nil {
+		k.eraseFile(temp, "a recording that could not be flushed to the disk")
+		log.Printf("warning: the recording saved for session %s could not be flushed to the disk; the next pass tries again: %v", sess.ID, err)
 		return false
 	}
 	saved := filepath.Join(k.audioDir, sess.ID+filepath.Ext(temp))
@@ -613,4 +660,14 @@ func (k *keptRecordings) names(audioPath, path string) bool {
 		}
 	}
 	return false
+}
+
+// syncKeptFile flushes the file at path to the disk. A variable, so that a
+// test can see when a save flushes its recording.
+var syncKeptFile = func(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Sync(), f.Close())
 }

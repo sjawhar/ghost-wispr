@@ -647,6 +647,166 @@ func TestThePassErasesTheAudioOfARecordedDelete(t *testing.T) {
 	}
 }
 
+// laterNamingStore is a store in which session "merged" starts to name the
+// file at path once the record of deleted session after is cleared, as a
+// Retry refinement of a restored merged session names and downloads its
+// sources' recordings while a pass runs.
+type laterNamingStore struct {
+	*storage.SQLiteStore
+	path, after string
+	naming      bool
+}
+
+func (s *laterNamingStore) ClearDeletedSessionAudio(id string) error {
+	if err := s.SQLiteStore.ClearDeletedSessionAudio(id); err != nil {
+		return err
+	}
+	if id == s.after {
+		s.naming = true
+	}
+	return nil
+}
+
+func (s *laterNamingStore) Recordings() ([]storage.SessionRecording, error) {
+	recordings, err := s.SQLiteStore.Recordings()
+	if s.naming {
+		recordings = append(recordings, storage.SessionRecording{ID: "merged", AudioPath: s.path})
+	}
+	return recordings, err
+}
+
+// Re-review of #76, P1: what sessions name is read just before each deleted
+// session's files are erased, not once as the pass starts: a session that
+// starts to name one of those files meanwhile keeps it.
+func TestThePassReadsWhatSessionsNameJustBeforeItErases(t *testing.T) {
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const first, second = "20261106140000", "20261106150000"
+	started := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
+	for _, id := range []string{first, second} {
+		path := filepath.Join(audioDir, id+".mp3")
+		if err := os.WriteFile(path, []byte("conversation "+id), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, started.Add(time.Minute), path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DeleteSession(id, audioDir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	named := filepath.Join(audioDir, second+".mp3")
+	wrapped := &laterNamingStore{SQLiteStore: store, path: named, after: first}
+
+	newKeptRecordings(wrapped, audio.NewRecorder(audioDir), audioDir, nil, nil).run(context.Background())
+
+	if _, err := os.Lstat(filepath.Join(audioDir, first+".mp3")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("control: %s.mp3 of the deleted session nobody names is still on disk (%v)", first, err)
+	}
+	if got, err := os.ReadFile(named); err != nil || string(got) != "conversation "+second {
+		t.Errorf("%s.mp3, which a session named before the pass erased it, holds %q (%v), want it as it was", second, got, err)
+	}
+}
+
+// Re-review of #76, P2: a save or an adoption never gives a session a file
+// another session names (on a restored unit, a merged session names its
+// sources' recordings): a save would overwrite that file, an adoption would
+// upload it into the source's Drive folder, where a later cut on the merged
+// session never replaces it. The raw recording stays, named for a person.
+func TestASaveOrAdoptionLeavesAFileAnotherSessionNames(t *testing.T) {
+	requireMP3Encoder(t)
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const withRaw, withoutRaw, merged = "20261106140000", "20261106150000", "20261106160000"
+	started := time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)
+	raw := filepath.Join(audioDir, withRaw+".pcm")
+	if err := os.WriteFile(raw, tone(1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var shared []string
+	for _, id := range []string{withRaw, withoutRaw} {
+		path := filepath.Join(audioDir, id+".mp3")
+		if err := os.WriteFile(path, []byte("merged session's "+id), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		shared = append(shared, path)
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(merged, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EndSession(merged, started.Add(time.Hour), strings.Join(shared, ",")); err != nil {
+		t.Fatal(err)
+	}
+	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil)
+
+	kept.run(context.Background())
+
+	for i, id := range []string{withRaw, withoutRaw} {
+		if got, err := os.ReadFile(shared[i]); err != nil || string(got) != "merged session's "+id {
+			t.Errorf("%s.mp3, which the merged session names, holds %q (%v), want it as it was", id, got, err)
+		}
+		if sess, err := store.GetSession(id); err != nil || sess.AudioPath != "" {
+			t.Errorf("session %s names %q (%v), want no recording: the merged session names its file", id, sess.AudioPath, err)
+		}
+	}
+	if _, err := os.Stat(raw); err != nil {
+		t.Errorf("the raw recording of %s is gone: %v", withRaw, err)
+	}
+	if census := kept.census(); !slices.Equal(census.ByHand, []string{withRaw}) {
+		t.Errorf("census names %v for a person, want [%s]", census.ByHand, withRaw)
+	}
+}
+
+// orderStore records whether the saved recording was flushed to the disk
+// before the session took it.
+type orderStore struct {
+	*storage.SQLiteStore
+	synced  *[]string
+	flushed bool
+}
+
+func (s *orderStore) RecordKeptRecording(id, audioPath string, place func() error) (bool, error) {
+	s.flushed = len(*s.synced) > 0
+	return s.SQLiteStore.RecordKeptRecording(id, audioPath, place)
+}
+
+// Re-review of #76, P3: the saved recording is on the disk before it takes
+// its name and the session takes it, since the raw recording can be zeroed in
+// the same pass: a power cut must not leave neither.
+func TestASavedRecordingIsOnTheDiskBeforeTheSessionTakesIt(t *testing.T) {
+	requireMP3Encoder(t)
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const id = "20261106140930"
+	keptSession(t, store, audioDir, id, 1)
+	var synced []string
+	flush := syncKeptFile
+	t.Cleanup(func() { syncKeptFile = flush })
+	syncKeptFile = func(path string) error {
+		synced = append(synced, filepath.Base(path))
+		return flush(path)
+	}
+	wrapped := &orderStore{SQLiteStore: store, synced: &synced}
+
+	newKeptRecordings(wrapped, audio.NewRecorder(audioDir), audioDir, nil, nil).run(context.Background())
+
+	if sess, err := store.GetSession(id); err != nil || sess.AudioPath == "" {
+		t.Fatalf("control: the session names %q (%v), want the saved recording", sess.AudioPath, err)
+	}
+	if !wrapped.flushed || !slices.Equal(synced, []string{".kept-" + id + ".mp3"}) {
+		t.Errorf("flushed before the session took it: %v; files flushed %v, want [.kept-%s.mp3]", wrapped.flushed, synced, id)
+	}
+}
+
 // copyFile copies the file at from over to, and fails the test if it cannot.
 func copyFile(t *testing.T, from, to string) {
 	t.Helper()

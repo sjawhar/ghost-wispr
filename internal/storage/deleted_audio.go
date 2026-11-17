@@ -28,10 +28,10 @@ func recordDeletedSessionAudio(tx *sql.Tx, sessionIDs []string) error {
 	return nil
 }
 
-// DeletedSessionAudio lists the recorded deleted sessions whose audio the
-// kept recordings pass has not cleared yet.
+// DeletedSessionAudio lists, by session id, the recorded deleted sessions
+// whose audio the kept recordings pass has not cleared yet.
 func (s *SQLiteStore) DeletedSessionAudio() ([]DeletedSessionAudio, error) {
-	rows, err := s.db.Query(`SELECT session_id, audio_path FROM deleted_session_audio`)
+	rows, err := s.db.Query(`SELECT session_id, audio_path FROM deleted_session_audio ORDER BY session_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list deleted session audio: %w", err)
 	}

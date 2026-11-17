@@ -56,6 +56,9 @@ type SessionStore interface {
 	ReserveRawSessionErase(id, originalPath, hiddenPath string) (string, error)
 	CancelRawSessionErase(id, hiddenPath string) error
 	SourceSessionIDs(sessionID string) ([]string, error)
+	// Recordings lists every session that names audio: a session delete
+	// leaves the files a remaining session names.
+	Recordings() ([]storage.SessionRecording, error)
 	DeleteSession(id, audioDir string) (string, error)
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)

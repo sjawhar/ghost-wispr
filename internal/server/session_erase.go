@@ -75,8 +75,11 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 //     sessions merged into it;
 //   - it hides each recording the deleted row named, and every other audio
 //     file of each deleted session in recordingDir, whatever the row named
-//     (sessionAudioFiles), and zeroes the hidden raw captures and recordings
-//     in the background.
+//     (sessionAudioFiles), except a file a remaining session names (on a
+//     restored unit a merged session names its sources' recordings), and
+//     zeroes the hidden raw captures and recordings in the background. If
+//     what remaining sessions name cannot be read, it hides only the
+//     recordings the row named, as before.
 //
 // Removing a whole audio file overwrites it with zeros before the file
 // system frees its blocks (Sami, 2026-11-12, "Zero every audio removal",
@@ -111,8 +114,17 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 	}
 	onDeleted(sessionIDs)
 
+	files := sessionAudioFiles(audioPath, recordingDir, sessionIDs)
+	named, err := remainingNamed(store, recordingDir)
+	if err != nil {
+		slog.Warn("could not read what remaining sessions name; erasing only the recordings the deleted row named", "session_id", sessionID, "error", err)
+		files, named = sessionAudioFiles(audioPath, recordingDir, nil), nil
+	}
 	pending := make([]erase.Pending, 0)
-	for _, p := range sessionAudioFiles(audioPath, recordingDir, sessionIDs) {
+	for _, p := range files {
+		if named[p] {
+			continue
+		}
 		hidden, err := beginErasing(p)
 		switch {
 		case errors.Is(err, erase.ErrLeftover):
@@ -168,6 +180,24 @@ func sessionAudioFiles(audioPath, recordingDir string, sessionIDs []string) []st
 		}
 	}
 	return files
+}
+
+// remainingNamed returns, absolute, every file a session the store still has
+// names, found where recording.Resolve finds it in recordingDir.
+func remainingNamed(store SessionStore, recordingDir string) (map[string]bool, error) {
+	recordings, err := store.Recordings()
+	if err != nil {
+		return nil, err
+	}
+	named := map[string]bool{}
+	for _, rec := range recordings {
+		for _, entry := range recordingname.Entries(rec.AudioPath) {
+			if abs, err := filepath.Abs(recordingname.Resolve(entry, recordingDir)); err == nil {
+				named[abs] = true
+			}
+		}
+	}
+	return named, nil
 }
 
 // beginErasing hides a whole recording before it is zeroed. Tests replace it

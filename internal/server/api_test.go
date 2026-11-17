@@ -197,6 +197,16 @@ func (*apiStoreStub) CancelRawSessionErase(string, string) error {
 func (*apiStoreStub) SourceSessionIDs(string) ([]string, error) {
 	return nil, nil
 }
+
+func (s *apiStoreStub) Recordings() ([]storage.SessionRecording, error) {
+	var recordings []storage.SessionRecording
+	for id := range s.sessions {
+		if s.sessions[id].AudioPath != "" {
+			recordings = append(recordings, storage.SessionRecording{ID: id, AudioPath: s.sessions[id].AudioPath})
+		}
+	}
+	return recordings, nil
+}
 func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	endedAtPtr := &endedAt
 	s.sessions[newID] = storage.Session{
@@ -846,6 +856,57 @@ func TestDeleteSession_ErasesEveryAudioFileOfTheSession(t *testing.T) {
 	}
 	if _, err := os.Stat(other); err != nil {
 		t.Errorf("another session's recording is gone: %v", err)
+	}
+}
+
+// Re-review of #76, P2: a session delete leaves every file a remaining
+// session names, the session's own <id>.mp3 included: on a restored unit a
+// merged session names its sources' recordings, and erasing one would leave
+// the merged session naming a file that is gone, its Retry refinement
+// refused for good. The files nobody else names still go.
+func TestDeleteSession_LeavesTheFilesARemainingSessionNames(t *testing.T) {
+	dir := t.TempDir()
+	shared := filepath.Join(dir, "s1.mp3")
+	own := filepath.Join(dir, "s1.wav")
+	for _, path := range []string{shared, own} {
+		if err := os.WriteFile(path, []byte("audio"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions: map[string]storage.Session{
+			"s1":     {ID: "s1", Status: storage.SessionEnded, AudioPath: shared},
+			"merged": {ID: "merged", Status: storage.SessionEnded, AudioPath: shared + "," + filepath.Join(dir, "s2.mp3")},
+		},
+		segments: map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("control: the delete erased none of the session's files")
+	}
+	if _, err := os.Lstat(own); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("control: s1.wav, which no remaining session names, is still on disk (%v)", err)
+	}
+	if got, err := os.ReadFile(shared); err != nil || string(got) != "audio" {
+		t.Errorf("s1.mp3, which the merged session names, holds %q (%v), want it as it was", got, err)
 	}
 }
 
