@@ -228,6 +228,17 @@ machine that reaches the Pi over SSH.
 the user services; verifies and installs the newest release; enables Tailscale Serve; and then
 starts the detached tagged-device join.
 
+The Ghost Wispr user service starts only once the Pi's clock is synchronized. The Pi has no
+battery-backed clock, so at boot its clock is behind until a time server sets it, and a session
+started before then is named and stamped with the wrong time. A user service cannot be ordered
+after the system's `time-sync.target`, so the service's start runs
+`/opt/ghost-wispr/wait-for-time-sync.sh` after the network wait: it waits for the mark
+`systemd-timesyncd` leaves once it synchronizes the clock, and after 120 s starts the service
+anyway, so a Pi that reaches no time server still records, its times possibly wrong. While it
+waits nothing records and the light is off. A Pi with no network at all does not start: the network
+wait before it fails and systemd tries again. A unit change reaches a Pi only when `provision.sh`
+runs again; the nightly update replaces the binary alone.
+
 Then run:
 
 <!-- provision_bundle_test.sh: provision -->

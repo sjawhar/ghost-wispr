@@ -257,6 +257,7 @@ for unit in ghost-wispr.service ghost-wispr-update.service ghost-wispr-update.ti
     "$repo_root/deploy/pi/files/$unit" "$user_unit_dir/$unit"
 done
 sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$repo_root/wait-for-network.sh" "$DEPLOY_DIR/wait-for-network.sh"
+sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$repo_root/deploy/pi/files/wait-for-time-sync.sh" "$DEPLOY_DIR/wait-for-time-sync.sh"
 sudo install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$repo_root/deploy/pi/update.sh" "$DEPLOY_DIR/update.sh"
 
 if [[ ${groups_changed:-false} == true ]]; then

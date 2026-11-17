@@ -8,7 +8,12 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=/opt/ghost-wispr
 ExecStartPre=/opt/ghost-wispr/wait-for-network.sh
+# A user unit cannot be ordered after the system's time-sync.target: this
+# waits for the clock to be synchronized itself, giving up after 120 s.
+ExecStartPre=/opt/ghost-wispr/wait-for-time-sync.sh
 ExecStart=/opt/ghost-wispr/ghost-wispr
+# Longer than both waits together; the user manager's default is 90 s.
+TimeoutStartSec=5min
 ExecStopPost=/opt/ghost-wispr/ghost-wispr light-off
 EnvironmentFile=/opt/ghost-wispr/.env
 Restart=always
