@@ -933,6 +933,7 @@ func TestDeleteSession_ClearsItsRecordOnceEveryFileIsOff(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		hideErr error // what hiding s1.mp3 answers; nil for success
+		rawErr  error // what hiding s1.pcm answers; nil for success
 		want    []string
 	}{
 		{name: "every file off its name", want: []string{"s1"}},
@@ -941,12 +942,28 @@ func TestDeleteSession_ClearsItsRecordOnceEveryFileIsOff(t *testing.T) {
 		// not be on the disk (the directory flush failed); a power cut can
 		// bring the name back, so the record stays for the pass.
 		{name: "a hide whose rename is not flushed", hideErr: erase.ErrLeftover},
+		// Re-review at bf1b454: the same for the raw capture.
+		{name: "a raw capture hide whose rename is not flushed", rawErr: erase.ErrLeftover},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			saved := filepath.Join(dir, "s1.mp3")
 			if err := os.WriteFile(saved, []byte("audio"), 0o600); err != nil {
 				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "s1.pcm"), []byte("raw"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.rawErr != nil {
+				beginRaw := beginReservedErasing
+				t.Cleanup(func() { beginReservedErasing = beginRaw })
+				beginReservedErasing = func(reservation erase.Reservation) (erase.Pending, error) {
+					pending, err := beginRaw(reservation)
+					if err != nil {
+						return pending, err
+					}
+					return pending, tc.rawErr
+				}
 			}
 			if tc.hideErr != nil {
 				begin := beginErasing

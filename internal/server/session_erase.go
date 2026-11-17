@@ -132,8 +132,9 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 	}
 	// Every file is off its name once each is hidden, the rename flushed, or
 	// already gone; then the delete records (storage.DeletedSessionAudio) have
-	// done their work.
-	allOff := namedErr == nil && recordsErr == nil
+	// done their work. A raw capture hidden with its rename not flushed is not
+	// off its name yet (hideRawCaptures).
+	allOff := namedErr == nil && recordsErr == nil && !slices.ContainsFunc(rawReservations, func(r rawEraseReservation) bool { return r.unflushed })
 	pending := make([]erase.Pending, 0)
 	seen := map[string]bool{}
 	for _, p := range files {
@@ -257,6 +258,10 @@ type rawEraseReservation struct {
 	sessionID, originalPath, hiddenPath string
 	pending                             erase.Pending
 	keepHidden                          bool
+	// unflushed is set when the raw file has its hidden name but the rename
+	// may not be on the disk: a power cut can bring the name back, so the
+	// delete record stays for the kept recordings pass.
+	unflushed bool
 }
 
 // hideRawCaptures reserves, then hides, the raw microphone capture of each
@@ -294,6 +299,7 @@ func hideRawCaptures(store SessionStore, sessionIDs []string, recordingDir strin
 		reservations = append(reservations, rawEraseReservation{
 			sessionID: rawID, originalPath: rawPath, hiddenPath: persistedHiddenPath, pending: hidden,
 			keepHidden: reusedReservation && rawErr != nil && !errors.Is(rawErr, erase.ErrLeftover),
+			unflushed:  errors.Is(rawErr, erase.ErrLeftover),
 		})
 		switch {
 		case errors.Is(rawErr, erase.ErrLeftover):
