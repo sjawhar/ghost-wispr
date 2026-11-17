@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/sjawhar/ghost-wispr/internal/recording"
 )
@@ -70,16 +71,53 @@ func (s *SQLiteStore) NamedAudio() ([]string, error) {
 }
 
 // recordDeletedSessionAudio records, in tx, the sessions about to be deleted
-// there, with the audio path each row names. Run it before the rows go.
+// there, each with the audio its row names and the recordings its restored
+// Drive folder holds (restored_recordings), which the row's delete drops with
+// it. Run it before the rows go.
 func recordDeletedSessionAudio(tx *sql.Tx, sessionIDs []string) error {
 	for _, id := range sessionIDs {
-		if _, err := tx.Exec(`INSERT INTO deleted_session_audio(session_id, audio_path)
-			SELECT id, audio_path FROM sessions WHERE id = ?
-			ON CONFLICT(session_id) DO UPDATE SET audio_path = excluded.audio_path`, id); err != nil {
+		var audioPath string
+		switch err := tx.QueryRow(`SELECT audio_path FROM sessions WHERE id = ?`, id).Scan(&audioPath); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return fmt.Errorf("read the audio of deleted session %s: %w", id, err)
+		}
+		restored, err := restoredRecordingNames(tx, []string{id})
+		if err != nil {
+			return err
+		}
+		entries := append(recording.Entries(audioPath), restored...)
+		if _, err := tx.Exec(`INSERT INTO deleted_session_audio(session_id, audio_path) VALUES(?, ?)
+			ON CONFLICT(session_id) DO UPDATE SET audio_path = excluded.audio_path`, id, strings.Join(entries, ",")); err != nil {
 			return fmt.Errorf("record the audio of deleted session %s: %w", id, err)
 		}
 	}
 	return nil
+}
+
+// restoredRecordingNames returns, in tx, the recordings the restored Drive
+// folders of sessionIDs hold (restored_recordings).
+func restoredRecordingNames(tx *sql.Tx, sessionIDs []string) ([]string, error) {
+	var names []string
+	for _, id := range sessionIDs {
+		rows, err := tx.Query(`SELECT recording_path FROM restored_recordings WHERE session_id = ? ORDER BY recording_path`, id)
+		if err != nil {
+			return nil, fmt.Errorf("list the restored recordings of session %s: %w", id, err)
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan a restored recording of session %s: %w", id, err)
+			}
+			names = append(names, name)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, fmt.Errorf("list the restored recordings of session %s: %w", id, err)
+		}
+	}
+	return names, nil
 }
 
 // DeletedSessionAudio lists, by session id, the recorded deleted sessions

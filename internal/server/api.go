@@ -886,7 +886,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
-			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) || errors.Is(err, storage.ErrMergeSessionExists) {
+			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) || errors.Is(err, storage.ErrMergeSessionExists) || errors.Is(err, storage.ErrSessionAudioPending) {
 				writeJSONError(w, http.StatusConflict, err.Error())
 				return
 			}

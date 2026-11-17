@@ -124,8 +124,9 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 		slog.Warn("could not read what remaining sessions name; erasing only the recordings the deleted row named", "session_id", sessionID, "error", namedErr)
 		files, named = sessionAudioFiles(audioPath, recordingDir, nil), nil
 	}
-	// Every file is off its name once each is hidden or already gone; then
-	// the delete records (storage.DeletedSessionAudio) have done their work.
+	// Every file is off its name once each is hidden, the rename flushed, or
+	// already gone; then the delete records (storage.DeletedSessionAudio) have
+	// done their work.
 	allOff := namedErr == nil
 	pending := make([]erase.Pending, 0)
 	for _, p := range files {
@@ -136,8 +137,11 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 		switch {
 		case errors.Is(err, erase.ErrLeftover):
 			// The file has its hidden name, but the rename may not be on
-			// disk yet; Finish flushes the directory again.
+			// disk yet; Finish flushes the directory again. A power cut
+			// before then can bring the name back, so the record stays for
+			// the kept recordings pass.
 			slog.Warn("could not flush the removal of a deleted session's recording; it is erased after the answer", "session_id", sessionID, "audio_path", p, "error", err)
+			allOff = false
 		case err != nil:
 			if !errors.Is(err, os.ErrNotExist) {
 				slog.Warn("could not remove a deleted session's recording", "session_id", sessionID, "audio_path", p, "error", err)

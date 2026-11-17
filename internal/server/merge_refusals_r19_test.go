@@ -81,6 +81,31 @@ func TestMergeRouteRefusesARecordingSessionWith409(t *testing.T) {
 	assertMergeConflict(t, postMerge(t, store, "20261113090000", "20261113100000"), "20261113100000", "still recording")
 }
 
+// Re-review of #76 at 1a167b7, P3: a merge whose id is that of a deleted
+// session the kept recordings pass has not cleared yet is refused with 409,
+// saying to try again, not answered 500.
+func TestMergeRouteRefusesAnIDWhoseDeleteIsPendingWith409(t *testing.T) {
+	started := time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)
+	store := mergeRouteStore(t, started, "20261113090000", "20261113100000")
+	if rr := postMerge(t, store, "20261113090000", "20261113100000"); rr.Code != http.StatusOK {
+		t.Fatalf("first merge = %d %s, want 200", rr.Code, rr.Body.String())
+	}
+	if _, err := store.DeleteSession("20261113090000-merged", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	// Two more sessions from the same start: their merge takes the same id.
+	for i, id := range []string{"20261113090001", "20261113100001"} {
+		at := started.Add(time.Duration(i) * time.Hour)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), "/audio/"+id+".mp3"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertMergeConflict(t, postMerge(t, store, "20261113090001", "20261113100001"), "still being erased")
+}
+
 // A merge takes its id from its earliest start. Re-merging it with a later
 // session chooses the next available suffix rather than conflicting with its
 // own id.

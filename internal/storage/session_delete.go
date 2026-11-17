@@ -40,13 +40,15 @@ const sessionsDeletedUnsweptKey = "sessions_deleted_unswept_v2"
 // DeleteSession deletes session id and its merged-source set, refusing a target
 // that feeds another merge (ErrDeleteMergeActive), any active member, or any
 // member that owes Google Drive a replacement
-// (ErrDeleteReplacementPending). It returns the target row's audio path: the
-// recordings the caller then erases are the ones the row named when it went,
-// not ones it read before. In the same transaction, before the rows go, it
-// records the directory of each of those recordings, found where
+// (ErrDeleteReplacementPending). It returns the audio paths the deleted rows
+// name and the recordings their restored Drive folders hold
+// (restored_recordings, which the rows' delete drops with them): the
+// recordings the caller then erases are the ones the rows named when they
+// went, not ones it read before. In the same transaction, before the rows
+// go, it records the directory of each of those recordings, found where
 // recording.Resolve finds it in audioDir (the one the caller then erases), so
 // an erase a stop cuts off is finished as the app starts, and it records each
-// session it deletes with the audio path its row names
+// session it deletes with the audio its row names
 // (recordDeletedSessionAudio), so the kept recordings pass erases the audio
 // files a stop left under their names; it deletes nothing if it cannot record
 // one. In that transaction too it deletes every stored
@@ -147,6 +149,11 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return "", fmt.Errorf("list merged sources of session %s: %w", id, err)
 	}
+	restored, err := restoredRecordingNames(tx, deletedIDs)
+	if err != nil {
+		return "", fmt.Errorf("delete session %s: %w", id, err)
+	}
+	paths = append(paths, restored...)
 	audioPath = strings.Join(paths, ",")
 	for _, entry := range append(recording.Entries(audioPath), recording.RawPath(audioDir, id)) {
 		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {

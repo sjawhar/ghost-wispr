@@ -509,7 +509,7 @@ func OpenAPISpec() map[string]any {
 							"description": "Merged session",
 						},
 						"409": map[string]any{
-							"description": "A session to merge is still recording, was already merged or discarded, or still has a deleted segment on Google Drive, or the merged session's id is already taken; the message names the session and the reason",
+							"description": "A session to merge is still recording, was already merged or discarded, or still has a deleted segment on Google Drive, the merged session's id is already taken, or a deleted session with that id still has audio being erased (try again in a few minutes); the message names the session and the reason",
 						},
 					},
 				},

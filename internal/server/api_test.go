@@ -923,12 +923,16 @@ func TestDeleteSession_LeavesTheFilesARemainingSessionNames(t *testing.T) {
 // take a file off its name leaves the record for that pass.
 func TestDeleteSession_ClearsItsRecordOnceEveryFileIsOff(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		hideFail bool
-		want     []string
+		name    string
+		hideErr error // what hiding s1.mp3 answers; nil for success
+		want    []string
 	}{
 		{name: "every file off its name", want: []string{"s1"}},
-		{name: "a file left under its name", hideFail: true},
+		{name: "a file left under its name", hideErr: errors.New("read-only file system")},
+		// Review 5936664943: the file has its hidden name, but the rename may
+		// not be on the disk (the directory flush failed); a power cut can
+		// bring the name back, so the record stays for the pass.
+		{name: "a hide whose rename is not flushed", hideErr: erase.ErrLeftover},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -936,14 +940,21 @@ func TestDeleteSession_ClearsItsRecordOnceEveryFileIsOff(t *testing.T) {
 			if err := os.WriteFile(saved, []byte("audio"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if tc.hideFail {
+			if tc.hideErr != nil {
 				begin := beginErasing
 				t.Cleanup(func() { beginErasing = begin })
 				beginErasing = func(path string) (erase.Pending, error) {
-					if path == saved {
-						return erase.Pending{}, errors.New("read-only file system")
+					if path != saved {
+						return begin(path)
 					}
-					return begin(path)
+					if errors.Is(tc.hideErr, erase.ErrLeftover) {
+						pending, err := begin(path)
+						if err != nil {
+							return pending, err
+						}
+						return pending, erase.ErrLeftover
+					}
+					return erase.Pending{}, tc.hideErr
 				}
 			}
 			store := &apiStoreStub{
