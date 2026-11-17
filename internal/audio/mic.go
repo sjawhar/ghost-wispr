@@ -154,6 +154,13 @@ func (m *Mic) Close() error {
 	}
 	defer func() { <-pa }()
 	m.mu.Lock()
+	// A Stream that began while Close waited for pa registered a stopping
+	// channel of its own, and holds the stream taken below: end it too, or it
+	// would go on calling the closed stream.
+	if m.stopping != nil {
+		close(m.stopping)
+		m.stopping = nil
+	}
 	stream := m.stream
 	m.stream = nil
 	m.mu.Unlock()
