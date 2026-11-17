@@ -21,14 +21,14 @@ import (
 // its kept raw recording (storage.SQLiteStore).
 type keptRecordingStore interface {
 	GetSession(id string) (storage.Session, error)
-	RecordKeptRecording(id, audioPath string) (bool, error)
+	RecordKeptRecording(id, audioPath string, place func() error) (bool, error)
 }
 
 // keptRecordingSaver lists the raw recordings the recorder is not using and
 // saves one, keeping it (audio.Recorder).
 type keptRecordingSaver interface {
 	KeptRawSessions() []string
-	SaveKept(sessionID string) (string, error)
+	SaveKept(ctx context.Context, sessionID string) (string, error)
 }
 
 // keptRecordings saves the raw recordings kept for sessions that ended
@@ -54,6 +54,13 @@ type keptRecordingSaver interface {
 // named the saved one, leaves exactly that. Where the end left a WAV beside
 // an MP3, the WAV is the recording: the end saves one only once its MP3
 // encoders failed.
+//
+// A save writes under a temporary name (recording.KeptTempPaths) and renames
+// the file into place only in the transaction that gives it to the session,
+// once the session is found to take it (storage.RecordKeptRecording). A
+// session delete holds the session (Hold), which stops a save of it under
+// way. A temporary file found as a pass starts is a save a stop cut off, and
+// is erased.
 type keptRecordings struct {
 	store    keptRecordingStore
 	recorder keptRecordingSaver
@@ -63,10 +70,23 @@ type keptRecordings struct {
 	// running keeps two passes (the start's and a sweep's) from saving one
 	// raw recording at once.
 	running sync.Mutex
+
+	// mu guards held, the sessions a delete holds, and saving, the saves
+	// under way.
+	mu     sync.Mutex
+	held   map[string]int
+	saving map[string]*keptSave
+}
+
+// keptSave is a save under way: cancel stops it, and done is closed once it
+// has ended.
+type keptSave struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func newKeptRecordings(store keptRecordingStore, recorder keptRecordingSaver, audioDir string, finish func(context.Context, string, string, time.Time)) *keptRecordings {
-	return &keptRecordings{store: store, recorder: recorder, audioDir: audioDir, finish: finish}
+	return &keptRecordings{store: store, recorder: recorder, audioDir: audioDir, finish: finish, held: map[string]int{}, saving: map[string]*keptSave{}}
 }
 
 // refineRecoveredRecording starts, for a recording saved from a kept raw
@@ -89,17 +109,18 @@ func (k *keptRecordings) run(ctx context.Context) {
 		return
 	}
 	defer k.running.Unlock()
+	k.eraseCutOffSaves()
 	for _, id := range k.recorder.KeptRawSessions() {
 		if ctx.Err() != nil {
 			return
 		}
 		sess, ok := k.endedSession(id)
-		if !ok {
+		if !ok || k.isHeld(id) {
 			continue
 		}
 		switch {
 		case sess.AudioPath == "" && sess.AudioRemovedAt == "":
-			k.save(&sess)
+			k.save(ctx, &sess)
 		case sess.SyncState == storage.SyncStateSynced && k.savedBeside(sess.AudioPath, id):
 			k.eraseRaw(id)
 		}
@@ -108,9 +129,99 @@ func (k *keptRecordings) run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if sess, ok := k.endedSession(id); ok && sess.AudioPath == "" && sess.AudioRemovedAt == "" {
+		if sess, ok := k.endedSession(id); ok && !k.isHeld(id) && sess.AudioPath == "" && sess.AudioRemovedAt == "" {
 			k.adopt(&sess, saved)
 		}
+	}
+}
+
+// Hold keeps the pass off the files of sessionIDs until release is called:
+// it stops a save of one under way (its encoder is killed) and waits for it
+// to end, and no save, raw erase or adoption of one starts. A session delete
+// holds its sessions while it erases their files, so no encoder writes a file
+// of a deleted session after the delete erased it.
+func (k *keptRecordings) Hold(sessionIDs []string) (release func()) {
+	if k == nil {
+		return func() {}
+	}
+	k.mu.Lock()
+	var running []*keptSave
+	for _, id := range sessionIDs {
+		k.held[id]++
+		if s := k.saving[id]; s != nil {
+			running = append(running, s)
+		}
+	}
+	k.mu.Unlock()
+	for _, s := range running {
+		s.cancel()
+	}
+	for _, s := range running {
+		<-s.done
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			k.mu.Lock()
+			defer k.mu.Unlock()
+			for _, id := range sessionIDs {
+				if k.held[id]--; k.held[id] <= 0 {
+					delete(k.held, id)
+				}
+			}
+		})
+	}
+}
+
+func (k *keptRecordings) isHeld(id string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.held[id] > 0
+}
+
+// startSave registers a save of session id under way, unless a delete holds
+// the session, and returns its context, which Hold cancels.
+func (k *keptRecordings) startSave(parent context.Context, id string) (context.Context, bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.held[id] > 0 {
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(parent)
+	k.saving[id] = &keptSave{cancel: cancel, done: make(chan struct{})}
+	return ctx, true
+}
+
+// endSave ends the save of session id that startSave registered.
+func (k *keptRecordings) endSave(id string) {
+	k.mu.Lock()
+	s := k.saving[id]
+	delete(k.saving, id)
+	k.mu.Unlock()
+	s.cancel()
+	close(s.done)
+}
+
+// eraseCutOffSaves erases every temporary file a save writes
+// (recording.IsKeptTemp): as a pass starts no save runs, so one there is a
+// save a stop cut off, or one a delete stopped.
+func (k *keptRecordings) eraseCutOffSaves() {
+	entries, err := os.ReadDir(k.audioDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if recordingname.IsKeptTemp(entry.Name()) {
+			k.eraseFile(filepath.Join(k.audioDir, entry.Name()), "a save a stop cut off")
+		}
+	}
+}
+
+// eraseFile erases the file at path, which holds audio, with zeros before
+// its blocks go; why says what it is, for the log.
+func (k *keptRecordings) eraseFile(path, why string) {
+	if err := erase.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("warning: %s, %s, could not be erased: %v", why, path, err)
 	}
 }
 
@@ -157,7 +268,7 @@ func (k *keptRecordings) savedWithoutRaw() map[string]string {
 // adopt makes saved, the recording a session end saved for sess, the
 // session's recording, and starts what a session end starts after saving.
 func (k *keptRecordings) adopt(sess *storage.Session, saved string) {
-	recorded, err := k.store.RecordKeptRecording(sess.ID, saved)
+	recorded, err := k.store.RecordKeptRecording(sess.ID, saved, nil)
 	if err != nil {
 		log.Printf("warning: session %s ended without naming its saved recording %s, and it could not be given it; the next pass tries again: %v", sess.ID, saved, err)
 		return
@@ -171,19 +282,46 @@ func (k *keptRecordings) adopt(sess *storage.Session, saved string) {
 	}
 }
 
-// save saves the raw recording kept for sess and makes it the session's
-// recording. A recording the session no longer takes (it was deleted, merged
-// or given a recording while this one was saved) is no session's, so it is
-// erased; the raw recording is left for the next pass.
-func (k *keptRecordings) save(sess *storage.Session) {
-	saved, err := k.recorder.SaveKept(sess.ID)
-	if err != nil {
-		log.Printf("warning: the raw recording kept for session %s could not be saved; the next pass tries again: %v", sess.ID, err)
+// save saves the raw recording kept for sess under a temporary name, then,
+// in the transaction that finds the session still takes it, renames it to
+// <id>.mp3 or <id>.wav and makes it the session's recording. A save a delete
+// stops (Hold), or one the session no longer takes (deleted, merged or given
+// a recording meanwhile), records nothing and erases what it wrote; the raw
+// recording is left for the next pass.
+func (k *keptRecordings) save(parent context.Context, sess *storage.Session) {
+	ctx, ok := k.startSave(parent, sess.ID)
+	if !ok {
 		return
 	}
-	recorded, err := k.store.RecordKeptRecording(sess.ID, saved)
+	defer k.endSave(sess.ID)
+	temp, err := k.recorder.SaveKept(ctx, sess.ID)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		for _, path := range recordingname.KeptTempPaths(k.audioDir, sess.ID) {
+			k.eraseFile(path, "a save that did not finish")
+		}
+		log.Printf("warning: the raw recording kept for session %s was not saved; the next pass tries again: %v", sess.ID, err)
+		return
+	}
+	saved := filepath.Join(k.audioDir, sess.ID+filepath.Ext(temp))
+	placed := false
+	recorded, err := k.store.RecordKeptRecording(sess.ID, saved, func() error {
+		if err := erase.Replace(temp, saved); err != nil && !errors.Is(err, erase.ErrLeftover) {
+			return err
+		}
+		placed = true
+		// The rename is on disk before the row names the file.
+		return syncRecordingDirectory(saved)
+	})
 	if err != nil || !recorded {
-		k.eraseUnnamed(sess.ID, saved, err)
+		k.eraseFile(temp, "a recording no session took")
+		if placed {
+			k.eraseUnnamed(sess.ID, saved, err)
+		} else {
+			log.Printf("session %s did not take the recording saved from its raw recording (%v); it is erased", sess.ID, err)
+		}
 		return
 	}
 	log.Printf("saved the raw recording kept for session %s as %s; the raw recording is erased once Drive has it", sess.ID, saved)

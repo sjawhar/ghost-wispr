@@ -60,6 +60,32 @@ func RawPath(audioDir, sessionID string) string {
 	return filepath.Join(audioDir, sessionID+".pcm")
 }
 
+// keptTempPrefix starts the name of a recording saved from a kept raw
+// recording until its session takes it.
+const keptTempPrefix = ".kept-"
+
+// KeptTempName returns the name, without its extension, of the recording
+// saved from session sessionID's kept raw recording until the session takes
+// it: hidden, so that no reader takes it for a recording, and named for the
+// session, so that a delete of the session finds it.
+func KeptTempName(sessionID string) string {
+	return keptTempPrefix + sessionID
+}
+
+// KeptTempPaths returns the files in audioDir that a save of session
+// sessionID's kept raw recording writes before the session takes one: the
+// MP3 and the WAV fallback.
+func KeptTempPaths(audioDir, sessionID string) []string {
+	name := filepath.Join(audioDir, KeptTempName(sessionID))
+	return []string{name + ".mp3", name + ".wav"}
+}
+
+// IsKeptTemp reports whether name is the file name of a recording saved from
+// a kept raw recording that no session has taken yet (KeptTempPaths).
+func IsKeptTemp(name string) bool {
+	return strings.HasPrefix(name, keptTempPrefix)
+}
+
 // Resolve returns the file one entry of a session's audio path names: the
 // entry as written, when a file is there, else the file of the entry's name
 // in audioDir, the audio directory now. The recorder writes

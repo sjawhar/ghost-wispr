@@ -18,6 +18,7 @@ import (
 	"github.com/hajimehoshi/go-mp3"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/erase"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
@@ -241,7 +242,9 @@ func TestAKeptRecordingStaysRawUntilDriveHasIt(t *testing.T) {
 // for a session deleted, or given a recording, while it was being saved.
 type refusingKeptStore struct{ *storage.SQLiteStore }
 
-func (refusingKeptStore) RecordKeptRecording(string, string) (bool, error) { return false, nil }
+func (refusingKeptStore) RecordKeptRecording(string, string, func() error) (bool, error) {
+	return false, nil
+}
 
 // A recording saved for a session that changed meanwhile (deleted while its
 // raw recording was being saved) belongs to no session: it is erased, and the
@@ -380,4 +383,125 @@ func TestASavedRecordingNoSessionNamesIsGivenToItsSession(t *testing.T) {
 			}
 		}
 	}
+}
+
+// restoreFromDrive imports session id as a Restore from Drive does, from a
+// Drive folder that holds no audio, and fails the test if it cannot.
+func restoreFromDrive(t *testing.T, store *storage.SQLiteStore, id string) {
+	t.Helper()
+	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
+	ended := started.Add(time.Hour)
+	rs := gdrive.RestoredSession{ID: id, Title: "Restored", StartedAt: started, EndedAt: &ended, DriveFolderID: "folder-1"}
+	restored := restoredDriveSession(&rs, ended)
+	if err := store.ImportSession(&restored, nil, nil); err != nil {
+		t.Fatalf("restore %s from Drive: %v", id, err)
+	}
+}
+
+// Review of #76, P1 (the reviewer's repro): a person deletes a session while
+// the kept recordings pass saves its raw recording, and the app stops before
+// the pass finds the session gone. The deleted conversation's saved
+// recording must not survive on the unit: else a later Restore from Drive,
+// which brings the session back with no recording, gives it that recording
+// and queues it for Drive. A session deleted the same way with no save under
+// way is the control.
+func TestADeletedSessionLeavesNoSavedRecordingToRestore(t *testing.T) {
+	requireMP3Encoder(t)
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const deleted, control = "20261106140930", "20261106150000"
+	raws := map[string]string{
+		deleted: keptSession(t, store, audioDir, deleted, 1),
+		control: keptSession(t, store, audioDir, control, 1),
+	}
+	recorder := audio.NewRecorder(audioDir)
+	// The save under way: the encoder has written the recording.
+	if _, err := recorder.SaveKept(context.Background(), deleted); err != nil {
+		t.Fatalf("save %s: %v", deleted, err)
+	}
+	// The delete, as the store and the raw erase do it; then the app stops
+	// before the save records anything.
+	for id, raw := range raws {
+		if _, err := store.DeleteSession(id, audioDir); err != nil {
+			t.Fatalf("delete %s: %v", id, err)
+		}
+		if err := erase.Remove(raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The next start.
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil).run(context.Background())
+	entries, err := os.ReadDir(audioDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), deleted) {
+			t.Errorf("after the next start: %s of the deleted session is still on disk", entry.Name())
+		}
+	}
+
+	for id := range raws {
+		restoreFromDrive(t, store, id)
+	}
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil).run(context.Background())
+	for id := range raws {
+		sess, err := store.GetSession(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sess.AudioPath != "" {
+			t.Errorf("after the restore and a pass: session %s audio_path=%q sync_state=%s refinement=%s, want no recording", id, sess.AudioPath, sess.SyncState, sess.RefinementStatus)
+		}
+	}
+}
+
+// A session delete holds the session's audio first (keptRecordings.Hold): a
+// save of its raw recording under way is stopped, its encoder killed, before
+// the hold returns, so no encoder writes a file of the session after the
+// delete erased it, and the save records nothing. The encoder here writes
+// its output, then hangs, as a long recording's encode does on a Pi.
+func TestAHoldStopsASaveOfTheSessionAndNothingIsRecorded(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\nfor out; do :; done\nprintf 'partial' > \"$out\"\nexec /bin/sleep 3600\n"
+	if err := os.WriteFile(filepath.Join(bin, "ffmpeg"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const id = "20261106140930"
+	keptSession(t, store, audioDir, id, 1)
+	kept := newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil)
+
+	passed := goDone(func() { kept.run(context.Background()) })
+	temp := filepath.Join(audioDir, ".kept-"+id+".mp3")
+	for deadline := time.Now().Add(testWait); ; time.Sleep(time.Millisecond) {
+		if _, err := os.Stat(temp); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the save never started encoding")
+		}
+	}
+	release := kept.Hold([]string{id})
+	// What the hold leaves, before the delete would erase anything: the
+	// save has ended, its encoder is gone and it wrote nothing that stays.
+	entries, err := os.ReadDir(audioDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if name := entry.Name(); name != id+".pcm" {
+			t.Errorf("when the hold returned, the save of the held session had left %s", name)
+		}
+	}
+	if sess, err := store.GetSession(id); err != nil || sess.AudioPath != "" {
+		t.Errorf("the held session names recording %q (%v), want none", sess.AudioPath, err)
+	}
+	if !returnedWithin(passed, testWait) {
+		t.Fatal("the pass did not end after the hold stopped its save")
+	}
+	release()
 }

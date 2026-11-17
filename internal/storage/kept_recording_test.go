@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -27,7 +28,11 @@ func TestRecordKeptRecording(t *testing.T) {
 		synced:        {SyncStatePending, SyncPending, "folder-1"},
 		remoteDeleted: {SyncStateRemoteDeleted, SyncFailed, "folder-2"},
 	} {
-		recorded, err := store.RecordKeptRecording(id, "/audio/"+id+".mp3")
+		placed := false
+		recorded, err := store.RecordKeptRecording(id, "/audio/"+id+".mp3", func() error { placed = true; return nil })
+		if !placed {
+			t.Errorf("RecordKeptRecording(%s) recorded the recording without putting it in place", id)
+		}
 		if err != nil || !recorded {
 			t.Fatalf("RecordKeptRecording(%s) = %v, %v; want recorded", id, recorded, err)
 		}
@@ -67,12 +72,32 @@ func TestRecordKeptRecordingRefusesOtherSessions(t *testing.T) {
 
 	for _, id := range []string{active, saved, removed, merged, "20261106990000"} {
 		before, beforeErr := store.GetSession(id)
-		if recorded, err := store.RecordKeptRecording(id, "/audio/kept.mp3"); err != nil || recorded {
-			t.Errorf("RecordKeptRecording(%s) = %v, %v; want nothing recorded", id, recorded, err)
+		placed := false
+		if recorded, err := store.RecordKeptRecording(id, "/audio/kept.mp3", func() error { placed = true; return nil }); err != nil || recorded || placed {
+			t.Errorf("RecordKeptRecording(%s) = %v, %v, placed %v; want nothing recorded and nothing put in place", id, recorded, err, placed)
 		}
 		after, afterErr := store.GetSession(id)
 		if (beforeErr == nil) != (afterErr == nil) || before.AudioPath != after.AudioPath || before.SyncState != after.SyncState || before.RefinementStatus != after.RefinementStatus {
 			t.Errorf("RecordKeptRecording(%s) changed the session: %+v -> %+v", id, before, after)
 		}
+	}
+}
+
+// A recording that cannot be put in place is not recorded: the session keeps
+// no recording, for the next pass to try again.
+func TestRecordKeptRecordingRecordsNothingWhenThePlaceFails(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	const id = "20261106140930"
+	if err := store.CreateSession(id, time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecoverStaleSessions(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if recorded, err := store.RecordKeptRecording(id, "/audio/"+id+".mp3", func() error { return errors.New("no space left on device") }); err == nil || recorded {
+		t.Errorf("RecordKeptRecording with a failed place = %v, %v; want an error and nothing recorded", recorded, err)
+	}
+	if sess, err := store.GetSession(id); err != nil || sess.AudioPath != "" || sess.RefinementStatus != RefinementNoAudio {
+		t.Errorf("after a failed place the session names %q with refinement %q (%v), want nothing and %q", sess.AudioPath, sess.RefinementStatus, err, RefinementNoAudio)
 	}
 }
