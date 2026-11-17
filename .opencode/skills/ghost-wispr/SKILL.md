@@ -165,9 +165,6 @@ curl -s -X POST "$GHOST_WISPR_HOST/api/tts/speak" -H 'Content-Type: application/
 curl -s "$GHOST_WISPR_HOST/api/tts/status/{id}" | jq
 ```
 
-A `409` from `/api/tts/speak` says why the speaker cannot play yet: a unit that started paused
-speaks only after its first resume, and the error names the reason.
-
 ### Audit one day for decisions or action items
 
 ```bash

@@ -1583,18 +1583,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// capture open like the microphone's own: it runs only inside a
 	// microphone start, under the start's red hold (startMicrophone,
 	// retryMicStartup), and through micDevice, never on its own at start-up. A
-	// unit that starts paused scans at its first resume. The speaker needs
-	// PortAudio, so it plays only once a scan has worked.
-	var paScan portAudioScan
-	speakerWarning := func() {
-		if cfg.SpeakerEnabled {
-			paScan.warn(warningRegistry)
-		}
-	}
+	// unit that starts paused scans at its first resume. The speaker plays
+	// through ALSA, without PortAudio, so it needs no scan.
+	var portAudioReady atomic.Bool
 	scanPortAudio := func(updateStartupState bool, scan func() error) error {
 		err := micDevice.probe(scan)
-		paScan.finished(err == nil)
-		speakerWarning()
+		portAudioReady.Store(err == nil)
 		if err != nil {
 			log.Printf("warning: portaudio init failed: %v — microphone unavailable", err)
 			warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
@@ -1727,7 +1721,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	startMic := func(atBoot bool) error {
 		var err error
-		if !paScan.ready.Load() {
+		if !portAudioReady.Load() {
 			err = scanPortAudio(atBoot, audio.InitializePortAudio)
 		}
 		if err == nil {
@@ -1758,11 +1752,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	case errors.Is(err, errNoCaptureDevice):
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "No microphone found"}
 	}
-	// No start has run yet when it waits for a resume, or for the light, so
-	// nothing has scanned: the start that brings the microphone up does.
-	speakerWarning()
-	// Initialize speaker output device. Its playback streams go through
-	// micDevice, so the Jabra's light never changes while one is open.
+	// Initialize the speaker. It plays through ALSA's playback device,
+	// opening no microphone and needing no red light, so it speaks while
+	// capture is paused. Its playback streams go through micDevice, so the
+	// Jabra's light never changes while one is open.
 	var speaker *audio.Speaker
 	if cfg.SpeakerEnabled {
 		speaker = audio.NewSpeaker(cfg.SpeakerDevice)
@@ -1802,7 +1795,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
-		controlHooks.TTSSpeakerWaits = paScan.speakerWaits
 	}
 
 	// Wire up the mic diagnostic hook. A paused instance opens the mic only on
@@ -2254,48 +2246,6 @@ func streamUntilClosed(ctx context.Context, capture *captureGate, streamer micSt
 	err := streamer.Stream(w)
 	close(streamed)
 	return <-result, err
-}
-
-// The speaker's warnings, which GET /api/status lists, and the reasons POST
-// /api/tts/speak refuses with, while PortAudio, which the speaker needs, is not
-// up (portAudioScan.speakerWaits).
-const (
-	speakerWaitsForScanWarning = "Speaker unavailable until the microphone starts: the PortAudio device scan it needs opens the microphone too, so a unit that starts paused speaks only after its first resume"
-	speakerNoPortAudioWarning  = "Speaker unavailable — PortAudio initialization failed"
-)
-
-// portAudioScan is whether PortAudio's device scan has run, and whether the
-// last one worked. HTTP handlers read it while a microphone start scans.
-type portAudioScan struct{ scanned, ready atomic.Bool }
-
-// finished records a scan that worked or failed.
-func (s *portAudioScan) finished(worked bool) {
-	s.scanned.Store(true)
-	s.ready.Store(worked)
-}
-
-// speakerWaits returns why the speaker cannot play yet, or "" once a scan has
-// worked: no microphone start has scanned yet, as in a unit that starts
-// paused, or the last scan failed.
-func (s *portAudioScan) speakerWaits() string {
-	switch {
-	case s.ready.Load():
-		return ""
-	case s.scanned.Load():
-		return speakerNoPortAudioWarning
-	default:
-		return speakerWaitsForScanWarning
-	}
-}
-
-// warn sets the speaker's warning while it cannot play, and clears it once it
-// can.
-func (s *portAudioScan) warn(warnings *warningsRegistry) {
-	if reason := s.speakerWaits(); reason != "" {
-		warnings.Set("speaker", reason)
-		return
-	}
-	warnings.Clear("speaker")
 }
 
 // micMissingWarningKey is the warning GET /api/status shows while no capture

@@ -51,11 +51,12 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 
 ### System dependencies
 
-PortAudio is required for microphone access:
+PortAudio is required for microphone access, and ALSA's library for the speaker on Linux
+(`portaudio19-dev` depends on `libasound2-dev`):
 
 ```bash
 # Debian/Ubuntu/Raspberry Pi
-sudo apt-get install portaudio19-dev
+sudo apt-get install portaudio19-dev libasound2-dev
 
 # macOS
 brew install portaudio
@@ -132,16 +133,18 @@ the blink(1) to read back red and keeps it red until the open has finished, so n
 while the light is off. Before it lights the blink(1) for an open, the recorder looks in
 `/proc/asound` for a capture device, without opening one: while there is none, the light stays off,
 `/api/status` warns `No microphone found`, and the start-up retry looks again every 15 seconds.
-A unit that starts paused scans
-only at its first resume, so its speaker plays only from then on: until then `/api/status` warns
-`Speaker unavailable until the microphone starts`, and `POST /api/tts/speak` answers `409` with
-that reason.
+A unit that starts paused scans only at its first resume. The speaker does not need the scan: on
+Linux it plays through the ALSA playback device that `speaker_device` names (a PCM such as
+`plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
+needing no red light, so it speaks while capture is paused.
 
 The microphone is never open while the blink(1) is off. The light stays red while the microphone is
 open, and goes off only once the recorder has closed it: after a pause, once no audio has reached
 the recording for 2 s (`no_audio`; the recorder opens it again under a new red check after a wait
-that doubles up to 30 s), before it waits to reconnect after a stream error, and at shutdown. If a
-pause cannot close it, the light stays red and `/api/status` warns until it closes. The recorder
+that doubles up to 30 s), before it waits to reconnect after a stream error, and at shutdown. A
+pause turns the light off within 500 ms: that is the bound for A1 ("Tap the Pi's power button: the
+light goes off"), and the tests hold the pause paths to it. If a pause cannot close the microphone,
+the light stays red and `/api/status` warns until it closes. The recorder
 reads the light back for each buffer of audio: once the light was not red while the microphone was
 open, as when it went off outside Ghost Wispr (an unplug, its watchdog, another `ghost-wispr
 light-off`), the recorder drops that audio and what the microphone holds, closes it and opens it

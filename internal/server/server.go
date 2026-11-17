@@ -206,10 +206,6 @@ type ControlHooks struct {
 	TTSWaitForSynthesis func(ctx context.Context, id string) (map[string]any, error)
 	TTSHasProvider      func() bool
 	TTSHasSpeaker       func() bool
-	// TTSSpeakerWaits returns why the speaker cannot play yet, or "" once it
-	// can: a unit that starts paused runs PortAudio's device scan, which the
-	// speaker needs, only at its first resume.
-	TTSSpeakerWaits func() string
 }
 
 func Handler(staticFS fs.FS, hub *Hub, store SessionStore, controls *ControlHooks, authToken string, healthChecker HealthChecker, cfgStore ...*config.Store) (http.Handler, error) {

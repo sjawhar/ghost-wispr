@@ -406,15 +406,18 @@ Before it lights the blink(1) for an open, Ghost Wispr looks in `/proc/asound` f
 the Jabra unplugged there is none unless another capture card is plugged in or loaded; then
 the blink(1) stays off, `/api/status` warns `No microphone found`, and the start-up retry (every 15
 seconds) and the reconnect (backing off to every 30 seconds) look again without lighting it. A unit that
-starts paused scans only at its first resume, so it speaks only from then on: meanwhile
-`/api/status` warns `Speaker unavailable until the microphone starts`, and `POST /api/tts/speak`
-answers `409` with that reason. A pause during an open keeps the blink(1) red until that open has
-finished.
+starts paused scans only at its first resume. The speaker does not wait for it: it plays through the
+ALSA playback PCM of the card `speaker_device: Jabra` names (`plughw:CARD=J75,DEV=0`, the Jabra's
+`pcmC0D0p` on the office Pi), opening no microphone and needing no red light, so a unit restarted
+paused still speaks. It needs no package beyond `libportaudio2`, whose dependency `libasound2t64`
+the Pi already has (`deploy/pi/baseline.txt`). A pause during an open keeps the blink(1) red until
+that open has finished.
 
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
 its read waits on a device that delivers no frame or its audio waits on a stuck recording file;
-then the blink(1) goes off. If a call into PortAudio does not return, the microphone cannot be
+then the blink(1) goes off, within 500 ms of the tap: that is the bound for A1. If a call into
+PortAudio does not return, the microphone cannot be
 closed: the blink(1) stays red, `/api/status` warns `Microphone still open after a pause` until it
 closes, and nothing is recorded meanwhile. Once no audio has reached the recording for 2 seconds,
 Ghost Wispr closes the microphone, and the blink(1) goes off, with `capture_state` `no_audio`; it
