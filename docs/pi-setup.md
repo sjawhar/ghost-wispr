@@ -323,6 +323,69 @@ through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing set
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
 ships GC off so it never runs before sync is on.
 
+## Pause and resume at the unit
+
+With `power_button: true` and `jabra_mute_button: true`, both set in
+`deploy/pi/files/ghost-wispr.yaml`, a short press of the Pi's power button and a tap of the Jabra
+Speak2 75's Mute button each pause recording, or resume it when it is paused. They change the
+same pause switch as the web page, `POST /api/pause` and `POST /api/resume`, so any of them
+resumes a pause made by any other, and a resume from a button checks the recording light as one
+from the web page does. A long press of the power button is left to the Pi, which powers off.
+
+`update.sh` replaces only the binary, so a provisioned unit gets a key added to the template only
+at its next `provision.sh` run, or its next `provision.sh --models` run, which also replaces
+settings saved in the UI. To turn the Jabra's button on or off without either, put
+`GHOST_WISPR_JABRA_MUTE_BUTTON=true` or `GHOST_WISPR_JABRA_MUTE_BUTTON=false` in
+`/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. A full
+`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it off while
+recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
+light as it last set it.
+
+The Jabra's mute light is on while recording is paused and off otherwise, whichever control
+paused it. Ghost Wispr sets it when it starts, after each tap, when the microphone stops or
+starts, within a quarter of a second after any other pause or resume, and when the Jabra is
+plugged in again. The blink(1) stays the recording light: the Jabra's light only shows the pause
+switch.
+
+The kernel's HID driver gives the Jabra's input device the HID Telephony usage Phone Mute as the
+key `KEY_MICMUTE`, and the HID LED usage Mute (page 0x08, usage 0x09) as the light `LED_MUTE`.
+Ghost Wispr finds the input device whose name starts with `Jabra ` and which has both (on the
+office Pi, `/dev/input/event1`), reads the key there and writes the light there. With two such
+Jabras plugged in, it uses the first one the kernel lists. The service user is in the `input`
+group, and `99-ghost-wispr.rules` gives the Jabra's input nodes mode 0660 and group `input`.
+While the Jabra is missing or not accessible, `/api/status` warns, and Ghost Wispr looks for it
+again every 10 seconds; the other controls still work.
+
+Answering each tap with the light is what a Microsoft Teams client does: in the
+[Teams devices general specification](https://learn.microsoft.com/en-us/microsoftteams/devices/certification-specifications)
+(V5, section 5.3 "Mute Button and LED"), the device mutes its own microphone on a tap, sends Phone
+Mute, and takes LED Mute from the client. Jabra's
+[call-control SDK](https://sdk.jabra.com/javascript/docs/jabra-js/4.4.1/interfaces/ICallControl.html)
+says its `mute` "Mutes or unmutes the microphone of the Jabra device", and that it "Should only be
+used during a call". Ghost Wispr uses the Jabra outside a call, so what the Jabra does with the
+light is checked on the unit. After a deploy that changes these controls, with the web page open:
+
+1. While it records (the blink(1) red), tap the Jabra's Mute button. The blink(1) goes off, the
+   Jabra's ring shows Muted (red), and the page shows the pause. Wait 70 seconds: the ring still
+   shows Muted. Ghost Wispr closes the microphone while paused; the Jabra's manual shows the Mute
+   button "only visible when the microphone is active", and its buttons fade after a minute.
+2. Tap Mute again. The blink(1) turns red, the ring goes off, and the page shows recording. Say
+   a sentence at once: it appears in the live transcript. If the buttons have faded, the first tap
+   may only light them; if it did not resume, tap Mute once more. A resume on the second tap
+   passes; none after two taps fails. Ghost Wispr sends the light again when the microphone
+   starts, so the ring may flash red for a moment as recording resumes.
+3. Press the power button briefly, twice. The blink(1) and the ring change as in steps 1 and 2.
+4. Pause on the web page: the ring shows Muted. Tap the Jabra's Mute button: recording resumes,
+   the ring goes off, and a sentence you say appears in the transcript, so the Jabra did not keep
+   its microphone muted.
+5. While paused, unplug the Jabra and plug it in again. Within about 10 seconds the ring shows
+   Muted again, and recording stays paused.
+
+After each step the state stays as it is: nothing pauses or resumes by itself. If any step fails,
+turn the Jabra's button off with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above, and set
+`jabra_mute_button: false` in `deploy/pi/files/ghost-wispr.yaml` so a provisioning run does not
+turn it on again; the power button and the web page still pause and resume.
+
 ## Restrict OpenSSH to loopback
 
 Only after Tailscale SSH works, restrict OpenSSH. Raspberry Pi OS Trixie can activate OpenSSH
@@ -485,7 +548,7 @@ at `127.0.0.1:8081`. The binary has no `--config` flag. Put the test credential 
 its certificate config in a private temporary directory, point the copied certificate config
 at the certificate that expires in 10 days, and use a copied YAML that sets its
 `google_credentials_file`, separate `db_path` and `audio_dir`, and disables Drive sync, GC,
-Envoy, speaker, indicator light, and power button. Before starting it, seed its
+Envoy, speaker, indicator light, power button, and Jabra mute button. Before starting it, seed its
 separate database as paused. A paused instance opens the microphone, and connects to Deepgram,
 only when someone resumes it, so the test instance does not hold the recorder's microphone; do
 not resume it. PortAudio still checks the audio devices once as the app starts. Seed and start

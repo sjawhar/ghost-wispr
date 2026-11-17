@@ -763,7 +763,7 @@ run_a10() {
 run_certificate_warning() {
   local cert_status
   if [[ "$cert_test" != true ]]; then
-    printf 'Cert-warning NEEDS-PERSON: use a copied config with separate db_path and audio_dir; disable Drive sync, GC, Envoy, speaker, light, and power button; point its copied credential config at a certificate expiring in 10 days; start it with GHOST_WISPR_CONFIG=<copy> and GHOST_WISPR_ADDR=127.0.0.1:%s; then rerun with --cert-test.\n' "$cert_test_port"
+    printf 'Cert-warning NEEDS-PERSON: use a copied config with separate db_path and audio_dir; disable Drive sync, GC, Envoy, speaker, light, power button, and Jabra mute button; point its copied credential config at a certificate expiring in 10 days; start it with GHOST_WISPR_CONFIG=<copy> and GHOST_WISPR_ADDR=127.0.0.1:%s; then rerun with --cert-test.\n' "$cert_test_port"
     return 2
   fi
   printf 'Cert-warning RAN: read /api/status from the test instance on 127.0.0.1:%s.\n' "$cert_test_port"
