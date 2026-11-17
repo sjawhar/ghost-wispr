@@ -1928,9 +1928,13 @@ func streamMicWithRetry(
 			}
 			// Before red: a resume during speech on the Jabra waits for it to
 			// end, then lights the Jabra, so its ring reads right while the
-			// microphone is open. A pause meanwhile cancels the resume.
-			if !capture.prepareMicOpen(ctx) {
-				continue
+			// microphone is open. A pause meanwhile cancels the resume, and
+			// the loop holds the closed microphone until the next resume and
+			// waits again: it never streams the microphone it closed.
+			for !capture.prepareMicOpen(ctx) {
+				if ctx.Err() != nil || !holdMicWhilePaused(ctx, capture, streamer, logf, hub) {
+					return
+				}
 			}
 			if err = capture.confirmMicStart(); err != nil {
 				logf("recording light unavailable before microphone restart: %v", err)

@@ -209,3 +209,125 @@ func TestAPauseDuringTheSpeechWaitCancelsTheResume(t *testing.T) {
 		waitForHardware(t, "the next resume to start the microphone", func() bool { return starts.Load() == 1 })
 	})
 }
+
+// TestAResumeLightsTheJabraWhenSpeechStartsDuringItsWrite fails if a speech
+// that starts just as the resume lights the Jabra makes the resume open the
+// microphone with the ring still showing Muted. A speech's playbackOpening
+// holds the light lock through its settle, then counts the playback; if the
+// resume has already found no playback, its light write finds one and writes
+// nothing. The test holds the light lock and counts the playback as
+// playbackOpening does, so the order is the same on every run. The control
+// lets the resume write the light first.
+func TestAResumeLightsTheJabraWhenSpeechStartsDuringItsWrite(t *testing.T) {
+	for _, speechFirst := range []bool{false, true} {
+		name := "control, the resume writes the light first"
+		if speechFirst {
+			name = "a speech takes the light lock first"
+		}
+		t.Run(name, func(t *testing.T) {
+			r := newSpeechResumeRig(t)
+			mic := r.startMicLoop(t)
+			time.Sleep(2 * jabraLightSettle) // the pause's light write has settled
+
+			if speechFirst {
+				r.device.lightMu.Lock()
+			}
+			r.capture.Resume()
+			waitOpen(t, r.capture)
+			if speechFirst {
+				time.Sleep(50 * time.Millisecond) // the resume found no playback and waits for the light lock
+				r.device.mu.Lock()
+				r.device.playing++ // as playbackOpening does under the light lock
+				r.device.mu.Unlock()
+				r.device.lightMu.Unlock()
+				time.Sleep(100 * time.Millisecond) // the speech plays
+				r.device.playbackClosing(func() {})
+			}
+			mic.expectEvents(t, "open")
+			if r.ring.Load() {
+				t.Fatal("the microphone opened while the Jabra's ring showed Muted")
+			}
+		})
+	}
+}
+
+// TestACancelledSpeechWaitThenAQuickResumeStillWaits fails if the mic loop,
+// whose wait for speech a pause cancelled, uses the microphone it closed
+// without waiting again, because a second resume opened the gate before the
+// loop looked: it would stream the closed microphone, and the reconnect after
+// that error would open it during the speech with the ring showing Muted. The
+// test holds the loop for that moment after the cancel.
+func TestACancelledSpeechWaitThenAQuickResumeStillWaits(t *testing.T) {
+	r := newSpeechResumeRig(t)
+	cancelled := make(chan struct{})
+	proceed := make(chan struct{})
+	var held atomic.Bool
+	prepare := r.capture.beforeMicOpen
+	r.capture.beforeMicOpen = func(ctx context.Context, closing <-chan struct{}) bool {
+		if prepare(ctx, closing) {
+			return true
+		}
+		if held.CompareAndSwap(false, true) {
+			close(cancelled)
+			<-proceed
+		}
+		return false
+	}
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(proceed)
+		}
+	}
+	t.Cleanup(release)
+	mic := r.startMicLoop(t)
+	r.speak(t)
+
+	r.capture.Resume()
+	waitOpen(t, r.capture)
+	time.Sleep(20 * time.Millisecond) // the resume waits for the speech
+	r.capture.Pause()
+	select {
+	case <-cancelled:
+	case <-time.After(testWait):
+		t.Fatal("control: the pause did not cancel the wait for the speech")
+	}
+	r.capture.Resume() // before the mic loop looks again
+	waitOpen(t, r.capture)
+	release()
+
+	var calls []string
+	deadline := time.After(150 * time.Millisecond) // the speech plays on
+speech:
+	for {
+		select {
+		case call := <-mic.events:
+			calls = append(calls, call)
+			if call != "close" {
+				t.Fatalf("the mic loop used the microphone during the speech, after a cancelled wait: device calls %v", calls)
+			}
+		case <-deadline:
+			break speech
+		}
+	}
+	r.finish()
+	for {
+		select {
+		case call := <-mic.events:
+			calls = append(calls, call)
+			switch call {
+			case "close":
+				continue
+			case "open":
+				if r.ring.Load() {
+					t.Fatal("the microphone opened while the Jabra's ring showed Muted")
+				}
+				return
+			default:
+				t.Fatalf("the microphone was used before it opened again: device calls %v", calls)
+			}
+		case <-time.After(testWait):
+			t.Fatalf("the microphone did not open once the speech ended: device calls %v", calls)
+		}
+	}
+}

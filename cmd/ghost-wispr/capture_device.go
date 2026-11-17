@@ -147,9 +147,11 @@ func (d *captureDevice) playbackClosing(closeStream func()) {
 // opens, so the Jabra's ring never reads Muted while the unit records: the
 // light cannot change once the microphone is open. While the light may not
 // show the pause and a playback stream is open, it waits for the playback to
-// close, then writes the light. It returns false, having written nothing, if
-// cancel closes (a pause) or ctx ends first. A Jabra light that fails to write
-// does not hold the microphone back: the button reconnects the Jabra.
+// close, then writes the light; a playback that opens as it writes holds the
+// write back, and it waits for that one too. It returns false, having written
+// nothing, if cancel closes (a pause) or ctx ends first. A Jabra light that
+// fails to write does not hold the microphone back: the button reconnects the
+// Jabra.
 func (d *captureDevice) prepareLightForOpen(ctx context.Context, cancel <-chan struct{}) bool {
 	for {
 		select {
@@ -166,8 +168,9 @@ func (d *captureDevice) prepareLightForOpen(ctx context.Context, cancel <-chan s
 		playing, silent := d.playing > 0, d.silent
 		d.mu.Unlock()
 		if !stale || !playing {
-			if stale {
-				d.writeLight()
+			if stale && d.writeLight() {
+				d.op.Unlock()
+				continue // the next pass waits for that playback
 			}
 			d.op.Unlock()
 			return true
@@ -226,15 +229,16 @@ func (d *captureDevice) syncLight() {
 }
 
 // writeLight writes the light as the pause wants it while no capture or
-// playback stream is open. The caller holds op.
-func (d *captureDevice) writeLight() {
+// playback stream is open. It reports whether an open playback stream held the
+// write back. The caller holds op.
+func (d *captureDevice) writeLight() (heldForPlayback bool) {
 	d.lightMu.Lock()
 	defer d.lightMu.Unlock()
 	d.mu.Lock()
-	write, open := d.light, d.open || d.playing > 0
+	write, open, playing := d.light, d.open, d.playing > 0
 	d.mu.Unlock()
-	if write == nil || open {
-		return
+	if write == nil || open || playing {
+		return write != nil && playing
 	}
 	on := d.paused()
 	err := write(on)
@@ -242,6 +246,7 @@ func (d *captureDevice) writeLight() {
 	defer d.mu.Unlock()
 	d.written, d.shown = err == nil, on
 	d.lightAt = jabra.MonotonicNow()
+	return false
 }
 
 // settleLight waits until jabraLightSettle has passed since the last light
