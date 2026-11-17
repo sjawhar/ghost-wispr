@@ -1500,6 +1500,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// After each sweep, a kept recordings pass saves the raw recordings of
 	// sessions that ended without a recording and erases those Drive has.
 	kept := newKeptRecordings(store, audioRecorder, cfg.AudioDir, refineRecoveredRecording(manager))
+	// A session delete stops a save of the session's kept raw recording
+	// before it erases the session's files.
+	controlHooks.HoldSessionAudio = kept.Hold
 	go sweepDriveSync(ctx, store, drive, warningRegistry, 5*time.Minute, kept)
 
 	go func() {

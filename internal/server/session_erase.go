@@ -41,7 +41,7 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 			return
 		}
 
-		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, func(sessionIDs []string) {
+		err = deleteSessionErasingAudio(store, sessionID, audioDir(), controls.RefreshRawEraseWarnings, controls.HoldSessionAudio, func(sessionIDs []string) {
 			if hub != nil {
 				hub.BroadcastSessionDeleted(sessionIDs[0], sessionIDs[1:])
 			}
@@ -62,6 +62,8 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 
 // deleteSessionErasingAudio deletes session sessionID and its merged sources
 // and erases their audio in recordingDir, in this order:
+//   - it holds their audio (hold, when not nil), which stops a save of a kept
+//     raw recording of one of them under way, until it returns;
 //   - it hides the raw microphone captures while their rows still exist
 //     (hideRawCaptures), so a delete that does not commit leaves them to
 //     restore;
@@ -71,8 +73,10 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 //     DeleteSession returned it, any other error prefixed "delete session";
 //   - it calls onDeleted with the deleted sessions: sessionID, then the
 //     sessions merged into it;
-//   - it hides each recording the deleted row named, and zeroes the hidden
-//     raw captures and recordings in the background.
+//   - it hides each recording the deleted row named, and every other audio
+//     file of each deleted session in recordingDir, whatever the row named
+//     (sessionAudioFiles), and zeroes the hidden raw captures and recordings
+//     in the background.
 //
 // Removing a whole audio file overwrites it with zeros before the file
 // system frees its blocks (Sami, 2026-11-12, "Zero every audio removal",
@@ -80,12 +84,15 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 // DeleteSession records every erase directory before the row goes, so an
 // erase cut off by a stop is finished as the app starts. The files leave
 // their names before this returns; the zeros follow.
-func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir string, refreshWarning func(), onDeleted func(sessionIDs []string)) error {
+func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir string, refreshWarning func(), hold func([]string) func(), onDeleted func(sessionIDs []string)) error {
 	sourceIDs, err := store.SourceSessionIDs(sessionID)
 	if err != nil {
 		return fmt.Errorf("list source sessions for raw erase: %w", err)
 	}
 	sessionIDs := append([]string{sessionID}, sourceIDs...)
+	if hold != nil {
+		defer hold(sessionIDs)()
+	}
 	rawReservations, err := hideRawCaptures(store, sessionIDs, recordingDir, refreshWarning)
 	if err != nil {
 		return err
@@ -105,8 +112,7 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 	onDeleted(sessionIDs)
 
 	pending := make([]erase.Pending, 0)
-	for _, p := range recordingname.Entries(audioPath) {
-		p = recordingname.Resolve(p, recordingDir)
+	for _, p := range sessionAudioFiles(audioPath, recordingDir, sessionIDs) {
 		hidden, err := beginErasing(p)
 		switch {
 		case errors.Is(err, erase.ErrLeftover):
@@ -128,6 +134,40 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 		go finishErasing(sessionID, pending)
 	}
 	return nil
+}
+
+// sessionAudioFiles returns, once each, the files a delete of sessionIDs
+// erases besides their raw captures: each recording the deleted row named
+// (audioPath, found where recording.Resolve finds it in recordingDir), and,
+// for each deleted session, its <id>.mp3 and <id>.wav in recordingDir and the
+// temporary files a save of its kept raw recording writes
+// (recording.KeptTempPaths), whatever the row named: a save cut off by a stop
+// or a failed WAV write can leave one that no row names.
+func sessionAudioFiles(audioPath, recordingDir string, sessionIDs []string) []string {
+	var files []string
+	seen := map[string]bool{}
+	add := func(path string) {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+		if !seen[path] {
+			seen[path] = true
+			files = append(files, path)
+		}
+	}
+	for _, entry := range recordingname.Entries(audioPath) {
+		add(recordingname.Resolve(entry, recordingDir))
+	}
+	if recordingDir != "" {
+		for _, id := range sessionIDs {
+			add(filepath.Join(recordingDir, id+".mp3"))
+			add(filepath.Join(recordingDir, id+".wav"))
+			for _, temp := range recordingname.KeptTempPaths(recordingDir, id) {
+				add(temp)
+			}
+		}
+	}
+	return files
 }
 
 // beginErasing hides a whole recording before it is zeroed. Tests replace it

@@ -21,6 +21,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/erase"
+	recordingname "github.com/sjawhar/ghost-wispr/internal/recording"
 	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -776,6 +777,125 @@ func TestDeleteSession_ZeroesItsRawPCM(t *testing.T) {
 	}
 	if !bytes.Equal(got, make([]byte, len(got))) {
 		t.Errorf("the removed raw PCM still holds %q", got)
+	}
+}
+
+// Review of #76, P1: a session delete erases every audio file of the session
+// in the audio directory, whatever its row names: its <id>.mp3 and <id>.wav,
+// which a save cut off by a stop or a failed WAV write can leave unnamed, and
+// the temporary files a save of its kept raw recording writes. Each is
+// zeroed before its blocks go, as the recording the row names is. Left, a
+// later pass would give one to the session a Restore from Drive brings back.
+func TestDeleteSession_ErasesEveryAudioFileOfTheSession(t *testing.T) {
+	dir := t.TempDir()
+	paths := append([]string{filepath.Join(dir, "s1.mp3"), filepath.Join(dir, "s1.wav")}, recordingname.KeptTempPaths(dir, "s1")...)
+	held := make([]*os.File, 0, len(paths))
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("deleted conversation"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		held = append(held, f)
+	}
+	other := filepath.Join(dir, "s2.mp3")
+	if err := os.WriteFile(other, []byte("another conversation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finish := finishErasing
+	t.Cleanup(func() { finishErasing = finish })
+	finished := make(chan struct{})
+	finishErasing = func(sessionID string, pending []erase.Pending) {
+		defer close(finished)
+		finish(sessionID, pending)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", Status: storage.SessionEnded}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the delete erased none of the session's files its row does not name")
+	}
+	for i, path := range paths {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s of the deleted session is still on disk (%v)", filepath.Base(path), err)
+			continue
+		}
+		got := make([]byte, len("deleted conversation"))
+		if _, err := held[i].ReadAt(got, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, make([]byte, len(got))) {
+			t.Errorf("the removed %s still holds %q", filepath.Base(path), got)
+		}
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("another session's recording is gone: %v", err)
+	}
+}
+
+// A session delete holds the audio of the session and its merged sources
+// (ControlHooks.HoldSessionAudio) before it hides any file, while their rows
+// still exist, and releases the hold once the files have left their names:
+// the hold stops a save of the session's kept raw recording, which would
+// otherwise write a file after the delete erased the session's files.
+func TestDeleteSession_HoldsTheSessionsAudioWhileItErases(t *testing.T) {
+	dir := t.TempDir()
+	saved := filepath.Join(dir, "s1.mp3")
+	if err := os.WriteFile(saved, []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &apiStoreStub{
+		sessionsByDate: map[string][]storage.Session{},
+		sessions:       map[string]storage.Session{"s1": {ID: "s1", Status: storage.SessionEnded, AudioPath: saved}},
+		segments:       map[string][]transcribe.Segment{},
+	}
+	var held []string
+	rowAtHold, savedAtHold, released := false, false, false
+	h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{
+		HoldSessionAudio: func(sessionIDs []string) func() {
+			held = sessionIDs
+			_, err := store.GetSession("s1")
+			rowAtHold = err == nil
+			_, err = os.Stat(saved)
+			savedAtHold = err == nil
+			return func() {
+				_, err := os.Stat(saved)
+				released = errors.Is(err, os.ErrNotExist)
+			}
+		},
+	}, "", nil, configStoreWithAudioDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+	}
+	if !slices.Equal(held, []string{"s1"}) {
+		t.Fatalf("the delete held %v, want [s1]", held)
+	}
+	if !rowAtHold || !savedAtHold {
+		t.Errorf("at the hold the row existed: %v, the recording was on disk: %v; want both", rowAtHold, savedAtHold)
+	}
+	if !released {
+		t.Error("the hold was not released, or was released before the recording left its name")
 	}
 }
 

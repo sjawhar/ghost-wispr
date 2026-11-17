@@ -139,11 +139,16 @@ type ControlHooks struct {
 	UnverifiedSessions func() int
 	// UnitOnlySessions is how many sessions are kept on this unit only:
 	// REMOTE_DELETED, with their audio still here.
-	UnitOnlySessions        func() int
-	ActiveSession           func() (string, time.Time)
-	Presets                 func() map[string]config.Preset
-	Resummarize             func(ctx context.Context, sessionID, preset string) error
-	OnSessionDeleted        func(sessionIDs []string) // the deleted session, then those merged into it
+	UnitOnlySessions func() int
+	ActiveSession    func() (string, time.Time)
+	Presets          func() map[string]config.Preset
+	Resummarize      func(ctx context.Context, sessionID, preset string) error
+	OnSessionDeleted func(sessionIDs []string) // the deleted session, then those merged into it
+	// HoldSessionAudio keeps the app's own writers off the audio files of
+	// sessionIDs (a session and those merged into it) until release is
+	// called: a session delete takes it before it hides any file, and
+	// releases it once the files have left their names.
+	HoldSessionAudio        func(sessionIDs []string) (release func())
 	OnSessionsMerged        func(sessionIDs []string)
 	OnSessionMerged         func(ctx context.Context, sessionID string)
 	EndSession              func(ctx context.Context) error
