@@ -135,7 +135,7 @@ Ghost Wispr:
 source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
 crt=$(mktemp) &&
 gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$crt" &&
-openssl x509 -in "$crt" -noout -subject -enddate &&
+openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 -enddate &&
 ssh "ghost-wispr@$PI_HOST" \
   'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service' <"$crt"
 rm -f -- "$crt"
@@ -199,7 +199,7 @@ the time you run the block:
 source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
 prepared=$(mktemp -d)
 gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$prepared/device.crt"
-openssl x509 -in "$prepared/device.crt" -noout -subject -enddate
+openssl x509 -in "$prepared/device.crt" -noout -subject -nameopt RFC2253 -enddate
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
 git -C "$PI_INFRA_CHECKOUT" fetch --quiet origin main
 git -C "$PI_INFRA_CHECKOUT" show "origin/main:$PI_SUBJECT_FILE" \
@@ -257,8 +257,10 @@ Then run:
 deploy/pi/provision-pi.sh --prepared "$prepared"
 ```
 
-`provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says
-so (exit 255).
+`provision-pi.sh`'s last line says what `provision.sh` did: it started the tagged tailnet join as
+a detached unit, which it names, or it found the Pi already joined and started none.
+`provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says so
+(exit 255).
 
 The tagged join makes a new Tailscale device. The temporary device you joined as your own still
 holds the name `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and

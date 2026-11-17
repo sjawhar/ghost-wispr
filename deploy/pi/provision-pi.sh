@@ -109,14 +109,28 @@ provision_rc=${PIPESTATUS[1]}
 set -e
 rm -rf -- "$stage"
 stage=
-join_started=false
-grep -Eq '^ghost-wispr provision: (starting the tagged tailnet join|already joined)' "$provision_log" && join_started=true
+# provision.sh's last step says which of the two it did: the Pi was already joined, and it started
+# no join, or it started the tagged tailnet join as a detached unit, which it names.
+join_unit=$(sed -n 's/^ghost-wispr provision: starting the tagged tailnet join as //p' "$provision_log" | tail -n 1)
+already_joined=false
+grep -q '^ghost-wispr provision: already joined' "$provision_log" && already_joined=true
+if [[ -n $join_unit ]]; then
+  outcome="it started the tagged tailnet join as the detached unit $join_unit"
+elif [[ $already_joined == true ]]; then
+  outcome="the Pi was already joined as tag:ghost-wispr, so it started no tailnet join"
+else
+  outcome="it said neither that the Pi was joined nor that it started the tailnet join; read its output above"
+fi
 case $provision_rc in
-  0) log "provision.sh finished; it started the tagged tailnet join as a detached unit" ;;
+  0) log "provision.sh finished; $outcome" ;;
   255)
-    [[ $join_started == true ]] \
+    [[ -n $join_unit || $already_joined == true ]] \
       || fail "the SSH session ended (exit 255) before provision.sh started the tailnet join; read its output above and run this again"
-    log "the SSH session ended (exit 255) after the tailnet join started, as it does while Tailscale re-authenticates; check the join as docs/pi-setup.md says"
+    if [[ -n $join_unit ]]; then
+      log "the SSH session ended (exit 255) after the tailnet join started, as it does while Tailscale re-authenticates; $outcome; check the join as docs/pi-setup.md says"
+    else
+      log "the SSH session ended (exit 255) after provision.sh finished; $outcome"
+    fi
     ;;
   *) fail "provision.sh failed (exit $provision_rc); read its output above" ;;
 esac
