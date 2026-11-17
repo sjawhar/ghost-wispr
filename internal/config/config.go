@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,10 +21,6 @@ const EnvPrefix = "GHOST_WISPR_"
 
 const (
 	IndicatorLightBlink1 = "blink1"
-	// DefaultEnvoyWebhookSecretName is the Secret Manager version the office
-	// recorder reads Envoy's webhook signing key from (dispatch://INFRA-3599
-	// gives its Google identity Secret Accessor on it).
-	DefaultEnvoyWebhookSecretName = "projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest"
 	// leftoverEnvoyWebhookSecretWarning names a signing key an earlier
 	// provisioner left in the environment or .env.
 	leftoverEnvoyWebhookSecretWarning = EnvPrefix + "ENVOY_WEBHOOK_SECRET is no longer read: Ghost Wispr reads the Envoy signing key from Secret Manager (envoy_webhook_secret_name). Remove it from the environment and .env."
@@ -59,7 +56,8 @@ type Config struct {
 	DBPath                        string             `yaml:"db_path"`
 	AudioDir                      string             `yaml:"audio_dir"`
 	LogLevel                      string             `yaml:"log_level"`
-	PublicURL                     string             `yaml:"public_url"` // the unit's own HTTPS address, its tailnet name
+	PublicURL                     string             `yaml:"public_url"`      // the unit's own HTTPS address, its tailnet name
+	RecordingRules                []string           `yaml:"recording_rules"` // the rules the web UI shows under Recording rules, as written; with none, it shows no button
 	SilenceTimeout                string             `yaml:"silence_timeout"`
 	MinSessionSegments            int                `yaml:"min_session_segments"`
 	MicSampleRate                 int                `yaml:"mic_sample_rate"`
@@ -140,7 +138,6 @@ func defaults() Config {
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
 		TTSMaxLength:                  5000,
-		EnvoyWebhookSecretName:        DefaultEnvoyWebhookSecretName,
 	}
 }
 
@@ -166,7 +163,7 @@ func Load(path string) (Config, []string, error) {
 		}
 	}
 
-	applyEnvOverrides(&cfg)
+	warnings = append(warnings, applyEnvOverrides(&cfg)...)
 	// An unknown light fails closed: dropping the setting would turn the light
 	// check off and let the recorder capture with no light on.
 	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
@@ -264,7 +261,10 @@ func (c *Config) SampleRateCandidates() []int {
 	return result
 }
 
-func applyEnvOverrides(cfg *Config) {
+// applyEnvOverrides sets each setting its environment variable names, and
+// returns a warning for an override it cannot read.
+func applyEnvOverrides(cfg *Config) []string {
+	var warnings []string
 	if v := os.Getenv(EnvPrefix + "DB_PATH"); v != "" {
 		cfg.DBPath = v
 	}
@@ -347,6 +347,14 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPrefix + "PUBLIC_URL"); v != "" {
 		cfg.PublicURL = strings.TrimSpace(v)
 	}
+	if v := os.Getenv(EnvPrefix + "RECORDING_RULES"); v != "" {
+		var rules []string
+		if err := json.Unmarshal([]byte(v), &rules); err != nil {
+			warnings = append(warnings, "Invalid "+EnvPrefix+`RECORDING_RULES — it must be a JSON list of strings, such as ["First rule.", "Second rule."]; using recording_rules from the config file.`)
+		} else {
+			cfg.RecordingRules = rules
+		}
+	}
 	if v := os.Getenv(EnvPrefix + "GC_ENABLED"); v != "" {
 		cfg.GCEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
@@ -389,6 +397,7 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.TTSMaxLength = n
 		}
 	}
+	return warnings
 }
 
 func applyGenAIConfigDefaults(cfg *Config, serviceAccountProject string) {
@@ -530,6 +539,7 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 	if cfg.BatchTranscription.Provider == "" {
 		cfg.BatchTranscription.Provider = "deepgram"
 	}
+	cfg.EnvoyWebhookSecretName = strings.TrimSpace(cfg.EnvoyWebhookSecretName)
 	if cfg.EnvoyEnabled {
 		webhookURL := strings.TrimSpace(cfg.EnvoyWebhookURL)
 		switch webhookURL {
@@ -541,10 +551,10 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 				warnings = append(warnings, "Envoy webhook URL must be an absolute HTTPS URL.")
 			}
 		}
-	}
-	cfg.EnvoyWebhookSecretName = strings.TrimSpace(cfg.EnvoyWebhookSecretName)
-	if cfg.EnvoyWebhookSecretName == "" {
-		cfg.EnvoyWebhookSecretName = DefaultEnvoyWebhookSecretName
+		// No signing key secret is a default: each deployment names its own.
+		if cfg.EnvoyWebhookSecretName == "" {
+			warnings = append(warnings, "Envoy enabled but its signing key secret is not named — set envoy_webhook_secret_name ("+EnvPrefix+"ENVOY_WEBHOOK_SECRET_NAME) to its Secret Manager version, or disable Envoy publishing.")
+		}
 	}
 	if publicURL := strings.TrimSpace(cfg.PublicURL); publicURL != "" {
 		parsed, err := url.Parse(publicURL)
@@ -559,6 +569,8 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 	if cfg.BatchTranscription.Model == "" {
 		cfg.BatchTranscription.Model = cfg.DeepgramModel
 	}
+	// A blank rule would show as an empty line under Recording rules.
+	cfg.RecordingRules = slices.DeleteFunc(cfg.RecordingRules, func(rule string) bool { return strings.TrimSpace(rule) == "" })
 	switch cfg.BatchTranscription.Provider {
 	case "deepgram", "groq", "openai":
 	default:

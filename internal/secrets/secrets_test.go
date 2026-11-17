@@ -15,7 +15,7 @@ import (
 	"google.golang.org/api/option"
 )
 
-const testSecretName = "projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest"
+const testSecretName = "projects/example-project/secrets/example-signing-secret/versions/latest"
 
 // fakeSecretManager answers Secret Manager's access call for one version
 // name with payload, and counts the calls.

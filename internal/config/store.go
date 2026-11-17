@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -135,6 +136,7 @@ func (s *Store) copyConfig() Config {
 		c.MicSampleRates = make([]int, len(s.cfg.MicSampleRates))
 		copy(c.MicSampleRates, s.cfg.MicSampleRates)
 	}
+	c.RecordingRules = slices.Clone(s.cfg.RecordingRules)
 
 	if s.cfg.Summarization.Presets != nil {
 		c.Summarization.Presets = make(map[string]Preset, len(s.cfg.Summarization.Presets))

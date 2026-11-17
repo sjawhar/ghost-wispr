@@ -217,4 +217,4 @@ func CertificateExpiryWarning(now, notAfter time.Time, hasCertificate bool) stri
 }
 
 // CertificateRenewal tells the operator how to renew the device certificate.
-const CertificateRenewal = `install the latest version of Secret Manager secret ghost-wispr-device-certificate with the runbook in docs/pi-setup.md, "Renew the X.509 certificate".`
+const CertificateRenewal = `renew it with the runbook in docs/pi-setup.md, "Renew the X.509 certificate".`

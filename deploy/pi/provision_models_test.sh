@@ -57,6 +57,11 @@ for bad_id in '' 'drive id' 'drive/id' 'drive"id' "drive'id" 'drive:id' $'drive\
 done
 provisioner_function valid_drive_id "$drive_id" || fail 'the shared-drive ID check rejected a valid ID'
 
+# The office Pi's deployment settings, which the template's Google project, signing key secret and
+# public_url must agree with.
+# shellcheck source=files/pi.env
+source "$test_root/deploy/pi/files/pi.env"
+
 # The committed template names the approved models and Google settings, and keeps sync and GC off.
 for line in \
   'deepgram_model: nova-3' \
@@ -66,21 +71,21 @@ for line in \
   'tts_provider: gemini' \
   'tts_voice: Kore' \
   'genai_backend: vertex' \
-  'gcp_project: theorem-agent-infra' \
+  "gcp_project: $PI_GCP_PROJECT" \
   'gcp_location: global' \
   'google_credentials_file: /opt/ghost-wispr/google-credentials.json' \
   'gdrive_sync_enabled: false' \
   'gc_enabled: false' \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
-  'envoy_webhook_url: __ENVOY_WEBHOOK_URL__'; do
+  'envoy_webhook_url: __ENVOY_WEBHOOK_URL__' \
+  "envoy_webhook_secret_name: projects/$PI_GCP_PROJECT/secrets/$PI_WEBHOOK_SECRET/versions/latest" \
+  'jabra_mute_button: false'; do
   assert_line "$line" "$template"
 done
 assert_count '^gdrive_folder_id:' 0 "$template"
-# The template's public_url is the address the tailnet join publishes.
-tailnet_host=$(provisioner_function eval 'printf %s "${TAILSCALE_HOSTNAME%.}"')
-[[ -n "$tailnet_host" ]] || fail 'could not read TAILSCALE_HOSTNAME from the provisioner'
-assert_line "public_url: https://$tailnet_host" "$template"
+# The template's public_url is the Pi's tailnet name, which the tailnet join checks it has.
+assert_line "public_url: https://$PI_HOST" "$template"
 assert_count '^public_url:' 1 "$template"
 
 # The full provisioner's configuration: the URL substituted literally, sync and GC off.
@@ -105,17 +110,19 @@ for line in \
   'tts_provider: gemini' \
   'tts_voice: Kore' \
   'genai_backend: vertex' \
-  'gcp_project: theorem-agent-infra' \
+  "gcp_project: $PI_GCP_PROJECT" \
   'gcp_location: global' \
   'gc_max_age_days: 0' \
   'gc_max_audio_size_mb: 20000' \
   "envoy_webhook_url: $relay_url" \
+  "envoy_webhook_secret_name: projects/$PI_GCP_PROJECT/secrets/$PI_WEBHOOK_SECRET/versions/latest" \
   "gdrive_folder_id: \"$drive_id\"" \
   'gdrive_sync_enabled: true' \
-  'gc_enabled: true'; do
+  'gc_enabled: true' \
+  'jabra_mute_button: false'; do
   assert_line "$line" "$models_config"
 done
-for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_webhook_url; do
+for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_webhook_url jabra_mute_button; do
   assert_count "^$key:" 1 "$models_config"
 done
 
@@ -185,7 +192,9 @@ drive_on_empty=$(provisioner_function deployed_drive_id "$empty_drive") \
 [[ -z "$drive_on_empty" ]] || fail "a configuration with an empty shared drive returned '$drive_on_empty'"
 
 # --models keeps every .env line but the Envoy signing key an earlier provisioner wrote, which the
-# recorder now reads from Secret Manager, and sets the Vertex embedding location exactly once.
+# recorder now reads from Secret Manager, and sets the Vertex embedding location exactly once. The
+# office Pi's Jabra Mute button is set by such a line (docs/pi-setup.md, "Pause and resume at the
+# unit"): --models keeps its value as it is, whatever it is, and writes no other.
 deployed_env="$work_dir/env"
 models_env="$work_dir/models.env"
 cat >"$deployed_env" <<'EOF'
@@ -193,11 +202,14 @@ GHOST_WISPR_ADDR=127.0.0.1:8080
 GHOST_WISPR_EMBEDDING_LOCATION=europe-west4
 GHOST_WISPR_DEEPGRAM_API_KEY=test-key
 GHOST_WISPR_ENVOY_WEBHOOK_SECRET=stale-signing-key
+GHOST_WISPR_JABRA_MUTE_BUTTON=false
 EOF
 provisioner_function render_models_env "$deployed_env" >"$models_env" \
   || fail 'the .env renderer rejected a deployed .env'
 assert_line 'GHOST_WISPR_ADDR=127.0.0.1:8080' "$models_env"
 assert_line 'GHOST_WISPR_DEEPGRAM_API_KEY=test-key' "$models_env"
+assert_line 'GHOST_WISPR_JABRA_MUTE_BUTTON=false' "$models_env"
+assert_count '^GHOST_WISPR_JABRA_MUTE_BUTTON=' 1 "$models_env"
 assert_line 'GHOST_WISPR_EMBEDDING_LOCATION=global' "$models_env"
 assert_count '^GHOST_WISPR_EMBEDDING_LOCATION=' 1 "$models_env"
 assert_count 'stale-signing-key' 0 "$models_env"

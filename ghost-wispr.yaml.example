@@ -22,6 +22,16 @@ silence_timeout: 30s
 # sessions under it.
 # public_url: https://ghost-wispr.example.ts.net
 
+# The rules people in the room agree to. The web UI shows a Recording rules button when there is
+# at least one, and its dialog shows each rule as written, as plain text. With none, there is no
+# button. GHOST_WISPR_RECORDING_RULES overrides the list with a JSON list of strings; a settings
+# save in the web UI then writes the override's rules into this file, where they stay after the
+# variable is removed.
+# recording_rules:
+#   - Say so before the meeting if you do not want it recorded.
+#   - Anyone can pause the recorder, at any time.
+#   - Ask the office manager to delete a segment.
+
 # Microphone — preferred sample rate tried first, then alternatives
 mic_sample_rate: 16000
 mic_sample_rates: [48000, 44100, 32000, 24000]
@@ -49,10 +59,11 @@ summarization:
 # gdrive_sync_enabled: false
 
 # Envoy webhook (optional). Posts are signed with the key Ghost Wispr reads from Secret Manager,
-# the secret version below, with google_credentials_file; it reads the key again on a 401.
+# the secret version below, with google_credentials_file; it reads the key again on a 401. The
+# secret version has no default: with Envoy enabled and none named, no event is sent.
 # envoy_enabled: false
 # envoy_webhook_url: https://relay.example.test/webhook/ghostwispr
-# envoy_webhook_secret_name: projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest
+# envoy_webhook_secret_name: projects/example-project/secrets/example-signing-secret/versions/latest
 
 # Garbage collection
 # gc_enabled: false

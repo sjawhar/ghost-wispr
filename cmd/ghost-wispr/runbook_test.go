@@ -42,3 +42,91 @@ func TestRunbookSaysWhatToDoWhenDeleteWaitsForDrive(t *testing.T) {
 		}
 	}
 }
+
+// TestRunbookOrdersARolloutThatAddsAConfigKey fails if the runbook does not
+// give the order for a release that reads a new key from the Pi's config:
+// install the template with the models step just before the merge, merge,
+// run update.sh by hand once the release is published, then check GET
+// /api/config. It also fails if the runbook does not say why: the nightly
+// update replaces only the binary, and a settings save of the old binary
+// drops a key that binary does not know. And it fails if a step can fail
+// without anyone noticing: the runbook must say where the shared-drive ID
+// comes from, to save no settings until the check, that update.sh is done
+// only when it says it installed the commit and does nothing during an active
+// session, what to do when the check fails, and that restarts end a meeting.
+func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
+	section := runbookSection(t, "## Roll out a release that adds a config key")
+	rest := section
+	for _, step := range []string{"1. Just before you merge", "provision.sh --models", "2. Merge", "3. As soon as", "update.sh", "4. Check", "/api/config"} {
+		_, after, found := strings.Cut(rest, step)
+		if !found {
+			t.Fatalf("the runbook's rollout order is missing %q, or has it out of order: %s", step, section)
+		}
+		rest = after
+	}
+	for _, why := range []string{"replaces only the binary", "drops"} {
+		if !strings.Contains(section, why) {
+			t.Errorf("the runbook's rollout order does not say why: no %q", why)
+		}
+	}
+	for _, safeguard := range []string{"gdrive_folder_id", "Save no settings", "installed commit", "active session", "models step again", "outside meetings", "only the full provisioner installs"} {
+		if !strings.Contains(section, safeguard) {
+			t.Errorf("the runbook's rollout order does not say %q", safeguard)
+		}
+	}
+}
+
+// TestRunbookRolloutKeepsTheJabraOverride fails if the rollout order does not
+// say what its steps do to a setting the office Pi holds in .env rather than
+// in its YAML, the Jabra Mute button (GHOST_WISPR_JABRA_MUTE_BUTTON): the
+// models step keeps that line as it is, the full provisioner rewrites .env and
+// the template's jabra_mute_button: false applies, and the button stays off
+// until a person's real taps pass the checks of "Pause and resume at the unit"
+// on the office Pi, whose step 6 checks the fix of defect D9, and until the
+// follow-up fix for a microphone that opens before the recording light reads
+// red has merged. It also fails if the rollout writes or checks for the button
+// turned on: these steps restart the recorder.
+func TestRunbookRolloutKeepsTheJabraOverride(t *testing.T) {
+	section := runbookSection(t, "## Roll out a release that adds a config key")
+	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "jabra_mute_button: false", "keeps every `.env` line", "rewrites `.env`", "D9", `"Pause and resume at the unit"`, "real taps", "before the recording light reads red"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's rollout order does not say %q", words)
+		}
+	}
+	for _, on := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON=true", "jabra_mute_button: true"} {
+		if strings.Contains(section, on) {
+			t.Errorf("the runbook's rollout order turns the Jabra's Mute button on: %q", on)
+		}
+	}
+}
+
+// TestTheJabraButtonStaysOffUntilTheTapChecksPass fails if the rollout order,
+// "Pause and resume at the unit" or the office Pi's template keeps the Jabra's
+// Mute button off "until the D9 fix ships": #75, the fix, is in the tree, so a
+// reader would take that as met and turn the button on. Each must name the two
+// conditions a reader can check: a person's real taps passing the checks of
+// "Pause and resume at the unit" on the office Pi, and the merge of the fix
+// for the microphone that opens before the recording light reads red.
+func TestTheJabraButtonStaysOffUntilTheTapChecksPass(t *testing.T) {
+	template, err := os.ReadFile(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
+	if err != nil {
+		t.Fatalf("read the Pi's config template: %v", err)
+	}
+	for name, text := range map[string]string{
+		"the rollout order":              runbookSection(t, "## Roll out a release that adds a config key"),
+		`"Pause and resume at the unit"`: runbookSection(t, "## Pause and resume at the unit"),
+		"the Pi's config template":       strings.Join(strings.Fields(string(template)), " "),
+	} {
+		text = strings.ReplaceAll(text, "# ", "")
+		for _, condition := range []string{"real taps", "before the recording light reads red"} {
+			if !strings.Contains(text, condition) {
+				t.Errorf("%s does not keep the Jabra's button off until %q is dealt with", name, condition)
+			}
+		}
+		for _, stale := range []string{"D9 fix ships", "fix of defect D9 ships", "D9 fix has shipped", "before the D9 fix"} {
+			if strings.Contains(text, stale) {
+				t.Errorf("%s still waits for %q, which #75 already is", name, stale)
+			}
+		}
+	}
+}

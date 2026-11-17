@@ -15,8 +15,10 @@ func TestDefaults_EnvoyConfig(t *testing.T) {
 	if cfg.EnvoyWebhookURL != "" {
 		t.Fatalf("expected no default webhook URL, got %q", cfg.EnvoyWebhookURL)
 	}
-	if cfg.EnvoyWebhookSecretName != "projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest" {
-		t.Fatalf("default signing key secret = %q, want the office recorder's", cfg.EnvoyWebhookSecretName)
+	// The repository is public: no deployment's Secret Manager version is a
+	// default. The office Pi's config names its own.
+	if cfg.EnvoyWebhookSecretName != "" {
+		t.Fatalf("default signing key secret = %q, want none", cfg.EnvoyWebhookSecretName)
 	}
 }
 
@@ -43,12 +45,12 @@ func TestEnvoySigningKeySecretIsNamedNotHeld(t *testing.T) {
 	}
 
 	clearEnv(t)
-	cfg, _, err = Load(writeConfig(t, "envoy_webhook_secret_name: \"\"\n"))
+	cfg, _, err = Load(writeConfig(t, "envoy_webhook_secret_name: \" \"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.EnvoyWebhookSecretName != defaults().EnvoyWebhookSecretName {
-		t.Fatalf("an empty envoy_webhook_secret_name loaded as %q, want the default", cfg.EnvoyWebhookSecretName)
+	if cfg.EnvoyWebhookSecretName != "" {
+		t.Fatalf("a blank envoy_webhook_secret_name loaded as %q, want none", cfg.EnvoyWebhookSecretName)
 	}
 }
 
@@ -91,6 +93,20 @@ func TestEnvoyEnabledWarnings(t *testing.T) {
 		}
 		if !strings.Contains(strings.Join(warnings, "\n"), EnvPrefix+"ENVOY_WEBHOOK_URL") {
 			t.Fatalf("warnings %q do not name the missing webhook URL", warnings)
+		}
+	})
+
+	t.Run("missing signing key secret", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
+		t.Setenv(EnvPrefix+"ENVOY_WEBHOOK_URL", "https://relay.example.test/webhook/ghostwispr")
+
+		_, warnings, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !strings.Contains(strings.Join(warnings, "\n"), EnvPrefix+"ENVOY_WEBHOOK_SECRET_NAME") {
+			t.Fatalf("warnings %q do not name the missing signing key secret", warnings)
 		}
 	})
 

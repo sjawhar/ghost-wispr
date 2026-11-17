@@ -2,7 +2,14 @@
 # Exercise the slice 2 acceptance checks from an operator machine on the tailnet.
 set -uo pipefail
 
-host=${GHOST_WISPR_HOST:-ghost-wispr.tail12ec1c.ts.net}
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# The office Pi's deployment settings (PI_HOST, PI_GCP_PROJECT, PI_SERVICE_ACCOUNT, PI_DRIVE_OWNER,
+# PI_NATS_SERVER); GHOST_WISPR_PI_ENV names another file, as the tests do.
+pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
+# shellcheck source=files/pi.env
+source "$pi_env" || { printf 'cannot read the Pi deployment settings in %s\n' "$pi_env" >&2; exit 1; }
+host=${GHOST_WISPR_HOST:-$PI_HOST}
 self_test=false
 drive_members_file=
 readers_group=
@@ -12,8 +19,8 @@ readonly service_account_key_body_pattern='"private_key"[[:space:]]*:[[:space:]]
 readonly credential_path=/opt/ghost-wispr/google-credentials.json
 readonly expected_certificate_config=/opt/ghost-wispr/certificate_config.json
 readonly deployed_config=/opt/ghost-wispr/ghost-wispr.yaml
-readonly service_account=ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com
-readonly drive_owner=sami@theorem.dev
+readonly service_account=$PI_SERVICE_ACCOUNT
+readonly drive_owner=$PI_DRIVE_OWNER
 readonly cert_test_port=8081
 readonly summarization_model=gemini/gemini-4-carbon
 readonly summary_provider_model=gemini-4-carbon
@@ -29,7 +36,7 @@ expected_config_lines=(
   "summarization.model: $summarization_model"
   "embedding_model: gemini/$embedding_model"
   'genai_backend: vertex'
-  'gcp_project: theorem-agent-infra'
+  "gcp_project: $PI_GCP_PROJECT"
   'gcp_location: global'
   'tts_provider: gemini'
   "tts_model: $tts_model"
@@ -208,7 +215,7 @@ expected_running_models=(
   "summarization=$summarization_model"
   "embedding=gemini/$embedding_model"
   'genai_backend=vertex'
-  'gcp_project=theorem-agent-infra'
+  "gcp_project=$PI_GCP_PROJECT"
   'gcp_location=global'
   'tts_provider=gemini'
   "tts=$tts_model"
@@ -508,7 +515,7 @@ service_embedding_location() {
 
 start_nats_subscriber() {
   [[ -z "$nats_pid" ]] || return 0
-  nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222 >"$nats_log" 2>&1 &
+  nats sub 'notifications.ghostwispr.>' --server "$PI_NATS_SERVER" >"$nats_log" 2>&1 &
   nats_pid=$!
   sleep 1
   if ! kill -0 "$nats_pid" 2>/dev/null; then
@@ -816,7 +823,7 @@ run_a10() {
       printf 'A10 FAILED: the shared drive members are not as approved\n' >&2
       return 1
     }
-    printf 'A10 RAN: only the service account and Sami are organizers, and %s is the only reader.\n' "$readers_group"
+    printf 'A10 RAN: only %s and %s are organizers, and %s is the only reader.\n' "$service_account" "$drive_owner" "$readers_group"
     return 0
   fi
   printf 'A10 NEEDS-PERSON: rerun with --drive-members FILE and --readers-group EMAIL from Task 2.4; as a readers-group member who is not a Manager, read a folder and confirm upload fails.\n'
@@ -968,7 +975,7 @@ run_self_test() (
     fail 'A8 self-test accepted warnings that are not an array'
   fi
   assert_no_warnings '{"warnings":[]}' || fail 'A8 self-test rejected a warning-free status'
-  good_config=$(cat <<'EOF'
+  good_config=$(cat <<EOF
 deepgram_model: nova-3
 batch_transcription:
   provider: deepgram
@@ -977,7 +984,7 @@ summarization:
   model: gemini/gemini-4-carbon
 embedding_model: gemini/gemini-embedding-2
 genai_backend: vertex
-gcp_project: theorem-agent-infra
+gcp_project: $PI_GCP_PROJECT
 gcp_location: global
 tts_provider: gemini
 tts_model: gemini-3.8-flash-tts
@@ -997,7 +1004,7 @@ EOF
     fail 'A8 self-test accepted swapped batch and summarization models'
   fi
   local good_running_config
-  good_running_config='{"summarization":{"model":"gemini/gemini-4-carbon"},"models":{"live_transcription":"nova-3","batch_transcription_provider":"deepgram","batch_transcription":"nova-3","summarization":"gemini/gemini-4-carbon","embedding":"gemini/gemini-embedding-2","genai_backend":"vertex","gcp_project":"theorem-agent-infra","gcp_location":"global","tts_provider":"gemini","tts":"gemini-3.8-flash-tts","tts_voice":"Kore"}}'
+  good_running_config=$(jq -cn --arg project "$PI_GCP_PROJECT" '{"summarization":{"model":"gemini/gemini-4-carbon"},"models":{"live_transcription":"nova-3","batch_transcription_provider":"deepgram","batch_transcription":"nova-3","summarization":"gemini/gemini-4-carbon","embedding":"gemini/gemini-embedding-2","genai_backend":"vertex","gcp_project":$project,"gcp_location":"global","tts_provider":"gemini","tts":"gemini-3.8-flash-tts","tts_voice":"Kore"}}')
   assert_running_models "$good_running_config" || fail 'A8 self-test rejected the running models of the plan'
   for drift in '.models.summarization = "gemini/gemini-2.5-flash"' '.models.embedding = "gemini/gemini-embedding-001"' \
     '.models.live_transcription = "nova-2"' '.models.batch_transcription = "whisper-1"' '.models.tts_voice = "Charon"' \
@@ -1162,26 +1169,28 @@ EOF
   printf 'A8 self-test RAN: every role is compared with the model the running process reports\n'
   printf 'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run\n'
 
-  if assert_drive_members $'sami@theorem.dev|organizer\nreaders@theorem.dev|reader' readers@theorem.dev 2>/dev/null; then
+  # The member lists name the configured organizers (service_account and drive_owner), so the
+  # self-test runs on any deployment's settings.
+  if assert_drive_members "$(printf '%s\n' "$drive_owner|organizer" 'readers@example.com|reader')" readers@example.com 2>/dev/null; then
     fail 'A10 self-test accepted a member list without the service account as organizer'
   fi
-  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer\nreaders@theorem.dev|reader\nextra@theorem.dev|writer' readers@theorem.dev 2>/dev/null; then
+  if assert_drive_members "$(printf '%s\n' "$service_account|organizer" "$drive_owner|organizer" 'readers@example.com|reader' 'extra@example.com|writer')" readers@example.com 2>/dev/null; then
     fail 'A10 self-test accepted an unapproved writer'
   fi
-  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer\noutside@example.com|reader' readers@theorem.dev 2>/dev/null; then
+  if assert_drive_members "$(printf '%s\n' "$service_account|organizer" "$drive_owner|organizer" 'outside@example.com|reader')" readers@example.com 2>/dev/null; then
     fail 'A10 self-test accepted a reader other than the approved group'
   fi
-  if assert_drive_members $'ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nsami@theorem.dev|organizer' readers@theorem.dev 2>/dev/null; then
+  if assert_drive_members "$(printf '%s\n' "$service_account|organizer" "$drive_owner|organizer")" readers@example.com 2>/dev/null; then
     fail 'A10 self-test accepted a member list without a reader'
   fi
-  assert_drive_members $'# Task 2.4 members\nghost-wispr@theorem-agent-infra.iam.gserviceaccount.com|organizer\nSami@theorem.dev | organizer\nreaders@theorem.dev|reader' readers@theorem.dev \
+  assert_drive_members "$(printf '%s\n' '# Task 2.4 members' "$service_account|organizer" "${drive_owner^} | organizer" 'readers@example.com|reader')" readers@example.com \
     || fail 'A10 self-test rejected the expected member roles'
   printf 'A10 self-test RAN: planted failure rejected\n'
 
   if assert_certificate_warning '{"warnings":["Vertex unavailable"]}'; then
     fail 'Cert-warning self-test accepted a status with no certificate warning'
   fi
-  assert_certificate_warning '{"warnings":["Google credential certificate expires on 2026-11-21; install the latest version of Secret Manager secret ghost-wispr-device-certificate with the runbook in docs/pi-setup.md, \"Renew the X.509 certificate\"."]}' \
+  assert_certificate_warning '{"warnings":["Google credential certificate expires on 2026-11-21; renew it with the runbook in docs/pi-setup.md, \"Renew the X.509 certificate\"."]}' \
     || fail 'Cert-warning self-test rejected a certificate-expiry warning'
   printf 'Cert-warning self-test RAN: planted failure rejected\n'
 

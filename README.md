@@ -97,23 +97,35 @@ Settings live in `ghost-wispr.yaml` (see `ghost-wispr.yaml.example`). Environmen
 | `GHOST_WISPR_MIC_SAMPLE_RATES` | No | `48000,44100,32000,24000` | Fallback sample rates to try |
 | `GHOST_WISPR_GDRIVE_FOLDER_ID` | No | — | Google Drive folder for audio sync |
 | `GHOST_WISPR_PUBLIC_URL` | No | — | The unit's own HTTPS address (`public_url`), such as its tailnet name: pages there may use the API, and Envoy events link to sessions under it |
+| `GHOST_WISPR_RECORDING_RULES` | No | — | The rules the web UI shows under Recording rules (`recording_rules`), as a JSON list of strings. A settings save writes them into `ghost-wispr.yaml`, where they stay after the variable is removed |
 | `google_credentials_file` | No | — | Authoritative Google credential file; when empty, Application Default Credentials are used |
 
 `ghost-wispr google-id-token --audience URL` mints an ID token from this credential file. Use `--credentials PATH` to override it for one command.
 
-## Consent rule
+## Recording rules
 
-Record only while the light is on. Anyone may pause it at any time without a reason.
-Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.
+`recording_rules` in `ghost-wispr.yaml` lists the rules that people in the room agree to. When
+the list has a rule, the web UI shows a Recording rules button in its header. Its dialog shows
+each rule as written, as plain text, and tells people how to pause the recorder and how to have a
+segment deleted. With no rules, the page shows no button. `GET /api/config` returns the list as
+`recording_rules`.
 
-With `indicator_light: blink1` the recorder keeps the first rule itself: it captures only while
-the blink(1) reads back red. With the light missing, or not reading back red, it starts no
-microphone and refuses a resume; if the light fails while it records, capture stops within one
-check (a second) without saving a pause. `/api/status` then names the cause in a warning and
-reports `capture_state` `light_unavailable`, and capture comes back once the light reads back red
-again, unless someone paused it meanwhile. Any other value of `indicator_light` stops the
-recorder from starting, so a typo cannot turn the light check off; leave it unset for a recorder
-with no light.
+```yaml
+recording_rules:
+  - Say so before the meeting if you do not want it recorded.
+  - Anyone can pause the recorder, at any time.
+  - Ask the office manager to delete a segment.
+```
+
+## Recording light
+
+With `indicator_light: blink1` the recorder captures only while the blink(1) reads back red.
+With the light missing, or not reading back red, it starts no microphone and refuses a resume;
+if the light fails while it records, capture stops within one check (a second) without saving a
+pause. `/api/status` then names the cause in a warning and reports `capture_state`
+`light_unavailable`, and capture comes back once the light reads back red again, unless someone
+paused it meanwhile. Any other value of `indicator_light` stops the recorder from starting, so a
+typo cannot turn the light check off; leave it unset for a recorder with no light.
 
 ## Deployment
 
@@ -155,8 +167,9 @@ read the text, fetch `session_url`, which returns what is left after any deletio
 
 Each event is signed with Envoy's webhook signing key, which Ghost Wispr reads from Google Secret
 Manager with its Google credential (`google_credentials_file`): the secret version
-`envoy_webhook_secret_name` (`GHOST_WISPR_ENVOY_WEBHOOK_SECRET_NAME`), by default
-`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`. It keeps
+`envoy_webhook_secret_name` (`GHOST_WISPR_ENVOY_WEBHOOK_SECRET_NAME`), such as
+`projects/example-project/secrets/example-signing-secret/versions/latest`. It has no default:
+with Envoy enabled and no secret named, Ghost Wispr sends no event and warns at startup. It keeps
 the key in memory and reads it again once when Envoy answers 401, so a rotated key needs no
 change on the unit. While the key cannot be read, no event is sent and `/api/status` warns. The
 five-minute sweep reads the key again, so the warning clears within five minutes of the key

@@ -12,6 +12,8 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly driver="$repo_root/deploy/pi/accept-slice1.sh"
+# The driver reads neutral deployment settings, not the office Pi's.
+export GHOST_WISPR_PI_ENV="$repo_root/deploy/pi/test-pi.env"
 
 fail() {
   printf 'slice 1 acceptance test FAILED: %s\n' "$*" >&2

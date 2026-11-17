@@ -39,6 +39,8 @@
     startSession,
     stopCurrentSession,
   } from './lib/api'
+  import { fetchConfig } from './lib/config-api'
+  import { configState, setConfig } from './lib/config.svelte'
   import { connect, disconnect } from './lib/ws.svelte'
 
   let expandedSessionId = $state('')
@@ -137,10 +139,23 @@
     await refreshSessionList(sessionIds)
   }
 
+  // The configuration, with the recording rules, loads apart from the page's
+  // other requests, and a failed load is tried again with each status poll,
+  // so one request that fails while the unit restarts does not hide the rules
+  // until a reload.
+  async function loadConfig(): Promise<void> {
+    try {
+      setConfig(await fetchConfig())
+    } catch {
+      // The next status poll tries again.
+    }
+  }
+
   onMount(() => {
     connect()
 
     let mounted = true
+    void loadConfig()
     const bootstrap = async () => {
       try {
         const [status, dates, presets] = await Promise.all([
@@ -198,6 +213,9 @@
     void bootstrap()
 
     const refreshTimer = setInterval(() => {
+      if (configState.config === null) {
+        void loadConfig()
+      }
       void fetchStatus()
         .then((status) => {
           setPaused(status.paused)
@@ -230,7 +248,7 @@
       <p class="subtitle">Live capture first, session memory second.</p>
     </div>
     <div class="header-actions">
-      <ConsentRule />
+      <ConsentRule rules={configState.config?.recording_rules ?? []} />
       <Controls
         connected={appState.connected}
         paused={appState.paused}

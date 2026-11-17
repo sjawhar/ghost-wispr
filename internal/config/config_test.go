@@ -21,7 +21,7 @@ func clearEnv(t *testing.T) {
 		"GCP_PROJECT", "GCP_LOCATION", "GENAI_BACKEND",
 		"BATCH_TRANSCRIPTION_PROVIDER", "BATCH_TRANSCRIPTION_MODEL",
 		"GDRIVE_SYNC_ENABLED", "GC_ENABLED", "GC_MAX_AGE_DAYS", "GC_MAX_AUDIO_SIZE_MB",
-		"INDICATOR_LIGHT", "POWER_BUTTON", "JABRA_MUTE_BUTTON", "PUBLIC_URL",
+		"INDICATOR_LIGHT", "POWER_BUTTON", "JABRA_MUTE_BUTTON", "PUBLIC_URL", "RECORDING_RULES",
 		"ENVOY_ENABLED", "ENVOY_WEBHOOK_URL", "ENVOY_WEBHOOK_SECRET", "ENVOY_WEBHOOK_SECRET_NAME",
 		"TTS_PROVIDER", "TTS_MODEL", "TTS_VOICE", "TTS_MAX_LENGTH",
 		"DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "CONFIG",
@@ -398,7 +398,7 @@ summarization:
 func TestGeminiTTSConfigurationLoadsModelAndVoice(t *testing.T) {
 	clearEnv(t)
 	configPath := writeConfig(t, `
-gcp_project: theorem-agent-infra
+gcp_project: example-project
 tts_provider: gemini
 tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
@@ -481,7 +481,7 @@ func TestConfigDoesNotNeedProjectIDInAnExternalAccountFile(t *testing.T) {
 	}
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credentialsPath)
 	t.Setenv(EnvPrefix+"GENAI_BACKEND", "vertex")
-	t.Setenv(EnvPrefix+"GCP_PROJECT", "theorem-agent-infra")
+	t.Setenv(EnvPrefix+"GCP_PROJECT", "example-project")
 
 	_, warnings, err := Load("")
 	if err != nil {

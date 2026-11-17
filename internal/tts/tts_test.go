@@ -581,7 +581,7 @@ func TestGoogle_Name(t *testing.T) {
 
 func TestGemini_Synthesize_SendsConfiguredVertexRequest(t *testing.T) {
 	const (
-		project       = "theorem-agent-infra"
+		project       = "example-project"
 		model         = "gemini-3.8-flash-tts"
 		providerModel = "provider-tts-model"
 		voice         = "Kore"

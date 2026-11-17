@@ -4,6 +4,12 @@ silence_timeout: 300s
 # The address tailscale serve publishes (provision.sh TAILSCALE_HOSTNAME): the web UI accepts
 # requests from pages there, and Envoy events link to sessions under it.
 public_url: https://ghost-wispr.tail12ec1c.ts.net
+# The office's recording rules: the web UI shows each under Recording rules, as written here.
+recording_rules:
+  - Record only while the light is on.
+  - Anyone may pause it at any time without a reason.
+  - Transcripts are readable by Theorem staff only.
+  - A person can ask for a segment to be deleted.
 deepgram_model: nova-3
 batch_transcription:
   provider: deepgram
@@ -28,6 +34,15 @@ tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
 indicator_light: blink1
 power_button: true
-jabra_mute_button: true
+# The Jabra's Mute button (docs/pi-setup.md, "Pause and resume at the unit") stays off until a
+# person's real taps pass that section's checks on the office Pi, and until the follow-up fix for
+# a microphone that opens before the recording light reads red has merged. The checks' step 6
+# checks the fix of defect D9 (#75): before it, a restart of a paused unit could resume recording
+# by itself, because the Jabra sends a mute-key press as the old process closes its microphone.
+# The office Pi's .env also holds GHOST_WISPR_JABRA_MUTE_BUTTON=false, which overrides this line;
+# a full provisioner run rewrites .env and leaves only this one. Turn this line on only after both.
+jabra_mute_button: false
 envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__
+# The Secret Manager version of Envoy's webhook signing key; Ghost Wispr has no default for it.
+envoy_webhook_secret_name: projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest

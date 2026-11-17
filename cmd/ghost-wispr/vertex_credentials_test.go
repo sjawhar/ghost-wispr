@@ -44,7 +44,7 @@ func vertexTestConfig(t *testing.T) *config.Config {
 	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 	t.Setenv("GHOST_WISPR_EMBEDDING_BACKEND", "")
 	t.Setenv("GHOST_WISPR_GENAI_BACKEND", "vertex")
-	return &config.Config{GoogleCredentialsFile: credentialPath, GenAIBackend: "vertex", GCPProject: "theorem-agent-infra", GCPLocation: "global"}
+	return &config.Config{GoogleCredentialsFile: credentialPath, GenAIBackend: "vertex", GCPProject: "example-project", GCPLocation: "global"}
 }
 
 func (r *vertexRequestRecorder) assertAuthorized(t *testing.T) {

@@ -25,7 +25,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/secrets"
 )
 
-const testSigningSecret = "projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest"
+const testSigningSecret = "projects/example-project/secrets/example-signing-secret/versions/latest"
 
 // secretManagerDenial is Secret Manager's answer to an identity that has no
 // Secret Accessor role on the secret.
@@ -282,6 +282,23 @@ func TestTheEnvoyFakeRefusesAPostWithoutGhostWisprHeaders(t *testing.T) {
 				t.Fatalf("listener stored %d events, want %d", listener.accepted(), wantStored)
 			}
 		})
+	}
+}
+
+// TestEnvoyWithNoSigningSecretNameSendsNothing fails if a config that names no
+// signing key secret builds a publisher: it would ask Secret Manager for a
+// secret with no name. Envoy stays off, as with no webhook URL, and the
+// startup warning names the missing setting.
+func TestEnvoyWithNoSigningSecretNameSendsNothing(t *testing.T) {
+	listener := signedListener(t, "unused")
+	publishing, _ := testEnvoyPublishing(t, fakeSecretManager(t, "unused", http.StatusOK, false))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := envoyConfig(listener.URL)
+	cfg.EnvoyWebhookSecretName = ""
+	publishing.configure(ctx, cfg, discardLogger)
+	if publishing.current.Load() != nil {
+		t.Fatal("a config with no envoy_webhook_secret_name built an Envoy publisher")
 	}
 }
 

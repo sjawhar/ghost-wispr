@@ -8,8 +8,8 @@
 #   --broker-host HOST make the read on HOST over SSH, for a machine whose secret-run has a
 #                      secrets-broker identity when this one has none.
 #   --broker-key KEY   read broker key KEY, which holds a copy of the secret. Without it the read is
-#                      Secret Manager envoy-ghostwispr-signing-secret through gcloud-broker, as the
-#                      admin login that broker key GCLOUD_SAMI mints.
+#                      Secret Manager's PI_WEBHOOK_SECRET in PI_GCP_PROJECT (the Pi's deployment
+#                      settings) through gcloud-broker, as the admin login GCLOUD_SAMI mints.
 #   --reason TEXT      what the broker page shows Sami as the reason.
 #
 # The read runs under one secrets-broker grant of one hour that Sami approves on the broker page
@@ -19,8 +19,14 @@
 # and the secret is never an argument.
 set -euo pipefail
 
-readonly WEBHOOK_SECRET_ID=envoy-ghostwispr-signing-secret
-readonly GCP_PROJECT=theorem-agent-infra
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# The office Pi's deployment settings; GHOST_WISPR_PI_ENV names another file, as the tests do.
+pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
+# shellcheck source=files/pi.env
+source "$pi_env" || { printf 'webhook-secret: cannot read the Pi deployment settings in %s\n' "$pi_env" >&2; exit 1; }
+readonly WEBHOOK_SECRET_ID=$PI_WEBHOOK_SECRET
+readonly GCP_PROJECT=$PI_GCP_PROJECT
 
 fail() {
   printf 'webhook-secret: %s\n' "$*" >&2

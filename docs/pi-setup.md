@@ -89,14 +89,17 @@ ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
 ```
 
 Give the resulting certificate-signing request to the `bootstrap` apply. After the apply,
-create the Google external-account credential files on a development machine, never on the Pi:
+create the Google external-account credential files on a development machine, never on the Pi,
+from a Ghost Wispr checkout. This block and the others the test `provision_bundle_test.sh` runs
+read the Pi's project, identities and resource names from `deploy/pi/files/pi.env`:
 
 <!-- provision_bundle_test.sh: credentials -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
 d=$(mktemp -d)
 gcloud iam workload-identity-pools create-cred-config \
-  projects/805240912354/locations/global/workloadIdentityPools/ghost-wispr/providers/ghost-wispr \
-  --service-account=ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com \
+  "$PI_WORKLOAD_PROVIDER" \
+  --service-account="$PI_SERVICE_ACCOUNT" \
   --credential-cert-path=/opt/ghost-wispr/device.crt \
   --credential-cert-private-key-path=/home/ghost-wispr/.config/ghost-wispr-identity/key.pem \
   --credential-cert-configuration-output-file="$d/certificate_config.json" \
@@ -122,16 +125,18 @@ join passes the same path with `ghost-wispr google-id-token --credentials`; it d
 Ghost Wispr warns on its status page when the certificate has fewer than 30 days left, or when it
 cannot read the certificate. The `bootstrap` apply renews the certificate and publishes it as the
 latest version of Secret Manager secret `ghost-wispr-device-certificate`; the Pi private key stays
-where it is. Apply `bootstrap` through its normal reviewed CI route. Then read the new certificate
-on a development machine whose `gcloud` is the devbox identity (the reader `bootstrap/README.md`
-names), check it, install it on the Pi and restart Ghost Wispr:
+where it is. Apply `bootstrap` through its normal reviewed CI route. Then, from a Ghost Wispr
+checkout on a development machine whose `gcloud` is the devbox identity (the reader
+`bootstrap/README.md` names), read the new certificate, check it, install it on the Pi and restart
+Ghost Wispr:
 
 <!-- provision_bundle_test.sh: renew -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
 crt=$(mktemp) &&
-gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$crt" &&
+gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$crt" &&
 openssl x509 -in "$crt" -noout -subject -enddate &&
-ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net \
+ssh "ghost-wispr@$PI_HOST" \
   'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service' <"$crt"
 rm -f -- "$crt"
 ```
@@ -157,8 +162,9 @@ The credential bundle holds six public files and one secret:
 
 The Envoy webhook signing key is not in the bundle, and `provision.sh` refuses a bundle that
 holds an `envoy-webhook-secret` file. Ghost Wispr reads the key from Secret Manager
-(`envoy_webhook_secret_name`, by default
-`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`) and keeps
+(`envoy_webhook_secret_name`, which `deploy/pi/files/ghost-wispr.yaml` sets to
+`projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest`; Ghost
+Wispr has no default for it) and keeps
 it in memory. When Envoy answers 401 it reads the key again once, so a rotation needs no change on
 the Pi. When it cannot read the key it sends no events and `/api/status` says so; recording goes on.
 It reads the key again every five minutes, so the warning clears within five minutes of the key
@@ -190,15 +196,16 @@ the time you run the block:
 
 <!-- provision_bundle_test.sh: prepare -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
 prepared=$(mktemp -d)
-gcloud secrets versions access latest --secret=ghost-wispr-device-certificate --project=theorem-agent-infra >"$prepared/device.crt"
+gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$prepared/device.crt"
 openssl x509 -in "$prepared/device.crt" -noout -subject -enddate
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
-git -C ~/src/agent-infra fetch --quiet origin main
-git -C ~/src/agent-infra show origin/main:root/Pulumi.prod.yaml \
-  | sed -n 's/^  agent-infra-root:ghostWisprAccountUniqueId: "\{0,1\}\([0-9][0-9]*\)"\{0,1\}$/\1/p' >"$prepared/tailscale-subject"
+git -C "$PI_INFRA_CHECKOUT" fetch --quiet origin main
+git -C "$PI_INFRA_CHECKOUT" show "origin/main:$PI_SUBJECT_FILE" \
+  | sed -n "s/^  $PI_SUBJECT_KEY: \"\{0,1\}\([0-9][0-9]*\)\"\{0,1\}\$/\1/p" >"$prepared/tailscale-subject"
 deploy/pi/tailnet-client-id.sh >"$prepared/tailscale-client-id"
-relay=$(gcloud run services list --project=theorem-agent-infra --filter='metadata.name ~ ^envoy-webhook-relay-' --format='value(status.url)')
+relay=$(gcloud run services list --project="$PI_GCP_PROJECT" --filter="metadata.name ~ ^$PI_RELAY_SERVICE_PREFIX" --format='value(status.url)')
 printf '%s/webhook/ghostwispr\n' "$relay" >"$prepared/envoy-webhook-url"
 head "$prepared/tailscale-subject" "$prepared/tailscale-client-id" "$prepared/envoy-webhook-url"
 rm -rf -- "$d"
@@ -225,8 +232,10 @@ machine that reaches the Pi over SSH.
 
 `provision.sh` runs as `ghost-wispr` with passwordless sudo. It installs `libportaudio2`,
 `ffmpeg`, `lame`, `jq`, and `curl`; copies the release runtime to `/opt/ghost-wispr`; installs
-the user services; verifies and installs the newest release; enables Tailscale Serve; and then
-starts the detached tagged-device join.
+the user services; verifies and installs the newest release; restarts a running recorder so it
+reads the configuration it installed; enables Tailscale Serve; and then starts the detached
+tagged-device join. The restart ends a conversation that is being recorded, so provision outside
+meetings.
 
 The Ghost Wispr user service starts only once the Pi's clock is synchronized. The Pi has no
 battery-backed clock, so at boot its clock is behind until a time server sets it, and a session
@@ -334,13 +343,20 @@ through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing set
 `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
 (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
-ships GC off so it never runs before sync is on.
+ships GC off so it never runs before sync is on. It also holds the office's four recording rules
+(`recording_rules`), which the web UI shows under Recording rules; both the full provisioner and
+the models step install them with the rest of the template.
 
 ## Pause and resume at the unit
 
-With `power_button: true` and `jabra_mute_button: true`, both set in
-`deploy/pi/files/ghost-wispr.yaml`, a short press of the Pi's power button and a tap of the Jabra
-Speak2 75's Mute button each pause recording, or resume it when it is paused. They change the
+With `power_button: true`, set in `deploy/pi/files/ghost-wispr.yaml`, a short press of the Pi's
+power button pauses recording, or resumes it when it is paused; with `jabra_mute_button` on, so
+does a tap of the Jabra Speak2 75's Mute button. The template keeps `jabra_mute_button: false`,
+and the office Pi's `.env` holds `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, until a person's real taps
+pass the checks at the end of this section on the office Pi, and until the follow-up fix for a
+microphone that opens before the recording light reads red has merged. Step 6 checks the fix of
+defect D9 (#75): before it, a restart of a paused unit could resume recording by itself, because
+the Jabra sends a mute-key press as the old process closes its microphone. The buttons change the
 same pause switch as the web page, `POST /api/pause` and `POST /api/resume`, so any of them
 resumes a pause made by any other, and a resume from a button checks the recording light as one
 from the web page does. A long press of the power button is left to the Pi, which powers off.
@@ -350,9 +366,10 @@ at its next `provision.sh` run, or its next `provision.sh --models` run, which a
 settings saved in the UI. To turn the Jabra's button on or off without either, put
 `GHOST_WISPR_JABRA_MUTE_BUTTON=true` or `GHOST_WISPR_JABRA_MUTE_BUTTON=false` in
 `/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. A full
-`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it off while
-recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
-light as it last set it.
+`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it on in `.env`
+only for the checks at the end of this section, and in the template only after they pass. Turn it
+off while recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the
+Jabra's light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
@@ -405,7 +422,9 @@ Mute, and takes LED Mute from the client. Jabra's
 [call-control SDK](https://sdk.jabra.com/javascript/docs/jabra-js/4.4.1/interfaces/ICallControl.html)
 says its `mute` "Mutes or unmutes the microphone of the Jabra device", and that it "Should only be
 used during a call". Ghost Wispr uses the Jabra outside a call, so what the Jabra does with the
-light is checked on the unit. After a deploy that changes these controls, with the web page open:
+light is checked on the unit. After a deploy that changes these controls, open the web page and
+turn the Jabra's button on with `GHOST_WISPR_JABRA_MUTE_BUTTON=true` in `/opt/ghost-wispr/.env` and
+a restart, as above. Then:
 
 1. While it records (the blink(1) red), tap the Jabra's Mute button. The blink(1) goes off, the
    Jabra's ring shows Muted (red), and the page shows the pause. Wait 70 seconds: the ring still
@@ -426,9 +445,11 @@ light is checked on the unit. After a deploy that changes these controls, with t
    `ghost-wispr` user. Recording stays paused, the blink(1) stays off, and the ring shows Muted.
 
 After each step the state stays as it is: nothing pauses or resumes by itself. If any step fails,
-turn the Jabra's button off with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above, and set
-`jabra_mute_button: false` in `deploy/pi/files/ghost-wispr.yaml` so a provisioning run does not
-turn it on again; the power button and the web page still pause and resume.
+turn the Jabra's button off again with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above; the template
+keeps `jabra_mute_button: false`, so a provisioning run leaves it off, and the power button and the
+web page still pause and resume. Only when every step passes, and the follow-up fix for a
+microphone that opens before the recording light reads red has merged, turn the button on in the
+template, in a pull request that also changes the deploy tests that keep it off.
 
 ## Restrict OpenSSH to loopback
 
@@ -472,6 +493,66 @@ ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user
 ssh ghost-wispr@ghost-wispr 'curl -fsS http://127.0.0.1:8080/api/version'
 ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user list-timers ghost-wispr-update.timer'
 ```
+
+## Roll out a release that adds a config key
+
+Follow this order for every release whose code reads a new key from
+`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules`, or needs a key that used to have a
+default, such as `envoy_webhook_secret_name`. The nightly update replaces only
+the binary: `update.sh` never writes the config, so a new binary that the timer installs starts
+on a config without the new key. The other order fails too: while the old binary runs on a config
+that has the key, a settings save drops the key, because the old binary writes back only the keys
+it knows.
+
+The models step restarts the recorder, and so does `update.sh` when it installs a release: a
+restart ends a conversation that is being recorded and turns the light off, so run these steps
+outside meetings. Save no settings in the web UI from step 1 until step 4 passes.
+
+A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
+files differently. The office Pi sets the Jabra's Mute button there, with
+`GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"); that line turns the button off
+until a person's real taps pass the checks of "Pause and resume at the unit", whose step 6 checks
+the fix of defect D9, and until the follow-up fix for a microphone that opens before the recording
+light reads red has merged. The models step keeps every `.env` line but an old Envoy signing key
+and the embedding location, which it writes again, so that line stays as it is. The full provisioner
+rewrites `.env` without it, and the template's `jabra_mute_button: false` applies. The button
+stays off either way. Leave the `.env` line as it is during the rollout, and turn the button on in
+neither file during the rollout: these steps restart the recorder.
+
+1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
+   the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
+   one the Pi has now, on the `gdrive_folder_id:` line of its config:
+
+   ```bash
+   ssh ghost-wispr@ghost-wispr "grep '^gdrive_folder_id:' /opt/ghost-wispr/ghost-wispr.yaml"
+   ```
+
+   When that line is missing or empty, the Pi never ran the models step, and `--models` would
+   turn Drive sync and GC on: run the full provisioner ("Provision") from the head instead. The
+   models step installs only the YAML and `.env`. When the release also changes a file that only
+   the full provisioner installs (a unit file, `wait-for-time-sync.sh`, `update.sh`), run the full
+   provisioner from the head instead; it keeps the shared drive. The running binary ignores the new
+   key, and either step restarts it on the new config.
+2. Merge the pull request. The release workflow publishes a release for the merge commit.
+3. As soon as that release is published, run `update.sh` by hand ("Update and inspect"). Do not
+   wait for the timer: until the new binary runs, a settings save drops the new key. The step is
+   done only when `update.sh` prints `installed commit <merge commit>` (or `already on commit
+   <merge commit>`, when the timer was first). During an active session it prints `active
+   session; leaving the current binary in place` and changes nothing: run it again once the
+   session has ended.
+4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
+   come back, and for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning. The
+   Jabra's Mute button must still be off: each line the `grep` prints ends in `false`.
+
+   ```bash
+   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/config | jq .recording_rules
+   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq .warnings
+   ssh ghost-wispr@ghost-wispr "grep -E '^(jabra_mute_button:|GHOST_WISPR_JABRA_MUTE_BUTTON=)' /opt/ghost-wispr/ghost-wispr.yaml /opt/ghost-wispr/.env"
+   ```
+
+   When they do not, the config lacks the key: step 1 was skipped, or a settings save dropped the
+   key before step 3. Run the models step again (or the full provisioner, as in step 1), from the
+   merge commit; the new binary keeps the key on a save. Then run A2 of "Accept slice 1".
 
 ## Recover a pending segment deletion
 
@@ -541,8 +622,9 @@ to run the read on a machine whose `secret-run` has a broker identity when this 
 
 <!-- provision_bundle_test.sh: accept -->
 ```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
 secret=$(deploy/pi/webhook-secret.sh ${broker_host:+--broker-host "$broker_host"} ${broker_key:+--broker-key "$broker_key"}) &&
-relay=$(gcloud run services list --project=theorem-agent-infra --filter='metadata.name ~ ^envoy-webhook-relay-' --format='value(status.url)') &&
+relay=$(gcloud run services list --project="$PI_GCP_PROJECT" --filter="metadata.name ~ ^$PI_RELAY_SERVICE_PREFIX" --format='value(status.url)') &&
 [[ $relay =~ ^https://[^[:space:]]+$ ]] &&
 GHOST_WISPR_RELAY_URL="$relay/webhook/ghostwispr" \
 GHOST_WISPR_ENVOY_WEBHOOK_SECRET="$secret" \
@@ -568,6 +650,11 @@ services. An empty inventory is UNKNOWN, not a pass. While it runs, a member dev
 subscribe with `nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222`
 and confirm the signed probe plus a real
 `session.started` and `session.ended` notification.
+
+A2 asks a person to open the unit's page and choose Recording rules. The page shows the rules
+under `recording_rules` in the Pi's config, `/opt/ghost-wispr/ghost-wispr.yaml`, which
+`provision.sh` renders from `deploy/pi/files/ghost-wispr.yaml`: each must appear verbatim and in
+order. A unit whose config has no rules shows no Recording rules button.
 
 ## Accept slice 2
 

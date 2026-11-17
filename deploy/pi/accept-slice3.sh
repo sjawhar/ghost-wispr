@@ -4,7 +4,14 @@
 # "Delete text and audio" on another (A11), and check what each deletion leaves behind.
 set -uo pipefail
 
-host=${GHOST_WISPR_HOST:-ghost-wispr.tail12ec1c.ts.net}
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# The office Pi's deployment settings (PI_HOST); GHOST_WISPR_PI_ENV names another file, as the
+# tests do.
+pi_env=${GHOST_WISPR_PI_ENV:-$script_dir/files/pi.env}
+# shellcheck source=files/pi.env
+source "$pi_env" || { printf 'cannot read the Pi deployment settings in %s\n' "$pi_env" >&2; exit 1; }
+host=${GHOST_WISPR_HOST:-$PI_HOST}
 self_test=false
 given_session=
 readonly deploy_dir=/opt/ghost-wispr

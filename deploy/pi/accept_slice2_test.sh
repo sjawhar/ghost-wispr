@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo_root
 driver="$repo_root/deploy/pi/accept-slice2.sh"
+# The driver, and each mutated copy of it, reads neutral deployment settings, not the office Pi's.
+export GHOST_WISPR_PI_ENV="$repo_root/deploy/pi/test-pi.env"
 
 fail() {
   printf 'slice 2 acceptance test: %s\n' "$*" >&2
@@ -47,7 +49,7 @@ assert_source_contains() {
   grep -Fq -- "$needle" "$driver" || fail "driver does not contain: $needle"
 }
 
-assert_source_contains "nats sub 'notifications.ghostwispr.>' --server nats://envoy-hub.tail12ec1c.ts.net:4222"
+assert_source_contains "nats sub 'notifications.ghostwispr.>' --server \"\$PI_NATS_SERVER\""
 assert_source_contains "/api/sessions/start"
 assert_source_contains "/api/sessions/\${acceptance_session_id}/resummarize"
 assert_source_contains '/api/search/semantic'

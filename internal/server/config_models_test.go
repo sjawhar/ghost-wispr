@@ -29,7 +29,7 @@ summarization:
   model: gemini/gemini-4-carbon
 embedding_model: gemini/gemini-embedding-2
 genai_backend: vertex
-gcp_project: theorem-agent-infra
+gcp_project: example-project
 gcp_location: global
 tts_provider: gemini
 tts_model: gemini-3.8-flash-tts
@@ -68,7 +68,7 @@ tts_voice: Kore
 		"summarization":                "gemini/gemini-4-carbon",
 		"embedding":                    "gemini/overridden-embedding",
 		"genai_backend":                "vertex",
-		"gcp_project":                  "theorem-agent-infra",
+		"gcp_project":                  "example-project",
 		"gcp_location":                 "global",
 		"tts_provider":                 "gemini",
 		"tts":                          "gemini-3.8-flash-tts",

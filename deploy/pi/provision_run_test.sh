@@ -15,6 +15,36 @@ fail() {
   exit 1
 }
 
+# The sha256 of the office Pi's recording_rules block in deploy/pi/files/ghost-wispr.yaml, which
+# its web UI shows under Recording rules, each as written and in this order (docs/pi-setup.md,
+# "Accept slice 1", A2). The test holds the hash, not the text, because the repository is public.
+# After a rule change, set it to the awk below run over the template, piped to sha256sum.
+readonly recording_rules_sha256=f4868276b26c15d966d3d28fa74b3242fb9f55c7f90cec2aba5c3932d05c8d33
+
+# assert_recording_rules fails unless the configuration provision.sh installed holds exactly the
+# office Pi's recording rules, once.
+assert_recording_rules() {
+  local config=$TEST_LOG.installed-ghost-wispr.yaml rules
+  rules=$(awk '/^recording_rules:/ { print; inside = 1; next } inside && /^  - / { print; next } { inside = 0 }' "$config" | sha256sum)
+  [[ $rules == "$recording_rules_sha256  -" ]] \
+    || fail "the $1 configuration does not hold the office Pi's four recording rules: $(<"$config")"
+}
+
+# assert_jabra_button_off fails unless the configuration and the .env provision.sh installed leave
+# the Jabra's Mute button off. It stays off until a person's real taps pass the checks of
+# docs/pi-setup.md, "Pause and resume at the unit", on the office Pi (their step 6 checks the fix
+# of defect D9, #75), and until the follow-up fix for a microphone that opens before the recording
+# light reads red has merged.
+assert_jabra_button_off() {
+  local config=$TEST_LOG.installed-ghost-wispr.yaml env=$TEST_LOG.installed-.env settings
+  settings=$(grep -E '^jabra_mute_button:' "$config") || true
+  [[ $settings == 'jabra_mute_button: false' ]] \
+    || fail "the $1 configuration does not turn the Jabra's Mute button off once: ${settings:-no jabra_mute_button line}"
+  if grep -Eq '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env"; then
+    fail "the $1 .env sets the Jabra's Mute button: $(grep -E '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env")"
+  fi
+}
+
 uid=$(id -u)
 readonly uid runtime_dir="/run/user/$uid"
 [[ -d $runtime_dir ]] || fail "this test needs $runtime_dir, where provision.sh stages the bundle"
@@ -53,15 +83,21 @@ cat >"$work_dir/bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
 printf 'tailscale %s\n' "$*" >>"$TEST_LOG"
 case $1 in
-  status) printf '{"Self":{"Tags":null,"DNSName":"ghost-wispr.tail12ec1c.ts.net."}}\n' ;;
+  status) printf '{"Self":{"Tags":null,"DNSName":"ghost-wispr.example-tailnet.ts.net."}}\n' ;;
   up) exit "${TEST_UP_EXIT:-0}" ;;
 esac
 EOF
 
-# The release's update.sh and binary, as provision.sh runs them from the deploy directory.
+# The release's update.sh and binary, as provision.sh runs them from the deploy directory. The real
+# update.sh reads /api/status once, and fails when the recorder runs but does not answer yet, as
+# it does right after a restart: so does this one when the recorder was restarted before it.
 cat >"$work_dir/deploy/update.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'update.sh XDG_RUNTIME_DIR=%s\n' "${XDG_RUNTIME_DIR:-}" >>"$TEST_LOG"
+if grep -q 'systemctl --user try-restart ghost-wispr.service$' "$TEST_LOG"; then
+  printf 'ghost-wispr update: ghost-wispr is active but /api/status did not answer\n' >&2
+  exit 1
+fi
 EOF
 cat >"$work_dir/deploy/ghost-wispr" <<'EOF'
 #!/usr/bin/env bash
@@ -79,11 +115,12 @@ printf '%s\n' "$SUBJECT" >"$work_dir/bundle/tailscale-subject"
 printf 'https://relay.example.test/webhook/ghostwispr\n' >"$work_dir/bundle/envoy-webhook-url"
 printf 'deepgram-key' >"$work_dir/bundle/deepgram-key"
 
-# run_provision runs provision.sh on a bundle of the named files.
+# run_provision runs provision.sh on a bundle of the named files, with neutral deployment settings.
 run_provision() {
   tar -C "$work_dir/bundle" -cf - "$@" \
     | env -u XDG_RUNTIME_DIR PATH="$work_dir/bin:$PATH" GHOST_WISPR_DEPLOY_DIR="$work_dir/deploy" \
-      GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
+      GHOST_WISPR_IDENTITY_KEY="$work_dir/key.pem" GHOST_WISPR_PI_ENV="$repo_root/deploy/pi/test-pi.env" \
+      bash "$repo_root/deploy/pi/provision.sh" >"$work_dir/out" 2>&1
 }
 readonly bundle_files=(device.crt google-credentials.json certificate_config.json tailscale-client-id
   tailscale-subject envoy-webhook-url deepgram-key)
@@ -106,6 +143,8 @@ run_provision "${bundle_files[@]}" || fail "provision.sh failed: $(<"$work_dir/o
 if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error (above)"
 fi
+assert_recording_rules 'installed'
+assert_jabra_button_off 'installed'
 
 # The .env the recorder runs with holds the Deepgram key and no Envoy signing key.
 env_file="$TEST_LOG.installed-.env"
@@ -168,6 +207,7 @@ grep -q '^tailscale serve' "$TEST_LOG" && fail "the join set Serve although tail
 # A rerun on a Pi that has a shared drive renders through render_models_config, which takes the
 # webhook URL as an argument too: it must keep the drive and say no bash error either.
 printf 'gdrive_folder_id: "drive-0123"\n' >"$work_dir/deploy/ghost-wispr.yaml"
+: >"$TEST_LOG"
 run_provision "${bundle_files[@]}" || fail "provision.sh failed on a rerun: $(<"$work_dir/out")"
 if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error on a rerun with a shared drive (above)"
@@ -177,4 +217,15 @@ for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' \
   grep -Fxq "$line" "$TEST_LOG.installed-ghost-wispr.yaml" \
     || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
 done
+assert_recording_rules "rerun's"
+assert_jabra_button_off "rerun's"
+# The recorder reads its configuration only when it starts, and update.sh restarts nothing when the
+# Pi already runs the newest release: a rerun restarts a running recorder once the configuration is
+# installed, and try-restart starts none that is stopped.
+# grep finding no line is a failure this check reports, not one that stops the test silently.
+config_at=$(grep -n -E '^sudo install .*/ghost-wispr\.yaml$' "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+restart_at=$(grep -n -F -x -- "sudo -u ghost-wispr XDG_RUNTIME_DIR=$runtime_dir systemctl --user try-restart ghost-wispr.service" \
+  "$TEST_LOG" | cut -d: -f1 | head -n 1) || true
+[[ -n $config_at && -n $restart_at && $restart_at -gt $config_at ]] \
+  || fail "the rerun did not restart a running recorder after it installed the configuration: $(<"$TEST_LOG")"
 printf 'provision run test passed\n'

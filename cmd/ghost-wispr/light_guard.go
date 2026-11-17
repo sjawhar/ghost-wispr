@@ -7,8 +7,8 @@ import (
 )
 
 // lightGuard keeps capture closed while the recording light cannot be
-// confirmed red, as the consent rule "record only while the light is on"
-// requires. The light controller reports each check to report, and so does a
+// confirmed red: a unit with a light records only while it is on. The light
+// controller reports each check to report, and so does a
 // red confirmation for audio that comes back after a stall
 // (hardwareControl.LightUnconfirmed); a failed check holds the capture gate
 // (captureGate.HoldForLight) and names the cause on /api/status, and the

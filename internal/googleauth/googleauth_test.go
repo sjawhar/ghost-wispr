@@ -38,9 +38,9 @@ func TestDetectServiceAccountFile(t *testing.T) {
 	credentialPath := filepath.Join(dir, "service-account.json")
 	writeTestJSON(t, credentialPath, map[string]any{
 		"type":         "service_account",
-		"project_id":   "theorem-agent-infra",
+		"project_id":   "example-project",
 		"private_key":  string(keyPEM),
-		"client_email": "ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com",
+		"client_email": "ghost-wispr@example-project.iam.gserviceaccount.com",
 		"token_uri":    "https://oauth2.googleapis.com/token",
 	})
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(dir, "ignored.json"))
@@ -149,10 +149,8 @@ func TestStatusWarnsWhenTheCertificateExpiresSoon(t *testing.T) {
 	if !strings.Contains(warning, "docs/pi-setup.md") {
 		t.Fatalf("warning %q does not name the renewal runbook", warning)
 	}
-	// The renewed certificate is the latest version of this Secret Manager
-	// secret; bootstrap's stack output that held it is gone.
-	if !strings.Contains(warning, "ghost-wispr-device-certificate") {
-		t.Fatalf("warning %q does not name the Secret Manager secret that holds the renewed certificate", warning)
+	if !strings.Contains(warning, `"Renew the X.509 certificate"`) {
+		t.Fatalf("warning %q does not name the runbook section that renews the certificate", warning)
 	}
 	if strings.HasPrefix(warning, "Google credential certificate expires on ") == false {
 		t.Fatalf("warning %q lost the prefix deploy/pi/accept-slice2.sh matches", warning)
@@ -165,7 +163,7 @@ func TestStatusWarnsWhenTheCertificateExpiresSoon(t *testing.T) {
 func TestCertificateExpiryWarningSaysExpired(t *testing.T) {
 	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	warning := CertificateExpiryWarning(now, now.AddDate(0, 0, -1), true)
-	if !strings.Contains(warning, "expired on 2026-11-09") || !strings.Contains(warning, "ghost-wispr-device-certificate") {
+	if !strings.Contains(warning, "expired on 2026-11-09") || !strings.Contains(warning, `"Renew the X.509 certificate"`) {
 		t.Fatalf("expired certificate warning = %q", warning)
 	}
 }
@@ -270,7 +268,7 @@ func newExternalAccountFixture(t *testing.T) *externalAccountFixture {
 			http.Error(w, "wrong bearer", http.StatusUnauthorized)
 			return
 		}
-		const accountPath = "/v1/projects/-/serviceAccounts/ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com"
+		const accountPath = "/v1/projects/-/serviceAccounts/ghost-wispr@example-project.iam.gserviceaccount.com"
 		switch r.URL.Path {
 		case accountPath + ":generateAccessToken":
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -306,7 +304,7 @@ func newExternalAccountFixture(t *testing.T) *externalAccountFixture {
 	fixture.iamServer.StartTLS()
 	t.Cleanup(fixture.iamServer.Close)
 
-	impersonationURL := fixture.iamServer.URL + "/v1/projects/-/serviceAccounts/ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com:generateAccessToken"
+	impersonationURL := fixture.iamServer.URL + "/v1/projects/-/serviceAccounts/ghost-wispr@example-project.iam.gserviceaccount.com:generateAccessToken"
 	credentialPath := filepath.Join(dir, "credentials.json")
 	writeTestJSON(t, credentialPath, map[string]any{
 		"type":                              "external_account",

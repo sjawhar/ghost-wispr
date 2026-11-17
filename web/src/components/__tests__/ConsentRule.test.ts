@@ -4,14 +4,19 @@ import AudioPlayer from '../AudioPlayer.svelte'
 import ConsentRule from '../ConsentRule.svelte'
 import { RefinementStatus, SummaryStatus } from '../../lib/types'
 
-const consentRule =
-  'Record only while the light is on. Anyone may pause it at any time without a reason. Transcripts are readable by Theorem staff only. A person can ask for a segment to be deleted.'
+// Example rules, not any unit's: the page shows whatever recording_rules the
+// unit's configuration holds.
+const rules = [
+  'Say so before the meeting if you do not want it recorded.',
+  'Anyone can pause the recorder, at any time.',
+  'Ask the <b>office manager</b> & no one else to delete a segment.',
+]
 
 const howTo =
   'Tap the button on the recorder to pause or resume. To have a segment’s text and audio removed, open the conversation once it has been refined, choose Delete on that segment, then choose Delete text and audio.'
 
 async function openRules(): Promise<HTMLElement> {
-  render(ConsentRule)
+  render(ConsentRule, { rules })
   await fireEvent.click(screen.getByRole('button', { name: 'Recording rules' }))
   return screen.getByRole('dialog', { name: 'Recording rules' })
 }
@@ -21,8 +26,27 @@ describe('ConsentRule', () => {
     cleanup()
   })
 
+  // A unit whose configuration has no recording_rules shows no button: it
+  // failed while the component showed fixed rules whatever it was given.
+  it('shows no Recording rules button without rules', () => {
+    render(ConsentRule, { rules: [] })
+
+    expect(screen.queryByRole('button', { name: 'Recording rules' })).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  // Each rule shows as written and in order, as text: the markup in a rule is
+  // shown, not rendered.
+  it('shows each configured rule as written, as text', async () => {
+    const dialog = await openRules()
+
+    const items = within(dialog).getAllByRole('listitem')
+    expect(items.map((item) => item.textContent)).toEqual(rules)
+    expect(dialog.querySelector('b')).toBeNull()
+  })
+
   it('opens the recording rules and closes them with Escape', async () => {
-    render(ConsentRule)
+    render(ConsentRule, { rules })
 
     expect(screen.getByRole('button', { name: 'Recording rules' })).toBeTruthy()
     expect(screen.queryByRole('dialog', { name: 'Recording rules' })).toBeNull()
@@ -30,7 +54,7 @@ describe('ConsentRule', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Recording rules' }))
 
     const dialog = screen.getByRole('dialog', { name: 'Recording rules' })
-    expect(within(dialog).getByText(consentRule)).toBeTruthy()
+    expect(within(dialog).getByText(rules[0])).toBeTruthy()
     expect(within(dialog).getByText(howTo)).toBeTruthy()
 
     await fireEvent.keyDown(window, { key: 'Escape' })
