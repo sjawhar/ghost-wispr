@@ -355,7 +355,8 @@ Muted while the unit records. A pause during that wait cancels the resume. If th
 show Muted while recording is on, as when the Jabra is plugged in while the microphone is open,
 or when a pause and a resume come during one microphone open, no audio is recorded: Ghost Wispr
 closes the microphone, darkens the Jabra and opens the microphone again, and the log says
-`the Jabra's ring may show the pause while capture is on; reopening the microphone`.
+`the Jabra's ring may show the pause while capture is on; reopening the microphone`. During
+speech that takes until the speech ends, with capture shown as resuming and the blink(1) off.
 
 A Mute press that would resume recording is ignored when the kernel stamped it during Ghost
 Wispr's own open, close or PortAudio device scan of the microphone, or the close of a speech

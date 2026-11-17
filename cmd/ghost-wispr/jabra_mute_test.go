@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -491,6 +492,63 @@ func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
 			button.press(report)
 			if !rig.capture.IsPaused() {
 				t.Fatal("the Jabra's own report, read late, resumed the paused unit")
+			}
+		})
+	}
+}
+
+// TestAResumeTapCostsNoReopen fails if a person's Jabra tap that resumes the
+// unit makes the mic loop refuse the first buffer and reopen the microphone,
+// although the resume already darkened the ring: press resumes, the controls
+// store the status change, and only then does press ask for the light again,
+// which can come after the microphone opened. statusWrite stands for that
+// SQLite write, and beforeGateOpen's 5 ms for the blink(1)'s red confirmation.
+// The control has a status write quicker than the red confirmation.
+func TestAResumeTapCostsNoReopen(t *testing.T) {
+	for _, statusWrite := range []time.Duration{0, 30 * time.Millisecond} {
+		name := "control, the status write is quicker than the red confirmation"
+		if statusWrite > 0 {
+			name = "the status write is slower than the red confirmation"
+		}
+		t.Run(name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			capture.Pause()
+			capture.beforeGateOpen = func() error { time.Sleep(5 * time.Millisecond); return nil }
+			device := newCaptureDevice(capture.IsPaused)
+			capture.beforeMicOpen = device.prepareLightForOpen
+			var ring atomic.Bool
+			detach := device.attach(func(on bool) error { ring.Store(on); return nil })
+			t.Cleanup(detach)
+			controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture.RequestResume, func(bool) { time.Sleep(statusWrite) })
+			button := newJabraMuteButton(capture, device, &server.ControlHooks{Pause: controls.Pause, Resume: controls.Resume}, newWarningsRegistry())
+			mic := newScriptedMic()
+			recording := &ringCheckingRecording{ring: &ring}
+			runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, recording, (&recordedWaits{}).wait)
+			mic.expectEvents(t, "close")
+			time.Sleep(2 * jabraOwnMuteWindow) // the tap is a person's, outside every operation's cover
+
+			button.press(jabra.MonotonicNow())
+			if capture.IsPaused() {
+				t.Fatal("control: the tap did not resume the unit")
+			}
+			mic.expectEvents(t, "open", "stream")
+			if ring.Load() {
+				t.Fatal("control: the microphone opened with the ring showing Muted")
+			}
+			mic.capture(t, make([]byte, 320))
+			var calls []string
+			deadline := time.After(100 * time.Millisecond)
+		watch:
+			for {
+				select {
+				case call := <-mic.events:
+					calls = append(calls, call)
+				case <-deadline:
+					break watch
+				}
+			}
+			if len(calls) > 0 || recording.bytes.Load() != 320 {
+				t.Fatalf("a resume tap cost a microphone reopen with the ring dark: device calls %v, the recording got %d of the first 320 bytes", calls, recording.bytes.Load())
 			}
 		})
 	}

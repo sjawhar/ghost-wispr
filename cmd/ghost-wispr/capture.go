@@ -293,14 +293,15 @@ func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 // light, or stalled or resuming while the gate is closed; and resuming after
 // the gate opens, until the start that brings the microphone and Deepgram
 // back has finished (finishResume) or the stall limit has passed, and for as
-// long as that start waits for the hardware (prepareMicOpen). It is ""
-// otherwise. Readiness checks read it.
+// long as any start of the microphone waits for the hardware
+// (prepareMicOpen), as when the Jabra's ring must be darkened after speech. It
+// is "" otherwise. Readiness checks read it.
 func (g *captureGate) MicHold() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	switch {
 	case !g.closed:
-		if g.starting && !g.switchOff && (g.preparing || time.Since(g.resumedAt) <= g.stallAfter) {
+		if !g.switchOff && (g.preparing || (g.starting && time.Since(g.resumedAt) <= g.stallAfter)) {
 			return captureResuming
 		}
 		return ""

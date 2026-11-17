@@ -204,10 +204,15 @@ func (d *captureDevice) attach(write func(on bool) error) (detach func()) {
 }
 
 // refreshLight writes the light again even if it already shows the pause, as
-// after a press: the Jabra may change its own light on one.
-func (d *captureDevice) refreshLight() {
+// after a press the kernel stamped at: the Jabra may change its own light on
+// one. A light written after at already overrides that change, since the
+// kernel sends a written light to the Jabra after the write returns, so it is
+// not asked for again.
+func (d *captureDevice) refreshLight(at time.Duration) {
 	d.mu.Lock()
-	d.written = false
+	if d.lightAt < at {
+		d.written = false
+	}
 	d.mu.Unlock()
 	d.syncLight()
 }
@@ -344,7 +349,10 @@ func (d *captureDevice) ringMayShowPause() bool {
 // refuses each buffer while the Jabra's ring may show the pause
 // (ringMayShowPause), with errRingShowsPause: the light cannot change while
 // the stream is open, so the mic loop closes the microphone, darkens the ring
-// and opens it again before any audio passes.
+// and opens it again before any audio passes. The capture gate's
+// beforeMicOpen must be the device's prepareLightForOpen, as main sets it:
+// that wait is what darkens the ring before the microphone opens again, and
+// without it the mic loop would reopen at once while speech holds the light.
 type orderedMic struct {
 	micStreamer
 	device *captureDevice

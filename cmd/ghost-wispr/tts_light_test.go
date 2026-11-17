@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/jabra"
 )
 
 // heldOutput is a TTS playback stream on the Jabra that stays open, writing,
@@ -229,7 +230,7 @@ func TestJabraLightWaitsForTTSPlaybackToClose(t *testing.T) {
 	if err := rig.controls.Pause(); err != nil {
 		t.Fatal(err)
 	}
-	rig.device.refreshLight() // as a press does
+	rig.device.refreshLight(jabra.MonotonicNow()) // as a press does
 	time.Sleep(20 * time.Millisecond)
 	if device.reportsSent() != reports || device.shows() {
 		t.Fatalf("the light changed while TTS playback was open: %d light reports, shows %t", device.reportsSent()-reports, device.shows())

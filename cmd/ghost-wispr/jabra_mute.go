@@ -181,7 +181,7 @@ func (b *jabraMuteButton) press(at time.Duration) {
 	} else if err := toggleCapture(func() bool { return paused }, b.controls.Pause, b.controls.Resume, b.controls.OnStatusChanged); err != nil {
 		log.Printf("warning: Jabra mute toggle: %v", err)
 	}
-	b.device.refreshLight()
+	b.device.refreshLight(at)
 }
 
 func (b *jabraMuteButton) waitForRetry(ctx context.Context) {

@@ -452,3 +452,42 @@ func TestAJabraThatConnectsWhileRecordingIsLitBeforeAudioPasses(t *testing.T) {
 		t.Fatalf("the recording got %d bytes, want 640: 320 before the Jabra connected and 320 once its ring was dark", got)
 	}
 }
+
+// TestTheRingWaitForSpeechReportsResuming fails if the mic loop, which closed
+// the microphone because a Jabra connected during speech while recording,
+// reports the microphone as unavailable while it waits for the speech to end
+// before it darkens the ring and opens the microphone again. Nothing records
+// meanwhile, and the blink(1) is off; readiness treats mic_unavailable as a
+// fault, and the wait is not one.
+func TestTheRingWaitForSpeechReportsResuming(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	device := newCaptureDevice(capture.IsPaused)
+	capture.beforeMicOpen = device.prepareLightForOpen
+	var ring atomic.Bool
+	if err := device.openStream(func() (bool, error) { return true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	mic := newScriptedMic()
+	recording := &ringCheckingRecording{ring: &ring}
+	runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, recording, (&recordedWaits{}).wait)
+	mic.expectEvents(t, "stream")
+	_, finish := playThroughDevice(t, device) // the unit speaks on the Jabra
+
+	ring.Store(true) // the Jabra connects showing Muted
+	detach := device.attach(func(on bool) error { ring.Store(on); return nil })
+	t.Cleanup(detach)
+	mic.capture(t, make([]byte, 320))
+	mic.expectEvents(t, "close")
+	opensDuring(t, mic, 50*time.Millisecond, "while TTS playback was open")
+	if got := capture.captureState(fakeMicState(false)); got != captureResuming {
+		t.Fatalf("capture state while the microphone waits for the speech to end = %q, want %q", got, captureResuming)
+	}
+	finish()
+	mic.expectEvents(t, "open", "stream")
+	if ring.Load() {
+		t.Fatal("the microphone opened again with the Jabra's ring showing Muted")
+	}
+	if got := recording.muted.Load(); got > 0 {
+		t.Fatalf("%d bytes reached the recording while the Jabra's ring showed Muted", got)
+	}
+}
