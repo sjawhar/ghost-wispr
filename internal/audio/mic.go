@@ -164,10 +164,13 @@ func (m *Mic) Close() error {
 	stream := m.stream
 	m.stream = nil
 	m.mu.Unlock()
-	m.held.Store(false)
 	if stream == nil {
+		m.held.Store(false)
 		return nil
 	}
+	// IsOpen stays true until PortAudio has stopped and closed the stream:
+	// the light, which follows it, must not go off while the device is open.
+	defer m.held.Store(false)
 	_ = stream.Stop() // a stream that never started reports it is stopped
 	return stream.Close()
 }

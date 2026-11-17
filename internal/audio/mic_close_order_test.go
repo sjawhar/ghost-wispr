@@ -2,6 +2,7 @@ package audio
 
 import (
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -78,6 +79,83 @@ func TestMicCloseEndsAStreamThatBeganWhileCloseWaited(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 			if _, _, _, misuse := stream.snapshot(); len(misuse) > 0 {
 				t.Fatalf("Stream called the capture stream after Close closed it: %v", misuse)
+			}
+		})
+	}
+}
+
+// slowCloseStream is a capture stream whose Stop or Close blocks until
+// release, as Pa_StopStream and Pa_CloseStream take some time on a device.
+type slowCloseStream struct {
+	blockStop bool
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (s *slowCloseStream) block() {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+}
+
+func (s *slowCloseStream) Start() error { return nil }
+
+func (s *slowCloseStream) Stop() error {
+	if s.blockStop {
+		s.block()
+	}
+	return nil
+}
+
+func (s *slowCloseStream) Close() error {
+	if !s.blockStop {
+		s.block()
+	}
+	return nil
+}
+
+func (s *slowCloseStream) AvailableToRead() (int, error) { return 0, nil }
+func (s *slowCloseStream) Read() error                   { return nil }
+
+// TestMicIsOpenUntilItsCaptureStreamHasClosed fails if IsOpen, which the
+// light controller reads, reports the mic closed while Close is still
+// stopping or closing its capture stream: the input device is open then, and
+// the light could go off before the microphone closes (ReviewPR77 on #77,
+// round 2, finding 2).
+func TestMicIsOpenUntilItsCaptureStreamHasClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		blockStop bool
+	}{{"during Stop", true}, {"during Close", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := openInputStreamFn
+			t.Cleanup(func() { openInputStreamFn = original })
+			s := &slowCloseStream{blockStop: tc.blockStop, entered: make(chan struct{}), release: make(chan struct{})}
+			openInputStreamFn = func(_, _ int, _ *[]int16) (inputStream, error) { return s, nil }
+			mic, err := NewMic(16000, 4000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !mic.IsOpen() {
+				t.Fatal("control: a mic just opened reports closed")
+			}
+			done := make(chan error, 1)
+			go func() { done <- mic.Close() }()
+			select {
+			case <-s.entered:
+			case <-time.After(time.Second):
+				t.Fatal("Close did not reach the stream")
+			}
+			openDuringClose := mic.IsOpen()
+			close(s.release)
+			if err := <-done; err != nil {
+				t.Fatalf("Close = %v", err)
+			}
+			if mic.IsOpen() {
+				t.Fatal("the mic reports open once Close returned")
+			}
+			if !openDuringClose {
+				t.Fatalf("IsOpen was false %s, while the capture stream was still open", tc.name)
 			}
 		})
 	}
