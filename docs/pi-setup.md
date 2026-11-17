@@ -603,9 +603,11 @@ against the working directory) and prints the absolute database path it wrote. C
 path is the copy's database, not the production one under `/opt/ghost-wispr`.
 
 Then run the driver with `--cert-test`. Without that flag, the row prints `NEEDS-PERSON`. With
-it, the row first reads the process that listens on `127.0.0.1:8081` and fails unless it has no
-supplementary groups, runs with `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, and holds no sound or input
-device.
+it, the row first reads the process that listens on `127.0.0.1:8081` and fails unless all its
+user and group ids are `ghost-wispr`'s, it holds no capabilities and no supplementary groups, runs
+with `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, and holds no sound or input device. It also fails if
+`ghost-wispr` with no groups can open any sound or input device, as it can while someone is logged
+in at the Pi's own console as `ghost-wispr`: the console session gives that user ACLs on them.
 
 The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
 
