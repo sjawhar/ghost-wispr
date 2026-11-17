@@ -124,6 +124,33 @@ fi
 grep -Fxq "update.sh XDG_RUNTIME_DIR=$runtime_dir" "$TEST_LOG" || fail "update.sh ran without XDG_RUNTIME_DIR=$runtime_dir"
 [[ -s $TEST_LOG.join ]] || fail "provision.sh started no detached join"
 
+# The service starts only once the Pi's clock is synchronized, so no session is named or stamped
+# with the time a Pi with no battery-backed clock restores at boot. A user unit cannot be ordered
+# after the system's time-sync.target, so the unit waits in a start step: provision.sh installs it
+# beside the binary, the unit runs it after the network wait and before Ghost Wispr, and the unit's
+# start time limit is longer than both waits together, so a Pi whose clock never synchronizes still
+# starts once the wait gives up instead of being killed and restarted for good.
+grep -Fxq "sudo install -o ghost-wispr -g ghost-wispr -m 0755 $repo_root/deploy/pi/files/wait-for-time-sync.sh $work_dir/deploy/wait-for-time-sync.sh" "$TEST_LOG" \
+  || fail "provision.sh does not install wait-for-time-sync.sh beside the binary"
+unit="$repo_root/deploy/pi/files/ghost-wispr.service"
+mapfile -t start_steps < <(grep -E '^Exec(StartPre|Start)=' "$unit")
+want_steps=(ExecStartPre=/opt/ghost-wispr/wait-for-network.sh ExecStartPre=/opt/ghost-wispr/wait-for-time-sync.sh
+  ExecStart=/opt/ghost-wispr/ghost-wispr)
+[[ "${start_steps[*]}" == "${want_steps[*]}" ]] \
+  || fail "ghost-wispr.service starts with [${start_steps[*]}], want [${want_steps[*]}]"
+network_wait=$(sed -n 's/.*GHOST_WISPR_NETWAIT_TIMEOUT:-\([0-9][0-9]*\).*/\1/p' "$repo_root/wait-for-network.sh")
+sync_wait=$(sed -n 's/.*GHOST_WISPR_TIMESYNC_TIMEOUT:-\([0-9][0-9]*\).*/\1/p' "$repo_root/deploy/pi/files/wait-for-time-sync.sh")
+[[ -n $network_wait && -n $sync_wait ]] || fail "cannot read the network wait ($network_wait) or the clock wait ($sync_wait)"
+start_limit=$(sed -n 's/^TimeoutStartSec=//p' "$unit")
+case $start_limit in
+  *min) start_limit=$((${start_limit%min} * 60)) ;;
+  *s) start_limit=${start_limit%s} ;;
+  '') fail "ghost-wispr.service sets no TimeoutStartSec: the user manager's 90 s default is shorter than its waits" ;;
+esac
+# The network wait's last try can run 5 s past its limit (a 3 s connect, then a 2 s sleep).
+((start_limit >= network_wait + 5 + sync_wait + 30)) \
+  || fail "ghost-wispr.service's TimeoutStartSec (${start_limit}s) does not cover the network wait (${network_wait}s) and the clock wait (${sync_wait}s)"
+
 # The join re-authenticates the node; Serve is set again after it, in the same unit.
 run_join() {
   : >"$TEST_LOG"

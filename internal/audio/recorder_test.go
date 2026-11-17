@@ -2,9 +2,11 @@ package audio
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -68,7 +70,7 @@ func TestRecorderProducesOutputFile(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
 
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
 		data, err := os.ReadFile(rawPath)
 		if err != nil {
 			return "", err
@@ -109,7 +111,7 @@ func TestRecorderProducesOutputFile(t *testing.T) {
 func TestTeeWriterWritesToBothDestinations(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
 		return filepath.Join(dir, sessionID+".wav"), os.WriteFile(filepath.Join(dir, sessionID+".wav"), []byte("ok"), 0o644)
 	}
 
@@ -142,7 +144,7 @@ func TestTeeWriterWritesToBothDestinations(t *testing.T) {
 func TestRecorderPrerollCapturesBeforeSessionStart(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
 		data, err := os.ReadFile(rawPath)
 		if err != nil {
 			return "", err
@@ -193,7 +195,7 @@ func TestRecorderPrerollCapturesBeforeSessionStart(t *testing.T) {
 func TestRecorderDiscardPrerollDropsBufferedAudio(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
 		data, err := os.ReadFile(rawPath)
 		if err != nil {
 			return "", err
@@ -234,7 +236,7 @@ func TestRecorderEndSessionRetriesARecordingItCouldNotSave(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
 	full := true
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
 		if full {
 			return "", errors.New("no space left on device")
 		}
@@ -283,7 +285,7 @@ func TestRecorderZeroesTheRawRecordingItSaved(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
 	var held *os.File
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
 		var err error
 		if held, err = os.Open(rawPath); err != nil {
 			return "", err
@@ -326,9 +328,17 @@ func TestRecorderZeroesAPartialEncoderOutput(t *testing.T) {
 	t.Setenv("PATH", bin)
 
 	dir := t.TempDir()
+	recorder := NewRecorder(dir)
+	if err := recorder.StartSession("meeting"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 3200)); err != nil {
+		t.Fatal(err)
+	}
 	// The fake encoders write into this file in place (a shell redirection
 	// keeps its inode), so a descriptor held on it reads what the removal
-	// leaves in the blocks.
+	// leaves in the blocks. It is made once the session has started: a
+	// session never starts over a recording on disk.
 	mp3Path := filepath.Join(dir, "meeting.mp3")
 	if err := os.WriteFile(mp3Path, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -339,13 +349,6 @@ func TestRecorderZeroesAPartialEncoderOutput(t *testing.T) {
 	}
 	defer func() { _ = held.Close() }()
 
-	recorder := NewRecorder(dir)
-	if err := recorder.StartSession("meeting"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 3200)); err != nil {
-		t.Fatal(err)
-	}
 	path, err := recorder.EndSession("meeting")
 	if err != nil || !strings.HasSuffix(path, ".wav") {
 		t.Fatalf("EndSession = (%q, %v), want the WAV fallback", path, err)
@@ -363,7 +366,7 @@ func TestRecorderZeroesAPartialEncoderOutput(t *testing.T) {
 }
 
 // When the session end gives up on a recording it cannot save, the recorder
-// stops retrying it and leaves its raw audio on disk for recovery by hand,
+// stops retrying it and leaves its raw audio on disk for a later save,
 // reporting where; with the raw file already gone, it reports none.
 func TestRecorderDiscardUnsavedKeepsTheRawAudio(t *testing.T) {
 	for _, tc := range []struct {
@@ -377,7 +380,7 @@ func TestRecorderDiscardUnsavedKeepsTheRawAudio(t *testing.T) {
 			dir := t.TempDir()
 			recorder := NewRecorder(dir)
 			encodes := 0
-			recorder.encode = func(string, string) (string, error) {
+			recorder.encode = func(context.Context, string, string) (string, error) {
 				encodes++
 				return "", errors.New("no space left on device")
 			}
@@ -425,10 +428,8 @@ func TestRecorderStartSessionLeavesNoSessionOpenWhenThePrerollCannotBeWritten(t 
 		t.Skip("needs /dev/full to make the preroll write fail")
 	}
 	dir := t.TempDir()
-	if err := os.Symlink("/dev/full", filepath.Join(dir, "meeting.pcm")); err != nil {
-		t.Fatal(err)
-	}
 	recorder := NewRecorder(dir)
+	recorder.createRaw = func(string) (*os.File, error) { return os.OpenFile("/dev/full", os.O_WRONLY, 0) }
 	writer := recorder.Writer(bytes.NewBuffer(nil))
 	if _, err := writer.Write([]byte{1, 2, 3, 4}); err != nil {
 		t.Fatalf("Write before the session: %v", err)
@@ -451,7 +452,7 @@ func TestRecorderStartSessionLeavesNoSessionOpenWhenThePrerollCannotBeWritten(t 
 // saveAsWAV makes recorder save a recording by copying its raw audio to
 // <session>.wav in dir, failing while *full is set.
 func saveAsWAV(recorder *Recorder, dir string, full *bool) {
-	recorder.encode = func(rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
 		if *full {
 			return "", errors.New("no space left on device")
 		}
@@ -487,8 +488,11 @@ func TestRecorderEndSessionNeverReturnsAnotherSessionsRecording(t *testing.T) {
 		t.Fatal("EndSession(earlier) saved a recording no encoder could write")
 	}
 
-	if err := os.Symlink("/dev/full", filepath.Join(dir, "later.pcm")); err != nil {
-		t.Fatal(err)
+	recorder.createRaw = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "later.pcm" {
+			return os.OpenFile("/dev/full", os.O_WRONLY, 0)
+		}
+		return createRawFile(path)
 	}
 	if _, err := writer.Write([]byte{5, 6}); err != nil {
 		t.Fatalf("Write before the later session: %v", err)
@@ -510,31 +514,24 @@ func TestRecorderEndSessionNeverReturnsAnotherSessionsRecording(t *testing.T) {
 	}
 }
 
-// KeptRawRecordings counts the raw recordings kept in the audio directory
-// because they could not be saved, with their total size: not the recording
-// under way, not one being saved or waiting for its retry, and not one left
-// beside its saved recording. One given up after failed saves counts.
-func TestRecorderKeptRawRecordings(t *testing.T) {
+// KeptRawSessions lists the sessions of the raw recordings in the audio
+// directory the recorder is not using: not the recording under way, not one
+// being saved or waiting for its retry. One beside its saved recording is
+// listed, and one given up after failed saves is listed once given up.
+func TestRecorderKeptRawSessionsWhileSaving(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	for name, size := range map[string]int{
-		"20261106100000.pcm": 1000, // kept: no saved recording
-		"20261106110000.pcm": 2000, // kept
-		"20261106120000.pcm": 4000, // left beside its saved recording
-		"20261106120000.mp3": 10,
-		"notes.txt":          50,
-	} {
-		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+	for _, name := range []string{"20261106100000.pcm", "20261106120000.pcm", "20261106120000.mp3", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte{1, 2}, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.Mkdir(filepath.Join(dir, "copies.pcm"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	expect := func(when string, wantCount int, wantBytes int64) {
+	expect := func(when string, want ...string) {
 		t.Helper()
-		if count, size := recorder.KeptRawRecordings(); count != wantCount || size != wantBytes {
-			t.Errorf("%s: KeptRawRecordings = (%d, %d), want (%d, %d)", when, count, size, wantCount, wantBytes)
+		got := recorder.KeptRawSessions()
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: KeptRawSessions = %v, want %v", when, got, want)
 		}
 	}
 
@@ -544,17 +541,17 @@ func TestRecorderKeptRawRecordings(t *testing.T) {
 	if _, err := recorder.Writer(bytes.NewBuffer(nil)).Write(make([]byte, 8000)); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
-	expect("while recording", 2, 3000)
+	expect("while recording", "20261106100000", "20261106120000")
 
-	recorder.encode = func(string, string) (string, error) {
-		expect("while saving", 2, 3000)
+	recorder.encode = func(context.Context, string, string) (string, error) {
+		expect("while saving", "20261106100000", "20261106120000")
 		return "", errors.New("no space left on device")
 	}
 	if _, err := recorder.EndSession("20261106130000"); err == nil {
 		t.Fatal("EndSession saved a recording no encoder could write")
 	}
-	expect("waiting for its retry", 2, 3000)
+	expect("waiting for its retry", "20261106100000", "20261106120000")
 
 	recorder.DiscardUnsaved()
-	expect("given up", 3, 11000)
+	expect("given up", "20261106100000", "20261106120000", "20261106130000")
 }

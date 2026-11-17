@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -39,13 +40,18 @@ const sessionsDeletedUnsweptKey = "sessions_deleted_unswept_v2"
 // DeleteSession deletes session id and its merged-source set, refusing a target
 // that feeds another merge (ErrDeleteMergeActive), any active member, or any
 // member that owes Google Drive a replacement
-// (ErrDeleteReplacementPending). It returns the target row's audio path: the
-// recordings the caller then erases are the ones the row named when it went,
-// not ones it read before. In the same transaction, before the rows go, it
-// records the directory of each of those recordings, found where
-// recording.Resolve finds it in audioDir (the one the caller then erases), so
-// an erase a stop cuts off is finished as the app starts; it deletes nothing
-// if it cannot record one. In that transaction too it deletes every stored
+// (ErrDeleteReplacementPending). It returns the audio paths the deleted rows
+// name: the recordings the caller then erases are the ones the rows named
+// when they went, not ones it read before. In the same transaction, before
+// the rows go, it records the directory of each of those recordings, found
+// where recording.Resolve finds it in audioDir (the one the caller then
+// erases), so an erase a stop cuts off is finished as the app starts, and it
+// records each session it deletes with every audio file of it in audioDir
+// (deleteFiles: the recordings its row names and its restored Drive folder
+// holds, its raw capture, <id>.mp3, <id>.wav and a save's temporary files),
+// so the caller and, after a stop, the kept recordings pass erase them; it
+// deletes nothing if it cannot record one. In that transaction too it
+// deletes every stored
 // event that names a session it deletes: a live transcript event holds the
 // conversation's words, a summary event its summary, and a component status
 // event that it existed and was refined and synced. It deletes the events
@@ -148,6 +154,11 @@ func (s *SQLiteStore) DeleteSession(id, audioDir string) (string, error) {
 		if err := recordEraseDirectory(tx, filepath.Dir(recording.Resolve(entry, audioDir))); err != nil {
 			return "", fmt.Errorf("delete session %s: %w", id, err)
 		}
+	}
+	if err := recordDeletedSessionAudio(tx, deletedIDs, func(sessionID, sessionAudioPath string) ([]string, error) {
+		return deleteFiles(tx, sessionID, sessionAudioPath, audioDir)
+	}); err != nil {
+		return "", fmt.Errorf("delete session %s: %w", id, err)
 	}
 	if _, err := tx.Exec(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
@@ -378,9 +389,11 @@ func (s *SQLiteStore) eraseAfterSessionDeletion(owed string, earlierOwed bool, s
 // source rows in one transaction, with every stored event that names one of
 // them (dropSessionSetEvents), and rebuilds the search index so their words
 // leave it (rebuildSearchIndex). It records every raw capture directory
-// before the rows go. It refuses when a session in that deletion set is
-// active, remote-deleted, refining, owes a Drive replacement, has an owed
-// Drive folder, or has a folder whose documents still need refresh. Once the
+// before the rows go, and each session it deletes for the kept recordings
+// pass (recordDeletedSessionAudio). It refuses when a session in that
+// deletion set is active, remote-deleted, refining, owes a Drive
+// replacement, has an owed Drive folder, or has a folder whose documents
+// still need refresh. Once the
 // delete commits, it is erased from the write-ahead log and the pre-migration
 // backup, as a person's delete is (eraseAfterSessionDeletion). It returns
 // the deleted session IDs so GC can erase each now-redundant raw capture.
@@ -440,6 +453,13 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 	case err != nil:
 		return nil, false, fmt.Errorf("check session %s and its sources before GC deletion: %w", id, err)
 	}
+	if audioDir != "" {
+		if only, err := keepsOnlyRawAudio(id, audioPath, audioDir); err != nil {
+			return nil, false, err
+		} else if only {
+			return nil, false, &GCSessionBlockError{BlockingSessionID: id, BlockingSessionIsTarget: true, Reason: "its only audio is its raw capture"}
+		}
+	}
 	rows, err := tx.Query(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
 			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
@@ -466,6 +486,11 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 			}
 		}
 	}
+	if err := recordDeletedSessionAudio(tx, deletedIDs, func(sessionID, sessionAudioPath string) ([]string, error) {
+		return ageDeleteFiles(sessionID, sessionAudioPath, audioDir), nil
+	}); err != nil {
+		return nil, false, fmt.Errorf("GC deletion of session %s: %w", id, err)
+	}
 	if err := dropSessionSetEvents(tx, id); err != nil {
 		return nil, false, err
 	}
@@ -490,4 +515,28 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 	}
 	s.eraseAfterSessionDeletion(owed, earlierOwed, deletedIDs)
 	return deletedIDs, true, nil
+}
+
+// keepsOnlyRawAudio reports whether session id's raw capture in audioDir is
+// its only audio: the capture is there and no file its audio path names (found
+// where recording.Resolve finds it) holds any audio. GC's age delete keeps
+// such a session: deleting it would record the delete, and the kept
+// recordings pass erases the audio of a recorded delete, while the row lets
+// that pass save the capture.
+func keepsOnlyRawAudio(id, audioPath, audioDir string) (bool, error) {
+	info, err := os.Stat(recording.RawPath(audioDir, id))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("check the raw capture of session %s: %w", id, err)
+	case !info.Mode().IsRegular():
+		return false, nil
+	}
+	for _, entry := range recording.Entries(audioPath) {
+		if saved, err := os.Stat(recording.Resolve(entry, audioDir)); err == nil && saved.Mode().IsRegular() && saved.Size() > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }

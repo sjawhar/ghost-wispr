@@ -371,8 +371,10 @@ func TestGCAgeChangesNothingWhenItCannotRecordWhereItErases(t *testing.T) {
 }
 
 // A raw .pcm whose session's saved recording is gone from disk is not a
-// redundant copy any more: GC deletes the session by its usual policy but
-// keeps the raw recording.
+// redundant copy any more: it is the session's only audio, so GC keeps the
+// session and the raw recording. Deleting the row would record the delete,
+// and the kept recordings pass erases the audio of a recorded delete (review
+// 5936222350 of #76).
 func TestGCKeepsTheRawRecordingWhenTheSavedRecordingIsGone(t *testing.T) {
 	dir := t.TempDir()
 	raw := writeRaw(t, dir, "20261106140930", 1024, time.Now())
@@ -385,8 +387,8 @@ func TestGCKeepsTheRawRecordingWhenTheSavedRecordingIsGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gc run: %v", err)
 	}
-	if len(deleted) != 1 {
-		t.Fatalf("deleted %v, want the session deleted by age", deleted)
+	if len(deleted) != 0 || len(store.deletedIDs) != 0 {
+		t.Fatalf("deleted %v (store %v), want the session kept with its only audio", deleted, store.deletedIDs)
 	}
 	expectKept(t, raw)
 }
@@ -440,7 +442,7 @@ func crashRecovered(t *testing.T, store *storage.SQLiteStore, dir, id string, st
 	t.Helper()
 	createSession(t, store, id, startedAt)
 	raw := writeRaw(t, dir, id, size, startedAt)
-	if _, err := store.RecoverStaleSessions(); err != nil {
+	if _, err := store.RecoverStaleSessions(dir); err != nil {
 		t.Fatalf("recover stale sessions: %v", err)
 	}
 	return raw
@@ -767,7 +769,7 @@ func TestGCNeverRemovesARawRecordingThatIsTheOnlyCopy(t *testing.T) {
 		}
 	})
 
-	t.Run("session deleted by age", func(t *testing.T) {
+	t.Run("session kept by age", func(t *testing.T) {
 		dir := t.TempDir()
 		store := newStore(t)
 		createSession(t, store, "20251001120000", daysAgo(400))
@@ -785,8 +787,13 @@ func TestGCNeverRemovesARawRecordingThatIsTheOnlyCopy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("gc run: %v", err)
 		}
-		if len(deleted) != 1 || deleted[0] != "20261001120000" {
-			t.Fatalf("deleted %v, want the session deleted by age", deleted)
+		// Its only audio is the raw capture: the age policy keeps the session,
+		// whose row lets the kept recordings pass save that capture.
+		if len(deleted) != 0 {
+			t.Fatalf("deleted %v, want the session kept with its only audio", deleted)
+		}
+		if _, err := store.GetSession("20261001120000"); err != nil {
+			t.Errorf("the session whose only audio is its raw capture is gone: %v", err)
 		}
 		expectKept(t, raw)
 	})

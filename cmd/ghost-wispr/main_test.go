@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -733,23 +734,32 @@ func TestMicLoopRunsInTheShutdownGroup(t *testing.T) {
 	}
 }
 
-// GET /api/status reports the raw recordings kept because they could not be
-// saved from a cache refreshed in the background, so a stuck disk or a hung
-// recording write cannot hang the status. The warning size is a tenth of the
-// audio budget.
+// GET /api/status reports the raw recordings the app keeps from a cache
+// refreshed in the background (keptRecordings.census), so a stuck disk or a
+// hung recording write cannot hang the status. The warning size is a tenth of
+// the audio budget.
 func TestRefreshKeptRawRecordings(t *testing.T) {
 	dir := t.TempDir()
+	store := openKeptStore(t)
+	started := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	keep := func(id string, size int) {
 		t.Helper()
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.RecoverStaleSessions(dir); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(filepath.Join(dir, id+".pcm"), make([]byte, size), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	keep("20261106100000", 3000)
+	kept := newKeptRecordings(store, audio.NewRecorder(dir), dir, nil, nil)
 	var cache atomic.Pointer[server.KeptRawRecordings]
 	ctx, cancel := context.WithCancel(context.Background())
 	refreshed := goDone(func() {
-		refreshKeptRawRecordings(ctx, audio.NewRecorder(dir), func() int { return 10 }, &cache, 10*time.Millisecond)
+		refreshKeptRawRecordings(ctx, kept, func() int { return 10 }, &cache, 10*time.Millisecond)
 	})
 	t.Cleanup(func() {
 		cancel()
@@ -758,7 +768,7 @@ func TestRefreshKeptRawRecordings(t *testing.T) {
 	waitCached := func(want server.KeptRawRecordings) {
 		t.Helper()
 		for deadline := time.Now().Add(testWait); ; time.Sleep(time.Millisecond) {
-			if got := cache.Load(); got != nil && *got == want {
+			if got := cache.Load(); got != nil && reflect.DeepEqual(*got, want) {
 				return
 			}
 			if time.Now().After(deadline) {
@@ -767,9 +777,9 @@ func TestRefreshKeptRawRecordings(t *testing.T) {
 		}
 	}
 
-	waitCached(server.KeptRawRecordings{Count: 1, Bytes: 3000, WarnBytes: 10 * 1024 * 1024 / 10})
+	waitCached(server.KeptRawRecordings{Count: 1, Bytes: 3000, Unsaved: 1, WarnBytes: 10 * 1024 * 1024 / 10})
 	keep("20261106110000", 1000)
-	waitCached(server.KeptRawRecordings{Count: 2, Bytes: 4000, WarnBytes: 10 * 1024 * 1024 / 10})
+	waitCached(server.KeptRawRecordings{Count: 2, Bytes: 4000, Unsaved: 2, WarnBytes: 10 * 1024 * 1024 / 10})
 
 	cancel()
 	if !returnedWithin(refreshed, testWait) {
@@ -798,7 +808,7 @@ func TestKeptRawWarningSizeNeverWraps(t *testing.T) {
 		var cache atomic.Pointer[server.KeptRawRecordings]
 		ctx, cancel := context.WithCancel(context.Background())
 		refreshed := goDone(func() {
-			refreshKeptRawRecordings(ctx, audio.NewRecorder(t.TempDir()), func() int { return int(tc.budgetMB) }, &cache, time.Hour)
+			refreshKeptRawRecordings(ctx, newKeptRecordings(openKeptStore(t), audio.NewRecorder(t.TempDir()), t.TempDir(), nil, nil), func() int { return int(tc.budgetMB) }, &cache, time.Hour)
 		})
 		for deadline := time.Now().Add(testWait); cache.Load() == nil; time.Sleep(time.Millisecond) {
 			if time.Now().After(deadline) {

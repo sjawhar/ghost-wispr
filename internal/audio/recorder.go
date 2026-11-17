@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -53,7 +54,13 @@ type Recorder struct {
 	// savingPath is the raw recording EndSession is saving now.
 	savingPath string
 
-	encode func(rawPath, sessionID string) (string, error)
+	// encode saves the raw recording at rawPath under name (without its
+	// extension) in the audio directory and returns the saved file
+	// (defaultEncode).
+	encode func(ctx context.Context, rawPath, name string) (string, error)
+	// createRaw creates a session's raw recording, refusing one that exists
+	// (createRawFile).
+	createRaw func(path string) (*os.File, error)
 }
 
 func NewRecorder(audioDir string) *Recorder {
@@ -67,6 +74,7 @@ func NewRecorder(audioDir string) *Recorder {
 		preroll:    transcribe.NewRingBuf(5 * defaultSampleRate * pcmBitDepth / 8 * pcmChannels),
 	}
 	r.encode = r.defaultEncode
+	r.createRaw = createRawFile
 	return r
 }
 
@@ -83,6 +91,17 @@ func (r *Recorder) Writer(dst io.Writer) io.Writer {
 	return &teeWriter{recorder: r, dst: dst}
 }
 
+// createRawFile creates the raw recording at path, and refuses, with an
+// error that wraps os.ErrExist, a file that is already there.
+func createRawFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+}
+
+// StartSession starts recording session sessionID into its raw recording. It
+// never reuses the id of a recording on disk, raw or saved as MP3 or WAV:
+// that is another session's audio (a clock set back can name a new session
+// as an earlier one), so it refuses with an error that wraps os.ErrExist,
+// leaving the file as it is and starting nothing.
 func (r *Recorder) StartSession(sessionID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -91,12 +110,22 @@ func (r *Recorder) StartSession(sessionID string) error {
 		return fmt.Errorf("create audio directory: %w", err)
 	}
 
+	for _, ext := range []string{".mp3", ".wav"} {
+		saved := filepath.Join(r.audioDir, sessionID+ext)
+		if _, err := os.Lstat(saved); err == nil {
+			return fmt.Errorf("the recording of session %s is on disk (%s): %w", sessionID, saved, os.ErrExist)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check for a recording of session %s: %w", sessionID, err)
+		}
+	}
+
 	if r.rawFile != nil {
 		_ = r.rawFile.Close()
+		r.sessionID, r.rawPath, r.rawFile = "", "", nil
 	}
 
 	rawPath := recording.RawPath(r.audioDir, sessionID)
-	rawFile, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	rawFile, err := r.createRaw(rawPath)
 	if err != nil {
 		return fmt.Errorf("open raw pcm file: %w", err)
 	}
@@ -159,7 +188,7 @@ func (r *Recorder) EndSession(sessionID string) (string, error) {
 // save encodes the closed recording of sessionID and removes its raw file. If
 // it cannot, the recording is kept for that session's next EndSession to save.
 func (r *Recorder) save(sessionID, rawPath string) (string, error) {
-	audioPath, err := r.encode(rawPath, sessionID)
+	audioPath, err := r.encode(context.Background(), rawPath, sessionID)
 	r.mu.Lock()
 	if r.savingPath == rawPath {
 		r.savingPath = ""
@@ -196,53 +225,66 @@ func (r *Recorder) writePCM(data []byte) error {
 	return nil
 }
 
-// KeptRawRecordings counts the raw recordings kept in the audio directory
-// because they could not be saved, and their total size: every .pcm there
-// except the recording under way, one being saved or waiting for its retry,
-// and one left beside its saved recording (<id>.mp3 or <id>.wav). Nothing
-// removes them; they are for recovery or deletion by hand.
-func (r *Recorder) KeptRawRecordings() (count int, size int64) {
+// KeptRawSessions returns the sessions whose raw recordings are in the audio
+// directory and that the recorder is not using: not the recording under way,
+// not one being saved, and not one waiting for its retry. A raw recording
+// left beside its saved recording is one of them.
+func (r *Recorder) KeptRawSessions() []string {
 	entries, err := os.ReadDir(r.audioDir)
 	if err != nil {
-		return 0, 0
+		return nil
 	}
-	// Read after listing, so a session that started or ended meanwhile is
-	// still recognised.
+	// Read after listing, as KeptRawRecordings does.
 	r.mu.Lock()
 	live, saving, unsaved := r.rawPath, r.savingPath, r.unsavedPath
 	r.mu.Unlock()
 
+	var ids []string
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || filepath.Ext(name) != ".pcm" {
+		if !entry.Type().IsRegular() || filepath.Ext(name) != ".pcm" || strings.HasPrefix(name, ".") {
 			continue
 		}
-		path := filepath.Join(r.audioDir, name)
-		if path == live || path == saving || path == unsaved {
+		if path := filepath.Join(r.audioDir, name); path == live || path == saving || path == unsaved {
 			continue
 		}
-		id := strings.TrimSuffix(name, ".pcm")
-		if isFile(filepath.Join(r.audioDir, id+".mp3")) || isFile(filepath.Join(r.audioDir, id+".wav")) {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		count++
-		size += info.Size()
+		ids = append(ids, strings.TrimSuffix(name, ".pcm"))
 	}
-	return count, size
+	return ids
 }
 
-func isFile(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
+// SaveKept saves the raw recording kept in the audio directory for session
+// sessionID as EndSession saves a session's recording (MP3, else WAV), and
+// returns the saved file. It saves it under a temporary name
+// (recording.KeptTempPaths), never the session's own, and keeps the raw
+// file: its caller renames the saved file into place only as the session
+// takes it, and erases the raw file once the saved recording is safe. So a
+// session deleted while this runs, then a stop, leaves no <id>.mp3 or
+// <id>.wav of it. It refuses a raw recording the recorder is using: the
+// recording under way, one being saved, or one waiting for its retry. Once
+// ctx is cancelled it saves nothing: the encoder is killed.
+func (r *Recorder) SaveKept(ctx context.Context, sessionID string) (string, error) {
+	rawPath := recording.RawPath(r.audioDir, sessionID)
+	r.mu.Lock()
+	inUse := rawPath == r.rawPath || rawPath == r.savingPath || rawPath == r.unsavedPath
+	r.mu.Unlock()
+	if inUse {
+		return "", fmt.Errorf("raw recording %s is in use by the recorder", rawPath)
+	}
+	info, err := os.Stat(rawPath)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("raw recording %s is not a regular file", rawPath)
+	}
+	return r.encode(ctx, rawPath, recording.KeptTempName(sessionID))
 }
 
 // DiscardUnsaved gives up on a recording EndSession closed but could not save:
-// later EndSession calls no longer try to save it. Its raw audio stays on disk
-// for recovery by hand; DiscardUnsaved returns its path, or "" if it is gone.
+// later EndSession calls no longer try to save it. Its raw audio stays on
+// disk, a kept raw recording that SaveKept can save later; DiscardUnsaved
+// returns its path, or "" if it is gone.
 func (r *Recorder) DiscardUnsaved() string {
 	r.mu.Lock()
 	rawPath := r.unsavedPath
@@ -266,7 +308,12 @@ func (r *Recorder) DiscardPreroll() {
 	r.preroll.Reset()
 }
 
-func (r *Recorder) defaultEncode(rawPath, sessionID string) (string, error) {
+// defaultEncode saves the raw recording at rawPath as <name>.mp3 in the audio
+// directory, else, once the MP3 encoders failed or ran out of time, as
+// <name>.wav, and returns the saved file. A failed encoder or WAV write leaves
+// no partial file. Once ctx is cancelled it saves nothing more: no WAV
+// fallback runs after a cancelled encoder.
+func (r *Recorder) defaultEncode(ctx context.Context, rawPath, name string) (string, error) {
 	r.mu.Lock()
 	sampleRate := r.sampleRate
 	r.mu.Unlock()
@@ -274,26 +321,30 @@ func (r *Recorder) defaultEncode(rawPath, sessionID string) (string, error) {
 		sampleRate = defaultSampleRate
 	}
 
-	mp3Path := filepath.Join(r.audioDir, sessionID+".mp3")
+	mp3Path := filepath.Join(r.audioDir, name+".mp3")
 
 	var pcmBytes int64
 	if info, err := os.Stat(rawPath); err == nil {
 		pcmBytes = info.Size()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), encodeTimeout(pcmBytes, sampleRate))
+	encodeCtx, cancel := context.WithTimeout(ctx, encodeTimeout(pcmBytes, sampleRate))
 	defer cancel()
 
-	if err := encodeWithFFmpeg(ctx, rawPath, mp3Path, sampleRate); err == nil {
+	if err := encodeWithFFmpeg(encodeCtx, rawPath, mp3Path, sampleRate); err == nil {
 		return mp3Path, nil
 	}
 
-	if err := encodeWithLame(ctx, rawPath, mp3Path, sampleRate); err == nil {
+	if err := encodeWithLame(encodeCtx, rawPath, mp3Path, sampleRate); err == nil {
 		return mp3Path, nil
 	}
 	_ = erase.Remove(mp3Path) // a partial file from an encoder that failed or ran out of time
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("save %s: %w", rawPath, err)
+	}
 
-	wavPath := filepath.Join(r.audioDir, sessionID+".wav")
+	wavPath := filepath.Join(r.audioDir, name+".wav")
 	if err := pcmToWav(rawPath, wavPath, sampleRate); err != nil {
+		_ = erase.Remove(wavPath) // a partial file the failed write left
 		return "", fmt.Errorf("encode wav fallback: %w", err)
 	}
 

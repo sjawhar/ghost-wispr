@@ -609,7 +609,7 @@ func TestRecoverStaleSessionsMarksRefinementNoAudio(t *testing.T) {
 	if err := store.CreateSession("20261106140930", time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := store.RecoverStaleSessions(); err != nil {
+	if _, err := store.RecoverStaleSessions(t.TempDir()); err != nil {
 		t.Fatalf("RecoverStaleSessions: %v", err)
 	}
 	session, err := store.GetSession("20261106140930")
@@ -618,6 +618,67 @@ func TestRecoverStaleSessionsMarksRefinementNoAudio(t *testing.T) {
 	}
 	if session.Status != SessionEnded || session.RefinementStatus != RefinementNoAudio {
 		t.Errorf("recovered session is %q with refinement_status %q, want ended and %q", session.Status, session.RefinementStatus, RefinementNoAudio)
+	}
+}
+
+// A session the app stopped inside ends when its audio stopped, the last
+// write of its raw recording, not when the app started again, which can be
+// long after. The end is never before the session started (a raw recording
+// written with the clock set back) and never after the restart (one written
+// with the clock ahead). A session with no raw recording ends at the restart.
+func TestRecoverStaleSessionsEndsASessionAtItsLastAudio(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	audioDir := t.TempDir()
+	started := time.Date(2026, 11, 6, 14, 9, 30, 0, time.UTC)
+	lastAudio := started.Add(80*time.Minute + 30*time.Second + 123456789)
+	const atLastAudio, beforeStart, afterRestart, noRaw = "20261106140930", "20261106141000", "20261106141100", "20261106141200"
+	written := map[string]time.Time{
+		atLastAudio:  lastAudio,
+		beforeStart:  started.Add(-time.Hour),
+		afterRestart: time.Now().UTC().Add(24 * time.Hour),
+	}
+	for _, id := range []string{atLastAudio, beforeStart, afterRestart, noRaw} {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for id, at := range written {
+		raw := filepath.Join(audioDir, id+".pcm")
+		if err := os.WriteFile(raw, []byte{1, 2}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(raw, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	restartFrom := time.Now().UTC()
+	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+		t.Fatalf("RecoverStaleSessions: %v", err)
+	}
+	restartTo := time.Now().UTC()
+
+	endedAt := func(id string) time.Time {
+		t.Helper()
+		sess, err := store.GetSession(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sess.Status != SessionEnded || sess.EndedAt == nil {
+			t.Fatalf("session %s is %q with end %v, want ended", id, sess.Status, sess.EndedAt)
+		}
+		return sess.EndedAt.UTC()
+	}
+	if got := endedAt(atLastAudio); !got.Equal(lastAudio) {
+		t.Errorf("a session whose raw recording was last written at %s ended at %s, want then", lastAudio.Format(time.RFC3339Nano), got.Format(time.RFC3339Nano))
+	}
+	if got := endedAt(beforeStart); !got.Equal(started) {
+		t.Errorf("a session whose raw recording reads as written before it started ended at %s, want its start %s", got.Format(time.RFC3339Nano), started.Format(time.RFC3339Nano))
+	}
+	for _, id := range []string{afterRestart, noRaw} {
+		if got := endedAt(id); got.Before(restartFrom) || got.After(restartTo) {
+			t.Errorf("session %s ended at %s, want the restart, between %s and %s", id, got.Format(time.RFC3339Nano), restartFrom.Format(time.RFC3339Nano), restartTo.Format(time.RFC3339Nano))
+		}
 	}
 }
 

@@ -58,7 +58,7 @@ Before `init()` runs any schema changes, `createPreMigrationBackup` (`internal/s
 
 One case removes the backup instead. If a deletion's erase after its commit fails (for example `VACUUM INTO` on a full disk), it stays owed, and the retry (`RetryOwedErasure`, `internal/storage/owed_erase.go`) cannot scrub the backup, because the deleted text is not kept. So when the backup has an older schema than the database, which is true for the rest of any run that applied a migration, the retry erases it. A rollback after that has no pre-migration backup to restore. This is a deliberate choice: a backup that may hold deleted words is worse than none.
 
-This is the most important safety net. If migrations corrupt data, you can restore.
+This is the most important safety net. If migrations corrupt data, you can restore. A restored database has no row for the sessions recorded since the backup, but their audio stays in the audio directory: the app erases the audio of a session with no row only when a delete recorded it (`deleted_session_files`), and `GET /api/status` lists, in `kept_raw_by_hand`, the raw captures it neither saves nor erases.
 
 ### 2. Default Values for Restored Data
 

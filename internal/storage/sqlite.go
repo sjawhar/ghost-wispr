@@ -416,6 +416,26 @@ func (s *SQLiteStore) init(dbPath string) error {
 		return fmt.Errorf("create app_state table: %w", err)
 	}
 
+	// deleted_session_files records each session a person's delete or GC's
+	// age delete took, with the files of it to erase (absolute paths, as a
+	// JSON array), in the transaction that deletes the rows
+	// (recordDeletedSessionAudio). The kept recordings pass erases those
+	// files a stop left behind, then clears the record (DeletedSessionAudio,
+	// ClearDeletedSessionAudio). It erases no other file of a session with no
+	// row: a restored backup has no row for the sessions recorded since it.
+	// Earlier heads of the change that added it (#76) made it as
+	// deleted_session_audio, with an audio_path column; no release carried
+	// that table, so it is dropped rather than read.
+	if _, err := s.db.Exec(`
+		DROP TABLE IF EXISTS deleted_session_audio;
+		CREATE TABLE IF NOT EXISTS deleted_session_files (
+			session_id TEXT PRIMARY KEY,
+			files TEXT NOT NULL DEFAULT '[]'
+		);
+	`); err != nil {
+		return fmt.Errorf("create deleted session audio table: %w", err)
+	}
+
 	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS drive_replacements (
 			session_id TEXT NOT NULL,
@@ -992,20 +1012,40 @@ func (s *SQLiteStore) runOnce(name, stmt string) error {
 	return nil
 }
 
+// ErrSessionExists is the error CreateSession returns, creating nothing, for
+// an id a session already has, or a deleted session still recorded in
+// deleted_session_files.
+var ErrSessionExists = errors.New("a session with this id exists")
+
+// CreateSession creates session id, active since startedAt. An id a session
+// already has is refused with ErrSessionExists, and that session is left as
+// it is. So is the id of a deleted session whose audio the kept recordings
+// pass has not cleared yet: that pass erases the audio files of the id.
 func (s *SQLiteStore) CreateSession(id string, startedAt time.Time) error {
 	if strings.TrimSpace(id) == "" {
 		return errors.New("session id is required")
 	}
 
-	_, err := s.db.Exec(
-		`INSERT INTO sessions(id, started_at, status, summary_status, envoy_publish_status) VALUES(?, ?, 'active', ?, ?)`,
+	res, err := s.db.Exec(
+		`INSERT INTO sessions(id, started_at, status, summary_status, envoy_publish_status)
+		 SELECT ?, ?, 'active', ?, ?
+		 WHERE NOT EXISTS (SELECT 1 FROM deleted_session_files WHERE session_id = ?)
+		 ON CONFLICT(id) DO NOTHING`,
 		id,
 		startedAt.UTC().Format(time.RFC3339Nano),
 		SummaryPending,
 		EnvoyPublishPending,
+		id,
 	)
 	if err != nil {
 		return fmt.Errorf("create session %s: %w", id, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("create session %s: %w", id, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("create session %s: %w", id, ErrSessionExists)
 	}
 	return nil
 }
@@ -1140,6 +1180,11 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("begin merge tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if pending, err := deletedAudioPending(tx, newID); err != nil {
+		return err
+	} else if pending {
+		return fmt.Errorf("merge into session %s: %w", newID, ErrSessionAudioPending)
+	}
 
 	placeholders, sourceArgs := placeholderList(sourceIDs)
 	args := append([]any{newID}, sourceArgs...)
@@ -2014,41 +2059,78 @@ func (s *SQLiteStore) RecoverStaleRefinements() error {
 	return nil
 }
 
-// RecoverStaleSessions ends any sessions still marked as 'active' and returns their IDs.
-// This handles the case where the app was restarted while a session was in progress.
-func (s *SQLiteStore) RecoverStaleSessions() ([]string, error) {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+// RecoverStaleSessions ends every session still marked active, which the app
+// stopped inside (a power cut, a crash), and returns their ids. Each ends when
+// its audio stopped: the last write of its raw recording in audioDir, not now,
+// which can be long after. That time is kept between the session's start and
+// now, the restart, since a clock set back or ahead while it recorded can
+// stamp the file outside them. A session with no raw recording ends now. Each
+// ends with no saved recording, so it cannot be refined (no_audio) until the
+// app saves its raw recording as its recording.
+func (s *SQLiteStore) RecoverStaleSessions(audioDir string) ([]string, error) {
+	now := time.Now().UTC()
 
-	rows, err := s.db.Query(`SELECT id FROM sessions WHERE status = 'active'`)
+	rows, err := s.db.Query(`SELECT id, started_at FROM sessions WHERE status = 'active'`)
 	if err != nil {
 		return nil, fmt.Errorf("query active sessions: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var ids []string
+	type staleSession struct {
+		id        string
+		startedAt string
+	}
+	var stale []staleSession
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var sess staleSession
+		if err := rows.Scan(&sess.id, &sess.startedAt); err != nil {
 			return nil, fmt.Errorf("scan active session: %w", err)
 		}
-		ids = append(ids, id)
+		stale = append(stale, sess)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate active sessions: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("iterate active sessions: %w", err)
+	}
 
-	for _, id := range ids {
+	ids := make([]string, 0, len(stale))
+	for _, sess := range stale {
+		endedAt := now
+		if lastAudio, ok := lastRawWrite(audioDir, sess.id); ok {
+			endedAt = lastAudio
+			if startedAt, err := time.Parse(time.RFC3339Nano, sess.startedAt); err == nil && endedAt.Before(startedAt) {
+				endedAt = startedAt.UTC()
+			}
+			if endedAt.After(now) {
+				endedAt = now
+			}
+		}
 		_, err := s.db.Exec(
-			// Ended with no saved recording, so it can never be refined.
 			`UPDATE sessions SET ended_at = ?, status = 'ended', refinement_status = ? WHERE id = ? AND status = 'active'`,
-			now, RefinementNoAudio, id,
+			endedAt.Format(time.RFC3339Nano), RefinementNoAudio, sess.id,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("end stale session %s: %w", id, err)
+			return nil, fmt.Errorf("end stale session %s: %w", sess.id, err)
 		}
+		ids = append(ids, sess.id)
 	}
 
 	return ids, nil
+}
+
+// lastRawWrite returns when session sessionID's raw recording in audioDir was
+// last written, and false if it has none there.
+func lastRawWrite(audioDir, sessionID string) (time.Time, bool) {
+	if strings.TrimSpace(audioDir) == "" {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(recording.RawPath(audioDir, sessionID))
+	if err != nil || !info.Mode().IsRegular() {
+		return time.Time{}, false
+	}
+	return info.ModTime().UTC(), true
 }
 
 // GetSessionsNeedingSummary returns IDs of ended sessions with pending or empty summaries.
@@ -2468,7 +2550,9 @@ func (s *SQLiteStore) MarkRemoteDeleted(id, folderID, errorMessage string) (bool
 // provenance: a later merge or retry reads them to name the session's
 // recordings, whose audio is not on this unit. The session keeps the time it
 // started, but its age for the retention policy runs from now, its restore.
-// Returns an error containing "already exists" if the session ID is already present.
+// Returns an error containing "already exists" if the session ID is already
+// present, and ErrSessionAudioPending while a recorded delete of the id waits
+// for the kept recordings pass.
 func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment, recordingPaths []string) error {
 	// Check for existing session first.
 	var exists int
@@ -2484,6 +2568,11 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		return fmt.Errorf("begin import tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if pending, err := deletedAudioPending(tx, sess.ID); err != nil {
+		return err
+	} else if pending {
+		return fmt.Errorf("import session %s: %w", sess.ID, ErrSessionAudioPending)
+	}
 
 	endedAt := ""
 	if sess.EndedAt != nil {

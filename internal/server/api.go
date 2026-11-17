@@ -56,6 +56,16 @@ type SessionStore interface {
 	ReserveRawSessionErase(id, originalPath, hiddenPath string) (string, error)
 	CancelRawSessionErase(id, hiddenPath string) error
 	SourceSessionIDs(sessionID string) ([]string, error)
+	// NamedAudio lists, absolute, every audio file a session names, the
+	// recordings a restored session's Drive folder holds in the audio
+	// directory included: a session delete leaves those files.
+	NamedAudio(audioDir string) ([]string, error)
+	// DeletedSessionAudio lists the delete records: a session delete erases
+	// the files its records list, the recordings a restored folder held
+	// included. ClearDeletedSessionAudio forgets one once every file of the
+	// session is off its name.
+	DeletedSessionAudio() ([]storage.DeletedSessionAudio, error)
+	ClearDeletedSessionAudio(id string) error
 	DeleteSession(id, audioDir string) (string, error)
 	MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error
 	Search(query string, opts storage.SearchOptions) ([]storage.SearchResult, error)
@@ -879,7 +889,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			return
 		}
 		if err := store.MergeSessions(newID, body.SessionIDs, earliest, latest); err != nil {
-			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) || errors.Is(err, storage.ErrMergeSessionExists) {
+			if errors.Is(err, storage.ErrMergeReplacementPending) || errors.Is(err, storage.ErrMergeSessionActive) || errors.Is(err, storage.ErrMergeSourceUnavailable) || errors.Is(err, storage.ErrMergeSessionExists) || errors.Is(err, storage.ErrSessionAudioPending) {
 				writeJSONError(w, http.StatusConflict, err.Error())
 				return
 			}
@@ -1348,6 +1358,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 				activeSessionStartedAt = startedAt.UTC().Format(time.RFC3339Nano)
 			}
 		}
+		keptByHand := append([]string{}, kept.ByHand...)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"paused":                    paused,
 			"capturing":                 capturing,
@@ -1355,6 +1366,7 @@ func registerAPIRoutes(mux *http.ServeMux, store SessionStore, controls *Control
 			"warnings":                  warnings,
 			"kept_raw_recordings":       kept.Count,
 			"kept_raw_bytes":            kept.Bytes,
+			"kept_raw_by_hand":          keptByHand,
 			"gc_hold":                   gcHold,
 			"unverified_sessions":       unverified,
 			"unit_only_sessions":        unitOnly,

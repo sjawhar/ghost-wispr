@@ -17,15 +17,31 @@ func FileName(path string) string {
 
 // LocalName returns the file name of the saved recording that the Drive file
 // name names, the inverse of FileName, and false for a name FileName does not
-// make: another file of the folder, or one whose rest is not a plain file
-// name (empty, "." or "..", or holding a separator), which joined to a
-// directory would name a path outside it.
+// make: another file of the folder, or one whose rest is not a recording's
+// plain file name (PlainName).
 func LocalName(name string) (string, bool) {
 	base, ok := strings.CutPrefix(name, driveNamePrefix)
-	if !ok || base == "" || base == "." || base == ".." || strings.ContainsRune(base, '/') || filepath.Base(base) != base {
+	if !ok || !PlainName(base) {
 		return "", false
 	}
 	return base, true
+}
+
+// PlainName reports whether name is the plain file name of a saved
+// recording: an .mp3 or .wav with no separator, not "." or "..", not hidden,
+// and with no comma. Joined to a directory it names a file in it; it never
+// names a file outside it, nor a file Resolve would find from the working
+// directory that is not a recording (such as .env or the binary), and an
+// audio path, a comma list, cannot split it into another path.
+func PlainName(name string) bool {
+	if name == "" || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/,`) || filepath.Base(name) != name {
+		return false
+	}
+	switch filepath.Ext(name) {
+	case ".mp3", ".wav":
+		return true
+	}
+	return false
 }
 
 // Key identifies the recording a path names whether it is saved as MP3 or as
@@ -58,6 +74,32 @@ func Entries(audioPath string) []string {
 // records, and keeps when the recording cannot be saved: <audioDir>/<id>.pcm.
 func RawPath(audioDir, sessionID string) string {
 	return filepath.Join(audioDir, sessionID+".pcm")
+}
+
+// keptTempPrefix starts the name of a recording saved from a kept raw
+// recording until its session takes it.
+const keptTempPrefix = ".kept-"
+
+// KeptTempName returns the name, without its extension, of the recording
+// saved from session sessionID's kept raw recording until the session takes
+// it: hidden, so that no reader takes it for a recording, and named for the
+// session, so that a delete of the session finds it.
+func KeptTempName(sessionID string) string {
+	return keptTempPrefix + sessionID
+}
+
+// KeptTempPaths returns the files in audioDir that a save of session
+// sessionID's kept raw recording writes before the session takes one: the
+// MP3 and the WAV fallback.
+func KeptTempPaths(audioDir, sessionID string) []string {
+	name := filepath.Join(audioDir, KeptTempName(sessionID))
+	return []string{name + ".mp3", name + ".wav"}
+}
+
+// IsKeptTemp reports whether name is the file name of a recording saved from
+// a kept raw recording that no session has taken yet (KeptTempPaths).
+func IsKeptTemp(name string) bool {
+	return strings.HasPrefix(name, keptTempPrefix)
 }
 
 // Resolve returns the file one entry of a session's audio path names: the

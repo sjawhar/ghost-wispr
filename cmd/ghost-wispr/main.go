@@ -552,30 +552,25 @@ func gcConfig(cfg *config.Config, drive sessionSyncer) gc.Config {
 	}
 }
 
-// keptRawRefreshEvery is how often the count of raw recordings kept because
-// they could not be saved is refreshed for GET /api/status.
+// keptRawRefreshEvery is how often the count of the raw recordings the app
+// keeps is refreshed for GET /api/status.
 const keptRawRefreshEvery = time.Minute
 
 // refreshKeptRawRecordings keeps cache up to date with the raw recordings the
-// recorder keeps because they could not be saved, every interval until ctx
-// ends. GET /api/status reads the cache, so a stuck disk or a hung recording
-// write cannot hang the status. The status warns once they take more than a
-// tenth of the audio budget, which they are not counted against, or as soon
-// as there is one when there is no budget (0): nothing removes them.
-func refreshKeptRawRecordings(ctx context.Context, recorder *audio.Recorder, budgetMB func() int, cache *atomic.Pointer[server.KeptRawRecordings], interval time.Duration) {
+// app keeps (keptRecordings.census), every interval until ctx ends. GET
+// /api/status reads the cache, so a stuck disk or a hung recording write
+// cannot hang the status. The status warns once they take more than a tenth
+// of the audio budget, which they are not counted against, or as soon as
+// there is one when there is no budget (0): GC never removes them.
+func refreshKeptRawRecordings(ctx context.Context, kept *keptRecordings, budgetMB func() int, cache *atomic.Pointer[server.KeptRawRecordings], interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		count, size := recorder.KeptRawRecordings()
-		var warnBytes int64
+		census := kept.census()
 		if budget, limited := gc.AudioBudgetBytes(budgetMB()); limited {
-			warnBytes = budget / 10
+			census.WarnBytes = budget / 10
 		}
-		cache.Store(&server.KeptRawRecordings{
-			Count:     count,
-			Bytes:     size,
-			WarnBytes: warnBytes,
-		})
+		cache.Store(&census)
 		select {
 		case <-ctx.Done():
 			return
@@ -719,8 +714,9 @@ func main() {
 		log.Fatalf("storage init failed: %v", err)
 	}
 
-	// Recover any sessions left as 'active' from a previous crash/restart.
-	recoveredIDs, err := store.RecoverStaleSessions()
+	// Recover any sessions left as 'active' from a previous crash/restart:
+	// each ends when its raw recording was last written.
+	recoveredIDs, err := store.RecoverStaleSessions(cfg.AudioDir)
 	if err != nil {
 		log.Printf("warning: failed to recover stale sessions: %v", err)
 	} else if len(recoveredIDs) > 0 {
@@ -1054,8 +1050,12 @@ func main() {
 		return result, nil
 	}
 
+	// The kept recordings pass saves the raw recordings of sessions that
+	// ended without a recording, and erases a raw recording once Drive has
+	// its saved recording or cannot take it; its census feeds the status.
+	kept := newKeptRecordings(store, audioRecorder, cfg.AudioDir, drive, refineRecoveredRecording(manager))
 	var keptRaw atomic.Pointer[server.KeptRawRecordings]
-	go refreshKeptRawRecordings(ctx, audioRecorder, func() int { return cfgStore.Get().GCMaxAudioSizeMB }, &keptRaw, keptRawRefreshEvery)
+	go refreshKeptRawRecordings(ctx, kept, func() int { return cfgStore.Get().GCMaxAudioSizeMB }, &keptRaw, keptRawRefreshEvery)
 	gcHealthState := &gcHealth{}
 	gcHealthState.countUnverified(store)
 
@@ -1496,7 +1496,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	// The Drive sync sweep runs whether sync is on or not: it syncs nothing
 	// while sync is off, and picks up a syncer turned on in the settings.
-	go sweepDriveSync(ctx, store, drive, warningRegistry, 5*time.Minute)
+	// After each sweep, a kept recordings pass runs (kept, above).
+	// A session delete stops a save of the session's kept raw recording
+	// before it erases the session's files.
+	controlHooks.HoldSessionAudio = kept.Hold
+	go sweepDriveSync(ctx, store, drive, warningRegistry, 5*time.Minute, kept)
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -1760,8 +1764,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// This cleanup must run before anything else splices or erases in these
 	// directories: before the HTTP listener below (segment and session
 	// deletions), before recoverPendingSplices, before the first Drive sweep
-	// (5 minutes), whose ticker starts above, and before GC, which starts
-	// below with a pass at once.
+	// (5 minutes), whose ticker starts above, before the kept recordings pass,
+	// which erases raw recordings, and before GC, which starts below with a
+	// pass at once.
 	// erase.Leftovers unlinks the second name an erase.Replace under way still
 	// needs, cleanupSpliceTempCopiesExcept removes the copies a running deletion
 	// splices, and ForgetEraseDirectories forgets directories no erase is
@@ -1774,6 +1779,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if err := cleanupRecordingDirectories(store, cfg.AudioDir); err != nil {
 		recordPendingSpliceCleanupWarning(warningRegistry, err)
 	}
+	// The recordings a stop cut off (storage.RecoverStaleSessions ended their
+	// sessions above) are saved now, not at the first sweep.
+	go kept.run(ctx)
 	if cfg.GCEnabled {
 		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}

@@ -49,7 +49,7 @@ func (s *erasureRetryStore) RetryOwedErasure() error {
 func TestTheSyncSweepRetriesOwedErasures(t *testing.T) {
 	store := &erasureRetryStore{}
 	ctx, cancel := context.WithCancel(context.Background())
-	swept := goDone(func() { sweepDriveSync(ctx, store, &driveSync{}, newWarningsRegistry(), time.Millisecond) })
+	swept := goDone(func() { sweepDriveSync(ctx, store, &driveSync{}, newWarningsRegistry(), time.Millisecond, nil) })
 	t.Cleanup(func() {
 		cancel()
 		<-swept
@@ -89,7 +89,7 @@ func TestDriveSyncSweepSurvivesSyncTurnedOffAndOn(t *testing.T) {
 	syncer := &countingSyncer{}
 	drive.Set(syncer)
 	ctx, cancel := context.WithCancel(context.Background())
-	swept := goDone(func() { sweepDriveSync(ctx, sweepStoreStub{}, drive, newWarningsRegistry(), time.Millisecond) })
+	swept := goDone(func() { sweepDriveSync(ctx, sweepStoreStub{}, drive, newWarningsRegistry(), time.Millisecond, nil) })
 	t.Cleanup(func() {
 		cancel()
 		<-swept

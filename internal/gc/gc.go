@@ -431,8 +431,9 @@ func (n names) forget(id string) {
 // waiting to sync them) and Drive confirms its folder and recordings. It
 // removes the session's raw .pcm only once a saved recording with audio in it
 // is gone, so the raw file was a redundant copy, and only when no session
-// names it; otherwise the raw file may be the only copy of the audio and
-// stays: GC never removes one.
+// names it. A session, or a merged source, whose raw file is its only audio
+// is not deleted: GC never removes such a file, and a deleted session's
+// files are erased by the kept recordings pass.
 func (c *Collector) deleteSession(id string, names names) error {
 	sess, err := c.store.GetSession(id)
 	if err != nil {
@@ -512,6 +513,16 @@ func (c *Collector) deleteSession(id string, names names) error {
 			if err := restoreReservedRaw(c.store, reservation); err != nil {
 				return fmt.Errorf("keep raw recording of session %s: %w", id, err)
 			}
+		}
+	}
+	// A session whose only audio is its raw capture stays: deleting its row
+	// would record the delete, and the kept recordings pass erases the audio
+	// of a recorded delete, while the row lets that pass save the capture.
+	if !hasSavedAudio && c.config.AudioDir != "" {
+		if _, err := os.Stat(c.rawPath(id)); err == nil {
+			return fmt.Errorf("session %s keeps its only audio as raw PCM", id)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat raw PCM of session %s: %w", id, err)
 		}
 	}
 

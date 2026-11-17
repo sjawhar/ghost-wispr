@@ -1559,7 +1559,7 @@ func TestFailedSessionEndKeepsTheGateClosedUntilItSucceeds(t *testing.T) {
 
 // A recording that can never be saved does not keep the microphone off for
 // good. After the recorder has failed to save it five times, the pause ends
-// the session without it, leaving the raw audio on disk for recovery by hand,
+// the session without it, leaving the raw audio on disk for a later save,
 // and the gate opens onto no session: speech after the resume starts a new
 // one, never the session from before the pause.
 func TestPauseEndsASessionWhoseRecordingCannotBeSaved(t *testing.T) {
