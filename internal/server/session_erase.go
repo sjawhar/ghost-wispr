@@ -79,7 +79,11 @@ func registerSessionDeleteRoute(mux *http.ServeMux, store SessionStore, controls
 //     restored unit a merged session names its sources' recordings), and
 //     zeroes the hidden raw captures and recordings in the background. If
 //     what remaining sessions name cannot be read, it hides only the
-//     recordings the row named, as before.
+//     recordings the row named, as before;
+//   - once every one of those files is off its name, it clears the delete
+//     records DeleteSession wrote (storage.DeletedSessionAudio), so a restore
+//     or a merge of the id is not refused until the kept recordings pass
+//     runs; otherwise that pass erases what is left, then clears them.
 //
 // Removing a whole audio file overwrites it with zeros before the file
 // system frees its blocks (Sami, 2026-11-12, "Zero every audio removal",
@@ -115,11 +119,14 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 	onDeleted(sessionIDs)
 
 	files := sessionAudioFiles(audioPath, recordingDir, sessionIDs)
-	named, err := remainingNamed(store, recordingDir)
-	if err != nil {
-		slog.Warn("could not read what remaining sessions name; erasing only the recordings the deleted row named", "session_id", sessionID, "error", err)
+	named, namedErr := remainingNamed(store, recordingDir)
+	if namedErr != nil {
+		slog.Warn("could not read what remaining sessions name; erasing only the recordings the deleted row named", "session_id", sessionID, "error", namedErr)
 		files, named = sessionAudioFiles(audioPath, recordingDir, nil), nil
 	}
+	// Every file is off its name once each is hidden or already gone; then
+	// the delete records (storage.DeletedSessionAudio) have done their work.
+	allOff := namedErr == nil
 	pending := make([]erase.Pending, 0)
 	for _, p := range files {
 		if named[p] {
@@ -134,10 +141,18 @@ func deleteSessionErasingAudio(store SessionStore, sessionID, recordingDir strin
 		case err != nil:
 			if !errors.Is(err, os.ErrNotExist) {
 				slog.Warn("could not remove a deleted session's recording", "session_id", sessionID, "audio_path", p, "error", err)
+				allOff = false
 			}
 			continue
 		}
 		pending = append(pending, hidden)
+	}
+	if allOff {
+		for _, id := range sessionIDs {
+			if err := store.ClearDeletedSessionAudio(id); err != nil {
+				slog.Warn("could not clear the delete record of a session; the kept recordings pass clears it", "session_id", id, "error", err)
+			}
+		}
 	}
 	if len(rawReservations) > 0 {
 		go finishRawErasing(store, rawReservations)
@@ -183,18 +198,18 @@ func sessionAudioFiles(audioPath, recordingDir string, sessionIDs []string) []st
 }
 
 // remainingNamed returns, absolute, every file a session the store still has
-// names, found where recording.Resolve finds it in recordingDir.
+// names, the recordings a restored session's Drive folder holds included
+// (storage.SQLiteStore.NamedAudio), each found where recording.Resolve finds
+// it in recordingDir.
 func remainingNamed(store SessionStore, recordingDir string) (map[string]bool, error) {
-	recordings, err := store.Recordings()
+	entries, err := store.NamedAudio()
 	if err != nil {
 		return nil, err
 	}
 	named := map[string]bool{}
-	for _, rec := range recordings {
-		for _, entry := range recordingname.Entries(rec.AudioPath) {
-			if abs, err := filepath.Abs(recordingname.Resolve(entry, recordingDir)); err == nil {
-				named[abs] = true
-			}
+	for _, entry := range entries {
+		if abs, err := filepath.Abs(recordingname.Resolve(entry, recordingDir)); err == nil {
+			named[abs] = true
 		}
 	}
 	return named, nil

@@ -1176,6 +1176,11 @@ func (s *SQLiteStore) MergeSessions(newID string, sourceIDs []string, startedAt,
 		return fmt.Errorf("begin merge tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if pending, err := deletedAudioPending(tx, newID); err != nil {
+		return err
+	} else if pending {
+		return fmt.Errorf("merge into session %s: %w", newID, ErrSessionAudioPending)
+	}
 
 	placeholders, sourceArgs := placeholderList(sourceIDs)
 	args := append([]any{newID}, sourceArgs...)
@@ -2541,7 +2546,9 @@ func (s *SQLiteStore) MarkRemoteDeleted(id, folderID, errorMessage string) (bool
 // provenance: a later merge or retry reads them to name the session's
 // recordings, whose audio is not on this unit. The session keeps the time it
 // started, but its age for the retention policy runs from now, its restore.
-// Returns an error containing "already exists" if the session ID is already present.
+// Returns an error containing "already exists" if the session ID is already
+// present, and ErrSessionAudioPending while a recorded delete of the id waits
+// for the kept recordings pass.
 func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment, recordingPaths []string) error {
 	// Check for existing session first.
 	var exists int
@@ -2557,6 +2564,11 @@ func (s *SQLiteStore) ImportSession(sess *Session, segments []transcribe.Segment
 		return fmt.Errorf("begin import tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if pending, err := deletedAudioPending(tx, sess.ID); err != nil {
+		return err
+	} else if pending {
+		return fmt.Errorf("import session %s: %w", sess.ID, ErrSessionAudioPending)
+	}
 
 	endedAt := ""
 	if sess.EndedAt != nil {

@@ -667,12 +667,12 @@ func (s *laterNamingStore) ClearDeletedSessionAudio(id string) error {
 	return nil
 }
 
-func (s *laterNamingStore) Recordings() ([]storage.SessionRecording, error) {
-	recordings, err := s.SQLiteStore.Recordings()
+func (s *laterNamingStore) NamedAudio() ([]string, error) {
+	named, err := s.SQLiteStore.NamedAudio()
 	if s.naming {
-		recordings = append(recordings, storage.SessionRecording{ID: "merged", AudioPath: s.path})
+		named = append(named, s.path)
 	}
-	return recordings, err
+	return named, err
 }
 
 // Re-review of #76, P1: what sessions name is read just before each deleted
@@ -804,6 +804,41 @@ func TestASavedRecordingIsOnTheDiskBeforeTheSessionTakesIt(t *testing.T) {
 	}
 	if !wrapped.flushed || !slices.Equal(synced, []string{".kept-" + id + ".mp3"}) {
 		t.Errorf("flushed before the session took it: %v; files flushed %v, want [.kept-%s.mp3]", wrapped.flushed, synced, id)
+	}
+}
+
+// Review 5936222350 of #76, P3: an adoption leaves a file a restored
+// session's Drive folder holds (restored_recordings): a merge or a Retry
+// refinement names it for that session later, so the source session with
+// the same id must not take it first.
+func TestAnAdoptionLeavesARestoredSessionsRecording(t *testing.T) {
+	store := openKeptStore(t)
+	audioDir := t.TempDir()
+	const source, restoredID = "20261106140000", "20261106160000"
+	if err := store.CreateSession(source, time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecoverStaleSessions(audioDir); err != nil {
+		t.Fatal(err)
+	}
+	downloaded := filepath.Join(audioDir, source+".mp3")
+	if err := os.WriteFile(downloaded, []byte("the restored merged session's recording"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, 11, 6, 16, 0, 0, 0, time.UTC)
+	ended := started.Add(time.Hour)
+	restored := storage.Session{ID: restoredID, StartedAt: started, EndedAt: &ended, Status: storage.SessionEnded, SummaryStatus: storage.SummaryCompleted, RefinementStatus: storage.RefinementNoAudio}
+	if err := store.ImportSession(&restored, nil, []string{source + ".mp3"}); err != nil {
+		t.Fatal(err)
+	}
+
+	newKeptRecordings(store, audio.NewRecorder(audioDir), audioDir, nil, nil).run(context.Background())
+
+	if sess, err := store.GetSession(source); err != nil || sess.AudioPath != "" {
+		t.Errorf("session %s names %q (%v), want no recording: the restored session's folder holds that file", source, sess.AudioPath, err)
+	}
+	if got, err := os.ReadFile(downloaded); err != nil || string(got) != "the restored merged session's recording" {
+		t.Errorf("%s.mp3 holds %q (%v), want it as it was", source, got, err)
 	}
 }
 

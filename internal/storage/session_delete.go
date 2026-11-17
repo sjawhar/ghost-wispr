@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -448,6 +449,13 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 	case err != nil:
 		return nil, false, fmt.Errorf("check session %s and its sources before GC deletion: %w", id, err)
 	}
+	if audioDir != "" {
+		if only, err := keepsOnlyRawAudio(id, audioPath, audioDir); err != nil {
+			return nil, false, err
+		} else if only {
+			return nil, false, &GCSessionBlockError{BlockingSessionID: id, BlockingSessionIsTarget: true, Reason: "its only audio is its raw capture"}
+		}
+	}
 	rows, err := tx.Query(`WITH RECURSIVE doomed(id) AS (
 			SELECT ?
 			UNION SELECT source.id FROM sessions AS source JOIN doomed ON source.merged_into = doomed.id
@@ -501,4 +509,28 @@ func (s *SQLiteStore) DeleteEndedSessionAndSources(id, audioPath, audioDir strin
 	}
 	s.eraseAfterSessionDeletion(owed, earlierOwed, deletedIDs)
 	return deletedIDs, true, nil
+}
+
+// keepsOnlyRawAudio reports whether session id's raw capture in audioDir is
+// its only audio: the capture is there and no file its audio path names (found
+// where recording.Resolve finds it) holds any audio. GC's age delete keeps
+// such a session: deleting it would record the delete, and the kept
+// recordings pass erases the audio of a recorded delete, while the row lets
+// that pass save the capture.
+func keepsOnlyRawAudio(id, audioPath, audioDir string) (bool, error) {
+	info, err := os.Stat(recording.RawPath(audioDir, id))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("check the raw capture of session %s: %w", id, err)
+	case !info.Mode().IsRegular():
+		return false, nil
+	}
+	for _, entry := range recording.Entries(audioPath) {
+		if saved, err := os.Stat(recording.Resolve(entry, audioDir)); err == nil && saved.Mode().IsRegular() && saved.Size() > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }

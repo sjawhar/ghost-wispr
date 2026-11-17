@@ -47,6 +47,8 @@ type apiStoreStub struct {
 	deletedAudioPath string
 	// deleteAudioDir is the audio directory the last DeleteSession was given.
 	deleteAudioDir string
+	// cleared is the deleted sessions whose audio records were cleared.
+	cleared []string
 }
 
 type embeddingClientStub struct {
@@ -198,15 +200,19 @@ func (*apiStoreStub) SourceSessionIDs(string) ([]string, error) {
 	return nil, nil
 }
 
-func (s *apiStoreStub) Recordings() ([]storage.SessionRecording, error) {
-	var recordings []storage.SessionRecording
+func (s *apiStoreStub) NamedAudio() ([]string, error) {
+	var named []string
 	for id := range s.sessions {
-		if s.sessions[id].AudioPath != "" {
-			recordings = append(recordings, storage.SessionRecording{ID: id, AudioPath: s.sessions[id].AudioPath})
-		}
+		named = append(named, recordingname.Entries(s.sessions[id].AudioPath)...)
 	}
-	return recordings, nil
+	return named, nil
 }
+
+func (s *apiStoreStub) ClearDeletedSessionAudio(id string) error {
+	s.cleared = append(s.cleared, id)
+	return nil
+}
+
 func (s *apiStoreStub) MergeSessions(newID string, sourceIDs []string, startedAt, endedAt time.Time) error {
 	endedAtPtr := &endedAt
 	s.sessions[newID] = storage.Session{
@@ -907,6 +913,57 @@ func TestDeleteSession_LeavesTheFilesARemainingSessionNames(t *testing.T) {
 	}
 	if got, err := os.ReadFile(shared); err != nil || string(got) != "audio" {
 		t.Errorf("s1.mp3, which the merged session names, holds %q (%v), want it as it was", got, err)
+	}
+}
+
+// Review 5936222350 of #76, P3: once a session delete has every audio file of
+// the deleted sessions off its name, it clears their delete records itself,
+// so a Restore from Drive or a merge that brings an id back is not refused
+// for minutes, waiting for the kept recordings pass. A delete that could not
+// take a file off its name leaves the record for that pass.
+func TestDeleteSession_ClearsItsRecordOnceEveryFileIsOff(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		hideFail bool
+		want     []string
+	}{
+		{name: "every file off its name", want: []string{"s1"}},
+		{name: "a file left under its name", hideFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			saved := filepath.Join(dir, "s1.mp3")
+			if err := os.WriteFile(saved, []byte("audio"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.hideFail {
+				begin := beginErasing
+				t.Cleanup(func() { beginErasing = begin })
+				beginErasing = func(path string) (erase.Pending, error) {
+					if path == saved {
+						return erase.Pending{}, errors.New("read-only file system")
+					}
+					return begin(path)
+				}
+			}
+			store := &apiStoreStub{
+				sessionsByDate: map[string][]storage.Session{},
+				sessions:       map[string]storage.Session{"s1": {ID: "s1", Status: storage.SessionEnded, AudioPath: saved}},
+				segments:       map[string][]transcribe.Segment{},
+			}
+			h, err := Handler(testStaticFS(t), NewHub(), store, &ControlHooks{}, "", nil, configStoreWithAudioDir(t, dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/sessions/s1", nil))
+			if rr.Code != http.StatusNoContent {
+				t.Fatalf("delete = %d %s", rr.Code, rr.Body.String())
+			}
+			if !slices.Equal(store.cleared, tc.want) {
+				t.Errorf("records cleared %v, want %v", store.cleared, tc.want)
+			}
+		})
 	}
 }
 

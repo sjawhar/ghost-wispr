@@ -25,9 +25,10 @@ import (
 type keptRecordingStore interface {
 	GetSession(id string) (storage.Session, error)
 	RecordKeptRecording(id, audioPath string, place func() error) (bool, error)
-	// Recordings lists every session that names audio, so a file another
-	// session names is never erased with a deleted session's.
-	Recordings() ([]storage.SessionRecording, error)
+	// NamedAudio lists every audio file a session names, the recordings a
+	// restored session's Drive folder holds included, so a file a session
+	// names is never erased with a deleted session's nor given to another.
+	NamedAudio() ([]string, error)
 	// DeletedSessionAudio lists the sessions a delete recorded, whose audio
 	// files a stop may have left; ClearDeletedSessionAudio forgets one once
 	// none is left.
@@ -368,18 +369,18 @@ func (k *keptRecordings) deletedAudioFiles(record *storage.DeletedSessionAudio) 
 	return files
 }
 
-// namedFiles returns, absolute, every file a session names.
+// namedFiles returns, absolute, every file a session names
+// (storage.SQLiteStore.NamedAudio), each found where recording.Resolve finds
+// it in the audio directory.
 func (k *keptRecordings) namedFiles() (map[string]bool, error) {
-	recordings, err := k.store.Recordings()
+	entries, err := k.store.NamedAudio()
 	if err != nil {
-		return nil, fmt.Errorf("list recordings: %w", err)
+		return nil, fmt.Errorf("list the audio sessions name: %w", err)
 	}
 	named := map[string]bool{}
-	for _, rec := range recordings {
-		for _, entry := range recordingname.Entries(rec.AudioPath) {
-			if abs, err := filepath.Abs(recordingname.Resolve(entry, k.audioDir)); err == nil {
-				named[abs] = true
-			}
+	for _, entry := range entries {
+		if abs, err := filepath.Abs(recordingname.Resolve(entry, k.audioDir)); err == nil {
+			named[abs] = true
 		}
 	}
 	return named, nil
