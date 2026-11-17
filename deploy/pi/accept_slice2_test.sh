@@ -35,6 +35,12 @@ done
 [[ "$output" == *'A8 self-test RAN: every role is compared with the model the running process reports'* ]] \
   || fail 'self-test did not prove A8 compares every role with the running process'
 
+# The Cert-warning row checks that the test instance cannot open the Jabra before it trusts the
+# instance's status: an instance that holds the audio or input group, runs with the Jabra button
+# on, or holds a sound or input device is refused.
+[[ "$output" == *'Cert-warning self-test RAN: a test instance that could open the Jabra is rejected'* ]] \
+  || fail 'self-test did not prove the Cert-warning row rejects a test instance that could open the Jabra'
+
 
 assert_source_contains() {
   local needle=$1
@@ -109,4 +115,60 @@ if bash "$mutated_driver" --self-test >/dev/null 2>&1; then
   fail 'self-test accepted a running-models check that always passes'
 fi
 
+# The cert-warning test instance runs beside the recorder, on the same Pi. Its PortAudio start-up
+# opens the Jabra's microphone, and with its Jabra button on it would also write the Jabra's light.
+# The recorder, running with its own Jabra button on, cannot see either: the Jabra then sends its
+# own Phone Mute, and the recorder reads it as a tap (docs/pi-setup.md, "Pause and resume at the
+# unit"). The runbook starts it with no supplementary groups, so it can open no sound device
+# (root:audio 0660 on the office Pi) and no input node (root:input 0660), and with the Jabra button
+# off. This runs the runbook's block with a fake sudo that resets the environment as sudo does, a
+# fake setpriv, and a fake binary that records the environment and the options each run gets.
+runbook_doc="$repo_root/docs/pi-setup.md"
+cert_block=$(awk -v marker='<!-- accept_slice2_test.sh: cert-test instance -->' '
+  $0 == marker { found = 1; next }
+  found && !capture && /^```bash$/ { capture = 1; next }
+  capture && /^```$/ { exit }
+  capture { print }
+' "$runbook_doc")
+[[ -n "$cert_block" ]] || fail 'docs/pi-setup.md has no bash block after <!-- accept_slice2_test.sh: cert-test instance -->'
+fake_dir="$mutation_dir/cert-instance"
+mkdir -p "$fake_dir/bin" "$fake_dir/test-dir"
+cat >"$fake_dir/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+# sudo's env_reset: the command gets none of the caller's environment.
+exec env -i PATH="$PATH" FAKE_DIR="$FAKE_DIR" "$@"
+EOF
+cat >"$fake_dir/bin/setpriv" <<'EOF'
+#!/usr/bin/env bash
+options=()
+while [[ $# -gt 0 && $1 == --* ]]; do options+=("$1"); shift; done
+printf '%s\n' "${options[@]}" >"$FAKE_DIR/setpriv-options"
+exec "$@"
+EOF
+cat >"$fake_dir/ghost-wispr" <<'EOF'
+#!/usr/bin/env bash
+env | LC_ALL=C sort >"$FAKE_DIR/env-${1:-instance}"
+[[ -z ${1:-} && -e $FAKE_DIR/setpriv-options ]] && cp "$FAKE_DIR/setpriv-options" "$FAKE_DIR/instance-setpriv-options"
+exit 0
+EOF
+chmod +x "$fake_dir/bin/sudo" "$fake_dir/bin/setpriv" "$fake_dir/ghost-wispr"
+(
+  export FAKE_DIR="$fake_dir" test_dir="$fake_dir/test-dir" PATH="$fake_dir/bin:$PATH"
+  bash -euo pipefail -c "${cert_block//\/opt\/ghost-wispr\/ghost-wispr/$fake_dir/ghost-wispr}"
+) || fail 'the runbook block that seeds and starts the cert-warning test instance failed against fakes'
+[[ -s "$fake_dir/env-seed-paused-state" ]] || fail 'the runbook block does not seed the test instance as paused'
+grep -Fqx "GHOST_WISPR_CONFIG=$fake_dir/test-dir/ghost-wispr.yaml" "$fake_dir/env-seed-paused-state" \
+  || fail "the runbook block seeds a database other than the copy's"
+[[ -s "$fake_dir/env-instance" ]] || fail 'the runbook block does not start the test instance'
+[[ -s "$fake_dir/instance-setpriv-options" ]] \
+  || fail 'the runbook block starts the test instance without sudo setpriv, so it keeps the audio and input groups'
+for option in --reuid=ghost-wispr --regid=ghost-wispr --clear-groups; do
+  grep -Fqx -- "$option" "$fake_dir/instance-setpriv-options" \
+    || fail "the runbook block starts the test instance without setpriv $option: $(tr '\n' ' ' <"$fake_dir/instance-setpriv-options")"
+done
+for setting in GHOST_WISPR_JABRA_MUTE_BUTTON=false GHOST_WISPR_ADDR=127.0.0.1:8081 \
+  "GHOST_WISPR_CONFIG=$fake_dir/test-dir/ghost-wispr.yaml"; do
+  grep -Fqx -- "$setting" "$fake_dir/env-instance" \
+    || fail "the test instance does not get $setting; its environment: $(tr '\n' ' ' <"$fake_dir/env-instance")"
+done
 printf 'slice 2 acceptance test passed\n'

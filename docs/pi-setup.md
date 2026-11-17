@@ -361,6 +361,14 @@ of the Pi's time does not move the stamps. The log says
 A press that would pause always pauses. The blink(1) stays the recording light: the Jabra's light
 only shows the pause switch.
 
+Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
+a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
+program's stream, so it may change the light while the stream is open, and the Jabra's own Phone
+Mute then comes when the other program closes it, outside every operation the guard covers: a
+paused unit would resume. Turn the button off first (`GHOST_WISPR_JABRA_MUTE_BUTTON=false` in
+`/opt/ghost-wispr/.env` and a restart, as above), or stop `ghost-wispr.service`. The slice 2
+certificate test starts its second instance so that it cannot open the Jabra ("Accept slice 2").
+
 The kernel's HID driver gives the Jabra's input device the HID Telephony usage Phone Mute as the
 key `KEY_MICMUTE`, and the HID LED usage Mute (page 0x08, usage 0x09) as the light `LED_MUTE`.
 Ghost Wispr finds the input device whose name starts with `Jabra ` and which has both (on the
@@ -566,17 +574,26 @@ its certificate config in a private temporary directory, point the copied certif
 at the certificate that expires in 10 days, and use a copied YAML that sets its
 `google_credentials_file`, separate `db_path` and `audio_dir`, and disables Drive sync, GC,
 Envoy, speaker, indicator light, power button, and Jabra mute button. Before starting it, seed its
-separate database as paused. A paused instance opens the microphone, and connects to Deepgram,
-only when someone resumes it, so the test instance does not hold the recorder's microphone; do
-not resume it. PortAudio still checks the audio devices once as the app starts. Seed and start
-it like this:
+separate database as paused, and do not resume it: a paused instance opens the microphone, and
+connects to Deepgram, only when someone resumes it.
 
+The test instance must not open the Jabra at all. PortAudio opens every audio device once as an
+instance starts, and the recorder, running beside it with the Jabra button on, cannot see that
+stream: a light change while it is open makes the Jabra send Phone Mute when it closes, which the
+recorder reads as a tap. So start it with no supplementary groups: the Pi's sound devices are
+`root:audio` and its input nodes `root:input`, both mode 0660, so it can open neither. Also set
+`GHOST_WISPR_JABRA_MUTE_BUTTON=false`, which overrides the YAML. Seed and start it like this:
+
+<!-- accept_slice2_test.sh: cert-test instance -->
 ```bash
 GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
 /opt/ghost-wispr/ghost-wispr seed-paused-state
-GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
-GHOST_WISPR_ADDR=127.0.0.1:8081 \
-/opt/ghost-wispr/ghost-wispr
+sudo setpriv --reuid=ghost-wispr --regid=ghost-wispr --clear-groups \
+  env HOME=/home/ghost-wispr \
+  GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
+  GHOST_WISPR_ADDR=127.0.0.1:8081 \
+  GHOST_WISPR_JABRA_MUTE_BUTTON=false \
+  /opt/ghost-wispr/ghost-wispr
 ```
 
 `seed-paused-state` resolves the config and its `db_path` exactly as the recorder does
@@ -584,7 +601,10 @@ GHOST_WISPR_ADDR=127.0.0.1:8081 \
 against the working directory) and prints the absolute database path it wrote. Check that the
 path is the copy's database, not the production one under `/opt/ghost-wispr`.
 
-Then run the driver with `--cert-test`. Without that flag, the row prints `NEEDS-PERSON`.
+Then run the driver with `--cert-test`. Without that flag, the row prints `NEEDS-PERSON`. With
+it, the row first reads the process that listens on `127.0.0.1:8081` and fails unless it has no
+supplementary groups, runs with `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, and holds no sound or input
+device.
 
 The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
 
