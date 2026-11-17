@@ -1368,6 +1368,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	micDevice := newCaptureDevice(capture.IsPaused)
 	capture.beforeMicOpen = micDevice.prepareLightForOpen
 	capture.onMicHeld = micHeldWarning(warningRegistry)
+	capture.capturePresent = captureDevicePresent(warningRegistry, audio.CaptureDevicePresent)
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry)
 
@@ -1722,6 +1723,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	case errors.Is(err, errLightNotConfirmed):
 		_, status := micStartFailureMessages(err)
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: status}
+	case errors.Is(err, errNoCaptureDevice):
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "No microphone found"}
 	}
 	// No start has run yet when it waits for a resume, or for the light, so
 	// nothing has scanned: the start that brings the microphone up does.
@@ -2003,9 +2006,17 @@ func streamMicWithRetry(
 				}
 			}
 			if err = capture.confirmMicOpen(); err != nil {
-				logf("recording light unavailable before microphone restart: %v", err)
+				if errors.Is(err, errNoCaptureDevice) {
+					logf("no capture device present; the microphone opens once one is")
+				} else {
+					logf("recording light unavailable before microphone restart: %v", err)
+				}
 				capture.finishResume()
 				wait(backoff)
+				backoff = min(backoff*2, maxBackoff)
+				// The microphone is closed: open it again, without closing it
+				// again, once the wait is over.
+				released = true
 				continue
 			}
 			err = streamer.Open()
@@ -2014,6 +2025,7 @@ func streamMicWithRetry(
 			// "resuming" state: readiness then reports what came back.
 			capture.finishResume()
 			if err == nil {
+				backoff = baseBackoff
 				logf("microphone reopened: capture resumed")
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone capture resumed")
@@ -2173,6 +2185,24 @@ func (s *portAudioScan) warn(warnings *warningsRegistry) {
 	warnings.Clear("speaker")
 }
 
+// micMissingWarningKey is the warning GET /api/status shows while no capture
+// device is present.
+const micMissingWarningKey = "microphone-missing"
+
+// captureDevicePresent is the capture gate's capturePresent: present looks for
+// a capture device without opening one, and the status warns while there is
+// none, which is also while the light stays off for it.
+func captureDevicePresent(warnings *warningsRegistry, present func() bool) func() bool {
+	return func() bool {
+		if present() {
+			warnings.Clear(micMissingWarningKey)
+			return true
+		}
+		warnings.Set(micMissingWarningKey, "No microphone found: the unit does not record, and the light stays off, until one is plugged in")
+		return false
+	}
+}
+
 // micHeldWarningKey is the warning GET /api/status shows while a pause could
 // not release the microphone.
 const micHeldWarningKey = "microphone-held"
@@ -2188,15 +2218,24 @@ func micHeldWarning(warnings *warningsRegistry) func(held bool) {
 	}
 }
 
-// reopenMic reopens the device once the recording light is confirmed red, and
-// reports each step on hub. It returns false, having closed the device and
-// reopened nothing, when the light cannot be confirmed red; otherwise true
-// and the reopen's error.
+// reopenMic reopens the device once a capture device is present and the
+// recording light is confirmed red, and reports each step on hub. It returns
+// false, having closed the device and reopened nothing, when the light cannot
+// be confirmed red; otherwise true and the reopen's error, which is
+// errNoCaptureDevice, with the device closed and the light left off, while no
+// capture device is present.
 func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) (bool, error) {
 	if hub != nil {
 		hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 	}
-	if err := capture.confirmMicOpen(); err != nil {
+	if err := capture.confirmMicOpen(); errors.Is(err, errNoCaptureDevice) {
+		logf("no capture device present; the microphone reconnects once one is")
+		closeMic(streamer, "with no capture device present", logf)
+		if hub != nil {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, "No microphone found")
+		}
+		return true, err
+	} else if err != nil {
 		logf("recording light unavailable before microphone reconnect: %v", err)
 		closeMic(streamer, "without a red recording light", logf)
 		return false, nil

@@ -401,8 +401,11 @@ only shows the pause switch.
 
 The blink(1) reads back red before the microphone opens, and stays red until it is open: every
 start, resume and reconnect of the microphone, and PortAudio's device scan, waits for that check.
-While the microphone is missing, the start-up retry tries again every 15 seconds, and the blink(1)
-shows red for as long as each try takes: red only while an open is being attempted. A unit that
+Before it lights the blink(1) for an open, Ghost Wispr looks in `/proc/asound` for a capture PCM
+(`cardN/pcmMc`), without opening one. A Pi 5's own sound cards, its HDMI outputs, only play, so with
+the Jabra unplugged there is none unless another capture card is plugged in or loaded; then
+the blink(1) stays off, `/api/status` warns `No microphone found`, and the start-up retry (every 15
+seconds) and the reconnect (backing off to every 30 seconds) look again without lighting it. A unit that
 starts paused scans only at its first resume, so it speaks only from then on: meanwhile
 `/api/status` warns `Speaker unavailable until the microphone starts`, and `POST /api/tts/speak`
 answers `409` with that reason. A pause during an open keeps the blink(1) red until that open has

@@ -129,8 +129,10 @@ typo cannot turn the light check off; leave it unset for a recorder with no ligh
 
 Every microphone open, and PortAudio's device scan, which opens the microphone too, waits for
 the blink(1) to read back red and keeps it red until the open has finished, so no microphone opens
-while the light is off. While the microphone is missing, the start-up retry tries again every 15
-seconds, and the blink(1) shows red for as long as each try takes. A unit that starts paused scans
+while the light is off. Before it lights the blink(1) for an open, the recorder looks in
+`/proc/asound` for a capture device, without opening one: while there is none, the light stays off,
+`/api/status` warns `No microphone found`, and the start-up retry looks again every 15 seconds.
+A unit that starts paused scans
 only at its first resume, so its speaker plays only from then on: until then `/api/status` warns
 `Speaker unavailable until the microphone starts`, and `POST /api/tts/speak` answers `409` with
 that reason. Audio passes only while the light has stayed red since the microphone opened: once

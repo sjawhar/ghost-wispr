@@ -92,6 +92,7 @@ type captureGate struct {
 	onLightUnconfirmed  func(error)   // a red confirmation for audio after a stall failed; must not block
 	lightOffs           func() uint64 // counts the times the recording light was written, or read back, as anything but red; nil without a light
 	onMicHeld           func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
+	capturePresent      func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
 	stallAfter          time.Duration // see captureStallAfter
 	writeWait           time.Duration // see captureWriteWait
 	control             sync.Mutex    // serializes closing and opening the gate, with their steps
@@ -404,10 +405,17 @@ func (g *captureGate) finishMicStart() {
 // confirmMicOpen confirms the light red for a microphone open or start, as
 // confirmMicStart does, holding it red until finishMicStart, and marks the
 // light as red from then on: audio passes the gate only while the light has
-// stayed red since (lightWentOff).
+// stayed red since (lightWentOff). It first looks for a capture device,
+// without opening one (capturePresent): with none it lights nothing and
+// returns errNoCaptureDevice, so the light stays off while the microphone is
+// missing. A light that cannot be confirmed red returns an error that wraps
+// errLightNotConfirmed.
 func (g *captureGate) confirmMicOpen() error {
+	if g.capturePresent != nil && !g.capturePresent() {
+		return errNoCaptureDevice
+	}
 	if err := g.confirmMicStart(); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
 	}
 	if g.lightOffs != nil {
 		g.redMark.Store(g.lightOffs())
@@ -415,15 +423,15 @@ func (g *captureGate) confirmMicOpen() error {
 	return nil
 }
 
-// openUnderRed runs open, which opens or starts a capture device, only once the
-// light is confirmed red (confirmMicOpen), and holds the light red until open
-// returns: the light controller cannot turn it off meanwhile, so no device
-// opens, and no PortAudio scan runs, while the light last showed anything but
-// red. A light that cannot be confirmed red runs nothing and returns
-// errLightNotConfirmed.
+// openUnderRed runs open, which opens or starts a capture device, only once a
+// capture device is present and the light is confirmed red (confirmMicOpen),
+// and holds the light red until open returns: the light controller cannot
+// turn it off meanwhile, so no device opens, and no PortAudio scan runs, while
+// the light last showed anything but red. Otherwise it runs nothing and
+// returns confirmMicOpen's error.
 func (g *captureGate) openUnderRed(open func() error) error {
 	if err := g.confirmMicOpen(); err != nil {
-		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
+		return err
 	}
 	defer g.finishMicStart()
 	return open()

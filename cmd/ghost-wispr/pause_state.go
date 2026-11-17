@@ -176,6 +176,11 @@ func micStartFailureMessages(err error) (warning, status string) {
 // light could not be confirmed red; the light's own warning names the cause.
 var errLightNotConfirmed = errors.New("recording light not confirmed red")
 
+// errNoCaptureDevice is what a microphone start or reconnect returns, without
+// lighting the light or opening anything, while no capture device is present:
+// the light stays off while the microphone is missing.
+var errNoCaptureDevice = errors.New("no capture device present")
+
 // startMicIfUnpaused starts the opened microphone unless capture is paused. A
 // paused instance opens no device (startMicrophone), but a pause that lands
 // after the device opened leaves it open and not started; the mic loop closes
