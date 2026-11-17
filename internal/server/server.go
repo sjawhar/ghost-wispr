@@ -54,7 +54,9 @@ const (
 )
 
 // KeptRawRecordings are the raw recordings kept in the audio directory because
-// they could not be saved, for recovery or deletion by hand.
+// they could not be saved yet: the app saves the one of a session that ended
+// without a recording, and one no session names is for recovery or deletion
+// by hand.
 type KeptRawRecordings struct {
 	Count     int
 	Bytes     int64

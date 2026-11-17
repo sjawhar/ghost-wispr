@@ -130,11 +130,12 @@ type syncSweepStore interface {
 // sweepDriveSync syncs, every interval until ctx ends, the sessions waiting
 // for their first sync and those whose retry is due. While sync is off it
 // syncs nothing, and a sweep under way stops when sync is turned off. After
-// every pass, sync on or off, it retries the erase a deletion still owes on
-// the unit (storage.RetryOwedErasure), and as it starts and after every pass
-// it brings the status warnings of owed Drive replacements up to date from
-// the store.
-func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync, warnings *warningsRegistry, every time.Duration) {
+// every pass, sync on or off, it runs a kept recordings pass (kept, nil for
+// none), which erases the raw recordings the pass just synced and saves those
+// still kept, and it retries the erase a deletion still owes on the unit
+// (storage.RetryOwedErasure). As it starts and after every pass it brings the
+// status warnings of owed Drive replacements up to date from the store.
+func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync, warnings *warningsRegistry, every time.Duration, kept *keptRecordings) {
 	refreshWarnings := func() {
 		if err := refreshDriveReplacementWarnings(store, warnings, time.Now().UTC()); err != nil {
 			log.Printf("gdrive replacement warnings: %v", err)
@@ -149,6 +150,7 @@ func sweepDriveSync(ctx context.Context, store syncSweepStore, drive *driveSync,
 			return
 		case <-ticker.C:
 			syncSweep(ctx, store, drive)
+			kept.run(ctx)
 			if err := store.RetryOwedErasure(); err != nil {
 				log.Printf("warning: a deleted segment's erase from the database log or backup is still owed: %v", err)
 			}

@@ -363,7 +363,7 @@ func TestRecorderZeroesAPartialEncoderOutput(t *testing.T) {
 }
 
 // When the session end gives up on a recording it cannot save, the recorder
-// stops retrying it and leaves its raw audio on disk for recovery by hand,
+// stops retrying it and leaves its raw audio on disk for a later save,
 // reporting where; with the raw file already gone, it reports none.
 func TestRecorderDiscardUnsavedKeepsTheRawAudio(t *testing.T) {
 	for _, tc := range []struct {

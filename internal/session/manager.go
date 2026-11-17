@@ -381,7 +381,7 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 				return fmt.Errorf("end audio recorder session: %w", err)
 			}
 			if rawPath := m.recorder.DiscardUnsaved(); rawPath != "" {
-				m.logger.Error("recording could not be saved; ending the session without it and keeping its raw audio for recovery by hand", "operation", "end_session", "session_id", sessionID, "attempts", end.saveFailures, "raw_audio", rawPath, "error", err)
+				m.logger.Error("recording could not be saved; ending the session without it and keeping its raw audio, which the app tries to save again after each Drive sync sweep", "operation", "end_session", "session_id", sessionID, "attempts", end.saveFailures, "raw_audio", rawPath, "error", err)
 			} else {
 				m.logger.Error("recording could not be saved and its raw audio is gone; ending the session without it", "operation", "end_session", "session_id", sessionID, "attempts", end.saveFailures, "error", err)
 			}

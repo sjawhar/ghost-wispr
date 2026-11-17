@@ -199,8 +199,9 @@ func (r *Recorder) writePCM(data []byte) error {
 // KeptRawRecordings counts the raw recordings kept in the audio directory
 // because they could not be saved, and their total size: every .pcm there
 // except the recording under way, one being saved or waiting for its retry,
-// and one left beside its saved recording (<id>.mp3 or <id>.wav). Nothing
-// removes them; they are for recovery or deletion by hand.
+// and one left beside its saved recording (<id>.mp3 or <id>.wav). The app
+// saves the one of a session that ended without a recording (SaveKept); one
+// no session names is for recovery or deletion by hand.
 func (r *Recorder) KeptRawRecordings() (count int, size int64) {
 	entries, err := os.ReadDir(r.audioDir)
 	if err != nil {
@@ -240,9 +241,62 @@ func isFile(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// KeptRawSessions returns the sessions whose raw recordings are in the audio
+// directory and that the recorder is not using: not the recording under way,
+// not one being saved, and not one waiting for its retry. A raw recording
+// left beside its saved recording is one of them.
+func (r *Recorder) KeptRawSessions() []string {
+	entries, err := os.ReadDir(r.audioDir)
+	if err != nil {
+		return nil
+	}
+	// Read after listing, as KeptRawRecordings does.
+	r.mu.Lock()
+	live, saving, unsaved := r.rawPath, r.savingPath, r.unsavedPath
+	r.mu.Unlock()
+
+	var ids []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || filepath.Ext(name) != ".pcm" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		if path := filepath.Join(r.audioDir, name); path == live || path == saving || path == unsaved {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(name, ".pcm"))
+	}
+	return ids
+}
+
+// SaveKept saves the raw recording kept in the audio directory for session
+// sessionID as EndSession saves a session's recording (MP3, else WAV), and
+// returns the saved file. Unlike EndSession it keeps the raw file: its caller
+// erases it once the saved recording is safe elsewhere. It refuses a raw
+// recording the recorder is using: the recording under way, one being saved,
+// or one waiting for its retry.
+func (r *Recorder) SaveKept(sessionID string) (string, error) {
+	rawPath := recording.RawPath(r.audioDir, sessionID)
+	r.mu.Lock()
+	inUse := rawPath == r.rawPath || rawPath == r.savingPath || rawPath == r.unsavedPath
+	r.mu.Unlock()
+	if inUse {
+		return "", fmt.Errorf("raw recording %s is in use by the recorder", rawPath)
+	}
+	info, err := os.Stat(rawPath)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("raw recording %s is not a regular file", rawPath)
+	}
+	return r.encode(rawPath, sessionID)
+}
+
 // DiscardUnsaved gives up on a recording EndSession closed but could not save:
-// later EndSession calls no longer try to save it. Its raw audio stays on disk
-// for recovery by hand; DiscardUnsaved returns its path, or "" if it is gone.
+// later EndSession calls no longer try to save it. Its raw audio stays on
+// disk, a kept raw recording that SaveKept can save later; DiscardUnsaved
+// returns its path, or "" if it is gone.
 func (r *Recorder) DiscardUnsaved() string {
 	r.mu.Lock()
 	rawPath := r.unsavedPath
