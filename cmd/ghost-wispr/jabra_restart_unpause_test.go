@@ -21,8 +21,11 @@ import (
 //	06:02:49.257Z KEY_MICMUTE value=1
 //	06:02:49.257Z KEY_MICMUTE value=0
 //
-// The same light written with no microphone stream open, or during a playback
-// stream, got no key back. a889869 wrote the light at connect while a
+// The same light written with no stream open got no key back. Written during
+// a playback stream, it got no key back at once, but the Jabra sent Phone Mute
+// by itself at the next microphone close (section 9.7, restart 1), so the
+// light waits for playback too (TestNoJabraLightWriteWhileTTSPlaybackIsOpen).
+// a889869 wrote the light at connect while a
 // microphone stream was open on the Jabra (PortAudio opens one as the app
 // starts, and a pause left it open), so at 05:50:48Z a restart of a paused
 // unit read the Jabra's own report as a tap and resumed: capture_state

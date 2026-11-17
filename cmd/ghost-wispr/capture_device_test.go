@@ -13,7 +13,9 @@ import (
 // stamped during an operation on the capture device, or within
 // jabraOwnMuteWindow after it (the Jabra's own report came 12-15 ms after its
 // microphone stream closed), is not taken for the Jabra's own report, or if
-// one stamped before the operation or after the window is.
+// one stamped before the operation or after the window is. The close of a TTS
+// playback stream counts as an operation: the trace did not test whether a
+// playback close also makes the Jabra report Phone Mute.
 func TestOwnOperationCoversTheJabraReportWindow(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -27,6 +29,11 @@ func TestOwnOperationCoversTheJabraReportWindow(t *testing.T) {
 		}},
 		{name: "PortAudio probe", run: func(d *captureDevice, during func()) error {
 			return d.probe(func() error { during(); return nil })
+		}},
+		{name: "TTS playback close", run: func(d *captureDevice, during func()) error {
+			d.playbackOpening()
+			d.playbackClosing(during)
+			return nil
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1672,7 +1672,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
 	}
-	// Initialize speaker output device (completely isolated from mic).
+	// Initialize speaker output device. Its playback streams go through
+	// micDevice, so the Jabra's light never changes while one is open.
 	var speaker *audio.Speaker
 	if cfg.SpeakerEnabled {
 		if paInitFailed {
@@ -1680,6 +1681,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			warningRegistry.Set("speaker", "Speaker unavailable — PortAudio initialization failed")
 		} else {
 			speaker = audio.NewSpeaker(cfg.SpeakerDevice)
+			speaker.SetOutputHooks(micDevice.playbackOpening, micDevice.playbackClosing)
 			log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
 		}
 	}

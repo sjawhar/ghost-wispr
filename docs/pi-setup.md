@@ -342,18 +342,21 @@ recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leav
 light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
-paused it. Ghost Wispr never changes it while the Jabra's microphone stream is open: a Jabra
-Speak2 75 whose light changed while its microphone stream was open sends Phone Mute by itself
-12-15 ms after that stream closes, which reads as a tap. So a pause closes the microphone, then
-lights the Jabra, and a resume darkens the Jabra, then opens the microphone. Ghost Wispr also sets
-the light when the Jabra connects or is plugged in again, after each tap, and within a quarter of
-a second after any other pause or resume, each time only while the microphone is closed.
+paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
+or a speech playback: a Jabra Speak2 75 whose light changed while one of its streams was open
+sends Phone Mute by itself 12-15 ms after its microphone stream next closes, which reads as a tap.
+So a pause closes the microphone, then lights the Jabra, and a resume darkens the Jabra, then
+opens the microphone. Ghost Wispr also sets the light when the Jabra connects or is plugged in
+again, after each tap, and within a quarter of a second after any other pause or resume, each
+time only while no stream is open; a change during speech waits for the speech to end. If a
+resume comes during speech, the microphone opens before the speech ends, so the ring keeps
+showing Muted while the unit records, until the next pause; the blink(1) is red throughout.
 
 A Mute press that would resume recording is ignored when the kernel stamped it during Ghost
-Wispr's own open, close or PortAudio device scan of the microphone, or within 100 ms after one:
-that is the Jabra's own report, and recording stays paused. Ghost Wispr has the kernel stamp the
-Jabra's events with the monotonic clock, so a change of the Pi's time does not move the stamps.
-The log says
+Wispr's own open, close or PortAudio device scan of the microphone, or the close of a speech
+playback, or within 100 ms after one: that is the Jabra's own report, and recording stays
+paused. Ghost Wispr has the kernel stamp the Jabra's events with the monotonic clock, so a change
+of the Pi's time does not move the stamps. The log says
 `Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused`.
 A press that would pause always pauses. The blink(1) stays the recording light: the Jabra's light
 only shows the pause switch.

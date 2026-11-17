@@ -18,25 +18,33 @@ import (
 // takes to see the unit pause and tap again.
 const jabraOwnMuteWindow = 100 * time.Millisecond
 
-// captureDevice orders the Jabra's mute light against the microphone's capture
-// stream. A Jabra whose mute light changes while its microphone stream is open
-// sends Phone Mute by itself just after that stream closes, which reads as a
-// person's tap. So each operation that opens, closes or probes the capture
-// device, and each light write, holds one lock, and the light is written only
-// while no capture stream is open: after a close, and before an open.
+// captureDevice orders the Jabra's mute light against every audio stream on
+// the Jabra: the microphone's capture stream and the speaker's playback
+// streams. A Jabra whose mute light changes while one of its streams is open
+// sends Phone Mute by itself just after its microphone stream next closes,
+// which reads as a person's tap (INFRA-1027 trace, sections 9.6 and 9.7). So
+// each operation that opens, closes or probes the capture device, and each
+// light write, holds one lock, and the light is written only while no stream
+// is open: after a close, and before an open. A playback stream is not opened
+// through that lock, because a PortAudio teardown, which a probe runs, waits
+// for playback to stop; a playback open waits only for a light write under
+// way (lightMu).
 //
 // It also keeps the span of its operations on CLOCK_MONOTONIC, the clock the
 // Jabra's events are stamped with (jabra.StampWithMonotonicClock), so that the
 // Jabra mute button can tell a report the Jabra sent because of one from a
-// person's tap (ownOperationAt).
+// person's tap (ownOperationAt). The close of a playback stream is one of
+// those operations.
 type captureDevice struct {
-	paused func() bool
-	op     sync.Mutex    // held through each operation and each light write
-	mu     sync.Mutex    // guards the fields below
-	open   bool          // a capture stream may be open
-	busy   bool          // an operation runs
-	since  time.Duration // CLOCK_MONOTONIC when the operations ownOperationAt covers began; 0 before any
-	until  time.Duration // CLOCK_MONOTONIC when that cover ends, once no operation runs
+	paused  func() bool
+	op      sync.Mutex    // held through each capture operation and each light write
+	lightMu sync.Mutex    // held through each light write, and while a playback stream counts itself open
+	mu      sync.Mutex    // guards the fields below
+	open    bool          // a capture stream may be open
+	playing int           // playback streams counted open (playbackOpening) and not yet closed
+	busy    int           // operations under way
+	since   time.Duration // CLOCK_MONOTONIC when the operations ownOperationAt covers began; 0 before any
+	until   time.Duration // CLOCK_MONOTONIC when that cover ends, once no operation runs
 	// light writes the connected Jabra's light, on while capture is paused;
 	// nil without a Jabra.
 	light   func(on bool) error
@@ -87,6 +95,32 @@ func (d *captureDevice) probe(fn func() error) error {
 	return err
 }
 
+// playbackOpening counts a speaker playback stream as open, once any light
+// write under way has finished, so that no light is written until the stream
+// closes (playbackClosing). The speaker calls it just before it opens the
+// stream.
+func (d *captureDevice) playbackOpening() {
+	d.lightMu.Lock()
+	defer d.lightMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.playing++
+}
+
+// playbackClosing closes a speaker playback stream with closeStream, as an
+// operation ownOperationAt covers, then writes the light if it may not show
+// the pause and no stream is open. The speaker calls it once it is done with
+// the stream.
+func (d *captureDevice) playbackClosing(closeStream func()) {
+	d.begin()
+	closeStream()
+	d.mu.Lock()
+	d.playing--
+	d.mu.Unlock()
+	d.end()
+	d.syncLight()
+}
+
 // attach makes write the light of the Jabra just connected, which may show
 // anything, and writes it at once unless a capture stream is open or an
 // operation runs. It returns the detach to call before the Jabra is closed.
@@ -111,9 +145,10 @@ func (d *captureDevice) refreshLight() {
 	d.syncLight()
 }
 
-// syncLight writes the light if it may not show the pause, unless a capture
-// stream is open or an operation runs. It never waits for either: each
-// operation writes the light once no stream is open.
+// syncLight writes the light if it may not show the pause, unless a stream is
+// open or a capture operation runs. It never waits for either: each capture
+// operation, and each playback close, writes the light once no stream is
+// open.
 func (d *captureDevice) syncLight() {
 	if !d.op.TryLock() {
 		return
@@ -128,11 +163,13 @@ func (d *captureDevice) syncLight() {
 	}
 }
 
-// writeLight writes the light as the pause wants it while no capture stream
-// is open. The caller holds op.
+// writeLight writes the light as the pause wants it while no capture or
+// playback stream is open. The caller holds op.
 func (d *captureDevice) writeLight() {
+	d.lightMu.Lock()
+	defer d.lightMu.Unlock()
 	d.mu.Lock()
-	write, open := d.light, d.open
+	write, open := d.light, d.open || d.playing > 0
 	d.mu.Unlock()
 	if write == nil || open {
 		return
@@ -153,23 +190,25 @@ func (d *captureDevice) ownOperationAt(at time.Duration) bool {
 	if d.since == 0 || at < d.since {
 		return false
 	}
-	return d.busy || at <= d.until
+	return d.busy > 0 || at <= d.until
 }
 
 func (d *captureDevice) begin() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if now := jabra.MonotonicNow(); now > d.until {
+	if now := jabra.MonotonicNow(); d.busy == 0 && now > d.until {
 		d.since = now
 	}
-	d.busy = true
+	d.busy++
 }
 
 func (d *captureDevice) end() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.busy = false
-	d.until = jabra.MonotonicNow() + jabraOwnMuteWindow
+	d.busy--
+	if until := jabra.MonotonicNow() + jabraOwnMuteWindow; until > d.until {
+		d.until = until
+	}
 }
 
 func (d *captureDevice) setOpen(open bool) {
