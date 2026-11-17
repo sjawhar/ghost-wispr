@@ -20,7 +20,12 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/server"
 )
 
+// fakeStreamer is a capture device whose streams return the errors in errs,
+// one each. Its fields are guarded by mu: the mic loop may Close it from
+// another goroutine while Stream runs (streamUntilClosed), as micStreamer
+// allows.
 type fakeStreamer struct {
+	mu         sync.Mutex
 	errs       []error
 	reopenErrs []error
 	calls      int
@@ -30,6 +35,8 @@ type fakeStreamer struct {
 }
 
 func (f *fakeStreamer) Stream(_ io.Writer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	if f.stopped {
 		return errors.New("microphone stopped")
@@ -43,6 +50,8 @@ func (f *fakeStreamer) Stream(_ io.Writer) error {
 }
 
 func (f *fakeStreamer) Reopen() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.reopens++
 	if len(f.reopenErrs) == 0 {
 		f.stopped = false
@@ -58,9 +67,16 @@ func (f *fakeStreamer) Reopen() error {
 
 func (f *fakeStreamer) Start() error { return nil }
 
-func (f *fakeStreamer) Open() error { f.stopped = false; return nil }
+func (f *fakeStreamer) Open() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = false
+	return nil
+}
 
 func (f *fakeStreamer) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.closes++
 	f.stopped = true
 	return nil
