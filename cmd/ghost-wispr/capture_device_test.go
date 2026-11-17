@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,10 +66,11 @@ func TestOwnOperationCoversTheJabraReportWindow(t *testing.T) {
 }
 
 // TestJabraStreamsOpenOnlyOnceTheLightHasSettled fails if a microphone or a
-// playback stream opens less than jabraLightSettle after a light write. The
-// kernel sends the light to the Jabra after the write returns, from a work
-// queue, so a stream opened at once can be open when the light changes, and
-// its next close would set off the Jabra's own Phone Mute.
+// playback stream opens, or the PortAudio scan, which opens streams on the
+// Jabra, starts, less than jabraLightSettle after a light write. The kernel
+// sends the light to the Jabra after the write returns, from a work queue, so
+// a stream opened at once can be open when the light changes, and its next
+// close would set off the Jabra's own Phone Mute.
 func TestJabraStreamsOpenOnlyOnceTheLightHasSettled(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -84,16 +86,37 @@ func TestJabraStreamsOpenOnlyOnceTheLightHasSettled(t *testing.T) {
 			d.playbackOpening()
 			return jabra.MonotonicNow()
 		}},
+		{name: "PortAudio scan", open: func(d *captureDevice) (scannedAt time.Duration) {
+			if err := d.probe(func() error { scannedAt = jabra.MonotonicNow(); return nil }); err != nil {
+				t.Fatal(err)
+			}
+			return scannedAt
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := newCaptureDevice(func() bool { return true })
-			var writtenAt time.Duration
-			detach := d.attach(func(bool) error { writtenAt = jabra.MonotonicNow(); return nil })
+			var mu sync.Mutex
+			var writes []time.Duration
+			detach := d.attach(func(bool) error {
+				mu.Lock()
+				defer mu.Unlock()
+				writes = append(writes, jabra.MonotonicNow())
+				return nil
+			})
 			t.Cleanup(detach)
-			if writtenAt == 0 {
-				t.Fatal("control: attaching the Jabra wrote no light")
+			openedAt := tc.open(d)
+			mu.Lock()
+			defer mu.Unlock()
+			var lastWrite time.Duration // the latest write before the open
+			for _, w := range writes {
+				if w <= openedAt && w > lastWrite {
+					lastWrite = w
+				}
 			}
-			if gap := tc.open(d) - writtenAt; gap < jabraLightSettle {
+			if lastWrite == 0 {
+				t.Fatal("control: no light was written before the open")
+			}
+			if gap := openedAt - lastWrite; gap < jabraLightSettle {
 				t.Fatalf("the %s stream opened %v after a light write, want at least %v", tc.name, gap, jabraLightSettle)
 			}
 		})

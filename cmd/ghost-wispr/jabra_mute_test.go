@@ -458,3 +458,40 @@ func TestOpenJabraOpensTheNodeToWrite(t *testing.T) {
 		t.Fatal("connectJabra used a node that refused the monotonic clock")
 	}
 }
+
+// TestJabraOwnReportReadLateStaysCovered fails if the Jabra's own Phone Mute,
+// stamped 12 ms after the pause's microphone close but read by the button loop
+// only after a later operation began (here a TTS playback close 150 ms later,
+// while the loop was still busy with the tap that paused), resumes the unit:
+// each recent operation's cover must hold for a report stamped in it, not only
+// the latest one's. The control has no later operation.
+func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
+	for _, speechEnds := range []bool{false, true} {
+		name := "control, no later operation"
+		if speechEnds {
+			name = "a speech ends before the report is read"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := newJabraRig(false)
+			button := newJabraMuteButton(rig.capture, rig.device, rig.controls, rig.warnings)
+			rig.openMic(t) // recording
+			if speechEnds {
+				rig.device.playbackOpening() // speech plays through the pause
+			}
+			button.press(jabra.MonotonicNow()) // a person's tap pauses
+			if !rig.capture.IsPaused() {
+				t.Fatal("control: the tap did not pause the unit")
+			}
+			rig.closeMic(t) // the mic loop closes the microphone for the pause
+			report := jabra.MonotonicNow() + 12*time.Millisecond
+			time.Sleep(150 * time.Millisecond) // the button loop is still busy with the tap
+			if speechEnds {
+				rig.device.playbackClosing(func() {})
+			}
+			button.press(report)
+			if !rig.capture.IsPaused() {
+				t.Fatal("the Jabra's own report, read late, resumed the paused unit")
+			}
+		})
+	}
+}

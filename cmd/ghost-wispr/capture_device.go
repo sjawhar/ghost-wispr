@@ -54,8 +54,7 @@ type captureDevice struct {
 	open    bool          // a capture stream may be open
 	playing int           // playback streams counted open (playbackOpening) and not yet closed
 	busy    int           // operations under way
-	since   time.Duration // CLOCK_MONOTONIC when the operations ownOperationAt covers began; 0 before any
-	until   time.Duration // CLOCK_MONOTONIC when that cover ends, once no operation runs
+	spans   []opSpan      // recent stretches of operations, oldest first; the last one is open while busy > 0
 	lightAt time.Duration // CLOCK_MONOTONIC of the last light write; 0 before any
 	// light writes the connected Jabra's light, on while capture is paused;
 	// nil without a Jabra.
@@ -101,13 +100,15 @@ func (d *captureDevice) closeStream(closeFn func() error) error {
 }
 
 // probe runs fn, which opens and closes capture streams of its own while it
-// lists the devices (PortAudio's initialization), as one operation, and
-// writes the light afterwards unless a capture stream is open.
+// lists the devices (PortAudio's initialization), as one operation, once the
+// last light write has settled (jabraLightSettle), and writes the light
+// afterwards unless a capture stream is open.
 func (d *captureDevice) probe(fn func() error) error {
 	d.op.Lock()
 	defer d.op.Unlock()
 	d.begin()
 	defer d.end()
+	d.settleLight()
 	err := fn()
 	d.writeLight()
 	return err
@@ -257,23 +258,46 @@ func (d *captureDevice) settleLight() {
 	}
 }
 
+// opSpan is one stretch of operations on the capture device, on
+// CLOCK_MONOTONIC: from the first one's begin until jabraOwnMuteWindow after
+// the last one's end.
+type opSpan struct{ since, until time.Duration }
+
+// jabraSpansKept is how long a stretch of operations is kept once its cover
+// has ended, so that a report the button loop reads late, after later
+// operations began, is still checked against the operation it came with.
+const jabraSpansKept = time.Minute
+
 // ownOperationAt reports whether at, a CLOCK_MONOTONIC reading, falls within
-// an operation on the capture device, or within jabraOwnMuteWindow after one
-// ended.
+// a recent operation on the capture device, or within jabraOwnMuteWindow after
+// one ended.
 func (d *captureDevice) ownOperationAt(at time.Duration) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.since == 0 || at < d.since {
-		return false
+	for i, span := range d.spans {
+		if at < span.since {
+			continue
+		}
+		if at <= span.until || (i == len(d.spans)-1 && d.busy > 0) {
+			return true
+		}
 	}
-	return d.busy > 0 || at <= d.until
+	return false
 }
 
 func (d *captureDevice) begin() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if now := jabra.MonotonicNow(); d.busy == 0 && now > d.until {
-		d.since = now
+	now := jabra.MonotonicNow()
+	if d.busy == 0 && (len(d.spans) == 0 || now > d.spans[len(d.spans)-1].until) {
+		kept := d.spans[:0]
+		for _, span := range d.spans {
+			if now-span.until <= jabraSpansKept {
+				kept = append(kept, span)
+			}
+		}
+		d.spans = kept
+		d.spans = append(d.spans, opSpan{since: now, until: now})
 	}
 	d.busy++
 }
@@ -282,8 +306,9 @@ func (d *captureDevice) end() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.busy--
-	if until := jabra.MonotonicNow() + jabraOwnMuteWindow; until > d.until {
-		d.until = until
+	last := &d.spans[len(d.spans)-1]
+	if until := jabra.MonotonicNow() + jabraOwnMuteWindow; until > last.until {
+		last.until = until
 	}
 }
 
