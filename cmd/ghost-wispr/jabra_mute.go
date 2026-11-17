@@ -172,11 +172,13 @@ func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) 
 // a CLOCK_MONOTONIC reading, except one that would resume capture and came
 // during an operation on the capture device or within jabraOwnMuteWindow after
 // one: the Jabra sends that report by itself as its microphone stream closes,
-// and capture stays paused. A press that would pause always pauses.
+// and capture stays paused. A press that would pause always pauses. The pause
+// state is read once, so the guard and the toggle act on the same state.
 func (b *jabraMuteButton) press(at time.Duration) {
-	if b.capture.IsPaused() && b.device.ownOperationAt(at) {
+	paused := b.capture.IsPaused()
+	if paused && b.device.ownOperationAt(at) {
 		log.Printf("Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused")
-	} else if err := toggleCapture(b.capture.IsPaused, b.controls.Pause, b.controls.Resume, b.controls.OnStatusChanged); err != nil {
+	} else if err := toggleCapture(func() bool { return paused }, b.controls.Pause, b.controls.Resume, b.controls.OnStatusChanged); err != nil {
 		log.Printf("warning: Jabra mute toggle: %v", err)
 	}
 	b.device.refreshLight()
