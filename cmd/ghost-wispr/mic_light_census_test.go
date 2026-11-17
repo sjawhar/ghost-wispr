@@ -82,12 +82,14 @@ func (r *lightRig) waitFor(t *testing.T, what string, cond func([]lightOp) bool)
 	waitForHardware(t, what, func() bool { return cond(r.device.snapshot()) })
 }
 
-// waitOff wakes the controller and waits until the light's last operation
-// shows it off: a write of off once it was red, or a read-back of off.
+// waitOff waits until the light's last operation shows it off: a write of off
+// once it was red, or a read-back of off. It wakes the controller on each
+// look, as the hub's status events do in the app: a fake device can change
+// what the light should show just after one wake has been read.
 func (r *lightRig) waitOff(t *testing.T) {
 	t.Helper()
-	r.hardware.Wake()
 	r.waitFor(t, "the light off", func(ops []lightOp) bool {
+		r.hardware.Wake()
 		return len(ops) > 0 && !isRedOp(ops[len(ops)-1])
 	})
 }
@@ -279,6 +281,18 @@ func TestEveryMicLoopOpenOpensOnlyWhileTheLightReadsRed(t *testing.T) {
 			})
 
 			if tc.paused {
+				// Resume only once the loop has closed the microphone for the
+				// pause: a resume before the loop's first pass would leave it
+				// streaming a microphone nobody opened, which production never
+				// does (startMicMonitoring starts the loop on an open one).
+				mic.mu.Lock()
+				closed := mic.closed
+				mic.mu.Unlock()
+				select {
+				case <-closed:
+				case <-time.After(testWait):
+					t.Fatal("the mic loop did not close the microphone for the pause")
+				}
 				r.waitOff(t)
 				if err := r.capture.RequestResume(); err != nil {
 					t.Fatalf("resume refused: %v", err)
