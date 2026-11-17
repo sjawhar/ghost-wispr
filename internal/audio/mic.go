@@ -57,7 +57,7 @@ func (m *Mic) Stop() error {
 }
 
 // Close stops and closes the capture stream, which releases the input device.
-// Start and Stream then fail until Reopen opens a fresh stream.
+// Start and Stream then fail until Open or Reopen opens a fresh stream.
 func (m *Mic) Close() error {
 	if m == nil {
 		return nil
@@ -72,26 +72,38 @@ func (m *Mic) Close() error {
 	return stream.Close()
 }
 
-// Reopen closes the current PortAudio stream and opens a fresh one with the
-// same parameters. This picks up new device nodes after a USB reconnect.
-func (m *Mic) Reopen() error {
-	_ = m.Close()
-	if err := ReinitPortAudio(); err != nil {
-		return fmt.Errorf("reinitialize portaudio: %w", err)
+// Open closes the current capture stream, if any, then opens a fresh one with
+// the same parameters and starts it, without re-initializing PortAudio. A
+// stream that opens but does not start is closed again, so a failed Open holds
+// no input device.
+func (m *Mic) Open() error {
+	if m == nil {
+		return fmt.Errorf("microphone stream unavailable")
 	}
+	_ = m.Close()
 	stream, err := openInputStreamFn(m.sampleRate, m.framesPerBuffer, m.buf)
 	if err != nil {
 		return err
 	}
 	m.stream = stream
-	err = m.stream.Start()
-	if err != nil {
+	if err := m.stream.Start(); err != nil {
 		_ = m.stream.Close()
 		m.stream = nil
 		return err
 	}
 	m.active.Store(true)
-	return err
+	return nil
+}
+
+// Reopen closes the current PortAudio stream, re-initializes PortAudio and
+// opens a fresh stream with the same parameters (Open). The re-initialization
+// picks up new device nodes after a USB reconnect.
+func (m *Mic) Reopen() error {
+	_ = m.Close()
+	if err := ReinitPortAudio(); err != nil {
+		return fmt.Errorf("reinitialize portaudio: %w", err)
+	}
+	return m.Open()
 }
 
 // Stream reads from the mic and writes PCM16-LE to w until an error or stop.

@@ -318,6 +318,69 @@ assert_certificate_warning() {
     >/dev/null <<<"$1"
 }
 
+# assert_cert_test_instance STATE passes only for a test instance that cannot open the Jabra: all
+# four of its user ids and group ids are ghost-wispr's, so it is not root; no capabilities in its
+# permitted, effective or ambient set; no supplementary groups (the Pi's sound devices are
+# root:audio 0660 and its input nodes root:input 0660); no sound or input device that ghost-wispr
+# with no groups can open, which an ACL from a console login would allow;
+# GHOST_WISPR_JABRA_MUTE_BUTTON=false; and no sound or input device held. STATE is
+# cert_test_instance_state's "user:", "uid:", "gid:", "caps:", "groups:", "reach:", "jabra:" and
+# "devices:" lines; a STATE without all of them is refused, so an unread instance never passes.
+assert_cert_test_instance() {
+  local state=$1 line user_uid user_gid groups reach jabra devices id
+  local -a uids gids caps
+  for line in user uid gid caps groups reach jabra devices; do
+    grep -q "^$line:" <<<"$state" || {
+      printf 'the test instance could not be read (no %s): %s\n' "$line" "$state" >&2
+      return 1
+    }
+  done
+  read -r user_uid user_gid <<<"$(sed -n 's/^user://p' <<<"$state")"
+  read -r -a uids <<<"$(sed -n 's/^uid://p' <<<"$state")"
+  read -r -a gids <<<"$(sed -n 's/^gid://p' <<<"$state")"
+  read -r -a caps <<<"$(sed -n 's/^caps://p' <<<"$state")"
+  groups=$(sed -n 's/^groups:[[:space:]]*//p' <<<"$state")
+  reach=$(sed -n 's/^reach:[[:space:]]*//p' <<<"$state")
+  jabra=$(sed -n 's/^jabra://p' <<<"$state")
+  devices=$(sed -n 's/^devices:[[:space:]]*//p' <<<"$state")
+  [[ $user_uid =~ ^[0-9]+$ && $user_gid =~ ^[0-9]+$ && ${#uids[@]} -eq 4 && ${#gids[@]} -eq 4 ]] || {
+    printf 'the test instance ids could not be read: user %s %s, uid %s, gid %s\n' "$user_uid" "$user_gid" "${uids[*]}" "${gids[*]}" >&2
+    return 1
+  }
+  for id in "${uids[@]}"; do
+    [[ $id == "$user_uid" ]] || {
+      printf 'the test instance runs with user ids %s, want all %s (ghost-wispr)\n' "${uids[*]}" "$user_uid" >&2
+      return 1
+    }
+  done
+  for id in "${gids[@]}"; do
+    [[ $id == "$user_gid" ]] || {
+      printf 'the test instance runs with group ids %s, want all %s (ghost-wispr)\n' "${gids[*]}" "$user_gid" >&2
+      return 1
+    }
+  done
+  [[ ${#caps[@]} -eq 3 && ${caps[0]} =~ ^0+$ && ${caps[1]} =~ ^0+$ && ${caps[2]} =~ ^0+$ ]] || {
+    printf 'the test instance holds capabilities (permitted, effective, ambient) %s, want none\n' "${caps[*]}" >&2
+    return 1
+  }
+  [[ -z "$groups" ]] || {
+    printf 'the test instance holds supplementary groups %s, so it can open the Jabra\n' "$groups" >&2
+    return 1
+  }
+  [[ -z "$reach" ]] || {
+    printf 'ghost-wispr with no groups can open %s, so the test instance can open the Jabra\n' "$reach" >&2
+    return 1
+  }
+  [[ "$jabra" == false ]] || {
+    printf 'the test instance runs with GHOST_WISPR_JABRA_MUTE_BUTTON=%s, want false\n' "${jabra:-<unset>}" >&2
+    return 1
+  }
+  [[ -z "$devices" ]] || {
+    printf 'the test instance holds %s\n' "$devices" >&2
+    return 1
+  }
+}
+
 run_key_sweep_locally() {
   bash -s <<<"$(key_sweep_script "$1" "$1" '')"
 }
@@ -760,12 +823,62 @@ run_a10() {
   return 2
 }
 
+# cert_test_instance_state prints ghost-wispr's ids, and the user and group ids, capabilities,
+# supplementary groups, Jabra button setting and sound and input devices of the process that
+# listens on 127.0.0.1:$cert_test_port, for assert_cert_test_instance, and the sound and input
+# devices that ghost-wispr with no groups can open ("reach:"; access(2) counts ACLs). The process
+# changed its user, so only root reads its /proc entries. Any read that fails, or no listener,
+# fails the whole call instead of printing an empty line.
+cert_test_instance_state() {
+  remote_run bash -s -- "$cert_test_port" <<'EOF'
+set -euo pipefail
+pid=$(sudo -n ss -ltnpH "sport = :$1" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sed -n 1p)
+[[ -n $pid ]] || exit 3
+user_ids="$(id -u ghost-wispr) $(id -g ghost-wispr)"
+status=$(sudo -n cat "/proc/$pid/status")
+field() {
+  local line
+  line=$(grep "^$1:" <<<"$status")
+  printf '%s' "${line#"$1":}"
+}
+uids=$(field Uid)
+gids=$(field Gid)
+groups=$(field Groups)
+caps="$(field CapPrm) $(field CapEff) $(field CapAmb)"
+jabra=$(sudo -n cat "/proc/$pid/environ" | tr '\000' '\n' | sed -n 's/^GHOST_WISPR_JABRA_MUTE_BUTTON=//p')
+devices=$(sudo -n find "/proc/$pid/fd" \( -lname '/dev/snd/*' -o -lname '/dev/input/*' \) -printf '%l ')
+# shellcheck disable=SC2016 # The inner shell expands these.
+reach=$(sudo -n setpriv --reuid=ghost-wispr --regid=ghost-wispr --clear-groups sh -c '
+  for f in /dev/snd/* /dev/input/*; do
+    [ -c "$f" ] || continue
+    if [ -r "$f" ] || [ -w "$f" ]; then printf "%s " "$f"; fi
+  done')
+printf 'user:%s\n' "$user_ids"
+printf 'uid:%s\n' "$uids"
+printf 'gid:%s\n' "$gids"
+printf 'caps:%s\n' "$caps"
+printf 'groups:%s\n' "$groups"
+printf 'reach:%s\n' "$reach"
+printf 'jabra:%s\n' "$jabra"
+printf 'devices:%s\n' "$devices"
+EOF
+}
+
 run_certificate_warning() {
-  local cert_status
+  local cert_status instance_state
   if [[ "$cert_test" != true ]]; then
-    printf 'Cert-warning NEEDS-PERSON: use a copied config with separate db_path and audio_dir; disable Drive sync, GC, Envoy, speaker, light, power button, and Jabra mute button; point its copied credential config at a certificate expiring in 10 days; start it with GHOST_WISPR_CONFIG=<copy> and GHOST_WISPR_ADDR=127.0.0.1:%s; then rerun with --cert-test.\n' "$cert_test_port"
+    printf 'Cert-warning NEEDS-PERSON: start a test instance on 127.0.0.1:%s as docs/pi-setup.md, "Accept slice 2", says: a copied config with separate db_path and audio_dir; Drive sync, GC, Envoy, speaker, light, power button, and Jabra mute button off; its copied credential config pointing at a certificate expiring in 10 days; seeded paused; started with sudo setpriv --reuid=ghost-wispr --regid=ghost-wispr --clear-groups and GHOST_WISPR_JABRA_MUTE_BUTTON=false, so it cannot open the Jabra; then rerun with --cert-test.\n' "$cert_test_port"
     return 2
   fi
+  instance_state=$(cert_test_instance_state) || {
+    printf 'Cert-warning FAILED: no test instance listens on 127.0.0.1:%s\n' "$cert_test_port" >&2
+    return 1
+  }
+  assert_cert_test_instance "$instance_state" || {
+    printf 'Cert-warning FAILED: the test instance could open the Jabra; stop it and start it as docs/pi-setup.md, "Accept slice 2", says\n' >&2
+    return 1
+  }
+  printf 'Cert-warning RAN: the test instance runs as ghost-wispr with no capabilities and no supplementary groups, with the Jabra button off, and holds no sound or input device.\n'
   printf 'Cert-warning RAN: read /api/status from the test instance on 127.0.0.1:%s.\n' "$cert_test_port"
   cert_status=$(remote_run "curl --fail --silent --show-error http://127.0.0.1:$cert_test_port/api/status") || {
     printf 'Cert-warning FAILED: no test instance answered on 127.0.0.1:%s\n' "$cert_test_port" >&2
@@ -1071,6 +1184,32 @@ EOF
   assert_certificate_warning '{"warnings":["Google credential certificate expires on 2026-11-21; install the latest version of Secret Manager secret ghost-wispr-device-certificate with the runbook in docs/pi-setup.md, \"Renew the X.509 certificate\"."]}' \
     || fail 'Cert-warning self-test rejected a certificate-expiry warning'
   printf 'Cert-warning self-test RAN: planted failure rejected\n'
+
+  # The office Pi's ghost-wispr user is uid and gid 1000.
+  local ids=$'user:1000 1000\nuid:\t1000\t1000\t1000\t1000\ngid:\t1000\t1000\t1000\t1000\ncaps:0000000000000000 0000000000000000 0000000000000000'
+  local good_instance="$ids"$'\ngroups:\nreach:\njabra:false\ndevices:'
+  assert_cert_test_instance "$good_instance" 2>/dev/null \
+    || fail 'Cert-warning self-test rejected a test instance as ghost-wispr with no groups, no capabilities, no device it can open, the Jabra button off and no device held'
+  for planted in \
+    "$ids"$'\ngroups:4 20 27 29 44 46 100 986 996\nreach:\njabra:false\ndevices:' \
+    "$ids"$'\ngroups:\nreach:\njabra:\ndevices:' \
+    "$ids"$'\ngroups:\nreach:\njabra:true\ndevices:' \
+    "$ids"$'\ngroups:\nreach:\njabra:false\ndevices:/dev/snd/pcmC0D0c ' \
+    "$ids"$'\ngroups:\nreach:\njabra:false\ndevices:/dev/input/event1 ' \
+    "$ids"$'\ngroups:\nreach:/dev/snd/controlC0 /dev/snd/pcmC0D0c \njabra:false\ndevices:' \
+    "$ids"$'\ngroups:\njabra:false\ndevices:' \
+    $'user:1000 1000\nuid:\t0\t0\t0\t0\ngid:\t0\t0\t0\t0\ncaps:000001ffffffffff 000001ffffffffff 0000000000000000\ngroups:\nreach:\njabra:false\ndevices:' \
+    $'user:1000 1000\nuid:\t1000\t0\t1000\t1000\ngid:\t1000\t1000\t1000\t1000\ncaps:0000000000000000 0000000000000000 0000000000000000\ngroups:\nreach:\njabra:false\ndevices:' \
+    $'user:1000 1000\nuid:\t1000\t1000\t1000\t1000\ngid:\t1000\t29\t1000\t1000\ncaps:0000000000000000 0000000000000000 0000000000000000\ngroups:\nreach:\njabra:false\ndevices:' \
+    $'user:1000 1000\nuid:\t1000\t1000\t1000\t1000\ngid:\t1000\t1000\t1000\t1000\ncaps:0000000000000000 0000000000000000 0000000000200000\ngroups:\nreach:\njabra:false\ndevices:' \
+    $'user:1000 1000\nuid:\t1000\t1000\t1000\t1000\ngid:\t1000\t1000\t1000\t1000\ncaps:0000000000000000 0000000000000000\ngroups:\nreach:\njabra:false\ndevices:' \
+    $'groups:\nreach:\njabra:false\ndevices:' \
+    ''; do
+    if assert_cert_test_instance "$planted" 2>/dev/null; then
+      fail "Cert-warning self-test accepted a test instance that could open the Jabra: ${planted//$'\n'/; }"
+    fi
+  done
+  printf 'Cert-warning self-test RAN: a test instance that could open the Jabra is rejected\n'
 )
 if [[ "$self_test" == true ]]; then
   run_self_test

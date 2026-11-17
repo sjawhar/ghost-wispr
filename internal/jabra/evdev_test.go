@@ -21,7 +21,14 @@ const (
 )
 
 func inputEvent(eventType, code uint16, value int32) []byte {
+	return stampedEvent(0, eventType, code, value)
+}
+
+// stampedEvent is an input_event the kernel stamped at, a clock reading.
+func stampedEvent(at time.Duration, eventType, code uint16, value int32) []byte {
 	buf := make([]byte, eventSize)
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(at/time.Second))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(at%time.Second/time.Microsecond))
 	binary.LittleEndian.PutUint16(buf[16:18], eventType)
 	binary.LittleEndian.PutUint16(buf[18:20], code)
 	binary.LittleEndian.PutUint32(buf[20:24], uint32(value))
@@ -104,12 +111,15 @@ func TestFindDeviceByNameAndCapability(t *testing.T) {
 
 // TestReadPressesSendsOneTogglePerPress fails if a release, a repeat, another
 // key, another event type with the mute key's code, or the light's own echo
-// counts as a press.
+// counts as a press, or if a press does not carry its kernel time stamp, which
+// tells the Jabra's own report from a person's tap.
 func TestReadPressesSendsOneTogglePerPress(t *testing.T) {
+	first := 10296*time.Second + 671885*time.Microsecond
+	second := first + 1500*time.Millisecond + 12*time.Microsecond
 	var stream bytes.Buffer
 	for _, event := range [][]byte{
 		inputEvent(evMsc, 4, 0xb002f),
-		inputEvent(evKey, keyMicMute, 1),
+		stampedEvent(first, evKey, keyMicMute, 1),
 		inputEvent(evSyn, 0, 0),
 		inputEvent(evKey, keyMicMute, 0),
 		inputEvent(evSyn, 0, 0),
@@ -117,24 +127,44 @@ func TestReadPressesSendsOneTogglePerPress(t *testing.T) {
 		inputEvent(evKey, 115, 1),        // KEY_VOLUMEUP
 		inputEvent(evAbs, keyMicMute, 1), // an EV_ABS event with KEY_MICMUTE's code
 		inputEvent(evLed, ledMute, 1),
-		inputEvent(evKey, keyMicMute, 1),
+		stampedEvent(second, evKey, keyMicMute, 1),
 		inputEvent(evKey, keyMicMute, 0),
 	} {
 		stream.Write(event)
 	}
-	presses := make(chan struct{}, 8)
+	presses := make(chan time.Duration, 8)
 	if err := ReadPresses(context.Background(), &stream, presses); err != nil {
 		t.Fatalf("read presses: %v", err)
 	}
-	if got := len(presses); got != 2 {
-		t.Fatalf("presses = %d, want 2", got)
+	close(presses)
+	var got []time.Duration
+	for at := range presses {
+		got = append(got, at)
+	}
+	if len(got) != 2 || got[0] != first || got[1] != second {
+		t.Fatalf("presses = %v, want the two presses stamped %v and %v", got, first, second)
 	}
 }
 
 func TestReadPressesReportsATruncatedEvent(t *testing.T) {
 	stream := bytes.NewReader(inputEvent(evKey, keyMicMute, 1)[:10])
-	if err := ReadPresses(context.Background(), stream, make(chan struct{}, 1)); err == nil {
+	if err := ReadPresses(context.Background(), stream, make(chan time.Duration, 1)); err == nil {
 		t.Fatal("truncated event read without an error")
+	}
+}
+
+// TestStampWithMonotonicClockRefusesANonEvdevFile fails if the clock request
+// on a file that is not an evdev node reports success, or reports a failure
+// that is not ErrNoMonotonicClock: the button would then compare wall-clock
+// stamps with the monotonic clock, or name the wrong cause.
+func TestStampWithMonotonicClockRefusesANonEvdevFile(t *testing.T) {
+	f, err := os.Create(filepath.Join(t.TempDir(), "event1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	if err := StampWithMonotonicClock(f); !errors.Is(err, ErrNoMonotonicClock) {
+		t.Fatalf("a regular file's clock request = %v, want ErrNoMonotonicClock", err)
 	}
 }
 
@@ -167,7 +197,7 @@ func TestReadPressesStopsWithTheContext(t *testing.T) {
 	reader := &stallingReader{event: inputEvent(evKey, keyMicMute, 1), handed: make(chan struct{}), stall: make(chan struct{})}
 	t.Cleanup(func() { close(reader.stall) })
 	done := make(chan error, 1)
-	go func() { done <- ReadPresses(ctx, reader, make(chan struct{})) }()
+	go func() { done <- ReadPresses(ctx, reader, make(chan time.Duration)) }()
 	// The press blocks on the unread channel until the context ends.
 	<-reader.handed
 	cancel()

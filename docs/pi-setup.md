@@ -342,10 +342,38 @@ recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leav
 light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
-paused it. Ghost Wispr sets it when it starts, after each tap, when the microphone stops or
-starts, within a quarter of a second after any other pause or resume, and when the Jabra is
-plugged in again. The blink(1) stays the recording light: the Jabra's light only shows the pause
-switch.
+paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
+or a speech playback: a Jabra Speak2 75 whose light changed while one of its streams was open
+sends Phone Mute by itself 12-15 ms after its microphone stream next closes, which reads as a tap.
+So a pause closes the microphone, then lights the Jabra, and a resume darkens the Jabra, then
+opens the microphone. Ghost Wispr also sets the light when the Jabra connects or is plugged in
+again, after each tap, and within a quarter of a second after any other pause or resume, each
+time only while no stream is open; a change during speech waits for the speech to end. A resume
+during speech waits for the speech to end, with capture shown as resuming and the blink(1) off,
+then darkens the Jabra, turns the blink(1) red and opens the microphone, so the ring never reads
+Muted while the unit records. A pause during that wait cancels the resume. If the ring may still
+show Muted while recording is on, as when the Jabra is plugged in while the microphone is open,
+or when a pause and a resume come during one microphone open, no audio is recorded: Ghost Wispr
+closes the microphone, darkens the Jabra and opens the microphone again, and the log says
+`the Jabra's ring may show the pause while capture is on; reopening the microphone`. During
+speech that takes until the speech ends, with capture shown as resuming and the blink(1) off.
+
+A Mute press that would resume recording is ignored when the kernel stamped it during Ghost
+Wispr's own open, close or PortAudio device scan of the microphone, or the close of a speech
+playback, or within 100 ms after one: that is the Jabra's own report, and recording stays
+paused. Ghost Wispr has the kernel stamp the Jabra's events with the monotonic clock, so a change
+of the Pi's time does not move the stamps. The log says
+`Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused`.
+A press that would pause always pauses. The blink(1) stays the recording light: the Jabra's light
+only shows the pause switch.
+
+Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
+a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
+program's stream, so it may change the light while the stream is open, and the Jabra's own Phone
+Mute then comes when the other program closes it, outside every operation the guard covers: a
+paused unit would resume. Turn the button off first (`GHOST_WISPR_JABRA_MUTE_BUTTON=false` in
+`/opt/ghost-wispr/.env` and a restart, as above), or stop `ghost-wispr.service`. The slice 2
+certificate test starts its second instance so that it cannot open the Jabra ("Accept slice 2").
 
 The kernel's HID driver gives the Jabra's input device the HID Telephony usage Phone Mute as the
 key `KEY_MICMUTE`, and the HID LED usage Mute (page 0x08, usage 0x09) as the light `LED_MUTE`.
@@ -353,8 +381,9 @@ Ghost Wispr finds the input device whose name starts with `Jabra ` and which has
 office Pi, `/dev/input/event1`), reads the key there and writes the light there. With two such
 Jabras plugged in, it uses the first one the kernel lists. The service user is in the `input`
 group, and `99-ghost-wispr.rules` gives the Jabra's input nodes mode 0660 and group `input`.
-While the Jabra is missing or not accessible, `/api/status` warns, and Ghost Wispr looks for it
-again every 10 seconds; the other controls still work.
+While the Jabra is missing or not accessible, or its input node refuses the monotonic clock, the
+button is off, `/api/status` warns and names which, and Ghost Wispr looks for it again every 10
+seconds; the other controls still work.
 
 Answering each tap with the light is what a Microsoft Teams client does: in the
 [Teams devices general specification](https://learn.microsoft.com/en-us/microsoftteams/devices/certification-specifications)
@@ -372,14 +401,16 @@ light is checked on the unit. After a deploy that changes these controls, with t
 2. Tap Mute again. The blink(1) turns red, the ring goes off, and the page shows recording. Say
    a sentence at once: it appears in the live transcript. If the buttons have faded, the first tap
    may only light them; if it did not resume, tap Mute once more. A resume on the second tap
-   passes; none after two taps fails. Ghost Wispr sends the light again when the microphone
-   starts, so the ring may flash red for a moment as recording resumes.
+   passes; none after two taps fails. Ghost Wispr sends the light again just before the microphone
+   opens, so the ring may flash red for a moment as recording resumes.
 3. Press the power button briefly, twice. The blink(1) and the ring change as in steps 1 and 2.
 4. Pause on the web page: the ring shows Muted. Tap the Jabra's Mute button: recording resumes,
    the ring goes off, and a sentence you say appears in the transcript, so the Jabra did not keep
    its microphone muted.
 5. While paused, unplug the Jabra and plug it in again. Within about 10 seconds the ring shows
    Muted again, and recording stays paused.
+6. While paused, restart Ghost Wispr with `systemctl --user restart ghost-wispr` as the
+   `ghost-wispr` user. Recording stays paused, the blink(1) stays off, and the ring shows Muted.
 
 After each step the state stays as it is: nothing pauses or resumes by itself. If any step fails,
 turn the Jabra's button off with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above, and set
@@ -549,17 +580,26 @@ its certificate config in a private temporary directory, point the copied certif
 at the certificate that expires in 10 days, and use a copied YAML that sets its
 `google_credentials_file`, separate `db_path` and `audio_dir`, and disables Drive sync, GC,
 Envoy, speaker, indicator light, power button, and Jabra mute button. Before starting it, seed its
-separate database as paused. A paused instance opens the microphone, and connects to Deepgram,
-only when someone resumes it, so the test instance does not hold the recorder's microphone; do
-not resume it. PortAudio still checks the audio devices once as the app starts. Seed and start
-it like this:
+separate database as paused, and do not resume it: a paused instance opens the microphone, and
+connects to Deepgram, only when someone resumes it.
 
+The test instance must not open the Jabra at all. PortAudio opens every audio device once as an
+instance starts, and the recorder, running beside it with the Jabra button on, cannot see that
+stream: a light change while it is open makes the Jabra send Phone Mute when it closes, which the
+recorder reads as a tap. So start it with no supplementary groups: the Pi's sound devices are
+`root:audio` and its input nodes `root:input`, both mode 0660, so it can open neither. Also set
+`GHOST_WISPR_JABRA_MUTE_BUTTON=false`, which overrides the YAML. Seed and start it like this:
+
+<!-- accept_slice2_test.sh: cert-test instance -->
 ```bash
 GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
 /opt/ghost-wispr/ghost-wispr seed-paused-state
-GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
-GHOST_WISPR_ADDR=127.0.0.1:8081 \
-/opt/ghost-wispr/ghost-wispr
+sudo setpriv --reuid=ghost-wispr --regid=ghost-wispr --clear-groups \
+  env HOME=/home/ghost-wispr \
+  GHOST_WISPR_CONFIG="$test_dir/ghost-wispr.yaml" \
+  GHOST_WISPR_ADDR=127.0.0.1:8081 \
+  GHOST_WISPR_JABRA_MUTE_BUTTON=false \
+  /opt/ghost-wispr/ghost-wispr
 ```
 
 `seed-paused-state` resolves the config and its `db_path` exactly as the recorder does
@@ -567,7 +607,12 @@ GHOST_WISPR_ADDR=127.0.0.1:8081 \
 against the working directory) and prints the absolute database path it wrote. Check that the
 path is the copy's database, not the production one under `/opt/ghost-wispr`.
 
-Then run the driver with `--cert-test`. Without that flag, the row prints `NEEDS-PERSON`.
+Then run the driver with `--cert-test`. Without that flag, the row prints `NEEDS-PERSON`. With
+it, the row first reads the process that listens on `127.0.0.1:8081` and fails unless all its
+user and group ids are `ghost-wispr`'s, it holds no capabilities and no supplementary groups, runs
+with `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, and holds no sound or input device. It also fails if
+`ghost-wispr` with no groups can open any sound or input device, as it can while someone is logged
+in at the Pi's own console as `ghost-wispr`: the console session gives that user ACLs on them.
 
 The live driver reports `RAN`, `FAILED`, or `NEEDS-PERSON` for each slice 2 row.
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,11 +88,15 @@ func (d *jabraFake) press(t *testing.T) {
 	d.key(t, 0)
 }
 
-// key sends the mute key going down (1) or up (0). The write returns once
-// the reader has taken the event.
+// key sends the mute key going down (1) or up (0), stamped now on the
+// monotonic clock, as the kernel stamps the Jabra's events. The write returns
+// once the reader has taken the event.
 func (d *jabraFake) key(t *testing.T, value uint32) {
 	t.Helper()
 	record := make([]byte, fakeEventSize)
+	now := jabra.MonotonicNow()
+	binary.LittleEndian.PutUint64(record[0:8], uint64(now/time.Second))
+	binary.LittleEndian.PutUint64(record[8:16], uint64(now%time.Second/time.Microsecond))
 	binary.LittleEndian.PutUint16(record[16:18], fakeEvKey)
 	binary.LittleEndian.PutUint16(record[18:20], fakeKeyMicMute)
 	binary.LittleEndian.PutUint32(record[20:24], value)
@@ -126,7 +131,7 @@ func (d *jabraFake) lightsItself(on bool) {
 
 type jabraRig struct {
 	capture  *captureGate
-	mic      *openMicFake
+	device   *captureDevice
 	controls *server.ControlHooks
 	warnings *warningsRegistry
 	devices  chan *jabraFake
@@ -137,7 +142,8 @@ type jabraRig struct {
 }
 
 // newJabraRig builds the Jabra mute button's surroundings: capture, its
-// durable controls, the microphone and the warnings, paused if paused is set.
+// durable controls, the capture device and the warnings, paused if paused is
+// set.
 func newJabraRig(paused bool) *jabraRig {
 	capture := newCaptureGate(nil, nil, nil)
 	if paused {
@@ -146,7 +152,7 @@ func newJabraRig(paused bool) *jabraRig {
 	controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture.RequestResume, nil)
 	return &jabraRig{
 		capture:    capture,
-		mic:        &openMicFake{},
+		device:     newCaptureDevice(capture.IsPaused),
 		controls:   &server.ControlHooks{Pause: controls.Pause, Resume: controls.Resume},
 		warnings:   newWarningsRegistry(),
 		devices:    make(chan *jabraFake, 4),
@@ -154,12 +160,38 @@ func newJabraRig(paused bool) *jabraRig {
 	}
 }
 
+// openMic opens a capture stream on the Jabra through the rig's capture
+// device, as the mic loop does.
+func (r *jabraRig) openMic(t *testing.T) {
+	t.Helper()
+	if err := r.device.openStream(func() (bool, error) { return true, nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// closeMic closes the capture stream through the rig's capture device, as the
+// mic loop does on a pause.
+func (r *jabraRig) closeMic(t *testing.T) {
+	t.Helper()
+	if err := r.device.closeStream(func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// attached reports whether a connected Jabra's light is attached to the
+// capture device.
+func (r *jabraRig) attached() bool {
+	r.device.mu.Lock()
+	defer r.device.mu.Unlock()
+	return r.device.light != nil
+}
+
 // start runs the Jabra mute button against fakes until the test ends. Each
 // connection fails with connectErr if it is set, else opens the next device
 // plugged in.
 func (r *jabraRig) start(t *testing.T) {
 	t.Helper()
-	button := newJabraMuteButton(r.capture, r.mic, r.controls, r.warnings)
+	button := newJabraMuteButton(r.capture, r.device, r.controls, r.warnings)
 	button.connect = func() (io.ReadWriteCloser, error) {
 		if r.connectErr != nil {
 			return nil, r.connectErr
@@ -306,28 +338,59 @@ func TestJabraRefusedResumeRelightsTheJabra(t *testing.T) {
 	}
 }
 
-// TestJabraLightIsSentAgainWhenTheMicrophoneOpensOrCloses fails if a Jabra
-// that resets its own light when its microphone stream stops or starts is
-// left showing the wrong state: a pause stops the microphone, and a resume
-// starts it, after the light was already sent.
-func TestJabraLightIsSentAgainWhenTheMicrophoneOpensOrCloses(t *testing.T) {
-	rig := newJabraRig(true)
-	rig.mic.open.Store(true)
-	rig.start(t)
+// TestJabraLightChangesOnlyWhileTheMicrophoneIsClosed fails if the Jabra's
+// light changes while a capture stream is open, or is not written after the
+// stream closes and before it opens: a Jabra whose light changed while its
+// microphone stream was open sends Phone Mute by itself as the stream closes.
+// The pause here comes from the web page; the power button's goes through the
+// same controls.
+func TestJabraLightChangesOnlyWhileTheMicrophoneIsClosed(t *testing.T) {
+	rig := startJabraRig(t, false)
 	device := rig.plugIn()
-	waitForHardware(t, "the Jabra light to show the pause", device.shows)
+	waitForHardware(t, "the Jabra to connect", func() bool { return device.reportsSent() > 0 })
+	rig.openMic(t)
 
-	device.lightsItself(false)
-	rig.mic.open.Store(false)
-	waitForHardware(t, "the light to be sent again when the microphone closes", device.shows)
+	reports := device.reportsSent()
+	if err := rig.controls.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // about fifty light checks
+	if device.reportsSent() != reports || device.shows() {
+		t.Fatalf("the light changed while the microphone was open: %d light reports, shows %t", device.reportsSent()-reports, device.shows())
+	}
+	rig.closeMic(t)
+	if !device.shows() {
+		t.Fatal("the Jabra light does not show the pause once the microphone closed")
+	}
 
 	if err := rig.controls.Resume(); err != nil {
 		t.Fatal(err)
 	}
-	waitForHardware(t, "the Jabra light to follow the resume", func() bool { return !device.shows() })
+	waitForHardware(t, "the Jabra light to follow the resume while the microphone is closed", func() bool { return !device.shows() })
+	device.lightsItself(true) // the Jabra lights itself; the open must write the light first
+	rig.openMic(t)
+	if device.shows() {
+		t.Fatal("the microphone opened before the Jabra light was written")
+	}
+	reports = device.reportsSent()
 	device.lightsItself(true)
-	rig.mic.open.Store(true)
-	waitForHardware(t, "the light to be sent again when the microphone opens", func() bool { return !device.shows() })
+	time.Sleep(50 * time.Millisecond)
+	if device.reportsSent() != reports {
+		t.Fatalf("the light was written %d times while the microphone was open", device.reportsSent()-reports)
+	}
+}
+
+// TestJabraOwnReportWindowNeverHoldsAPause fails if a press just after Ghost
+// Wispr closed the microphone is dropped while capture records: anyone may
+// pause at any time, and only a press that would resume is held back.
+func TestJabraOwnReportWindowNeverHoldsAPause(t *testing.T) {
+	rig := startJabraRig(t, false)
+	device := rig.plugIn()
+	waitForHardware(t, "the Jabra to connect", rig.attached)
+	rig.openMic(t)
+	rig.closeMic(t) // a reconnect, with capture still on
+	device.press(t)
+	waitForHardware(t, "a press within the window to pause capture", rig.capture.IsPaused)
 }
 
 // TestJabraPermissionWarningNamesTheUdevRule fails if a Jabra node the
@@ -341,10 +404,38 @@ func TestJabraPermissionWarningNamesTheUdevRule(t *testing.T) {
 	})
 }
 
-// TestConnectJabraOpensTheNodeToWrite fails if the Jabra's node is opened
+// TestJabraClockRefusalWarningNamesTheClock fails if a Jabra node that is
+// found and opened, but refuses the monotonic clock the press guard needs, is
+// reported as a missing Jabra. The button stays off then, which is right, but
+// the page must name the cause the log names.
+func TestJabraClockRefusalWarningNamesTheClock(t *testing.T) {
+	dir := t.TempDir()
+	devices := filepath.Join(dir, "devices")
+	block := "N: Name=\"Jabra Speak2 75\"\nH: Handlers=kbd leds event1\nB: KEY=fff 0 0 0 40 100000000000000 0 0 0\nB: LED=80\n"
+	if err := os.WriteFile(devices, []byte(block), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file is no evdev node: it refuses the clock request.
+	if err := os.WriteFile(filepath.Join(dir, "event1"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, clockErr := connectJabra(devices, dir)
+	if clockErr == nil {
+		t.Fatal("control: a regular file took the evdev clock request")
+	}
+	rig := newJabraRig(false)
+	rig.connectErr = clockErr
+	rig.start(t)
+	waitForHardware(t, "a warning that names the clock", func() bool {
+		return strings.Contains(rig.warning(), "clock") && !strings.Contains(rig.warning(), "not found")
+	})
+}
+
+// TestOpenJabraOpensTheNodeToWrite fails if the Jabra's node is opened
 // read-only: the light write would then fail on the unit, and the button
-// would never toggle.
-func TestConnectJabraOpensTheNodeToWrite(t *testing.T) {
+// would never toggle. It also fails if connectJabra uses a node that refuses
+// the monotonic clock, whose stamps the press guard could not compare.
+func TestOpenJabraOpensTheNodeToWrite(t *testing.T) {
 	dir := t.TempDir()
 	devices := filepath.Join(dir, "devices")
 	block := "N: Name=\"Jabra Speak2 75\"\nH: Handlers=kbd leds event1\nB: KEY=fff 0 0 0 40 100000000000000 0 0 0\nB: LED=80\n"
@@ -354,12 +445,111 @@ func TestConnectJabraOpensTheNodeToWrite(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "event1"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	device, err := connectJabra(devices, dir)
+	device, err := openJabra(devices, dir)
 	if err != nil {
-		t.Fatalf("connect the Jabra: %v", err)
+		t.Fatalf("open the Jabra: %v", err)
 	}
 	t.Cleanup(func() { _ = device.Close() })
 	if _, err := device.Write(make([]byte, fakeEventSize)); err != nil {
 		t.Fatalf("write to the Jabra's node: %v", err)
+	}
+	// A regular file is no evdev node: it refuses the clock.
+	if connected, err := connectJabra(devices, dir); err == nil {
+		_ = connected.Close()
+		t.Fatal("connectJabra used a node that refused the monotonic clock")
+	}
+}
+
+// TestJabraOwnReportReadLateStaysCovered fails if the Jabra's own Phone Mute,
+// stamped 12 ms after the pause's microphone close but read by the button loop
+// only after a later operation began (here a TTS playback close 150 ms later,
+// while the loop was still busy with the tap that paused), resumes the unit:
+// each recent operation's cover must hold for a report stamped in it, not only
+// the latest one's. The control has no later operation.
+func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
+	for _, speechEnds := range []bool{false, true} {
+		name := "control, no later operation"
+		if speechEnds {
+			name = "a speech ends before the report is read"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := newJabraRig(false)
+			button := newJabraMuteButton(rig.capture, rig.device, rig.controls, rig.warnings)
+			rig.openMic(t) // recording
+			if speechEnds {
+				rig.device.playbackOpening() // speech plays through the pause
+			}
+			button.press(jabra.MonotonicNow()) // a person's tap pauses
+			if !rig.capture.IsPaused() {
+				t.Fatal("control: the tap did not pause the unit")
+			}
+			rig.closeMic(t) // the mic loop closes the microphone for the pause
+			report := jabra.MonotonicNow() + 12*time.Millisecond
+			time.Sleep(150 * time.Millisecond) // the button loop is still busy with the tap
+			if speechEnds {
+				rig.device.playbackClosing(func() {})
+			}
+			button.press(report)
+			if !rig.capture.IsPaused() {
+				t.Fatal("the Jabra's own report, read late, resumed the paused unit")
+			}
+		})
+	}
+}
+
+// TestAResumeTapCostsNoReopen fails if a person's Jabra tap that resumes the
+// unit makes the mic loop refuse the first buffer and reopen the microphone,
+// although the resume already darkened the ring: press resumes, the controls
+// store the status change, and only then does press ask for the light again,
+// which can come after the microphone opened. statusWrite stands for that
+// SQLite write, and beforeGateOpen's 5 ms for the blink(1)'s red confirmation.
+// The control has a status write quicker than the red confirmation.
+func TestAResumeTapCostsNoReopen(t *testing.T) {
+	for _, statusWrite := range []time.Duration{0, 30 * time.Millisecond} {
+		name := "control, the status write is quicker than the red confirmation"
+		if statusWrite > 0 {
+			name = "the status write is slower than the red confirmation"
+		}
+		t.Run(name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			capture.Pause()
+			capture.beforeGateOpen = func() error { time.Sleep(5 * time.Millisecond); return nil }
+			device := newCaptureDevice(capture.IsPaused)
+			capture.beforeMicOpen = device.prepareLightForOpen
+			var ring atomic.Bool
+			detach := device.attach(func(on bool) error { ring.Store(on); return nil })
+			t.Cleanup(detach)
+			controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture.RequestResume, func(bool) { time.Sleep(statusWrite) })
+			button := newJabraMuteButton(capture, device, &server.ControlHooks{Pause: controls.Pause, Resume: controls.Resume}, newWarningsRegistry())
+			mic := newScriptedMic()
+			recording := &ringCheckingRecording{ring: &ring}
+			runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, recording, (&recordedWaits{}).wait)
+			mic.expectEvents(t, "close")
+			time.Sleep(2 * jabraOwnMuteWindow) // the tap is a person's, outside every operation's cover
+
+			button.press(jabra.MonotonicNow())
+			if capture.IsPaused() {
+				t.Fatal("control: the tap did not resume the unit")
+			}
+			mic.expectEvents(t, "open", "stream")
+			if ring.Load() {
+				t.Fatal("control: the microphone opened with the ring showing Muted")
+			}
+			mic.capture(t, make([]byte, 320))
+			var calls []string
+			deadline := time.After(100 * time.Millisecond)
+		watch:
+			for {
+				select {
+				case call := <-mic.events:
+					calls = append(calls, call)
+				case <-deadline:
+					break watch
+				}
+			}
+			if len(calls) > 0 || recording.bytes.Load() != 320 {
+				t.Fatalf("a resume tap cost a microphone reopen with the ring dark: device calls %v, the recording got %d of the first 320 bytes", calls, recording.bytes.Load())
+			}
+		})
 	}
 }

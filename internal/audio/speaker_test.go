@@ -509,3 +509,54 @@ func TestSpeakerWritesCorrectSamples(t *testing.T) {
 		}
 	}
 }
+
+// TestSpeakerOutputHooksBracketTheStream fails if the output hooks do not run
+// around the playback stream: opening before the stream opens, and closing
+// once Play is done, with the stream still open until closing's closeStream
+// runs. The Jabra mute button counts a playback stream as open from opening to
+// closing, so it writes no light while one is open on the Jabra.
+func TestSpeakerOutputHooksBracketTheStream(t *testing.T) {
+	mock := &mockOutputStream{}
+	speaker := NewSpeaker("")
+	var calls []string
+	speaker.openStream = func(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (outputStream, error) {
+		calls = append(calls, "open")
+		mock.buf = buf
+		return mock, nil
+	}
+	speaker.SetOutputHooks(
+		func() { calls = append(calls, "opening") },
+		func(closeStream func()) {
+			mock.mu.Lock()
+			closedBefore := mock.closed
+			mock.mu.Unlock()
+			calls = append(calls, fmt.Sprintf("closing (closed before closeStream: %t)", closedBefore))
+			closeStream()
+			mock.mu.Lock()
+			calls = append(calls, fmt.Sprintf("closed: %t, stopped: %t", mock.closed, mock.stopped))
+			mock.mu.Unlock()
+		})
+	if _, err := speaker.Play(makePCM16Bytes([]int16{1, 2, 3, 4}), AudioFormat{SampleRate: 16000, Channels: 1, Encoding: EncodingPCM16}); err != nil {
+		t.Fatalf("Play: %v", err)
+	}
+	want := []string{"opening", "open", "closing (closed before closeStream: false)", "closed: true, stopped: true"}
+	if fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Fatalf("calls = %q, want %q", calls, want)
+	}
+}
+
+// TestSpeakerOutputHooksRunWhenTheStreamDoesNotOpen fails if a playback whose
+// stream fails to open leaves the closing hook uncalled: the Jabra mute button
+// would count that playback open for good and never write the light again.
+func TestSpeakerOutputHooksRunWhenTheStreamDoesNotOpen(t *testing.T) {
+	speaker := NewSpeaker("")
+	speaker.openStream = newFailingStreamFactory(fmt.Errorf("no output device"))
+	opened, closed := 0, 0
+	speaker.SetOutputHooks(func() { opened++ }, func(closeStream func()) { closed++; closeStream() })
+	if _, err := speaker.Play(makePCM16Bytes([]int16{1, 2}), AudioFormat{SampleRate: 16000, Channels: 1, Encoding: EncodingPCM16}); err == nil {
+		t.Fatal("Play succeeded with no output device")
+	}
+	if opened != 1 || closed != 1 {
+		t.Fatalf("opening ran %d times and closing %d times, want once each", opened, closed)
+	}
+}

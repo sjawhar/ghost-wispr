@@ -48,6 +48,7 @@ func (m *deliveringMic) IsOpen() bool  { return m.open.Load() }
 func (m *deliveringMic) Start() error  { m.open.Store(true); return nil }
 func (m *deliveringMic) Stop() error   { m.open.Store(false); return nil }
 func (m *deliveringMic) Close() error  { m.open.Store(false); return nil }
+func (m *deliveringMic) Open() error   { m.open.Store(true); return nil }
 func (m *deliveringMic) Reopen() error { m.open.Store(true); return nil }
 func (m *deliveringMic) Stream(w io.Writer) error {
 	buf := make([]byte, m.chunk)

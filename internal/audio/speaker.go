@@ -36,6 +36,10 @@ type Speaker struct {
 	// openStream is the factory for creating output streams.
 	// Override in tests to avoid PortAudio hardware dependency.
 	openStream func(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (outputStream, error)
+
+	// opening and closing bracket each output stream (SetOutputHooks).
+	opening func()
+	closing func(closeStream func())
 }
 
 // NewSpeaker creates a new Speaker. deviceName is optional — if empty,
@@ -43,9 +47,22 @@ type Speaker struct {
 func NewSpeaker(deviceName string) *Speaker {
 	s := &Speaker{
 		deviceName: deviceName,
+		opening:    func() {},
+		closing:    func(closeStream func()) { closeStream() },
 	}
 	s.openStream = s.defaultOpenStream
 	return s
+}
+
+// SetOutputHooks brackets each output stream Play opens: opening runs just
+// before Play opens it, and closing runs once Play is done with it, whether it
+// opened or not, and must call closeStream, which stops and closes it. Call it
+// before the first Play. The Jabra mute button uses it to keep the Jabra's
+// light from changing while a playback stream is open on the Jabra.
+func (s *Speaker) SetOutputHooks(opening func(), closing func(closeStream func())) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opening, s.closing = opening, closing
 }
 
 // Play sends audio bytes to the speaker. If format.Encoding is EncodingMP3,
@@ -133,23 +150,38 @@ func (s *Speaker) Play(audioData []byte, format AudioFormat) (result *PlaybackRe
 	outputs.begin(s)
 	defer outputs.end(s)
 
-	stream, actualRate, err := s.openStreamWithFallback(sampleRate, channels, framesPerBuffer, outputBuf)
+	// The output hooks bracket the stream, from before it opens until after
+	// it closes, on every path out of Play.
+	var stream outputStream
+	started := false
+	s.opening()
+	defer s.closing(func() {
+		if stream == nil {
+			return
+		}
+		if started {
+			_ = stream.Stop()
+		}
+		_ = stream.Close()
+	})
+
+	var actualRate int
+	stream, actualRate, err = s.openStreamWithFallback(sampleRate, channels, framesPerBuffer, outputBuf)
 	if err != nil {
+		stream = nil
 		return nil, fmt.Errorf("open output stream: %w", err)
 	}
-	defer func() { _ = stream.Close() }()
 
 	// Resample PCM if the actual stream rate differs from the source rate.
 	if actualRate != sampleRate {
 		samples = resamplePCM(samples, channels, sampleRate, actualRate)
 		sampleRate = actualRate
 	}
-	defer func() { _ = stream.Close() }()
 
 	if err := stream.Start(); err != nil {
 		return nil, fmt.Errorf("start output stream: %w", err)
 	}
-	defer func() { _ = stream.Stop() }()
+	started = true
 
 	// Write samples in chunks.
 	var bytesWritten int64

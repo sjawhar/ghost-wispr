@@ -28,6 +28,7 @@ type deepgramEndpoint struct {
 	header http.Header
 	query  url.Values
 	types  []string // the "type" of each text frame read
+	audio  int      // binary frames, which carry audio, read
 	conn   chan *websocket.Conn
 	ended  chan struct{} // closed when the connection ends
 }
@@ -53,6 +54,9 @@ func startDeepgramEndpoint(t *testing.T) (*deepgramEndpoint, string) {
 				return
 			}
 			if kind != websocket.TextMessage {
+				fake.mu.Lock()
+				fake.audio++
+				fake.mu.Unlock()
 				continue
 			}
 			var frame struct {
@@ -74,6 +78,12 @@ func (f *deepgramEndpoint) received() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.types)
+}
+
+func (f *deepgramEndpoint) audioFrames() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.audio
 }
 
 func (f *deepgramEndpoint) waitFor(t *testing.T, within time.Duration, messageType string) {
