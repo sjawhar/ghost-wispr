@@ -30,6 +30,20 @@ assert_recording_rules() {
     || fail "the $1 configuration does not hold the office Pi's four recording rules: $(<"$config")"
 }
 
+# assert_jabra_button_off fails unless the configuration and the .env provision.sh installed leave
+# the Jabra's Mute button off. It stays off until the fix of defect D9 ships: a restart of a paused
+# unit can resume recording, because the Jabra sends a mute-key press as the old process closes
+# its microphone (docs/pi-setup.md, "Pause and resume at the unit").
+assert_jabra_button_off() {
+  local config=$TEST_LOG.installed-ghost-wispr.yaml env=$TEST_LOG.installed-.env settings
+  settings=$(grep -E '^jabra_mute_button:' "$config") || true
+  [[ $settings == 'jabra_mute_button: false' ]] \
+    || fail "the $1 configuration does not turn the Jabra's Mute button off once: ${settings:-no jabra_mute_button line}"
+  if grep -Eq '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env"; then
+    fail "the $1 .env sets the Jabra's Mute button: $(grep -E '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env")"
+  fi
+}
+
 uid=$(id -u)
 readonly uid runtime_dir="/run/user/$uid"
 [[ -d $runtime_dir ]] || fail "this test needs $runtime_dir, where provision.sh stages the bundle"
@@ -129,6 +143,7 @@ if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error (above)"
 fi
 assert_recording_rules 'installed'
+assert_jabra_button_off 'installed'
 
 # The .env the recorder runs with holds the Deepgram key and no Envoy signing key.
 env_file="$TEST_LOG.installed-.env"
@@ -202,6 +217,7 @@ for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' \
     || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
 done
 assert_recording_rules "rerun's"
+assert_jabra_button_off "rerun's"
 # The recorder reads its configuration only when it starts, and update.sh restarts nothing when the
 # Pi already runs the newest release: a rerun restarts a running recorder once the configuration is
 # installed, and try-restart starts none that is stopped.

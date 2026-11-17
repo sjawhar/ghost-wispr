@@ -34,10 +34,12 @@ tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
 indicator_light: blink1
 power_button: true
-# The Jabra's Mute button pauses and resumes (docs/pi-setup.md, "Pause and resume at the unit"). The
-# office Pi's .env also sets GHOST_WISPR_JABRA_MUTE_BUTTON=true, which overrides this line; keep the
-# two the same, because a full provisioner run rewrites .env and leaves only this one.
-jabra_mute_button: true
+# The Jabra's Mute button (docs/pi-setup.md, "Pause and resume at the unit") stays off until the
+# fix of defect D9 ships: with it on, a restart of a paused unit can resume recording by itself,
+# because the Jabra sends a mute-key press as the old process closes its microphone. The office
+# Pi's .env also holds GHOST_WISPR_JABRA_MUTE_BUTTON=false, which overrides this line; a full
+# provisioner run rewrites .env and leaves only this one. Turn neither on before the D9 fix.
+jabra_mute_button: false
 envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__
 # The Secret Manager version of Envoy's webhook signing key; Ghost Wispr has no default for it.

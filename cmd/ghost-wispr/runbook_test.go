@@ -78,15 +78,22 @@ func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
 
 // TestRunbookRolloutKeepsTheJabraOverride fails if the rollout order does not
 // say what its steps do to a setting the office Pi holds in .env rather than
-// in its YAML: its Jabra Mute button is on through GHOST_WISPR_JABRA_MUTE_BUTTON,
-// the models step keeps .env and the full provisioner rewrites it, so the
-// template's jabra_mute_button must agree, and step 4 checks the Jabra's
-// warning ("Pause and resume at the unit").
+// in its YAML, the Jabra Mute button (GHOST_WISPR_JABRA_MUTE_BUTTON): the
+// models step keeps that line as it is, the full provisioner rewrites .env and
+// the template's jabra_mute_button: false applies, and the button stays off
+// until the fix of defect D9 ships ("Pause and resume at the unit"). It also
+// fails if the rollout writes or checks for the button turned on: a restart of
+// a paused unit with the button on can resume recording by itself.
 func TestRunbookRolloutKeepsTheJabraOverride(t *testing.T) {
 	section := runbookSection(t, "## Roll out a release that adds a config key")
-	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON=true", "jabra_mute_button: true", "keeps every `.env` line", "rewrites `.env`", "Jabra mute button", `"Pause and resume at the unit"`} {
+	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "jabra_mute_button: false", "keeps every `.env` line", "rewrites `.env`", "D9", `"Pause and resume at the unit"`} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's rollout order does not say %q", words)
+		}
+	}
+	for _, on := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON=true", "jabra_mute_button: true"} {
+		if strings.Contains(section, on) {
+			t.Errorf("the runbook's rollout order turns the Jabra's Mute button on: %q", on)
 		}
 	}
 }

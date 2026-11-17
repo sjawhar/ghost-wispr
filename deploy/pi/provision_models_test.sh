@@ -80,7 +80,7 @@ for line in \
   'gc_max_audio_size_mb: 20000' \
   'envoy_webhook_url: __ENVOY_WEBHOOK_URL__' \
   "envoy_webhook_secret_name: projects/$PI_GCP_PROJECT/secrets/$PI_WEBHOOK_SECRET/versions/latest" \
-  'jabra_mute_button: true'; do
+  'jabra_mute_button: false'; do
   assert_line "$line" "$template"
 done
 assert_count '^gdrive_folder_id:' 0 "$template"
@@ -118,10 +118,11 @@ for line in \
   "envoy_webhook_secret_name: projects/$PI_GCP_PROJECT/secrets/$PI_WEBHOOK_SECRET/versions/latest" \
   "gdrive_folder_id: \"$drive_id\"" \
   'gdrive_sync_enabled: true' \
-  'gc_enabled: true'; do
+  'gc_enabled: true' \
+  'jabra_mute_button: false'; do
   assert_line "$line" "$models_config"
 done
-for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_webhook_url; do
+for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_webhook_url jabra_mute_button; do
   assert_count "^$key:" 1 "$models_config"
 done
 
@@ -192,8 +193,8 @@ drive_on_empty=$(provisioner_function deployed_drive_id "$empty_drive") \
 
 # --models keeps every .env line but the Envoy signing key an earlier provisioner wrote, which the
 # recorder now reads from Secret Manager, and sets the Vertex embedding location exactly once. The
-# office Pi's Jabra Mute button is on through such a line (docs/pi-setup.md, "Pause and resume at
-# the unit"); it stays, and agrees with the template's jabra_mute_button.
+# office Pi's Jabra Mute button is set by such a line (docs/pi-setup.md, "Pause and resume at the
+# unit"): --models keeps its value as it is, whatever it is, and writes no other.
 deployed_env="$work_dir/env"
 models_env="$work_dir/models.env"
 cat >"$deployed_env" <<'EOF'
@@ -201,13 +202,14 @@ GHOST_WISPR_ADDR=127.0.0.1:8080
 GHOST_WISPR_EMBEDDING_LOCATION=europe-west4
 GHOST_WISPR_DEEPGRAM_API_KEY=test-key
 GHOST_WISPR_ENVOY_WEBHOOK_SECRET=stale-signing-key
-GHOST_WISPR_JABRA_MUTE_BUTTON=true
+GHOST_WISPR_JABRA_MUTE_BUTTON=false
 EOF
 provisioner_function render_models_env "$deployed_env" >"$models_env" \
   || fail 'the .env renderer rejected a deployed .env'
 assert_line 'GHOST_WISPR_ADDR=127.0.0.1:8080' "$models_env"
 assert_line 'GHOST_WISPR_DEEPGRAM_API_KEY=test-key' "$models_env"
-assert_line 'GHOST_WISPR_JABRA_MUTE_BUTTON=true' "$models_env"
+assert_line 'GHOST_WISPR_JABRA_MUTE_BUTTON=false' "$models_env"
+assert_count '^GHOST_WISPR_JABRA_MUTE_BUTTON=' 1 "$models_env"
 assert_line 'GHOST_WISPR_EMBEDDING_LOCATION=global' "$models_env"
 assert_count '^GHOST_WISPR_EMBEDDING_LOCATION=' 1 "$models_env"
 assert_count 'stale-signing-key' 0 "$models_env"

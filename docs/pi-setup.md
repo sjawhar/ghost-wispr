@@ -349,9 +349,12 @@ the models step install them with the rest of the template.
 
 ## Pause and resume at the unit
 
-With `power_button: true` and `jabra_mute_button: true`, both set in
-`deploy/pi/files/ghost-wispr.yaml`, a short press of the Pi's power button and a tap of the Jabra
-Speak2 75's Mute button each pause recording, or resume it when it is paused. They change the
+With `power_button: true`, set in `deploy/pi/files/ghost-wispr.yaml`, a short press of the Pi's
+power button pauses recording, or resumes it when it is paused; with `jabra_mute_button` on, so
+does a tap of the Jabra Speak2 75's Mute button. The template keeps `jabra_mute_button: false`,
+and the office Pi's `.env` holds `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, until the fix of defect D9
+ships: with the button on, a restart of a paused unit can resume recording by itself, because the
+Jabra sends a mute-key press as the old process closes its microphone. The buttons change the
 same pause switch as the web page, `POST /api/pause` and `POST /api/resume`, so any of them
 resumes a pause made by any other, and a resume from a button checks the recording light as one
 from the web page does. A long press of the power button is left to the Pi, which powers off.
@@ -361,9 +364,9 @@ at its next `provision.sh` run, or its next `provision.sh --models` run, which a
 settings saved in the UI. To turn the Jabra's button on or off without either, put
 `GHOST_WISPR_JABRA_MUTE_BUTTON=true` or `GHOST_WISPR_JABRA_MUTE_BUTTON=false` in
 `/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. A full
-`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it off while
-recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
-light as it last set it.
+`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it on in
+neither file before the D9 fix ships. Turn it off while recording, or unplug the Jabra and plug it
+in again afterwards: Ghost Wispr leaves the Jabra's light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
@@ -416,7 +419,8 @@ Mute, and takes LED Mute from the client. Jabra's
 [call-control SDK](https://sdk.jabra.com/javascript/docs/jabra-js/4.4.1/interfaces/ICallControl.html)
 says its `mute` "Mutes or unmutes the microphone of the Jabra device", and that it "Should only be
 used during a call". Ghost Wispr uses the Jabra outside a call, so what the Jabra does with the
-light is checked on the unit. After a deploy that changes these controls, with the web page open:
+light is checked on the unit. After a deploy that changes these controls, with the web page open,
+and once the D9 fix has shipped and the Jabra's button is on:
 
 1. While it records (the blink(1) red), tap the Jabra's Mute button. The blink(1) goes off, the
    Jabra's ring shows Muted (red), and the page shows the pause. Wait 70 seconds: the ring still
@@ -499,13 +503,14 @@ restart ends a conversation that is being recorded and turns the light off, so r
 outside meetings. Save no settings in the web UI from step 1 until step 4 passes.
 
 A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
-files differently. The office Pi turns the Jabra's Mute button on there, with
-`GHOST_WISPR_JABRA_MUTE_BUTTON=true` ("Pause and resume at the unit"). The models step keeps every
-`.env` line but an old Envoy signing key and the embedding location, which it writes again, so
-that line stays. The full provisioner rewrites `.env` without it, and the template's
-`jabra_mute_button: true` applies. The button stays on either way, because the two agree. Leave
-the `.env` line as it is during the rollout, and keep the template's line the same as it: a later
-change to the button changes both.
+files differently. The office Pi sets the Jabra's Mute button there, with
+`GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"); until the fix of defect D9 ships,
+that line turns the button off. The models step keeps every `.env` line but an old Envoy signing
+key and the embedding location, which it writes again, so that line stays as it is. The full
+provisioner rewrites `.env` without it, and the template's `jabra_mute_button: false` applies. The
+button stays off either way. Leave the `.env` line as it is during the rollout, and turn the
+button on in neither file before the D9 fix: with it on, a restart of a paused unit can resume
+recording by itself, and these steps restart the recorder.
 
 1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
    the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
@@ -526,12 +531,13 @@ change to the button changes both.
    session; leaving the current binary in place` and changes nothing: run it again once the
    session has ended.
 4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
-   come back, and `/api/status` must hold no Envoy warning (for `envoy_webhook_secret_name`) and no
-   "Jabra mute button" warning (the button is still on and found):
+   come back, and for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning. The
+   Jabra's Mute button must still be off: each line the `grep` prints ends in `false`.
 
    ```bash
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/config | jq .recording_rules
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq .warnings
+   ssh ghost-wispr@ghost-wispr "grep -E '^(jabra_mute_button:|GHOST_WISPR_JABRA_MUTE_BUTTON=)' /opt/ghost-wispr/ghost-wispr.yaml /opt/ghost-wispr/.env"
    ```
 
    When they do not, the config lacks the key: step 1 was skipped, or a settings save dropped the
