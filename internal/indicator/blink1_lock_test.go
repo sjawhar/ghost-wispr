@@ -299,6 +299,48 @@ func TestAReadDoesNotReturnAnotherProcesssRed(t *testing.T) {
 	}
 }
 
+// TestAReadTakesOnlyTheReplyToItsOwnCommand fails if ReadRGB takes the reply
+// to another command for the light's colour. A program that takes no lock
+// (blink1-tool, or a lone SET that Ghost Wispr sends without the lock once its
+// wait has run out) writes pattern line 0 as red between the read's
+// SET_FEATURE and its GET_FEATURE: the LED stays off, and the buffer holds that
+// command's echo, 01 50 ff 00 00, whose bytes 2-4 read as red. The blink(1)
+// answers a colour read with 'r' in byte 1 (0172ff00 on the office Pi,
+// usbmon 2026-11-17), so a reply with anything else there is not red: the
+// read fails with ErrOtherReply. Found by the red team on #79.
+func TestAReadTakesOnlyTheReplyToItsOwnCommand(t *testing.T) {
+	device := &sharedBlink1{names: map[uintptr]string{}, setFrom: map[string]chan struct{}{}}
+	original := featureIOCTL
+	featureIOCTL = device.ioctl
+	t.Cleanup(func() { featureIOCTL = original })
+	reader, _ := openTwice(t, device)
+
+	if r, g, b, err := reader.ReadRGB(); err != nil || r != 0 || g != 0 || b != 0 {
+		t.Fatalf("control: ReadRGB of an off light = %d,%d,%d, %v, want 0,0,0", r, g, b, err)
+	}
+	device.mu.Lock()
+	device.betweenWho, device.betweenCmd, device.betweenDone = "first", 'r', false
+	device.between = func() {
+		line := Blink1Report('P', [6]byte{255, 0, 0, 0, 100, 0})
+		_ = device.ioctl(^uintptr(0), hidIOCSetFeature, &line)
+	}
+	device.mu.Unlock()
+
+	r, g, b, err := reader.ReadRGB()
+	device.mu.Lock()
+	led := device.colour
+	device.mu.Unlock()
+	if led != [3]byte{} {
+		t.Fatalf("control: the LED is %v, want off", led)
+	}
+	if r == 255 && g == 0 && b == 0 {
+		t.Fatalf("false red: ReadRGB = 255,0,0 with the LED %d,%d,%d: it took the echo of another program's 'P' for the reply to its 'r'", led[0], led[1], led[2])
+	}
+	if !errors.Is(err, ErrOtherReply) || r != 0 || g != 0 || b != 0 {
+		t.Fatalf("ReadRGB answered by another command's echo = %d,%d,%d, %v, want no colour and ErrOtherReply", r, g, b, err)
+	}
+}
+
 // TestABusyBlink1ReadsUnknownNotRed fails if a command waits without bound for
 // a blink(1) another handle holds, sends anything without its lock, or if a
 // read that could not get the light reports a colour: it must report

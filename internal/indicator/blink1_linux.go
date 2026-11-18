@@ -112,8 +112,19 @@ func (b *blink1) send(report *[8]byte) error {
 
 // query sends a command report and reads the device's reply into it, holding
 // the light from the SET to the GET, so no other command's reply answers it.
+// Byte 1 of a reply names the command it answers (0172ff00 answers a colour
+// read, 01760033 a version query, on the office Pi). A reply that names
+// another command came from a program that takes no lock, between this SET and
+// GET: query returns ErrOtherReply, and the reply is not used.
 func (b *blink1) query(report *[8]byte) error {
-	return b.exchange(report, true)
+	command := report[1]
+	if err := b.exchange(report, true); err != nil {
+		return err
+	}
+	if report[1] != command {
+		return fmt.Errorf("%w: %q answered %q", ErrOtherReply, report[1], command)
+	}
+	return nil
 }
 
 // exchange sends report and, if reply, reads the reply into it, all under the

@@ -21,6 +21,13 @@ var ErrNotRed = errors.New("recording light does not read back red")
 // unknown, which counts as not red.
 var ErrBusy = errors.New("blink(1) busy with another command")
 
+// ErrOtherReply reports a query whose reply belongs to another command: byte
+// 1 of a blink(1)'s reply names the command it answers, and another program's
+// command reached the device between the query's SET and its GET. The reply
+// says nothing about this query, so a read that returns it has no colour,
+// which counts as not red.
+var ErrOtherReply = errors.New("blink(1) reply is another command's")
+
 // Blink1Report builds an eight-byte blink(1) feature report.
 func Blink1Report(command byte, args [6]byte) [8]byte {
 	return [8]byte{0x01, command, args[0], args[1], args[2], args[3], args[4], args[5]}
