@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/sjawhar/ghost-wispr/internal/indicator"
 )
 
 // TestAPassingCheckDoesNotEraseAFailedConfirmation fails if the light guard
@@ -41,5 +46,56 @@ func TestAPassingCheckDoesNotEraseAFailedConfirmation(t *testing.T) {
 	guard.mu.Unlock()
 	if fault != nil {
 		t.Fatalf("control: a passing check after run read the failure left the guard's check %v, want nil", fault)
+	}
+}
+
+// TestABusyLightCheckLeavesNoWarningOnceItPasses fails if a light check that
+// another program got in the way of (indicator.Contended: the lock was held
+// past the wait) leaves a warning after the next check passes, or names the
+// light as failed. On a uhid blink(1), with the recorder paused, a 5 s holder
+// left "Recording light failed" on /api/status after the light was free again:
+// nothing but a red confirmation cleared it (review 5954543056 of #79). A
+// real failure keeps its warning until a red confirmation passes.
+func TestABusyLightCheckLeavesNoWarningOnceItPasses(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fault     error
+		wantAfter []string
+	}{
+		{"another program held the lock", fmt.Errorf("read blink(1) version: %w", indicator.ErrBusy), nil},
+		{"control: the light failed", errors.New("blink(1) feature report: input/output error"), []string{recordingLightFailedWarning}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			capture.Pause() // nothing confirms red while paused
+			warnings := newWarningsRegistry()
+			guard := newLightGuard(capture, warnings, time.Hour)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go guard.run(ctx)
+			waitWarnings := func(what string, want func([]string) bool) []string {
+				t.Helper()
+				for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
+					got := warnings.List()
+					if want(got) {
+						return got
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("%s: warnings %v", what, got)
+					}
+				}
+			}
+
+			guard.report(tc.fault)
+			got := waitWarnings("a failed check set no warning", func(w []string) bool { return len(w) == 1 })
+			if busy := indicator.Contended(tc.fault); busy != strings.Contains(got[0], "busy") {
+				t.Fatalf("warning for %v = %q, want it to say busy: %t", tc.fault, got[0], busy)
+			}
+			guard.report(nil)
+			time.Sleep(50 * time.Millisecond) // run applies the pass
+			if got := warnings.List(); !slices.Equal(got, tc.wantAfter) {
+				t.Fatalf("warnings after the next check passed = %v, want %v", got, tc.wantAfter)
+			}
+		})
 	}
 }

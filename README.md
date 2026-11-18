@@ -164,10 +164,11 @@ last command any program sent. So every command Ghost Wispr sends, from the reco
 subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node from the command to its
 reply, and a read takes only a reply that names its own command. A recorder command that does not
 get the lock within 50 ms, or a subcommand's within 2 s, sends nothing: the recorder counts such a
-read as the light not red, and `light-state` prints `unknown` and fails. A waiting recorder gets the
-lock before a subcommand does, so `light-state` runs that finish do not make the recorder drop
-audio. One that is stopped while it holds the lock (Ctrl-Z, `kill -STOP`) does: until it is
-continued, each of the recorder's reads is unknown, so no audio is recorded and the microphone
+read as the light not red, and `light-state` prints `unknown` and fails; `/api/status` warns that
+the recording light is busy until the recorder's next look at the light gets through. A waiting
+recorder gets the lock before a subcommand does, so `light-state` runs that finish do not make the
+recorder drop audio. One that is stopped while it holds the lock (Ctrl-Z, `kill -STOP`) does: until
+it is continued, each of the recorder's reads is unknown, so no audio is recorded and the microphone
 opens only once the lock is free. The watchdog tickle and an off write, which wait for no reply,
 are the exception: they are then sent without the lock, so another program that holds the lock does
 not let the watchdog fire while the recorder runs, a pause still turns the light off within 500 ms,

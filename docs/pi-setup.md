@@ -439,7 +439,9 @@ from the recorder or from a subcommand, holds an exclusive `flock` on the blink(
 from the command to its reply, and a read takes only a reply that names its own command. A recorder
 command that does not get the lock within 50 ms, or a subcommand's within 2 seconds, sends nothing:
 the recorder counts such a read as the light not red, and `light-state` prints `unknown` and
-fails. A waiting recorder gets the lock before a subcommand does, so `light-state` runs that finish
+fails. While another program keeps the light from the recorder, `/api/status` warns `Recording
+light busy: another program is using it`, until the recorder's next look at the light gets
+through. A waiting recorder gets the lock before a subcommand does, so `light-state` runs that finish
 do not make the recorder drop audio; one stopped while it holds the lock does, until it is
 continued. The watchdog tickle and an off write, which wait for no reply, are then sent without the
 lock, so the watchdog does not fire while the recorder runs, a pause turns the blink(1) off within

@@ -33,6 +33,10 @@ const (
 	recordingLightMissingWarning = "Recording light not found; the unit does not record until it is back"
 	recordingLightNotRedWarning  = "Recording light does not show red; the unit does not record until it does"
 	recordingLightFailedWarning  = "Recording light failed; the unit does not record until it shows red again"
+	// recordingLightBusyWarning names a light another program had
+	// (indicator.Contended), not a failed one; the light guard clears it at
+	// the next check that passes.
+	recordingLightBusyWarning = "Recording light busy: another program is using it; the unit does not record until it shows red again"
 )
 
 func recordingLightWarning(err error) string {
@@ -41,6 +45,8 @@ func recordingLightWarning(err error) string {
 		return recordingLightMissingWarning
 	case errors.Is(err, indicator.ErrNotRed):
 		return recordingLightNotRedWarning
+	case indicator.Contended(err):
+		return recordingLightBusyWarning
 	default:
 		return recordingLightFailedWarning
 	}

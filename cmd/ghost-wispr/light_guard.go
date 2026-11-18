@@ -84,6 +84,10 @@ func (g *lightGuard) apply(fault error) {
 		g.capture.HoldForLight()
 		return
 	}
+	// A check that passes ends a busy light's warning: another program had
+	// the light, which did not fail. Any other warning waits for a red
+	// confirmation; ClearIf leaves it.
+	g.warnings.ClearIf("recording-light", recordingLightBusyWarning)
 	if !g.capture.isLightHeld() || time.Since(g.lastRelease) < g.releaseEvery {
 		return
 	}
