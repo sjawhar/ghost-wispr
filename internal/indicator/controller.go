@@ -15,6 +15,12 @@ var ErrNoBlink1 = errors.New("blink(1) indicator not found")
 // ErrNotRed reports a light that does not read back red after a red write.
 var ErrNotRed = errors.New("recording light does not read back red")
 
+// ErrBusy reports a blink(1) command that could not get the light: another
+// command, from this process or another, held it past the wait. The command
+// sent nothing. A read that returns it has no colour: the light's colour is
+// unknown, which counts as not red.
+var ErrBusy = errors.New("blink(1) busy with another command")
+
 // Blink1Report builds an eight-byte blink(1) feature report.
 func Blink1Report(command byte, args [6]byte) [8]byte {
 	return [8]byte{0x01, command, args[0], args[1], args[2], args[3], args[4], args[5]}

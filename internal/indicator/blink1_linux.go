@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -17,6 +18,27 @@ import (
 const (
 	hidIOCSetFeature = 0xC0084806
 	hidIOCGetFeature = 0xC0084807
+)
+
+// A blink(1) has one feature-report buffer, which every open handle shares: a
+// GET_FEATURE returns what the last SET_FEATURE left in it, whoever sent that
+// SET. So each command holds the light for its whole exchange, its SET and,
+// for a query, the GET of the reply: flock(LOCK_EX) on the hidraw node, which
+// every open of the node contends for, in this process or another (the
+// recorder, `ghost-wispr light-state`, `ghost-wispr light-off`); and the
+// handle's mu, since a flock does not exclude the handle's own goroutines.
+//
+// exchangeWait bounds a command's wait for the light: a command that does not
+// get it in that time sends nothing and returns ErrBusy. lockPoll is how often
+// it tries again meanwhile. exchangeGap is how long a handle leaves the light
+// free after an exchange before its next one, so a handle that sends one
+// command after another, as the recorder does when it writes the black
+// pattern, does not keep a polling `light-state` out until its wait ends.
+var exchangeWait = 2 * time.Second
+
+const (
+	lockPoll    = time.Millisecond
+	exchangeGap = 3 * lockPoll
 )
 
 var featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
@@ -30,6 +52,8 @@ var featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
 type blink1 struct {
 	file         *os.File
 	patternLines uint8
+	mu           sync.Mutex // the handle's part of the exchange lock
+	released     time.Time  // the end of the handle's last exchange, under mu
 }
 
 // OpenBlink1 finds ThingM's blink(1) by its hidraw uevent identity.
@@ -81,25 +105,72 @@ func (b *blink1) loadVersion() error {
 	return nil
 }
 
-func (b *blink1) setFeature(report *[8]byte) error {
-	return featureIOCTL(b.file.Fd(), hidIOCSetFeature, report)
+// send sends a command report, holding the light while it does.
+func (b *blink1) send(report *[8]byte) error {
+	return b.exchange(report, false)
 }
 
-func (b *blink1) getFeature(report *[8]byte) error {
-	return featureIOCTL(b.file.Fd(), hidIOCGetFeature, report)
-}
-
-// query sends a command report and reads the device's reply into it.
+// query sends a command report and reads the device's reply into it, holding
+// the light from the SET to the GET, so no other command's reply answers it.
 func (b *blink1) query(report *[8]byte) error {
-	if err := b.setFeature(report); err != nil {
+	return b.exchange(report, true)
+}
+
+// exchange sends report and, if reply, reads the reply into it, all under the
+// exchange lock. Every command to the blink(1) goes through here.
+func (b *blink1) exchange(report *[8]byte, reply bool) error {
+	fd := b.file.Fd()
+	if err := b.lock(fd); err != nil {
 		return err
 	}
-	return b.getFeature(report)
+	err := featureIOCTL(fd, hidIOCSetFeature, report)
+	if err == nil && reply {
+		err = featureIOCTL(fd, hidIOCGetFeature, report)
+	}
+	if unlockErr := unix.Flock(int(fd), unix.LOCK_UN); unlockErr != nil && err == nil {
+		err = fmt.Errorf("unlock blink(1): %w", unlockErr)
+	}
+	b.released = time.Now()
+	b.mu.Unlock()
+	return err
+}
+
+// lock takes the exchange lock, the handle's mu and then the flock on its
+// node, or returns ErrBusy once exchangeWait has passed. It leaves the light
+// free for exchangeGap after the handle's last exchange first. It tries before
+// it looks at the clock, so a process stopped while it waited still gets a
+// free light when it runs again.
+func (b *blink1) lock(fd uintptr) error {
+	deadline := time.Now().Add(exchangeWait)
+	for !b.mu.TryLock() {
+		if !time.Now().Before(deadline) {
+			return ErrBusy
+		}
+		time.Sleep(lockPoll)
+	}
+	if free := exchangeGap - time.Since(b.released); free > 0 {
+		time.Sleep(free)
+	}
+	for {
+		err := unix.Flock(int(fd), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			b.mu.Unlock()
+			return fmt.Errorf("lock blink(1): %w", err)
+		}
+		if !time.Now().Before(deadline) {
+			b.mu.Unlock()
+			return ErrBusy
+		}
+		time.Sleep(lockPoll)
+	}
 }
 
 func (b *blink1) SetRGB(r, g, blue uint8) error {
 	report := Blink1Report('n', [6]byte{r, g, blue})
-	return b.setFeature(&report)
+	return b.send(&report)
 }
 
 func (b *blink1) ReadRGB() (r, g, blue uint8, err error) {
@@ -113,14 +184,14 @@ func (b *blink1) ReadRGB() (r, g, blue uint8, err error) {
 func (b *blink1) ServerDown(timeout time.Duration) error {
 	if timeout <= 0 {
 		report := Blink1Report('D', [6]byte{})
-		return b.setFeature(&report)
+		return b.send(&report)
 	}
 	ticks := timeout / (10 * time.Millisecond)
 	if ticks > 0xffff {
 		ticks = 0xffff
 	}
 	report := Blink1Report('D', [6]byte{1, byte(ticks >> 8), byte(ticks), 1, 0, b.flashPatternLines() - 1})
-	return b.setFeature(&report)
+	return b.send(&report)
 }
 
 // BlackPattern persists an all-black, non-zero-duration pattern so the
@@ -155,17 +226,17 @@ func (b *blink1) patternIsBlack() (bool, error) {
 
 func (b *blink1) writeBlackPattern() error {
 	allLEDs := Blink1Report('l', [6]byte{})
-	if err := b.setFeature(&allLEDs); err != nil {
+	if err := b.send(&allLEDs); err != nil {
 		return err
 	}
 	for line := uint8(0); line < b.flashPatternLines(); line++ {
 		black := Blink1Report('P', [6]byte{0, 0, 0, 0, 10, line})
-		if err := b.setFeature(&black); err != nil {
+		if err := b.send(&black); err != nil {
 			return err
 		}
 	}
 	save := Blink1Report('W', [6]byte{0xbe, 0xef, 0xca, 0xfe})
-	_ = b.setFeature(&save)
+	_ = b.send(&save)
 	black, err := b.patternIsBlack()
 	if err != nil {
 		return err
