@@ -2003,9 +2003,19 @@ func streamMicWithRetry(
 	// (audio.ErrMicStillReading); the close that releases it clears the
 	// warning.
 	held := false
+	// closeAtShutdown closes the microphone unless it is closed already.
+	// Shutdown turns the light off once every mic loop has ended, so no loop
+	// may end with its microphone open: not one a start that shutdown
+	// overtook handed an open microphone, nor one that has just opened it.
+	closeAtShutdown := func() {
+		if !released {
+			closeMic(capture, streamer, "at shutdown", logf)
+		}
+	}
 
 	for {
 		if ctx.Err() != nil {
+			closeAtShutdown()
 			return
 		}
 
@@ -2082,6 +2092,7 @@ func streamMicWithRetry(
 			}
 			released = closed.released
 			if err == nil || ctx.Err() != nil {
+				closeAtShutdown()
 				return
 			}
 			if closed.stalled && !capture.isClosed() {
