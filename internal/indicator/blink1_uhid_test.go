@@ -284,24 +284,40 @@ func TestUhidFlockOnAHidrawNodeExcludesItsOtherOpens(t *testing.T) {
 }
 
 // lightStateLoop is `ghost-wispr light-state` run again and again: it opens the
-// blink(1) (a version query), reads its colour and closes it. It prints how
-// many reads it made and how many were not red, then waits for its input to
-// end before it exits, so its exit signals no process that is in a request.
+// blink(1) (a version query), reads its colour and closes it, then waits 10 ms,
+// as the next light-state process takes to start (run back to back, the real
+// binary ran about once each 24 ms on the devbox, review of #79). Without
+// that wait, its next open takes the lock it has just let go of before any
+// other handle can, which no real light-state does. It prints how many reads
+// it made, how many were not red and how many could not read the light
+// (unknown: ErrBusy or ErrOtherReply), then waits for its input to end before
+// it exits, so its exit signals no process that is in a request.
 func lightStateLoop() int {
 	iterations, err := strconv.Atoi(os.Getenv("GHOST_WISPR_TEST_ITERATIONS"))
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	reads, notRed := 0, 0
-	for range iterations {
+	reads, notRed, unknown := 0, 0, 0
+	for i := range iterations {
+		if i > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
 		light, err := OpenBlink1("/sys", os.Getenv("GHOST_WISPR_TEST_DEV_ROOT"))
+		if contended(err) {
+			unknown++
+			continue
+		}
 		if err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, "open:", err)
 			return 1
 		}
 		r, g, b, err := light.ReadRGB()
 		_ = light.Close()
+		if contended(err) {
+			unknown++
+			continue
+		}
 		if err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, "read:", err)
 			return 1
@@ -312,9 +328,15 @@ func lightStateLoop() int {
 			_, _ = fmt.Fprintf(os.Stderr, "light-state read %d,%d,%d\n", r, g, b)
 		}
 	}
-	fmt.Println(reads, notRed)
+	fmt.Println(reads, notRed, unknown)
 	_, _ = io.Copy(io.Discard, os.Stdin)
 	return 0
+}
+
+// contended reports a read that another command got in the way of: it has no
+// colour, and light-state prints unknown for it.
+func contended(err error) bool {
+	return errors.Is(err, ErrBusy) || errors.Is(err, ErrOtherReply)
 }
 
 // TestUhidARecorderReadIsNotAnsweredByLightState fails if the recorder's read
@@ -323,7 +345,8 @@ func lightStateLoop() int {
 // read 0,51,51, light-state's version reply, and light-state read 1,1,44, the
 // recorder's watchdog tickle. Here the recorder tickles the watchdog and reads
 // the light back, over and over, while two other processes run light-state
-// 150 times each.
+// 150 times each, back to back. A read may then not get the light within its
+// wait: it reports unknown, which is allowed. A colour other than red is not.
 //
 // uhid fails a request with EIO when a signal ends its wait for the reply,
 // and Go's runtime preempts goroutines with signals, so the test needs
@@ -383,7 +406,7 @@ func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
 		}
 	})
 
-	reads, notRed := 0, 0
+	reads, notRed, unknown := 0, 0, 0
 	var first string
 	var outputs []string
 	for len(outputs) < 2 {
@@ -397,6 +420,10 @@ func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
 			t.Fatalf("tickle: %v", err)
 		}
 		r, g, b, err := recorder.ReadRGB()
+		if contended(err) {
+			unknown++
+			continue
+		}
 		if err != nil {
 			t.Fatalf("recorder read: %v", err)
 		}
@@ -415,7 +442,7 @@ func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
 		}
 	}
 
-	t.Logf("the recorder read its red light %d times, %d not red; light-state (reads, not red): %s", reads, notRed, strings.Join(outputs, "; "))
+	t.Logf("the recorder read its red light %d times, %d not red, %d unknown; light-state (reads, not red, unknown): %s", reads, notRed, unknown, strings.Join(outputs, "; "))
 	if reads < 20 {
 		t.Fatalf("the recorder read the light only %d times while light-state ran: too few to show anything", reads)
 	}
@@ -423,9 +450,9 @@ func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
 		t.Errorf("the recorder read its red light as not red %d of %d times, first %s", notRed, reads, first)
 	}
 	for _, output := range outputs {
-		var loopReads, loopNotRed int
-		if _, err := fmt.Sscan(output, &loopReads, &loopNotRed); err != nil || loopReads != 150 {
-			t.Fatalf("light-state loop printed %q, want 150 reads", output)
+		var loopReads, loopNotRed, loopUnknown int
+		if _, err := fmt.Sscan(output, &loopReads, &loopNotRed, &loopUnknown); err != nil || loopReads+loopUnknown != 150 || loopReads < 20 {
+			t.Fatalf("light-state loop printed %q, want 150 runs, at least 20 of them reads", output)
 		}
 		if loopNotRed > 0 {
 			t.Errorf("light-state read the red light as not red %d of %d times", loopNotRed, loopReads)
