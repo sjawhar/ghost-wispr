@@ -79,14 +79,21 @@ func runLightOff(stderr io.Writer) error {
 	return nil
 }
 
+// runLightState prints the blink(1)'s colour: red, off, or other with its
+// values. When it cannot read the light, as when another command held the
+// blink(1) past the wait (indicator.ErrBusy), it prints unknown and fails.
 func runLightState(stdout io.Writer) error {
 	light, err := openBlink1(blinkSysfsRoot, blinkDevRoot)
 	if err != nil {
+		if errors.Is(err, indicator.ErrBusy) {
+			_, _ = fmt.Fprintln(stdout, "unknown")
+		}
 		return fmt.Errorf("open indicator: %w", err)
 	}
 	defer func() { _ = light.Close() }()
 	r, g, b, err := light.ReadRGB()
 	if err != nil {
+		_, _ = fmt.Fprintln(stdout, "unknown")
 		return fmt.Errorf("read indicator: %w", err)
 	}
 	if r == 255 && g == 0 && b == 0 {
