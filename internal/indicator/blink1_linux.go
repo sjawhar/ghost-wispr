@@ -26,15 +26,17 @@ const (
 // for a query, the GET of the reply: flock(LOCK_EX) on the hidraw node, which
 // every open of the node contends for, in this process or another (the
 // recorder, `ghost-wispr light-state`, `ghost-wispr light-off`); and the
-// handle's mu, since a flock does not exclude the handle's own goroutines.
+// handle's mu, since a flock does not exclude the handle's own goroutines. A
+// command waits for mu without a bound (exchange); only the flock's wait is
+// bounded.
 //
-// exchangeWait bounds the recorder's wait for the light, and commandWait that
-// of a subcommand (`light-state`, `light-off`). A query, or a write that
-// sendLone does not send, that does not get the light in that time sends
+// exchangeWait bounds the recorder's wait for the node's lock, and commandWait
+// that of a subcommand (`light-state`, `light-off`). A query, or a write that
+// sendLone does not send, that does not get the lock in that time sends
 // nothing and returns ErrBusy. exchangeGap is how long a handle leaves the
 // light free after an exchange before its next one, so a handle that sends one
 // command after another, as the recorder does when it writes the black
-// pattern, does not keep another out until its wait ends.
+// pattern, does not keep another open out until its wait ends.
 //
 // The recorder's wait is short because its light calls queue behind each
 // other: the controller's watchdog tickle waits for a read-back of the gate's
@@ -43,8 +45,8 @@ const (
 // its 3 s timeout (review of #79). An exchange takes about 8 ms on the office
 // Pi (usbmon), so 50 ms lets another Ghost Wispr command finish first.
 //
-// The lock serves its waiters in no order, so a waiting recorder is made to go
-// first: it tries again every recorderPoll, a subcommand only every
+// The flock serves its waiters in no order, so a waiting recorder is made to
+// go first: it tries again every recorderPoll, a subcommand only every
 // commandPoll, and a subcommand leaves the light free for exchangeGap before
 // its first exchange too. Polling as often as the recorder, back-to-back
 // light-state runs took the light from it until its wait ran out: with 4
@@ -78,7 +80,7 @@ type blink1 struct {
 	// command marks a subcommand's handle: it waits commandWait, polling every
 	// commandPoll, so a waiting recorder goes first.
 	command  bool
-	mu       sync.Mutex // the handle's part of the exchange lock
+	mu       sync.Mutex // the handle's part of the exchange lock; waited for without a bound
 	released time.Time  // the end of the handle's last exchange, under mu
 
 	versionMu sync.Mutex
@@ -214,9 +216,10 @@ func (b *blink1) send(report *[8]byte) error {
 
 // sendLone sends a lone SET that must reach the light whoever holds it: the
 // watchdog tickle, or an off write. It waits for the light as send does, and
-// once that wait has run out sends the report without the lock. A lone SET has
-// no GET to protect; it can only answer a query of the holder, whose reply
-// check then refuses it.
+// once that wait has run out sends the report without the node's lock. A lone
+// SET has no GET to protect; it can only answer a query of another open,
+// whose reply check then refuses it. It never goes inside an exchange of its
+// own handle (exchange).
 func (b *blink1) sendLone(report *[8]byte) error {
 	return b.exchange(report, false, true)
 }
@@ -239,11 +242,30 @@ func (b *blink1) query(report *[8]byte) error {
 }
 
 // exchange sends report and, if reply, reads the reply into it, all under the
-// exchange lock. Every command to the blink(1) goes through here. With
-// anyway, a lone SET whose wait for the lock ran out is sent without it.
+// exchange lock. Every command to the blink(1) goes through here. A command
+// waits for the handle's own exchange in flight without a bound, since that
+// exchange is bounded: its wait for the node's lock, then two transfers. A
+// bound there made a command of the handle report another program (ErrBusy)
+// when only its own pattern check had the handle, and sent a lone SET inside
+// that check's query (review 5956273705 of #79). With anyway, a lone SET whose
+// wait for the node's lock ran out is sent without it, still under the
+// handle's mu.
 func (b *blink1) exchange(report *[8]byte, reply, anyway bool) error {
 	fd := b.file.Fd()
-	if err := b.lock(fd); err != nil {
+	wait, poll := exchangeWait, recorderPoll
+	if b.command {
+		wait, poll = commandWait, commandPoll
+	}
+	deadline := time.Now().Add(wait)
+	b.mu.Lock()
+	defer func() {
+		b.released = time.Now()
+		b.mu.Unlock()
+	}()
+	if free := exchangeGap - time.Since(b.released); free > 0 {
+		time.Sleep(free)
+	}
+	if err := flockUntil(fd, deadline, poll); err != nil {
 		if anyway && !reply && errors.Is(err, ErrBusy) {
 			return featureIOCTL(fd, hidIOCSetFeature, report)
 		}
@@ -256,43 +278,23 @@ func (b *blink1) exchange(report *[8]byte, reply, anyway bool) error {
 	if unlockErr := unix.Flock(int(fd), unix.LOCK_UN); unlockErr != nil && err == nil {
 		err = fmt.Errorf("unlock blink(1): %w", unlockErr)
 	}
-	b.released = time.Now()
-	b.mu.Unlock()
 	return err
 }
 
-// lock takes the exchange lock, the handle's mu and then the flock on its
-// node, or returns ErrBusy once the handle's wait (exchangeWait, or
-// commandWait for a subcommand) has passed. It leaves the light free for
-// exchangeGap after the handle's last exchange first. It tries before it
-// looks at the clock, so a process stopped while it waited still gets a free
-// light when it runs again.
-func (b *blink1) lock(fd uintptr) error {
-	wait, poll := exchangeWait, recorderPoll
-	if b.command {
-		wait, poll = commandWait, commandPoll
-	}
-	deadline := time.Now().Add(wait)
-	for !b.mu.TryLock() {
-		if !time.Now().Before(deadline) {
-			return ErrBusy
-		}
-		time.Sleep(poll)
-	}
-	if free := exchangeGap - time.Since(b.released); free > 0 {
-		time.Sleep(free)
-	}
+// flockUntil takes the flock on the node, trying every poll, or returns
+// ErrBusy once deadline has passed: another open of the node held it. It
+// tries before it looks at the clock, so a process stopped while it waited
+// still gets a free light when it runs again.
+func flockUntil(fd uintptr, deadline time.Time, poll time.Duration) error {
 	for {
 		err := unix.Flock(int(fd), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
 			return nil
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
-			b.mu.Unlock()
 			return fmt.Errorf("lock blink(1): %w", err)
 		}
 		if !time.Now().Before(deadline) {
-			b.mu.Unlock()
 			return ErrBusy
 		}
 		time.Sleep(poll)

@@ -16,9 +16,10 @@ var ErrNoBlink1 = errors.New("blink(1) indicator not found")
 var ErrNotRed = errors.New("recording light does not read back red")
 
 // ErrBusy reports a blink(1) command that could not get the light: another
-// command, from this process or another, held it past the wait. The command
-// sent nothing. A read that returns it has no colour: the light's colour is
-// unknown, which counts as not red.
+// open of its node, in this process or another, held the node's lock past the
+// wait. A command never gets it for its own handle's other commands, which it
+// waits for. The command sent nothing. A read that returns it has no colour:
+// the light's colour is unknown, which counts as not red.
 var ErrBusy = errors.New("blink(1) busy with another command")
 
 // ErrOtherReply reports a query whose reply belongs to another command: byte
