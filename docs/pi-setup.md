@@ -443,9 +443,11 @@ fails. A waiting recorder gets the lock before a subcommand does, so `light-stat
 do not make the recorder drop audio; one stopped while it holds the lock does, until it is
 continued. The watchdog tickle and an off write, which wait for no reply, are then sent without the
 lock, so the watchdog does not fire while the recorder runs, a pause turns the blink(1) off within
-500 ms whoever holds the lock, and `light-off` turns it off. A red write sends nothing. After a
-device error, the recorder keeps a blink(1) whose black pattern it could not check for the lock,
-tickles it and writes it off, and lights it red only once the pattern is checked. Other programs
+500 ms whoever holds the lock, and `light-off` turns it off. A red write sends nothing. The recorder
+tickles only a blink(1) whose stored pattern it found black. After a device error it knows the same
+unit by its serial number and tickles it at once, whoever holds the lock; another unit, or one with
+no serial number, gets off writes only until the check before a red confirmation finds its pattern
+black. Other programs
 that open the blink(1), such as `blink1-tool`, do not take the lock: do not run them while the
 recorder runs, since their own colour read can still answer the recorder's. A process stopped while
 it holds the lock (`kill -STOP`) keeps it;

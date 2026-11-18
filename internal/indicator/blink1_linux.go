@@ -73,6 +73,8 @@ var featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
 
 type blink1 struct {
 	file *os.File
+	// serial is the unit's USB serial number (HID_UNIQ), "" when it reports none.
+	serial string
 	// command marks a subcommand's handle: it waits commandWait, polling every
 	// commandPoll, so a waiting recorder goes first.
 	command  bool
@@ -83,6 +85,40 @@ type blink1 struct {
 	// patternLines is how many pattern lines the light's flash holds, from its
 	// version; 0 until it is read (lines).
 	patternLines uint8
+}
+
+// checkedUnits maps the serial number of each blink(1) whose stored pattern
+// this process found black (BlackPattern) to its pattern line count. A unit
+// opened again, as after a device error, is then known black: it needs no
+// version query and no pattern check, which another open holding the lock
+// could keep from it, and its watchdog can be tickled at once (review
+// 5954543056 of #79). A unit with no serial is never known.
+var (
+	checkedMu    sync.Mutex
+	checkedUnits = map[string]uint8{}
+)
+
+// PatternKnownBlack reports whether this process found this unit's stored
+// pattern black on an earlier handle or this one (KnownBlack).
+func (b *blink1) PatternKnownBlack() bool {
+	if b.serial == "" {
+		return false
+	}
+	checkedMu.Lock()
+	defer checkedMu.Unlock()
+	_, known := checkedUnits[b.serial]
+	return known
+}
+
+// uniq returns the HID_UNIQ value of a hidraw device's uevent, "" when it has
+// none.
+func uniq(uevent string) string {
+	for line := range strings.SplitSeq(uevent, "\n") {
+		if value, ok := strings.CutPrefix(line, "HID_UNIQ="); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // OpenBlink1 finds ThingM's blink(1) by its hidraw uevent identity and opens
@@ -123,9 +159,14 @@ func openBlink1(sysfsRoot, devRoot string, command bool) (Light, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open blink(1) %s: %w", entry.Name(), err)
 		}
-		light := &blink1{file: file, command: command}
+		light := &blink1{file: file, serial: uniq(string(uevent)), command: command}
 		if command {
 			light.released = time.Now()
+		}
+		if light.serial != "" {
+			checkedMu.Lock()
+			light.patternLines = checkedUnits[light.serial]
+			checkedMu.Unlock()
 		}
 		if _, err := light.lines(); err != nil && !Contended(err) {
 			_ = file.Close()
@@ -299,16 +340,24 @@ func (b *blink1) ServerDown(timeout time.Duration) error {
 }
 
 // BlackPattern persists an all-black, non-zero-duration pattern so the
-// watchdog turns every LED off after the recorder stops ticking it.
+// watchdog turns every LED off after the recorder stops ticking it. Once the
+// pattern reads back black, the unit is known black (checkedUnits).
 func (b *blink1) BlackPattern() error {
 	black, err := b.patternIsBlack()
 	if err != nil {
 		return err
 	}
-	if black {
-		return nil
+	if !black {
+		if err := b.writeBlackPattern(); err != nil {
+			return err
+		}
 	}
-	return b.writeBlackPattern()
+	if b.serial != "" {
+		checkedMu.Lock()
+		checkedUnits[b.serial] = b.patternLines
+		checkedMu.Unlock()
+	}
+	return nil
 }
 
 func (b *blink1) patternIsBlack() (bool, error) {

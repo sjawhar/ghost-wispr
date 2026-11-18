@@ -240,13 +240,19 @@ func (h *hardwareControl) Stop() {
 // EnsureRed confirms the configured indicator is red before a microphone
 // starts or capture opens. Each successful check owns a temporary red hold
 // until that start attempt ends. A missing light fails the check like any
-// other: the unit records only while its light is on.
+// other: the unit records only while its light is on. A light whose stored
+// pattern is not yet found black is checked first, before the red hold and
+// without the light's lock, so a pause meanwhile turns the light off at once.
 func (h *hardwareControl) EnsureRed() error {
 	if h.stopped.Load() {
 		return fmt.Errorf("recording light stopped")
 	}
 	if h.light == nil {
 		return nil
+	}
+	if err := h.light.CheckPattern(); err != nil {
+		h.Wake()
+		return err
 	}
 	// Hold red before the write: reconnectingLight.SetRGB then refuses an off
 	// write the controller decided before this confirmation.
@@ -381,15 +387,18 @@ type reconnectingLight struct {
 	mu       sync.Mutex
 	deviceMu sync.Mutex
 	light    indicator.Light
-	// patternUnchecked marks a light opened while its black pattern could not
-	// be checked, because another command had the light (indicator.Contended).
-	// It is kept, so tickles and off writes, which go without the lock, still
-	// reach it; it lights no red until checkPattern has checked the pattern.
-	// Under deviceMu.
+	// patternUnchecked marks a light whose stored pattern the recorder has not
+	// found black: a unit it does not know (indicator.KnownBlack), opened while
+	// another command had the lock for its check. It is kept, so off writes,
+	// which go without the lock, still reach it; it gets no watchdog tickle and
+	// no red until CheckPattern finds its pattern black, since its watchdog
+	// would play that pattern (review 5954543056 of #79). Under deviceMu.
 	patternUnchecked bool
-	nextAttempt      time.Time
-	lastErr          error
-	warnings         *warningsRegistry
+	// checkMu lets one CheckPattern run at a time.
+	checkMu     sync.Mutex
+	nextAttempt time.Time
+	lastErr     error
+	warnings    *warningsRegistry
 	// holdRed reports that the light must stay red. SetRGB checks it under
 	// deviceMu, so an off write decided before a red confirmation cannot land
 	// after it.
@@ -437,41 +446,67 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 		l.warnings.Set("recording-light", recordingLightWarning(err))
 		return nil, err
 	}
-	if err := light.BlackPattern(); err != nil {
-		if indicator.Contended(err) {
-			// Another command had the light. Closed, the light would wait
-			// retryDelay for the next open, with no tickle and no off write
-			// meanwhile (review 5953011789 of #79).
-			l.light = light
-			l.patternUnchecked = true
-			l.offs.Add(1)
-			l.lastErr = nil
+	// A unit this process found black before, as the same blink(1) after a
+	// device error, needs no check, which another open holding the lock could
+	// keep from it. Another unit is checked now; if another command has the
+	// lock for that, it is kept unchecked.
+	unchecked := false
+	if !indicator.KnownBlack(light) {
+		if err := light.BlackPattern(); err != nil {
+			if !indicator.Contended(err) {
+				_ = light.Close()
+				l.lastErr = err
+				l.nextAttempt = time.Now().Add(l.retryDelay())
+				l.warnings.Set("recording-light", recordingLightWarning(err))
+				return nil, err
+			}
+			// Closed, the light would wait retryDelay for the next open, with
+			// no off write meanwhile (review 5953011789 of #79).
+			unchecked = true
 			l.warnings.Set("recording-light", recordingLightWarning(err))
-			return light, nil
 		}
-		_ = light.Close()
-		l.lastErr = err
-		l.nextAttempt = time.Now().Add(l.retryDelay())
-		l.warnings.Set("recording-light", recordingLightWarning(err))
-		return nil, err
 	}
-	l.patternUnchecked = false
+	l.patternUnchecked = unchecked
 	l.light = light
 	l.offs.Add(1)
 	l.lastErr = nil
-	l.warnings.Clear("recording-light")
+	if !unchecked {
+		l.warnings.Clear("recording-light")
+	}
 	return light, nil
 }
 
-// checkPattern checks the black pattern of a light kept with it unchecked
-// (patternUnchecked), and reports an error while it is still unchecked. Call
-// it under deviceMu.
-func (l *reconnectingLight) checkPattern(light indicator.Light) error {
-	if !l.patternUnchecked {
-		return nil
-	}
-	if err := light.BlackPattern(); err != nil {
+// errLightUnchecked refuses a watchdog tickle, a red write or a red
+// confirmation for a light whose stored pattern is not found black
+// (patternUnchecked).
+var errLightUnchecked = errors.New("the recording light's stored pattern is not checked black yet")
+
+// CheckPattern checks the stored pattern of a light kept unchecked
+// (patternUnchecked), opening the light first if there is none. It runs
+// without deviceMu, so off writes meanwhile reach the light at once, and
+// EnsureRed runs it before it holds the light red. It fails while another
+// command keeps the check from the light.
+func (l *reconnectingLight) CheckPattern() error {
+	l.checkMu.Lock()
+	defer l.checkMu.Unlock()
+	l.deviceMu.Lock()
+	light, err := l.currentForConfirmation()
+	unchecked := l.patternUnchecked
+	l.deviceMu.Unlock()
+	if err != nil || !unchecked {
 		return err
+	}
+	err = light.BlackPattern()
+	l.deviceMu.Lock()
+	defer l.deviceMu.Unlock()
+	if l.light != light {
+		return errLightUnchecked // opened again meanwhile
+	}
+	if err != nil {
+		if indicator.Contended(err) {
+			return err
+		}
+		return l.failed(err)
 	}
 	l.patternUnchecked = false
 	l.warnings.Clear("recording-light")
@@ -515,8 +550,8 @@ func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
 	}
 	if !red {
 		l.offs.Add(1)
-	} else if err := l.checkPattern(light); err != nil {
-		return l.failed(err)
+	} else if l.patternUnchecked {
+		return errLightUnchecked
 	}
 	if err := light.SetRGB(r, g, b); err != nil {
 		return l.failed(err)
@@ -541,6 +576,10 @@ func (l *reconnectingLight) ReadRGB() (uint8, uint8, uint8, error) {
 	return r, g, b, nil
 }
 
+// ServerDown tickles the light's watchdog, or with timeout 0 turns it off. A
+// light whose stored pattern is not found black (patternUnchecked) gets no
+// tickle: its watchdog would play that pattern if the recorder stopped. Its
+// watchdog may still be turned off.
 func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
 	l.deviceMu.Lock()
 	defer l.deviceMu.Unlock()
@@ -548,11 +587,10 @@ func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	if err := light.ServerDown(timeout); err != nil {
-		return l.failed(err)
+	if timeout > 0 && l.patternUnchecked {
+		return errLightUnchecked
 	}
-	// After the tickle, so a pattern check that meets the lock never delays it.
-	if err := l.checkPattern(light); err != nil && !indicator.Contended(err) {
+	if err := light.ServerDown(timeout); err != nil {
 		return l.failed(err)
 	}
 	return nil
@@ -579,8 +617,8 @@ func (l *reconnectingLight) ConfirmRed() error {
 	if err != nil {
 		return err
 	}
-	if err := l.checkPattern(light); err != nil {
-		return l.failed(err)
+	if l.patternUnchecked {
+		return errLightUnchecked // CheckPattern comes first (EnsureRed)
 	}
 	if err := light.SetRGB(255, 0, 0); err != nil {
 		return l.failed(err)

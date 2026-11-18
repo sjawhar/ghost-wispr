@@ -35,6 +35,15 @@ func Contended(err error) bool {
 	return errors.Is(err, ErrBusy) || errors.Is(err, ErrOtherReply)
 }
 
+// KnownBlack reports whether light can tell, without sending a command, that
+// its unit's stored pattern is black: this process checked that unit, by its
+// serial number, and opened it again, as after a device error. Its watchdog
+// may then be armed at once. A light that cannot tell needs BlackPattern.
+func KnownBlack(light Light) bool {
+	known, ok := light.(interface{ PatternKnownBlack() bool })
+	return ok && known.PatternKnownBlack()
+}
+
 // Blink1Report builds an eight-byte blink(1) feature report.
 func Blink1Report(command byte, args [6]byte) [8]byte {
 	return [8]byte{0x01, command, args[0], args[1], args[2], args[3], args[4], args[5]}

@@ -171,11 +171,15 @@ continued, each of the recorder's reads is unknown, so no audio is recorded and 
 opens only once the lock is free. The watchdog tickle and an off write, which wait for no reply,
 are the exception: they are then sent without the lock, so another program that holds the lock does
 not let the watchdog fire while the recorder runs, a pause still turns the light off within 500 ms,
-and `light-off` still turns it off. A red write is not: it sends nothing. This holds also when the
-recorder opens the light again after a device error: it keeps a light whose black pattern it could
-not check for the lock, sends it tickles and off writes, and lights it red only once the pattern is
-checked. Programs that do not take the lock, such as `blink1-tool`, must not run while the recorder
-runs: their own colour read can still answer the recorder's.
+and `light-off` still turns it off. A red write is not: it sends nothing. The recorder tickles only
+a blink(1) whose stored pattern it found black, since the watchdog plays that pattern. When it
+opens the light again after a device error, it knows the same unit by its serial number, so it needs
+to ask it nothing, and tickles it at once, also while another program holds the lock. Any other
+unit, or one with no serial number, is checked first; while another program holds the lock for
+that check, the unit gets off writes only, no tickle and no red, until the check that comes before
+a red confirmation finds it black. That check does not hold the light, so a pause during it still
+turns the light off at once. Programs that do not take the lock, such as `blink1-tool`, must not run
+while the recorder runs: their own colour read can still answer the recorder's.
 
 ## Deployment
 
