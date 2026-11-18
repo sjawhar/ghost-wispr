@@ -1,4 +1,4 @@
-//go:build linux && uhid
+//go:build linux && (amd64 || arm64) && uhid
 
 package indicator
 
