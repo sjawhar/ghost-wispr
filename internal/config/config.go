@@ -80,7 +80,7 @@ type Config struct {
 	BatchTranscription            BatchTranscription `yaml:"batch_transcription"`
 	EmbeddingModel                string             `yaml:"embedding_model"`
 	DeepgramModel                 string             `yaml:"deepgram_model"`
-	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size"`
+	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size"` // bytes of live audio held while Deepgram reconnects; 0 holds 60 s at the rate the microphone opened at
 	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
@@ -135,7 +135,7 @@ func defaults() Config {
 		},
 		EmbeddingModel:                "",
 		DeepgramModel:                 "nova-3",
-		DeepgramBufferSize:            1920000,
+		DeepgramBufferSize:            0,
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
 		TTSMaxLength:                  5000,

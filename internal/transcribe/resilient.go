@@ -5,6 +5,14 @@ import (
 	"time"
 )
 
+// DefaultBufferSeconds is how much audio the ResilientClient holds while it
+// reconnects, when ResilientConfig sets no BufferSize.
+const DefaultBufferSeconds = 60
+
+// defaultBufferRate is the sample rate the default buffer is sized for when
+// ResilientConfig sets none.
+const defaultBufferRate = 16000
+
 // NewResilientClient creates a new ResilientClient that wraps a Deepgram client
 // with automatic reconnection and audio buffering during disconnects.
 func NewResilientClient(
@@ -15,7 +23,11 @@ func NewResilientClient(
 	onStateChange ConnectionCallback,
 ) *ResilientClient {
 	if config.BufferSize <= 0 {
-		config.BufferSize = 60 * 32000
+		rate := config.SampleRate
+		if rate <= 0 {
+			rate = defaultBufferRate
+		}
+		config.BufferSize = DefaultBufferSeconds * rate * 2 // 16-bit mono PCM
 	}
 	if config.InitialReconnectDelay <= 0 {
 		config.InitialReconnectDelay = 500 * time.Millisecond

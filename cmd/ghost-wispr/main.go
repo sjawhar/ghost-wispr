@@ -518,6 +518,15 @@ var streamMicLoopStarter = func(ctx context.Context, loops *sync.WaitGroup, capt
 // Deepgram send queues while a write waits: more than deepgramWriteTimeout.
 const deepgramSendChunks = 64
 
+// newSessionRecorder is the app's recorder: it keeps the sample rate of each
+// session's raw recording with the session in store, so a raw recording kept
+// after a stop inside its session is saved at its true duration.
+func newSessionRecorder(audioDir string, store audio.SessionRates) *audio.Recorder {
+	recorder := audio.NewRecorder(audioDir)
+	recorder.UseSessionRates(store)
+	return recorder
+}
+
 // startMicMonitoring starts the mic loop. The recorder gets each buffer
 // first, and downstream, live transcription, gets it through a bounded queue
 // that never blocks the loop (transcribe.AsyncSender), so no Deepgram
@@ -796,7 +805,7 @@ func main() {
 	hub := server.NewHub(appLogger)
 	hub.SetEventStore(store)
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
-	audioRecorder := audio.NewRecorder(cfg.AudioDir)
+	audioRecorder := newSessionRecorder(cfg.AudioDir, store)
 
 	clientFactory := func(provider, model string) (llm.Client, error) {
 		latestCfg := cfgStore.Get()
@@ -1689,11 +1698,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
 			VadEvents:      true,
 		}
-		resilientConfig := transcribe.ResilientConfig{
-			BufferSize:            cfg.DeepgramBufferSize,
-			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
-			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
-		}
+		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
 		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, micWait, log.Printf, hub))

@@ -14,7 +14,7 @@ import (
 // saveAsCopy makes recorder save a recording by copying its raw audio to
 // <session>.mp3 in dir.
 func saveAsCopy(recorder *Recorder, dir string) {
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		data, err := os.ReadFile(rawPath)
 		if err != nil {
 			return "", err
@@ -52,7 +52,7 @@ func TestRecorderKeptRawSessions(t *testing.T) {
 		t.Errorf("KeptRawSessions while recording = %v, want %v", got, want)
 	}
 
-	recorder.encode = func(context.Context, string, string) (string, error) {
+	recorder.encode = func(context.Context, string, string, int) (string, error) {
 		return "", errors.New("no space left on device")
 	}
 	if _, err := recorder.EndSession("20261106130000"); err == nil {
@@ -145,7 +145,7 @@ func TestRecorderSaveKeptRefusesARecordingInUse(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
 	encodes := 0
-	recorder.encode = func(context.Context, string, string) (string, error) {
+	recorder.encode = func(context.Context, string, string, int) (string, error) {
 		encodes++
 		return "", errors.New("no space left on device")
 	}
