@@ -1405,10 +1405,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	capture.beforeMicOpen = micDevice.prepareLightForOpen
 	capture.onMicHeld = micHeldWarning(warningRegistry)
 	capture.capturePresent = captureDevicePresent(warningRegistry, func() bool { return audio.CaptureDevicePresent(cfg.MicDevice) })
-	// A named microphone opens through ALSA's plug layer, at the 16000 Hz the
-	// recording and Deepgram take, whatever rate its card captures at. Set
-	// before any PortAudio initialization, all of which run in a microphone
-	// start, below.
+	// A named microphone opens through ALSA's plug layer, so it opens at the
+	// first rate the start tries, 16000 Hz, whatever rate its card captures
+	// at; the recorder and Deepgram take the rate it opened at. Set before any
+	// PortAudio initialization, all of which run in a microphone start, below.
 	if err := audio.UsePlugCapture(cfg.MicDevice); err != nil {
 		log.Printf("warning: open the microphone through ALSA's plug layer: %v", err)
 	}
