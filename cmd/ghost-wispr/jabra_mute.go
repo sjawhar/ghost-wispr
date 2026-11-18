@@ -32,6 +32,7 @@ type jabraMuteButton struct {
 	device   *captureDevice
 	controls *server.ControlHooks
 	warnings *warningsRegistry
+	toggle   *buttonToggle
 	// connect finds and opens the Jabra's evdev node; tests replace it.
 	connect    func() (io.ReadWriteCloser, error)
 	retryEvery time.Duration
@@ -44,6 +45,7 @@ func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *s
 		device:     device,
 		controls:   controls,
 		warnings:   warnings,
+		toggle:     newButtonToggle(capture, controls, "Jabra mute"),
 		connect:    func() (io.ReadWriteCloser, error) { return connectJabra(inputDevices, inputDevRoot) },
 		retryEvery: hardwareRetry,
 		checkEvery: jabraLightCheckEvery,
@@ -172,16 +174,19 @@ func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) 
 // a CLOCK_MONOTONIC reading, except one that would resume capture and came
 // during an operation on the capture device or within jabraOwnMuteWindow after
 // one: the Jabra sends that report by itself as its microphone stream closes,
-// and capture stays paused. A press that would pause always pauses. The pause
-// state is read once, so the guard and the toggle act on the same state.
+// and capture stays paused. A press that would pause always pauses, and does
+// so at once; a press that resumes runs its light check in the background, so
+// the next press is taken meanwhile (buttonToggle). The light is written
+// again once the press has asked, and again when its resume ends.
 func (b *jabraMuteButton) press(at time.Duration) {
-	paused := b.capture.IsPaused()
-	if paused && b.device.ownOperationAt(at) {
-		log.Printf("Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused")
-	} else if err := toggleCapture(func() bool { return paused }, b.controls.Pause, b.controls.Resume, b.controls.OnStatusChanged); err != nil {
-		log.Printf("warning: Jabra mute toggle: %v", err)
-	}
-	b.device.refreshLight(at)
+	done := b.toggle.press(
+		func() bool { return b.device.ownOperationAt(at) },
+		func() { b.device.refreshLight(at) },
+	)
+	go func() {
+		<-done
+		b.device.refreshLight(at)
+	}()
 }
 
 func (b *jabraMuteButton) waitForRetry(ctx context.Context) {

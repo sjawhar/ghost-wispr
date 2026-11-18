@@ -108,8 +108,9 @@ type captureGate struct {
 	control            sync.Mutex    // serializes closing and opening the gate, with their steps
 	mu                 sync.Mutex    // guards the fields below
 	switchOff          bool          // Pause was called and Resume has not been since
-	pauses             int           // counts Pause calls, so a resume whose light check a pause came during does nothing
+	pauses             int           // counts pauses asked for, so a resume whose light check a pause came during does nothing
 	pendingPauses      int           // Pause calls that wait for control: a resume then counts the unit as paused
+	requestedPauses    int           // pauses asked for (pauseRequested) that Pause has not taken yet
 	lightHeld          bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
 	resumedAt          time.Time     // when Resume last moved the switch on
 	starting           bool          // that Resume's start of the microphone has not finished (finishResume)
@@ -174,10 +175,15 @@ func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
 // behind a closed gate; it waits for nothing (the app's only sets a flag), so
 // the gate closes at once. Pausing while the gate is closed only cancels a
 // pending Resume. It counts itself (pauses) when called, before it waits for
-// control, so a resume called after it is the later call.
+// control, so a resume called after it is the later call; a pause already
+// counted when it was asked for (pauseRequested) is not counted again.
 func (g *captureGate) Pause() {
 	g.mu.Lock()
-	g.pauses++
+	if g.requestedPauses > 0 {
+		g.requestedPauses--
+	} else {
+		g.pauses++
+	}
 	g.pendingPauses++
 	g.mu.Unlock()
 	g.control.Lock()
@@ -188,6 +194,26 @@ func (g *captureGate) Pause() {
 	g.pendingPauses--
 	g.mu.Unlock()
 	g.closeGate()
+}
+
+// pauseRequested counts a pause a person asked for, before the persistent
+// controls' lock, which may be held by another resume's save: a resume called
+// after it then carries it in its ticket and is not overtaken by it, and a
+// resume whose check it came during is overtaken (review 5963682292 of #79).
+// The Pause that the request leads to takes this count instead of counting
+// again, so each pauseRequested must lead to one Pause.
+func (g *captureGate) pauseRequested() {
+	g.mu.Lock()
+	g.pauses++
+	g.requestedPauses++
+	g.mu.Unlock()
+}
+
+// pauseCount is the number of pauses asked for so far.
+func (g *captureGate) pauseCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.pauses
 }
 
 // HoldForLight closes the gate because the recording light cannot be
@@ -304,14 +330,15 @@ var errResumeOvertaken = errors.New("resume overtaken by a later pause")
 
 // prepareResume is the part of a resume that can take seconds, so it runs
 // before control, and before the persistent controls' lock: it reads the
-// pause count and, if the switch is off or a Pause waits for control, checks
-// the light's stored pattern (checkLightPattern). A resume of a unit whose
-// switch is on checks nothing: a failed check must not be taken for a
-// refused resume of a unit that records (review 5961636823 of #79).
+// pause count and, if the switch is off or a pause is asked for and has not
+// taken control yet, checks the light's stored pattern (checkLightPattern). A
+// resume of a unit whose switch is on checks nothing: a failed check must not
+// be taken for a refused resume of a unit that records (review 5961636823 of
+// #79).
 func (g *captureGate) prepareResume() (resumeTicket, error) {
 	g.mu.Lock()
 	t := resumeTicket{pauses: g.pauses}
-	paused := g.switchOff || g.pendingPauses > 0
+	paused := g.switchOff || g.pendingPauses > 0 || g.requestedPauses > 0
 	g.mu.Unlock()
 	if paused && g.beforeResumeRequest != nil && g.checkLightPattern != nil && !g.captureMissing() {
 		if err := g.checkLightPattern(); err != nil {

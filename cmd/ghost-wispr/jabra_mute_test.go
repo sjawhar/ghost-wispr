@@ -503,7 +503,9 @@ func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
 // store the status change, and only then does press ask for the light again,
 // which can come after the microphone opened. statusWrite stands for that
 // SQLite write, and beforeGateOpen's 5 ms for the blink(1)'s red confirmation.
-// The control has a status write quicker than the red confirmation.
+// The control has a status write quicker than the red confirmation. A press
+// that resumes returns before its resume ends (buttonToggle), so the tap's
+// resume is waited for.
 func TestAResumeTapCostsNoReopen(t *testing.T) {
 	for _, statusWrite := range []time.Duration{0, 30 * time.Millisecond} {
 		name := "control, the status write is quicker than the red confirmation"
@@ -528,9 +530,7 @@ func TestAResumeTapCostsNoReopen(t *testing.T) {
 			time.Sleep(2 * jabraOwnMuteWindow) // the tap is a person's, outside every operation's cover
 
 			button.press(jabra.MonotonicNow())
-			if capture.IsPaused() {
-				t.Fatal("control: the tap did not resume the unit")
-			}
+			waitForHardware(t, "the tap to resume the unit", func() bool { return !capture.IsPaused() })
 			mic.expectEvents(t, "open", "stream")
 			if ring.Load() {
 				t.Fatal("control: the microphone opened with the ring showing Muted")

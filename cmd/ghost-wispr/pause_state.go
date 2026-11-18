@@ -109,9 +109,13 @@ type persistentControls struct {
 // resumeGate is the capture gate's resume in its two steps (captureGate):
 // prepareResume, the light's check, which can take seconds, and resumeWith,
 // the resume itself, which a Pause called since the check overtakes.
+// pauseRequested counts a pause the moment a person asks for it, before the
+// controls' lock, and IsPaused is the gate's switch.
 type resumeGate interface {
 	prepareResume() (resumeTicket, error)
 	resumeWith(t resumeTicket, persist func() error) error
+	pauseRequested()
+	IsPaused() bool
 }
 
 var errRefusedResumeNotPersisted = errors.New("refused resume pause state was not persisted")
@@ -120,7 +124,13 @@ func newPersistentControls(store pauseStore, pause func(), gate resumeGate, onSt
 	return &persistentControls{store: store, pause: pause, gate: gate, onStatusChanged: onStatusChanged}
 }
 
+// Pause counts the pause on the gate before it takes the controls' lock,
+// which another resume's save may hold: a resume called after this pause then
+// carries it and is not overtaken by it, and a resume whose light check it
+// came during is overtaken (review 5963682292 of #79). The Pause it then
+// makes takes that count rather than counting again.
 func (c *persistentControls) Pause() error {
+	c.gate.pauseRequested()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pause()
@@ -144,9 +154,15 @@ func (c *persistentControls) Resume() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err != nil {
-		// Nothing changed: the switch stays off, as the clients are told.
+		// Nothing changed. The clients hear the gate's switch as it is: a
+		// resume that overtook this one may have moved it on, and the unit
+		// then records (review 5963682292 of #79).
+		paused := c.gate.IsPaused()
 		if c.onStatusChanged != nil {
-			c.onStatusChanged(true)
+			c.onStatusChanged(paused)
+		}
+		if !paused {
+			return nil
 		}
 		return err
 	}

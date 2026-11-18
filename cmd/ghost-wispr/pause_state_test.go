@@ -48,10 +48,15 @@ type pauseGateFake struct{ calls int }
 func (g *pauseGateFake) Pause() { g.calls++ }
 
 // resumeFunc is a resume gate (resumeGate) whose resume is f, run after the
-// controls' write: no light check, and no pause overtakes it.
+// controls' write: no light check, no pause overtakes it, and its switch
+// always reads paused, as a gate whose resume has not run yet.
 type resumeFunc func() error
 
 func (resumeFunc) prepareResume() (resumeTicket, error) { return resumeTicket{}, nil }
+
+func (resumeFunc) pauseRequested() {}
+
+func (resumeFunc) IsPaused() bool { return true }
 
 func (f resumeFunc) resumeWith(_ resumeTicket, persist func() error) error {
 	if err := persist(); err != nil {

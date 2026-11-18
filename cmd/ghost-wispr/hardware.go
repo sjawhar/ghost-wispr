@@ -168,6 +168,103 @@ func toggleCapture(isPaused func() bool, pause, resume func() error, onStatusCha
 	return err
 }
 
+// buttonToggle is a hardware button's presses: the power button's taps and
+// the Jabra's mute presses. A press reads the state the person last asked
+// for, not the gate's switch, which a resume moves only once its light check
+// has passed. A press that pauses pauses at once; a press that resumes runs
+// in the background, so the button takes the next press while the resume's
+// light check runs, and that press pauses (review 5963682292 of #79).
+type buttonToggle struct {
+	capture  *captureGate
+	controls *server.ControlHooks
+	name     string
+
+	mu sync.Mutex
+	// asked is the last pause a press asked for: true after a press that
+	// paused, false after one that resumed, and the gate's switch before the
+	// first press. pauses is the gate's pause count then: a pause from
+	// anywhere else (the web page, a restored pause) changes it, and the next
+	// press reads the gate again.
+	asked   bool
+	pauses  int
+	started bool
+	running sync.WaitGroup
+}
+
+func newButtonToggle(capture *captureGate, controls *server.ControlHooks, name string) *buttonToggle {
+	return &buttonToggle{capture: capture, controls: controls, name: name}
+}
+
+// press toggles capture for one press. keepPaused, when set and true, keeps a
+// paused unit paused: the Jabra's guard for its own mute report. after runs
+// once the press has pauses or has started its resume, before the resume
+// ends. The returned channel closes once the press, its resume included, is
+// over.
+func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct{} {
+	paused := t.lastAsked()
+	done := make(chan struct{})
+	switch {
+	case paused && keepPaused != nil && keepPaused():
+		log.Printf("%s report came with Ghost Wispr's own microphone operation; capture stays paused", t.name)
+		close(done)
+	case paused:
+		// A resume can take seconds: its light check reads the blink(1)'s
+		// stored pattern. The button must take the next press meanwhile.
+		t.setAsked(false)
+		t.running.Add(1)
+		go func() {
+			defer t.running.Done()
+			defer close(done)
+			if err := t.controls.Resume(); err != nil {
+				log.Printf("warning: %s toggle: %v", t.name, err)
+			} else if t.controls.OnStatusChanged != nil {
+				t.controls.OnStatusChanged(false)
+			}
+		}()
+	default:
+		t.setAsked(true)
+		err := t.controls.Pause()
+		// A Pause error still leaves capture paused, so clients must hear of it.
+		if t.controls.OnStatusChanged != nil {
+			t.controls.OnStatusChanged(true)
+		}
+		if err != nil {
+			log.Printf("warning: %s toggle: %v", t.name, err)
+		}
+		close(done)
+	}
+	if after != nil {
+		after()
+	}
+	return done
+}
+
+// lastAsked is the pause the person last asked for through this button,
+// unless a pause or resume from elsewhere has changed the gate since.
+func (t *buttonToggle) lastAsked() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if paused := t.capture.IsPaused(); !t.started || t.capture.pauseCount() != t.pauses || paused == t.asked {
+		t.started, t.asked, t.pauses = true, paused, t.capture.pauseCount()
+	}
+	return t.asked
+}
+
+// setAsked records what this press asked for, with the gate's pause count as
+// it is once the press has asked: a pause from elsewhere after it changes
+// that count, and the next press reads the gate again.
+func (t *buttonToggle) setAsked(paused bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if paused {
+		t.capture.pauseRequested()
+	}
+	t.started, t.asked, t.pauses = true, paused, t.capture.pauseCount()
+}
+
+// wait returns once every resume this button started is over.
+func (t *buttonToggle) wait() { t.running.Wait() }
+
 // hardwareControl coordinates the indicator with the capture transitions.
 type hardwareControl struct {
 	light      *reconnectingLight
@@ -717,6 +814,8 @@ func (l *reconnectingLight) Close() error {
 }
 
 func runPowerButton(ctx context.Context, capture *captureGate, controls *server.ControlHooks, warnings *warningsRegistry) {
+	toggle := newButtonToggle(capture, controls, "power-button")
+	defer toggle.wait()
 	for ctx.Err() == nil {
 		path, err := powerbutton.FindDevice(inputDevices, inputDevRoot)
 		if err != nil {
@@ -753,9 +852,7 @@ func runPowerButton(ctx context.Context, capture *captureGate, controls *server.
 				_ = file.Close()
 				return
 			case <-taps:
-				if err := toggleCapture(capture.IsPaused, controls.Pause, controls.Resume, controls.OnStatusChanged); err != nil {
-					log.Printf("warning: power-button toggle: %v", err)
-				}
+				toggle.press(nil, nil)
 			case err := <-readDone:
 				cancelDevice()
 				_ = file.Close()
