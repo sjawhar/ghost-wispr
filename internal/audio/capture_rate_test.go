@@ -215,3 +215,33 @@ func TestARelabelThatCannotBeRecordedStillSavesAtTheNewRate(t *testing.T) {
 		t.Fatalf("the session's end encoded at %d Hz, want 48000", encodedAt)
 	}
 }
+
+// TestARawWithNoRateRecordedEncodesAtTheMicsRate fails if a raw kept by a
+// build that recorded no rate (its row reads 0) is encoded at a fixed 16000 Hz
+// rather than the rate this run's microphone opened at, as main encoded it:
+// those builds had the same fallback to 48000, 44100 and 32000 Hz (ReviewPR78
+// on #78, finding 2).
+func TestARawWithNoRateRecordedEncodesAtTheMicsRate(t *testing.T) {
+	for _, tool := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not installed: %v", tool, err)
+		}
+	}
+	dir := t.TempDir()
+	const id = "20261118090000"
+	if err := os.WriteFile(recording.RawPath(dir, id), make([]byte, 2*2*48000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recorder := NewRecorder(dir)
+	recorder.UseSessionRates(&fakeRates{}) // the row reads 0
+	if err := recorder.SetSampleRate(48000); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := recorder.SaveKept(context.Background(), id)
+	if err != nil {
+		t.Fatalf("SaveKept: %v", err)
+	}
+	if got := durationOf(t, saved); math.Abs(got-2) > 0.1 {
+		t.Fatalf("a raw with no rate recorded, saved while the microphone is at 48000 Hz, lasts %.2f s, want 2 s", got)
+	}
+}

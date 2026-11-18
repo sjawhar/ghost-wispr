@@ -22,8 +22,7 @@ import (
 
 const (
 	// defaultSampleRate is the rate the recorder takes before the microphone
-	// opens, and the rate of a raw recording a build before session rates
-	// were kept captured (SessionRates): those builds captured at 16000 Hz.
+	// opens.
 	defaultSampleRate = 16000
 	pcmChannels       = 1
 	pcmBitDepth       = 16
@@ -137,9 +136,9 @@ func (r *Recorder) SetSampleRate(sampleRate int) error {
 }
 
 // SessionRates keeps the sample rate each session's raw recording is captured
-// at, which a raw .pcm does not store (storage.SQLiteStore). A session with
-// none recorded reads as 0, and its raw recording is taken as captured at
-// defaultSampleRate, as builds before this one captured.
+// at, which a raw .pcm does not store (storage.SQLiteStore). A session from a
+// build that kept none reads as 0, and its raw recording is taken as captured
+// at the rate the recorder has now (SaveKept).
 type SessionRates interface {
 	SetSessionSampleRate(id string, rate int) error
 	SessionSampleRate(id string) (int, error)
@@ -346,8 +345,10 @@ func (r *Recorder) KeptRawSessions() []string {
 // SaveKept saves the raw recording kept in the audio directory for session
 // sessionID as EndSession saves a session's recording (MP3, else WAV), and
 // returns the saved file. It encodes it at the rate the session rates have
-// for it (UseSessionRates), else at defaultSampleRate, the rate of a raw
-// recording from a build that kept no rate. It saves it under a temporary
+// for it (UseSessionRates). A session from a build that kept no rate has
+// none, and its raw recording is encoded at the rate the recorder has now,
+// the rate this run's microphone opened at (else defaultSampleRate), as
+// those builds encoded it. It saves it under a temporary
 // name (recording.KeptTempPaths), never the session's own, and keeps the raw
 // file: its caller renames the saved file into place only as the session
 // takes it, and erases the raw file once the saved recording is safe. So a
@@ -359,7 +360,7 @@ func (r *Recorder) SaveKept(ctx context.Context, sessionID string) (string, erro
 	rawPath := recording.RawPath(r.audioDir, sessionID)
 	r.mu.Lock()
 	inUse := rawPath == r.rawPath || rawPath == r.savingPath || rawPath == r.unsavedPath
-	rates := r.rates
+	rates, rate := r.rates, r.sampleRate
 	r.mu.Unlock()
 	if inUse {
 		return "", fmt.Errorf("raw recording %s is in use by the recorder", rawPath)
@@ -371,7 +372,6 @@ func (r *Recorder) SaveKept(ctx context.Context, sessionID string) (string, erro
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("raw recording %s is not a regular file", rawPath)
 	}
-	rate := defaultSampleRate
 	if rates != nil {
 		recorded, err := rates.SessionSampleRate(sessionID)
 		if err != nil {
