@@ -30,19 +30,21 @@ assert_recording_rules() {
     || fail "the $1 configuration does not hold the office Pi's four recording rules: $(<"$config")"
 }
 
-# assert_jabra_button_off fails unless the configuration and the .env provision.sh installed leave
-# the Jabra's Mute button off. It stays off until a person's real taps pass the checks of
-# docs/pi-setup.md, "Pause and resume at the unit", on the office Pi (their step 6 checks the fix
-# of defect D9, #75), and until the follow-up fix for a microphone that opens before the recording
-# light reads red has merged.
-assert_jabra_button_off() {
+# assert_office_pi_devices fails unless the configuration provision.sh installed turns the Jabra's
+# Mute button on once, with no .env line to override it, and names the Jabra as the microphone's
+# sound card once (mic_device), so another capture card, such as an ALSA loopback, never counts as
+# the microphone. The full provisioner rewrites .env, so the template's settings are the Pi's.
+assert_office_pi_devices() {
   local config=$TEST_LOG.installed-ghost-wispr.yaml env=$TEST_LOG.installed-.env settings
   settings=$(grep -E '^jabra_mute_button:' "$config") || true
-  [[ $settings == 'jabra_mute_button: false' ]] \
-    || fail "the $1 configuration does not turn the Jabra's Mute button off once: ${settings:-no jabra_mute_button line}"
+  [[ $settings == 'jabra_mute_button: true' ]] \
+    || fail "the $1 configuration does not turn the Jabra's Mute button on once: ${settings:-no jabra_mute_button line}"
   if grep -Eq '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env"; then
     fail "the $1 .env sets the Jabra's Mute button: $(grep -E '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env")"
   fi
+  settings=$(grep -E '^mic_device:' "$config") || true
+  [[ $settings == 'mic_device: Jabra' ]] \
+    || fail "the $1 configuration does not name the Jabra as the microphone once: ${settings:-no mic_device line}"
 }
 
 uid=$(id -u)
@@ -144,7 +146,7 @@ if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
   fail "provision.sh printed a bash error (above)"
 fi
 assert_recording_rules 'installed'
-assert_jabra_button_off 'installed'
+assert_office_pi_devices 'installed'
 
 # The .env the recorder runs with holds the Deepgram key and no Envoy signing key.
 env_file="$TEST_LOG.installed-.env"
@@ -218,7 +220,7 @@ for line in 'gdrive_folder_id: "drive-0123"' 'gdrive_sync_enabled: true' \
     || fail "the rerun's configuration lacks '$line': $(<"$TEST_LOG.installed-ghost-wispr.yaml")"
 done
 assert_recording_rules "rerun's"
-assert_jabra_button_off "rerun's"
+assert_office_pi_devices "rerun's"
 # The recorder reads its configuration only when it starts, and update.sh restarts nothing when the
 # Pi already runs the newest release: a rerun restarts a running recorder once the configuration is
 # installed, and try-restart starts none that is stopped.

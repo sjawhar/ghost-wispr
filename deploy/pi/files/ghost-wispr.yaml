@@ -29,19 +29,20 @@ gc_max_age_days: 0
 gc_max_audio_size_mb: 20000
 speaker_enabled: true
 speaker_device: Jabra
+# The microphone opens only the Jabra's capture device: another capture card, such as the ALSA
+# loopback an injected-audio acceptance run loads (docs/pi-setup.md, "Inject speech for
+# acceptance"), is never recorded, and with the Jabra unplugged the light is never lit.
+mic_device: Jabra
 tts_provider: gemini
 tts_model: gemini-3.8-flash-tts
 tts_voice: Kore
 indicator_light: blink1
 power_button: true
-# The Jabra's Mute button (docs/pi-setup.md, "Pause and resume at the unit") stays off until a
-# person's real taps pass that section's checks on the office Pi, and until the follow-up fix for
-# a microphone that opens before the recording light reads red has merged. The checks' step 6
-# checks the fix of defect D9 (#75): before it, a restart of a paused unit could resume recording
-# by itself, because the Jabra sends a mute-key press as the old process closes its microphone.
-# The office Pi's .env also holds GHOST_WISPR_JABRA_MUTE_BUTTON=false, which overrides this line;
-# a full provisioner run rewrites .env and leaves only this one. Turn this line on only after both.
-jabra_mute_button: false
+# The Jabra's Mute button pauses and resumes, as the power button does (docs/pi-setup.md, "Pause
+# and resume at the unit"). A restart of a paused unit stays paused (defect D9, #75). The office
+# Pi's .env can override this line with GHOST_WISPR_JABRA_MUTE_BUTTON; a full provisioner run
+# rewrites .env without it.
+jabra_mute_button: true
 envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__
 # The Secret Manager version of Envoy's webhook signing key; Ghost Wispr has no default for it.
