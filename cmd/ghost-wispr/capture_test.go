@@ -1651,6 +1651,18 @@ type prerollFunc func()
 
 func (f prerollFunc) DiscardPreroll() { f() }
 
+// countingResumeGate is the capture gate with onResume run as each resume
+// enters the gate (resumeWith).
+type countingResumeGate struct {
+	*captureGate
+	onResume func()
+}
+
+func (g countingResumeGate) resumeWith(t resumeTicket, persist func() error) error {
+	g.onResume()
+	return g.captureGate.resumeWith(t, persist)
+}
+
 // TestGateOpenRefusalDoesNotDeadlockConcurrentResume fails within its timeout
 // if the refusal callback runs while openAfter still holds g.control.
 func TestGateOpenRefusalDoesNotDeadlockConcurrentResume(t *testing.T) {
@@ -1659,12 +1671,11 @@ func TestGateOpenRefusalDoesNotDeadlockConcurrentResume(t *testing.T) {
 	store := &pauseStoreFake{}
 	var resumeCalls atomic.Int32
 	secondRequest := make(chan struct{})
-	controls := newPersistentControls(store, capture.Pause, func() error {
+	controls := newPersistentControls(store, capture.Pause, countingResumeGate{capture, func() {
 		if resumeCalls.Add(1) == 2 {
 			close(secondRequest)
 		}
-		return capture.RequestResume()
-	}, nil)
+	}}, nil)
 	gateCheckEntered := make(chan struct{})
 	releaseGateCheck := make(chan struct{})
 	var gateCheckRan atomic.Bool

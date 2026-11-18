@@ -149,7 +149,7 @@ func newJabraRig(paused bool) *jabraRig {
 	if paused {
 		capture.Pause()
 	}
-	controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture, nil)
 	return &jabraRig{
 		capture:    capture,
 		device:     newCaptureDevice(capture.IsPaused),
@@ -519,7 +519,7 @@ func TestAResumeTapCostsNoReopen(t *testing.T) {
 			var ring atomic.Bool
 			detach := device.attach(func(on bool) error { ring.Store(on); return nil })
 			t.Cleanup(detach)
-			controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture.RequestResume, func(bool) { time.Sleep(statusWrite) })
+			controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture, func(bool) { time.Sleep(statusWrite) })
 			button := newJabraMuteButton(capture, device, &server.ControlHooks{Pause: controls.Pause, Resume: controls.Resume}, newWarningsRegistry())
 			mic := newScriptedMic()
 			recording := &ringCheckingRecording{ring: &ring}

@@ -1382,7 +1382,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	pauseControls := newPersistentControls(
 		store,
 		func() { pauseCapture(capture, hardware) },
-		capture.RequestResume,
+		capture,
 		hub.BroadcastStatusChanged,
 	)
 	wirePauseControls(controlHooks, pauseControls, capture, hardware, warningRegistry)
@@ -1648,7 +1648,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
-		if err := startOpenedMic(capture, ordered, func() { micRef.Store(nil) }, log.Printf); err != nil {
+		if err := startOpenedMic(capture, ordered, func() { micRef.Store(nil) }, log.Printf); errors.Is(err, errMicStartPaused) {
+			// A pause came during the light's check: as during the scan, the
+			// next resume starts again (startMicrophone).
+			return err
+		} else if err != nil {
 			warning, status := micStartFailureMessages(err)
 			if warning != "" {
 				warningRegistry.Set("microphone", warning)
@@ -2056,7 +2060,13 @@ func streamMicWithRetry(
 					return
 				}
 			}
-			if err = capture.confirmMicOpen(); err != nil {
+			if err = capture.confirmMicOpen(); errors.Is(err, errMicStartPaused) {
+				// A pause came during the light's check: nothing is lit or
+				// opened, and the loop top waits for the next resume.
+				capture.finishResume()
+				released = true
+				continue
+			} else if err != nil {
 				if errors.Is(err, errNoCaptureDevice) {
 					logf("no capture device present; the microphone opens once one is")
 				} else {
@@ -2304,14 +2314,19 @@ func micHeldWarning(warnings *warningsRegistry) func(held bool) {
 // reopenMic reopens the device once a capture device is present and the
 // recording light is confirmed red, and reports each step on hub. It returns
 // false, having closed the device and reopened nothing, when the light cannot
-// be confirmed red; otherwise true and the reopen's error, which is
-// errNoCaptureDevice, with the device closed and the light left off, while no
-// capture device is present.
+// be confirmed red or a pause came during its check (errMicStartPaused);
+// otherwise true and the reopen's error, which is errNoCaptureDevice, with the
+// device closed and the light left off, while no capture device is present.
 func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) (bool, error) {
 	if hub != nil {
 		hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 	}
-	if err := capture.confirmMicOpen(); errors.Is(err, errNoCaptureDevice) {
+	if err := capture.confirmMicOpen(); errors.Is(err, errMicStartPaused) {
+		// A pause came during the light's check: the loop top waits for the
+		// next resume, and opens the device under its own confirmation.
+		closeMic(capture, streamer, "for capture pause", logf)
+		return false, nil
+	} else if errors.Is(err, errNoCaptureDevice) {
 		logf("no capture device present; the microphone reconnects once one is")
 		closeMic(capture, streamer, "with no capture device present", logf)
 		if hub != nil {

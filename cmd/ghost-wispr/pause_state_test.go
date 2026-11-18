@@ -47,6 +47,19 @@ type pauseGateFake struct{ calls int }
 
 func (g *pauseGateFake) Pause() { g.calls++ }
 
+// resumeFunc is a resume gate (resumeGate) whose resume is f, run after the
+// controls' write: no light check, and no pause overtakes it.
+type resumeFunc func() error
+
+func (resumeFunc) prepareResume() (resumeTicket, error) { return resumeTicket{}, nil }
+
+func (f resumeFunc) resumeWith(_ resumeTicket, persist func() error) error {
+	if err := persist(); err != nil {
+		return err
+	}
+	return f()
+}
+
 // TestRestorePausePausesWhenStored fails if a persisted pause is not restored
 // before capture begins.
 func TestRestorePausePausesWhenStored(t *testing.T) {
@@ -85,10 +98,10 @@ func TestRestorePausePausesWhenStored(t *testing.T) {
 func TestPersistingControlsWritesBeforeReturning(t *testing.T) {
 	store := &pauseStoreFake{}
 	var pauses, resumes int
-	controls := newPersistentControls(store, func() { pauses++ }, func() error {
+	controls := newPersistentControls(store, func() { pauses++ }, resumeFunc(func() error {
 		resumes++
 		return nil
-	}, nil)
+	}), nil)
 	pause, resume := controls.Pause, controls.Resume
 
 	if err := pause(); err != nil {
@@ -116,10 +129,10 @@ func TestPersistingControlsWritesBeforeReturning(t *testing.T) {
 func TestAStoreWriteFailureIsReported(t *testing.T) {
 	store := &pauseStoreFake{err: errors.New("disk full")}
 	var pauses, resumes int
-	controls := newPersistentControls(store, func() { pauses++ }, func() error {
+	controls := newPersistentControls(store, func() { pauses++ }, resumeFunc(func() error {
 		resumes++
 		return nil
-	}, nil)
+	}), nil)
 	pause, resume := controls.Pause, controls.Resume
 
 	if err := pause(); err == nil {
@@ -145,7 +158,7 @@ func TestPauseHTTPPersists(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	capture := newCaptureGate(nil, nil, nil)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	pause, resume := controls.Pause, controls.Resume
 	handler, err := server.Handler(
 		fstest.MapFS{"index.html": {Data: []byte("ok")}},
@@ -286,7 +299,7 @@ func TestRefusedResumeHTTPReturns500(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
 	capture.beforeResumeRequest = func() error { return errors.New("recording light stayed off") }
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	handler, err := server.Handler(
 		fstest.MapFS{"index.html": {Data: []byte("ok")}},
 		server.NewHub(),
@@ -331,7 +344,7 @@ func TestPersistentControlsSerializePauseAgainstResume(t *testing.T) {
 		zeroStarted: make(chan struct{}),
 		releaseZero: make(chan struct{}),
 	}
-	controls := newPersistentControls(store, func() {}, func() error { return nil }, nil)
+	controls := newPersistentControls(store, func() {}, resumeFunc(func() error { return nil }), nil)
 	resumeDone := make(chan error, 1)
 	go func() { resumeDone <- controls.Resume() }()
 	select {
@@ -382,7 +395,7 @@ func TestRefusedResumeWriteBackFailureIsReported(t *testing.T) {
 	controls := newPersistentControls(
 		store,
 		capture.Pause,
-		capture.RequestResume,
+		capture,
 		func(paused bool) { statuses = append(statuses, paused) },
 	)
 	err := controls.Resume()
@@ -407,7 +420,7 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 		controls := newPersistentControls(
 			store,
 			capture.Pause,
-			capture.RequestResume,
+			capture,
 			func(paused bool) { statuses = append(statuses, paused) },
 		)
 		handler, err := server.Handler(
@@ -440,7 +453,7 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 		controls := newPersistentControls(
 			store,
 			capture.Pause,
-			capture.RequestResume,
+			capture,
 			func(paused bool) { statuses = append(statuses, paused) },
 		)
 		for range 2 {

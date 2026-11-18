@@ -166,7 +166,7 @@ func TestTapTogglesAndPersists(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	capture := newCaptureGate(nil, nil, nil)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	pause, resume := controls.Pause, controls.Resume
 	var statuses []bool
 	if err := toggleCapture(capture.IsPaused, pause, resume, func(paused bool) { statuses = append(statuses, paused) }); err != nil {
@@ -672,7 +672,7 @@ func TestResumeRequiresRedBeforeOpeningCapture(t *testing.T) {
 		return errors.New("light is off")
 	}
 	guardResumeWithLight(capture, newWarningsRegistry(), nil)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	capture.Pause()
 	if err := controls.Resume(); err == nil {
 		t.Fatal("resume succeeded after red confirmation failed")
@@ -973,7 +973,7 @@ func TestResumeDoesNotLightBeforeGateOpens(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	capture.Pause()
 	if err := controls.Resume(); err != nil {
@@ -1018,7 +1018,7 @@ func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
 		statuses   []bool
 		statusesMu sync.Mutex
 	)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, func(paused bool) {
+	controls := newPersistentControls(store, capture.Pause, capture, func(paused bool) {
 		statusesMu.Lock()
 		defer statusesMu.Unlock()
 		statuses = append(statuses, paused)

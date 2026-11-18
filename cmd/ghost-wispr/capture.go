@@ -109,6 +109,7 @@ type captureGate struct {
 	mu                 sync.Mutex    // guards the fields below
 	switchOff          bool          // Pause was called and Resume has not been since
 	pauses             int           // counts Pause calls, so a resume whose light check a pause came during does nothing
+	pendingPauses      int           // Pause calls that wait for control: a resume then counts the unit as paused
 	lightHeld          bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
 	resumedAt          time.Time     // when Resume last moved the switch on
 	starting           bool          // that Resume's start of the microphone has not finished (finishResume)
@@ -177,12 +178,14 @@ func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
 func (g *captureGate) Pause() {
 	g.mu.Lock()
 	g.pauses++
+	g.pendingPauses++
 	g.mu.Unlock()
 	g.control.Lock()
 	defer g.control.Unlock()
 
 	g.mu.Lock()
 	g.switchOff = true
+	g.pendingPauses--
 	g.mu.Unlock()
 	g.closeGate()
 }
@@ -277,24 +280,69 @@ func (g *captureGate) Resume() {
 // While no capture device is present (captureMissing), it takes no light
 // check, so the light stays off: nothing can open, and every microphone open
 // confirms red for itself once a device is there. It checks the light's
-// stored pattern (checkLightPattern) before it takes control; a Pause called
+// stored pattern before it takes control (prepareResume); a Pause called
 // during that check is the later call and wins: the resume then does nothing
-// and returns nil.
+// and returns nil (resumeWith).
 func (g *captureGate) RequestResume() error {
+	t, err := g.prepareResume()
+	if err != nil {
+		return err
+	}
+	if err := g.resumeWith(t, nil); !errors.Is(err, errResumeOvertaken) {
+		return err
+	}
+	return nil
+}
+
+// resumeTicket is what a resume's light check (prepareResume) leaves for the
+// resume itself (resumeWith): the pause count before the check.
+type resumeTicket struct{ pauses int }
+
+// errResumeOvertaken reports a resume that a Pause called during its light
+// check overtook: the later call, the pause, wins, and the resume did nothing.
+var errResumeOvertaken = errors.New("resume overtaken by a later pause")
+
+// prepareResume is the part of a resume that can take seconds, so it runs
+// before control, and before the persistent controls' lock: it reads the
+// pause count and, if the switch is off or a Pause waits for control, checks
+// the light's stored pattern (checkLightPattern). A resume of a unit whose
+// switch is on checks nothing: a failed check must not be taken for a
+// refused resume of a unit that records (review 5961636823 of #79).
+func (g *captureGate) prepareResume() (resumeTicket, error) {
 	g.mu.Lock()
-	pauses := g.pauses
+	t := resumeTicket{pauses: g.pauses}
+	paused := g.switchOff || g.pendingPauses > 0
 	g.mu.Unlock()
-	if g.beforeResumeRequest != nil && g.checkLightPattern != nil && !g.captureMissing() {
+	if paused && g.beforeResumeRequest != nil && g.checkLightPattern != nil && !g.captureMissing() {
 		if err := g.checkLightPattern(); err != nil {
-			return err
+			return t, err
 		}
 	}
+	return t, nil
+}
 
+// resumeWith resumes once prepareResume has checked the light. Under control,
+// it returns errResumeOvertaken, having done nothing, if a Pause was called
+// since t; otherwise it runs persist, if set, and, if the switch is off,
+// confirms the light red (beforeResumeRequest) and moves the switch on. The
+// gate opens once the pause has settled.
+func (g *captureGate) resumeWith(t resumeTicket, persist func() error) error {
 	g.control.Lock()
 	defer g.control.Unlock()
 
 	g.mu.Lock()
-	if !g.switchOff || g.pauses != pauses {
+	overtaken := g.pauses != t.pauses
+	g.mu.Unlock()
+	if overtaken {
+		return errResumeOvertaken
+	}
+	if persist != nil {
+		if err := persist(); err != nil {
+			return err
+		}
+	}
+	g.mu.Lock()
+	if !g.switchOff {
 		g.mu.Unlock()
 		return nil
 	}
@@ -474,16 +522,27 @@ func (g *captureGate) captureMissing() bool {
 // stayed red since (lightWentOff). It first looks for a capture device,
 // without opening one (capturePresent): with none it lights nothing and
 // returns errNoCaptureDevice, so the light stays off while the microphone is
-// missing. It checks the light's stored pattern first (checkLightPattern). A
-// light that cannot be confirmed red returns an error that wraps
-// errLightNotConfirmed.
+// missing. It checks the light's stored pattern first (checkLightPattern),
+// which can take seconds and holds no lock of the gate; a Pause, or a closing
+// for the light, during that check cancels the open: it lights nothing and
+// returns errMicStartPaused (review 5961636823 of #79). A light that cannot
+// be confirmed red returns an error that wraps errLightNotConfirmed.
 func (g *captureGate) confirmMicOpen() error {
 	if g.captureMissing() {
 		return errNoCaptureDevice
 	}
 	if g.checkLightPattern != nil {
+		g.mu.Lock()
+		closings, pauses := g.closings, g.pauses
+		g.mu.Unlock()
 		if err := g.checkLightPattern(); err != nil {
 			return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
+		}
+		g.mu.Lock()
+		cancelled := g.closings != closings || g.pauses != pauses
+		g.mu.Unlock()
+		if cancelled {
+			return errMicStartPaused
 		}
 	}
 	if err := g.confirmMicStart(); err != nil {

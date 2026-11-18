@@ -180,8 +180,9 @@ unit, or one with no serial number, gets off writes only, no tickle and no red, 
 its pattern black: the one a resume, a gate opening or a microphone open runs before its red
 confirmation, or one that a refused tickle or red write starts. That check sends one command at a
 time, lets the recorder's other commands in between, and runs before a resume or a gate opening
-takes the pause switch, so a pause during it still turns the light off at once, and the resume or
-gate opening it overtakes does not light the light. A save of the black pattern that does not reach
+takes the pause switch, from the web page, the power button or the Jabra alike, so a pause during it
+is not held up and turns the light off at once; the resume, gate opening or microphone open it
+overtakes lights nothing and opens nothing. A save of the black pattern that does not reach
 the unit leaves it unknown, so it is checked again when it comes back. Programs that do not take the
 lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
 answer the recorder's.

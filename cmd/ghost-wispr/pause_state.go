@@ -101,15 +101,23 @@ func seedPausedState(configPath string, out io.Writer) (string, error) {
 type persistentControls struct {
 	store           pauseStore
 	pause           func()
-	resume          func() error
+	gate            resumeGate
 	onStatusChanged func(bool)
 	mu              sync.Mutex
 }
 
+// resumeGate is the capture gate's resume in its two steps (captureGate):
+// prepareResume, the light's check, which can take seconds, and resumeWith,
+// the resume itself, which a Pause called since the check overtakes.
+type resumeGate interface {
+	prepareResume() (resumeTicket, error)
+	resumeWith(t resumeTicket, persist func() error) error
+}
+
 var errRefusedResumeNotPersisted = errors.New("refused resume pause state was not persisted")
 
-func newPersistentControls(store pauseStore, pause func(), resume func() error, onStatusChanged func(bool)) *persistentControls {
-	return &persistentControls{store: store, pause: pause, resume: resume, onStatusChanged: onStatusChanged}
+func newPersistentControls(store pauseStore, pause func(), gate resumeGate, onStatusChanged func(bool)) *persistentControls {
+	return &persistentControls{store: store, pause: pause, gate: gate, onStatusChanged: onStatusChanged}
 }
 
 func (c *persistentControls) Pause() error {
@@ -126,13 +134,33 @@ func (c *persistentControls) Pause() error {
 	return nil
 }
 
+// Resume runs the light's check before it takes the controls' lock, so a
+// person's Pause meanwhile is not held up behind it, and that Pause, the later
+// call, wins: the resume then saves nothing and returns nil (review
+// 5961636823 of #79). The resume saves the switch on just before it confirms
+// the light red, and saves it off again if the light refuses it.
 func (c *persistentControls) Resume() error {
+	ticket, err := c.gate.prepareResume()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.store.SetAppState(storage.AppStateCapturePaused, "0"); err != nil {
-		return fmt.Errorf("persist capture resume: %w", err)
+	if err != nil {
+		// Nothing changed: the switch stays off, as the clients are told.
+		if c.onStatusChanged != nil {
+			c.onStatusChanged(true)
+		}
+		return err
 	}
-	if err := c.resume(); err != nil {
+	var persistErr error
+	err = c.gate.resumeWith(ticket, func() error {
+		persistErr = c.store.SetAppState(storage.AppStateCapturePaused, "0")
+		return persistErr
+	})
+	switch {
+	case persistErr != nil:
+		return fmt.Errorf("persist capture resume: %w", persistErr)
+	case errors.Is(err, errResumeOvertaken):
+		return nil // the later pause saved and announced the switch off
+	case err != nil:
 		if storeErr := c.store.SetAppState(storage.AppStateCapturePaused, "1"); storeErr != nil {
 			if c.onStatusChanged != nil {
 				c.onStatusChanged(true)
