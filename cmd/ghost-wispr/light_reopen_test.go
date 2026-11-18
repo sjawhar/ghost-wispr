@@ -302,6 +302,53 @@ func TestAPauseDuringAReopenTurnsTheLightOffAtOnce(t *testing.T) {
 	}
 }
 
+// TestARedWriteChecksAnUncheckedLightWithoutWaiting fails if the
+// controller's red write to a unit it opened again, not known black, never
+// gets the light red, or waits for the unit's pattern check. While a
+// microphone is open the controller wants red and writes red, and nothing
+// else checked the unit, so the unit stayed unchecked and off and capture
+// stayed held (TestCaptureResumesWhenTheLightIsRedAgain). The red write now
+// starts the check and is refused at once; a pause during the check still
+// turns the light off; once the check passes, the controller is woken and
+// the next red write lights it.
+func TestARedWriteChecksAnUncheckedLightWithoutWaiting(t *testing.T) {
+	var held atomic.Bool
+	light, second := failTheRecordersHandle(t, &held, false)
+	second.checkTakes = 1500 * time.Millisecond
+	woken := make(chan struct{}, 1)
+	light.checked = func() { woken <- struct{}{} }
+	if _, _, _, err := light.ReadRGB(); err != nil { // the reopen
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	if err := light.SetRGB(255, 0, 0); !errors.Is(err, errLightUnchecked) {
+		t.Fatalf("red write to an unchecked unit = %v, want errLightUnchecked", err)
+	}
+	if took := time.Since(started); took > 100*time.Millisecond {
+		t.Fatalf("the red write to an unchecked unit took %v: it waited for the pattern check", took)
+	}
+	time.Sleep(100 * time.Millisecond) // the check is under way
+	paused := time.Now()
+	if err := light.SetRGB(0, 0, 0); err != nil || second.colour() != ([3]uint8{}) {
+		t.Fatalf("off write during the check: %v, colour %v, want it off", err, second.colour())
+	}
+	if took := time.Since(paused); took > 500*time.Millisecond {
+		t.Fatalf("the off write during the check took %v, want within 500ms", took)
+	}
+	select {
+	case <-woken:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the red write started no pattern check that passed within 3s (pattern checks %d)", second.patternChecks.Load())
+	}
+	if err := light.SetRGB(255, 0, 0); err != nil || !second.isRed() {
+		t.Fatalf("red write once the check passed: %v, red %t, want it red", err, second.isRed())
+	}
+	if n := second.patternChecks.Load(); n != 1 {
+		t.Fatalf("pattern checks = %d, want 1", n)
+	}
+}
+
 // TestAPauseDoesNotWaitForAPatternCheck fails if a pause's off write waits for
 // the pattern check of a light the recorder opened again after a device
 // error. The check takes 1.5 s, as 33 commands do when another open lets each

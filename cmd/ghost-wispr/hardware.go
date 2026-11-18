@@ -338,6 +338,7 @@ func startHardware(ctx context.Context, cfg *config.Config, capture *captureGate
 			warnings:   warnings,
 			holdRed:    func() bool { return !hardware.stopped.Load() && wantRed() },
 			retryEvery: lightRetryEvery,
+			checked:    hardware.Wake,
 		}
 		guard := newLightGuard(capture, warnings, lightRetryEvery)
 		hardware.reportLight = guard.report
@@ -400,8 +401,13 @@ type reconnectingLight struct {
 	// since its watchdog would play that pattern (review 5954543056 of #79).
 	// Under deviceMu.
 	patternUnchecked bool
-	// checkMu lets one CheckPattern run at a time.
-	checkMu     sync.Mutex
+	// checkMu lets one pattern check run at a time.
+	checkMu sync.Mutex
+	// checking is set while a check that a red write started runs
+	// (checkInBackground); checked, when set, is called once such a check
+	// passes, so the controller looks at the light again (hardwareControl.Wake).
+	checking    atomic.Bool
+	checked     func()
 	nextAttempt time.Time
 	lastErr     error
 	warnings    *warningsRegistry
@@ -479,20 +485,26 @@ var errLightUnchecked = errors.New("the recording light's stored pattern is not 
 // a pause's off write waits for at most one of them, the recorder's other
 // commands never meet the check on the handle, and a Close or a failure
 // closes the handle only between two of them, after which the check stops
-// and fails (review 5956273705 of #79). EnsureRed runs it before it holds the
-// light red, and the controller before its first update (BlackPattern). It
-// fails while another command keeps the check from the light.
+// and fails (review 5956273705 of #79). It runs only on the red path:
+// EnsureRed runs it before it holds the light red, a red write that found the
+// light unchecked starts it (checkInBackground), and the controller runs it
+// before its first update (BlackPattern). It fails while another command
+// keeps the check from the light.
 func (l *reconnectingLight) CheckPattern() error {
-	l.checkMu.Lock()
-	defer l.checkMu.Unlock()
 	l.deviceMu.Lock()
 	light, err := l.currentForConfirmation()
-	if err != nil || !l.patternUnchecked {
-		l.deviceMu.Unlock()
+	l.deviceMu.Unlock()
+	if err != nil {
 		return err
 	}
+	return l.checkPattern(light)
+}
+
+// checkPattern runs light's stepwise check to the end, one at a time.
+func (l *reconnectingLight) checkPattern(light indicator.Light) error {
+	l.checkMu.Lock()
+	defer l.checkMu.Unlock()
 	check := indicator.NewPatternCheck(light)
-	l.deviceMu.Unlock()
 	for {
 		done, err := l.checkStep(light, check)
 		if err != nil || done {
@@ -502,12 +514,16 @@ func (l *reconnectingLight) CheckPattern() error {
 }
 
 // checkStep sends check's next command to light under deviceMu, unless light
-// was closed or opened again since the check began.
+// was closed or opened again since the check began, or is no longer
+// unchecked.
 func (l *reconnectingLight) checkStep(light indicator.Light, check indicator.PatternCheck) (bool, error) {
 	l.deviceMu.Lock()
 	defer l.deviceMu.Unlock()
 	if l.light != light {
 		return false, errLightUnchecked
+	}
+	if !l.patternUnchecked {
+		return true, nil
 	}
 	done, err := check.Step()
 	if err != nil {
@@ -521,6 +537,24 @@ func (l *reconnectingLight) checkStep(light indicator.Light, check indicator.Pat
 		l.warnings.Clear("recording-light")
 	}
 	return done, nil
+}
+
+// checkInBackground starts the check of light for a red write that found it
+// unchecked, unless one such check runs. The write is refused at once, so the
+// controller never waits for the check and a pause meanwhile still reaches
+// the light. Once the check passes, checked wakes the controller, whose next
+// red write lights the light. It checks only light: once light is closed it
+// stops, and it opens no other.
+func (l *reconnectingLight) checkInBackground(light indicator.Light) {
+	if !l.checking.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer l.checking.Store(false)
+		if err := l.checkPattern(light); err == nil && l.checked != nil {
+			l.checked()
+		}
+	}()
 }
 
 // failed counts a failed command as a time the light may not be red, and,
@@ -561,6 +595,7 @@ func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
 	if !red {
 		l.offs.Add(1)
 	} else if l.patternUnchecked {
+		l.checkInBackground(light)
 		return errLightUnchecked
 	}
 	if err := light.SetRGB(r, g, b); err != nil {
