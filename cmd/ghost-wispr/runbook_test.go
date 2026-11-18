@@ -124,7 +124,7 @@ func TestTheJabraButtonIsOnInTheTemplateAndTheRunbook(t *testing.T) {
 // how to inject speech for an acceptance run with mic_device: load the ALSA
 // loopback, set GHOST_WISPR_MIC_DEVICE=Loopback in the Pi's .env for the run,
 // play into the loopback device the recorder captures from, then remove the
-// line and unload the loopback. With mic_device: Jabra the recorder opens no
+// line and unload the loopback. With mic_device: J75 the recorder opens no
 // other card, so the old way, an .asoundrc that moved ALSA's default input to
 // the loopback, no longer reaches it.
 func TestRunbookInjectsSpeechThroughMicDevice(t *testing.T) {
@@ -141,10 +141,10 @@ func TestRunbookInjectsSpeechThroughMicDevice(t *testing.T) {
 
 // TestRunbookRolloutChecksTheMicDevice fails if the rollout order does not
 // name mic_device among the keys a release adds, and its check: the Pi's
-// config holds mic_device: Jabra.
+// config holds mic_device: J75.
 func TestRunbookRolloutChecksTheMicDevice(t *testing.T) {
 	section := runbookSection(t, "## Roll out a release that adds a config key")
-	for _, words := range []string{"`mic_device`", "mic_device: Jabra"} {
+	for _, words := range []string{"`mic_device`", "mic_device: J75"} {
 		if !strings.Contains(section, words) {
 			t.Errorf("the runbook's rollout order does not say %q", words)
 		}

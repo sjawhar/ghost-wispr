@@ -28,11 +28,13 @@ gc_enabled: false
 gc_max_age_days: 0
 gc_max_audio_size_mb: 20000
 speaker_enabled: true
-speaker_device: Jabra
-# The microphone opens only the Jabra's capture device: another capture card, such as the ALSA
-# loopback an injected-audio acceptance run loads (docs/pi-setup.md, "Inject speech for
-# acceptance"), is never recorded, and with the Jabra unplugged the light is never lit.
-mic_device: Jabra
+# The speaker and the microphone open only the Jabra Speak2 75, named by its ALSA card id (J75 in
+# /proc/asound/cards), not by "Jabra", which a second Jabra device would also match. Another
+# capture card, such as the ALSA loopback an injected-audio acceptance run loads (docs/pi-setup.md,
+# "Inject speech for acceptance"), is never recorded, and with the Jabra unplugged the light is
+# never lit.
+speaker_device: J75
+mic_device: J75
 tts_provider: gemini
 tts_model: gemini-3.8-flash-tts
 tts_voice: Kore

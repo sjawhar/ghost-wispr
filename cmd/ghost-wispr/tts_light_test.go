@@ -61,7 +61,7 @@ func playThroughDevice(t *testing.T, device *captureDevice) (out *heldOutput, fi
 
 // TestNoJabraLightWriteWhileTTSPlaybackIsOpen fails if the Jabra's light is
 // written while TTS playback holds an output stream open on the Jabra
-// (deploy/pi/files/ghost-wispr.yaml: speaker_device Jabra). A light change
+// (deploy/pi/files/ghost-wispr.yaml: speaker_device J75). A light change
 // while only a playback stream was open made the Jabra send Phone Mute by
 // itself at the next microphone close on the office Pi (INFRA-1027 trace,
 // section 9.7, restart 1), and a microphone close while recording, such as a

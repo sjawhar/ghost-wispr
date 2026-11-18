@@ -31,9 +31,10 @@ assert_recording_rules() {
 }
 
 # assert_office_pi_devices fails unless the configuration provision.sh installed turns the Jabra's
-# Mute button on once, with no .env line to override it, and names the Jabra as the microphone's
-# sound card once (mic_device), so another capture card, such as an ALSA loopback, never counts as
-# the microphone. The full provisioner rewrites .env, so the template's settings are the Pi's.
+# Mute button on once, with no .env line to override it, and names the Jabra Speak2 75 by its ALSA
+# card id as the microphone's and the speaker's sound card once (mic_device and speaker_device: J75),
+# so another capture card, such as an ALSA loopback or a second Jabra device, never counts as the
+# microphone. The full provisioner rewrites .env, so the template's settings are the Pi's.
 assert_office_pi_devices() {
   local config=$TEST_LOG.installed-ghost-wispr.yaml env=$TEST_LOG.installed-.env settings
   settings=$(grep -E '^jabra_mute_button:' "$config") || true
@@ -43,8 +44,11 @@ assert_office_pi_devices() {
     fail "the $1 .env sets the Jabra's Mute button: $(grep -E '^GHOST_WISPR_JABRA_MUTE_BUTTON=' "$env")"
   fi
   settings=$(grep -E '^mic_device:' "$config") || true
-  [[ $settings == 'mic_device: Jabra' ]] \
+  [[ $settings == 'mic_device: J75' ]] \
     || fail "the $1 configuration does not name the Jabra as the microphone once: ${settings:-no mic_device line}"
+  settings=$(grep -E '^speaker_device:' "$config") || true
+  [[ $settings == 'speaker_device: J75' ]] \
+    || fail "the $1 configuration does not name the Jabra as the speaker once: ${settings:-no speaker_device line}"
 }
 
 uid=$(id -u)

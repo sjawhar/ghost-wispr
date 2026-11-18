@@ -81,7 +81,8 @@ for line in \
   'envoy_webhook_url: __ENVOY_WEBHOOK_URL__' \
   "envoy_webhook_secret_name: projects/$PI_GCP_PROJECT/secrets/$PI_WEBHOOK_SECRET/versions/latest" \
   'jabra_mute_button: true' \
-  'mic_device: Jabra'; do
+  'mic_device: J75' \
+  'speaker_device: J75'; do
   assert_line "$line" "$template"
 done
 assert_count '^gdrive_folder_id:' 0 "$template"
@@ -121,10 +122,11 @@ for line in \
   'gdrive_sync_enabled: true' \
   'gc_enabled: true' \
   'jabra_mute_button: true' \
-  'mic_device: Jabra'; do
+  'mic_device: J75' \
+  'speaker_device: J75'; do
   assert_line "$line" "$models_config"
 done
-for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_webhook_url jabra_mute_button mic_device; do
+for key in gdrive_folder_id gdrive_sync_enabled gc_enabled envoy_webhook_url jabra_mute_button mic_device speaker_device; do
   assert_count "^$key:" 1 "$models_config"
 done
 

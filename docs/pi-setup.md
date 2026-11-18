@@ -398,13 +398,13 @@ only shows the pause switch.
 The blink(1) reads back red before the microphone opens, and stays red until it is open: every
 start, resume and reconnect of the microphone, and PortAudio's device scan, waits for that check.
 Before it lights the blink(1) for an open, Ghost Wispr looks in `/proc/asound` for a capture PCM
-(`cardN/pcmMc`) of the card `mic_device: Jabra` names, without opening one, and it opens only that
-card's input. With the Jabra unplugged there is none, also while another capture card, such as
-the ALSA loopback, is loaded; then
+(`cardN/pcmMc`) of the card `mic_device: J75` names, the Jabra Speak2 75's ALSA card id, without
+opening one, and it opens only that card's input. With the Jabra unplugged there is none, also while
+another capture card, such as the ALSA loopback or a second Jabra device, is present; then
 the blink(1) stays off, `/api/status` warns `No microphone found`, and the start-up retry (every 15
 seconds) and the reconnect (backing off to every 30 seconds) look again without lighting it. A unit that
 starts paused scans only at its first resume. The speaker does not wait for it: it plays through the
-ALSA playback PCM of the card `speaker_device: Jabra` names (`plughw:CARD=J75,DEV=0`, the Jabra's
+ALSA playback PCM of the card `speaker_device: J75` names (`plughw:CARD=J75,DEV=0`, the Jabra's
 `pcmC0D0p` on the office Pi), opening no microphone and needing no red light, so a unit restarted
 paused still speaks. It needs no package beyond `libportaudio2`, whose dependency `libasound2t64`
 the Pi already has (`deploy/pi/baseline.txt`). A pause during an open keeps the blink(1) red until
@@ -418,7 +418,9 @@ PortAudio does not return, the microphone cannot be
 closed: the blink(1) stays red, `/api/status` warns `Microphone still open after a pause` until it
 closes, and nothing is recorded meanwhile. Once no audio has reached the recording for 2 seconds,
 Ghost Wispr closes the microphone, and the blink(1) goes off, with `capture_state` `no_audio`; it
-opens it again under a new check after a wait that doubles up to 30 seconds. After a stream error
+opens it again under a new check after a wait that doubles up to 30 seconds: with a microphone that
+delivers nothing, the light shows red for about 2 seconds at each retry while nothing is recorded.
+After a stream error
 it closes the microphone before it waits to reconnect. It reads the blink(1) back for each buffer
 of audio: once the blink(1) was not red while the microphone was open, as when it was unplugged or
 its watchdog turned it off, Ghost Wispr drops what the microphone holds and opens it again under a
@@ -564,7 +566,7 @@ that line stays as it is. The full provisioner rewrites `.env` without it, and t
    session has ended.
 4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
    come back; for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning; for
-   `mic_device`, the config must hold `mic_device: Jabra`, `/api/status` no `No microphone found`
+   `mic_device`, the config must hold `mic_device: J75`, `/api/status` no `No microphone found`
    warning, and `capture_state` must be `capturing` or `paused`. The Jabra's Mute button must be on:
    each line the last `grep` prints ends in `true`.
 
@@ -645,7 +647,7 @@ recording, because its echo cancellation removes it. Ghost Wispr records only th
 steps on the Pi as `ghost-wispr`, outside meetings, with no session active.
 
 1. Load the loopback: `sudo modprobe snd-aloop`. `grep Loopback /proc/asound/cards` shows its card.
-   While `mic_device: Jabra` applies, Ghost Wispr ignores that card.
+   While `mic_device: J75` applies, Ghost Wispr ignores that card.
 2. Add `GHOST_WISPR_MIC_DEVICE=Loopback` to `/opt/ghost-wispr/.env`, which overrides the YAML, and
    restart `ghost-wispr.service`. Ghost Wispr then captures from the loopback's device 0, under the
    same light rule as on the Jabra.
