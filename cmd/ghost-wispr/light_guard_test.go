@@ -55,16 +55,20 @@ func TestAPassingCheckDoesNotEraseAFailedConfirmation(t *testing.T) {
 // capture's hold, or names the light as failed. On a uhid blink(1), with the
 // recorder paused, a 5 s holder left "Recording light failed" on /api/status
 // after the light was free again: nothing but a red confirmation cleared it
-// (review 5954543056 of #79). A real failure keeps its warning until a red
+// (review 5954543056 of #79). The same holds for a unit whose stored pattern
+// is not checked yet (errLightUnchecked), which the status called failed too
+// (review 5958478401 of #79). A real failure keeps its warning until a red
 // confirmation passes.
 func TestABusyLightCheckLeavesNoWarningOnceItPasses(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		fault     error
+		says      string
 		wantAfter []string
 	}{
-		{"another program held the lock", fmt.Errorf("read blink(1) version: %w", indicator.ErrBusy), nil},
-		{"control: the light failed", errors.New("blink(1) feature report: input/output error"), []string{recordingLightFailedWarning}},
+		{"another program held the lock", fmt.Errorf("read blink(1) version: %w", indicator.ErrBusy), "busy", nil},
+		{"the unit's pattern is not checked yet", errLightUnchecked, "not checked yet", nil},
+		{"control: the light failed", errors.New("blink(1) feature report: input/output error"), "failed", []string{recordingLightFailedWarning}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -89,8 +93,8 @@ func TestABusyLightCheckLeavesNoWarningOnceItPasses(t *testing.T) {
 
 			guard.report(tc.fault)
 			got := waitWarnings("a failed check set no warning", func(w []string) bool { return len(w) == 1 })
-			if busy := indicator.Contended(tc.fault); busy != strings.Contains(got[0], "busy") {
-				t.Fatalf("warning for %v = %q, want it to say busy: %t", tc.fault, got[0], busy)
+			if !strings.Contains(got[0], tc.says) {
+				t.Fatalf("warning for %v = %q, want it to say %q", tc.fault, got[0], tc.says)
 			}
 			guard.report(nil)
 			time.Sleep(50 * time.Millisecond) // run applies the pass

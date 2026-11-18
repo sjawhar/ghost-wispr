@@ -609,9 +609,9 @@ func TestWireLightConsentRequiresRedBeforeStartOrResume(t *testing.T) {
 }
 
 // TestConfirmRedRetriesDiscoveryBeforeRecording fails if a cached missing-light
-// result lets capture begin after the blink(1) appears. It confirms red as a
-// microphone start does (EnsureRed): the light it finds is a unit not known
-// black, whose pattern is checked before the red confirmation.
+// result lets capture begin after the blink(1) appears. It confirms red as the
+// capture gate does: CheckLight checks the stored pattern of the unit it finds,
+// which is not known black, and then EnsureRed confirms it red.
 func TestConfirmRedRetriesDiscoveryBeforeRecording(t *testing.T) {
 	device := &operationLightFake{}
 	original := openBlink1
@@ -629,6 +629,9 @@ func TestConfirmRedRetriesDiscoveryBeforeRecording(t *testing.T) {
 		t.Fatalf("initial discovery error = %v, want ErrNoBlink1", err)
 	}
 	hardware := &hardwareControl{light: light}
+	if err := hardware.CheckLight(); err != nil {
+		t.Fatalf("check the light after it appears: %v", err)
+	}
 	if err := hardware.EnsureRed(); err != nil {
 		t.Fatalf("confirm red after light appears: %v", err)
 	}

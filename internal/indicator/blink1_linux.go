@@ -359,7 +359,13 @@ func (b *blink1) BlackPattern() error {
 // one command per Step: the version query if the line count is not known,
 // then a query of each pattern line. At the first line that is not black, it
 // writes the black pattern ('l', a 'P' per line, 'W') and reads every line
-// again; a saved pattern that does not read back black fails it.
+// again; a pattern that does not read back black fails it. The reads see the
+// lines in RAM, which the watchdog plays; 'W' saves them to flash, which a
+// power-up loads. A save that did not reach the unit (another open held the
+// lock past its wait, or the transfer failed) still passes the check, as
+// before, but does not make the unit known black (checkedUnits): plugged in
+// again, it loads its old pattern and must be checked (review 5958478401 of
+// #79).
 func (b *blink1) PatternCheck() PatternCheck { return &blink1PatternCheck{b: b} }
 
 type blink1PatternCheck struct {
@@ -368,6 +374,7 @@ type blink1PatternCheck struct {
 	phase   int   // checkRead, checkSelectLEDs, checkWrite or checkSave
 	line    uint8 // the next line to read or write
 	written bool  // the black pattern is written: the reads check it
+	unsaved bool  // the written pattern's save did not reach the unit
 	done    bool
 }
 
@@ -412,7 +419,7 @@ func (c *blink1PatternCheck) Step() (bool, error) {
 		if c.line++; c.line < c.lines {
 			return false, nil
 		}
-		if c.b.serial != "" {
+		if c.b.serial != "" && !c.unsaved {
 			checkedMu.Lock()
 			checkedUnits[c.b.serial] = c.lines
 			checkedMu.Unlock()
@@ -435,7 +442,7 @@ func (c *blink1PatternCheck) Step() (bool, error) {
 		}
 	case checkSave:
 		save := Blink1Report('W', [6]byte{0xbe, 0xef, 0xca, 0xfe})
-		_ = c.b.send(&save)
+		c.unsaved = c.b.send(&save) != nil
 		c.phase, c.line, c.written = checkRead, 0, true
 	}
 	return false, nil

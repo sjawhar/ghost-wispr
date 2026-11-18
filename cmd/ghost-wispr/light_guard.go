@@ -84,13 +84,13 @@ func (g *lightGuard) apply(fault error) {
 		g.capture.HoldForLight()
 		return
 	}
-	// A check that passes ends a busy light's warning: another program had
-	// the light, which did not fail. But not while capture stays held for the
-	// light: its warning says why the unit does not record (red team, review
-	// 5956273705 of #79). Any other warning waits for a red confirmation;
-	// ClearIf leaves it.
+	// A check that passes ends a busy or unchecked light's warning: another
+	// program had the light, or its pattern was being checked, and it did not
+	// fail. But not while capture stays held for the light: its warning says
+	// why the unit does not record (red team, review 5956273705 of #79). Any
+	// other warning waits for a red confirmation; ClearIf leaves it.
 	if !g.capture.isLightHeld() {
-		g.warnings.ClearIf("recording-light", recordingLightBusyWarning)
+		g.clearTransientWarning()
 		return
 	}
 	if time.Since(g.lastRelease) < g.releaseEvery {
@@ -98,5 +98,12 @@ func (g *lightGuard) apply(fault error) {
 	}
 	g.lastRelease = time.Now()
 	g.capture.ReleaseLightHold()
+	g.clearTransientWarning()
+}
+
+// clearTransientWarning clears the light's warning if it is one a passing
+// check ends: busy, or not checked yet.
+func (g *lightGuard) clearTransientWarning() {
 	g.warnings.ClearIf("recording-light", recordingLightBusyWarning)
+	g.warnings.ClearIf("recording-light", recordingLightUncheckedWarning)
 }

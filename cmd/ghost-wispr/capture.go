@@ -86,33 +86,40 @@ type captureGate struct {
 	beforeGateOpen      func() error
 	onResumeRefused     func(error)
 	beforeMicStart      func() error
-	beforeMicOpen       func(ctx context.Context, closing <-chan struct{}) bool // readies the hardware before a resume's red confirmation; false once closing closes or ctx ends (prepareMicOpen)
-	afterMicStart       func()
-	afterGateOpen       func()
-	onLightUnconfirmed  func(error)   // a red confirmation for a microphone open failed; must not block
-	lightOffs           func() uint64 // counts the times the recording light was written, or read back, as anything but red; nil without a light
-	lightRedMark        func() uint64 // lightOffs as the light's last red confirmation left it, read under the light's lock
-	checkLight          func()        // reads the light back, which counts it in lightOffs unless it is red; nil without a light
-	afterMicClose       func()        // runs after the mic loop closed the microphone, so the light, which follows it, can go off; must not block
-	onMicHeld           func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
-	capturePresent      func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
-	audioStall          time.Duration // see audioStallAfter
-	stallAfter          time.Duration // see captureStallAfter
-	writeWait           time.Duration // see captureWriteWait
-	control             sync.Mutex    // serializes closing and opening the gate, with their steps
-	mu                  sync.Mutex    // guards the fields below
-	switchOff           bool          // Pause was called and Resume has not been since
-	lightHeld           bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
-	resumedAt           time.Time     // when Resume last moved the switch on
-	starting            bool          // that Resume's start of the microphone has not finished (finishResume)
-	preparing           bool          // a start waits in beforeMicOpen (prepareMicOpen)
-	closed              bool          // no audio passes the gate
-	closings            int           // counts closings, so a Resume left from an earlier one does nothing
-	resumed             chan struct{} // closed while the gate is open
-	closing             chan struct{} // closed while the gate is closed
-	settled             chan struct{} // closed once the latest closing has settled
-	writing             int           // writes that passed the gate and are still running
-	writesDone          *sync.Cond    // signalled (with mu) when a write finishes
+	// checkLightPattern readies the light for a red confirmation: it checks
+	// the stored pattern of a unit not yet checked (hardwareControl.CheckLight).
+	// It can take seconds, so RequestResume and openAfter run it before they
+	// take control, and a pause meanwhile takes control at once (review
+	// 5958478401 of #79); confirmMicOpen runs it before its confirmation.
+	checkLightPattern  func() error
+	beforeMicOpen      func(ctx context.Context, closing <-chan struct{}) bool // readies the hardware before a resume's red confirmation; false once closing closes or ctx ends (prepareMicOpen)
+	afterMicStart      func()
+	afterGateOpen      func()
+	onLightUnconfirmed func(error)   // a red confirmation for a microphone open failed; must not block
+	lightOffs          func() uint64 // counts the times the recording light was written, or read back, as anything but red; nil without a light
+	lightRedMark       func() uint64 // lightOffs as the light's last red confirmation left it, read under the light's lock
+	checkLight         func()        // reads the light back, which counts it in lightOffs unless it is red; nil without a light
+	afterMicClose      func()        // runs after the mic loop closed the microphone, so the light, which follows it, can go off; must not block
+	onMicHeld          func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
+	capturePresent     func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
+	audioStall         time.Duration // see audioStallAfter
+	stallAfter         time.Duration // see captureStallAfter
+	writeWait          time.Duration // see captureWriteWait
+	control            sync.Mutex    // serializes closing and opening the gate, with their steps
+	mu                 sync.Mutex    // guards the fields below
+	switchOff          bool          // Pause was called and Resume has not been since
+	pauses             int           // counts Pause calls, so a resume whose light check a pause came during does nothing
+	lightHeld          bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
+	resumedAt          time.Time     // when Resume last moved the switch on
+	starting           bool          // that Resume's start of the microphone has not finished (finishResume)
+	preparing          bool          // a start waits in beforeMicOpen (prepareMicOpen)
+	closed             bool          // no audio passes the gate
+	closings           int           // counts closings, so a Resume left from an earlier one does nothing
+	resumed            chan struct{} // closed while the gate is open
+	closing            chan struct{} // closed while the gate is closed
+	settled            chan struct{} // closed once the latest closing has settled
+	writing            int           // writes that passed the gate and are still running
+	writesDone         *sync.Cond    // signalled (with mu) when a write finishes
 	// audioAt is when audio last reached the recording through the gate, or
 	// when a start or gate opening gave it audioStall to begin (armAudio), in
 	// Unix nanoseconds; 0 before the first. While it is older than audioStall,
@@ -165,8 +172,12 @@ func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
 // background. onPause runs first so nothing it blocks (new sessions) can start
 // behind a closed gate; it waits for nothing (the app's only sets a flag), so
 // the gate closes at once. Pausing while the gate is closed only cancels a
-// pending Resume.
+// pending Resume. It counts itself (pauses) when called, before it waits for
+// control, so a resume called after it is the later call.
 func (g *captureGate) Pause() {
+	g.mu.Lock()
+	g.pauses++
+	g.mu.Unlock()
 	g.control.Lock()
 	defer g.control.Unlock()
 
@@ -265,13 +276,25 @@ func (g *captureGate) Resume() {
 // after beforeResume once settling finishes, unless a Pause comes first.
 // While no capture device is present (captureMissing), it takes no light
 // check, so the light stays off: nothing can open, and every microphone open
-// confirms red for itself once a device is there.
+// confirms red for itself once a device is there. It checks the light's
+// stored pattern (checkLightPattern) before it takes control; a Pause called
+// during that check is the later call and wins: the resume then does nothing
+// and returns nil.
 func (g *captureGate) RequestResume() error {
+	g.mu.Lock()
+	pauses := g.pauses
+	g.mu.Unlock()
+	if g.beforeResumeRequest != nil && g.checkLightPattern != nil && !g.captureMissing() {
+		if err := g.checkLightPattern(); err != nil {
+			return err
+		}
+	}
+
 	g.control.Lock()
 	defer g.control.Unlock()
 
 	g.mu.Lock()
-	if !g.switchOff {
+	if !g.switchOff || g.pauses != pauses {
 		g.mu.Unlock()
 		return nil
 	}
@@ -356,20 +379,28 @@ func (g *captureGate) MicHold() string {
 // beforeGateOpen then holds the gate for the light again, where a person's
 // resume is refused and the switch goes off. While no capture device is
 // present, it takes no light check, and so releases no hold (afterGateOpen).
+// It checks the light's stored pattern (checkLightPattern) before it takes
+// control, so a pause meanwhile takes control at once; the switch it then
+// finds off stops the opening.
 func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight bool) {
 	<-settled
+	var lightErr error
+	if g.beforeGateOpen != nil && g.checkLightPattern != nil && g.canOpen(closing) && !g.captureMissing() {
+		lightErr = g.checkLightPattern()
+	}
 	g.control.Lock()
 
-	g.mu.Lock()
-	open := g.closed && !g.switchOff && !g.lightHeld && g.closings == closing
-	g.mu.Unlock()
-	if !open {
+	if !g.canOpen(closing) {
 		g.control.Unlock()
 		return
 	}
 	checked := g.beforeGateOpen != nil && !g.captureMissing()
 	if checked {
-		if err := g.beforeGateOpen(); err != nil {
+		err := lightErr
+		if err == nil {
+			err = g.beforeGateOpen()
+		}
+		if err != nil {
 			g.mu.Lock()
 			if g.closed && g.closings == closing {
 				if forLight {
@@ -408,6 +439,15 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 	}
 }
 
+// canOpen reports whether openAfter for closing number closing may still open
+// the gate: it is closed, the switch is on, the light does not hold it, and no
+// later closing has happened.
+func (g *captureGate) canOpen(closing int) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closed && !g.switchOff && !g.lightHeld && g.closings == closing
+}
+
 func (g *captureGate) confirmMicStart() error {
 	if g.beforeMicStart == nil {
 		return nil
@@ -434,11 +474,17 @@ func (g *captureGate) captureMissing() bool {
 // stayed red since (lightWentOff). It first looks for a capture device,
 // without opening one (capturePresent): with none it lights nothing and
 // returns errNoCaptureDevice, so the light stays off while the microphone is
-// missing. A light that cannot be confirmed red returns an error that wraps
+// missing. It checks the light's stored pattern first (checkLightPattern). A
+// light that cannot be confirmed red returns an error that wraps
 // errLightNotConfirmed.
 func (g *captureGate) confirmMicOpen() error {
 	if g.captureMissing() {
 		return errNoCaptureDevice
+	}
+	if g.checkLightPattern != nil {
+		if err := g.checkLightPattern(); err != nil {
+			return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
+		}
 	}
 	if err := g.confirmMicStart(); err != nil {
 		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)

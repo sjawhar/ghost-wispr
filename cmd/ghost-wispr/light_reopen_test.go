@@ -29,6 +29,7 @@ type heldLight struct {
 	patternChecks atomic.Int32
 	black         atomic.Bool
 	armedUnknown  atomic.Int32 // tickles that armed the watchdog before the pattern was known black
+	lastRed       atomic.Int64 // when the last red write reached the light, in Unix nanoseconds; 0 before any
 }
 
 var errHeld = fmt.Errorf("read blink(1) version: %w", indicator.ErrBusy)
@@ -77,7 +78,17 @@ func (l *heldLight) SetRGB(r, g, b uint8) error {
 	if l.held.Load() && (r != 0 || g != 0 || b != 0) {
 		return indicator.ErrBusy
 	}
-	return l.reconnectLightFake.SetRGB(r, g, b)
+	err := l.reconnectLightFake.SetRGB(r, g, b)
+	if err == nil && r == 255 && g == 0 && b == 0 {
+		l.lastRed.Store(time.Now().UnixNano())
+	}
+	return err
+}
+
+// redAfter reports whether a red write reached the light after at.
+func (l *heldLight) redAfter(at time.Time) bool {
+	last := l.lastRed.Load()
+	return last != 0 && time.Unix(0, last).After(at)
 }
 
 func (l *heldLight) ServerDown(timeout time.Duration) error {

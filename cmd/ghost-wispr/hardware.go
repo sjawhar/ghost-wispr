@@ -34,9 +34,11 @@ const (
 	recordingLightNotRedWarning  = "Recording light does not show red; the unit does not record until it does"
 	recordingLightFailedWarning  = "Recording light failed; the unit does not record until it shows red again"
 	// recordingLightBusyWarning names a light another program had
-	// (indicator.Contended), not a failed one; the light guard clears it at
-	// the next check that passes.
-	recordingLightBusyWarning = "Recording light busy: another program is using it; the unit does not record until it shows red again"
+	// (indicator.Contended), and recordingLightUncheckedWarning a unit whose
+	// stored pattern is not checked yet (errLightUnchecked); neither light
+	// failed. The light guard clears them at the next check that passes.
+	recordingLightBusyWarning      = "Recording light busy: another program is using it; the unit does not record until it shows red again"
+	recordingLightUncheckedWarning = "Recording light not checked yet: its stored pattern is being checked; the unit does not record until it shows red"
 )
 
 func recordingLightWarning(err error) string {
@@ -47,6 +49,8 @@ func recordingLightWarning(err error) string {
 		return recordingLightNotRedWarning
 	case indicator.Contended(err):
 		return recordingLightBusyWarning
+	case errors.Is(err, errLightUnchecked):
+		return recordingLightUncheckedWarning
 	default:
 		return recordingLightFailedWarning
 	}
@@ -243,13 +247,12 @@ func (h *hardwareControl) Stop() {
 	h.stopped.Store(true)
 }
 
-// EnsureRed confirms the configured indicator is red before a microphone
-// starts or capture opens. Each successful check owns a temporary red hold
-// until that start attempt ends. A missing light fails the check like any
-// other: the unit records only while its light is on. A light whose stored
-// pattern is not yet found black is checked first, before the red hold and
-// without the light's lock, so a pause meanwhile turns the light off at once.
-func (h *hardwareControl) EnsureRed() error {
+// CheckLight checks the stored pattern of a light whose unit is not yet known
+// black (reconnectingLight.CheckPattern), one command at a time. It can take
+// seconds, so it runs before the capture gate's control is taken
+// (captureGate.checkLightPattern), never under it: a pause meanwhile is not
+// held up, and the resume it overtakes does nothing.
+func (h *hardwareControl) CheckLight() error {
 	if h.stopped.Load() {
 		return fmt.Errorf("recording light stopped")
 	}
@@ -259,6 +262,22 @@ func (h *hardwareControl) EnsureRed() error {
 	if err := h.light.CheckPattern(); err != nil {
 		h.Wake()
 		return err
+	}
+	return nil
+}
+
+// EnsureRed confirms the configured indicator is red before a microphone
+// starts or capture opens. Each successful check owns a temporary red hold
+// until that start attempt ends. A missing light fails the check like any
+// other: the unit records only while its light is on. It checks no stored
+// pattern: CheckLight comes first, and a unit still unchecked is refused
+// (errLightUnchecked).
+func (h *hardwareControl) EnsureRed() error {
+	if h.stopped.Load() {
+		return fmt.Errorf("recording light stopped")
+	}
+	if h.light == nil {
+		return nil
 	}
 	// Hold red before the write: reconnectingLight.SetRGB then refuses an off
 	// write the controller decided before this confirmation.
@@ -301,6 +320,13 @@ func guardResumeWithLight(capture *captureGate, warnings *warningsRegistry, onRe
 // red while a microphone is open (startHardware), so it goes off only once the
 // mic loop has closed it, which wakes it.
 func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings *warningsRegistry, onResumeRefused func(error)) {
+	capture.checkLightPattern = func() error {
+		if err := hardware.CheckLight(); err != nil {
+			warnings.Set("recording-light", recordingLightWarning(err))
+			return err
+		}
+		return nil
+	}
 	capture.beforeMicStart = hardware.EnsureRed
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
