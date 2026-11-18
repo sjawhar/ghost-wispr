@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -185,6 +186,21 @@ var errNoCaptureDevice = errors.New("no capture device present")
 // before it opened a device: it opened nothing, and the next resume starts
 // the microphone.
 var errMicStartPaused = errors.New("microphone start cancelled by a pause")
+
+// micStartCancelled reports why a microphone start must open no device now:
+// errMicStartPaused once a pause came during its scan, and an error that
+// wraps ctx's once shutdown has begun. Shutdown waits a bounded time for the
+// mic loops and then turns the light off, so a microphone opened after it
+// would be open with the light off, and nothing would close it.
+func micStartCancelled(ctx context.Context, capture *captureGate) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("microphone start cancelled by shutdown: %w", err)
+	}
+	if capture.isClosed() {
+		return errMicStartPaused
+	}
+	return nil
+}
 
 // startMicIfUnpaused starts the opened microphone unless capture is paused. A
 // paused instance opens no device (startMicrophone), but a pause that lands

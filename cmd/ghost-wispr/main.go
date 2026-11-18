@@ -1607,10 +1607,12 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 		// A pause during the scan cancels the start before any device opens:
 		// the light then goes off at once, and the next resume starts again.
-		if capture.isClosed() {
-			return errMicStartPaused
-		}
+		// So does shutdown, whose wait for the mic loops a long scan can
+		// outlast: nothing would close a microphone opened after it.
 		for _, rate := range cfg.SampleRateCandidates() {
+			if err := micStartCancelled(ctx, capture); err != nil {
+				return err
+			}
 			var candidate *audio.Mic
 			openErr := micDevice.openStream(func() (bool, error) {
 				var err error
