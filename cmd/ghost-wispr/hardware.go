@@ -85,13 +85,11 @@ func runLightOff(stderr io.Writer) error {
 
 // runLightState prints the blink(1)'s colour: red, off, or other with its
 // values. When it cannot read the light, as when another command had the
-// blink(1) (indicator.Contended), it prints unknown and fails.
+// blink(1) (indicator.Contended), it prints unknown and fails. Its open does
+// not fail for another command: the version waits (OpenBlink1ForCommand).
 func runLightState(stdout io.Writer) error {
 	light, err := openBlink1Command(blinkSysfsRoot, blinkDevRoot)
 	if err != nil {
-		if indicator.Contended(err) {
-			_, _ = fmt.Fprintln(stdout, "unknown")
-		}
 		return fmt.Errorf("open indicator: %w", err)
 	}
 	defer func() { _ = light.Close() }()

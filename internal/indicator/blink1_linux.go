@@ -50,13 +50,15 @@ const (
 // light-state runs took the light from it until its wait ran out: with 4
 // light-state loops on a uhid blink(1), the recorder dropped 18 buffers of
 // audio in 20 s (review of #79). A subcommand can wait the longer commandWait.
+// recorderPoll is 1 ms because a shorter sleep sleeps 1 ms anyway: Go's
+// runtime waits for a timer in whole milliseconds (netpoll_epoll.go, go1.25).
 var (
 	exchangeWait = 50 * time.Millisecond
 	commandWait  = 2 * time.Second
 )
 
 const (
-	recorderPoll = 250 * time.Microsecond
+	recorderPoll = time.Millisecond
 	commandPoll  = 5 * time.Millisecond
 	exchangeGap  = 3 * time.Millisecond
 )

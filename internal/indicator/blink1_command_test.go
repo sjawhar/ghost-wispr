@@ -93,6 +93,72 @@ func TestLightOffReachesALightAnotherOpenHolds(t *testing.T) {
 	}
 }
 
+// TestACommandOpenDoesNotFailForAnotherCommand fails if a subcommand's open
+// (`light-state`, `light-off`) fails because another command had the light at
+// its version query: the lock was held past its wait, or another command's
+// reply answered the query. On a uhid blink(1), light-state printed nothing
+// for a version query that the recorder's tickle answered (review of #79).
+// The open must return the light, and a read once the light is free reads it.
+func TestACommandOpenDoesNotFailForAnotherCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		hold  bool // another open holds the lock at the open
+		other bool // another command's reply answers the version query
+	}{
+		{name: "the lock held past the wait", hold: true},
+		{name: "the version query answered by another command", other: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sysfsRoot, devRoot, node := fakeBlink1Sysfs(t)
+			var answeredByOther atomic.Bool
+			answeredByOther.Store(tc.other)
+			original, originalWait := featureIOCTL, commandWait
+			t.Cleanup(func() { featureIOCTL, commandWait = original, originalWait })
+			commandWait = 50 * time.Millisecond
+			featureIOCTL = func(_ uintptr, request uintptr, report *[8]byte) error {
+				if request != hidIOCGetFeature {
+					return nil
+				}
+				switch report[1] {
+				case 'v':
+					if answeredByOther.Load() {
+						*report = Blink1Report('D', [6]byte{1, 1, 44})
+					} else {
+						report[3] = '3'
+					}
+				case 'r':
+					report[2] = 255
+				}
+				return nil
+			}
+			holder, err := os.Open(node)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = holder.Close() })
+			if tc.hold {
+				if err := unix.Flock(int(holder.Fd()), unix.LOCK_EX); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			light, err := OpenBlink1ForCommand(sysfsRoot, devRoot)
+			if err != nil {
+				t.Fatalf("a subcommand's open with %s: %v, want the light", tc.name, err)
+			}
+			t.Cleanup(func() { _ = light.Close() })
+
+			answeredByOther.Store(false)
+			if err := unix.Flock(int(holder.Fd()), unix.LOCK_UN); err != nil {
+				t.Fatal(err)
+			}
+			if r, g, b, err := light.ReadRGB(); err != nil || r != 255 || g != 0 || b != 0 {
+				t.Fatalf("control: read once the light is free = %d,%d,%d, %v, want 255,0,0", r, g, b, err)
+			}
+		})
+	}
+}
+
 // TestAWaitingRecorderGoesBeforeLightState fails if the recorder's reads do
 // not get the light within their wait while light-state runs back to back in
 // four other processes. Such a read is unknown, and the gate drops that buffer

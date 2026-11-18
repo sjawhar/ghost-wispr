@@ -104,30 +104,22 @@ func TestLightStateSubcommand(t *testing.T) {
 // TestLightStateSaysUnknownWhenItCannotRead fails if `ghost-wispr light-state`
 // prints a colour, or nothing, when it could not read the light: when another
 // command held the blink(1) past the wait (indicator.ErrBusy) or answered the
-// query (indicator.ErrOtherReply), at its read or at the version query that
-// opens it, or the read failed. It must print unknown and fail, never red,
-// though the light is red. On a uhid blink(1) light-state printed nothing for
-// a version query that the recorder's tickle answered (review of #79).
+// read (indicator.ErrOtherReply), or the read failed. It must print unknown
+// and fail, never red, though the light is red. Its open does not fail for
+// another command (TestACommandOpenDoesNotFailForAnotherCommand).
 func TestLightStateSaysUnknownWhenItCannotRead(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		openErr error
 		readErr error
 	}{
 		{name: "read busy", readErr: indicator.ErrBusy},
+		{name: "read answered by another command", readErr: fmt.Errorf("%w: 'D' answered 'r'", indicator.ErrOtherReply)},
 		{name: "read failed", readErr: errors.New("blink(1) feature report: no such device")},
-		{name: "version query busy", openErr: fmt.Errorf("read blink(1) version: %w", indicator.ErrBusy)},
-		{name: "version query answered by another command", openErr: fmt.Errorf("read blink(1) version: %w: 'D' answered 'v'", indicator.ErrOtherReply)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			light := &commandLightFake{colour: [3]uint8{255, 0, 0}, readErr: tc.readErr}
 			original := openBlink1Command
-			openBlink1Command = func(string, string) (indicator.Light, error) {
-				if tc.openErr != nil {
-					return nil, tc.openErr
-				}
-				return light, nil
-			}
+			openBlink1Command = func(string, string) (indicator.Light, error) { return light, nil }
 			t.Cleanup(func() { openBlink1Command = original })
 			var stdout, stderr bytes.Buffer
 			if code := runLightCommand([]string{"light-state"}, &stdout, &stderr); code != 1 {
@@ -136,7 +128,7 @@ func TestLightStateSaysUnknownWhenItCannotRead(t *testing.T) {
 			if got := stdout.String(); got != "unknown\n" {
 				t.Fatalf("light-state output = %q, want %q", got, "unknown\n")
 			}
-			if want := errors.Join(tc.openErr, tc.readErr).Error(); !strings.Contains(stderr.String(), want) {
+			if want := tc.readErr.Error(); !strings.Contains(stderr.String(), want) {
 				t.Fatalf("light-state stderr = %q, want the cause %q", stderr.String(), want)
 			}
 		})
