@@ -116,9 +116,13 @@ func TestReadRGBIsNotAnsweredByAnotherHandlesCommand(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			device := &sharedBlink1{names: map[uintptr]string{}, setFrom: map[string]chan struct{}{"second": make(chan struct{}, 1)}}
-			original := featureIOCTL
+			original, originalWait := featureIOCTL, exchangeWait
 			featureIOCTL = device.ioctl
-			t.Cleanup(func() { featureIOCTL = original })
+			// The other handle's command waits for the lock past the 100 ms
+			// this test holds the read between its SET and GET: a lone SET
+			// whose wait ran out goes without the lock (sendLone).
+			exchangeWait = time.Second
+			t.Cleanup(func() { featureIOCTL, exchangeWait = original, originalWait })
 			reader, other := openTwice(t, device)
 			if err := reader.SetRGB(255, 0, 0); err != nil {
 				t.Fatal(err)

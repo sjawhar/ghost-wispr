@@ -197,6 +197,9 @@ func (d fileBlink1) setColour(t *testing.T, colour [3]byte) {
 // lights it red and reads it back.
 func lightRedAndRead() int {
 	featureIOCTL = fileBlink1{path: os.Getenv("GHOST_WISPR_TEST_DEVICE")}.ioctl
+	// It waits for the light past the read the test holds between its SET and
+	// GET, so its commands land after that GET if the read holds the lock.
+	exchangeWait = 5 * time.Second
 	file, err := os.OpenFile(os.Getenv("GHOST_WISPR_TEST_HIDRAW"), os.O_RDWR, 0)
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
@@ -510,8 +513,11 @@ func TestEveryBlink1CommandHoldsTheLock(t *testing.T) {
 		patterns   = map[byte]bool{}
 		sent       = map[byte]int{}
 	)
-	original := featureIOCTL
-	t.Cleanup(func() { featureIOCTL = original })
+	original, originalWait := featureIOCTL, exchangeWait
+	t.Cleanup(func() { featureIOCTL, exchangeWait = original, originalWait })
+	// No command's wait runs out here, so every command, lone SETs too, must
+	// hold the lock.
+	exchangeWait = 10 * time.Second
 	featureIOCTL = func(_ uintptr, request uintptr, report *[8]byte) error {
 		// The sending handle holds the lock if another open of the node cannot take it.
 		held := true

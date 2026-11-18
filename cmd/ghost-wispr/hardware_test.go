@@ -215,6 +215,7 @@ type reconnectLightFake struct {
 	setErr  error
 	readErr error
 	closed  bool
+	tickles int
 }
 
 func (l *reconnectLightFake) SetRGB(r, g, b uint8) error {
@@ -236,8 +237,15 @@ func (l *reconnectLightFake) ReadRGB() (uint8, uint8, uint8, error) {
 	return l.colour[0], l.colour[1], l.colour[2], nil
 }
 
-func (*reconnectLightFake) ServerDown(time.Duration) error { return nil }
-func (*reconnectLightFake) BlackPattern() error            { return nil }
+func (l *reconnectLightFake) ServerDown(timeout time.Duration) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if timeout > 0 {
+		l.tickles++
+	}
+	return nil
+}
+func (*reconnectLightFake) BlackPattern() error { return nil }
 
 func (l *reconnectLightFake) Close() error {
 	l.mu.Lock()
@@ -291,6 +299,46 @@ func TestABusyLightReadCountsAsNotRed(t *testing.T) {
 	}
 	if !device.isRed() {
 		t.Fatal("control: the light is not red, so the test would not show a busy read of red")
+	}
+}
+
+// TestAContendedReadKeepsTheLightOpen fails if a read that another command got
+// in the way of (indicator.ErrBusy, indicator.ErrOtherReply) closes the
+// recorder's handle on the blink(1), as a failed device does. The device did
+// not fail; and closed, the light must be opened again for the next command,
+// with a version query and the black pattern's 33 reads, each waiting for the
+// same lock, so the watchdog tickle never reached the light while another open
+// held it (review of #79). The read still counts the light as not red.
+func TestAContendedReadKeepsTheLightOpen(t *testing.T) {
+	for _, contended := range []error{indicator.ErrBusy, fmt.Errorf("%w: 'P' answered 'r'", indicator.ErrOtherReply)} {
+		t.Run(contended.Error(), func(t *testing.T) {
+			device := &reconnectLightFake{colour: [3]uint8{255, 0, 0}, readErr: contended}
+			opens := 0
+			original := openBlink1
+			openBlink1 = func(string, string) (indicator.Light, error) { opens++; return device, nil }
+			t.Cleanup(func() { openBlink1 = original })
+			light := &reconnectingLight{light: device, warnings: newWarningsRegistry()}
+
+			before := light.offs.Load()
+			if _, _, _, err := light.ReadRGB(); !errors.Is(err, contended) {
+				t.Fatalf("ReadRGB = %v, want %v", err, contended)
+			}
+			if light.offs.Load() == before {
+				t.Fatal("a contended read counted the light as red")
+			}
+			if err := light.ServerDown(3 * time.Second); err != nil {
+				t.Fatalf("watchdog tickle after a contended read: %v", err)
+			}
+			device.mu.Lock()
+			closed, tickles := device.closed, device.tickles
+			device.mu.Unlock()
+			if closed || opens != 0 {
+				t.Fatalf("a contended read closed the light (closed=%t, opened again %d times), want it kept open", closed, opens)
+			}
+			if tickles != 1 {
+				t.Fatalf("watchdog tickles that reached the light = %d, want 1", tickles)
+			}
+		})
 	}
 }
 

@@ -28,13 +28,21 @@ const (
 // recorder, `ghost-wispr light-state`, `ghost-wispr light-off`); and the
 // handle's mu, since a flock does not exclude the handle's own goroutines.
 //
-// exchangeWait bounds a command's wait for the light: a command that does not
-// get it in that time sends nothing and returns ErrBusy. lockPoll is how often
-// it tries again meanwhile. exchangeGap is how long a handle leaves the light
-// free after an exchange before its next one, so a handle that sends one
-// command after another, as the recorder does when it writes the black
-// pattern, does not keep a polling `light-state` out until its wait ends.
-var exchangeWait = 2 * time.Second
+// exchangeWait bounds a command's wait for the light. A query, or a write
+// that sendLone does not send, that does not get the light in that time sends
+// nothing and returns ErrBusy. lockPoll is how often it tries again meanwhile.
+// exchangeGap is how long a handle leaves the light free after an exchange
+// before its next one, so a handle that sends one command after another, as
+// the recorder does when it writes the black pattern, does not keep a polling
+// `light-state` out until its wait ends.
+//
+// The wait is short because the recorder's light calls queue behind each
+// other: the controller's watchdog tickle waits for a read-back of the gate's
+// writer, and a pause's off write for the controller's own read. With a 2 s
+// wait, another open that held the lock kept the tickle from the light past
+// its 3 s timeout (review of #79). An exchange takes about 8 ms on the office
+// Pi (usbmon), so 50 ms lets another Ghost Wispr command finish first.
+var exchangeWait = 50 * time.Millisecond
 
 const (
 	lockPoll    = time.Millisecond
@@ -107,7 +115,15 @@ func (b *blink1) loadVersion() error {
 
 // send sends a command report, holding the light while it does.
 func (b *blink1) send(report *[8]byte) error {
-	return b.exchange(report, false)
+	return b.exchange(report, false, false)
+}
+
+// sendLone sends a lone SET that must reach the light whoever holds it: the
+// watchdog tickle. It waits for the light as send does, and once that wait has
+// run out sends the report without the lock. A lone SET has no GET to protect;
+// it can only answer a query of the holder, whose reply check then refuses it.
+func (b *blink1) sendLone(report *[8]byte) error {
+	return b.exchange(report, false, true)
 }
 
 // query sends a command report and reads the device's reply into it, holding
@@ -118,7 +134,7 @@ func (b *blink1) send(report *[8]byte) error {
 // GET: query returns ErrOtherReply, and the reply is not used.
 func (b *blink1) query(report *[8]byte) error {
 	command := report[1]
-	if err := b.exchange(report, true); err != nil {
+	if err := b.exchange(report, true, false); err != nil {
 		return err
 	}
 	if report[1] != command {
@@ -128,10 +144,14 @@ func (b *blink1) query(report *[8]byte) error {
 }
 
 // exchange sends report and, if reply, reads the reply into it, all under the
-// exchange lock. Every command to the blink(1) goes through here.
-func (b *blink1) exchange(report *[8]byte, reply bool) error {
+// exchange lock. Every command to the blink(1) goes through here. With
+// anyway, a lone SET whose wait for the lock ran out is sent without it.
+func (b *blink1) exchange(report *[8]byte, reply, anyway bool) error {
 	fd := b.file.Fd()
 	if err := b.lock(fd); err != nil {
+		if anyway && !reply && errors.Is(err, ErrBusy) {
+			return featureIOCTL(fd, hidIOCSetFeature, report)
+		}
 		return err
 	}
 	err := featureIOCTL(fd, hidIOCSetFeature, report)
@@ -192,17 +212,20 @@ func (b *blink1) ReadRGB() (r, g, blue uint8, err error) {
 	return report[2], report[3], report[4], nil
 }
 
+// ServerDown tickles the blink(1)'s watchdog, or with timeout 0 turns it off.
+// It reaches the light whoever holds it (sendLone), so the watchdog does not
+// fire while the recorder runs.
 func (b *blink1) ServerDown(timeout time.Duration) error {
 	if timeout <= 0 {
 		report := Blink1Report('D', [6]byte{})
-		return b.send(&report)
+		return b.sendLone(&report)
 	}
 	ticks := timeout / (10 * time.Millisecond)
 	if ticks > 0xffff {
 		ticks = 0xffff
 	}
 	report := Blink1Report('D', [6]byte{1, byte(ticks >> 8), byte(ticks), 1, 0, b.flashPatternLines() - 1})
-	return b.send(&report)
+	return b.sendLone(&report)
 }
 
 // BlackPattern persists an all-black, non-zero-duration pattern so the

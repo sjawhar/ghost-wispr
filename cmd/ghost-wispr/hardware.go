@@ -443,8 +443,14 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 	return light, nil
 }
 
+// failed counts a failed command as a time the light may not be red, and,
+// unless another command only got in its way (lightContended), closes the
+// handle, so the next command opens the light again.
 func (l *reconnectingLight) failed(err error) error {
 	l.offs.Add(1)
+	if lightContended(err) {
+		return err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.light != nil {
@@ -455,6 +461,16 @@ func (l *reconnectingLight) failed(err error) error {
 	l.nextAttempt = time.Time{}
 	l.warnings.Set("recording-light", recordingLightWarning(err))
 	return err
+}
+
+// lightContended reports an error that says another command had the
+// blink(1), not that it failed: its lock was held past the wait
+// (indicator.ErrBusy), or another command's reply answered a query
+// (indicator.ErrOtherReply). The handle stays open. Closed, it would have to
+// be opened again, with a version query and the black pattern's reads, each
+// waiting on the same lock, before the next watchdog tickle could be sent.
+func lightContended(err error) bool {
+	return errors.Is(err, indicator.ErrBusy) || errors.Is(err, indicator.ErrOtherReply)
 }
 
 func (l *reconnectingLight) SetRGB(r, g, b uint8) error {

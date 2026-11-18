@@ -162,9 +162,12 @@ again under a new red check.
 also while the recorder runs. The blink(1) has one report buffer: a read gets the reply to the
 last command any program sent. So every command Ghost Wispr sends, from the recorder or a
 subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node from the command to its
-reply. A command that does not get the lock within 2 s sends nothing: the recorder counts such a
-read as the light not red, and `light-state` prints `unknown` and fails. Programs that do not
-take the lock, such as `blink1-tool`, must not run while the recorder runs.
+reply, and a read takes only a reply that names its own command. A command that does not get the
+lock within 50 ms sends nothing: the recorder counts such a read as the light not red, and
+`light-state` prints `unknown` and fails. The watchdog tickle, which waits for no reply, is the
+exception: it is then sent without the lock, so another program that holds the lock does not let
+the watchdog fire while the recorder runs. Programs that do not take the lock, such as
+`blink1-tool`, must not run while the recorder runs.
 
 ## Deployment
 

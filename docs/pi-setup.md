@@ -436,12 +436,14 @@ has one report buffer, and each read gets the reply to the last command that any
 on the office Pi a `light-state` run while the recorder recorded made the recorder read its red
 light as 0,51,51, the version reply, and drop its audio. So every command that Ghost Wispr sends,
 from the recorder or from a subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node
-from the command to its reply. A command that does not get the lock within 2 seconds sends
-nothing: the recorder counts such a read as the light not red, and `light-state` prints `unknown`
-and fails. Other programs that open the blink(1), such as `blink1-tool`, do not take the lock:
-do not run them while the recorder runs. A process stopped while it holds the lock (`kill -STOP`)
-keeps it; the slice 1 driver's Light hang step therefore stops the recorder with `flock` on the
-node, between two of its commands.
+from the command to its reply, and a read takes only a reply that names its own command. A command
+that does not get the lock within 50 ms sends nothing: the recorder counts such a read as the
+light not red, and `light-state` prints `unknown` and fails. The watchdog tickle, which waits for
+no reply, is then sent without the lock, so the watchdog does not fire while the recorder runs.
+Other programs that open the blink(1), such as `blink1-tool`, do not take the lock: do not run
+them while the recorder runs. A process stopped while it holds the lock (`kill -STOP`) keeps it;
+the slice 1 driver's Light hang step therefore stops the recorder with `flock` on the node, between
+two of its commands.
 
 Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
 a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
