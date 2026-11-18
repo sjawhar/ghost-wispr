@@ -380,12 +380,18 @@ func wakeLightOnCaptureEvent(raw []byte, hardware *hardwareControl) {
 }
 
 type reconnectingLight struct {
-	mu          sync.Mutex
-	deviceMu    sync.Mutex
-	light       indicator.Light
-	nextAttempt time.Time
-	lastErr     error
-	warnings    *warningsRegistry
+	mu       sync.Mutex
+	deviceMu sync.Mutex
+	light    indicator.Light
+	// patternUnchecked marks a light opened while its black pattern could not
+	// be checked, because another command had the light (indicator.Contended).
+	// It is kept, so tickles and off writes, which go without the lock, still
+	// reach it; it lights no red until checkPattern has checked the pattern.
+	// Under deviceMu.
+	patternUnchecked bool
+	nextAttempt      time.Time
+	lastErr          error
+	warnings         *warningsRegistry
 	// holdRed reports that the light must stay red. SetRGB checks it under
 	// deviceMu, so an off write decided before a red confirmation cannot land
 	// after it.
@@ -434,17 +440,44 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 		return nil, err
 	}
 	if err := light.BlackPattern(); err != nil {
+		if indicator.Contended(err) {
+			// Another command had the light. Closed, the light would wait
+			// retryDelay for the next open, with no tickle and no off write
+			// meanwhile (review 5953011789 of #79).
+			l.light = light
+			l.patternUnchecked = true
+			l.offs.Add(1)
+			l.lastErr = nil
+			l.warnings.Set("recording-light", recordingLightWarning(err))
+			return light, nil
+		}
 		_ = light.Close()
 		l.lastErr = err
 		l.nextAttempt = time.Now().Add(l.retryDelay())
 		l.warnings.Set("recording-light", recordingLightWarning(err))
 		return nil, err
 	}
+	l.patternUnchecked = false
 	l.light = light
 	l.offs.Add(1)
 	l.lastErr = nil
 	l.warnings.Clear("recording-light")
 	return light, nil
+}
+
+// checkPattern checks the black pattern of a light kept with it unchecked
+// (patternUnchecked), and reports an error while it is still unchecked. Call
+// it under deviceMu.
+func (l *reconnectingLight) checkPattern(light indicator.Light) error {
+	if !l.patternUnchecked {
+		return nil
+	}
+	if err := light.BlackPattern(); err != nil {
+		return err
+	}
+	l.patternUnchecked = false
+	l.warnings.Clear("recording-light")
+	return nil
 }
 
 // failed counts a failed command as a time the light may not be red, and,
@@ -463,6 +496,7 @@ func (l *reconnectingLight) failed(err error) error {
 	if l.light != nil {
 		_ = l.light.Close()
 		l.light = nil
+		l.patternUnchecked = false
 	}
 	l.lastErr = err
 	l.nextAttempt = time.Time{}
@@ -483,6 +517,8 @@ func (l *reconnectingLight) SetRGB(r, g, b uint8) error {
 	}
 	if !red {
 		l.offs.Add(1)
+	} else if err := l.checkPattern(light); err != nil {
+		return l.failed(err)
 	}
 	if err := light.SetRGB(r, g, b); err != nil {
 		return l.failed(err)
@@ -517,6 +553,10 @@ func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
 	if err := light.ServerDown(timeout); err != nil {
 		return l.failed(err)
 	}
+	// After the tickle, so a pattern check that meets the lock never delays it.
+	if err := l.checkPattern(light); err != nil && !indicator.Contended(err) {
+		return l.failed(err)
+	}
 	return nil
 }
 
@@ -530,6 +570,7 @@ func (l *reconnectingLight) BlackPattern() error {
 	if err := light.BlackPattern(); err != nil {
 		return l.failed(err)
 	}
+	l.patternUnchecked = false
 	return nil
 }
 
@@ -539,6 +580,9 @@ func (l *reconnectingLight) ConfirmRed() error {
 	light, err := l.currentForConfirmation()
 	if err != nil {
 		return err
+	}
+	if err := l.checkPattern(light); err != nil {
+		return l.failed(err)
 	}
 	if err := light.SetRGB(255, 0, 0); err != nil {
 		return l.failed(err)
@@ -565,6 +609,7 @@ func (l *reconnectingLight) Close() error {
 	}
 	err := l.light.Close()
 	l.light = nil
+	l.patternUnchecked = false
 	return err
 }
 
