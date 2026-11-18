@@ -28,25 +28,37 @@ const (
 // recorder, `ghost-wispr light-state`, `ghost-wispr light-off`); and the
 // handle's mu, since a flock does not exclude the handle's own goroutines.
 //
-// exchangeWait bounds a command's wait for the light. A query, or a write
-// that sendLone does not send, that does not get the light in that time sends
-// nothing and returns ErrBusy. lockPoll is how often it tries again meanwhile.
-// exchangeGap is how long a handle leaves the light free after an exchange
-// before its next one, so a handle that sends one command after another, as
-// the recorder does when it writes the black pattern, does not keep a polling
-// `light-state` out until its wait ends.
+// exchangeWait bounds the recorder's wait for the light, and commandWait that
+// of a subcommand (`light-state`, `light-off`). A query, or a write that
+// sendLone does not send, that does not get the light in that time sends
+// nothing and returns ErrBusy. exchangeGap is how long a handle leaves the
+// light free after an exchange before its next one, so a handle that sends one
+// command after another, as the recorder does when it writes the black
+// pattern, does not keep another out until its wait ends.
 //
-// The wait is short because the recorder's light calls queue behind each
+// The recorder's wait is short because its light calls queue behind each
 // other: the controller's watchdog tickle waits for a read-back of the gate's
 // writer, and a pause's off write for the controller's own read. With a 2 s
 // wait, another open that held the lock kept the tickle from the light past
 // its 3 s timeout (review of #79). An exchange takes about 8 ms on the office
 // Pi (usbmon), so 50 ms lets another Ghost Wispr command finish first.
-var exchangeWait = 50 * time.Millisecond
+//
+// The lock serves its waiters in no order, so a waiting recorder is made to go
+// first: it tries again every recorderPoll, a subcommand only every
+// commandPoll, and a subcommand leaves the light free for exchangeGap before
+// its first exchange too. Polling as often as the recorder, back-to-back
+// light-state runs took the light from it until its wait ran out: with 4
+// light-state loops on a uhid blink(1), the recorder dropped 18 buffers of
+// audio in 20 s (review of #79). A subcommand can wait the longer commandWait.
+var (
+	exchangeWait = 50 * time.Millisecond
+	commandWait  = 2 * time.Second
+)
 
 const (
-	lockPoll    = time.Millisecond
-	exchangeGap = 3 * lockPoll
+	recorderPoll = 250 * time.Microsecond
+	commandPoll  = 5 * time.Millisecond
+	exchangeGap  = 3 * time.Millisecond
 )
 
 var featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
@@ -58,14 +70,37 @@ var featureIOCTL = func(fd uintptr, request uintptr, report *[8]byte) error {
 }
 
 type blink1 struct {
-	file         *os.File
+	file *os.File
+	// command marks a subcommand's handle: it waits commandWait, polling every
+	// commandPoll, so a waiting recorder goes first.
+	command  bool
+	mu       sync.Mutex // the handle's part of the exchange lock
+	released time.Time  // the end of the handle's last exchange, under mu
+
+	versionMu sync.Mutex
+	// patternLines is how many pattern lines the light's flash holds, from its
+	// version; 0 until it is read (lines).
 	patternLines uint8
-	mu           sync.Mutex // the handle's part of the exchange lock
-	released     time.Time  // the end of the handle's last exchange, under mu
 }
 
-// OpenBlink1 finds ThingM's blink(1) by its hidraw uevent identity.
+// OpenBlink1 finds ThingM's blink(1) by its hidraw uevent identity and opens
+// it for the recorder.
 func OpenBlink1(sysfsRoot, devRoot string) (Light, error) {
+	return openBlink1(sysfsRoot, devRoot, false)
+}
+
+// OpenBlink1ForCommand opens the blink(1) for a subcommand, `light-state` or
+// `light-off`: its commands wait for the light longer than the recorder's,
+// and let a waiting recorder go first.
+func OpenBlink1ForCommand(sysfsRoot, devRoot string) (Light, error) {
+	return openBlink1(sysfsRoot, devRoot, true)
+}
+
+// openBlink1 opens the blink(1) and reads its version. When another command
+// has the light, the version waits until a command needs it (lines), so an
+// open, and with it `light-off`'s off write, does not fail because another
+// open holds the lock (review of #79).
+func openBlink1(sysfsRoot, devRoot string, command bool) (Light, error) {
 	hidrawDir := filepath.Join(sysfsRoot, "class", "hidraw")
 	entries, err := os.ReadDir(hidrawDir)
 	if err != nil {
@@ -86,14 +121,30 @@ func OpenBlink1(sysfsRoot, devRoot string) (Light, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open blink(1) %s: %w", entry.Name(), err)
 		}
-		light := &blink1{file: file}
-		if err := light.loadVersion(); err != nil {
+		light := &blink1{file: file, command: command}
+		if command {
+			light.released = time.Now()
+		}
+		if _, err := light.lines(); err != nil && !Contended(err) {
 			_ = file.Close()
-			return nil, fmt.Errorf("read blink(1) version: %w", err)
+			return nil, err
 		}
 		return light, nil
 	}
 	return nil, ErrNoBlink1
+}
+
+// lines returns how many pattern lines the light's flash holds, reading its
+// version first if no command has yet.
+func (b *blink1) lines() (uint8, error) {
+	b.versionMu.Lock()
+	defer b.versionMu.Unlock()
+	if b.patternLines == 0 {
+		if err := b.loadVersion(); err != nil {
+			return 0, fmt.Errorf("read blink(1) version: %w", err)
+		}
+	}
+	return b.patternLines, nil
 }
 
 func (b *blink1) loadVersion() error {
@@ -168,17 +219,22 @@ func (b *blink1) exchange(report *[8]byte, reply, anyway bool) error {
 }
 
 // lock takes the exchange lock, the handle's mu and then the flock on its
-// node, or returns ErrBusy once exchangeWait has passed. It leaves the light
-// free for exchangeGap after the handle's last exchange first. It tries before
-// it looks at the clock, so a process stopped while it waited still gets a
-// free light when it runs again.
+// node, or returns ErrBusy once the handle's wait (exchangeWait, or
+// commandWait for a subcommand) has passed. It leaves the light free for
+// exchangeGap after the handle's last exchange first. It tries before it
+// looks at the clock, so a process stopped while it waited still gets a free
+// light when it runs again.
 func (b *blink1) lock(fd uintptr) error {
-	deadline := time.Now().Add(exchangeWait)
+	wait, poll := exchangeWait, recorderPoll
+	if b.command {
+		wait, poll = commandWait, commandPoll
+	}
+	deadline := time.Now().Add(wait)
 	for !b.mu.TryLock() {
 		if !time.Now().Before(deadline) {
 			return ErrBusy
 		}
-		time.Sleep(lockPoll)
+		time.Sleep(poll)
 	}
 	if free := exchangeGap - time.Since(b.released); free > 0 {
 		time.Sleep(free)
@@ -196,7 +252,7 @@ func (b *blink1) lock(fd uintptr) error {
 			b.mu.Unlock()
 			return ErrBusy
 		}
-		time.Sleep(lockPoll)
+		time.Sleep(poll)
 	}
 }
 
@@ -232,7 +288,11 @@ func (b *blink1) ServerDown(timeout time.Duration) error {
 	if ticks > 0xffff {
 		ticks = 0xffff
 	}
-	report := Blink1Report('D', [6]byte{1, byte(ticks >> 8), byte(ticks), 1, 0, b.flashPatternLines() - 1})
+	lines, err := b.lines()
+	if err != nil {
+		return err
+	}
+	report := Blink1Report('D', [6]byte{1, byte(ticks >> 8), byte(ticks), 1, 0, lines - 1})
 	return b.sendLone(&report)
 }
 
@@ -249,12 +309,12 @@ func (b *blink1) BlackPattern() error {
 	return b.writeBlackPattern()
 }
 
-func (b *blink1) flashPatternLines() uint8 {
-	return b.patternLines
-}
-
 func (b *blink1) patternIsBlack() (bool, error) {
-	for line := uint8(0); line < b.flashPatternLines(); line++ {
+	lines, err := b.lines()
+	if err != nil {
+		return false, err
+	}
+	for line := range lines {
 		report := Blink1Report('R', [6]byte{0, 0, 0, 0, 0, line})
 		if err := b.query(&report); err != nil {
 			return false, err
@@ -267,11 +327,15 @@ func (b *blink1) patternIsBlack() (bool, error) {
 }
 
 func (b *blink1) writeBlackPattern() error {
+	lines, err := b.lines()
+	if err != nil {
+		return err
+	}
 	allLEDs := Blink1Report('l', [6]byte{})
 	if err := b.send(&allLEDs); err != nil {
 		return err
 	}
-	for line := uint8(0); line < b.flashPatternLines(); line++ {
+	for line := range lines {
 		black := Blink1Report('P', [6]byte{0, 0, 0, 0, 10, line})
 		if err := b.send(&black); err != nil {
 			return err

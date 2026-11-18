@@ -54,8 +54,12 @@ func listenAddress(address string) string {
 }
 
 var (
-	openBlink1    = indicator.OpenBlink1
-	errLightOther = errors.New("recording light is neither red nor off")
+	openBlink1 = indicator.OpenBlink1
+	// openBlink1Command opens the light for `light-off` and `light-state`:
+	// their commands wait for the light longer than the recorder's, and let a
+	// waiting recorder go first.
+	openBlink1Command = indicator.OpenBlink1ForCommand
+	errLightOther     = errors.New("recording light is neither red nor off")
 	// lightCheckEvery is how often the controller checks the recording light;
 	// lightRetryEvery is how long it waits before it looks again for a light
 	// it lost. Tests shorten both.
@@ -64,7 +68,7 @@ var (
 )
 
 func runLightOff(stderr io.Writer) error {
-	light, err := openBlink1(blinkSysfsRoot, blinkDevRoot)
+	light, err := openBlink1Command(blinkSysfsRoot, blinkDevRoot)
 	if err != nil {
 		if errors.Is(err, indicator.ErrNoBlink1) {
 			_, _ = fmt.Fprintf(stderr, "light-off: %v\n", err)
@@ -80,12 +84,12 @@ func runLightOff(stderr io.Writer) error {
 }
 
 // runLightState prints the blink(1)'s colour: red, off, or other with its
-// values. When it cannot read the light, as when another command held the
-// blink(1) past the wait (indicator.ErrBusy), it prints unknown and fails.
+// values. When it cannot read the light, as when another command had the
+// blink(1) (indicator.Contended), it prints unknown and fails.
 func runLightState(stdout io.Writer) error {
-	light, err := openBlink1(blinkSysfsRoot, blinkDevRoot)
+	light, err := openBlink1Command(blinkSysfsRoot, blinkDevRoot)
 	if err != nil {
-		if errors.Is(err, indicator.ErrBusy) {
+		if indicator.Contended(err) {
 			_, _ = fmt.Fprintln(stdout, "unknown")
 		}
 		return fmt.Errorf("open indicator: %w", err)
@@ -444,11 +448,14 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 }
 
 // failed counts a failed command as a time the light may not be red, and,
-// unless another command only got in its way (lightContended), closes the
-// handle, so the next command opens the light again.
+// unless another command only got in its way (indicator.Contended), closes
+// the handle, so the next command opens the light again. Closed, the light
+// would have to be opened again, with a version query and the black pattern's
+// reads, each waiting on the same lock, before the next watchdog tickle could
+// be sent.
 func (l *reconnectingLight) failed(err error) error {
 	l.offs.Add(1)
-	if lightContended(err) {
+	if indicator.Contended(err) {
 		return err
 	}
 	l.mu.Lock()
@@ -461,16 +468,6 @@ func (l *reconnectingLight) failed(err error) error {
 	l.nextAttempt = time.Time{}
 	l.warnings.Set("recording-light", recordingLightWarning(err))
 	return err
-}
-
-// lightContended reports an error that says another command had the
-// blink(1), not that it failed: its lock was held past the wait
-// (indicator.ErrBusy), or another command's reply answered a query
-// (indicator.ErrOtherReply). The handle stays open. Closed, it would have to
-// be opened again, with a version query and the black pattern's reads, each
-// waiting on the same lock, before the next watchdog tickle could be sent.
-func lightContended(err error) bool {
-	return errors.Is(err, indicator.ErrBusy) || errors.Is(err, indicator.ErrOtherReply)
 }
 
 func (l *reconnectingLight) SetRGB(r, g, b uint8) error {

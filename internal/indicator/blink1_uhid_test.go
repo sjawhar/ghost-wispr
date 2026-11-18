@@ -303,8 +303,8 @@ func lightStateLoop() int {
 		if i > 0 {
 			time.Sleep(10 * time.Millisecond)
 		}
-		light, err := OpenBlink1("/sys", os.Getenv("GHOST_WISPR_TEST_DEV_ROOT"))
-		if contended(err) {
+		light, err := OpenBlink1ForCommand("/sys", os.Getenv("GHOST_WISPR_TEST_DEV_ROOT"))
+		if Contended(err) {
 			unknown++
 			continue
 		}
@@ -314,7 +314,7 @@ func lightStateLoop() int {
 		}
 		r, g, b, err := light.ReadRGB()
 		_ = light.Close()
-		if contended(err) {
+		if Contended(err) {
 			unknown++
 			continue
 		}
@@ -333,20 +333,16 @@ func lightStateLoop() int {
 	return 0
 }
 
-// contended reports a read that another command got in the way of: it has no
-// colour, and light-state prints unknown for it.
-func contended(err error) bool {
-	return errors.Is(err, ErrBusy) || errors.Is(err, ErrOtherReply)
-}
-
 // TestUhidARecorderReadIsNotAnsweredByLightState fails if the recorder's read
 // of its red light, or a `ghost-wispr light-state` run meanwhile, is answered
 // by the other's command on a real hidraw node: on the office Pi the recorder
 // read 0,51,51, light-state's version reply, and light-state read 1,1,44, the
 // recorder's watchdog tickle. Here the recorder tickles the watchdog and reads
 // the light back, over and over, while two other processes run light-state
-// 150 times each, back to back. A read may then not get the light within its
-// wait: it reports unknown, which is allowed. A colour other than red is not.
+// 150 times each, back to back. A light-state read may then not get the light
+// within its wait: it reports unknown, which is allowed. A colour other than
+// red is not, and the recorder, which goes first, must get the light each time:
+// an unknown read drops a buffer of audio (review of #79).
 //
 // uhid fails a request with EIO when a signal ends its wait for the reply,
 // and Go's runtime preempts goroutines with signals, so the test needs
@@ -420,7 +416,7 @@ func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
 			t.Fatalf("tickle: %v", err)
 		}
 		r, g, b, err := recorder.ReadRGB()
-		if contended(err) {
+		if Contended(err) {
 			unknown++
 			continue
 		}
@@ -448,6 +444,9 @@ func TestUhidARecorderReadIsNotAnsweredByLightState(t *testing.T) {
 	}
 	if notRed > 0 {
 		t.Errorf("the recorder read its red light as not red %d of %d times, first %s", notRed, reads, first)
+	}
+	if unknown > 0 {
+		t.Errorf("the recorder's read got no light %d of %d times while light-state ran, want 0", unknown, reads+unknown)
 	}
 	for _, output := range outputs {
 		var loopReads, loopNotRed, loopUnknown int

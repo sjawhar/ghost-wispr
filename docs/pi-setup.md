@@ -436,14 +436,16 @@ has one report buffer, and each read gets the reply to the last command that any
 on the office Pi a `light-state` run while the recorder recorded made the recorder read its red
 light as 0,51,51, the version reply, and drop its audio. So every command that Ghost Wispr sends,
 from the recorder or from a subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node
-from the command to its reply, and a read takes only a reply that names its own command. A command
-that does not get the lock within 50 ms sends nothing: the recorder counts such a read as the
-light not red, and `light-state` prints `unknown` and fails. The watchdog tickle and an off write,
-which wait for no reply, are then sent without the lock, so the watchdog does not fire while the
-recorder runs, and a pause turns the blink(1) off within 500 ms whoever holds the lock. A red
-write sends nothing.
-Other programs that open the blink(1), such as `blink1-tool`, do not take the lock: do not run
-them while the recorder runs. A process stopped while it holds the lock (`kill -STOP`) keeps it;
+from the command to its reply, and a read takes only a reply that names its own command. A recorder
+command that does not get the lock within 50 ms, or a subcommand's within 2 seconds, sends nothing:
+the recorder counts such a read as the light not red, and `light-state` prints `unknown` and
+fails. A waiting recorder gets the lock before a subcommand does, so `light-state` runs do not make
+the recorder drop audio. The watchdog tickle and an off write, which wait for no reply, are then
+sent without the lock, so the watchdog does not fire while the recorder runs, a pause turns the
+blink(1) off within 500 ms whoever holds the lock, and `light-off` turns it off. A red write sends
+nothing. Other programs that open the blink(1), such as `blink1-tool`, do not take the lock: do
+not run them while the recorder runs, since their own colour read can still answer the recorder's.
+A process stopped while it holds the lock (`kill -STOP`) keeps it;
 the slice 1 driver's Light hang step therefore stops the recorder with `flock` on the node, between
 two of its commands.
 

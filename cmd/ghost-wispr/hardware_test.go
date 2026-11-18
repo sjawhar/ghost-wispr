@@ -43,9 +43,9 @@ func (l *commandLightFake) Close() error {
 // recording indicator lit.
 func TestLightOffSubcommandSendsOff(t *testing.T) {
 	light := &commandLightFake{colour: [3]uint8{255, 0, 0}}
-	original := openBlink1
-	openBlink1 = func(string, string) (indicator.Light, error) { return light, nil }
-	t.Cleanup(func() { openBlink1 = original })
+	original := openBlink1Command
+	openBlink1Command = func(string, string) (indicator.Light, error) { return light, nil }
+	t.Cleanup(func() { openBlink1Command = original })
 
 	var stderr bytes.Buffer
 	if err := runLightOff(&stderr); err != nil {
@@ -60,9 +60,9 @@ func TestLightOffSubcommandSendsOff(t *testing.T) {
 }
 
 func TestLightOffSubcommandWithoutDeviceSucceeds(t *testing.T) {
-	original := openBlink1
-	openBlink1 = func(string, string) (indicator.Light, error) { return nil, indicator.ErrNoBlink1 }
-	t.Cleanup(func() { openBlink1 = original })
+	original := openBlink1Command
+	openBlink1Command = func(string, string) (indicator.Light, error) { return nil, indicator.ErrNoBlink1 }
+	t.Cleanup(func() { openBlink1Command = original })
 
 	var stderr bytes.Buffer
 	if err := runLightOff(&stderr); err != nil {
@@ -86,9 +86,9 @@ func TestLightStateSubcommand(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			light := &commandLightFake{colour: tc.color}
-			original := openBlink1
-			openBlink1 = func(string, string) (indicator.Light, error) { return light, nil }
-			t.Cleanup(func() { openBlink1 = original })
+			original := openBlink1Command
+			openBlink1Command = func(string, string) (indicator.Light, error) { return light, nil }
+			t.Cleanup(func() { openBlink1Command = original })
 			var stdout bytes.Buffer
 			err := runLightState(&stdout)
 			if (err != nil) != tc.wantErr {
@@ -103,9 +103,11 @@ func TestLightStateSubcommand(t *testing.T) {
 
 // TestLightStateSaysUnknownWhenItCannotRead fails if `ghost-wispr light-state`
 // prints a colour, or nothing, when it could not read the light: when another
-// command held the blink(1) past the wait (indicator.ErrBusy), at its read or
-// at the version query that opens it, or the read failed. It must print
-// unknown and fail, never red, though the light is red.
+// command held the blink(1) past the wait (indicator.ErrBusy) or answered the
+// query (indicator.ErrOtherReply), at its read or at the version query that
+// opens it, or the read failed. It must print unknown and fail, never red,
+// though the light is red. On a uhid blink(1) light-state printed nothing for
+// a version query that the recorder's tickle answered (review of #79).
 func TestLightStateSaysUnknownWhenItCannotRead(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -115,17 +117,18 @@ func TestLightStateSaysUnknownWhenItCannotRead(t *testing.T) {
 		{name: "read busy", readErr: indicator.ErrBusy},
 		{name: "read failed", readErr: errors.New("blink(1) feature report: no such device")},
 		{name: "version query busy", openErr: fmt.Errorf("read blink(1) version: %w", indicator.ErrBusy)},
+		{name: "version query answered by another command", openErr: fmt.Errorf("read blink(1) version: %w: 'D' answered 'v'", indicator.ErrOtherReply)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			light := &commandLightFake{colour: [3]uint8{255, 0, 0}, readErr: tc.readErr}
-			original := openBlink1
-			openBlink1 = func(string, string) (indicator.Light, error) {
+			original := openBlink1Command
+			openBlink1Command = func(string, string) (indicator.Light, error) {
 				if tc.openErr != nil {
 					return nil, tc.openErr
 				}
 				return light, nil
 			}
-			t.Cleanup(func() { openBlink1 = original })
+			t.Cleanup(func() { openBlink1Command = original })
 			var stdout, stderr bytes.Buffer
 			if code := runLightCommand([]string{"light-state"}, &stdout, &stderr); code != 1 {
 				t.Fatalf("light-state exit code = %d, want 1", code)
