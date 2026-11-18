@@ -62,6 +62,7 @@ type Config struct {
 	MinSessionSegments            int                `yaml:"min_session_segments"`
 	MicSampleRate                 int                `yaml:"mic_sample_rate"`
 	MicSampleRates                []int              `yaml:"mic_sample_rates"`
+	MicDevice                     string             `yaml:"mic_device"` // the sound card the microphone opens, by its ALSA id or name; empty opens the default input
 	GDriveFolderID                string             `yaml:"gdrive_folder_id"`
 	GoogleCredentialsFile         string             `yaml:"google_credentials_file"`
 	GCPProject                    string             `yaml:"gcp_project"`
@@ -373,6 +374,9 @@ func applyEnvOverrides(cfg *Config) []string {
 	}
 	if v := os.Getenv(EnvPrefix + "SPEAKER_DEVICE"); v != "" {
 		cfg.SpeakerDevice = v
+	}
+	if v := os.Getenv(EnvPrefix + "MIC_DEVICE"); v != "" {
+		cfg.MicDevice = strings.TrimSpace(v)
 	}
 	if v := os.Getenv(EnvPrefix + "INDICATOR_LIGHT"); v != "" {
 		cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(v))

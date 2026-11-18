@@ -29,7 +29,7 @@ func TestMicCloseEndsAStreamThatBeganWhileCloseWaited(t *testing.T) {
 			t.Cleanup(func() { openInputStreamFn = original })
 			stream := newHeldStream()
 			openInputStreamFn = stream.open
-			mic, err := NewMic(16000, 4)
+			mic, err := NewMic("", 16000, 4)
 			if err != nil {
 				t.Fatalf("NewMic: %v", err)
 			}
@@ -131,8 +131,8 @@ func TestMicIsOpenUntilItsCaptureStreamHasClosed(t *testing.T) {
 			original := openInputStreamFn
 			t.Cleanup(func() { openInputStreamFn = original })
 			s := &slowCloseStream{blockStop: tc.blockStop, entered: make(chan struct{}), release: make(chan struct{})}
-			openInputStreamFn = func(_, _ int, _ *[]int16) (inputStream, error) { return s, nil }
-			mic, err := NewMic(16000, 4000)
+			openInputStreamFn = func(_ string, _, _ int, _ *[]int16) (inputStream, error) { return s, nil }
+			mic, err := NewMic("", 16000, 4000)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,8 +42,9 @@ type inputStream interface {
 	Read() error
 }
 
-// openInputStreamFn opens a capture stream that reads into *window: each Read
-// reads len(*window) frames into it.
+// openInputStreamFn opens a capture stream on device, the mic_device setting
+// (openInputStream), that reads into *window: each Read reads len(*window)
+// frames into it.
 var openInputStreamFn = openInputStream
 
 // Mic is a PortAudio capture stream that delivers buffers of framesPerBuffer
@@ -70,15 +72,18 @@ type Mic struct {
 	// through a pointer to window, so each Read reads len(window) frames.
 	buf             []int16
 	window          []int16
+	device          string // the mic_device setting: the sound card it opens, or "" for the default input
 	sampleRate      int
 	framesPerBuffer int
 	held            atomic.Bool // a capture stream is open: from the open until Close closes it
 }
 
-// NewMic opens a PortAudio capture stream with the given sample rate and buffer size (in frames).
-func NewMic(sampleRate, framesPerBuffer int) (*Mic, error) {
-	m := &Mic{buf: make([]int16, framesPerBuffer), sampleRate: sampleRate, framesPerBuffer: framesPerBuffer}
-	stream, err := openInputStreamFn(sampleRate, framesPerBuffer, &m.window)
+// NewMic opens a PortAudio capture stream on device, the mic_device setting
+// ("" for the default input), with the given sample rate and buffer size (in
+// frames).
+func NewMic(device string, sampleRate, framesPerBuffer int) (*Mic, error) {
+	m := &Mic{buf: make([]int16, framesPerBuffer), device: device, sampleRate: sampleRate, framesPerBuffer: framesPerBuffer}
+	stream, err := openInputStreamFn(device, sampleRate, framesPerBuffer, &m.window)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +191,7 @@ func (m *Mic) Open() error {
 	if err := m.Close(); errors.Is(err, ErrMicStillReading) {
 		return err
 	}
-	stream, err := openInputStreamFn(m.sampleRate, m.framesPerBuffer, &m.window)
+	stream, err := openInputStreamFn(m.device, m.sampleRate, m.framesPerBuffer, &m.window)
 	if err != nil {
 		return err
 	}
@@ -318,7 +323,23 @@ func (m *Mic) SampleRate() int {
 	return m.sampleRate
 }
 
-func openInputStream(sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
+// Each PortAudio call openInputStream makes for a named device; tests replace
+// them.
+var (
+	paInputDevices = portaudio.Devices
+	paOpenInput    = func(params portaudio.StreamParameters, window *[]int16) (inputStream, error) {
+		return portaudio.OpenStream(params, window)
+	}
+)
+
+// openInputStream opens a capture stream. With device set, the mic_device
+// setting, it opens the input of the sound card device names, and no other
+// (openNamedInput). Empty, it opens PortAudio's default input, else the
+// first input device that opens.
+func openInputStream(device string, sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
+	if device != "" {
+		return openNamedInput(device, sampleRate, framesPerBuffer, window)
+	}
 	stream, err := portaudio.OpenDefaultStream(1, 0, float64(sampleRate), framesPerBuffer, window)
 	if err == nil {
 		return stream, nil
@@ -352,4 +373,49 @@ func openInputStream(sampleRate, framesPerBuffer int, window *[]int16) (inputStr
 		return nil, fmt.Errorf("default input failed: %w; fallback device open failed: %w", err, firstErr)
 	}
 	return nil, err
+}
+
+// openNamedInput opens the first capture PCM of the sound card device names
+// (findCard), through the PortAudio device ALSA lists for it ("... (hw:N,M)",
+// or "(plughw:N,M)" with PA_ALSA_PLUGHW set), and fails when it cannot: it
+// falls back to no other input, which could record from a card nobody chose,
+// such as an ALSA loopback, with the light red. PortAudio converts the sample
+// format and the channel count; the caller tries each sample rate.
+func openNamedInput(device string, sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
+	card, _, dev, cards, found := findCard(device, "c")
+	if !found {
+		return nil, fmt.Errorf("mic_device %q: no sound card with a capture device matches it (cards: %s)", device, strings.Join(cards, ", "))
+	}
+	devices, err := paInputDevices()
+	if err != nil {
+		return nil, fmt.Errorf("mic_device %q: list PortAudio devices: %w", device, err)
+	}
+	info := inputDeviceFor(devices, card, dev)
+	if info == nil {
+		return nil, fmt.Errorf("mic_device %q: PortAudio lists no input for card %s, device %s", device, card, dev)
+	}
+	params := portaudio.HighLatencyParameters(info, nil)
+	params.Input.Channels = 1
+	params.SampleRate = float64(sampleRate)
+	params.FramesPerBuffer = framesPerBuffer
+	// Stream polls the stream every micReadPoll and takes a buffer of
+	// framesPerBuffer frames at a time: let ALSA hold two of them.
+	params.Input.Latency = max(params.Input.Latency, 2*time.Duration(framesPerBuffer)*time.Second/time.Duration(sampleRate))
+	return paOpenInput(params, window)
+}
+
+// inputDeviceFor returns the PortAudio input device for ALSA card card,
+// device dev, or nil when PortAudio lists none.
+func inputDeviceFor(devices []*portaudio.DeviceInfo, card, dev string) *portaudio.DeviceInfo {
+	for _, info := range devices {
+		if info == nil || info.MaxInputChannels < 1 {
+			continue
+		}
+		for _, prefix := range []string{"(hw:", "(plughw:"} {
+			if strings.HasSuffix(info.Name, prefix+card+","+dev+")") {
+				return info
+			}
+		}
+	}
+	return nil
 }

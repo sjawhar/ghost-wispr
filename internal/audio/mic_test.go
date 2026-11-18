@@ -43,7 +43,7 @@ func newHeldStream() *heldStream {
 }
 
 // open is an openInputStreamFn that opens s.
-func (s *heldStream) open(_, _ int, window *[]int16) (inputStream, error) {
+func (s *heldStream) open(_ string, _, _ int, window *[]int16) (inputStream, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.window = window
@@ -184,7 +184,7 @@ func openHeldMic(t *testing.T, framesPerBuffer int, w io.Writer) (*heldStream, *
 	t.Cleanup(func() { openInputStreamFn = original })
 	stream := newHeldStream()
 	openInputStreamFn = stream.open
-	mic, err := NewMic(16000, framesPerBuffer)
+	mic, err := NewMic("", 16000, framesPerBuffer)
 	if err != nil {
 		t.Fatalf("NewMic: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestNewMicUsesOpenInputStreamFn(t *testing.T) {
 	})
 
 	wantErr := errors.New("boom")
-	openInputStreamFn = func(sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
+	openInputStreamFn = func(_ string, sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
 		if sampleRate != 16000 {
 			t.Fatalf("unexpected sample rate: %d", sampleRate)
 		}
@@ -316,13 +316,13 @@ func TestNewMicUsesOpenInputStreamFn(t *testing.T) {
 		return nil, wantErr
 	}
 
-	_, err := NewMic(16000, 4000)
+	_, err := NewMic("", 16000, 4000)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected %v, got %v", wantErr, err)
 	}
 
-	openInputStreamFn = func(int, int, *[]int16) (inputStream, error) { return newHeldStream(), nil }
-	mic, err := NewMic(16000, 4000)
+	openInputStreamFn = func(string, int, int, *[]int16) (inputStream, error) { return newHeldStream(), nil }
+	mic, err := NewMic("", 16000, 4000)
 	if err != nil {
 		t.Fatalf("NewMic: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestMicReopenFailureClearsStreamAndMarksInactive(t *testing.T) {
 		openInputStreamFn = original
 	})
 
-	openInputStreamFn = func(int, int, *[]int16) (inputStream, error) {
+	openInputStreamFn = func(string, int, int, *[]int16) (inputStream, error) {
 		return nil, errors.New("open failed")
 	}
 
@@ -414,7 +414,7 @@ func TestMicIsOpenIsSafeDuringReopen(t *testing.T) {
 		openInputStreamFn = original
 	})
 	// A stream that opens but cannot start: each Reopen opens and closes one.
-	openInputStreamFn = func(int, int, *[]int16) (inputStream, error) {
+	openInputStreamFn = func(string, int, int, *[]int16) (inputStream, error) {
 		return &portaudio.Stream{}, nil
 	}
 
@@ -448,7 +448,7 @@ func TestMicOpenDoesNotReinitializePortAudio(t *testing.T) {
 	})
 	opens := 0
 	// A stand-in stream opens but cannot start.
-	openInputStreamFn = func(int, int, *[]int16) (inputStream, error) {
+	openInputStreamFn = func(string, int, int, *[]int16) (inputStream, error) {
 		opens++
 		return &portaudio.Stream{}, nil
 	}

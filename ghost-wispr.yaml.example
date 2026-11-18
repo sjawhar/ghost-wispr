@@ -35,6 +35,10 @@ silence_timeout: 30s
 # Microphone — preferred sample rate tried first, then alternatives
 mic_sample_rate: 16000
 mic_sample_rates: [48000, 44100, 32000, 24000]
+# The sound card the microphone opens, by its ALSA id or a word of its name in
+# /proc/asound/cards (GHOST_WISPR_MIC_DEVICE overrides it). Set, no other input
+# opens, and no other card counts as the microphone. Unset, the default input.
+# mic_device: Jabra
 
 # Office recorder hardware (each is disabled unless configured)
 # indicator_light: blink1

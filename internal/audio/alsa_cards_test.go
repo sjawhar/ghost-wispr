@@ -23,17 +23,17 @@ func TestCaptureDevicePresentReadsALSAsCardList(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if CaptureDevicePresent() {
+	if CaptureDevicePresent("") {
 		t.Fatal("found a capture device where ALSA lists only playback PCMs")
 	}
 	if err := os.MkdirAll(filepath.Join(root, "card2", "pcm0c"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if !CaptureDevicePresent() {
+	if !CaptureDevicePresent("") {
 		t.Fatal("missed the capture PCM ALSA lists as card2/pcm0c")
 	}
 	asoundRoot = filepath.Join(root, "missing")
-	if !CaptureDevicePresent() {
+	if !CaptureDevicePresent("") {
 		t.Fatal("a system with no /proc/asound reported no capture device, which holds the microphone back")
 	}
 }

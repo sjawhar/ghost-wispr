@@ -1395,7 +1395,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	micDevice := newCaptureDevice(capture.IsPaused)
 	capture.beforeMicOpen = micDevice.prepareLightForOpen
 	capture.onMicHeld = micHeldWarning(warningRegistry)
-	capture.capturePresent = captureDevicePresent(warningRegistry, audio.CaptureDevicePresent)
+	capture.capturePresent = captureDevicePresent(warningRegistry, func() bool { return audio.CaptureDevicePresent(cfg.MicDevice) })
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry)
 
@@ -1614,7 +1614,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			var candidate *audio.Mic
 			openErr := micDevice.openStream(func() (bool, error) {
 				var err error
-				candidate, err = audio.NewMic(rate, rate/4) // 250ms buffer
+				candidate, err = audio.NewMic(cfg.MicDevice, rate, rate/4) // 250ms buffer
 				return err == nil, err
 			})
 			if openErr != nil {
