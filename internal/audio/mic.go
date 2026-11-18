@@ -376,11 +376,14 @@ func openInputStream(device string, sampleRate, framesPerBuffer int, window *[]i
 }
 
 // openNamedInput opens the first capture PCM of the sound card device names
-// (findCard), through the PortAudio device ALSA lists for it ("... (hw:N,M)",
-// or "(plughw:N,M)" with PA_ALSA_PLUGHW set), and fails when it cannot: it
-// falls back to no other input, which could record from a card nobody chose,
-// such as an ALSA loopback, with the light red. PortAudio converts the sample
-// format and the channel count; the caller tries each sample rate.
+// (findCard), through the plug device PortAudio lists for it, "...
+// (plughw:N,M)" (UsePlugCapture), at sampleRate, which ALSA's plug layer
+// converts from the rate the card takes. It fails when PortAudio lists no plug
+// device for the card, as when it lists only the raw "(hw:N,M)", which opens
+// only at the card's own rate (32000 Hz on the Jabra Speak2 75), where every
+// 16000 Hz assumption downstream would be wrong. It falls back to no other
+// input, which could record from a card nobody chose, such as an ALSA
+// loopback, with the light red.
 func openNamedInput(device string, sampleRate, framesPerBuffer int, window *[]int16) (inputStream, error) {
 	card, _, dev, cards, found := findCard(device, "c")
 	if !found {
@@ -390,9 +393,9 @@ func openNamedInput(device string, sampleRate, framesPerBuffer int, window *[]in
 	if err != nil {
 		return nil, fmt.Errorf("mic_device %q: list PortAudio devices: %w", device, err)
 	}
-	info := inputDeviceFor(devices, card, dev)
+	info := plugInputFor(devices, card, dev)
 	if info == nil {
-		return nil, fmt.Errorf("mic_device %q: PortAudio lists no input for card %s, device %s", device, card, dev)
+		return nil, fmt.Errorf("mic_device %q: PortAudio lists no plug input (plughw:%s,%s) for card %s, device %s", device, card, dev, card, dev)
 	}
 	params := portaudio.HighLatencyParameters(info, nil)
 	params.Input.Channels = 1
@@ -404,17 +407,12 @@ func openNamedInput(device string, sampleRate, framesPerBuffer int, window *[]in
 	return paOpenInput(params, window)
 }
 
-// inputDeviceFor returns the PortAudio input device for ALSA card card,
-// device dev, or nil when PortAudio lists none.
-func inputDeviceFor(devices []*portaudio.DeviceInfo, card, dev string) *portaudio.DeviceInfo {
+// plugInputFor returns the PortAudio input device for ALSA card card, device
+// dev, through ALSA's plug layer, or nil when PortAudio lists none.
+func plugInputFor(devices []*portaudio.DeviceInfo, card, dev string) *portaudio.DeviceInfo {
 	for _, info := range devices {
-		if info == nil || info.MaxInputChannels < 1 {
-			continue
-		}
-		for _, prefix := range []string{"(hw:", "(plughw:"} {
-			if strings.HasSuffix(info.Name, prefix+card+","+dev+")") {
-				return info
-			}
+		if info != nil && info.MaxInputChannels > 0 && strings.HasSuffix(info.Name, "(plughw:"+card+","+dev+")") {
+			return info
 		}
 	}
 	return nil

@@ -137,7 +137,8 @@ while the light is off. Before it lights the blink(1) for an open, the recorder 
 `/api/status` warns `No microphone found`, and the start-up retry looks again every 15 seconds.
 With `mic_device` set (a sound card's ALSA id or a word of its name, as `Jabra`; or
 `GHOST_WISPR_MIC_DEVICE`), only that card's capture device counts, and the microphone opens that
-card's input and no other; unset, any capture device counts and the default input opens.
+card's input and no other, through ALSA's plug layer (`plughw`), so it captures at 16000 Hz
+whatever rate the card takes; unset, any capture device counts and the default input opens.
 A unit that starts paused scans only at its first resume. The speaker does not need the scan: on
 Linux it plays through the ALSA playback device that `speaker_device` names (a PCM such as
 `plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and

@@ -399,8 +399,11 @@ The blink(1) reads back red before the microphone opens, and stays red until it 
 start, resume and reconnect of the microphone, and PortAudio's device scan, waits for that check.
 Before it lights the blink(1) for an open, Ghost Wispr looks in `/proc/asound` for a capture PCM
 (`cardN/pcmMc`) of the card `mic_device: J75` names, the Jabra Speak2 75's ALSA card id, without
-opening one, and it opens only that card's input. With the Jabra unplugged there is none, also while
-another capture card, such as the ALSA loopback or a second Jabra device, is present; then
+opening one, and it opens only that card's input, through ALSA's plug layer (`plughw:0,0`): the
+Jabra captures only at 32000 Hz, and the plug layer gives Ghost Wispr the 16000 Hz it records and
+streams at, so the log says `microphone started at 16000 Hz`. With the Jabra unplugged there is
+none, also while another capture card, such as the ALSA loopback or a second Jabra device, is
+present; then
 the blink(1) stays off, `/api/status` warns `No microphone found`, and the start-up retry (every 15
 seconds) and the reconnect (backing off to every 30 seconds) look again without lighting it. A unit that
 starts paused scans only at its first resume. The speaker does not wait for it: it plays through the

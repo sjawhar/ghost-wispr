@@ -78,9 +78,10 @@ func TestCaptureDevicePresentLooksOnlyAtTheNamedCard(t *testing.T) {
 func TestANamedMicrophoneOpensOnlyThatCardsInput(t *testing.T) {
 	originalDevices, originalOpen := paInputDevices, paOpenInput
 	t.Cleanup(func() { paInputDevices, paOpenInput = originalDevices, originalOpen })
-	// PortAudio's ALSA names: "<card name>: <device name> (hw:<card>,<device>)".
-	loopback := &portaudio.DeviceInfo{Name: "Loopback: PCM (hw:3,0)", MaxInputChannels: 32}
-	jabra := &portaudio.DeviceInfo{Name: "Jabra Speak2 75: USB Audio (hw:0,0)", MaxInputChannels: 1}
+	// PortAudio's ALSA names with the plug layer (UsePlugCapture):
+	// "<card name>: <device name> (plughw:<card>,<device>)".
+	loopback := &portaudio.DeviceInfo{Name: "Loopback: PCM (plughw:3,0)", MaxInputChannels: 32}
+	jabra := &portaudio.DeviceInfo{Name: "Jabra Speak2 75: USB Audio (plughw:0,0)", MaxInputChannels: 1}
 	defaultInput := &portaudio.DeviceInfo{Name: "default", MaxInputChannels: 32}
 	var opened []string
 	paOpenInput = func(params portaudio.StreamParameters, _ *[]int16) (inputStream, error) {
