@@ -200,11 +200,12 @@ func TestAKnownLightOpenedAgainWhileHeldIsTickled(t *testing.T) {
 // the watchdog of a blink(1) whose stored pattern it has not found black: a
 // unit plugged in after an unplug. If no tickle followed (a crash, kill
 // -STOP), that watchdog would play the unit's own pattern, not black (red
-// team, review 5954543056 of #79). It also fails if the reopen checks that
-// pattern itself: the red path does, one command at a time (review 5956273705
-// of #79). The unit gets off writes, and no red, and once the check before a
-// red confirmation finds it black it is tickled. The lock is free, or another
-// open holds it, at the reopen.
+// team, review 5954543056 of #79). It also fails if the reopen, a tickle or
+// a write waits for that check: the unit gets off writes at once and no red,
+// and a refused tickle or red write starts the check in the background,
+// one command at a time (reviews 5956273705 and 5958478401 of #79). Once the
+// check finds the unit black, it is tickled and lit red; the unit is checked
+// once. The lock is free, or another open holds it, at the reopen.
 func TestAnotherUnitIsNotArmedUntilItsPatternIsChecked(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -216,41 +217,38 @@ func TestAnotherUnitIsNotArmedUntilItsPatternIsChecked(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var held atomic.Bool
 			light, second := failTheRecordersHandle(t, &held, false)
+			second.checkTakes = 330 * time.Millisecond // 10 ms a command
 			held.Store(tc.heldAtReopen)
+			started := time.Now()
 			for range 3 {
 				_ = light.ServerDown(3 * time.Second)
-			}
-			held.Store(false)
-			if n := second.armedUnknown.Load(); n > 0 {
-				t.Fatalf("%d of 3 watchdog tickles armed a blink(1) whose stored pattern was not found black", n)
-			}
-			if n := second.tickleCount(); n != 0 {
-				t.Fatalf("tickles that reached the unchecked unit = %d, want 0", n)
-			}
-			if n := second.patternChecks.Load(); n != 0 {
-				t.Fatalf("pattern checks run by the reopen and its tickles = %d, want 0: only the check before a red confirmation runs one", n)
 			}
 			if err := light.SetRGB(0, 0, 0); err != nil || second.colour() != ([3]uint8{}) {
 				t.Fatalf("off write to the unchecked unit: %v, colour %v, want it off", err, second.colour())
 			}
-			if err := light.SetRGB(255, 0, 0); err == nil || second.colour() != ([3]uint8{}) {
+			held.Store(false)
+			if err := light.SetRGB(255, 0, 0); !errors.Is(err, errLightUnchecked) || second.colour() != ([3]uint8{}) {
 				t.Fatalf("red write to the unchecked unit: %v, colour %v, want it refused", err, second.colour())
 			}
-			if err := light.ConfirmRed(); err == nil {
-				t.Fatal("red confirmation of the unchecked unit passed, want it refused")
+			if err := light.ConfirmRed(); !errors.Is(err, errLightUnchecked) {
+				t.Fatalf("red confirmation of the unchecked unit = %v, want errLightUnchecked", err)
 			}
-			if n := second.patternChecks.Load(); n != 0 {
-				t.Fatalf("pattern checks run by writes and a confirmation = %d, want 0", n)
+			if took := time.Since(started); took > 100*time.Millisecond {
+				t.Fatalf("three tickles, two writes and a confirmation of the unchecked unit took %v: one waited for its check", took)
 			}
 
-			if err := light.CheckPattern(); err != nil {
+			if err := light.CheckPattern(); err != nil { // waits for a check the tickles or the red write started
 				t.Fatalf("the pattern check before a red confirmation, with the lock free: %v", err)
 			}
 			if err := light.ConfirmRed(); err != nil {
 				t.Fatalf("red confirmation once the pattern is checked: %v", err)
 			}
-			if err := light.ServerDown(3 * time.Second); err != nil || second.tickleCount() != 1 {
-				t.Fatalf("tickle once the pattern is checked: %v, %d reached the unit, want 1", err, second.tickleCount())
+			before := second.tickleCount()
+			if err := light.ServerDown(3 * time.Second); err != nil || second.tickleCount() != before+1 {
+				t.Fatalf("tickle once the pattern is checked: %v, %d reached the unit, want %d", err, second.tickleCount(), before+1)
+			}
+			if n := second.armedUnknown.Load(); n > 0 {
+				t.Fatalf("%d watchdog tickles armed a blink(1) whose stored pattern was not found black", n)
 			}
 			if n := second.patternChecks.Load(); n != 1 {
 				t.Fatalf("pattern checks = %d, want 1", n)

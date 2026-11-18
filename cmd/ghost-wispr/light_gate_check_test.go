@@ -172,3 +172,42 @@ func TestACheckStepOfAReplacedLightSendsNothing(t *testing.T) {
 		t.Fatalf("control: a step of the current light's check = %t, %v, sent %d; want one command sent", done, err, own.(*heldCheck).sent)
 	}
 }
+
+// TestARefusedTickleChecksAnUncheckedLight fails if the controller's
+// watchdog tickle to a unit it opened again, not known black, starts no
+// check of the unit's pattern, or waits for one. A unit that still reads red
+// from before the device error needs no red write, so the red write's check
+// never started, and the unit stayed unchecked and untickled: on a uhid
+// blink(1) the replacement was not red again within 8 s (review 5958478401
+// of #79, TestReviewUhidALitStoredPattern, a unit with no serial number).
+// The tickle is refused at once; once the check passes, the next tickle
+// reaches the unit.
+func TestARefusedTickleChecksAnUncheckedLight(t *testing.T) {
+	var held atomic.Bool
+	light, second := failTheRecordersHandle(t, &held, false)
+	second.checkTakes = 300 * time.Millisecond
+	woken := make(chan struct{}, 1)
+	light.checked = func() { woken <- struct{}{} }
+	if r, _, _, err := light.ReadRGB(); err != nil || r != 255 { // the reopen: the unit still reads red
+		t.Fatalf("control: the reopen reads %d, %v; want red", r, err)
+	}
+
+	started := time.Now()
+	if err := light.ServerDown(3 * time.Second); !errors.Is(err, errLightUnchecked) {
+		t.Fatalf("tickle of an unchecked unit = %v, want errLightUnchecked", err)
+	}
+	if took := time.Since(started); took > 100*time.Millisecond {
+		t.Fatalf("the tickle of an unchecked unit took %v: it waited for the pattern check", took)
+	}
+	if n := second.tickleCount(); n != 0 {
+		t.Fatalf("tickles that reached the unchecked unit = %d, want 0", n)
+	}
+	select {
+	case <-woken:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the refused tickle started no pattern check that passed within 3s (pattern checks %d)", second.patternChecks.Load())
+	}
+	if err := light.ServerDown(3 * time.Second); err != nil || second.tickleCount() != 1 {
+		t.Fatalf("tickle once the check passed: %v, %d reached the unit, want 1", err, second.tickleCount())
+	}
+}

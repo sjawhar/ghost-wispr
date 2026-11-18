@@ -448,8 +448,8 @@ lock, so the watchdog does not fire while the recorder runs, a pause turns the b
 500 ms whoever holds the lock, and `light-off` turns it off. A red write sends nothing. The recorder
 tickles only a blink(1) whose stored pattern it found black. After a device error it knows the same
 unit by its serial number and tickles it at once, whoever holds the lock; another unit, or one with
-no serial number, gets off writes only until a check on the red path finds its pattern black (the
-one before a red confirmation, or one a refused red write starts). That check runs before a resume
+no serial number, gets off writes only until a check finds its pattern black (the one before a red
+confirmation, or one a refused tickle or red write starts). That check runs before a resume
 takes the pause switch, so a pause tapped during it is not held up, and that resume then does not
 light the blink(1). Other programs
 that open the blink(1), such as `blink1-tool`, do not take the lock: do not run them while the

@@ -565,11 +565,13 @@ func (l *reconnectingLight) checkStep(light indicator.Light, check indicator.Pat
 	return done, nil
 }
 
-// checkInBackground starts the check of light for a red write that found it
-// unchecked, unless one such check runs. The write is refused at once, so the
-// controller never waits for the check and a pause meanwhile still reaches
-// the light. Once the check passes, checked wakes the controller, whose next
-// red write lights the light. It checks only light: once light is closed it
+// checkInBackground starts the check of light for a tickle or a red write that
+// found it unchecked, unless one such check runs. The command is refused at
+// once, so the controller never waits for the check and a pause meanwhile
+// still reaches the light. The tickle comes with every controller update, so
+// a unit that needs no red write (it still reads red) is checked too. Once
+// the check passes, checked wakes the controller, whose next update tickles
+// the light and lights it. It checks only light: once light is closed it
 // stops, and it opens no other.
 func (l *reconnectingLight) checkInBackground(light indicator.Light) {
 	if !l.checking.CompareAndSwap(false, true) {
@@ -649,7 +651,8 @@ func (l *reconnectingLight) ReadRGB() (uint8, uint8, uint8, error) {
 
 // ServerDown tickles the light's watchdog, or with timeout 0 turns it off. A
 // light whose stored pattern is not found black (patternUnchecked) gets no
-// tickle: its watchdog would play that pattern if the recorder stopped. Its
+// tickle: its watchdog would play that pattern if the recorder stopped. The
+// refused tickle starts the light's check instead (checkInBackground). Its
 // watchdog may still be turned off.
 func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
 	l.deviceMu.Lock()
@@ -659,6 +662,7 @@ func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
 		return err
 	}
 	if timeout > 0 && l.patternUnchecked {
+		l.checkInBackground(light)
 		return errLightUnchecked
 	}
 	if err := light.ServerDown(timeout); err != nil {

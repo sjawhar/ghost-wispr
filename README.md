@@ -176,9 +176,9 @@ and `light-off` still turns it off. A red write is not: it sends nothing. The re
 a blink(1) whose stored pattern it found black, since the watchdog plays that pattern. When it
 opens the light again after a device error, it knows the same unit by its serial number, so it needs
 to ask it nothing, and tickles it at once, also while another program holds the lock. Any other
-unit, or one with no serial number, gets off writes only, no tickle and no red, until a check on the
-red path finds its pattern black: the one a resume, a gate opening or a microphone open runs before
-its red confirmation, or one that a refused red write starts. That check sends one command at a
+unit, or one with no serial number, gets off writes only, no tickle and no red, until a check finds
+its pattern black: the one a resume, a gate opening or a microphone open runs before its red
+confirmation, or one that a refused tickle or red write starts. That check sends one command at a
 time, lets the recorder's other commands in between, and runs before a resume or a gate opening
 takes the pause switch, so a pause during it still turns the light off at once, and the resume or
 gate opening it overtakes does not light the light. A save of the black pattern that does not reach
