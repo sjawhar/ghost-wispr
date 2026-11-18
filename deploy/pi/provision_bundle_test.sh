@@ -365,8 +365,13 @@ check_case() {
 }
 
 export TEST_ARGV_LOG
-run_runbook "$work_dir/local" || fail "the runbook's commands failed against the sources the devbox identity reads"
+run_runbook "$work_dir/local" >"$work_dir/local.out" \
+  || { cat "$work_dir/local.out"; fail "the runbook's commands failed against the sources the devbox identity reads"; }
 check_case "$work_dir/local"
+# The runbook says openssl must print subject=CN=ghost-wispr. OpenSSL 3.0 prints its default
+# form, subject=CN = ghost-wispr, unless the command asks for RFC 2253.
+grep -qx 'subject=CN=ghost-wispr' "$work_dir/local.out" \
+  || fail "the runbook's certificate check did not print subject=CN=ghost-wispr: $(grep '^subject=' "$work_dir/local.out")"
 
 if TEST_PROVISION_EXIT=1 run_runbook "$work_dir/failed" 2>/dev/null; then
   fail "the runbook succeeded although provision.sh failed"
@@ -380,9 +385,26 @@ grep -q 'rm -rf --' "$work_dir/failed/pi/removed" || fail "a failed provisioning
 if TEST_PROVISION_EXIT=255 run_runbook "$work_dir/dropped-early" 2>/dev/null; then
   fail "the runbook succeeded although the SSH session ended before the tailnet join started"
 fi
-TEST_PROVISION_EXIT=255 TEST_PROVISION_SAYS='ghost-wispr provision: starting the tagged tailnet join as ghost-wispr-tailnet-join-1' \
-  run_runbook "$work_dir/dropped-after-join" 2>/dev/null \
-  || fail "the runbook failed although the SSH session ended after the tailnet join started"
+
+# provision-pi.sh's last line says what provision.sh did: it started the join as the unit it named,
+# or found the Pi already joined and started none.
+readonly join_said='ghost-wispr provision: starting the tagged tailnet join as ghost-wispr-tailnet-join-1'
+readonly joined_said='ghost-wispr provision: already joined as tag:ghost-wispr at ghost-wispr'
+for outcome in started:0 started:255 joined:0 joined:255; do
+  said=$join_said
+  [[ ${outcome%:*} == joined ]] && said=$joined_said
+  case_dir="$work_dir/outcome-${outcome/:/-}"
+  TEST_PROVISION_EXIT=${outcome#*:} TEST_PROVISION_SAYS=$said run_runbook "$case_dir" >/dev/null 2>"$case_dir.err" \
+    || { cat "$case_dir.err"; fail "$outcome: the runbook failed although provision.sh said: $said"; }
+  last=$(grep '^provision-pi: ' "$case_dir.err" | tail -n 1)
+  if [[ ${outcome%:*} == started ]]; then
+    [[ $last == *'started the tagged tailnet join as the detached unit ghost-wispr-tailnet-join-1'* ]] \
+      || fail "$outcome: provision-pi.sh's last line does not name the join provision.sh started: $last"
+  else
+    [[ $last == *'already joined'* && $last == *'started no tailnet join'* && $last != *'started the tagged tailnet join'* ]] \
+      || fail "$outcome: provision-pi.sh's last line does not say the Pi was already joined and no join started: $last"
+  fi
+done
 
 # A creation prints the client id as `+ … : "ID"`; the default case's replacement prints `~ … : "OLD" => "ID"`.
 TEST_CREATION_FORM=create run_runbook "$work_dir/create-form" >/dev/null 2>&1 \
@@ -464,10 +486,12 @@ run_renew() {
   (
     cd "$repo_root"
     TMPDIR="$case_dir/tmp" TEST_PI="$case_dir/pi" PATH="$work_dir/bin:$PATH" bash "$renew"
-  ) >/dev/null 2>&1 || true
+  ) >"$case_dir/out" 2>/dev/null || true
 }
 run_renew "$work_dir/renew"
 cmp -s "$work_dir/renew/pi/renewed.crt" "$TEST_CERTIFICATE" || fail "renewal did not install Secret Manager's certificate on the Pi"
+grep -qx 'subject=CN=ghost-wispr' "$work_dir/renew/out" \
+  || fail "the renewal's certificate check did not print subject=CN=ghost-wispr: $(grep '^subject=' "$work_dir/renew/out")"
 TEST_CERT_READ_FAIL=1 run_renew "$work_dir/renew-failed"
 [[ ! -e $work_dir/renew-failed/pi/renewed.crt ]] || fail "renewal installed a certificate on the Pi although the read failed"
 [[ -z $(find "$work_dir/renew/tmp" "$work_dir/renew-failed/tmp" -mindepth 1 -print -quit) ]] \

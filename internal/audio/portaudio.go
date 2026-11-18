@@ -3,6 +3,7 @@ package audio
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -15,6 +16,22 @@ var (
 	paTerminate  = portaudio.Terminate
 	paInitialize = portaudio.Initialize
 )
+
+// UsePlugCapture makes every later PortAudio initialization list each ALSA
+// card's devices through ALSA's plug layer, as "plughw:N,M" rather than the
+// raw "hw:N,M": Pa_Initialize reads PA_ALSA_PLUGHW (PortAudio 19.6,
+// pa_linux_alsa.c:1250-1256). With device set, the mic_device setting, the
+// microphone then opens the named card at the rate the start asks for, 16000
+// Hz, which ALSA converts from the rate the card takes: the Jabra Speak2 75
+// captures only at 32000 Hz, and its raw device refused 16000. Call it before
+// the first initialization. With device empty it changes nothing, and the
+// default input opens as before.
+func UsePlugCapture(device string) error {
+	if device == "" {
+		return nil
+	}
+	return os.Setenv("PA_ALSA_PLUGHW", "1")
+}
 
 // outputStopWait is how long a teardown of PortAudio waits for speaker
 // playbacks to stop. A playback stops at its next 250 ms buffer.

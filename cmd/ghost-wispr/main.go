@@ -306,23 +306,28 @@ func (p *resilientClientProxy) IsConnected() bool {
 }
 
 // micRetryEvery is how long the microphone start-up waits before it tries
-// again, after an attempt failed or PortAudio failed to initialize.
+// again, after an attempt failed.
 const micRetryEvery = 15 * time.Second
 
 // resumeWaiter is the part of the capture gate a microphone start waits on:
 // waitResumed blocks until the gate is open, prepareMicOpen readies the
-// hardware before the start opens the microphone, and finishResume ends a
+// hardware before the start opens the microphone, openUnderRed runs the start
+// with the recording light confirmed and held red, and finishResume ends a
 // resume's "resuming" state once the start that brings capture back has
 // finished.
 type resumeWaiter interface {
 	waitResumed(ctx context.Context) bool
 	prepareMicOpen(ctx context.Context) bool
+	openUnderRed(open func() error) error
 	finishResume()
 }
 
 // retryMicStartup runs start every retryInterval until it succeeds or ctx
 // ends. A paused instance opens no input device: a retry that comes due
 // while capture is paused waits (capture.waitResumed) until capture resumes.
+// Each attempt runs under a red hold (openUnderRed): the PortAudio scan and the
+// device open it makes both open capture streams. A light that cannot be
+// confirmed red fails the attempt before either.
 func retryMicStartup(
 	ctx context.Context,
 	retryInterval time.Duration,
@@ -337,12 +342,16 @@ func retryMicStartup(
 		after = time.After
 	}
 
+	wait := true
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-after(retryInterval):
+		if wait {
+			select {
+			case <-ctx.Done():
+				return
+			case <-after(retryInterval):
+			}
 		}
+		wait = true
 		if !capture.waitResumed(ctx) {
 			return
 		}
@@ -364,8 +373,13 @@ func retryMicStartup(
 
 		// The attempt, whether it works or not, ends a resume's "resuming"
 		// state: readiness then reports what came back.
-		err := start()
+		err := capture.openUnderRed(start)
 		capture.finishResume()
+		if errors.Is(err, errMicStartPaused) {
+			// A pause cancelled the attempt: the next resume tries again.
+			wait = false
+			continue
+		}
 		if err != nil {
 			if onError != nil {
 				onError(err)
@@ -381,21 +395,27 @@ func retryMicStartup(
 }
 
 // startMicrophone opens the input device and starts capture with start, and
-// runs retry in loops if start fails or PortAudio is not ready. A paused
-// instance opens no input device until it resumes: while the capture gate is
-// closed, start runs in loops once the gate opens and the hardware is ready
-// for it (prepareMicOpen), with atBoot false, and startMicrophone returns
-// deferred true; that start, whether it works or not, ends the resume's
-// "resuming" state (finishResume). A pause while it waits for the hardware
-// cancels that resume, and the next resume starts the microphone. Otherwise
-// start runs at once with atBoot true, so it can write the start-up status.
+// runs retry in loops if start fails. start runs only under a red hold
+// (openUnderRed): the light is confirmed red before it, and held red until it
+// returns, so every capture stream it opens, the PortAudio scan's included,
+// opens while the light last read red. A paused instance opens no input device
+// until it resumes: while the capture gate is closed, start runs in loops once
+// the gate opens and the hardware is ready for it (prepareMicOpen), with atBoot
+// false, and startMicrophone returns deferred true; that start, whether it
+// works or not, ends the resume's "resuming" state (finishResume). A pause
+// while it waits for the hardware, or one that cancels the start before it
+// opens a device (errMicStartPaused), cancels that resume, and the next
+// resume starts the microphone. Otherwise start runs at once with atBoot true,
+// so it can write the start-up status, and startMicrophone returns its error:
+// one that wraps errLightNotConfirmed if the light refused it, or
+// errNoCaptureDevice, and start did not run.
 //
 // Nothing runs in loops before booted closes, once start-up has sent its
 // component statuses: a power-button resume can come during start-up, and
 // the statuses its start sends (microphone and Deepgram connected) must not be
 // followed by the start-up ones (paused), which would then stand for every
 // page that connects later.
-func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, booted <-chan struct{}, portAudioReady bool, start func(atBoot bool) error, retry func()) (deferred bool) {
+func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, booted <-chan struct{}, start func(atBoot bool) error, retry func()) (deferred bool, err error) {
 	afterBoot := func(run func()) {
 		loops.Go(func() {
 			select {
@@ -405,8 +425,8 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 			}
 		})
 	}
-	if capture.isClosed() {
-		afterBoot(func() {
+	startOnResume := func() {
+		for {
 			for {
 				if !capture.waitResumed(ctx) {
 					return
@@ -415,20 +435,32 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 					break
 				}
 			}
-			started := portAudioReady && start(false) == nil
+			err := capture.openUnderRed(func() error { return start(false) })
 			capture.finishResume()
-			if started {
+			switch {
+			case err == nil:
 				return
+			case errors.Is(err, errMicStartPaused):
+				continue
 			}
 			retry()
-		})
-		return true
+			return
+		}
 	}
-	if portAudioReady && start(true) == nil {
-		return false
+	if capture.isClosed() {
+		afterBoot(startOnResume)
+		return true, nil
+	}
+	err = capture.openUnderRed(func() error { return start(true) })
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, errMicStartPaused):
+		afterBoot(startOnResume)
+		return true, nil
 	}
 	afterBoot(retry)
-	return false
+	return false, err
 }
 
 type transcriptCallback struct {
@@ -508,14 +540,15 @@ func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *cap
 	return sender
 }
 
-// micShutdownWait is how long shutdown waits for the mic loops to end. A loop
-// streaming from a working device ends at its next buffer (250 ms).
+// micShutdownWait is how long shutdown waits for the mic loops to end. Each
+// loop closes its microphone as shutdown begins (streamUntilClosed), which
+// ends its Stream at once, even on a device that delivers no frame.
 const micShutdownWait = 5 * time.Second
 
 // joinMicLoops waits up to wait for the mic loops to end once shutdown has
-// cancelled their context. It reports false if one has not: it is stuck in a
-// read from a device that stopped delivering audio, and nothing may stop the
-// device or terminate PortAudio under it.
+// cancelled their context. It reports false if one has not: its Stream is
+// stuck in a write of its audio, or in a PortAudio call, that does not
+// return, and nothing may stop the device or terminate PortAudio under it.
 func joinMicLoops(loops *sync.WaitGroup, wait time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
@@ -1340,13 +1373,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.
 	manager.SetRefinementWarningHook(refinementModelWarningHook(warningRegistry))
-	hardware := startHardware(ctx, &cfg, capture, micStatus, warningRegistry, hub)
+	// The light has a context of its own, which shutdown ends only once the
+	// mic loops have closed every microphone: the light is never off while
+	// one is open.
+	lightCtx, stopLight := context.WithCancel(context.Background())
+	defer stopLight()
+	hardware := startHardware(lightCtx, &cfg, capture, micStatus, warningRegistry, hub)
 	pauseControls := newPersistentControls(
 		store,
-		func() {
-			capture.Pause()
-			hardware.CaptureStopped()
-		},
+		func() { pauseCapture(capture, hardware) },
 		capture.RequestResume,
 		hub.BroadcastStatusChanged,
 	)
@@ -1359,6 +1394,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// until the light can show it (prepareLightForOpen).
 	micDevice := newCaptureDevice(capture.IsPaused)
 	capture.beforeMicOpen = micDevice.prepareLightForOpen
+	capture.onMicHeld = micHeldWarning(warningRegistry)
+	capture.capturePresent = captureDevicePresent(warningRegistry, func() bool { return audio.CaptureDevicePresent(cfg.MicDevice) })
+	// A named microphone opens through ALSA's plug layer, at the 16000 Hz the
+	// recording and Deepgram take, whatever rate its card captures at. Set
+	// before any PortAudio initialization, all of which run in a microphone
+	// start, below.
+	if err := audio.UsePlugCapture(cfg.MicDevice); err != nil {
+		log.Printf("warning: open the microphone through ALSA's plug layer: %v", err)
+	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
 	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry)
 
@@ -1535,13 +1579,6 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 	}
 
-	paErr := micDevice.probe(audio.InitializePortAudio)
-	paInitFailed := false
-	if paErr != nil {
-		log.Printf("warning: portaudio init failed: %v — microphone unavailable", paErr)
-		paInitFailed = true
-	}
-
 	client.Init(client.InitLib{LogLevel: client.LogLevelDefault})
 
 	// micLoops holds every mic loop and the mic startup retry, so shutdown can
@@ -1549,17 +1586,44 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	var micLoops sync.WaitGroup
 	micWait := func(d time.Duration) { capture.sleepUnlessPaused(ctx, d) }
 
+	// PortAudio's device scan opens capture streams on the Jabra, so it is a
+	// capture open like the microphone's own: it runs only inside a
+	// microphone start, under the start's red hold (startMicrophone,
+	// retryMicStartup), and through micDevice, never on its own at start-up. A
+	// unit that starts paused scans at its first resume. The speaker plays
+	// through ALSA, without PortAudio, so it needs no scan.
+	var portAudioReady atomic.Bool
+	scanPortAudio := func(updateStartupState bool, scan func() error) error {
+		err := micDevice.probe(scan)
+		portAudioReady.Store(err == nil)
+		if err != nil {
+			log.Printf("warning: portaudio init failed: %v — microphone unavailable", err)
+			warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
+			if updateStartupState {
+				startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
+			}
+			return fmt.Errorf("initialize portaudio: %w", err)
+		}
+		return nil
+	}
 	startMicPipeline := func(updateStartupState bool) error {
 		var (
 			mic        *audio.Mic
 			sampleRate int
 		)
 
+		// A pause during the scan cancels the start before any device opens:
+		// the light then goes off at once, and the next resume starts again.
+		// So does shutdown, whose wait for the mic loops a long scan can
+		// outlast: nothing would close a microphone opened after it.
 		for _, rate := range cfg.SampleRateCandidates() {
+			if err := micStartCancelled(ctx, capture); err != nil {
+				return err
+			}
 			var candidate *audio.Mic
 			openErr := micDevice.openStream(func() (bool, error) {
 				var err error
-				candidate, err = audio.NewMic(rate, rate/4) // 250ms buffer
+				candidate, err = audio.NewMic(cfg.MicDevice, rate, rate/4) // 250ms buffer
 				return err == nil, err
 			})
 			if openErr != nil {
@@ -1630,7 +1694,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
-		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub, !updateStartupState)
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
 		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, micWait, log.Printf, hub))
 		return nil
@@ -1648,7 +1712,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				}
 			},
 			func() error {
-				if err := micDevice.probe(audio.ReinitPortAudio); err != nil {
+				if err := scanPortAudio(false, audio.ReinitPortAudio); err != nil {
 					return err
 				}
 				return startMicPipeline(false)
@@ -1665,7 +1729,13 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		)
 	}
 	startMic := func(atBoot bool) error {
-		err := startMicPipeline(atBoot)
+		var err error
+		if !portAudioReady.Load() {
+			err = scanPortAudio(atBoot, audio.InitializePortAudio)
+		}
+		if err == nil {
+			err = startMicPipeline(atBoot)
+		}
 		if err != nil {
 			slog.Warn("microphone unavailable, running API/UI only", "error", err)
 		}
@@ -1673,38 +1743,33 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	}
 	// booted closes once start-up has sent its component statuses.
 	booted := make(chan struct{})
-	if startMicrophone(ctx, &micLoops, capture, booted, !paInitFailed, startMic, retryMic) {
-		switch {
-		case capture.isLightHeld() && !capture.IsPaused():
-			startupStatus.Mic = config.ComponentState{Name: "mic", Status: captureLightUnavailable, Message: "Microphone closed: the recording light is not confirmed red"}
-			if cfg.DeepgramAPIKey != "" {
-				startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: captureLightUnavailable, Message: "Deepgram connects once the recording light is confirmed red"}
-			}
-		default:
-			startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
-			if cfg.DeepgramAPIKey != "" {
-				startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
-			}
+	deferred, err := startMicrophone(ctx, &micLoops, capture, booted, startMic, retryMic)
+	switch {
+	case deferred && capture.isLightHeld() && !capture.IsPaused():
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: captureLightUnavailable, Message: "Microphone closed: the recording light is not confirmed red"}
+		if cfg.DeepgramAPIKey != "" {
+			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: captureLightUnavailable, Message: "Deepgram connects once the recording light is confirmed red"}
 		}
+	case deferred:
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: storage.ComponentStatusPaused, Message: "Microphone closed while capture is paused"}
+		if cfg.DeepgramAPIKey != "" {
+			startupStatus.Deepgram = config.ComponentState{Name: "deepgram", Status: storage.ComponentStatusPaused, Message: "Deepgram connects when capture resumes"}
+		}
+	case errors.Is(err, errLightNotConfirmed):
+		_, status := micStartFailureMessages(err)
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: status}
+	case errors.Is(err, errNoCaptureDevice):
+		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "No microphone found"}
 	}
-
-	if paInitFailed {
-		slog.Warn("microphone unavailable, running API/UI only")
-		warningRegistry.Set("microphone", "Microphone unavailable — recording and live transcription are disabled")
-		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "Microphone unavailable"}
-	}
-	// Initialize speaker output device. Its playback streams go through
-	// micDevice, so the Jabra's light never changes while one is open.
+	// Initialize the speaker. It plays through ALSA's playback device,
+	// opening no microphone and needing no red light, so it speaks while
+	// capture is paused. Its playback streams go through micDevice, so the
+	// Jabra's light never changes while one is open.
 	var speaker *audio.Speaker
 	if cfg.SpeakerEnabled {
-		if paInitFailed {
-			slog.Warn("speaker requested but portaudio init failed — speaker disabled")
-			warningRegistry.Set("speaker", "Speaker unavailable — PortAudio initialization failed")
-		} else {
-			speaker = audio.NewSpeaker(cfg.SpeakerDevice)
-			speaker.SetOutputHooks(micDevice.playbackOpening, micDevice.playbackClosing)
-			log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
-		}
+		speaker = audio.NewSpeaker(cfg.SpeakerDevice)
+		speaker.SetOutputHooks(micDevice.playbackOpening, micDevice.playbackClosing)
+		log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
 	}
 
 	// Initialize TTS orchestrator if both speaker and provider are configured.
@@ -1829,17 +1894,22 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	<-sig
 
 	log.Println("ghost-wispr: shutting down")
-	hardware.Stop()
 	cancel()
 	manager.StopSessionStartPublishes()
-	// The mic loops end at the device's next buffer. Stopping the device or
-	// terminating PortAudio while one is still inside a read crashes inside
-	// PortAudio, so neither happens before they end, nor at all if one is stuck
-	// in a read: the process exit releases the device then.
+	// Each mic loop closes its microphone and ends, even if its device
+	// delivers no frame. Stopping the device or terminating PortAudio while a
+	// Stream still runs crashes inside PortAudio, so neither happens before
+	// they end, nor at all if one is stuck: the process exit releases the
+	// device then.
 	micLoopsEnded := joinMicLoops(&micLoops, micShutdownWait)
 	if !micLoopsEnded {
 		log.Printf("warning: microphone still reading %v after shutdown began; leaving the device and PortAudio to the process exit", micShutdownWait)
 	}
+	// Only now, with the microphones closed, does the light go off. Stop
+	// refuses any further red confirmation, and lets the off write through
+	// even if a microphone is stuck open, since the process is exiting.
+	hardware.Stop()
+	stopLight()
 	select {
 	case <-lightOff:
 	case <-time.After(lightShutdownWait):
@@ -1881,7 +1951,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 // micStreamer is the capture device the mic loop drives. Open opens a fresh
 // stream and starts it, without re-initializing PortAudio; Reopen
-// re-initializes PortAudio first, to pick up a device plugged in again.
+// re-initializes PortAudio first, to pick up a device plugged in again. Close
+// may be called from another goroutine while Stream runs, and then ends that
+// Stream: a pause closes the device that way (streamUntilClosed).
 type micStreamer interface {
 	Stream(writer io.Writer) error
 	Start() error
@@ -1920,30 +1992,60 @@ func streamMicWithRetry(
 	)
 
 	backoff := baseBackoff
+	// stallWait is how long the loop holds the microphone closed after no
+	// audio reached the recording; it doubles while it opens to no audio, and
+	// starts again once audio passes.
+	stallWait := baseBackoff
 	gated := shutdownWriter{ctx: ctx, dst: capture.Writer(writer)}
-	// ringShowsPause is set when the Jabra's ring may show the pause while
-	// capture is on, so no audio passed (orderedMic).
-	ringShowsPause := false
+	// reopen is set when the microphone must close, and open again under a
+	// fresh red confirmation, before more audio passes; reopenWhy says why.
+	// The Jabra's ring may show the pause while capture is on (orderedMic),
+	// and its light cannot change while the microphone is open; or the
+	// recording light was not red at some point since the microphone opened
+	// (errLightWentOff), so what the microphone still holds may have been
+	// captured with the light off.
+	reopen, reopenWhy := false, ""
+	// released is set once the microphone is closed already, as by
+	// streamUntilClosed; the loop top then closes nothing more.
+	released := false
+	// held is set while a pause could not release the microphone
+	// (audio.ErrMicStillReading); the close that releases it clears the
+	// warning.
+	held := false
+	// closeAtShutdown closes the microphone unless it is closed already.
+	// Shutdown turns the light off once every mic loop has ended, so no loop
+	// may end with its microphone open: not one a start that shutdown
+	// overtook handed an open microphone, nor one that has just opened it.
+	closeAtShutdown := func() {
+		if !released {
+			closeMic(capture, streamer, "at shutdown", logf)
+		}
+	}
 
 	for {
 		if ctx.Err() != nil {
+			closeAtShutdown()
 			return
 		}
 
 		var err error
-		if capture.isClosed() || ringShowsPause {
+		if capture.isClosed() || reopen || released {
+			// No device is held while the gate is closed.
+			why := reopenWhy
 			if capture.isClosed() {
-				// holdMicWhilePaused closes the device: none is held while
-				// the gate is closed.
-				if !holdMicWhilePaused(ctx, capture, streamer, logf, hub) || ctx.Err() != nil {
-					return
-				}
-			} else {
-				// The light cannot change while the microphone is open: close
-				// it, so the ring can be darkened, and open it again below.
-				closeMic(streamer, "while the Jabra's ring may show the pause", logf)
+				why = "for capture pause"
 			}
-			ringShowsPause = false
+			if !released {
+				closeMic(capture, streamer, why, logf)
+			}
+			if held {
+				held = false
+				capture.micHeld(false)
+			}
+			if capture.isClosed() && (!waitWhilePaused(ctx, capture, logf, hub) || ctx.Err() != nil) {
+				return
+			}
+			reopen, reopenWhy, released = false, "", false
 			// Before red: a resume during speech on the Jabra waits for it to
 			// end, then lights the Jabra, so its ring reads right while the
 			// microphone is open. A pause meanwhile cancels the resume, and
@@ -1954,10 +2056,19 @@ func streamMicWithRetry(
 					return
 				}
 			}
-			if err = capture.confirmMicStart(); err != nil {
-				logf("recording light unavailable before microphone restart: %v", err)
+			if err = capture.confirmMicOpen(); err != nil {
+				if errors.Is(err, errNoCaptureDevice) {
+					logf("no capture device present; the microphone opens once one is")
+				} else {
+					logf("recording light unavailable before microphone restart: %v", err)
+					capture.lightUnconfirmed(err)
+				}
 				capture.finishResume()
 				wait(backoff)
+				backoff = min(backoff*2, maxBackoff)
+				// The microphone is closed: open it again, without closing it
+				// again, once the wait is over.
+				released = true
 				continue
 			}
 			err = streamer.Open()
@@ -1966,6 +2077,8 @@ func streamMicWithRetry(
 			// "resuming" state: readiness then reports what came back.
 			capture.finishResume()
 			if err == nil {
+				backoff = baseBackoff
+				capture.stalled.Store(false)
 				logf("microphone reopened: capture resumed")
 				if hub != nil {
 					hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone capture resumed")
@@ -1974,24 +2087,63 @@ func streamMicWithRetry(
 			}
 			// The device did not come back (unplugged during the pause). A
 			// failed Open holds no device; reconnect below.
+			released = true
 		} else {
-			err = streamer.Stream(gated)
+			armed := capture.audioAt.Load()
+			var closed micClose
+			closed, err = streamUntilClosed(ctx, capture, streamer, gated, logf)
+			if capture.audioAt.Load() != armed {
+				stallWait = baseBackoff // audio passed
+			}
+			if closed.held {
+				// Once Stream has returned, the loop top closes the device.
+				held, reopen, reopenWhy = true, true, "once its read returned"
+			}
+			released = closed.released
 			if err == nil || ctx.Err() != nil {
+				closeAtShutdown()
 				return
+			}
+			if closed.stalled && !capture.isClosed() {
+				// The microphone is closed, and the light off, until the wait
+				// is over; then the loop top opens it again under red.
+				if hub != nil {
+					hub.BroadcastComponentStatus("mic", captureNoAudio, "No audio reached the recording; the microphone is closed and opens again")
+				}
+				wait(stallWait)
+				stallWait = min(stallWait*2, maxBackoff)
+				continue
 			}
 			// A pause, or a device error that coincides with one: close the
 			// device at the loop top instead of reporting a failure.
-			if errors.Is(err, errGateClosed) || capture.isClosed() {
+			if released || held || errors.Is(err, errGateClosed) || capture.isClosed() {
 				continue
 			}
 			if errors.Is(err, errRingShowsPause) {
 				logf("the Jabra's ring may show the pause while capture is on; reopening the microphone")
-				ringShowsPause = true
+				reopen, reopenWhy = true, "while the Jabra's ring may show the pause"
+				continue
+			}
+			if errors.Is(err, errLightWentOff) {
+				logf("the recording light was not red while the microphone was open; reopening the microphone")
+				reopen, reopenWhy = true, "after the recording light was not red"
 				continue
 			}
 		}
 
-		if strings.Contains(strings.ToLower(err.Error()), "overflow") {
+		// The stream failed, or did not open, and the loop waits before it
+		// reconnects: the microphone is closed first, so the light, which goes
+		// off with it, is never off while it is open. A failed Open holds no
+		// device, so it needs no close.
+		if !released {
+			why := "after a stream error"
+			if isOverflow(err) {
+				why = "after an overflow"
+			}
+			closeMic(capture, streamer, why, logf)
+		}
+		released = true // the loop top, after a pause, closes nothing more
+		if isOverflow(err) {
 			logf("warning: mic input overflow, restarting stream")
 			if hub != nil {
 				hub.BroadcastComponentStatus("mic", "warning", "Mic input overflow, restarting stream")
@@ -2003,8 +2155,11 @@ func streamMicWithRetry(
 			if capture.isClosed() {
 				continue
 			}
-			// The loop top streams again, whatever the reopen did.
-			_, _ = reopenMic(capture, streamer, logf, hub)
+			// The loop top streams again, whatever the reopen did, unless the
+			// light refused it: the device is closed then, and the loop top
+			// opens it again under a new confirmation.
+			confirmed, _ := reopenMic(capture, streamer, logf, hub)
+			released = !confirmed
 			continue
 		}
 
@@ -2021,29 +2176,152 @@ func streamMicWithRetry(
 			return
 		}
 		if capture.isClosed() {
-			continue // never reopen the mic while paused; the loop top stops it
+			continue // never reopen the mic while paused; the loop top waits
 		}
-		switch confirmed, reopenErr := reopenMic(capture, streamer, logf, hub); {
+		confirmed, reopenErr := reopenMic(capture, streamer, logf, hub)
+		switch {
 		case !confirmed:
 		case reopenErr != nil:
 			backoff = min(backoff*2, maxBackoff)
 		default:
 			backoff = baseBackoff
 		}
+		released = !confirmed
 	}
 }
 
-// reopenMic reopens the device once the recording light is confirmed red, and
-// reports each step on hub. It returns false, having closed the device and
-// reopened nothing, when the light cannot be confirmed red; otherwise true
-// and the reopen's error.
+// isOverflow reports whether err is PortAudio's input overflow.
+func isOverflow(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "overflow")
+}
+
+// micClose is how streamUntilClosed closed the microphone while it streamed:
+// released when the close released it, held when it could not
+// (audio.ErrMicStillReading), and stalled when it closed it because no audio
+// reached the recording.
+type micClose struct{ released, held, stalled bool }
+
+// streamUntilClosed runs streamer's Stream into w and closes streamer from
+// another goroutine as soon as the gate closes (a pause, or a hold for the
+// light), shutdown begins (ctx ends), or no audio has reached the recording
+// for the gate's audioStall since it last did, or since the start armed it.
+// A Stream whose read blocks, on a device that delivers no frame, writes
+// nothing, so neither errGateClosed nor shutdownWriter reaches it: without
+// that close, the device would stay open until the read returned or the
+// process exited, and the light, which stays red while it is open, with it.
+// A close that cannot release the device (audio.ErrMicStillReading) reports
+// the microphone held (captureGate.micHeld) until the mic loop closes it once
+// Stream has returned. After a close, the light is woken, so it goes off.
+func streamUntilClosed(ctx context.Context, capture *captureGate, streamer micStreamer, w io.Writer, logf func(string, ...any)) (micClose, error) {
+	closing := capture.closingSignal()
+	streamed := make(chan struct{})
+	result := make(chan micClose, 1)
+	go func() {
+		timer := time.NewTimer(time.Hour)
+		defer timer.Stop()
+		var closed micClose
+	watch:
+		for {
+			var stall <-chan time.Time
+			if at := capture.audioAt.Load(); at != 0 {
+				left := time.Until(time.Unix(0, at).Add(capture.audioStall))
+				if left <= 0 {
+					closed.stalled = true
+					break
+				}
+				timer.Reset(left)
+				stall = timer.C
+			}
+			select {
+			case <-streamed:
+				result <- closed
+				return
+			case <-closing:
+				break watch
+			case <-ctx.Done():
+				break watch
+			case <-stall:
+			}
+		}
+		why := "for capture pause"
+		if closed.stalled {
+			why = fmt.Sprintf("after no audio reached the recording for %v", capture.audioStall)
+			logf("no audio reached the recording for %v; closing the microphone", capture.audioStall)
+			capture.stalled.Store(true)
+		}
+		switch err := streamer.Close(); {
+		case errors.Is(err, audio.ErrMicStillReading):
+			logf("warning: the microphone is still reading; it stays open, with the light red, until its read returns")
+			capture.micHeld(true)
+			closed.held = true
+		case err != nil:
+			logf("warning: close microphone %s: %v", why, err)
+			closed.released = true
+		default:
+			closed.released = true
+		}
+		capture.micClosed()
+		result <- closed
+	}()
+	err := streamer.Stream(w)
+	close(streamed)
+	return <-result, err
+}
+
+// micMissingWarningKey is the warning GET /api/status shows while no capture
+// device is present.
+const micMissingWarningKey = "microphone-missing"
+
+// captureDevicePresent is the capture gate's capturePresent: present looks for
+// a capture device without opening one, and the status warns while there is
+// none, which is also while the light stays off for it.
+func captureDevicePresent(warnings *warningsRegistry, present func() bool) func() bool {
+	return func() bool {
+		if present() {
+			warnings.Clear(micMissingWarningKey)
+			return true
+		}
+		warnings.Set(micMissingWarningKey, "No microphone found: the unit does not record, and the light stays off, until one is plugged in")
+		return false
+	}
+}
+
+// micHeldWarningKey is the warning GET /api/status shows while a pause could
+// not release the microphone.
+const micHeldWarningKey = "microphone-held"
+
+// micHeldWarning is the capture gate's onMicHeld for warnings.
+func micHeldWarning(warnings *warningsRegistry) func(held bool) {
+	return func(held bool) {
+		if held {
+			warnings.Set(micHeldWarningKey, "Microphone still open after a pause: a call into PortAudio does not return. The light stays red while it is open, and nothing is recorded; restart the unit to close it")
+			return
+		}
+		warnings.Clear(micHeldWarningKey)
+	}
+}
+
+// reopenMic reopens the device once a capture device is present and the
+// recording light is confirmed red, and reports each step on hub. It returns
+// false, having closed the device and reopened nothing, when the light cannot
+// be confirmed red; otherwise true and the reopen's error, which is
+// errNoCaptureDevice, with the device closed and the light left off, while no
+// capture device is present.
 func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) (bool, error) {
 	if hub != nil {
 		hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 	}
-	if err := capture.confirmMicStart(); err != nil {
+	if err := capture.confirmMicOpen(); errors.Is(err, errNoCaptureDevice) {
+		logf("no capture device present; the microphone reconnects once one is")
+		closeMic(capture, streamer, "with no capture device present", logf)
+		if hub != nil {
+			hub.BroadcastComponentStatus("mic", storage.ComponentStatusError, "No microphone found")
+		}
+		return true, err
+	} else if err != nil {
 		logf("recording light unavailable before microphone reconnect: %v", err)
-		closeMic(streamer, "without a red recording light", logf)
+		capture.lightUnconfirmed(err)
+		closeMic(capture, streamer, "without a red recording light", logf)
 		return false, nil
 	}
 	err := streamer.Reopen()
@@ -2055,6 +2333,7 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 		}
 		return true, err
 	}
+	capture.stalled.Store(false)
 	logf("mic reopened successfully")
 	if hub != nil {
 		hub.BroadcastComponentStatus("mic", storage.ComponentStatusConnected, "Microphone reconnected")
@@ -2062,22 +2341,27 @@ func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...
 	return true, nil
 }
 
-// closeMic closes the capture device, so it holds no input device: while
-// capture is paused, and when the light cannot be confirmed red before a
-// reconnect. An overflow, or a transient read error, leaves the device
-// capturing with IsOpen false, so the light goes dark while audio still flows;
-// after a refused reconnect the next Stream fails on the closed device, and
-// the error path backs off and confirms red again before it reopens.
-func closeMic(streamer micStreamer, which string, logf func(string, ...any)) {
+// closeMic closes the capture device, so it holds no input device, and wakes
+// the light, which stays red while the device is open: while capture is
+// paused, before the loop waits after a stream error, and when the light
+// cannot be confirmed red before a reconnect.
+func closeMic(capture *captureGate, streamer micStreamer, which string, logf func(string, ...any)) {
 	if err := streamer.Close(); err != nil {
 		logf("warning: close microphone %s: %v", which, err)
 	}
+	capture.micClosed()
 }
 
 // holdMicWhilePaused closes the capture device, which releases it, and blocks
-// until capture resumes. It reports false if ctx ends first.
+// until capture resumes (waitWhilePaused). It reports false if ctx ends first.
 func holdMicWhilePaused(ctx context.Context, capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) bool {
-	closeMic(streamer, "for capture pause", logf)
+	closeMic(capture, streamer, "for capture pause", logf)
+	return waitWhilePaused(ctx, capture, logf, hub)
+}
+
+// waitWhilePaused reports the closed microphone and blocks until capture
+// resumes. It reports false if ctx ends first.
+func waitWhilePaused(ctx context.Context, capture *captureGate, logf func(string, ...any), hub *server.Hub) bool {
 	logf("microphone closed: capture paused")
 	if hub != nil {
 		if capture.isLightHeld() && !capture.IsPaused() {

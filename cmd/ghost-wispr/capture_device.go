@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/jabra"
 )
 
@@ -89,14 +90,16 @@ func (d *captureDevice) openStream(open func() (holds bool, err error)) error {
 }
 
 // closeStream runs closeFn, which closes the capture stream, as one operation,
-// and writes the light afterwards.
+// and writes the light afterwards. A close that leaves the stream open, as one
+// whose read is still running (audio.ErrMicStillReading), keeps it counted
+// open, so the light is not written while the stream is open.
 func (d *captureDevice) closeStream(closeFn func() error) error {
 	d.op.Lock()
 	defer d.op.Unlock()
 	d.begin()
 	defer d.end()
 	err := closeFn()
-	d.setOpen(false)
+	d.setOpen(errors.Is(err, audio.ErrMicStillReading))
 	d.writeLight()
 	return err
 }

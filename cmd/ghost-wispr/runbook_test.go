@@ -76,57 +76,77 @@ func TestRunbookOrdersARolloutThatAddsAConfigKey(t *testing.T) {
 	}
 }
 
-// TestRunbookRolloutKeepsTheJabraOverride fails if the rollout order does not
-// say what its steps do to a setting the office Pi holds in .env rather than
-// in its YAML, the Jabra Mute button (GHOST_WISPR_JABRA_MUTE_BUTTON): the
-// models step keeps that line as it is, the full provisioner rewrites .env and
-// the template's jabra_mute_button: false applies, and the button stays off
-// until a person's real taps pass the checks of "Pause and resume at the unit"
-// on the office Pi, whose step 6 checks the fix of defect D9, and until the
-// follow-up fix for a microphone that opens before the recording light reads
-// red has merged. It also fails if the rollout writes or checks for the button
-// turned on: these steps restart the recorder.
-func TestRunbookRolloutKeepsTheJabraOverride(t *testing.T) {
-	section := runbookSection(t, "## Roll out a release that adds a config key")
-	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "jabra_mute_button: false", "keeps every `.env` line", "rewrites `.env`", "D9", `"Pause and resume at the unit"`, "real taps", "before the recording light reads red"} {
-		if !strings.Contains(section, words) {
-			t.Errorf("the runbook's rollout order does not say %q", words)
-		}
-	}
-	for _, on := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON=true", "jabra_mute_button: true"} {
-		if strings.Contains(section, on) {
-			t.Errorf("the runbook's rollout order turns the Jabra's Mute button on: %q", on)
-		}
-	}
-}
-
-// TestTheJabraButtonStaysOffUntilTheTapChecksPass fails if the rollout order,
-// "Pause and resume at the unit" or the office Pi's template keeps the Jabra's
-// Mute button off "until the D9 fix ships": #75, the fix, is in the tree, so a
-// reader would take that as met and turn the button on. Each must name the two
-// conditions a reader can check: a person's real taps passing the checks of
-// "Pause and resume at the unit" on the office Pi, and the merge of the fix
-// for the microphone that opens before the recording light reads red.
-func TestTheJabraButtonStaysOffUntilTheTapChecksPass(t *testing.T) {
-	template, err := os.ReadFile(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
+// TestTheJabraButtonIsOnInTheTemplateAndTheRunbook fails if the office Pi's
+// template does not turn the Jabra's Mute button on, or if the template, the
+// rollout order or "Pause and resume at the unit" still keeps the button off
+// until a person's taps pass or until a follow-up fix merges: Sami turned it
+// on on the office Pi (2026-11-18), and the full provisioner rewrites .env,
+// so the template's setting is the Pi's. It also fails if the rollout order
+// does not say what its steps do to the Pi's .env override, or checks for the
+// button off; or if "Pause and resume at the unit" drops the rule that no
+// other program opens the Jabra while the button is on.
+func TestTheJabraButtonIsOnInTheTemplateAndTheRunbook(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
 	if err != nil {
 		t.Fatalf("read the Pi's config template: %v", err)
 	}
+	template := string(raw)
+	if !strings.Contains(template, "\njabra_mute_button: true\n") || strings.Contains(template, "jabra_mute_button: false") {
+		t.Error("the Pi's config template does not turn the Jabra's Mute button on")
+	}
+	rollout := runbookSection(t, "## Roll out a release that adds a config key")
+	pause := runbookSection(t, "## Pause and resume at the unit")
 	for name, text := range map[string]string{
-		"the rollout order":              runbookSection(t, "## Roll out a release that adds a config key"),
-		`"Pause and resume at the unit"`: runbookSection(t, "## Pause and resume at the unit"),
-		"the Pi's config template":       strings.Join(strings.Fields(string(template)), " "),
+		"the rollout order":              rollout,
+		`"Pause and resume at the unit"`: pause,
+		"the Pi's config template":       strings.ReplaceAll(strings.Join(strings.Fields(template), " "), "# ", ""),
 	} {
-		text = strings.ReplaceAll(text, "# ", "")
-		for _, condition := range []string{"real taps", "before the recording light reads red"} {
-			if !strings.Contains(text, condition) {
-				t.Errorf("%s does not keep the Jabra's button off until %q is dealt with", name, condition)
+		for _, stale := range []string{"real taps", "before the recording light reads red", "stays off either way", "until a person", "follow-up fix", "keeps `jabra_mute_button: false`"} {
+			if strings.Contains(text, stale) {
+				t.Errorf("%s still keeps the Jabra's button off: %q", name, stale)
 			}
 		}
-		for _, stale := range []string{"D9 fix ships", "fix of defect D9 ships", "D9 fix has shipped", "before the D9 fix"} {
-			if strings.Contains(text, stale) {
-				t.Errorf("%s still waits for %q, which #75 already is", name, stale)
-			}
+	}
+	for _, words := range []string{"GHOST_WISPR_JABRA_MUTE_BUTTON", "keeps every `.env` line", "rewrites `.env`", "jabra_mute_button: true", "ends in `true`"} {
+		if !strings.Contains(rollout, words) {
+			t.Errorf("the runbook's rollout order does not say %q", words)
+		}
+	}
+	if strings.Contains(rollout, "ends in `false`") {
+		t.Error("the runbook's rollout order checks that the Jabra's Mute button is off")
+	}
+	if !strings.Contains(pause, "Do not open the Jabra's microphone or speaker with another program") {
+		t.Error(`"Pause and resume at the unit" no longer says that no other program may open the Jabra while the button is on`)
+	}
+}
+
+// TestRunbookInjectsSpeechThroughMicDevice fails if the runbook does not say
+// how to inject speech for an acceptance run with mic_device: load the ALSA
+// loopback, set GHOST_WISPR_MIC_DEVICE=Loopback in the Pi's .env for the run,
+// play into the loopback device the recorder captures from, then remove the
+// line and unload the loopback. With mic_device: J75 the recorder opens no
+// other card, so the old way, an .asoundrc that moved ALSA's default input to
+// the loopback, no longer reaches it.
+func TestRunbookInjectsSpeechThroughMicDevice(t *testing.T) {
+	section := runbookSection(t, "## Inject speech for acceptance")
+	for _, step := range []string{"modprobe snd-aloop", "GHOST_WISPR_MIC_DEVICE=Loopback", "/opt/ghost-wispr/.env", "plughw:CARD=Loopback,DEV=1", "remove", "modprobe -r snd-aloop"} {
+		if !strings.Contains(section, step) {
+			t.Errorf("the runbook's \"Inject speech for acceptance\" does not say %q", step)
+		}
+	}
+	if strings.Contains(section, "asoundrc") {
+		t.Error("the runbook's \"Inject speech for acceptance\" still routes the input with an .asoundrc")
+	}
+}
+
+// TestRunbookRolloutChecksTheMicDevice fails if the rollout order does not
+// name mic_device among the keys a release adds, and its check: the Pi's
+// config holds mic_device: J75.
+func TestRunbookRolloutChecksTheMicDevice(t *testing.T) {
+	section := runbookSection(t, "## Roll out a release that adds a config key")
+	for _, words := range []string{"`mic_device`", "mic_device: J75"} {
+		if !strings.Contains(section, words) {
+			t.Errorf("the runbook's rollout order does not say %q", words)
 		}
 	}
 }

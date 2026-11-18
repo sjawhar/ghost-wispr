@@ -217,6 +217,7 @@ func TestLightReturnKeepsAPersonsPause(t *testing.T) {
 	waitForHardware(t, "the light red while capturing", device.isRed)
 	device.plug(false)
 	waitForHardware(t, "capture to stop while the light is unplugged", capture.isClosed)
+	mic.open.Store(false) // the mic loop closes the microphone once the gate closes
 
 	capture.Pause()
 	device.plug(true)

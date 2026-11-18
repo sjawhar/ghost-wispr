@@ -267,11 +267,11 @@ func TestResilientClient_ReconnectsWhenTheNewSocketFailsWhileDraining(t *testing
 	}
 }
 
-// TestResilientClient_ConnectRedialsAfterAFailedFirstDial fails if one failed
-// first dial leaves the client with no socket for good, as a single dial did:
-// live transcription then stayed off until a restart. The audio written while
-// it redials must reach the socket it gets.
-func TestResilientClient_ConnectRedialsAfterAFailedFirstDial(t *testing.T) {
+// TestResilientClient_ConnectInBackgroundRedialsAfterAFailedFirstDial fails
+// if one failed first dial leaves the client with no socket for good, as a
+// single dial did: live transcription then stayed off until a restart. The
+// audio written while it redials must reach the socket it gets.
+func TestResilientClient_ConnectInBackgroundRedialsAfterAFailedFirstDial(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -288,13 +288,10 @@ func TestResilientClient_ConnectRedialsAfterAFailedFirstDial(t *testing.T) {
 		InitialReconnectDelay: 10 * time.Millisecond,
 		MaxReconnectBackoff:   10 * time.Millisecond,
 	}, nil, nil)
-	if err := rc.Connect(); err == nil {
-		t.Fatal("Connect reported success for a failed dial")
-	}
+	rc.ConnectInBackground()
 	if _, err := rc.Write([]byte("while redialling")); err != nil {
 		t.Fatal(err)
 	}
-
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && (!rc.IsConnected() || len(live.getData()) == 0) {
 		time.Sleep(5 * time.Millisecond)
@@ -304,6 +301,44 @@ func TestResilientClient_ConnectRedialsAfterAFailedFirstDial(t *testing.T) {
 	}
 	if got := string(live.getData()); got != "while redialling" {
 		t.Fatalf("the socket got %q, want the audio written while redialling", got)
+	}
+}
+
+// TestResilientClient_ConnectInBackgroundReturnsBeforeTheDial fails if
+// ConnectInBackground waits for a dial: a microphone start holds the
+// recording light red until it returns, and a dial can take the handshake
+// limit. Audio written meanwhile must reach the socket once it connects.
+func TestResilientClient_ConnectInBackgroundReturnsBeforeTheDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	live := &mockWriter{}
+	answer := make(chan struct{})
+	factory := func(context.Context) (io.WriteCloser, error) {
+		<-answer
+		return live, nil
+	}
+	rc := NewResilientClient(ctx, factory, ResilientConfig{BufferSize: 1024}, nil, nil)
+	returned := make(chan struct{})
+	go func() { rc.ConnectInBackground(); close(returned) }()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		close(answer)
+		t.Fatal("ConnectInBackground waited for the dial")
+	}
+	if rc.IsConnected() {
+		t.Fatal("the client says connected before its first dial answered")
+	}
+	if _, err := rc.Write([]byte("before the dial answered")); err != nil {
+		t.Fatal(err)
+	}
+	close(answer)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (!rc.IsConnected() || len(live.getData()) == 0) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := string(live.getData()); !rc.IsConnected() || got != "before the dial answered" {
+		t.Fatalf("after the dial answered: connected=%t, the socket got %q; want connected and the audio written before", rc.IsConnected(), got)
 	}
 }
 

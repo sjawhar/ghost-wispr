@@ -395,6 +395,9 @@ func TestPausedMicIsNotReopenedAfterDeviceError(t *testing.T) {
 
 	runMicLoop(t, capture, mic, deepgram, waits.wait, nil)
 	mic.expectEvents(t, "stream", "close")
+	// The loop closes the mic before its wait, so the close can come before
+	// the pause the wait makes: resume only once the pause has landed.
+	waitForHardware(t, "the pause during the reconnect backoff", capture.isClosed)
 	mic.expectNoEvents(t)
 
 	capture.Resume()
@@ -418,6 +421,9 @@ func TestPausedMicIsNotReopenedAfterOverflow(t *testing.T) {
 
 	runMicLoop(t, capture, mic, io.Discard, waits.wait, nil)
 	mic.expectEvents(t, "stream", "close")
+	// The loop closes the mic before its wait, so the close can come before
+	// the pause the wait makes: resume only once the pause has landed.
+	waitForHardware(t, "the pause during the overflow wait", capture.isClosed)
 
 	capture.Resume()
 	mic.expectEvents(t, "open", "stream")

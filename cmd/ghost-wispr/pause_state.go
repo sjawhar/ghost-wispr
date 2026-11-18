@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -176,20 +177,41 @@ func micStartFailureMessages(err error) (warning, status string) {
 // light could not be confirmed red; the light's own warning names the cause.
 var errLightNotConfirmed = errors.New("recording light not confirmed red")
 
+// errNoCaptureDevice is what a microphone start or reconnect returns, without
+// lighting the light or opening anything, while no capture device is present:
+// the light stays off while the microphone is missing.
+var errNoCaptureDevice = errors.New("no capture device present")
+
+// errMicStartPaused is what a microphone start returns when a pause came
+// before it opened a device: it opened nothing, and the next resume starts
+// the microphone.
+var errMicStartPaused = errors.New("microphone start cancelled by a pause")
+
+// micStartCancelled reports why a microphone start must open no device now:
+// errMicStartPaused once a pause came during its scan, and an error that
+// wraps ctx's once shutdown has begun. Shutdown waits a bounded time for the
+// mic loops and then turns the light off, so a microphone opened after it
+// would be open with the light off, and nothing would close it.
+func micStartCancelled(ctx context.Context, capture *captureGate) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("microphone start cancelled by shutdown: %w", err)
+	}
+	if capture.isClosed() {
+		return errMicStartPaused
+	}
+	return nil
+}
+
 // startMicIfUnpaused starts the opened microphone unless capture is paused. A
 // paused instance opens no device (startMicrophone), but a pause that lands
 // after the device opened leaves it open and not started; the mic loop closes
 // it, and opens it again on resume. Each start attempt confirms red first and
-// clears any forced-red hold afterward.
+// holds it red until the start returns (openUnderRed).
 func startMicIfUnpaused(capture *captureGate, start func() error) error {
 	if capture.IsPaused() {
 		return nil
 	}
-	if err := capture.confirmMicStart(); err != nil {
-		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
-	}
-	defer capture.finishMicStart()
-	return start()
+	return capture.openUnderRed(start)
 }
 
 // startOpenedMic starts mic, which the caller has opened and published,

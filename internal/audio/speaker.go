@@ -10,11 +10,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/gordonklaus/portaudio"
 	"github.com/hajimehoshi/go-mp3"
 )
 
-// outputStream abstracts a PortAudio output stream for testability.
+// outputStream is a playback stream: ALSA's on Linux, PortAudio's elsewhere
+// (openPlaybackStream). Tests replace it.
 type outputStream interface {
 	Start() error
 	Stop() error
@@ -22,7 +22,10 @@ type outputStream interface {
 	Close() error
 }
 
-// Speaker plays PCM audio through a PortAudio output device.
+// Speaker plays PCM audio through a playback device. On Linux it opens the
+// ALSA playback PCM that speaker_device names, and nothing else: no capture
+// device, and no PortAudio, whose initialization opens every capture PCM. So
+// it needs no red recording light, and plays while capture is paused.
 // It is completely isolated from the Mic — no shared streams or buffers.
 type Speaker struct {
 	mu         sync.Mutex
@@ -34,7 +37,7 @@ type Speaker struct {
 	cancel   context.CancelFunc
 
 	// openStream is the factory for creating output streams.
-	// Override in tests to avoid PortAudio hardware dependency.
+	// Override in tests to avoid a hardware dependency.
 	openStream func(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (outputStream, error)
 
 	// opening and closing bracket each output stream (SetOutputHooks).
@@ -43,7 +46,8 @@ type Speaker struct {
 }
 
 // NewSpeaker creates a new Speaker. deviceName is optional — if empty,
-// the system default output device is used.
+// the system default output device is used. On Linux it names an ALSA PCM,
+// or a sound card by its id or name (playbackDevice).
 func NewSpeaker(deviceName string) *Speaker {
 	s := &Speaker{
 		deviceName: deviceName,
@@ -140,15 +144,19 @@ func (s *Speaker) Play(audioData []byte, format AudioFormat) (result *PlaybackRe
 		return &PlaybackResult{}, nil
 	}
 
-	// Open PortAudio output stream with sample rate fallback.
+	// Open the output stream with sample rate fallback.
 	framesPerBuffer := sampleRate / 4 // 250ms buffer
 	outputBuf := make([]int16, framesPerBuffer*channels)
 
-	// PortAudio must not be torn down while the stream is open: hold the output
-	// guard from before it opens until after it closes (deferred first, so it
-	// is released last). A teardown stops this playback and waits for it.
-	outputs.begin(s)
-	defer outputs.end(s)
+	// Where playback goes through PortAudio (not Linux), PortAudio must not be
+	// torn down while the stream is open: hold the output guard from before it
+	// opens until after it closes (deferred first, so it is released last). A
+	// teardown stops this playback and waits for it. An ALSA playback stream
+	// does not depend on PortAudio, so a re-initialization leaves it playing.
+	if playbackUsesPortAudio {
+		outputs.begin(s)
+		defer outputs.end(s)
+	}
 
 	// The output hooks bracket the stream, from before it opens until after
 	// it closes, on every path out of Play.
@@ -266,7 +274,7 @@ func samplesToMs(totalSamples int64, channels, sampleRate int) int64 {
 }
 
 func (s *Speaker) defaultOpenStream(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (outputStream, error) {
-	return openOutputStream(sampleRate, channels, framesPerBuffer, buf, deviceName)
+	return openPlaybackStream(sampleRate, channels, framesPerBuffer, buf, deviceName)
 }
 
 // openStreamWithFallback tries the source sample rate first, then falls back to
@@ -320,49 +328,6 @@ func resamplePCM(samples []int16, channels, srcRate, dstRate int) []int16 {
 		}
 	}
 	return out
-}
-
-func openOutputStream(sampleRate, channels, framesPerBuffer int, buf []int16, deviceName string) (*portaudio.Stream, error) {
-	// Try default output device first.
-	stream, err := portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
-	if err == nil {
-		return stream, nil
-	}
-
-	// Fallback: enumerate devices and try ones with sufficient output channels.
-	devices, devErr := portaudio.Devices()
-	if devErr != nil {
-		return nil, err
-	}
-
-	var firstErr error
-	for _, dev := range devices {
-		if dev == nil || dev.MaxOutputChannels < channels {
-			continue
-		}
-		// If a specific device name was requested, only try matching devices.
-		if deviceName != "" && dev.Name != deviceName {
-			continue
-		}
-
-		params := portaudio.HighLatencyParameters(nil, dev)
-		params.Output.Channels = channels
-		params.SampleRate = float64(sampleRate)
-		params.FramesPerBuffer = framesPerBuffer
-
-		candidate, openErr := portaudio.OpenStream(params, buf)
-		if openErr == nil {
-			return candidate, nil
-		}
-		if firstErr == nil {
-			firstErr = openErr
-		}
-	}
-
-	if firstErr != nil {
-		return nil, fmt.Errorf("default output failed: %w; fallback device open failed: %w", err, firstErr)
-	}
-	return nil, err
 }
 
 // decodeMP3 decodes MP3 audio data to PCM16 little-endian samples.

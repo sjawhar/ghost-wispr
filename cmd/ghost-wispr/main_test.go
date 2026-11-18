@@ -20,7 +20,12 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/server"
 )
 
+// fakeStreamer is a capture device whose streams return the errors in errs,
+// one each. Its fields are guarded by mu: the mic loop may Close it from
+// another goroutine while Stream runs (streamUntilClosed), as micStreamer
+// allows.
 type fakeStreamer struct {
+	mu         sync.Mutex
 	errs       []error
 	reopenErrs []error
 	calls      int
@@ -30,6 +35,8 @@ type fakeStreamer struct {
 }
 
 func (f *fakeStreamer) Stream(_ io.Writer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	if f.stopped {
 		return errors.New("microphone stopped")
@@ -43,20 +50,33 @@ func (f *fakeStreamer) Stream(_ io.Writer) error {
 }
 
 func (f *fakeStreamer) Reopen() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.reopens++
 	if len(f.reopenErrs) == 0 {
+		f.stopped = false
 		return nil
 	}
 	err := f.reopenErrs[0]
 	f.reopenErrs = f.reopenErrs[1:]
+	if err == nil {
+		f.stopped = false
+	}
 	return err
 }
 
 func (f *fakeStreamer) Start() error { return nil }
 
-func (f *fakeStreamer) Open() error { return nil }
+func (f *fakeStreamer) Open() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = false
+	return nil
+}
 
 func (f *fakeStreamer) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.closes++
 	f.stopped = true
 	return nil
@@ -97,7 +117,9 @@ func TestStreamMicWithRetryOverflowReopens(t *testing.T) {
 
 // TestStreamMicWithRetryRequiresRedBeforeEachReopen fails if either reconnect
 // path starts microphone capture after the light refuses confirmation, or
-// retries a stopped device without another confirmation.
+// opens the closed device again without another confirmation. The device is
+// closed before the wait and again when the light refuses; the loop then opens
+// it again under a new confirmation instead of streaming the closed device.
 func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -135,10 +157,10 @@ func TestStreamMicWithRetryRequiresRedBeforeEachReopen(t *testing.T) {
 				t.Fatalf("red confirmations = %d, want 2", confirmations)
 			}
 			if streamer.closes != 2 {
-				t.Fatalf("microphone closes after red confirmation failed = %d, want 2: a refused reconnect must release the input device", streamer.closes)
+				t.Fatalf("microphone closes after red confirmation failed = %d, want 2: the stream error and the refused reconnect each release the input device", streamer.closes)
 			}
-			if streamer.calls != 2 {
-				t.Fatalf("stream calls = %d, want first error and stopped retry", streamer.calls)
+			if streamer.calls != 1 {
+				t.Fatalf("stream calls = %d, want 1: a refused reconnect leaves the device closed, and the loop opens it again rather than stream it", streamer.calls)
 			}
 		})
 	}
@@ -305,9 +327,12 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 		waits = append(waits, d)
 	}, func(string, ...any) {}, nil)
 
-	// err1 → 1s wait, reopen fails → err2 (still in loop) → 2s wait, reopen succeeds (reset) → err3 → 1s wait, reopen succeeds → nil
-	if len(waits) != 3 {
-		t.Fatalf("expected 3 waits, got %d: %v", len(waits), waits)
+	// err1 → close, 1s wait, reopen fails → the closed device fails its stream
+	// → close, 2s wait, reopen succeeds (reset) → err2 → 1s wait, reopen
+	// succeeds → err3 → 1s wait, reopen succeeds → nil. The loop closes the
+	// device before each wait, so a failed reopen leaves it closed.
+	if len(waits) != 4 {
+		t.Fatalf("expected 4 waits, got %d: %v", len(waits), waits)
 	}
 	if waits[0] != time.Second {
 		t.Fatalf("expected first wait 1s, got %v", waits[0])
@@ -315,8 +340,8 @@ func TestStreamMicWithRetryResetsBackoffOnSuccessfulReopen(t *testing.T) {
 	if waits[1] != 2*time.Second {
 		t.Fatalf("expected second wait 2s, got %v", waits[1])
 	}
-	if waits[2] != time.Second {
-		t.Fatalf("expected third wait 1s (reset), got %v", waits[2])
+	if waits[2] != time.Second || waits[3] != time.Second {
+		t.Fatalf("expected the waits after a reopen that worked to be 1s (reset), got %v", waits[2:])
 	}
 }
 
@@ -404,7 +429,7 @@ func TestPausedStartOpensNoInputDeviceUntilResume(t *testing.T) {
 		}
 	})
 
-	deferred := startMicrophone(ctx, &loops, capture, alreadyBooted(), true, func(atBoot bool) error {
+	deferred, _ := startMicrophone(ctx, &loops, capture, alreadyBooted(), func(atBoot bool) error {
 		opened <- atBoot
 		return nil
 	}, func() { t.Error("the start-up retried, but no attempt failed") })
@@ -434,12 +459,12 @@ func TestPausedStartOpensNoInputDeviceUntilResume(t *testing.T) {
 func TestUnpausedStartOpensTheInputDeviceAtOnce(t *testing.T) {
 	var loops sync.WaitGroup
 	var attempts []bool
-	deferred := startMicrophone(context.Background(), &loops, newCaptureGate(nil, nil, nil), alreadyBooted(), true, func(atBoot bool) error {
+	deferred, err := startMicrophone(context.Background(), &loops, newCaptureGate(nil, nil, nil), alreadyBooted(), func(atBoot bool) error {
 		attempts = append(attempts, atBoot)
 		return nil
 	}, func() { t.Error("the start-up retried, but no attempt failed") })
-	if deferred || len(attempts) != 1 || !attempts[0] {
-		t.Fatalf("unpaused start: deferred=%t attempts(atBoot)=%v, want deferred=false and one boot attempt", deferred, attempts)
+	if deferred || err != nil || len(attempts) != 1 || !attempts[0] {
+		t.Fatalf("unpaused start: deferred=%t err=%v attempts(atBoot)=%v, want deferred=false, no error and one boot attempt", deferred, err, attempts)
 	}
 	if !joinMicLoops(&loops, testWait) {
 		t.Fatal("a start that succeeded left a start-up goroutine running")
@@ -454,12 +479,12 @@ func TestUnpausedStartOpensTheInputDeviceAtOnce(t *testing.T) {
 // connects later, while the unit records.
 func TestDeferredMicStartWaitsForTheStartUpStatus(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		paused         bool
-		portAudioReady bool
+		name     string
+		paused   bool
+		startErr error
 	}{
-		{name: "resume during start-up", paused: true, portAudioReady: true},
-		{name: "retry after PortAudio failed", portAudioReady: false},
+		{name: "resume during start-up", paused: true},
+		{name: "retry after the boot start failed", startErr: errors.New("initialize portaudio: no device")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -476,7 +501,10 @@ func TestDeferredMicStartWaitsForTheStartUpStatus(t *testing.T) {
 					t.Error("microphone start-up still running after shutdown")
 				}
 			})
-			startMicrophone(ctx, &loops, capture, booted, tc.portAudioReady, func(bool) error {
+			_, _ = startMicrophone(ctx, &loops, capture, booted, func(atBoot bool) error {
+				if atBoot {
+					return tc.startErr
+				}
 				ran <- "start"
 				return nil
 			}, func() { ran <- "retry" })
@@ -500,17 +528,14 @@ func TestDeferredMicStartWaitsForTheStartUpStatus(t *testing.T) {
 
 // TestDeferredMicStartEndsTheResumeWindow fails if a paused start, run on
 // resume, does not end the resume's resuming state once it has finished,
-// whether it opened the microphone and connected Deepgram, failed, or could
-// not run because PortAudio was not ready.
+// whether it opened the microphone and connected Deepgram, or failed.
 func TestDeferredMicStartEndsTheResumeWindow(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		startErr       error
-		portAudioReady bool
+		name     string
+		startErr error
 	}{
-		{name: "started", portAudioReady: true},
-		{name: "start failed", startErr: errors.New("microphone unavailable"), portAudioReady: true},
-		{name: "PortAudio not ready"},
+		{name: "started"},
+		{name: "start failed", startErr: errors.New("microphone unavailable")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			capture := newCaptureGate(nil, nil, nil)
@@ -523,7 +548,7 @@ func TestDeferredMicStartEndsTheResumeWindow(t *testing.T) {
 					t.Error("microphone start-up still running after shutdown")
 				}
 			})
-			startMicrophone(ctx, &loops, capture, alreadyBooted(), tc.portAudioReady, func(bool) error { return tc.startErr }, func() {})
+			_, _ = startMicrophone(ctx, &loops, capture, alreadyBooted(), func(bool) error { return tc.startErr }, func() {})
 			capture.Resume()
 			waitOpen(t, capture)
 			waitMicHold(t, capture, "")

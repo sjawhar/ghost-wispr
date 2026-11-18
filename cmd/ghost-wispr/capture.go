@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -51,6 +52,14 @@ const (
 // It ends Mic.Stream, so streamMicWithRetry can close the device.
 var errGateClosed = errors.New("microphone capture gate closed")
 
+// errLightWentOff is what a captureGate writer returns for audio the recording
+// light may not have been red for: since the microphone opened under a red
+// confirmation (confirmMicOpen), the light was written, or read back, as
+// anything but red. The audio is dropped, and streamMicWithRetry closes the
+// microphone, which drops what its stream still holds, and opens it again
+// under a fresh confirmation.
+var errLightWentOff = errors.New("the recording light was not red while the microphone was open")
+
 // captureGate is the pause switch for microphone capture. Pause closes the gate
 // before it returns, so no audio the microphone captures after that passes the
 // gate's writer to the recorder or Deepgram, and streamMicWithRetry closes the
@@ -80,7 +89,14 @@ type captureGate struct {
 	beforeMicOpen       func(ctx context.Context, closing <-chan struct{}) bool // readies the hardware before a resume's red confirmation; false once closing closes or ctx ends (prepareMicOpen)
 	afterMicStart       func()
 	afterGateOpen       func()
-	onLightUnconfirmed  func(error)   // a red confirmation for audio after a stall failed; must not block
+	onLightUnconfirmed  func(error)   // a red confirmation for a microphone open failed; must not block
+	lightOffs           func() uint64 // counts the times the recording light was written, or read back, as anything but red; nil without a light
+	lightRedMark        func() uint64 // lightOffs as the light's last red confirmation left it, read under the light's lock
+	checkLight          func()        // reads the light back, which counts it in lightOffs unless it is red; nil without a light
+	afterMicClose       func()        // runs after the mic loop closed the microphone, so the light, which follows it, can go off; must not block
+	onMicHeld           func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
+	capturePresent      func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
+	audioStall          time.Duration // see audioStallAfter
 	stallAfter          time.Duration // see captureStallAfter
 	writeWait           time.Duration // see captureWriteWait
 	control             sync.Mutex    // serializes closing and opening the gate, with their steps
@@ -88,7 +104,7 @@ type captureGate struct {
 	switchOff           bool          // Pause was called and Resume has not been since
 	lightHeld           bool          // HoldForLight was called and ReleaseLightHold, or a resume that confirmed red, has not been since
 	resumedAt           time.Time     // when Resume last moved the switch on
-	starting            bool          // that Resume's start of the microphone, and Deepgram, has not finished (finishResume)
+	starting            bool          // that Resume's start of the microphone has not finished (finishResume)
 	preparing           bool          // a start waits in beforeMicOpen (prepareMicOpen)
 	closed              bool          // no audio passes the gate
 	closings            int           // counts closings, so a Resume left from an earlier one does nothing
@@ -98,26 +114,34 @@ type captureGate struct {
 	writing             int           // writes that passed the gate and are still running
 	writesDone          *sync.Cond    // signalled (with mu) when a write finishes
 	// audioAt is when audio last reached the recording through the gate, or
-	// when a start or gate opening gave it audioStallAfter to begin
-	// (armAudio), in Unix nanoseconds; 0 before the first. While it is older
-	// than audioStallAfter, the unit is not recording: the light goes off and
-	// the status says no_audio.
+	// when a start or gate opening gave it audioStall to begin (armAudio), in
+	// Unix nanoseconds; 0 before the first. While it is older than audioStall,
+	// the unit is not recording: the mic loop closes the microphone, and the
+	// light, which follows it, goes off.
 	audioAt atomic.Int64
+	// stalled is set while the mic loop holds the microphone closed because no
+	// audio reached the recording: the status says no_audio.
+	stalled atomic.Bool
+	// redMark is lightOffs as the last red confirmation for a microphone open
+	// or start left it (confirmMicOpen). While lightOffs still reads it, the
+	// light has been red since that microphone opened.
+	redMark atomic.Uint64
 }
 
 // audioStallAfter is how long the microphone may deliver nothing to the
 // recording, with the gate and the device open, before the unit counts as not
-// recording. The device delivers a buffer every 250 ms.
+// recording, and the mic loop closes it. The device delivers a buffer every
+// 250 ms.
 const audioStallAfter = 2 * time.Second
 
-// armAudio gives a capture that is starting audioStallAfter to deliver.
+// armAudio gives a capture that is starting audioStall to deliver.
 func (g *captureGate) armAudio() { g.audioAt.Store(time.Now().UnixNano()) }
 
 // audioFlowing reports whether audio reached the recording within
-// audioStallAfter. Before any start it has nothing to judge, and says yes.
+// audioStall. Before any start it has nothing to judge, and says yes.
 func (g *captureGate) audioFlowing() bool {
 	at := g.audioAt.Load()
-	return at == 0 || time.Since(time.Unix(0, at)) <= audioStallAfter
+	return at == 0 || time.Since(time.Unix(0, at)) <= g.audioStall
 }
 
 func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
@@ -128,6 +152,7 @@ func newCaptureGate(onPause, settle, beforeResume func()) *captureGate {
 		settle:       settle,
 		beforeResume: beforeResume,
 		stallAfter:   captureStallAfter,
+		audioStall:   audioStallAfter,
 		writeWait:    captureWriteWait,
 		resumed:      resumed,
 		closing:      make(chan struct{}),
@@ -238,6 +263,9 @@ func (g *captureGate) Resume() {
 // RequestResume checks a requested resume before changing the switch, then
 // returns without waiting for the paused session to settle. The gate opens
 // after beforeResume once settling finishes, unless a Pause comes first.
+// While no capture device is present (captureMissing), it takes no light
+// check, so the light stays off: nothing can open, and every microphone open
+// confirms red for itself once a device is there.
 func (g *captureGate) RequestResume() error {
 	g.control.Lock()
 	defer g.control.Unlock()
@@ -248,7 +276,8 @@ func (g *captureGate) RequestResume() error {
 		return nil
 	}
 	g.mu.Unlock()
-	if g.beforeResumeRequest != nil {
+	checked := g.beforeResumeRequest != nil && !g.captureMissing()
+	if checked {
 		if err := g.beforeResumeRequest(); err != nil {
 			return err
 		}
@@ -260,7 +289,7 @@ func (g *captureGate) RequestResume() error {
 		return nil
 	}
 	g.switchOff = false
-	if g.beforeResumeRequest != nil {
+	if checked {
 		// It has just confirmed the light red.
 		g.lightHeld = false
 	}
@@ -272,7 +301,9 @@ func (g *captureGate) RequestResume() error {
 
 // captureState reports what capture is doing: paused, light_unavailable,
 // resuming or stalled while the gate is closed, resuming until the resume's
-// start has finished (MicHold), then capturing or mic_unavailable.
+// start has finished (MicHold), then capturing, no_audio while no audio
+// reaches the recording (the mic loop then holds the microphone closed for a
+// while), or mic_unavailable.
 func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 	if hold := g.MicHold(); hold != "" {
 		return hold
@@ -281,6 +312,9 @@ func (g *captureGate) captureState(mic interface{ IsOpen() bool }) string {
 		return capturePaused // the moment between Pause starting and the gate closing
 	}
 	if !mic.IsOpen() {
+		if g.stalled.Load() {
+			return captureNoAudio
+		}
 		return captureMicUnavailable
 	}
 	if !g.audioFlowing() {
@@ -320,7 +354,8 @@ func (g *captureGate) MicHold() string {
 // switch is still on, the light does not hold it, and no later closing has
 // happened. forLight says ReleaseLightHold asked: a refusal from
 // beforeGateOpen then holds the gate for the light again, where a person's
-// resume is refused and the switch goes off.
+// resume is refused and the switch goes off. While no capture device is
+// present, it takes no light check, and so releases no hold (afterGateOpen).
 func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight bool) {
 	<-settled
 	g.control.Lock()
@@ -332,7 +367,8 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 		g.control.Unlock()
 		return
 	}
-	if g.beforeGateOpen != nil {
+	checked := g.beforeGateOpen != nil && !g.captureMissing()
+	if checked {
 		if err := g.beforeGateOpen(); err != nil {
 			g.mu.Lock()
 			if g.closed && g.closings == closing {
@@ -367,7 +403,7 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 	g.mu.Unlock()
 	g.armAudio()
 	g.control.Unlock()
-	if g.afterGateOpen != nil {
+	if checked && g.afterGateOpen != nil {
 		g.afterGateOpen()
 	}
 }
@@ -383,6 +419,89 @@ func (g *captureGate) finishMicStart() {
 	g.armAudio()
 	if g.afterMicStart != nil {
 		g.afterMicStart()
+	}
+}
+
+// captureMissing reports that capturePresent finds no capture device: the
+// light then stays off, since nothing can open.
+func (g *captureGate) captureMissing() bool {
+	return g.capturePresent != nil && !g.capturePresent()
+}
+
+// confirmMicOpen confirms the light red for a microphone open or start, as
+// confirmMicStart does, holding it red until finishMicStart, and marks the
+// light as red from then on: audio passes the gate only while the light has
+// stayed red since (lightWentOff). It first looks for a capture device,
+// without opening one (capturePresent): with none it lights nothing and
+// returns errNoCaptureDevice, so the light stays off while the microphone is
+// missing. A light that cannot be confirmed red returns an error that wraps
+// errLightNotConfirmed.
+func (g *captureGate) confirmMicOpen() error {
+	if g.captureMissing() {
+		return errNoCaptureDevice
+	}
+	if err := g.confirmMicStart(); err != nil {
+		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
+	}
+	if g.lightRedMark != nil {
+		// Read under the light's lock by the confirmation itself, so no
+		// failure counted after it is taken into the mark.
+		g.redMark.Store(g.lightRedMark())
+	}
+	return nil
+}
+
+// openUnderRed runs open, which opens or starts a capture device, only once a
+// capture device is present and the light is confirmed red (confirmMicOpen),
+// and holds the light red until open returns: the light controller cannot
+// turn it off meanwhile, so no device opens, and no PortAudio scan runs, while
+// the light last showed anything but red. Otherwise it runs nothing and
+// returns confirmMicOpen's error.
+func (g *captureGate) openUnderRed(open func() error) error {
+	if err := g.confirmMicOpen(); err != nil {
+		return err
+	}
+	defer g.finishMicStart()
+	return open()
+}
+
+// lightWentOff reports whether the light was written, or read back, as
+// anything but red since the microphone last opened under confirmMicOpen.
+func (g *captureGate) lightWentOff() bool {
+	return g.lightOffs != nil && g.lightOffs() != g.redMark.Load()
+}
+
+// closingSignal returns a channel that is closed once the gate is closed: at
+// once if it is closed now, else at its next closing.
+func (g *captureGate) closingSignal() <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closing
+}
+
+// micHeld reports to onMicHeld that a pause could not release the microphone
+// (true), or that it is released after all (false).
+func (g *captureGate) micHeld(held bool) {
+	if g.onMicHeld != nil {
+		g.onMicHeld(held)
+	}
+}
+
+// micClosed tells the light that the mic loop closed the microphone: the
+// light follows the open microphone, so it may now go off.
+func (g *captureGate) micClosed() {
+	if g.afterMicClose != nil {
+		g.afterMicClose()
+	}
+}
+
+// lightUnconfirmed hands a red confirmation that failed for a microphone open
+// to the light guard, which holds the gate for the light: a light that reads
+// back off while the controller wants it off passes the controller's own
+// check, so only a confirmation finds it broken.
+func (g *captureGate) lightUnconfirmed(err error) {
+	if g.onLightUnconfirmed != nil && errors.Is(err, errLightNotConfirmed) {
+		g.onLightUnconfirmed(err)
 	}
 }
 
@@ -424,7 +543,8 @@ func (g *captureGate) IsPaused() bool {
 }
 
 // finishResume ends the resuming state of the latest Resume once its start of
-// the microphone, and Deepgram, has finished, whether it worked or failed:
+// the microphone has finished, whether it worked or failed (Deepgram then
+// connects in the background):
 // readiness then reports what is up and what is not. A start that finishes
 // while the gate is closed again does not end the next Resume's state; that
 // Resume's own start does.
@@ -514,14 +634,16 @@ type gatedWriter struct {
 	dst  io.Writer
 }
 
-// Write records p. Audio that comes back after a stall, which turned the
-// light off, is recorded only once the light is confirmed red again
-// (beforeMicStart, as for a microphone start): otherwise it would be recorded
-// with the light off until the light's next check. Audio the light cannot be
-// confirmed red for is dropped, and the failure goes to the light guard
-// (onLightUnconfirmed), which holds the gate for the light: the light can read
-// back off, as its controller wants while nothing is recorded, so only this
-// confirmation finds it broken.
+// Write records p, only while the light has stayed red since the microphone
+// opened under a red confirmation. It reads the light back first
+// (checkLight), so a light that went off, also from outside Ghost Wispr (an
+// unplug, the blink(1)'s watchdog, another `ghost-wispr light-off`), stops
+// the audio at once, not at the light controller's next look. Once the light
+// was not red at some point since the microphone opened (lightWentOff), the
+// audio is dropped with errLightWentOff: some of it, and whatever the
+// microphone still holds, may have been captured with the light off, so the
+// mic loop closes the microphone and opens it again under a new red
+// confirmation.
 func (w *gatedWriter) Write(p []byte) (int, error) {
 	g := w.gate
 	g.mu.Lock()
@@ -532,14 +654,11 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 	g.writing++
 	g.mu.Unlock()
 	defer g.finishWrite()
-	if !g.audioFlowing() {
-		if err := g.confirmMicStart(); err != nil {
-			if g.onLightUnconfirmed != nil {
-				g.onLightUnconfirmed(err)
-			}
-			return len(p), nil
-		}
-		defer g.finishMicStart()
+	if g.checkLight != nil {
+		g.checkLight()
+	}
+	if g.lightWentOff() {
+		return 0, errLightWentOff
 	}
 	n, err := w.dst.Write(p)
 	if err == nil {

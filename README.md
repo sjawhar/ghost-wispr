@@ -51,11 +51,12 @@ Microphone → Deepgram WebSocket → Session Manager → SQLite
 
 ### System dependencies
 
-PortAudio is required for microphone access:
+PortAudio is required for microphone access, and ALSA's library for the speaker on Linux
+(`portaudio19-dev` depends on `libasound2-dev`):
 
 ```bash
 # Debian/Ubuntu/Raspberry Pi
-sudo apt-get install portaudio19-dev
+sudo apt-get install portaudio19-dev libasound2-dev
 
 # macOS
 brew install portaudio
@@ -120,12 +121,42 @@ recording_rules:
 ## Recording light
 
 With `indicator_light: blink1` the recorder captures only while the blink(1) reads back red.
-With the light missing, or not reading back red, it starts no microphone and refuses a resume;
+With the light missing, or not reading back red, it starts no microphone and refuses a resume.
+While no capture device is present, a resume is accepted and lights nothing: no microphone can
+open, and the light is checked once one can;
 if the light fails while it records, capture stops within one check (a second) without saving a
 pause. `/api/status` then names the cause in a warning and reports `capture_state`
 `light_unavailable`, and capture comes back once the light reads back red again, unless someone
 paused it meanwhile. Any other value of `indicator_light` stops the recorder from starting, so a
 typo cannot turn the light check off; leave it unset for a recorder with no light.
+
+Every microphone open, and PortAudio's device scan, which opens the microphone too, waits for
+the blink(1) to read back red and keeps it red until the open has finished, so no microphone opens
+while the light is off. Before it lights the blink(1) for an open, the recorder looks in
+`/proc/asound` for a capture device, without opening one: while there is none, the light stays off,
+`/api/status` warns `No microphone found`, and the start-up retry looks again every 15 seconds.
+With `mic_device` set (a sound card's ALSA id or a word of its name, as `Jabra`; or
+`GHOST_WISPR_MIC_DEVICE`), only that card's capture device counts, and the microphone opens that
+card's input and no other, through ALSA's plug layer (`plughw`), so it captures at 16000 Hz
+whatever rate the card takes; unset, any capture device counts and the default input opens.
+A unit that starts paused scans only at its first resume. The speaker does not need the scan: on
+Linux it plays through the ALSA playback device that `speaker_device` names (a PCM such as
+`plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
+needing no red light, so it speaks while capture is paused.
+
+The microphone is never open while the blink(1) is off. The light stays red while the microphone is
+open, and goes off only once the recorder has closed it: after a pause, once no audio has reached
+the recording for 2 s (`no_audio`; the recorder opens it again under a new red check after a wait
+that doubles up to 30 s, so with a microphone that delivers nothing the light shows red for about
+2 s at each retry while nothing is recorded), before it waits to reconnect after a stream error,
+and at shutdown. A
+pause turns the light off within 500 ms: that is the bound for A1 ("Tap the Pi's power button: the
+light goes off"), and the tests hold the pause paths to it. If a pause cannot close the microphone,
+the light stays red and `/api/status` warns until it closes. The recorder
+reads the light back for each buffer of audio: once the light was not red while the microphone was
+open, as when it went off outside Ghost Wispr (an unplug, its watchdog, another `ghost-wispr
+light-off`), the recorder drops that audio and what the microphone holds, closes it and opens it
+again under a new red check.
 
 ## Deployment
 
@@ -141,9 +172,9 @@ outputs, credential bundle, provisioning command, tailnet join, and acceptance c
 | `GET` | `/api/sessions?date=YYYY-MM-DD` | List sessions for a date (defaults to today) |
 | `GET` | `/api/sessions/{id}` | Get session details with transcript segments |
 | `GET` | `/api/sessions/{id}/audio` | Stream session audio (supports range requests) |
-| `POST` | `/api/pause` | Pause capture. The pause persists through restarts; the active session ends, the microphone closes, and nothing is recorded or sent to Deepgram until resume. A unit that starts paused opens the microphone, and connects to Deepgram, only when it resumes. When enabled, the Pi power button and the Jabra's Mute button toggle the same control, and the Jabra's mute light is on while capture is paused. |
-| `POST` | `/api/resume` | Resume a persisted pause. With a configured light, it confirms red before returning, and a missing light refuses the resume. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone reopens; while the unit speaks through the Jabra, the microphone reopens once the speech ends, and a pause meanwhile cancels the resume. |
-| `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `light_unavailable` while the switch is on but the recording light is missing or does not read back red, `resuming` from a resume until the microphone has started and Deepgram has connected, or the start failed, for at most 30 s, or for as long as the microphone waits for speech on the Jabra to end before it opens, `stalled`, `mic_unavailable`, `no_audio` while the microphone and the gate are open but no audio has reached the recording for 2 s, so nothing is recorded and the light is off, or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (every raw `.pcm` recording the app keeps: those of sessions that ended without a recording, which it tries again to save after every Drive sync sweep, those beside a saved recording, which it erases once Drive has it, and those it neither saves nor erases), `kept_raw_by_hand` (the sessions of those last ones, which wait for a person), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
+| `POST` | `/api/pause` | Pause capture. The pause persists through restarts; the active session ends, the microphone closes at once, even while its read waits for a device that delivers nothing, and then the recording light goes off; nothing is recorded or sent to Deepgram until resume. If the microphone cannot be closed, the light stays red and `/api/status` warns until it closes. A unit that starts paused opens the microphone, and connects to Deepgram, only when it resumes. When enabled, the Pi power button and the Jabra's Mute button toggle the same control, and the Jabra's mute light is on while capture is paused. |
+| `POST` | `/api/resume` | Resume a persisted pause. With a configured light, it confirms red before returning, and a missing light refuses the resume; while no capture device is present, it is accepted without a light check, and the light stays off until a microphone can open. A `204` accepts the request, but a second gate-open check can still keep capture paused if the light fails while the session settles; the page receives `status_changed`. Returns `500` if red cannot be confirmed at request time or persistent state cannot be saved. Audio flows only after the paused session has ended and the microphone reopens; while the unit speaks through the Jabra, the microphone reopens once the speech ends, and a pause meanwhile cancels the resume. |
+| `GET` | `/api/status` | `paused` (the switch), `capturing` (audio is flowing), `capture_state` (`paused`, `light_unavailable` while the switch is on but the recording light is missing or does not read back red, `resuming` from a resume until the microphone has started, or the start failed, for at most 30 s, or for as long as the microphone waits for speech on the Jabra to end before it opens (Deepgram then connects in the background), `stalled`, `mic_unavailable`, `no_audio` once no audio has reached the recording for 2 s: the microphone is closed, and the light off, until it opens again, or `capturing`), `kept_raw_recordings` and `kept_raw_bytes` (every raw `.pcm` recording the app keeps: those of sessions that ended without a recording, which it tries again to save after every Drive sync sweep, those beside a saved recording, which it erases once Drive has it, and those it neither saves nor erases), `kept_raw_by_hand` (the sessions of those last ones, which wait for a person), `gc_hold` (null, or the last GC pass held back because Drive sync is off, has no folder, or cannot verify that Drive still has the session audio), `unverified_sessions` (sessions an earlier version synced that GC keeps until a sync re-checks their Drive documents), `unit_only_sessions` (sessions kept on this unit only, with their audio, because their Drive folder is gone or unreadable; with a warning while there are any), and the active session |
 | `WS` | `/ws` | Real-time events (transcripts, session state) |
 
 With no `GHOST_WISPR_AUTH_TOKEN`, as on the Pi, tailnet membership is the only access control. So that a page on another site,

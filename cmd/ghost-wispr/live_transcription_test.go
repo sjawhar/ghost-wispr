@@ -64,7 +64,7 @@ func TestLiveTranscriptionConnectsAfterATransientFirstDialFailure(t *testing.T) 
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 200 * time.Millisecond, MaxReconnectBackoff: 200 * time.Millisecond},
-		nil, warnings, nil, false)
+		nil, warnings, nil)
 	t.Cleanup(func() { _ = rc.Close() })
 	if rc.IsConnected() {
 		t.Fatal("live transcription says connected after its first dial got HTTP 503")
@@ -152,11 +152,12 @@ func TestDeepgramWarningFollowsLaterDisconnects(t *testing.T) {
 		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
-		nil, warnings, nil, false)
+		nil, warnings, nil)
 	t.Cleanup(func() { _ = rc.Close() })
-	if !rc.IsConnected() || notConnectedWarning(warnings) {
-		t.Fatalf("after a first dial that worked: connected=%t, warnings %q", rc.IsConnected(), warnings.List())
-	}
+	// The first dial runs in the background.
+	waitForHardwareWithin(t, 3*time.Second, "the first dial to connect and clear the warning", func() bool {
+		return rc.IsConnected() && !notConnectedWarning(warnings)
+	})
 
 	// The microphone's audio, as the send queue writes it.
 	stop := make(chan struct{})

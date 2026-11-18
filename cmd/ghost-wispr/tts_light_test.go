@@ -61,7 +61,7 @@ func playThroughDevice(t *testing.T, device *captureDevice) (out *heldOutput, fi
 
 // TestNoJabraLightWriteWhileTTSPlaybackIsOpen fails if the Jabra's light is
 // written while TTS playback holds an output stream open on the Jabra
-// (deploy/pi/files/ghost-wispr.yaml: speaker_device Jabra). A light change
+// (deploy/pi/files/ghost-wispr.yaml: speaker_device J75). A light change
 // while only a playback stream was open made the Jabra send Phone Mute by
 // itself at the next microphone close on the office Pi (INFRA-1027 trace,
 // section 9.7, restart 1), and a microphone close while recording, such as a
@@ -144,7 +144,8 @@ func TestNoJabraLightWriteDuringTTSOnAnyMicrophonePath(t *testing.T) {
 			setup: func(_ *captureGate, mic *scriptedMic) {
 				mic.streamErrs = []error{errors.New("Input overflowed")}
 			},
-			events: []string{"stream", "reopen", "stream"},
+			// The loop closes the device before it waits to reconnect.
+			events: []string{"stream", "close", "reopen", "stream"},
 		},
 		{
 			name: "close when red cannot be confirmed before a reconnect",
@@ -152,7 +153,9 @@ func TestNoJabraLightWriteDuringTTSOnAnyMicrophonePath(t *testing.T) {
 				capture.beforeMicStart = func() error { return errors.New("recording light stayed off") }
 				mic.streamErrs = []error{errors.New("device disconnected")}
 			},
-			events: []string{"stream", "close", "stream"},
+			// The device closes before the wait, and again when the light
+			// refuses the reconnect; the loop then waits for the light.
+			events: []string{"stream", "close", "close"},
 		},
 		{
 			name:   "close when the light guard holds capture",

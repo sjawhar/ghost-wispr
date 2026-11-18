@@ -136,10 +136,11 @@ func TestAResumeDuringSpeechWaitsForPlaybackToClose(t *testing.T) {
 		t.Cleanup(func() { cancel(); loops.Wait() })
 		booted := make(chan struct{})
 		close(booted)
-		if !startMicrophone(ctx, &loops, r.capture, booted, true, func(bool) error {
+		deferred, _ := startMicrophone(ctx, &loops, r.capture, booted, func(bool) error {
 			started <- r.ring.Load()
 			return nil
-		}, func() { t.Error("the start-up retried, but no attempt failed") }) {
+		}, func() { t.Error("the start-up retried, but no attempt failed") })
+		if !deferred {
 			t.Fatal("control: a paused start did not defer the microphone")
 		}
 		r.speak(t)
@@ -190,7 +191,7 @@ func TestAPauseDuringTheSpeechWaitCancelsTheResume(t *testing.T) {
 		t.Cleanup(func() { cancel(); loops.Wait() })
 		booted := make(chan struct{})
 		close(booted)
-		startMicrophone(ctx, &loops, r.capture, booted, true, func(bool) error {
+		_, _ = startMicrophone(ctx, &loops, r.capture, booted, func(bool) error {
 			starts.Add(1)
 			return nil
 		}, func() { t.Error("the start-up retried, but no attempt failed") })

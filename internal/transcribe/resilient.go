@@ -104,23 +104,17 @@ func (rc *ResilientClient) setStateLocked(newState ConnectionState) {
 	}
 }
 
-// Connect dials the first socket and returns the dial's error. A failed dial
-// leaves the client disconnected and redialling with backoff, buffering the
-// audio written meanwhile, so one failed dial never turns live transcription
-// off.
-func (rc *ResilientClient) Connect() error {
-	client, err := rc.Factory(rc.ctx)
-	if err != nil {
-		rc.Mu.Lock()
-		rc.setStateLocked(StateDisconnected)
-		rc.Mu.Unlock()
-		rc.startReconnect()
-		return err
-	}
+// ConnectInBackground dials the first socket on a goroutine of its own and
+// returns at once: a dial can take as long as the handshake limit, and a
+// microphone start, which holds the recording light red until it returns,
+// must not wait for it. Until a socket is connected the client is
+// reconnecting and buffers the audio written meanwhile, which it sends once
+// one is, and a failed dial is retried with backoff, as after a disconnect.
+func (rc *ResilientClient) ConnectInBackground() {
 	rc.Mu.Lock()
-	rc.Client = client
+	rc.setStateLocked(StateReconnecting)
 	rc.Mu.Unlock()
-	return nil
+	go rc.reconnect(0)
 }
 
 // startReconnect starts a background reconnect goroutine (safe to call multiple times).
@@ -133,28 +127,34 @@ func (rc *ResilientClient) startReconnect() {
 	rc.setStateLocked(StateReconnecting)
 	rc.Mu.Unlock()
 
-	go rc.reconnect()
+	go rc.reconnect(rc.Config.InitialReconnectDelay)
 }
 
-// reconnect handles reconnection with exponential backoff.
-// Stops when rc.ctx is cancelled.
-func (rc *ResilientClient) reconnect() {
-	delay := rc.Config.InitialReconnectDelay
+// reconnect dials after wait, then again with exponential backoff, until a
+// socket is connected and the buffered audio sent. Stops when rc.ctx is
+// cancelled.
+func (rc *ResilientClient) reconnect(wait time.Duration) {
+	next := rc.Config.InitialReconnectDelay
+	if wait > 0 {
+		next = min(2*wait, rc.Config.MaxReconnectBackoff)
+	}
+	backOff := func() {
+		wait, next = next, min(2*next, rc.Config.MaxReconnectBackoff)
+	}
 
 	for {
+		timer := time.NewTimer(wait)
 		select {
 		case <-rc.ctx.Done():
+			timer.Stop()
 			return
-		case <-time.After(delay):
+		case <-timer.C:
 		}
 
 		newClient, err := rc.Factory(rc.ctx)
 		if err != nil {
-			rc.log("deepgram reconnect failed (retrying in %v): %v", delay, err)
-			delay *= 2
-			if delay > rc.Config.MaxReconnectBackoff {
-				delay = rc.Config.MaxReconnectBackoff
-			}
+			rc.log("deepgram reconnect failed (retrying in %v): %v", next, err)
+			backOff()
 			continue
 		}
 
@@ -166,15 +166,12 @@ func (rc *ResilientClient) reconnect() {
 		if err := rc.drainBuffer(); err != nil {
 			// The new socket is dead too: keep the rest of the buffer for
 			// the next one rather than throwing it into this one.
-			rc.log("deepgram socket failed while draining buffered audio (redialling in %v): %v", delay, err)
+			rc.log("deepgram socket failed while draining buffered audio (redialling in %v): %v", next, err)
 			rc.Mu.Lock()
 			rc.setStateLocked(StateReconnecting)
 			rc.Mu.Unlock()
 			_ = newClient.Close()
-			delay *= 2
-			if delay > rc.Config.MaxReconnectBackoff {
-				delay = rc.Config.MaxReconnectBackoff
-			}
+			backOff()
 			continue
 		}
 

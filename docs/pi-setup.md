@@ -135,7 +135,7 @@ Ghost Wispr:
 source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}" &&
 crt=$(mktemp) &&
 gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$crt" &&
-openssl x509 -in "$crt" -noout -subject -enddate &&
+openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 -enddate &&
 ssh "ghost-wispr@$PI_HOST" \
   'sudo install -o ghost-wispr -g ghost-wispr -m 0644 /dev/stdin /opt/ghost-wispr/device.crt && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart ghost-wispr.service' <"$crt"
 rm -f -- "$crt"
@@ -199,7 +199,7 @@ the time you run the block:
 source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
 prepared=$(mktemp -d)
 gcloud secrets versions access latest --secret="$PI_CERTIFICATE_SECRET" --project="$PI_GCP_PROJECT" >"$prepared/device.crt"
-openssl x509 -in "$prepared/device.crt" -noout -subject -enddate
+openssl x509 -in "$prepared/device.crt" -noout -subject -nameopt RFC2253 -enddate
 cp "$d/certificate_config.json" "$d/google-credentials.json" "$prepared/"
 git -C "$PI_INFRA_CHECKOUT" fetch --quiet origin main
 git -C "$PI_INFRA_CHECKOUT" show "origin/main:$PI_SUBJECT_FILE" \
@@ -257,8 +257,10 @@ Then run:
 deploy/pi/provision-pi.sh --prepared "$prepared"
 ```
 
-`provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says
-so (exit 255).
+`provision-pi.sh`'s last line says what `provision.sh` did: it started the tagged tailnet join as
+a detached unit, which it names, or it found the Pi already joined and started none.
+`provision.sh` can end the SSH session while Tailscale re-authenticates; the script then says so
+(exit 255).
 
 The tagged join makes a new Tailscale device. The temporary device you joined as your own still
 holds the name `ghost-wispr`, so Tailscale names the tagged one `ghost-wispr-1`, and
@@ -350,26 +352,22 @@ the models step install them with the rest of the template.
 ## Pause and resume at the unit
 
 With `power_button: true`, set in `deploy/pi/files/ghost-wispr.yaml`, a short press of the Pi's
-power button pauses recording, or resumes it when it is paused; with `jabra_mute_button` on, so
-does a tap of the Jabra Speak2 75's Mute button. The template keeps `jabra_mute_button: false`,
-and the office Pi's `.env` holds `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, until a person's real taps
-pass the checks at the end of this section on the office Pi, and until the follow-up fix for a
-microphone that opens before the recording light reads red has merged. Step 6 checks the fix of
-defect D9 (#75): before it, a restart of a paused unit could resume recording by itself, because
-the Jabra sends a mute-key press as the old process closes its microphone. The buttons change the
-same pause switch as the web page, `POST /api/pause` and `POST /api/resume`, so any of them
-resumes a pause made by any other, and a resume from a button checks the recording light as one
-from the web page does. A long press of the power button is left to the Pi, which powers off.
+power button pauses recording, or resumes it when it is paused; with `jabra_mute_button: true`,
+which the template also sets, so does a tap of the Jabra Speak2 75's Mute button. A restart of a
+paused unit stays paused: before the fix of defect D9 (#75) it could resume recording by itself,
+because the Jabra sends a mute-key press as the old process closes its microphone. The buttons
+change the same pause switch as the web page, `POST /api/pause` and `POST /api/resume`, so any of
+them resumes a pause made by any other, and a resume from a button checks the recording light as
+one from the web page does. A long press of the power button is left to the Pi, which powers off.
 
 `update.sh` replaces only the binary, so a provisioned unit gets a key added to the template only
 at its next `provision.sh` run, or its next `provision.sh --models` run, which also replaces
-settings saved in the UI. To turn the Jabra's button on or off without either, put
-`GHOST_WISPR_JABRA_MUTE_BUTTON=true` or `GHOST_WISPR_JABRA_MUTE_BUTTON=false` in
+settings saved in the UI. To turn the Jabra's button off or on without either, put
+`GHOST_WISPR_JABRA_MUTE_BUTTON=false` or `GHOST_WISPR_JABRA_MUTE_BUTTON=true` in
 `/opt/ghost-wispr/.env`, which overrides the YAML, and restart `ghost-wispr.service`. A full
-`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it on in `.env`
-only for the checks at the end of this section, and in the template only after they pass. Turn it
-off while recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the
-Jabra's light as it last set it.
+`provision.sh` run rewrites `.env`, and the template's setting applies again. Turn it off while
+recording, or unplug the Jabra and plug it in again afterwards: Ghost Wispr leaves the Jabra's
+light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
@@ -397,6 +395,41 @@ of the Pi's time does not move the stamps. The log says
 A press that would pause always pauses. The blink(1) stays the recording light: the Jabra's light
 only shows the pause switch.
 
+The blink(1) reads back red before the microphone opens, and stays red until it is open: every
+start, resume and reconnect of the microphone, and PortAudio's device scan, waits for that check.
+Before it lights the blink(1) for an open, Ghost Wispr looks in `/proc/asound` for a capture PCM
+(`cardN/pcmMc`) of the card `mic_device: J75` names, the Jabra Speak2 75's ALSA card id, without
+opening one, and it opens only that card's input, through ALSA's plug layer (`plughw:0,0`): the
+Jabra captures only at 32000 Hz, and the plug layer gives Ghost Wispr the 16000 Hz it records and
+streams at, so the log says `microphone started at 16000 Hz`. With the Jabra unplugged there is
+none, also while another capture card, such as the ALSA loopback or a second Jabra device, is
+present; then
+the blink(1) stays off, `/api/status` warns `No microphone found`, and the start-up retry (every 15
+seconds) and the reconnect (backing off to every 30 seconds) look again without lighting it. A unit that
+starts paused scans only at its first resume. The speaker does not wait for it: it plays through the
+ALSA playback PCM of the card `speaker_device: J75` names (`plughw:CARD=J75,DEV=0`, the Jabra's
+`pcmC0D0p` on the office Pi), opening no microphone and needing no red light, so a unit restarted
+paused still speaks. It needs no package beyond `libportaudio2`, whose dependency `libasound2t64`
+the Pi already has (`deploy/pi/baseline.txt`). A pause during an open keeps the blink(1) red until
+that open has finished.
+
+The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
+is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while
+its read waits on a device that delivers no frame or its audio waits on a stuck recording file;
+then the blink(1) goes off, within 500 ms of the tap: that is the bound for A1. If a call into
+PortAudio does not return, the microphone cannot be
+closed: the blink(1) stays red, `/api/status` warns `Microphone still open after a pause` until it
+closes, and nothing is recorded meanwhile. Once no audio has reached the recording for 2 seconds,
+Ghost Wispr closes the microphone, and the blink(1) goes off, with `capture_state` `no_audio`; it
+opens it again under a new check after a wait that doubles up to 30 seconds: with a microphone that
+delivers nothing, the light shows red for about 2 seconds at each retry while nothing is recorded.
+After a stream error
+it closes the microphone before it waits to reconnect. It reads the blink(1) back for each buffer
+of audio: once the blink(1) was not red while the microphone was open, as when it was unplugged or
+its watchdog turned it off, Ghost Wispr drops what the microphone holds and opens it again under a
+new check; the log says `the recording light was not red while the microphone was open; reopening
+the microphone`. At shutdown the blink(1) goes off once the microphone is closed.
+
 Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
 a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
 program's stream, so it may change the light while the stream is open, and the Jabra's own Phone
@@ -422,9 +455,8 @@ Mute, and takes LED Mute from the client. Jabra's
 [call-control SDK](https://sdk.jabra.com/javascript/docs/jabra-js/4.4.1/interfaces/ICallControl.html)
 says its `mute` "Mutes or unmutes the microphone of the Jabra device", and that it "Should only be
 used during a call". Ghost Wispr uses the Jabra outside a call, so what the Jabra does with the
-light is checked on the unit. After a deploy that changes these controls, open the web page and
-turn the Jabra's button on with `GHOST_WISPR_JABRA_MUTE_BUTTON=true` in `/opt/ghost-wispr/.env` and
-a restart, as above. Then:
+light is checked on the unit. After a deploy that changes these controls, open the web page, with
+the Jabra's button on (the template's setting). Then:
 
 1. While it records (the blink(1) red), tap the Jabra's Mute button. The blink(1) goes off, the
    Jabra's ring shows Muted (red), and the page shows the pause. Wait 70 seconds: the ring still
@@ -445,11 +477,10 @@ a restart, as above. Then:
    `ghost-wispr` user. Recording stays paused, the blink(1) stays off, and the ring shows Muted.
 
 After each step the state stays as it is: nothing pauses or resumes by itself. If any step fails,
-turn the Jabra's button off again with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above; the template
-keeps `jabra_mute_button: false`, so a provisioning run leaves it off, and the power button and the
-web page still pause and resume. Only when every step passes, and the follow-up fix for a
-microphone that opens before the recording light reads red has merged, turn the button on in the
-template, in a pull request that also changes the deploy tests that keep it off.
+turn the Jabra's button off with `GHOST_WISPR_JABRA_MUTE_BUTTON=false` as above, and the power
+button and the web page still pause and resume. A full provisioning run rewrites `.env` and turns
+the button on again, so also set `jabra_mute_button: false` in the template, in a pull request that
+also changes the deploy tests that pin it on.
 
 ## Restrict OpenSSH to loopback
 
@@ -497,8 +528,8 @@ ssh ghost-wispr@ghost-wispr 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user
 ## Roll out a release that adds a config key
 
 Follow this order for every release whose code reads a new key from
-`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules`, or needs a key that used to have a
-default, such as `envoy_webhook_secret_name`. The nightly update replaces only
+`/opt/ghost-wispr/ghost-wispr.yaml`, such as `recording_rules` or `mic_device`, or needs a key that
+used to have a default, such as `envoy_webhook_secret_name`. The nightly update replaces only
 the binary: `update.sh` never writes the config, so a new binary that the timer installs starts
 on a config without the new key. The other order fails too: while the old binary runs on a config
 that has the key, a settings save drops the key, because the old binary writes back only the keys
@@ -509,15 +540,11 @@ restart ends a conversation that is being recorded and turns the light off, so r
 outside meetings. Save no settings in the web UI from step 1 until step 4 passes.
 
 A setting the Pi holds in `/opt/ghost-wispr/.env` overrides its YAML, and the steps treat the two
-files differently. The office Pi sets the Jabra's Mute button there, with
-`GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"); that line turns the button off
-until a person's real taps pass the checks of "Pause and resume at the unit", whose step 6 checks
-the fix of defect D9, and until the follow-up fix for a microphone that opens before the recording
-light reads red has merged. The models step keeps every `.env` line but an old Envoy signing key
-and the embedding location, which it writes again, so that line stays as it is. The full provisioner
-rewrites `.env` without it, and the template's `jabra_mute_button: false` applies. The button
-stays off either way. Leave the `.env` line as it is during the rollout, and turn the button on in
-neither file during the rollout: these steps restart the recorder.
+files differently. The office Pi can set the Jabra's Mute button there, with
+`GHOST_WISPR_JABRA_MUTE_BUTTON` ("Pause and resume at the unit"). The models step keeps every
+`.env` line but an old Envoy signing key and the embedding location, which it writes again, so
+that line stays as it is. The full provisioner rewrites `.env` without it, and the template's
+`jabra_mute_button: true` applies.
 
 1. Just before you merge, run the models step ("Enable models and Drive sync") from a checkout of
    the pull request's head (`provision.sh --models <shared-drive-id>`). The shared-drive ID is the
@@ -541,12 +568,15 @@ neither file during the rollout: these steps restart the recorder.
    session; leaving the current binary in place` and changes nothing: run it again once the
    session has ended.
 4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
-   come back, and for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning. The
-   Jabra's Mute button must still be off: each line the `grep` prints ends in `false`.
+   come back; for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning; for
+   `mic_device`, the config must hold `mic_device: J75`, `/api/status` no `No microphone found`
+   warning, and `capture_state` must be `capturing` or `paused`. The Jabra's Mute button must be on:
+   each line the last `grep` prints ends in `true`.
 
    ```bash
    curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/config | jq .recording_rules
-   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq .warnings
+   curl -fsS https://ghost-wispr.tail12ec1c.ts.net/api/status | jq '{capture_state, warnings}'
+   ssh ghost-wispr@ghost-wispr "grep '^mic_device:' /opt/ghost-wispr/ghost-wispr.yaml"
    ssh ghost-wispr@ghost-wispr "grep -E '^(jabra_mute_button:|GHOST_WISPR_JABRA_MUTE_BUTTON=)' /opt/ghost-wispr/ghost-wispr.yaml /opt/ghost-wispr/.env"
    ```
 
@@ -610,6 +640,26 @@ trash. To clear it:
 3. Delete the session from the unit again.
 
 The warning goes once no such session is left. The count is read again at each status request.
+
+## Inject speech for acceptance
+
+The rows that need speech (slice 2's A6 and A8, slice 3) can run on synthesized speech that
+bypasses the microphone: speech played through the Jabra's own speaker does not reach its
+recording, because its echo cancellation removes it. Ghost Wispr records only the sound card
+`mic_device` names, so for the run point it at the ALSA loopback, and back afterwards. Run these
+steps on the Pi as `ghost-wispr`, outside meetings, with no session active.
+
+1. Load the loopback: `sudo modprobe snd-aloop`. `grep Loopback /proc/asound/cards` shows its card.
+   While `mic_device: J75` applies, Ghost Wispr ignores that card.
+2. Add `GHOST_WISPR_MIC_DEVICE=Loopback` to `/opt/ghost-wispr/.env`, which overrides the YAML, and
+   restart `ghost-wispr.service`. Ghost Wispr then captures from the loopback's device 0, under the
+   same light rule as on the Jabra.
+3. Play each conversation into the loopback's device 1, whose sound comes out of device 0:
+   `aplay -D plughw:CARD=Loopback,DEV=1 <conversation>.wav`.
+4. Afterwards, remove the `GHOST_WISPR_MIC_DEVICE` line from `.env`, restart `ghost-wispr.service`,
+   and unload the loopback: `sudo modprobe -r snd-aloop`. Then `/api/status` must show
+   `capture_state` `capturing` (or `paused`) with no `No microphone found` warning: the Jabra is
+   the microphone again.
 
 ## Accept slice 1
 
@@ -683,10 +733,11 @@ Envoy, speaker, indicator light, power button, and Jabra mute button. Before sta
 separate database as paused, and do not resume it: a paused instance opens the microphone, and
 connects to Deepgram, only when someone resumes it.
 
-The test instance must not open the Jabra at all. PortAudio opens every audio device once as an
-instance starts, and the recorder, running beside it with the Jabra button on, cannot see that
-stream: a light change while it is open makes the Jabra send Phone Mute when it closes, which the
-recorder reads as a tap. So start it with no supplementary groups: the Pi's sound devices are
+The test instance must not open the Jabra at all. PortAudio opens every audio device once when an
+instance first starts its microphone: at start-up, or, for an instance seeded paused, at its
+first resume. The recorder, running beside it with the Jabra button on, cannot see that stream: a
+light change while it is open makes the Jabra send Phone Mute when it closes, which the recorder
+reads as a tap. So start it with no supplementary groups: the Pi's sound devices are
 `root:audio` and its input nodes `root:input`, both mode 0660, so it can open neither. Also set
 `GHOST_WISPR_JABRA_MUTE_BUTTON=false`, which overrides the YAML. Seed and start it like this:
 
