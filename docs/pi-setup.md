@@ -438,8 +438,10 @@ light as 0,51,51, the version reply, and drop its audio. So every command that G
 from the recorder or from a subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node
 from the command to its reply, and a read takes only a reply that names its own command. A command
 that does not get the lock within 50 ms sends nothing: the recorder counts such a read as the
-light not red, and `light-state` prints `unknown` and fails. The watchdog tickle, which waits for
-no reply, is then sent without the lock, so the watchdog does not fire while the recorder runs.
+light not red, and `light-state` prints `unknown` and fails. The watchdog tickle and an off write,
+which wait for no reply, are then sent without the lock, so the watchdog does not fire while the
+recorder runs, and a pause turns the blink(1) off within 500 ms whoever holds the lock. A red
+write sends nothing.
 Other programs that open the blink(1), such as `blink1-tool`, do not take the lock: do not run
 them while the recorder runs. A process stopped while it holds the lock (`kill -STOP`) keeps it;
 the slice 1 driver's Light hang step therefore stops the recorder with `flock` on the node, between

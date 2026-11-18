@@ -317,4 +317,35 @@ func TestControllerReportsWhetherTheLightShowsRed(t *testing.T) {
 	}
 }
 
+// TestControllerTurnsAnUnreadableLightOffWhileNotRecording fails if a check
+// while nothing records leaves the light as it is when it cannot read it, as
+// when another open holds the blink(1)'s lock: the light stays red after a
+// pause until the read gets through. The off write goes anyway, and the check
+// still reports the failed read.
+func TestControllerTurnsAnUnreadableLightOffWhileNotRecording(t *testing.T) {
+	light := &fakeLight{colour: [3]uint8{255, 0, 0}, readErr: ErrBusy}
+	reports := make(chan error, 16)
+	controller := NewController(light, func() bool { return false }, time.Hour, func(err error) { reports <- err })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { controller.Run(ctx); close(done) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	select {
+	case err := <-reports:
+		if !errors.Is(err, ErrBusy) {
+			t.Fatalf("check of an unreadable light reported %v, want ErrBusy", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the controller's first check reported nothing")
+	}
+	light.mu.Lock()
+	defer light.mu.Unlock()
+	if light.colour != ([3]uint8{}) {
+		t.Fatalf("light after a check while not recording that could not read it = %v, want off", light.colour)
+	}
+}
+
 var errDisconnected = errors.New("disconnected")

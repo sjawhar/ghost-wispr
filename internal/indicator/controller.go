@@ -126,9 +126,15 @@ func (c *Controller) update() {
 // or written, or, while recording, does not read back red after a red write:
 // the recorder then may not capture. An off write that does not read back
 // off is not a failure, since a red confirmation can hold the light red.
+// While nothing records, a light it cannot read is written off anyway, as
+// when another open holds the blink(1)'s lock: a pause turns the light off
+// without waiting for the read to get through.
 func (c *Controller) apply(wantRed uint8) error {
 	red, green, blue, err := c.light.ReadRGB()
 	if err != nil {
+		if wantRed == 0 {
+			_ = c.light.SetRGB(0, 0, 0)
+		}
 		return err
 	}
 	if red == wantRed && green == 0 && blue == 0 {

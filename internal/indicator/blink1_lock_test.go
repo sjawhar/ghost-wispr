@@ -345,9 +345,11 @@ func TestAReadTakesOnlyTheReplyToItsOwnCommand(t *testing.T) {
 }
 
 // TestABusyBlink1ReadsUnknownNotRed fails if a command waits without bound for
-// a blink(1) another handle holds, sends anything without its lock, or if a
-// read that could not get the light reports a colour: it must report
-// ErrBusy (unknown), never red, though the light is red.
+// a blink(1) another handle holds, if a read or a red write sends anything
+// without its lock, or if a read that could not get the light reports a
+// colour: it must report ErrBusy (unknown), never red, though the light is
+// red. It also fails if an off write or a watchdog tickle, lone SETs that must
+// reach the light, are not sent once the wait has run out.
 func TestABusyBlink1ReadsUnknownNotRed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hidraw0")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
@@ -392,11 +394,30 @@ func TestABusyBlink1ReadsUnknownNotRed(t *testing.T) {
 	if waited < exchangeWait || waited > exchangeWait+time.Second {
 		t.Fatalf("ReadRGB of a held blink(1) waited %v, want %v", waited, exchangeWait)
 	}
-	if err := light.SetRGB(0, 0, 0); !errors.Is(err, ErrBusy) {
-		t.Fatalf("SetRGB of a held blink(1) error = %v, want ErrBusy", err)
+	if err := light.SetRGB(255, 0, 0); !errors.Is(err, ErrBusy) {
+		t.Fatalf("red SetRGB of a held blink(1) error = %v, want ErrBusy", err)
 	}
 	if n := sent.Load(); n != 0 {
 		t.Fatalf("feature reports sent to a held blink(1) = %d, want 0", n)
+	}
+	for _, lone := range []struct {
+		name string
+		send func() error
+	}{
+		{"off SetRGB", func() error { return light.SetRGB(0, 0, 0) }},
+		{"watchdog tickle", func() error { return light.ServerDown(3 * time.Second) }},
+	} {
+		before := sent.Load()
+		started := time.Now()
+		if err := lone.send(); err != nil {
+			t.Fatalf("%s of a held blink(1): %v, want it sent without the lock", lone.name, err)
+		}
+		if waited := time.Since(started); waited < exchangeWait {
+			t.Fatalf("%s of a held blink(1) went after %v, before its wait of %v for the lock ran out", lone.name, waited, exchangeWait)
+		}
+		if n := sent.Load() - before; n != 1 {
+			t.Fatalf("%s of a held blink(1) sent %d feature reports, want 1", lone.name, n)
+		}
 	}
 
 	// Control: once the other handle lets go, the same read gets red.

@@ -119,9 +119,10 @@ func (b *blink1) send(report *[8]byte) error {
 }
 
 // sendLone sends a lone SET that must reach the light whoever holds it: the
-// watchdog tickle. It waits for the light as send does, and once that wait has
-// run out sends the report without the lock. A lone SET has no GET to protect;
-// it can only answer a query of the holder, whose reply check then refuses it.
+// watchdog tickle, or an off write. It waits for the light as send does, and
+// once that wait has run out sends the report without the lock. A lone SET has
+// no GET to protect; it can only answer a query of the holder, whose reply
+// check then refuses it.
 func (b *blink1) sendLone(report *[8]byte) error {
 	return b.exchange(report, false, true)
 }
@@ -199,8 +200,15 @@ func (b *blink1) lock(fd uintptr) error {
 	}
 }
 
+// SetRGB writes the light's colour. An off write reaches the light whoever
+// holds it (sendLone), so a pause turns the light off; a red write waits for
+// the lock and otherwise sends nothing (ErrBusy). With the reply check, an
+// off write's echo, 01 6e 00 00 00, cannot read as red to another reader.
 func (b *blink1) SetRGB(r, g, blue uint8) error {
 	report := Blink1Report('n', [6]byte{r, g, blue})
+	if r == 0 && g == 0 && blue == 0 {
+		return b.sendLone(&report)
+	}
 	return b.send(&report)
 }
 
