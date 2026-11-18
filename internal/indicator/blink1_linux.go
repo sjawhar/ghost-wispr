@@ -343,67 +343,102 @@ func (b *blink1) ServerDown(timeout time.Duration) error {
 
 // BlackPattern persists an all-black, non-zero-duration pattern so the
 // watchdog turns every LED off after the recorder stops ticking it. Once the
-// pattern reads back black, the unit is known black (checkedUnits).
+// pattern reads back black, the unit is known black (checkedUnits). It runs
+// PatternCheck to the end.
 func (b *blink1) BlackPattern() error {
-	black, err := b.patternIsBlack()
-	if err != nil {
-		return err
-	}
-	if !black {
-		if err := b.writeBlackPattern(); err != nil {
+	check := b.PatternCheck()
+	for {
+		done, err := check.Step()
+		if err != nil || done {
 			return err
 		}
 	}
-	if b.serial != "" {
-		checkedMu.Lock()
-		checkedUnits[b.serial] = b.patternLines
-		checkedMu.Unlock()
-	}
-	return nil
 }
 
-func (b *blink1) patternIsBlack() (bool, error) {
-	lines, err := b.lines()
-	if err != nil {
-		return false, err
+// PatternCheck returns the black pattern check of BlackPattern, which sends
+// one command per Step: the version query if the line count is not known,
+// then a query of each pattern line. At the first line that is not black, it
+// writes the black pattern ('l', a 'P' per line, 'W') and reads every line
+// again; a saved pattern that does not read back black fails it.
+func (b *blink1) PatternCheck() PatternCheck { return &blink1PatternCheck{b: b} }
+
+type blink1PatternCheck struct {
+	b       *blink1
+	lines   uint8 // 0 until the line count is known
+	phase   int   // checkRead, checkSelectLEDs, checkWrite or checkSave
+	line    uint8 // the next line to read or write
+	written bool  // the black pattern is written: the reads check it
+	done    bool
+}
+
+const (
+	checkRead = iota
+	checkSelectLEDs
+	checkWrite
+	checkSave
+)
+
+func (c *blink1PatternCheck) Step() (bool, error) {
+	if c.done {
+		return true, nil
 	}
-	for line := range lines {
-		report := Blink1Report('R', [6]byte{0, 0, 0, 0, 0, line})
-		if err := b.query(&report); err != nil {
+	if c.lines == 0 {
+		c.b.versionMu.Lock()
+		known := c.b.patternLines
+		c.b.versionMu.Unlock()
+		if known == 0 {
+			lines, err := c.b.lines() // the version query: this step's command
+			if err != nil {
+				return false, err
+			}
+			c.lines = lines
+			return false, nil
+		}
+		c.lines = known
+	}
+	switch c.phase {
+	case checkRead:
+		report := Blink1Report('R', [6]byte{0, 0, 0, 0, 0, c.line})
+		if err := c.b.query(&report); err != nil {
 			return false, err
 		}
 		if report[2] != 0 || report[3] != 0 || report[4] != 0 || (report[5] == 0 && report[6] == 0) {
+			if c.written {
+				return false, errors.New("saved blink(1) pattern is not black")
+			}
+			c.phase, c.line = checkSelectLEDs, 0
 			return false, nil
 		}
-	}
-	return true, nil
-}
-
-func (b *blink1) writeBlackPattern() error {
-	lines, err := b.lines()
-	if err != nil {
-		return err
-	}
-	allLEDs := Blink1Report('l', [6]byte{})
-	if err := b.send(&allLEDs); err != nil {
-		return err
-	}
-	for line := range lines {
-		black := Blink1Report('P', [6]byte{0, 0, 0, 0, 10, line})
-		if err := b.send(&black); err != nil {
-			return err
+		if c.line++; c.line < c.lines {
+			return false, nil
 		}
+		if c.b.serial != "" {
+			checkedMu.Lock()
+			checkedUnits[c.b.serial] = c.lines
+			checkedMu.Unlock()
+		}
+		c.done = true
+		return true, nil
+	case checkSelectLEDs:
+		allLEDs := Blink1Report('l', [6]byte{})
+		if err := c.b.send(&allLEDs); err != nil {
+			return false, err
+		}
+		c.phase = checkWrite
+	case checkWrite:
+		black := Blink1Report('P', [6]byte{0, 0, 0, 0, 10, c.line})
+		if err := c.b.send(&black); err != nil {
+			return false, err
+		}
+		if c.line++; c.line == c.lines {
+			c.phase = checkSave
+		}
+	case checkSave:
+		save := Blink1Report('W', [6]byte{0xbe, 0xef, 0xca, 0xfe})
+		_ = c.b.send(&save)
+		c.phase, c.line, c.written = checkRead, 0, true
 	}
-	save := Blink1Report('W', [6]byte{0xbe, 0xef, 0xca, 0xfe})
-	_ = b.send(&save)
-	black, err := b.patternIsBlack()
-	if err != nil {
-		return err
-	}
-	if !black {
-		return fmt.Errorf("saved blink(1) pattern is not black")
-	}
-	return nil
+	return false, nil
 }
 
 func (b *blink1) Close() error {

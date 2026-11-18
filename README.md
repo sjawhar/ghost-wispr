@@ -176,10 +176,10 @@ and `light-off` still turns it off. A red write is not: it sends nothing. The re
 a blink(1) whose stored pattern it found black, since the watchdog plays that pattern. When it
 opens the light again after a device error, it knows the same unit by its serial number, so it needs
 to ask it nothing, and tickles it at once, also while another program holds the lock. Any other
-unit, or one with no serial number, is checked first; while another program holds the lock for
-that check, the unit gets off writes only, no tickle and no red, until the check that comes before
-a red confirmation finds it black. That check does not hold the light, so a pause during it still
-turns the light off at once. Programs that do not take the lock, such as `blink1-tool`, must not run
+unit, or one with no serial number, gets off writes only, no tickle and no red, until the check that
+comes before a red confirmation finds its pattern black. That check sends one command at a time
+and lets the recorder's other commands in between, so a pause during it still turns the light off
+at once. Programs that do not take the lock, such as `blink1-tool`, must not run
 while the recorder runs: their own colour read can still answer the recorder's.
 
 ## Deployment

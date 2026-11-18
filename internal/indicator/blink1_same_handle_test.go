@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -168,5 +169,73 @@ func TestAnOffWriteDoesNotLandInsideItsHandlesOwnExchange(t *testing.T) {
 	}
 	if write == 0 || log[write-1] != "GET R" {
 		t.Fatalf("the off write went at transfer %d, after %q: inside an exchange of its own handle (transfers %v)", write, log[max(write-1, 0)], log[max(write-3, 0):min(write+2, len(log))])
+	}
+}
+
+// TestAPatternCheckStepSendsOneCommand fails if a Step of the driver's pattern
+// check sends more or fewer than one command, or if the steps are not the
+// black pattern check of BlackPattern: the version query, a query per line up
+// to the first line that is not black, the black pattern written ('l', a 'P'
+// per line, 'W'), and every line read again. The recorder holds deviceMu for
+// one step at a time, so a step that sent the whole check would keep a pause
+// from the light again (review 5956273705 of #79).
+func TestAPatternCheckStepSendsOneCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hidraw0")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	var (
+		sent    []byte
+		written = map[byte]bool{}
+	)
+	original := featureIOCTL
+	t.Cleanup(func() { featureIOCTL = original })
+	featureIOCTL = func(_ uintptr, request uintptr, report *[8]byte) error {
+		if request != hidIOCGetFeature {
+			sent = append(sent, report[1])
+			if report[1] == 'P' {
+				written[report[7]] = true
+			}
+			return nil
+		}
+		switch report[1] {
+		case 'v':
+			report[3] = '3'
+		case 'R':
+			if report[7] == 3 && !written[3] {
+				report[2] = 255 // line 3 is lit until the black pattern is written
+			} else {
+				report[6] = 10
+			}
+		}
+		return nil
+	}
+	check := (&blink1{file: file}).PatternCheck()
+	steps := 0
+	for done := false; !done; {
+		before := len(sent)
+		var err error
+		if done, err = check.Step(); err != nil {
+			t.Fatalf("step %d: %v", steps+1, err)
+		}
+		steps++
+		if n := len(sent) - before; n != 1 {
+			t.Fatalf("step %d sent %d commands (%q), want 1", steps, n, sent[before:])
+		}
+		if steps > 200 {
+			t.Fatal("the check did not end within 200 steps")
+		}
+	}
+	want := "vRRRRl" + strings.Repeat("P", 32) + "W" + strings.Repeat("R", 32)
+	if string(sent) != want {
+		t.Fatalf("the check's commands = %q, want %q", sent, want)
+	}
+	if done, err := check.Step(); !done || err != nil || len(sent) != len(want) {
+		t.Fatalf("a step after the check ended = %t, %v, and sent %d commands, want done and none", done, err, len(sent)-len(want))
 	}
 }

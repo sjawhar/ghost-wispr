@@ -394,11 +394,11 @@ type reconnectingLight struct {
 	deviceMu sync.Mutex
 	light    indicator.Light
 	// patternUnchecked marks a light whose stored pattern the recorder has not
-	// found black: a unit it does not know (indicator.KnownBlack), opened while
-	// another command had the lock for its check. It is kept, so off writes,
-	// which go without the lock, still reach it; it gets no watchdog tickle and
-	// no red until CheckPattern finds its pattern black, since its watchdog
-	// would play that pattern (review 5954543056 of #79). Under deviceMu.
+	// found black: a unit it does not know (indicator.KnownBlack). It is kept,
+	// so off writes, which go without the lock, still reach it; it gets no
+	// watchdog tickle and no red until CheckPattern finds its pattern black,
+	// since its watchdog would play that pattern (review 5954543056 of #79).
+	// Under deviceMu.
 	patternUnchecked bool
 	// checkMu lets one CheckPattern run at a time.
 	checkMu     sync.Mutex
@@ -453,25 +453,11 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 		return nil, err
 	}
 	// A unit this process found black before, as the same blink(1) after a
-	// device error, needs no check, which another open holding the lock could
-	// keep from it. Another unit is checked now; if another command has the
-	// lock for that, it is kept unchecked.
-	unchecked := false
-	if !indicator.KnownBlack(light) {
-		if err := light.BlackPattern(); err != nil {
-			if !indicator.Contended(err) {
-				_ = light.Close()
-				l.lastErr = err
-				l.nextAttempt = time.Now().Add(l.retryDelay())
-				l.warnings.Set("recording-light", recordingLightWarning(err))
-				return nil, err
-			}
-			// Closed, the light would wait retryDelay for the next open, with
-			// no off write meanwhile (review 5953011789 of #79).
-			unchecked = true
-			l.warnings.Set("recording-light", recordingLightWarning(err))
-		}
-	}
+	// device error, needs no check. Another is kept unchecked: the red path
+	// checks it (CheckPattern), one command at a time. Checked here, under
+	// deviceMu, it kept a pause's off write from the light for the whole
+	// check (review 5956273705 of #79).
+	unchecked := !indicator.KnownBlack(light)
 	l.patternUnchecked = unchecked
 	l.light = light
 	l.offs.Add(1)
@@ -488,35 +474,53 @@ func (l *reconnectingLight) currentWithRetry(force bool) (indicator.Light, error
 var errLightUnchecked = errors.New("the recording light's stored pattern is not checked black yet")
 
 // CheckPattern checks the stored pattern of a light kept unchecked
-// (patternUnchecked), opening the light first if there is none. It runs
-// without deviceMu, so off writes meanwhile reach the light at once, and
-// EnsureRed runs it before it holds the light red. It fails while another
-// command keeps the check from the light.
+// (patternUnchecked), opening the light first if there is none. It holds
+// deviceMu for one command of the check at a time (indicator.NewPatternCheck):
+// a pause's off write waits for at most one of them, the recorder's other
+// commands never meet the check on the handle, and a Close or a failure
+// closes the handle only between two of them, after which the check stops
+// and fails (review 5956273705 of #79). EnsureRed runs it before it holds the
+// light red, and the controller before its first update (BlackPattern). It
+// fails while another command keeps the check from the light.
 func (l *reconnectingLight) CheckPattern() error {
 	l.checkMu.Lock()
 	defer l.checkMu.Unlock()
 	l.deviceMu.Lock()
 	light, err := l.currentForConfirmation()
-	unchecked := l.patternUnchecked
-	l.deviceMu.Unlock()
-	if err != nil || !unchecked {
+	if err != nil || !l.patternUnchecked {
+		l.deviceMu.Unlock()
 		return err
 	}
-	err = light.BlackPattern()
+	check := indicator.NewPatternCheck(light)
+	l.deviceMu.Unlock()
+	for {
+		done, err := l.checkStep(light, check)
+		if err != nil || done {
+			return err
+		}
+	}
+}
+
+// checkStep sends check's next command to light under deviceMu, unless light
+// was closed or opened again since the check began.
+func (l *reconnectingLight) checkStep(light indicator.Light, check indicator.PatternCheck) (bool, error) {
 	l.deviceMu.Lock()
 	defer l.deviceMu.Unlock()
 	if l.light != light {
-		return errLightUnchecked // opened again meanwhile
+		return false, errLightUnchecked
 	}
+	done, err := check.Step()
 	if err != nil {
 		if indicator.Contended(err) {
-			return err
+			return false, err
 		}
-		return l.failed(err)
+		return false, l.failed(err)
 	}
-	l.patternUnchecked = false
-	l.warnings.Clear("recording-light")
-	return nil
+	if done {
+		l.patternUnchecked = false
+		l.warnings.Clear("recording-light")
+	}
+	return done, nil
 }
 
 // failed counts a failed command as a time the light may not be red, and,
@@ -602,18 +606,10 @@ func (l *reconnectingLight) ServerDown(timeout time.Duration) error {
 	return nil
 }
 
+// BlackPattern is the controller's check before its first update:
+// CheckPattern.
 func (l *reconnectingLight) BlackPattern() error {
-	l.deviceMu.Lock()
-	defer l.deviceMu.Unlock()
-	light, err := l.current()
-	if err != nil {
-		return err
-	}
-	if err := light.BlackPattern(); err != nil {
-		return l.failed(err)
-	}
-	l.patternUnchecked = false
-	return nil
+	return l.CheckPattern()
 }
 
 func (l *reconnectingLight) ConfirmRed() error {

@@ -45,6 +45,34 @@ func KnownBlack(light Light) bool {
 	return ok && known.PatternKnownBlack()
 }
 
+// PatternCheck is a light's black pattern check run one command per Step, as
+// BlackPattern runs it at once, so a caller can send its other commands to
+// the light between two steps.
+type PatternCheck interface {
+	// Step sends the check's next command. done reports that the light's
+	// stored pattern is black: it was, or it is now written so.
+	Step() (done bool, err error)
+}
+
+// NewPatternCheck returns light's stepwise black pattern check. A light that
+// has none gets a check whose one step is BlackPattern.
+func NewPatternCheck(light Light) PatternCheck {
+	if stepwise, ok := light.(interface{ PatternCheck() PatternCheck }); ok {
+		return stepwise.PatternCheck()
+	}
+	return wholePatternCheck{light}
+}
+
+// wholePatternCheck is the one-step check of a light with no stepwise one.
+type wholePatternCheck struct{ light Light }
+
+func (c wholePatternCheck) Step() (bool, error) {
+	if err := c.light.BlackPattern(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Blink1Report builds an eight-byte blink(1) feature report.
 func Blink1Report(command byte, args [6]byte) [8]byte {
 	return [8]byte{0x01, command, args[0], args[1], args[2], args[3], args[4], args[5]}

@@ -17,8 +17,9 @@ import (
 // the light. The black pattern check, which starts with the version query and
 // pattern reads, is a query; checkBusy makes it alone meet the lock, as when
 // another command gets in between two of its 33 queries, and checkTakes is how
-// long it takes when it gets the light. known is what the driver reports for a
-// unit this process checked black before, by its serial number.
+// long it takes when it gets the light: BlackPattern at once, PatternCheck in
+// 33 steps of checkTakes/33. known is what the driver reports for a unit this
+// process checked black before, by its serial number.
 type heldLight struct {
 	*reconnectLightFake
 	held          *atomic.Bool
@@ -42,6 +43,27 @@ func (l *heldLight) BlackPattern() error {
 	l.patternChecks.Add(1)
 	l.black.Store(true)
 	return nil
+}
+
+func (l *heldLight) PatternCheck() indicator.PatternCheck { return &heldCheck{light: l} }
+
+// heldCheck is heldLight's stepwise check, one command per Step.
+type heldCheck struct {
+	light *heldLight
+	sent  int
+}
+
+func (c *heldCheck) Step() (bool, error) {
+	if c.light.held.Load() || c.light.checkBusy.Load() {
+		return false, errHeld
+	}
+	time.Sleep(c.light.checkTakes / 33)
+	if c.sent++; c.sent < 33 {
+		return false, nil
+	}
+	c.light.patternChecks.Add(1)
+	c.light.black.Store(true)
+	return true, nil
 }
 
 func (l *heldLight) ReadRGB() (uint8, uint8, uint8, error) {
@@ -165,18 +187,19 @@ func TestAKnownLightOpenedAgainWhileHeldIsTickled(t *testing.T) {
 
 // TestAnotherUnitIsNotArmedUntilItsPatternIsChecked fails if the recorder arms
 // the watchdog of a blink(1) whose stored pattern it has not found black: a
-// unit plugged in after an unplug, opened while another open held the lock for
-// its black pattern check. If no tickle followed (a crash, kill -STOP), that
-// watchdog would play the unit's own pattern, not black (red team, review
-// 5954543056 of #79). The unit still gets off writes, and no red, and once a
-// red confirmation's check finds it black it is tickled. Control: with the
-// lock free at the reopen, the check runs at once and the tickles reach it.
+// unit plugged in after an unplug. If no tickle followed (a crash, kill
+// -STOP), that watchdog would play the unit's own pattern, not black (red
+// team, review 5954543056 of #79). It also fails if the reopen checks that
+// pattern itself: the red path does, one command at a time (review 5956273705
+// of #79). The unit gets off writes, and no red, and once the check before a
+// red confirmation finds it black it is tickled. The lock is free, or another
+// open holds it, at the reopen.
 func TestAnotherUnitIsNotArmedUntilItsPatternIsChecked(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		heldAtReopen bool
 	}{
-		{"control: the lock is free at the reopen", false},
+		{"the lock is free at the reopen", false},
 		{"another open holds the lock at the reopen", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -190,14 +213,11 @@ func TestAnotherUnitIsNotArmedUntilItsPatternIsChecked(t *testing.T) {
 			if n := second.armedUnknown.Load(); n > 0 {
 				t.Fatalf("%d of 3 watchdog tickles armed a blink(1) whose stored pattern was not found black", n)
 			}
-			if !tc.heldAtReopen {
-				if n := second.tickleCount(); n != 3 {
-					t.Fatalf("control: tickles that reached a unit checked at its reopen = %d, want 3", n)
-				}
-				return
-			}
 			if n := second.tickleCount(); n != 0 {
 				t.Fatalf("tickles that reached the unchecked unit = %d, want 0", n)
+			}
+			if n := second.patternChecks.Load(); n != 0 {
+				t.Fatalf("pattern checks run by the reopen and its tickles = %d, want 0: only the check before a red confirmation runs one", n)
 			}
 			if err := light.SetRGB(0, 0, 0); err != nil || second.colour() != ([3]uint8{}) {
 				t.Fatalf("off write to the unchecked unit: %v, colour %v, want it off", err, second.colour())
@@ -209,7 +229,7 @@ func TestAnotherUnitIsNotArmedUntilItsPatternIsChecked(t *testing.T) {
 				t.Fatal("red confirmation of the unchecked unit passed, want it refused")
 			}
 			if n := second.patternChecks.Load(); n != 0 {
-				t.Fatalf("pattern checks run by tickles, writes and a confirmation = %d, want 0: only the check before a red confirmation runs one", n)
+				t.Fatalf("pattern checks run by writes and a confirmation = %d, want 0", n)
 			}
 
 			if err := light.CheckPattern(); err != nil {
@@ -228,13 +248,68 @@ func TestAnotherUnitIsNotArmedUntilItsPatternIsChecked(t *testing.T) {
 	}
 }
 
+// TestAPauseDuringAReopenTurnsTheLightOffAtOnce fails if a pause while the
+// recorder opens the light again after a device error leaves it on more than
+// 500 ms. The reopen checked the stored pattern of a unit not known black
+// under deviceMu, and the off write waited for the whole check: 1.70 s while
+// another open let each of its 33 commands through only after a 50 ms wait
+// (red team, review 5956273705 of #79). Controls: a unit known black, whose
+// reopen needs no check, and a check with no other open in its way (363 ms).
+func TestAPauseDuringAReopenTurnsTheLightOffAtOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		known bool
+		check time.Duration
+	}{
+		{"control: a unit known black by its serial", true, 33 * 53 * time.Millisecond},
+		{"control: no other open slows the check", false, 33 * 11 * time.Millisecond},
+		{"another open waits out each of the check's commands", false, 33 * 53 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var held atomic.Bool
+			light, second := failTheRecordersHandle(t, &held, tc.known)
+			second.checkTakes = tc.check
+			reopened := make(chan struct{})
+			go func() {
+				defer close(reopened)
+				_, _, _, _ = light.ReadRGB() // the next command opens the light again
+			}()
+			t.Cleanup(func() { <-reopened })
+			time.Sleep(50 * time.Millisecond)
+
+			paused := time.Now()
+			wrote := make(chan struct{})
+			go func() {
+				defer close(wrote)
+				_ = light.SetRGB(0, 0, 0) // the controller's off write after the pause
+			}()
+			var off time.Duration = -1
+			for deadline := paused.Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+				if second.colour() == ([3]uint8{}) {
+					off = time.Since(paused)
+					break
+				}
+			}
+			<-wrote
+			if off < 0 || off > 500*time.Millisecond {
+				t.Fatalf("a pause 50ms into the reopen turned the light off after %v (-1ns: not within 3s), want within 500ms", off)
+			}
+			<-reopened
+			if n := second.patternChecks.Load(); n != 0 {
+				t.Fatalf("pattern checks run by the reopen = %d, want 0", n)
+			}
+		})
+	}
+}
+
 // TestAPauseDoesNotWaitForAPatternCheck fails if a pause's off write waits for
-// the pattern check of a light the recorder opened again while another open
-// held the lock. The check takes 1.5 s, as 33 commands do when another open
-// lets each through only after the recorder's 50 ms wait (review 5954543056
-// of #79: 1.86 s). It ran after a tickle, in front of the controller's off
-// write, and in a red confirmation, whose red hold swallowed the off write; it
-// now runs before the hold, without the light's lock.
+// the pattern check of a light the recorder opened again after a device
+// error. The check takes 1.5 s, as 33 commands do when another open lets each
+// through only after the recorder's 50 ms wait (review 5954543056 of #79:
+// 1.86 s). It ran after a tickle, in front of the controller's off write; in
+// a red confirmation, whose red hold swallowed the off write; and in the
+// controller's check before its first update, under deviceMu throughout. It
+// now runs before the red hold, one command per hold of deviceMu.
 func TestAPauseDoesNotWaitForAPatternCheck(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -251,6 +326,9 @@ func TestAPauseDoesNotWaitForAPatternCheck(t *testing.T) {
 				}
 				return err
 			}
+		}},
+		{"the controller's check before its first update", func(h *hardwareControl) func() error {
+			return func() error { return h.light.BlackPattern() }
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
