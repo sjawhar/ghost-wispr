@@ -1653,7 +1653,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		ordered := orderedMic{micStreamer: mic, device: micDevice}
 
-		audioRecorder.SetSampleRate(sampleRate)
+		if err := audioRecorder.SetSampleRate(sampleRate); err != nil {
+			// The session's recording still saves at this rate when it ends;
+			// only a raw kept after a stop would be saved at the old one.
+			log.Printf("warning: the session under way keeps its old sample rate in the database: %v", err)
+		}
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)

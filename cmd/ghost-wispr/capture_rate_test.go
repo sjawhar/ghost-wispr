@@ -36,7 +36,9 @@ func TestARawKeptAfterAStopIsSavedAtItsTrueDuration(t *testing.T) {
 		t.Fatal(err)
 	}
 	stopped := newSessionRecorder(audioDir, store)
-	stopped.SetSampleRate(48000)
+	if err := stopped.SetSampleRate(48000); err != nil {
+		t.Fatal(err)
+	}
 	if err := stopped.StartSession(id); err != nil {
 		t.Fatalf("StartSession: %v", err)
 	}

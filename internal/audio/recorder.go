@@ -99,16 +99,41 @@ func NewRecorder(audioDir string) *Recorder {
 // SetSampleRate sets the rate the microphone opened at, which the audio the
 // recorder takes from now on has. The preroll then holds prerollSeconds at
 // that rate, and drops audio it held at another rate: that cannot lead a
-// recording at this one.
-func (r *Recorder) SetSampleRate(sampleRate int) {
+// recording at this one. A recording already open takes the new rate too,
+// and with session rates kept (UseSessionRates) its session's row does: a
+// session can start before the microphone first opens (a manual start during
+// the start-up retry, or while the light is not confirmed red), and the rate
+// changes only before audio first flows, so all of its audio is at the new
+// rate. It returns the error of that row's write; the recording itself still
+// saves at the new rate when its session ends.
+func (r *Recorder) SetSampleRate(sampleRate int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if sampleRate <= 0 || sampleRate == r.sampleRate {
-		return
+		return nil
 	}
 	r.sampleRate = sampleRate
 	r.preroll = transcribe.NewRingBuf(prerollSeconds * pcmBytesPerSecond(sampleRate))
+	if r.rawFile == nil {
+		return nil
+	}
+	r.sessionRate = sampleRate
+	// The row is written outside the lock, as StartSession writes it, and
+	// again while the recording's rate changed meanwhile.
+	for id := r.sessionID; r.rates != nil; {
+		rates, rate := r.rates, r.sessionRate
+		r.mu.Unlock()
+		err := rates.SetSessionSampleRate(id, rate)
+		r.mu.Lock()
+		if err != nil {
+			return fmt.Errorf("record the sample rate of session %s: %w", id, err)
+		}
+		if r.sessionID != id || r.sessionRate == rate {
+			return nil
+		}
+	}
+	return nil
 }
 
 // SessionRates keeps the sample rate each session's raw recording is captured

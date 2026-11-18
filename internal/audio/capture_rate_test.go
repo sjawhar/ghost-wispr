@@ -40,7 +40,9 @@ func TestAPrerollHoldsFiveSecondsAtTheRateTheMicOpenedAt(t *testing.T) {
 	if err := recorder.writePCM(pcmSeconds(1, 16000, 20000)); err != nil {
 		t.Fatal(err)
 	}
-	recorder.SetSampleRate(48000)
+	if err := recorder.SetSampleRate(48000); err != nil {
+		t.Fatal(err)
+	}
 	sixSeconds := pcmSeconds(6, 48000, 0)
 	if err := recorder.writePCM(sixSeconds); err != nil {
 		t.Fatal(err)
@@ -118,7 +120,9 @@ func TestARecoveredRawEncodesAtItsTrueDuration(t *testing.T) {
 	// The run that stopped: a session captured at 48000 Hz, never ended.
 	stopped := NewRecorder(dir)
 	stopped.UseSessionRates(rates)
-	stopped.SetSampleRate(48000)
+	if err := stopped.SetSampleRate(48000); err != nil {
+		t.Fatal(err)
+	}
 	const captured, older = "20261118100000", "20261118090000"
 	if err := stopped.StartSession(captured); err != nil {
 		t.Fatalf("StartSession: %v", err)
@@ -173,3 +177,41 @@ func (refusingRates) SetSessionSampleRate(string, int) error {
 	return errors.New("database is locked")
 }
 func (refusingRates) SessionSampleRate(string) (int, error) { return 0, nil }
+
+// writesOnce is a SessionRates whose first write works and the rest fail.
+type writesOnce struct{ writes int }
+
+func (w *writesOnce) SetSessionSampleRate(string, int) error {
+	w.writes++
+	if w.writes > 1 {
+		return errors.New("database is locked")
+	}
+	return nil
+}
+func (w *writesOnce) SessionSampleRate(string) (int, error) { return 0, nil }
+
+// TestARelabelThatCannotBeRecordedStillSavesAtTheNewRate fails if
+// SetSampleRate hides a failed write of an open recording's new rate, or if
+// that failure makes the session's end encode at the old rate: the recording
+// in memory takes the new rate either way.
+func TestARelabelThatCannotBeRecordedStillSavesAtTheNewRate(t *testing.T) {
+	recorder := NewRecorder(t.TempDir())
+	recorder.UseSessionRates(&writesOnce{})
+	var encodedAt int
+	recorder.encode = func(_ context.Context, _, _ string, rate int) (string, error) {
+		encodedAt = rate
+		return "", nil
+	}
+	if err := recorder.StartSession("20261118100000"); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := recorder.SetSampleRate(48000); err == nil {
+		t.Fatal("SetSampleRate hid a failed write of the session's new rate")
+	}
+	if _, err := recorder.EndSession("20261118100000"); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if encodedAt != 48000 {
+		t.Fatalf("the session's end encoded at %d Hz, want 48000", encodedAt)
+	}
+}
