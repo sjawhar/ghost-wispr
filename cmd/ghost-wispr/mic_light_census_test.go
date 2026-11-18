@@ -374,11 +374,19 @@ func TestNoAudioPassesOnceTheLightWasNotRedWhileTheMicrophoneWasOpen(t *testing.
 		{name: "the light read back off by itself", lightOff: func(t *testing.T, r *lightRig) {
 			r.device.mu.Lock()
 			r.device.colour = [3]uint8{}
+			start := len(r.device.ops)
 			r.device.mu.Unlock()
 			r.hardware.Wake()
+			// Look for the read of off and the red read-back after it anywhere
+			// since the change: a later check, from a wake already queued, can
+			// add operations after them before this wait looks.
 			r.waitFor(t, "the controller to find the light off and light it again", func(ops []lightOp) bool {
-				n := len(ops)
-				return n >= 3 && ops[n-3] == lightOp{read: true} && isRedReadBack(ops[n-1])
+				for i := start; i+2 < len(ops); i++ {
+					if ops[i] == (lightOp{read: true}) && isRedReadBack(ops[i+2]) {
+						return true
+					}
+				}
+				return false
 			})
 		}},
 	} {
