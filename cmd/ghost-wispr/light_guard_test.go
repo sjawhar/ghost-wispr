@@ -51,11 +51,12 @@ func TestAPassingCheckDoesNotEraseAFailedConfirmation(t *testing.T) {
 
 // TestABusyLightCheckLeavesNoWarningOnceItPasses fails if a light check that
 // another program got in the way of (indicator.Contended: the lock was held
-// past the wait) leaves a warning after the next check passes, or names the
-// light as failed. On a uhid blink(1), with the recorder paused, a 5 s holder
-// left "Recording light failed" on /api/status after the light was free again:
-// nothing but a red confirmation cleared it (review 5954543056 of #79). A
-// real failure keeps its warning until a red confirmation passes.
+// past the wait) leaves a warning after the next check passes and releases
+// capture's hold, or names the light as failed. On a uhid blink(1), with the
+// recorder paused, a 5 s holder left "Recording light failed" on /api/status
+// after the light was free again: nothing but a red confirmation cleared it
+// (review 5954543056 of #79). A real failure keeps its warning until a red
+// confirmation passes.
 func TestABusyLightCheckLeavesNoWarningOnceItPasses(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -95,6 +96,47 @@ func TestABusyLightCheckLeavesNoWarningOnceItPasses(t *testing.T) {
 			time.Sleep(50 * time.Millisecond) // run applies the pass
 			if got := warnings.List(); !slices.Equal(got, tc.wantAfter) {
 				t.Fatalf("warnings after the next check passed = %v, want %v", got, tc.wantAfter)
+			}
+		})
+	}
+}
+
+// TestCaptureHeldForTheLightKeepsItsWarning fails if capture stays held for
+// the light with no warning on /api/status. A check that passes inside
+// releaseEvery leaves the hold, and it cleared the busy warning anyway, so
+// the status said the light was unavailable and not why (red team, review
+// 5956273705 of #79). The busy warning now ends with the hold. Control: the
+// warning of a light that failed stays, as before.
+func TestCaptureHeldForTheLightKeepsItsWarning(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault error
+	}{
+		{"control: the light failed", errors.New("blink(1) feature report: input/output error")},
+		{"another program held the lock", fmt.Errorf("read blink(1) version: %w", indicator.ErrBusy)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			warnings := newWarningsRegistry()
+			guard := newLightGuard(capture, warnings, time.Hour)
+			guard.lastRelease = time.Now() // the last release was just now: the next waits releaseEvery
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go guard.run(ctx)
+
+			guard.report(tc.fault)
+			for deadline := time.Now().Add(2 * time.Second); !capture.isLightHeld() || len(warnings.List()) == 0; time.Sleep(time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("control: a failed check left capture held %t with warnings %v", capture.isLightHeld(), warnings.List())
+				}
+			}
+			guard.report(nil)
+			time.Sleep(50 * time.Millisecond) // run applies the pass
+			if !capture.isLightHeld() {
+				t.Fatal("control: a passing check inside releaseEvery released the hold")
+			}
+			if got := warnings.List(); len(got) == 0 {
+				t.Fatalf("capture held for the light (capture_state %q) with no warning, after a check failed (%s) and the next one passed", capture.MicHold(), tc.name)
 			}
 		})
 	}
