@@ -263,6 +263,9 @@ func (g *captureGate) Resume() {
 // RequestResume checks a requested resume before changing the switch, then
 // returns without waiting for the paused session to settle. The gate opens
 // after beforeResume once settling finishes, unless a Pause comes first.
+// While no capture device is present (captureMissing), it takes no light
+// check, so the light stays off: nothing can open, and every microphone open
+// confirms red for itself once a device is there.
 func (g *captureGate) RequestResume() error {
 	g.control.Lock()
 	defer g.control.Unlock()
@@ -273,7 +276,8 @@ func (g *captureGate) RequestResume() error {
 		return nil
 	}
 	g.mu.Unlock()
-	if g.beforeResumeRequest != nil {
+	checked := g.beforeResumeRequest != nil && !g.captureMissing()
+	if checked {
 		if err := g.beforeResumeRequest(); err != nil {
 			return err
 		}
@@ -285,7 +289,7 @@ func (g *captureGate) RequestResume() error {
 		return nil
 	}
 	g.switchOff = false
-	if g.beforeResumeRequest != nil {
+	if checked {
 		// It has just confirmed the light red.
 		g.lightHeld = false
 	}
@@ -350,7 +354,8 @@ func (g *captureGate) MicHold() string {
 // switch is still on, the light does not hold it, and no later closing has
 // happened. forLight says ReleaseLightHold asked: a refusal from
 // beforeGateOpen then holds the gate for the light again, where a person's
-// resume is refused and the switch goes off.
+// resume is refused and the switch goes off. While no capture device is
+// present, it takes no light check, and so releases no hold (afterGateOpen).
 func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight bool) {
 	<-settled
 	g.control.Lock()
@@ -362,7 +367,8 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 		g.control.Unlock()
 		return
 	}
-	if g.beforeGateOpen != nil {
+	checked := g.beforeGateOpen != nil && !g.captureMissing()
+	if checked {
 		if err := g.beforeGateOpen(); err != nil {
 			g.mu.Lock()
 			if g.closed && g.closings == closing {
@@ -397,7 +403,7 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 	g.mu.Unlock()
 	g.armAudio()
 	g.control.Unlock()
-	if g.afterGateOpen != nil {
+	if checked && g.afterGateOpen != nil {
 		g.afterGateOpen()
 	}
 }
@@ -416,6 +422,12 @@ func (g *captureGate) finishMicStart() {
 	}
 }
 
+// captureMissing reports that capturePresent finds no capture device: the
+// light then stays off, since nothing can open.
+func (g *captureGate) captureMissing() bool {
+	return g.capturePresent != nil && !g.capturePresent()
+}
+
 // confirmMicOpen confirms the light red for a microphone open or start, as
 // confirmMicStart does, holding it red until finishMicStart, and marks the
 // light as red from then on: audio passes the gate only while the light has
@@ -425,7 +437,7 @@ func (g *captureGate) finishMicStart() {
 // missing. A light that cannot be confirmed red returns an error that wraps
 // errLightNotConfirmed.
 func (g *captureGate) confirmMicOpen() error {
-	if g.capturePresent != nil && !g.capturePresent() {
+	if g.captureMissing() {
 		return errNoCaptureDevice
 	}
 	if err := g.confirmMicStart(); err != nil {
