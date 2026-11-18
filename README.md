@@ -158,6 +158,14 @@ open, as when it went off outside Ghost Wispr (an unplug, its watchdog, another 
 light-off`), the recorder drops that audio and what the microphone holds, closes it and opens it
 again under a new red check.
 
+`ghost-wispr light-state` prints the blink(1)'s colour and `ghost-wispr light-off` turns it off,
+also while the recorder runs. The blink(1) has one report buffer: a read gets the reply to the
+last command any program sent. So every command Ghost Wispr sends, from the recorder or a
+subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node from the command to its
+reply. A command that does not get the lock within 2 s sends nothing: the recorder counts such a
+read as the light not red, and `light-state` prints `unknown` and fails. Programs that do not
+take the lock, such as `blink1-tool`, must not run while the recorder runs.
+
 ## Deployment
 
 The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is

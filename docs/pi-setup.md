@@ -430,6 +430,19 @@ its watchdog turned it off, Ghost Wispr drops what the microphone holds and open
 new check; the log says `the recording light was not red while the microphone was open; reopening
 the microphone`. At shutdown the blink(1) goes off once the microphone is closed.
 
+`/opt/ghost-wispr/ghost-wispr light-state` prints the blink(1)'s colour (`red`, `off`, or `other`
+and its values) and `light-off` turns it off; both may run while the recorder runs. The blink(1)
+has one report buffer, and each read gets the reply to the last command that any program sent:
+on the office Pi a `light-state` run while the recorder recorded made the recorder read its red
+light as 0,51,51, the version reply, and drop its audio. So every command that Ghost Wispr sends,
+from the recorder or from a subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node
+from the command to its reply. A command that does not get the lock within 2 seconds sends
+nothing: the recorder counts such a read as the light not red, and `light-state` prints `unknown`
+and fails. Other programs that open the blink(1), such as `blink1-tool`, do not take the lock:
+do not run them while the recorder runs. A process stopped while it holds the lock (`kill -STOP`)
+keeps it; the slice 1 driver's Light hang step therefore stops the recorder with `flock` on the
+node, between two of its commands.
+
 Do not open the Jabra's microphone or speaker with another program, such as `arecord`, `aplay` or
 a second Ghost Wispr, while the unit runs with the Jabra button on. Ghost Wispr cannot see that
 program's stream, so it may change the light while the stream is open, and the Jabra's own Phone
