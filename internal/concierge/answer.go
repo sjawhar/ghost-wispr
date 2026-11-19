@@ -673,7 +673,7 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 		// One clear match (R5): the voice said the issue it took, and the
 		// model answers from its record rather than search again.
 		prompt += "\n\nThe record of " + found.key + ", the issue a search of the question's words chose, read while it was asked:\n" + found.text +
-			"\nAnswer from it. Call a tool only for what it does not hold."
+			"\nAnswer from it. Call a tool only for what it does not hold. Begin your first sentence with " + found.key + ", as in \"" + found.key + " is …\", so the room hears which issue it is."
 	case found.searched:
 		prompt += "\n\nA search of the record for the question's words, made while it was asked. Its hits may not be what the question is about: use them only if they are, and call a tool for what they do not hold:\n" + found.text
 	default:
@@ -690,6 +690,11 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	source.WriteString(found.text)
 	said := &sentences{sp: sp, source: source, asked: turn}
 	budget := maxToolCalls
+	if asking {
+		// The holder answers what the record does not: the model says what
+		// it was given, with no tool (R6, R7).
+		budget = 0
+	}
 	reason := ""
 	for try := 1; try <= earTries; try++ {
 		note := ""
@@ -1061,13 +1066,20 @@ func (s *speaker) sayText(ctx context.Context, text string, mode voice.SayMode) 
 	if s.lead != "" {
 		lead := s.lead
 		s.lead = ""
-		if !strings.HasPrefix(text, s.leadKey) {
+		if !beginsWithKey(text, s.leadKey) {
 			if err := s.queueLocked(ctx, lead, voice.Lead); err != nil {
 				return err
 			}
 		}
 	}
 	return s.queueLocked(ctx, text, mode)
+}
+
+// beginsWithKey reports whether text begins with the issue key key as a
+// whole key: "ABC-1's agent" does for ABC-1, "ABC-12 is" does not.
+func beginsWithKey(text, key string) bool {
+	loc := earKey.FindStringIndex(text)
+	return len(loc) == 2 && loc[0] == 0 && text[:loc[1]] == key
 }
 
 // queueLocked queues text as mode and keeps it. s.mu is held.

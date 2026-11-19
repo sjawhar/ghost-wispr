@@ -501,6 +501,11 @@ func TestADescribedTurnAsksNoHolderUnasked(t *testing.T) {
 		if !strings.Contains(prompt, "The record of ABC-12, the issue a search of the question's words chose") || strings.Contains(prompt, "may not be what the question is about") {
 			t.Fatalf("one clear match: the prompt does not give the chosen issue's record to answer from")
 		}
+		// R5: a first fact that begins with the key names the issue, so
+		// the room hears no separate line before it.
+		if !strings.Contains(prompt, "Begin your first sentence with ABC-12") {
+			t.Fatalf("one clear match: the prompt does not ask for the key first")
+		}
 	}
 }
 
