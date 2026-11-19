@@ -930,15 +930,18 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		defer s.mu.Unlock()
 		ex.said = true
 		if mode == Fact && !ex.factDone && !ex.factPending {
-			// The first fact's audio: now if speech already plays, at its
-			// start if it began and ended during Say, else when it starts.
+			// The first fact's audio. Voice A's Say returns once the last of
+			// its audio is queued, about as long as it plays, so the time is
+			// never when Say returned: at its speech's start when it began
+			// during Say; when Say was called if earlier speech still played,
+			// since the Output queues 200 ms at most; else when it starts.
 			switch {
-			case s.voiceSpeaking:
-				ex.factDone = true
-				s.timing("fact_audio", x.SessionID, time.Now())
 			case !s.voiceStarted.Before(called):
 				ex.factDone = true
 				s.timing("fact_audio", x.SessionID, s.voiceStarted)
+			case s.voiceSpeaking:
+				ex.factDone = true
+				s.timing("fact_audio", x.SessionID, called)
 			default:
 				ex.factPending = true
 			}

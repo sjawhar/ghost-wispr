@@ -616,6 +616,7 @@ type rig struct {
 	session  string
 	start    float64 // the next transcript's socket time
 	timings  []string
+	timingAt map[string]time.Time
 }
 
 func newRig(t *testing.T, c *fakeConcierge) *rig {
@@ -672,11 +673,24 @@ func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *
 	return r
 }
 
-// timing records the Supervisor's timing events.
+// timing records the Supervisor's timing events, and when each said it was.
 func (r *rig) timing(event, sessionID string, at time.Time, _ ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.timings = append(r.timings, event)
+	if r.timingAt == nil {
+		r.timingAt = map[string]time.Time{}
+	}
+	if _, ok := r.timingAt[event]; !ok {
+		r.timingAt[event] = at
+	}
+}
+
+// timingOf is when timing event first said it was, zero if it did not come.
+func (r *rig) timingOf(event string) time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.timingAt[event]
 }
 
 func (r *rig) timingEvents() []string {
