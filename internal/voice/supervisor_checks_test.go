@@ -694,3 +694,113 @@ func TestVoiceDisabled(t *testing.T) {
 	r.setEnabled(true)
 	r.ask("what is happening?")
 }
+
+// TestFactAudioFollowsTheVoicesTextAudio fails if, for a voice that
+// synthesises a text while the one before plays (voice A) and so returns from
+// Say before the text plays, the first fact's audio is timed at its Say rather
+// than when the voice reports the fact's text begins to play (EventTextAudio).
+func TestFactAudioFollowsTheVoicesTextAudio(t *testing.T) {
+	c := newFakeConcierge("The issue is in review.")
+	c.acks, c.ackMode = []string{"I took ABC-12."}, Lead
+	var v *pipelinedVoice
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
+		v = &pipelinedVoice{r: r, lead: 300 * time.Millisecond}
+		cfg.Voice = func() (Voice, error) { return v, nil }
+		// The fake plays its second text 300 ms after the first with nothing
+		// queued between, which voice A does not do; the window keeps the
+		// exchange open meanwhile.
+		cfg.FollowUpWait = time.Minute
+	})
+	r.ask("what is happening with the voice work?")
+	waitTimings(t, r, "fact_audio")
+	factAt := v.playedAt("The issue is in review.")
+	if diff := r.timingOf("fact_audio").Sub(factAt); diff < -50*time.Millisecond || diff > 50*time.Millisecond {
+		t.Fatalf("fact_audio came %v from the fact's text audio, want at it", diff.Round(time.Millisecond))
+	}
+}
+
+// pipelinedVoice opens the rig's fake sessions as voice A now behaves: Say
+// returns at once, and each text plays in order, the first for lead, with
+// EventTextAudio as it begins.
+type pipelinedVoice struct {
+	r    *rig
+	lead time.Duration
+	mu   sync.Mutex
+	at   map[string]time.Time
+}
+
+func (v *pipelinedVoice) playedAt(text string) time.Time {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.at[text]
+}
+
+func (v *pipelinedVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
+	s, err := v.r.voice.Open(ctx, x)
+	if err != nil {
+		return nil, err
+	}
+	p := &pipelinedSession{Session: s, v: v, texts: make(chan sayText, 8), events: make(chan Event, 64), played: make(chan struct{})}
+	go p.forward()
+	go p.play(ctx)
+	return p, nil
+}
+
+type sayText struct {
+	text string
+	mode SayMode
+}
+
+type pipelinedSession struct {
+	Session
+	v      *pipelinedVoice
+	texts  chan sayText
+	events chan Event
+	played chan struct{} // closed when play ends: events closes after it
+}
+
+func (*pipelinedSession) ReportsTextAudio() bool { return true }
+func (p *pipelinedSession) Events() <-chan Event { return p.events }
+
+func (p *pipelinedSession) Say(_ context.Context, text string, mode SayMode) error {
+	p.texts <- sayText{text, mode}
+	return nil
+}
+
+// forward passes the rig session's events on; once they end (Close), it
+// waits for play to stop, then closes Events.
+func (p *pipelinedSession) forward() {
+	for e := range p.Session.Events() {
+		p.events <- e
+	}
+	<-p.played
+	close(p.events)
+}
+
+func (p *pipelinedSession) play(ctx context.Context) {
+	defer close(p.played)
+	first := true
+	for {
+		select {
+		case s := <-p.texts:
+			if !first {
+				select {
+				case <-time.After(p.v.lead): // the text before plays
+				case <-ctx.Done():
+					return
+				}
+			}
+			first = false
+			p.v.mu.Lock()
+			if p.v.at == nil {
+				p.v.at = map[string]time.Time{}
+			}
+			p.v.at[s.text] = time.Now()
+			p.v.mu.Unlock()
+			p.events <- Event{Kind: EventTextAudio, Text: s.text}
+			_ = p.Session.Say(ctx, s.text, s.mode)
+		case <-ctx.Done():
+			return
+		}
+	}
+}

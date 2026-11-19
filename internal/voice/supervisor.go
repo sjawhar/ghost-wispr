@@ -258,6 +258,7 @@ type exchange struct {
 	firstOutDone bool       // the turn's first audio was reported
 	factPending  bool       // a fact was queued while nothing played: its audio is the next start
 	factDone     bool       // the turn's first fact audio was reported
+	factText     string     // that fact, for a voice that reports when a text plays
 	followUp     bool       // the exchange waits for a follow-up after Wispr's answer
 	// followUpTurn: the turn now heard began in the follow-up window with no
 	// wake phrase, so it continues the exchange only as a question (R10).
@@ -811,6 +812,11 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 				ex.spokeAt = time.Now()
 			}
 			s.touchLocked(ex)
+		case EventTextAudio:
+			if e.Text != "" && e.Text == ex.factText && !ex.factDone {
+				ex.factDone = true
+				s.timing("fact_audio", ex.x.SessionID, time.Now())
+			}
 		case EventSpeechEnded:
 			if ex.drives && !ex.spokeAt.IsZero() && !ex.ended {
 				s.noteLocked(ex, EventSpoken, ex.x.SessionID)
@@ -1031,7 +1037,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange) {
 	ex.answering = true
 	ex.turnAt = time.Now()
 	ex.times.lastTurnEnd = ex.turnAt
-	ex.firstOutDone, ex.factPending, ex.factDone = false, false, false
+	ex.firstOutDone, ex.factPending, ex.factDone, ex.factText = false, false, false, ""
 	turn := s.turnOf(ex)
 	ex.x.AskerTurn = turn
 	if ex.x.SessionID == "" {
@@ -1058,9 +1064,14 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 	if sess == nil {
 		return
 	}
+	_, reportsText := sess.(TextAudioReporter)
 	say := func(ctx context.Context, text string, mode SayMode) error {
 		s.mu.Lock()
 		s.addOwnLocked(text, time.Now())
+		if reportsText && mode == Fact && !ex.factDone && ex.factText == "" {
+			// The voice reports when this text begins to play.
+			ex.factText = text
+		}
 		s.mu.Unlock()
 		called := time.Now()
 		if err := sess.Say(ctx, text, mode); err != nil {
@@ -1070,12 +1081,12 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		defer s.mu.Unlock()
 		ex.said = true
 		ex.askedBack = isQuestion(text)
-		if mode == Fact && !ex.factDone && !ex.factPending {
-			// The first fact's audio. Voice A's Say returns once the last of
-			// its audio is queued, about as long as it plays, so the time is
-			// never when Say returned: at its speech's start when it began
-			// during Say; when Say was called if earlier speech still played,
-			// since the Output queues 200 ms at most; else when it starts.
+		if !reportsText && mode == Fact && !ex.factDone && !ex.factPending {
+			// The first fact's audio, for a voice whose Say returns once
+			// the last of its audio is queued: at its speech's start when
+			// it began during Say; when Say was called if earlier speech
+			// still played, since the Output queues 200 ms at most; else
+			// when it starts.
 			switch {
 			case !s.voiceStarted.Before(called):
 				ex.factDone = true

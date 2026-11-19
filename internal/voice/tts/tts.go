@@ -296,6 +296,12 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 // Deliver takes no late tool results: the Concierge drives voice A's turn.
 func (s *session) Deliver(context.Context, string, json.RawMessage) error { return nil }
 
+// ReportsTextAudio: voice A reports EventTextAudio at each text's first
+// frame, since its Say returns before the text plays.
+func (*session) ReportsTextAudio() bool { return true }
+
+var _ voice.TextAudioReporter = (*session)(nil)
+
 // Interrupt stops the Say in flight and every Say queued, and ends the
 // speech, without waiting for the engine or the Output. The next Say begins
 // a fresh Playback.

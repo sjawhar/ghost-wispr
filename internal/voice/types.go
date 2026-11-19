@@ -142,6 +142,12 @@ const (
 	EventTextAudio
 )
 
+// TextAudioReporter is a Session that reports EventTextAudio for each Say's
+// text, as voice A does: its Say returns before the text plays.
+type TextAudioReporter interface {
+	ReportsTextAudio() bool
+}
+
 // Event is one thing a Session reports.
 type Event struct {
 	Kind EventKind
