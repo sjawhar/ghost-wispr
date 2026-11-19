@@ -203,7 +203,10 @@ after one, nor when the attempt cannot be recorded; and a save seen to reach the
 after it, which for a day lets a check that finds that unit's pattern black know it black without
 a save. An attempt with no confirmed save after it, as after a crash or a failed transfer, leaves
 the unit unknown. So a recorder restarted over and over writes the blink(1)'s flash at most once a
-day. Programs that do not take the
+day. Ghost Wispr must be the only program that writes the blink(1)'s stored pattern, between
+recorder runs too: a confirmed save that an earlier run recorded counts for a day, and another
+program that writes the pattern in that time, even one that takes the lock, can leave the unit
+known black while its stored pattern is lit. Programs that do not take the
 lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
 answer the recorder's.
 
