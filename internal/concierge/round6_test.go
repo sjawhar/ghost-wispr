@@ -68,7 +68,7 @@ func TestOneClearMatch(t *testing.T) {
 	for _, c := range []struct {
 		ratio float64
 		first string
-	}{{1.4, "Did you mean ABC-12, Realtime voice, or ABC-13, Wake word?"}, {1.6, "I took ABC-12: Realtime voice."}} {
+	}{{1.4, "Did you mean ABC-12, Realtime voice, or ABC-13, Wake word?"}, {1.6, "I took ABC-12."}} {
 		r := newRig(t)
 		heldIssue(r, "none", false)
 		r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13", Title: "Wake word", Status: "done"}
@@ -145,7 +145,7 @@ func TestFastAnswerOrder(t *testing.T) {
 	r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13"}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
 	spoken := answerTurn(t, r, "what is happening with the realtime voice")
-	if len(spoken) != 2 || spoken[0].text != "I took ABC-12: Realtime voice." || spoken[1].text != "PR 80 is in review." {
+	if len(spoken) != 2 || spoken[0].text != "I took ABC-12." || spoken[1].text != "PR 80 is in review." {
 		t.Fatalf("spoken = %+v, want the issue, then the fact", spoken)
 	}
 	if len(r.agents.sent) != 0 {

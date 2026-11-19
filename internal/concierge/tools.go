@@ -327,10 +327,14 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 	}
 	var got found
 	select {
-	case got = <-full:
-	case <-cut:
-		c.logger.Info("concierge took the keyword result: the full search had not answered by its mark")
-		return map[string]any{"issues": kwIssues, "clear_match": false}, nil
+	case got = <-full: // a full result already in wins over the mark
+	default:
+		select {
+		case got = <-full:
+		case <-cut:
+			c.logger.Info("concierge took the keyword result: the full search had not answered by its mark")
+			return map[string]any{"issues": kwIssues, "clear_match": false}, nil
+		}
 	}
 	if got.err == nil {
 		issues, clear := issuesOf(got.hits)
