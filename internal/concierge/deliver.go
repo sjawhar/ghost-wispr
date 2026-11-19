@@ -118,7 +118,7 @@ func (c *Concierge) forget(agent string, ids ...string) {
 func (c *Concierge) announce(task *storage.VoiceTask, written string) {
 	ctx, cancel := context.WithTimeout(context.Background(), earTimeout)
 	defer cancel()
-	spoken := c.forEar(ctx, task.IssueKey, strings.TrimSpace(written))
+	spoken := c.forEar(ctx, strings.TrimSpace(written))
 	if _, err := c.store.VoiceTask(task.ID); err != nil {
 		c.logger.Info("concierge dropped an answer whose task is gone", "task", task.ID, "error", err)
 		return

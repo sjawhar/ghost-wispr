@@ -261,3 +261,28 @@ func TestALocalFailureIsNotBlamedOnDispatch(t *testing.T) {
 		t.Fatalf("a failure to record the question = %v", result)
 	}
 }
+
+// TestEmptyStreamedPartsDoNotGoBackToTheModel: Vertex streams an empty part
+// at the end of a turn and refuses it when it is sent back ("required oneof
+// field 'data' must have one initialized field", seen live 2026-11-19). A
+// signature-only part keeps its signature on the part before it.
+func TestEmptyStreamedPartsDoNotGoBackToTheModel(t *testing.T) {
+	r := newRig(t)
+	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12"}}
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(call("c1", "search_issues", map[string]any{"query": "voice"}, "")), chunk(&genai.Part{ThoughtSignature: []byte("sig-1")}), chunk(&genai.Part{})},
+		{chunk(text("ABC-12 is open."))},
+	}
+	var spoken []said
+	if err := r.concierge.Answer(context.Background(), &r.exchange, "x", recorder(&spoken)); err != nil {
+		t.Fatal(err)
+	}
+	second := r.model.requests[1]
+	modelTurn := second[len(second)-2]
+	if len(modelTurn.Parts) != 1 {
+		t.Fatalf("the model turn sent back has %d parts, want the call alone: %+v", len(modelTurn.Parts), modelTurn.Parts)
+	}
+	if part := modelTurn.Parts[0]; part.FunctionCall == nil || string(part.ThoughtSignature) != "sig-1" {
+		t.Fatalf("the call went back as %+v, want it with the signature", part)
+	}
+}

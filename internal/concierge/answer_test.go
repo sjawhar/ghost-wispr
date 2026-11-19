@@ -113,11 +113,33 @@ func TestTheSystemPromptHoldsTheRoomsRules(t *testing.T) {
 	prompt := systemPrompt
 	for _, want := range []string{
 		"cannot identify", "read-only", "Never change anything", "ask_agent", "only when the record cannot answer",
-		"one to three short sentences", "exactly as written", "I cannot reach Dispatch yet",
+		"one to three short sentences", "exactly as written", "I cannot reach Dispatch yet", "Say how old the fact is",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("the system prompt lacks %q", want)
 		}
+	}
+	// Figures stay as written, so nothing tells the model to round them.
+	if strings.Contains(prompt, "Round numbers") {
+		t.Error("the system prompt tells the model to round numbers")
+	}
+}
+
+// TestTheEarRewriteAddsNothing: live, "pong" came back as "INFRA-4592 is
+// resolved, and the answer is simply pong." The rewrite adds no fact, and the
+// issue key is not offered to it as a topic to talk about.
+func TestTheEarRewriteAddsNothing(t *testing.T) {
+	for _, want := range []string{"Add nothing", "unchanged"} {
+		if !strings.Contains(earPrompt, want) {
+			t.Errorf("the rewrite prompt lacks %q", want)
+		}
+	}
+	r := newRig(t)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("pong"))}}
+	r.concierge.forEar(context.Background(), "pong")
+	prompt := r.model.requests[0][0].Parts[0].Text
+	if strings.Contains(prompt, "about") {
+		t.Errorf("the rewrite is asked to talk about something: %q", prompt)
 	}
 }
 
