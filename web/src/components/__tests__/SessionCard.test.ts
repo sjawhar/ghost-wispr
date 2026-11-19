@@ -29,12 +29,13 @@ const baseSession: SessionSummary = {
 type SessionCardProps = ComponentProps<typeof SessionCard>
 
 function render(
-  props: Omit<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted'> &
-    Partial<Pick<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted'>>,
+  props: Omit<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted' | 'voiceTasks'> &
+    Partial<Pick<SessionCardProps, 'onRefreshSession' | 'onSegmentDeleted' | 'voiceTasks'>>,
 ) {
   return renderSvelte(SessionCard, {
     onRefreshSession: vi.fn().mockResolvedValue(undefined),
     onSegmentDeleted: vi.fn(),
+    voiceTasks: undefined,
     ...props,
   })
 }

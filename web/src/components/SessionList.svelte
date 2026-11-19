@@ -1,6 +1,7 @@
 <script lang="ts">
   import SessionCard from './SessionCard.svelte'
   import { fetchSearch, requestErrorMessage } from '../lib/api'
+  import type { SessionVoiceTasks } from '../lib/state.svelte'
   import {
     SessionStatus,
     SummaryStatus,
@@ -16,6 +17,7 @@
     dates,
     sessionsByDate,
     sessionDetails,
+    voiceTasks,
     presets,
     expandedSessionId,
     onToggleSession,
@@ -30,6 +32,8 @@
     dates: string[]
     sessionsByDate: Map<string, SessionSummary[]>
     sessionDetails: Map<string, SessionDetailResponse>
+    // By session, its questions to agents, once read.
+    voiceTasks: Map<string, SessionVoiceTasks>
     presets: PresetMap
     expandedSessionId: string
     onToggleSession: (id: string) => void
@@ -317,6 +321,7 @@
               <SessionCard
                 {session}
                 detail={sessionDetails.get(session.id)}
+                voiceTasks={voiceTasks.get(session.id)}
                 expanded={expandedSessionId === session.id}
                 {presets}
                 selected={selectedIds.has(session.id)}

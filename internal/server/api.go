@@ -72,6 +72,9 @@ type SessionStore interface {
 	AggregateSessions(opts storage.AggregateOptions) (storage.AggregateResult, error)
 	GetEventsSince(cursor int64, limit int) ([]storage.StoredEvent, error)
 	GetSessionsForBackfill() ([]string, error)
+	// VoiceTasks lists the questions the voice sent agents in a session,
+	// oldest first, with each agent's written answer.
+	VoiceTasks(sessionID string) ([]storage.VoiceTask, error)
 }
 
 // VersionInfo holds build metadata exposed via /api/version.

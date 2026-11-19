@@ -5,6 +5,7 @@ import {
   applySegmentDeletion,
   applySummaryUpdate,
   beginSessionDetailRequest,
+  loadVoiceTasks,
   removeSession,
   resetState,
   setDates,
@@ -16,8 +17,10 @@ import {
   ComponentStatus,
   RefinementStatus,
   SummaryStatus,
+  VoiceTaskState,
   type SessionDetailResponse,
   type SessionSummary,
+  type VoiceTask,
 } from '../types'
 
 function makeSession(id: string): SessionSummary {
@@ -41,6 +44,7 @@ function makeSession(id: string): SessionSummary {
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.unstubAllGlobals()
   resetState()
 })
 
@@ -349,5 +353,146 @@ describe('a deleted session', () => {
     status('sync', 'b')
     status('refinement', 'm')
     expect(Object.keys(appState.componentStatuses).sort()).toEqual(['summary'])
+  })
+})
+
+describe('voice tasks', () => {
+  const waiting: VoiceTask = {
+    id: 'evt-1',
+    issue_key: 'ABC-12',
+    holder: 'session:agent-7',
+    state: VoiceTaskState.Working,
+    asked_at: '2026-11-19T09:30:00Z',
+    answer_written: '',
+  }
+  const answered: VoiceTask = {
+    ...waiting,
+    state: VoiceTaskState.Done,
+    answer_written: 'It merged.',
+  }
+  const url = '/api/sessions/s1/voice-tasks'
+
+  // The unit's answer to each request in turn: a list of tasks, or a
+  // Response; a request whose answer is a promise waits for it.
+  function stubFetch(...answers: (VoiceTask[] | Response | Promise<Response>)[]) {
+    const fetchMock = vi.fn<(input: RequestInfo | URL) => Promise<Response>>(() => {
+      const answer = answers.shift()
+      if (answer === undefined) {
+        return Promise.reject(new Error('unexpected request'))
+      }
+      return Array.isArray(answer)
+        ? Promise.resolve(Response.json(answer))
+        : Promise.resolve(answer)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function held(): { answer: Promise<Response>; release: (tasks: VoiceTask[]) => void } {
+    let release: (tasks: VoiceTask[]) => void = () => {}
+    const answer = new Promise<Response>((resolve) => {
+      release = (tasks) => resolve(Response.json(tasks))
+    })
+    return { answer, release }
+  }
+
+  const voiceEvent = (type: string, sessionId: string) =>
+    applyEvent({
+      type,
+      version: 1,
+      timestamp: '2026-11-19T09:31:00Z',
+      session_id: sessionId,
+    } as never)
+
+  it("reads a session's questions to agents", async () => {
+    const fetchMock = stubFetch([answered])
+
+    await loadVoiceTasks('s1')
+
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url])
+    expect(appState.voiceTasks.get('s1')).toEqual({ tasks: [answered], error: '' })
+  })
+
+  // The two events that change a question's answer or spoken time read the
+  // session's questions again; it failed while nothing listened for them.
+  it.each(['voice_answer_ready', 'voice_spoken'])(
+    "reads a read session's questions again on %s for it, and on nothing else",
+    async (type) => {
+      const fetchMock = stubFetch([waiting], [answered])
+      await loadVoiceTasks('s1')
+
+      voiceEvent(type, 'other')
+      voiceEvent('voice_wake', 's1')
+      voiceEvent(type, 's1')
+
+      await vi.waitFor(() => expect(appState.voiceTasks.get('s1')?.tasks).toEqual([answered]))
+      expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([url, url])
+    },
+  )
+
+  it('does not read the questions of a session the tab never read', () => {
+    const fetchMock = stubFetch()
+
+    voiceEvent('voice_answer_ready', 's1')
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(appState.voiceTasks.has('s1')).toBe(false)
+  })
+
+  // A read that answers after a later one must not show its older state.
+  it('keeps the newest read when an older one answers last', async () => {
+    const first = held()
+    stubFetch(first.answer, [answered])
+
+    const older = loadVoiceTasks('s1')
+    await loadVoiceTasks('s1')
+    first.release([waiting])
+    await older
+
+    expect(appState.voiceTasks.get('s1')?.tasks).toEqual([answered])
+  })
+
+  // A deleted session's questions and answers leave the tab, also those a
+  // read in flight at the delete brings back afterwards.
+  it("drops a deleted session's questions, and a read in flight at the delete", async () => {
+    const inFlight = held()
+    const fetchMock = stubFetch([answered], inFlight.answer)
+    await loadVoiceTasks('s1')
+    const read = loadVoiceTasks('s1')
+
+    applyEvent({
+      type: 'session_deleted',
+      version: 1,
+      timestamp: '2026-11-19T09:32:00Z',
+      session_id: 's1',
+      source_session_ids: [],
+    } as never)
+    expect(appState.voiceTasks.has('s1')).toBe(false)
+
+    inFlight.release([answered])
+    await read
+    expect(appState.voiceTasks.has('s1')).toBe(false)
+
+    voiceEvent('voice_answer_ready', 's1')
+    await loadVoiceTasks('s1')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(appState.voiceTasks.has('s1')).toBe(false)
+  })
+
+  // A failed read says why and keeps what an earlier read showed, so a
+  // failure never reads as a session with no questions.
+  it('records why a read failed, and keeps the questions read before', async () => {
+    stubFetch(
+      [answered],
+      Response.json({ error: 'list voice tasks: database is locked' }, { status: 500 }),
+    )
+    await loadVoiceTasks('s1')
+
+    await loadVoiceTasks('s1')
+
+    expect(appState.voiceTasks.get('s1')).toEqual({
+      tasks: [answered],
+      error: 'list voice tasks: database is locked',
+    })
   })
 })

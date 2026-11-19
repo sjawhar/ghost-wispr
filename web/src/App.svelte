@@ -13,6 +13,7 @@
     appState,
     applySegmentDeletion,
     beginSessionDetailRequest,
+    loadVoiceTasks,
     removeSession,
     setCapturing,
     setDates,
@@ -58,8 +59,11 @@
     setSessionsForDate(date, sessions)
   }
 
+  // The session's page: its detail and, beside it, its questions to agents,
+  // whose read never holds the detail back.
   async function fetchAndStoreSession(id: string): Promise<void> {
     const requestVersion = beginSessionDetailRequest(id)
+    void loadVoiceTasks(id)
     const detail = await fetchSession(id)
     setSessionDetailIfCurrent(detail, requestVersion)
   }
@@ -181,6 +185,7 @@
 
           try {
             const requestVersion = beginSessionDetailRequest(status.active_session_id)
+            void loadVoiceTasks(status.active_session_id)
             const detail = await fetchSession(status.active_session_id)
             if (setSessionDetailIfCurrent(detail, requestVersion)) {
               setLiveSegmentsForSession(
@@ -307,6 +312,7 @@
         dates={appState.dates}
         sessionsByDate={appState.sessionsByDate}
         sessionDetails={appState.sessionDetails}
+        voiceTasks={appState.voiceTasks}
         presets={appState.presets}
         {expandedSessionId}
         {onToggleSession}

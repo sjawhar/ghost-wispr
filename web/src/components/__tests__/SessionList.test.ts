@@ -13,12 +13,13 @@ import {
 type SessionListProps = ComponentProps<typeof SessionList>
 
 function render(
-  props: Omit<SessionListProps, 'onRefreshSession' | 'onSegmentDeleted'> &
-    Partial<Pick<SessionListProps, 'onRefreshSession' | 'onSegmentDeleted'>>,
+  props: Omit<SessionListProps, 'onRefreshSession' | 'onSegmentDeleted' | 'voiceTasks'> &
+    Partial<Pick<SessionListProps, 'onRefreshSession' | 'onSegmentDeleted' | 'voiceTasks'>>,
 ) {
   return renderSvelte(SessionList, {
     onRefreshSession: vi.fn().mockResolvedValue(undefined),
     onSegmentDeleted: vi.fn(),
+    voiceTasks: new Map(),
     ...props,
   })
 }

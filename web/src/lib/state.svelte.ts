@@ -1,3 +1,4 @@
+import { fetchVoiceTasks, requestErrorMessage } from './api'
 import { ComponentStatus as ComponentStatusValue, SummaryStatus } from './types'
 import type {
   ComponentStatusEvent,
@@ -6,6 +7,7 @@ import type {
   SessionDetailResponse,
   SessionSummary,
   SummaryReadyEvent,
+  VoiceTask,
   WebSocketEvent,
 } from './types'
 
@@ -15,6 +17,13 @@ export type ComponentStatus = {
   timestamp: string
   // The session the status is about, from the event's session_id.
   sessionId?: string
+}
+
+// A session's questions to agents as last read, and why the last read
+// failed ('' when it did not), so a failed read never shows as no questions.
+export type SessionVoiceTasks = {
+  tasks: VoiceTask[]
+  error: string
 }
 
 type AppState = {
@@ -28,6 +37,8 @@ type AppState = {
   liveSegmentsSessionId: string
   sessionsByDate: Map<string, SessionSummary[]>
   sessionDetails: Map<string, SessionDetailResponse>
+  // By session, its questions to agents, once the tab has read them.
+  voiceTasks: Map<string, SessionVoiceTasks>
   dates: string[]
   warnings: string[]
   presets: PresetMap
@@ -47,6 +58,7 @@ export const appState = $state<AppState>({
   liveSegmentsSessionId: '',
   sessionsByDate: new Map(),
   sessionDetails: new Map(),
+  voiceTasks: new Map(),
   dates: [],
   warnings: [],
   presets: {},
@@ -60,6 +72,9 @@ export const appState = $state<AppState>({
 
 const detailRequestVersions = new Map<string, number>()
 const summaryDeletionTimes = new Map<string, number>()
+// By session, the number of the latest read of its questions to agents: only
+// that read's answer is shown.
+const voiceTaskReads = new Map<string, number>()
 
 export function getTodaysSessions(): SessionSummary[] {
   const today = new Date().toISOString().slice(0, 10)
@@ -134,6 +149,32 @@ function clearLiveSegmentsOf(sessionID: string): void {
   if (appState.liveSegmentsSessionId === sessionID) {
     setLiveSegmentsForSession('', [])
   }
+}
+
+// loadVoiceTasks reads the session's questions to agents. Only the latest
+// read is shown, and none of a session this tab removed. A failed read keeps
+// the questions shown and says why.
+export async function loadVoiceTasks(sessionID: string): Promise<void> {
+  if (removedSessions.has(sessionID)) {
+    return
+  }
+  const read = (voiceTaskReads.get(sessionID) ?? 0) + 1
+  voiceTaskReads.set(sessionID, read)
+  let next: SessionVoiceTasks
+  try {
+    next = { tasks: await fetchVoiceTasks(sessionID), error: '' }
+  } catch (error) {
+    next = {
+      tasks: appState.voiceTasks.get(sessionID)?.tasks ?? [],
+      error: requestErrorMessage(error),
+    }
+  }
+  if (voiceTaskReads.get(sessionID) !== read || removedSessions.has(sessionID)) {
+    return
+  }
+  const voiceTasks = new Map(appState.voiceTasks)
+  voiceTasks.set(sessionID, next)
+  appState.voiceTasks = voiceTasks
 }
 
 // The server has removed the selected timed occurrence and queued a fresh
@@ -296,6 +337,14 @@ export function applyEvent(event: WebSocketEvent): void {
         removeSession(id)
       }
       return
+    // An answer landed or was spoken: a session whose questions this tab
+    // read reads them again.
+    case 'voice_answer_ready':
+    case 'voice_spoken':
+      if (voiceTaskReads.has(event.session_id)) {
+        void loadVoiceTasks(event.session_id)
+      }
+      return
     default:
       return
   }
@@ -333,9 +382,11 @@ export function resetState(): void {
   appState.liveSegmentsSessionId = ''
   detailRequestVersions.clear()
   summaryDeletionTimes.clear()
+  voiceTaskReads.clear()
   removedSessions.clear()
   appState.sessionsByDate = new Map()
   appState.sessionDetails = new Map()
+  appState.voiceTasks = new Map()
   appState.dates = []
   appState.activeSessionId = ''
   appState.activeSessionStartedAt = 0
@@ -348,8 +399,8 @@ export function resetState(): void {
 }
 
 // removeSession drops a deleted session from this tab: its list entry, its
-// detail (title, summary, segments), its live segments and its statuses,
-// and keeps any later status about it out.
+// detail (title, summary, segments), its questions to agents, its live
+// segments and its statuses, and keeps any later status about it out.
 export function removeSession(sessionId: string): void {
   removedSessions.add(sessionId)
   invalidateSessionDetailRequest(sessionId)
@@ -370,6 +421,11 @@ export function removeSession(sessionId: string): void {
     const nextDetails = new Map(appState.sessionDetails)
     nextDetails.delete(sessionId)
     appState.sessionDetails = nextDetails
+  }
+  if (appState.voiceTasks.has(sessionId)) {
+    const nextVoiceTasks = new Map(appState.voiceTasks)
+    nextVoiceTasks.delete(sessionId)
+    appState.voiceTasks = nextVoiceTasks
   }
   appState.componentStatuses = Object.fromEntries(
     Object.entries(appState.componentStatuses).filter(([, s]) => s.sessionId !== sessionId),

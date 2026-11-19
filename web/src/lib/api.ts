@@ -4,6 +4,7 @@ import type {
   SessionDetailResponse,
   SessionSummary,
   StatusResponse,
+  VoiceTask,
 } from './types'
 
 export class RequestError extends Error {
@@ -55,6 +56,12 @@ export function fetchSessions(date: string): Promise<SessionSummary[]> {
 
 export function fetchSession(id: string): Promise<SessionDetailResponse> {
   return request<SessionDetailResponse>(`/api/sessions/${encodeURIComponent(id)}`)
+}
+
+// The questions the voice sent agents in the session and in those merged
+// into it, oldest first, with each agent's written answer.
+export function fetchVoiceTasks(id: string): Promise<VoiceTask[]> {
+  return request<VoiceTask[]>(`/api/sessions/${encodeURIComponent(id)}/voice-tasks`)
 }
 
 export function fetchStatus(): Promise<StatusResponse> {
