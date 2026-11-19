@@ -150,12 +150,13 @@ func wireVoiceToCapture(capture *captureGate, link *voiceLink) {
 // voiceKeyterms are the keyterms the live Deepgram request carries while a
 // voice can run, which is while the unit has a speaker: a person turns the
 // voice on with no restart, and the live request is not redialled for it.
-// Only Nova-3 takes keyterms.
-func voiceKeyterms(cfg *config.Config) []string {
+// They are the wake phrases, then Dispatch's project keys, so "infra" is
+// not heard as "in for" (R4). Only Nova-3 takes keyterms.
+func voiceKeyterms(cfg *config.Config, projects []string) []string {
 	if !cfg.SpeakerEnabled || !strings.HasPrefix(cfg.DeepgramModel, "nova-3") {
 		return nil
 	}
-	return transcript.Keyterms(cfg.Voice.WakePhrases, nil)
+	return transcript.Keyterms(cfg.Voice.WakePhrases, projects)
 }
 
 // voiceDeps is what the voice needs from the rest of the unit.
@@ -171,6 +172,7 @@ type voiceDeps struct {
 	session     func() string // the recording session now
 	red         func() bool   // the light reads red and audio passes the gate
 	notify      func(kind, sessionID string)
+	projects    func() []string // Dispatch's project keys, for spoken keys
 }
 
 // startVoice starts the Supervisor over the speaker output, and sets it on
@@ -192,6 +194,7 @@ func startVoice(deps *voiceDeps) error {
 		Red:         deps.red,
 		Enabled:     deps.enabled,
 		Notify:      deps.notify,
+		ProjectKeys: deps.projects,
 		Tap:         deps.tap,
 		Timing:      deps.timing,
 		Logf:        log.Printf,

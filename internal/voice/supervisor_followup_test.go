@@ -163,3 +163,21 @@ func TestAnAnswerToWisprsQuestionContinuesTheExchange(t *testing.T) {
 		}
 	})
 }
+
+// TestASpokenKeyReachesTheConciergeWritten fails if a key of one of
+// Dispatch's projects, said as Deepgram writes it ("in for forty five ninety
+// two", end-to-end run 8c), reaches the Concierge as words it cannot read as
+// a key (R4).
+func TestASpokenKeyReachesTheConciergeWritten(t *testing.T) {
+	c := newFakeConcierge("The voice issue is in review.")
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) {
+		cfg.ProjectKeys = func() []string { return []string{"INFRA", "ABC"} }
+	})
+	r.ask("please ask the agent on in for forty five ninety two when slice one ships?")
+	c.mu.Lock()
+	turns := append([]string(nil), c.turns...)
+	c.mu.Unlock()
+	if want := "please ask the agent on INFRA-4592 when slice one ships?"; len(turns) == 0 || turns[0] != want {
+		t.Fatalf("the Concierge got %q, want %q", turns, want)
+	}
+}

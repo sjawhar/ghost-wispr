@@ -41,11 +41,11 @@ func (stubConcierge) NeverMind(context.Context, string) error { return nil }
 // not take them.
 func TestKeytermsOnlyForNova3(t *testing.T) {
 	cfg := &config.Config{DeepgramModel: "nova-2", SpeakerEnabled: true, Voice: config.Voice{WakePhrases: []string{"Wispr"}}}
-	if got := voiceKeyterms(cfg); len(got) != 0 {
+	if got := voiceKeyterms(cfg, nil); len(got) != 0 {
 		t.Fatalf("keyterms %q for nova-2, want none", got)
 	}
 	cfg.DeepgramModel = "nova-3-general"
-	if got := voiceKeyterms(cfg); !slices.Equal(got, []string{"Wispr"}) {
+	if got := voiceKeyterms(cfg, nil); !slices.Equal(got, []string{"Wispr"}) {
 		t.Fatalf("keyterms %q for nova-3-general, want the wake phrase", got)
 	}
 }

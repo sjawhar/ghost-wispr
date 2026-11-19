@@ -171,11 +171,11 @@ func TestVoiceAudioOnlyAfterTheGate(t *testing.T) {
 // or sends them with no speaker.
 func TestLiveOptionsCarryTheWakeKeyterms(t *testing.T) {
 	cfg := config.Config{DeepgramModel: "nova-3", SpeakerEnabled: true, Voice: config.Voice{WakePhrases: []string{"Wispr", "Ghost Wispr"}}}
-	if got := liveTranscriptionOptions(&cfg, 16000).Keyterm; !slices.Equal(got, []string{"Wispr", "Ghost Wispr"}) {
+	if got := liveTranscriptionOptions(&cfg, 16000, nil).Keyterm; !slices.Equal(got, []string{"Wispr", "Ghost Wispr"}) {
 		t.Errorf("keyterms %q with a speaker and the voice off, want the wake phrases", got)
 	}
 	cfg.SpeakerEnabled = false
-	if got := liveTranscriptionOptions(&cfg, 16000).Keyterm; len(got) != 0 {
+	if got := liveTranscriptionOptions(&cfg, 16000, nil).Keyterm; len(got) != 0 {
 		t.Errorf("keyterms %q with no speaker, want none", got)
 	}
 }

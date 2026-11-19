@@ -150,8 +150,11 @@ type SupervisorConfig struct {
 	Session     func() string // the recording session now, "" before one starts
 	Red         func() bool   // the light reads red and room audio passes the gate
 	// Enabled reports voice.enabled, read on each result; nil is always on.
-	Enabled      func() bool
-	Notify       func(kind, sessionID string)
+	Enabled func() bool
+	Notify  func(kind, sessionID string)
+	// ProjectKeys are Dispatch's project keys, whose spoken keys the turn
+	// writes as keys; nil writes none. It must return at once.
+	ProjectKeys  func() []string
 	Tap          *Tap
 	TurnWait     time.Duration // 0: DefaultTurnWait
 	SilenceWait  time.Duration // 0: DefaultSilenceWait
@@ -856,7 +859,12 @@ func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
 // turnLocked adds words of the asker's turn, and hands the turn to the
 // Concierge once Deepgram marks it final.
 func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
+	// A key of Dispatch's projects said in a spoken form ("in for forty five
+	// ninety two") is written as the key, which the Concierge reads (R4).
 	words = strings.TrimSpace(words)
+	if s.cfg.ProjectKeys != nil {
+		words = transcript.WriteKeys(words, s.cfg.ProjectKeys())
+	}
 	if t.IsFinal {
 		if words != "" {
 			ex.turn = append(ex.turn, words)
