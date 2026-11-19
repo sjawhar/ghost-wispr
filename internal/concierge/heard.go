@@ -58,16 +58,16 @@ func readTarget(words string) string {
 type read struct {
 	done   chan struct{}
 	record string
+	cancel context.CancelFunc
 }
 
-// prefetch is the record read for one exchange while its asker speaks: at
-// most one read runs at a time, and the latest words wait their turn.
+// prefetch is the record read for one exchange while its asker speaks. Each
+// new target replaces the read still running for an older one, which the
+// words since have made stale: at most one read runs.
 type prefetch struct {
 	at      time.Time
 	reads   map[string]*read
-	latest  *read
-	want    string
-	running bool
+	current string
 }
 
 // Heard tells the Concierge the turn so far in exchange x. It returns at
@@ -95,34 +95,27 @@ func (c *Concierge) Heard(x *voice.Exchange, words string) {
 	if _, read := p.reads[target]; read {
 		return
 	}
-	p.want = target
-	if !p.running {
-		c.startReadLocked(&exchange, p, target)
-	}
-}
-
-// startReadLocked starts the read of target for p; c.mu is held.
-func (c *Concierge) startReadLocked(x *voice.Exchange, p *prefetch, target string) {
-	r := &read{done: make(chan struct{})}
-	p.reads[target], p.latest, p.running = r, r, true
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
-		defer cancel()
-		r.record = c.readRecord(ctx, x, target)
-		close(r.done)
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		p.running = false
-		if _, read := p.reads[p.want]; !read && p.want != "" {
-			c.startReadLocked(x, p, p.want)
+	if running, ok := p.reads[p.current]; ok {
+		select {
+		case <-running.done:
+		default:
+			running.cancel()
+			delete(p.reads, p.current)
 		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
+	r := &read{done: make(chan struct{}), cancel: cancel}
+	p.reads[target], p.current = r, target
+	go func() {
+		defer cancel()
+		r.record = c.readRecord(ctx, &exchange, target)
+		close(r.done)
 	}()
 }
 
-// readFor is the record Answer gives the model for turn: the read of the
-// issue the final turn names (read now if Heard did not), else the latest
-// read Heard started for the exchange, else a search for the turn read now.
-// It waits at most prefetchWait for a read still running.
+// readFor is the record Answer gives the model for turn: the read Heard made
+// of exactly what the final turn asks, waited for at most prefetchWait, else
+// a read made now.
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) string {
 	target := readTarget(turn)
 	if target == "" {
@@ -131,11 +124,7 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 	c.mu.Lock()
 	var pending *read
 	if p, ok := c.prefetches[exchangeKey(x)]; ok {
-		if r, read := p.reads[target]; read {
-			pending = r
-		} else if !strings.HasPrefix(target, "key:") {
-			pending = p.latest
-		}
+		pending = p.reads[target]
 	}
 	c.mu.Unlock()
 	if pending != nil {

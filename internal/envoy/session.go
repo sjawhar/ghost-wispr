@@ -323,14 +323,18 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 		conn.Close()
 		return nil, fmt.Errorf("envoy: subscribe to the relay subject: %w", err)
 	}
-	if err := conn.FlushWithContext(ctx); err != nil {
+	// The flush and the first registration bound themselves: NATS refuses a
+	// flush on a context with no deadline, and a caller need not give one.
+	openCtx, cancel := context.WithTimeout(ctx, openTimeout)
+	defer cancel()
+	if err := conn.FlushWithContext(openCtx); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("envoy: flush the relay subscription: %w", err)
 	}
 	session.mu.Lock()
 	session.conn, session.sub = conn, sub
 	session.mu.Unlock()
-	if err := session.register(ctx); err != nil {
+	if err := session.register(openCtx); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -338,6 +342,10 @@ func OpenSession(ctx context.Context, listener *Listener, cfg *SessionConfig) (*
 	go session.heartbeat()
 	return session, nil
 }
+
+// openTimeout bounds OpenSession's flush of the relay subscription and its
+// first registration.
+const openTimeout = 15 * time.Second
 
 // ID is the session's id.
 func (s *Session) ID() string { return s.cfg.SessionID }
