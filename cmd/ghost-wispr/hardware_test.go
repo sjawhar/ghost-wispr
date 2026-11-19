@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -16,8 +17,9 @@ import (
 )
 
 type commandLightFake struct {
-	colour [3]uint8
-	closed bool
+	colour  [3]uint8
+	readErr error
+	closed  bool
 }
 
 func (l *commandLightFake) SetRGB(r, g, b uint8) error {
@@ -25,6 +27,9 @@ func (l *commandLightFake) SetRGB(r, g, b uint8) error {
 	return nil
 }
 func (l *commandLightFake) ReadRGB() (uint8, uint8, uint8, error) {
+	if l.readErr != nil {
+		return 0, 0, 0, l.readErr
+	}
 	return l.colour[0], l.colour[1], l.colour[2], nil
 }
 func (*commandLightFake) ServerDown(time.Duration) error { return nil }
@@ -38,9 +43,9 @@ func (l *commandLightFake) Close() error {
 // recording indicator lit.
 func TestLightOffSubcommandSendsOff(t *testing.T) {
 	light := &commandLightFake{colour: [3]uint8{255, 0, 0}}
-	original := openBlink1
-	openBlink1 = func(string, string) (indicator.Light, error) { return light, nil }
-	t.Cleanup(func() { openBlink1 = original })
+	original := openBlink1Command
+	openBlink1Command = func(string, string) (indicator.Light, error) { return light, nil }
+	t.Cleanup(func() { openBlink1Command = original })
 
 	var stderr bytes.Buffer
 	if err := runLightOff(&stderr); err != nil {
@@ -55,9 +60,9 @@ func TestLightOffSubcommandSendsOff(t *testing.T) {
 }
 
 func TestLightOffSubcommandWithoutDeviceSucceeds(t *testing.T) {
-	original := openBlink1
-	openBlink1 = func(string, string) (indicator.Light, error) { return nil, indicator.ErrNoBlink1 }
-	t.Cleanup(func() { openBlink1 = original })
+	original := openBlink1Command
+	openBlink1Command = func(string, string) (indicator.Light, error) { return nil, indicator.ErrNoBlink1 }
+	t.Cleanup(func() { openBlink1Command = original })
 
 	var stderr bytes.Buffer
 	if err := runLightOff(&stderr); err != nil {
@@ -81,9 +86,9 @@ func TestLightStateSubcommand(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			light := &commandLightFake{colour: tc.color}
-			original := openBlink1
-			openBlink1 = func(string, string) (indicator.Light, error) { return light, nil }
-			t.Cleanup(func() { openBlink1 = original })
+			original := openBlink1Command
+			openBlink1Command = func(string, string) (indicator.Light, error) { return light, nil }
+			t.Cleanup(func() { openBlink1Command = original })
 			var stdout bytes.Buffer
 			err := runLightState(&stdout)
 			if (err != nil) != tc.wantErr {
@@ -91,6 +96,40 @@ func TestLightStateSubcommand(t *testing.T) {
 			}
 			if got := stdout.String(); got != tc.want {
 				t.Fatalf("light-state output = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLightStateSaysUnknownWhenItCannotRead fails if `ghost-wispr light-state`
+// prints a colour, or nothing, when it could not read the light: when another
+// command held the blink(1) past the wait (indicator.ErrBusy) or answered the
+// read (indicator.ErrOtherReply), or the read failed. It must print unknown
+// and fail, never red, though the light is red. Its open does not fail for
+// another command (TestACommandOpenDoesNotFailForAnotherCommand).
+func TestLightStateSaysUnknownWhenItCannotRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		readErr error
+	}{
+		{name: "read busy", readErr: indicator.ErrBusy},
+		{name: "read answered by another command", readErr: fmt.Errorf("%w: 'D' answered 'r'", indicator.ErrOtherReply)},
+		{name: "read failed", readErr: errors.New("blink(1) feature report: no such device")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			light := &commandLightFake{colour: [3]uint8{255, 0, 0}, readErr: tc.readErr}
+			original := openBlink1Command
+			openBlink1Command = func(string, string) (indicator.Light, error) { return light, nil }
+			t.Cleanup(func() { openBlink1Command = original })
+			var stdout, stderr bytes.Buffer
+			if code := runLightCommand([]string{"light-state"}, &stdout, &stderr); code != 1 {
+				t.Fatalf("light-state exit code = %d, want 1", code)
+			}
+			if got := stdout.String(); got != "unknown\n" {
+				t.Fatalf("light-state output = %q, want %q", got, "unknown\n")
+			}
+			if want := tc.readErr.Error(); !strings.Contains(stderr.String(), want) {
+				t.Fatalf("light-state stderr = %q, want the cause %q", stderr.String(), want)
 			}
 		})
 	}
@@ -127,7 +166,7 @@ func TestTapTogglesAndPersists(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	capture := newCaptureGate(nil, nil, nil)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	pause, resume := controls.Pause, controls.Resume
 	var statuses []bool
 	if err := toggleCapture(capture.IsPaused, pause, resume, func(paused bool) { statuses = append(statuses, paused) }); err != nil {
@@ -166,10 +205,12 @@ func TestTapFailureBroadcastsPause(t *testing.T) {
 }
 
 type reconnectLightFake struct {
-	mu     sync.Mutex
-	colour [3]uint8
-	setErr error
-	closed bool
+	mu      sync.Mutex
+	colour  [3]uint8
+	setErr  error
+	readErr error
+	closed  bool
+	tickles int
 }
 
 func (l *reconnectLightFake) SetRGB(r, g, b uint8) error {
@@ -185,11 +226,21 @@ func (l *reconnectLightFake) SetRGB(r, g, b uint8) error {
 func (l *reconnectLightFake) ReadRGB() (uint8, uint8, uint8, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.readErr != nil {
+		return 0, 0, 0, l.readErr
+	}
 	return l.colour[0], l.colour[1], l.colour[2], nil
 }
 
-func (*reconnectLightFake) ServerDown(time.Duration) error { return nil }
-func (*reconnectLightFake) BlackPattern() error            { return nil }
+func (l *reconnectLightFake) ServerDown(timeout time.Duration) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if timeout > 0 {
+		l.tickles++
+	}
+	return nil
+}
+func (*reconnectLightFake) BlackPattern() error { return nil }
 
 func (l *reconnectLightFake) Close() error {
 	l.mu.Lock()
@@ -208,6 +259,82 @@ func (l *reconnectLightFake) isClosed() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.closed
+}
+
+// TestABusyLightReadCountsAsNotRed fails if the recorder takes a read that
+// could not get the blink(1) (indicator.ErrBusy: another command held it past
+// the wait, so its colour is unknown) for red: a red confirmation must fail,
+// so no microphone opens, and a read-back for a buffer of audio must count as
+// the light not red, so the gate drops that audio. The light itself is red.
+func TestABusyLightReadCountsAsNotRed(t *testing.T) {
+	device := &reconnectLightFake{}
+	original := openBlink1
+	openBlink1 = func(string, string) (indicator.Light, error) { return device, nil }
+	t.Cleanup(func() { openBlink1 = original })
+	hardware := &hardwareControl{light: &reconnectingLight{light: device, warnings: newWarningsRegistry()}}
+	if err := hardware.EnsureRed(); err != nil {
+		t.Fatalf("control: red confirmation of a free light: %v", err)
+	}
+	hardware.ReleaseRedHold()
+	mark := hardware.lightRedMark()
+	hardware.checkLight()
+	if hardware.lightOffs() != mark {
+		t.Fatal("control: a read-back of red counted the light as not red")
+	}
+
+	device.mu.Lock()
+	device.readErr = indicator.ErrBusy
+	device.mu.Unlock()
+	hardware.checkLight()
+	if hardware.lightOffs() == mark {
+		t.Fatal("a busy read-back for a buffer of audio counted the light as red")
+	}
+	if err := hardware.EnsureRed(); !errors.Is(err, indicator.ErrBusy) {
+		t.Fatalf("red confirmation with a busy read = %v, want indicator.ErrBusy", err)
+	}
+	if !device.isRed() {
+		t.Fatal("control: the light is not red, so the test would not show a busy read of red")
+	}
+}
+
+// TestAContendedReadKeepsTheLightOpen fails if a read that another command got
+// in the way of (indicator.ErrBusy, indicator.ErrOtherReply) closes the
+// recorder's handle on the blink(1), as a failed device does. The device did
+// not fail; and closed, the light must be opened again for the next command,
+// with a version query and the black pattern's 33 reads, each waiting for the
+// same lock, so the watchdog tickle never reached the light while another open
+// held it (review of #79). The read still counts the light as not red.
+func TestAContendedReadKeepsTheLightOpen(t *testing.T) {
+	for _, contended := range []error{indicator.ErrBusy, fmt.Errorf("%w: 'P' answered 'r'", indicator.ErrOtherReply)} {
+		t.Run(contended.Error(), func(t *testing.T) {
+			device := &reconnectLightFake{colour: [3]uint8{255, 0, 0}, readErr: contended}
+			opens := 0
+			original := openBlink1
+			openBlink1 = func(string, string) (indicator.Light, error) { opens++; return device, nil }
+			t.Cleanup(func() { openBlink1 = original })
+			light := &reconnectingLight{light: device, warnings: newWarningsRegistry()}
+
+			before := light.offs.Load()
+			if _, _, _, err := light.ReadRGB(); !errors.Is(err, contended) {
+				t.Fatalf("ReadRGB = %v, want %v", err, contended)
+			}
+			if light.offs.Load() == before {
+				t.Fatal("a contended read counted the light as red")
+			}
+			if err := light.ServerDown(3 * time.Second); err != nil {
+				t.Fatalf("watchdog tickle after a contended read: %v", err)
+			}
+			device.mu.Lock()
+			closed, tickles := device.closed, device.tickles
+			device.mu.Unlock()
+			if closed || opens != 0 {
+				t.Fatalf("a contended read closed the light (closed=%t, opened again %d times), want it kept open", closed, opens)
+			}
+			if tickles != 1 {
+				t.Fatalf("watchdog tickles that reached the light = %d, want 1", tickles)
+			}
+		})
+	}
 }
 
 // TestControllerReopensAfterAWriteError fails if a transient USB failure leaves
@@ -482,7 +609,9 @@ func TestWireLightConsentRequiresRedBeforeStartOrResume(t *testing.T) {
 }
 
 // TestConfirmRedRetriesDiscoveryBeforeRecording fails if a cached missing-light
-// result lets capture begin after the blink(1) appears.
+// result lets capture begin after the blink(1) appears. It confirms red as the
+// capture gate does: CheckLight checks the stored pattern of the unit it finds,
+// which is not known black, and then EnsureRed confirms it red.
 func TestConfirmRedRetriesDiscoveryBeforeRecording(t *testing.T) {
 	device := &operationLightFake{}
 	original := openBlink1
@@ -499,9 +628,14 @@ func TestConfirmRedRetriesDiscoveryBeforeRecording(t *testing.T) {
 	if _, err := light.current(); !errors.Is(err, indicator.ErrNoBlink1) {
 		t.Fatalf("initial discovery error = %v, want ErrNoBlink1", err)
 	}
-	if err := light.ConfirmRed(); err != nil {
+	hardware := &hardwareControl{light: light}
+	if err := hardware.CheckLight(); err != nil {
+		t.Fatalf("check the light after it appears: %v", err)
+	}
+	if err := hardware.EnsureRed(); err != nil {
 		t.Fatalf("confirm red after light appears: %v", err)
 	}
+	hardware.ReleaseRedHold()
 	if opens != 2 {
 		t.Fatalf("blink(1) discoveries = %d, want 2", opens)
 	}
@@ -538,7 +672,7 @@ func TestResumeRequiresRedBeforeOpeningCapture(t *testing.T) {
 		return errors.New("light is off")
 	}
 	guardResumeWithLight(capture, newWarningsRegistry(), nil)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	capture.Pause()
 	if err := controls.Resume(); err == nil {
 		t.Fatal("resume succeeded after red confirmation failed")
@@ -839,7 +973,7 @@ func TestResumeDoesNotLightBeforeGateOpens(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	wireLightConsent(capture, hardware, newWarningsRegistry(), nil)
 	capture.Pause()
 	if err := controls.Resume(); err != nil {
@@ -884,7 +1018,7 @@ func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
 		statuses   []bool
 		statusesMu sync.Mutex
 	)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, func(paused bool) {
+	controls := newPersistentControls(store, capture.Pause, capture, func(paused bool) {
 		statusesMu.Lock()
 		defer statusesMu.Unlock()
 		statuses = append(statuses, paused)

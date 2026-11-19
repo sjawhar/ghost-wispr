@@ -59,8 +59,11 @@ type captureDevice struct {
 	busy    int           // operations under way
 	spans   []opSpan      // recent stretches of operations, oldest first; the last one is open while busy > 0
 	lightAt time.Duration // CLOCK_MONOTONIC of the last light write; 0 before any
-	// light writes the connected Jabra's light, on while capture is paused;
-	// nil without a Jabra.
+	// ring, when set (showPaused), is what the Jabra's ring shows in place of
+	// paused: the Jabra button's count.
+	ring func() bool
+	// light writes the connected Jabra's light, on while the ring shows the
+	// pause (ringPaused); nil without a Jabra.
 	light   func(on bool) error
 	written bool // light has written shown since it was attached or refreshed
 	shown   bool
@@ -72,6 +75,29 @@ type captureDevice struct {
 
 func newCaptureDevice(paused func() bool) *captureDevice {
 	return &captureDevice{paused: paused, silent: make(chan struct{})}
+}
+
+// showPaused makes the Jabra's ring show ring in place of the pause switch.
+// The Jabra button counts the unit as resumed while its own resume checks
+// the light, before the switch moves, so the person's next press, on an
+// unmuted ring, pauses (review 5968112897 of #79).
+func (d *captureDevice) showPaused(ring func() bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ring = ring
+}
+
+// ringPaused reports whether the Jabra's ring should show the pause: ring if
+// it is set, else the pause switch. Neither shows the pause while the unit
+// records: the Jabra button counts a recording unit as resumed.
+func (d *captureDevice) ringPaused() bool {
+	d.mu.Lock()
+	ring := d.ring
+	d.mu.Unlock()
+	if ring != nil {
+		return ring()
+	}
+	return d.paused()
 }
 
 // openStream runs open, which opens a capture stream, as one operation, and
@@ -171,7 +197,7 @@ func (d *captureDevice) prepareLightForOpen(ctx context.Context, cancel <-chan s
 			return false
 		default:
 		}
-		paused := d.paused()
+		paused := d.ringPaused()
 		d.op.Lock()
 		d.mu.Lock()
 		stale := d.light != nil && (!d.written || d.shown != paused)
@@ -234,7 +260,7 @@ func (d *captureDevice) syncLight() {
 		return
 	}
 	defer d.op.Unlock()
-	paused := d.paused()
+	paused := d.ringPaused()
 	d.mu.Lock()
 	stale := !d.written || d.shown != paused
 	d.mu.Unlock()
@@ -255,7 +281,7 @@ func (d *captureDevice) writeLight() (heldForPlayback bool) {
 	if write == nil || open || playing {
 		return write != nil && playing
 	}
-	on := d.paused()
+	on := d.ringPaused()
 	err := write(on)
 	d.mu.Lock()
 	defer d.mu.Unlock()

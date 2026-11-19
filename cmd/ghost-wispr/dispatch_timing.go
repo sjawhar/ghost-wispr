@@ -59,7 +59,8 @@ func envoyRoute(path string) string {
 }
 
 // dispatchRoute names a Dispatch API path by its route, as dispatch.APIError
-// does: projects, search, issue, events, document, else other.
+// does: projects, search, search_keywords, issue, events, document, else
+// other.
 func dispatchRoute(path string) string {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) < 3 || parts[0] != "api" || parts[1] != "v1" {
@@ -70,6 +71,8 @@ func dispatchRoute(path string) string {
 		return "projects"
 	case len(parts) == 3 && parts[2] == "search":
 		return "search"
+	case len(parts) == 4 && parts[2] == "search" && parts[3] == "results":
+		return "search_keywords" // the keyword search (keywords_only)
 	case parts[2] != "issues":
 		return "other"
 	case len(parts) == 4:

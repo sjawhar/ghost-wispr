@@ -158,6 +158,24 @@ func (p *fakePlayback) audio() []byte {
 	return bytes.Join(frames, nil)
 }
 
+// waitPlayback waits until the Output began want playbacks and the last one
+// got n bytes, since a Say returns once its text is synthesised, before
+// its audio is all written.
+func (o *fakeOutput) waitPlayback(t *testing.T, want, n int) []*fakePlayback {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pbs := o.begun()
+		if len(pbs) >= want && len(pbs[want-1].audio()) >= n {
+			return pbs
+		}
+		if time.Now().After(deadline) {
+			return pbs
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // ramp is n bytes counting up from start, so the order of audio shows.
 func ramp(start, n int) []byte {
 	b := make([]byte, n)
@@ -184,6 +202,7 @@ var kindNames = map[voice.EventKind]string{
 	voice.EventToolCall:      "ToolCall",
 	voice.EventErr:           "Err",
 	voice.EventAgentText:     "AgentText",
+	voice.EventTextAudio:     "TextAudio",
 }
 
 func nextEvent(t *testing.T, events <-chan voice.Event) voice.Event {
@@ -247,7 +266,7 @@ func TestSayWritesWholeFramesOfAtMost20msInOrder(t *testing.T) {
 	if err := s.Say(context.Background(), "Twelve open issues.", voice.Fact); err != nil {
 		t.Fatalf("Say: %v", err)
 	}
-	pbs := out.begun()
+	pbs := out.waitPlayback(t, 1, len(want))
 	if len(pbs) != 1 {
 		t.Fatalf("Say began %d playbacks, want 1", len(pbs))
 	}
@@ -277,15 +296,15 @@ func TestSayReportsAgentTextThenSpeechStartedThenSpeechEnded(t *testing.T) {
 	if err := s.Say(context.Background(), "Hello there.", voice.Ack); err != nil {
 		t.Fatalf("Say: %v", err)
 	}
-	got := expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted, voice.EventSpeechEnded)
+	got := expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted, voice.EventTextAudio, voice.EventSpeechEnded)
 	if got[0].Text != "Hello there." {
 		t.Fatalf("AgentText = %q, want the words spoken", got[0].Text)
 	}
 }
 
-// TestSayReturnsOnceQueuedNotOncePlayed fails if a Say waits for its audio to
-// play, or SpeechEnded comes before the playback drained.
-func TestSayReturnsOnceQueuedNotOncePlayed(t *testing.T) {
+// TestSayReturnsOnceSynthesisedNotOncePlayed fails if a Say waits for its
+// audio to play, or SpeechEnded comes before the playback drained.
+func TestSayReturnsOnceSynthesisedNotOncePlayed(t *testing.T) {
 	out := newFakeOutput()
 	out.drainGate = make(chan struct{})
 	s := openSession(t, speaks(map[string][]byte{"One moment.": ramp(0, 3000)}), out)
@@ -298,9 +317,9 @@ func TestSayReturnsOnceQueuedNotOncePlayed(t *testing.T) {
 			t.Fatalf("Say: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Say still running 2 s after its audio was queued: it waits for playback")
+		t.Fatal("Say still running 2 s after its audio was synthesised: it waits for playback")
 	}
-	expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted)
+	expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted, voice.EventTextAudio)
 	expectNoEvent(t, s.Events(), 50*time.Millisecond)
 	close(out.drainGate)
 	expectEvents(t, s.Events(), voice.EventSpeechEnded)
@@ -345,18 +364,33 @@ func TestSaysQueuedBehindASpeechPlayInOrderInOnePlayback(t *testing.T) {
 	if !slices.Equal(order, []string{"first", "second", "third"}) {
 		t.Fatalf("streamed %q, want the Says in the order they were called", order)
 	}
-	pbs := out.begun()
+	want := bytes.Join([][]byte{audioOf["first"], audioOf["second"], audioOf["third"]}, nil)
+	pbs := out.waitPlayback(t, 1, len(want))
 	if len(pbs) != 1 {
 		t.Fatalf("began %d playbacks, want one speech in one", len(pbs))
 	}
-	want := bytes.Join([][]byte{audioOf["first"], audioOf["second"], audioOf["third"]}, nil)
 	if got := pbs[0].audio(); !bytes.Equal(got, want) {
 		t.Fatalf("played %d bytes, want the three texts' %d in order", len(got), len(want))
 	}
-	got := expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted,
-		voice.EventAgentText, voice.EventAgentText, voice.EventSpeechEnded)
-	if got[0].Text != "first" || got[2].Text != "second" || got[3].Text != "third" {
-		t.Fatalf("AgentText events %q, %q, %q, want first, second, third", got[0].Text, got[2].Text, got[3].Text)
+	// The synthesis stage reports each text as it starts on it, the playback
+	// stage each text's first frame: their order is each stage's.
+	var texts, plays []string
+	starts, ends := 0, 0
+	for ends == 0 {
+		e := nextEvent(t, s.Events())
+		switch e.Kind {
+		case voice.EventAgentText:
+			texts = append(texts, e.Text)
+		case voice.EventTextAudio:
+			plays = append(plays, e.Text)
+		case voice.EventSpeechStarted:
+			starts++
+		case voice.EventSpeechEnded:
+			ends++
+		}
+	}
+	if order := []string{"first", "second", "third"}; !slices.Equal(texts, order) || !slices.Equal(plays, order) || starts != 1 {
+		t.Fatalf("AgentText %q, TextAudio %q and %d SpeechStarted, want each text in order in one speech", texts, plays, starts)
 	}
 }
 
@@ -397,7 +431,7 @@ func TestInterruptReturnsAnInFlightSayWithin100msAndTheNextSayPlays(t *testing.T
 	if err := s.Say(context.Background(), "after", voice.Fact); err != nil {
 		t.Fatalf("Say after Interrupt: %v", err)
 	}
-	pbs := out.begun()
+	pbs := out.waitPlayback(t, 2, len(after))
 	if len(pbs) != 2 {
 		t.Fatalf("began %d playbacks, want a fresh one after Interrupt", len(pbs))
 	}
@@ -491,13 +525,13 @@ func TestInterruptEndsTheSpeech(t *testing.T) {
 	if err := s.Say(context.Background(), "one", voice.Fact); err != nil {
 		t.Fatalf("Say: %v", err)
 	}
-	expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted)
+	expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted, voice.EventTextAudio)
 	s.Interrupt()
 	expectEvents(t, s.Events(), voice.EventSpeechEnded)
 	if err := s.Say(context.Background(), "two", voice.Fact); err != nil {
 		t.Fatalf("Say after Interrupt: %v", err)
 	}
-	expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted)
+	expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted, voice.EventTextAudio)
 	close(out.drainGate)
 	expectEvents(t, s.Events(), voice.EventSpeechEnded)
 	expectNoEvent(t, s.Events(), 50*time.Millisecond)
@@ -521,11 +555,12 @@ func TestEngineErrorSurfacesAsSayErrorAndEventErr(t *testing.T) {
 	}
 }
 
-// TestAFailedWriteFailsTheSayAndTheNextSayBeginsAnotherPlayback fails if a
-// Say whose playback the Output ended does not fail with the Output's error
-// and report it, or a Say queued behind it writes to the ended playback
-// instead of a fresh one.
-func TestAFailedWriteFailsTheSayAndTheNextSayBeginsAnotherPlayback(t *testing.T) {
+// TestAFailedWriteIsReportedAndTheNextSayBeginsAnotherPlayback fails if a
+// write the Output refused, once it ended the playback, is not reported (as
+// the Say's error when it came before the Say's synthesis ended, and as
+// EventErr), or a Say queued behind it writes to the ended playback instead
+// of a fresh one.
+func TestAFailedWriteIsReportedAndTheNextSayBeginsAnotherPlayback(t *testing.T) {
 	next := ramp(3, 2000)
 	queued := make(chan struct{})
 	out := newFakeOutput()
@@ -547,22 +582,29 @@ func TestAFailedWriteFailsTheSayAndTheNextSayBeginsAnotherPlayback(t *testing.T)
 	go func() { nextSaid <- s.Say(context.Background(), "next", voice.Fact) }()
 	time.Sleep(50 * time.Millisecond)
 	close(queued)
-	if err := <-failed; !errors.Is(err, audio.ErrCancelled) {
-		t.Fatalf("Say whose playback ended = %v, want the Output's ErrCancelled", err)
+	// The Say ends with its synthesis: a write failure before then fails it,
+	// one after is reported as EventErr only (the Say returned already).
+	if err := <-failed; err != nil && !errors.Is(err, audio.ErrCancelled) {
+		t.Fatalf("Say whose playback ended = %v, want nil or the Output's ErrCancelled", err)
 	}
 	if err := <-nextSaid; err != nil {
 		t.Fatalf("the Say queued behind it: %v", err)
 	}
-	pbs := out.begun()
+	pbs := out.waitPlayback(t, 2, len(next))
 	if len(pbs) != 2 {
 		t.Fatalf("began %d playbacks, want a fresh one after the first ended", len(pbs))
 	}
 	if got := pbs[1].audio(); !bytes.Equal(got, next) {
 		t.Fatalf("the fresh playback got %d bytes, want the queued Say's %d", len(got), len(next))
 	}
-	got := expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted, voice.EventErr)
-	if !errors.Is(got[2].Err, audio.ErrCancelled) {
-		t.Fatalf("EventErr = %v, want the Output's ErrCancelled", got[2].Err)
+	for {
+		e := nextEvent(t, s.Events())
+		if e.Kind == voice.EventErr {
+			if !errors.Is(e.Err, audio.ErrCancelled) {
+				t.Fatalf("EventErr = %v, want the Output's ErrCancelled", e.Err)
+			}
+			return
+		}
 	}
 }
 

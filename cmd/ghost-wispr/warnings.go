@@ -31,6 +31,16 @@ func (r *warningsRegistry) Clear(key string) {
 	delete(r.entries, key)
 }
 
+// ClearIf clears key's warning only while its text is text, so a caller
+// clears the warning it set and no other that replaced it.
+func (r *warningsRegistry) ClearIf(key, text string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.entries[key] == text {
+		delete(r.entries, key)
+	}
+}
+
 // ReplacePrefix makes entries the registry's whole set of warnings whose key
 // starts with prefix: it clears every other key with that prefix.
 func (r *warningsRegistry) ReplacePrefix(prefix string, entries map[string]string) {

@@ -88,6 +88,9 @@ const (
 	Ack    SayMode = iota + 1 // an acknowledgement or a routing line
 	Fact                      // a fact from the record
 	Answer                    // a holder's answer
+	// Lead names the issue a search chose (R5, "I took KEY."): it leads the
+	// answer and is never dropped, and it holds no fact to time.
+	Lead
 )
 
 func (m SayMode) String() string {
@@ -98,6 +101,8 @@ func (m SayMode) String() string {
 		return "fact"
 	case Answer:
 		return "answer"
+	case Lead:
+		return "lead"
 	default:
 		return "unknown"
 	}
@@ -130,6 +135,11 @@ const (
 	EventToolCall  // Call holds the request
 	EventErr       // Err holds the failure
 	EventAgentText // Text holds words the voice speaks or is about to, for the own-speech filter
+	// EventTextAudio: Text, one Say's text, begins to play (its first frame
+	// is queued to the Output). A voice that synthesises a Say while the one
+	// before plays (voice A) reports it, so the first fact's audio is timed
+	// right; a voice that does not report it is timed by its speech.
+	EventTextAudio
 )
 
 // Event is one thing a Session reports.

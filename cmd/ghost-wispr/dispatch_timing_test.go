@@ -56,6 +56,7 @@ func TestDispatchRoutes(t *testing.T) {
 	for path, want := range map[string]string{
 		"/api/v1/projects":                       "projects",
 		"/api/v1/search":                         "search",
+		"/api/v1/search/results":                 "search_keywords",
 		"/api/v1/issues/ABC-12":                  "issue",
 		"/api/v1/issues/ABC-12/events":           "events",
 		"/api/v1/issues/ABC-12/artifacts/s/text": "document",
