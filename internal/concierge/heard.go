@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
@@ -42,12 +43,16 @@ func issueKeysIn(words string) []string {
 }
 
 // read is one read of the record for a target. complete is set when it ran
-// to its end, not stopped or replaced; found is then what it found.
+// to its end, not stopped or replaced; found is then what it found. seen is
+// closed once its issue's holder is known, which early then holds.
 type read struct {
 	done     chan struct{}
 	found    *reading
 	complete bool
 	cancel   context.CancelFunc
+	seen     chan struct{}
+	early    *reading
+	once     sync.Once
 }
 
 // reading is what a read of the record found for a turn.
@@ -142,8 +147,8 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		}
 	}
 	key := exchangeKey(&exchange)
-	p, ok := c.prefetches[key]
-	if !ok {
+	p := c.prefetchLocked(&exchange)
+	if p == nil {
 		p = &prefetch{at: now, reads: map[string]*read{}}
 		c.prefetches[key] = p
 	}
@@ -159,11 +164,11 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		}
 	}
 	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-	r := &read{done: make(chan struct{}), cancel: cancel}
+	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel}
 	p.reads[target], p.current = r, target
 	go func() {
 		defer cancel()
-		found := c.readRecord(readCtx, &exchange, target)
+		found := c.readRecord(readCtx, &exchange, target, r.heldBy)
 		if readCtx.Err() == nil {
 			r.found, r.complete = found, true
 		}
@@ -171,21 +176,45 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	}()
 }
 
+// heldBy keeps the issue and holder a read learned before it ended, for an
+// "ask" turn that need not wait for the rest.
+func (r *read) heldBy(early *reading) {
+	r.once.Do(func() {
+		r.early = early
+		close(r.seen)
+	})
+}
+
 // readFor is what the record holds for turn: the read Heard made of exactly
 // what the final turn asks, which is final once it ran to its end, else a
 // read made now, bounded as Heard's are.
-func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) *reading {
+func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading)) *reading {
 	target := c.readTarget(ctx, turn, true)
 	if target == "" {
 		return &reading{}
 	}
 	c.mu.Lock()
 	var pending *read
-	if p, ok := c.prefetches[exchangeKey(x)]; ok {
+	if p := c.prefetchLocked(x); p != nil {
 		pending = p.reads[target]
 	}
 	c.mu.Unlock()
 	if pending != nil {
+		if onHolder != nil {
+			go func() {
+				select {
+				case <-pending.seen:
+					onHolder(pending.early)
+				case <-pending.done:
+					select {
+					case <-pending.seen:
+						onHolder(pending.early)
+					default:
+					}
+				case <-ctx.Done():
+				}
+			}()
+		}
 		select {
 		case <-pending.done:
 			if pending.complete {
@@ -197,7 +226,26 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 	}
 	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
 	defer cancel()
-	return c.readRecord(readCtx, x, target)
+	return c.readRecord(readCtx, x, target, onHolder)
+}
+
+// prefetchLocked is exchange x's read-ahead. An exchange whose wake came
+// before the recording session existed got its id only later, so its reads
+// from before then are under no session id: they move to the id it has now.
+// c.mu is held.
+func (c *Concierge) prefetchLocked(x *voice.Exchange) *prefetch {
+	key := exchangeKey(x)
+	if p, ok := c.prefetches[key]; ok || x.SessionID == "" {
+		return p
+	}
+	early := exchangeKey(&voice.Exchange{WakeAt: x.WakeAt})
+	p, ok := c.prefetches[early]
+	if !ok {
+		return nil
+	}
+	delete(c.prefetches, early)
+	c.prefetches[key] = p
+	return p
 }
 
 // readRecord reads target with the tools, as the model would call them. For
@@ -208,15 +256,12 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 // clear match (R5) is kept: the voice names the issue it took when it is not,
 // and asks its holder nothing unasked. A failure other than not-found, such as
 // Dispatch out of reach, ends the read.
-func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string) *reading {
+func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string, onHolder func(*reading)) *reading {
 	tools := &runner{c: c, x: x}
 	found := &reading{}
 	var lines []string
-	call := func(name string, args map[string]any, keepErrors bool) map[string]any {
-		result, err := tools.call(ctx, name, args)
-		if err != nil {
-			return nil
-		}
+	// record keeps name's call and result for the model and R8's check.
+	record := func(name string, args, result map[string]any, keepErrors bool) map[string]any {
 		if result["error"] == cannotReachDispatch {
 			found.unreachable = true
 		}
@@ -228,10 +273,33 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 		lines = append(lines, fmt.Sprintf("%s(%s) = %s", name, encodedArgs, encoded))
 		return result
 	}
+	call := func(name string, args map[string]any, keepErrors bool) map[string]any {
+		result, err := tools.call(ctx, name, args)
+		if err != nil {
+			return nil
+		}
+		return record(name, args, result, keepErrors)
+	}
 	// readIssue reads key and its holder, and reports whether key names an
-	// issue; a failure other than not-found ends the read.
+	// issue; a failure other than not-found ends the read. The holder needs
+	// only the key, so it is read beside the issue, and onHolder hears it
+	// at once: a slow spec read holds no question to the holder back.
 	readIssue := func(key string) (named, stop bool) {
+		holderArgs := map[string]any{"key": key}
+		searched, clear := found.searched, found.clear
+		held := make(chan map[string]any, 1)
+		go func() {
+			holder, err := (&runner{c: c, x: x}).call(ctx, "issue_holder", holderArgs)
+			if err != nil {
+				holder = nil
+			}
+			if holder != nil && holder["error"] == nil && onHolder != nil {
+				onHolder(&reading{key: key, holder: holder, searched: searched, clear: clear})
+			}
+			held <- holder
+		}()
 		issue := call("read_issue", map[string]any{"key": key}, false)
+		holder := <-held
 		switch {
 		case issue == nil:
 			return false, true
@@ -239,7 +307,7 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 			found.key, _ = issue["key"].(string)
 			found.title, _ = issue["title"].(string)
 			found.newest = tools.newest[found.key]
-			if holder := call("issue_holder", map[string]any{"key": key}, true); holder != nil && holder["error"] == nil {
+			if holder != nil && record("issue_holder", holderArgs, holder, true)["error"] == nil {
 				found.holder = holder
 			}
 			return true, true

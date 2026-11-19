@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/genai"
@@ -120,10 +121,40 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
 	defer sp.routeAfter(ctx, c.routingAfter, c.routingLine(ctx, turn))()
-	found := c.readFor(ctx, x, turn)
+	// The ask runs beside the facts, so Envoy's time holds no fact back. A
+	// person's "ask" needs only the holder, so it goes out once the holder
+	// is known, before the rest of the record is read (R7).
+	asking := make(chan askResult, 1)
+	var askStarted atomic.Bool
+	startAsk := func(session string, found *reading) {
+		if askStarted.CompareAndSwap(false, true) {
+			go func() { asking <- c.ask(ctx, x, session, turn, found) }()
+		}
+	}
+	var onHolder func(*reading)
+	if askWord.MatchString(turn) {
+		onHolder = func(early *reading) {
+			if session, _ := c.askPlan(turn, early); session != "" {
+				startAsk(session, early)
+			}
+		}
+	}
+	found := c.readFor(ctx, x, turn, onHolder)
 	switch {
 	case parent.Err() != nil:
 		return parent.Err()
+	case ctx.Err() != nil && askStarted.Load():
+		// The record was slow, but the question went out: say so.
+		result := <-asking
+		if result.line != "" {
+			if err := sp.sayText(parent, result.line, voice.Ack); err != nil {
+				return err
+			}
+		}
+		if result.unreachable {
+			return errOutOfReach
+		}
+		return nil
 	case ctx.Err() != nil:
 		return c.failed(parent, sp, errors.New("concierge: the record took the whole answer's time"))
 	case found.unreachable:
@@ -140,12 +171,9 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			return err
 		}
 	}
-	// The ask runs beside the facts, so Envoy's time holds no fact back.
 	session, asked := c.askPlan(turn, found)
-	var asking chan askResult
 	if session != "" {
-		asking = make(chan askResult, 1)
-		go func() { asking <- c.ask(ctx, x, session, turn, found) }()
+		startAsk(session, found)
 	}
 	tools := &runner{c: c, x: x}
 	err := c.facts(ctx, tools, turn, found, sp)
@@ -155,12 +183,15 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	case errors.Is(err, errNoWords) && len(lead) > 0:
 		err = nil
 	case err != nil && ctx.Err() != nil && sp.count() == 0:
-		return c.failed(parent, sp, errors.New("concierge: the answer took more than its 8 s"))
+		if !askStarted.Load() {
+			return c.failed(parent, sp, errors.New("concierge: the answer took more than its 8 s"))
+		}
+		err = nil // the question went out: the voice says so below
 	case err != nil:
 		err = c.failed(parent, sp, err)
 	}
 	unreachable := tools.unreachable || outOfReach(found.holder)
-	if asking != nil {
+	if askStarted.Load() {
 		// An ask the bound cut says nothing: whether it was sent is unknown,
 		// and an answer that comes plays its chime all the same.
 		var result askResult
