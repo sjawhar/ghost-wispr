@@ -1681,6 +1681,11 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		// A vendor may delegate before its own transcript of the turn.
 		args.Question = turn
 	}
+	// The turn as heard by now: a follow-up's final may have come while
+	// followUpTurn waited for it.
+	s.mu.Lock()
+	x = t.ex.x
+	s.mu.Unlock()
 	var (
 		said   []string // the result's lines, in order
 		spoken bool     // a line was spoken at once
@@ -1689,10 +1694,19 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		t.ex.saidMu.Lock()
 		lead := mode == Ack && len(said) == 0
 		t.ex.saidMu.Unlock()
-		if lead && t.speak(sayCtx, text) == nil {
+		if lead {
+			// Spoken at once, and not waited for: a vendor such as
+			// Deepgram's Voice Agent plays a line said during a call only
+			// after the call's own reply, which this answer is.
 			t.ex.saidMu.Lock()
 			spoken = true
 			t.ex.saidMu.Unlock()
+			exCtx := t.ex.ctx
+			s.spawn(func() {
+				if err := t.speak(exCtx, text); err != nil && exCtx.Err() == nil {
+					s.logf("voice: the routing line was not spoken: %v", err)
+				}
+			})
 			return nil
 		}
 		t.ex.saidMu.Lock()

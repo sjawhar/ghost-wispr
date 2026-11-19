@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"context"
 	"encoding/json"
 	"slices"
 	"testing"
@@ -237,4 +238,102 @@ func TestAnAnswerInTheFollowUpWindowNeedNotWaitForItsEnd(t *testing.T) {
 	if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {
 		t.Fatalf("said %q, want the holder's answer", got)
 	}
+}
+
+// TestAFollowUpGetsItsWholeTurn fails if the Concierge gets, as the
+// exchange's AskerTurn, the interim prefix of a follow-up whose final came
+// while the answer tool waited for it (GWDgAgent's follow_up_after_answer-2:
+// "And who").
+func TestAFollowUpGetsItsWholeTurn(t *testing.T) {
+	c := newFakeConcierge("The holder is the agent on the issue.")
+	r := newDrivingRigWith(t, time.Minute, c)
+	r.s.cfg.FollowUpWait = time.Minute
+	r.heard("Wispr, what is happening?", true, true)
+	sess := r.waitSession()
+	speakAs(t, sess, "The issue is in review since this morning.")
+	r.waitSpeaking()
+	r.speaker.finish(audio.InputVoice)
+	eventually(t, "the follow-up window opened", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.s.ex != nil && r.s.ex.followUpTimer != nil
+	})
+	r.heard("And who", false, false)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"And who holds that issue?"}`)})
+	}()
+	time.Sleep(100 * time.Millisecond)
+	r.heard("And who holds that issue?", true, true)
+	<-done
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.exchanges) == 0 || c.exchanges[len(c.exchanges)-1].AskerTurn != "And who holds that issue?" {
+		t.Fatalf("the Concierge's exchanges %+v, want the whole follow-up as AskerTurn", c.exchanges)
+	}
+}
+
+// TestARoutingLineDoesNotHoldTheAnswerTool fails if the answer tool waits for
+// the routing line's Say: a vendor such as Deepgram's Voice Agent plays it
+// only after the call's own reply, so waiting holds the answer until the
+// Say gives up.
+func TestARoutingLineDoesNotHoldTheAnswerTool(t *testing.T) {
+	c := newFakeConcierge("The issue is in review.")
+	c.acks = []string{"Reading ABC-12."}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
+		cfg.Voice = func() (Voice, error) { return heldAckVoice{r: r, release: release}, nil }
+		cfg.IdleWait = time.Minute
+	})
+	r.heard("Wispr, what is happening with ABC-12?", true, true)
+	sess := r.waitSession()
+	out := make(chan json.RawMessage, 1)
+	go func() {
+		res, _ := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
+		out <- res
+	}()
+	select {
+	case res := <-out:
+		var got AnswerResult
+		if err := json.Unmarshal(res, &got); err != nil || got.Say != "The issue is in review." {
+			t.Fatalf("the answer tool returned %s", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the answer tool waited on the routing line's Say")
+	}
+}
+
+// heldAckVoice opens the rig's fake sessions, as a voice that drives its own
+// turn, whose Ack Says do not return until release.
+type heldAckVoice struct {
+	r       *rig
+	release chan struct{}
+}
+
+func (heldAckVoice) DrivesTurn() bool { return true }
+
+func (v heldAckVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
+	s, err := v.r.voice.Open(ctx, x)
+	if err != nil {
+		return nil, err
+	}
+	return heldAckSession{Session: s, release: v.release}, nil
+}
+
+type heldAckSession struct {
+	Session
+	release chan struct{}
+}
+
+func (p heldAckSession) Say(ctx context.Context, text string, mode SayMode) error {
+	if mode == Ack {
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return p.Session.Say(ctx, text, mode)
 }

@@ -330,9 +330,11 @@ func TestAFailedAnswerToolSpeaksTheConciergesLine(t *testing.T) {
 	if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)}); !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("the answer tool returned %v, want ErrUnreachable", err)
 	}
-	if says := sess.saysCopy(); !slices.Equal(says, []string{"I cannot reach Dispatch yet."}) {
-		t.Fatalf("the session spoke %q, want the Concierge's line", says)
-	}
+	// The Concierge's line led, so it is spoken at once in the background,
+	// not waited for.
+	eventually(t, "the Concierge's line spoken once", func() bool {
+		return slices.Equal(sess.saysCopy(), []string{"I cannot reach Dispatch yet."})
+	})
 	eventually(t, "the error sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "error") })
 }
 
