@@ -442,6 +442,44 @@ func TestALSAStreamLogsWhetherItRewinds(t *testing.T) {
 	}
 }
 
+// TestALSAStreamLogsTheWayEachCancelTookBack fails unless each Cancel's take-
+// back says whether it rewound or dropped: a device that rewinds, as the
+// stream logs at open, can still leave more in flight than a period, and then
+// the cancel drops, so only this line shows what the Jabra does.
+func TestALSAStreamLogsTheWayEachCancelTookBack(t *testing.T) {
+	for _, tc := range []struct {
+		inflight int
+		want     string
+	}{
+		{inflight: 144, want: "way=rewind"},
+		{inflight: 1440, want: "way=drop"},
+	} {
+		var logs strings.Builder
+		var mu sync.Mutex
+		original := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil)))
+		pcm := newFakePCM(48000, 960)
+		pcm.inflight = tc.inflight
+		stream := streamOn(pcm)
+		frame := make([]int16, 480)
+		for range 4 {
+			if err := stream.Write(frame); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := stream.Drop(); err != nil {
+			t.Fatal(err)
+		}
+		slog.SetDefault(original)
+		mu.Lock()
+		got := logs.String()
+		mu.Unlock()
+		if n := strings.Count(got, "speaker cancel"); n != 1 || !strings.Contains(got, tc.want) {
+			t.Errorf("a cancel with %d frames in flight logged %q, want one speaker cancel line with %s", tc.inflight, got, tc.want)
+		}
+	}
+}
+
 type lockedWriter struct {
 	mu *sync.Mutex
 	w  io.Writer

@@ -131,7 +131,8 @@ func (s *alsaStream) tell() {
 // back. What the device has already taken, as what is in flight to a USB
 // speaker, it cannot take back, and the room hears it; when that is more than
 // a period, or the PCM does not rewind, it drops the PCM instead, which also
-// cuts what is in flight, and prepares it for the next write.
+// cuts what is in flight, and prepares it for the next write. It logs which
+// it did: the stream's open line says only whether the PCM can rewind.
 func (s *alsaStream) Drop() (int, error) {
 	held := s.held()
 	if held == 0 {
@@ -141,10 +142,10 @@ func (s *alsaStream) Drop() (int, error) {
 	if n := s.pcm.rewindable(); n > 0 {
 		back = max(0, s.pcm.rewind(n))
 	}
-	if back > 0 {
-		if tail, rc := s.pcm.delay(); rc >= 0 && tail <= s.params.period {
-			return back, nil
-		}
+	tail, rc := s.pcm.delay()
+	if back > 0 && rc >= 0 && tail <= s.params.period {
+		s.logCancel("rewind", back, tail)
+		return back, nil
 	}
 	back += s.held()
 	if rc := s.pcm.drop(); rc < 0 {
@@ -153,7 +154,14 @@ func (s *alsaStream) Drop() (int, error) {
 	if rc := s.pcm.prepare(); rc < 0 {
 		return 0, alsaErr("prepare", rc)
 	}
+	s.logCancel("drop", back, tail)
 	return back, nil
+}
+
+// logCancel logs how a Cancel took back frames from the PCM, and what was
+// left to play then, in flight or held.
+func (s *alsaStream) logCancel(way string, frames, tail int) {
+	slog.Info("speaker cancel", "way", way, "took_back", frameTime(frames, s.params.rate), "left", frameTime(max(tail, 0), s.params.rate))
 }
 
 // held is how many frames the PCM holds that the device has not taken.

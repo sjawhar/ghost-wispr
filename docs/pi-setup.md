@@ -418,8 +418,9 @@ speech, as when someone talks over it, the speaker rewinds that buffer, so the s
 and writes the rest of the mix (a chime, say) again without the speech. Audio the Jabra has
 already taken still plays. If that is more than a period, or the device cannot rewind, the speaker
 drops the buffer instead. Each time the speaker opens, the log says
-`speaker stream` with the rate, period and buffer the Jabra granted, and `rewind=true` or
-`rewind=false`. The first underrun of a stream and every 100th after it, when the speaker runs out
+`speaker stream` with the rate, period and buffer the Jabra granted, and `rewind=true` if it can
+rewind. Each cancel logs `speaker cancel` with `way=rewind` or `way=drop`, so the log shows what
+the Jabra did. The first underrun of a stream and every 100th after it, when the speaker runs out
 of audio and clicks, are logged as `speaker underrun: the device ran out of audio`, and their count
 as `speaker stream closed after underruns`. It needs no package beyond `libportaudio2`,
 whose dependency `libasound2t64` the Pi already has (`deploy/pi/baseline.txt`). A pause during an
