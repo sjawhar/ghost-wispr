@@ -45,21 +45,20 @@ func TestTheWordsOfACutSpeechAreDroppedHoweverLateTheyArrive(t *testing.T) {
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
 
-	cutAt := c.sessionMs()
-	c.audioDelta(ramp(1000, 2400))
+	cutAt := c.inputMs()
+	c.audioDelta(ramp(1000, 2400)) // 100 ms, which plays
 	out.nextSpeech(t).waitSamples(t, 2400)
 	s.Interrupt()
-	c.audioDelta(ramp(1000, 2400)) // more of the cut speech, which plays nothing
+	c.audioDelta(ramp(1000, 2400)) // 100 ms more of the cut speech, which plays nothing
 
 	time.Sleep(speechGap + 200*time.Millisecond)
-	c.audioDelta(ramp(5000, 2400))
-	c.said("Sure.")
+	c.speak("Sure.")
 	out.nextSpeech(t)
 
 	time.Sleep(time.Until(time.UnixMilli(c.startedAt.Load() + cutAt + 2000)))
-	c.saidAt("words nobody heard", cutAt)
-	c.saidAt("of it either", cutAt+150)
-	c.said("Okay.")
+	c.saidAt("words nobody heard", cutAt+130)
+	c.saidAt("of it either", cutAt+180)
+	c.speak("Okay.")
 	for _, text := range agentTexts(t, s, "Okay.") {
 		if text == "words nobody heard" || text == "of it either" {
 			t.Fatalf("agent text %q of the cut speech arrived 2 s late and was reported as Wispr's", text)
@@ -70,7 +69,7 @@ func TestTheWordsOfACutSpeechAreDroppedHoweverLateTheyArrive(t *testing.T) {
 // The words of the speech after a cut one are Wispr's, though their fragment
 // lies within the cut speech's span: a server that sends audio faster than
 // it plays makes the cut speech's span, its start plus its length, run past
-// the start of the next one. A fragment goes to the latest speech it fits.
+// the start of the next one. A fragment whose audio played is Wispr's.
 func TestTheSpeechAfterACutOneKeepsItsWords(t *testing.T) {
 	out := newFakeOutput()
 	srv := newLiveServer(t)
@@ -81,7 +80,7 @@ func TestTheSpeechAfterACutOneKeepsItsWords(t *testing.T) {
 	s.Interrupt()
 	c.audioDelta(ramp(1000, SampleRate))         // the rest of the cut speech, a second of it at once
 	time.Sleep(speechGap + 200*time.Millisecond) // the second still runs on, on the cut speech's span
-	next := c.sessionMs()
+	next := c.inputMs()
 	c.audioDelta(ramp(5000, 2400))
 	out.nextSpeech(t)
 	c.saidAt("Here is the answer.", next)
@@ -92,36 +91,56 @@ func TestTheSpeechAfterACutOneKeepsItsWords(t *testing.T) {
 	}
 }
 
-// The probe measures how far GPT-Live's transcript fragments fall outside
-// the speech they belong to, as the session places that speech on its own
-// clock, to size the margin around a cut speech.
+// timelineMeasure is what the session reports for the probe: the offset of
+// each speech's first words from its audio, and the words that matched no
+// speech.
+type timelineMeasure interface {
+	TimelineOffsets() []time.Duration
+	UnmatchedWords() int
+}
+
+// The probe measures each speech's first words against its audio on the
+// session's clock, to size the margin around a cut speech: the offset's
+// sign, and its spread from speech to speech.
 func TestTheSessionMeasuresTheTranscriptsTimelineOffset(t *testing.T) {
 	out := newFakeOutput()
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
 
-	at := c.sessionMs()
+	at := c.inputMs()
 	c.audioDelta(ramp(1000, 2400)) // 100 ms
 	c.audioDelta(ramp(1000, 2400)) // 100 ms
-	c.saidAt("Inside.", at+100)
+	c.saidAt("Late.", at+40)
+	c.saidAt("Inside.", at+150)
 	time.Sleep(speechGap + 200*time.Millisecond)
-	at = c.sessionMs()
+	at = c.inputMs()
 	c.audioDelta(ramp(1000, 2400))
 	c.saidAt("Early.", at-120)
-	c.said("Done.")
+	time.Sleep(speechGap + 200*time.Millisecond)
+	c.speak("Done.")
 	agentTexts(t, s, "Done.")
-	m, ok := s.(interface{ TimelineOffsets() []time.Duration })
+	m, ok := s.(timelineMeasure)
 	if !ok {
-		t.Fatal("the session does not report its timeline offsets")
+		t.Fatal("the session does not report its timeline measure")
 	}
 	got := m.TimelineOffsets()
 	if len(got) != 3 {
-		t.Fatalf("offsets %v, want one per fragment of uncut speech (3)", got)
+		t.Fatalf("offsets %v, want one per speech (3)", got)
 	}
-	for i, want := range []time.Duration{0, -120 * time.Millisecond, 0} {
+	for i, want := range []time.Duration{40 * time.Millisecond, -120 * time.Millisecond, 0} {
 		if d := got[i] - want; d < -40*time.Millisecond || d > 40*time.Millisecond {
-			t.Errorf("offset %d is %v, want about %v: how far the fragment falls outside its speech", i, got[i], want)
+			t.Errorf("offset %d is %v, want about %v: the speech's first words less its audio's start", i, got[i], want)
 		}
+	}
+	if n := m.UnmatchedWords(); n != 0 {
+		t.Errorf("%d words matched no speech, want 0", n)
+	}
+
+	// Words a second past any speech match none, and say so.
+	c.saidAt("Nowhere.", c.inputMs()+1000)
+	time.Sleep(wordHold + 300*time.Millisecond)
+	if n := m.UnmatchedWords(); n != 1 {
+		t.Errorf("%d words matched no speech, want 1", n)
 	}
 }
 
@@ -284,7 +303,7 @@ func TestAnInterruptAfterASpeechEndedCutsNothing(t *testing.T) {
 	time.Sleep(speechGap + 100*time.Millisecond)
 	s.Interrupt()
 	c.saidAt("It is in review.", at)
-	c.said("Okay.")
+	c.speak("Okay.")
 	if got := agentTexts(t, s, "Okay."); got[0] != "It is in review." {
 		t.Fatalf("agent text %q, want the ended speech's words: an Interrupt after it cut nothing", got)
 	}

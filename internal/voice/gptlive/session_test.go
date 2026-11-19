@@ -575,13 +575,28 @@ func TestTheVoicesWordsAndWhatItHeardReachEvents(t *testing.T) {
 
 	c.heard("Wispr, how is ")
 	c.heard("ABC-123 doing?")
-	c.said("It is in review.")
-	if ev := waitEvent(t, s, voice.EventAgentText); ev.Text != "It is in review." {
-		t.Errorf("agent text %q, want the model's words as they come", ev.Text)
-	}
-	c.audioDelta(ramp(0, 480))
+	c.speak("It is in review.")
 	if ev := waitEvent(t, s, voice.EventUserTurn); ev.Text != "Wispr, how is ABC-123 doing?" {
 		t.Errorf("user turn %q, want what the model heard before it spoke", ev.Text)
+	}
+	if ev := waitEvent(t, s, voice.EventAgentText); ev.Text != "It is in review." {
+		t.Errorf("agent text %q, want the model's words once they played", ev.Text)
+	}
+}
+
+// The model's words with no audio of them are not Wispr's speech: the room
+// heard none of them.
+func TestWordsWithNoAudioAreNotWisprsSpeech(t *testing.T) {
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
+
+	c.said("words with no audio")
+	time.Sleep(wordHold + 200*time.Millisecond)
+	c.speak("Okay.")
+	for _, text := range agentTexts(t, s, "Okay.") {
+		if text == "words with no audio" {
+			t.Fatal("words with no audio of them reached the own-speech feed")
+		}
 	}
 }
 
@@ -704,11 +719,12 @@ func TestTheWordsOfAnInterruptedSpeechAreNotWisprsSpeech(t *testing.T) {
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
 
-	c.audioDelta(ramp(1000, 2400))
+	at := c.inputMs()
+	c.audioDelta(ramp(1000, 2400)) // 100 ms, which plays
 	out.nextSpeech(t).waitSamples(t, 2400)
 	s.Interrupt()
 	waitEvent(t, s, voice.EventSpeechEnded)
-	c.said("words nobody heard")
+	c.saidAt("words nobody heard", at+150) // in the rest, which does not play
 	c.audioDelta(ramp(1000, 2400))
 	deadline := time.After(200 * time.Millisecond)
 	for done := false; !done; {
@@ -724,8 +740,7 @@ func TestTheWordsOfAnInterruptedSpeechAreNotWisprsSpeech(t *testing.T) {
 
 	// The next speech, after a pause, is Wispr's again.
 	time.Sleep(speechGap)
-	c.audioDelta(ramp(1000, 480))
-	c.said("Sure.")
+	c.speak("Sure.")
 	if ev := waitEvent(t, s, voice.EventAgentText); ev.Text != "Sure." {
 		t.Fatalf("agent text %q, want the next speech's words", ev.Text)
 	}
@@ -810,7 +825,7 @@ func TestSayAndDeliverAfterCloseReportClosed(t *testing.T) {
 func TestTheClosedPlayerTakesNoAudio(t *testing.T) {
 	p := newPlayer(&session{})
 	p.stop()
-	if p.push(ramp(1000, 480), time.Now()) || len(p.queue) != 0 {
+	if p.push(ramp(1000, 480), time.Now()) != audioOutside || len(p.queue) != 0 {
 		t.Fatal("a stopped player queued model audio")
 	}
 }

@@ -117,11 +117,26 @@ type liveConn struct {
 	// startedAt is when the stand-in sent session.started: the start of its
 	// session timeline, which transcript fragments are stamped on.
 	startedAt atomic.Int64
+	// inSamples and lastInAt are the input audio the stand-in has received
+	// and when it last received some: its input-audio timeline.
+	inSamples atomic.Int64
+	lastInAt  atomic.Int64
 }
 
 // sessionMs is the stand-in's session timeline now, in milliseconds.
 func (c *liveConn) sessionMs() int64 {
 	return time.Now().UnixMilli() - c.startedAt.Load()
+}
+
+// inputMs is the stand-in's input-audio timeline now: the input audio
+// received, plus the time since the last of it arrived. With no input it is
+// sessionMs. It models a server whose timeline counts the input audio.
+func (c *liveConn) inputMs() int64 {
+	last := c.lastInAt.Load()
+	if last == 0 {
+		return c.sessionMs()
+	}
+	return c.inSamples.Load()*1000/SampleRate + time.Now().UnixMilli() - last
 }
 
 func (c *liveConn) read() {
@@ -141,6 +156,12 @@ func (c *liveConn) read() {
 			continue
 		}
 		ev.raw = data
+		if ev.Type == evInputAudioAppend {
+			if b, err := base64.StdEncoding.DecodeString(ev.Audio); err == nil {
+				c.inSamples.Add(int64(len(b) / 2))
+				c.lastInAt.Store(time.Now().UnixMilli())
+			}
+		}
 		if c.autoAck {
 			switch ev.Type {
 			case evInstructionsAppend, evThinkingAppend, evCommentaryAppend:
@@ -224,8 +245,17 @@ func (c *liveConn) heard(text string) {
 }
 
 // said sends a fragment of the model's speech, stamped now on the session
-// timeline, as a server that sends speech as it plays does.
-func (c *liveConn) said(text string) { c.saidAt(text, c.sessionMs()) }
+// timeline, as a server that sends speech as it plays does. The timeline
+// counts input audio, as inputMs does; with no input it runs on wall time.
+func (c *liveConn) said(text string) { c.saidAt(text, c.inputMs()) }
+
+// speak sends 100 ms of the model's speech with text, its words, stamped
+// at the speech's place on the timeline.
+func (c *liveConn) speak(text string) {
+	at := c.inputMs()
+	c.audioDelta(ramp(3000, SampleRate/10))
+	c.saidAt(text, at)
+}
 
 // saidAt sends a fragment of the model's speech for the audio at startMs
 // on the session timeline, whenever it arrives.

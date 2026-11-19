@@ -324,6 +324,7 @@ func newSession(ctx context.Context, cfg Config, x *voice.Exchange, conn *websoc
 		heardWake:    make(chan struct{}, 1),
 	}
 	s.player = newPlayer(s)
+	s.tl.release = s.spokeWords
 	s.wg.Add(4)
 	go s.read()
 	go s.pumpTap()
@@ -460,6 +461,7 @@ func (s *session) Close() error {
 
 	deadline := time.Now().Add(closeGrace)
 	s.player.stop()
+	s.tl.close()
 	if s.lockWrite(deadline) {
 		sent := false
 		if !s.dead.Load() {
@@ -798,8 +800,9 @@ func (s *session) onAudio(delta string) {
 		pcm[i] = int16(binary.LittleEndian.Uint16(data[2*i:]))
 	}
 	now := time.Now()
-	s.tl.audio(now, pcm)
-	if s.player.push(pcm, now) {
+	kind := s.player.push(pcm, now)
+	s.tl.audio(now, pcm, kind)
+	if kind == audioNew {
 		s.flushTurn()
 	}
 }
@@ -815,20 +818,26 @@ func (s *session) onHeard(delta string) {
 	signal(s.heardWake)
 }
 
-// onSaid reports and keeps what GPT-Live says, as its fragments arrive.
-// The words of a speech Interrupt dropped are not Wispr's speech: the room
-// did not hear them, and the Supervisor's own-speech filter would take a
-// person's same words for Wispr's echo. They are found by the fragment's
-// place on the session timeline, startMs, however late the fragment arrives.
+// onSaid holds a fragment of what GPT-Live says until the audio of it has
+// played: only then is it Wispr's speech. The words of a speech Interrupt
+// cut, or that never played, are not: the room did not hear them, and the
+// Supervisor's own-speech filter would take a person's same words for
+// Wispr's echo. A fragment is placed by startMs, its place on the session
+// timeline, however late or early it arrives.
 func (s *session) onSaid(delta string, startMs int64) {
-	if s.player.closed() || s.tl.cutWords(startMs, time.Now()) {
+	if s.player.closed() {
 		return
 	}
+	s.tl.said(delta, startMs, time.Now())
+}
+
+// spokeWords reports words of GPT-Live's whose audio played.
+func (s *session) spokeWords(text string) {
 	s.mu.Lock()
-	s.noteLocked(true, delta)
+	s.noteLocked(true, text)
 	s.mu.Unlock()
-	if strings.TrimSpace(delta) != "" {
-		s.emit(&voice.Event{Kind: voice.EventAgentText, Text: delta})
+	if strings.TrimSpace(text) != "" {
+		s.emit(&voice.Event{Kind: voice.EventAgentText, Text: text})
 	}
 }
 
@@ -950,10 +959,14 @@ func (s *session) questionLocked() string {
 	return question
 }
 
-// TimelineOffsets reports how far each transcript fragment of uncut speech
-// fell outside its speech on the session's own clock: what CutMargin must
-// cover. gptlive-probe prints them.
-func (s *session) TimelineOffsets() []time.Duration { return s.tl.measured() }
+// TimelineOffsets reports, for each speech whose words played, how far its
+// earliest words' place fell from its audio's start on the session's clock:
+// what CutMargin must cover, and how steady it is. gptlive-probe prints them.
+func (s *session) TimelineOffsets() []time.Duration { return s.tl.offsets() }
+
+// UnmatchedWords reports how many transcript fragments matched no speech
+// at all: their place was over CutMargin from every speech's audio.
+func (s *session) UnmatchedWords() int { return s.tl.unmatchedWords() }
 
 // words is s in lower case with every run of other than letters and digits
 // made one space, to compare two transcripts of the same words.
@@ -1060,7 +1073,11 @@ func (s *session) pumpTap() {
 }
 
 func (s *session) sendAudio(pcm []int16) error {
-	return s.send(inputAudioAppend{Type: evInputAudioAppend, Audio: base64.StdEncoding.EncodeToString(pcm16Bytes(pcm))})
+	if err := s.send(inputAudioAppend{Type: evInputAudioAppend, Audio: base64.StdEncoding.EncodeToString(pcm16Bytes(pcm))}); err != nil {
+		return err
+	}
+	s.tl.sent(len(pcm), time.Now())
+	return nil
 }
 
 func pcm16Bytes(pcm []int16) []byte {
@@ -1083,13 +1100,18 @@ const silenceLevel = 128
 // player plays the model's speech on the voice input, one Playback a
 // speech. A speech starts with audible audio and ends once the model's
 // audio has been silent or absent for speechGap and what it queued has
-// played. Silence inside a speech plays; silence outside one does not.
+// played. Silence inside a speech plays; silence outside one does not. It
+// numbers the speeches in the order they start, as the timeline does, and
+// tells the timeline what of each has played.
 type player struct {
 	s    *session
 	wake chan struct{}
 
 	mu      sync.Mutex
 	queue   []int16
+	segs    []queued  // which speech each run of queue is
+	seq     int       // the speech now arriving
+	next    int       // the number of the next speech
 	last    time.Time // when the model's last audible audio arrived
 	muted   bool      // drop the model's audio until it pauses: an interrupted speech
 	cut     bool      // end the speech under way now
@@ -1099,41 +1121,72 @@ type player struct {
 	changed chan struct{}
 }
 
+// queued is a run of n samples of the queue, of speech seq.
+type queued struct{ seq, n int }
+
 func newPlayer(s *session) *player {
 	return &player{s: s, wake: make(chan struct{}, 1), changed: make(chan struct{})}
 }
 
-// push queues the model's audio and reports whether it starts a speech.
-func (p *player) push(pcm []int16, now time.Time) bool {
+// push queues the model's audio and says what it was: the start of a
+// speech, more of one, or neither.
+func (p *player) push(pcm []int16, now time.Time) speechAudio {
 	p.mu.Lock()
 	defer signal(p.wake)
 	defer p.mu.Unlock()
 	if p.stopped {
-		return false
+		return audioOutside
 	}
 	inSpeech := !p.last.IsZero() && now.Sub(p.last) < speechGap
 	if !audible(pcm) {
-		if inSpeech && !p.muted {
+		if !inSpeech {
+			return audioOutside
+		}
+		if !p.muted {
 			p.enqueueLocked(pcm)
 		}
-		return false
+		return audioContinue
 	}
 	p.last = now
-	if p.muted {
-		if inSpeech {
-			return false
+	if inSpeech {
+		if !p.muted {
+			p.enqueueLocked(pcm)
 		}
-		p.muted = false
+		return audioContinue
 	}
+	p.muted = false
+	p.seq, p.next = p.next, p.next+1
 	p.enqueueLocked(pcm)
-	return !inSpeech
+	return audioNew
 }
 
 func (p *player) enqueueLocked(pcm []int16) {
 	p.queue = append(p.queue, pcm...)
+	if n := len(p.segs); n > 0 && p.segs[n-1].seq == p.seq {
+		p.segs[n-1].n += len(pcm)
+	} else {
+		p.segs = append(p.segs, queued{seq: p.seq, n: len(pcm)})
+	}
 	if over := len(p.queue) - maxQueuedAudio; over > 0 {
 		p.queue = p.queue[over:]
+		p.takeSegsLocked(over)
 	}
+}
+
+// takeSegsLocked takes n samples off the front of segs and returns which
+// speeches they were of.
+func (p *player) takeSegsLocked(n int) []queued {
+	var taken []queued
+	for n > 0 && len(p.segs) > 0 {
+		k := min(n, p.segs[0].n)
+		taken = append(taken, queued{seq: p.segs[0].seq, n: k})
+		p.segs[0].n -= k
+		n -= k
+		if p.segs[0].n == 0 {
+			p.segs = p.segs[1:]
+		}
+	}
+	return taken
 }
 
 func audible(pcm []int16) bool {
@@ -1149,7 +1202,7 @@ func audible(pcm []int16) bool {
 // under way: the session is closing.
 func (p *player) stop() {
 	p.mu.Lock()
-	p.queue, p.muted, p.cut, p.stopped = nil, true, true, true
+	p.queue, p.segs, p.muted, p.cut, p.stopped = nil, nil, true, true, true
 	p.mu.Unlock()
 	signal(p.wake)
 }
@@ -1166,7 +1219,7 @@ func (p *player) closed() bool {
 // rest of it as it arrives.
 func (p *player) interrupt() {
 	p.mu.Lock()
-	p.queue, p.muted, p.cut = nil, true, true
+	p.queue, p.segs, p.muted, p.cut = nil, nil, true, true
 	p.mu.Unlock()
 	signal(p.wake)
 }
@@ -1202,8 +1255,12 @@ func (p *player) run() {
 	defer p.s.wg.Done()
 	ctx := p.s.ctx
 	var speech voice.Playback
-	end := func() {
-		speech = nil
+	var inPlayback []int // the speeches written to this Playback
+	end := func(finished bool) {
+		if finished {
+			p.s.tl.finished(inPlayback)
+		}
+		speech, inPlayback = nil, nil
 		p.count(false)
 		p.s.emit(&voice.Event{Kind: voice.EventSpeechEnded})
 	}
@@ -1215,16 +1272,18 @@ func (p *player) run() {
 		p.cut = false
 		n := min(len(p.queue), writeFrame)
 		var frame []byte
+		var taken []queued
 		if n > 0 {
 			frame = pcm16Bytes(p.queue[:n])
 			p.queue = p.queue[n:]
+			taken = p.takeSegsLocked(n)
 		}
 		idle := time.Since(p.last)
 		p.mu.Unlock()
 
 		switch {
 		case cut && speech != nil:
-			end()
+			end(false)
 			continue
 		case n > 0:
 			// An Interrupt or Close since the frame was taken dropped it
@@ -1244,16 +1303,25 @@ func (p *player) run() {
 				// The Supervisor cancelled the voice input: the rest of this
 				// speech does not play.
 				p.mu.Lock()
-				p.queue, p.muted = nil, true
+				p.queue, p.segs, p.muted = nil, nil, true
 				p.mu.Unlock()
-				end()
+				p.s.tl.cut(time.Now())
+				end(false)
+				continue
+			}
+			for _, q := range taken {
+				p.s.tl.played(q.seq, q.n)
+				if len(inPlayback) == 0 || inPlayback[len(inPlayback)-1] != q.seq {
+					inPlayback = append(inPlayback, q.seq)
+				}
 			}
 			continue
 		case speech != nil && idle >= speechGap:
-			if err := speech.Drain(ctx); err != nil && ctx.Err() != nil {
+			err := speech.Drain(ctx)
+			if err != nil && ctx.Err() != nil {
 				return
 			}
-			end()
+			end(err == nil && !p.dropped())
 			continue
 		}
 		wait := time.Hour
