@@ -131,18 +131,21 @@ func (c *Concierge) Tools(x *voice.Exchange) voice.ToolRunner {
 
 // IssueHolder answers exactly what the issue_holder tool answers for key, for
 // a caller with no exchange, such as the acceptance driver. The session it
-// names is made askable for no exchange.
+// names is made askable for no exchange. An Envoy out of reach is in the
+// answer, not in the error.
 func (c *Concierge) IssueHolder(ctx context.Context, key string) (json.RawMessage, error) {
-	raw, err := json.Marshal(map[string]string{"key": key})
+	result, err := (&runner{c: c, x: &voice.Exchange{}}).call(ctx, "issue_holder", map[string]any{"key": key})
 	if err != nil {
 		return nil, err
 	}
-	return (&runner{c: c, x: &voice.Exchange{}}).Run(ctx, voice.ToolCall{Name: "issue_holder", Args: raw})
+	return json.Marshal(result)
 }
 
 // Run runs one tool. A tool that fails answers {"error": "..."}, which a
-// model can say; Run's error is for an unknown tool or a stop. The
-// Supervisor answers voice.AnswerTool itself, through Answer.
+// model can say. An answer that says Dispatch or Envoy did not answer
+// (outOfReach) comes with an error that wraps voice.ErrUnreachable, for
+// R10's error sound; Run's other errors are an unknown tool or a stop, with
+// no answer. The Supervisor answers voice.AnswerTool itself, through Answer.
 func (r *runner) Run(ctx context.Context, call voice.ToolCall) (json.RawMessage, error) {
 	var args map[string]any
 	if err := json.Unmarshal(orEmpty(call.Args), &args); err != nil {
@@ -152,7 +155,11 @@ func (r *runner) Run(ctx context.Context, call voice.ToolCall) (json.RawMessage,
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(result)
+	raw, err := json.Marshal(result)
+	if err == nil && outOfReach(result) {
+		err = errOutOfReach
+	}
+	return raw, err
 }
 
 func orEmpty(raw json.RawMessage) json.RawMessage {
