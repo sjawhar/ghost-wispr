@@ -338,10 +338,10 @@ func TestTheFloorQueuesOtherSpeech(t *testing.T) {
 	select {
 	case err := <-free:
 		if err != nil {
-			t.Fatalf("WaitFloor: %v", err)
+			t.Fatalf("WithFloor: %v", err)
 		}
 	case <-time.After(testWait):
-		t.Fatal("WaitFloor still waits after the exchange ended")
+		t.Fatal("WithFloor still waits after the exchange ended")
 	}
 }
 

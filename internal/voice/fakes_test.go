@@ -440,6 +440,13 @@ func (s *fakeSession) state() (interrupted, closedAt time.Time, closed bool) {
 	return s.interrupted, s.closedAt, s.closed
 }
 
+// saysCopy returns the texts the session was asked to say, in order.
+func (s *fakeSession) saysCopy() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.says...)
+}
+
 // fakeConcierge answers each turn with its lines, or holds the turn until
 // its context ends when hold is set.
 type fakeConcierge struct {
@@ -457,6 +464,10 @@ type fakeConcierge struct {
 	// answerErr is what each Answer returns once its lines are said.
 	answerErr  error
 	neverMinds []string
+	// acks are said in Ack mode before the lines, which wait for afterAcks
+	// when it is set.
+	acks      []string
+	afterAcks chan struct{}
 }
 
 func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
@@ -483,6 +494,18 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 	c.exchanges = append(c.exchanges, *x)
 	c.mu.Unlock()
 	c.asked <- turn
+	for _, a := range c.acks {
+		if err := say(ctx, a, Ack); err != nil {
+			return err
+		}
+	}
+	if c.afterAcks != nil {
+		select {
+		case <-c.afterAcks:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	for _, l := range c.lines {
 		if err := say(ctx, l, Fact); err != nil {
 			c.cancelled <- time.Now()
