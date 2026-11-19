@@ -157,3 +157,21 @@ func TestALongFirstUtteranceIsAllInTheRecording(t *testing.T) {
 		t.Fatalf("the recording holds seconds %s; want it to end with the whole first utterance %s, whose words the live transcript holds", secondsString(got), secondsString(utterance))
 	}
 }
+
+// TestWordsDeepgramTookBackDoNotLeadTheNextSession fails if words Deepgram
+// showed only in interim results, then finalized as no words, still hold the
+// audio from before them for the next session: it opens with the last 5 s
+// before its own first words, as with no taken-back words.
+func TestWordsDeepgramTookBackDoNotLeadTheNextSession(t *testing.T) {
+	c := newCapture(t)
+	c.say(1, 2, 3)
+	c.hear(liveResult(t, false, false, "Um"))
+	c.say(4, 5, 6, 7, 8, 9, 10, 11, 12)
+	c.hear(liveResult(t, true, false)) // Deepgram took "Um" back
+	c.say(13)
+	c.hear(liveResult(t, true, true, "Hello."))
+
+	if got, want := c.recordedSeconds(), []uint16{9, 10, 11, 12, 13}; !slices.Equal(got, want) {
+		t.Fatalf("the recording holds seconds %s; want %s, the last 5 s before its first words", secondsString(got), secondsString(want))
+	}
+}

@@ -9,9 +9,12 @@ import (
 // reconnects, when ResilientConfig sets no BufferSize.
 const DefaultBufferSeconds = 60
 
-// defaultBufferRate is the sample rate the default buffer is sized for when
-// ResilientConfig sets none.
+// defaultBufferRate is the sample rate of the audio when ResilientConfig sets
+// none.
 const defaultBufferRate = 16000
+
+// bytesPerSample is the size of a sample of the 16-bit mono PCM written.
+const bytesPerSample = 2
 
 // NewResilientClient creates a new ResilientClient that wraps a Deepgram client
 // with automatic reconnection and audio buffering during disconnects.
@@ -22,12 +25,11 @@ func NewResilientClient(
 	logger func(string, ...any),
 	onStateChange ConnectionCallback,
 ) *ResilientClient {
+	if config.SampleRate <= 0 {
+		config.SampleRate = defaultBufferRate
+	}
 	if config.BufferSize <= 0 {
-		rate := config.SampleRate
-		if rate <= 0 {
-			rate = defaultBufferRate
-		}
-		config.BufferSize = DefaultBufferSeconds * rate * 2 // 16-bit mono PCM
+		config.BufferSize = DefaultBufferSeconds * config.SampleRate * bytesPerSample
 	}
 	if config.InitialReconnectDelay <= 0 {
 		config.InitialReconnectDelay = 500 * time.Millisecond
@@ -61,6 +63,7 @@ func (rc *ResilientClient) Write(p []byte) (int, error) {
 	}
 
 	rc.Mu.Lock()
+	rc.accepted += int64(len(p))
 	state := rc.State
 	client := rc.Client
 	rc.Mu.Unlock()
@@ -172,6 +175,8 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 
 		rc.Mu.Lock()
 		rc.Client = newClient
+		// The new socket's stream starts at the oldest buffered byte.
+		rc.origin = rc.accepted - int64(rc.Buffer.Len())
 		rc.setStateLocked(StateDraining)
 		rc.Mu.Unlock()
 
@@ -238,6 +243,29 @@ func (rc *ResilientClient) IsConnected() bool {
 	return rc.State == StateConnected
 }
 
+// CapturedSince returns how much audio was written to the client after the
+// point at seconds into the current socket's stream, the time Deepgram gives
+// the words it hears: the audio sent to that socket since, and the audio
+// buffered for it or for the next. Audio Finalize drops from the buffer is
+// taken out of the stream, as it never reaches the socket.
+func (rc *ResilientClient) CapturedSince(at float64) time.Duration {
+	rate := int64(rc.Config.SampleRate)
+	rc.Mu.Lock()
+	since := rc.accepted - rc.origin - int64(at*float64(rate))*bytesPerSample
+	rc.Mu.Unlock()
+	if since <= 0 {
+		return 0
+	}
+	return time.Duration(since) * time.Second / time.Duration(rate*bytesPerSample)
+}
+
+// MaxBehind returns how far the stream Deepgram hears can fall behind the
+// audio written: the most audio the client buffers while it is not
+// connected.
+func (rc *ResilientClient) MaxBehind() time.Duration {
+	return time.Duration(rc.Buffer.Cap()) * time.Second / time.Duration(rc.Config.SampleRate*bytesPerSample)
+}
+
 // Finalize ends the current stretch of audio. It drops the audio buffered
 // during a disconnect, which a reconnect would otherwise send, waits for a
 // buffered chunk the reconnect is already writing, then asks Deepgram to
@@ -246,6 +274,8 @@ func (rc *ResilientClient) IsConnected() bool {
 // the pause comes back before the pause ends, not after it.
 func (rc *ResilientClient) Finalize() error {
 	rc.Mu.Lock()
+	// The live socket, still draining, would have been sent these next.
+	rc.origin += int64(rc.Buffer.Len())
 	rc.Buffer.Reset()
 	rc.Mu.Unlock()
 

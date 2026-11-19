@@ -356,9 +356,11 @@ func (r *recorderMock) DiscardUnsaved() string {
 	return r.unsavedPath
 }
 
-func (*recorderMock) HoldPreroll() {}
+func (*recorderMock) HoldPreroll(time.Duration) {}
 
 func (*recorderMock) ReleasePreroll() {}
+
+func (*recorderMock) SetLookback(time.Duration) {}
 
 func (r *recorderMock) counts() (started, ended int) {
 	r.mu.Lock()

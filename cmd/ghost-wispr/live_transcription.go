@@ -43,7 +43,9 @@ const deepgramNotConnected = "Deepgram is not connected; live transcription keep
 // goes once a socket is connected and its buffered audio sent. Sessions start
 // only from live transcripts, so without this one failed dial left the unit
 // saving nothing until a restart. Each change of the client's state is
-// broadcast on hub.
+// broadcast on hub. The client is manager's live stream (SetLiveStream), so a
+// session's recording starts before the first words Deepgram hears, even when
+// it hears them late after a reconnect.
 func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, manager session.LifecycleManager, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
 	var rc *transcribe.ResilientClient
 	// syncWarning sets the warning from the client's state as it is now. The
@@ -67,6 +69,9 @@ func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfac
 		}
 	})
 	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, transcriptCallback{manager: manager}, deepgramWriteTimeout)
+	if manager != nil {
+		manager.SetLiveStream(rc)
+	}
 	// Set before the dial, so a dial that connects first clears it.
 	warnings.Set(deepgramWarningKey, deepgramNotConnected)
 	rc.ConnectInBackground()

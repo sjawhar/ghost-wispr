@@ -42,7 +42,7 @@ type ResilientConfig struct {
 	BufferSize int
 
 	// SampleRate is the rate of the audio written, which sizes the default
-	// buffer. Zero is 16000 Hz.
+	// buffer and times the stream (CapturedSince). Zero is 16000 Hz.
 	SampleRate int
 
 	// MaxReconnectBackoff is the maximum delay between reconnection attempts.
@@ -128,4 +128,10 @@ type ResilientClient struct {
 	// drainMu is held across each chunk drainBuffer reads and writes, and by
 	// Finalize, so a finalize never overtakes buffered audio already in flight.
 	drainMu sync.Mutex
+
+	// accepted counts the bytes Write has taken, and origin is the count at
+	// the first byte the current Client was sent: the stream Deepgram times
+	// its results in starts there (CapturedSince). Both are guarded by Mu.
+	accepted int64
+	origin   int64
 }

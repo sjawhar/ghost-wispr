@@ -56,13 +56,27 @@ type Recorder interface {
 	StartSession(sessionID string) error
 	EndSession(sessionID string) (string, error)
 	DiscardUnsaved() string
-	// HoldPreroll keeps all the audio from now on to lead the next session's
-	// recording, after the audio that leads it already, until that session
-	// starts or ReleasePreroll; it does nothing while a recording is open.
-	HoldPreroll()
+	// HoldPreroll makes the next session's recording start a preroll before
+	// the audio captured ago, keeping that audio and all the audio from now
+	// on until that session starts or ReleasePreroll; it does nothing while a
+	// recording is open.
+	HoldPreroll(ago time.Duration)
 	// ReleasePreroll ends a hold whose words opened no session: only the
 	// usual preroll then leads the next session.
 	ReleasePreroll()
+	// SetLookback sets how far before now HoldPreroll can reach, besides
+	// the preroll.
+	SetLookback(lookback time.Duration)
+}
+
+// LiveStream is the stream of audio live transcription sends Deepgram, which
+// times the words in its results from the stream's start.
+type LiveStream interface {
+	// CapturedSince returns how much audio has been captured after the
+	// point at seconds into the stream.
+	CapturedSince(at float64) time.Duration
+	// MaxBehind returns how far the stream can fall behind the microphone.
+	MaxBehind() time.Duration
 }
 
 type Summarizer interface {
@@ -108,4 +122,6 @@ type LifecycleManager interface {
 	Message(mr *api.MessageResponse) error
 	UtteranceEnd(ur *api.UtteranceEndResponse) error
 	ForceEndSession(ctx context.Context) error
+	// SetLiveStream sets the stream whose results Message takes.
+	SetLiveStream(stream LiveStream)
 }

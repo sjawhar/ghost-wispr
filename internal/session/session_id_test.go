@@ -36,9 +36,11 @@ func (*takenRecorder) EndSession(string) (string, error) { return "", nil }
 
 func (*takenRecorder) DiscardUnsaved() string { return "" }
 
-func (*takenRecorder) HoldPreroll() {}
+func (*takenRecorder) HoldPreroll(time.Duration) {}
 
 func (*takenRecorder) ReleasePreroll() {}
+
+func (*takenRecorder) SetLookback(time.Duration) {}
 
 func openIDStore(t *testing.T) *storage.SQLiteStore {
 	t.Helper()

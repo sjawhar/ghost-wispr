@@ -49,6 +49,7 @@ type Manager struct {
 	failedEnd                      sessionEnd    // how far an end of the current session that failed got
 	finalizeWaiter                 chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
 	lastIDTime                     time.Time     // the start second the latest session ID names
+	stream                         LiveStream    // the live transcription's audio stream (SetLiveStream); nil until set
 	lifecyclePublishes             sync.WaitGroup
 	lifecycleStartPublishesStopped bool
 }
@@ -131,7 +132,6 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 		}
 		return nil
 	}
-	m.holdPreroll()
 
 	// Extract words from the Deepgram response.
 	words := make([]transcribe.Word, 0, len(mr.Channel.Alternatives[0].Words))
@@ -143,6 +143,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 			End:            word.End,
 		})
 	}
+	m.holdPreroll(heardFrom(mr, words))
 
 	// Interim result (not final) — prepend any buffered words for context, then broadcast.
 	if !mr.IsFinal {
@@ -218,21 +219,51 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 	return nil
 }
 
-// holdPreroll keeps the audio for the next session's start from now on while
-// no session is open: Deepgram has heard words, which open a session only at
-// the end of their speech (flushBuffer), and the recording must hold them
-// from the first, as the live transcript does. The recorder leads the
-// session's recording with the held audio (Recorder.HoldPreroll). While
-// capture is paused it holds nothing: the resume drops that audio.
-func (m *Manager) holdPreroll() {
+// heardFrom returns where in the live stream the words of result mr begin:
+// its first word's start, else the start of the audio it covers.
+func heardFrom(mr *api.MessageResponse, words []transcribe.Word) float64 {
+	if len(words) > 0 {
+		return words[0].Start
+	}
+	return mr.Start
+}
+
+// holdPreroll makes the next session's recording start before the words
+// Deepgram heard from at seconds into the live stream, while no session is
+// open: the words open a session only at the end of their speech
+// (flushBuffer), Deepgram can hear them late, as after a reconnect, and the
+// recording must hold them from the first, as the live transcript does. The
+// live stream (SetLiveStream) says how long ago they were captured; without
+// one, they are taken as captured now. While capture is paused it holds
+// nothing: the resume drops that audio.
+func (m *Manager) holdPreroll(at float64) {
 	if m.recorder == nil {
 		return
 	}
 	m.mu.Lock()
 	idle := m.currentSessionID == "" && !m.capturePaused
+	stream := m.stream
 	m.mu.Unlock()
-	if idle {
-		m.recorder.HoldPreroll()
+	if !idle {
+		return
+	}
+	var ago time.Duration
+	if stream != nil {
+		ago = stream.CapturedSince(at)
+	}
+	m.recorder.HoldPreroll(ago)
+}
+
+// SetLiveStream sets the stream of audio live transcription sends Deepgram,
+// whose results Message takes, and makes the recorder keep as much audio as
+// the stream can fall behind, so a recording can start before words Deepgram
+// hears late.
+func (m *Manager) SetLiveStream(stream LiveStream) {
+	m.mu.Lock()
+	m.stream = stream
+	m.mu.Unlock()
+	if m.recorder != nil {
+		m.recorder.SetLookback(stream.MaxBehind())
 	}
 }
 
