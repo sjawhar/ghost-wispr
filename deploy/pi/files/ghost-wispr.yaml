@@ -64,6 +64,11 @@ voice:
   # The wake listener while paused stays off until its false-wake rate is measured below 0.5 an
   # hour (slice 4).
   paused_listener: false
+  # Voice B's OpenAI workload identity: ids, not secrets. The Pi exchanges its Google ID token
+  # for an OpenAI access token with them. Pick gptlive on the settings page to use voice B.
+  gptlive:
+    openai_identity_provider_id: idp_b2d6c7c4ac719ef0764eba89
+    openai_service_account_id: user-cd72c7d9a1bb41594ed3c6e7
 # The Concierge reads Dispatch with the Pi's own no-scope token (GHOST_WISPR_DISPATCH_TOKEN, the
 # credential bundle's dispatch-token) and asks an issue's agent through the Envoy listener.
 concierge:

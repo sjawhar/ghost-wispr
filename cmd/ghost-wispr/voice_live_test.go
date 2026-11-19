@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -85,6 +86,31 @@ func TestTheVoiceStartsWithASpeakerAndAConcierge(t *testing.T) {
 			}
 			link.Close()
 		})
+	}
+}
+
+// The office Pi's config carries voice B's OpenAI workload identity, so that
+// picking gptlive on the settings page builds voice B with no other change.
+// It keeps voice A as the engine it starts with.
+func TestThePiConfigCanPickVoiceB(t *testing.T) {
+	cfg, _, err := config.Load(filepath.Join("..", "..", "deploy", "pi", "files", "ghost-wispr.yaml"))
+	if err != nil {
+		t.Fatalf("load the Pi's config: %v", err)
+	}
+	if cfg.Voice.Engine != config.VoiceEngineTTS {
+		t.Errorf("the Pi starts with voice.engine %q, want %q until a build with voice B runs there", cfg.Voice.Engine, config.VoiceEngineTTS)
+	}
+	ids := cfg.Voice.GPTLive
+	if !strings.HasPrefix(ids.OpenAIIdentityProviderID, "idp_") || !strings.HasPrefix(ids.OpenAIServiceAccountID, "user-") {
+		t.Fatalf("the Pi's voice.gptlive is %+v, want its OpenAI identity provider (idp_…) and service account (user-…)", ids)
+	}
+	cfg.Voice.Engine = config.VoiceEngineGPTLive
+	var source voiceSource
+	source.apply(t.Context(), &cfg)
+	if v, err := source.Voice(); err != nil {
+		t.Fatalf("picking gptlive with the Pi's config: %v, %v", v, err)
+	} else if _, ok := v.(*gptlive.Voice); !ok {
+		t.Fatalf("picking gptlive with the Pi's config built %T, want voice B", v)
 	}
 }
 
