@@ -42,14 +42,33 @@ func issueKeysIn(words string) []string {
 }
 
 // read is one read of the record for a target. complete is set when it ran
-// to its end, not stopped or replaced; record is then what it found, and
-// searched whether it came from a search.
+// to its end, not stopped or replaced; found is then what it found.
 type read struct {
 	done     chan struct{}
-	record   string
-	searched bool
+	found    *reading
 	complete bool
 	cancel   context.CancelFunc
+}
+
+// reading is what a read of the record found for a turn.
+type reading struct {
+	// text is each call and its result on a line: the record the model gets,
+	// and the source R8's check holds a fast answer to.
+	text string
+	// searched: the issue came from a search, not a key the turn named.
+	searched bool
+	// noResult: a search found no issue.
+	noResult bool
+	// clear: the search had one clear match (R5).
+	clear bool
+	// key and title name the chosen issue; empty when none was read.
+	key, title string
+	// holder is issue_holder's answer for it; nil when not read.
+	holder map[string]any
+	// newest is the chosen issue's newest event; zero when it has none.
+	newest time.Time
+	// unreachable: Dispatch did not answer.
+	unreachable bool
 }
 
 // prefetch is the record read for one exchange while its asker speaks. Each
@@ -144,22 +163,21 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	p.reads[target], p.current = r, target
 	go func() {
 		defer cancel()
-		record, searched := c.readRecord(readCtx, &exchange, target)
+		found := c.readRecord(readCtx, &exchange, target)
 		if readCtx.Err() == nil {
-			r.record, r.searched, r.complete = record, searched, true
+			r.found, r.complete = found, true
 		}
 		close(r.done)
 	}()
 }
 
-// readFor is the record Answer gives the model for turn, and whether it came
-// from a search rather than a key the turn named: the read Heard made of
-// exactly what the final turn asks, which is final once it ran to its end,
-// else a read made now, bounded as Heard's are.
-func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) (record string, searched bool) {
+// readFor is what the record holds for turn: the read Heard made of exactly
+// what the final turn asks, which is final once it ran to its end, else a
+// read made now, bounded as Heard's are.
+func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) *reading {
 	target := c.readTarget(ctx, turn, true)
 	if target == "" {
-		return "", false
+		return &reading{}
 	}
 	c.mu.Lock()
 	var pending *read
@@ -171,10 +189,10 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 		select {
 		case <-pending.done:
 			if pending.complete {
-				return pending.record, pending.searched
+				return pending.found
 			}
 		case <-ctx.Done():
-			return "", false
+			return &reading{}
 		}
 	}
 	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
@@ -182,21 +200,27 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 	return c.readRecord(readCtx, x, target)
 }
 
-// readRecord reads target with the tools, as the model would call them, and
-// writes each call and its result on a line, and reports whether it searched.
-// For keys, the first key that names an issue is read with its holder, and
-// the reads of the others are left out, so the model is not told of an issue
-// nobody asked about; when none names one, the terms are searched. A failure
-// other than not-found, such as Dispatch out of reach, ends the read. For a
-// search, the hits and the top hit's issue are read, and no holder: the hit
-// may not be what the question is about, so it makes no session askable. It
-// is empty when nothing was found.
-func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string) (string, bool) {
+// readRecord reads target with the tools, as the model would call them. For
+// keys, the first key that names an issue is read with its holder, and the
+// reads of the others are left out, so the model is not told of an issue
+// nobody asked about; when none names one, the terms are searched. For a
+// search, the top hit's issue is read with its holder, and whether it is one
+// clear match (R5) is kept: the voice names the issue it took when it is not,
+// and asks its holder nothing unasked. A failure other than not-found, such as
+// Dispatch out of reach, ends the read.
+func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string) *reading {
 	tools := &runner{c: c, x: x}
+	found := &reading{}
 	var lines []string
 	call := func(name string, args map[string]any, keepErrors bool) map[string]any {
 		result, err := tools.call(ctx, name, args)
-		if err != nil || (!keepErrors && result["error"] != nil) {
+		if err != nil {
+			return nil
+		}
+		if result["error"] == cannotReachDispatch {
+			found.unreachable = true
+		}
+		if !keepErrors && result["error"] != nil {
 			return result
 		}
 		encodedArgs, _ := json.Marshal(args)
@@ -204,12 +228,39 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 		lines = append(lines, fmt.Sprintf("%s(%s) = %s", name, encodedArgs, encoded))
 		return result
 	}
-	search := func(terms string) {
-		found := call("search_issues", map[string]any{"query": terms}, true)
-		if issues, ok := found["issues"].([]map[string]any); ok && len(issues) > 0 {
-			if key, ok := issues[0]["key"].(string); ok {
-				call("read_issue", map[string]any{"key": key}, false)
+	// readIssue reads key and its holder, and reports whether key names an
+	// issue; a failure other than not-found ends the read.
+	readIssue := func(key string) (named, stop bool) {
+		issue := call("read_issue", map[string]any{"key": key}, false)
+		switch {
+		case issue == nil:
+			return false, true
+		case issue["error"] == nil:
+			found.key, _ = issue["key"].(string)
+			found.title, _ = issue["title"].(string)
+			found.newest = tools.newest[found.key]
+			if holder := call("issue_holder", map[string]any{"key": key}, true); holder != nil && holder["error"] == nil {
+				found.holder = holder
 			}
+			return true, true
+		default:
+			return false, issue["error"] != noSuchIssue
+		}
+	}
+	search := func(terms string) {
+		found.searched = true
+		hits := call("search_issues", map[string]any{"query": terms}, true)
+		issues, _ := hits["issues"].([]map[string]any)
+		if hits == nil || hits["error"] != nil {
+			return
+		}
+		if len(issues) == 0 {
+			found.noResult = true
+			return
+		}
+		found.clear, _ = hits["clear_match"].(bool)
+		if key, ok := issues[0]["key"].(string); ok && ctx.Err() == nil {
+			readIssue(key)
 		}
 	}
 	switch {
@@ -217,27 +268,19 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 		list, terms, _ := strings.Cut(strings.TrimPrefix(target, "keys:"), "|")
 		for _, key := range strings.Split(list, ",") {
 			if ctx.Err() != nil {
-				return strings.Join(lines, "\n"), false
+				break
 			}
-			read := call("read_issue", map[string]any{"key": key}, false)
-			switch {
-			case read == nil:
-				return strings.Join(lines, "\n"), false
-			case read["error"] == nil:
-				call("issue_holder", map[string]any{"key": key}, true)
-				return strings.Join(lines, "\n"), false
-			case read["error"] != noSuchIssue:
-				return strings.Join(lines, "\n"), false
+			if named, stop := readIssue(key); named || stop {
+				found.text = strings.Join(lines, "\n")
+				return found
 			}
 		}
-		if terms == "" || ctx.Err() != nil {
-			return strings.Join(lines, "\n"), false
+		if terms != "" && ctx.Err() == nil {
+			search(terms)
 		}
-		search(terms)
-		return strings.Join(lines, "\n"), true
 	case strings.HasPrefix(target, "search:"):
 		search(strings.TrimPrefix(target, "search:"))
-		return strings.Join(lines, "\n"), true
 	}
-	return "", false
+	found.text = strings.Join(lines, "\n")
+	return found
 }

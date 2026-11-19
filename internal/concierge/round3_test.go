@@ -467,25 +467,28 @@ func TestAnAnswerOfAnEndedSessionIsNotAnnounced(t *testing.T) {
 	}
 }
 
-// TestADescribedTurnGetsTheSearchNotAHolder: a turn with no key is searched;
-// the model is told the hits may not be what the question is about, and no
-// holder is looked up, so no session becomes askable from a search.
-func TestADescribedTurnGetsTheSearchNotAHolder(t *testing.T) {
+// TestADescribedTurnAsksNoHolderUnasked: a turn with no key is searched; the
+// model is told the hits may not be what the question is about, and a search
+// with no one clear match makes the Concierge ask no holder, even on "ask":
+// the room heard which issue it took and can name it.
+func TestADescribedTurnAsksNoHolderUnasked(t *testing.T) {
 	r := newRig(t)
 	voiceIssue(r)
 	r.records.issues["ABC-12"].Claim = &dispatch.Claim{Actor: actor("session", "agent-9", "Worker")}
 	r.agents.states["agent-9"] = envoy.SessionInfo{SessionID: "agent-9", State: envoy.StateLive}
+	r.records.hits = append(r.records.hits, dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word"})
+	r.records.hits[0].Score, r.records.hits[1].Score = 0.007, 0.006
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 	var spoken []said
-	if err := r.concierge.Answer(context.Background(), &r.exchange, "who joined this meeting so far", recorder(&spoken)); err != nil {
+	if err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on the realtime voice whether it shipped", recorder(&spoken)); err != nil {
 		t.Fatal(err)
 	}
 	prompt := r.model.requests[0][0].Parts[0].Text
-	if !strings.Contains(prompt, "may not be what the question is about") || strings.Contains(prompt, "issue_holder") {
+	if !strings.Contains(prompt, "may not be what the question is about") {
 		t.Fatalf("the prompt for a described turn:\n%s", prompt)
 	}
-	if r.concierge.wasNamed(&r.exchange, "agent-9") {
-		t.Fatal("a search made a holder askable")
+	if len(r.agents.sent) != 0 {
+		t.Fatalf("a search with no clear match asked %+v", r.agents.sent)
 	}
 }
 

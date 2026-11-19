@@ -68,7 +68,7 @@ func TestAnswerRunsToolsThenSpeaksTheFactSentenceBySentence(t *testing.T) {
 		t.Errorf("the search result did not reach the model: %v", responseTurn.Parts[0].FunctionResponse.Response)
 	}
 	config := r.model.configs[0]
-	if config.SystemInstruction == nil || len(config.Tools) != 1 || len(config.Tools[0].FunctionDeclarations) != len(ToolSpecs()) {
+	if config.SystemInstruction == nil || len(config.Tools) != 1 || len(config.Tools[0].FunctionDeclarations) != len(factTools) {
 		t.Errorf("config = %+v", config)
 	}
 	if r.model.models[0] != "test-model" {
@@ -111,7 +111,7 @@ func TestAnswerNeverSpeaksThoughts(t *testing.T) {
 func TestTheSystemPromptHoldsTheRoomsRules(t *testing.T) {
 	prompt := systemPrompt
 	for _, want := range []string{
-		"cannot identify", "read-only", "Never change anything", "ask_agent", "only when the record cannot answer",
+		"cannot identify", "read-only", "Never change anything", "only when the record cannot answer",
 		"one to three short sentences", "exactly as written", "I cannot reach Dispatch yet", "Say how old the fact is",
 	} {
 		if !strings.Contains(prompt, want) {

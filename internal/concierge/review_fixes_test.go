@@ -48,7 +48,7 @@ func TestAModelRefusalLogsNoRoomWords(t *testing.T) {
 	logs := r.captureLogs()
 	r.model.errs = []error{genai.APIError{Code: 400, Status: "INVALID_ARGUMENT", Message: "the prompt holds private room words"}}
 	var spoken []said
-	err := r.concierge.Answer(context.Background(), &r.exchange, "private room words", recorder(&spoken))
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what is it", recorder(&spoken))
 	if err == nil {
 		t.Fatal("control: the model's refusal was hidden")
 	}
@@ -158,29 +158,33 @@ func TestATurnThatSaysNothingSpeaksTheFallback(t *testing.T) {
 	}
 }
 
-// TestTheLastRoundAsksNoAgent: in the last tool round the model may call no
-// tool, so no question goes out while the room hears sorry.
-func TestTheLastRoundAsksNoAgent(t *testing.T) {
+// TestTheModelAsksNoAgent: the model of a fast answer cannot ask an agent:
+// ask_agent is not among its tools, a call of it is refused, and the round
+// after its last allowed tool call may call none. The Concierge asks the
+// holder itself (R7).
+func TestTheModelAsksNoAgent(t *testing.T) {
 	r := newRig(t)
 	r.records.issues["ABC-12"] = claimed("ABC-12", "session", "agent-7", "Worker")
 	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateLive}
-	for round := range maxSteps {
-		name, args := "issue_holder", map[string]any{"key": "ABC-12"}
-		if round == maxSteps-1 {
-			name, args = "ask_agent", map[string]any{"session": "agent-7", "question": "q"}
-		}
-		r.model.turns = append(r.model.turns, []*genai.GenerateContentResponse{chunk(call("c", name, args, ""))})
+	r.model.turns = append(r.model.turns, []*genai.GenerateContentResponse{chunk(call("c", "ask_agent", map[string]any{"session": "agent-7", "question": "q"}, ""))})
+	for range maxToolCalls + 1 {
+		r.model.turns = append(r.model.turns, []*genai.GenerateContentResponse{chunk(call("c", "issue_holder", map[string]any{"key": "ABC-12"}, ""))})
 	}
 	var spoken []said
 	if err := r.concierge.Answer(context.Background(), &r.exchange, "x", recorder(&spoken)); err == nil {
-		t.Error("a turn that ran out of rounds reported success")
+		t.Error("a turn that ran out of tool calls with no words reported success")
 	}
 	if len(r.agents.sent) != 0 {
-		t.Fatalf("the last round sent %d questions", len(r.agents.sent))
+		t.Fatalf("the model sent %d questions", len(r.agents.sent))
 	}
-	last := r.model.configs[maxSteps-1]
+	for _, declaration := range r.model.configs[0].Tools[0].FunctionDeclarations {
+		if declaration.Name == "ask_agent" {
+			t.Fatal("the fast answer's model is given ask_agent")
+		}
+	}
+	last := r.model.configs[len(r.model.configs)-1]
 	if last.ToolConfig == nil || last.ToolConfig.FunctionCallingConfig == nil || last.ToolConfig.FunctionCallingConfig.Mode != genai.FunctionCallingConfigModeNone {
-		t.Errorf("the last round's config lets the model call tools: %+v", last.ToolConfig)
+		t.Errorf("the round after the last tool call lets the model call tools: %+v", last.ToolConfig)
 	}
 	if len(spoken) != 1 || spoken[0].text != sorry {
 		t.Fatalf("spoken = %+v", spoken)

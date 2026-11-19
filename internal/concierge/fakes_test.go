@@ -36,6 +36,7 @@ type fakeRecords struct {
 	err        error
 	queries    []string
 	issueCalls []string
+	limits     []int
 	// block, when set, holds each Issue call (of blockKey only, when that is
 	// set) until it is closed or the call's context ends.
 	block    chan struct{}
@@ -102,11 +103,21 @@ func (f *fakeRecords) calls() []string {
 	return append([]string(nil), f.issueCalls...)
 }
 
-func (f *fakeRecords) Events(_ context.Context, key string, _ int) ([]dispatch.Event, error) {
+func (f *fakeRecords) Events(_ context.Context, key string, limit int) ([]dispatch.Event, error) {
+	f.mu.Lock()
+	f.limits = append(f.limits, limit)
+	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.events[key], nil
+}
+
+// eventLimits is a copy of the limits Events was called with.
+func (f *fakeRecords) eventLimits() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.limits...)
 }
 
 func (f *fakeRecords) DocumentText(_ context.Context, key, slug string) (string, error) {
@@ -121,11 +132,13 @@ func (f *fakeRecords) DocumentText(_ context.Context, key, slug string) (string,
 }
 
 type fakeAgents struct {
-	mu      sync.Mutex
-	id      string
-	states  map[string]envoy.SessionInfo
-	sent    []envoy.SendRequest
-	sendErr error
+	mu     sync.Mutex
+	id     string
+	states map[string]envoy.SessionInfo
+	sent   []envoy.SendRequest
+	// attempts is every send asked, the failed ones too.
+	attempts []envoy.SendRequest
+	sendErr  error
 	// onSend runs inside Send before it answers, with Send's own context and
 	// the event id it is about to answer.
 	onSend func(ctx context.Context, eventID string) error
@@ -147,6 +160,7 @@ func (f *fakeAgents) Lookup(_ context.Context, id string) (envoy.SessionInfo, er
 
 func (f *fakeAgents) Send(ctx context.Context, request *envoy.SendRequest) (envoy.SendResult, error) {
 	f.mu.Lock()
+	f.attempts = append(f.attempts, *request)
 	if f.sendErr != nil {
 		f.mu.Unlock()
 		return envoy.SendResult{}, f.sendErr
@@ -174,9 +188,12 @@ type scriptedModel struct {
 	models   []string
 	// onCall runs at the start of each call, numbered from 0.
 	onCall func(call int)
+	// block, when set, holds every call until it is closed or the call's
+	// context ends.
+	block chan struct{}
 }
 
-func (m *scriptedModel) GenerateContentStream(_ context.Context, model string, contents []*genai.Content, config *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (m *scriptedModel) GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, config *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
 	m.mu.Lock()
 	call := len(m.requests)
 	m.requests = append(m.requests, append([]*genai.Content(nil), contents...))
@@ -194,7 +211,16 @@ func (m *scriptedModel) GenerateContentStream(_ context.Context, model string, c
 	if m.onCall != nil {
 		m.onCall(call)
 	}
+	block := m.block
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {
+		if block != nil {
+			select {
+			case <-block:
+			case <-ctx.Done():
+				yield(nil, ctx.Err())
+				return
+			}
+		}
 		for _, chunk := range chunks {
 			if !yield(chunk, nil) {
 				return

@@ -68,7 +68,7 @@ func TestNewClientRefusesNoURLOrNoToken(t *testing.T) {
 func TestSearchSendsTheQueryAndTheBearerToken(t *testing.T) {
 	fake, client := newFakeDispatch(t)
 	fake.answer("/api/v1/search", `{"results":[
-		{"kind":"issue","issue":{"key":"ABC-12","title":"Realtime voice","status":"backlog"},"snippet":"<mark>realtime</mark> voice","href":"/issues/ABC-12"},
+		{"kind":"issue","issue":{"key":"ABC-12","title":"Realtime voice","status":"backlog"},"snippet":"<mark>realtime</mark> voice","href":"/issues/ABC-12","rank":0.00655},
 		{"kind":"document","issue":{"key":"ABC-12","title":"Realtime voice","status":"backlog"},"artifact":{"slug":"spec"},"snippet":"the <mark>spec</mark>"},
 		{"kind":"comment","snippet":"no issue at all"}
 	]}`)
@@ -96,7 +96,7 @@ func TestSearchSendsTheQueryAndTheBearerToken(t *testing.T) {
 	if len(hits) != 3 {
 		t.Fatalf("hits = %+v, want 3", hits)
 	}
-	if hits[0].Kind != "issue" || hits[0].IssueKey != "ABC-12" || hits[0].Title != "Realtime voice" || hits[0].Status != "backlog" || hits[0].Snippet != "realtime voice" {
+	if hits[0].Kind != "issue" || hits[0].IssueKey != "ABC-12" || hits[0].Title != "Realtime voice" || hits[0].Status != "backlog" || hits[0].Snippet != "realtime voice" || hits[0].Score != 0.00655 {
 		t.Errorf("first hit = %+v", hits[0])
 	}
 	if hits[1].Document != "spec" || hits[1].Snippet != "the spec" {
