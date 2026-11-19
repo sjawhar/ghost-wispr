@@ -334,6 +334,7 @@ func runIssueHolderCommand(ctx context.Context, args []string, configPath string
 	if err != nil {
 		return fail(err)
 	}
+	defer c.Stop()
 	// Without an Envoy URL, the tool answers that it cannot reach the agents.
 	if cfg.Concierge.EnvoyURL != "" {
 		listener, err := envoy.NewListener(cfg.Concierge.EnvoyURL, nil)

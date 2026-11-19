@@ -50,7 +50,7 @@ func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
 		return nil
 	}
 	c.logger.Info("concierge took an agent's answer", "task", task.ID, "session", task.SessionID)
-	go c.announce(&task, message.Text)
+	c.background(func(life context.Context) { c.announce(life, &task, message.Text) })
 	return nil
 }
 
@@ -220,16 +220,19 @@ func (c *Concierge) forget(agent string, ids ...string) {
 // announce rewrites an answer for the ear and queues its announcement; the
 // queue hands it to Answers unless its meeting ends or is deleted first. An
 // answer whose meeting no longer records goes to no model: it will not be
-// spoken.
-func (c *Concierge) announce(task *storage.VoiceTask, written string) {
+// spoken. It runs under the Concierge's life: Stop ends its rewrite.
+func (c *Concierge) announce(life context.Context, task *storage.VoiceTask, written string) {
 	c.mu.Lock()
 	closed, _ := c.closedLocked(task.SessionID)
 	c.mu.Unlock()
 	if closed || !c.stillOwed(&voice.PendingAnswer{TaskID: task.ID}) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), earTimeout)
+	ctx, cancel := context.WithTimeout(life, earTimeout)
 	defer cancel()
 	spoken := c.forEar(ctx, strings.TrimSpace(written), task.IssueKey)
+	if life.Err() != nil {
+		return // stopped: the answer stays in the ledger, for its page
+	}
 	c.enqueue(&voice.PendingAnswer{TaskID: task.ID, SessionID: task.SessionID, IssueKey: task.IssueKey, Text: spoken, AskedAt: task.AskedAt})
 }
