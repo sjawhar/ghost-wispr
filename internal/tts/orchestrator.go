@@ -262,7 +262,8 @@ func (o *Orchestrator) play(resp *SpeechResponse) (bytesWritten, durationMs int6
 		err = nil // it played until the Cancel
 	}
 	played := playback.Played()
-	frames := int64(played) * int64(format.SampleRate) / int64(time.Second)
+	// Played counts whole frames, cut to whole nanoseconds: round back.
+	frames := (int64(played)*int64(format.SampleRate) + int64(time.Second)/2) / int64(time.Second)
 	return frames * int64(format.Channels) * 2, played.Milliseconds(), err
 }
 

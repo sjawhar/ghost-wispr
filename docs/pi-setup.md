@@ -413,10 +413,15 @@ starts paused scans only at its first resume. The speaker does not wait for it: 
 ALSA playback PCM of the card `speaker_device: J75` names (`plughw:CARD=J75,DEV=0`, the Jabra's
 `pcmC0D0p` on the office Pi), opening no microphone and needing no red light, so a unit restarted
 paused still speaks. It plays at the first of 48000, 44100, 32000, 24000 and 16000 Hz that the
-Jabra takes without resampling, with 10 ms periods and an 80 ms buffer; a cancel of the speech, as
-when someone talks over it, drops that buffer, so the speech stops within 20 ms. Each underrun,
-when the speaker runs out of audio and clicks, is logged as
-`speaker underrun: the device ran out of audio`. It needs no package beyond `libportaudio2`,
+Jabra takes without resampling, with 10 ms periods and an 80 ms buffer. When a cancel stops the
+speech, as when someone talks over it, the speaker rewinds that buffer, so the stream plays on,
+and writes the rest of the mix (a chime, say) again without the speech. Audio the Jabra has
+already taken still plays. If that is more than a period, or the device cannot rewind, the speaker
+drops the buffer instead. Each time the speaker opens, the log says
+`speaker stream` with the rate, period and buffer the Jabra granted, and `rewind=true` or
+`rewind=false`. The first underrun of a stream and every 100th after it, when the speaker runs out
+of audio and clicks, are logged as `speaker underrun: the device ran out of audio`, and their count
+as `speaker stream closed after underruns`. It needs no package beyond `libportaudio2`,
 whose dependency `libasound2t64` the Pi already has (`deploy/pi/baseline.txt`). A pause during an
 open keeps the blink(1) red until that open has finished.
 
