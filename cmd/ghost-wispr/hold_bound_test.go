@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -238,18 +239,18 @@ func TestAStartAPauseCancelledRunsAgainAtTheNextResume(t *testing.T) {
 	})
 }
 
-// pauseCancelledStartLoop is a loop that starts the microphone at a resume
-// and, when a pause cancels the start (errMicStartPaused), starts it again at
-// the next resume. run starts it on capture, and it calls start once the gate
-// is open.
+// pauseCancelledStartLoop is a loop that starts the microphone and, when a
+// pause cancels the start (errMicStartPaused), starts it again at the next
+// resume. run starts it on capture.
 type pauseCancelledStartLoop struct {
 	name string
 	run  func(t *testing.T, ctx context.Context, loops *sync.WaitGroup, capture *captureGate, start func() error)
 }
 
-// pauseCancelledStartLoops are the two: the first resume after a paused
-// start-up, and the start-up retry.
-var pauseCancelledStartLoops = []pauseCancelledStartLoop{
+// resumeStartLoops are the loops that wait for the gate to open, and for the
+// hardware (prepareMicOpen), before every start: the first resume after a
+// paused start-up, and the start-up retry.
+var resumeStartLoops = []pauseCancelledStartLoop{
 	{name: "first resume after a paused start", run: func(t *testing.T, ctx context.Context, loops *sync.WaitGroup, capture *captureGate, start func() error) {
 		capture.Pause()
 		_, _ = startMicrophone(ctx, loops, capture, alreadyBooted(), func(bool) error { return start() }, func() { t.Error("a start a pause cancelled went to the start-up retry") })
@@ -263,10 +264,21 @@ var pauseCancelledStartLoops = []pauseCancelledStartLoop{
 	}},
 }
 
+// pauseCancelledStartLoops are those, and the boot start, which runs at once
+// on the open gate and hands a start a pause cancelled to the first.
+var pauseCancelledStartLoops = append(slices.Clip(resumeStartLoops), pauseCancelledStartLoop{
+	name: "boot start", run: func(t *testing.T, ctx context.Context, loops *sync.WaitGroup, capture *captureGate, start func() error) {
+		loops.Go(func() {
+			_, _ = startMicrophone(ctx, loops, capture, alreadyBooted(), func(bool) error { return start() }, func() { t.Error("a start a pause cancelled went to the start-up retry") })
+		})
+	},
+})
+
 // runOn runs the loop on capture until the test ends, with start as the
-// microphone start, and returns once start has run the first time. start gets
-// the number of its call, 1 first, after the call is sent on the returned
-// channel.
+// microphone start, and returns the channel on which each start sends the
+// number of its call, 1 first, before start runs. A start that runs while
+// the gate is closed fails the test: the microphone opens only while the
+// unit is not paused.
 func (l pauseCancelledStartLoop) runOn(t *testing.T, capture *captureGate, start func(call int) error) <-chan int {
 	t.Helper()
 	var loops sync.WaitGroup
@@ -279,13 +291,27 @@ func (l pauseCancelledStartLoop) runOn(t *testing.T, capture *captureGate, start
 	calls := 0
 	l.run(t, t.Context(), &loops, capture, func() error {
 		calls++
+		if capture.isClosed() {
+			t.Errorf("start %d ran while the gate was closed", calls)
+		}
 		starts <- calls
 		return start(calls)
 	})
-	if got := receiveWithin(t, starts); got != 1 {
-		t.Fatalf("start %d, want 1", got)
-	}
 	return starts
+}
+
+// nextStart fails the test unless the next start on starts is call number
+// want, within testWait. what says when that start must come.
+func nextStart(t *testing.T, starts <-chan int, want int, what string) {
+	t.Helper()
+	select {
+	case got := <-starts:
+		if got != want {
+			t.Fatalf("start %d %s, want start %d", got, what, want)
+		}
+	case <-time.After(testWait):
+		t.Fatalf("no start within %v %s", testWait, what)
+	}
 }
 
 // TestAResumeBeforeTheLoopWaitsAgainStartsTheMicrophone fails if a resume
@@ -315,14 +341,8 @@ func TestAResumeBeforeTheLoopWaitsAgainStartsTheMicrophone(t *testing.T) {
 				}
 				return errMicStartPaused
 			})
-			select {
-			case got := <-starts:
-				if got != 2 {
-					t.Fatalf("start %d after the resume, want 2", got)
-				}
-			case <-time.After(testWait):
-				t.Fatalf("no start within %v of a resume that landed before the loop waited again: the resume was lost", testWait)
-			}
+			nextStart(t, starts, 1, "once the gate was open")
+			nextStart(t, starts, 2, "after a resume that landed before the loop waited again: the resume was lost")
 			if hold := <-holds; hold != captureResuming {
 				t.Fatalf("mic hold while the start after the resume ran = %q, want %q: the cancelled start ended the resume's state", hold, captureResuming)
 			}
@@ -355,6 +375,7 @@ func TestAPauseAfterTheLastResumeKeepsACancelledStartClosed(t *testing.T) {
 				close(paused)
 				return errMicStartPaused
 			})
+			nextStart(t, starts, 1, "once the gate was open")
 			capture.Resume() // the switch is on: nothing to resume
 			close(resumed)
 			if !returnedWithin(paused, testWait) {
@@ -370,9 +391,37 @@ func TestAPauseAfterTheLastResumeKeepsACancelledStartClosed(t *testing.T) {
 				t.Fatal("the switch is on after a pause that came after the last resume")
 			}
 			capture.Resume()
-			if got := receiveWithin(t, starts); got != 2 {
-				t.Fatalf("start %d after the next resume, want 2", got)
+			nextStart(t, starts, 2, "after the next resume")
+		})
+	}
+}
+
+// TestAPauseWhileAStartWaitsForTheHardwareStartsAtTheNextResume fails if a
+// pause that comes while a start waits for the hardware (prepareMicOpen, as
+// while speech plays on the Jabra) makes the next resume wait for anything
+// but the gate: the start-up retry waited its 15 s interval first.
+func TestAPauseWhileAStartWaitsForTheHardwareStartsAtTheNextResume(t *testing.T) {
+	for _, tc := range resumeStartLoops {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			paused := make(chan struct{})
+			prepares := 0
+			capture.beforeMicOpen = func(_ context.Context, closing <-chan struct{}) bool {
+				prepares++
+				if prepares > 1 {
+					return true
+				}
+				capture.Pause() // while the hardware gets ready
+				close(paused)
+				<-closing
+				return false
 			}
+			starts := tc.runOn(t, capture, func(int) error { return nil })
+			if !returnedWithin(paused, testWait) {
+				t.Fatal("the start never waited for the hardware")
+			}
+			capture.Resume()
+			nextStart(t, starts, 1, "after the resume that followed a pause during the wait for the hardware")
 		})
 	}
 }

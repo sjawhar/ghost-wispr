@@ -354,8 +354,9 @@ func retryMicStartup(
 			return
 		}
 		// A pause while it waits for the Jabra (prepareMicOpen) cancels the
-		// attempt; the next comes once capture resumes.
+		// attempt; the next comes once capture resumes, without the interval.
 		if !capture.prepareMicOpen(ctx) {
+			wait = false
 			continue
 		}
 
