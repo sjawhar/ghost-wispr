@@ -173,7 +173,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 
 // readFor is what the record holds for turn: the read Heard made of exactly
 // what the final turn asks, which is final once it ran to its end, else a
-// read made now, bounded as Heard's are.
+// read made now. ctx, the answer's, bounds both.
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) *reading {
 	target := c.readTarget(ctx, turn, true)
 	if target == "" {
@@ -195,9 +195,7 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 			return &reading{}
 		}
 	}
-	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-	defer cancel()
-	return c.readRecord(readCtx, x, target)
+	return c.readRecord(ctx, x, target)
 }
 
 // readRecord reads target with the tools, as the model would call them. For
