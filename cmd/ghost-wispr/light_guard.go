@@ -31,6 +31,7 @@ type lightGuard struct {
 	checked chan struct{} // holds one signal: a check is waiting to be applied
 
 	lastRelease time.Time // used by run alone
+	pending     bool      // a check is recorded that run has not read, under mu
 }
 
 func newLightGuard(capture *captureGate, warnings *warningsRegistry, releaseEvery time.Duration) *lightGuard {
@@ -43,10 +44,16 @@ func newLightGuard(capture *captureGate, warnings *warningsRegistry, releaseEver
 }
 
 // report records a check of the light, nil when it shows what capture wants.
-// It never blocks.
+// A failure that run has not read yet is kept over a later pass: the pass
+// does not show the light red again, as when the controller finds the light
+// off, as it wants it while nothing records, right after a failed red
+// confirmation. It never blocks.
 func (g *lightGuard) report(err error) {
 	g.mu.Lock()
-	g.fault = err
+	if err != nil || !g.pending || g.fault == nil {
+		g.fault = err
+	}
+	g.pending = true
 	g.mu.Unlock()
 	select {
 	case g.checked <- struct{}{}:
@@ -64,6 +71,7 @@ func (g *lightGuard) run(ctx context.Context) {
 		}
 		g.mu.Lock()
 		fault := g.fault
+		g.pending = false
 		g.mu.Unlock()
 		g.apply(fault)
 	}
@@ -71,13 +79,31 @@ func (g *lightGuard) run(ctx context.Context) {
 
 func (g *lightGuard) apply(fault error) {
 	if fault != nil {
-		g.capture.HoldForLight()
+		// The warning first: once capture is held, /api/status names the light.
 		g.warnings.Set("recording-light", recordingLightWarning(fault))
+		g.capture.HoldForLight()
 		return
 	}
-	if !g.capture.isLightHeld() || time.Since(g.lastRelease) < g.releaseEvery {
+	// A check that passes ends a busy or unchecked light's warning: another
+	// program had the light, or its pattern was being checked, and it did not
+	// fail. But not while capture stays held for the light: its warning says
+	// why the unit does not record (red team, review 5956273705 of #79). Any
+	// other warning waits for a red confirmation; ClearIf leaves it.
+	if !g.capture.isLightHeld() {
+		g.clearTransientWarning()
+		return
+	}
+	if time.Since(g.lastRelease) < g.releaseEvery {
 		return
 	}
 	g.lastRelease = time.Now()
 	g.capture.ReleaseLightHold()
+	g.clearTransientWarning()
+}
+
+// clearTransientWarning clears the light's warning if it is one a passing
+// check ends: busy, or not checked yet.
+func (g *lightGuard) clearTransientWarning() {
+	g.warnings.ClearIf("recording-light", recordingLightBusyWarning)
+	g.warnings.ClearIf("recording-light", recordingLightUncheckedWarning)
 }

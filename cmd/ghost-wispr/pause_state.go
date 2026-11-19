@@ -101,18 +101,36 @@ func seedPausedState(configPath string, out io.Writer) (string, error) {
 type persistentControls struct {
 	store           pauseStore
 	pause           func()
-	resume          func() error
+	gate            resumeGate
 	onStatusChanged func(bool)
 	mu              sync.Mutex
 }
 
-var errRefusedResumeNotPersisted = errors.New("refused resume pause state was not persisted")
-
-func newPersistentControls(store pauseStore, pause func(), resume func() error, onStatusChanged func(bool)) *persistentControls {
-	return &persistentControls{store: store, pause: pause, resume: resume, onStatusChanged: onStatusChanged}
+// resumeGate is the capture gate's resume in its two steps (captureGate):
+// prepareResume, the light's check, which can take seconds, and resumeWith,
+// the resume itself, which a Pause called since the check overtakes.
+// pauseRequested counts a pause the moment a person asks for it, before the
+// controls' lock, and IsPaused is the gate's switch.
+type resumeGate interface {
+	prepareResume() (resumeTicket, error)
+	resumeWith(t resumeTicket, persist func() error) error
+	pauseRequested()
+	IsPaused() bool
 }
 
+var errRefusedResumeNotPersisted = errors.New("refused resume pause state was not persisted")
+
+func newPersistentControls(store pauseStore, pause func(), gate resumeGate, onStatusChanged func(bool)) *persistentControls {
+	return &persistentControls{store: store, pause: pause, gate: gate, onStatusChanged: onStatusChanged}
+}
+
+// Pause counts the pause on the gate before it takes the controls' lock,
+// which another resume's save may hold: a resume called after this pause then
+// carries it and is not overtaken by it, and a resume whose light check it
+// came during is overtaken (review 5963682292 of #79). The Pause it then
+// makes takes that count rather than counting again.
 func (c *persistentControls) Pause() error {
+	c.gate.pauseRequested()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pause()
@@ -126,13 +144,39 @@ func (c *persistentControls) Pause() error {
 	return nil
 }
 
+// Resume runs the light's check before it takes the controls' lock, so a
+// person's Pause meanwhile is not held up behind it, and that Pause, the later
+// call, wins: the resume then saves nothing and returns nil (review
+// 5961636823 of #79). The resume saves the switch on just before it confirms
+// the light red, and saves it off again if the light refuses it.
 func (c *persistentControls) Resume() error {
+	ticket, err := c.gate.prepareResume()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.store.SetAppState(storage.AppStateCapturePaused, "0"); err != nil {
-		return fmt.Errorf("persist capture resume: %w", err)
+	if err != nil {
+		// Nothing changed. The clients hear the gate's switch as it is: a
+		// resume that overtook this one may have moved it on, and the unit
+		// then records (review 5963682292 of #79).
+		paused := c.gate.IsPaused()
+		if c.onStatusChanged != nil {
+			c.onStatusChanged(paused)
+		}
+		if !paused {
+			return nil
+		}
+		return err
 	}
-	if err := c.resume(); err != nil {
+	var persistErr error
+	err = c.gate.resumeWith(ticket, func() error {
+		persistErr = c.store.SetAppState(storage.AppStateCapturePaused, "0")
+		return persistErr
+	})
+	switch {
+	case persistErr != nil:
+		return fmt.Errorf("persist capture resume: %w", persistErr)
+	case errors.Is(err, errResumeOvertaken):
+		return nil // the later pause saved and announced the switch off
+	case err != nil:
 		if storeErr := c.store.SetAppState(storage.AppStateCapturePaused, "1"); storeErr != nil {
 			if c.onStatusChanged != nil {
 				c.onStatusChanged(true)

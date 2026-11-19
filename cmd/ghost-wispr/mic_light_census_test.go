@@ -18,8 +18,9 @@ import (
 )
 
 // The census of every path that opens a capture device: each must open it
-// only while the blink(1)'s last operation is a read-back of red, and keep it
-// so until the open has finished. The PortAudio scan opens capture streams on
+// only while the blink(1) was last read back red, with nothing but writes of
+// red after that read-back (requireRed), and keep it so until the open has
+// finished. The PortAudio scan opens capture streams on
 // the Jabra, so it counts as an open: startMicPipeline's start runs it first,
 // and Mic.Reopen runs it before it opens the stream again.
 //
@@ -98,18 +99,37 @@ func (r *lightRig) waitOff(t *testing.T) {
 // operations as it began, and once it had taken portAudioOpenTook.
 type openSteps struct{ begin, end []lightOp }
 
-// requireRed fails the test unless the light's last operation, as each step
-// of the open saw it, is a read-back of red.
+// requireRed fails the test unless the light, as each step of the open saw
+// it, was read back red and nothing after that read-back but red writes: the
+// controller may write red again after a red confirmation's read-back, which
+// keeps the light red (review 5967147417 of #79 saw `write ff0000 read ff0000
+// write ff0000` once in 50 runs).
 func requireRed(t *testing.T, what string, steps openSteps) {
 	t.Helper()
 	for _, step := range []struct {
 		when string
 		ops  []lightOp
 	}{{"as it began", steps.begin}, {"once it had taken " + portAudioOpenTook.String(), steps.end}} {
-		if len(step.ops) == 0 || !isRedReadBack(step.ops[len(step.ops)-1]) {
-			t.Fatalf("%s %s with light operations %v, want the last a read-back of ff0000", what, step.when, step.ops)
+		last := -1
+		for i, op := range step.ops {
+			if isRedReadBack(op) {
+				last = i
+			}
+		}
+		if last < 0 || !allRedWrites(step.ops[last+1:]) {
+			t.Fatalf("%s %s with light operations %v, want a read-back of ff0000 with only writes of ff0000 after it", what, step.when, step.ops)
 		}
 	}
+}
+
+// allRedWrites reports whether every operation in ops is a write of red.
+func allRedWrites(ops []lightOp) bool {
+	for _, op := range ops {
+		if op.read || !isRedOp(op) {
+			return false
+		}
+	}
+	return true
 }
 
 // recordingStart stands in for a microphone start (startMicPipeline): its
@@ -374,11 +394,19 @@ func TestNoAudioPassesOnceTheLightWasNotRedWhileTheMicrophoneWasOpen(t *testing.
 		{name: "the light read back off by itself", lightOff: func(t *testing.T, r *lightRig) {
 			r.device.mu.Lock()
 			r.device.colour = [3]uint8{}
+			start := len(r.device.ops)
 			r.device.mu.Unlock()
 			r.hardware.Wake()
+			// Look for the read of off and the red read-back after it anywhere
+			// since the change: a later check, from a wake already queued, can
+			// add operations after them before this wait looks.
 			r.waitFor(t, "the controller to find the light off and light it again", func(ops []lightOp) bool {
-				n := len(ops)
-				return n >= 3 && ops[n-3] == lightOp{read: true} && isRedReadBack(ops[n-1])
+				for i := start; i+2 < len(ops); i++ {
+					if ops[i] == (lightOp{read: true}) && isRedReadBack(ops[i+2]) {
+						return true
+					}
+				}
+				return false
 			})
 		}},
 	} {

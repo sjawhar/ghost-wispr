@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -47,6 +48,24 @@ type pauseGateFake struct{ calls int }
 
 func (g *pauseGateFake) Pause() { g.calls++ }
 
+// resumeFunc is a resume gate (resumeGate) whose resume is f, run after the
+// controls' write: no light check, no pause overtakes it, and its switch
+// always reads paused, as a gate whose resume has not run yet.
+type resumeFunc func() error
+
+func (resumeFunc) prepareResume() (resumeTicket, error) { return resumeTicket{}, nil }
+
+func (resumeFunc) pauseRequested() {}
+
+func (resumeFunc) IsPaused() bool { return true }
+
+func (f resumeFunc) resumeWith(_ resumeTicket, persist func() error) error {
+	if err := persist(); err != nil {
+		return err
+	}
+	return f()
+}
+
 // TestRestorePausePausesWhenStored fails if a persisted pause is not restored
 // before capture begins.
 func TestRestorePausePausesWhenStored(t *testing.T) {
@@ -85,10 +104,10 @@ func TestRestorePausePausesWhenStored(t *testing.T) {
 func TestPersistingControlsWritesBeforeReturning(t *testing.T) {
 	store := &pauseStoreFake{}
 	var pauses, resumes int
-	controls := newPersistentControls(store, func() { pauses++ }, func() error {
+	controls := newPersistentControls(store, func() { pauses++ }, resumeFunc(func() error {
 		resumes++
 		return nil
-	}, nil)
+	}), nil)
 	pause, resume := controls.Pause, controls.Resume
 
 	if err := pause(); err != nil {
@@ -116,10 +135,10 @@ func TestPersistingControlsWritesBeforeReturning(t *testing.T) {
 func TestAStoreWriteFailureIsReported(t *testing.T) {
 	store := &pauseStoreFake{err: errors.New("disk full")}
 	var pauses, resumes int
-	controls := newPersistentControls(store, func() { pauses++ }, func() error {
+	controls := newPersistentControls(store, func() { pauses++ }, resumeFunc(func() error {
 		resumes++
 		return nil
-	}, nil)
+	}), nil)
 	pause, resume := controls.Pause, controls.Resume
 
 	if err := pause(); err == nil {
@@ -145,7 +164,7 @@ func TestPauseHTTPPersists(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	capture := newCaptureGate(nil, nil, nil)
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	pause, resume := controls.Pause, controls.Resume
 	handler, err := server.Handler(
 		fstest.MapFS{"index.html": {Data: []byte("ok")}},
@@ -275,6 +294,42 @@ func TestFailedMicStartClosesTheDevice(t *testing.T) {
 	}
 }
 
+// TestAPauseDuringAStartsOpenCancelsTheStart fails if a pause and a resume
+// that land while a start opens the device (audio.NewMic), before the start's
+// own light check, make that check anything but a cancelled start: the switch
+// is on but the gate is still closed until the pause settles, so the check
+// refuses with errMicStartPaused, the device is closed and withdrawn, nothing
+// starts, and the error the start returns is still errMicStartPaused once
+// wrapped. startMicPipeline returns that error before it sets a "Microphone
+// failed to start" warning or start-up status, and startMicrophone starts
+// again at the next resume. (Review 5975477041 of #93, finding 1; the branch
+// in startMicPipeline is in main's closure, which no test reaches.)
+func TestAPauseDuringAStartsOpenCancelsTheStart(t *testing.T) {
+	settle := make(chan struct{})
+	t.Cleanup(sync.OnceFunc(func() { close(settle) }))
+	capture := newCaptureGate(nil, func() { <-settle }, nil)
+	// As wireLightConsent wires it: the open's red confirmation consults the gate.
+	capture.beforeMicOpenRed = func(allowed func() error) error { return allowed() }
+	capture.Pause() // during audio.NewMic
+	capture.Resume()
+	if capture.IsPaused() || !capture.isClosed() {
+		t.Fatalf("setup: paused %v closed %v, want the switch on and the gate closed", capture.IsPaused(), capture.isClosed())
+	}
+	mic := newScriptedMic()
+	withdrawn := false
+	err := startOpenedMic(capture, mic, func() { withdrawn = true }, func(string, ...any) {})
+	if !errors.Is(err, errMicStartPaused) {
+		t.Fatalf("a start whose open a pause and a resume overlapped = %v, want errMicStartPaused", err)
+	}
+	if !withdrawn {
+		t.Error("the device a cancelled start opened was not withdrawn")
+	}
+	mic.expectEvents(t, "close")
+	if wrapped := fmt.Errorf("microphone start failed at %d Hz: %w", 16000, err); !errors.Is(wrapped, errMicStartPaused) {
+		t.Fatalf("the start's error once wrapped = %v, want errMicStartPaused, which startMicrophone takes as a cancelled start", wrapped)
+	}
+}
+
 // TestRefusedResumeHTTPReturns500 fails if the public resume route reports
 // success after the pre-resume light confirmation refuses it.
 func TestRefusedResumeHTTPReturns500(t *testing.T) {
@@ -286,7 +341,7 @@ func TestRefusedResumeHTTPReturns500(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
 	capture.Pause()
 	capture.beforeResumeRequest = func() error { return errors.New("recording light stayed off") }
-	controls := newPersistentControls(store, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(store, capture.Pause, capture, nil)
 	handler, err := server.Handler(
 		fstest.MapFS{"index.html": {Data: []byte("ok")}},
 		server.NewHub(),
@@ -331,7 +386,7 @@ func TestPersistentControlsSerializePauseAgainstResume(t *testing.T) {
 		zeroStarted: make(chan struct{}),
 		releaseZero: make(chan struct{}),
 	}
-	controls := newPersistentControls(store, func() {}, func() error { return nil }, nil)
+	controls := newPersistentControls(store, func() {}, resumeFunc(func() error { return nil }), nil)
 	resumeDone := make(chan error, 1)
 	go func() { resumeDone <- controls.Resume() }()
 	select {
@@ -382,7 +437,7 @@ func TestRefusedResumeWriteBackFailureIsReported(t *testing.T) {
 	controls := newPersistentControls(
 		store,
 		capture.Pause,
-		capture.RequestResume,
+		capture,
 		func(paused bool) { statuses = append(statuses, paused) },
 	)
 	err := controls.Resume()
@@ -407,7 +462,7 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 		controls := newPersistentControls(
 			store,
 			capture.Pause,
-			capture.RequestResume,
+			capture,
 			func(paused bool) { statuses = append(statuses, paused) },
 		)
 		handler, err := server.Handler(
@@ -440,7 +495,7 @@ func TestPersistentControlsAnnounceHTTPAndPowerTransitions(t *testing.T) {
 		controls := newPersistentControls(
 			store,
 			capture.Pause,
-			capture.RequestResume,
+			capture,
 			func(paused bool) { statuses = append(statuses, paused) },
 		)
 		for range 2 {

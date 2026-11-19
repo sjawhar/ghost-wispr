@@ -146,6 +146,18 @@ wait_for_light() {
   done
 }
 
+# light_locked_stop_command PID [SYSFS DEV] prints the command that stops PID on the Pi while it holds
+# the blink(1)'s lock. Every ghost-wispr command to the light holds that lock, a flock on its hidraw
+# node, across its whole exchange, so PID stops between two commands to the light, never inside one:
+# stopped inside one, it would keep the lock, and each light-state would wait for it and print
+# unknown. The node is the one ghost-wispr opens, the first hidraw device with the blink(1)'s HID_ID.
+light_locked_stop_command() {
+  local pid=$1 sysfs=${2:-/sys} dev=${3:-/dev}
+  # shellcheck disable=SC2016 # $uevent and $node are the Pi shell's.
+  printf 'for uevent in %s/class/hidraw/*/device/uevent; do if grep -qs HID_ID=0003:000027B8:000001ED "$uevent"; then node=${uevent%%/device/uevent}; exec flock -w 5 %s/"${node##*/}" kill -STOP %s; fi; done; exit 1' \
+    "$sysfs" "$dev" "$pid"
+}
+
 assert_dark_until_capturing() {
   local current_status capture_state light_state
   for _ in $(seq 1 240); do
@@ -536,8 +548,10 @@ printf 'A1 RAN: pause stopped audio and Deepgram growth, then resume restored ca
 printf 'Light hang RAN: stop the recorder process and require darkness within 3 seconds.\n'
 main_pid=$(remote_run "XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemctl --user show --property=MainPID --value ghost-wispr.service")
 [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "Light hang FAILED: no Ghost Wispr main PID"
-remote_run "kill -STOP $main_pid"
+# Set before the stop, so a lost SSH reply still leaves cleanup to continue the recorder.
 stopped_pid=$main_pid
+remote_run "$(light_locked_stop_command "$main_pid")" \
+  || fail "Light hang FAILED: could not stop the recorder between two commands to the blink(1)"
 if ! wait_for_light off 3000; then
   fail "Light hang FAILED: light did not turn off within 3 seconds"
 fi

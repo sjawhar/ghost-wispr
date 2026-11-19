@@ -34,11 +34,62 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      # The same apt package cache as CI's Go job (ci.yml), which says why; copied, since the pin
+      # test (deploy/pi/workflow_pins_test.sh) admits no local composite action. This install
+      # timed out six times on 2026-11-11. This runner image gets packages from ports.ubuntu.com
+      # alone, with no mirror to fail over to, and keeps apt's 3 retries of 30 s: 5 retries give a
+      # host that answers 503 for a while 31 s of growing pauses to recover, not 7 s.
+      - name: Name the apt package cache
+        id: apt-key
+        run: |
+          echo "image=apt-release-$ImageOS-$RUNNER_ARCH-$ImageVersion-ffmpeg-portaudio19-dev" >>"$GITHUB_OUTPUT"
+          echo "os=apt-release-$ImageOS-$RUNNER_ARCH-" >>"$GITHUB_OUTPUT"
+
+      - name: Restore the apt package cache
+        id: apt-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-key.outputs.image }}
+          restore-keys: |
+            ${{ steps.apt-key.outputs.image }}-
+            ${{ steps.apt-key.outputs.os }}
+
       - name: Install audio build dependencies
+        id: apt-install
         timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg portaudio19-dev
+          archives="$HOME/apt-archives"
+          mkdir -p "$archives/partial"
+          sudo chmod o+x "$HOME" # so apt's _apt user reaches the directory, and downloads stay sandboxed
+          apt_get=(sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives="$archives"
+            -o Acquire::Retries=5)
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends ffmpeg portaudio19-dev
+          installed=$(dpkg-query -W -f='${Package}_${Version}\n' | sed 's/:/%3a/g')
+          for deb in "$archives"/*.deb; do
+            name=${deb##*/}
+            grep -qxF "${name%_*}" <<<"$installed" || sudo rm -f "$deb"
+          done
+
+      - name: List the apt package cache
+        id: apt-contents
+        if: ${{ !cancelled() && steps.apt-install.outcome != 'skipped' }}
+        env:
+          IMAGE_KEY: ${{ steps.apt-key.outputs.image }}
+        run: |
+          archives="$HOME/apt-archives"
+          sudo chown -R "$(id -u):$(id -g)" "$archives"
+          echo "$(find "$archives" -maxdepth 1 -name '*.deb' | wc -l) packages in the apt cache"
+          sum=$(cd "$archives" && find . -type f -printf '%P %s\n' | sort | sha256sum | cut -c1-16)
+          echo "key=$IMAGE_KEY-$sum" >>"$GITHUB_OUTPUT"
+
+      - name: Save the apt package cache
+        if: ${{ !cancelled() && steps.apt-contents.outputs.key != '' && steps.apt-contents.outputs.key != steps.apt-cache.outputs.cache-matched-key }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-contents.outputs.key }}
 
       - name: Build web assets
         working-directory: web

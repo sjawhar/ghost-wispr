@@ -164,6 +164,40 @@ open, as when it went off outside Ghost Wispr (an unplug, its watchdog, another 
 light-off`), the recorder drops that audio and what the microphone holds, closes it and opens it
 again under a new red check.
 
+`ghost-wispr light-state` prints the blink(1)'s colour and `ghost-wispr light-off` turns it off,
+also while the recorder runs. The blink(1) has one report buffer: a read gets the reply to the
+last command any program sent. So every command Ghost Wispr sends, from the recorder or a
+subcommand, holds an exclusive `flock` on the blink(1)'s hidraw node from the command to its
+reply, and a read takes only a reply that names its own command. A recorder command that does not
+get the lock within 50 ms, or a subcommand's within 2 s, sends nothing: the recorder counts such a
+read as the light not red, and `light-state` prints `unknown` and fails; `/api/status` warns that
+the recording light is busy until the recorder's next look at the light gets through. A waiting
+recorder gets the lock before a subcommand does, so `light-state` runs that finish do not make the
+recorder drop audio. One that is stopped while it holds the lock (Ctrl-Z, `kill -STOP`) does: until
+it is continued, each of the recorder's reads is unknown, so no audio is recorded and the microphone
+opens only once the lock is free. The watchdog tickle and an off write, which wait for no reply,
+are the exception: they are then sent without the lock, so another program that holds the lock does
+not let the watchdog fire while the recorder runs, a pause still turns the light off within 500 ms,
+and `light-off` still turns it off. A red write is not: it sends nothing. The recorder tickles only
+a blink(1) whose stored pattern it found black, since the watchdog plays that pattern. When it
+opens the light again after a device error, it knows the same unit by its serial number, so it needs
+to ask it nothing, and tickles it at once, also while another program holds the lock. Any other
+unit, or one with no serial number, gets off writes only, no tickle and no red, until a check finds
+its pattern black: the one a resume, a gate opening or a microphone open runs before its red
+confirmation, or one that a refused tickle or red write starts. That check sends one command at a
+time, lets the recorder's other commands in between, and runs before a resume or a gate opening
+takes the pause switch, from the web page, the power button or the Jabra alike, so a pause during it
+is not held up and turns the light off at once; the resume, gate opening or microphone open it
+overtakes lights nothing and opens nothing. A press of the power button or the Jabra that resumes
+returns at once and checks the light in the background. Each press reads the pause switch, except
+while that button's own resume is still checking the light with no pause since: then the press
+counts the unit as resumed and pauses. The Jabra's mute light shows what its button counts: unmuted
+during that button's own resume, and the pause switch otherwise. A refused resume leaves the switch
+off and lights the Jabra's mute light again, so the next press resumes again. A save of the black pattern that does not reach
+the unit leaves it unknown, so it is checked again when it comes back. Programs that do not take the
+lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
+answer the recorder's.
+
 A session starts when Deepgram hears the end of its first stretch of speech, and its recording
 starts 5 s before the first word the live transcript holds, so the recording and the refined
 transcript that replaces the live one hold every word from the first. To do that, while no session

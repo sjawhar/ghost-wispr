@@ -311,21 +311,19 @@ const micRetryEvery = 15 * time.Second
 
 // resumeWaiter is the part of the capture gate a microphone start waits on:
 // waitResumed blocks until the gate is open, prepareMicOpen readies the
-// hardware before the start opens the microphone, openUnderRed runs the start
-// with the recording light confirmed and held red, and finishResume ends a
-// resume's "resuming" state once the start that brings capture back has
-// finished.
+// hardware before the start opens the microphone, and startUnderRed runs the
+// start with the recording light confirmed and held red, then ends a resume's
+// "resuming" state unless a pause cancelled the start.
 type resumeWaiter interface {
 	waitResumed(ctx context.Context) bool
 	prepareMicOpen(ctx context.Context) bool
-	openUnderRed(open func() error) error
-	finishResume()
+	startUnderRed(start func() error) error
 }
 
 // retryMicStartup runs start every retryInterval until it succeeds or ctx
 // ends. A paused instance opens no input device: a retry that comes due
 // while capture is paused waits (capture.waitResumed) until capture resumes.
-// Each attempt runs under a red hold (openUnderRed): the PortAudio scan and the
+// Each attempt runs under a red hold (startUnderRed): the PortAudio scan and the
 // device open it makes both open capture streams. A light that cannot be
 // confirmed red fails the attempt before either.
 func retryMicStartup(
@@ -356,8 +354,9 @@ func retryMicStartup(
 			return
 		}
 		// A pause while it waits for the Jabra (prepareMicOpen) cancels the
-		// attempt; the next comes once capture resumes.
+		// attempt; the next comes once capture resumes, without the interval.
 		if !capture.prepareMicOpen(ctx) {
+			wait = false
 			continue
 		}
 
@@ -371,12 +370,10 @@ func retryMicStartup(
 			return
 		}
 
-		// The attempt, whether it works or not, ends a resume's "resuming"
-		// state: readiness then reports what came back.
-		err := capture.openUnderRed(start)
-		capture.finishResume()
+		err := capture.startUnderRed(start)
 		if errors.Is(err, errMicStartPaused) {
-			// A pause cancelled the attempt: the next resume tries again.
+			// A pause cancelled the attempt: the next resume tries again, and
+			// that attempt ends the resume's "resuming" state.
 			wait = false
 			continue
 		}
@@ -396,19 +393,20 @@ func retryMicStartup(
 
 // startMicrophone opens the input device and starts capture with start, and
 // runs retry in loops if start fails. start runs only under a red hold
-// (openUnderRed): the light is confirmed red before it, and held red until it
+// (startUnderRed): the light is confirmed red before it, and held red until it
 // returns, so every capture stream it opens, the PortAudio scan's included,
 // opens while the light last read red. A paused instance opens no input device
 // until it resumes: while the capture gate is closed, start runs in loops once
 // the gate opens and the hardware is ready for it (prepareMicOpen), with atBoot
-// false, and startMicrophone returns deferred true; that start, whether it
-// works or not, ends the resume's "resuming" state (finishResume). A pause
-// while it waits for the hardware, or one that cancels the start before it
-// opens a device (errMicStartPaused), cancels that resume, and the next
-// resume starts the microphone. Otherwise start runs at once with atBoot true,
-// so it can write the start-up status, and startMicrophone returns its error:
-// one that wraps errLightNotConfirmed if the light refused it, or
-// errNoCaptureDevice, and start did not run.
+// false, and startMicrophone returns deferred true. A pause while it waits for
+// the hardware, or one that cancels the start before it opens a device
+// (errMicStartPaused), cancels that resume, and the next resume starts the
+// microphone. Otherwise start runs at once with atBoot true, so it can write
+// the start-up status, and startMicrophone returns its error: one that wraps
+// errLightNotConfirmed if the light refused it, or errNoCaptureDevice, and
+// start did not run. Every start, whether it works or not, ends the "resuming"
+// state of a resume that came before or during it, unless a pause cancelled
+// it: that resume is then resuming until the start after it finishes.
 //
 // Nothing runs in loops before booted closes, once start-up has sent its
 // component statuses: a power-button resume can come during start-up, and
@@ -435,15 +433,13 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 					break
 				}
 			}
-			err := capture.openUnderRed(func() error { return start(false) })
-			capture.finishResume()
-			switch {
-			case err == nil:
-				return
-			case errors.Is(err, errMicStartPaused):
+			err := capture.startUnderRed(func() error { return start(false) })
+			if errors.Is(err, errMicStartPaused) {
 				continue
 			}
-			retry()
+			if err != nil {
+				retry()
+			}
 			return
 		}
 	}
@@ -451,7 +447,7 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 		afterBoot(startOnResume)
 		return true, nil
 	}
-	err = capture.openUnderRed(func() error { return start(true) })
+	err = capture.startUnderRed(func() error { return start(true) })
 	switch {
 	case err == nil:
 		return false, nil
@@ -1391,7 +1387,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	pauseControls := newPersistentControls(
 		store,
 		func() { pauseCapture(capture, hardware) },
-		capture.RequestResume,
+		capture,
 		hub.BroadcastStatusChanged,
 	)
 	wirePauseControls(controlHooks, pauseControls, capture, hardware, warningRegistry)
@@ -1661,7 +1657,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
-		if err := startOpenedMic(capture, ordered, func() { micRef.Store(nil) }, log.Printf); err != nil {
+		if err := startOpenedMic(capture, ordered, func() { micRef.Store(nil) }, log.Printf); errors.Is(err, errMicStartPaused) {
+			// A pause came during the light's check: as during the scan, the
+			// next resume starts again (startMicrophone).
+			return err
+		} else if err != nil {
 			warning, status := micStartFailureMessages(err)
 			if warning != "" {
 				warningRegistry.Set("microphone", warning)
@@ -2065,7 +2065,14 @@ func streamMicWithRetry(
 					return
 				}
 			}
-			if err = capture.confirmMicOpen(); err != nil {
+			if err = capture.confirmMicOpen(); errors.Is(err, errMicStartPaused) {
+				// A pause came during the light's check: nothing is lit or
+				// opened, and the loop top waits for the next resume. The
+				// resuming state is left to that resume's own open: a resume
+				// that came after the pause is still starting.
+				released = true
+				continue
+			} else if err != nil {
 				if errors.Is(err, errNoCaptureDevice) {
 					logf("no capture device present; the microphone opens once one is")
 				} else {
@@ -2082,6 +2089,15 @@ func streamMicWithRetry(
 			}
 			err = streamer.Open()
 			capture.finishMicStart()
+			if err == nil && capture.closedSinceMicOpen() {
+				// A pause, or a hold for the light, came during the red
+				// confirmation or the open, and a resume may have opened the
+				// gate again since: the device may have captured through the
+				// pause. Close it, which drops what it holds, and open it
+				// again once capture is back.
+				reopen, reopenWhy = true, "after a pause during its open"
+				continue
+			}
 			// This start, whether it works or not, ends the resume's
 			// "resuming" state: readiness then reports what came back.
 			capture.finishResume()
@@ -2136,6 +2152,11 @@ func streamMicWithRetry(
 			if errors.Is(err, errLightWentOff) {
 				logf("the recording light was not red while the microphone was open; reopening the microphone")
 				reopen, reopenWhy = true, "after the recording light was not red"
+				continue
+			}
+			if errors.Is(err, errClosedSinceMicOpen) {
+				logf("the capture gate closed while the microphone was open; reopening the microphone")
+				reopen, reopenWhy = true, "after a pause while it was open"
 				continue
 			}
 		}
@@ -2313,14 +2334,19 @@ func micHeldWarning(warnings *warningsRegistry) func(held bool) {
 // reopenMic reopens the device once a capture device is present and the
 // recording light is confirmed red, and reports each step on hub. It returns
 // false, having closed the device and reopened nothing, when the light cannot
-// be confirmed red; otherwise true and the reopen's error, which is
-// errNoCaptureDevice, with the device closed and the light left off, while no
-// capture device is present.
+// be confirmed red or a pause came during its check (errMicStartPaused);
+// otherwise true and the reopen's error, which is errNoCaptureDevice, with the
+// device closed and the light left off, while no capture device is present.
 func reopenMic(capture *captureGate, streamer micStreamer, logf func(string, ...any), hub *server.Hub) (bool, error) {
 	if hub != nil {
 		hub.BroadcastComponentStatus("mic", storage.ComponentStatusReconnecting, "Attempting to reconnect microphone...")
 	}
-	if err := capture.confirmMicOpen(); errors.Is(err, errNoCaptureDevice) {
+	if err := capture.confirmMicOpen(); errors.Is(err, errMicStartPaused) {
+		// A pause came during the light's check: the loop top waits for the
+		// next resume, and opens the device under its own confirmation.
+		closeMic(capture, streamer, "for capture pause", logf)
+		return false, nil
+	} else if errors.Is(err, errNoCaptureDevice) {
 		logf("no capture device present; the microphone reconnects once one is")
 		closeMic(capture, streamer, "with no capture device present", logf)
 		if hub != nil {
