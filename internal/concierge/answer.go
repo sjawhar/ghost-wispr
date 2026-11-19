@@ -169,11 +169,12 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		return c.routingLine(ctx, turn)
 	})()
 	// An "ask", or a question the record cannot answer, goes to the live
-	// holder once the holder is known.
+	// holder once the holder is known; a follow-up turn said with no wake
+	// phrase goes only on "ask".
 	var onHolder func(*reading)
-	if saysAsk(turn) || !aboutStatus(turn) {
+	if saysAsk(turn) || !aboutStatus(turn) && !x.FollowUpTurn {
 		onHolder = func(early *reading) {
-			if session := c.askPlan(turn, early); session != "" {
+			if session := c.askPlan(turn, early, x.FollowUpTurn); session != "" {
 				startAsk(session, early)
 			}
 		}
@@ -231,7 +232,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		}
 	}
 	holderCase := found.holderCase()
-	if session := c.askPlan(turn, found); session != "" {
+	if session := c.askPlan(turn, found, x.FollowUpTurn); session != "" {
 		startAsk(session, found)
 	}
 	searchesLeft := maxSearches - aheadSearches
@@ -466,18 +467,22 @@ type askResult struct {
 }
 
 // askPlan names the live holder's session when R7 asks it now: the person
-// said "ask", the question is not about status, or the record has no event
-// from the last 60 minutes. It names none for a holder that is a person,
-// nobody, or a session not answering, nor for an issue a search took with no
-// one clear match: the voice asks which issue first (R5).
-func (c *Concierge) askPlan(turn string, found *reading) string {
+// said "ask", or, but for a follow-up turn said with no wake phrase, the
+// question is not about status or the record has no event from the last 60
+// minutes. It names none for a holder that is a person, nobody, or a session
+// not answering, nor for an issue a search took with no one clear match:
+// the voice asks which issue first (R5).
+func (c *Concierge) askPlan(turn string, found *reading, followUp bool) string {
 	session, _ := found.holder["session"].(string)
 	switch {
 	case found.holder["holder"] != "session" || found.holder["live"] != true || session == "":
 		return ""
 	case found.searched && !found.clear:
 		return ""
-	case !saysAsk(turn) && aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord:
+	case saysAsk(turn):
+	case followUp:
+		return ""
+	case aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord:
 		return ""
 	}
 	return session

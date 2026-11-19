@@ -908,3 +908,89 @@ func TestThePromptKeepsTheAgentsToolForAgentQuestions(t *testing.T) {
 		t.Fatal("the system prompt does not keep list_joined_agents for agent questions")
 	}
 }
+
+// TestAnAskReadBeforeTheSessionExistedGoesOut (R7; PR #89's review, finding
+// 4): "ask the agent on ABC-12 …" heard before the recording session existed
+// reads the holder with no session id; the answer, with the id, asks it.
+// Exactly one question goes either way.
+func TestAnAskReadBeforeTheSessionExistedGoesOut(t *testing.T) {
+	const turn = "ask the agent on ABC-12 whether the tap is merged"
+	for _, early := range []bool{false, true} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		x := r.exchange
+		if early {
+			x.SessionID = ""
+		}
+		r.concierge.Heard(context.Background(), &x, turn)
+		eventually(t, "the read-ahead of ABC-12", func() bool { return slices.Contains(r.records.calls(), "ABC-12") })
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		spoken := answerTurn(t, r, turn)
+		r.agents.mu.Lock()
+		sent := len(r.agents.sent)
+		r.agents.mu.Unlock()
+		if sent != 1 {
+			t.Fatalf("early %v: %d questions went to the holder, want 1; the voice said %+v", early, sent, spoken)
+		}
+	}
+}
+
+// TestEarlyStateGoesWithTheMeetingOrTheGate (PR #89's review): what the
+// Concierge read, offered or named for an exchange heard before its session
+// existed, held under no session id, goes on a session's end, its delete,
+// and the gate closing, as the session's own does.
+func TestEarlyStateGoesWithTheMeetingOrTheGate(t *testing.T) {
+	for _, how := range []string{"end", "delete", "gate"} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		x := r.exchange
+		x.SessionID = ""
+		r.concierge.Heard(context.Background(), &x, "ask the agent on ABC-12 whether the tap is merged")
+		eventually(t, "the early read named the holder", func() bool { return r.concierge.wasNamed(&x, "agent-7") })
+		r.concierge.offerPick(&x, "the realtime voice", []candidate{{"ABC-12", "Realtime voice"}, {"ABC-13", "Wake word"}})
+		switch how {
+		case "end":
+			_ = r.concierge.SessionEnded("meeting-1")
+		case "delete":
+			r.concierge.SessionDeleted("meeting-1")
+		case "gate":
+			r.concierge.GateClosed()
+		}
+		r.concierge.mu.Lock()
+		left := len(r.concierge.prefetches) + len(r.concierge.picks) + len(r.concierge.named)
+		r.concierge.mu.Unlock()
+		if left != 0 {
+			t.Errorf("%s: %d early entries left", how, left)
+		}
+	}
+}
+
+// TestAFollowUpTurnIsAskedOnlyWhenItSaysAsk (R7; PR #89's review): a turn
+// said in the follow-up window with no wake phrase ("should we tell the
+// voice team before the demo?") is answered from the record, and goes to the
+// holder only when it says "ask"; a turn with a wake phrase is asked as R7
+// says.
+func TestAFollowUpTurnIsAskedOnlyWhenItSaysAsk(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		followUp bool
+		turn     string
+		asked    bool
+	}{
+		{"follow-up, not about status", true, "should ABC-12 wait for the demo", false},
+		{"follow-up that says ask", true, "ask the agent on ABC-12 whether it should wait for the demo", true},
+		{"woken, not about status", false, "should ABC-12 wait for the demo", true},
+	} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		r.exchange.FollowUpTurn = c.followUp
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		answerTurn(t, r, c.turn)
+		r.agents.mu.Lock()
+		asked := len(r.agents.sent) == 1
+		r.agents.mu.Unlock()
+		if asked != c.asked {
+			t.Errorf("%s: asked %v, want %v", c.name, asked, c.asked)
+		}
+	}
+}

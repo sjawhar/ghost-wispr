@@ -107,15 +107,21 @@ func TestSearchSendsTheQueryAndTheBearerToken(t *testing.T) {
 }
 
 // TestSearchKeywordsAsksForWordsOnly: the keyword-only search asks Dispatch
-// for its words leg alone, which reaches no embedding model.
+// for its words leg alone, which reaches no embedding model, on the route
+// that declares keywords_only: an older Dispatch answers the plain search
+// route with the member dropped, a full search.
 func TestSearchKeywordsAsksForWordsOnly(t *testing.T) {
 	fake, client := newFakeDispatch(t)
-	fake.answer("/api/v1/search", `{"results":[{"kind":"issue","issue":{"key":"ABC-12","title":"Realtime voice","status":"backlog"},"rank":0.5}]}`)
+	fake.answer("/api/v1/search/results", `{"results":[{"kind":"issue","issue":{"key":"ABC-12","title":"Realtime voice","status":"backlog"},"rank":0.5}]}`)
 	hits, err := client.SearchKeywords(context.Background(), "realtime voice", 5)
 	if err != nil {
 		t.Fatalf("SearchKeywords: %v", err)
 	}
-	query := fake.last().URL.Query()
+	request := fake.last()
+	query := request.URL.Query()
+	if request.URL.Path != "/api/v1/search/results" {
+		t.Errorf("path = %q, want /api/v1/search/results", request.URL.Path)
+	}
 	if query.Get("keywords_only") != "true" || query.Get("q") != "realtime voice" || query.Get("limit") != "5" {
 		t.Errorf("query = %v, want keywords_only=true with q and limit", query)
 	}
