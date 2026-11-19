@@ -202,7 +202,7 @@ readonly tailscale_subject
 deepgram_key=$(require_single_line_file deepgram-key)
 readonly deepgram_key
 dispatch_token=""
-if [[ -e "$staging_dir/dispatch-token" ]]; then
+if [[ -e "$staging_dir/dispatch-token" || -L "$staging_dir/dispatch-token" ]]; then
   [[ -f "$staging_dir/dispatch-token" && ! -L "$staging_dir/dispatch-token" ]] || fail "dispatch-token must be a regular file"
   dispatch_token=$(require_single_line_file dispatch-token)
 fi

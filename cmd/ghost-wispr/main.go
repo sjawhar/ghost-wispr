@@ -477,19 +477,35 @@ type voiceListener interface {
 	OnUtteranceEnd(closings int, gateOpen bool)
 }
 
-// Message hands a Deepgram result to the session manager, then to the voice,
-// with the capture gate's stamp taken as it arrived.
+// keptMessager is a session manager that reports what of each result its
+// transcript keeps (session.Manager.MessageKept): words from before the latest
+// pause are dropped, and the voice reads exactly what is left.
+type keptMessager interface {
+	MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error)
+}
+
+// Message hands a Deepgram result to the session manager, then what the
+// manager's transcript kept of it to the voice, with the capture gate's stamp
+// taken as the result arrived.
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
-	var t *voice.Transcript
-	if c.voice != nil {
-		t = voiceTranscript(mr, c.stamp)
+	var closings int
+	open := true
+	if c.stamp != nil {
+		closings, open = c.stamp()
 	}
+	kept := mr
 	var err error
-	if c.manager != nil {
-		err = c.manager.Message(mr)
+	switch manager := c.manager.(type) {
+	case nil:
+	case keptMessager:
+		kept, err = manager.MessageKept(mr)
+	default:
+		err = manager.Message(mr)
 	}
-	if t != nil {
-		c.voice.OnTranscript(t)
+	if c.voice != nil && kept != nil {
+		if t := voiceTranscript(kept, func() (int, bool) { return closings, open }); t != nil {
+			c.voice.OnTranscript(t)
+		}
 	}
 	return err
 }

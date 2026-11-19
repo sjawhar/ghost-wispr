@@ -159,6 +159,15 @@ type Supervisor struct {
 	recent        []TurnText
 	lastHeard     time.Time // the last word heard
 	chimedAt      time.Time
+	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
+	wg            sync.WaitGroup // the goroutines Close waits for
+}
+
+// heardCall is one Concierge.Heard call, made outside the lock.
+type heardCall struct {
+	ctx   context.Context
+	x     Exchange
+	words string
 }
 
 type pendingAnswer struct {
@@ -236,12 +245,16 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 		floor:  floor,
 	}
 	s.unlisten = cfg.Speaker.OnSpeech(s.onSpeech)
-	go s.sendNotes()
-	go s.offerAnswers()
+	s.spawn(s.sendNotes)
+	s.spawn(s.offerAnswers)
 	return s
 }
 
+// closeWait bounds how long Close waits for the Supervisor's goroutines.
+const closeWait = 2 * time.Second
+
 // Close stops every exchange, as shutdown does, and the Supervisor with it.
+// It waits, up to closeWait, for every goroutine it started to return.
 func (s *Supervisor) Close() {
 	s.mu.Lock()
 	if s.closed {
@@ -253,6 +266,23 @@ func (s *Supervisor) Close() {
 	s.mu.Unlock()
 	s.unlisten()
 	s.cancel()
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(closeWait):
+		s.logf("voice: a goroutine of the voice did not return within %v of shutdown", closeWait)
+	}
+}
+
+// spawn runs f on a goroutine that Close waits for. A goroutine it starts
+// runs while another of its goroutines runs, or before Close.
+func (s *Supervisor) spawn(f func()) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		f()
+	}()
 }
 
 // GateClosed stops every exchange because the capture gate closed, for a pause
@@ -263,6 +293,7 @@ func (s *Supervisor) GateClosed(closings int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closings = max(s.closings, closings)
+	s.recent = nil // a delete may follow, and a pause ends the session
 	s.stopLocked("capture gate closed")
 }
 
@@ -341,7 +372,19 @@ func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool) {
 // commands, and barge-in.
 func (s *Supervisor) OnTranscript(t *Transcript) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.onTranscriptLocked(t)
+	heard := s.heard
+	s.heard = nil
+	s.mu.Unlock()
+	// The Concierge's Heard takes its own lock: never under the Supervisor's,
+	// so a stop never waits on it. One reader calls OnTranscript, so the calls
+	// keep their order.
+	for i := range heard {
+		s.cfg.Concierge.Heard(heard[i].ctx, &heard[i].x, heard[i].words)
+	}
+}
+
+func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 	// A Finalize reply, a result that arrived while the gate was closed, or one
 	// from before the latest closing is about audio from before a stop.
 	if s.closed || t.FromFinalize || !t.GateOpen || t.Closings < s.closings || strings.TrimSpace(t.Text) == "" {
@@ -368,6 +411,10 @@ func (s *Supervisor) OnTranscript(t *Transcript) {
 		same := ex != nil && ex.answer == nil && sameStart(ex.wakeStart, wakeStart(t, m))
 		switch {
 		case cmd == transcript.GoAhead:
+			if ex != nil && ex.answer == nil && !ex.answering && !ex.drives {
+				// The wake that this invitation's own interim opened.
+				s.endLocked(ex, true, "Wispr, go ahead")
+			}
 			s.goAheadLocked()
 		case same && !ex.answering:
 			s.turnLocked(ex, t, m.Rest)
@@ -394,6 +441,12 @@ func (s *Supervisor) OnTranscript(t *Transcript) {
 		return
 	}
 	s.touchLocked(ex)
+	if t.IsFinal && ex.answer == nil && !ex.answering && !ex.drives && covers(t.Words, ex.wakeStart) {
+		// The final result of the words an interim wake came from holds no
+		// wake: it was misheard, and nobody addressed Wispr.
+		s.endLocked(ex, true, "the wake was misheard")
+		return
+	}
 	if !ex.answering && !ex.drives {
 		s.turnLocked(ex, t, t.Text)
 		return
@@ -406,13 +459,10 @@ func (s *Supervisor) OnTranscript(t *Transcript) {
 		}
 		// A voice that drives its own turn stops speaking at once and stays
 		// open: its vendor hears the interruption and answers it.
-		sess := ex.session
-		go func() {
-			if sess != nil {
-				sess.Interrupt()
-			}
-			s.cfg.Speaker.Cancel(audio.InputVoice)
-		}()
+		s.cfg.Speaker.Cancel(audio.InputVoice)
+		if sess := ex.session; sess != nil {
+			s.spawn(sess.Interrupt)
+		}
 	}
 }
 
@@ -443,7 +493,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	s.noteLocked(ex, EventWakeHeard, sessionID)
 	s.turnLocked(ex, t, m.Rest)
 	x := ex.x
-	go s.open(ex, voice, &x, true)
+	s.spawn(func() { s.open(ex, voice, &x, true) })
 }
 
 // open opens ex's voice and, for a wake, plays the wake chime alongside.
@@ -452,7 +502,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 	s.cfg.Speaker.Cancel(audio.InputVoice)
 	if chime {
-		go s.playChime(ex.ctx, WakeChime(), ex.wakeAt)
+		s.spawn(func() { s.playChime(ex.ctx, WakeChime(), ex.wakeAt) })
 	}
 	sess, err := voice.Open(ex.ctx, x)
 	s.mu.Lock()
@@ -460,11 +510,16 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 	defer close(ex.opened)
 	if err != nil {
 		s.logf("voice: open the voice: %v", err)
+		if p := ex.answer; p != nil && !ex.ended {
+			// Not heard: it waits for "Wispr, go ahead" again.
+			p.needsInvite = true
+			s.pending = append([]*pendingAnswer{p}, s.pending...)
+		}
 		s.endLocked(ex, false, "the voice did not open")
 		return
 	}
 	if ex.ended {
-		go func() { _ = sess.Close() }()
+		s.spawn(func() { _ = sess.Close() })
 		return
 	}
 	ex.session = sess
@@ -472,7 +527,7 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 		s.noteLocked(ex, EventExchangeStarted, x.SessionID)
 		s.touchLocked(ex)
 	}
-	go s.readEvents(ex, sess)
+	s.spawn(func() { s.readEvents(ex, sess) })
 }
 
 // playChime plays pcm on the chime input, in 20 ms frames.
@@ -569,8 +624,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	turn := s.turnOf(ex)
 	ex.x.AskerTurn = turn
 	if turn != "" {
-		x := ex.x
-		s.cfg.Concierge.Heard(ex.ctx, &x, turn)
+		s.heard = append(s.heard, heardCall{ctx: ex.ctx, x: ex.x, words: turn})
 	}
 	if ex.drives {
 		return // the vendor drives the turn
@@ -622,7 +676,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange) {
 	ex.x.Recent = s.recentLocked()
 	s.noteLocked(ex, EventExchangeStarted, ex.x.SessionID)
 	x := ex.x
-	go s.answer(ex, &x, turn)
+	s.spawn(func() { s.answer(ex, &x, turn) })
 }
 
 // answer runs the Concierge on the turn and speaks what it says, then ends
@@ -700,7 +754,7 @@ func (s *Supervisor) goAheadLocked() {
 
 // speakLocked speaks a held answer in an exchange of its own.
 func (s *Supervisor) speakLocked(p *pendingAnswer) {
-	s.pending = s.pending[1:]
+	s.pending = slices.DeleteFunc(s.pending, func(q *pendingAnswer) bool { return q == p })
 	ctx, cancel := context.WithTimeout(s.ctx, exchangeMax)
 	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), answering: true, answer: p, wakeStart: -1, notified: map[string]bool{}}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
@@ -709,7 +763,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
 	x := ex.x
 	voice := s.cfg.Voice()
-	go func() {
+	s.spawn(func() {
 		s.open(ex, voice, &x, false)
 		select {
 		case <-ex.opened:
@@ -741,7 +795,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		if s.finish(ex, p.SessionID) {
 			s.spoken(p.TaskID)
 		}
-	}()
+	})
 }
 
 func (s *Supervisor) spoken(taskID string) {
@@ -786,6 +840,8 @@ func (s *Supervisor) offerAnswers() {
 	}
 }
 
+// offer chimes each held answer once while the light reads red, and speaks by
+// itself the oldest one that needs no invitation, once the room is silent.
 func (s *Supervisor) offer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -793,17 +849,19 @@ func (s *Supervisor) offer() {
 		return
 	}
 	now := time.Now()
-	p := s.pending[0]
-	if !p.chimed {
+	for _, p := range s.pending {
+		if p.chimed {
+			continue
+		}
 		p.chimed = true
 		s.chimedAt = now
 		ctx, cancel := context.WithCancel(s.ctx)
 		s.chimeCancel = cancel
-		go func() {
+		s.spawn(func() {
 			defer cancel()
 			s.playChime(ctx, AnswerChime(), time.Time{})
-		}()
-		return
+		})
+		return // one chime at a time; the next offer chimes the next
 	}
 	quietSince := s.lastHeard
 	for _, t := range []time.Time{s.voiceEnded, s.chimedAt} {
@@ -811,10 +869,15 @@ func (s *Supervisor) offer() {
 			quietSince = t
 		}
 	}
-	if p.needsInvite || s.voiceSpeaking || now.Sub(quietSince) < s.cfg.SilenceWait {
+	if s.voiceSpeaking || now.Sub(quietSince) < s.cfg.SilenceWait {
 		return
 	}
-	s.speakLocked(p)
+	for _, p := range s.pending {
+		if !p.needsInvite {
+			s.speakLocked(p)
+			return
+		}
+	}
 }
 
 // stopLocked ends the exchange holding the floor for reason, and makes every
@@ -832,7 +895,7 @@ func (s *Supervisor) stopLocked(reason string) {
 		s.endLocked(ex, true, reason)
 		return
 	}
-	go s.cfg.Speaker.Cancel(audio.InputChime)
+	s.cfg.Speaker.Cancel(audio.InputChime)
 }
 
 // endLocked ends ex. cut says a stop or a barge-in ended it: its voice and
@@ -861,28 +924,31 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 			ex.answer.needsInvite = true
 			s.pending = append([]*pendingAnswer{ex.answer}, s.pending...)
 		} else {
-			go s.spoken(ex.answer.TaskID)
+			s.spawn(func() { s.spoken(ex.answer.TaskID) })
 		}
 	}
 	sess := ex.session
 	s.logf("voice: exchange ended (%s)", reason)
-	// Its context first: a chime or a speech whose playback begins after the
-	// speaker's cancel below cannot then play.
+	// Its context first, then the speaker, both at once under the lock: a
+	// chime or a speech whose playback begins after this cannot play, and a
+	// cut landing late can never end the next exchange's chime. The voice's
+	// own interrupt and close may wait on its vendor, so they run apart.
 	ex.cancel()
-	go func() {
+	if cut {
+		s.cfg.Speaker.Cancel(audio.InputVoice)
+		s.cfg.Speaker.Cancel(audio.InputChime)
+	}
+	s.spawn(func() {
+		if sess == nil {
+			return
+		}
 		if cut {
-			if sess != nil {
-				sess.Interrupt()
-			}
-			s.cfg.Speaker.Cancel(audio.InputVoice)
-			s.cfg.Speaker.Cancel(audio.InputChime)
+			sess.Interrupt()
 		}
-		if sess != nil {
-			if err := sess.Close(); err != nil {
-				s.logf("voice: close the voice: %v", err)
-			}
+		if err := sess.Close(); err != nil {
+			s.logf("voice: close the voice: %v", err)
 		}
-	}()
+	})
 }
 
 // takeFloorLocked makes ex the exchange holding the floor.
@@ -1047,6 +1113,15 @@ func wakeLag(t *Transcript, m transcript.Match) time.Duration {
 	}
 	lag := t.Words[len(t.Words)-1].End - wakeStart(t, m)
 	return max(0, time.Duration(lag*float64(time.Second)))
+}
+
+// covers reports whether words span the stream time at, within 50 ms: the
+// final result of the words an interim result held.
+func covers(words []Word, at float64) bool {
+	if len(words) == 0 {
+		return false
+	}
+	return words[0].Start <= at+0.05 && at <= words[len(words)-1].End
 }
 
 func sameStart(a, b float64) bool {

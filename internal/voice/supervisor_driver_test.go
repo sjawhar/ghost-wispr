@@ -82,6 +82,7 @@ func TestADriverBargeInStopsTheSpeechAndKeepsTheSession(t *testing.T) {
 	r.heard("Wispr, what is happening?", true, true)
 	sess := r.waitSession()
 	speakAs(t, sess, "The issue is in review since this morning.")
+	r.waitSpeaking()
 	r.heard("wait, who holds it?", false, false)
 	eventually(t, "the speech interrupted", func() bool { i, _, _ := sess.state(); return !i.IsZero() })
 	if _, ok := r.speaker.cancelledAt(audio.InputVoice); !ok {
@@ -98,6 +99,7 @@ func TestAnIdleDriverExchangeEnds(t *testing.T) {
 	r.heard("Wispr, what is happening?", true, true)
 	sess := r.waitSession()
 	speakAs(t, sess, "The issue is in review since this morning.")
+	r.waitSpeaking()
 	never(t, "an exchange ended while its voice spoke", 600*time.Millisecond, func() bool { _, _, closed := sess.state(); return closed })
 	r.speaker.finish(audio.InputVoice)
 	eventually(t, "the idle exchange ended", func() bool { _, _, closed := sess.state(); return closed })

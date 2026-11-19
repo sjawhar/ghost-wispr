@@ -185,6 +185,7 @@ func TestBargeIn(t *testing.T) {
 			r := newRig(t, fc)
 			sess := r.ask("what is happening?")
 			waitSaid(t, sess)
+			r.waitSpeaking()
 			r.heard(c.heard, false, false)
 			if c.stops {
 				eventually(t, "a barge-in", func() bool { i, _, _ := sess.state(); return !i.IsZero() })
@@ -206,6 +207,7 @@ func TestWordsFarApartAreNotABargeIn(t *testing.T) {
 	r := newRig(t, fc)
 	sess := r.ask("what is happening?")
 	waitSaid(t, sess)
+	r.waitSpeaking()
 	tr := transcriptOf("wait there", 50, false, false, 0)
 	tr.Words[1].Start = tr.Words[0].Start + 0.9
 	r.s.OnTranscript(&tr)
@@ -220,6 +222,7 @@ func TestOwnWordsAreNotABargeInOrAWake(t *testing.T) {
 	r := newRig(t, fc)
 	sess := r.ask("what is happening?")
 	waitSaid(t, sess)
+	r.waitSpeaking()
 
 	r.heard("the voice issue is in review since", false, false)
 	r.heard("Wispr here: the voice issue is in review", true, true)

@@ -29,10 +29,14 @@ type fakeSpeaker struct {
 	nextID    int
 	began     chan string              // each Begin's input
 	hold      map[string]chan struct{} // a Begin on this input waits until it closes
+	events    chan audio.SpeechEvent
+	// cancelDelay holds each Cancel of an input back, as a late cancel does.
+	cancelDelay map[string]time.Duration
+	writePace   map[string]time.Duration // each Write on an input takes this long
 }
 
 func newFakeSpeaker() *fakeSpeaker {
-	return &fakeSpeaker{
+	s := &fakeSpeaker{
 		writes:    map[string]int{},
 		cancels:   map[string]time.Time{},
 		speaking:  map[string]bool{},
@@ -40,7 +44,24 @@ func newFakeSpeaker() *fakeSpeaker {
 		finished:  map[string]chan struct{}{},
 		listeners: map[int]func(audio.SpeechEvent){},
 		began:     make(chan string, 64),
+		events:    make(chan audio.SpeechEvent, 256),
 	}
+	// Speech events reach listeners in order on a goroutine of the speaker's,
+	// as audio.Output sends them: never inside Cancel or Write.
+	go func() {
+		for e := range s.events {
+			s.mu.Lock()
+			fns := make([]func(audio.SpeechEvent), 0, len(s.listeners))
+			for _, fn := range s.listeners {
+				fns = append(fns, fn)
+			}
+			s.mu.Unlock()
+			for _, fn := range fns {
+				fn(e)
+			}
+		}
+	}()
+	return s
 }
 
 func (s *fakeSpeaker) Begin(input string) Playback {
@@ -81,6 +102,10 @@ func (s *fakeSpeaker) holdBegins(input string) (release func()) {
 
 func (s *fakeSpeaker) Cancel(input string) {
 	s.mu.Lock()
+	delay := s.cancelDelay[input]
+	s.mu.Unlock()
+	time.Sleep(delay)
+	s.mu.Lock()
 	s.cancels[input] = time.Now()
 	s.gen[input]++
 	if ch := s.finished[input]; ch != nil {
@@ -109,15 +134,28 @@ func (s *fakeSpeaker) OnSpeech(fn func(audio.SpeechEvent)) func() {
 }
 
 func (s *fakeSpeaker) emit(e audio.SpeechEvent) {
+	s.events <- e
+}
+
+// paceWrites makes every Write on input take d, as the device plays it.
+func (s *fakeSpeaker) paceWrites(input string, d time.Duration) {
 	s.mu.Lock()
-	fns := make([]func(audio.SpeechEvent), 0, len(s.listeners))
-	for _, fn := range s.listeners {
-		fns = append(fns, fn)
+	defer s.mu.Unlock()
+	if s.writePace == nil {
+		s.writePace = map[string]time.Duration{}
 	}
-	s.mu.Unlock()
-	for _, fn := range fns {
-		fn(e)
+	s.writePace[input] = d
+}
+
+// delayCancels makes every Cancel of input wait d before it acts, as a cancel
+// sent late from another goroutine does.
+func (s *fakeSpeaker) delayCancels(input string, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancelDelay == nil {
+		s.cancelDelay = map[string]time.Duration{}
 	}
+	s.cancelDelay[input] = d
 }
 
 // finish plays out what input holds: its playbacks drain, and its speech
@@ -157,6 +195,10 @@ type fakePlayback struct {
 
 func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
 	s := p.s
+	s.mu.Lock()
+	pace := s.writePace[p.input]
+	s.mu.Unlock()
+	time.Sleep(pace)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -214,9 +256,18 @@ type fakeVoice struct {
 
 func newFakeVoice() *fakeVoice { return &fakeVoice{opened: make(chan *fakeSession, 16)} }
 
+func (v *fakeVoice) failOpens(err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.openErr = err
+}
+
 func (v *fakeVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
-	if v.openErr != nil {
-		return nil, v.openErr
+	v.mu.Lock()
+	err := v.openErr
+	v.mu.Unlock()
+	if err != nil {
+		return nil, err
 	}
 	v.mu.Lock()
 	s := &fakeSession{x: *x, events: make(chan Event, 64), said: make(chan string, 16), sayErr: v.sayErr}
@@ -354,12 +405,6 @@ type fakeConcierge struct {
 	spoken    []string
 	asked     chan string
 	heard     []heardCall
-}
-
-type heardCall struct {
-	ctx   context.Context
-	x     Exchange
-	words string
 }
 
 func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
@@ -569,6 +614,17 @@ func (r *rig) waitTurn() string {
 		r.t.Fatal("the Concierge got no turn")
 		return ""
 	}
+}
+
+// waitSpeaking waits until the Supervisor has heard that the voice input
+// speaks: speech events reach it on the speaker's goroutine, after the write.
+func (r *rig) waitSpeaking() {
+	r.t.Helper()
+	eventually(r.t, "the voice input speaking", func() bool {
+		r.s.mu.Lock()
+		defer r.s.mu.Unlock()
+		return r.s.voiceSpeaking
+	})
 }
 
 func (r *rig) waitEvent(want string) {

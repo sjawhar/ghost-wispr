@@ -177,6 +177,13 @@ if run_provision "${bundle_files[@]}" dispatch-token; then
   fail "provision.sh accepted a dispatch-token of two lines"
 fi
 rm "$work_dir/bundle/dispatch-token"
+# A dispatch-token that is a link to nothing is refused, not skipped as absent.
+ln -s "$work_dir/no-such-token" "$work_dir/bundle/dispatch-token"
+if run_provision "${bundle_files[@]}" dispatch-token; then
+  fail "provision.sh accepted a dispatch-token that links to nothing"
+fi
+grep -q 'dispatch-token' "$work_dir/out" || fail "provision.sh refused the linked dispatch-token for another reason: $(<"$work_dir/out")"
+rm "$work_dir/bundle/dispatch-token"
 
 # A lingering user service has no seat, so only the audio group opens the ALSA devices.
 grep -Fxq 'sudo usermod -aG audio ghost-wispr' "$TEST_LOG" || fail "provision.sh does not add ghost-wispr to the audio group"
