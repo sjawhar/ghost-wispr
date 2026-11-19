@@ -118,19 +118,9 @@ func (c *Concierge) Tools(x *voice.Exchange) voice.ToolRunner {
 }
 
 // Run runs one tool. A tool that fails answers {"error": "..."}, which a
-// model can say; Run's error is for an unknown tool or a stop.
+// model can say; Run's error is for an unknown tool or a stop. The
+// Supervisor answers voice.AnswerTool itself, through Answer.
 func (r *runner) Run(ctx context.Context, call voice.ToolCall) (json.RawMessage, error) {
-	if call.Name == voice.AnswerTool {
-		var args voice.AnswerArgs
-		if err := json.Unmarshal(orEmpty(call.Args), &args); err != nil {
-			return nil, fmt.Errorf("concierge: %s arguments: %w", call.Name, err)
-		}
-		result, err := r.c.answerForVoice(ctx, r.x, args)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(result)
-	}
 	var args map[string]any
 	if err := json.Unmarshal(orEmpty(call.Args), &args); err != nil {
 		return nil, fmt.Errorf("concierge: %s arguments: %w", call.Name, err)
@@ -635,17 +625,23 @@ func (c *Concierge) sending(session string, delta int) {
 }
 
 // task reads a task by its id, or by the Envoy event of its question while
-// the task still holds its local id.
+// the task still holds its local id, or by the event of the request its
+// agent got to reply again with in_reply_to.
 func (c *Concierge) task(id string) (storage.VoiceTask, error) {
 	task, err := c.store.VoiceTask(id)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return task, err
 	}
 	c.mu.Lock()
-	local, ok := c.sentAs[id]
+	local, sent := c.sentAs[id]
+	asked, again := c.againFor[id]
 	c.mu.Unlock()
-	if !ok {
+	switch {
+	case sent:
+		return c.store.VoiceTask(local)
+	case again:
+		return c.task(asked)
+	default:
 		return task, err
 	}
-	return c.store.VoiceTask(local)
 }

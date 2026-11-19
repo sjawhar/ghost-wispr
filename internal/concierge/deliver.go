@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
@@ -23,12 +25,13 @@ var errAskStillSending = errors.New("concierge: the reply names a question still
 // Deliver takes one message from the unit's Envoy session: an agent's reply
 // to a question the voice asked. The reply names the question's event in
 // in_reply_to, which is its task's id (or leads to it, while the task still
-// holds its local id); a reply that names nothing is matched to its sender's
-// one unanswered task. The written answer is stored at once, and announced on
-// Answers once rewritten for the ear. A message that is no answer to a task
-// of a meeting the unit still holds changes nothing. An error answers the
-// frame nak, so Envoy delivers it again: a store that could not be written,
-// or a reply to a question still being sent.
+// holds its local id, or when it names the request to reply again). A message
+// that names nothing is never taken as an answer: its sender is asked once,
+// per question, to reply with in_reply_to. The written answer is stored at
+// once, and announced on Answers once rewritten for the ear. A message that
+// is no answer to a task of a meeting the unit still holds changes nothing.
+// An error answers the frame nak, so Envoy delivers it again: a store that
+// could not be written, or a reply to a question still being sent.
 func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
 	task, ok, err := c.taskOf(message)
 	if err != nil || !ok {
@@ -45,11 +48,7 @@ func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
 	if !answered {
 		return nil
 	}
-	matchedBy := "sender"
-	if message.InReplyTo != "" {
-		matchedBy = "in_reply_to"
-	}
-	c.logger.Info("concierge took an agent's answer", "task", task.ID, "session", task.SessionID, "matched_by", matchedBy)
+	c.logger.Info("concierge took an agent's answer", "task", task.ID, "session", task.SessionID)
 	go c.announce(&task, message.Text)
 	return nil
 }
@@ -81,27 +80,74 @@ func (c *Concierge) taskOf(message *envoy.Message) (storage.VoiceTask, bool, err
 		}
 		return task, true, nil
 	}
+	c.askAgain(message)
+	return storage.VoiceTask{}, false, nil
+}
+
+// askAgain meets a message that names no question it answers. It is never
+// taken as an answer by guess: the sender gets, once per question still
+// waiting on it, a request to reply with in_reply_to. A reply to that request
+// names it, and so lands on its question's task.
+func (c *Concierge) askAgain(message *envoy.Message) {
+	agents := c.currentAgents()
 	c.mu.Lock()
 	pending := slices.Clone(c.working[message.SourceSession])
 	c.mu.Unlock()
-	var found []storage.VoiceTask
+	if agents == nil || message.SourceSession == "" || len(pending) == 0 {
+		c.logger.Info("concierge took an Envoy message that answers no question", "from", message.SourceSession)
+		return
+	}
 	for _, id := range pending {
 		task, err := c.task(id)
-		if err == nil && task.State == storage.VoiceTaskWorking {
-			found = append(found, task)
+		if err != nil || task.State != storage.VoiceTaskWorking {
+			continue
 		}
-	}
-	if len(found) != 1 {
-		if message.SourceSession != "" {
-			c.logger.Info("concierge took an Envoy message that answers no question", "from", message.SourceSession, "candidates", len(found))
+		c.mu.Lock()
+		_, asked := c.askedAgain[task.ID]
+		if !asked {
+			c.askedAgain[task.ID] = ""
 		}
-		return storage.VoiceTask{}, false, nil
+		c.mu.Unlock()
+		if asked {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+		sent, err := agents.Send(ctx, &envoy.SendRequest{
+			Target:         message.SourceSession,
+			Message:        c.askAgainMessage(&task),
+			IdempotencyKey: uuid.NewString(),
+			InReplyTo:      message.EventID,
+		})
+		cancel()
+		c.mu.Lock()
+		if err != nil {
+			delete(c.askedAgain, task.ID)
+		} else {
+			c.askedAgain[task.ID] = sent.EventID
+			c.againFor[sent.EventID] = task.ID
+		}
+		c.mu.Unlock()
+		if err != nil {
+			c.logger.Warn("concierge could not ask an agent to reply with in_reply_to", "task", task.ID, "error", err)
+			continue
+		}
+		c.logger.Info("concierge asked an agent to reply with in_reply_to", "task", task.ID, "request", sent.EventID)
 	}
-	return found[0], true, nil
+}
+
+// askAgainMessage asks the agent to send its answer to task's question again
+// as a reply. It names the question by its issue and time, not its words.
+func (c *Concierge) askAgainMessage(task *storage.VoiceTask) string {
+	about := "my question"
+	if task.IssueKey != "" {
+		about = "my question about " + task.IssueKey
+	}
+	return "Ghost Wispr here. Your message has no in_reply_to, so I cannot tell which of my questions it answers, and nobody in the room heard it. " +
+		"If it answers " + about + " (asked " + task.AskedAt.UTC().Format("15:04:05") + " UTC), reply to this message (envoy_send with in_reply_to) with that answer, in three sentences or fewer. Your reply is read aloud in the room."
 }
 
 // forget drops answered task ids, local or event, from the agent's
-// unanswered tasks.
+// unanswered tasks, and the request to reply again that it got for them.
 func (c *Concierge) forget(agent string, ids ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -109,24 +155,19 @@ func (c *Concierge) forget(agent string, ids ...string) {
 	if len(c.working[agent]) == 0 {
 		delete(c.working, agent)
 	}
+	for _, id := range ids {
+		if request, ok := c.askedAgain[id]; ok {
+			delete(c.againFor, request)
+			delete(c.askedAgain, id)
+		}
+	}
 }
 
-// announce rewrites an answer for the ear and puts it on Answers, unless its
-// meeting was deleted while it was rewritten. A full channel drops the
-// announcement, not the answer: it stays in the ledger, where task_status
-// reads it.
+// announce rewrites an answer for the ear and queues its announcement; the
+// queue hands it to Answers unless its meeting ends or is deleted first.
 func (c *Concierge) announce(task *storage.VoiceTask, written string) {
 	ctx, cancel := context.WithTimeout(context.Background(), earTimeout)
 	defer cancel()
 	spoken := c.forEar(ctx, strings.TrimSpace(written))
-	if _, err := c.store.VoiceTask(task.ID); err != nil {
-		c.logger.Info("concierge dropped an answer whose task is gone", "task", task.ID, "error", err)
-		return
-	}
-	answer := voice.PendingAnswer{TaskID: task.ID, SessionID: task.SessionID, IssueKey: task.IssueKey, Text: spoken}
-	select {
-	case c.answers <- answer:
-	default:
-		c.logger.Warn("concierge dropped the announcement of an answer; nobody reads Answers", "task", task.ID)
-	}
+	c.enqueue(voice.PendingAnswer{TaskID: task.ID, SessionID: task.SessionID, IssueKey: task.IssueKey, Text: spoken})
 }

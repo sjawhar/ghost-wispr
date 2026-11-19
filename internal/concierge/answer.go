@@ -42,30 +42,16 @@ const maxSteps = 6
 const sorry = "Sorry, I cannot answer that right now."
 
 // Answer answers one turn of x, speaking through say as sentences complete.
+// What Heard read of the record while the asker spoke goes to the model with
+// the turn, so the first fact needs no tool round; an issue the final turn
+// names that was not read yet is read first.
 func (c *Concierge) Answer(ctx context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
-	return c.answer(ctx, x, c.turnPrompt(transcriptOf(x.Recent), turn), say)
-}
-
-// answerForVoice is voice.AnswerTool: the same turn, with what is said
-// collected and returned instead of spoken.
-func (c *Concierge) answerForVoice(ctx context.Context, x *voice.Exchange, args voice.AnswerArgs) (voice.AnswerResult, error) {
-	var spoken []string
-	collect := func(_ context.Context, text string, _ voice.SayMode) error {
-		spoken = append(spoken, text)
-		return nil
+	prompt := c.turnPrompt(transcriptOf(x.Recent), turn)
+	if record := c.readFor(ctx, x, turn); record != "" {
+		prompt += "\n\nThe record, read for this question while it was asked:\n" + record +
+			"\nAnswer from it. Call a tool only for what it does not hold."
 	}
-	transcript := args.Transcript
-	if transcript == "" {
-		transcript = transcriptOf(x.Recent)
-	}
-	err := c.answer(ctx, x, c.turnPrompt(transcript, args.Question), collect)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return voice.AnswerResult{}, ctxErr
-	}
-	if err != nil {
-		c.logger.Warn("concierge could not answer a delegated turn", "error", err)
-	}
-	return voice.AnswerResult{Say: strings.Join(spoken, " ")}, nil
+	return c.answer(ctx, x, prompt, say)
 }
 
 func transcriptOf(recent []voice.TurnText) string {
