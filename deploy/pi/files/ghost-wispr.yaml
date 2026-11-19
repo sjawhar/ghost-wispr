@@ -10,6 +10,7 @@ recording_rules:
   - Anyone may pause it at any time without a reason.
   - Transcripts are readable by Theorem staff only.
   - A person can ask for a segment to be deleted.
+  - Saying "Wispr" asks the voice about our work; a question it sends to an agent leaves the unit, and deleting the segment cannot recall it.
 deepgram_model: nova-3
 batch_transcription:
   provider: deepgram
@@ -49,3 +50,22 @@ envoy_enabled: true
 envoy_webhook_url: __ENVOY_WEBHOOK_URL__
 # The Secret Manager version of Envoy's webhook signing key; Ghost Wispr has no default for it.
 envoy_webhook_secret_name: projects/theorem-agent-infra/secrets/envoy-ghostwispr-signing-secret/versions/latest
+# The meeting voice (README "Meeting voice"): "Wispr, …" at the start of a sentence asks about the
+# work in Dispatch. Voice A speaks with the Pi's own Gemini TTS voice, streamed from Vertex AI's us
+# multi-region, which is faster to first audio than global.
+voice:
+  enabled: true
+  engine: tts
+  wake_phrases: [Wispr, Ghost Wispr]
+  tts_engine: gemini
+  tts_model: gemini-3.8-flash-tts
+  tts_voice: Kore
+  tts_location: us
+  # The wake listener while paused stays off until its false-wake rate is measured below 0.5 an
+  # hour (slice 4).
+  paused_listener: false
+# The Concierge reads Dispatch with the Pi's own no-scope token (GHOST_WISPR_DISPATCH_TOKEN, the
+# credential bundle's dispatch-token) and asks an issue's agent through the Envoy listener.
+concierge:
+  dispatch_url: https://dispatch.tail12ec1c.ts.net
+  envoy_url: http://envoy-hub.tail12ec1c.ts.net:9020

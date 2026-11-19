@@ -345,7 +345,7 @@ through `GHOST_WISPR_EMBEDDING_LOCATION` in `/opt/ghost-wispr/.env`. Nothing set
 `GOOGLE_APPLICATION_CREDENTIALS`. Garbage collection keeps every session
 (`gc_max_age_days: 0`) and holds local audio to a 20000 MB budget
 (`gc_max_audio_size_mb: 20000`), removing only audio that Drive holds a copy of; the template
-ships GC off so it never runs before sync is on. It also holds the office's four recording rules
+ships GC off so it never runs before sync is on. It also holds the office's five recording rules
 (`recording_rules`), which the web UI shows under Recording rules; both the full provisioner and
 the models step install them with the rest of the template.
 
@@ -574,7 +574,7 @@ that line stays as it is. The full provisioner rewrites `.env` without it, and t
    <merge commit>`, when the timer was first). During an active session it prints `active
    session; leaving the current binary in place` and changes nothing: run it again once the
    session has ended.
-4. Check that the new binary reads the key. For `recording_rules`, the template's four rules must
+4. Check that the new binary reads the key. For `recording_rules`, the template's five rules must
    come back; for `envoy_webhook_secret_name`, `/api/status` must hold no Envoy warning; for
    `mic_device`, the config must hold `mic_device: J75`, `/api/status` no `No microphone found`
    warning, and `capture_state` must be `capturing` or `paused`. The Jabra's Mute button must be on:
@@ -667,6 +667,48 @@ steps on the Pi as `ghost-wispr`, outside meetings, with no session active.
    and unload the loopback: `sudo modprobe -r snd-aloop`. Then `/api/status` must show
    `capture_state` `capturing` (or `paused`) with no `No microphone found` warning: the Jabra is
    the microphone again.
+
+## Turn on the meeting voice
+
+The template turns the meeting voice on (`voice.enabled: true`; README, "Meeting voice"): "Wispr,
+what is happening with …?" gets a chime, then voice A speaks the answer from Dispatch's record
+in Gemini TTS's Kore voice, streamed from Vertex AI's `us` multi-region with the Pi's own Google
+identity. The fifth recording rule tells the room that a question sent to an agent leaves the unit.
+
+1. Reach. The Concierge reads `concierge.dispatch_url` and registers with the Envoy listener at
+   `concierge.envoy_url`. The Pi reaches neither until the tailnet grant of dispatch://INFRA-4617
+   is applied; until then the voice answers "I cannot reach Dispatch yet", and the log warns every
+   minute that the Envoy session did not open, with no restart needed once it can.
+2. The Pi's Dispatch token: a no-scope agent token (`POST /api/v1/me/agent-tokens` with
+   `{"name":"ghost-wispr-office-pi","scopes":[]}`), never a person's. Put it, one line, in the
+   credential bundle as `dispatch-token`; the full provisioner writes it to `.env` as
+   `GHOST_WISPR_DISPATCH_TOKEN`. Without it the voice answers "I cannot reach Dispatch yet".
+3. After the deploy, `/api/status` must hold no `voice` warning, and the journal must say
+   `voice: on (voice A on gemini, ...)`.
+4. Time to first audio of the first sentence: the Gemini engine warms its connection when the voice
+   opens, at the wake. Measure it once on the Pi, with and without the warm-up, using the voice
+   package's live test (`GHOST_WISPR_LIVE_TTS=gemini ... TestLiveFirstSayTimeToFirstAudio`, built for
+   arm64); keep the warm-up only if it lowers the median of the first sentence.
+
+## Accept the meeting voice
+
+`deploy/pi/accept-voice.sh` runs slice 1 of the meeting voice on the loopback, so nothing plays in
+the room and nothing of the room is recorded. Run it on the Pi as `ghost-wispr`, outside meetings,
+with the unit paused and no session active:
+
+1. `sudo modprobe snd-aloop`, as in "Inject speech for acceptance".
+2. Make a WAV of the question, such as "Wispr, what is happening with the issue about the meeting
+   voice?", and optionally one of "Wispr, go ahead.", with any text-to-speech engine.
+3. `bash accept-voice.sh --question question.wav [--go-ahead go-ahead.wav]`. It switches `.env` to the
+   loopback (microphone `Loopback`, speaker `plughw:CARD=Loopback,DEV=0,SUBDEV=1`, voice on),
+   restarts the service, resumes, plays the question in, and records the speaker's side. It prints
+   one `PASS` or `FAIL` line for each of `voice_wake`, `voice_exchange_started` and `voice_spoken` on
+   `/ws` (session id only, no words), the chime after the wake (at most 400 ms) and the speech after
+   the question (at most 3000 ms), and with `--go-ahead`, `voice_answer_ready` and the held answer.
+   `UNKNOWN` means it read nothing.
+4. Whatever the result, and on Ctrl-C, it pauses capture, stops the service, writes `.env` back
+   byte for byte and the saved capture state it read, starts the service and checks it reads paused.
+   Then unload the loopback: `sudo modprobe -r snd-aloop`.
 
 ## Accept slice 1
 
