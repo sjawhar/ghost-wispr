@@ -40,6 +40,18 @@ type fakeRecords struct {
 	// set) until it is closed or the call's context ends.
 	block    chan struct{}
 	blockKey string
+	// projects is Dispatch's project keys; nil is a project list that does
+	// not answer.
+	projects []string
+}
+
+func (f *fakeRecords) Projects(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.projects == nil {
+		return nil, &dispatch.APIError{Status: 503, Code: "UNAVAILABLE", Route: "projects"}
+	}
+	return append([]string(nil), f.projects...), nil
 }
 
 func (f *fakeRecords) Search(_ context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
@@ -71,7 +83,7 @@ func (f *fakeRecords) Issue(ctx context.Context, key string) (*dispatch.Issue, e
 	}
 	issue, ok := f.issues[key]
 	if !ok {
-		return nil, &dispatch.APIError{Status: 404, Code: "NOT_FOUND", Message: "not found"}
+		return nil, &dispatch.APIError{Status: 404, Code: "NOT_FOUND", Message: "not found", Route: "issue"}
 	}
 	return issue, nil
 }
@@ -103,7 +115,7 @@ func (f *fakeRecords) DocumentText(_ context.Context, key, slug string) (string,
 	}
 	text, ok := f.docs[key+"/"+slug]
 	if !ok {
-		return "", &dispatch.APIError{Status: 404, Code: "NOT_FOUND"}
+		return "", &dispatch.APIError{Status: 404, Code: "NOT_FOUND", Route: "document"}
 	}
 	return text, nil
 }

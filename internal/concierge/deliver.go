@@ -44,6 +44,7 @@ func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
 	if err != nil {
 		return err
 	}
+	c.tellChanged(task.SessionID)
 	c.forget(message.SourceSession, task.ID, message.InReplyTo)
 	if !answered {
 		return nil
@@ -126,9 +127,12 @@ func (c *Concierge) askAgain(message *envoy.Message) {
 		})
 		cancel()
 		c.mu.Lock()
-		if err != nil {
+		_, deleted := c.closedLocked(task.SessionID)
+		switch {
+		case err != nil || deleted:
+			// A deleted meeting's request adds nothing back.
 			delete(c.askedAgain, task.ID)
-		} else {
+		default:
 			c.askedAgain[task.ID] = sent.EventID
 			c.againFor[sent.EventID] = task.ID
 		}

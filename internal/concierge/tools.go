@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -169,9 +170,12 @@ func (r *runner) call(ctx context.Context, name string, args map[string]any) (ma
 		return nil, ctxErr
 	}
 	if err != nil {
-		// Not-found is an answer, not a failure: a key said in the room that
-		// names no issue is no reason to log.
-		if !dispatch.IsNotFound(err) {
+		// An issue read Dispatch answers not-found is an answer, not a
+		// failure: a key said in the room that names no issue is no reason to
+		// log. A not-found on any other route is, since a wrong Dispatch URL
+		// answers every route that way.
+		var refused *dispatch.APIError
+		if !errors.As(err, &refused) || refused.Status != http.StatusNotFound || refused.Route != "issue" {
 			r.c.logger.Warn("concierge tool failed", "tool", name, "error", err)
 		}
 		return map[string]any{"error": toolError(err)}, nil
@@ -181,6 +185,9 @@ func (r *runner) call(ctx context.Context, name string, args map[string]any) (ma
 
 // somethingWrong is a tool's answer for a failure on the recorder itself.
 const somethingWrong = "Something went wrong on the recorder."
+
+// noSuchIssue is what the model is told of an issue Dispatch does not have.
+const noSuchIssue = "Dispatch has no such issue."
 
 // toolError is what a model is told of a failure: a bad key as such,
 // Dispatch's not-found as such, a Dispatch that does not answer or refuses
@@ -194,7 +201,7 @@ func toolError(err error) string {
 	case errors.Is(err, dispatch.ErrBadIssueKey):
 		return "That is not an issue key; an issue key looks like ABC-12."
 	case dispatch.IsNotFound(err):
-		return "Dispatch has no such issue."
+		return noSuchIssue
 	case errors.Is(err, dispatch.ErrUnreachable), errors.As(err, &refused):
 		return cannotReachDispatch
 	default:
@@ -217,14 +224,16 @@ func (r *runner) recordsOrTell() (Records, error) {
 }
 
 func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any, error) {
-	if query == "" {
-		return nil, tell("Search for what? Give a few keywords.")
-	}
 	records, err := r.recordsOrTell()
 	if err != nil {
 		return nil, err
 	}
-	hits, err := records.Search(ctx, query, 10)
+	// Dispatch gets the issue words of what was said, never the sentence.
+	terms := searchTerms(query)
+	if terms == "" {
+		return nil, tell("Search for what? Give a few keywords.")
+	}
+	hits, err := records.Search(ctx, terms, 10)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +284,7 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 	recent := make([]map[string]any, 0, len(events))
 	for i := range events {
 		event := &events[i]
-		entry := map[string]any{"type": event.Type, "when": ago(now, event.CreatedAt), "by": event.Actor.Title()}
+		entry := map[string]any{"type": event.Type, "when": ago(now, event.CreatedAt), "by": spokenName(event.Actor.Title())}
 		if text := eventText(event.Payload); text != "" {
 			entry["text"] = cut(text, eventTextChars)
 		}
@@ -369,7 +378,7 @@ func (r *runner) issueHolder(ctx context.Context, key string) (map[string]any, e
 // registry.
 func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string]any {
 	r.c.remember(r.x, id)
-	result := map[string]any{"session": id, "title": title}
+	result := map[string]any{"session": id, "title": spokenName(title)}
 	agents := r.c.currentAgents()
 	if agents == nil {
 		result["holder"], result["state"] = "unresponsive", "unknown"
@@ -384,7 +393,7 @@ func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string
 		return result
 	}
 	if title == "" {
-		result["title"] = info.Title
+		result["title"] = spokenName(info.Title)
 	}
 	if info.State == envoy.StateLive {
 		result["holder"], result["live"] = "session", true
@@ -450,6 +459,12 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	r.c.mu.Lock()
+	closed, _ := r.c.closedLocked(r.x.SessionID)
+	r.c.mu.Unlock()
+	if closed {
+		return nil, tell("This meeting has ended, so I ask no agent for it.")
+	}
 	if err := r.c.store.CreateVoiceTask(&storage.VoiceTask{
 		ID: localID, SessionID: r.x.SessionID, AskedAt: now, IssueKey: issueKey, Holder: "session:" + session,
 	}); err != nil {
@@ -466,6 +481,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		if deleteErr := r.c.store.DeleteVoiceTask(localID); deleteErr != nil {
 			r.c.logger.Warn("concierge could not remove the task of a question it did not send", "task", localID, "error", deleteErr)
 		}
+		r.c.tellChanged(r.x.SessionID)
 		return nil, err
 	}
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
@@ -480,6 +496,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		if deleteErr := r.c.store.DeleteVoiceTask(localID); deleteErr != nil {
 			r.c.logger.Warn("concierge could not remove the task of a question it did not send", "task", localID, "error", deleteErr)
 		}
+		r.c.tellChanged(r.x.SessionID)
 		r.c.logger.Warn("concierge could not send a question", "session", session, "error", err)
 		return nil, tell("The question did not reach the agent.")
 	}
@@ -504,17 +521,35 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 	}
 	r.c.mu.Lock()
-	if r.c.closedLocked(r.x.SessionID) {
-		// The meeting ended or was deleted while the question was sent:
-		// what it held is gone, and this adds nothing back.
+	closed, deleted := r.c.closedLocked(r.x.SessionID)
+	switch {
+	case deleted:
+		// The meeting was deleted while the question was sent: what it held
+		// is gone, and this adds nothing back.
 		delete(r.c.sentAs, taskID)
 		delete(r.c.sessionOf, taskID)
 		delete(r.c.sessionOf, localID)
-	} else {
+	case closed:
+		// The meeting ended while the question was sent: the lead to its
+		// task stays for a late reply, and the question is cancelled like
+		// the meeting's others.
+	default:
 		r.c.lastAsk[asker] = taskID
 		r.c.working[session] = append(r.c.working[session], taskID)
 	}
 	r.c.mu.Unlock()
+	if closed && !deleted {
+		row := taskID
+		if _, err := r.c.store.VoiceTask(taskID); err != nil {
+			row = localID
+		}
+		if _, err := r.c.store.EndVoiceTask(row, storage.VoiceTaskCancelled); err != nil {
+			r.c.logger.Warn("concierge could not cancel the question of an ended session", "task", row, "error", err)
+		}
+	}
+	if !deleted {
+		r.c.tellChanged(r.x.SessionID)
+	}
 	result := map[string]any{
 		"task_id":         taskID,
 		"recipient_state": string(sent.RecipientState),
@@ -587,7 +622,7 @@ func (r *runner) listJoinedAgents() map[string]any {
 	if r.c.joined != nil {
 		for _, agent := range r.c.joined() {
 			r.c.remember(r.x, agent.SessionID)
-			agents = append(agents, map[string]any{"session": agent.SessionID, "title": agent.Title, "issue_key": agent.IssueKey})
+			agents = append(agents, map[string]any{"session": agent.SessionID, "title": spokenName(agent.Title), "issue_key": agent.IssueKey})
 		}
 	}
 	return map[string]any{"agents": agents}
@@ -614,7 +649,7 @@ func (c *Concierge) remember(x *voice.Exchange, session string) {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closedLocked(x.SessionID) {
+	if closed, _ := c.closedLocked(x.SessionID); closed {
 		return
 	}
 	for key, entry := range c.named {
