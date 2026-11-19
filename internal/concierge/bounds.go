@@ -48,6 +48,14 @@ func (b boundedRecords) Search(ctx context.Context, query string, limit int) (hi
 	return hits, err
 }
 
+func (b boundedRecords) SearchKeywords(ctx context.Context, query string, limit int) (hits []dispatch.SearchHit, err error) {
+	err = boundCall(ctx, b.searchBound, errSearchSlow, func(ctx context.Context) error {
+		hits, err = b.inner.SearchKeywords(ctx, query, limit)
+		return err
+	})
+	return hits, err
+}
+
 func (b boundedRecords) Issue(ctx context.Context, key string) (issue *dispatch.Issue, err error) {
 	err = b.within(ctx, func(ctx context.Context) error {
 		issue, err = b.inner.Issue(ctx, key)

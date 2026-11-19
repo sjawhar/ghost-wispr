@@ -291,15 +291,54 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 	if r.searchesLeft != nil {
 		*r.searchesLeft--
 	}
-	hits, err := records.Search(ctx, terms, 10)
-	if errors.Is(err, errSearchSlow) {
-		// Slow, not out of reach: it has found nothing yet (R6, R10).
-		r.c.logger.Info("concierge's search found nothing in its time", "bound", r.c.searchBound)
+	return r.c.searchBoth(ctx, records, terms)
+}
+
+// searchBoth runs Dispatch's keyword-only search and its full search, words
+// and meaning, at once; together they are one search. A keyword result with
+// one clear match (R5) is taken at once and the full search is stopped:
+// keywords answer in about 0.15 s, the full search in 1 to 6 s. Otherwise
+// the full result is taken, or, when it fails or runs past its bound, the
+// keyword result. A search that found nothing in its time is slow, not out
+// of reach (R6, R10).
+func (c *Concierge) searchBoth(ctx context.Context, records Records, terms string) (map[string]any, error) {
+	type found struct {
+		hits []dispatch.SearchHit
+		err  error
+	}
+	fullCtx, stopFull := context.WithCancel(ctx)
+	defer stopFull()
+	full := make(chan found, 1)
+	go func() {
+		hits, err := records.Search(fullCtx, terms, 10)
+		full <- found{hits, err}
+	}()
+	kwHits, kwErr := records.SearchKeywords(ctx, terms, 10)
+	if kwErr == nil {
+		if issues, clear := issuesOf(kwHits); clear {
+			return map[string]any{"issues": issues, "clear_match": true}, nil
+		}
+	}
+	got := <-full
+	if got.err == nil {
+		issues, clear := issuesOf(got.hits)
+		return map[string]any{"issues": issues, "clear_match": clear}, nil
+	}
+	if kwErr == nil && ctx.Err() == nil {
+		c.logger.Info("concierge took the keyword result: the full search failed", "error", got.err)
+		issues, clear := issuesOf(kwHits)
+		return map[string]any{"issues": issues, "clear_match": clear}, nil
+	}
+	if errors.Is(got.err, errSearchSlow) {
+		c.logger.Info("concierge's search found nothing in its time", "bound", c.searchBound)
 		return map[string]any{"issues": []map[string]any{}, "clear_match": false, "note": "The search took too long. Ask for the issue's key."}, nil
 	}
-	if err != nil {
-		return nil, err
-	}
+	return nil, got.err
+}
+
+// issuesOf is a search's issues, best first and once each, at most five,
+// and whether the best is one clear match (R5).
+func issuesOf(hits []dispatch.SearchHit) ([]map[string]any, bool) {
 	issues := []map[string]any{}
 	best := map[string]float64{}
 	for _, hit := range hits {
@@ -320,7 +359,7 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 		issue["score"] = best[issue["key"].(string)]
 		scores = append(scores, best[issue["key"].(string)])
 	}
-	return map[string]any{"issues": issues, "clear_match": clearMatch(scores)}, nil
+	return issues, clearMatch(scores)
 }
 
 // clearMatchRatio is how far the best issue's score must lead the second's
@@ -400,7 +439,8 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 }
 
 // eventText is what an event says in words: a comment's body, an ask's
-// question and answer, a document's name.
+// question and answer, a document's name, without a file extension, which
+// the ear hears as "spec dot md" and R8 refuses.
 func eventText(payload json.RawMessage) string {
 	var fields map[string]any
 	if json.Unmarshal(payload, &fields) != nil {
@@ -409,7 +449,11 @@ func eventText(payload json.RawMessage) string {
 	var parts []string
 	for _, key := range []string{"body", "question", "name", "title", "reason"} {
 		if value, ok := fields[key].(string); ok && strings.TrimSpace(value) != "" {
-			parts = append(parts, strings.TrimSpace(value))
+			value = strings.TrimSpace(value)
+			if key == "name" {
+				value = earFileName.ReplaceAllStringFunc(value, func(name string) string { return name[:strings.LastIndexByte(name, '.')] })
+			}
+			parts = append(parts, value)
 		}
 	}
 	if answer, ok := fields["answer"].(map[string]any); ok {
@@ -554,7 +598,8 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	retry := [2]string{asker[0], base}
 	r.c.mu.Lock()
 	last := r.c.lastAsk[asker]
-	key := r.c.unsent[retry]
+	unconfirmed := r.c.unsent[retry]
+	key := unconfirmed.key
 	r.c.mu.Unlock()
 	var previous *storage.VoiceTask
 	if last.task != "" {
@@ -576,6 +621,9 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	}
 
 	now := r.c.now()
+	if !unconfirmed.at.IsZero() {
+		now = unconfirmed.at
+	}
 	localID := uuid.NewString()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -615,7 +663,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	cancel()
 	r.c.mu.Lock()
 	if closed, _ := r.c.closedLocked(r.x.SessionID); err != nil && !closed {
-		r.c.unsent[retry] = key
+		r.c.unsent[retry] = unsentAsk{key: key, at: now}
 	} else {
 		delete(r.c.unsent, retry)
 	}
@@ -626,9 +674,10 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		r.c.tellChanged(r.x.SessionID)
 		r.c.logger.Warn("concierge could not send a question", "session", session, "error", err)
-		// Envoy that answered and refused is reachable: no error sound.
+		// Envoy that answered and refused (4xx) is reachable: no error
+		// sound. A server fault (5xx) is Envoy out of service.
 		var refused *envoy.ListenerError
-		if errors.As(err, &refused) {
+		if errors.As(err, &refused) && refused.Status < http.StatusInternalServerError {
 			return nil, tell(questionRefused)
 		}
 		return nil, tell(questionNotSent)
@@ -722,6 +771,13 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 // sentAsk is an exchange's newest question to an agent: its task, its Envoy
 // event ("" when Envoy did not name it), and its askBase.
 type sentAsk struct{ task, event, base string }
+
+// unsentAsk is a send Envoy did not confirm: its idempotency key and when it
+// was asked.
+type unsentAsk struct {
+	key string
+	at  time.Time
+}
 
 // askBase names question to agent session in exchange x, so the same
 // question asked again there is known as such.

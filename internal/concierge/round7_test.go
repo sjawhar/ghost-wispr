@@ -26,6 +26,67 @@ func unclearSearch(r *rig) {
 	}
 }
 
+// TestAClearKeywordMatchAnswersAtOnce (R5, R6): each search runs the
+// keyword-only search and the full one at once. A keyword result with one
+// clear match is taken at once, and the full search is stopped; together
+// they are one search.
+func TestAClearKeywordMatchAnswersAtOnce(t *testing.T) {
+	r := newRig(t)
+	unclearSearch(r)
+	r.records.kwHits = []dispatch.SearchHit{
+		{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.9},
+		{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.1},
+	}
+	r.records.searchDelay = time.Hour
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is done."))}}
+	start := time.Now()
+	spoken := answerTurn(t, r, "what is happening with the wake word")
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the answer took %v, want the keyword result at once", took)
+	}
+	if len(spoken) < 1 || spoken[0].text != "I took ABC-13: Wake word." {
+		t.Fatalf("spoken = %+v, want the keyword match first", spoken)
+	}
+	if kw, full := len(r.records.kwQueries), len(r.records.searches()); kw != 1 || full != 1 {
+		t.Fatalf("keyword searches %d, full %d; want one of each, at once", kw, full)
+	}
+}
+
+// TestAnUnclearKeywordMatchTakesTheFullSearch (R5, R6): when the keyword
+// result has no one clear match, or fails, the full search's result is taken.
+// A full search past its bound falls back to the keyword result.
+func TestAnUnclearKeywordMatchTakesTheFullSearch(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		kw   []dispatch.SearchHit
+		err  error
+		want string
+	}{
+		{"unclear keyword result", []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.5}, {Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.4}}, nil, "I took ABC-12: Realtime voice."},
+		{"no keyword result", nil, nil, "I took ABC-12: Realtime voice."},
+		{"keyword search failed", nil, errors.New("dispatch: 500"), "I took ABC-12: Realtime voice."},
+	} {
+		r := newRig(t)
+		unclearSearch(r)
+		r.records.hits[0].Score = 0.012
+		r.records.kwHits, r.records.kwErr = c.kw, c.err
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		spoken := answerTurn(t, r, "what is happening with the realtime voice")
+		if len(spoken) == 0 || spoken[0].text != c.want {
+			t.Errorf("%s: spoken = %+v, want %q first", c.name, spoken, c.want)
+		}
+	}
+	r := newRig(t)
+	r.concierge.searchBound = 200 * time.Millisecond
+	unclearSearch(r)
+	r.records.kwHits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.5}, {Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.4}}
+	r.records.searchDelay = time.Hour
+	spoken := answerTurn(t, r, "what is happening with the realtime voice")
+	if len(spoken) != 1 || spoken[0].text != "Did you mean ABC-13, Wake word, or ABC-12, Realtime voice?" {
+		t.Fatalf("a full search past its bound: spoken = %+v, want the keyword result's top two", spoken)
+	}
+}
+
 // TestAnUnclearSearchOffersTheTopTwo (c-find, R5): a search with no one clear
 // match makes the voice ask, in one line, which of the top two issues the
 // person meant, and do nothing else: no model call and no ask, and nothing
@@ -44,14 +105,16 @@ func TestAnUnclearSearchOffersTheTopTwo(t *testing.T) {
 }
 
 // TestAPickAnswersTheQuestionAsked (c-find, R5; c-ask-holder, R7): the next
-// turn of the same exchange picks one of the two, by its place or its key, and
-// the Concierge answers the question first asked about that issue: here it
-// asks its holder.
+// turn of the same exchange picks one of the two, by its place, its key, or
+// words of exactly one title, and the Concierge answers the question first
+// asked about that issue: here it asks its holder.
 func TestAPickAnswersTheQuestionAsked(t *testing.T) {
 	for _, c := range []struct{ pick, key, holder string }{
 		{"the first one", "ABC-12", "agent-7"},
 		{"the second", "ABC-13", "agent-9"},
 		{"ABC 13", "ABC-13", "agent-9"},
+		{"the one about the wake word", "ABC-13", "agent-9"},
+		{"wake word", "ABC-13", "agent-9"},
 	} {
 		r := newRig(t)
 		unclearSearch(r)
@@ -66,6 +129,25 @@ func TestAPickAnswersTheQuestionAsked(t *testing.T) {
 		}
 		if last := spoken[len(spoken)-1].text; !strings.Contains(last, "asked the agent on "+c.key) {
 			t.Errorf("%q: spoken = %+v, want the asked line for %s", c.pick, spoken, c.key)
+		}
+	}
+}
+
+// TestAReplyThatPicksNothingIsItsOwnQuestion (c-find, R5): "one" alone picks
+// nothing, nor do words of both titles or of neither; such a turn is a
+// question of its own, and asks nobody unasked.
+func TestAReplyThatPicksNothingIsItsOwnQuestion(t *testing.T) {
+	for _, reply := range []string{"that one", "the voice word", "never mind the tap"} {
+		r := newRig(t)
+		unclearSearch(r)
+		r.records.issues["ABC-12"].Title, r.records.hits[0].Title = "Voice word", "Voice word"
+		answerTurn(t, r, "ask the agent on the realtime voice whether the tap is merged")
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is open."))}}
+		answerTurn(t, r, reply)
+		for _, m := range r.agents.sent {
+			if strings.Contains(m.Message, "whether the tap is merged") {
+				t.Errorf("%q picked an issue: sent %+v", reply, m)
+			}
 		}
 	}
 }
@@ -335,5 +417,232 @@ func TestAReplaceLogsAReplace(t *testing.T) {
 	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "who reviews it"})
 	if !strings.Contains(logs.String(), `msg="concierge told an agent its question was replaced"`) {
 		t.Fatalf("the log lacks the replace line:\n%s", logs)
+	}
+}
+
+// TestASearchedIssueIsNamedFirst (c-fast-answer, R6): when a search chose the
+// issue, with one clear match, the answer names it, then gives the facts.
+func TestASearchedIssueIsNamedFirst(t *testing.T) {
+	r := newRig(t)
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	spoken := answerTurn(t, r, "what is happening with the realtime voice")
+	if len(spoken) != 2 || spoken[0].text != "I took ABC-12: Realtime voice." || spoken[1].text != "PR 80 is in review." {
+		t.Fatalf("spoken = %+v, want the issue, then the fact", spoken)
+	}
+}
+
+// TestAHungProjectListIsAnOutage (R10): the read of Dispatch's projects ends
+// at a read's bound. With an older list kept, the key is read, which ends at
+// its own bound; with none, a key-shaped word cannot be told, and Dispatch is
+// out of reach. Either way the room hears so, with the error sound, well
+// inside the answer's 8 s.
+func TestAHungProjectListIsAnOutage(t *testing.T) {
+	for _, known := range []bool{true, false} {
+		r := newRig(t)
+		r.concierge.callBound = 200 * time.Millisecond
+		heldIssue(r, "none", false)
+		r.records.mu.Lock()
+		r.records.projectsBlock = make(chan struct{})
+		r.records.block = make(chan struct{})
+		r.records.mu.Unlock()
+		r.concierge.mu.Lock()
+		r.concierge.projectsRead = time.Time{}
+		if !known {
+			r.concierge.projects = nil
+		}
+		r.concierge.mu.Unlock()
+		var spoken []said
+		start := time.Now()
+		err := r.concierge.Answer(context.Background(), &r.exchange, "what about ABC-12", recorder(&spoken))
+		took := time.Since(start)
+		close(r.records.projectsBlock)
+		close(r.records.block)
+		if took > 1500*time.Millisecond || !errors.Is(err, voice.ErrUnreachable) {
+			t.Fatalf("list known %v: Answer = %v after %v, want voice.ErrUnreachable within the bounds", known, err, took)
+		}
+		if len(spoken) == 0 || spoken[len(spoken)-1].text != cannotReachDispatch {
+			t.Fatalf("list known %v: spoken = %+v, want %q", known, spoken, cannotReachDispatch)
+		}
+	}
+}
+
+// TestWhoHoldsItIsSaid (R6): the model may say who holds the issue when the
+// question asks it; otherwise it leaves that to the recorder.
+func TestWhoHoldsItIsSaid(t *testing.T) {
+	if !strings.Contains(systemPrompt, "Do not say who holds the issue unless the question asks who holds it.") {
+		t.Fatal("the system prompt forbids saying the holder even when asked who holds it")
+	}
+}
+
+// TestEarCheckReadsClockTimesAndListsOfTeens (R8): "ten thirty" is 10:30,
+// and "twelve, thirteen" is 12 and 13, not the years 1030 and 1213.
+func TestEarCheckReadsClockTimesAndListsOfTeens(t *testing.T) {
+	const source = "It starts at 10:30 and 11:15; rows 12, 13 failed in 2026."
+	for _, c := range []struct {
+		text  string
+		fails bool
+	}{
+		{"It starts at ten thirty.", false},
+		{"It starts at eleven fifteen.", false},
+		{"Rows twelve, thirteen failed.", false},
+		{"It failed in twenty twenty-six.", false},
+		{"It starts at ten forty.", true},
+	} {
+		if reason := earCheck(c.text, source, ""); (reason != "") != c.fails {
+			t.Errorf("earCheck(%q) = %q, want failing %v", c.text, reason, c.fails)
+		}
+	}
+	if earForm("It runs on Node.js and Next.js.") != "" {
+		t.Error("a product name read as a file name")
+	}
+}
+
+// TestTheReadAheadSearchesOnceSettled (R6): Heard searches only words that
+// have settled, at most once a turn, so the read-ahead's searches and the
+// answer's are at most two together.
+func TestTheReadAheadSearchesOnceSettled(t *testing.T) {
+	r := newRig(t)
+	r.concierge.searchSettle = 150 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	for _, words := range []string{"what is happening with the realtime", "what is happening with the realtime voice"} {
+		r.concierge.Heard(context.Background(), &r.exchange, words)
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(400 * time.Millisecond)
+	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the realtime voice today now")
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(call("a", "search_issues", map[string]any{"query": "wake word"}, ""))},
+		{chunk(call("b", "search_issues", map[string]any{"query": "voice"}, ""))},
+		{chunk(text("PR 80 is in review."))},
+	}
+	answerTurn(t, r, "what is happening with the realtime voice today now")
+	if searches := r.records.searches(); len(searches) > 2 || searches[0] != "realtime voice" {
+		t.Fatalf("searches = %q, want the settled words first and at most two in all", searches)
+	}
+}
+
+// TestAnAskWithNoWordsFromTheModelSaysNoSorry (R6, R7): when the holder is
+// asked and the model has nothing to add, the room hears the asked line, no
+// apology, and the answer has no error.
+func TestAnAskWithNoWordsFromTheModelSaysNoSorry(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text(""))}, {chunk(text(""))}}
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
+	if err != nil || slices.ContainsFunc(spoken, func(s said) bool { return s.text == sorry }) {
+		t.Fatalf("Answer = %v, spoken %+v; want no error and no apology", err, spoken)
+	}
+	if last := spoken[len(spoken)-1].text; !strings.Contains(last, "asked the agent on ABC-12") {
+		t.Fatalf("spoken = %+v, want the asked line last", spoken)
+	}
+}
+
+// TestTheRoutingLineSaysAnAskNotAboutStatus (R6): a question not about
+// status is asked of the live holder as soon as the holder is known, so the
+// routing line says so while the rest of the record is read.
+func TestTheRoutingLineSaysAnAskNotAboutStatus(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	issue := r.records.issues["ABC-12"]
+	issue.PrimaryArtifactID = "doc-1"
+	issue.Artifacts = append(issue.Artifacts, struct {
+		ID   string `json:"id"`
+		Slug string `json:"slug"`
+	}{ID: "doc-1", Slug: "spec"})
+	r.records.docs["ABC-12/spec"] = "## Summary"
+	r.records.docBlock = make(chan struct{})
+	go func() {
+		time.Sleep(2200 * time.Millisecond)
+		close(r.records.docBlock)
+	}()
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	spoken := answerTurn(t, r, "is the tap on ABC-12 merged")
+	if len(spoken) == 0 || spoken[0].text != "Asking the agent on ABC-12." {
+		t.Fatalf("spoken = %+v, want the routing line to say the ask", spoken)
+	}
+}
+
+// TestAnEnvoyFaultIsAnOutage (R10): Envoy that answers a send with a server
+// fault is out of service: the error sound plays. A refusal (4xx) is not.
+func TestAnEnvoyFaultIsAnOutage(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.agents.sendErr = &envoy.ListenerError{Path: "/v1/messages/send", Status: 503, Message: "bus unanswered"}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
+	if !errors.Is(err, voice.ErrUnreachable) {
+		t.Fatalf("Answer on Envoy's 503 = %v, want voice.ErrUnreachable", err)
+	}
+}
+
+// TestADocumentIsNamedForTheEar (R8): an event names a document without its
+// file extension, so the model never says "spec.md".
+func TestADocumentIsNamedForTheEar(t *testing.T) {
+	if got := eventText([]byte(`{"name":"spec.md"}`)); got != "spec" {
+		t.Fatalf("eventText = %q, want spec", got)
+	}
+	if got := eventText([]byte(`{"name":"Node.js notes"}`)); got != "Node.js notes" {
+		t.Fatalf("eventText = %q, want a name with no file extension kept", got)
+	}
+}
+
+// TestARetryRepeatsNoSentence (R6): when a sentence fails R8's check and the
+// model writes again, a sentence the room already heard is not said twice.
+func TestARetryRepeatsNoSentence(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("It is in review. It went to Alex."))},
+		{chunk(text("It is in review. PR 80 is in review."))},
+	}
+	times := 0
+	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {
+		if s.text == "It is in review." {
+			times++
+		}
+	}
+	if times != 1 {
+		t.Fatalf("a sentence was said %d times, want once", times)
+	}
+}
+
+// TestAnAskThatCannotGoIsToldToTheModel (R6, R7): when the person says "ask"
+// and the recorder cannot ask the holder, the model is told so, and to say
+// only what the record holds.
+func TestAnAskThatCannotGoIsToldToTheModel(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.concierge.SetAgents(nil)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	var spoken []said
+	_ = r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 when slice one will be ready", recorder(&spoken))
+	if len(r.model.requests) == 0 || !strings.Contains(r.model.requests[0][0].Parts[0].Text, "The recorder cannot ask the agent that holds ABC-12 now.") {
+		t.Fatalf("the prompt does not say the recorder cannot ask")
+	}
+}
+
+// TestARetriedQuestionKeepsItsFirstTime (R7): a question sent again after a
+// send Envoy did not confirm keeps the time it was first asked, which the
+// stored question and the request to reply again both name.
+func TestARetriedQuestionKeepsItsFirstTime(t *testing.T) {
+	r := newRig(t)
+	clock := testNow
+	r.concierge.now = func() time.Time { return clock }
+	r.name(t, "agent-7")
+	ask := map[string]string{"session": "agent-7", "question": "is the tap merged"}
+	r.agents.landedErr = errors.New("envoy: context deadline exceeded")
+	r.run(t, "ask_agent", ask)
+	r.agents.landedErr = nil
+	clock = clock.Add(3 * time.Second)
+	result := r.run(t, "ask_agent", ask)
+	taskID, _ := result["task_id"].(string)
+	task, err := r.store.VoiceTask(taskID)
+	if err != nil || !task.AskedAt.Equal(testNow) {
+		t.Fatalf("the retried task = %+v, %v; want it asked at %v", task, err, testNow)
 	}
 }

@@ -23,6 +23,10 @@ import (
 const (
 	// prefetchTimeout bounds one read.
 	prefetchTimeout = 10 * time.Second
+	// searchSettle is how long a turn's search words must stay the same
+	// before Heard searches them: each new word changes them, and every
+	// search reaches Dispatch and its embedding model (R6).
+	searchSettle = 400 * time.Millisecond
 	// maxKeys is how many of a turn's keys a read tries.
 	maxKeys = 3
 )
@@ -44,15 +48,24 @@ func issueKeysIn(words string) []string {
 
 // read is one read of the record for a target. complete is set when it ran
 // to its end, not stopped or replaced; found is then what it found. seen is
-// closed once its issue's holder is known, which early then holds.
+// closed once its issue's holder is known, which early then holds. A search
+// read waits for its words to settle, or for start, which an answer closes
+// (begin) when it needs the read now.
 type read struct {
-	done     chan struct{}
-	found    *reading
-	complete bool
-	cancel   context.CancelFunc
-	seen     chan struct{}
-	early    *reading
-	once     sync.Once
+	done      chan struct{}
+	found     *reading
+	complete  bool
+	cancel    context.CancelFunc
+	seen      chan struct{}
+	early     *reading
+	once      sync.Once
+	start     chan struct{}
+	startOnce sync.Once
+}
+
+// begin starts r now if it waits for its words to settle.
+func (r *read) begin() {
+	r.startOnce.Do(func() { close(r.start) })
 }
 
 // reading is what a read of the record found for a turn.
@@ -76,6 +89,8 @@ type reading struct {
 	newest time.Time
 	// unreachable: Dispatch did not answer.
 	unreachable bool
+	// ahead: the read-ahead made this reading while the asker spoke.
+	ahead bool
 }
 
 // candidate is an issue a search offers, by key and title.
@@ -83,11 +98,13 @@ type candidate struct{ key, title string }
 
 // prefetch is the record read for one exchange while its asker speaks. Each
 // new target replaces the read still running for an older one, which the
-// words since have made stale: at most one read runs.
+// words since have made stale: at most one read runs. searches is how many
+// searches the read-ahead made since the exchange's last answer: at most one.
 type prefetch struct {
-	at      time.Time
-	reads   map[string]*read
-	current string
+	at       time.Time
+	reads    map[string]*read
+	current  string
+	searches int
 }
 
 // cancelAll ends every read of p still running.
@@ -160,6 +177,12 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	if _, read := p.reads[target]; read {
 		return
 	}
+	// A search waits for its words to settle, and the read-ahead makes one
+	// a turn: every search reaches Dispatch and its embedding model (R6).
+	search := strings.HasPrefix(target, "search:")
+	if search && p.searches > 0 {
+		return
+	}
 	if running, ok := p.reads[p.current]; ok {
 		select {
 		case <-running.done:
@@ -169,15 +192,34 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		}
 	}
 	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel}
+	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel, start: make(chan struct{})}
 	p.reads[target], p.current = r, target
+	settle := c.searchSettle
 	go func() {
 		defer cancel()
+		defer close(r.done)
+		if search {
+			select {
+			case <-time.After(settle):
+			case <-r.start:
+			case <-readCtx.Done():
+				return
+			}
+			c.mu.Lock()
+			counted := p.searches == 0 && readCtx.Err() == nil
+			if counted {
+				p.searches++
+			}
+			c.mu.Unlock()
+			if !counted {
+				return
+			}
+		}
 		found := c.readRecord(readCtx, &exchange, target, r.heldBy)
 		if readCtx.Err() == nil {
+			found.ahead = true
 			r.found, r.complete = found, true
 		}
-		close(r.done)
 	}()
 }
 
@@ -196,6 +238,11 @@ func (r *read) heldBy(early *reading) {
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading)) *reading {
 	target := c.readTarget(ctx, turn, true)
 	if target == "" {
+		// A key-shaped word with no list of projects to tell it by: Dispatch
+		// did not answer (R10).
+		if len(issueKeysIn(turn)) > 0 && c.projectsDownNow() {
+			return &reading{unreachable: true}
+		}
 		return &reading{}
 	}
 	c.mu.Lock()
@@ -205,6 +252,8 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 	}
 	c.mu.Unlock()
 	if pending != nil {
+		// The answer needs the read now: a search still settling starts.
+		pending.begin()
 		if onHolder != nil {
 			go func() {
 				select {
@@ -249,6 +298,20 @@ func (c *Concierge) prefetchLocked(x *voice.Exchange) *prefetch {
 	delete(c.prefetches, early)
 	c.prefetches[key] = p
 	return p
+}
+
+// takeAheadSearches is how many searches x's read-ahead made since its last
+// answer, which count toward this answer's two (R6); the count starts over.
+func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.prefetchLocked(x)
+	if p == nil {
+		return 0
+	}
+	n := p.searches
+	p.searches = 0
+	return n
 }
 
 // readRecord reads target with the tools, as the model would call them. For

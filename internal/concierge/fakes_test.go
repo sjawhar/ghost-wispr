@@ -44,6 +44,11 @@ type fakeRecords struct {
 	// searchDelay, when set, is how long each Search takes, or until its
 	// context ends.
 	searchDelay time.Duration
+	// kwHits are SearchKeywords' answer, kwQueries its queries; kwErr, when
+	// set, its failure.
+	kwHits    []dispatch.SearchHit
+	kwQueries []string
+	kwErr     error
 	// projects is Dispatch's project keys; nil is a project list that does
 	// not answer.
 	projects []string
@@ -90,6 +95,16 @@ func (f *fakeRecords) Search(ctx context.Context, query string, _ int) ([]dispat
 		}
 	}
 	return hits, err
+}
+
+func (f *fakeRecords) SearchKeywords(_ context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kwQueries = append(f.kwQueries, query)
+	if f.kwErr != nil {
+		return nil, f.kwErr
+	}
+	return f.kwHits, f.err
 }
 
 func (f *fakeRecords) Issue(ctx context.Context, key string) (*dispatch.Issue, error) {

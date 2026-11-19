@@ -27,7 +27,7 @@ const systemPrompt = `You are Wispr, the meeting helper of the office meeting re
 The recorder tells the room who holds the issue when that matters, and asks the holder itself, only when the record cannot answer. Your part is the facts.
 
 How you answer:
-- Say the facts of the record that answer the question, the conclusion first. Do not say who holds the issue.
+- Say the facts of the record that answer the question, the conclusion first. Do not say who holds the issue unless the question asks who holds it.
 - Say how old the fact is, using the ages the tools give, such as "updated two hours ago".
 - Use the record you are given. Call a tool only for what it does not hold.
 - Speak for the ear: one to three short sentences, at most 50 words, and at most 20 words a sentence. No lists, tables, file paths, links, code or markdown.
@@ -162,8 +162,10 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		}
 		return c.routingLine(ctx, turn)
 	})()
+	// An "ask", or a question the record cannot answer, goes to the live
+	// holder once the holder is known.
 	var onHolder func(*reading)
-	if saysAsk(turn) {
+	if saysAsk(turn) || !aboutStatus(turn) {
 		onHolder = func(early *reading) {
 			if session := c.askPlan(turn, early); session != "" {
 				startAsk(session, early)
@@ -206,14 +208,23 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		c.offerPick(x, turn, found.candidates)
 		return sp.sayText(ctx, didYouMean(found.candidates), voice.Ack)
 	}
+	// R6: the issue a search chose, then the facts.
+	lead := found.lead()
+	for _, line := range lead {
+		if err := sp.sayText(ctx, line, voice.Fact); err != nil {
+			return err
+		}
+	}
 	holderCase := found.holderCase()
 	if session := c.askPlan(turn, found); session != "" {
 		startAsk(session, found)
 	}
-	searchesLeft := maxSearches
-	if found.searched {
+	// R6: at most two searches an answer, the read-ahead's counted.
+	searchesLeft := maxSearches - c.takeAheadSearches(x)
+	if found.searched && !found.ahead {
 		searchesLeft--
 	}
+	searchesLeft = max(searchesLeft, 0)
 	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft}
 	// With no fact by c.knownBound, the model stops and the voice says what
 	// is known (R6), rather than run into the bound.
@@ -241,7 +252,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		if sayErr := sp.sayText(parent, found.known(), mode); sayErr != nil {
 			return sayErr
 		}
-	case errors.Is(err, errNoWords) && holderCase != "":
+	case errors.Is(err, errNoWords) && (len(lead) > 0 || holderCase != "" || askStarted.Load()):
 		err = nil
 	case err != nil && ctx.Err() != nil && sp.count() == 0:
 		if !askStarted.Load() {
@@ -341,6 +352,20 @@ func (c *Concierge) routingLine(ctx context.Context, turn string) string {
 		}
 	}
 	return "Reading the record."
+}
+
+// lead is what the voice says before the facts (R6): the issue a search
+// chose, by key and the start of its title. A turn that named the key hears
+// none.
+func (r *reading) lead() []string {
+	if r.key == "" || !r.searched {
+		return nil
+	}
+	full := "I took " + r.key + "."
+	if title := titleStart(r.title); title != "" {
+		full = "I took " + r.key + ": " + title + "."
+	}
+	return []string{spokenLine(full, "I took "+r.key+".")}
 }
 
 // maxHolderWords bounds the holder's case line (R6).
@@ -508,8 +533,11 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 		prompt += "\n\nThe record of the issue the question names, read while it was asked:\n" + found.text +
 			"\nAnswer from it. Call a tool only for what it does not hold."
 	}
-	if asking {
+	switch {
+	case asking:
 		prompt += "\n\nThe recorder is asking the agent that holds " + found.key + " this question. Say only what the record holds; the agent's answer comes later."
+	case saysAsk(turn) && found.key != "":
+		prompt += "\n\nThe recorder cannot ask the agent that holds " + found.key + " now. Say only what the record holds, and ask nobody to change anything."
 	}
 	source := &strings.Builder{}
 	source.WriteString(found.text)
@@ -981,6 +1009,12 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// A retry may start with a sentence the room already heard.
+	for _, heard := range s.sp.said() {
+		if strings.EqualFold(strings.TrimSpace(heard), sentence) {
+			return nil
+		}
 	}
 	words := len(strings.Fields(sentence))
 	if s.spoken >= maxFactSentences || s.words+words > maxFactWords {

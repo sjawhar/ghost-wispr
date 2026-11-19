@@ -119,9 +119,22 @@ func (c *Client) Projects(ctx context.Context) ([]string, error) {
 // embedding model, outside Dispatch, so a caller sends the fewest words that
 // name the work, never a sentence said in a room.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+	return c.search(ctx, query, limit, false)
+}
+
+// SearchKeywords runs Dispatch's words leg alone, which reaches no embedding
+// model and answers in about 0.15 s, against 1 to 6 s for Search.
+func (c *Client) SearchKeywords(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+	return c.search(ctx, query, limit, true)
+}
+
+func (c *Client) search(ctx context.Context, query string, limit int, keywordsOnly bool) ([]SearchHit, error) {
 	params := url.Values{"q": {query}}
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
+	}
+	if keywordsOnly {
+		params.Set("keywords_only", "true")
 	}
 	var answer struct {
 		Results []struct {
