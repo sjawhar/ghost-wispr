@@ -723,6 +723,30 @@ func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
 	}
 }
 
+// TestAnswerReusesAnEarlyReadAheadsSearch (run 8i): the read-ahead searched
+// while the session did not exist yet; the answer, with the session's id and
+// the final words, takes that search and searches no more.
+func TestAnswerReusesAnEarlyReadAheadsSearch(t *testing.T) {
+	r := newRig(t)
+	r.concierge.searchSettle = 30 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	early := r.exchange
+	early.SessionID = ""
+	words := strings.Fields("what is happening with the issue about real time spoken conversation?")
+	for i := range words {
+		r.concierge.Heard(context.Background(), &early, strings.Join(words[:i+1], " "))
+		time.Sleep(10 * time.Millisecond)
+	}
+	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	time.Sleep(100 * time.Millisecond)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	answerTurn(t, r, strings.Join(words, " "))
+	if full, kw := len(r.records.searches()), len(r.records.kwQueries); full != 1 || kw != 1 {
+		t.Fatalf("full searches %q, keyword %q; want the read-ahead's one of each, reused", r.records.searches(), r.records.kwQueries)
+	}
+}
+
 // TestTheHolderGetsAQuestionInTheAskersIntent (R7, run 8g): the holder gets
 // the asker's question as one clean sentence: no routing clause ("who holds
 // the issue about …"), an embedded question made direct, Deepgram's
@@ -1118,7 +1142,19 @@ func TestTheHoldersQuestionKeepsItsShape(t *testing.T) {
 		"when the agent who is on it will finish":                                  "When will the agent who is on it finish?",
 		"how reliably does the wake word fire":                                     "How reliably does the wake word fire?",
 		"when realistically will it ship":                                          "When realistically will it ship?",
-		"ask the agent on ABC-12.":                                                 "Ask the agent on ABC-12?",
+		// The sixth review: a key-like number in a kept clause keeps it; a
+		// pause after "agent" keeps a clause with no key; an -ly word joins
+		// only the bare "how", and a name is no adverb.
+		"ask the agent on ABC-12 about PR 80, is it merged":                      "About PR 80, is it merged?",
+		"ask the agent on ABC-12: for the demo on November 20, will it be ready": "For the demo on November 20, will it be ready?",
+		"ask the agent, for the demo on Friday, will ABC-12 be ready":            "For the demo on Friday, will ABC-12 be ready?",
+		"ask the agent, on ABC-12, is it merged":                                 "Is it merged?",
+		"how often nightly builds are skipped":                                   "How often are nightly builds skipped?",
+		"how long early access will stay open":                                   "How long will early access stay open?",
+		"when Emily will be back":                                                "When will Emily be back?",
+		"why nightly is failing":                                                 "Why is nightly failing?",
+		"how Kelly is doing":                                                     "How is Kelly doing?",
+		"ask the agent on ABC-12.":                                               "Ask the agent on ABC-12?",
 	} {
 		if got := fewestWords(turn); got != want {
 			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)

@@ -262,10 +262,23 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 	var pending *read
 	if p := c.prefetchLocked(x); p != nil {
 		pending = p.reads[target]
-		if pending == nil && wordsHeldBy(p.current, target) {
+		switch {
+		case pending != nil:
+		case wordsHeldBy(p.current, target):
 			// The read-ahead searched words the final turn holds: its search,
 			// keyword and full, is this answer's (Main's rule).
 			pending = p.reads[p.current]
+		case strings.HasPrefix(p.current, "search:") && strings.HasPrefix(target, "search:"):
+			// Counts only, never the words: why the answer searches again.
+			ahead := strings.Fields(strings.TrimPrefix(p.current, "search:"))
+			held := set(strings.Fields(strings.TrimPrefix(target, "search:")))
+			n := 0
+			for _, word := range ahead {
+				if held[word] {
+					n++
+				}
+			}
+			c.logger.Info("concierge searches again: the turn holds not all of the read-ahead's words", "ahead_words", len(ahead), "held", n)
 		}
 	}
 	c.mu.Unlock()
