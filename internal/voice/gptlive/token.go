@@ -26,16 +26,25 @@ const Audience = "https://api.openai.com/v1"
 // that lives less than twice as long is renewed at half its life.
 const tokenRenewBefore = 5 * time.Minute
 
-// tokenExchangeTimeout bounds one exchange when the caller's context has no
-// deadline of its own.
-const tokenExchangeTimeout = 15 * time.Second
+// tokenExchangeTimeout bounds one exchange, whatever the caller's deadline:
+// the Supervisor's is the exchange's 2 minutes, and a wake must not wait
+// that long on a token endpoint that does not answer.
+var tokenExchangeTimeout = 15 * time.Second
+
+// tokenExpiryMargin is how long before its expiry a cached token stops
+// being handed out when its renewal has failed.
+const tokenExpiryMargin = 30 * time.Second
 
 // TokenConfig configures a TokenSource. IdentityProviderID and
-// ServiceAccountID are ids, not secrets (config `openai.identity_provider_id`
-// and `openai.service_account_id`).
+// ServiceAccountID are ids, not secrets (config
+// `voice.gptlive.openai_identity_provider_id` and
+// `voice.gptlive.openai_service_account_id`).
 type TokenConfig struct {
 	// Endpoint is the token exchange URL; empty means TokenEndpoint.
-	Endpoint           string
+	Endpoint string
+	// Audience is the Google ID token's audience; empty means Audience. The
+	// probe's control asks for another, which OpenAI must refuse.
+	Audience           string
 	IdentityProviderID string
 	ServiceAccountID   string
 	// Subject mints the Google ID token for audience, as googleauth.IDToken
@@ -53,9 +62,10 @@ type TokenConfig struct {
 type TokenSource struct {
 	cfg TokenConfig
 
-	mu      sync.Mutex
-	token   string
-	renewAt time.Time
+	mu       sync.Mutex
+	token    string
+	renewAt  time.Time
+	expireAt time.Time
 }
 
 // NewTokenSource makes a TokenSource.
@@ -78,11 +88,16 @@ func NewTokenSource(cfg TokenConfig) (*TokenSource, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Audience == "" {
+		cfg.Audience = Audience
+	}
 	return &TokenSource{cfg: cfg}, nil
 }
 
 // Token returns an access token that is valid now, exchanging a new one when
 // the one it holds is due for renewal. Concurrent callers share one exchange.
+// A renewal that fails while the token it holds has more than
+// tokenExpiryMargin left hands that token out instead.
 func (s *TokenSource) Token(ctx context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -92,9 +107,12 @@ func (s *TokenSource) Token(ctx context.Context) (string, error) {
 	}
 	token, expireAt, err := s.exchange(ctx, now)
 	if err != nil {
+		if s.token != "" && now.Before(s.expireAt.Add(-tokenExpiryMargin)) {
+			return s.token, nil
+		}
 		return "", err
 	}
-	s.token = token
+	s.token, s.expireAt = token, expireAt
 	s.renewAt = expireAt.Add(-min(tokenRenewBefore, expireAt.Sub(now)/2))
 	return token, nil
 }
@@ -122,12 +140,9 @@ type tokenExchangeError struct {
 }
 
 func (s *TokenSource) exchange(ctx context.Context, now time.Time) (string, time.Time, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, tokenExchangeTimeout)
-		defer cancel()
-	}
-	subject, err := s.cfg.Subject(ctx, Audience)
+	ctx, cancel := context.WithTimeout(ctx, tokenExchangeTimeout)
+	defer cancel()
+	subject, err := s.cfg.Subject(ctx, s.cfg.Audience)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("openai token: mint Google ID token: %w", err)
 	}
@@ -169,9 +184,16 @@ func (s *TokenSource) exchange(ctx context.Context, now time.Time) (string, time
 	if answer.TokenType != "" && !strings.EqualFold(answer.TokenType, "bearer") {
 		return "", time.Time{}, fmt.Errorf("openai token: exchange answer has token_type %q, want Bearer", answer.TokenType)
 	}
-	expireAt := time.Unix(answer.ExpiresAt, 0)
-	if answer.ExpiresAt == 0 {
-		expireAt = now.Add(time.Duration(answer.ExpiresIn) * time.Second)
+	// expires_at is the token's exp claim, and expires_in counts from its
+	// issue; they should agree, and where they do not the earlier holds.
+	var expireAt time.Time
+	if answer.ExpiresAt > 0 {
+		expireAt = time.Unix(answer.ExpiresAt, 0)
+	}
+	if answer.ExpiresIn > 0 {
+		if in := now.Add(time.Duration(answer.ExpiresIn) * time.Second); expireAt.IsZero() || in.Before(expireAt) {
+			expireAt = in
+		}
 	}
 	if !expireAt.After(now) {
 		return "", time.Time{}, errors.New("openai token: exchange answer has expired")

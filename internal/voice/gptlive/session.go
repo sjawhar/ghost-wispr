@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/gorilla/websocket"
 
@@ -68,6 +70,16 @@ const (
 	// closeGrace is how long Close gives the server to finalize the session
 	// after session.close, inside Close's 100 ms.
 	closeGrace = 60 * time.Millisecond
+	// transcriptSettle is how long a delegation waits after the last words
+	// GPT-Live heard before it takes them as the question: its transcript can
+	// arrive after the delegation, a fragment at a time.
+	transcriptSettle = 250 * time.Millisecond
+	// questionWait is the longest a delegation waits for those words.
+	questionWait = 1500 * time.Millisecond
+	// nothingFound answers a delegation the Concierge had nothing to say on.
+	nothingFound = "There is nothing to report on this. Say so in one short sentence."
+	// lookupFailed answers a delegation whose answer tool failed.
+	lookupFailed = "The lookup failed. Say in one short sentence that you could not get the answer just now."
 )
 
 // stopInstruction is what Interrupt tells GPT-Live when someone talks over it.
@@ -94,7 +106,9 @@ var sayStartTimeout = 15 * time.Second
 // sentence. How long GPT-Live pauses between sentences is unmeasured.
 const sayQuiet = 1200 * time.Millisecond
 
-// APIError is an error event from the Live API.
+// APIError is an error event from the Live API. Its text is the code, type
+// and parameter only: the message can quote what the session sent, and the
+// error reaches the journal, which no delete path reaches.
 type APIError struct {
 	Type, Code, Message, Param string
 }
@@ -104,7 +118,11 @@ func (e *APIError) Error() string {
 	if code == "" {
 		code = e.Type
 	}
-	return fmt.Sprintf("gpt-live %s: %s", code, e.Message)
+	text := "gpt-live error " + code
+	if e.Param != "" {
+		text += " (" + e.Param + ")"
+	}
+	return text
 }
 
 // Config configures voice B.
@@ -167,14 +185,14 @@ func (v *Voice) Open(ctx context.Context, x *voice.Exchange) (voice.Session, err
 		return nil, fmt.Errorf("gptlive: access token: %w", err)
 	}
 	conn, resp, err := v.dialer.DialContext(ctx, v.cfg.URL, http.Header{"Authorization": {"Bearer " + token}})
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
 	if err != nil {
 		if resp != nil {
-			return nil, fmt.Errorf("gptlive: connect: HTTP %d: %w", resp.StatusCode, err)
+			return nil, fmt.Errorf("gptlive: connect: HTTP %d%s: %w", resp.StatusCode, refusal(resp), err)
 		}
 		return nil, fmt.Errorf("gptlive: connect: %w", err)
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
 	}
 
 	s := newSession(ctx, v.cfg, x, conn)
@@ -231,9 +249,16 @@ type session struct {
 	cancel context.CancelFunc
 	events chan voice.Event
 	// wg counts the goroutines that emit events or write the socket for the
-	// session: its reader, tap pump, player and Interrupt's sends. Tool runs
-	// are not counted: Close cancels them and does not wait.
+	// session: its reader, tap pump, player, event forwarder, delegations
+	// waiting for their question and Interrupt's sends. Tool runs are not
+	// counted: Close cancels them and does not wait.
 	wg sync.WaitGroup
+
+	// evQueue holds events for forward to hand to Events, so a slow reader
+	// of Events never stops the socket's reader, and with it the speech.
+	evMu    sync.Mutex
+	evQueue []voice.Event
+	evWake  chan struct{}
 
 	writeMu sync.Mutex
 	dead    atomic.Bool // the connection is closed
@@ -257,6 +282,8 @@ type session struct {
 	asked       bool            // a delegation has taken the asker's words
 	turn        strings.Builder // heard since the last EventUserTurn
 	sinceAsk    strings.Builder // heard since the last delegation
+	heardAt     time.Time       // when GPT-Live last heard the room say something
+	heardWake   chan struct{}   // signalled at each word GPT-Live hears
 	dialogue    []dialogueLine  // what was heard and said in this session
 }
 
@@ -285,12 +312,15 @@ func newSession(ctx context.Context, cfg Config, x *voice.Exchange, conn *websoc
 		finished:     make(chan struct{}),
 		pending:      map[string]chan error{},
 		delegations:  map[string]bool{},
+		evWake:       make(chan struct{}, 1),
+		heardWake:    make(chan struct{}, 1),
 	}
 	s.player = newPlayer(s)
-	s.wg.Add(3)
+	s.wg.Add(4)
 	go s.read()
 	go s.pumpTap()
 	go s.player.run()
+	go s.forward()
 	return s
 }
 
@@ -338,7 +368,7 @@ func (s *session) spoken(ctx context.Context, mark int) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.ended:
-			return ErrDisconnected
+			return s.lostErr()
 		}
 	}
 }
@@ -368,6 +398,11 @@ func (s *session) deliver(ctx context.Context, callID string, result json.RawMes
 	}
 	for _, c := range chunks(r.Say) {
 		items = append(items, appendItem{typ: evCommentaryAppend, content: c})
+	}
+	if len(items) == 0 {
+		// GPT-Live is told not to guess while it waits: a delegation with
+		// no result would leave it waiting.
+		items = append(items, appendItem{typ: evCommentaryAppend, content: nothingFound})
 	}
 	return s.appendAll(ctx, &callID, items)
 }
@@ -414,7 +449,7 @@ func (s *session) Close() error {
 	}
 
 	deadline := time.Now().Add(closeGrace)
-	s.player.interrupt()
+	s.player.stop()
 	if s.lockWrite(deadline) {
 		sent := false
 		if !s.dead.Load() {
@@ -492,7 +527,7 @@ func (s *session) send(event any) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.dead.Load() {
-		return ErrDisconnected
+		return s.lostErr()
 	}
 	if err := s.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		s.abort()
@@ -541,7 +576,11 @@ func (s *session) track() (string, chan error) {
 	defer s.mu.Unlock()
 	id := s.newIDLocked()
 	if s.pendingDone {
-		ack <- ErrDisconnected
+		if s.closing {
+			ack <- ErrClosed
+		} else {
+			ack <- ErrDisconnected
+		}
 		return id, ack
 	}
 	s.pending[id] = ack
@@ -577,11 +616,49 @@ func (s *session) failPending(err error) {
 	s.pendingDone = true
 }
 
-// emit reports e, unless the session is closing.
+// lostErr is why a call on a session whose connection has ended fails:
+// ErrClosed after Close, else ErrDisconnected.
+func (s *session) lostErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return ErrClosed
+	}
+	return ErrDisconnected
+}
+
+// emit queues e for Events. It never waits: forward hands the queue on.
 func (s *session) emit(e *voice.Event) {
-	select {
-	case s.events <- *e:
-	case <-s.ctx.Done():
+	s.evMu.Lock()
+	s.evQueue = append(s.evQueue, *e)
+	s.evMu.Unlock()
+	signal(s.evWake)
+}
+
+// forward hands queued events to Events, in order, until the session closes.
+// A session lives for one exchange, so the queue stays small even when
+// nobody reads Events.
+func (s *session) forward() {
+	defer s.wg.Done()
+	for {
+		s.evMu.Lock()
+		if len(s.evQueue) == 0 {
+			s.evMu.Unlock()
+			select {
+			case <-s.evWake:
+				continue
+			case <-s.ctx.Done():
+				return
+			}
+		}
+		e := s.evQueue[0]
+		s.evQueue = s.evQueue[1:]
+		s.evMu.Unlock()
+		select {
+		case s.events <- e:
+		case <-s.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -717,14 +794,22 @@ func (s *session) onAudio(delta string) {
 // onHeard keeps what GPT-Live heard the room say.
 func (s *session) onHeard(delta string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.turn.WriteString(delta)
 	s.sinceAsk.WriteString(delta)
+	s.heardAt = time.Now()
 	s.noteLocked(false, delta)
+	s.mu.Unlock()
+	signal(s.heardWake)
 }
 
 // onSaid reports and keeps what GPT-Live says, as its fragments arrive.
+// The words of a speech Interrupt dropped are not Wispr's speech: the room
+// did not hear them, and the Supervisor's own-speech filter would take a
+// person's same words for Wispr's echo.
 func (s *session) onSaid(delta string) {
+	if s.player.dropping(time.Now()) {
+		return
+	}
 	s.mu.Lock()
 	s.noteLocked(true, delta)
 	s.mu.Unlock()
@@ -754,7 +839,9 @@ func (s *session) flushTurn() {
 
 // onDelegation turns a client delegation, which carries no task text, into
 // the Concierge's answer tool: the question is what the asker said, and the
-// transcript is the meeting before the call and the exchange since.
+// transcript is the meeting before the call and the exchange since. GPT-Live
+// can delegate before its transcript of the question arrives, so ask waits
+// for the transcript to settle first.
 func (s *session) onDelegation(ev *serverEvent) {
 	id := ev.Delegation.ID
 	if ev.Delegation.Target != delegationTargetClient || id == "" {
@@ -767,15 +854,20 @@ func (s *session) onDelegation(ev *serverEvent) {
 		return
 	}
 	s.delegations[id] = true
-	question := strings.TrimSpace(s.sinceAsk.String())
-	s.sinceAsk.Reset()
-	if !s.asked {
-		s.asked = true
-		question = strings.TrimSpace(strings.TrimSpace(s.x.AskerTurn) + " " + question)
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.ask(id)
+}
+
+// ask builds delegation id's question once the transcript has settled, then
+// reports the tool call and runs it.
+func (s *session) ask(id string) {
+	defer s.wg.Done()
+	if !s.awaitQuestion() {
+		return
 	}
-	if question == "" {
-		question = s.lastHeardLocked()
-	}
+	s.mu.Lock()
+	question := s.questionLocked()
 	transcript := s.transcriptLocked()
 	s.mu.Unlock()
 	s.flushTurn()
@@ -790,6 +882,66 @@ func (s *session) onDelegation(ev *serverEvent) {
 	go s.answer(call)
 }
 
+// awaitQuestion waits until GPT-Live has heard something since the last
+// delegation and then nothing for transcriptSettle, or questionWait has
+// passed. It reports false when the session closed meanwhile.
+func (s *session) awaitQuestion() bool {
+	limit := time.NewTimer(questionWait)
+	defer limit.Stop()
+	settle := time.NewTimer(time.Hour)
+	defer settle.Stop()
+	for {
+		s.mu.Lock()
+		heard := strings.TrimSpace(s.sinceAsk.String()) != ""
+		quiet := time.Since(s.heardAt)
+		s.mu.Unlock()
+		if heard && quiet >= transcriptSettle {
+			return true
+		}
+		if heard {
+			settle.Reset(transcriptSettle - quiet)
+		}
+		select {
+		case <-s.heardWake:
+		case <-settle.C:
+		case <-limit.C:
+			return true
+		case <-s.ctx.Done():
+			return false
+		}
+	}
+}
+
+// questionLocked is the question for a delegation: what GPT-Live heard
+// since the last one, with the asker's words at the wake before it on the
+// first unless it heard them too; else the last words heard, else the
+// meeting's last line, so a question never goes out empty.
+func (s *session) questionLocked() string {
+	question := strings.TrimSpace(s.sinceAsk.String())
+	s.sinceAsk.Reset()
+	if !s.asked {
+		s.asked = true
+		if asker := strings.TrimSpace(s.x.AskerTurn); asker != "" && !strings.Contains(words(question), words(asker)) {
+			question = strings.TrimSpace(asker + " " + question)
+		}
+	}
+	if question == "" {
+		question = s.lastHeardLocked()
+	}
+	for i := len(s.x.Recent) - 1; question == "" && i >= 0; i-- {
+		question = strings.Join(strings.Fields(s.x.Recent[i].Text), " ")
+	}
+	return question
+}
+
+// words is s in lower case with every run of other than letters and digits
+// made one space, to compare two transcripts of the same words.
+func words(s string) string {
+	return strings.Join(strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}), " ")
+}
+
 // answer runs the answer tool for call and returns its result on the
 // delegation.
 func (s *session) answer(call voice.ToolCall) {
@@ -801,7 +953,7 @@ func (s *session) answer(call voice.ToolCall) {
 		// The tool's error can quote the asker's words (a search query), and
 		// the journal is outside every delete path, so its text stays out.
 		s.log.Warn("gptlive: the answer tool failed", "delegation", call.ID, "timeout", errors.Is(err, context.DeadlineExceeded))
-		result, _ = json.Marshal(voice.AnswerResult{Say: "The lookup failed. Say in one short sentence that you could not get the answer just now."})
+		result, _ = json.Marshal(voice.AnswerResult{Say: lookupFailed})
 	}
 	if err := s.deliver(s.ctx, call.ID, result); err != nil && s.ctx.Err() == nil {
 		s.log.Warn("gptlive: return the answer", "delegation", call.ID, "error", err)
@@ -932,6 +1084,7 @@ type player struct {
 	last    time.Time // when the model's last audible audio arrived
 	muted   bool      // drop the model's audio until it pauses: an interrupted speech
 	cut     bool      // end the speech under way now
+	stopped bool      // the session closed: nothing more plays
 	begun   int       // speeches begun
 	ended   int       // speeches ended
 	changed chan struct{}
@@ -946,6 +1099,9 @@ func (p *player) push(pcm []int16, now time.Time) bool {
 	p.mu.Lock()
 	defer signal(p.wake)
 	defer p.mu.Unlock()
+	if p.stopped {
+		return false
+	}
 	inSpeech := !p.last.IsZero() && now.Sub(p.last) < speechGap
 	if !audible(pcm) {
 		if inSpeech && !p.muted {
@@ -978,6 +1134,23 @@ func audible(pcm []int16) bool {
 		}
 	}
 	return false
+}
+
+// stop drops what is queued and everything after it, and ends the speech
+// under way: the session is closing.
+func (p *player) stop() {
+	p.mu.Lock()
+	p.queue, p.muted, p.cut, p.stopped = nil, true, true, true
+	p.mu.Unlock()
+	signal(p.wake)
+}
+
+// dropping reports whether the model's speech is being dropped at now: an
+// interrupted speech that has not yet paused, or a closed session.
+func (p *player) dropping(now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stopped || (p.muted && !p.last.IsZero() && now.Sub(p.last) < speechGap)
 }
 
 // interrupt drops what is queued, ends the speech under way, and drops the
@@ -1045,6 +1218,11 @@ func (p *player) run() {
 			end()
 			continue
 		case n > 0:
+			// An Interrupt or Close since the frame was taken dropped it
+			// with the rest of the speech.
+			if p.dropped() {
+				continue
+			}
 			if speech == nil {
 				speech = p.s.x.Out.Begin()
 				p.count(true)
@@ -1083,9 +1261,33 @@ func (p *player) run() {
 	}
 }
 
+// refusal is the API's reason for a refused upgrade, read from the start of
+// its body: its error code and message, or nothing. The upgrade carries no
+// words of the room, so its message can be shown.
+func refusal(resp *http.Response) string {
+	if resp.Body == nil {
+		return ""
+	}
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	_ = resp.Body.Close()
+	var body tokenExchangeError
+	if json.Unmarshal(data, &body) != nil || len(body.Error) == 0 {
+		return ""
+	}
+	return " (" + exchangeErrorText(data) + ")"
+}
+
 func signal(c chan struct{}) {
 	select {
 	case c <- struct{}{}:
 	default:
 	}
+}
+
+// dropped reports whether an Interrupt or Close has dropped the speech
+// since the run loop last looked.
+func (p *player) dropped() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cut || p.muted || p.stopped
 }

@@ -1,17 +1,22 @@
 // Command gptlive-probe checks voice B's route to OpenAI from the office
 // unit, once the unit's Google identity is mapped to an OpenAI service
-// account: it exchanges the unit's Google ID token for an OpenAI access
-// token, opens one GPT-Live session, sends one text turn, and reports the
-// speech that comes back. It sends GPT-Live silence, never the room, and
-// prints no token.
+// account. First a control: a Google ID token for another audience, which
+// OpenAI must refuse as an invalid subject token, so a refusal of the real
+// one reads as a missing mapping and not a bad token. Then it exchanges the
+// unit's Google ID token for an OpenAI access token, opens one GPT-Live
+// session, sends one text turn, and reports the speech that comes back. It
+// sends GPT-Live silence, never the room, and prints no token.
 //
-//	gptlive-probe --identity-provider-id idp_… --service-account-id user-…
+// Run it on the unit as the ghost-wispr user, who owns the credential's key:
+//
+//	sudo -u ghost-wispr gptlive-probe --identity-provider-id idp_… --service-account-id user-…
 package main
 
 import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,6 +32,15 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
+
+// controlAudience is the control's audience: one OpenAI's identity
+// provider does not accept.
+const controlAudience = "https://example.invalid/gptlive-probe-control"
+
+// probeSettle is how long the probe listens after Say returns. Speech in
+// that time means Say returned before GPT-Live had finished, and the
+// Supervisor, which ends an exchange when Say returns, would cut it.
+const probeSettle = 2 * time.Second
 
 // probeConfig is what one probe run needs.
 type probeConfig struct {
@@ -54,6 +68,7 @@ func run() int {
 	wav := flag.String("wav", "", "write GPT-Live's speech to this WAV file")
 	timeout := flag.Duration("timeout", 60*time.Second, "give up after this long")
 	flag.Parse()
+	clientCertificatesOff()
 	if *provider == "" || *account == "" {
 		printf(os.Stderr, "gptlive-probe needs --identity-provider-id and --service-account-id\n")
 		return 2
@@ -81,6 +96,17 @@ func run() int {
 	return 0
 }
 
+// clientCertificateEnv turns client certificates for Google's APIs on or
+// off. The unit's service sets it false for its ID-token paths, and the
+// probe does the same unless its caller set it.
+const clientCertificateEnv = "GOOGLE_API_USE_CLIENT_CERTIFICATE"
+
+func clientCertificatesOff() {
+	if os.Getenv(clientCertificateEnv) == "" {
+		_ = os.Setenv(clientCertificateEnv, "false")
+	}
+}
+
 // printf writes one report line; a report that cannot be written changes
 // nothing the probe does.
 func printf(out io.Writer, format string, args ...any) {
@@ -89,6 +115,11 @@ func printf(out io.Writer, format string, args ...any) {
 
 // probe runs one check and writes its report to out.
 func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
+	if err := control(ctx, cfg); err != nil {
+		return err
+	}
+	printf(out, "control: a token for another audience was refused (invalid_subject_token)\n")
+
 	tokens, err := gptlive.NewTokenSource(gptlive.TokenConfig{
 		Endpoint:           cfg.TokenURL,
 		IdentityProviderID: cfg.IdentityProviderID,
@@ -118,31 +149,30 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	defer func() { _ = s.Close() }()
 	printf(out, "session: started (%v)\n", time.Since(begin).Round(time.Millisecond))
+	seen := watch(s.Events())
 
 	// Say returns once GPT-Live has spoken the turn's answer and it played.
 	turn := time.Now()
 	if err := s.Say(ctx, cfg.Text, voice.Ack); err != nil {
 		return fmt.Errorf("text turn: %w", err)
 	}
-	var words strings.Builder
-	for drained := false; !drained; {
-		select {
-		case ev := <-s.Events():
-			switch ev.Kind {
-			case voice.EventAgentText:
-				words.WriteString(ev.Text)
-			case voice.EventErr:
-				return fmt.Errorf("session: %w", ev.Err)
-			}
-		default:
-			drained = true
-		}
+	said := rec.duration()
+	select {
+	case <-time.After(probeSettle):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if more := rec.duration() - said; more > 0 {
+		return fmt.Errorf("the answer was cut: GPT-Live spoke %v more after Say returned, and an exchange ends when Say returns", more)
+	}
+	if err := seen.failure(); err != nil {
+		return fmt.Errorf("session: %w", err)
 	}
 	if first, ok := rec.firstAt(); ok {
 		printf(out, "first audio: %v after the text turn\n", first.Sub(turn).Round(time.Millisecond))
 	}
 	printf(out, "audio: %.2f s at %d Hz\n", rec.duration().Seconds(), gptlive.SampleRate)
-	printf(out, "words: %s\n", strings.TrimSpace(words.String()))
+	printf(out, "words: %s\n", seen.words())
 	if rec.duration() < cfg.MinAudio {
 		return fmt.Errorf("GPT-Live spoke %v, want %v or more", rec.duration(), cfg.MinAudio)
 	}
@@ -157,6 +187,69 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	printf(out, "result: PASS\n")
 	return nil
+}
+
+// control exchanges a Google ID token for another audience, which OpenAI
+// must refuse as an invalid subject token: then a refusal of the real token
+// means the mapping, not the token.
+func control(ctx context.Context, cfg *probeConfig) error {
+	tokens, err := gptlive.NewTokenSource(gptlive.TokenConfig{
+		Endpoint:           cfg.TokenURL,
+		Audience:           controlAudience,
+		IdentityProviderID: cfg.IdentityProviderID,
+		ServiceAccountID:   cfg.ServiceAccountID,
+		Subject:            cfg.Subject,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = tokens.Token(ctx)
+	switch {
+	case err == nil:
+		return errors.New("control: OpenAI took a token for another audience, so this run cannot tell a refused token from a missing mapping")
+	case !strings.Contains(err.Error(), "invalid_subject_token"):
+		return fmt.Errorf("control: a token for another audience was refused with %w, want invalid_subject_token", err)
+	}
+	return nil
+}
+
+// events is what the probe saw on a session's Events, read as it comes so
+// that nothing waits on the probe.
+type events struct {
+	mu    sync.Mutex
+	text  strings.Builder
+	first error
+}
+
+func watch(c <-chan voice.Event) *events {
+	e := &events{}
+	go func() {
+		for ev := range c {
+			e.mu.Lock()
+			switch ev.Kind {
+			case voice.EventAgentText:
+				e.text.WriteString(ev.Text)
+			case voice.EventErr:
+				if e.first == nil {
+					e.first = ev.Err
+				}
+			}
+			e.mu.Unlock()
+		}
+	}()
+	return e
+}
+
+func (e *events) words() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return strings.TrimSpace(e.text.String())
+}
+
+func (e *events) failure() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.first
 }
 
 // silence feeds the session 250 ms of silence every 250 ms, as a quiet room

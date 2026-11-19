@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -274,12 +275,13 @@ func TestDeliverSpeaksALateHolderAnswerOnItsDelegation(t *testing.T) {
 }
 
 func TestDeliverReportsTheServersRefusal(t *testing.T) {
-	tools := newFakeTools(voice.AnswerResult{})
+	tools := newFakeTools(voice.AnswerResult{Say: "I asked the agent."})
 	srv := newLiveServer(t)
 	srv.autoAck = false
 	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
 	c.delegate("item_2")
 	tools.call(t)
+	c.expect(evCommentaryAppend) // the first answer, left unacknowledged
 
 	late, _ := json.Marshal(voice.AnswerResult{Say: "The agent answered."})
 	done := make(chan error, 1)
@@ -625,4 +627,186 @@ func TestTapAudioHeldWhileStartingIsDroppedWhenTheExchangeEnds(t *testing.T) {
 		defer func() { _ = s.Close() }()
 	}
 	c.noAudio(300 * time.Millisecond)
+}
+
+// GPT-Live can delegate before its transcript of the question arrives: the
+// docs say transcript delivery can be uneven. The question must still carry
+// the asker's words.
+func TestADelegationBeforeTheTranscriptStillCarriesTheQuestion(t *testing.T) {
+	tools := newFakeTools(voice.AnswerResult{Say: "It is in review."})
+	x := testExchange(newFakeOutput(), tools)
+	x.AskerTurn = ""
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, x)
+
+	c.delegate("item_q")
+	time.Sleep(100 * time.Millisecond)
+	c.heard("Wispr, what is the status of ")
+	c.heard("ABC-123?")
+	ev := waitEvent(t, s, voice.EventToolCall)
+	var args voice.AnswerArgs
+	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
+		t.Fatalf("args %s: %v", ev.Call.Args, err)
+	}
+	if args.Question != "Wispr, what is the status of ABC-123?" {
+		t.Fatalf("question %q, want the words GPT-Live heard after it delegated", args.Question)
+	}
+}
+
+// With no words heard at all, the question falls back to the meeting's last
+// line rather than going out empty.
+func TestADelegationWithNothingHeardAsksTheLastLine(t *testing.T) {
+	tools := newFakeTools(voice.AnswerResult{Say: "It is in review."})
+	x := testExchange(newFakeOutput(), tools)
+	x.AskerTurn = ""
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, x)
+
+	c.delegate("item_n")
+	ev := waitEvent(t, s, voice.EventToolCall)
+	var args voice.AnswerArgs
+	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
+		t.Fatalf("args %s: %v", ev.Call.Args, err)
+	}
+	if args.Question != "Wispr knows." {
+		t.Fatalf("question %q, want the meeting's last line", args.Question)
+	}
+}
+
+// The asker's words at the wake and GPT-Live's transcript of the same words
+// go in the question once.
+func TestTheQuestionHoldsTheAskersWordsOnce(t *testing.T) {
+	tools := newFakeTools(voice.AnswerResult{Say: "It is in review."})
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
+
+	c.heard("What is happening with ABC-123?")
+	c.delegate("item_d")
+	ev := waitEvent(t, s, voice.EventToolCall)
+	var args voice.AnswerArgs
+	if err := json.Unmarshal(ev.Call.Args, &args); err != nil {
+		t.Fatalf("args %s: %v", ev.Call.Args, err)
+	}
+	if args.Question != "What is happening with ABC-123?" {
+		t.Fatalf("question %q, want the asker's words once", args.Question)
+	}
+}
+
+// After Interrupt, GPT-Live's transcript of the speech that no longer plays
+// is not Wispr's speech: the Supervisor would take a person's matching words
+// for Wispr's echo.
+func TestTheWordsOfAnInterruptedSpeechAreNotWisprsSpeech(t *testing.T) {
+	out := newFakeOutput()
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
+
+	c.audioDelta(ramp(1000, 2400))
+	out.nextSpeech(t).waitSamples(t, 2400)
+	s.Interrupt()
+	waitEvent(t, s, voice.EventSpeechEnded)
+	c.said("words nobody heard")
+	c.audioDelta(ramp(1000, 2400))
+	deadline := time.After(200 * time.Millisecond)
+	for done := false; !done; {
+		select {
+		case ev := <-s.Events():
+			if ev.Kind == voice.EventAgentText {
+				t.Fatalf("agent text %q from a speech Interrupt dropped", ev.Text)
+			}
+		case <-deadline:
+			done = true
+		}
+	}
+
+	// The next speech, after a pause, is Wispr's again.
+	time.Sleep(speechGap)
+	c.audioDelta(ramp(1000, 480))
+	c.said("Sure.")
+	if ev := waitEvent(t, s, voice.EventAgentText); ev.Text != "Sure." {
+		t.Fatalf("agent text %q, want the next speech's words", ev.Text)
+	}
+}
+
+// A Supervisor that reads Events slowly must not stall the session: a long
+// answer of many transcript pieces plays to its end.
+func TestAnUnreadEventsChannelDoesNotStallTheSpeech(t *testing.T) {
+	out := newFakeOutput()
+	srv := newLiveServer(t)
+	_, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
+
+	for i := range 300 {
+		c.said(fmt.Sprintf("word%d ", i))
+		c.audioDelta(ramp(1000, 240))
+	}
+	p := out.nextSpeech(t)
+	p.waitSamples(t, 300*240)
+}
+
+func TestOpenReportsWhyTheServerRefusedTheConnection(t *testing.T) {
+	srv := newLiveServer(t)
+	srv.refuseStatus = http.StatusForbidden
+	srv.refuseBody = `{"error":{"message":"The project cannot use gpt-live-1.","type":"invalid_request_error","code":"model_not_found"}}`
+	_, err := newTestVoice(t, srv).Open(context.Background(), testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
+	if err == nil || !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "model_not_found") {
+		t.Fatalf("Open = %v, want the HTTP 403 and the API's model_not_found", err)
+	}
+}
+
+// A delegation the Concierge has nothing to say about still gets an answer:
+// GPT-Live is told not to guess while it waits.
+func TestAnEmptyAnswerStillAnswersTheDelegation(t *testing.T) {
+	tools := newFakeTools(voice.AnswerResult{})
+	srv := newLiveServer(t)
+	_, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
+
+	c.delegate("item_e")
+	tools.call(t)
+	ev := c.expect(evCommentaryAppend)
+	if ev.DelegationID == nil || *ev.DelegationID != "item_e" || !strings.Contains(ev.Content, "nothing") {
+		t.Fatalf("append %s, want a commentary on item_e saying nothing was found", ev.raw)
+	}
+}
+
+// Wispr says a held answer in a session nobody addressed: the instructions
+// must have GPT-Live say the application's commentary.
+func TestTheInstructionsSayApplicationCommentaryAtOnce(t *testing.T) {
+	if !strings.Contains(instructions, "say it at once") {
+		t.Fatalf("instructions do not tell GPT-Live to say the application's commentary at once:\n%s", instructions)
+	}
+}
+
+// An API error's message can echo what the session sent, and the error goes
+// to the journal: its text is the code, type and parameter only.
+func TestAnAPIErrorsTextLeavesOutItsMessage(t *testing.T) {
+	e := &APIError{Type: "invalid_request_error", Code: "bad_content", Message: "the words someone said", Param: "content"}
+	if got := e.Error(); strings.Contains(got, "said") || !strings.Contains(got, "bad_content") || !strings.Contains(got, "content") {
+		t.Fatalf("Error() = %q, want the code and parameter and no message", got)
+	}
+}
+
+func TestSayAndDeliverAfterCloseReportClosed(t *testing.T) {
+	tools := newFakeTools(voice.AnswerResult{Say: "x"})
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
+	c.delegate("item_c")
+	tools.call(t)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	result, _ := json.Marshal(voice.AnswerResult{Say: "late"})
+	if err := s.Say(context.Background(), "hello", voice.Ack); !errors.Is(err, ErrClosed) {
+		t.Errorf("Say after Close = %v, want ErrClosed", err)
+	}
+	if err := s.Deliver(context.Background(), "item_c", result); !errors.Is(err, ErrClosed) {
+		t.Errorf("Deliver after Close = %v, want ErrClosed", err)
+	}
+}
+
+// Once the session closes, audio that was already on its way plays nothing.
+func TestTheClosedPlayerTakesNoAudio(t *testing.T) {
+	p := newPlayer(&session{})
+	p.stop()
+	if p.push(ramp(1000, 480), time.Now()) || len(p.queue) != 0 {
+		t.Fatal("a stopped player queued model audio")
+	}
 }

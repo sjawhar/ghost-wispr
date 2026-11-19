@@ -5,8 +5,8 @@ import "encoding/json"
 // The Live WebSocket's events this voice sends and reads, as the API
 // reference names them (https://developers.openai.com/api/reference/resources/live/primary-websocket)
 // and openai-go v3.103.0's live package types them. openai-go's Live
-// WebSocket needs Go 1.26 (gap-GapSDKs.md (a)), so this package owns the
-// socket and these few shapes.
+// WebSocket needs Go 1.26 and this module builds with Go 1.25, so this
+// package owns the socket and these few shapes.
 
 // Client events.
 const (

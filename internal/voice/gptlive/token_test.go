@@ -3,6 +3,7 @@ package gptlive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,6 +24,10 @@ type tokenEndpoint struct {
 	status   int
 	body     string
 	requests chan tokenRequest
+	// delay holds each answer back, so concurrent callers overlap.
+	delay time.Duration
+	// hang holds each answer until the request is abandoned.
+	hang bool
 }
 
 type tokenRequest struct {
@@ -56,7 +61,15 @@ func (e *tokenEndpoint) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	e.requests <- req
+	select {
+	case e.requests <- req:
+	default:
+	}
+	if e.hang {
+		<-r.Context().Done()
+		return
+	}
+	time.Sleep(e.delay)
 	if e.status != 0 {
 		w.WriteHeader(e.status)
 		_, _ = w.Write([]byte(e.body))
@@ -212,6 +225,7 @@ func TestTokenSourceNeverUsesAnExpiredToken(t *testing.T) {
 func TestTokenSourceMakesOneExchangeForConcurrentCallers(t *testing.T) {
 	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
 	e := newTokenEndpoint(t, clock.Now)
+	e.delay = 50 * time.Millisecond // every caller arrives while the first exchange is under way
 	s := newTestTokenSource(t, e, clock, nil)
 
 	var wg sync.WaitGroup
@@ -271,5 +285,161 @@ func TestNewTokenSourceRequiresTheProviderAndServiceAccount(t *testing.T) {
 		if _, err := NewTokenSource(cfg); err == nil {
 			t.Errorf("%s: NewTokenSource accepted %+v", name, cfg)
 		}
+	}
+}
+
+// A renewal that fails while the token it holds is still good keeps the
+// unit talking: it uses that token until shortly before it expires.
+func TestTokenSourceKeepsAValidTokenWhenARenewalFails(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	e := newTokenEndpoint(t, clock.Now)
+	s := newTestTokenSource(t, e, clock, nil)
+	first, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	clock.Advance(56 * time.Minute)
+	e.status, e.body = http.StatusServiceUnavailable, `{"error":{"message":"try later","type":"server_error","code":"unavailable"}}`
+	if got, err := s.Token(context.Background()); err != nil || got != first {
+		t.Fatalf("Token with a failed renewal 4 minutes before expiry = %q, %v; want the cached token", got, err)
+	}
+	clock.Advance(3*time.Minute + 40*time.Second)
+	if got, err := s.Token(context.Background()); err == nil {
+		t.Fatalf("Token 20 s before expiry with the endpoint down = %q, nil; want an error", got)
+	}
+}
+
+// The Supervisor's context has a 2-minute deadline: a token endpoint that
+// never answers must not hold a wake that long.
+func TestTokenSourceBoundsAnExchangeThatHangs(t *testing.T) {
+	defer func(d time.Duration) { tokenExchangeTimeout = d }(tokenExchangeTimeout)
+	tokenExchangeTimeout = 200 * time.Millisecond
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	e := newTokenEndpoint(t, clock.Now)
+	e.hang = true
+	s := newTestTokenSource(t, e, clock, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	begin := time.Now()
+	if _, err := s.Token(ctx); err == nil {
+		t.Fatal("Token against an endpoint that never answers succeeded")
+	}
+	if took := time.Since(begin); took > 2*time.Second {
+		t.Fatalf("Token took %v against an endpoint that never answers, want the exchange's own limit", took)
+	}
+}
+
+func TestTokenSourceRenewsByExpiresInAlone(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	e := newTokenEndpoint(t, clock.Now)
+	e.status, e.body = http.StatusOK, `{"access_token":"a1","token_type":"Bearer","expires_in":3600}`
+	s := newTestTokenSource(t, e, clock, nil)
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	clock.Advance(56 * time.Minute)
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if e.calls.Load() != 2 {
+		t.Fatalf("56 minutes into a token that expires_in 3600: %d exchanges, want 2", e.calls.Load())
+	}
+}
+
+// expires_in and expires_at should agree; where they do not, the earlier one
+// holds.
+func TestTokenSourceRenewsByTheEarlierOfItsTwoExpiries(t *testing.T) {
+	for name, body := range map[string]string{
+		"expires_at earlier": `{"access_token":"a1","token_type":"Bearer","expires_in":3600,"expires_at":1800000600}`,
+		"expires_in earlier": `{"access_token":"a1","token_type":"Bearer","expires_in":600,"expires_at":1800003600}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+			e := newTokenEndpoint(t, clock.Now)
+			e.status, e.body = http.StatusOK, body
+			s := newTestTokenSource(t, e, clock, nil)
+			if _, err := s.Token(context.Background()); err != nil {
+				t.Fatalf("Token: %v", err)
+			}
+			clock.Advance(6 * time.Minute)
+			if _, err := s.Token(context.Background()); err != nil {
+				t.Fatalf("Token: %v", err)
+			}
+			if e.calls.Load() != 2 {
+				t.Fatalf("6 minutes into a 10-minute token: %d exchanges, want 2", e.calls.Load())
+			}
+		})
+	}
+}
+
+func TestTokenSourceRefusesAnAnswerItCannotUse(t *testing.T) {
+	for name, body := range map[string]string{
+		"not a bearer":    `{"access_token":"a1","token_type":"mac","expires_in":3600}`,
+		"already expired": `{"access_token":"a1","token_type":"Bearer","expires_at":1799999000}`,
+		"no lifetime":     `{"access_token":"a1","token_type":"Bearer"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+			e := newTokenEndpoint(t, clock.Now)
+			e.status, e.body = http.StatusOK, body
+			s := newTestTokenSource(t, e, clock, nil)
+			if got, err := s.Token(context.Background()); err == nil {
+				t.Fatalf("Token = %q, nil; want an error for %s", got, name)
+			}
+		})
+	}
+}
+
+func TestTokenSourceReadsAnOAuthErrorString(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	e := newTokenEndpoint(t, clock.Now)
+	e.status, e.body = http.StatusBadRequest, `{"error":"invalid_request","error_description":"subject_token is missing"}`
+	s := newTestTokenSource(t, e, clock, nil)
+	_, err := s.Token(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "invalid_request") || !strings.Contains(err.Error(), "subject_token is missing") {
+		t.Fatalf("Token = %v, want the OAuth error and its description", err)
+	}
+}
+
+func TestTokenSourceReportsAGoogleTokenItCouldNotMint(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	e := newTokenEndpoint(t, clock.Now)
+	s := newTestTokenSource(t, e, clock, func(context.Context, string) (string, error) {
+		return "", errors.New("impersonation denied")
+	})
+	if _, err := s.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "impersonation denied") {
+		t.Fatalf("Token = %v, want the Google ID token's failure", err)
+	}
+	if e.calls.Load() != 0 {
+		t.Fatalf("%d exchanges without a Google ID token", e.calls.Load())
+	}
+}
+
+// The probe's wrong-audience control mints a Google ID token for another
+// audience through the same source.
+func TestTokenSourceMintsForTheAudienceItIsGiven(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	e := newTokenEndpoint(t, clock.Now)
+	var audience string
+	s, err := NewTokenSource(TokenConfig{
+		Endpoint:           e.server.URL + "/oauth/token",
+		IdentityProviderID: "idp_test",
+		ServiceAccountID:   "user-test",
+		Audience:           "https://example.invalid/control",
+		Subject: func(_ context.Context, aud string) (string, error) {
+			audience = aud
+			return "t", nil
+		},
+		Client: e.server.Client(),
+		Now:    clock.Now,
+	})
+	if err != nil {
+		t.Fatalf("NewTokenSource: %v", err)
+	}
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if audience != "https://example.invalid/control" {
+		t.Fatalf("audience %q, want the configured one", audience)
 	}
 }

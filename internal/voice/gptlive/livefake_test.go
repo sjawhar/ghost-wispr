@@ -35,6 +35,10 @@ type liveServer struct {
 	// autoAck answers each instructions, thinking and commentary append with
 	// its acknowledgement, as the server does once the context is injected.
 	autoAck bool
+	// refuse, when set, answers the upgrade with this status and body, as
+	// the API does for a model the project may not use.
+	refuseStatus int
+	refuseBody   string
 }
 
 func newLiveServer(t *testing.T) *liveServer {
@@ -48,6 +52,12 @@ func newLiveServer(t *testing.T) *liveServer {
 		}
 		if r.URL.RawQuery != "" {
 			http.Error(w, "Live takes no query parameters", http.StatusBadRequest)
+			return
+		}
+		if s.refuseStatus != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(s.refuseStatus)
+			_, _ = w.Write([]byte(s.refuseBody))
 			return
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer "+s.bearer {
