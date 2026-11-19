@@ -5,6 +5,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,7 +279,9 @@ var pauseCancelledStartLoops = append(slices.Clip(resumeStartLoops), pauseCancel
 // microphone start, and returns the channel on which each start sends the
 // number of its call, 1 first, before start runs. A start that runs while
 // the gate is closed fails the test: the microphone opens only while the
-// unit is not paused.
+// unit is not paused. Unless the test readies the hardware itself
+// (beforeMicOpen), so does a loop that readies it while the gate is closed:
+// it did not wait for the gate, and spins while the unit is paused.
 func (l pauseCancelledStartLoop) runOn(t *testing.T, capture *captureGate, start func(call int) error) <-chan int {
 	t.Helper()
 	var loops sync.WaitGroup
@@ -287,6 +290,15 @@ func (l pauseCancelledStartLoop) runOn(t *testing.T, capture *captureGate, start
 			t.Error("microphone start-up still running after shutdown")
 		}
 	})
+	if capture.beforeMicOpen == nil {
+		var reported atomic.Bool
+		capture.beforeMicOpen = func(context.Context, <-chan struct{}) bool {
+			if capture.isClosed() && !reported.Swap(true) {
+				t.Error("the loop readied the hardware while the gate was closed: it did not wait for the gate to open")
+			}
+			return true
+		}
+	}
 	starts := make(chan int, 4)
 	calls := 0
 	l.run(t, t.Context(), &loops, capture, func() error {
@@ -423,6 +435,54 @@ func TestAPauseWhileAStartWaitsForTheHardwareStartsAtTheNextResume(t *testing.T)
 			capture.Resume()
 			nextStart(t, starts, 1, "after the resume that followed a pause during the wait for the hardware")
 		})
+	}
+}
+
+// TestAPauseJustBeforeAStartOpensNothing fails if a pause that lands after a
+// loop found the gate open, but before the start runs, lets the start run:
+// the start's PortAudio scan would open capture streams after the pause. A
+// pause once the hardware is ready must also stop the light from being
+// confirmed red for the start, which would light it red again after the
+// pause; one during that confirmation stops the start under the red hold.
+// The next resume starts the microphone.
+func TestAPauseJustBeforeAStartOpensNothing(t *testing.T) {
+	for _, during := range []string{"after the hardware is ready", "during the red confirmation"} {
+		for _, tc := range resumeStartLoops {
+			t.Run(during+"/"+tc.name, func(t *testing.T) {
+				capture := newCaptureGate(nil, nil, nil)
+				paused := make(chan struct{})
+				pause := sync.OnceFunc(func() {
+					capture.Pause()
+					close(paused)
+				})
+				capture.beforeMicOpen = func(context.Context, <-chan struct{}) bool {
+					if during == "after the hardware is ready" {
+						pause()
+					}
+					return true
+				}
+				capture.beforeMicStart = func() error {
+					if during == "during the red confirmation" {
+						pause()
+					} else if capture.isClosed() {
+						t.Error("the light was confirmed red for a start while the gate was closed")
+					}
+					return nil
+				}
+				starts := tc.runOn(t, capture, func(int) error { return nil })
+				if !returnedWithin(paused, testWait) {
+					t.Fatal("the pause never came")
+				}
+				expectStaysClosed(t, capture, "after a pause just before a start")
+				select {
+				case got := <-starts:
+					t.Fatalf("start %d ran after a pause %s", got, during)
+				default:
+				}
+				capture.Resume()
+				nextStart(t, starts, 1, "after the resume that followed a pause "+during)
+			})
+		}
 	}
 }
 

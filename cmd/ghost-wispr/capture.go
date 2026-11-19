@@ -599,12 +599,23 @@ func (g *captureGate) openUnderRed(open func() error) error {
 
 // startUnderRed runs a microphone start under a red hold (openUnderRed), then
 // ends the latest Resume's "resuming" state (finishResume), whether the start
-// worked or failed: readiness then reports what came back. A start a pause
-// cancelled before it opened a device (errMicStartPaused) ends no resume's
-// state: the gate can be open again for a later Resume by then, and that
-// Resume's own start ends it.
+// worked or failed: readiness then reports what came back. A start finds the
+// gate open when its loop looks; a pause, or a hold for the light, that closed
+// it since then cancels the start before the light is confirmed red, or under
+// the red hold before the start runs: it opens nothing, not even a PortAudio
+// scan, and returns errMicStartPaused. A start a pause cancelled ends no
+// resume's state: the gate can be open again for a later Resume by then, and
+// that Resume's own start ends it.
 func (g *captureGate) startUnderRed(start func() error) error {
-	err := g.openUnderRed(start)
+	err := errMicStartPaused
+	if !g.isClosed() {
+		err = g.openUnderRed(func() error {
+			if g.isClosed() {
+				return errMicStartPaused
+			}
+			return start()
+		})
+	}
 	if !errors.Is(err, errMicStartPaused) {
 		g.finishResume()
 	}
