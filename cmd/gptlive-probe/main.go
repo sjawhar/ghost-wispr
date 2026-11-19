@@ -42,7 +42,10 @@ type probeConfig struct {
 	WAV      string        // where to write the speech; empty writes none
 }
 
-func main() {
+func main() { os.Exit(run()) }
+
+// run parses the flags, runs the probe and returns the exit code.
+func run() int {
 	credentials := flag.String("credentials", "/opt/ghost-wispr/google-credentials.json", "the unit's Google credential file")
 	provider := flag.String("identity-provider-id", "", "OpenAI workload identity provider id (idp_…)")
 	account := flag.String("service-account-id", "", "OpenAI service account id the provider maps the unit to (user-…)")
@@ -52,15 +55,15 @@ func main() {
 	timeout := flag.Duration("timeout", 60*time.Second, "give up after this long")
 	flag.Parse()
 	if *provider == "" || *account == "" {
-		fmt.Fprintln(os.Stderr, "gptlive-probe needs --identity-provider-id and --service-account-id")
-		os.Exit(2)
+		printf(os.Stderr, "gptlive-probe needs --identity-provider-id and --service-account-id\n")
+		return 2
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	err := probe(ctx, probeConfig{
+	err := probe(ctx, &probeConfig{
 		IdentityProviderID: *provider,
 		ServiceAccountID:   *account,
 		Subject: func(ctx context.Context, audience string) (string, error) {
@@ -72,13 +75,20 @@ func main() {
 		WAV:      *wav,
 	}, os.Stdout)
 	if err != nil {
-		fmt.Printf("result: FAIL: %v\n", err)
-		os.Exit(1)
+		printf(os.Stdout, "result: FAIL: %v\n", err)
+		return 1
 	}
+	return 0
+}
+
+// printf writes one report line; a report that cannot be written changes
+// nothing the probe does.
+func printf(out io.Writer, format string, args ...any) {
+	_, _ = fmt.Fprintf(out, format, args...)
 }
 
 // probe runs one check and writes its report to out.
-func probe(ctx context.Context, cfg probeConfig, out io.Writer) error {
+func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	tokens, err := gptlive.NewTokenSource(gptlive.TokenConfig{
 		Endpoint:           cfg.TokenURL,
 		IdentityProviderID: cfg.IdentityProviderID,
@@ -92,7 +102,7 @@ func probe(ctx context.Context, cfg probeConfig, out io.Writer) error {
 	if _, err := tokens.Token(ctx); err != nil {
 		return fmt.Errorf("token exchange: %w", err)
 	}
-	fmt.Fprintf(out, "token exchange: ok (%v)\n", time.Since(begin).Round(time.Millisecond))
+	printf(out, "token exchange: ok (%v)\n", time.Since(begin).Round(time.Millisecond))
 
 	v, err := gptlive.New(gptlive.Config{URL: cfg.LiveURL, Voice: cfg.Voice, Token: tokens.Token})
 	if err != nil {
@@ -102,22 +112,20 @@ func probe(ctx context.Context, cfg probeConfig, out io.Writer) error {
 	go silence(ctx, tap)
 	rec := &recording{}
 	begin = time.Now()
-	s, err := v.Open(ctx, voice.Exchange{SessionID: "gptlive-probe", WakeAt: begin, Tap: tap, Out: rec, Tools: probeTools{}})
+	s, err := v.Open(ctx, &voice.Exchange{SessionID: "gptlive-probe", WakeAt: begin, Tap: tap, Out: rec, Tools: probeTools{}})
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
 	defer func() { _ = s.Close() }()
-	fmt.Fprintf(out, "session: started (%v)\n", time.Since(begin).Round(time.Millisecond))
+	printf(out, "session: started (%v)\n", time.Since(begin).Round(time.Millisecond))
 
+	// Say returns once GPT-Live has spoken the turn's answer and it played.
 	turn := time.Now()
 	if err := s.Say(ctx, cfg.Text, voice.Ack); err != nil {
 		return fmt.Errorf("text turn: %w", err)
 	}
 	var words strings.Builder
-	heard := false
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	for !heard {
+	for drained := false; !drained; {
 		select {
 		case ev := <-s.Events():
 			switch ev.Kind {
@@ -125,19 +133,19 @@ func probe(ctx context.Context, cfg probeConfig, out io.Writer) error {
 				words.WriteString(ev.Text)
 			case voice.EventErr:
 				return fmt.Errorf("session: %w", ev.Err)
-			case voice.EventSpeechEnded:
-				heard = rec.duration() >= cfg.MinAudio
 			}
-		case <-tick.C:
-		case <-ctx.Done():
-			return fmt.Errorf("%v of speech before the deadline, want %v: %w", rec.duration(), cfg.MinAudio, ctx.Err())
+		default:
+			drained = true
 		}
 	}
 	if first, ok := rec.firstAt(); ok {
-		fmt.Fprintf(out, "first audio: %v after the text turn\n", first.Sub(turn).Round(time.Millisecond))
+		printf(out, "first audio: %v after the text turn\n", first.Sub(turn).Round(time.Millisecond))
 	}
-	fmt.Fprintf(out, "audio: %.2f s at %d Hz\n", rec.duration().Seconds(), gptlive.SampleRate)
-	fmt.Fprintf(out, "words: %s\n", strings.TrimSpace(words.String()))
+	printf(out, "audio: %.2f s at %d Hz\n", rec.duration().Seconds(), gptlive.SampleRate)
+	printf(out, "words: %s\n", strings.TrimSpace(words.String()))
+	if rec.duration() < cfg.MinAudio {
+		return fmt.Errorf("GPT-Live spoke %v, want %v or more", rec.duration(), cfg.MinAudio)
+	}
 	if err := s.Close(); err != nil {
 		return fmt.Errorf("close: %w", err)
 	}
@@ -145,9 +153,9 @@ func probe(ctx context.Context, cfg probeConfig, out io.Writer) error {
 		if err := os.WriteFile(cfg.WAV, rec.wav(), 0o600); err != nil {
 			return fmt.Errorf("write %s: %w", cfg.WAV, err)
 		}
-		fmt.Fprintf(out, "wav: %s\n", cfg.WAV)
+		printf(out, "wav: %s\n", cfg.WAV)
 	}
-	fmt.Fprintln(out, "result: PASS")
+	printf(out, "result: PASS\n")
 	return nil
 }
 

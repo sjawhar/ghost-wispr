@@ -301,13 +301,16 @@ func TestDeliverReportsTheServersRefusal(t *testing.T) {
 	}
 }
 
-func TestSayAppendsSessionCommentaryAndWaitsForItsAcknowledgement(t *testing.T) {
+func TestSayReturnsOnceGPTLiveHasSpokenTheText(t *testing.T) {
+	out := newFakeOutput()
 	srv := newLiveServer(t)
 	srv.autoAck = false
-	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
+	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
 
 	done := make(chan error, 1)
-	go func() { done <- s.Say(context.Background(), "The agent on ABC-123 answered: the fix is merged.", voice.Answer) }()
+	go func() {
+		done <- s.Say(context.Background(), "The agent on ABC-123 answered: the fix is merged.", voice.Answer)
+	}()
 	ev := c.expect(evCommentaryAppend)
 	if ev.DelegationID != nil || !strings.Contains(string(ev.raw), `"delegation_id":null`) {
 		t.Errorf("Say sent %s, want session-wide commentary (delegation_id null)", ev.raw)
@@ -315,19 +318,41 @@ func TestSayAppendsSessionCommentaryAndWaitsForItsAcknowledgement(t *testing.T) 
 	if ev.Content != "The agent on ABC-123 answered: the fix is merged." {
 		t.Errorf("Say sent content %q", ev.Content)
 	}
+	c.send(map[string]any{"type": evCommentaryAppended, "event_id": "event_ack", "client_event_id": ev.EventID, "start_ms": 10, "end_ms": 20})
+	// The acknowledgement says the text reached the model, not that the
+	// room heard it: Say waits for the speech, so that an exchange that ends
+	// once Say returns does not cut it.
 	select {
 	case err := <-done:
-		t.Fatalf("Say returned %v before the server acknowledged it", err)
-	case <-time.After(50 * time.Millisecond):
+		t.Fatalf("Say returned %v before GPT-Live spoke", err)
+	case <-time.After(100 * time.Millisecond):
 	}
-	c.send(map[string]any{"type": evCommentaryAppended, "event_id": "event_ack", "client_event_id": ev.EventID, "start_ms": 10, "end_ms": 20})
+	c.audioDelta(ramp(1000, 2400))
+	p := out.nextSpeech(t)
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Say: %v", err)
 		}
 	case <-time.After(testWait):
-		t.Fatal("Say did not return after its acknowledgement")
+		t.Fatal("Say did not return after GPT-Live spoke")
+	}
+	p.mu.Lock()
+	drained := p.drained
+	p.mu.Unlock()
+	if !drained || len(p.samples()) != 2400 {
+		t.Fatalf("Say returned before its speech played: drained %v, %d of 2400 samples", drained, len(p.samples()))
+	}
+}
+
+func TestSayFailsWhenGPTLiveSaysNothing(t *testing.T) {
+	defer func(d time.Duration) { sayStartTimeout = d }(sayStartTimeout)
+	sayStartTimeout = 200 * time.Millisecond
+	srv := newLiveServer(t)
+	s, _, _ := openSession(t, srv, testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
+
+	if err := s.Say(context.Background(), "Say this.", voice.Answer); !errors.Is(err, ErrNoSpeech) {
+		t.Fatalf("Say with no speech from GPT-Live = %v, want ErrNoSpeech", err)
 	}
 }
 
@@ -358,8 +383,55 @@ func TestLongCommentaryGoesInAppendsOf500TokensOrLess(t *testing.T) {
 	if strings.Join(got, " ") != text {
 		t.Errorf("the appends do not add up to the text")
 	}
+	c.audioDelta(ramp(1000, 480))
 	if err := <-done; err != nil {
 		t.Fatalf("Say: %v", err)
+	}
+}
+
+func TestSilenceFromTheModelOpensNoSpeech(t *testing.T) {
+	out := newFakeOutput()
+	srv := newLiveServer(t)
+	_, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
+
+	// A second of silence opens no speech, so the speaker's stream stays shut.
+	for range 10 {
+		c.audioDelta(make([]int16, 2400))
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(speechGap)
+	if n := len(out.speeches()); n != 0 {
+		t.Fatalf("silence from the model began %d speeches", n)
+	}
+
+	// Speech plays, with the quiet inside it.
+	c.audioDelta(ramp(1000, 2400))
+	c.audioDelta(make([]int16, 480))
+	c.audioDelta(ramp(5000, 480))
+	p := out.nextSpeech(t)
+	p.waitSamples(t, 2400+480+480)
+	got := p.samples()
+	if got[0] != 1000 || got[2400] != 0 || got[2880] != 5000 {
+		t.Fatalf("speech played %d, %d, %d at the joins, want the speech, its quiet, and the rest", got[0], got[2400], got[2880])
+	}
+
+	// Silence after the speech has ended plays nothing.
+	time.Sleep(speechGap + 100*time.Millisecond)
+	c.audioDelta(make([]int16, 2400))
+	time.Sleep(100 * time.Millisecond)
+	if n := len(out.samples()); n != 2400+480+480 {
+		t.Fatalf("silence after the speech played: %d samples, want %d", n, 2400+480+480)
+	}
+}
+
+func TestTheVoiceDrivesItsOwnTurn(t *testing.T) {
+	v, err := New(Config{Token: func(context.Context) (string, error) { return "t", nil }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var d voice.TurnDriver = v
+	if !d.DrivesTurn() {
+		t.Fatal("voice B does not drive its own turn, so the Supervisor would hand the turn to the Concierge too")
 	}
 }
 

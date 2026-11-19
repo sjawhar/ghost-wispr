@@ -80,7 +80,19 @@ var (
 	ErrDisconnected = errors.New("gptlive: the Live connection ended")
 	// ErrClosed is a call on a session that has been closed.
 	ErrClosed = errors.New("gptlive: session closed")
+	// ErrNoSpeech is a Say that GPT-Live did not speak.
+	ErrNoSpeech = errors.New("gptlive: GPT-Live did not speak the text")
 )
+
+// sayStartTimeout is how long Say waits for GPT-Live to start speaking the
+// text it was given.
+var sayStartTimeout = 15 * time.Second
+
+// sayQuiet is how long Say waits, after GPT-Live's speech has played, for
+// more of it before it takes the text as spoken. GPT-Live marks no end of
+// an answer, and an exchange that ends when Say returns would cut a second
+// sentence. How long GPT-Live pauses between sentences is unmeasured.
+const sayQuiet = 1200 * time.Millisecond
 
 // APIError is an error event from the Live API.
 type APIError struct {
@@ -116,7 +128,10 @@ type Voice struct {
 	dialer websocket.Dialer
 }
 
-var _ voice.Voice = (*Voice)(nil)
+var (
+	_ voice.Voice      = (*Voice)(nil)
+	_ voice.TurnDriver = (*Voice)(nil)
+)
 
 // New makes voice B.
 func New(cfg Config) (*Voice, error) {
@@ -133,10 +148,14 @@ func New(cfg Config) (*Voice, error) {
 	return &Voice{cfg: cfg, dialer: websocket.Dialer{HandshakeTimeout: handshakeTimeout, Proxy: http.ProxyFromEnvironment}}, nil
 }
 
+// DrivesTurn reports that GPT-Live drives the turn: it decides when to
+// answer and delegates to the Concierge's answer tool.
+func (v *Voice) DrivesTurn() bool { return true }
+
 // Open connects to GPT-Live and starts a session for x. It returns once the
 // session has started, so x's tap audio, which it keeps from the start,
 // reaches the model.
-func (v *Voice) Open(ctx context.Context, x voice.Exchange) (voice.Session, error) {
+func (v *Voice) Open(ctx context.Context, x *voice.Exchange) (voice.Session, error) {
 	if x.Out == nil {
 		return nil, errors.New("gptlive: the exchange has no output")
 	}
@@ -241,11 +260,12 @@ type dialogueLine struct {
 
 var _ voice.Session = (*session)(nil)
 
-func newSession(ctx context.Context, cfg Config, x voice.Exchange, conn *websocket.Conn) *session {
+// newSession starts a session's goroutines on conn. It keeps a copy of x.
+func newSession(ctx context.Context, cfg Config, x *voice.Exchange, conn *websocket.Conn) *session {
 	sctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s := &session{
 		cfg:          cfg,
-		x:            x,
+		x:            *x,
 		conn:         conn,
 		log:          cfg.Logger.With("session_id", x.SessionID),
 		ctx:          sctx,
@@ -259,7 +279,7 @@ func newSession(ctx context.Context, cfg Config, x voice.Exchange, conn *websock
 		pending:      map[string]chan error{},
 		delegations:  map[string]bool{},
 	}
-	s.player = &player{s: s, wake: make(chan struct{}, 1)}
+	s.player = newPlayer(s)
 	s.wg.Add(3)
 	go s.read()
 	go s.pumpTap()
@@ -268,14 +288,52 @@ func newSession(ctx context.Context, cfg Config, x voice.Exchange, conn *websock
 }
 
 // Say has GPT-Live say text, in its own words: session-wide commentary. It
-// returns once the server has taken the text into the conversation.
+// returns once GPT-Live has spoken it: a speech began after the text went
+// in, and every speech since has played and been followed by sayQuiet of
+// quiet. The server's acknowledgement says only that the text reached the
+// model, so an exchange that ended on it would cut the speech.
 func (s *session) Say(ctx context.Context, text string, mode voice.SayMode) error {
 	items := make([]appendItem, 0, 1)
 	for _, c := range chunks(text) {
 		items = append(items, appendItem{typ: evCommentaryAppend, content: c})
 	}
 	s.log.Debug("gptlive say", "mode", mode.String(), "appends", len(items))
-	return s.appendAll(ctx, nil, items)
+	mark, _, _ := s.player.state()
+	if err := s.appendAll(ctx, nil, items); err != nil {
+		return err
+	}
+	return s.spoken(ctx, mark)
+}
+
+// spoken waits until GPT-Live has spoken since mark speeches had begun.
+func (s *session) spoken(ctx context.Context, mark int) error {
+	start := time.NewTimer(sayStartTimeout)
+	defer start.Stop()
+	quiet := time.NewTimer(sayQuiet)
+	defer quiet.Stop()
+	for {
+		begun, ended, changed := s.player.state()
+		startC := start.C
+		if begun > mark {
+			startC = nil
+		}
+		if begun > mark && begun == ended {
+			quiet.Reset(sayQuiet)
+		} else {
+			quiet.Stop()
+		}
+		select {
+		case <-changed:
+		case <-quiet.C:
+			return nil
+		case <-startC:
+			return ErrNoSpeech
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ended:
+			return ErrDisconnected
+		}
+	}
 }
 
 // Deliver returns result, an AnswerResult, on delegation callID: its
@@ -368,7 +426,7 @@ func (s *session) Close() error {
 	s.abort()
 	s.wg.Wait()
 	s.failPending(ErrClosed)
-	if s.player.speaking.Load() {
+	if s.player.speaking() {
 		select {
 		case s.events <- voice.Event{Kind: voice.EventSpeechEnded}:
 		default:
@@ -509,9 +567,9 @@ func (s *session) failPending(err error) {
 }
 
 // emit reports e, unless the session is closing.
-func (s *session) emit(e voice.Event) {
+func (s *session) emit(e *voice.Event) {
 	select {
-	case s.events <- e:
+	case s.events <- *e:
 	case <-s.ctx.Done():
 	}
 }
@@ -542,7 +600,7 @@ func (s *session) read() {
 				close(s.started)
 			}
 		case evError:
-			s.onError(ev, started)
+			s.onError(&ev, started)
 		case evInstructionsAppended, evThinkingAppended, evCommentaryAppended:
 			s.resolve(ev.ClientEventID, nil)
 		case evOutputAudioDelta:
@@ -552,7 +610,7 @@ func (s *session) read() {
 		case evOutputTranscript:
 			s.onSaid(ev.Delta)
 		case evDelegationCreated:
-			s.onDelegation(ev)
+			s.onDelegation(&ev)
 		case evSessionClosed:
 			s.onClosed(ev.Reason, started)
 		}
@@ -573,7 +631,7 @@ func (s *session) lost(err error, started bool) {
 	s.mu.Unlock()
 	if report {
 		s.log.Warn("gptlive: the Live connection ended", "error", err)
-		s.emit(voice.Event{Kind: voice.EventErr, Err: fmt.Errorf("%w: %v", ErrDisconnected, err)})
+		s.emit(&voice.Event{Kind: voice.EventErr, Err: fmt.Errorf("%w: %v", ErrDisconnected, err)})
 	}
 }
 
@@ -584,7 +642,7 @@ func (s *session) startFailed(err error) {
 	}
 }
 
-func (s *session) onError(ev serverEvent, started bool) {
+func (s *session) onError(ev *serverEvent, started bool) {
 	e := &APIError{Type: ev.Error.Type, Code: ev.Error.Code, Message: ev.Error.Message, Param: ev.Error.Param}
 	id := ev.Error.ClientEventID
 	if id == "" {
@@ -598,7 +656,7 @@ func (s *session) onError(ev serverEvent, started bool) {
 		return
 	}
 	s.log.Warn("gptlive: error event", "type", e.Type, "code", e.Code, "param", e.Param)
-	s.emit(voice.Event{Kind: voice.EventErr, Err: e})
+	s.emit(&voice.Event{Kind: voice.EventErr, Err: e})
 }
 
 func (s *session) onClosed(reason string, started bool) {
@@ -618,7 +676,7 @@ func (s *session) onClosed(reason string, started bool) {
 	s.mu.Unlock()
 	if report {
 		s.log.Warn("gptlive: the server ended the session", "reason", reason)
-		s.emit(voice.Event{Kind: voice.EventErr, Err: fmt.Errorf("gptlive: the server ended the session: %s", reason)})
+		s.emit(&voice.Event{Kind: voice.EventErr, Err: fmt.Errorf("gptlive: the server ended the session: %s", reason)})
 	}
 }
 
@@ -660,7 +718,7 @@ func (s *session) onSaid(delta string) {
 	s.noteLocked(true, delta)
 	s.mu.Unlock()
 	if strings.TrimSpace(delta) != "" {
-		s.emit(voice.Event{Kind: voice.EventAgentText, Text: delta})
+		s.emit(&voice.Event{Kind: voice.EventAgentText, Text: delta})
 	}
 }
 
@@ -679,14 +737,14 @@ func (s *session) flushTurn() {
 	s.turn.Reset()
 	s.mu.Unlock()
 	if text != "" {
-		s.emit(voice.Event{Kind: voice.EventUserTurn, Text: text})
+		s.emit(&voice.Event{Kind: voice.EventUserTurn, Text: text})
 	}
 }
 
 // onDelegation turns a client delegation, which carries no task text, into
 // the Concierge's answer tool: the question is what the asker said, and the
 // transcript is the meeting before the call and the exchange since.
-func (s *session) onDelegation(ev serverEvent) {
+func (s *session) onDelegation(ev *serverEvent) {
 	id := ev.Delegation.ID
 	if ev.Delegation.Target != delegationTargetClient || id == "" {
 		s.log.Warn("gptlive: delegation not for the client", "target", ev.Delegation.Target)
@@ -717,7 +775,7 @@ func (s *session) onDelegation(ev serverEvent) {
 		return
 	}
 	call := voice.ToolCall{ID: id, Name: voice.AnswerTool, Args: args}
-	s.emit(voice.Event{Kind: voice.EventToolCall, Call: call})
+	s.emit(&voice.Event{Kind: voice.EventToolCall, Call: call})
 	go s.answer(call)
 }
 
@@ -840,40 +898,71 @@ func pcm16Bytes(pcm []int16) []byte {
 // format is the model's speech as it plays.
 var format = audio.AudioFormat{SampleRate: SampleRate, Channels: 1, Encoding: audio.EncodingPCM16}
 
-// player plays the model's speech on the voice input, one Playback a
-// speech. A speech ends once the model's audio has paused for speechGap and
-// what it queued has played.
-type player struct {
-	s        *session
-	wake     chan struct{}
-	speaking atomic.Bool
+// silenceLevel is the loudest sample the player takes for silence, about
+// -48 dBFS. GPT-Live sends no event at the end of its speech, and audio of
+// silence between its speeches must not open the speaker's stream, which
+// holds back every Jabra light write while it is open.
+const silenceLevel = 128
 
-	mu    sync.Mutex
-	queue []int16
-	last  time.Time // when the model's last audio arrived
-	muted bool      // drop the model's audio until it pauses: an interrupted speech
-	cut   bool      // end the speech under way now
+// player plays the model's speech on the voice input, one Playback a
+// speech. A speech starts with audible audio and ends once the model's
+// audio has been silent or absent for speechGap and what it queued has
+// played. Silence inside a speech plays; silence outside one does not.
+type player struct {
+	s    *session
+	wake chan struct{}
+
+	mu      sync.Mutex
+	queue   []int16
+	last    time.Time // when the model's last audible audio arrived
+	muted   bool      // drop the model's audio until it pauses: an interrupted speech
+	cut     bool      // end the speech under way now
+	begun   int       // speeches begun
+	ended   int       // speeches ended
+	changed chan struct{}
+}
+
+func newPlayer(s *session) *player {
+	return &player{s: s, wake: make(chan struct{}, 1), changed: make(chan struct{})}
 }
 
 // push queues the model's audio and reports whether it starts a speech.
 func (p *player) push(pcm []int16, now time.Time) bool {
 	p.mu.Lock()
-	fresh := p.last.IsZero() || now.Sub(p.last) >= speechGap
+	defer signal(p.wake)
+	defer p.mu.Unlock()
+	inSpeech := !p.last.IsZero() && now.Sub(p.last) < speechGap
+	if !audible(pcm) {
+		if inSpeech && !p.muted {
+			p.enqueueLocked(pcm)
+		}
+		return false
+	}
 	p.last = now
 	if p.muted {
-		if !fresh {
-			p.mu.Unlock()
+		if inSpeech {
 			return false
 		}
 		p.muted = false
 	}
+	p.enqueueLocked(pcm)
+	return !inSpeech
+}
+
+func (p *player) enqueueLocked(pcm []int16) {
 	p.queue = append(p.queue, pcm...)
 	if over := len(p.queue) - maxQueuedAudio; over > 0 {
 		p.queue = p.queue[over:]
 	}
-	p.mu.Unlock()
-	signal(p.wake)
-	return fresh
+}
+
+func audible(pcm []int16) bool {
+	for _, v := range pcm {
+		if v > silenceLevel || v < -silenceLevel {
+			return true
+		}
+	}
+	return false
 }
 
 // interrupt drops what is queued, ends the speech under way, and drops the
@@ -885,14 +974,41 @@ func (p *player) interrupt() {
 	signal(p.wake)
 }
 
+// state reports how many speeches have begun and ended, and a channel that
+// closes when either changes.
+func (p *player) state() (begun, ended int, changed <-chan struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.begun, p.ended, p.changed
+}
+
+// speaking reports whether a speech is under way.
+func (p *player) speaking() bool {
+	begun, ended, _ := p.state()
+	return begun != ended
+}
+
+// count records a speech beginning or ending.
+func (p *player) count(began bool) {
+	p.mu.Lock()
+	if began {
+		p.begun++
+	} else {
+		p.ended++
+	}
+	close(p.changed)
+	p.changed = make(chan struct{})
+	p.mu.Unlock()
+}
+
 func (p *player) run() {
 	defer p.s.wg.Done()
 	ctx := p.s.ctx
 	var speech voice.Playback
 	end := func() {
 		speech = nil
-		p.speaking.Store(false)
-		p.s.emit(voice.Event{Kind: voice.EventSpeechEnded})
+		p.count(false)
+		p.s.emit(&voice.Event{Kind: voice.EventSpeechEnded})
 	}
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
@@ -916,8 +1032,8 @@ func (p *player) run() {
 		case n > 0:
 			if speech == nil {
 				speech = p.s.x.Out.Begin()
-				p.speaking.Store(true)
-				p.s.emit(voice.Event{Kind: voice.EventSpeechStarted})
+				p.count(true)
+				p.s.emit(&voice.Event{Kind: voice.EventSpeechStarted})
 			}
 			if err := speech.Write(ctx, frame, format); err != nil {
 				if ctx.Err() != nil {

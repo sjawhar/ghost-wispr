@@ -52,7 +52,7 @@ const historyBudget = 16000
 // history is the session's starting text history: the meeting transcript
 // before the call, labelled by speaker and oldest first, then the asker's
 // words so far. It keeps the newest whole lines that fit historyBudget.
-func history(x voice.Exchange) []initialItem {
+func history(x *voice.Exchange) []initialItem {
 	var tail string
 	if asker := strings.TrimSpace(x.AskerTurn); asker != "" {
 		tail = "The person calling you has said so far: " + truncate(asker, historyBudget/2)

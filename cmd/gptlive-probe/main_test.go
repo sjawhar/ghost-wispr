@@ -65,7 +65,16 @@ func newStandIns(t *testing.T) *standIns {
 				s.said <- ev.Content
 				_ = ws.WriteJSON(map[string]any{"type": "session.commentary.appended", "event_id": "e2", "client_event_id": ev.EventID})
 				_ = ws.WriteJSON(map[string]any{"type": "session.output_transcript.delta", "event_id": "e3", "delta": "Hello from the stand-in."})
-				speech := base64.StdEncoding.EncodeToString(make([]byte, 2*24000*6/10))
+				// 0.6 s of a square wave at 1,000 of 32,767: speech, not silence.
+				pcm := make([]byte, 2*24000*6/10)
+				for i := 0; i < len(pcm); i += 2 {
+					v := int16(1000)
+					if i/2%48 < 24 {
+						v = -1000
+					}
+					pcm[i], pcm[i+1] = byte(uint16(v)), byte(uint16(v)>>8)
+				}
+				speech := base64.StdEncoding.EncodeToString(pcm)
 				for range 2 {
 					_ = ws.WriteJSON(map[string]any{"type": "session.output_audio.delta", "delta": speech})
 				}
@@ -99,7 +108,7 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := probe(ctx, cfg, &out); err != nil {
+	if err := probe(ctx, &cfg, &out); err != nil {
 		t.Fatalf("probe: %v\n%s", err, out.String())
 	}
 	if got := <-s.bearer; got != "Bearer "+fakeAccessToken {
@@ -133,7 +142,7 @@ func TestTheProbeNamesARefusedExchange(t *testing.T) {
 	cfg := s.config(t)
 	cfg.ServiceAccountID = "user-unmapped"
 	var out bytes.Buffer
-	err := probe(context.Background(), cfg, &out)
+	err := probe(context.Background(), &cfg, &out)
 	if err == nil || !strings.Contains(err.Error(), "invalid_grant") {
 		t.Fatalf("probe with no mapping = %v, want the exchange's invalid_grant", err)
 	}

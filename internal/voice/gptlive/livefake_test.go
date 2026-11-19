@@ -399,8 +399,8 @@ func (f *fakeTools) call(t *testing.T) voice.ToolCall {
 }
 
 // testExchange is an exchange with a fake output and tools and no tap.
-func testExchange(out *fakeOutput, tools voice.ToolRunner) voice.Exchange {
-	return voice.Exchange{
+func testExchange(out *fakeOutput, tools voice.ToolRunner) *voice.Exchange {
+	return &voice.Exchange{
 		SessionID: "session-1",
 		WakeAt:    time.Unix(1_800_000_000, 0),
 		AskerTurn: "what is happening with ABC-123",
@@ -415,7 +415,7 @@ func testExchange(out *fakeOutput, tools voice.ToolRunner) voice.Exchange {
 
 // openSession opens a session on srv for x, playing the server's side of
 // the start, and returns it with the server's side of its socket.
-func openSession(t *testing.T, srv *liveServer, x voice.Exchange) (voice.Session, *liveConn, clientEvent) {
+func openSession(t *testing.T, srv *liveServer, x *voice.Exchange) (voice.Session, *liveConn, clientEvent) {
 	t.Helper()
 	v, err := New(Config{URL: srv.url(), Token: func(context.Context) (string, error) { return "access-token", nil }})
 	if err != nil {
