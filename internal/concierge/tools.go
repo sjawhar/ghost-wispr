@@ -122,6 +122,9 @@ type runner struct {
 	// unreachable: a tool's answer said Dispatch or Envoy did not answer
 	// (outOfReach).
 	unreachable bool
+	// searchesLeft, when set, is how many more searches the answer may
+	// make (R6); nil is no bound.
+	searchesLeft *int
 }
 
 // Tools gives x's tools, for x.Tools.
@@ -181,6 +184,13 @@ func (r *runner) call(ctx context.Context, name string, args map[string]any) (ma
 	)
 	switch name {
 	case "search_issues":
+		if r.searchesLeft != nil && *r.searchesLeft <= 0 {
+			err = tell("This answer has made its searches; answer from what you have.")
+			break
+		}
+		if r.searchesLeft != nil {
+			*r.searchesLeft--
+		}
 		result, err = r.searchIssues(ctx, arg("query"))
 	case "read_issue":
 		result, err = r.readIssue(ctx, arg("key"))

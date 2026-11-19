@@ -44,8 +44,14 @@ const earPrompt = `An agent answered a question asked in a meeting room. Rewrite
 const (
 	// fastAnswerBound bounds one fast answer (R6).
 	fastAnswerBound = 8 * time.Second
+	// knownAfter is when, with no fact yet, the model stops and the voice
+	// says what is known (R6).
+	knownAfter = 6 * time.Second
 	// maxToolCalls bounds the model's tool calls in one fast answer (R6).
 	maxToolCalls = 6
+	// maxSearches bounds one answer's searches, the read's and the model's
+	// together (R6).
+	maxSearches = 2
 	// routingAfter is when the voice says a routing line if it has said
 	// nothing yet (R6).
 	routingAfter = 1500 * time.Millisecond
@@ -69,9 +75,6 @@ const (
 	// usualWait is the wait the voice names after asking the holder (R6).
 	// Measurement 4 has not run; the live replies seen took 4 to 19 s.
 	usualWait = "Its answer usually comes within a minute, with a chime."
-	// askWithheld is what the voice says when the person said "ask" of an
-	// issue a search took with no one clear match: it asks nobody (R7).
-	askWithheld = "I did not ask its agent. Say the issue's key to ask it."
 )
 
 // factTools are the tools the model of a fast answer may call: all but
@@ -90,12 +93,13 @@ var factTools = func() []ToolSpec {
 var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 
 // Answer answers one turn of x, speaking through say as it goes (R5 to R8):
-//   - with no fact said 1.5 s after the turn, a routing line;
+//   - with no fact said 1.5 s after the turn, a routing line, which says the
+//     Concierge asks the holder when it does;
 //   - the issue a search took, by key and title, when the search had no one
 //     clear match; when it found none, that it found no issue and the
 //     question for its key;
-//   - the holder's case;
 //   - the facts of the record, each checked against it;
+//   - the holder's case, only when it changes what happens next;
 //   - when the holder must be asked, that it was, and the usual wait.
 //
 // What Heard read while the asker spoke is the record; an issue the final
@@ -118,28 +122,49 @@ func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn strin
 
 // answer is Answer's work, bounded by c.fastBound; sp speaks it.
 func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn string, sp *speaker) error {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
-	defer sp.routeAfter(ctx, c.routingAfter, c.routingLine(ctx, turn))()
+	// A turn that picks one of the issues the last answer offered answers
+	// the question first asked, about that issue (R5).
+	target := ""
+	if asked, key, ok := c.takePick(x, turn); ok {
+		turn, target = asked, "keys:"+key
+	}
 	// The ask runs beside the facts, so Envoy's time holds no fact back. A
 	// person's "ask" needs only the holder, so it goes out once the holder
 	// is known, before the rest of the record is read (R7).
 	asking := make(chan askResult, 1)
 	var askStarted atomic.Bool
+	var askingKey atomic.Pointer[string]
 	startAsk := func(session string, found *reading) {
 		if askStarted.CompareAndSwap(false, true) {
+			askingKey.Store(&found.key)
 			go func() { asking <- c.ask(ctx, x, session, turn, found) }()
 		}
 	}
+	// The routing line is chosen when it plays: it says the Concierge asks
+	// the holder once it does (R6).
+	defer sp.routeAfter(ctx, c.routingAfter, func() string {
+		if key := askingKey.Load(); key != nil && *key != "" {
+			return "Asking the agent on " + *key + "."
+		}
+		return c.routingLine(ctx, turn)
+	})()
 	var onHolder func(*reading)
 	if askWord.MatchString(turn) {
 		onHolder = func(early *reading) {
-			if session, _ := c.askPlan(turn, early); session != "" {
+			if session := c.askPlan(turn, early); session != "" {
 				startAsk(session, early)
 			}
 		}
 	}
-	found := c.readFor(ctx, x, turn, onHolder)
+	var found *reading
+	if target != "" {
+		found = c.readRecord(ctx, x, target, onHolder)
+	} else {
+		found = c.readFor(ctx, x, turn, onHolder)
+	}
 	switch {
 	case parent.Err() != nil:
 		return parent.Err()
@@ -164,23 +189,48 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		return errOutOfReach
 	case found.noResult:
 		return sp.sayText(ctx, noIssueFound, voice.Ack)
+	case found.searched && !found.clear && len(found.candidates) > 1:
+		// R5: no one clear match. The voice asks which of the top two the
+		// person meant; the next turn of the exchange picks one.
+		c.offerPick(x, turn, found.candidates)
+		return sp.sayText(ctx, didYouMean(found.candidates), voice.Ack)
 	}
-	lead := found.lead()
-	for _, sentence := range lead {
-		if err := sp.sayText(ctx, sentence, voice.Fact); err != nil {
-			return err
-		}
-	}
-	session, asked := c.askPlan(turn, found)
-	if session != "" {
+	holderCase := found.holderCase()
+	if session := c.askPlan(turn, found); session != "" {
 		startAsk(session, found)
 	}
-	tools := &runner{c: c, x: x}
-	err := c.facts(ctx, tools, turn, found, sp)
+	searchesLeft := maxSearches
+	if found.searched {
+		searchesLeft--
+	}
+	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft}
+	// With no fact by c.knownBound, the model stops and the voice says what
+	// is known (R6), rather than run into the bound.
+	factsCtx, stopFacts := context.WithCancel(ctx)
+	defer stopFacts()
+	var knownCut atomic.Bool
+	knownTimer := time.AfterFunc(c.knownBound-time.Since(start), func() {
+		if sp.count() == 0 {
+			knownCut.Store(true)
+			stopFacts()
+		}
+	})
+	err := c.facts(factsCtx, tools, turn, found, sp)
+	knownTimer.Stop()
 	switch {
 	case parent.Err() != nil:
 		return parent.Err()
-	case errors.Is(err, errNoWords) && len(lead) > 0:
+	case knownCut.Load():
+		c.logger.Info("concierge said what it knew: no fact by its mark", "after", c.knownBound)
+		err = nil
+		mode := voice.Fact
+		if found.key == "" {
+			mode = voice.Ack
+		}
+		if sayErr := sp.sayText(parent, found.known(), mode); sayErr != nil {
+			return sayErr
+		}
+	case errors.Is(err, errNoWords) && holderCase != "":
 		err = nil
 	case err != nil && ctx.Err() != nil && sp.count() == 0:
 		if !askStarted.Load() {
@@ -190,7 +240,14 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	case err != nil:
 		err = c.failed(parent, sp, err)
 	}
+	if holderCase != "" {
+		// R6: after the facts, only when it changes what happens next.
+		if sayErr := sp.sayText(parent, holderCase, voice.Fact); sayErr != nil {
+			return errors.Join(err, sayErr)
+		}
+	}
 	unreachable := tools.unreachable || outOfReach(found.holder)
+	asked := ""
 	if askStarted.Load() {
 		// An ask the bound cut says nothing: whether it was sent is unknown,
 		// and an answer that comes plays its chime all the same.
@@ -217,6 +274,32 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	return err
 }
 
+// didYouMean asks which of a search's top two issues the person meant (R5),
+// by key and title when that has the ear's form, else by key.
+func didYouMean(candidates []candidate) string {
+	named := func(c candidate) string {
+		if title := spokenName(c.title); title != "" {
+			return c.key + ", " + title
+		}
+		return c.key
+	}
+	return spokenLine("Did you mean "+named(candidates[0])+", or "+named(candidates[1])+"?",
+		"Did you mean "+candidates[0].key+" or "+candidates[1].key+"?")
+}
+
+// known is what the voice says when no fact came by the mark (R6): the
+// chosen issue's status as the record shows it, or that it found no issue.
+func (r *reading) known() string {
+	switch {
+	case r.key == "":
+		return noIssueFound
+	case r.status == "":
+		return "I found " + r.key + ", and no fact of it yet."
+	default:
+		return r.key + " is " + strings.ReplaceAll(r.status, "_", " ") + "."
+	}
+}
+
 // routingLine is the routing line for turn: the issue key it names, when it
 // names one of Dispatch's known projects, else the record.
 func (c *Concierge) routingLine(ctx context.Context, turn string) string {
@@ -230,25 +313,22 @@ func (c *Concierge) routingLine(ctx context.Context, turn string) string {
 	return "Reading the record."
 }
 
-// lead is what the Concierge says before the facts: the issue a search took,
-// by key and title, when the search had no one clear match (R5), then the
-// holder's case (R5, R6), or that it could not be read, which names the key
-// (R8).
-func (r *reading) lead() []string {
+// maxHolderWords bounds the holder's case line (R6).
+const maxHolderWords = 8
+
+// holderCase is the holder's case the voice says after the facts, only when
+// it changes what happens next (R6): a person holds the issue, nobody does,
+// its session is not answering or out of reach, or the holder could not be
+// read, which names the key (R8). A live holder gets none: when the
+// Concierge asks it, the routing line and the asked line say so.
+func (r *reading) holderCase() string {
 	if r.key == "" {
-		return nil
-	}
-	var lead []string
-	if r.searched && !r.clear {
-		lead = append(lead, spokenLine("I took "+r.key+": "+spokenName(r.title)+".", "I took "+r.key+"."))
+		return ""
 	}
 	if r.holder == nil {
-		return append(lead, "I could not read who holds "+r.key+".")
+		return "I could not read who holds " + r.key + "."
 	}
-	if line := holderLine(r.key, r.holder); line != "" {
-		lead = append(lead, line)
-	}
-	return lead
+	return holderLine(r.key, r.holder)
 }
 
 // spokenLine is full when it has the ear's form (R8), else short.
@@ -259,22 +339,22 @@ func spokenLine(full, short string) string {
 	return short
 }
 
-// holderLine is issue_holder's answer for key in one sentence (R5).
+// holderLine is issue_holder's answer for key in at most 8 words, for the
+// answers R6 speaks; "" for a live session.
 func holderLine(key string, holder map[string]any) string {
-	if holder == nil {
-		return ""
-	}
 	switch holder["holder"] {
-	case "session":
-		return key + " is held by a live agent session."
 	case "unresponsive":
 		if outOfReach(holder) {
-			return key + " is held by an agent session, and I cannot reach the agents yet."
+			return "I cannot reach " + key + "'s agent yet."
 		}
-		return key + " is held by an agent session that is not answering."
+		return key + "'s agent is not answering."
 	case "person":
 		person, _ := holder["person"].(string)
-		return spokenLine(key+" is held by "+spokenName(person)+".", key+" is held by a person.")
+		full := key + " is held by " + spokenName(person) + "."
+		if len(strings.Fields(full)) > maxHolderWords {
+			full = ""
+		}
+		return spokenLine(full, key+" is held by a person.")
 	case "none":
 		return "No agent session is on " + key + "."
 	}
@@ -302,26 +382,22 @@ type askResult struct {
 	unreachable bool
 }
 
-// askPlan says whether R7 asks the live holder now: when the person said
-// "ask", the question is not about status, or the record has no event from
-// the last 60 minutes. It names the session to ask, or none, and what the
-// voice says of an "ask" it withholds. It asks nothing for a holder that is a
-// person, nobody, or a session not answering, nor for an issue a search took
-// with no one clear match, which it says when the person said "ask".
-func (c *Concierge) askPlan(turn string, found *reading) (session, withheld string) {
-	session, _ = found.holder["session"].(string)
+// askPlan names the live holder's session when R7 asks it now: the person
+// said "ask", the question is not about status, or the record has no event
+// from the last 60 minutes. It names none for a holder that is a person,
+// nobody, or a session not answering, nor for an issue a search took with no
+// one clear match: the voice asks which issue first (R5).
+func (c *Concierge) askPlan(turn string, found *reading) string {
+	session, _ := found.holder["session"].(string)
 	switch {
 	case found.holder["holder"] != "session" || found.holder["live"] != true || session == "":
-		return "", ""
+		return ""
 	case found.searched && !found.clear:
-		if askWord.MatchString(turn) {
-			return "", askWithheld
-		}
-		return "", ""
+		return ""
 	case !askWord.MatchString(turn) && aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord:
-		return "", ""
+		return ""
 	}
-	return session, ""
+	return session
 }
 
 // ask sends the question to the holder, session, and says how it went. An
@@ -786,18 +862,19 @@ func (s *speaker) said() []string {
 	return append([]string(nil), s.texts...)
 }
 
-// routeAfter queues line after the wait when nothing was queued by then
-// (R6). The returned stop ends it; once stop returns, the line is not
-// queued.
-func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line string) (stop func()) {
+// routeAfter queues the routing line after the wait when nothing was queued
+// by then (R6); line chooses it then. The returned stop ends it; once stop
+// returns, the line is not queued.
+func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line func() string) (stop func()) {
 	timer := time.AfterFunc(wait, func() {
+		text := line()
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.closed || len(s.texts) > 0 || ctx.Err() != nil {
 			return
 		}
 		s.closed = true
-		s.enqueueLocked(line, voice.Ack)
+		s.enqueueLocked(text, voice.Ack)
 	})
 	return func() {
 		timer.Stop()

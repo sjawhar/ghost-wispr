@@ -66,8 +66,10 @@ type reading struct {
 	noResult bool
 	// clear: the search had one clear match (R5).
 	clear bool
-	// key and title name the chosen issue; empty when none was read.
-	key, title string
+	// key, title and status name the chosen issue; empty when none was read.
+	key, title, status string
+	// candidates are a search's top two issues, best first.
+	candidates []candidate
 	// holder is issue_holder's answer for it; nil when not read.
 	holder map[string]any
 	// newest is the chosen issue's newest event; zero when it has none.
@@ -75,6 +77,9 @@ type reading struct {
 	// unreachable: Dispatch did not answer.
 	unreachable bool
 }
+
+// candidate is an issue a search offers, by key and title.
+type candidate struct{ key, title string }
 
 // prefetch is the record read for one exchange while its asker speaks. Each
 // new target replaces the read still running for an older one, which the
@@ -187,7 +192,7 @@ func (r *read) heldBy(early *reading) {
 
 // readFor is what the record holds for turn: the read Heard made of exactly
 // what the final turn asks, which is final once it ran to its end, else a
-// read made now, bounded as Heard's are.
+// read made now. ctx, the answer's, bounds both.
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading)) *reading {
 	target := c.readTarget(ctx, turn, true)
 	if target == "" {
@@ -224,9 +229,7 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 			return &reading{}
 		}
 	}
-	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-	defer cancel()
-	return c.readRecord(readCtx, x, target, onHolder)
+	return c.readRecord(ctx, x, target, onHolder)
 }
 
 // prefetchLocked is exchange x's read-ahead. An exchange whose wake came
@@ -306,6 +309,7 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 		case issue["error"] == nil:
 			found.key, _ = issue["key"].(string)
 			found.title, _ = issue["title"].(string)
+			found.status, _ = issue["status"].(string)
 			found.newest = tools.newest[found.key]
 			if holder != nil && record("issue_holder", holderArgs, holder, true)["error"] == nil {
 				found.holder = holder
@@ -327,6 +331,11 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 			return
 		}
 		found.clear, _ = hits["clear_match"].(bool)
+		for _, issue := range issues[:min(2, len(issues))] {
+			key, _ := issue["key"].(string)
+			title, _ := issue["title"].(string)
+			found.candidates = append(found.candidates, candidate{key: key, title: title})
+		}
 		if key, ok := issues[0]["key"].(string); ok && ctx.Err() == nil {
 			readIssue(key)
 		}

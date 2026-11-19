@@ -215,8 +215,9 @@ What the voice hears, and where the room's words go:
   Each question goes to the Concierge on the unit, whose own model (Gemini on Vertex AI) words the
   answer, and Deepgram speaks it word for word. An exchange opens at the wake phrase; a held answer also opens voice C without one, but only on "Wispr, go ahead", or when nobody has
   spoken since its question and the light reads red. Between exchanges nothing goes to the Voice Agent.
-- Dispatch gets a question's words only as a few search keywords, never the whole sentence, and
-  only as a keyword search, which Dispatch sends to no embedding model. An issue key the asker says
+- Dispatch gets a question's words only as a few search keywords (at most five), never the whole
+  sentence. Dispatch's search also ranks by meaning, so those keywords reach its embedding model,
+  Cohere Embed v4 on Microsoft Azure. An issue key the asker says
   ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's access log
   records. A number said after a word that is no project of Dispatch ("the last 30 days") is not
   read as a key.

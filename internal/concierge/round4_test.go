@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/genai"
 
@@ -67,6 +68,46 @@ func TestAQuestionSentAsTheMeetingEndsIsCancelled(t *testing.T) {
 	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "q"})
 	if task, err := r.store.VoiceTask("evt-1"); err != nil || task.State != storage.VoiceTaskCancelled {
 		t.Fatalf("task = %+v, %v; want cancelled", task, err)
+	}
+}
+
+// TestAnEndBeforeTheTaskWasRecordedStillCancelsIt: the meeting's end lands
+// after ask_agent found it open but before its task was written, so the
+// end's own cancel found no row. The cancel after the send still ends it.
+// The send's hook marks the meeting ended without the end's row cancel,
+// which is that window's state.
+func TestAnEndBeforeTheTaskWasRecordedStillCancelsIt(t *testing.T) {
+	r := newRig(t)
+	r.name(t, "agent-7")
+	r.agents.onSend = func(context.Context, string) error {
+		r.concierge.mu.Lock()
+		r.concierge.closeLocked("meeting-1", false)
+		r.concierge.mu.Unlock()
+		return nil
+	}
+	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "q"})
+	if task, err := r.store.VoiceTask("evt-1"); err != nil || task.State != storage.VoiceTaskCancelled {
+		t.Fatalf("task = %+v, %v; want cancelled", task, err)
+	}
+}
+
+// TestAFreshReadEndsWithTheAnswersBound: a read made at Answer, of a record
+// Dispatch does not answer, ends with the answer's bound, and the voice says
+// it cannot answer.
+func TestAFreshReadEndsWithTheAnswersBound(t *testing.T) {
+	r := newRig(t)
+	r.concierge.fastBound = 300 * time.Millisecond
+	heldIssue(r, "none", false)
+	r.records.block, r.records.blockKey = make(chan struct{}), "ABC-12"
+	defer close(r.records.block)
+	var spoken []said
+	start := time.Now()
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what about ABC-12", recorder(&spoken))
+	if took := time.Since(start); took > time.Second || err == nil {
+		t.Fatalf("Answer of a record that never answers = %v after %v, want an error at the 300 ms bound", err, took)
+	}
+	if len(spoken) != 1 || spoken[0].text != sorry {
+		t.Fatalf("spoken = %+v, want the apology", spoken)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -119,11 +120,11 @@ func TestFastAnswerFactsHaveSourcesAndAges(t *testing.T) {
 			t.Fatalf("a pull request the record does not hold was spoken: %+v", spoken)
 		}
 	}
-	if last := spoken[len(spoken)-1]; last.text != notInRecord {
-		t.Fatalf("spoken = %+v, want the record-only sentence last", spoken)
+	if spoken[0].text != notInRecord {
+		t.Fatalf("spoken = %+v, want the record-only sentence first", spoken)
 	}
-	if limits := r.records.eventLimits(); len(limits) == 0 || limits[0] != 10 {
-		t.Errorf("read_issue asked for %v events, want 10", limits)
+	if limits := r.records.eventLimits(); !slices.Contains(limits, recentEvents) || slices.ContainsFunc(limits, func(n int) bool { return n != recentEvents && n != holderEvents }) {
+		t.Errorf("event reads asked for %v, want read_issue's 10 (beside issue_holder's 50)", limits)
 	}
 	prompt := r.model.requests[0][0].Parts[0].Text
 	if !strings.Contains(prompt, `"updated_ago":"2 hours ago"`) || !strings.Contains(prompt, `"when":"5 minutes ago"`) {
@@ -134,28 +135,82 @@ func TestFastAnswerFactsHaveSourcesAndAges(t *testing.T) {
 	heldIssue(r, "none", false)
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review, as of five minutes ago."))}}
 	spoken = answerTurn(t, r, "what is happening with ABC-12")
-	if last := spoken[len(spoken)-1]; last.text != "PR 80 is in review, as of five minutes ago." {
-		t.Fatalf("a fact the record holds was not spoken: %+v", spoken)
+	if spoken[0].text != "PR 80 is in review, as of five minutes ago." {
+		t.Fatalf("a fact the record holds was not spoken first: %+v", spoken)
 	}
 }
 
-// TestFastAnswerOrder (c-fast-answer, R6): the answer gives the issue search
-// chose, then the holder's case, then the facts.
+// TestFastAnswerOrder (c-fast-answer, R6): with one clear match, the answer
+// is the facts; a live holder gets no line of its own.
 func TestFastAnswerOrder(t *testing.T) {
 	r := newRig(t)
 	heldIssue(r, "session", false)
-	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.007}, {Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.006}}
+	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.012}, {Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.006}}
 	r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13"}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
 	spoken := answerTurn(t, r, "what is happening with the realtime voice")
-	if len(spoken) != 3 {
-		t.Fatalf("spoken = %+v, want the issue, the holder and a fact", spoken)
-	}
-	if !strings.Contains(spoken[0].text, "Realtime voice") || !strings.Contains(spoken[1].text, "live agent session") || spoken[2].text != "PR 80 is in review." {
-		t.Fatalf("spoken out of order: %+v", spoken)
+	if len(spoken) != 1 || spoken[0].text != "PR 80 is in review." {
+		t.Fatalf("spoken = %+v, want the fact alone", spoken)
 	}
 	if len(r.agents.sent) != 0 {
 		t.Errorf("a status question to a fresh record asked the holder")
+	}
+}
+
+// TestHolderCaseOnlyWhenItChangesWhatHappensNext (c-fast-answer, R6): the
+// holder's case is spoken only for a person, nobody, or a session that is
+// not answering, after the facts, in at most 8 words that name the issue. A
+// live holder gets none.
+func TestHolderCaseOnlyWhenItChangesWhatHappensNext(t *testing.T) {
+	for _, holder := range []string{"session", "person", "none", "unresponsive"} {
+		r := newRig(t)
+		kind := holder
+		if holder == "unresponsive" {
+			kind = "session"
+		}
+		heldIssue(r, kind, false)
+		if holder == "unresponsive" {
+			r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateUnresponsive}
+		}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		spoken := answerTurn(t, r, "what is happening with ABC-12")
+		if len(spoken) == 0 || spoken[0].text != "PR 80 is in review." {
+			t.Errorf("%s: spoken = %+v, want the fact first", holder, spoken)
+			continue
+		}
+		lines := spoken[1:]
+		if holder == "session" {
+			if len(lines) != 0 {
+				t.Errorf("%s: spoken = %+v, want no line for a live holder", holder, spoken)
+			}
+			continue
+		}
+		if len(lines) != 1 || !strings.Contains(lines[0].text, "ABC-12") || len(strings.Fields(lines[0].text)) > 8 {
+			t.Errorf("%s: spoken = %+v, want one line of at most 8 words naming ABC-12 after the fact", holder, spoken)
+		}
+	}
+}
+
+// TestTheRoutingLineSaysTheAsk (c-fast-answer, R6): with no fact 1.5 s after
+// the turn, the routing line says the Concierge is asking the live holder
+// when it is, and otherwise names the issue it reads.
+func TestTheRoutingLineSaysTheAsk(t *testing.T) {
+	for _, c := range []struct{ turn, want string }{
+		{"ask the agent on ABC-12 whether the tap is merged", "Asking the agent on ABC-12."},
+		{"what is happening with ABC-12", "Reading ABC-12."},
+	} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		r.model.block = make(chan struct{})
+		go func() {
+			time.Sleep(2200 * time.Millisecond)
+			close(r.model.block)
+		}()
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		spoken := answerTurn(t, r, c.turn)
+		if len(spoken) == 0 || spoken[0].text != c.want || spoken[0].mode != voice.Ack {
+			t.Errorf("%q: spoken = %+v, want the routing line %q first", c.turn, spoken, c.want)
+		}
 	}
 }
 
@@ -271,8 +326,8 @@ func TestWhenToAskTheHolder(t *testing.T) {
 			if len(r.agents.sent) != 0 {
 				t.Errorf("%s: asked %+v", c.name, r.agents.sent)
 			}
-			if withheld := spoken[len(spoken)-1].text == askWithheld; withheld != c.search {
-				t.Errorf("%s: spoken = %+v; want the withheld ask said %v", c.name, spoken, c.search)
+			if offered := strings.HasPrefix(spoken[len(spoken)-1].text, "Did you mean "); offered != c.search {
+				t.Errorf("%s: spoken = %+v; want the top two offered %v", c.name, spoken, c.search)
 			}
 			continue
 		}
@@ -323,21 +378,24 @@ func TestTheAskRunsBesideTheFacts(t *testing.T) {
 	}
 }
 
-// TestTheRoutingLineOnlyWhenNothingWasSaid (c-fast-answer, R6): a holder's
-// case said before 1.5 s keeps the routing line silent, however long the
-// facts then take.
+// TestTheRoutingLineOnlyWhenNothingWasSaid (c-fast-answer, R6): a fact said
+// before 1.5 s keeps the routing line silent, however long the rest of the
+// answer then takes.
 func TestTheRoutingLineOnlyWhenNothingWasSaid(t *testing.T) {
 	r := newRig(t)
-	heldIssue(r, "person", false)
-	r.model.block = make(chan struct{})
-	go func() {
-		time.Sleep(2200 * time.Millisecond)
-		close(r.model.block)
-	}()
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("PR 80 is in review."), call("c1", "read_issue", map[string]any{"key": "ABC-12"}, ""))},
+		{chunk(text("It is open."))},
+	}
+	r.model.onCall = func(call int) {
+		if call == 1 {
+			time.Sleep(2200 * time.Millisecond)
+		}
+	}
 	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {
 		if s.mode == voice.Ack {
-			t.Fatalf("a routing line after the holder's case was said: %q", s.text)
+			t.Fatalf("a routing line after a fact was said: %q", s.text)
 		}
 	}
 }
@@ -502,7 +560,7 @@ func TestNothingSentToAPersonOrNone(t *testing.T) {
 		if len(r.agents.sent) != 0 {
 			t.Errorf("%s: sent %+v", holder, r.agents.sent)
 		}
-		if spoken[len(spoken)-1].text != "PR 80 is in review." {
+		if spoken[0].text != "PR 80 is in review." {
 			t.Errorf("%s: spoken = %+v, want the record's fact", holder, spoken)
 		}
 	}
