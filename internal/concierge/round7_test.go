@@ -780,8 +780,8 @@ func TestASearchedTurnSaysWhatIsKnownAtTheMark(t *testing.T) {
 	r.model.block = make(chan struct{})
 	defer close(r.model.block)
 	spoken := answerTurn(t, r, "what is happening with the realtime voice")
-	if len(spoken) != 2 || spoken[0].mode != voice.Ack || spoken[1].text != "ABC-12 is in progress." {
-		t.Fatalf("spoken = %+v, want the issue (an Ack), then what is known", spoken)
+	if len(spoken) != 2 || spoken[0].mode != voice.Lead || spoken[1].text != "ABC-12 is in progress." {
+		t.Fatalf("spoken = %+v, want the issue (voice.Lead: it always leads, holds no fact), then what is known", spoken)
 	}
 }
 
@@ -945,9 +945,10 @@ func TestAnAskReadBeforeTheSessionExistedGoesOut(t *testing.T) {
 }
 
 // TestEarlyStateGoesWithTheMeetingOrTheGate (PR #89's review): what the
-// Concierge read, offered or named for an exchange heard before its session
-// existed, held under no session id, goes on a session's end, its delete,
-// and the gate closing, as the session's own does.
+// Concierge read or offered for an exchange heard before its session existed
+// holds room words: it goes on any session's end or delete, and on the gate
+// closing. The agents named there are only session ids: they go with the
+// gate, or after their hour.
 func TestEarlyStateGoesWithTheMeetingOrTheGate(t *testing.T) {
 	for _, how := range []string{"end", "delete", "gate"} {
 		r := newRig(t)
@@ -966,11 +967,35 @@ func TestEarlyStateGoesWithTheMeetingOrTheGate(t *testing.T) {
 			r.concierge.GateClosed()
 		}
 		r.concierge.mu.Lock()
-		left := len(r.concierge.prefetches) + len(r.concierge.picks) + len(r.concierge.named)
+		words := len(r.concierge.prefetches) + len(r.concierge.picks)
+		names := len(r.concierge.named)
 		r.concierge.mu.Unlock()
-		if left != 0 {
-			t.Errorf("%s: %d early entries left", how, left)
+		if words != 0 || (how == "gate") != (names == 0) {
+			t.Errorf("%s: %d early reads and offers left, %d names; want none of the first, and names gone with the gate only", how, words, names)
 		}
+	}
+}
+
+// TestAnotherMeetingsEndKeepsAnEarlyAsk (the fourth review): an exchange
+// heard before its session existed, then given it, still asks its holder
+// when another meeting ends or is deleted in between.
+func TestAnotherMeetingsEndKeepsAnEarlyAsk(t *testing.T) {
+	const turn = "ask the agent on ABC-12 whether the tap is merged"
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	early := r.exchange
+	early.SessionID = ""
+	r.concierge.Heard(context.Background(), &early, turn)
+	eventually(t, "the early read named the holder", func() bool { return r.concierge.wasNamed(&early, "agent-7") })
+	r.concierge.Heard(context.Background(), &r.exchange, turn)
+	r.concierge.SessionDeleted("an-older-meeting")
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	spoken := answerTurn(t, r, turn)
+	r.agents.mu.Lock()
+	sent := len(r.agents.sent)
+	r.agents.mu.Unlock()
+	if sent != 1 {
+		t.Fatalf("%d questions went to the holder, want 1; the voice said %+v", sent, spoken)
 	}
 }
 
@@ -1070,7 +1095,30 @@ func TestTheHoldersQuestionKeepsItsShape(t *testing.T) {
 		"whether or not the tap is merged":        "Is the tap merged?",
 		"when exactly will it be ready":           "When exactly will it be ready?",
 		"when the old cache is gone, what breaks": "When the old cache is gone, what breaks?",
-		"ask the agent on ABC-12.":                "Ask the agent on ABC-12?",
+		// The fourth review: with a key named, a leading clause is the
+		// question's own; subjects joined by "and" or commas, and relative
+		// clauses, still invert; an adjective in -ly is no adverb.
+		"ask the agent on ABC-12: for the demo on Friday, will it be ready": "For the demo on Friday, will it be ready?",
+		"ask the agent on ABC-12 about the tap, is it merged":               "About the tap, is it merged?",
+		"whether the tap and the ring are merged":                           "Are the tap and the ring merged?",
+		"whether the tap, the ring and the light are merged":                "Are the tap, the ring and the light merged?",
+		"whether the agent who owns it is done":                             "Is the agent who owns it done?",
+		"when the PR and the docs will land":                                "When will the PR and the docs land?",
+		"when nightly builds will run again":                                "When will nightly builds run again?",
+		"why daily standups are skipped":                                    "Why are daily standups skipped?",
+		"when the tap ships, will the ring follow":                          "When the tap ships, will the ring follow?",
+		// The fifth review: with a key, a routing clause still ends at its
+		// comma; a verb inside a relative clause stays there; an -ly adverb
+		// after "how", or before the verb, stays with the question word.
+		"ask the agent on ABC-12 about the tap, is it merged and if not, why":      "About the tap, is it merged and if not, why?",
+		"ask the agent on the wake word spotter, is ABC-12 merged and if not, why": "Is ABC-12 merged and if not, why?",
+		"ask the agent on the wake word spotter, is PR 80 merged and if not, why":  "Is PR 80 merged and if not, why?",
+		"ask the agent who holds ABC-12, is it merged":                             "Is it merged?",
+		"whether the agent who is working on it is done":                           "Is the agent who is working on it done?",
+		"when the agent who is on it will finish":                                  "When will the agent who is on it finish?",
+		"how reliably does the wake word fire":                                     "How reliably does the wake word fire?",
+		"when realistically will it ship":                                          "When realistically will it ship?",
+		"ask the agent on ABC-12.":                                                 "Ask the agent on ABC-12?",
 	} {
 		if got := fewestWords(turn); got != want {
 			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)
