@@ -1033,8 +1033,13 @@ func TestResumeKeepsGateClosedWhenLightFailsDuringSettle(t *testing.T) {
 		t.Fatalf("resume request: %v", err)
 	}
 	close(settled)
+	// The gate marks the capture paused before it hands the refusal to
+	// controls, which persists it and broadcasts it: wait for both.
 	waitForHardware(t, "light failure to re-pause capture", func() bool {
-		return capture.IsPaused() && capture.isClosed() && !recordingSignal(capture, mic)
+		statusesMu.Lock()
+		broadcasts := len(statuses)
+		statusesMu.Unlock()
+		return capture.IsPaused() && capture.isClosed() && !recordingSignal(capture, mic) && broadcasts >= 2
 	})
 	value, ok, err := store.GetAppState(storage.AppStateCapturePaused)
 	if err != nil || !ok || value != "1" {

@@ -80,7 +80,7 @@ type Config struct {
 	BatchTranscription            BatchTranscription `yaml:"batch_transcription"`
 	EmbeddingModel                string             `yaml:"embedding_model"`
 	DeepgramModel                 string             `yaml:"deepgram_model"`
-	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size,omitempty"` // bytes of live audio held while Deepgram reconnects; 0 holds 60 s at the rate the microphone opened at, and is not written back on a save
+	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size,omitempty"` // bytes of live audio held while Deepgram reconnects; 0 holds 60 s at the rate the microphone opened at, and is not written back on a save. The recorder keeps as much audio again, plus 35 s, in memory while no session records, so a recording can start before words Deepgram hears late
 	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 	SpeakerEnabled                bool               `yaml:"speaker_enabled"`

@@ -13,7 +13,10 @@ import (
 // chunk into a free slot and returns at once, and a goroutine writes the
 // slots in order. With every slot taken, Write drops the chunk; the recording
 // has it already. Finalize goes through the same queue, so it follows every
-// chunk written before it.
+// chunk written before it. A ResilientClient behind it counts the audio
+// queued here, and each chunk dropped here at its place, in its stream's
+// clock (CapturedSince): that audio was captured after any the client has,
+// though it took none of it.
 type AsyncSender struct {
 	dst interface {
 		io.Writer
@@ -24,6 +27,20 @@ type AsyncSender struct {
 	queue   chan sendItem
 	dropped atomic.Int64
 	log     func(string, ...any)
+	// queued counts the bytes in slots not yet counted by dst.
+	queued atomic.Int64
+	// watcher is dst when it counts this queue (ResilientClient), else nil.
+	watcher sendQueueWatcher
+}
+
+// sendQueueWatcher is a destination that counts, in its stream's clock, the
+// audio an AsyncSender in front of it holds and drops (ResilientClient).
+type sendQueueWatcher interface {
+	watchSendQueue(queued func() int64)
+	sendQueueDropped(n int64)
+	// writeFromQueue writes p, a chunk the queue holds, and takes it out of
+	// queued as it counts it, in one step.
+	writeFromQueue(p []byte, queued *atomic.Int64) (int, error)
 }
 
 type sendItem struct {
@@ -53,6 +70,10 @@ func NewAsyncSender(ctx context.Context, dst interface {
 	for i := range chunks {
 		s.free <- i
 	}
+	if watcher, ok := dst.(sendQueueWatcher); ok {
+		s.watcher = watcher
+		watcher.watchSendQueue(s.queued.Load)
+	}
 	go s.run(ctx)
 	return s
 }
@@ -62,8 +83,12 @@ func (s *AsyncSender) Write(p []byte) (int, error) {
 	select {
 	case i := <-s.free:
 		s.slots[i] = append(s.slots[i][:0], p...)
+		s.queued.Add(int64(len(p)))
 		s.queue <- sendItem{slot: i}
 	default:
+		if s.watcher != nil {
+			s.watcher.sendQueueDropped(int64(len(p)))
+		}
 		if s.dropped.Add(1) == 1 {
 			s.log("warning: live transcription is behind; dropping audio for it (the recording keeps it)")
 		}
@@ -103,7 +128,15 @@ func (s *AsyncSender) run(ctx context.Context) {
 				item.done <- s.dst.Finalize()
 				continue
 			}
-			_, _ = s.dst.Write(s.slots[item.slot])
+			if s.watcher != nil {
+				// The chunk leaves the queue's count as the client counts it,
+				// in one step, so a capture resume that marks the count
+				// (Captured) marks the pause neither early nor late.
+				_, _ = s.watcher.writeFromQueue(s.slots[item.slot], &s.queued)
+			} else {
+				_, _ = s.dst.Write(s.slots[item.slot])
+				s.queued.Add(-int64(len(s.slots[item.slot])))
+			}
 			if s.dropped.Swap(0) > 0 {
 				s.log("live transcription caught up")
 			}

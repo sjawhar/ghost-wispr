@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,14 +27,33 @@ const (
 	defaultSampleRate = 16000
 	pcmChannels       = 1
 	pcmBitDepth       = 16
-	// prerollSeconds is how much audio before a session's start leads its
+	// prerollSeconds is how much audio from before a session's start, or from
+	// before the first words Deepgram heard for it (HoldPreroll), leads its
 	// recording.
 	prerollSeconds = 5
+	// maxHeldSeconds bounds the audio a hold (HoldPreroll) keeps for the next
+	// session's start: far longer than any stretch of speech without the end
+	// of speech or the utterance end that starts a session.
+	maxHeldSeconds = 300
 )
 
 // pcmBytesPerSecond is the byte rate of the recorder's PCM at sampleRate.
 func pcmBytesPerSecond(sampleRate int) int {
 	return sampleRate * pcmChannels * pcmBitDepth / 8
+}
+
+// pcmBytes is the size of d of the recorder's PCM at sampleRate, in whole
+// samples. It splits d at the second, so a long d does not overflow it.
+func pcmBytes(d time.Duration, sampleRate int) int {
+	rate := int64(sampleRate)
+	samples := int64(d/time.Second)*rate + int64(d%time.Second)*rate/int64(time.Second)
+	return int(samples) * pcmChannels * pcmBitDepth / 8
+}
+
+// pcmDuration is how long n bytes of the recorder's PCM at sampleRate last.
+func pcmDuration(n int, sampleRate int) time.Duration {
+	perSecond := pcmBytesPerSecond(sampleRate)
+	return time.Duration(n/perSecond)*time.Second + time.Duration(n%perSecond)*time.Second/time.Duration(perSecond)
 }
 
 // encodeTimeout is how long the MP3 encoders (ffmpeg, then lame) together may
@@ -55,7 +75,25 @@ type Recorder struct {
 	rawPath    string
 	rawFile    *os.File
 	sampleRate int
-	preroll    *transcribe.RingBuf
+	// history keeps the audio taken while no recording is open: the last
+	// prerollSeconds plus lookback of it. The last prerollSeconds lead the
+	// next recording, or, during a hold, as much as the hold asks.
+	history  *transcribe.RingBuf
+	lookback time.Duration
+	// holding is set while words Deepgram heard may still open a session
+	// (HoldPreroll). history then stops taking audio, and the audio taken goes
+	// to held instead; the last holdBack bytes of history and all of held lead
+	// the next recording. holdBack never exceeds history.Len(): whatever
+	// shrinks history during a hold (SetLookback) shrinks holdBack with it.
+	holding  bool
+	holdBack int
+	held     []byte
+	// trimWarned is set once the hold under way has dropped its oldest
+	// audio past maxHeldSeconds and said so in the log.
+	trimWarned bool
+	// sinceClose counts the bytes taken since the last recording closed
+	// (SinceClose).
+	sinceClose int
 	// sessionRate is the rate the recording under way is captured at, as
 	// StartSession recorded it.
 	sessionRate int
@@ -88,23 +126,50 @@ func NewRecorder(audioDir string) *Recorder {
 	r := &Recorder{
 		audioDir:   audioDir,
 		sampleRate: defaultSampleRate,
-		preroll:    transcribe.NewRingBuf(prerollSeconds * pcmBytesPerSecond(defaultSampleRate)),
 	}
+	r.history = r.newHistoryLocked()
 	r.encode = r.defaultEncode
 	r.createRaw = createRawFile
 	return r
 }
 
+// newHistoryLocked returns an empty history for the recorder's rate and
+// lookback. It must be called with r.mu held, or before r is shared.
+func (r *Recorder) newHistoryLocked() *transcribe.RingBuf {
+	return transcribe.NewRingBuf(prerollSeconds*pcmBytesPerSecond(r.sampleRate) + pcmBytes(r.lookback, r.sampleRate))
+}
+
+// SetLookback sets how far behind the microphone the words that open a
+// session can be heard: the most audio live transcription holds unsent while
+// Deepgram is not connected. The recorder then keeps that much audio from
+// before a session besides the preroll, so a hold (HoldPreroll) can reach
+// back to the first words Deepgram hears late. The audio kept stays.
+func (r *Recorder) SetLookback(lookback time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lookback = max(lookback, 0)
+	if lookback == r.lookback {
+		return
+	}
+	r.lookback = lookback
+	kept := make([]byte, r.history.Len())
+	_, _ = r.history.Read(kept)
+	r.history = r.newHistoryLocked()
+	_, _ = r.history.Write(kept)
+	r.holdBack = min(r.holdBack, r.history.Len())
+}
+
 // SetSampleRate sets the rate the microphone opened at, which the audio the
-// recorder takes from now on has. The preroll then holds prerollSeconds at
-// that rate, and drops audio it held at another rate: that cannot lead a
-// recording at this one. A recording already open takes the new rate too,
-// and with session rates kept (UseSessionRates) its session's row does: a
-// session can start before the microphone first opens (a manual start during
-// the start-up retry, or while the light is not confirmed red), and the rate
-// changes only before audio first flows, so all of its audio is at the new
-// rate. It returns the error of that row's write; the recording itself still
-// saves at the new rate when its session ends.
+// recorder takes from now on has. The history then holds prerollSeconds and
+// the lookback at that rate, and drops audio it held at another rate, with
+// any audio a hold kept: that cannot lead a recording at this one. A
+// recording already open takes the new rate too, and with session rates kept
+// (UseSessionRates) its session's row does: a session can start before the
+// microphone first opens (a manual start during the start-up retry, or while
+// the light is not confirmed red), and the rate changes only before audio
+// first flows, so all of its audio is at the new rate. It returns the error
+// of that row's write; the recording itself still saves at the new rate when
+// its session ends.
 func (r *Recorder) SetSampleRate(sampleRate int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -113,7 +178,8 @@ func (r *Recorder) SetSampleRate(sampleRate int) error {
 		return nil
 	}
 	r.sampleRate = sampleRate
-	r.preroll = transcribe.NewRingBuf(prerollSeconds * pcmBytesPerSecond(sampleRate))
+	r.history = r.newHistoryLocked()
+	r.holding, r.holdBack, r.held = false, 0, nil
 	if r.rawFile == nil {
 		return nil
 	}
@@ -222,12 +288,10 @@ func (r *Recorder) StartSession(sessionID string) error {
 	r.rawFile = rawFile
 	r.sessionRate = rate
 
-	// Flush preroll buffer into the new file
-	if n := r.preroll.Len(); n > 0 {
-		buf := make([]byte, n)
-		_, _ = r.preroll.Read(buf)
-		r.preroll.Reset()
-		if _, err := r.rawFile.Write(buf); err != nil {
+	// The audio buffered for the session's start leads its recording.
+	before, held := r.takeLeadLocked()
+	for _, lead := range [][]byte{before, held} {
+		if _, err := r.rawFile.Write(lead); err != nil {
 			// Leave no session open: the caller rolls the session back, and
 			// later audio must not be appended to its file.
 			_ = r.rawFile.Close()
@@ -237,6 +301,23 @@ func (r *Recorder) StartSession(sessionID string) error {
 	}
 
 	return nil
+}
+
+// takeLeadLocked returns the audio buffered for the next session's start,
+// oldest first, and empties the buffer: during a hold (HoldPreroll), the last
+// holdBack bytes of history and all the audio held; else the last
+// prerollSeconds of history. It must be called with r.mu held.
+func (r *Recorder) takeLeadLocked() (before, held []byte) {
+	n := min(prerollSeconds*pcmBytesPerSecond(r.sampleRate), r.history.Len())
+	if r.holding {
+		n = r.holdBack
+	}
+	r.history.Discard(r.history.Len() - n)
+	before = make([]byte, n)
+	_, _ = r.history.Read(before) // all that is left: history is empty after
+	held = r.held
+	r.holding, r.holdBack, r.held = false, 0, nil
+	return before, held
 }
 
 // EndSession closes session sessionID's recording and saves it, returning the
@@ -261,6 +342,7 @@ func (r *Recorder) EndSession(sessionID string) (string, error) {
 	r.rawPath = ""
 	r.rawFile = nil
 	r.savingPath = rawPath
+	r.sinceClose = 0
 	r.mu.Unlock()
 
 	if err := rawFile.Close(); err != nil {
@@ -304,7 +386,23 @@ func (r *Recorder) writePCM(data []byte) error {
 	defer r.mu.Unlock()
 
 	if r.rawFile == nil {
-		_, _ = r.preroll.Write(data)
+		r.sinceClose += len(data)
+		if !r.holding {
+			_, _ = r.history.Write(data)
+			return nil
+		}
+		r.held = append(r.held, data...)
+		// Past maxHeldSeconds, the oldest audio goes: first what history
+		// keeps for the hold, then what the hold took.
+		if over := r.holdBack + len(r.held) - maxHeldSeconds*pcmBytesPerSecond(r.sampleRate); over > 0 {
+			back := min(over, r.holdBack)
+			r.holdBack -= back
+			r.held = r.held[over-back:]
+			if !r.trimWarned {
+				r.trimWarned = true
+				log.Printf("warning: the audio kept for the next session's start reached %d s with no session started; its oldest audio is dropped from now on, and with it maybe the first words", maxHeldSeconds)
+			}
+		}
 		return nil
 	}
 
@@ -402,13 +500,84 @@ func (r *Recorder) DiscardUnsaved() string {
 	return rawPath
 }
 
-// DiscardPreroll drops the audio buffered for the next session's start. A
-// capture resume calls it, so a session after the pause does not open with
-// audio from before it.
+// DiscardPreroll drops the audio buffered for the next session's start, the
+// history and any hold's audio, and ends the hold. A capture resume calls it,
+// so a session after the pause does not open with audio from before it.
 func (r *Recorder) DiscardPreroll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.preroll.Reset()
+	r.history.Reset()
+	r.holding, r.holdBack, r.held = false, 0, nil
+}
+
+// HoldPreroll makes the next session's recording start prerollSeconds before
+// the audio taken ago, or at the oldest audio history keeps: it keeps that
+// audio, and all the audio taken from now on, until that session starts
+// (StartSession), a ReleasePreroll, or a DiscardPreroll; up to
+// maxHeldSeconds in all. Words Deepgram hears open a session only at the end
+// of their speech, and it can hear them late (SetLookback), so the session
+// manager calls it at each result with words while no session is open, ago
+// being how long before now their first word was captured: the recording
+// then holds them from the first, however long they run before the session
+// starts. A later call that reaches further back moves the start back. While
+// a recording is open it does nothing.
+func (r *Recorder) HoldPreroll(ago time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rawFile != nil {
+		return
+	}
+	if !r.holding {
+		r.holding, r.holdBack, r.held, r.trimWarned = true, 0, nil, false
+	}
+	reach := pcmBytes(max(ago, 0), r.sampleRate) + prerollSeconds*pcmBytesPerSecond(r.sampleRate)
+	// No further back than maxHeldSeconds: a hold at its bound has dropped
+	// its oldest audio (writePCM), and history no longer joins what it holds.
+	bound := maxHeldSeconds*pcmBytesPerSecond(r.sampleRate) - len(r.held)
+	r.holdBack = max(r.holdBack, min(reach-len(r.held), r.history.Len(), bound))
+}
+
+// ReleasePreroll ends a hold (HoldPreroll) whose words opened no session,
+// because Deepgram took them back: history takes the audio the hold took, as
+// if there had been no hold.
+func (r *Recorder) ReleasePreroll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.holding {
+		return
+	}
+	_, _ = r.history.Write(r.held)
+	r.holding, r.holdBack, r.held = false, 0, nil
+}
+
+// Pending returns how much audio the next session's recording would open
+// with if it started now: the last prerollSeconds, or all that a hold keeps
+// (HoldPreroll). While a recording is open it returns 0. The session manager
+// starts a session at the time its recording starts: now minus Pending.
+func (r *Recorder) Pending() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rawFile != nil {
+		return 0
+	}
+	n := min(prerollSeconds*pcmBytesPerSecond(r.sampleRate), r.history.Len())
+	if r.holding {
+		n = r.holdBack + len(r.held)
+	}
+	return pcmDuration(n, r.sampleRate)
+}
+
+// SinceClose returns how much audio has been taken since the last recording
+// closed, and true; while a recording is open it returns false. Words
+// Deepgram hears while a session ends, captured longer ago than that, are in
+// that session's recording; the rest are not, and open the next session.
+func (r *Recorder) SinceClose() (time.Duration, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rawFile != nil {
+		return 0, false
+	}
+	return pcmDuration(r.sinceClose, r.sampleRate), true
 }
 
 // defaultEncode saves the raw recording at rawPath, captured at sampleRate,
@@ -568,11 +737,17 @@ type teeWriter struct {
 	dst      io.Writer
 }
 
-// Write records p, then hands it to dst, live transcription: the recording
-// never waits on it.
+// Write hands p to dst, live transcription, then records it, whatever dst
+// returned, and returns the recorder's error first. dst does not block (the
+// app's is a send queue), so the recording never waits on it, and live
+// transcription's count of the audio is never behind the recorder's: the
+// session manager places a recording's close in that count as the count less
+// the audio taken since the close, which a chunk the recorder had first would
+// make early.
 func (w *teeWriter) Write(p []byte) (int, error) {
+	n, dstErr := w.dst.Write(p)
 	if err := w.recorder.writePCM(p); err != nil {
 		return 0, err
 	}
-	return w.dst.Write(p)
+	return n, dstErr
 }

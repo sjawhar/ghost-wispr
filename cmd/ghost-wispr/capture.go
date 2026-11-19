@@ -109,6 +109,7 @@ type captureGate struct {
 	lightRedMark       func() uint64 // lightOffs as the light's last red confirmation left it, read under the light's lock
 	checkLight         func()        // reads the light back, which counts it in lightOffs unless it is red; nil without a light
 	afterMicClose      func()        // runs after the mic loop closed the microphone, so the light, which follows it, can go off; must not block
+	dropHeldAudio      func()        // drops the audio the recorder keeps for the next session's start; runs at every microphone close, before afterMicClose
 	onMicHeld          func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
 	capturePresent     func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
 	audioStall         time.Duration // see audioStallAfter
@@ -730,9 +731,16 @@ func (g *captureGate) micHeld(held bool) {
 	}
 }
 
-// micClosed tells the light that the mic loop closed the microphone: the
-// light follows the open microphone, so it may now go off.
+// micClosed drops the audio the recorder keeps for the next session's start,
+// then tells the light that the mic loop closed the microphone: the light
+// follows the open microphone, so it may now go off. Audio from before the
+// light went off, for a pause, a hold for the light, a stall or a light that
+// read back off, never leads a recording that starts after it reads red
+// again.
 func (g *captureGate) micClosed() {
+	if g.dropHeldAudio != nil {
+		g.dropHeldAudio()
+	}
 	if g.afterMicClose != nil {
 		g.afterMicClose()
 	}
@@ -960,6 +968,8 @@ type deepgramFinalizer interface{ Finalize() error }
 //     are kept and its recording is closed.
 //   - After that, a Resume drops preroll audio from before the pause and lets
 //     sessions start again, all before audio flows.
+//   - Every close of the microphone, which turns the light off, drops the
+//     audio the recorder keeps for the next session's start too.
 //
 // Every wait before the gate opens is bounded except on the database and on
 // the recording file: captureWriteWait for a write in flight at the pause,
@@ -981,7 +991,7 @@ type deepgramFinalizer interface{ Finalize() error }
 // may then open, but it lets nothing through: the mic loops drop every buffer
 // written after shutdown began, and end.
 func newSessionCaptureGate(ctx context.Context, sessions captureSessions, preroll interface{ DiscardPreroll() }, deepgram func() deepgramFinalizer, finalizeWait, endRetry time.Duration, logf func(string, ...any)) *captureGate {
-	return newCaptureGate(
+	g := newCaptureGate(
 		sessions.PauseCapture,
 		func() { settleCapturePause(ctx, sessions, deepgram(), finalizeWait, endRetry, logf) },
 		func() {
@@ -989,6 +999,8 @@ func newSessionCaptureGate(ctx context.Context, sessions captureSessions, prerol
 			sessions.ResumeCapture()
 		},
 	)
+	g.dropHeldAudio = preroll.DiscardPreroll
+	return g
 }
 
 func settleCapturePause(ctx context.Context, sessions captureSessions, dg deepgramFinalizer, finalizeWait, endRetry time.Duration, logf func(string, ...any)) {

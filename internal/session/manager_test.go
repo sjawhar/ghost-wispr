@@ -356,6 +356,18 @@ func (r *recorderMock) DiscardUnsaved() string {
 	return r.unsavedPath
 }
 
+func (*recorderMock) HoldPreroll(time.Duration) {}
+
+func (*recorderMock) ReleasePreroll() {}
+
+func (*recorderMock) SetLookback(time.Duration) {}
+
+func (*recorderMock) Pending() time.Duration { return 0 }
+
+// SinceClose says a recording is open: the mock takes no audio, so every
+// word Deepgram hears while a session ends is the ending session's.
+func (*recorderMock) SinceClose() (time.Duration, bool) { return 0, false }
+
 func (r *recorderMock) counts() (started, ended int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

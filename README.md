@@ -198,6 +198,21 @@ the unit leaves it unknown, so it is checked again when it comes back. Programs 
 lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
 answer the recorder's.
 
+A session starts when Deepgram hears the end of its first stretch of speech, and its recording
+starts 5 s before the first word the live transcript holds, so the recording and the refined
+transcript that replaces the live one hold every word from the first. To do that, while no session
+is recording the recorder keeps the last 5 s of audio in memory, plus as much as Deepgram can fall
+behind: the live client buffers up to 60 s (`deepgram_buffer_size`) while Deepgram is away, and
+its words for that audio come only after the reconnect, so the recorder keeps 95 s in all. From the
+first words Deepgram hears until the session starts, it keeps all the audio after them too, up to
+300 s. It keeps only audio captured while the light was red: every close of the microphone (a
+pause, the light reading back off or failing, no audio reaching the recording) drops it, and no
+audio of an earlier session is ever kept. A session's start time is when its recording starts.
+Deepgram can give its words for the last seconds before a pause, or before a session's recording
+closed, only after the resume or the end, as when it lags after an outage; the recorder places each
+word in the audio it captured, and drops every word from before the pause or the close, so none
+reaches a later session, and none reaches the page or the voice during a pause.
+
 ## Deployment
 
 The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is

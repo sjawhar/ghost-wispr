@@ -129,31 +129,21 @@ func TestValidateStartup_EnabledDisabledLists(t *testing.T) {
 	}
 }
 
-func TestMaskAPIKey_Empty(t *testing.T) {
-	if got := MaskAPIKey(""); got != "missing" {
-		t.Errorf("expected 'missing' for empty key, got %q", got)
-	}
-}
-
-func TestMaskAPIKey_Short(t *testing.T) {
-	if got := MaskAPIKey("abcdef"); got != "****" {
-		t.Errorf("expected '****' for short key, got %q", got)
-	}
-	if got := MaskAPIKey("123456789012"); got != "****" {
-		t.Errorf("expected '****' for 12-char key, got %q", got)
-	}
-}
-
-func TestMaskAPIKey_Long(t *testing.T) {
-	got := MaskAPIKey("dg-abcdefghij-xyz")
-	if !strings.HasPrefix(got, "dg-a") {
-		t.Errorf("expected prefix 'dg-a', got %q", got)
-	}
-	if !strings.HasSuffix(got, "-xyz") {
-		t.Errorf("expected suffix '-xyz', got %q", got)
-	}
-	if !strings.Contains(got, "****") {
-		t.Errorf("expected masked middle, got %q", got)
+// TestAPIKeyStatusShowsNoPartOfTheKey fails if the status the startup log
+// gives for the Deepgram key shows any of its characters: the log goes to the
+// journal and to anyone who reads it, and the first and last four characters
+// of a key narrow the search for it. The status says only "configured" or
+// "missing".
+func TestAPIKeyStatusShowsNoPartOfTheKey(t *testing.T) {
+	for key, want := range map[string]string{
+		"":                  "missing",
+		"abcdef":            "configured",
+		"123456789012":      "configured",
+		"dg-abcdefghij-xyz": "configured",
+	} {
+		if got := APIKeyStatus(key); got != want {
+			t.Errorf("APIKeyStatus(%q) = %q, want %q", key, got, want)
+		}
 	}
 }
 
