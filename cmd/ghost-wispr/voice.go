@@ -16,6 +16,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
+	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 	voicetts "github.com/sjawhar/ghost-wispr/internal/voice/tts"
 	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
 )

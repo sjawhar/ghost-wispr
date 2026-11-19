@@ -75,13 +75,16 @@ summarization:
 # speaker (speaker_enabled). The voice hears the room only while the light reads red.
 # voice:
 #   enabled: false
-#   engine: tts                       # tts (voice A); gptlive and dgagent are not in this build
+#   engine: tts                       # tts (voice A) or gptlive (voice B); dgagent is not in this build
 #   wake_phrases: [Wispr, Ghost Wispr]
 #   tts_engine: gemini                # gemini (Vertex AI, gcp_project) or aura (the Deepgram key)
 #   tts_model: gemini-3.8-flash-tts
 #   tts_voice: Kore                   # aura: an Aura-2 voice such as aura-2-harmonia-en
 #   tts_location: us
 #   paused_listener: false            # not built yet
+#   gptlive:                          # voice B: the OpenAI workload identity ids, not secrets
+#     openai_identity_provider_id: idp_example
+#     openai_service_account_id: user-example
 # The Concierge: its Gemini model on the genai settings above, Dispatch with the unit's own token
 # (GHOST_WISPR_DISPATCH_TOKEN), and the Envoy listener that relays its questions to an issue's agent.
 # concierge:
