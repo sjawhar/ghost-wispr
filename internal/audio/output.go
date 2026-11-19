@@ -303,7 +303,8 @@ func (o *Output) Begin(input string) *Playback {
 // Write queues frame, at most MaxWriteFrame of whole PCM16 frames in format,
 // whose channels it mixes down to one. It waits while the input holds
 // InputQueue, or holds audio at another rate. Once the playback has ended it
-// returns why: ErrCancelled, the stream's failure, or ErrOutputClosed.
+// returns why: ErrCancelled, the stream's failure, or ErrOutputClosed; once
+// ctx is done, ctx's error, having queued nothing.
 func (p *Playback) Write(ctx context.Context, frame []byte, format AudioFormat) error {
 	frames, err := wholeFrames(frame, format)
 	if err != nil {
@@ -318,6 +319,12 @@ func (p *Playback) Write(ctx context.Context, frame []byte, format AudioFormat) 
 	for {
 		if p.gen.err != nil {
 			return p.gen.err
+		}
+		// A writer whose context is done queues nothing: its exchange may
+		// have been stopped just before this playback began, after the
+		// Cancel that ended the ones before it.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if frames == 0 {
 			return nil

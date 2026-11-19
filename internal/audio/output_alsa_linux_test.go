@@ -21,11 +21,13 @@ import (
 // device takes a frame every 1/rate seconds from samples, and the room hears
 // each inflight frames after the device took it.
 type pcmRun struct {
-	start   time.Time
-	started bool
-	samples []int16
-	heard   int // frames the room heard: set when the run stops
-	stopped bool
+	start      time.Time
+	started    bool
+	samples    []int16
+	heard      int // frames the room heard: set when the run stops
+	stopped    bool
+	taken      int // frames a lockstep device took
+	startClock int // the lockstep clock when the run started
 }
 
 // fakePCM is a mono ALSA playback PCM that plays in real time, as the
@@ -41,9 +43,19 @@ type fakePCM struct {
 	rate, buffer int
 	inflight     int
 	noRewind     bool
+	// lockstep makes the device take frames only as writes need room, so its
+	// time is the stream's, not the clock's (writei).
+	lockstep bool
 
-	mu      sync.Mutex
-	runs    []*pcmRun
+	mu    sync.Mutex
+	runs  []*pcmRun
+	clock int // frames a lockstep device has taken in all runs
+	// fire, on a lockstep device, runs once from inside the write that takes
+	// its clock to fireAt; firedAt is the clock then.
+	fire    func()
+	fireAt  int
+	fired   bool
+	firedAt int
 	xrun    bool
 	closed  bool
 	xruns   int
@@ -62,6 +74,9 @@ func (p *fakePCM) consumed(run *pcmRun, now time.Time) int {
 	}
 	if !run.started {
 		return 0
+	}
+	if p.lockstep {
+		return run.taken
 	}
 	return min(len(run.samples), int(int64(now.Sub(run.start))*int64(p.rate)/int64(time.Second)))
 }
@@ -83,7 +98,10 @@ func (p *fakePCM) stop(run *pcmRun, now time.Time) {
 }
 
 // writei writes frames as ALSA's blocking writei does: as much as fits, then
-// the rest as the device frees room, starting the device once it is full.
+// the rest as the device frees room, starting the device once it is full. In
+// lockstep the device takes, at once, as many frames as the write needs room
+// for: its time moves only with the writes, so a write that comes late,
+// however late, finds the device where the last one left it.
 func (p *fakePCM) writei(interleaved []int16, frames int) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -98,7 +116,7 @@ func (p *fakePCM) writei(interleaved []int16, frames int) int {
 		run := p.runs[len(p.runs)-1]
 		now := time.Now()
 		held := len(run.samples) - p.consumed(run, now)
-		if run.started && held == 0 {
+		if run.started && held == 0 && !p.lockstep {
 			run.heard, run.stopped = len(run.samples), true // what was in flight plays out
 			p.xrun = true
 			p.xruns++
@@ -111,11 +129,23 @@ func (p *fakePCM) writei(interleaved []int16, frames int) int {
 			run.samples = append(run.samples, interleaved[written:written+fit]...)
 			written += fit
 			if !run.started && len(run.samples) >= p.buffer {
-				run.start, run.started = now, true
+				run.start, run.started, run.startClock = now, true, p.clock
 			}
 		}
 		if written == frames {
 			return written
+		}
+		if p.lockstep {
+			take := min(held, frames-written)
+			run.taken += take
+			p.clock += take
+			if p.fire != nil && !p.fired && p.clock >= p.fireAt {
+				p.fired, p.firedAt = true, p.clock
+				p.mu.Unlock()
+				p.fire()
+				p.mu.Lock()
+			}
+			continue
 		}
 		wait := time.Duration(frames-written) * time.Second / time.Duration(p.rate)
 		p.mu.Unlock()
@@ -220,6 +250,26 @@ func (p *fakePCM) heard(fn func(sample int16, end time.Time)) {
 	}
 }
 
+// heardInStreamTime calls fn, on a lockstep PCM, with each frame the room
+// has heard and the device clock, in frames taken, when it was heard.
+func (p *fakePCM) heardInStreamTime(fn func(sample int16, clock int)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, run := range p.runs {
+		for i := range p.heardBy(run, time.Time{}) {
+			fn(run.samples[i], run.startClock+i+p.inflight)
+		}
+	}
+}
+
+// cancelClock is the clock of a lockstep PCM when fire ran, and whether it
+// ran.
+func (p *fakePCM) cancelClock() (clock int, fired bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.firedAt, p.fired
+}
+
 // outputOnPCM is an Output on a fakePCM through the ALSA path, with the
 // period and buffer the speaker opens on the device.
 func outputOnPCM(t *testing.T, pcm *fakePCM, idle time.Duration) *Output {
@@ -246,6 +296,11 @@ func streamOn(pcm *fakePCM) *alsaStream {
 //   - a PCM that cannot rewind drops what it holds instead;
 //   - a PCM whose audio in flight would play on for more than the bound
 //     after a rewind is dropped too, which cuts what is in flight.
+//
+// The device runs in lockstep and the Cancel comes from inside its write at
+// 200 ms of its clock, so the time is the stream's, counted in frames from
+// the Cancel to the last frame of the voice the room hears: a loaded machine
+// slows the run but cannot stretch it.
 func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -259,8 +314,9 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
-			pcm.inflight, pcm.noRewind = int(48*tc.inflight/time.Millisecond), tc.noRewind
+			pcm.inflight, pcm.noRewind, pcm.lockstep = int(48*tc.inflight/time.Millisecond), tc.noRewind, true
 			out := outputOnPCM(t, pcm, 100*time.Millisecond)
+			pcm.fireAt, pcm.fire = 48000/5, func() { out.Cancel(InputVoice) }
 			ctx := testContext(t)
 			voice, chime := out.Begin(InputVoice), out.Begin(InputChime)
 			go func() { _ = voice.WriteAll(ctx, constant(48000, 2*time.Second, 1000), mono48k) }()
@@ -272,34 +328,34 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 				}
 				chimed <- err
 			}()
-			time.Sleep(200 * time.Millisecond)
-			cancelled := time.Now()
-			out.Cancel(InputVoice)
 			if err := <-chimed; err != nil {
 				t.Fatalf("the chime: %v", err)
 			}
 			waitFor(t, "the idle stream to close", pcm.isClosed)
 
-			var lastVoice time.Time
-			chimeFrames := 0
-			pcm.heard(func(sample int16, end time.Time) {
+			cancelled, fired := pcm.cancelClock()
+			if !fired {
+				t.Fatal("control: the device never reached the Cancel")
+			}
+			lastVoice, chimeFrames := -1, 0
+			pcm.heardInStreamTime(func(sample int16, clock int) {
 				switch sample {
 				case 1500: // voice and chime
-					lastVoice = end
+					lastVoice = clock
 					chimeFrames++
 				case 1000:
-					lastVoice = end
+					lastVoice = clock
 				case 500:
 					chimeFrames++
 				}
 			})
-			if lastVoice.IsZero() {
+			if lastVoice < 0 {
 				t.Fatal("control: the room never heard the voice")
 			}
-			heard := lastVoice.Sub(cancelled)
-			t.Logf("the voice was last heard %v after Cancel; the room heard %d frames of the chime", heard, chimeFrames)
+			heard := time.Duration(lastVoice+1-cancelled) * time.Second / 48000
+			t.Logf("the voice was last heard %v of stream time after Cancel; the room heard %d frames of the chime", heard, chimeFrames)
 			if heard > 20*time.Millisecond {
-				t.Fatalf("the room heard the voice for %v after Cancel, want silence within 20 ms", heard)
+				t.Fatalf("the room heard the voice for %v of stream time after Cancel, want silence within 20 ms", heard)
 			}
 			if tc.exactChime && chimeFrames != 24000 {
 				t.Fatalf("the room heard %d frames of the chime, want each of its 24000 (500 ms) once", chimeFrames)
@@ -318,18 +374,33 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 // barge-in often lands, takes nothing off and does not mark the speech
 // cancelled; a Cancel while the device holds the speech's end takes off what
 // it held.
+//
+// The device runs in lockstep, the speech is queued before the stream opens,
+// and the Cancel comes from inside the device's write at a point of its
+// clock, so where the Cancel lands in the speech is the stream's, not the
+// machine's.
 func TestALSAOutputReportsWhatTheRoomHeardOfACancelledSpeech(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
-		after     time.Duration // from Drain to Cancel
+		at        int // the device clock, in frames, at the Cancel
+		heard     time.Duration
 		cancelled bool
 	}{
-		{name: "cancel after the speech played out", after: 90 * time.Millisecond},
-		{name: "cancel while the device holds its end", after: 10 * time.Millisecond, cancelled: true},
+		// The 100 ms speech is frames 0-4799; the device holds 3840, so it
+		// has taken 960 when the speech's last frame is written.
+		{name: "cancel after the speech played out", at: 5280, heard: 100 * time.Millisecond},
+		{name: "cancel while the device holds its end", at: 1440, heard: 30 * time.Millisecond, cancelled: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
-			out := outputOnPCM(t, pcm, 100*time.Millisecond)
+			pcm.lockstep = true
+			gate := make(chan struct{})
+			out := NewOutput(OutputConfig{IdleClose: 100 * time.Millisecond, Open: func(string) (PlaybackStream, int, error) {
+				<-gate
+				return streamOn(pcm), pcm.rate, nil
+			}})
+			t.Cleanup(func() { _ = out.Close() })
+			pcm.fireAt, pcm.fire = tc.at, func() { out.Cancel(InputVoice) }
 			ends := make(chan SpeechEvent, 4)
 			defer out.OnSpeech(func(e SpeechEvent) {
 				if !e.Started {
@@ -341,33 +412,31 @@ func TestALSAOutputReportsWhatTheRoomHeardOfACancelledSpeech(t *testing.T) {
 			if err := pb.WriteAll(ctx, constant(48000, 100*time.Millisecond, 1000), mono48k); err != nil {
 				t.Fatal(err)
 			}
-			if err := pb.Drain(ctx); err != nil {
-				t.Fatal(err)
-			}
-			time.Sleep(tc.after)
-			out.Cancel(InputVoice)
+			close(gate)
 			var end SpeechEvent
 			select {
 			case end = <-ends:
-			case <-time.After(2 * time.Second):
+			case <-time.After(5 * time.Second):
 				t.Fatal("no end event")
 			}
 			waitFor(t, "the idle stream to close", pcm.isClosed)
+			if _, fired := pcm.cancelClock(); !fired {
+				t.Fatal("control: the device never reached the Cancel")
+			}
 			heardFrames := 0
-			pcm.heard(func(s int16, _ time.Time) {
+			pcm.heardInStreamTime(func(s int16, _ int) {
 				if s == 1000 {
 					heardFrames++
 				}
 			})
 			heard := time.Duration(heardFrames) * time.Second / 48000
-			if tc.cancelled && heard >= 100*time.Millisecond {
-				t.Fatalf("control: the device played all %v of the voice; the Cancel came too late to cut it", heard)
+			if heard != tc.heard {
+				t.Fatalf("control: the room heard %v of the voice, want %v", heard, tc.heard)
 			}
-			const slack = outputFrame // the Output counts what it mixed a frame at a time
-			if played := pb.Played(); played < heard-slack || played > heard+slack {
+			if played := pb.Played(); played != heard {
 				t.Fatalf("the playback reports %v played, the device played %v of it", played, heard)
 			}
-			if end.Played < heard-slack || end.Played > heard+slack || end.Cancelled != tc.cancelled {
+			if end.Played != heard || end.Cancelled != tc.cancelled {
 				t.Fatalf("end event = %+v, want %v played (what the device played), cancelled %t", end, heard, tc.cancelled)
 			}
 		})

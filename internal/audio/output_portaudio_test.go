@@ -69,6 +69,7 @@ func TestPortAudioTeardownClosesThePlayingOutput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			playing, next := newFakeStream(48000), newFakeStream(48000)
+			playing.block = make(chan struct{}) // every write waits, until the teardown has stopped the playback
 			out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{playing, next}})
 			terminated, streamOpen := false, false
 			origTerminate, origInitialize := paTerminate, paInitialize
@@ -85,28 +86,39 @@ func TestPortAudioTeardownClosesThePlayingOutput(t *testing.T) {
 			go func() { written <- pb.WriteAll(ctx, constant(48000, time.Minute, 1000), mono48k) }()
 			playing.waitWriting(t)
 
-			began := time.Now()
-			if err := tc.teardown(); err != nil {
-				t.Fatalf("teardown: %v", err)
-			}
-			// The Output closes its stream before its next frame, not once it
-			// has been idle (OutputIdleClose): a mic reconnect waits for it.
-			if took := time.Since(began); took > 100*time.Millisecond {
-				t.Fatalf("the teardown waited %v for the speaker's stream, want it closed before the next frame", took)
-			}
-			if !terminated {
-				t.Fatal("PortAudio was not terminated")
-			}
-			if streamOpen {
-				t.Fatal("PortAudio terminated while the speaker's output stream was still open")
-			}
+			tornDown := make(chan error, 1)
+			go func() { tornDown <- tc.teardown() }()
 			select {
 			case err := <-written:
 				if !errors.Is(err, ErrCancelled) {
 					t.Fatalf("the playback under the teardown = %v, want ErrCancelled", err)
 				}
 			case <-time.After(10 * time.Second):
-				t.Fatal("speaker still playing 10s after the teardown")
+				t.Fatal("speaker still playing 10s after the teardown began")
+			}
+			// The teardown has stopped the playback while a write of the
+			// stream waits. The Output must close its stream before its next
+			// frame, not once it has been idle (OutputIdleClose): a mic
+			// reconnect waits for the close. Counting the frames the stream
+			// is given, not the time the teardown takes, keeps load out of it.
+			before := len(playing.played())
+			close(playing.block)
+			select {
+			case err := <-tornDown:
+				if err != nil {
+					t.Fatalf("teardown: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the teardown did not return in 10s")
+			}
+			if more := len(playing.played()) - before; more > 0 {
+				t.Fatalf("the speaker's stream was given %d more frames after the teardown stopped its playback, want it closed before the next frame", more)
+			}
+			if !terminated {
+				t.Fatal("PortAudio was not terminated")
+			}
+			if streamOpen {
+				t.Fatal("PortAudio terminated while the speaker's output stream was still open")
 			}
 			pb = out.Begin(InputVoice)
 			if err := pb.WriteAll(ctx, constant(48000, 20*time.Millisecond, 1000), mono48k); err != nil {
