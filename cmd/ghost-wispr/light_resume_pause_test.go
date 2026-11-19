@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -354,4 +355,118 @@ func TestAPauseDuringAMicOpensCheckLeavesTheNextResumeResuming(t *testing.T) {
 	}
 	let(1)
 	mic.expectEvents(t, "open", "stream")
+}
+
+// TestAPauseDuringAStartsCheckLeavesTheNextResumeResuming is
+// TestAPauseDuringAMicOpensCheckLeavesTheNextResumeResuming for the start of
+// a microphone deferred by a paused start-up (startMicrophone's
+// startOnResume): a start a pause cancelled must not end the resuming state of
+// a resume that came after that pause (review 5974388115 of #79).
+func TestAPauseDuringAStartsCheckLeavesTheNextResumeResuming(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	capture.Pause()
+	entered := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	release := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	var releases [2]sync.Once
+	let := func(i int) { releases[i].Do(func() { close(release[i]) }) }
+	var calls atomic.Int32
+	capture.checkLightPattern = func() error {
+		if i := int(calls.Add(1)) - 1; i < 2 {
+			close(entered[i])
+			<-release[i]
+		}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var loops sync.WaitGroup
+	t.Cleanup(func() { let(0); let(1); cancel(); loops.Wait() })
+	started := make(chan struct{})
+	var startOnce sync.Once
+	deferred, err := startMicrophone(ctx, &loops, capture, alreadyBooted(), func(atBoot bool) error {
+		startOnce.Do(func() { close(started) })
+		return nil
+	}, func() {})
+	if err != nil || !deferred {
+		t.Fatalf("control: startMicrophone on a paused gate = %t, %v, want deferred", deferred, err)
+	}
+	waitFor := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(testWait):
+			t.Fatalf("control: %s did not happen within %v", what, testWait)
+		}
+	}
+
+	capture.Resume()
+	waitFor(entered[0], "the start's light check")
+	capture.Pause() // cancels that start
+	capture.Resume()
+	waitOpen(t, capture)
+	if got := capture.MicHold(); got != captureResuming {
+		t.Fatalf("control: right after the later resume opened the gate, mic hold = %q, want %q", got, captureResuming)
+	}
+	let(0) // the cancelled start returns errMicStartPaused
+	waitFor(entered[1], "the next start's light check")
+	got := capture.MicHold()
+	let(1)
+	waitFor(started, "the next start")
+	if got != captureResuming {
+		t.Fatalf("while the start after a cancelled one checks the light, mic hold = %q, want %q: the cancelled start ended the later resume's state", got, captureResuming)
+	}
+}
+
+// TestAPauseDuringARetrysCheckLeavesTheNextResumeResuming is the same for
+// retryMicStartup: an attempt a pause cancelled is retried at once, and the
+// next attempt's check must still see the later resume resuming (review
+// 5974388115 of #79).
+func TestAPauseDuringARetrysCheckLeavesTheNextResumeResuming(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	entered := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	release := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	var releases [2]sync.Once
+	let := func(i int) { releases[i].Do(func() { close(release[i]) }) }
+	var calls atomic.Int32
+	capture.checkLightPattern = func() error {
+		if i := int(calls.Add(1)) - 1; i < 2 {
+			close(entered[i])
+			<-release[i]
+		}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.Cleanup(func() { let(0); let(1); cancel(); <-done })
+	started := make(chan struct{})
+	go func() {
+		defer close(done)
+		retryMicStartup(ctx, time.Hour, oneShotAfter(), capture, nil, func() error {
+			close(started)
+			return nil
+		}, func(error) {}, nil)
+	}()
+	waitFor := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(testWait):
+			t.Fatalf("control: %s did not happen within %v", what, testWait)
+		}
+	}
+
+	waitFor(entered[0], "the retry's light check")
+	capture.Pause() // cancels that attempt
+	capture.Resume()
+	waitOpen(t, capture)
+	if got := capture.MicHold(); got != captureResuming {
+		t.Fatalf("control: right after the later resume opened the gate, mic hold = %q, want %q", got, captureResuming)
+	}
+	let(0) // the cancelled attempt returns errMicStartPaused
+	waitFor(entered[1], "the next attempt's light check")
+	got := capture.MicHold()
+	let(1)
+	waitFor(started, "the next attempt")
+	if got != captureResuming {
+		t.Fatalf("while the attempt after a cancelled one checks the light, mic hold = %q, want %q: the cancelled attempt ended the later resume's state", got, captureResuming)
+	}
 }

@@ -374,12 +374,13 @@ func retryMicStartup(
 		// The attempt, whether it works or not, ends a resume's "resuming"
 		// state: readiness then reports what came back.
 		err := capture.openUnderRed(start)
-		capture.finishResume()
 		if errors.Is(err, errMicStartPaused) {
-			// A pause cancelled the attempt: the next resume tries again.
+			// A pause cancelled the attempt: the next resume tries again,
+			// and the resuming state is left to it.
 			wait = false
 			continue
 		}
+		capture.finishResume()
 		if err != nil {
 			if onError != nil {
 				onError(err)
@@ -436,12 +437,14 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 				}
 			}
 			err := capture.openUnderRed(func() error { return start(false) })
-			capture.finishResume()
-			switch {
-			case err == nil:
-				return
-			case errors.Is(err, errMicStartPaused):
+			if errors.Is(err, errMicStartPaused) {
+				// A pause cancelled the start: the resuming state is left to
+				// the next start, for a resume that came after the pause.
 				continue
+			}
+			capture.finishResume()
+			if err == nil {
+				return
 			}
 			retry()
 			return
