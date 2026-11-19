@@ -143,7 +143,7 @@ type session struct {
 // chunks until play writes it.
 type sayRequest struct {
 	ctx    context.Context
-	cancel context.CancelCauseFunc // ends ctx once play is done with the Say
+	cancel func(error) // ends ctx, and its tie to the caller's, once play is done with the Say
 	text   string
 	gen    int
 	done   chan error // the Say's result, once
@@ -200,6 +200,9 @@ func (r *sayRequest) next() (pcm []byte, more bool, err error) {
 	for {
 		r.mu.Lock()
 		switch {
+		case r.ctx.Err() != nil:
+			r.mu.Unlock()
+			return nil, false, context.Cause(r.ctx)
 		case len(r.chunks) > 0:
 			pcm, r.chunks = r.chunks[0], r.chunks[1:]
 			r.mu.Unlock()
@@ -249,6 +252,10 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		// A stop came first: nothing of the text is queued, nor sent.
+		return context.Cause(ctx)
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -259,18 +266,21 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 	s.mu.Unlock()
 
 	// The request ends with its generation, synchronously, so an Interrupt
-	// reaches it, and its audio synthesised ahead, at once. The caller's ctx
-	// ends it until Say returns; after that its audio is the session's to
-	// play, and play releases it.
+	// reaches it, and its audio synthesised ahead, at once. It also ends with
+	// the caller's ctx, the exchange's, until play is done with it: a stop
+	// cuts the text synthesised ahead though its Say has returned.
 	rctx, cancel := context.WithCancelCause(epoch)
 	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
-	defer stop()
+	release := func(err error) {
+		stop()
+		cancel(err)
+	}
 
-	r := &sayRequest{ctx: rctx, cancel: cancel, text: text, gen: gen, done: make(chan error, 1), more: make(chan struct{}, 1)}
+	r := &sayRequest{ctx: rctx, cancel: release, text: text, gen: gen, done: make(chan error, 1), more: make(chan struct{}, 1)}
 	select {
 	case s.says <- r:
 	case <-rctx.Done():
-		cancel(nil)
+		release(nil)
 		s.mu.Lock()
 		s.pending--
 		s.settleLocked()
@@ -552,6 +562,11 @@ func (s *session) writeFrame(r *sayRequest, frame []byte, first *bool) error {
 	if r.gen != s.gen {
 		s.mu.Unlock()
 		return ErrInterrupted
+	}
+	if err := r.ctx.Err(); err != nil {
+		// A stop ended the request: begin no playback for it.
+		s.mu.Unlock()
+		return context.Cause(r.ctx)
 	}
 	if s.pb == nil {
 		s.pb, s.pbGen = s.out.Begin(), r.gen

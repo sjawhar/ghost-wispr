@@ -57,11 +57,13 @@ const (
 	// ownWordsKept is how long Wispr's spoken words are kept for the own-speech
 	// match.
 	ownWordsKept = 30 * time.Second
-	// recentKept is how much of the transcript an exchange gets as Recent.
-	recentKept = 2 * time.Minute
 	// sorryLine is said for a failed answer when the Concierge said nothing.
 	sorryLine = "Sorry, I could not answer that."
 )
+
+// recentKept is how much of the transcript an exchange gets as Recent; a
+// test shortens it.
+var recentKept = 2 * time.Minute
 
 // exchangeMax bounds one exchange, whatever its voice or Concierge do; a test
 // shortens it.
@@ -456,6 +458,7 @@ func (s *Supervisor) offLocked() bool {
 		s.stopLocked("voice turned off")
 		s.pending = nil
 		s.lastTimes = nil
+		s.recent = nil // the room's words from before the off go with it
 	}
 	return true
 }
@@ -1612,8 +1615,17 @@ func (s *Supervisor) keepRecentLocked(t *Transcript, now time.Time) {
 	s.recent = kept
 }
 
+// recentLocked is the transcript of the last recentKept, pruned by age as it
+// is read: nothing may have been heard since to prune it.
 func (s *Supervisor) recentLocked() []TurnText {
-	return append([]TurnText(nil), s.recent...)
+	var kept []TurnText
+	now := time.Now()
+	for _, r := range s.recent {
+		if now.Sub(r.At) < recentKept {
+			kept = append(kept, r)
+		}
+	}
+	return kept
 }
 
 // wakeStart is the start on the socket of the wake phrase's first word in t.
@@ -1661,19 +1673,41 @@ func normWord(w string) string {
 }
 
 // exchangeOutput is ex's voice input: it keeps ex's latest playback, so the
-// Supervisor can wait for its speech to play.
+// Supervisor can wait for its speech to play. A playback begun once ex has
+// ended refuses every write: the speaker's Cancel ends only the playbacks
+// begun before it, and a voice that synthesised ahead (voice A) may begin
+// one for its next sentence before its own Interrupt runs. endLocked marks ex
+// ended under s.mu before it cancels, and Begin reads that under s.mu, so no
+// playback begun after the cut can play.
 type exchangeOutput struct {
 	s  *Supervisor
 	ex *exchange
 }
 
 func (o exchangeOutput) Begin() Playback {
-	pb := o.s.cfg.Speaker.Begin(audio.InputVoice)
 	o.s.mu.Lock()
+	defer o.s.mu.Unlock()
+	if o.ex.ended {
+		return endedPlayback{}
+	}
+	pb := o.s.cfg.Speaker.Begin(audio.InputVoice)
 	o.ex.last = pb
-	o.s.mu.Unlock()
 	return pb
 }
+
+// errExchangeEnded refuses the writes of a playback begun after its exchange
+// ended.
+var errExchangeEnded = errors.New("voice: the exchange has ended")
+
+// endedPlayback is a playback begun after its exchange ended: it plays
+// nothing.
+type endedPlayback struct{}
+
+func (endedPlayback) Write(context.Context, []byte, audio.AudioFormat) error {
+	return errExchangeEnded
+}
+
+func (endedPlayback) Drain(context.Context) error { return nil }
 
 // exchangeTools runs the Concierge's tools for ex, and the answer tool
 // through Concierge.Answer.

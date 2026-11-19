@@ -1,6 +1,8 @@
 package voice
 
 import (
+	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -102,4 +104,85 @@ func TestTurningTheVoiceOffCutsSpeech(t *testing.T) {
 	}
 	// The session closes as its exchange's answer goroutine sees the cut.
 	eventually(t, "the exchange's session closed", func() bool { _, _, closed := sess.state(); return closed })
+}
+
+// TestAStopRefusesAPlaybackBegunAfterIt fails if a voice that begins a
+// playback after a stop, as voice A's playback stage does for the sentence it
+// synthesised ahead, can write audio to the speaker: the speaker's Cancel
+// ends only the playbacks begun before it, and the voice's own Interrupt
+// comes later, on a goroutine of its own (ReviewPR89's round 3, finding 3).
+func TestAStopRefusesAPlaybackBegunAfterIt(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		name := "control: no stop"
+		if stop {
+			name = "a stop, then the voice begins a playback"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := newFakeConcierge()
+			c.hold = true
+			r := newRig(t, c)
+			r.heard("Wispr, what is happening?", true, true)
+			sess := r.waitSession()
+			if stop {
+				r.s.Stop("Jabra button")
+				eventually(t, "the voice input cancelled", func() bool { _, ok := r.speaker.cancelledAt(audio.InputVoice); return ok })
+			}
+			before := r.speaker.written(audio.InputVoice)
+			pb := sess.x.Out.Begin() // as voice A's play stage, under no context of the exchange
+			err := pb.Write(context.Background(), make([]byte, 960), ChimeFormat)
+			got := r.speaker.written(audio.InputVoice) - before
+			if !stop {
+				if err != nil || got != 1 {
+					t.Fatalf("with no stop the write gave %v and %d frames, want it written", err, got)
+				}
+				return
+			}
+			if err == nil || got != 0 {
+				t.Fatalf("after the stop the write gave %v and %d frames reached the speaker, want it refused", err, got)
+			}
+		})
+	}
+}
+
+// TestTurningTheVoiceOffForgetsTheRoomsWords fails if the transcript kept
+// while the voice was on reaches an exchange after the voice was turned off
+// and on again (ReviewPR89's round 3: offLocked kept s.recent).
+func TestTurningTheVoiceOffForgetsTheRoomsWords(t *testing.T) {
+	c := newFakeConcierge("fact")
+	r := newRig(t, c)
+	r.heard("the budget review moved to Thursday", true, true)
+	r.setEnabled(false)
+	r.s.EnabledChanged()
+	r.setEnabled(true)
+	r.heard("Wispr, what is happening?", true, true)
+	r.waitTurn()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, x := range c.exchanges {
+		for _, tt := range x.Recent {
+			if strings.Contains(tt.Text, "budget") {
+				t.Fatalf("an exchange after the voice was off got %q", tt.Text)
+			}
+		}
+	}
+}
+
+// TestAnExchangeGetsOnlyTheLastTwoMinutes fails if words older than the kept
+// window reach an exchange because nothing was heard since to prune them.
+func TestAnExchangeGetsOnlyTheLastTwoMinutes(t *testing.T) {
+	kept := recentKept
+	recentKept = 200 * time.Millisecond
+	t.Cleanup(func() { recentKept = kept })
+	c := newFakeConcierge("fact")
+	r := newRig(t, c)
+	r.heard("the budget review moved to Thursday", true, true)
+	time.Sleep(300 * time.Millisecond)
+	r.s.mu.Lock()
+	recent := r.s.recentLocked()
+	r.s.mu.Unlock()
+	for _, tt := range recent {
+		if strings.Contains(tt.Text, "budget") {
+			t.Fatalf("words older than the kept window were kept: %q", tt.Text)
+		}
+	}
 }
