@@ -373,3 +373,20 @@ func TestAToolThatCannotReachDispatchPlaysTheErrorSound(t *testing.T) {
 	}
 	eventually(t, "the error sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "error") })
 }
+
+// TestAnIdleEndWithAnUnspokenAnswerSoundsTheError fails if a driving voice's
+// exchange ends for idleness while the voice holds an answer the answer tool
+// returned and never began to speak it, and the room hears nothing (R10: a
+// voice that fails plays the error sound; GWDgAgent's model_speaks_with_call-2).
+func TestAnIdleEndWithAnUnspokenAnswerSoundsTheError(t *testing.T) {
+	c := newFakeConcierge("The issue is in review.")
+	r := newDrivingRigWith(t, 300*time.Millisecond, c)
+	r.heard("Wispr, what is happening with ABC-12?", true, true)
+	sess := r.waitSession()
+	if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)}); err != nil {
+		t.Fatalf("the answer tool: %v", err)
+	}
+	// The voice never speaks the answer it got.
+	eventually(t, "the exchange ended for idleness", func() bool { _, _, closed := sess.state(); return closed })
+	eventually(t, "the error sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "error") })
+}

@@ -262,9 +262,12 @@ type exchange struct {
 	// lastTurnEnd is when the exchange's last turn ended: R7's t0 for an
 	// answer to a question it asked.
 	lastTurnEnd time.Time
-	turnAt      time.Time // when the turn was handed to the Concierge
-	notified    map[string]bool
-	idle        *time.Timer // a driving voice's idle wait
+	// unspokenAnswer: the answer tool returned words the driving voice has
+	// not begun to speak.
+	unspokenAnswer bool
+	turnAt         time.Time // when the turn was handed to the Concierge
+	notified       map[string]bool
+	idle           *time.Timer // a driving voice's idle wait
 	// A driving voice's follow-up window: armed when its speech ends, unless
 	// a barge-in cut it; a person's word disarms it (R10).
 	followUpTimer *time.Timer
@@ -822,7 +825,14 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 		s.touchLocked(ex)
 		return
 	}
+	unspoken := ex.unspokenAnswer
 	s.endLocked(ex, false, "idle")
+	if unspoken {
+		// The voice got an answer to speak and never began it: the room
+		// hears that it failed (R10), not silence.
+		s.logf("voice: the voice did not speak the answer it got")
+		s.errorLocked(ex.x.SessionID)
+	}
 }
 
 // driverSpeechLocked follows the speech of ex's voice, which drives its own
@@ -831,6 +841,9 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
 	s.disarmFollowUpLocked(ex)
 	ex.newTurn = true
+	if started {
+		ex.unspokenAnswer = false
+	}
 	if started || ex.ended {
 		return
 	}
@@ -1738,6 +1751,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	if len(lines) > 0 {
 		s.mu.Lock()
 		t.ex.askedBack = isQuestion(lines[len(lines)-1])
+		t.ex.unspokenAnswer = true // until the voice's speech starts
 		s.mu.Unlock()
 	}
 	return json.Marshal(AnswerResult{Say: strings.Join(lines, " ")})
