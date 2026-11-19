@@ -964,3 +964,33 @@ func TestEarlyStateGoesWithTheMeetingOrTheGate(t *testing.T) {
 		}
 	}
 }
+
+// TestAFollowUpTurnIsAskedOnlyWhenItSaysAsk (R7; PR #89's review): a turn
+// said in the follow-up window with no wake phrase ("should we tell the
+// voice team before the demo?") is answered from the record, and goes to the
+// holder only when it says "ask"; a turn with a wake phrase is asked as R7
+// says.
+func TestAFollowUpTurnIsAskedOnlyWhenItSaysAsk(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		followUp bool
+		turn     string
+		asked    bool
+	}{
+		{"follow-up, not about status", true, "should ABC-12 wait for the demo", false},
+		{"follow-up that says ask", true, "ask the agent on ABC-12 whether it should wait for the demo", true},
+		{"woken, not about status", false, "should ABC-12 wait for the demo", true},
+	} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		r.exchange.FollowUpTurn = c.followUp
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		answerTurn(t, r, c.turn)
+		r.agents.mu.Lock()
+		asked := len(r.agents.sent) == 1
+		r.agents.mu.Unlock()
+		if asked != c.asked {
+			t.Errorf("%s: asked %v, want %v", c.name, asked, c.asked)
+		}
+	}
+}
