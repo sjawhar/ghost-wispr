@@ -94,7 +94,10 @@ func (m SayMode) String() string {
 
 // Session is one open voice.
 type Session interface {
-	// Say speaks text, and returns once it has been queued to the Output.
+	// Say speaks text. It returns no sooner than its speech is queued to the
+	// Output (voice A returns then; a vendor voice may return once it has
+	// played), and an error means the text was not heard: the Supervisor
+	// keeps a held answer whose Say failed for the next invitation.
 	Say(ctx context.Context, text string, mode SayMode) error
 	// Deliver hands a late tool result to the voice, such as GPT-Live's
 	// delegation id.

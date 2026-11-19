@@ -399,6 +399,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	ex.x = Exchange{
 		SessionID: sessionID,
 		WakeAt:    t.At,
+		AskerTurn: strings.TrimSpace(m.Rest),
 		Recent:    s.recentLocked(),
 		Tap:       s.cfg.Tap.Open(wakeLag(t, m)),
 		Out:       exchangeOutput{s: s, ex: ex},
@@ -526,6 +527,8 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		ex.interim = words
 	}
 	if ex.drives {
+		// The vendor drives the turn; its tools still read what was asked.
+		ex.x.AskerTurn = s.turnOf(ex)
 		return
 	}
 	if t.IsFinal && t.SpeechFinal && s.turnOf(ex) != "" {
@@ -678,6 +681,14 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		}
 		if err := sess.Say(ex.ctx, p.Text, Answer); err != nil {
 			s.logf("voice: speak a held answer: %v", err)
+			// Not heard: it waits for "Wispr, go ahead" again, unless a stop
+			// already put it back.
+			s.mu.Lock()
+			if !ex.ended && ex.ctx.Err() == nil {
+				p.needsInvite = true
+				s.pending = append([]*pendingAnswer{p}, s.pending...)
+			}
+			s.mu.Unlock()
 		} else {
 			s.mu.Lock()
 			ex.said = true
@@ -1022,6 +1033,10 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	var args AnswerArgs
 	if err := json.Unmarshal(c.Args, &args); err != nil {
 		return nil, errors.New("answer tool: arguments are not an AnswerArgs object")
+	}
+	if strings.TrimSpace(args.Question) == "" {
+		// A vendor may delegate before its own transcript of the turn.
+		args.Question = x.AskerTurn
 	}
 	var said []string
 	err := s.cfg.Concierge.Answer(ctx, &x, args.Question, func(_ context.Context, text string, _ SayMode) error {

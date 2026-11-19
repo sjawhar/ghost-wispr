@@ -182,6 +182,7 @@ type fakeVoice struct {
 	sessions []*fakeSession
 	opened   chan *fakeSession
 	openErr  error
+	sayErr   error // every Say of a session opened while set fails with it
 }
 
 func newFakeVoice() *fakeVoice { return &fakeVoice{opened: make(chan *fakeSession, 16)} }
@@ -190,12 +191,18 @@ func (v *fakeVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
 	if v.openErr != nil {
 		return nil, v.openErr
 	}
-	s := &fakeSession{x: *x, events: make(chan Event, 64), said: make(chan string, 16)}
 	v.mu.Lock()
+	s := &fakeSession{x: *x, events: make(chan Event, 64), said: make(chan string, 16), sayErr: v.sayErr}
 	v.sessions = append(v.sessions, s)
 	v.mu.Unlock()
 	v.opened <- s
 	return s, nil
+}
+
+func (v *fakeVoice) failSays(err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.sayErr = err
 }
 
 type fakeSession struct {
@@ -210,6 +217,7 @@ type fakeSession struct {
 	eventsDone  bool
 	says        []string
 	modes       []SayMode
+	sayErr      error
 }
 
 func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error {
@@ -217,6 +225,10 @@ func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error 
 	if s.closed {
 		s.mu.Unlock()
 		return errors.New("session closed")
+	}
+	if s.sayErr != nil {
+		s.mu.Unlock()
+		return s.sayErr
 	}
 	s.says = append(s.says, text)
 	s.modes = append(s.modes, mode)
