@@ -341,6 +341,7 @@ export function applyEvent(event: WebSocketEvent): void {
     // read reads them again.
     case 'voice_answer_ready':
     case 'voice_spoken':
+    case 'voice_tasks_changed':
       if (voiceTaskReads.has(event.session_id)) {
         void loadVoiceTasks(event.session_id)
       }

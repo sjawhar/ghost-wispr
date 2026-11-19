@@ -33,7 +33,7 @@ func TestVoiceEventsGoToWebSocketsOnlyAndHoldNoWords(t *testing.T) {
 	ch := hub.Subscribe()
 	defer hub.Unsubscribe(ch)
 
-	kinds := []string{"voice_wake", "voice_exchange_started", "voice_answer_ready", "voice_spoken", "agent_joined", "agent_left"}
+	kinds := []string{"voice_wake", "voice_exchange_started", "voice_answer_ready", "voice_spoken", "voice_tasks_changed", "agent_joined", "agent_left"}
 	for _, kind := range kinds {
 		hub.BroadcastVoiceEvent(kind, "20261119-090000")
 		select {

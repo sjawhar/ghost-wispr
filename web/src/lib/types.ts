@@ -132,13 +132,15 @@ export interface SessionDeletedEvent extends BaseEvent {
 }
 
 // What the meeting voice did, in the recording session session_id: no words.
-// voice_answer_ready and voice_spoken change the session's questions to agents.
+// voice_answer_ready, voice_spoken and voice_tasks_changed change the session's
+// questions to agents.
 export interface VoiceEvent extends BaseEvent {
   type:
     | 'voice_wake'
     | 'voice_exchange_started'
     | 'voice_answer_ready'
     | 'voice_spoken'
+    | 'voice_tasks_changed'
     | 'agent_joined'
     | 'agent_left'
   session_id: string

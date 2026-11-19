@@ -1945,7 +1945,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	stopConcierge := func() {}
 	if cfg.Voice.Enabled {
 		if err := func() error {
-			conc, stop, err := startConcierge(ctx, &cfg, store, appLogger)
+			// The session page reads a session's questions again on each change.
+			conc, stop, err := startConcierge(ctx, &cfg, store, appLogger, func(sessionID string) {
+				hub.BroadcastVoiceEvent("voice_tasks_changed", sessionID)
+			})
 			if err != nil {
 				return err
 			}

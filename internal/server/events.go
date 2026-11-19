@@ -84,7 +84,8 @@ type SessionDeletedEvent struct {
 
 // VoiceEvent tells a web client what the voice did (voice_wake,
 // voice_exchange_started, voice_answer_ready, voice_spoken, agent_joined,
-// agent_left): a session id and no words. It is never stored.
+// agent_left) or that a session's questions to agents changed
+// (voice_tasks_changed): a session id and no words. It is never stored.
 type VoiceEvent struct {
 	Event
 	SessionID string `json:"session_id"`

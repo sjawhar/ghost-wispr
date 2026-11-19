@@ -277,6 +277,7 @@ var voiceEventTypes = map[string]bool{
 	"voice_exchange_started": true,
 	"voice_answer_ready":     true,
 	"voice_spoken":           true,
+	"voice_tasks_changed":    true, // the session's questions to agents changed
 	"agent_joined":           true,
 	"agent_left":             true,
 }

@@ -413,9 +413,10 @@ describe('voice tasks', () => {
     expect(appState.voiceTasks.get('s1')).toEqual({ tasks: [answered], error: '' })
   })
 
-  // The two events that change a question's answer or spoken time read the
+  // The events that change a question's answer or spoken time read the
   // session's questions again; it failed while nothing listened for them.
-  it.each(['voice_answer_ready', 'voice_spoken'])(
+  // voice_tasks_changed also covers an ended meeting's late answer.
+  it.each(['voice_answer_ready', 'voice_spoken', 'voice_tasks_changed'])(
     "reads a read session's questions again on %s for it, and on nothing else",
     async (type) => {
       const fetchMock = stubFetch([waiting], [answered])

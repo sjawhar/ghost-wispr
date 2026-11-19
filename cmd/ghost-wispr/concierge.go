@@ -25,7 +25,7 @@ const envoyRetryEvery = time.Minute
 // no token or no Dispatch URL the tools say they cannot reach Dispatch yet;
 // with no Envoy the Concierge answers from the record alone until the session
 // opens. stop closes the Envoy session.
-func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger) (*concierge.Concierge, func(), error) {
+func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string)) (*concierge.Concierge, func(), error) {
 	options := genAIOptions(cfg, cfg.GeminiAPIKey)
 	if err := addVertexCredentials(ctx, cfg, options); err != nil {
 		return nil, nil, fmt.Errorf("concierge: %w", err)
@@ -56,6 +56,7 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 		Store:     store,
 		PublicURL: cfg.PublicURL,
 		Logger:    logger,
+		Changed:   changed,
 	})
 	if err != nil {
 		return nil, nil, err

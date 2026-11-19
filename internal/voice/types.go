@@ -65,7 +65,9 @@ type AnswerResult struct {
 }
 
 // Voice opens a Session for an Exchange. Each call gets an Exchange of its own,
-// which the Supervisor does not change afterwards.
+// which the Supervisor does not change afterwards. ctx is the exchange's: a
+// Session may end when ctx ends, after Open has returned too, so a caller must
+// not pass a context that ends with the call alone.
 type Voice interface {
 	Open(ctx context.Context, x *Exchange) (Session, error)
 }
