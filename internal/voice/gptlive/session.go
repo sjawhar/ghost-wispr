@@ -174,7 +174,9 @@ func (v *Voice) DrivesTurn() bool { return true }
 
 // Open connects to GPT-Live and starts a session for x. It returns once the
 // session has started, so x's tap audio, which it keeps from the start,
-// reaches the model.
+// reaches the model. ctx is the exchange's: when it ends, after Open has
+// returned too, the session closes, and with it the room audio to OpenAI.
+// A caller must not pass a context that ends with the call alone.
 func (v *Voice) Open(ctx context.Context, x *voice.Exchange) (voice.Session, error) {
 	if x.Out == nil {
 		return nil, errors.New("gptlive: the exchange has no output")
@@ -272,21 +274,25 @@ type session struct {
 	finished     chan struct{} // Close returned
 
 	player *player
+	// tl places the model's speech on the session timeline, to match its
+	// transcript to it.
+	tl timeline
 
-	mu          sync.Mutex
-	closing     bool
-	release     func() bool // stops the close on the exchange's end
-	over        bool        // the session ended and said so on Events
-	nextID      int
-	pending     map[string]chan error // acknowledgements awaited, by client event id
-	pendingDone bool
-	delegations map[string]bool
-	asked       bool            // a delegation has taken the asker's words
-	turn        strings.Builder // heard since the last EventUserTurn
-	sinceAsk    strings.Builder // heard since the last delegation
-	heardAt     time.Time       // when GPT-Live last heard the room say something
-	heardWake   chan struct{}   // signalled at each word GPT-Live hears
-	dialogue    []dialogueLine  // what was heard and said in this session
+	mu           sync.Mutex
+	closing      bool
+	release      func() bool // stops the close on the exchange's end
+	over         bool        // the session ended and said so on Events
+	nextID       int
+	pending      map[string]chan error // acknowledgements awaited, by client event id
+	pendingDone  bool
+	delegations  map[string]bool
+	asked        bool            // a delegation has taken the asker's words
+	lastQuestion string          // the last delegation's question
+	turn         strings.Builder // heard since the last EventUserTurn
+	sinceAsk     strings.Builder // heard since the last delegation
+	heardAt      time.Time       // when GPT-Live last heard the room say something
+	heardWake    chan struct{}   // signalled at each word GPT-Live hears
+	dialogue     []dialogueLine  // what was heard and said in this session
 }
 
 type dialogueLine struct {
@@ -420,6 +426,8 @@ func (s *session) Interrupt() {
 	id := s.newIDLocked()
 	s.wg.Add(1)
 	s.mu.Unlock()
+	now := time.Now()
+	s.tl.cut(now)
 	s.player.interrupt()
 	go func() {
 		defer s.wg.Done()
@@ -687,6 +695,7 @@ func (s *session) read() {
 		case evSessionStarted:
 			if !started {
 				started = true
+				s.tl.begin(time.Now())
 				close(s.started)
 			}
 		case evError:
@@ -698,7 +707,7 @@ func (s *session) read() {
 		case evInputTranscriptDelta:
 			s.onHeard(ev.Delta)
 		case evOutputTranscript:
-			s.onSaid(ev.Delta)
+			s.onSaid(ev.Delta, ev.StartMs)
 		case evDelegationCreated:
 			s.onDelegation(&ev)
 		case evSessionClosed:
@@ -788,7 +797,9 @@ func (s *session) onAudio(delta string) {
 	for i := range pcm {
 		pcm[i] = int16(binary.LittleEndian.Uint16(data[2*i:]))
 	}
-	if s.player.push(pcm, time.Now()) {
+	now := time.Now()
+	s.tl.audio(now, pcm)
+	if s.player.push(pcm, now) {
 		s.flushTurn()
 	}
 }
@@ -807,9 +818,10 @@ func (s *session) onHeard(delta string) {
 // onSaid reports and keeps what GPT-Live says, as its fragments arrive.
 // The words of a speech Interrupt dropped are not Wispr's speech: the room
 // did not hear them, and the Supervisor's own-speech filter would take a
-// person's same words for Wispr's echo.
-func (s *session) onSaid(delta string) {
-	if s.player.dropping(time.Now()) {
+// person's same words for Wispr's echo. They are found by the fragment's
+// place on the session timeline, startMs, however late the fragment arrives.
+func (s *session) onSaid(delta string, startMs int64) {
+	if s.player.closed() || s.tl.cutWords(startMs, time.Now()) {
 		return
 	}
 	s.mu.Lock()
@@ -916,7 +928,8 @@ func (s *session) awaitQuestion() bool {
 
 // questionLocked is the question for a delegation: what GPT-Live heard
 // since the last one, with the asker's words at the wake before it on the
-// first unless it heard them too; else the last words heard, else the
+// first unless it heard them too. A delegation that heard nothing new asks
+// the last question again; with none, the last words heard, else the
 // meeting's last line, so a question never goes out empty.
 func (s *session) questionLocked() string {
 	question := strings.TrimSpace(s.sinceAsk.String())
@@ -928,13 +941,22 @@ func (s *session) questionLocked() string {
 		}
 	}
 	if question == "" {
+		question = s.lastQuestion
+	}
+	if question == "" {
 		question = s.lastHeardLocked()
 	}
 	for i := len(s.x.Recent) - 1; question == "" && i >= 0; i-- {
 		question = strings.Join(strings.Fields(s.x.Recent[i].Text), " ")
 	}
+	s.lastQuestion = question
 	return question
 }
+
+// TimelineOffsets reports how far each transcript fragment of uncut speech
+// fell outside its speech on the session's own clock: what CutMargin must
+// cover. gptlive-probe prints them.
+func (s *session) TimelineOffsets() []time.Duration { return s.tl.measured() }
 
 // words is s in lower case with every run of other than letters and digits
 // made one space, to compare two transcripts of the same words.
@@ -982,7 +1004,7 @@ func (s *session) transcriptLocked() string {
 			b.WriteByte('\n')
 		}
 	}
-	if asker := strings.TrimSpace(s.x.AskerTurn); asker != "" {
+	if asker := strings.TrimSpace(s.x.AskerTurn); asker != "" && !askerInRecent(&s.x) {
 		b.WriteString("Asker, calling Wispr: ")
 		b.WriteString(asker)
 		b.WriteByte('\n')
@@ -1145,12 +1167,12 @@ func (p *player) stop() {
 	signal(p.wake)
 }
 
-// dropping reports whether the model's speech is being dropped at now: an
-// interrupted speech that has not yet paused, or a closed session.
-func (p *player) dropping(now time.Time) bool {
+// closed reports whether the session has closed: nothing more plays, and
+// none of the model's words are Wispr's.
+func (p *player) closed() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.stopped || (p.muted && !p.last.IsZero() && now.Sub(p.last) < speechGap)
+	return p.stopped
 }
 
 // interrupt drops what is queued, ends the speech under way, and drops the

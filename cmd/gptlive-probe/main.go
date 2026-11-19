@@ -37,10 +37,18 @@ import (
 // provider does not accept.
 const controlAudience = "https://example.invalid/gptlive-probe-control"
 
-// probeSettle is how long the probe listens after Say returns. Speech in
-// that time means Say returned before GPT-Live had finished, and the
-// Supervisor, which ends an exchange when Say returns, would cut it.
-const probeSettle = 2 * time.Second
+// probeSettle is how long the probe listens after Say returns. GPT-Live
+// marks no end of an answer: no event closes a response, and its transcript
+// has no done event. Speech in that time means Say returned before the
+// answer finished, and the meeting voice, which ends an exchange when Say
+// returns, would cut it off.
+const probeSettle = 10 * time.Second
+
+// offsetSpread is the most the transcript's offset from the audio may vary
+// for the cut-speech check to match fragments by their place on the session
+// timeline; past it, the check needs a sideband connection, whose output
+// audio carries its own timestamps.
+const offsetSpread = 200 * time.Millisecond
 
 // probeConfig is what one probe run needs.
 type probeConfig struct {
@@ -54,6 +62,8 @@ type probeConfig struct {
 	Voice    string        // GPT-Live's voice; empty means its default
 	MinAudio time.Duration // the speech that passes the probe
 	WAV      string        // where to write the speech; empty writes none
+	// Settle is how long to listen after Say returns; 0 means probeSettle.
+	Settle time.Duration
 }
 
 func main() { os.Exit(run()) }
@@ -157,13 +167,25 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 		return fmt.Errorf("text turn: %w", err)
 	}
 	said := rec.duration()
-	select {
-	case <-time.After(probeSettle):
-	case <-ctx.Done():
-		return ctx.Err()
+	settle := cfg.Settle
+	if settle <= 0 {
+		settle = probeSettle
 	}
-	if more := rec.duration() - said; more > 0 {
-		return fmt.Errorf("the answer was cut: GPT-Live spoke %v more after Say returned, and an exchange ends when Say returns", more)
+	listen := time.NewTimer(settle)
+	defer listen.Stop()
+	poll := time.NewTicker(50 * time.Millisecond)
+	defer poll.Stop()
+	for listening := true; listening; {
+		select {
+		case <-listen.C:
+			listening = false
+		case <-poll.C:
+			if more := rec.duration() - said; more > 0 {
+				return fmt.Errorf("the answer was cut: Say returned before the answer finished, and GPT-Live spoke %v more after it returned; the meeting voice ends an exchange when Say returns, so the room would not hear the rest", more)
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	if err := seen.failure(); err != nil {
 		return fmt.Errorf("session: %w", err)
@@ -173,6 +195,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	printf(out, "audio: %.2f s at %d Hz\n", rec.duration().Seconds(), gptlive.SampleRate)
 	printf(out, "words: %s\n", seen.words())
+	reportOffsets(out, s)
 	if rec.duration() < cfg.MinAudio {
 		return fmt.Errorf("GPT-Live spoke %v, want %v or more", rec.duration(), cfg.MinAudio)
 	}
@@ -187,6 +210,35 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	}
 	printf(out, "result: PASS\n")
 	return nil
+}
+
+// reportOffsets prints how far GPT-Live's transcript fragments fell outside
+// their speech on the session's clock, and what that means for the margin
+// the cut-speech check uses (gptlive.CutMargin).
+func reportOffsets(out io.Writer, s voice.Session) {
+	m, ok := s.(interface{ TimelineOffsets() []time.Duration })
+	if !ok {
+		printf(out, "timeline offset: UNKNOWN: the session does not measure it\n")
+		return
+	}
+	offsets := m.TimelineOffsets()
+	if len(offsets) == 0 {
+		printf(out, "timeline offset: UNKNOWN: no transcript fragment of GPT-Live's speech to measure\n")
+		return
+	}
+	least, most, far := offsets[0], offsets[0], time.Duration(0)
+	for _, o := range offsets {
+		least, most, far = min(least, o), max(most, o), max(far, o, -o)
+	}
+	printf(out, "timeline offset: %d fragments, from %v to %v outside their speech (spread %v)\n", len(offsets), least, most, most-least)
+	switch {
+	case most-least > offsetSpread:
+		printf(out, "timeline offset: unstable (spread over %v): match cut speech through a sideband connection instead\n", offsetSpread)
+	case far+100*time.Millisecond > gptlive.CutMargin:
+		printf(out, "timeline offset: raise gptlive.CutMargin from %v to %v\n", gptlive.CutMargin, far+100*time.Millisecond)
+	default:
+		printf(out, "timeline offset: gptlive.CutMargin %v covers it\n", gptlive.CutMargin)
+	}
 }
 
 // control exchanges a Google ID token for another audience, which OpenAI

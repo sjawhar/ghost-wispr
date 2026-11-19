@@ -162,6 +162,7 @@ func runProbe(t *testing.T, s *standIns, cfg *probeConfig) (string, error) {
 func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 	s := newStandIns(t)
 	cfg := s.config(t)
+	cfg.Settle = time.Second // nothing comes after Say; the 10 s default is TestTheProbeFailsOnASecondSentenceFiveSecondsLater's
 	report, err := runProbe(t, s, &cfg)
 	if err != nil {
 		t.Fatalf("probe: %v\n%s", err, report)
@@ -179,7 +180,7 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 	if !s.heardAudio.Load() {
 		t.Error("the probe sent GPT-Live no input audio: its timeline runs on input audio")
 	}
-	for _, want := range []string{"control: a token for another audience was refused (invalid_subject_token)", "token exchange: ok", "session: started", "audio: 1.2", "words: Hello from the stand-in.", "result: PASS"} {
+	for _, want := range []string{"control: a token for another audience was refused (invalid_subject_token)", "token exchange: ok", "session: started", "audio: 1.2", "words: Hello from the stand-in.", "timeline offset:", "result: PASS"} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report does not say %q:\n%s", want, report)
 		}
@@ -228,6 +229,7 @@ func TestTheProbeHearsALongAnswerToItsEnd(t *testing.T) {
 		}
 	}
 	cfg := s.config(t)
+	cfg.Settle = time.Second
 	report, err := runProbe(t, s, &cfg)
 	if err != nil {
 		t.Fatalf("probe: %v\n%s", err, report)
@@ -252,10 +254,27 @@ func TestTheProbeFailsOnACutAnswer(t *testing.T) {
 	}
 }
 
+// GPT-Live marks no end of an answer, so the probe listens 10 s after Say
+// returns: a second sentence 5 s after the first fails it.
+func TestTheProbeFailsOnASecondSentenceFiveSecondsLater(t *testing.T) {
+	s := newStandIns(t)
+	s.answer = func(send func(any)) {
+		send(speechDelta(1200 * time.Millisecond))
+		time.Sleep(5 * time.Second)
+		send(speechDelta(600 * time.Millisecond))
+	}
+	cfg := s.config(t)
+	report, err := runProbe(t, s, &cfg)
+	if err == nil || !strings.Contains(err.Error(), "Say returned before the answer finished") {
+		t.Fatalf("probe with a second sentence 5 s after the first = %v, want a failure naming that Say returned too early\n%s", err, report)
+	}
+}
+
 func TestTheProbeFailsOnTooLittleSpeech(t *testing.T) {
 	s := newStandIns(t)
 	s.answer = func(send func(any)) { send(speechDelta(300 * time.Millisecond)) }
 	cfg := s.config(t)
+	cfg.Settle = time.Second
 	if report, err := runProbe(t, s, &cfg); err == nil {
 		t.Fatalf("probe with 0.3 s of speech passed:\n%s", report)
 	}
@@ -268,6 +287,7 @@ func TestTheProbeFailsOnAServerError(t *testing.T) {
 		send(map[string]any{"type": "error", "event_id": "e9", "error": map[string]any{"type": "server_error", "code": "internal_error", "message": "boom"}})
 	}
 	cfg := s.config(t)
+	cfg.Settle = time.Second
 	if report, err := runProbe(t, s, &cfg); err == nil || !strings.Contains(err.Error(), "internal_error") {
 		t.Fatalf("probe with a server error = %v, want the error\n%s", err, report)
 	}

@@ -52,12 +52,18 @@ const historyBudget = 16000
 
 // history is the session's starting text history: the meeting transcript
 // before the call, labelled by speaker and oldest first, then the asker's
-// words so far. It keeps the newest whole lines that fit historyBudget, and
-// stops at the first that does not, so the transcript it keeps has no gap;
-// a newest line too long for the budget on its own keeps its last words.
+// words so far, unless the transcript's last line already holds them, as
+// the Supervisor's does. It keeps the newest whole lines that fit
+// historyBudget, and stops at the first that does not, so the transcript it
+// keeps has no gap; a newest line too long for the budget on its own keeps
+// its last words.
 func history(x *voice.Exchange) []initialItem {
 	var tail string
-	if asker := strings.TrimSpace(x.AskerTurn); asker != "" {
+	switch asker := strings.TrimSpace(x.AskerTurn); {
+	case asker == "":
+	case askerInRecent(x):
+		tail = "The last line above is the person calling you."
+	default:
 		tail = "The person calling you has said so far: " + truncate(asker, historyBudget/2)
 	}
 	header := "Meeting transcript before you were called, oldest first:"
@@ -95,6 +101,21 @@ func history(x *voice.Exchange) []initialItem {
 		return nil
 	}
 	return []initialItem{userMessage(b.String())}
+}
+
+// askerInRecent reports whether x's newest transcript line already holds
+// the asker's words: the Supervisor's Recent ends with the wake sentence.
+func askerInRecent(x *voice.Exchange) bool {
+	asker := words(x.AskerTurn)
+	if asker == "" {
+		return false
+	}
+	for i := len(x.Recent) - 1; i >= 0; i-- {
+		if text := words(x.Recent[i].Text); text != "" {
+			return strings.Contains(text, asker)
+		}
+	}
+	return false
 }
 
 func userMessage(text string) initialItem {

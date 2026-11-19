@@ -110,7 +110,10 @@ type serverEvent struct {
 	ClientEventID string          `json:"client_event_id"`
 	Session       json.RawMessage `json:"session"`
 	Delta         string          `json:"delta"`
-	Delegation    struct {
+	// StartMs is a transcript fragment's place on the session timeline, in
+	// milliseconds from the session's start; it carries no response id.
+	StartMs    int64 `json:"start_ms"`
+	Delegation struct {
 		ID     string `json:"id"`
 		Target string `json:"target"`
 	} `json:"delegation"`

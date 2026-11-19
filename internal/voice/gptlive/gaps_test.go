@@ -568,7 +568,9 @@ func TestChunksCutTextWithNoSpacesOnARuneBoundary(t *testing.T) {
 func TestChunksCutTextWithNoSentenceEndAtASpace(t *testing.T) {
 	words := make([]string, 300)
 	for i := range words {
-		words[i] = fmt.Sprintf("word%03d", i)
+		// 8 bytes and a space: 1,000 bytes is not a word boundary, so a
+		// hard cut there would split a word.
+		words[i] = fmt.Sprintf("word%04d", i)
 	}
 	text := strings.Join(words, " ")
 	got := chunks(text)
@@ -576,8 +578,13 @@ func TestChunksCutTextWithNoSentenceEndAtASpace(t *testing.T) {
 		t.Fatalf("%d chunks that do not add up to the text at spaces", len(got))
 	}
 	for _, c := range got {
-		if len(c) > appendLimit || !strings.HasPrefix(c, "word") || len(strings.Fields(c)[len(strings.Fields(c))-1]) != 7 {
-			t.Fatalf("chunk %q is over the limit or cuts a word", c[max(0, len(c)-20):])
+		if len(c) > appendLimit {
+			t.Fatalf("chunk of %d bytes, over the limit", len(c))
+		}
+		for _, w := range strings.Fields(c) {
+			if len(w) != 8 || !strings.HasPrefix(w, "word") {
+				t.Fatalf("chunk cuts a word: %q", w)
+			}
 		}
 	}
 }

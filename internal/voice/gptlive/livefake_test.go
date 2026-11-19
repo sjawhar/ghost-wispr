@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,6 +114,14 @@ type liveConn struct {
 	done    chan struct{}
 	writeMu sync.Mutex
 	autoAck bool
+	// startedAt is when the stand-in sent session.started: the start of its
+	// session timeline, which transcript fragments are stamped on.
+	startedAt atomic.Int64
+}
+
+// sessionMs is the stand-in's session timeline now, in milliseconds.
+func (c *liveConn) sessionMs() int64 {
+	return time.Now().UnixMilli() - c.startedAt.Load()
 }
 
 func (c *liveConn) read() {
@@ -196,6 +205,7 @@ func (c *liveConn) start() clientEvent {
 	if ev.Type != evSessionStart {
 		c.t.Fatalf("first event %q, want %s", ev.Type, evSessionStart)
 	}
+	c.startedAt.Store(time.Now().UnixMilli())
 	c.send(map[string]any{"type": evSessionStarted, "event_id": "event_started", "session": map[string]any{"id": "sess_test", "model": "gpt-live-1"}})
 	return ev
 }
@@ -213,8 +223,14 @@ func (c *liveConn) heard(text string) {
 	c.send(map[string]any{"type": evInputTranscriptDelta, "event_id": "event_in", "delta": text, "start_ms": 0, "end_ms": 100})
 }
 
-func (c *liveConn) said(text string) {
-	c.send(map[string]any{"type": evOutputTranscript, "event_id": "event_out", "delta": text, "start_ms": 0, "end_ms": 100})
+// said sends a fragment of the model's speech, stamped now on the session
+// timeline, as a server that sends speech as it plays does.
+func (c *liveConn) said(text string) { c.saidAt(text, c.sessionMs()) }
+
+// saidAt sends a fragment of the model's speech for the audio at startMs
+// on the session timeline, whenever it arrives.
+func (c *liveConn) saidAt(text string, startMs int64) {
+	c.send(map[string]any{"type": evOutputTranscript, "event_id": "event_out", "delta": text, "start_ms": startMs, "end_ms": startMs + 100})
 }
 
 // closed waits for the session to close its socket.
