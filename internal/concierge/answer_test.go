@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -169,6 +170,59 @@ func TestAnUnreachableDispatchSaysSoAndWrapsErrUnreachable(t *testing.T) {
 	}
 	if len(spoken) == 0 || spoken[len(spoken)-1] != (said{cannotReachDispatch, voice.Ack}) {
 		t.Fatalf("spoken = %+v, want %q last", spoken, cannotReachDispatch)
+	}
+}
+
+// TestAnUnreachableEnvoySaysSoAndWrapsErrUnreachable (R10's error sound):
+// when the holder's lookup, the ask, or a tool the model calls cannot reach
+// Envoy or Dispatch, the voice says so, and Answer's error wraps voice's
+// ErrUnreachable. With Envoy answering, Answer returns no error.
+func TestAnUnreachableEnvoySaysSoAndWrapsErrUnreachable(t *testing.T) {
+	const (
+		status   = "what is happening with ABC-12"
+		ask      = "ask the agent on ABC-12 whether the tap is merged"
+		heldLine = "ABC-12 is held by an agent session, and I cannot reach the agents yet."
+		askLine  = "I could not ask the agent on ABC-12: I cannot reach the agents yet."
+	)
+	down := errors.New("envoy: dial tcp: no route to host")
+	for _, c := range []struct {
+		name, turn, line string
+		cut              func(r *rig)
+	}{
+		{"no Envoy session", status, heldLine, func(r *rig) { r.concierge.SetAgents(nil) }},
+		{"the holder's lookup", status, heldLine, func(r *rig) { r.agents.lookupErr = down }},
+		{"the ask's lookup", ask, askLine, func(r *rig) { r.agents.lookupErr, r.agents.lookupsBeforeErr = down, 1 }},
+		{"the ask's send", ask, askLine, func(r *rig) { r.agents.sendErr = down }},
+		{"a tool the model calls", status, "", func(r *rig) {
+			r.records.issues["XYZ-34"] = claimed("XYZ-34", "session", "agent-9", "Other")
+			r.agents.lookupErr, r.agents.lookupsBeforeErr = down, 1
+			r.model.turns = [][]*genai.GenerateContentResponse{
+				{chunk(call("c1", "issue_holder", map[string]any{"key": "XYZ-34"}, ""))},
+				{chunk(text("PR 80 is in review."))},
+			}
+		}},
+		{"control: Envoy answers", ask, "", nil},
+	} {
+		r := newRig(t)
+		heldIssue(r, "session", false)
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+		if c.cut != nil {
+			c.cut(r)
+		}
+		var spoken []said
+		err := r.concierge.Answer(context.Background(), &r.exchange, c.turn, recorder(&spoken))
+		if c.cut == nil {
+			if err != nil {
+				t.Errorf("%s: Answer = %v, want no error", c.name, err)
+			}
+			continue
+		}
+		if !errors.Is(err, voice.ErrUnreachable) {
+			t.Errorf("%s: Answer = %v, want voice.ErrUnreachable", c.name, err)
+		}
+		if c.line != "" && !slices.ContainsFunc(spoken, func(s said) bool { return s.text == c.line }) {
+			t.Errorf("%s: spoken = %+v, want %q", c.name, spoken, c.line)
+		}
 	}
 }
 

@@ -144,6 +144,11 @@ type fakeAgents struct {
 	onSend func(ctx context.Context, eventID string) error
 	// onLookup runs inside Lookup before it answers.
 	onLookup func(id string)
+	// lookupErr, when set, is the answer of every Lookup after the first
+	// lookupsBeforeErr.
+	lookupErr        error
+	lookupsBeforeErr int
+	lookups          int
 }
 
 func (f *fakeAgents) ID() string { return f.id }
@@ -151,6 +156,13 @@ func (f *fakeAgents) ID() string { return f.id }
 func (f *fakeAgents) Lookup(_ context.Context, id string) (envoy.SessionInfo, error) {
 	if f.onLookup != nil {
 		f.onLookup(id)
+	}
+	f.mu.Lock()
+	f.lookups++
+	failing := f.lookupErr != nil && f.lookups > f.lookupsBeforeErr
+	f.mu.Unlock()
+	if failing {
+		return envoy.SessionInfo{}, f.lookupErr
 	}
 	if info, ok := f.states[id]; ok {
 		return info, nil
@@ -303,7 +315,9 @@ func newRig(t *testing.T) *rig {
 	return r
 }
 
-// run calls one tool through the exchange's runner and decodes its result.
+// run calls one tool through the exchange's runner and decodes its result. An
+// answer that says Dispatch or Envoy is out of reach, and only such, comes
+// with an error that wraps voice.ErrUnreachable.
 func (r *rig) run(t *testing.T, name string, args any) map[string]any {
 	t.Helper()
 	raw, err := json.Marshal(args)
@@ -311,12 +325,15 @@ func (r *rig) run(t *testing.T, name string, args any) map[string]any {
 		t.Fatal(err)
 	}
 	result, err := r.concierge.Tools(&r.exchange).Run(context.Background(), voice.ToolCall{ID: "call-1", Name: name, Args: raw})
-	if err != nil {
+	if err != nil && !errors.Is(err, voice.ErrUnreachable) {
 		t.Fatalf("Run(%s): %v", name, err)
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(result, &decoded); err != nil {
 		t.Fatalf("Run(%s) answered no JSON object: %s", name, result)
+	}
+	if (err != nil) != outOfReach(decoded) {
+		t.Fatalf("Run(%s) = %s, error %v: want voice.ErrUnreachable with an out-of-reach answer, and only with one", name, result, err)
 	}
 	return decoded
 }

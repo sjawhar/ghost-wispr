@@ -82,6 +82,9 @@ var factTools = func() []ToolSpec {
 	return specs
 }()
 
+// errOutOfReach is Answer's error when Dispatch or Envoy did not answer.
+var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
+
 // Answer answers one turn of x, speaking through say as it goes (R5 to R8):
 //   - with no fact said 1.5 s after the turn, a routing line;
 //   - the issue a search took, by key and title, when the search had no one
@@ -93,7 +96,9 @@ var factTools = func() []ToolSpec {
 //
 // What Heard read while the asker spoke is the record; an issue the final
 // turn names that was not read yet is read first. One answer takes at most
-// 8 s and 6 tool calls of the model's.
+// 8 s and 6 tool calls of the model's. When Dispatch or Envoy did not answer
+// a read, a lookup or the ask, the voice says so and the error wraps
+// voice.ErrUnreachable, for R10's error sound.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
@@ -109,7 +114,7 @@ func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn strin
 		if err := sp.sayText(parent, cannotReachDispatch, voice.Ack); err != nil {
 			return err
 		}
-		return fmt.Errorf("concierge: %w", voice.ErrUnreachable)
+		return errOutOfReach
 	case found.noResult:
 		return sp.sayText(ctx, noIssueFound, voice.Ack)
 	}
@@ -119,8 +124,9 @@ func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn strin
 			return err
 		}
 	}
-	asked := c.askIfNeeded(ctx, x, turn, found)
-	err := c.facts(ctx, x, turn, found, sp)
+	tools := &runner{c: c, x: x}
+	asked := c.askIfNeeded(ctx, tools, turn, found)
+	err := c.facts(ctx, tools, turn, found, sp)
 	switch {
 	case parent.Err() != nil:
 		return parent.Err()
@@ -135,6 +141,10 @@ func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn strin
 		if sayErr := sp.sayText(parent, asked, voice.Ack); sayErr != nil {
 			return errors.Join(err, sayErr)
 		}
+	}
+	if tools.unreachable || outOfReach(found.holder) {
+		// R10: the Supervisor plays the error sound.
+		err = errors.Join(err, errOutOfReach)
 	}
 	return err
 }
@@ -186,6 +196,9 @@ func holderLine(key string, holder map[string]any) string {
 	case "session":
 		return key + " is held by a live agent session."
 	case "unresponsive":
+		if outOfReach(holder) {
+			return key + " is held by an agent session, and I cannot reach the agents yet."
+		}
 		return key + " is held by an agent session that is not answering."
 	case "person":
 		person, _ := holder["person"].(string)
@@ -211,7 +224,7 @@ var (
 // from the last 60 minutes. It asks nothing for a holder that is a person,
 // nobody, or a session not answering, nor for an issue a search took with no
 // one clear match. It returns what the voice says after the facts.
-func (c *Concierge) askIfNeeded(ctx context.Context, x *voice.Exchange, turn string, found *reading) string {
+func (c *Concierge) askIfNeeded(ctx context.Context, tools *runner, turn string, found *reading) string {
 	session, _ := found.holder["session"].(string)
 	if found.holder["holder"] != "session" || found.holder["live"] != true || session == "" || (found.searched && !found.clear) {
 		return ""
@@ -219,10 +232,12 @@ func (c *Concierge) askIfNeeded(ctx context.Context, x *voice.Exchange, turn str
 	if !askWord.MatchString(turn) && aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord {
 		return ""
 	}
-	result, err := (&runner{c: c, x: x}).call(ctx, "ask_agent", map[string]any{"session": session, "question": fewestWords(turn), "issue_key": found.key})
+	result, err := tools.call(ctx, "ask_agent", map[string]any{"session": session, "question": fewestWords(turn), "issue_key": found.key})
 	switch {
 	case err != nil:
 		return ""
+	case outOfReach(result):
+		return "I could not ask the agent on " + found.key + ": " + cannotReachEnvoy
 	case result["error"] != nil:
 		return "I could not ask the agent on " + found.key + "."
 	default:
@@ -257,12 +272,12 @@ func fewestWords(turn string) string {
 	return question
 }
 
-// facts has the model say the facts of the record. A sentence that holds a
-// fact the record does not is not spoken (R8): the model writes once more,
-// told why, and after a second failure the voice says it can only say what
-// the record holds.
-func (c *Concierge) facts(ctx context.Context, x *voice.Exchange, turn string, found *reading, sp *speaker) error {
-	prompt := c.turnPrompt(transcriptOf(x.Recent), turn)
+// facts has the model say the facts of the record, with the answer's tools.
+// A sentence that holds a fact the record does not is not spoken (R8): the
+// model writes once more, told why, and after a second failure the voice
+// says it can only say what the record holds.
+func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found *reading, sp *speaker) error {
+	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
 	case found.searched:
@@ -283,7 +298,7 @@ func (c *Concierge) facts(ctx context.Context, x *voice.Exchange, turn string, f
 		if reason != "" {
 			note += "\n\nYour last answer held a fact the record does not: " + reason + ". Answer again from the record only."
 		}
-		err := c.generate(ctx, x, prompt+note, source, &budget, sp)
+		err := c.generate(ctx, tools, prompt+note, source, &budget, sp)
 		var invented *inventedError
 		if !errors.As(err, &invented) {
 			return err
@@ -314,8 +329,7 @@ func (e *inventedError) Error() string { return "concierge: the model said " + e
 // the round after the last may call none. Thoughts are never spoken. The
 // model's own turn, its thought signatures included, goes back to it with
 // the tools' results, as Gemini requires.
-func (c *Concierge) generate(ctx context.Context, x *voice.Exchange, prompt string, source *strings.Builder, budget *int, sp *speaker) error {
-	tools := &runner{c: c, x: x}
+func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, source *strings.Builder, budget *int, sp *speaker) error {
 	contents := []*genai.Content{genai.NewContentFromText(prompt, genai.RoleUser)}
 	config := c.generateConfig(systemPrompt, factTools)
 	last := *config

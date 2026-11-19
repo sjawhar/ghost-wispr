@@ -23,8 +23,12 @@ import (
 // or the unit has no token for it: words the voice can say as they are.
 const cannotReachDispatch = "I cannot reach Dispatch yet."
 
-// cannotReachEnvoy is ask_agent's answer when the unit has no Envoy session.
+// cannotReachEnvoy is a tool's answer when the unit has no Envoy session, or
+// Envoy does not answer a lookup.
 const cannotReachEnvoy = "I cannot reach the agents yet."
+
+// questionNotSent is ask_agent's answer when Envoy did not take the question.
+const questionNotSent = "The question did not reach the agent."
 
 const (
 	// specSummaryChars is how much of an issue's spec read_issue gives.
@@ -115,6 +119,9 @@ type runner struct {
 	x *voice.Exchange
 	// newest is, per issue read_issue read, its newest event's time.
 	newest map[string]time.Time
+	// unreachable: a tool's answer said Dispatch or Envoy did not answer
+	// (outOfReach).
+	unreachable bool
 }
 
 // Tools gives x's tools, for x.Tools.
@@ -124,18 +131,21 @@ func (c *Concierge) Tools(x *voice.Exchange) voice.ToolRunner {
 
 // IssueHolder answers exactly what the issue_holder tool answers for key, for
 // a caller with no exchange, such as the acceptance driver. The session it
-// names is made askable for no exchange.
+// names is made askable for no exchange. An Envoy out of reach is in the
+// answer, not in the error.
 func (c *Concierge) IssueHolder(ctx context.Context, key string) (json.RawMessage, error) {
-	raw, err := json.Marshal(map[string]string{"key": key})
+	result, err := (&runner{c: c, x: &voice.Exchange{}}).call(ctx, "issue_holder", map[string]any{"key": key})
 	if err != nil {
 		return nil, err
 	}
-	return (&runner{c: c, x: &voice.Exchange{}}).Run(ctx, voice.ToolCall{Name: "issue_holder", Args: raw})
+	return json.Marshal(result)
 }
 
 // Run runs one tool. A tool that fails answers {"error": "..."}, which a
-// model can say; Run's error is for an unknown tool or a stop. The
-// Supervisor answers voice.AnswerTool itself, through Answer.
+// model can say. An answer that says Dispatch or Envoy did not answer
+// (outOfReach) comes with an error that wraps voice.ErrUnreachable, for
+// R10's error sound; Run's other errors are an unknown tool or a stop, with
+// no answer. The Supervisor answers voice.AnswerTool itself, through Answer.
 func (r *runner) Run(ctx context.Context, call voice.ToolCall) (json.RawMessage, error) {
 	var args map[string]any
 	if err := json.Unmarshal(orEmpty(call.Args), &args); err != nil {
@@ -145,7 +155,11 @@ func (r *runner) Run(ctx context.Context, call voice.ToolCall) (json.RawMessage,
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(result)
+	raw, err := json.Marshal(result)
+	if err == nil && outOfReach(result) {
+		err = errOutOfReach
+	}
+	return raw, err
 }
 
 func orEmpty(raw json.RawMessage) json.RawMessage {
@@ -193,9 +207,22 @@ func (r *runner) call(ctx context.Context, name string, args map[string]any) (ma
 		if !errors.As(err, &refused) || refused.Status != http.StatusNotFound || refused.Route != "issue" {
 			r.c.logger.Warn("concierge tool failed", "tool", name, "error", err)
 		}
-		return map[string]any{"error": toolError(err)}, nil
+		result = map[string]any{"error": toolError(err)}
+	}
+	if outOfReach(result) {
+		r.unreachable = true
 	}
 	return result, nil
+}
+
+// outOfReach reports whether a tool's answer says Dispatch or Envoy did not
+// answer: R10's error sound.
+func outOfReach(result map[string]any) bool {
+	switch result["error"] {
+	case cannotReachDispatch, cannotReachEnvoy, questionNotSent:
+		return true
+	}
+	return result["note"] == cannotReachEnvoy
 }
 
 // somethingWrong is a tool's answer for a failure on the recorder itself.
@@ -553,7 +580,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		r.c.tellChanged(r.x.SessionID)
 		r.c.logger.Warn("concierge could not send a question", "session", session, "error", err)
-		return nil, tell("The question did not reach the agent.")
+		return nil, tell(questionNotSent)
 	}
 	taskID := sent.EventID
 	r.c.mu.Lock()

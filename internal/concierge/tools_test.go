@@ -212,6 +212,38 @@ func TestWithoutDispatchTheToolsSaySo(t *testing.T) {
 	}
 }
 
+// TestToolRunSignalsOutOfReach (R10, voices B and C): a tool whose answer
+// says Dispatch or Envoy did not answer returns that answer with an error
+// that wraps voice.ErrUnreachable, so the Supervisor plays the error sound.
+// Another answer has no error, and IssueHolder's never has one.
+func TestToolRunSignalsOutOfReach(t *testing.T) {
+	run := func(r *rig, name string, args string) (string, error) {
+		raw, err := r.concierge.Tools(&r.exchange).Run(context.Background(), voice.ToolCall{ID: "c1", Name: name, Args: json.RawMessage(args)})
+		return string(raw), err
+	}
+	r := newRig(t)
+	r.records.err = fmt.Errorf("%w: dial tcp: no route to host", dispatch.ErrUnreachable)
+	if raw, err := run(r, "read_issue", `{"key":"ABC-1"}`); !errors.Is(err, voice.ErrUnreachable) || !strings.Contains(raw, cannotReachDispatch) {
+		t.Errorf("read_issue when Dispatch does not answer = %s, %v", raw, err)
+	}
+
+	r = newRig(t)
+	heldIssue(r, "session", false)
+	if raw, err := run(r, "issue_holder", `{"key":"ABC-12"}`); err != nil || !strings.Contains(raw, `"live":true`) {
+		t.Fatalf("control: issue_holder with Envoy answering = %s, %v", raw, err)
+	}
+	r.agents.lookupErr = errors.New("envoy: dial tcp: no route to host")
+	if raw, err := run(r, "issue_holder", `{"key":"ABC-12"}`); !errors.Is(err, voice.ErrUnreachable) || !strings.Contains(raw, cannotReachEnvoy) {
+		t.Errorf("issue_holder when Envoy does not answer = %s, %v", raw, err)
+	}
+	if raw, err := r.concierge.IssueHolder(context.Background(), "ABC-12"); err != nil || !strings.Contains(string(raw), cannotReachEnvoy) {
+		t.Errorf("IssueHolder when Envoy does not answer = %s, %v; want its answer and no error", raw, err)
+	}
+	if raw, err := run(r, "read_issue", `{"key":"../x"}`); err != nil || !strings.Contains(raw, "issue key") {
+		t.Errorf("read_issue of a bad key = %s, %v; want no error", raw, err)
+	}
+}
+
 func TestAskAgentSendsAReadOnlyPointerQuestionAndRecordsATask(t *testing.T) {
 	r := newRig(t)
 	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateLive}
