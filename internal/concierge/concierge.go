@@ -293,15 +293,15 @@ func (c *Concierge) stillOwed(answer *voice.PendingAnswer) bool {
 	}
 }
 
-// enqueue queues an announcement for offerAnswers, unless its meeting was
-// deleted.
-func (c *Concierge) enqueue(answer voice.PendingAnswer) {
+// enqueue queues an announcement for offerAnswers, unless its meeting ended
+// or was deleted.
+func (c *Concierge) enqueue(answer *voice.PendingAnswer) {
 	c.mu.Lock()
 	if c.closedLocked(answer.SessionID) {
 		c.mu.Unlock()
 		return
 	}
-	c.queue = append(c.queue, answer)
+	c.queue = append(c.queue, *answer)
 	c.mu.Unlock()
 	select {
 	case c.queued <- struct{}{}:

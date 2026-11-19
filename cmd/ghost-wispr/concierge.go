@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
@@ -112,4 +114,50 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 		}
 	}
 	return c, stop, nil
+}
+
+// conciergeSessions is what the Concierge does when a session ends or is
+// deleted; *concierge.Concierge implements it.
+type conciergeSessions interface {
+	SessionEnded(sessionID string) error
+	SessionDeleted(sessionID string)
+}
+
+// conciergeHooks reaches the Concierge from the session manager and the
+// session deletes, which are wired before it starts. Until set, and with the
+// voice off, they do nothing.
+type conciergeHooks struct {
+	mu sync.RWMutex
+	c  conciergeSessions
+}
+
+func (h *conciergeHooks) set(c conciergeSessions) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.c = c
+}
+
+func (h *conciergeHooks) get() conciergeSessions {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.c
+}
+
+// SessionEnded cancels the questions an ended session still waits on: their
+// answers are kept for its page and never announced in a later meeting.
+func (h *conciergeHooks) SessionEnded(sessionID string) {
+	if c := h.get(); c != nil {
+		if err := c.SessionEnded(sessionID); err != nil {
+			log.Printf("warning: concierge: cancel the questions of ended session %s: %v", sessionID, err)
+		}
+	}
+}
+
+// SessionsDeleted drops what the Concierge holds of deleted sessions.
+func (h *conciergeHooks) SessionsDeleted(sessionIDs []string) {
+	if c := h.get(); c != nil {
+		for _, id := range sessionIDs {
+			c.SessionDeleted(id)
+		}
+	}
 }

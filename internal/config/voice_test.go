@@ -139,3 +139,16 @@ func TestVoiceConfigWarnings(t *testing.T) {
 		}
 	}
 }
+
+// TestVoiceBOpenAIIdentityComesFromTheConfig fails if voice B's two OpenAI
+// workload-identity ids (not secrets) are not read from voice.gptlive.
+func TestVoiceBOpenAIIdentityComesFromTheConfig(t *testing.T) {
+	clearVoiceEnv(t)
+	cfg, _, err := Load(writeConfig(t, "voice:\n  gptlive:\n    openai_identity_provider_id: idp-example\n    openai_service_account_id: sa-example\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Voice.GPTLive; got.OpenAIIdentityProviderID != "idp-example" || got.OpenAIServiceAccountID != "sa-example" {
+		t.Fatalf("voice.gptlive = %+v, want the file's ids", got)
+	}
+}

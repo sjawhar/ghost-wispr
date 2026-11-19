@@ -19,7 +19,7 @@ fail() {
 # its web UI shows under Recording rules, each as written and in this order (docs/pi-setup.md,
 # "Accept slice 1", A2). The test holds the hash, not the text, because the repository is public.
 # After a rule change, set it to the awk below run over the template, piped to sha256sum.
-readonly recording_rules_sha256=f4868276b26c15d966d3d28fa74b3242fb9f55c7f90cec2aba5c3932d05c8d33
+readonly recording_rules_sha256=89f65b9df94d27abf6657ba13e183921b7c27e19d8ba5e90c189e4046c5c8040
 
 # assert_recording_rules fails unless the configuration provision.sh installed holds exactly the
 # office Pi's recording rules, once.
@@ -27,7 +27,7 @@ assert_recording_rules() {
   local config=$TEST_LOG.installed-ghost-wispr.yaml rules
   rules=$(awk '/^recording_rules:/ { print; inside = 1; next } inside && /^  - / { print; next } { inside = 0 }' "$config" | sha256sum)
   [[ $rules == "$recording_rules_sha256  -" ]] \
-    || fail "the $1 configuration does not hold the office Pi's four recording rules: $(<"$config")"
+    || fail "the $1 configuration does not hold the office Pi's five recording rules: $(<"$config")"
 }
 
 # assert_office_pi_devices fails unless the configuration provision.sh installed turns the Jabra's
@@ -159,6 +159,24 @@ grep -Fxq "GHOST_WISPR_$deepgram_key_name=deepgram-key" "$env_file" || fail "the
 if grep -q 'ENVOY_WEBHOOK_SECRET' "$env_file"; then
   fail "the installed .env still holds an Envoy webhook secret"
 fi
+# Without a dispatch-token in the bundle, the .env gives the meeting voice no Dispatch token.
+dispatch_token_name="DISPATCH""_TOKEN"
+if grep -q "^GHOST_WISPR_$dispatch_token_name=" "$env_file"; then
+  fail "the installed .env has a Dispatch token the bundle did not carry"
+fi
+
+# The unit's own Dispatch token, when the bundle carries one, reaches the .env for the Concierge,
+# and a token that is not one line is refused. Each run starts a fresh log, as a first run does.
+: >"$TEST_LOG"
+printf 'dispatch-token-value' >"$work_dir/bundle/dispatch-token"
+run_provision "${bundle_files[@]}" dispatch-token || fail "provision.sh failed with a dispatch-token: $(<"$work_dir/out")"
+grep -Fxq "GHOST_WISPR_$dispatch_token_name=dispatch-token-value" "$TEST_LOG.installed-.env" \
+  || fail "the installed .env has no Dispatch token from the bundle's dispatch-token"
+printf 'two\nlines' >"$work_dir/bundle/dispatch-token"
+if run_provision "${bundle_files[@]}" dispatch-token; then
+  fail "provision.sh accepted a dispatch-token of two lines"
+fi
+rm "$work_dir/bundle/dispatch-token"
 
 # A lingering user service has no seat, so only the audio group opens the ALSA devices.
 grep -Fxq 'sudo usermod -aG audio ghost-wispr' "$TEST_LOG" || fail "provision.sh does not add ghost-wispr to the audio group"

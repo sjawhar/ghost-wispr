@@ -78,6 +78,15 @@ type Voice struct {
 	TTSModel       string `yaml:"tts_model"`    // "" is the engine's default
 	TTSVoice       string `yaml:"tts_voice"`    // "" is the engine's default
 	TTSLocation    string `yaml:"tts_location"` // the Vertex AI location Gemini streams from
+	// GPTLive is voice B's OpenAI route: the workload identity ids its token
+	// exchange names. They are not secrets.
+	GPTLive GPTLive `yaml:"gptlive"`
+}
+
+// GPTLive configures voice B (voice.engine gptlive).
+type GPTLive struct {
+	OpenAIIdentityProviderID string `yaml:"openai_identity_provider_id"`
+	OpenAIServiceAccountID   string `yaml:"openai_service_account_id"`
 }
 
 // Concierge configures the agent loop that answers the voice from Dispatch

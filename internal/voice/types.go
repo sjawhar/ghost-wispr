@@ -94,7 +94,10 @@ func (m SayMode) String() string {
 
 // Session is one open voice.
 type Session interface {
-	// Say speaks text, and returns once it has been queued to the Output.
+	// Say speaks text. It returns no sooner than its speech is queued to the
+	// Output (voice A returns then; a vendor voice may return once it has
+	// played), and an error means the text was not heard: the Supervisor
+	// keeps a held answer whose Say failed for the next invitation.
 	Say(ctx context.Context, text string, mode SayMode) error
 	// Deliver hands a late tool result to the voice, such as GPT-Live's
 	// delegation id.
@@ -151,6 +154,11 @@ type Concierge interface {
 	// Tools gives x's tools, for x.Tools: ask_agent's pointer names x's
 	// session and span. x.SessionID names a session the store already has.
 	Tools(x *Exchange) ToolRunner
+	// Heard tells it the asker's turn so far, on each result after the wake,
+	// so it can read the record while the asker speaks. It returns at once;
+	// the read ends with ctx, the exchange's, which every stop cancels. x
+	// carries the SessionID and WakeAt the later Tools and Answer calls carry.
+	Heard(ctx context.Context, x *Exchange, words string)
 	// Answer answers one turn of x. It speaks through say as it goes (an
 	// acknowledgement, then the facts) and returns once the turn is done. The
 	// Supervisor cancels ctx to stop its model and tool calls.
@@ -170,5 +178,6 @@ type PendingAnswer struct {
 	TaskID    string
 	SessionID string
 	IssueKey  string
-	Text      string // rewritten for the ear
+	Text      string    // rewritten for the ear
+	AskedAt   time.Time // when the question was sent; a stop since then makes it wait for "Wispr, go ahead"
 }

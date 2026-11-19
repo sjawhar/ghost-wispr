@@ -27,7 +27,8 @@ type fakeSpeaker struct {
 	finished  map[string]chan struct{}
 	listeners map[int]func(audio.SpeechEvent)
 	nextID    int
-	began     chan string // each Begin's input
+	began     chan string              // each Begin's input
+	hold      map[string]chan struct{} // a Begin on this input waits until it closes
 }
 
 func newFakeSpeaker() *fakeSpeaker {
@@ -44,6 +45,12 @@ func newFakeSpeaker() *fakeSpeaker {
 
 func (s *fakeSpeaker) Begin(input string) Playback {
 	s.mu.Lock()
+	hold := s.hold[input]
+	s.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.finished[input] == nil {
 		s.finished[input] = make(chan struct{})
@@ -53,6 +60,23 @@ func (s *fakeSpeaker) Begin(input string) Playback {
 	default:
 	}
 	return &fakePlayback{s: s, input: input, gen: s.gen[input]}
+}
+
+// holdBegins makes every Begin on input wait until release is called.
+func (s *fakeSpeaker) holdBegins(input string) (release func()) {
+	ch := make(chan struct{})
+	s.mu.Lock()
+	if s.hold == nil {
+		s.hold = map[string]chan struct{}{}
+	}
+	s.hold[input] = ch
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		delete(s.hold, input)
+		s.mu.Unlock()
+		close(ch)
+	}
 }
 
 func (s *fakeSpeaker) Cancel(input string) {
@@ -133,6 +157,9 @@ type fakePlayback struct {
 
 func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
 	s := p.s
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if s.gen[p.input] != p.gen {
 		s.mu.Unlock()
@@ -182,6 +209,7 @@ type fakeVoice struct {
 	sessions []*fakeSession
 	opened   chan *fakeSession
 	openErr  error
+	sayErr   error // every Say of a session opened while set fails with it
 }
 
 func newFakeVoice() *fakeVoice { return &fakeVoice{opened: make(chan *fakeSession, 16)} }
@@ -190,12 +218,18 @@ func (v *fakeVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
 	if v.openErr != nil {
 		return nil, v.openErr
 	}
-	s := &fakeSession{x: *x, events: make(chan Event, 64), said: make(chan string, 16)}
 	v.mu.Lock()
+	s := &fakeSession{x: *x, events: make(chan Event, 64), said: make(chan string, 16), sayErr: v.sayErr}
 	v.sessions = append(v.sessions, s)
 	v.mu.Unlock()
 	v.opened <- s
 	return s, nil
+}
+
+func (v *fakeVoice) failSays(err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.sayErr = err
 }
 
 type fakeSession struct {
@@ -207,8 +241,10 @@ type fakeSession struct {
 	interrupted time.Time
 	closedAt    time.Time
 	closed      bool
+	eventsDone  bool
 	says        []string
 	modes       []SayMode
+	sayErr      error
 }
 
 func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error {
@@ -216,6 +252,10 @@ func (s *fakeSession) Say(ctx context.Context, text string, mode SayMode) error 
 	if s.closed {
 		s.mu.Unlock()
 		return errors.New("session closed")
+	}
+	if s.sayErr != nil {
+		s.mu.Unlock()
+		return s.sayErr
 	}
 	s.says = append(s.says, text)
 	s.modes = append(s.modes, mode)
@@ -238,7 +278,7 @@ func (s *fakeSession) send(kind EventKind, text string) {
 	e := Event{Kind: kind, Text: text}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.eventsDone {
 		return
 	}
 	select {
@@ -265,9 +305,33 @@ func (s *fakeSession) Close() error {
 	if !s.closed {
 		s.closed = true
 		s.closedAt = time.Now()
-		close(s.events)
+		s.endEventsLocked()
 	}
 	return nil
+}
+
+func (s *fakeSession) endEventsLocked() {
+	if !s.eventsDone {
+		s.eventsDone = true
+		close(s.events)
+	}
+}
+
+// fail reports a failure, as a vendor whose connection dropped does.
+func (s *fakeSession) fail(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.eventsDone {
+		s.events <- Event{Kind: EventErr, Err: err}
+	}
+}
+
+// die ends the session's events with no Close, as a voice that ended by
+// itself does.
+func (s *fakeSession) die() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.endEventsLocked()
 }
 
 func (s *fakeSession) state() (interrupted, closedAt time.Time, closed bool) {
@@ -289,6 +353,25 @@ type fakeConcierge struct {
 	cancelled chan time.Time
 	spoken    []string
 	asked     chan string
+	heard     []heardCall
+}
+
+type heardCall struct {
+	ctx   context.Context
+	x     Exchange
+	words string
+}
+
+func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.heard = append(c.heard, heardCall{ctx: ctx, x: *x, words: words})
+}
+
+func (c *fakeConcierge) heardCalls() []heardCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]heardCall(nil), c.heard...)
 }
 
 func newFakeConcierge(lines ...string) *fakeConcierge {
@@ -380,8 +463,14 @@ type rig struct {
 
 func newRig(t *testing.T, c *fakeConcierge) *rig {
 	t.Helper()
+	return newRigWith(t, c, nil)
+}
+
+// newRigWith is newRig with change applied to the Supervisor's config.
+func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *rig)) *rig {
+	t.Helper()
 	r := &rig{t: t, speaker: newFakeSpeaker(), voice: newFakeVoice(), concierge: c, events: newEvents(), tap: NewTap(), red: true, session: "sess-1"}
-	r.s = NewSupervisor(&SupervisorConfig{
+	cfg := &SupervisorConfig{
 		Voice:       func() Voice { return r.voice },
 		Concierge:   c,
 		Speaker:     r.speaker,
@@ -401,7 +490,11 @@ func newRig(t *testing.T, c *fakeConcierge) *rig {
 		TurnWait:    300 * time.Millisecond,
 		SilenceWait: 200 * time.Millisecond,
 		Logf:        t.Logf,
-	})
+	}
+	if change != nil {
+		change(cfg, r)
+	}
+	r.s = NewSupervisor(cfg)
 	t.Cleanup(r.s.Close)
 	return r
 }
