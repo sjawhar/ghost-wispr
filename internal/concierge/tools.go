@@ -884,15 +884,16 @@ func exchangeKey(x *voice.Exchange) string {
 }
 
 // remember makes session askable in x: issue_holder or list_joined_agents
-// named it there.
+// named it there. An exchange heard before its recording session existed
+// keeps its names under no session id; wasNamed reads both.
 func (c *Concierge) remember(x *voice.Exchange, session string) {
-	if x.SessionID == "" {
-		return
+	if x.SessionID == "" && x.WakeAt.IsZero() {
+		return // no exchange, as IssueHolder's
 	}
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if closed, _ := c.closedLocked(x.SessionID); closed {
+	if closed, _ := c.closedLocked(x.SessionID); x.SessionID != "" && closed {
 		return
 	}
 	for key, entry := range c.named {
@@ -910,13 +911,18 @@ func (c *Concierge) remember(x *voice.Exchange, session string) {
 }
 
 // wasNamed reports whether the tools named session in x, so ask_agent may ask
-// it. Room speech, an issue's text or an agent's answer cannot name a session
-// to ask; only the record's holder or a joined agent is asked.
+// it, by x's session or, for a read made before that session existed, by its
+// wake alone. Room speech, an issue's text or an agent's answer cannot name a
+// session to ask; only the record's holder or a joined agent is asked.
 func (c *Concierge) wasNamed(x *voice.Exchange, session string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.named[exchangeKey(x)]
-	return ok && entry.sessions[session]
+	for _, key := range []string{exchangeKey(x), exchangeKey(&voice.Exchange{WakeAt: x.WakeAt})} {
+		if entry, ok := c.named[key]; ok && entry.sessions[session] {
+			return true
+		}
+	}
+	return false
 }
 
 // sending counts the questions on their way to agent session session.

@@ -426,6 +426,8 @@ func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 			delete(c.picks, key)
 		}
 	}
+	// What exchanges heard before any session existed hold goes too.
+	c.forgetEarlyLocked()
 	of := func(id string) bool { return c.sessionOf[id] == sessionID }
 	for agent, ids := range c.working {
 		if ids = slices.DeleteFunc(ids, of); len(ids) == 0 {
@@ -592,6 +594,36 @@ func (c *Concierge) SessionEnded(sessionID string) error {
 		c.tellChanged(sessionID)
 	}
 	return nil
+}
+
+// GateClosed drops what the Concierge holds of exchanges heard before their
+// recording session existed: their reads, the issues offered them, the
+// agents named in them. The Supervisor calls it when the unit stops
+// listening; a session's end and its delete drop them too.
+func (c *Concierge) GateClosed() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forgetEarlyLocked()
+}
+
+// forgetEarlyLocked drops the state held under no session id. c.mu is held.
+func (c *Concierge) forgetEarlyLocked() {
+	for key := range c.named {
+		if strings.HasPrefix(key, "|") {
+			delete(c.named, key)
+		}
+	}
+	for key, p := range c.prefetches {
+		if strings.HasPrefix(key, "|") {
+			p.cancelAll()
+			delete(c.prefetches, key)
+		}
+	}
+	for key, p := range c.picks {
+		if p.sessionID == "" {
+			delete(c.picks, key)
+		}
+	}
 }
 
 // SessionDeleted drops what the Concierge holds of a deleted meeting: its
