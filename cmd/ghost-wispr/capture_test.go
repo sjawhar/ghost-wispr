@@ -772,6 +772,73 @@ func TestCaptureGateStaleResumeDoesNotOpenALaterPause(t *testing.T) {
 	waitOpen(t, capture)
 }
 
+// TestCaptureGateStaleOpeningDoesNotOpenALaterPause fails if a gate opening
+// left from an earlier pause opens the gate during a later pause that has not
+// settled yet. openAfter checks the light's stored pattern before it takes
+// control, so an opening can sit in that check while a pause and a resume go
+// by. Two resumes wait on the first pause; the opening that wins waits until
+// the other is in its check too, and opens the gate. The stale one is held in
+// its check until a second pause has closed the gate and a resume waits on
+// that pause's settle; released then, it must find the later closing and do
+// nothing (red team, review 5969364339 of #79). It holds the stale opening on
+// purpose, where TestCaptureGateStaleResumeDoesNotOpenALaterPause needs the
+// second Pause to win control from it.
+func TestCaptureGateStaleOpeningDoesNotOpenALaterPause(t *testing.T) {
+	first, release := make(chan struct{}), make(chan struct{})
+	var settles atomic.Int32
+	capture := newCaptureGate(nil, func() {
+		switch settles.Add(1) {
+		case 1:
+			<-first
+		case 2:
+			<-release
+		}
+	}, nil)
+	bothChecking, staleRelease := make(chan struct{}), make(chan struct{})
+	var staleOnce, releaseOnce sync.Once
+	letStale := func() { staleOnce.Do(func() { close(staleRelease) }) }
+	letSecond := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() { letStale(); letSecond() })
+	var checks atomic.Int32
+	capture.beforeGateOpen = func() error { return nil }
+	capture.checkLightPattern = func() error {
+		switch checks.Add(1) {
+		case 1: // the opening that wins waits until the other is in its check
+			select {
+			case <-bothChecking:
+			case <-time.After(testWait):
+			}
+		case 2: // the stale opening, held until a later pause closed the gate
+			close(bothChecking)
+			select {
+			case <-staleRelease:
+			case <-time.After(testWait):
+			}
+		}
+		return nil
+	}
+
+	capture.Pause()
+	capture.Resume()
+	capture.Pause()
+	capture.Resume()
+	close(first)
+	select {
+	case <-bothChecking:
+	case <-time.After(testWait):
+		t.Fatal("control: the two gate openings did not both reach their light check")
+	}
+	waitOpen(t, capture)
+
+	capture.Pause() // the later pause; its settle is held
+	capture.Resume()
+	letStale()
+	time.Sleep(50 * time.Millisecond) // the stale opening takes control and looks
+	expectStaysClosed(t, capture, "from a gate opening left from an earlier pause, before the later pause settled")
+	letSecond()
+	waitOpen(t, capture)
+}
+
 // A Resume that comes after a Pause still waiting for the gate (the gate busy
 // reopening) is not lost: the last call wins and the gate opens.
 func TestCaptureGateResumeAfterAQueuedPauseIsNotLost(t *testing.T) {
