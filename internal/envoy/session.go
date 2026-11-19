@@ -571,6 +571,8 @@ func (s *Session) wrote(streamID string, seq uint64) {
 type SendRequest struct {
 	Target  string
 	Message string
+	// NoReply sends a notice that asks no reply (expects_reply false).
+	NoReply bool
 	// IdempotencyKey names this message: a resend under it is dropped as a
 	// repeat.
 	IdempotencyKey string
@@ -588,7 +590,8 @@ type SendResult struct {
 	State string
 }
 
-// Send sends a message from this session that requires a reply.
+// Send sends a message from this session that requires a reply, or, with
+// NoReply, a notice that asks none.
 func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, error) {
 	if err := ValidSessionID(request.Target); err != nil {
 		return SendResult{}, err
@@ -601,6 +604,9 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 		"idempotency_key": request.IdempotencyKey,
 		"expects_reply":   "required",
 		"urgency":         "high",
+	}
+	if request.NoReply {
+		body["expects_reply"], body["urgency"] = "false", "med"
 	}
 	if request.InReplyTo != "" {
 		body["in_reply_to"] = request.InReplyTo

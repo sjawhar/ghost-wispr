@@ -81,6 +81,7 @@ type Store interface {
 	RekeyVoiceTask(id, newID string) error
 	DeleteVoiceTask(id string) error
 	VoiceTask(id string) (storage.VoiceTask, error)
+	VoiceTasks(sessionID string) ([]storage.VoiceTask, error)
 	AnswerVoiceTask(id, written string) (bool, error)
 	EndVoiceTask(id string, state storage.VoiceTaskState) (bool, error)
 	MarkVoiceTaskSpoken(id string, at time.Time) error

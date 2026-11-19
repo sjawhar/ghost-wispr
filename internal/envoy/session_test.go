@@ -219,6 +219,12 @@ func TestSendAsksForAReplyAsThisSession(t *testing.T) {
 			t.Errorf("send %s = %v, want %v", field, body[field], want)
 		}
 	}
+	if _, err := session.Send(context.Background(), &SendRequest{Target: "agent-7", Message: "Do not answer.", IdempotencyKey: "key-2", NoReply: true}); err != nil {
+		t.Fatal(err)
+	}
+	if notice := fake.lastBody(t, "/v1/messages/send"); notice["expects_reply"] != "false" {
+		t.Errorf("a notice's expects_reply = %v, want false", notice["expects_reply"])
+	}
 }
 
 func TestASendToAGoneSessionSaysSo(t *testing.T) {
