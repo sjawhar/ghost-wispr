@@ -47,8 +47,11 @@ func TestAClearKeywordMatchAnswersAtOnce(t *testing.T) {
 	if len(spoken) < 1 || spoken[0].text != "I took ABC-13." {
 		t.Fatalf("spoken = %+v, want the keyword match first", spoken)
 	}
+	// The full search starts beside the keyword one; its goroutine may run
+	// after the answer, once the clear keyword result stopped it.
+	eventually(t, "the full search started", func() bool { return len(r.records.searches()) == 1 })
 	if kw, full := len(r.records.kwQueries), len(r.records.searches()); kw != 1 || full != 1 {
-		t.Fatalf("keyword searches %d, full %d; want one of each, at once", kw, full)
+		t.Fatalf("keyword searches %d, full %d; want one of each", kw, full)
 	}
 }
 
