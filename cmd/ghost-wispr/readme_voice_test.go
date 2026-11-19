@@ -23,6 +23,7 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"The text Wispr speaks goes to the text-to-speech engine",
 		"A question sent to an agent leaves the unit, and deleting the segment or the session cannot recall it",
 		"Deleting a session erases its questions and the answers the agents wrote",
+		"An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not",
 		"The unit keeps no words of the room for a question it sent",
 		"Every pause, the Jabra's Mute button and \"Wispr, stop\" stop the voice at once",
 	} {
