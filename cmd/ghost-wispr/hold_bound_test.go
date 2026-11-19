@@ -188,11 +188,15 @@ func TestAStartAPauseCancelledRunsAgainAtTheNextResume(t *testing.T) {
 		calls := 0
 		_, _ = startMicrophone(ctx, &loops, capture, alreadyBooted(), func(bool) error {
 			calls++
-			starts <- calls
 			if calls == 1 {
+				// The pause lands before the test hears of this start, so its
+				// next Resume always comes after it: reported first, a slow
+				// runner let the Resume win and the pause stood (#89's CI).
 				capture.Pause() // during the scan
+				starts <- calls
 				return errMicStartPaused
 			}
+			starts <- calls
 			return nil
 		}, func() { t.Error("a start a pause cancelled went to the start-up retry") })
 		capture.Resume()
@@ -212,11 +216,12 @@ func TestAStartAPauseCancelledRunsAgainAtTheNextResume(t *testing.T) {
 			// oneShotAfter fires once: a second interval wait never ends.
 			retryMicStartup(context.Background(), time.Hour, oneShotAfter(), capture, nil, func() error {
 				calls++
-				starts <- calls
 				if calls == 1 {
-					capture.Pause()
+					capture.Pause() // reported after the pause, as above
+					starts <- calls
 					return errMicStartPaused
 				}
+				starts <- calls
 				return nil
 			}, func(err error) { t.Errorf("a start a pause cancelled was reported as failed: %v", err) }, nil)
 		})
