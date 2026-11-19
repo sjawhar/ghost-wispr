@@ -112,9 +112,9 @@ var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 // Answer answers one turn of x, speaking through say as it goes (R5 to R8):
 //   - with no fact said 1.5 s after the turn, a routing line, which says the
 //     Concierge asks the holder when it does;
-//   - the issue a search took, by key and title, when the search had no one
-//     clear match; when it found none, that it found no issue and the
-//     question for its key;
+//   - the issue a search chose, by key, when the search had one clear match;
+//     with none, which of its top two the person meant; when it found none,
+//     that it found no issue and the question for its key;
 //   - the facts of the record, each checked against it;
 //   - the holder's case, only when it changes what happens next;
 //   - when the holder must be asked, that it was, and the usual wait.
@@ -526,7 +526,14 @@ func fewestWords(turn string) string {
 	// Deepgram may end a sentence at the key ("…on INFRA-4592. When …"): the
 	// question starts at its first word, in the asker's own words.
 	question = strings.TrimLeftFunc(question, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
-	question = routingClause.ReplaceAllString(question, "$1")
+	// With a key named, a leading clause before a comma is the question's
+	// own ("for the demo on Friday, will it be ready"): only a clause that
+	// runs to a question word routes.
+	routing := routingClause
+	if len(issueKeysIn(turn)) > 0 {
+		routing = routingClauseToQuestion
+	}
+	question = routing.ReplaceAllString(question, "$1")
 	question = camelNumber.ReplaceAllStringFunc(question, func(word string) string {
 		parts := camelNumber.FindStringSubmatch(word)
 		return strings.ToLower(parts[1]) + " " + strings.ToLower(parts[2])
@@ -551,6 +558,9 @@ var (
 	// whether …", "for the cache, is it …". It ends at the first comma, which
 	// goes with it, or at the question's first word, which it keeps.
 	routingClause = regexp.MustCompile(`(?i)^(?:(?:who|that)\s+(?:holds|is\s+holding|owns|is\s+working\s+on|works\s+on)|on|for|about|of|working\s+on|holding)\s+[^,;]*?(?:[,;]\s*|\b(when|whether|if|what|how|why|where|which|who)\b)`)
+	// routingClauseToQuestion is routingClause that ends only at the
+	// question's first word, for a turn that named the issue's key.
+	routingClauseToQuestion = regexp.MustCompile(`(?i)^(?:(?:who|that)\s+(?:holds|is\s+holding|owns|is\s+working\s+on|works\s+on)|on|for|about|of|working\s+on|holding)\s+.*?\b(when|whether|if|what|how|why|where|which|who)\b`)
 	// camelNumber is Deepgram's "SliceOne" for "slice one".
 	camelNumber = regexp.MustCompile(`\b([A-Z][a-z]+)(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\b`)
 	// auxiliaries are the verbs a direct question puts before its subject.
@@ -558,14 +568,18 @@ var (
 	// howWords join "how" in a question's first phrase: "how long"; after
 	// "how many" and "how much", the noun joins too.
 	howWords = set(strings.Fields("long many much soon often far big old late early"))
-	// questionWords start a question.
+	// questionWords start a question; clauseWords start a clause within one.
 	questionWords = set(strings.Fields("when where why how what which who whom whose whether"))
+	clauseWords   = set(strings.Fields("when where why how what whether"))
+	// adverbs join the question word before the verb: "when exactly".
+	adverbs = set(strings.Fields("exactly roughly approximately really actually probably likely precisely quickly badly"))
 )
 
 // direct makes an embedded question direct, with a capital and a question
 // mark: "whether the tap is merged" is "Is the tap merged?", "when slice one
 // will be ready" is "When will slice one be ready?". The verb that moves
-// stands before any comma, "and", "or", "but" or later question word. After
+// stands before a new clause: a comma, "and", "or" or "but" followed by a
+// verb or a question word, or a question word that starts a clause. After
 // "what", "which" and "who", which may be a question's subject or its
 // noun's, and when a later clause is the question ("when the cache is gone,
 // what breaks"), the words keep their order.
@@ -577,10 +591,13 @@ func direct(question string) string {
 	word := func(i int) string { return strings.ToLower(strings.Trim(words[i], ",;")) }
 	auxAfter := func(from int) int {
 		for i := from; i < len(words); i++ {
-			switch w := word(i); {
-			case auxiliaries[w]:
+			w := word(i)
+			if auxiliaries[w] {
 				return i
-			case strings.HasSuffix(words[i], ",") || strings.HasSuffix(words[i], ";") || w == "and" || w == "or" || w == "but" || questionWords[w]:
+			}
+			joins := strings.HasSuffix(words[i], ",") || strings.HasSuffix(words[i], ";") || w == "and" || w == "or" || w == "but"
+			nextStarts := i+1 < len(words) && (auxiliaries[word(i+1)] || questionWords[word(i+1)])
+			if joins && nextStarts || clauseWords[w] {
 				return -1
 			}
 		}
@@ -609,7 +626,7 @@ func direct(question string) string {
 				phrase = 3
 			}
 		}
-		if phrase < len(words) && strings.HasSuffix(word(phrase), "ly") {
+		if phrase < len(words) && adverbs[word(phrase)] {
 			phrase++ // "when exactly"
 		}
 		if i := auxAfter(phrase); i > phrase {

@@ -426,8 +426,11 @@ func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 			delete(c.picks, key)
 		}
 	}
-	// What exchanges heard before any session existed hold goes too.
-	c.forgetEarlyLocked()
+	// What exchanges heard before any session existed read and were offered
+	// holds room words: it goes too. The agents named there are only
+	// session ids, which a running exchange may still need: they go with the
+	// gate, or after their hour.
+	c.forgetEarlyWordsLocked()
 	of := func(id string) bool { return c.sessionOf[id] == sessionID }
 	for agent, ids := range c.working {
 		if ids = slices.DeleteFunc(ids, of); len(ids) == 0 {
@@ -602,20 +605,21 @@ func (c *Concierge) SessionEnded(sessionID string) error {
 // GateClosed drops what the Concierge holds of exchanges heard before their
 // recording session existed: their reads, the issues offered them, the
 // agents named in them. The Supervisor calls it when the unit stops
-// listening; a session's end and its delete drop them too.
+// listening; a session's end and its delete drop the reads and offers too.
 func (c *Concierge) GateClosed() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.forgetEarlyLocked()
-}
-
-// forgetEarlyLocked drops the state held under no session id. c.mu is held.
-func (c *Concierge) forgetEarlyLocked() {
+	c.forgetEarlyWordsLocked()
 	for key := range c.named {
 		if strings.HasPrefix(key, "|") {
 			delete(c.named, key)
 		}
 	}
+}
+
+// forgetEarlyWordsLocked drops the reads and offers held under no session
+// id, which hold room words. c.mu is held.
+func (c *Concierge) forgetEarlyWordsLocked() {
 	for key, p := range c.prefetches {
 		if strings.HasPrefix(key, "|") {
 			p.cancelAll()
