@@ -1132,7 +1132,10 @@ func (m *Manager) openWaitingSession() {
 }
 
 // StopSession ends a specific session by ID. If the given sessionID does not
-// match the currently active session, returns ErrNoActiveSession.
+// match the currently active session, returns ErrNoActiveSession. Like
+// ForceEndSession, it first saves the words Deepgram finalized that wait for
+// the end of their speech to the session: their audio is in its recording,
+// and the end drops them from the buffer.
 func (m *Manager) StopSession(ctx context.Context, sessionID string) error {
 	m.mu.Lock()
 	if m.currentSessionID != sessionID {
@@ -1141,6 +1144,9 @@ func (m *Manager) StopSession(ctx context.Context, sessionID string) error {
 	}
 	m.mu.Unlock()
 
+	if err := m.flushBuffer(); err != nil && !errors.Is(err, ErrNoActiveSession) {
+		m.logger.Warn("flush buffer failed", "operation", "stop_session", "session_id", sessionID, "error", err)
+	}
 	return m.endCurrentSession(ctx)
 }
 

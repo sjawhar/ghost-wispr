@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -79,5 +80,26 @@ func TestMessageKeptOfAResultFromBeforeACloseIsNothing(t *testing.T) {
 	}
 	if kept != nil {
 		t.Fatalf("MessageKept returned %q, captured before the ended session's recording closed", strings.TrimSpace(kept.Channel.Alternatives[0].Transcript))
+	}
+}
+
+// TestAManualStopKeepsItsBufferedWordsInItsLiveTranscript fails if words
+// Deepgram finalized before a person stopped the session, still buffered for
+// the end of their speech, are not in the stopped session's live transcript:
+// their audio is in its recording, and the end drops them from the buffer, so
+// only its refined transcript held them.
+func TestAManualStopKeepsItsBufferedWordsInItsLiveTranscript(t *testing.T) {
+	c := newCapture(t)
+	c.manager.SetLiveStream(clockStream{c})
+	c.say(1, 2)
+	c.hear(timedResult(t, true, true, 0, "Bye."))
+	stopped, _ := c.manager.ActiveSession()
+	c.say(3)
+	c.hear(timedResult(t, true, false, 2*time.Second, "Last.")) // a final, buffered until its speech ends
+	if err := c.manager.StopSession(context.Background(), stopped); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := c.textOf(stopped), []string{"Bye.", "Last."}; !slices.Equal(got, want) {
+		t.Fatalf("the stopped session's live transcript is %q; want %q, with the words buffered at the stop", got, want)
 	}
 }
