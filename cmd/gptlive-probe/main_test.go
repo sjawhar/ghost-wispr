@@ -50,13 +50,12 @@ type standIns struct {
 	// acceptAny makes the token endpoint take any subject token, so the
 	// wrong-audience control is not refused.
 	acceptAny bool
-	// offsets shift each turn's words on the timeline from their audio; the
-	// last one holds for later turns.
-	offsets []int64
+	// wordsAfter sends the default answer's words this long after its audio,
+	// rather than just before it as GPT-Live does.
+	wordsAfter time.Duration
 	// answer replies to a text turn through send, with at the timeline now;
 	// nil sends 1.2 s of speech and its words.
 	answer func(send func(any), at func() int64)
-	turns  atomic.Int32
 	// delegate makes the Live server delegate once it has heard loud input
 	// audio and then quiet, as GPT-Live does for a spoken question.
 	delegate  bool
@@ -166,16 +165,27 @@ func newStandIns(t *testing.T) *standIns {
 					continue
 				}
 				s.said <- ev.Content
-				turn := int(s.turns.Add(1)) - 1
 				if s.answer != nil {
 					go s.answer(send, s.inputMs)
 					continue
 				}
-				offset := int64(0)
-				if len(s.offsets) > 0 {
-					offset = s.offsets[min(turn, len(s.offsets)-1)]
+				if s.wordsAfter > 0 {
+					go func() {
+						// 1.2 s of speech in real time, its words partway in.
+						begin := time.Now()
+						sent := false
+						for range 12 {
+							send(speechDelta(100 * time.Millisecond))
+							if !sent && time.Since(begin) >= s.wordsAfter {
+								send(transcript("Hello from the stand-in.", s.inputMs()))
+								sent = true
+							}
+							time.Sleep(100 * time.Millisecond)
+						}
+					}()
+					continue
 				}
-				send(transcript("Hello from the stand-in.", s.inputMs()+offset))
+				send(transcript("Hello from the stand-in.", s.inputMs()))
 				for range 2 {
 					send(speechDelta(600 * time.Millisecond))
 				}
@@ -264,7 +274,7 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 		"control: a token for another audience was refused (invalid_subject_token)",
 		"token exchange: ok", "session: started", "audio: 3.60",
 		"words: Hello from the stand-in.",
-		"timeline offset: 3 speeches", "covers it", "result: PASS",
+		"speech lead: 3 speeches", "each within 300ms", "result: PASS",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report does not say %q:\n%s", want, report)
@@ -284,29 +294,17 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 	}
 }
 
-// The probe fails when GPT-Live's words are off from their audio by more
-// than the cut-speech margin covers, early or late, or when the offset
-// varies from speech to speech by over 200 ms.
-func TestTheProbeFailsOnAnOffsetTheMarginDoesNotCover(t *testing.T) {
-	for name, c := range map[string]struct {
-		offsets []int64
-		want    string
-	}{
-		"late":     {offsets: []int64{250}, want: "raise gptlive.CutMargin"},
-		"early":    {offsets: []int64{-250}, want: "raise gptlive.CutMargin"},
-		"unstable": {offsets: []int64{0, 250, -50}, want: "unstable"},
-		"too far":  {offsets: []int64{2000}, want: "matched no speech"}, // past the 1.2 s speech and the margin
-	} {
-		t.Run(name, func(t *testing.T) {
-			s := newStandIns(t)
-			s.offsets = c.offsets
-			cfg := s.config(t)
-			cfg.Settle = time.Second
-			report, err := runProbe(t, s, &cfg)
-			if err == nil || !strings.Contains(err.Error(), c.want) {
-				t.Fatalf("probe with words %v ms off their audio = %v, want a failure naming %q\n%s", c.offsets, err, c.want, report)
-			}
-		})
+// The probe fails when a speech's first word reaches the own-speech filter
+// over 300 ms after its audio starts: the room would hear Wispr before the
+// filter knew its words.
+func TestTheProbeFailsWhenWordsComeAfterTheirAudio(t *testing.T) {
+	s := newStandIns(t)
+	s.wordsAfter = 600 * time.Millisecond
+	cfg := s.config(t)
+	cfg.Settle = time.Second
+	report, err := runProbe(t, s, &cfg)
+	if err == nil || !strings.Contains(err.Error(), "after its audio started") {
+		t.Fatalf("probe whose words come 600 ms after their audio = %v, want that failure\n%s", err, report)
 	}
 }
 
@@ -421,37 +419,33 @@ func TestTheProbeTurnsOffGoogleClientCertificatesUnlessSet(t *testing.T) {
 	}
 }
 
-// offsetSession is a session that reports the measure it took.
-type offsetSession struct {
-	voice.Session
-	offsets   []time.Duration
-	unmatched int
-}
-
-func (s offsetSession) TimelineOffsets() []time.Duration { return s.offsets }
-func (s offsetSession) UnmatchedWords() int              { return s.unmatched }
-
-// A spread over 200 ms gets the sideband verdict, an offset the margin does
-// not cover gets the raise verdict, and both, like too little to measure,
-// fail the probe; one within both passes.
-func TestReportOffsetsNamesItsVerdict(t *testing.T) {
+// A speech whose first word reaches the filter by 300 ms after its audio
+// starts passes; a later one, a speech with no words, and nothing measured
+// fail the probe.
+func TestReportLeadNamesItsVerdict(t *testing.T) {
 	ms := time.Millisecond
+	at := time.Unix(1_800_000_000, 0)
+	sp := func(start, first time.Duration, words bool) spoken {
+		s := spoken{start: at.Add(start)}
+		if words {
+			s.firstWord = at.Add(first)
+		}
+		return s
+	}
 	for name, c := range map[string]struct {
-		s    offsetSession
-		want string
-		fail bool
+		speeches []spoken
+		want     string
+		fail     bool
 	}{
-		"unstable":       {s: offsetSession{offsets: []time.Duration{-100 * ms, 150 * ms}}, want: "sideband", fail: true},
-		"covered":        {s: offsetSession{offsets: []time.Duration{-50 * ms, 50 * ms}}, want: "covers it"},
-		"late":           {s: offsetSession{offsets: []time.Duration{200 * ms, 250 * ms}}, want: "raise gptlive.CutMargin", fail: true},
-		"early":          {s: offsetSession{offsets: []time.Duration{-250 * ms, -200 * ms}}, want: "raise gptlive.CutMargin", fail: true},
-		"one speech":     {s: offsetSession{offsets: []time.Duration{10 * ms}}, want: "UNKNOWN", fail: true},
-		"nothing":        {s: offsetSession{}, want: "UNKNOWN", fail: true},
-		"unmatched word": {s: offsetSession{offsets: []time.Duration{0, 10 * ms}, unmatched: 2}, want: "matched no speech", fail: true},
+		"text first":    {speeches: []spoken{sp(0, -240*ms, true), sp(5*time.Second, 5*time.Second-100*ms, true)}, want: "from -240ms to -100ms"},
+		"just in time":  {speeches: []spoken{sp(0, 300*ms, true)}, want: "within 300ms"},
+		"late":          {speeches: []spoken{sp(0, -50*ms, true), sp(time.Second, time.Second+400*ms, true)}, want: "speech 2's first word reached the filter 400ms after its audio started", fail: true},
+		"no words":      {speeches: []spoken{sp(0, 0, false)}, want: "speech 1: no words reached the filter", fail: true},
+		"nothing heard": {want: "UNKNOWN", fail: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var out bytes.Buffer
-			err := reportOffsets(&out, c.s)
+			err := reportLead(&out, c.speeches)
 			if !strings.Contains(out.String(), c.want) || (err != nil) != c.fail {
 				t.Fatalf("report %q, error %v; want %q and a failure %v", out.String(), err, c.want, c.fail)
 			}
@@ -459,33 +453,35 @@ func TestReportOffsetsNamesItsVerdict(t *testing.T) {
 	}
 }
 
-// The probe and the unit send input in 250 ms frames. Should GPT-Live's
-// timeline count those frames as steps, the session's clock runs up to
-// 250 ms ahead of it; the probe starts each turn at a random point of a
-// frame so that the spread it measures shows those steps.
-func TestTheProbeStartsEachTurnAtARandomPointOfAFrame(t *testing.T) {
-	seen := map[time.Duration]bool{}
-	for range 50 {
-		d := framePhase()
-		if d < 0 || d >= 250*time.Millisecond {
-			t.Fatalf("phase %v, want within one 250 ms frame", d)
-		}
-		seen[d.Round(10*time.Millisecond)] = true
+// The watcher gives a word that arrives between speeches to the next one,
+// since GPT-Live sends a speech's text just before its audio.
+func TestTheWatcherGivesEachSpeechItsFirstWord(t *testing.T) {
+	c := make(chan voice.Event, 8)
+	e := watch(c)
+	c <- voice.Event{Kind: voice.EventAgentText, Text: "one"}
+	time.Sleep(20 * time.Millisecond)
+	c <- voice.Event{Kind: voice.EventSpeechStarted}
+	c <- voice.Event{Kind: voice.EventAgentText, Text: " two"}
+	c <- voice.Event{Kind: voice.EventSpeechEnded}
+	c <- voice.Event{Kind: voice.EventSpeechStarted}
+	time.Sleep(20 * time.Millisecond)
+	c <- voice.Event{Kind: voice.EventAgentText, Text: "late"}
+	c <- voice.Event{Kind: voice.EventSpeechEnded}
+	c <- voice.Event{Kind: voice.EventSpeechStarted}
+	close(c)
+	time.Sleep(50 * time.Millisecond)
+	got := e.speeches()
+	if len(got) != 3 {
+		t.Fatalf("%d speeches, want 3", len(got))
 	}
-	if len(seen) < 5 {
-		t.Fatalf("50 phases took %d values, want them spread over the frame", len(seen))
+	if lead := got[0].firstWord.Sub(got[0].start); lead >= 0 {
+		t.Errorf("speech 1's first word came %v after its audio, want before: it arrived first", lead)
 	}
-
-	s := newStandIns(t)
-	cfg := s.config(t)
-	cfg.Settle = time.Second
-	calls := 0
-	cfg.Phase = func() time.Duration { calls++; return 10 * time.Millisecond }
-	if report, err := runProbe(t, s, &cfg); err != nil {
-		t.Fatalf("probe: %v\n%s", err, report)
+	if lead := got[1].firstWord.Sub(got[1].start); lead < 15*time.Millisecond {
+		t.Errorf("speech 2's first word came %v after its audio, want about 20ms", lead)
 	}
-	if calls != probeTurns {
-		t.Fatalf("the probe drew %d phases for %d turns", calls, probeTurns)
+	if !got[2].firstWord.IsZero() {
+		t.Errorf("speech 3 got a word, want none")
 	}
 }
 

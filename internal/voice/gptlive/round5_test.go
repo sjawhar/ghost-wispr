@@ -2,76 +2,65 @@ package gptlive
 
 import (
 	"fmt"
-	"slices"
 	"testing"
 	"time"
 
-	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
-// B3: the Supervisor opens a session with up to two seconds of the room's
-// audio at once, the wake replay. A server whose timeline counts input audio
-// is then two seconds ahead of the wall clock. The session's clock counts the
-// input audio it sent too, so a cut speech's words still match it.
-func TestACutSpeechsWordsMatchItAfterTheWakeReplay(t *testing.T) {
-	out := newFakeOutput()
-	x := testExchange(out, newFakeTools(voice.AnswerResult{}))
-	tap := make(chan audio.Frame, 16)
-	for range 8 { // 2 s, held while the session starts and then sent at once
-		tap <- audio.Frame{PCM: make([]int16, 4000), Rate: 16000, Channels: 1}
-	}
-	x.Tap = tap
-	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, x)
-	deadline := time.Now().Add(testWait)
-	for c.inSamples.Load() < 2*SampleRate-1 {
-		if time.Now().After(deadline) {
-			t.Fatalf("the stand-in received %d samples of the replay, want 2 s", c.inSamples.Load())
+// streamSpeech sends d of the model's speech the way the real GPT-Live
+// does, as measured from the office unit: 100 ms of audio every 100 ms. Each
+// of words goes out just before the audio it is due with, as GPT-Live sends
+// its text ahead of its audio. It stops early when stop closes.
+func streamSpeech(c *liveConn, d time.Duration, words map[int]string, stop <-chan struct{}) {
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for i := range int(d / (100 * time.Millisecond)) {
+		if w, ok := words[i]; ok {
+			c.said(w)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	at := c.inputMs()
-	c.audioDelta(ramp(1000, 2400)) // 100 ms, which plays
-	out.nextSpeech(t).waitSamples(t, 2400)
-	s.Interrupt()
-	c.audioDelta(ramp(1000, 2400)) // 100 ms more, which does not
-	c.saidAt("words nobody heard", at+150)
-	time.Sleep(speechGap + 200*time.Millisecond)
-	c.speak("Sure.")
-	got := agentTexts(t, s, "Sure.")
-	if slices.Contains(got, "words nobody heard") {
-		t.Fatalf("agent text %q: the cut speech's words reached the own-speech feed after a wake replay", got)
+		c.audioDelta(ramp(1000+i, SampleRate/10))
+		select {
+		case <-tick.C:
+		case <-stop:
+			return
+		}
 	}
 }
 
-// B1: a server can send a speech's audio, and all its words, faster than the
-// speech plays. Only the words whose audio played before Interrupt are
-// Wispr's; and the next speech's words, sent before its audio, are Wispr's
-// once it plays.
-func TestOnlyWordsWhoseAudioPlayedAreWisprs(t *testing.T) {
+// The real GPT-Live sends a speech's words just before their audio, and the
+// session takes each word as it arrives:
+//   - Words that arrived before a barge-in count, though their audio may not
+//     have played. This is the measured, accepted limit: up to about 1.4 s
+//     of an interrupted answer.
+//   - Words that arrive after the barge-in, while the cut speech goes on,
+//     do not count.
+//   - The next speech's words count, even when they come before its audio.
+func TestWordsCountAsTheyArriveUntilABargeIn(t *testing.T) {
 	out := newFakeOutput()
 	out.pace = true
 	srv := newLiveServer(t)
 	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
 
-	at := c.inputMs()
-	c.audioDelta(ramp(1000, 2*SampleRate)) // 2 s at once
-	for i := range 5 {
-		c.saidAt(fmt.Sprintf("w%d", i), at+int64(400*i))
-	}
+	cut := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// 2 s of speech; its first three words go out ahead of their audio,
+		// and one more after the barge-in, before the server stops.
+		streamSpeech(c, 2*time.Second, map[int]string{0: "w0", 1: "w1", 2: "w2", 8: "after the cut"}, cut)
+	}()
 	p := out.nextSpeech(t)
 	p.waitSamples(t, SampleRate/2) // 500 ms played
 	s.Interrupt()
+	time.Sleep(400 * time.Millisecond) // the server goes on 0.4 s, past the word at 0.8 s
+	close(cut)
+	<-done
 
 	time.Sleep(speechGap + 200*time.Millisecond)
-	next := c.inputMs() + 100
-	c.saidAt("b0", next) // before its audio
-	time.Sleep(100 * time.Millisecond)
-	c.audioDelta(ramp(5000, 2400))
+	streamSpeech(c, 300*time.Millisecond, map[int]string{0: "b0"}, nil)
 	got := agentTexts(t, s, "b0")
-	if fmt.Sprint(got) != "[w0 w1 b0]" {
-		t.Fatalf("agent text %q, want [w0 w1 b0]: the words whose audio played, and the next speech's", got)
+	if fmt.Sprint(got) != "[w0 w1 w2 b0]" {
+		t.Fatalf("agent text %q, want [w0 w1 w2 b0]: the words that arrived before the barge-in, and the next speech's", got)
 	}
 }

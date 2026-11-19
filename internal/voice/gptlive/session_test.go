@@ -584,22 +584,6 @@ func TestTheVoicesWordsAndWhatItHeardReachEvents(t *testing.T) {
 	}
 }
 
-// The model's words with no audio of them are not Wispr's speech: the room
-// heard none of them.
-func TestWordsWithNoAudioAreNotWisprsSpeech(t *testing.T) {
-	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
-
-	c.said("words with no audio")
-	time.Sleep(wordHold + 200*time.Millisecond)
-	c.speak("Okay.")
-	for _, text := range agentTexts(t, s, "Okay.") {
-		if text == "words with no audio" {
-			t.Fatal("words with no audio of them reached the own-speech feed")
-		}
-	}
-}
-
 // The Supervisor gives Open the exchange's context, which its 2-minute limit
 // and every ending cancel: the session, and the room audio it streams to
 // OpenAI, must end with it.
@@ -825,7 +809,7 @@ func TestSayAndDeliverAfterCloseReportClosed(t *testing.T) {
 func TestTheClosedPlayerTakesNoAudio(t *testing.T) {
 	p := newPlayer(&session{})
 	p.stop()
-	if p.push(ramp(1000, 480), time.Now()) != audioOutside || len(p.queue) != 0 {
+	if p.push(ramp(1000, 480), time.Now()) || len(p.queue) != 0 {
 		t.Fatal("a stopped player queued model audio")
 	}
 }

@@ -36,40 +36,8 @@ func agentTexts(t *testing.T, s voice.Session, until string) []string {
 	}
 }
 
-// GPT-Live's transcript fragments carry no response or item id, only their
-// place on the session timeline. The words of a speech Interrupt dropped are
-// found by that place, however late their fragment arrives: here two seconds
-// after its audio, and after the next speech began.
-func TestTheWordsOfACutSpeechAreDroppedHoweverLateTheyArrive(t *testing.T) {
-	out := newFakeOutput()
-	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
-
-	cutAt := c.inputMs()
-	c.audioDelta(ramp(1000, 2400)) // 100 ms, which plays
-	out.nextSpeech(t).waitSamples(t, 2400)
-	s.Interrupt()
-	c.audioDelta(ramp(1000, 2400)) // 100 ms more of the cut speech, which plays nothing
-
-	time.Sleep(speechGap + 200*time.Millisecond)
-	c.speak("Sure.")
-	out.nextSpeech(t)
-
-	time.Sleep(time.Until(time.UnixMilli(c.startedAt.Load() + cutAt + 2000)))
-	c.saidAt("words nobody heard", cutAt+130)
-	c.saidAt("of it either", cutAt+180)
-	c.speak("Okay.")
-	for _, text := range agentTexts(t, s, "Okay.") {
-		if text == "words nobody heard" || text == "of it either" {
-			t.Fatalf("agent text %q of the cut speech arrived 2 s late and was reported as Wispr's", text)
-		}
-	}
-}
-
-// The words of the speech after a cut one are Wispr's, though their fragment
-// lies within the cut speech's span: a server that sends audio faster than
-// it plays makes the cut speech's span, its start plus its length, run past
-// the start of the next one. A fragment whose audio played is Wispr's.
+// The words of the speech after a cut one are Wispr's, though the cut
+// speech's audio ran on in a burst before the pause.
 func TestTheSpeechAfterACutOneKeepsItsWords(t *testing.T) {
 	out := newFakeOutput()
 	srv := newLiveServer(t)
@@ -88,59 +56,6 @@ func TestTheSpeechAfterACutOneKeepsItsWords(t *testing.T) {
 	got := agentTexts(t, s, "Okay.")
 	if got[0] != "Here is the answer." {
 		t.Fatalf("agent text %q, want the next speech's first words", got)
-	}
-}
-
-// timelineMeasure is what the session reports for the probe: the offset of
-// each speech's first words from its audio, and the words that matched no
-// speech.
-type timelineMeasure interface {
-	TimelineOffsets() []time.Duration
-	UnmatchedWords() int
-}
-
-// The probe measures each speech's first words against its audio on the
-// session's clock, to size the margin around a cut speech: the offset's
-// sign, and its spread from speech to speech.
-func TestTheSessionMeasuresTheTranscriptsTimelineOffset(t *testing.T) {
-	out := newFakeOutput()
-	srv := newLiveServer(t)
-	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
-
-	at := c.inputMs()
-	c.audioDelta(ramp(1000, 2400)) // 100 ms
-	c.audioDelta(ramp(1000, 2400)) // 100 ms
-	c.saidAt("Late.", at+40)
-	c.saidAt("Inside.", at+150)
-	time.Sleep(speechGap + 200*time.Millisecond)
-	at = c.inputMs()
-	c.audioDelta(ramp(1000, 2400))
-	c.saidAt("Early.", at-120)
-	time.Sleep(speechGap + 200*time.Millisecond)
-	c.speak("Done.")
-	agentTexts(t, s, "Done.")
-	m, ok := s.(timelineMeasure)
-	if !ok {
-		t.Fatal("the session does not report its timeline measure")
-	}
-	got := m.TimelineOffsets()
-	if len(got) != 3 {
-		t.Fatalf("offsets %v, want one per speech (3)", got)
-	}
-	for i, want := range []time.Duration{40 * time.Millisecond, -120 * time.Millisecond, 0} {
-		if d := got[i] - want; d < -40*time.Millisecond || d > 40*time.Millisecond {
-			t.Errorf("offset %d is %v, want about %v: the speech's first words less its audio's start", i, got[i], want)
-		}
-	}
-	if n := m.UnmatchedWords(); n != 0 {
-		t.Errorf("%d words matched no speech, want 0", n)
-	}
-
-	// Words a second past any speech match none, and say so.
-	c.saidAt("Nowhere.", c.inputMs()+1000)
-	time.Sleep(wordHold + 300*time.Millisecond)
-	if n := m.UnmatchedWords(); n != 1 {
-		t.Errorf("%d words matched no speech, want 1", n)
 	}
 }
 
@@ -289,8 +204,8 @@ func TestTheModelsWordsDuringCloseAreNotWisprs(t *testing.T) {
 	}
 }
 
-// R4x2: an Interrupt after a speech has ended cuts nothing: that speech
-// played, and its words, however late they arrive, are Wispr's.
+// R4x2: an Interrupt after a speech has ended cuts nothing: words that
+// arrive after it are Wispr's.
 func TestAnInterruptAfterASpeechEndedCutsNothing(t *testing.T) {
 	out := newFakeOutput()
 	srv := newLiveServer(t)

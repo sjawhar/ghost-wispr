@@ -267,6 +267,23 @@ What the voice hears, and where the room's words go:
   Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
   Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
   `mip_opt_out=true`.
+- Voice B (`voice.engine: gptlive`) sends room audio to OpenAI's GPT-Live, only while the light reads
+  red, from the wake phrase to the end of the exchange: nothing said before the wake phrase goes. The
+  audio held for the wake starts inside the phrase itself, about 0.3 s into it in our tests.
+  An exchange opens at the wake phrase; a held answer also opens voice B without one, but only on
+  "Wispr, go ahead", or when nobody has spoken since its question and the light reads red, and its
+  room audio goes from that moment. An exchange ends 6 s after Wispr's speech unless a person speaks,
+  after 10 s in which nobody and nothing speaks, and after 5 minutes at most. Between exchanges
+  nothing goes to OpenAI. With the audio go the last two
+  minutes of the transcript as text, and the Concierge's answers for GPT-Live to say in its own
+  words. The session starts with `store: false`, so OpenAI stores no recording of it to fork later.
+  The question and the transcript still go to the Concierge's model, as with voice A. The unit signs
+  in to OpenAI with its own Google identity and holds no OpenAI key.
+  A measured limit of voice B: GPT-Live sends its words just before their audio, and their
+  timestamps run on a clock the unit cannot follow, so the unit takes each word as it arrives. When
+  someone talks over Wispr, the words GPT-Live had already sent count as spoken, though up to about
+  1.4 s of them never played. They only make barge-in slightly less sensitive to those exact words
+  during Wispr's next speech.
 - With `voice.engine: dgagent` (voice C), during an exchange only, the unit streams the room's
   audio and the last two minutes of the meeting's transcript to Deepgram's Voice Agent, with
   `mip_opt_out` set so Deepgram does not use them to train its models. Deepgram's model keeps the

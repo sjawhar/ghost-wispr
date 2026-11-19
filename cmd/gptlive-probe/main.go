@@ -6,12 +6,13 @@
 // unit's Google ID token for an OpenAI access token and opens one GPT-Live
 // session. The session starts with a 2 s lead-in of silence sent at once, as
 // the meeting voice's wake replay does. It sends three text turns, listens
-// 10 s after each, and reports the speech that comes back and how GPT-Live's
-// words line up with their audio. With --ask, it then streams a spoken
-// question from a WAV file, waits for GPT-Live to delegate it, answers from
-// its own backend, and reports the round trip. It fails when an answer goes
-// on after Say returned, when GPT-Live does not delegate the question, or
-// when the alignment is outside what the cut-speech check covers. It opens
+// 10 s after each, and reports the speech that comes back and when each
+// speech's first word reached the own-speech feed against its audio. With
+// --ask, it then streams a spoken question from a WAV file, waits for
+// GPT-Live to delegate it, answers from its own backend, and reports the
+// round trip. It fails when an answer goes on after Say returned, when
+// GPT-Live does not delegate the question, or when a speech's first word
+// reaches the feed over 300 ms after its audio starts. It opens
 // no microphone and no speaker: it sends GPT-Live silence and the question
 // file, never the room, keeps GPT-Live's speech in memory, and prints no
 // token.
@@ -29,7 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -54,35 +55,22 @@ const controlAudience = "https://example.invalid/gptlive-probe-control"
 // returns, would cut it off.
 const probeSettle = 10 * time.Second
 
-// probeTurns is how many text turns the probe sends: the timeline offset
-// is measured once a speech, and its spread needs more than one.
+// probeTurns is how many text turns the probe sends: each speech's lead is
+// measured.
 const probeTurns = 3
 
 // leadIn is the room audio the probe sends at once as the session opens,
 // as the Supervisor's wake replay does: 2 s, in 250 ms frames at 16 kHz.
 const leadIn = 8
 
-// leadInWait is how long the probe lets the lead-in go before its first
-// text turn.
-const leadInWait = time.Second
-
 // inputFrame is how much audio each input frame carries, the unit's and the
 // probe's alike.
 const inputFrame = 250 * time.Millisecond
 
-// framePhase is a random point of an input frame. The probe waits that
-// long before each turn, so that should GPT-Live's timeline count input
-// frames as steps, the spread it measures shows the up to 250 ms they put
-// between its timeline and the session's clock.
-func framePhase() time.Duration {
-	return time.Duration(rand.Int64N(int64(inputFrame)))
-}
-
-// offsetSpread is the most the transcript's offset from the audio may vary
-// for the cut-speech check to match fragments by their place on the session
-// timeline; past it, the check needs a sideband connection, whose output
-// audio carries its own timestamps.
-const offsetSpread = 200 * time.Millisecond
+// wordLate is the latest a speech's first word may reach the own-speech
+// feed after its audio starts: the Supervisor hears its echo about that
+// much later, through the room's microphone and Deepgram.
+const wordLate = 300 * time.Millisecond
 
 // probeConfig is what one probe run needs.
 type probeConfig struct {
@@ -100,8 +88,6 @@ type probeConfig struct {
 	Settle time.Duration
 	// Turns is how many text turns to send; 0 means probeTurns.
 	Turns int
-	// Phase is the wait before each turn; nil means framePhase.
-	Phase func() time.Duration
 	// Ask is a spoken question, 16 kHz mono PCM16, streamed in after the
 	// turns for GPT-Live to delegate; empty asks none.
 	Ask []int16
@@ -127,7 +113,7 @@ func run() int {
 	text := flag.String("text", "Say in one short sentence that the Ghost Wispr probe reached you.", "the text turn GPT-Live answers")
 	voiceName := flag.String("voice", "", "GPT-Live voice, such as marin")
 	wav := flag.String("wav", "", "write GPT-Live's speech to this WAV file")
-	turns := flag.Int("turns", probeTurns, "text turns to send; the timeline offset's spread needs 2 or more")
+	turns := flag.Int("turns", probeTurns, "text turns to send; each speech's lead is measured")
 	ask := flag.String("ask", "", "a spoken question, a 16 kHz mono 16-bit WAV, for GPT-Live to delegate to the probe's backend")
 	timeout := flag.Duration("timeout", 3*time.Minute, "give up after this long")
 	flag.Parse()
@@ -231,14 +217,6 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	defer func() { _ = s.Close() }()
 	printf(out, "session: started (%v)\n", time.Since(begin).Round(time.Millisecond))
 	seen := watch(s.Events())
-	// The wake replay goes before anyone speaks to the model: let the
-	// lead-in reach it before the first text turn, so the turn's words are
-	// placed after it on the timeline.
-	select {
-	case <-time.After(leadInWait):
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 
 	settle := cfg.Settle
 	if settle <= 0 {
@@ -248,16 +226,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	if turns <= 0 {
 		turns = probeTurns
 	}
-	phase := cfg.Phase
-	if phase == nil {
-		phase = framePhase
-	}
 	for i := range turns {
-		select {
-		case <-time.After(phase()):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 		// Say returns once GPT-Live has spoken the turn's answer and it
 		// played.
 		turn := time.Now()
@@ -284,7 +253,7 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	if rec.duration() < cfg.MinAudio {
 		return fmt.Errorf("GPT-Live spoke %v, want %v or more", rec.duration(), cfg.MinAudio)
 	}
-	if err := reportOffsets(out, s); err != nil {
+	if err := reportLead(out, seen.speeches()); err != nil {
 		return err
 	}
 	if err := s.Close(); err != nil {
@@ -322,46 +291,31 @@ func listen(ctx context.Context, rec *recording, settle time.Duration) error {
 	}
 }
 
-// timelineMeasure is what the session measures of GPT-Live's timeline.
-type timelineMeasure interface {
-	TimelineOffsets() []time.Duration
-	UnmatchedWords() int
-}
-
-// reportOffsets prints how far GPT-Live's words fell from their audio on
-// the session's clock, a speech at a time, and what that means for the
-// margin the cut-speech check uses (gptlive.CutMargin). It fails when the
-// margin does not cover the offset, when the offset is unstable, when words
-// matched no speech, and when there is too little to judge.
-func reportOffsets(out io.Writer, s voice.Session) error {
-	m, ok := s.(timelineMeasure)
-	if !ok {
-		printf(out, "timeline offset: UNKNOWN: the session does not measure it\n")
-		return errors.New("timeline offset: UNKNOWN: the session does not measure it")
+// reportLead prints, for GPT-Live's speeches, when each one's first word
+// reached the own-speech feed relative to the start of its audio: negative
+// when the word came first. It fails when a speech's first word came over
+// wordLate after its audio started, or never, and when there is no speech
+// to judge. The session releases each word as it arrives, so this lead is
+// what keeps the Supervisor from taking Wispr's own voice for a person.
+func reportLead(out io.Writer, speeches []spoken) error {
+	if len(speeches) == 0 {
+		printf(out, "speech lead: UNKNOWN: no speech of GPT-Live's to measure\n")
+		return errors.New("speech lead: UNKNOWN: no speech of GPT-Live's to measure")
 	}
-	if n := m.UnmatchedWords(); n > 0 {
-		printf(out, "timeline offset: %d words matched no speech: they fell over %v from every speech's audio\n", n, gptlive.CutMargin)
-		return fmt.Errorf("timeline offset: %d words matched no speech, over %v from their audio: raise gptlive.CutMargin, or match cut speech through a sideband connection", n, gptlive.CutMargin)
+	least, most := time.Duration(math.MaxInt64), time.Duration(math.MinInt64)
+	for i, sp := range speeches {
+		if sp.firstWord.IsZero() {
+			printf(out, "speech lead: speech %d: no words reached the filter\n", i+1)
+			return fmt.Errorf("speech lead: speech %d: no words reached the filter", i+1)
+		}
+		lead := sp.firstWord.Sub(sp.start).Round(time.Millisecond)
+		if lead > wordLate {
+			printf(out, "speech lead: speech %d's first word reached the filter %v after its audio started\n", i+1, lead)
+			return fmt.Errorf("speech lead: speech %d's first word reached the filter %v after its audio started, over %v", i+1, lead, wordLate)
+		}
+		least, most = min(least, lead), max(most, lead)
 	}
-	offsets := m.TimelineOffsets()
-	if len(offsets) < 2 {
-		printf(out, "timeline offset: UNKNOWN: %d speeches measured, and a spread needs 2 or more\n", len(offsets))
-		return fmt.Errorf("timeline offset: UNKNOWN: %d speeches measured, want 2 or more", len(offsets))
-	}
-	least, most, far := offsets[0], offsets[0], time.Duration(0)
-	for _, o := range offsets {
-		least, most, far = min(least, o), max(most, o), max(far, o, -o)
-	}
-	printf(out, "timeline offset: %d speeches, their first words from %v to %v off their audio (spread %v)\n", len(offsets), least, most, most-least)
-	switch {
-	case most-least > offsetSpread:
-		printf(out, "timeline offset: unstable (spread over %v): match cut speech through a sideband connection instead\n", offsetSpread)
-		return fmt.Errorf("timeline offset: unstable, a spread of %v over %v: match cut speech through a sideband connection", most-least, offsetSpread)
-	case far+100*time.Millisecond > gptlive.CutMargin:
-		printf(out, "timeline offset: raise gptlive.CutMargin from %v to %v\n", gptlive.CutMargin, far+100*time.Millisecond)
-		return fmt.Errorf("timeline offset: raise gptlive.CutMargin from %v to %v", gptlive.CutMargin, far+100*time.Millisecond)
-	}
-	printf(out, "timeline offset: gptlive.CutMargin %v covers it\n", gptlive.CutMargin)
+	printf(out, "speech lead: %d speeches, their first word from %v to %v after their audio started (negative: before), each within %v\n", len(speeches), least, most, wordLate)
 	return nil
 }
 
@@ -390,21 +344,44 @@ func control(ctx context.Context, cfg *probeConfig) error {
 }
 
 // events is what the probe saw on a session's Events, read as it comes so
-// that nothing waits on the probe.
+// that nothing waits on the probe: GPT-Live's words, its first error, and
+// each speech with when its first word reached the own-speech feed.
 type events struct {
-	mu    sync.Mutex
-	text  strings.Builder
-	first error
+	mu      sync.Mutex
+	text    strings.Builder
+	first   error
+	spoken  []spoken
+	open    bool      // a speech is under way
+	pending time.Time // a word that came between speeches, for the next
+}
+
+// spoken is one of GPT-Live's speeches as the probe saw it: when its audio
+// started, and when its first word reached the own-speech feed (zero for
+// none).
+type spoken struct {
+	start, firstWord time.Time
 }
 
 func watch(c <-chan voice.Event) *events {
 	e := &events{}
 	go func() {
 		for ev := range c {
+			now := time.Now()
 			e.mu.Lock()
 			switch ev.Kind {
 			case voice.EventAgentText:
 				e.text.WriteString(ev.Text)
+				switch {
+				case e.open && e.spoken[len(e.spoken)-1].firstWord.IsZero():
+					e.spoken[len(e.spoken)-1].firstWord = now
+				case !e.open && e.pending.IsZero():
+					e.pending = now
+				}
+			case voice.EventSpeechStarted:
+				e.spoken = append(e.spoken, spoken{start: now, firstWord: e.pending})
+				e.open, e.pending = true, time.Time{}
+			case voice.EventSpeechEnded:
+				e.open = false
 			case voice.EventErr:
 				if e.first == nil {
 					e.first = ev.Err
@@ -428,9 +405,15 @@ func (e *events) failure() error {
 	return e.first
 }
 
+func (e *events) speeches() []spoken {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]spoken(nil), e.spoken...)
+}
+
 // feeder feeds the session's tap 250 ms of audio every 250 ms, as the room's
 // microphone would: silence, or the question it was given. GPT-Live's
-// timeline runs on its input audio.
+// session runs on its input audio.
 type feeder struct {
 	ask   chan []int16
 	ended chan time.Time // when the last of a question was sent
@@ -509,7 +492,7 @@ func delegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeT
 			return ctx.Err()
 		}
 	}
-	// Let the answer play to its end, for its words and timeline.
+	// Let the answer play to its end, for its words and lead.
 	for last := rec.duration(); ; {
 		select {
 		case <-time.After(2 * time.Second):
