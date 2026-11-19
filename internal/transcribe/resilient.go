@@ -2,6 +2,7 @@ package transcribe
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,12 +59,27 @@ func NewResilientClient(
 
 // Write always returns (len(p), nil) — error absorption is the whole point.
 func (rc *ResilientClient) Write(p []byte) (int, error) {
+	return rc.write(p, nil)
+}
+
+// writeFromQueue writes p, a chunk the send queue in front of the client
+// holds, and takes it out of queued, the queue's count, as it counts it, under
+// the same lock: Captured and CapturedSince then count the chunk once, never
+// twice while a socket write stalls, and never not at all (sendQueueWatcher).
+func (rc *ResilientClient) writeFromQueue(p []byte, queued *atomic.Int64) (int, error) {
+	return rc.write(p, queued)
+}
+
+func (rc *ResilientClient) write(p []byte, queued *atomic.Int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 
 	rc.Mu.Lock()
 	rc.accepted += int64(len(p))
+	if queued != nil {
+		queued.Add(-int64(len(p)))
+	}
 	client := rc.Client
 	if rc.State != StateConnected || client == nil {
 		// Buffered under the lock that counted p and read the state: a

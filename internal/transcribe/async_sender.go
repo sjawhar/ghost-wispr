@@ -27,7 +27,7 @@ type AsyncSender struct {
 	queue   chan sendItem
 	dropped atomic.Int64
 	log     func(string, ...any)
-	// queued counts the bytes in slots not yet handed to dst.
+	// queued counts the bytes in slots not yet counted by dst.
 	queued atomic.Int64
 	// watcher is dst when it counts this queue (ResilientClient), else nil.
 	watcher sendQueueWatcher
@@ -38,6 +38,9 @@ type AsyncSender struct {
 type sendQueueWatcher interface {
 	watchSendQueue(queued func() int64)
 	sendQueueDropped(n int64)
+	// writeFromQueue writes p, a chunk the queue holds, and takes it out of
+	// queued as it counts it, in one step.
+	writeFromQueue(p []byte, queued *atomic.Int64) (int, error)
 }
 
 type sendItem struct {
@@ -125,10 +128,15 @@ func (s *AsyncSender) run(ctx context.Context) {
 				item.done <- s.dst.Finalize()
 				continue
 			}
-			// Out of the queue before dst counts it, so it is never counted
-			// twice.
-			s.queued.Add(-int64(len(s.slots[item.slot])))
-			_, _ = s.dst.Write(s.slots[item.slot])
+			if s.watcher != nil {
+				// The chunk leaves the queue's count as the client counts it,
+				// in one step, so a capture resume that marks the count
+				// (Captured) marks the pause neither early nor late.
+				_, _ = s.watcher.writeFromQueue(s.slots[item.slot], &s.queued)
+			} else {
+				_, _ = s.dst.Write(s.slots[item.slot])
+				s.queued.Add(-int64(len(s.slots[item.slot])))
+			}
 			if s.dropped.Swap(0) > 0 {
 				s.log("live transcription caught up")
 			}

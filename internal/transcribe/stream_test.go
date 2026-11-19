@@ -6,11 +6,57 @@ import (
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 const secondOfAudio = 16000 * bytesPerSample
+
+// heldHandOff is a live client that waits at release once the send queue has
+// handed it a chunk, before it counts the chunk.
+type heldHandOff struct {
+	*ResilientClient
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *heldHandOff) writeFromQueue(p []byte, queued *atomic.Int64) (int, error) {
+	h.entered <- struct{}{}
+	<-h.release
+	return h.ResilientClient.writeFromQueue(p, queued)
+}
+
+// TestCapturedCountsAChunkTheQueueHandsOn fails if Captured, the count a
+// capture resume marks, leaves out a chunk the send queue has handed to the
+// client that the client has not counted yet: a resume then marked the pause
+// a chunk early, and the words of that chunk, from before the pause, reached
+// the session the resume's words open. The wait widens a moment that is a
+// function call in the app. TestCapturedSinceCountsTheAudioQueuedBeforeTheClient
+// catches the other side, a chunk counted twice while the socket write stalls.
+func TestCapturedCountsAChunkTheQueueHandsOn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := NewResilientClient(ctx, nil, ResilientConfig{SampleRate: 16000}, nil, nil)
+	handOff := &heldHandOff{ResilientClient: rc, entered: make(chan struct{}), release: make(chan struct{})}
+	sender := NewAsyncSender(ctx, handOff, 4, nil)
+	if _, err := sender.Write(make([]byte, secondOfAudio)); err != nil {
+		t.Fatal(err)
+	}
+	<-handOff.entered
+	during := rc.Captured()
+	close(handOff.release)
+	deadline := time.Now().Add(5 * time.Second)
+	for rc.Captured() != time.Second {
+		if time.Now().After(deadline) {
+			t.Fatalf("Captured() = %v after the hand-off, want 1s", rc.Captured())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if during != time.Second {
+		t.Fatalf("Captured() = %v while the send queue hands a second of audio to the client, want 1s", during)
+	}
+}
 
 // TestCapturedSinceCountsFromTheSocketsFirstByte fails if CapturedSince does
 // not time Deepgram's results from the first byte the current socket was
