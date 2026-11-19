@@ -25,8 +25,10 @@ const (
 
 // jabraMuteButton toggles capture on each press of the Jabra's mute button,
 // as the power button does, and keeps the Jabra's mute light on while capture
-// is paused, whichever control paused it. The light is written through device,
-// so it never changes while a capture stream is open.
+// is paused, whichever control paused it, except while its own resume checks
+// the light: the light then shows what the button counts, unmuted (showPaused).
+// The light is written through device, so it never changes while a capture
+// stream is open.
 type jabraMuteButton struct {
 	capture  *captureGate
 	device   *captureDevice
@@ -42,8 +44,10 @@ type jabraMuteButton struct {
 	checkEvery time.Duration
 }
 
+// newJabraMuteButton makes the Jabra's mute button, and makes device's ring
+// show what that button counts.
 func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) *jabraMuteButton {
-	return &jabraMuteButton{
+	b := &jabraMuteButton{
 		capture:    capture,
 		device:     device,
 		controls:   controls,
@@ -53,6 +57,8 @@ func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *s
 		retryEvery: hardwareRetry,
 		checkEvery: jabraLightCheckEvery,
 	}
+	device.showPaused(b.toggle.counted)
+	return b
 }
 
 func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) {

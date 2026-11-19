@@ -185,8 +185,9 @@ is not held up and turns the light off at once; the resume, gate opening or micr
 overtakes lights nothing and opens nothing. A press of the power button or the Jabra that resumes
 returns at once and checks the light in the background. Each press reads the pause switch, except
 while that button's own resume is still checking the light with no pause since: then the press
-counts the unit as resumed and pauses. A refused resume leaves the switch off, so the next press
-resumes again. A save of the black pattern that does not reach
+counts the unit as resumed and pauses. The Jabra's mute light shows what its button counts: unmuted
+during that button's own resume, and the pause switch otherwise. A refused resume leaves the switch
+off and lights the Jabra's mute light again, so the next press resumes again. A save of the black pattern that does not reach
 the unit leaves it unknown, so it is checked again when it comes back. Programs that do not take the
 lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
 answer the recorder's.

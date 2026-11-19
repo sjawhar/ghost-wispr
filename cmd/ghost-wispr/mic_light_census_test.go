@@ -18,8 +18,9 @@ import (
 )
 
 // The census of every path that opens a capture device: each must open it
-// only while the blink(1)'s last operation is a read-back of red, and keep it
-// so until the open has finished. The PortAudio scan opens capture streams on
+// only while the blink(1) was last read back red, with nothing but writes of
+// red after that read-back (requireRed), and keep it so until the open has
+// finished. The PortAudio scan opens capture streams on
 // the Jabra, so it counts as an open: startMicPipeline's start runs it first,
 // and Mic.Reopen runs it before it opens the stream again.
 //

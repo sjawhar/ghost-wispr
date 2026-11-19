@@ -244,7 +244,9 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 }
 
 // counted reports the unit as paused or not for a press: resumed while this
-// button's own resume runs with no pause since, else the gate's switch.
+// button's own resume runs with no pause since, else the gate's switch. The
+// Jabra's ring shows the Jabra button's count (captureDevice.showPaused), so
+// a press does what the ring it is pressed on shows.
 func (t *buttonToggle) counted() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

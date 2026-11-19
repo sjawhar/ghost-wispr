@@ -581,3 +581,173 @@ func TestAButtonPauseLeavesNoRequestedPause(t *testing.T) {
 		})
 	}
 }
+
+// TestAJabraPressActsOnTheRingItIsPressedOn fails if a press of the Jabra's
+// mute button does the opposite of what the ring it is pressed on shows: a
+// press on a ring that shows Muted must unmute, one on an unmuted ring must
+// mute. The person unmutes a paused unit on the Jabra; while that press's
+// resume checks the light, Ghost Wispr wrote the ring Muted again from the
+// pause switch, which the resume had not moved yet, but the button counted
+// the unit as resumed, so the person's second press, on a Muted ring, paused
+// (red team, review 5968112897 of #79). Control: a unit known black, whose
+// resume ends before the second press.
+func TestAJabraPressActsOnTheRingItIsPressedOn(t *testing.T) {
+	for _, tc := range gateChecks {
+		t.Run(tc.name, func(t *testing.T) {
+			capture, _ := gateOnReopenedLight(t, tc.known, tc.check)
+			persistent := newPersistentControls(&lockedPauseStore{}, capture.Pause, capture, nil)
+			if err := persistent.Pause(); err != nil {
+				t.Fatalf("control: the first pause: %v", err)
+			}
+			rig := &jabraRig{
+				capture:    capture,
+				device:     newCaptureDevice(capture.IsPaused),
+				controls:   &server.ControlHooks{Pause: persistent.Pause, Resume: persistent.Resume},
+				warnings:   newWarningsRegistry(),
+				devices:    make(chan *jabraFake, 4),
+				checkEvery: time.Hour,
+			}
+			rig.start(t)
+			device := rig.plugIn()
+			waitForHardware(t, "the Jabra ring to show the pause", func() bool { return rig.attached() && device.shows() })
+
+			// The person presses mute on a ring that shows Muted: the Jabra
+			// flips its own ring, and the press reaches the button.
+			device.lightsItself(false)
+			device.press(t)
+			time.Sleep(150 * time.Millisecond)
+			ringMuted := device.shows()
+
+			// The person presses again, on what the ring shows now.
+			device.lightsItself(!ringMuted)
+			device.press(t)
+			time.Sleep(tc.check + time.Second) // the first press's check and resume end
+			if paused := capture.IsPaused(); paused == ringMuted {
+				t.Fatalf("the second Jabra press, made on a ring that showed Muted %t (as Ghost Wispr wrote it 150ms after the first press), left capture paused %t: a press on a Muted ring must unmute, on an unmuted ring must mute", ringMuted, paused)
+			}
+		})
+	}
+}
+
+// TestAJabraRingShowsMutedAgainOnceItsResumeIsRefused fails if the Jabra's
+// ring does not show unmuted while its press's resume checks the light, or
+// does not show Muted again once the light refuses that resume: the unit is
+// then still paused. Control: a resume that is not refused leaves the ring
+// unmuted.
+func TestAJabraRingShowsMutedAgainOnceItsResumeIsRefused(t *testing.T) {
+	for _, refused := range []bool{false, true} {
+		name := "control: the resume is not refused"
+		if refused {
+			name = "the red confirmation refuses the resume"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := newJabraRig(true)
+			rig.checkEvery = time.Hour
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			rig.capture.beforeResumeRequest = func() error {
+				<-release
+				if refused {
+					return errors.New("recording light stayed off")
+				}
+				return nil
+			}
+			rig.start(t)
+			// Runs before the rig's cleanup, which waits for the press.
+			t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+			device := rig.plugIn()
+			waitForHardware(t, "the Jabra ring to show the pause", func() bool { return rig.attached() && device.shows() })
+
+			device.lightsItself(false) // the Jabra flips its own ring on the press
+			device.press(t)
+			time.Sleep(50 * time.Millisecond)
+			if device.shows() {
+				t.Fatal("the Jabra ring showed Muted while its press's resume checked the light: the button counts the unit as resumed")
+			}
+			releaseOnce.Do(func() { close(release) })
+			if refused {
+				waitForHardware(t, "the ring to show Muted again once the light refused the resume", device.shows)
+				if !rig.capture.IsPaused() {
+					t.Fatal("control: the refused resume left the unit recording")
+				}
+				return
+			}
+			waitForHardware(t, "the resume", func() bool { return !rig.capture.IsPaused() })
+			time.Sleep(50 * time.Millisecond)
+			if device.shows() {
+				t.Fatal("control: the ring showed Muted after a resume that worked")
+			}
+		})
+	}
+}
+
+// TestAnOldResumeEndingDoesNotEndTheNewOne fails if a button's resume that
+// its own pause overtook, ending while a later resume of that button still
+// checks the light, makes the button stop counting the later one: a press
+// during the later resume's check would then be taken for a resume. Presses:
+// A resumes, B pauses during A's check, C resumes, D comes during C's check
+// and must pause (review 5968112897 of #79). Control: A ends after D.
+func TestAnOldResumeEndingDoesNotEndTheNewOne(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		firstEndsFirst bool
+	}{
+		{"control: the first resume ends after the last press", false},
+		{"the first resume ends before the last press", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newCountingToggleRig(t)
+			if err := r.persistent.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			entered := []chan struct{}{make(chan struct{}), make(chan struct{})}
+			release := []chan struct{}{make(chan struct{}), make(chan struct{})}
+			var releases [2]sync.Once
+			let := func(i int) { releases[i].Do(func() { close(release[i]) }) }
+			var calls atomic.Int32
+			r.capture.beforeResumeRequest = func() error { return nil }
+			r.capture.checkLightPattern = func() error {
+				if i := int(calls.Add(1)) - 1; i < 2 {
+					close(entered[i])
+					<-release[i]
+				}
+				return nil
+			}
+			// Runs before the rig's cleanup, which waits for the resumes.
+			t.Cleanup(func() { let(0); let(1) })
+			waitFor := func(ch <-chan struct{}, what string) {
+				t.Helper()
+				select {
+				case <-ch:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("control: %s did not happen within 5s", what)
+				}
+			}
+
+			first := r.toggle.press(nil, nil) // A, a resume
+			waitFor(entered[0], "resume A's check")
+			waitFor(r.toggle.press(nil, nil), "pause B")
+			if !r.capture.IsPaused() {
+				t.Fatal("control: pause B did not pause")
+			}
+			r.toggle.press(nil, nil) // C, a resume
+			waitFor(entered[1], "resume C's check")
+			if tc.firstEndsFirst {
+				let(0)
+				waitFor(first, "resume A to end")
+			}
+			before := r.resumes.Load()
+			last := r.toggle.press(nil, nil) // D, during C's check
+			if !tc.firstEndsFirst {
+				let(0)
+				waitFor(first, "resume A to end")
+			}
+			let(1)
+			waitFor(last, "press D")
+			r.toggle.wait()
+			if resumed := r.resumes.Load() - before; resumed != 0 || !r.capture.IsPaused() {
+				t.Fatalf("press D, made during resume C's check, was taken for a resume (resumes after it %d), and the unit ends paused %t: want D a pause and the unit paused", resumed, r.capture.IsPaused())
+			}
+		})
+	}
+}
