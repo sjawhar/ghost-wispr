@@ -541,6 +541,22 @@ func TestNoAudioCapturedDuringAPauseReachesTheRecording(t *testing.T) {
 			}
 			capture.Resume()
 		}},
+		{name: "a pause before the red confirmation began, a resume during the open", run: func(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer) {
+			capture.Pause()
+			runPauseBufferMicLoop(t, capture, mic, recorded, nopLogf)
+			mic.expectEvents(t, "close")
+			var once sync.Once
+			capture.beforeMicOpen = func(context.Context, <-chan struct{}) bool {
+				once.Do(capture.Pause) // just after the hardware is ready
+				return true
+			}
+			mic.onOpen = func() { // the device opens during the pause
+				capture.Resume()
+				waitOpenIn(t, capture)
+				mic.holdPauseAudio()
+			}
+			capture.Resume()
+		}},
 		{name: "a pause and a resume during a reopen after a stream error", run: func(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer) {
 			mic.streamErrs = []error{errors.New("device disconnected")}
 			mic.onOpen = func() {
