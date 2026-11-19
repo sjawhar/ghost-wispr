@@ -737,11 +737,17 @@ type teeWriter struct {
 	dst      io.Writer
 }
 
-// Write records p, then hands it to dst, live transcription: the recording
-// never waits on it.
+// Write hands p to dst, live transcription, then records it, whatever dst
+// returned, and returns the recorder's error first. dst does not block (the
+// app's is a send queue), so the recording never waits on it, and live
+// transcription's count of the audio is never behind the recorder's: the
+// session manager places a recording's close in that count as the count less
+// the audio taken since the close, which a chunk the recorder had first would
+// make early.
 func (w *teeWriter) Write(p []byte) (int, error) {
+	n, dstErr := w.dst.Write(p)
 	if err := w.recorder.writePCM(p); err != nil {
 		return 0, err
 	}
-	return w.dst.Write(p)
+	return n, dstErr
 }

@@ -527,8 +527,8 @@ func newSessionRecorder(audioDir string, store audio.SessionRates) *audio.Record
 	return recorder
 }
 
-// startMicMonitoring starts the mic loop. The recorder gets each buffer
-// first, and downstream, live transcription, gets it through a bounded queue
+// startMicMonitoring starts the mic loop. Live transcription, downstream,
+// gets each buffer just before the recorder, through a bounded queue
 // that never blocks the loop (transcribe.AsyncSender), so no Deepgram
 // trouble stops the recording. It returns that queue, whose Finalize the
 // capture pause uses, or nil without downstream.

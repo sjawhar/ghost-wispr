@@ -1,9 +1,47 @@
 package audio
 
 import (
+	"io"
 	"testing"
 	"time"
 )
+
+// countingDst is live transcription: on each write it notes how much audio
+// the recorder had taken since its last close.
+type countingDst struct {
+	recorder *Recorder
+	seen     []time.Duration
+}
+
+func (d *countingDst) Write(p []byte) (int, error) {
+	since, _ := d.recorder.SinceClose()
+	d.seen = append(d.seen, since)
+	return len(p), nil
+}
+
+var _ io.Writer = (*countingDst)(nil)
+
+// TestLiveTranscriptionHasEachChunkBeforeTheRecorder fails if the microphone's
+// writer gives the recorder a chunk before live transcription has it. The
+// session manager places a recording's close in live transcription's count of
+// the audio as that count less the audio the recorder took since the close; a
+// chunk the recorder had and live transcription did not placed the close a
+// chunk early, and the words of that chunk, in the ended recording, reached
+// the next session.
+func TestLiveTranscriptionHasEachChunkBeforeTheRecorder(t *testing.T) {
+	r := NewRecorder(t.TempDir())
+	dst := &countingDst{recorder: r}
+	mic := r.Writer(dst)
+	if _, err := mic.Write(holdSecond(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mic.Write(holdSecond(2)); err != nil {
+		t.Fatal(err)
+	}
+	if want := []time.Duration{0, time.Second}; len(dst.seen) != 2 || dst.seen[0] != want[0] || dst.seen[1] != want[1] {
+		t.Fatalf("live transcription got each chunk when the recorder had taken %v since its close, want %v", dst.seen, want)
+	}
+}
 
 // TestPendingIsWhatTheNextRecordingOpensWith fails if Pending does not say
 // how much audio the next session's recording would open with now: the last

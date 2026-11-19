@@ -174,9 +174,10 @@ first words Deepgram hears until the session starts, it keeps all the audio afte
 300 s. It keeps only audio captured while the light was red: every close of the microphone (a
 pause, the light reading back off or failing, no audio reaching the recording) drops it, and no
 audio of an earlier session is ever kept. A session's start time is when its recording starts.
-Deepgram can give its words for the last seconds before a pause only after the resume, as when it
-lags after an outage; the recorder places each word in the audio it captured, and drops every word
-from before the pause, so none reaches a later session.
+Deepgram can give its words for the last seconds before a pause, or before a session's recording
+closed, only after the resume or the end, as when it lags after an outage; the recorder places each
+word in the audio it captured, and drops every word from before the pause or the close, so none
+reaches a later session, and none reaches the page or the voice during a pause.
 
 ## Deployment
 
