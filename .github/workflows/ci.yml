@@ -23,7 +23,7 @@ jobs:
       # longer than the install's 10 minutes, at about 100 kB/s. apt downloads them into a
       # directory the job caches after every install, also one that timed out, so each run
       # downloads only what the cache lacks. A new runner image starts from the last image's
-      # packages, and apt-get autoclean drops those the archive no longer has.
+      # packages; after an install, the cache keeps only the archives of the installed versions.
       - name: Name the apt package cache
         id: apt-key
         run: |
@@ -47,10 +47,19 @@ jobs:
         run: |
           archives="$HOME/apt-archives"
           mkdir -p "$archives/partial"
+          # $HOME is closed to other users, so apt's _apt user could not reach this directory and
+          # apt would download as root, outside its sandbox.
+          sudo chmod o+x "$HOME"
           apt_get=(sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives="$archives")
           "${apt_get[@]}" update
           "${apt_get[@]}" install -y --no-install-recommends ffmpeg portaudio19-dev pulseaudio
-          "${apt_get[@]}" autoclean
+          # apt-get autoclean skips archives named for a CPU variant (*_amd64v3.deb), so it keeps
+          # every outdated one. Keep only the archives of the versions now installed.
+          installed=$(dpkg-query -W -f='${Package}_${Version}\n' | sed 's/:/%3a/g')
+          for deb in "$archives"/*.deb; do
+            name=${deb##*/}
+            grep -qxF "${name%_*}" <<<"$installed" || sudo rm -f "$deb"
+          done
 
       # Runs after an install that failed or timed out too, so what it downloaded is kept.
       - name: List the apt package cache
