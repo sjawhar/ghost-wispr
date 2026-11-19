@@ -706,6 +706,35 @@ under `recording_rules` in the Pi's config, `/opt/ghost-wispr/ghost-wispr.yaml`,
 `provision.sh` renders from `deploy/pi/files/ghost-wispr.yaml`: each must appear verbatim and in
 order. A unit whose config has no rules shows no Recording rules button.
 
+A5 asks a person to reach the recorder from a phone that is off the tailnet and from a device that
+carries `PI_DENIED_TAG`; both must fail. The Hindsight memory server's control-plane pods carry that
+tag, in namespace `legion` of the `dispatch` GKE cluster. The tailscaled in their `tailscale`
+container listens on the socket `/scratch/tailscaled.sock`, so the CLI there needs `--socket`. Run
+the probe on a tailnet member whose kubectl context is that cluster and on which
+`kubectl -n legion auth can-i create pods --subresource=exec` answers `yes`:
+
+```bash
+source "${GHOST_WISPR_PI_ENV:-deploy/pi/files/pi.env}"
+recorder=$(tailscale ip -4 "${PI_HOST:?}")
+member=$(tailscale ip -4)
+pod=$(kubectl -n legion get pods -l app=hindsight-control-plane --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+ts() { kubectl -n legion exec "${pod:?}" -c tailscale -- tailscale --socket=/scratch/tailscaled.sock "$@"; }
+netmap() { jq --arg tag "$PI_DENIED_TAG" --arg ip "${recorder:?}" \
+  '{carries_denied_tag: (.Self.Tags // [] | index($tag) != null), online: .Self.Online, recorder_peers: [.Peer // {} | .[] | select(.TailscaleIPs | index($ip)) | .HostName]}'; }
+tailscale status --json | netmap
+ts status --json | netmap
+ts ping -c 3 "${recorder:?}"
+ts ping --until-direct=false -c 3 "${member:?}"
+```
+
+When a lookup finds nothing, each command that needs it prints `parameter null or not set` and
+does not run. The first `netmap`, of this member device, is the control for the filter: its
+`recorder_peers` must name `ghost-wispr`. The pod must carry the tag and be `online`, which means
+it is connected to the coordination server and its netmap is current. Its `recorder_peers` must
+be empty, and the first ping must say `no matching peer`. The second ping is the control for the
+pod: it must get a pong from this member device and exit 0, so kubectl prints no
+`command terminated` line. With `--until-direct=false`, pongs through a DERP relay count too.
+
 ## Accept slice 2
 
 Run both from a tailnet member after the models step. The self-test plants a

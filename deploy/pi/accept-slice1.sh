@@ -575,7 +575,7 @@ done <<<"$app_listeners"
 assert_listener_boundary
 status >/dev/null
 check_sshd_loopback
-printf 'A5 RAN: local listener boundary passed. A5 NEEDS-PERSON: test a phone off-tailnet and %s; both must fail.\n' "$PI_DENIED_TAG"
+printf 'A5 RAN: local listener boundary passed. A5 NEEDS-PERSON: test a phone off-tailnet and a %s device (docs/pi-setup.md, "Accept slice 1"); both must fail.\n' "$PI_DENIED_TAG"
 
 if [[ -n "$relay_url" ]]; then
   printf 'Envoy RAN: check a signed probe and an unsigned Pi request.\n'
