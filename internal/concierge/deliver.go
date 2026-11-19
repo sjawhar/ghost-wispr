@@ -174,10 +174,18 @@ func (c *Concierge) forget(agent string, ids ...string) {
 }
 
 // announce rewrites an answer for the ear and queues its announcement; the
-// queue hands it to Answers unless its meeting ends or is deleted first.
+// queue hands it to Answers unless its meeting ends or is deleted first. An
+// answer whose meeting no longer records goes to no model: it will not be
+// spoken.
 func (c *Concierge) announce(task *storage.VoiceTask, written string) {
+	c.mu.Lock()
+	closed, _ := c.closedLocked(task.SessionID)
+	c.mu.Unlock()
+	if closed || !c.stillOwed(&voice.PendingAnswer{TaskID: task.ID}) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), earTimeout)
 	defer cancel()
-	spoken := c.forEar(ctx, strings.TrimSpace(written))
+	spoken := c.forEar(ctx, strings.TrimSpace(written), task.IssueKey)
 	c.enqueue(&voice.PendingAnswer{TaskID: task.ID, SessionID: task.SessionID, IssueKey: task.IssueKey, Text: spoken, AskedAt: task.AskedAt})
 }

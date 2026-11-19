@@ -222,6 +222,12 @@ func New(cfg *Config) (*Concierge, error) {
 		c.logger = slog.Default()
 	}
 	go c.offerAnswers()
+	if c.records != nil {
+		// The project list is read at once, so the first question's keys
+		// are known (isProject).
+		c.projectsBusy = true
+		go c.readProjects(context.Background())
+	}
 	return c, nil
 }
 
@@ -426,9 +432,10 @@ func (c *Concierge) closeLocked(sessionID string, deleted bool) {
 const projectsFor = 10 * time.Minute
 
 // isProject reports whether key names one of Dispatch's projects. Until the
-// projects are known, every key does. With wait, a stale or missing list is
-// read first; without, it is read in the background and this call answers
-// from what is known.
+// projects are known, or while their read fails, none does: a "word NN" said
+// in the room is no key, so it never reaches Dispatch in an address. With
+// wait, a stale or missing list is read first; without, it is read in the
+// background and this call answers from what is known.
 func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bool {
 	c.mu.Lock()
 	stale := c.now().Sub(c.projectsRead) > projectsFor
@@ -445,7 +452,7 @@ func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bo
 			go c.readProjects(context.WithoutCancel(ctx))
 		}
 	}
-	return known == nil || known[strings.ToUpper(project)]
+	return known[strings.ToUpper(project)]
 }
 
 // readProjects reads Dispatch's project keys and keeps them. A failed read

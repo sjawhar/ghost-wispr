@@ -152,10 +152,14 @@ func TestAnUnreachableDispatchEndsTheKeyReads(t *testing.T) {
 }
 
 // TestANumberThatNamesNoIssueGivesWayToASearch: "at 10 am" reads as AT-10,
-// which names no issue; the turn's words are searched instead.
+// a key of a project Dispatch has (AT here) that names no issue; the turn's
+// words are searched instead.
 func TestANumberThatNamesNoIssueGivesWayToASearch(t *testing.T) {
 	r := newRig(t)
 	voiceIssue(r)
+	r.concierge.mu.Lock()
+	r.concierge.projects["AT"] = true
+	r.concierge.mu.Unlock()
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 	var spoken []said
 	if err := r.concierge.Answer(context.Background(), &r.exchange, "what did we decide at 10 am about the realtime voice", recorder(&spoken)); err != nil {

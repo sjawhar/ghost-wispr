@@ -40,9 +40,14 @@ const DeliverSubjectPrefix = "notifications.envoy.deliver."
 // every 90 seconds.
 const HeartbeatEvery = 60 * time.Second
 
-// deliverTimeout bounds the host's handling of one frame, well inside the
-// listener's 60 s ack wait.
-const deliverTimeout = 20 * time.Second
+// progressEvery is how often a frame the host still holds is answered
+// progress, which restarts the listener's 60 s ack wait (the relay's
+// "progress" reply, legion packages/envoy/cmd/listener/session_relay.go).
+const progressEvery = 20 * time.Second
+
+// deliverTimeout bounds the host's handling of one frame. progress keeps the
+// listener waiting for it meanwhile.
+const deliverTimeout = 2 * time.Minute
 
 // SessionState is what a session's last registration says about it.
 type SessionState string
@@ -250,6 +255,10 @@ type Session struct {
 	stop    chan struct{}
 	stopped sync.WaitGroup
 	closed  bool
+	// heartbeatEvery and progressEvery are HeartbeatEvery and progressEvery;
+	// a test shortens them.
+	heartbeatEvery time.Duration
+	progressEvery  time.Duration
 }
 
 func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
@@ -267,6 +276,8 @@ func newSession(listener *Listener, cfg *SessionConfig) (*Session, error) {
 		clientInstanceID: randomID(),
 		epoch:            randomID(),
 		stop:             make(chan struct{}),
+		heartbeatEvery:   HeartbeatEvery,
+		progressEvery:    progressEvery,
 	}
 	if cfg.Resume != nil && cfg.Resume.StreamID != "" {
 		resume := *cfg.Resume
@@ -352,7 +363,7 @@ func (s *Session) ID() string { return s.cfg.SessionID }
 
 func (s *Session) heartbeat() {
 	defer s.stopped.Done()
-	ticker := time.NewTicker(HeartbeatEvery)
+	ticker := time.NewTicker(s.heartbeatEvery)
 	defer ticker.Stop()
 	for {
 		select {
@@ -455,7 +466,9 @@ func (s *Session) save() {
 
 // handle answers one relay message: a probe done at once, a frame that does
 // not decode done (a redelivery cannot fix it), and a frame received, then
-// done once Deliver wrote it or nak when it could not.
+// progress every progressEvery while Deliver holds it, then done once Deliver
+// wrote it or nak when it could not. respond is called from one goroutine at
+// a time.
 func (s *Session) handle(header nats.Header, data []byte, respond func(string)) {
 	if header.Get("Envoy-Probe") == "1" {
 		respond("done")
@@ -503,7 +516,23 @@ func (s *Session) handle(header nats.Header, data []byte, respond func(string)) 
 	}
 	if s.cfg.Deliver != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
+		held, progressed := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(progressed)
+			ticker := time.NewTicker(s.progressEvery)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-held:
+					return
+				case <-ticker.C:
+					respond("progress")
+				}
+			}
+		}()
 		err := s.cfg.Deliver(ctx, &message)
+		close(held)
+		<-progressed
 		cancel()
 		if err != nil {
 			s.logger.Warn("envoy session could not take a message; it comes again", "event_id", message.EventID, "error", err)

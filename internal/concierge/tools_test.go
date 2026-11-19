@@ -134,42 +134,50 @@ func claimed(key, kind, id, title string) *dispatch.Issue {
 	return &dispatch.Issue{Key: key, Status: "in_progress", Claim: &dispatch.Claim{Actor: actor(kind, id, title), At: testNow.Add(-time.Hour)}}
 }
 
-func TestIssueHolderFindsALiveClaimingSession(t *testing.T) {
+// TestIssueHolderCases (c-find): issue_holder's four answers. A live session
+// gives {session, live}; an unresponsive or gone one {unresponsive}; a
+// person's claim {person}, whom ask_agent never asks; no claim and no session
+// in the events {none}.
+func TestIssueHolderCases(t *testing.T) {
 	r := newRig(t)
 	r.records.issues["ABC-12"] = claimed("ABC-12", "session", "agent-7", "Legion architect")
 	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateLive, Title: "Legion architect", LastSeen: testNow.Add(-time.Minute)}
 	result := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
 	if result["holder"] != "session" || result["session"] != "agent-7" || result["live"] != true || result["title"] != "Legion architect" {
-		t.Fatalf("holder = %v", result)
+		t.Fatalf("live holder = %v", result)
 	}
-}
 
-func TestIssueHolderSaysAStalledSessionIsUnresponsive(t *testing.T) {
-	r := newRig(t)
-	r.records.issues["ABC-12"] = claimed("ABC-12", "session", "agent-7", "Worker")
 	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateUnresponsive, LastSeen: testNow.Add(-20 * time.Minute)}
-	result := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
+	result = r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
 	if result["holder"] != "unresponsive" || result["session"] != "agent-7" || result["last_seen"] != "20 minutes ago" {
-		t.Fatalf("holder = %v", result)
+		t.Fatalf("unresponsive holder = %v", result)
 	}
-	// A session Envoy no longer knows is unresponsive too, as gone.
 	delete(r.agents.states, "agent-7")
 	result = r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
 	if result["holder"] != "unresponsive" || result["state"] != "gone" {
-		t.Fatalf("holder of a gone session = %v", result)
+		t.Fatalf("gone holder = %v", result)
 	}
-}
 
-func TestIssueHolderNamesAPerson(t *testing.T) {
-	r := newRig(t)
-	r.records.issues["ABC-12"] = claimed("ABC-12", "user", "lead@example.com", "")
-	result := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
+	r.records.issues["ABC-13"] = claimed("ABC-13", "user", "lead@example.com", "")
+	result = r.run(t, "issue_holder", map[string]string{"key": "ABC-13"})
 	if result["holder"] != "person" || result["person"] != "lead@example.com" {
-		t.Fatalf("holder = %v", result)
+		t.Fatalf("person holder = %v", result)
+	}
+	if asked := r.run(t, "ask_agent", map[string]string{"session": "lead@example.com", "question": "q"}); asked["error"] == nil || len(r.agents.sent) != 0 {
+		t.Fatalf("ask_agent asked a person: %v, %d sent", asked, len(r.agents.sent))
+	}
+
+	r.records.issues["ABC-14"] = &dispatch.Issue{Key: "ABC-14", Status: "backlog", Assignee: "lead@example.com"}
+	r.records.events["ABC-14"] = []dispatch.Event{{Type: "issue.created", Actor: actor("user", "lead@example.com", "")}}
+	result = r.run(t, "issue_holder", map[string]string{"key": "ABC-14"})
+	if result["holder"] != "none" || result["assignee"] != "lead@example.com" {
+		t.Fatalf("no holder = %v", result)
 	}
 }
 
-func TestIssueHolderFallsBackToTheNewestSessionInTheEvents(t *testing.T) {
+// TestHolderFromEventsWithNoClaim (c-find): with no claim, the holder is the
+// newest session in the issue's events, other than this unit.
+func TestHolderFromEventsWithNoClaim(t *testing.T) {
 	r := newRig(t)
 	r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: "backlog"}
 	r.records.events["ABC-12"] = []dispatch.Event{
@@ -182,16 +190,6 @@ func TestIssueHolderFallsBackToTheNewestSessionInTheEvents(t *testing.T) {
 	result := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
 	if result["holder"] != "session" || result["session"] != "agent-9" || result["live"] != true {
 		t.Fatalf("holder = %v, want agent-9, the newest session that is not this unit", result)
-	}
-}
-
-func TestIssueHolderSaysNoneWhenNobodyWorksOnIt(t *testing.T) {
-	r := newRig(t)
-	r.records.issues["ABC-12"] = &dispatch.Issue{Key: "ABC-12", Status: "backlog", Assignee: "lead@example.com"}
-	r.records.events["ABC-12"] = []dispatch.Event{{Type: "issue.created", Actor: actor("user", "lead@example.com", "")}}
-	result := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"})
-	if result["holder"] != "none" || result["assignee"] != "lead@example.com" {
-		t.Fatalf("holder = %v", result)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,12 +17,13 @@ import (
 )
 
 // fakeListener is an Envoy listener's HTTP API that records each request
-// body by path and answers what the test sets.
+// body by path, each request's headers, and answers what the test sets.
 type fakeListener struct {
 	mu      sync.Mutex
 	bodies  map[string][]map[string]any
 	answers map[string]func(w http.ResponseWriter, r *http.Request)
 	deletes []string
+	headers []http.Header
 }
 
 func newFakeListener(t *testing.T) (*fakeListener, *httptest.Server) {
@@ -29,6 +31,7 @@ func newFakeListener(t *testing.T) (*fakeListener, *httptest.Server) {
 	fake := &fakeListener{bodies: map[string][]map[string]any{}, answers: map[string]func(http.ResponseWriter, *http.Request){}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fake.mu.Lock()
+		fake.headers = append(fake.headers, r.Header.Clone())
 		if r.Method == http.MethodDelete {
 			fake.deletes = append(fake.deletes, r.URL.String())
 		}
@@ -118,7 +121,10 @@ func TestNATSURLComesFromTheListenersHost(t *testing.T) {
 	}
 }
 
-func TestRegisterAsksForConsumerDeliveryAndKeepsTheFloor(t *testing.T) {
+// TestSessionRegistersWithConsumerDelivery (c-identity): a registration asks
+// for consumer delivery with this process's epoch, and keeps the floor of the
+// resume point its answer names.
+func TestSessionRegistersWithConsumerDelivery(t *testing.T) {
 	fake, server := newFakeListener(t)
 	fake.answer("/v1/interests/subscribe", http.StatusOK, `{"session_id":"pi-session-1","topics":[],"delivery":{"mode":"consumer","subject":"notifications.envoy.deliver.pi-session-1","stream_id":"stream-A","consumer_start":41}}`)
 	var saved []ResumePoint
@@ -152,6 +158,32 @@ func TestRegisterAsksForConsumerDeliveryAndKeepsTheFloor(t *testing.T) {
 	resume, _ := delivery["resume"].(map[string]any)
 	if resume["stream_id"] != "stream-A" || resume["seq"] != float64(40) {
 		t.Errorf("the next registration's resume = %v, want stream-A at 40", delivery["resume"])
+	}
+
+	// An opened session subscribes to its delivery subject before it
+	// registers, so no frame the registration starts is lost.
+	natsServer := newFakeNATS(t)
+	subscribedFirst := false
+	fake.mu.Lock()
+	fake.answers["/v1/interests/subscribe"] = func(w http.ResponseWriter, _ *http.Request) {
+		subscribedFirst = slices.Contains(natsServer.subjects(), DeliverSubjectPrefix+"pi-session-1")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"session_id":"pi-session-1","delivery":{"mode":"consumer","stream_id":"stream-A","consumer_start":41}}`))
+	}
+	fake.mu.Unlock()
+	listener, err := NewListener(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenSession(context.Background(), listener, &SessionConfig{SessionID: "pi-session-1", NATSURL: natsServer.url(), Plugin: "ghost-wispr"})
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer func() { _ = opened.Close(context.Background()) }()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if !subscribedFirst {
+		t.Fatal("the session registered before it subscribed to its delivery subject")
 	}
 }
 
@@ -235,19 +267,26 @@ func frame(seq, streamID string) nats.Header {
 	return header
 }
 
-func TestAFrameIsDeliveredThenAnsweredDone(t *testing.T) {
+// TestFramesAnswered (c-identity): a frame is answered received, then
+// progress every progressEvery while the host holds it, then done once it
+// wrote it; a probe frame is answered done.
+func TestFramesAnswered(t *testing.T) {
 	_, server := newFakeListener(t)
 	var got []Message
 	var saved []ResumePoint
+	release := make(chan struct{})
 	session := testSession(t, server, func(_ context.Context, message *Message) error {
 		got = append(got, *message)
+		if message.EventID == "evt-held" {
+			<-release
+		}
 		return nil
 	}, &saved)
+	session.progressEvery = 20 * time.Millisecond
 
 	var replies []string
 	envelope := `{"event_id":"evt-20","source":"agent","source_session":"agent-7","topic":"notifications.agent.pi-session-1","in_reply_to":"evt-9","payload_summary":"First line.","payload":"First line.\nSecond line.","issued_at":1795066288022}`
 	session.handle(frame("41", "stream-A"), []byte(envelope), func(body string) { replies = append(replies, body) })
-
 	if strings.Join(replies, ",") != "received,done" {
 		t.Fatalf("replies = %q, want received then done", replies)
 	}
@@ -263,6 +302,114 @@ func TestAFrameIsDeliveredThenAnsweredDone(t *testing.T) {
 	session.handle(frame("42", "stream-A"), []byte(`{"event_id":"evt-21","source_session":"agent-7","payload_summary":"pong"}`), func(body string) { replies = append(replies, body) })
 	if len(got) != 2 || got[1].Text != "pong" {
 		t.Fatalf("one-line message = %+v", got)
+	}
+
+	// A frame the host holds is answered progress while it holds it.
+	var mu sync.Mutex
+	replies = nil
+	go func() {
+		time.Sleep(110 * time.Millisecond)
+		close(release)
+	}()
+	session.handle(frame("43", "stream-A"), []byte(`{"event_id":"evt-held","payload_summary":"x"}`), func(body string) {
+		mu.Lock()
+		defer mu.Unlock()
+		replies = append(replies, body)
+	})
+	mu.Lock()
+	held := replies
+	mu.Unlock()
+	if len(held) < 4 || held[0] != "received" || held[len(held)-1] != "done" {
+		t.Fatalf("replies to a held frame = %q, want received, progress at least twice, then done", held)
+	}
+	for _, reply := range held[1 : len(held)-1] {
+		if reply != "progress" {
+			t.Fatalf("replies to a held frame = %q, want only progress between received and done", held)
+		}
+	}
+	if progressEvery > 20*time.Second {
+		t.Errorf("progressEvery = %v, want at most 20 s", progressEvery)
+	}
+
+	// A probe frame is answered done.
+	probe := nats.Header{}
+	probe.Set("Envoy-Probe", "1")
+	replies = nil
+	session.handle(probe, nil, func(body string) { replies = append(replies, body) })
+	if strings.Join(replies, ",") != "done" {
+		t.Fatalf("replies to a probe = %q, want done", replies)
+	}
+}
+
+// TestReRegistersWithin90s (c-identity): the listener calls a session live
+// for a while after each registration and asks for one at least every 90 s;
+// the heartbeat registers again on every tick.
+func TestReRegistersWithin90s(t *testing.T) {
+	fake, server := newFakeListener(t)
+	session := testSession(t, server, nil, nil)
+	if session.heartbeatEvery > 90*time.Second || HeartbeatEvery > 90*time.Second {
+		t.Fatalf("a session registers every %v (default %v), want at most 90 s", session.heartbeatEvery, HeartbeatEvery)
+	}
+	session.heartbeatEvery = 10 * time.Millisecond
+	session.stopped.Add(1)
+	go session.heartbeat()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fake.mu.Lock()
+		registrations := len(fake.bodies["/v1/interests/subscribe"])
+		fake.mu.Unlock()
+		if registrations >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d registrations in 2 s of 10 ms ticks, want 3", registrations)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNoEnvoyCredentialSent (c-identity): the listener's API needs only
+// reach; no request of a session carries a credential.
+func TestNoEnvoyCredentialSent(t *testing.T) {
+	fake, server := newFakeListener(t)
+	fake.answer("/v1/messages/send", http.StatusOK, `{"event_id":"evt-1","recipient_state":"live","state":"connected"}`)
+	session := testSession(t, server, nil, nil)
+	if err := session.register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Send(context.Background(), &SendRequest{Target: "agent-7", Message: "q", IdempotencyKey: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Lookup(context.Background(), "agent-7"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.headers) != 4 {
+		t.Fatalf("control: %d requests reached the fake listener, want 4", len(fake.headers))
+	}
+	for _, header := range fake.headers {
+		for name := range header {
+			lower := strings.ToLower(name)
+			if lower == "authorization" || lower == "cookie" || strings.Contains(lower, "token") || strings.Contains(lower, "key") || strings.Contains(lower, "secret") || strings.Contains(lower, "signature") {
+				t.Errorf("a request carries %s", name)
+			}
+		}
+	}
+	for path, bodies := range fake.bodies {
+		for _, body := range bodies {
+			for field := range body {
+				if lower := strings.ToLower(field); strings.Contains(lower, "token") || strings.Contains(lower, "secret") || lower == "key" {
+					t.Errorf("%s carries the field %s", path, field)
+				}
+			}
+		}
 	}
 }
 
@@ -344,7 +491,9 @@ func TestAProbeAndABadFrameAreAnsweredDoneAndNotDelivered(t *testing.T) {
 	}
 }
 
-func TestCloseRemovesOnlyThisProcesssRegistration(t *testing.T) {
+// TestSessionEndsAtShutdown (c-identity): Close removes this process's
+// registration, and only it.
+func TestSessionEndsAtShutdown(t *testing.T) {
 	fake, server := newFakeListener(t)
 	session := testSession(t, server, nil, nil)
 	if err := session.Close(context.Background()); err != nil {

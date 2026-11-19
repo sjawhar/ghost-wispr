@@ -490,9 +490,13 @@ func TestADescribedTurnGetsTheSearchNotAHolder(t *testing.T) {
 }
 
 // TestAReadThatFoundNothingIsNotReadAgain: the read Heard made of the final
-// turn finished and found nothing; Answer does not read it again.
+// turn finished and found nothing (LAST-24, of a project LAST that has no such
+// issue); Answer does not read it again.
 func TestAReadThatFoundNothingIsNotReadAgain(t *testing.T) {
 	r := newRig(t)
+	r.concierge.mu.Lock()
+	r.concierge.projects["LAST"] = true
+	r.concierge.mu.Unlock()
 	const turn = "what changed in the last 24 hours"
 	r.concierge.Heard(context.Background(), &r.exchange, turn)
 	eventually(t, "the read of LAST-24", func() bool { return slices.Contains(r.records.calls(), "LAST-24") })

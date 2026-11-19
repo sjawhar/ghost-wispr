@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -163,10 +164,10 @@ func TestAVoiceTaskNeedsItsSession(t *testing.T) {
 	}
 }
 
-// TestDeleteSessionRemovesItsVoiceTasks: a person's delete of a merged
-// session removes the voice tasks of it and of the sessions merged into it,
-// and keeps another session's.
-func TestDeleteSessionRemovesItsVoiceTasks(t *testing.T) {
+// TestSessionDeleteRemovesVoiceTasks (c-record): a person's delete of a
+// merged session removes the voice tasks of it and of the sessions merged
+// into it, and keeps another session's.
+func TestSessionDeleteRemovesVoiceTasks(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	started := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
 	for i, id := range []string{"a", "b", "kept"} {
@@ -212,10 +213,10 @@ func TestAgeDeleteRemovesItsVoiceTasks(t *testing.T) {
 	}
 }
 
-// TestTheWriteAheadLogEraseCoversVoiceTasks: a deleted session's written
+// TestWALEraseCoversVoiceTasks (c-record): a deleted session's written
 // answers are in no file of the database once the delete returns, the
 // write-ahead log included, while a kept session's answer still is.
-func TestTheWriteAheadLogEraseCoversVoiceTasks(t *testing.T) {
+func TestWALEraseCoversVoiceTasks(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "voice.db")
 	store, err := NewSQLiteStore(path)
 	if err != nil {
@@ -242,4 +243,71 @@ func TestTheWriteAheadLogEraseCoversVoiceTasks(t *testing.T) {
 		t.Fatalf("DeleteSession: %v", err)
 	}
 	assertDatabaseFilesLack(t, path, secret, kept)
+}
+
+// TestSegmentDeleteLeavesNoVoiceText (c-record): the voice keeps no words of
+// the room, so once a segment is deleted no table holds its words; the
+// session's question keeps only the agent's written answer.
+func TestSegmentDeleteLeavesNoVoiceText(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	segmentTestSession(t, store, "s")
+	revision, segments := publishRefinedSegmentTestSession(t, store, "s", "recording.mp3", "b")
+	askVoiceTask(t, store, "task", "s", "the agent's written answer")
+	span := DeletedSpan{AudioPath: "recording.mp3", Start: 2, End: 4, SHA256Before: "b", SHA256After: "a"}
+	if err := store.DeleteRefinedSegmentAudio("s", segments[1].ID, revision, &span); err != nil {
+		t.Fatalf("DeleteRefinedSegmentAudio: %v", err)
+	}
+	tables, err := store.DB().Query(`SELECT name FROM sqlite_master WHERE type = 'table'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	_ = tables.Close()
+	sawAnswer := false
+	for _, table := range names {
+		rows, err := store.DB().Query(`SELECT * FROM "` + table + `"`)
+		if err != nil {
+			t.Fatalf("read %s: %v", table, err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				t.Fatal(err)
+			}
+			for i, value := range values {
+				text := ""
+				switch v := value.(type) {
+				case string:
+					text = v
+				case []byte:
+					text = string(v)
+				}
+				if strings.Contains(text, "private deletion token") {
+					t.Errorf("%s.%s holds the deleted segment's words", table, columns[i])
+				}
+				if table == "voice_tasks" && strings.Contains(text, "the agent's written answer") {
+					sawAnswer = columns[i] == "answer_written"
+				}
+			}
+		}
+		_ = rows.Close()
+	}
+	if !sawAnswer {
+		t.Error("control: the question's written answer is not in voice_tasks.answer_written")
+	}
 }
