@@ -469,6 +469,8 @@ type fakeConcierge struct {
 	// when it is set.
 	acks      []string
 	afterAcks chan struct{}
+	// ackMode, when set, is the mode the acks are said in (Ack else).
+	ackMode SayMode
 	// toolsUnreachable makes every tool answer as with Dispatch out of reach.
 	toolsUnreachable bool
 }
@@ -500,7 +502,11 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 	c.mu.Unlock()
 	c.asked <- turn
 	for _, a := range c.acks {
-		if err := say(ctx, a, Ack); err != nil {
+		mode := Ack
+		if c.ackMode != 0 {
+			mode = c.ackMode
+		}
+		if err := say(ctx, a, mode); err != nil {
 			return err
 		}
 	}

@@ -88,6 +88,9 @@ const (
 	Ack    SayMode = iota + 1 // an acknowledgement or a routing line
 	Fact                      // a fact from the record
 	Answer                    // a holder's answer
+	// Lead names the issue a search chose (R5, "I took KEY."): it leads the
+	// answer and is never dropped, and it holds no fact to time.
+	Lead
 )
 
 func (m SayMode) String() string {
@@ -98,6 +101,8 @@ func (m SayMode) String() string {
 		return "fact"
 	case Answer:
 		return "answer"
+	case Lead:
+		return "lead"
 	default:
 		return "unknown"
 	}

@@ -284,18 +284,22 @@ func TestAFollowUpGetsItsWholeTurn(t *testing.T) {
 func TestARoutingLineDoesNotHoldTheAnswerTool(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
+		ack   string
+		mode  SayMode
 		delay time.Duration // before the Concierge's fact
 		want  string
 	}{
-		{"a fact ready within the bound", 0, "The issue is in review."},
-		{"a fact later than the bound", 1500 * time.Millisecond, "Reading ABC-12. The issue is in review."},
+		{"a fact ready within the bound", "Reading ABC-12.", Ack, 0, "The issue is in review."},
+		{"a fact later than the bound", "Reading ABC-12.", Ack, 1500 * time.Millisecond, "Reading ABC-12. The issue is in review."},
+		// R5's line naming the issue a search chose always leads (Main).
+		{"R5's line, a fact within the bound", "I took ABC-12.", Lead, 0, "I took ABC-12. The issue is in review."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bound := leadLineDropWithin
 			leadLineDropWithin = time.Second // above leadLineWait, the routing line's 0.5 s to start
 			t.Cleanup(func() { leadLineDropWithin = bound })
 			c := newFakeConcierge("The issue is in review.")
-			c.acks = []string{"Reading ABC-12."}
+			c.acks, c.ackMode = []string{tc.ack}, tc.mode
 			c.afterAcks = make(chan struct{})
 			release := make(chan struct{})
 			t.Cleanup(func() { close(release) })
@@ -320,8 +324,33 @@ func TestARoutingLineDoesNotHoldTheAnswerTool(t *testing.T) {
 			case <-time.After(4 * time.Second):
 				t.Fatal("the answer tool waited on the routing line's Say")
 			}
-			never(t, "the held routing line spoken as well", 200*time.Millisecond, func() bool { return slices.Contains(sess.saysCopy(), "Reading ABC-12.") })
+			never(t, "the held lead line spoken as well", 200*time.Millisecond, func() bool { return slices.Contains(sess.saysCopy(), tc.ack) })
 		})
+	}
+}
+
+// TestTheLeadLineIsSpokenAtOnce fails if R5's line naming the issue a search
+// chose waits for the answer tool's result instead of being spoken at once,
+// as the routing line is, or is spoken twice.
+func TestTheLeadLineIsSpokenAtOnce(t *testing.T) {
+	c := newFakeConcierge("The issue is in review.")
+	c.acks, c.ackMode = []string{"I took ABC-12."}, Lead
+	c.afterAcks = make(chan struct{})
+	r := newDrivingRigWith(t, time.Minute, c)
+	r.heard("Wispr, what is happening with the voice work?", true, true)
+	sess := r.waitSession()
+	result := make(chan json.RawMessage, 1)
+	go func() {
+		out, _ := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
+		result <- out
+	}()
+	if got := waitSaid(t, sess); got != "I took ABC-12." {
+		t.Fatalf("said %q at once, want R5's line", got)
+	}
+	close(c.afterAcks)
+	var res AnswerResult
+	if err := json.Unmarshal(<-result, &res); err != nil || res.Say != "The issue is in review." {
+		t.Fatalf("the answer tool returned %+v (%v), want the fact alone", res, err)
 	}
 }
 
@@ -348,7 +377,7 @@ type heldAckSession struct {
 }
 
 func (p heldAckSession) Say(ctx context.Context, text string, mode SayMode) error {
-	if mode == Ack {
+	if mode == Ack || mode == Lead {
 		select {
 		case <-p.release:
 		case <-ctx.Done():
