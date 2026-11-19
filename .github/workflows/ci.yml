@@ -19,11 +19,44 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The Ubuntu mirror a runner gets can be slow: twice the 71.5 MB of archives below took
+      # longer than the install's 10 minutes, at about 100 kB/s. The packages apt downloads are
+      # cached per runner image, and a new image starts from the last image's, so a run
+      # downloads only what the archive changed since.
+      - name: Read the runner image
+        id: image
+        run: |
+          echo "os=$ImageOS" >>"$GITHUB_OUTPUT"
+          echo "version=$ImageVersion" >>"$GITHUB_OUTPUT"
+
+      - name: Restore the apt package cache
+        id: apt-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: apt-${{ steps.image.outputs.os }}-${{ steps.image.outputs.version }}-ffmpeg-portaudio19-dev-pulseaudio
+          restore-keys: apt-${{ steps.image.outputs.os }}-
+
       - name: Install system dependencies
         timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg portaudio19-dev pulseaudio
+          archives="$HOME/apt-archives"
+          mkdir -p "$archives/partial"
+          apt_get=(sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives="$archives")
+          "${apt_get[@]}" update
+          "${apt_get[@]}" install -y --no-install-recommends ffmpeg portaudio19-dev pulseaudio
+          # Keep only packages the archive still has, so the cache does not grow.
+          "${apt_get[@]}" autoclean
+          sudo chown -R "$(id -u):$(id -g)" "$archives"
+          echo "$(find "$archives" -maxdepth 1 -name '*.deb' | wc -l) packages in the apt cache"
+
+      # Saved before the tests, so a run whose tests fail still keeps the packages.
+      - name: Save the apt package cache
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
 
       # PortAudio's PulseAudio host API fails to initialize without a sound server, and then
       # internal/audio's mic reopen test fails before it reaches the open failure it checks.
