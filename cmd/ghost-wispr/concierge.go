@@ -15,10 +15,6 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
-// envoyRetryEvery is how often the unit tries again to open its Envoy session
-// while it cannot: reach can come back without a restart.
-const envoyRetryEvery = time.Minute
-
 // startConcierge builds the voice's Concierge: its Gemini model client on the
 // unit's genai settings, Dispatch's record with the unit's own token, and,
 // in the background, the unit's Envoy session for asking an issue's agent. With
@@ -73,12 +69,13 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 	if err != nil {
 		return nil, nil, fmt.Errorf("concierge: the Envoy session's state: %w", err)
 	}
-	sessions := make(chan *envoy.Session, 1)
+	sessions := make(chan envoySession, 1)
 	sessionCtx, cancel := context.WithCancel(ctx)
 	go func() {
 		defer close(sessions)
+		wait := envoyRetryFirst
 		for {
-			session, err := envoy.OpenSession(sessionCtx, listener, &envoy.SessionConfig{
+			session, err := openEnvoySession(sessionCtx, listener, &envoy.SessionConfig{
 				SessionID:     state.SessionID,
 				Resume:        state.Resume,
 				SaveResume:    state.SaveResume,
@@ -96,12 +93,13 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 				sessions <- session
 				return
 			}
-			logger.Warn("concierge: the Envoy session did not open; trying again", "error", err, "retry_in", envoyRetryEvery)
+			logger.Warn("concierge: the Envoy session did not open; trying again", "error", err, "retry_in", wait)
 			select {
 			case <-sessionCtx.Done():
 				return
-			case <-time.After(envoyRetryEvery):
+			case <-time.After(wait):
 			}
+			wait = nextEnvoyRetry(wait)
 		}
 	}()
 	stop := func() {
@@ -115,6 +113,35 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 		}
 	}
 	return c, stop, nil
+}
+
+// envoySession is the unit's Envoy session as the Concierge uses it.
+type envoySession interface {
+	concierge.Agents
+	Close(ctx context.Context) error
+}
+
+// openEnvoySession opens the unit's Envoy session; a test replaces it.
+var openEnvoySession = func(ctx context.Context, listener *envoy.Listener, cfg *envoy.SessionConfig) (envoySession, error) {
+	session, err := envoy.OpenSession(ctx, listener, cfg)
+	if err != nil {
+		return nil, err // never a nil *Session in the interface
+	}
+	return session, nil
+}
+
+// envoyRetryFirst is the first wait before the Envoy session is opened again;
+// each wait doubles, up to envoyRetryMax, for as long as the unit runs: reach
+// can come back without a restart. Until the session opens, the Concierge says
+// it cannot reach the agents yet.
+var envoyRetryFirst = time.Second
+
+// envoyRetryMax caps the wait between attempts.
+const envoyRetryMax = time.Minute
+
+// nextEnvoyRetry is the wait after wait.
+func nextEnvoyRetry(wait time.Duration) time.Duration {
+	return min(2*wait, envoyRetryMax)
 }
 
 // conciergeSessions is what the Concierge does when a session ends or is
