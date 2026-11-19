@@ -130,6 +130,52 @@ if result=$(on_pi deepgram_bytes_sent 192.0.2.10:40000 216.200.21.203:443); then
   fail "deepgram_bytes_sent read $result from a socket the Pi does not hold"
 fi
 
+# The Light hang step stops the recorder only while it holds the blink(1)'s lock, the flock that every
+# ghost-wispr command to the light holds across its exchange. A recorder stopped inside a command would
+# keep the lock, and each light-state after it would print unknown. The driver's stop command runs
+# against a fake Pi whose blink(1) is its second hidraw device; the first is another HID device.
+eval "$(function_source light_locked_stop_command)"
+sysfs=$state_dir/sys
+dev=$state_dir/dev
+mkdir -p "$sysfs/class/hidraw/hidraw0/device" "$sysfs/class/hidraw/hidraw1/device" "$dev"
+printf 'HID_ID=0003:0000046D:0000C52B\n' >"$sysfs/class/hidraw/hidraw0/device/uevent"
+printf 'HID_ID=0003:000027B8:000001ED\n' >"$sysfs/class/hidraw/hidraw1/device/uevent"
+: >"$dev/hidraw0"
+: >"$dev/hidraw1"
+sleep 60 &
+recorder=$!
+trap 'kill -CONT "$recorder" 2>/dev/null; kill "$recorder" 2>/dev/null; rm -rf -- "$state_dir"' EXIT
+stopped() {
+  local state
+  for _ in {1..100}; do
+    state=$(ps -o stat= -p "$recorder" | tr -d ' ')
+    [[ $state == T* ]] && return
+    sleep 0.01
+  done
+  return 1
+}
+# The recorder is inside a command to the light, so it holds the light's lock.
+exec {light_lock}<"$dev/hidraw1"
+flock "$light_lock"
+bash -c "$(light_locked_stop_command "$recorder" "$sysfs" "$dev")" &
+stopper=$!
+sleep 0.5
+! stopped || fail "the Light hang step stopped the recorder while it held the blink(1)'s lock"
+# The other HID device's lock is not the light's: hold it, and let the light go.
+exec {other_lock}<"$dev/hidraw0"
+flock "$other_lock"
+flock -u "$light_lock"
+wait "$stopper" || fail "the Light hang step's stop failed once the blink(1) was free"
+stopped || fail "the Light hang step did not stop the recorder once the blink(1) was free"
+kill -CONT "$recorder"
+exec {light_lock}<&- {other_lock}<&-
+# With no blink(1), the stop fails and stops nothing.
+rm -- "$sysfs/class/hidraw/hidraw1/device/uevent"
+if bash -c "$(light_locked_stop_command "$recorder" "$sysfs" "$dev")"; then
+  fail "the Light hang step's stop succeeded with no blink(1)"
+fi
+! stopped || fail "the Light hang step stopped the recorder with no blink(1)"
+
 bash "$driver" --self-test >/dev/null 2>&1 || fail "accept-slice1.sh --self-test failed: $(bash "$driver" --self-test 2>&1)"
 
 printf 'slice 1 acceptance test passed\n'

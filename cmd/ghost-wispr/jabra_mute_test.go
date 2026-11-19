@@ -149,7 +149,7 @@ func newJabraRig(paused bool) *jabraRig {
 	if paused {
 		capture.Pause()
 	}
-	controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture.RequestResume, nil)
+	controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture, nil)
 	return &jabraRig{
 		capture:    capture,
 		device:     newCaptureDevice(capture.IsPaused),
@@ -191,6 +191,17 @@ func (r *jabraRig) attached() bool {
 // plugged in.
 func (r *jabraRig) start(t *testing.T) {
 	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := r.run(ctx)
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+// run runs the Jabra mute button against fakes until ctx ends, as start does.
+// The returned channel closes once the button's run has returned.
+func (r *jabraRig) run(ctx context.Context) <-chan struct{} {
 	button := newJabraMuteButton(r.capture, r.device, r.controls, r.warnings)
 	button.connect = func() (io.ReadWriteCloser, error) {
 		if r.connectErr != nil {
@@ -204,16 +215,12 @@ func (r *jabraRig) start(t *testing.T) {
 		}
 	}
 	button.retryEvery, button.checkEvery = time.Millisecond, r.checkEvery
-	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		button.run(ctx)
 	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
+	return done
 }
 
 func startJabraRig(t *testing.T, paused bool) *jabraRig {
@@ -279,6 +286,57 @@ func TestJabraLostDeviceEndsItsReader(t *testing.T) {
 	device.mu.Unlock()
 	close(release)
 	waitForHardware(t, "the button to report the lost Jabra", func() bool { return strings.Contains(rig.warning(), "Jabra mute button not found") })
+}
+
+// TestTheJabraButtonEndsOnlyOnceItsPressesHave fails if the Jabra button's run
+// returns while a press's resume, which runs in the background, still runs:
+// nothing would then wait for it or for the light written after it, as
+// runPowerButton waits for its own (review 5967147417 of #79).
+func TestTheJabraButtonEndsOnlyOnceItsPressesHave(t *testing.T) {
+	rig := newJabraRig(true)
+	rig.checkEvery = time.Hour
+	resuming, release := make(chan struct{}), make(chan struct{})
+	resume := rig.controls.Resume
+	rig.controls.Resume = func() error {
+		close(resuming)
+		<-release
+		return resume()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := rig.run(ctx)
+	released := false
+	t.Cleanup(func() {
+		cancel()
+		if !released {
+			close(release)
+		}
+		<-done
+	})
+	device := rig.plugIn()
+	waitForHardware(t, "the Jabra to connect", func() bool { return device.reportsSent() > 0 })
+
+	device.press(t)
+	select {
+	case <-resuming:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the press started no resume within 5s")
+	}
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("the Jabra button's run returned while its press's resume still ran")
+	case <-time.After(200 * time.Millisecond):
+	}
+	released = true
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Jabra button's run did not return within 5s of its press's resume")
+	}
+	if rig.capture.IsPaused() {
+		t.Fatal("the press's resume left capture paused")
+	}
 }
 
 // TestJabraLightFollowsEveryPauseSource fails if a pause or resume from the
@@ -503,7 +561,9 @@ func TestJabraOwnReportReadLateStaysCovered(t *testing.T) {
 // store the status change, and only then does press ask for the light again,
 // which can come after the microphone opened. statusWrite stands for that
 // SQLite write, and beforeGateOpen's 5 ms for the blink(1)'s red confirmation.
-// The control has a status write quicker than the red confirmation.
+// The control has a status write quicker than the red confirmation. A press
+// that resumes returns before its resume ends (buttonToggle), so the tap's
+// resume is waited for.
 func TestAResumeTapCostsNoReopen(t *testing.T) {
 	for _, statusWrite := range []time.Duration{0, 30 * time.Millisecond} {
 		name := "control, the status write is quicker than the red confirmation"
@@ -519,7 +579,7 @@ func TestAResumeTapCostsNoReopen(t *testing.T) {
 			var ring atomic.Bool
 			detach := device.attach(func(on bool) error { ring.Store(on); return nil })
 			t.Cleanup(detach)
-			controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture.RequestResume, func(bool) { time.Sleep(statusWrite) })
+			controls := newPersistentControls(&pauseStoreFake{}, capture.Pause, capture, func(bool) { time.Sleep(statusWrite) })
 			button := newJabraMuteButton(capture, device, &server.ControlHooks{Pause: controls.Pause, Resume: controls.Resume}, newWarningsRegistry())
 			mic := newScriptedMic()
 			recording := &ringCheckingRecording{ring: &ring}
@@ -528,9 +588,7 @@ func TestAResumeTapCostsNoReopen(t *testing.T) {
 			time.Sleep(2 * jabraOwnMuteWindow) // the tap is a person's, outside every operation's cover
 
 			button.press(jabra.MonotonicNow())
-			if capture.IsPaused() {
-				t.Fatal("control: the tap did not resume the unit")
-			}
+			waitForHardware(t, "the tap to resume the unit", func() bool { return !capture.IsPaused() })
 			mic.expectEvents(t, "open", "stream")
 			if ring.Load() {
 				t.Fatal("control: the microphone opened with the ring showing Muted")

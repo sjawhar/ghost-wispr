@@ -15,6 +15,64 @@ var ErrNoBlink1 = errors.New("blink(1) indicator not found")
 // ErrNotRed reports a light that does not read back red after a red write.
 var ErrNotRed = errors.New("recording light does not read back red")
 
+// ErrBusy reports a blink(1) command that could not get the light: another
+// open of its node, in this process or another, held the node's lock past the
+// wait. A command never gets it for its own handle's other commands, which it
+// waits for. The command sent nothing. A read that returns it has no colour:
+// the light's colour is unknown, which counts as not red.
+var ErrBusy = errors.New("blink(1) busy with another command")
+
+// ErrOtherReply reports a query whose reply belongs to another command: byte
+// 1 of a blink(1)'s reply names the command it answers, and another program's
+// command reached the device between the query's SET and its GET. The reply
+// says nothing about this query, so a read that returns it has no colour,
+// which counts as not red.
+var ErrOtherReply = errors.New("blink(1) reply is another command's")
+
+// Contended reports an error that says another command had the blink(1), not
+// that the light failed: ErrBusy or ErrOtherReply. A read that returns it has
+// no colour, which counts as not red.
+func Contended(err error) bool {
+	return errors.Is(err, ErrBusy) || errors.Is(err, ErrOtherReply)
+}
+
+// KnownBlack reports whether light can tell, without sending a command, that
+// its unit's stored pattern is black: this process checked that unit, by its
+// serial number, and opened it again, as after a device error. Its watchdog
+// may then be armed at once. A light that cannot tell needs BlackPattern.
+func KnownBlack(light Light) bool {
+	known, ok := light.(interface{ PatternKnownBlack() bool })
+	return ok && known.PatternKnownBlack()
+}
+
+// PatternCheck is a light's black pattern check run one command per Step, as
+// BlackPattern runs it at once, so a caller can send its other commands to
+// the light between two steps.
+type PatternCheck interface {
+	// Step sends the check's next command. done reports that the light's
+	// stored pattern is black: it was, or it is now written so.
+	Step() (done bool, err error)
+}
+
+// NewPatternCheck returns light's stepwise black pattern check. A light that
+// has none gets a check whose one step is BlackPattern.
+func NewPatternCheck(light Light) PatternCheck {
+	if stepwise, ok := light.(interface{ PatternCheck() PatternCheck }); ok {
+		return stepwise.PatternCheck()
+	}
+	return wholePatternCheck{light}
+}
+
+// wholePatternCheck is the one-step check of a light with no stepwise one.
+type wholePatternCheck struct{ light Light }
+
+func (c wholePatternCheck) Step() (bool, error) {
+	if err := c.light.BlackPattern(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Blink1Report builds an eight-byte blink(1) feature report.
 func Blink1Report(command byte, args [6]byte) [8]byte {
 	return [8]byte{0x01, command, args[0], args[1], args[2], args[3], args[4], args[5]}
@@ -113,9 +171,15 @@ func (c *Controller) update() {
 // or written, or, while recording, does not read back red after a red write:
 // the recorder then may not capture. An off write that does not read back
 // off is not a failure, since a red confirmation can hold the light red.
+// While nothing records, a light it cannot read is written off anyway, as
+// when another open holds the blink(1)'s lock: a pause turns the light off
+// without waiting for the read to get through.
 func (c *Controller) apply(wantRed uint8) error {
 	red, green, blue, err := c.light.ReadRGB()
 	if err != nil {
+		if wantRed == 0 {
+			_ = c.light.SetRGB(0, 0, 0)
+		}
 		return err
 	}
 	if red == wantRed && green == 0 && blue == 0 {
