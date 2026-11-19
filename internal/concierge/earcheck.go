@@ -58,10 +58,16 @@ func earCheck(text, source, questionKey string) string {
 			return "a pull request number the source does not hold"
 		}
 	}
+	// A figure is compared without a percent sign, which the ear says as a
+	// word: "4.5%" is held by "4.5 percent".
+	figure := func(token string) string { return strings.TrimSuffix(token, "%") }
 	sourceTokens := earTokens(allowed)
-	known := set(sourceTokens)
+	known := make(map[string]bool, len(sourceTokens))
+	for _, token := range sourceTokens {
+		known[figure(token)] = true
+	}
 	held := func(token string) bool {
-		if known[token] {
+		if known[figure(token)] {
 			return true
 		}
 		if len(token) == cutIdentifierSize {

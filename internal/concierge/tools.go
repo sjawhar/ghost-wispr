@@ -113,11 +113,24 @@ func ToolSpecs() []ToolSpec {
 type runner struct {
 	c *Concierge
 	x *voice.Exchange
+	// newest is, per issue read_issue read, its newest event's time.
+	newest map[string]time.Time
 }
 
 // Tools gives x's tools, for x.Tools.
 func (c *Concierge) Tools(x *voice.Exchange) voice.ToolRunner {
 	return &runner{c: c, x: x}
+}
+
+// IssueHolder answers exactly what the issue_holder tool answers for key, for
+// a caller with no exchange, such as the acceptance driver. The session it
+// names is made askable for no exchange.
+func (c *Concierge) IssueHolder(ctx context.Context, key string) (json.RawMessage, error) {
+	raw, err := json.Marshal(map[string]string{"key": key})
+	if err != nil {
+		return nil, err
+	}
+	return (&runner{c: c, x: &voice.Exchange{}}).Run(ctx, voice.ToolCall{Name: "issue_holder", Args: raw})
 }
 
 // Run runs one tool. A tool that fails answers {"error": "..."}, which a
@@ -240,15 +253,45 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 		return nil, err
 	}
 	issues := []map[string]any{}
-	seen := map[string]bool{}
+	best := map[string]float64{}
 	for _, hit := range hits {
-		if hit.IssueKey == "" || seen[hit.IssueKey] || len(issues) == 5 {
+		if hit.IssueKey == "" {
 			continue
 		}
-		seen[hit.IssueKey] = true
-		issues = append(issues, map[string]any{"key": hit.IssueKey, "title": hit.Title, "status": hit.Status, "match": hit.Snippet})
+		if score, seen := best[hit.IssueKey]; seen {
+			best[hit.IssueKey] = max(score, hit.Score)
+			continue
+		}
+		best[hit.IssueKey] = hit.Score
+		if len(issues) < 5 {
+			issues = append(issues, map[string]any{"key": hit.IssueKey, "title": hit.Title, "status": hit.Status, "match": hit.Snippet})
+		}
 	}
-	return map[string]any{"issues": issues}, nil
+	scores := make([]float64, 0, len(issues))
+	for _, issue := range issues {
+		issue["score"] = best[issue["key"].(string)]
+		scores = append(scores, best[issue["key"].(string)])
+	}
+	return map[string]any{"issues": issues, "clear_match": clearMatch(scores)}, nil
+}
+
+// clearMatchRatio is how far the best issue's score must lead the second's
+// for a search to have one clear match (R5).
+const clearMatchRatio = 1.5
+
+// clearMatch reports whether the first of scores, the best issue's, is at
+// least clearMatchRatio times every other's. One issue is a clear match; none
+// is not.
+func clearMatch(scores []float64) bool {
+	if len(scores) == 0 {
+		return false
+	}
+	for _, score := range scores[1:] {
+		if scores[0] < clearMatchRatio*score {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, error) {
@@ -284,14 +327,22 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 		return nil, err
 	}
 	recent := make([]map[string]any, 0, len(events))
+	var newest time.Time
 	for i := range events {
 		event := &events[i]
+		if event.CreatedAt.After(newest) {
+			newest = event.CreatedAt
+		}
 		entry := map[string]any{"type": event.Type, "when": ago(now, event.CreatedAt), "by": spokenName(event.Actor.Title())}
 		if text := eventText(event.Payload); text != "" {
 			entry["text"] = cut(text, eventTextChars)
 		}
 		recent = append(recent, entry)
 	}
+	if r.newest == nil {
+		r.newest = map[string]time.Time{}
+	}
+	r.newest[issue.Key] = newest
 	result["recent_events"] = recent
 	return result, nil
 }
@@ -443,16 +494,18 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		return nil, tell("That agent's session has ended, so it cannot be asked.")
 	}
 
-	asker := [2]string{r.x.SessionID, session}
+	// A new question to the same holder in the same exchange replaces the
+	// older one (R7).
+	asker := [2]string{exchangeKey(r.x), session}
 	r.c.mu.Lock()
 	supersedes := r.c.lastAsk[asker]
 	r.c.mu.Unlock()
-	previousID := ""
+	var previous *storage.VoiceTask
 	if supersedes != "" {
-		if previous, err := r.c.task(supersedes); err != nil || previous.State != storage.VoiceTaskWorking {
+		if task, err := r.c.task(supersedes); err != nil || task.State != storage.VoiceTaskWorking {
 			supersedes = ""
 		} else {
-			previousID = previous.ID
+			previous = &task
 		}
 	}
 
@@ -490,7 +543,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	sent, err := agents.Send(sendCtx, &envoy.SendRequest{
 		Target:         session,
 		Message:        r.c.askMessage(r.x, now, question, issueKey),
-		IdempotencyKey: localID,
+		IdempotencyKey: r.c.askKey(r.x, session, question),
 		Supersedes:     supersedes,
 	})
 	cancel()
@@ -517,9 +570,14 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		delete(r.c.sessionOf, localID)
 		r.c.mu.Unlock()
 	}
-	if previousID != "" {
-		if _, err := r.c.store.EndVoiceTask(previousID, storage.VoiceTaskReplaced); err != nil {
-			r.c.logger.Warn("concierge could not mark a task replaced", "task", previousID, "error", err)
+	if previous != nil {
+		replaced, err := r.c.store.EndVoiceTask(previous.ID, storage.VoiceTaskReplaced)
+		if err != nil {
+			r.c.logger.Warn("concierge could not mark a task replaced", "task", previous.ID, "error", err)
+		}
+		if replaced {
+			r.c.forget(session, previous.ID)
+			r.c.tellHolderEnded(ctx, previous, session, "a newer question replaces it")
 		}
 	}
 	r.c.mu.Lock()
@@ -561,6 +619,13 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		result["note"] = "Asked, but the agent is not answering now; its answer may take a while."
 	}
 	return result, nil
+}
+
+// askKey is the idempotency key of question to agent session in exchange x:
+// the same question resent in the same exchange, after a send that failed or
+// timed out, is one message to the agent.
+func (c *Concierge) askKey(x *voice.Exchange, session, question string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("ghost-wispr ask "+exchangeKey(x)+" "+session+" "+question)).String()
 }
 
 // askMessage is the question as the agent reads it: who sends it, that it is
@@ -648,6 +713,9 @@ func exchangeKey(x *voice.Exchange) string {
 // remember makes session askable in x: issue_holder or list_joined_agents
 // named it there.
 func (c *Concierge) remember(x *voice.Exchange, session string) {
+	if x.SessionID == "" {
+		return
+	}
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()

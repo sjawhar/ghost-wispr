@@ -95,6 +95,8 @@ type SearchHit struct {
 	Status   string `json:"status,omitempty"`
 	Document string `json:"document,omitempty"`
 	Snippet  string `json:"snippet,omitempty"`
+	// Score is Dispatch's rank of the result, higher for a better match.
+	Score float64 `json:"score,omitempty"`
 }
 
 // Projects lists Dispatch's project keys.
@@ -133,7 +135,8 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchH
 			Artifact *struct {
 				Slug string `json:"slug"`
 			} `json:"artifact"`
-			Snippet string `json:"snippet"`
+			Snippet string  `json:"snippet"`
+			Rank    float64 `json:"rank"`
 		} `json:"results"`
 	}
 	if err := c.get(ctx, "search", "/api/v1/search", params, &answer); err != nil {
@@ -141,7 +144,7 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchH
 	}
 	hits := make([]SearchHit, 0, len(answer.Results))
 	for _, result := range answer.Results {
-		hit := SearchHit{Kind: result.Kind, Snippet: markTags.Replace(result.Snippet)}
+		hit := SearchHit{Kind: result.Kind, Snippet: markTags.Replace(result.Snippet), Score: result.Rank}
 		if result.Issue != nil {
 			hit.IssueKey, hit.Title, hit.Status = result.Issue.Key, result.Issue.Title, result.Issue.Status
 		}

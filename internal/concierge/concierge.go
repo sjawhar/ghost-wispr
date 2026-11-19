@@ -132,8 +132,9 @@ type Concierge struct {
 
 	mu     sync.Mutex
 	agents Agents
-	// lastAsk is the newest task each meeting sent each agent, by meeting
-	// and agent session, so a second question replaces the first.
+	// lastAsk is the newest task each exchange sent each agent, by exchange
+	// (exchangeKey) and agent session, so a second question replaces the
+	// first (R7).
 	lastAsk map[[2]string]string
 	// working lists the unanswered tasks sent to each agent session, so a
 	// message from it that names no question can be met with a request to
@@ -172,6 +173,10 @@ type Concierge struct {
 	projects     map[string]bool
 	projectsRead time.Time
 	projectsBusy bool
+	// fastBound and routingAfter are fastAnswerBound and routingAfter; a
+	// test shortens them.
+	fastBound    time.Duration
+	routingAfter time.Duration
 }
 
 // closure is a meeting's end or delete.
@@ -191,27 +196,29 @@ func New(cfg *Config) (*Concierge, error) {
 		return nil, errors.New("concierge: no store")
 	}
 	c := &Concierge{
-		model:      cfg.Model,
-		generator:  cfg.Generator,
-		records:    cfg.Records,
-		store:      cfg.Store,
-		publicURL:  cfg.PublicURL,
-		joined:     cfg.Joined,
-		changed:    cfg.Changed,
-		now:        cfg.Now,
-		logger:     cfg.Logger,
-		answers:    make(chan voice.PendingAnswer),
-		lastAsk:    map[[2]string]string{},
-		working:    map[string][]string{},
-		askedAgain: map[string]string{},
-		againFor:   map[string]string{},
-		sentAs:     map[string]string{},
-		inflight:   map[string]int{},
-		named:      map[string]*named{},
-		queued:     make(chan struct{}, 1),
-		prefetches: map[string]*prefetch{},
-		sessionOf:  map[string]string{},
-		closed:     map[string]closure{},
+		model:        cfg.Model,
+		generator:    cfg.Generator,
+		records:      cfg.Records,
+		store:        cfg.Store,
+		publicURL:    cfg.PublicURL,
+		joined:       cfg.Joined,
+		changed:      cfg.Changed,
+		now:          cfg.Now,
+		logger:       cfg.Logger,
+		answers:      make(chan voice.PendingAnswer),
+		lastAsk:      map[[2]string]string{},
+		working:      map[string][]string{},
+		askedAgain:   map[string]string{},
+		againFor:     map[string]string{},
+		sentAs:       map[string]string{},
+		inflight:     map[string]int{},
+		named:        map[string]*named{},
+		queued:       make(chan struct{}, 1),
+		prefetches:   map[string]*prefetch{},
+		sessionOf:    map[string]string{},
+		closed:       map[string]closure{},
+		fastBound:    fastAnswerBound,
+		routingAfter: routingAfter,
 	}
 	if c.model == "" {
 		c.model = DefaultModel
@@ -357,12 +364,12 @@ func (c *Concierge) withdrawLocked(sessionID string) chan struct{} {
 // to reply again to their tasks; after an end they stay, so a late reply
 // still lands in the ledger. c.mu is held.
 func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
+	prefix := sessionID + "|"
 	for key := range c.lastAsk {
-		if key[0] == sessionID {
+		if strings.HasPrefix(key[0], prefix) {
 			delete(c.lastAsk, key)
 		}
 	}
-	prefix := sessionID + "|"
 	for key := range c.named {
 		if strings.HasPrefix(key, prefix) {
 			delete(c.named, key)

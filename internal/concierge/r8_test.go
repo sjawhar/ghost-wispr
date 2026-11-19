@@ -52,6 +52,8 @@ func TestEarCheck(t *testing.T) {
 		{"a cut 40-character identifier", "Trace 0123456 holds it.", "", false},
 		{"a capitalised first word the source does not hold", "Indeed, the tap merged.", "", false},
 		{"a percentage", "Only 4.5% of tests ran.", "", false},
+		{"a percentage said in words", "Only 4.5 percent of tests ran.", "", false},
+		{"a changed percentage", "Only 4.6 percent of tests ran.", "", true},
 		{"the question's key", "ABC-12: the tap merged.", "ABC-12", false},
 		{"a changed key", "ABC-13 is next.", "", true},
 		{"an invented key", "INFRA-4592 is resolved.", "", true},
@@ -122,6 +124,10 @@ func TestTwoFailedRewritesSpeakTheFixedSentence(t *testing.T) {
 	}
 	if spoken := r.concierge.forEar(context.Background(), "PR #80 merged.", ""); spoken != fixedSentence {
 		t.Fatalf("spoken = %q, want the fixed sentence", spoken)
+	}
+	r.model.turns = append(r.model.turns, []*genai.GenerateContentResponse{chunk(text("PR 81 merged it."))}, []*genai.GenerateContentResponse{chunk(text("PR 81 merged it."))})
+	if spoken := r.concierge.forEar(context.Background(), "PR #80 merged.", "ABC-12"); spoken != "ABC-12: "+fixedSentence {
+		t.Fatalf("spoken = %q, want the fixed sentence with the question's key (R8)", spoken)
 	}
 	if !strings.Contains(logs.String(), "fixed sentence") || strings.Contains(logs.String(), "Alex") || strings.Contains(logs.String(), "merged") {
 		t.Errorf("the log = %q, want the fall-back and its reason, no words", logs)
