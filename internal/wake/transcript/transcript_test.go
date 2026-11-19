@@ -142,6 +142,8 @@ func TestIssueKeyForms(t *testing.T) {
 		"infra four five nine two":                           {"INFRA-4592"},
 		"in for forty five ninety two please":                {"INFRA-4592"},
 		"I am in for a minute":                               nil,
+		// End-to-end run 8e: smart formatting writes "4,592".
+		"ask the agent on in For 4,592 when": {"INFRA-4592"},
 	}
 	for text, want := range cases {
 		if got := IssueKeys(text); !slices.Equal(got, want) {

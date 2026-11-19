@@ -864,12 +864,7 @@ func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
 // turnLocked adds words of the asker's turn, and hands the turn to the
 // Concierge once Deepgram marks it final.
 func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
-	// A key of Dispatch's projects said in a spoken form ("in for forty five
-	// ninety two") is written as the key, which the Concierge reads (R4).
 	words = strings.TrimSpace(words)
-	if s.cfg.ProjectKeys != nil {
-		words = transcript.WriteKeys(words, s.cfg.ProjectKeys())
-	}
 	if t.IsFinal {
 		if words != "" {
 			ex.turn = append(ex.turn, words)
@@ -907,8 +902,15 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	ex.timer = time.AfterFunc(s.cfg.TurnWait, func() { s.turnWaited(ex) })
 }
 
+// turnOf is the asker's turn so far. A key of Dispatch's projects said in a
+// spoken form ("in for forty five ninety two"), whose words may come in two
+// results, is written as the key, which the Concierge reads (R4).
 func (s *Supervisor) turnOf(ex *exchange) string {
-	return strings.TrimSpace(strings.Join(append(ex.turn[:len(ex.turn):len(ex.turn)], ex.interim), " "))
+	turn := strings.TrimSpace(strings.Join(append(ex.turn[:len(ex.turn):len(ex.turn)], ex.interim), " "))
+	if s.cfg.ProjectKeys != nil {
+		turn = transcript.WriteKeys(turn, s.cfg.ProjectKeys())
+	}
+	return turn
 }
 
 // isQuestion reports whether Deepgram punctuated turn as a question.

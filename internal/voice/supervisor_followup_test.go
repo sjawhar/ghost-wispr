@@ -182,6 +182,22 @@ func TestASpokenKeyReachesTheConciergeWritten(t *testing.T) {
 	}
 }
 
+// TestASpokenKeySplitAcrossResultsReachesTheConciergeWritten fails if a key
+// whose words came in two of Deepgram's results ("…agent on in" then "For
+// 4,592 when…", end-to-end run 8e) is not written as the key in the turn.
+func TestASpokenKeySplitAcrossResultsReachesTheConciergeWritten(t *testing.T) {
+	c := newFakeConcierge("The voice issue is in review.")
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) {
+		cfg.ProjectKeys = func() []string { return []string{"INFRA"} }
+	})
+	r.heard("Wispr, please ask the agent on in", true, false)
+	r.waitSession()
+	r.heard("For 4,592 when slice one will be ready to try?", true, true)
+	if got, want := r.waitTurn(), "please ask the agent on INFRA-4592 when slice one will be ready to try?"; got != want {
+		t.Fatalf("the Concierge got %q, want %q", got, want)
+	}
+}
+
 // TestAReplyToWisprsQuestionKeepsTheFloorFree fails if a person's reply to
 // Wispr's own question ("The first one.") counts as room speech against R7's
 // free floor: it is part of the exchange, whose last turn is R7's t0, so the

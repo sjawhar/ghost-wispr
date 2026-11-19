@@ -401,7 +401,9 @@ func numberWord(w string) bool {
 // and how many tokens it read.
 func spokenNumber(tokens []string) (string, int) {
 	if len(tokens) > 0 {
-		if w := strings.TrimSuffix(normalise(tokens[0]), "'s"); digitsOnly(w) {
+		// Written digits, with the grouping commas smart formatting writes
+		// ("4,592").
+		if w := strings.ReplaceAll(strings.TrimSuffix(normalise(tokens[0]), "'s"), ",", ""); digitsOnly(w) {
 			return w, 1
 		}
 	}
