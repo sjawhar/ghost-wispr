@@ -434,20 +434,32 @@ func TestTimingEvents(t *testing.T) {
 	c := newFakeConcierge("The voice issue is in review.")
 	r := newRig(t, c)
 	sess := r.ask("what is happening?")
+	// The whole exchange can end within a millisecond here, before the wake
+	// sound's first frame; a stop then rightly cuts it.
+	eventually(t, "the wake sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "wake") })
 	waitSaid(t, sess)
 	r.speaker.finish(audio.InputVoice)
 	r.waitEvent("voice_spoken:sess-1")
 	r.s.Stop("Jabra button")
 	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"}
-	eventually(t, "every timing event", func() bool {
+	want := []string{"wake_heard", "wake_chime_queued", "turn_end", "first_audio", "fact_audio", "speech_end", "stop", "answer_ready", "answer_chime"}
+	missing := func() []string {
 		got := r.timingEvents()
-		for _, want := range []string{"wake_heard", "wake_chime_queued", "turn_end", "first_audio", "fact_audio", "speech_end", "stop", "answer_ready", "answer_chime"} {
-			if !slices.Contains(got, want) {
-				return false
+		var out []string
+		for _, w := range want {
+			if !slices.Contains(got, w) {
+				out = append(out, w)
 			}
 		}
-		return true
-	})
+		return out
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(missing()) > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if m := missing(); len(m) > 0 {
+		t.Fatalf("missing timing events %v; got %v", m, r.timingEvents())
+	}
 }
 
 // --- c-voices ---

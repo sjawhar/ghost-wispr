@@ -173,6 +173,7 @@ type Supervisor struct {
 	chimeCtx      context.Context    // that chime's context, nil while none plays
 	pending       []*pendingAnswer
 	voiceSpeaking bool      // the voice input plays
+	voiceStarted  time.Time // when it last started
 	voiceEnded    time.Time // when it last stopped
 	own           []ownWords
 	recent        []TurnText
@@ -847,6 +848,7 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		s.mu.Lock()
 		s.addOwnLocked(text, time.Now())
 		s.mu.Unlock()
+		called := time.Now()
 		if err := sess.Say(ctx, text, mode); err != nil {
 			return err
 		}
@@ -854,12 +856,16 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		defer s.mu.Unlock()
 		ex.said = true
 		if mode == Fact && !ex.factDone && !ex.factPending {
-			// The first fact's audio: now if speech already plays, else at
-			// its start.
-			if s.voiceSpeaking {
+			// The first fact's audio: now if speech already plays, at its
+			// start if it began and ended during Say, else at its start.
+			switch {
+			case s.voiceSpeaking:
 				ex.factDone = true
 				s.timing("fact_audio", x.SessionID, time.Now())
-			} else {
+			case !s.voiceStarted.Before(called):
+				ex.factDone = true
+				s.timing("fact_audio", x.SessionID, s.voiceStarted)
+			default:
 				ex.factPending = true
 			}
 		}
@@ -1238,7 +1244,9 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	if ex != nil {
 		sessionID = ex.x.SessionID
 	}
-	if !e.Started {
+	if e.Started {
+		s.voiceStarted = e.At
+	} else {
 		s.voiceEnded = time.Now()
 		s.timing("speech_end", sessionID, e.At)
 	}
