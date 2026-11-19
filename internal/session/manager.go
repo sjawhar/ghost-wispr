@@ -231,19 +231,21 @@ func heardFrom(mr *api.MessageResponse, words []transcribe.Word) time.Duration {
 }
 
 // holdPreroll makes the next session's recording start before the words
-// Deepgram heard from at into the live stream, while no session is open: the
-// words open a session only at the end of their speech (flushBuffer),
+// Deepgram heard from at into the live stream, while no session is open or
+// the current one is ending: the words open a session only at the end of
+// their speech (flushBuffer), or once the ending session has ended,
 // Deepgram can hear them late, as after a reconnect, and the recording must
 // hold them from the first, as the live transcript does. The live stream
 // (SetLiveStream) says how long ago they were captured; without one, they are
-// taken as captured now. While capture is paused it holds nothing: the
-// resume drops that audio.
+// taken as captured now. The recorder holds nothing while a recording is
+// open, and keeps no audio of one that closed. While capture is paused it
+// holds nothing: the resume drops that audio.
 func (m *Manager) holdPreroll(at time.Duration) {
 	if m.recorder == nil {
 		return
 	}
 	m.mu.Lock()
-	idle := m.currentSessionID == "" && !m.capturePaused
+	idle := (m.currentSessionID == "" || m.endingSession) && !m.capturePaused
 	stream := m.stream
 	m.mu.Unlock()
 	if !idle {
@@ -255,6 +257,14 @@ func (m *Manager) holdPreroll(at time.Duration) {
 	}
 	m.recorder.HoldPreroll(ago)
 }
+
+// lateResultMargin is how much more audio than the live stream can fall
+// behind (LiveStream.MaxBehind) the recorder keeps from before a session:
+// after an outage, Deepgram's first result for the audio the live client
+// buffered comes some seconds after the reconnect, and the audio queued in
+// front of the client (at most 16 s, deepgramSendChunks) is captured
+// meanwhile.
+const lateResultMargin = 30 * time.Second
 
 // SetLiveStream sets the stream of audio live transcription sends Deepgram,
 // whose results Message takes, and makes the recorder keep as much audio as
@@ -270,21 +280,22 @@ func (m *Manager) SetLiveStream(stream LiveStream) {
 	}
 	var lookback time.Duration
 	if stream != nil {
-		lookback = stream.MaxBehind()
+		lookback = stream.MaxBehind() + lateResultMargin
 	}
 	m.recorder.SetLookback(lookback)
 }
 
 // releasePreroll ends the hold of holdPreroll once Deepgram has finalized
-// audio with no words while no session is open and none of its words wait to
-// open one: words it showed only as interim results were taken back, and they
-// open no session, so no more audio than the usual preroll leads the next.
+// audio with no words while no session is open (or the current one is
+// ending) and none of its words wait to open one: words it showed only as
+// interim results were taken back, and they open no session, so no more
+// audio than the usual preroll leads the next.
 func (m *Manager) releasePreroll() {
 	if m.recorder == nil {
 		return
 	}
 	m.mu.Lock()
-	idle := m.currentSessionID == "" && m.buffer.Len() == 0
+	idle := (m.currentSessionID == "" || m.endingSession) && m.buffer.Len() == 0
 	m.mu.Unlock()
 	if idle {
 		m.recorder.ReleasePreroll()
@@ -306,6 +317,15 @@ func (m *Manager) flushBuffer() error {
 	// never open a session after the resume.
 	m.mu.Lock()
 	words := m.buffer.Flush()
+	if m.endingSession && !m.capturePaused {
+		// The current session is ending, and its recording may be closed
+		// already: the words spoken after it closed wait for the next
+		// session, which its end opens (endCurrentSession), and whose
+		// recording holds them (holdPreroll).
+		var later []transcribe.Word
+		words, later = m.splitAtCloseLocked(words)
+		m.buffer.PutBack(later)
+	}
 	segments := transcribe.GroupWordsBySpeaker(words)
 	if len(segments) == 0 {
 		m.mu.Unlock()
@@ -333,6 +353,34 @@ func (m *Manager) flushBuffer() error {
 		}
 	}
 	return nil
+}
+
+// splitAtCloseLocked splits words, in the order Deepgram heard them, into
+// those captured before the current recording closed, which its session
+// keeps (its recording holds their audio), and those captured after. A word
+// was captured before the close when the live stream says it was captured
+// longer ago than the audio the recorder has taken since the close; without
+// a live stream, words are taken as captured now. While the recording is
+// still open, every word is before the close. It must be called with m.mu
+// held; it reads the recorder and the live stream, which never take m.mu.
+func (m *Manager) splitAtCloseLocked(words []transcribe.Word) (before, after []transcribe.Word) {
+	if m.recorder == nil {
+		return words, nil
+	}
+	since, closed := m.recorder.SinceClose()
+	if !closed {
+		return words, nil
+	}
+	for i, word := range words {
+		var ago time.Duration
+		if m.stream != nil {
+			ago = m.stream.CapturedSince(time.Duration(word.Start * float64(time.Second)))
+		}
+		if ago <= since {
+			return words[:i], words[i:]
+		}
+	}
+	return words, nil
 }
 
 func (m *Manager) ForceEndSession(ctx context.Context) error {
@@ -377,7 +425,7 @@ func (m *Manager) claimSessionLocked(now time.Time) (string, error) {
 	}
 
 	sessionID := m.newSessionIDLocked(now)
-	startedAt := now.UTC()
+	startedAt := m.recordingStart(now.UTC())
 	m.currentSessionID = sessionID
 	m.currentStartedAt = startedAt
 	m.sessionStarts++
@@ -528,6 +576,9 @@ func (m *Manager) endCurrentSession(ctx context.Context) error {
 	ended = true
 	minSegs := m.minSessionSegments
 	m.mu.Unlock()
+	// Words spoken after the recording closed waited in the buffer
+	// (flushBuffer): they open the next session once this one has ended.
+	defer m.openWaitingSession()
 
 	// Check if session meets minimum segment threshold.
 	if minSegs > 0 {
@@ -972,7 +1023,8 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 
 	sessionID := m.newSessionIDLocked(now)
 	m.currentSessionID = sessionID
-	m.currentStartedAt = now
+	startedAt := m.recordingStart(now)
+	m.currentStartedAt = startedAt
 	m.manualSession = true
 	// Manual sessions use a 5-minute silence timeout instead of the default,
 	// set in the same hold that claims the session, so no end of an earlier
@@ -985,7 +1037,7 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	m.mu.Unlock()
 	defer m.finishSessionStart()
 
-	sessionID, err := m.startSession(sessionID, now)
+	sessionID, err := m.startSession(sessionID, startedAt)
 	if err != nil {
 		m.mu.Lock()
 		m.currentSessionID = ""
@@ -1011,6 +1063,29 @@ func (m *Manager) ManualStartSession(ctx context.Context, titleHint string) (str
 	// keeps the session's id, never its words.
 	m.logger.Info("manual session started", "operation", "manual_start", "session_id", sessionID, "title_hint_set", titleHint != "")
 	return sessionID, nil
+}
+
+// recordingStart returns when the recording of a session starting at now
+// begins: now minus the audio the recorder would open it with
+// (Recorder.Pending). A session starts when its recording does, so a refined
+// segment's time, the session's start plus the segment's offset into the
+// recording, is the time it was spoken.
+func (m *Manager) recordingStart(now time.Time) time.Time {
+	if m.recorder == nil {
+		return now
+	}
+	return now.Add(-m.recorder.Pending())
+}
+
+// openWaitingSession opens the next session with the words spoken while the
+// last one was ending, which flushBuffer left in the buffer.
+func (m *Manager) openWaitingSession() {
+	if m.buffer.Len() == 0 {
+		return
+	}
+	if err := m.flushBuffer(); err != nil {
+		m.logger.Warn("could not save the words spoken while the last session ended", "operation", "end_session", "error", err)
+	}
 }
 
 // StopSession ends a specific session by ID. If the given sessionID does not

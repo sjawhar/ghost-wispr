@@ -13,7 +13,9 @@ import (
 // chunk into a free slot and returns at once, and a goroutine writes the
 // slots in order. With every slot taken, Write drops the chunk; the recording
 // has it already. Finalize goes through the same queue, so it follows every
-// chunk written before it.
+// chunk written before it. A ResilientClient behind it counts the audio
+// queued and dropped here in its stream's clock (CapturedSince): that audio
+// was captured after any the client has, though it took none of it.
 type AsyncSender struct {
 	dst interface {
 		io.Writer
@@ -24,6 +26,16 @@ type AsyncSender struct {
 	queue   chan sendItem
 	dropped atomic.Int64
 	log     func(string, ...any)
+	// queued counts the bytes in slots not yet handed to dst, and skipped
+	// the bytes Write ever dropped.
+	queued  atomic.Int64
+	skipped atomic.Int64
+}
+
+// backlogCounter is a destination that counts the audio an AsyncSender
+// holds or dropped in front of it (ResilientClient).
+type backlogCounter interface {
+	countBacklog(backlog func() (queued, skipped int64))
 }
 
 type sendItem struct {
@@ -53,8 +65,16 @@ func NewAsyncSender(ctx context.Context, dst interface {
 	for i := range chunks {
 		s.free <- i
 	}
+	if counter, ok := dst.(backlogCounter); ok {
+		counter.countBacklog(s.backlog)
+	}
 	go s.run(ctx)
 	return s
+}
+
+// backlog returns the bytes queued for dst now and the bytes ever dropped.
+func (s *AsyncSender) backlog() (queued, skipped int64) {
+	return s.queued.Load(), s.skipped.Load()
 }
 
 // Write queues a copy of p and never blocks.
@@ -62,8 +82,10 @@ func (s *AsyncSender) Write(p []byte) (int, error) {
 	select {
 	case i := <-s.free:
 		s.slots[i] = append(s.slots[i][:0], p...)
+		s.queued.Add(int64(len(p)))
 		s.queue <- sendItem{slot: i}
 	default:
+		s.skipped.Add(int64(len(p)))
 		if s.dropped.Add(1) == 1 {
 			s.log("warning: live transcription is behind; dropping audio for it (the recording keeps it)")
 		}
@@ -103,6 +125,9 @@ func (s *AsyncSender) run(ctx context.Context) {
 				item.done <- s.dst.Finalize()
 				continue
 			}
+			// Out of the queue before dst counts it, so it is never counted
+			// twice.
+			s.queued.Add(-int64(len(s.slots[item.slot])))
 			_, _ = s.dst.Write(s.slots[item.slot])
 			if s.dropped.Swap(0) > 0 {
 				s.log("live transcription caught up")

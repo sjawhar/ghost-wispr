@@ -134,4 +134,9 @@ type ResilientClient struct {
 	// its results in starts there (CapturedSince). Both are guarded by Mu.
 	accepted int64
 	origin   int64
+	// backlog reports the audio an AsyncSender in front of the client holds
+	// and has dropped (countBacklog), and skippedAtSwap what it had dropped
+	// when the current Client connected; nil without a sender. Guarded by Mu.
+	backlog       func() (queued, skipped int64)
+	skippedAtSwap int64
 }

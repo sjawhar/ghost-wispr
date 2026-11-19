@@ -42,6 +42,6 @@ func TestAHoldThatReachesFurtherKeepsAtMostMaxHeldSeconds(t *testing.T) {
 	r.HoldPreroll(320 * time.Second)
 	got := startedWith(t, dir, r)
 	if want := secondsFrom(51, 350); !slices.Equal(got, want) {
-		t.Fatalf("the recording opened with %d seconds, %d to %d; want the last %d, seconds 51 to 350", len(got), got[0], got[len(got)-1], maxHeldSeconds)
+		t.Fatalf("the recording opened with %d seconds, %s; want the last %d, seconds 51 to 350", len(got), span(got), maxHeldSeconds)
 	}
 }

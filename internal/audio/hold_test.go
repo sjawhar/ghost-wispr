@@ -1,14 +1,11 @@
 package audio
 
 import (
-	"bytes"
 	"encoding/binary"
-	"os"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
-
-	"github.com/sjawhar/ghost-wispr/internal/recording"
 )
 
 // holdSecond returns one second of audio at the default rate whose samples
@@ -42,27 +39,15 @@ func secondsFrom(first, last uint16) []uint16 {
 // raw recording opened with.
 func startedWith(t *testing.T, dir string, r *Recorder) []uint16 {
 	t.Helper()
-	const id = "20261119060000"
-	if err := r.StartSession(id); err != nil {
-		t.Fatalf("StartSession: %v", err)
+	return openedWith(t, dir, r, "20261119060000")
+}
+
+// span names the first and the last of labels, or none.
+func span(labels []uint16) string {
+	if len(labels) == 0 {
+		return "none"
 	}
-	raw, err := os.ReadFile(recording.RawPath(dir, id))
-	if err != nil {
-		t.Fatal(err)
-	}
-	second := pcmBytesPerSecond(defaultSampleRate)
-	if len(raw)%second != 0 {
-		t.Fatalf("the recording opened with %d bytes, not whole seconds", len(raw))
-	}
-	var labels []uint16
-	for at := 0; at < len(raw); at += second {
-		label := binary.LittleEndian.Uint16(raw[at:])
-		if !bytes.Equal(raw[at:at+second], holdSecond(label)) {
-			t.Fatalf("second %d of the recording is not one captured second", at/second)
-		}
-		labels = append(labels, label)
-	}
-	return labels
+	return fmt.Sprintf("%d to %d", labels[0], labels[len(labels)-1])
 }
 
 // TestAHoldReachesBackToWordsHeardLate fails if a hold (HoldPreroll) for
@@ -141,6 +126,6 @@ func TestAHoldKeepsAtMostMaxHeldSeconds(t *testing.T) {
 	r.HoldPreroll(5 * time.Second)
 	takeSeconds(t, r, secondsFrom(11, maxHeldSeconds+20)...)
 	if got, want := startedWith(t, dir, r), secondsFrom(21, maxHeldSeconds+20); !slices.Equal(got, want) {
-		t.Fatalf("the recording opened with %d seconds, %d to %d; want the last %d", len(got), got[0], got[len(got)-1], maxHeldSeconds)
+		t.Fatalf("the recording opened with %d seconds, %s; want the last %d", len(got), span(got), maxHeldSeconds)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +50,12 @@ func pcmBytes(d time.Duration, sampleRate int) int {
 	return int(samples) * pcmChannels * pcmBitDepth / 8
 }
 
+// pcmDuration is how long n bytes of the recorder's PCM at sampleRate last.
+func pcmDuration(n int, sampleRate int) time.Duration {
+	perSecond := pcmBytesPerSecond(sampleRate)
+	return time.Duration(n/perSecond)*time.Second + time.Duration(n%perSecond)*time.Second/time.Duration(perSecond)
+}
+
 // encodeTimeout is how long the MP3 encoders (ffmpeg, then lame) together may
 // take for a recording of pcmBytes at sampleRate before the recording is kept
 // as WAV instead: a minute plus a tenth of the recording's length, far slower
@@ -76,10 +83,17 @@ type Recorder struct {
 	// holding is set while words Deepgram heard may still open a session
 	// (HoldPreroll). history then stops taking audio, and the audio taken goes
 	// to held instead; the last holdBack bytes of history and all of held lead
-	// the next recording.
+	// the next recording. holdBack never exceeds history.Len(): whatever
+	// shrinks history during a hold (SetLookback) shrinks holdBack with it.
 	holding  bool
 	holdBack int
 	held     []byte
+	// trimWarned is set once the hold under way has dropped its oldest
+	// audio past maxHeldSeconds and said so in the log.
+	trimWarned bool
+	// sinceClose counts the bytes taken since the last recording closed
+	// (SinceClose).
+	sinceClose int
 	// sessionRate is the rate the recording under way is captured at, as
 	// StartSession recorded it.
 	sessionRate int
@@ -328,6 +342,7 @@ func (r *Recorder) EndSession(sessionID string) (string, error) {
 	r.rawPath = ""
 	r.rawFile = nil
 	r.savingPath = rawPath
+	r.sinceClose = 0
 	r.mu.Unlock()
 
 	if err := rawFile.Close(); err != nil {
@@ -371,6 +386,7 @@ func (r *Recorder) writePCM(data []byte) error {
 	defer r.mu.Unlock()
 
 	if r.rawFile == nil {
+		r.sinceClose += len(data)
 		if !r.holding {
 			_, _ = r.history.Write(data)
 			return nil
@@ -382,6 +398,10 @@ func (r *Recorder) writePCM(data []byte) error {
 			back := min(over, r.holdBack)
 			r.holdBack -= back
 			r.held = r.held[over-back:]
+			if !r.trimWarned {
+				r.trimWarned = true
+				log.Printf("warning: the audio kept for the next session's start reached %d s with no session started; its oldest audio is dropped from now on, and with it maybe the first words", maxHeldSeconds)
+			}
 		}
 		return nil
 	}
@@ -508,7 +528,7 @@ func (r *Recorder) HoldPreroll(ago time.Duration) {
 		return
 	}
 	if !r.holding {
-		r.holding, r.holdBack, r.held = true, 0, nil
+		r.holding, r.holdBack, r.held, r.trimWarned = true, 0, nil, false
 	}
 	reach := pcmBytes(max(ago, 0), r.sampleRate) + prerollSeconds*pcmBytesPerSecond(r.sampleRate)
 	// No further back than maxHeldSeconds: a hold at its bound has dropped
@@ -528,6 +548,36 @@ func (r *Recorder) ReleasePreroll() {
 	}
 	_, _ = r.history.Write(r.held)
 	r.holding, r.holdBack, r.held = false, 0, nil
+}
+
+// Pending returns how much audio the next session's recording would open
+// with if it started now: the last prerollSeconds, or all that a hold keeps
+// (HoldPreroll). While a recording is open it returns 0. The session manager
+// starts a session at the time its recording starts: now minus Pending.
+func (r *Recorder) Pending() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rawFile != nil {
+		return 0
+	}
+	n := min(prerollSeconds*pcmBytesPerSecond(r.sampleRate), r.history.Len())
+	if r.holding {
+		n = r.holdBack + len(r.held)
+	}
+	return pcmDuration(n, r.sampleRate)
+}
+
+// SinceClose returns how much audio has been taken since the last recording
+// closed, and true; while a recording is open it returns false. Words
+// Deepgram hears while a session ends, captured longer ago than that, are in
+// that session's recording; the rest are not, and open the next session.
+func (r *Recorder) SinceClose() (time.Duration, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rawFile != nil {
+		return 0, false
+	}
+	return pcmDuration(r.sinceClose, r.sampleRate), true
 }
 
 // defaultEncode saves the raw recording at rawPath, captured at sampleRate,

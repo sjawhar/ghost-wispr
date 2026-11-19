@@ -146,7 +146,9 @@ func (rc *ResilientClient) startReconnect() {
 
 // reconnect dials after wait, then again with exponential backoff, until a
 // socket is connected and the buffered audio sent. Stops when rc.ctx is
-// cancelled.
+// cancelled. It first closes the socket that failed, which returns once that
+// socket has handed on its last result: no result timed in the old socket's
+// stream is then read against the new one's (CapturedSince).
 func (rc *ResilientClient) reconnect(wait time.Duration) {
 	next := rc.Config.InitialReconnectDelay
 	if wait > 0 {
@@ -154,6 +156,13 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 	}
 	backOff := func() {
 		wait, next = next, min(2*next, rc.Config.MaxReconnectBackoff)
+	}
+
+	rc.Mu.Lock()
+	failed := rc.Client
+	rc.Mu.Unlock()
+	if failed != nil {
+		_ = failed.Close()
 	}
 
 	for {
@@ -176,6 +185,9 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 		rc.Client = newClient
 		// The new socket's stream starts at the oldest buffered byte.
 		rc.origin = rc.accepted - int64(rc.Buffer.Len())
+		if rc.backlog != nil {
+			_, rc.skippedAtSwap = rc.backlog()
+		}
 		rc.setStateLocked(StateDraining)
 		rc.Mu.Unlock()
 
@@ -247,19 +259,35 @@ func (rc *ResilientClient) IsConnected() bool {
 	return rc.State == StateConnected
 }
 
-// CapturedSince returns how much audio was written to the client after the
-// point at into the current socket's stream, the time Deepgram gives the
-// words it hears: the audio sent to that socket since, and the audio
-// buffered for it or for the next. Audio Finalize drops from the buffer is
-// taken out of the stream, as it never reaches the socket.
+// CapturedSince returns how much audio was captured after the point at into
+// the current socket's stream, the time Deepgram gives the words it hears:
+// the audio sent to that socket since, the audio buffered for it or for the
+// next, and the audio queued in front of the client (AsyncSender), with any
+// the queue dropped since the socket connected, which may count a little
+// too much and so lengthens a recording's lead, never shortens it. Audio
+// Finalize drops from the buffer is taken out of the stream, as it never
+// reaches the socket.
 func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 	rc.Mu.Lock()
 	since := rc.accepted - rc.origin - rc.streamBytes(at)
+	if rc.backlog != nil {
+		queued, skipped := rc.backlog()
+		since += queued + skipped - rc.skippedAtSwap
+	}
 	rc.Mu.Unlock()
 	if since <= 0 {
 		return 0
 	}
 	return rc.streamDuration(since)
+}
+
+// countBacklog makes CapturedSince count the audio an AsyncSender in front
+// of the client holds or dropped (backlogCounter).
+func (rc *ResilientClient) countBacklog(backlog func() (queued, skipped int64)) {
+	rc.Mu.Lock()
+	defer rc.Mu.Unlock()
+	rc.backlog = backlog
+	_, rc.skippedAtSwap = backlog()
 }
 
 // MaxBehind returns how far the stream Deepgram hears can fall behind the

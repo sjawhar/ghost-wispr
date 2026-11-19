@@ -198,15 +198,17 @@ func recordedLabels(t *testing.T, path string) []uint16 {
 	return labels
 }
 
-// TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording fails if a
-// session's recording starts after the first words its live transcript holds
-// when Deepgram transcribes them late. While Deepgram is not connected, the
-// live client buffers the microphone's audio (up to 60 s) and sends it once a
-// socket connects again; Deepgram's results for it come only then. The
-// recording kept only the last 5 s before those results came back, so the
-// first words of a meeting that began during the outage were in the live
-// transcript and not in the recording, nor in the refined transcript.
-func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T) {
+// outageRecording runs the real manager, recorder and live client against a
+// peer that times its results in each socket's own stream, as Deepgram does:
+// room seconds of audio (labels 1, 2, ...) reach a first socket; the peer
+// drops it and refuses new ones, and the live client buffers the audio,
+// first some probe seconds (label 3) until it sees the socket gone, then
+// speech seconds (labels from 10); the peer accepts again, the client sends
+// what it buffered, and latency seconds more are captured before the peer's
+// first result for the words that began at label 10. It returns the labels
+// of the seconds the session the words open records first.
+func outageRecording(t *testing.T, room, speech, latency int) []uint16 {
+	t.Helper()
 	peer, host := startListeningDeepgram(t)
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
 	if err != nil {
@@ -217,14 +219,13 @@ func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T
 	recorder := audio.NewRecorder(audioDir)
 	manager := session.NewManager(store, recorder, nil, nil, session.NewDetector(time.Hour), 0)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 	rc := newLiveTranscription(ctx, "test-key",
 		&interfaces.ClientOptions{Host: host},
 		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
 		transcribe.ResilientConfig{SampleRate: 16000, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
 		manager, newWarningsRegistry(), nil)
 	t.Cleanup(func() { _ = rc.Close() })
-	t.Cleanup(func() { _ = manager.ForceEndSession(context.Background()) })
 	mic := recorder.Writer(rc)
 	say := func(labels ...uint16) {
 		t.Helper()
@@ -234,11 +235,19 @@ func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T
 			}
 		}
 	}
+	sayFrom := func(first uint16, n int) uint16 {
+		t.Helper()
+		for range n {
+			say(first)
+			first++
+		}
+		return first
+	}
 
 	waitUntil(t, "the first socket", func() bool { return rc.IsConnected() && peer.latest() != nil })
 	first := peer.latest()
-	say(1, 2) // the room before anyone speaks
-	waitUntil(t, "the first socket to get its audio", func() bool { return first.streamSeconds() >= 2 })
+	sayFrom(1, room) // the room before anyone speaks
+	waitUntil(t, "the first socket to get its audio", func() bool { return first.streamSeconds() >= float64(room) })
 
 	// Deepgram drops the socket and refuses the next ones: the room's audio
 	// waits in the live client.
@@ -248,7 +257,7 @@ func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T
 		say(3)
 		return !rc.IsConnected()
 	})
-	say(10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21) // "Good morning, everyone. This is a synthetic test..."
+	next := sayFrom(10, speech) // "Good morning, everyone. ..."
 
 	// Deepgram is back: the live client sends what it buffered to a new
 	// socket, then the room's audio as it comes.
@@ -257,15 +266,15 @@ func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T
 	second := peer.latest()
 	waitUntil(t, "the buffered audio to reach the second socket", func() bool {
 		at, ok := second.heardAt(10)
-		return ok && second.streamSeconds() >= at+12
+		return ok && second.streamSeconds() >= at+float64(speech)
 	})
-	say(22, 23)
+	sayFrom(next, latency)
 	spoken, _ := second.heardAt(10)
 
 	// Deepgram's results for the second socket's stream, timed in it.
 	second.result(t, true, false, 0, spoken, 0)
 	second.result(t, false, false, spoken, 2, spoken, "Good", "morning,")
-	second.result(t, true, true, spoken, 12, spoken, "Good", "morning,", "everyone.", "This", "is", "a", "synthetic", "test", "of", "the", "office", "recorder.")
+	second.result(t, true, true, spoken, float64(speech), spoken, "Good", "morning,", "everyone.")
 	waitUntil(t, "the first words to open a session", func() bool {
 		id, _ := manager.ActiveSession()
 		return id != ""
@@ -273,10 +282,41 @@ func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T
 	// The session is current before its recording starts: wait for the start.
 	manager.WaitForSessionStarts()
 	id, _ := manager.ActiveSession()
+	return recordedLabels(t, recording.RawPath(audioDir, id))
+}
 
-	got := recordedLabels(t, recording.RawPath(audioDir, id))
-	utterance := []uint16{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
-	if len(got) < len(utterance) || !slices.Equal(got[len(got)-len(utterance):], utterance) {
-		t.Fatalf("the recording holds seconds %v; want it to end with %v, from the first words the live transcript holds", got, utterance)
+// opensAPrerollBefore fails the test unless the recording holds exactly
+// prerollSeconds (5 s) before label 10, the first words, and every second
+// from them on.
+func opensAPrerollBefore(t *testing.T, got []uint16, speech, latency int) {
+	t.Helper()
+	var words []uint16
+	for label := uint16(10); label < uint16(10+speech+latency); label++ {
+		words = append(words, label)
 	}
+	if len(got) != 5+len(words) || !slices.Equal(got[5:], words) {
+		t.Fatalf("the recording holds %d seconds, opening with %v; want exactly 5 s, then seconds 10 to %d, from the first words the live transcript holds", len(got), got[:min(8, len(got))], 10+speech+latency-1)
+	}
+}
+
+// TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording fails if a
+// session's recording does not open 5 s before the first words its live
+// transcript holds when Deepgram transcribes them late. While Deepgram is not
+// connected, the live client buffers the microphone's audio (up to 60 s) and
+// sends it once a socket connects again; Deepgram's results for it come only
+// then. The recording kept only the last 5 s before those results came back,
+// so the first words of a meeting that began during the outage were in the
+// live transcript and not in the recording, nor in the refined transcript.
+func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T) {
+	opensAPrerollBefore(t, outageRecording(t, 9, 12, 2), 12, 2)
+}
+
+// TestFirstWordsAfterALongOutageAreAllInTheRecording fails if words Deepgram
+// hears after an outage that nearly filled the live client's 60 s buffer,
+// with its first result some seconds after the reconnect, have lost their
+// start: the recorder kept only the buffer's length plus 5 s, so the delay to
+// Deepgram's first result came out of the 5 s before the words, and past 5 s
+// out of the words.
+func TestFirstWordsAfterALongOutageAreAllInTheRecording(t *testing.T) {
+	opensAPrerollBefore(t, outageRecording(t, 9, 55, 12), 55, 12)
 }

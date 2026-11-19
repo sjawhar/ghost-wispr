@@ -67,6 +67,12 @@ type Recorder interface {
 	// SetLookback sets how far before now HoldPreroll can reach, besides
 	// the preroll.
 	SetLookback(lookback time.Duration)
+	// Pending returns how much audio the next session's recording would
+	// open with if it started now; 0 while a recording is open.
+	Pending() time.Duration
+	// SinceClose returns how much audio has been taken since the last
+	// recording closed, and true; false while a recording is open.
+	SinceClose() (time.Duration, bool)
 }
 
 // LiveStream is the stream of audio live transcription sends Deepgram, which

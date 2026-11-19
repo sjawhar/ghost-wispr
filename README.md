@@ -164,6 +164,17 @@ open, as when it went off outside Ghost Wispr (an unplug, its watchdog, another 
 light-off`), the recorder drops that audio and what the microphone holds, closes it and opens it
 again under a new red check.
 
+A session starts when Deepgram hears the end of its first stretch of speech, and its recording
+starts 5 s before the first word the live transcript holds, so the recording and the refined
+transcript that replaces the live one hold every word from the first. To do that, while no session
+is recording the recorder keeps the last 5 s of audio in memory, plus as much as Deepgram can fall
+behind: the live client buffers up to 60 s (`deepgram_buffer_size`) while Deepgram is away, and
+its words for that audio come only after the reconnect, so the recorder keeps 95 s in all. From the
+first words Deepgram hears until the session starts, it keeps all the audio after them too, up to
+300 s. It keeps only audio captured while the light was red: every close of the microphone (a
+pause, the light reading back off or failing, no audio reaching the recording) drops it, and no
+audio of an earlier session is ever kept. A session's start time is when its recording starts.
+
 ## Deployment
 
 The office recorder runs a verified arm64 release binary on a Raspberry Pi 5. The Pi is

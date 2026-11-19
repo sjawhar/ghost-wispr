@@ -2,7 +2,10 @@ package transcribe
 
 import (
 	"context"
+	"errors"
 	"io"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -63,5 +66,123 @@ func TestFinalizeTakesTheAudioItDropsOutOfTheStream(t *testing.T) {
 	_, _ = rc.Write(make([]byte, secondOfAudio))
 	if got := rc.CapturedSince(time.Second); got != time.Second {
 		t.Fatalf("CapturedSince(1s) = %v, want 1s: the stream's second second is the audio after the resume", got)
+	}
+}
+
+// heldSocket is a Deepgram socket whose writes wait until release closes,
+// as on a congested uplink; entered gets a signal at each write.
+type heldSocket struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *heldSocket) Write(p []byte) (int, error) {
+	s.entered <- struct{}{}
+	<-s.release
+	return len(p), nil
+}
+
+func (*heldSocket) Close() error { return nil }
+
+func (*heldSocket) Finalize() error { return nil }
+
+// TestCapturedSinceCountsTheAudioQueuedBeforeTheClient fails if audio the
+// send queue in front of the client (AsyncSender) holds, or dropped because
+// it was full, is left out of CapturedSince: on a congested uplink every
+// socket write still finishes inside its time limit, the queue fills to 16 s
+// and then drops, and a recording started up to 11 s after the first words.
+func TestCapturedSinceCountsTheAudioQueuedBeforeTheClient(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	socket := &heldSocket{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	t.Cleanup(func() { close(socket.release) })
+	rc := NewResilientClient(ctx, func(context.Context) (io.WriteCloser, error) { return socket, nil }, ResilientConfig{}, nil, nil)
+	rc.reconnect(0)
+	sender := NewAsyncSender(ctx, rc, 4, nil)
+	_, _ = sender.Write(make([]byte, secondOfAudio)) // the socket write that waits
+	<-socket.entered
+	for range 5 { // 3 s queued, then 2 s dropped
+		_, _ = sender.Write(make([]byte, secondOfAudio))
+	}
+	if got, want := rc.CapturedSince(0), 6*time.Second; got != want {
+		t.Fatalf("CapturedSince(0) = %v, want %v: the second sent, 3 s queued and 2 s dropped", got, want)
+	}
+}
+
+// eventSocket logs its Close as "close <name>".
+type eventSocket struct {
+	name     string
+	log      *eventLog
+	writeErr error
+}
+
+func (s *eventSocket) Write(p []byte) (int, error) {
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
+	return len(p), nil
+}
+
+func (s *eventSocket) Close() error {
+	s.log.add("close " + s.name)
+	return nil
+}
+
+type eventLog struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (l *eventLog) add(event string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, event)
+}
+
+func (l *eventLog) get() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.events)
+}
+
+// TestAReconnectClosesTheFailedSocketFirst fails if a reconnect dials the
+// next socket before it has closed the one that failed. The app's socket
+// closes only once its reader has handed on the last result, so a result
+// timed in the old socket's stream cannot be read against the new one's
+// (CapturedSince), and the old socket holds no connection meanwhile.
+func TestAReconnectClosesTheFailedSocketFirst(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := &eventLog{}
+	first := &eventSocket{name: "first", log: log}
+	dials := 0
+	var mu sync.Mutex
+	rc := NewResilientClient(ctx, func(context.Context) (io.WriteCloser, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		dials++
+		log.add("dial")
+		if dials == 1 {
+			return first, nil
+		}
+		return &eventSocket{name: "second", log: log}, nil
+	}, ResilientConfig{InitialReconnectDelay: time.Millisecond, MaxReconnectBackoff: time.Millisecond}, nil, nil)
+	rc.reconnect(0)
+	first.writeErr = errors.New("the peer closed the socket")
+	_, _ = rc.Write(make([]byte, 320))
+	redialled := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return dials == 2
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !rc.IsConnected() || !redialled() {
+		if time.Now().After(deadline) {
+			t.Fatalf("no reconnect: events %v", log.get())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got, want := log.get(), []string{"dial", "close first", "dial"}; !slices.Equal(got, want) {
+		t.Fatalf("events %v, want %v: the failed socket closed before the next dial", got, want)
 	}
 }

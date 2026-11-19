@@ -35,6 +35,13 @@ func labelledSecond(label uint16) []byte {
 // or a final that ends the speech (speechFinal), with words as its transcript.
 func liveResult(t *testing.T, isFinal, speechFinal bool, words ...string) *api.MessageResponse {
 	t.Helper()
+	return timedResult(t, isFinal, speechFinal, 0, words...)
+}
+
+// timedResult is liveResult with its words a second apart from first into
+// the live stream.
+func timedResult(t *testing.T, isFinal, speechFinal bool, first time.Duration, words ...string) *api.MessageResponse {
+	t.Helper()
 	type word struct {
 		Speaker        int     `json:"speaker"`
 		Word           string  `json:"word"`
@@ -44,7 +51,8 @@ func liveResult(t *testing.T, isFinal, speechFinal bool, words ...string) *api.M
 	}
 	timed := make([]word, len(words))
 	for i, w := range words {
-		timed[i] = word{Word: w, PunctuatedWord: w, Start: float64(i), End: float64(i) + 0.5}
+		at := first.Seconds() + float64(i)
+		timed[i] = word{Word: w, PunctuatedWord: w, Start: at, End: at + 0.5}
 	}
 	raw, err := json.Marshal(map[string]any{
 		"type":         "Results",
@@ -62,20 +70,31 @@ func liveResult(t *testing.T, isFinal, speechFinal bool, words ...string) *api.M
 }
 
 // capture is a manager on the real recorder, with the microphone's writer.
+// said is how much audio it has captured, which a clockStream times
+// Deepgram's words against.
 type capture struct {
 	t        *testing.T
 	dir      string
+	store    *storeMock
 	recorder *audio.Recorder
 	manager  *Manager
 	mic      io.Writer
+	said     time.Duration
 }
 
 func newCapture(t *testing.T) *capture {
 	t.Helper()
+	return newCaptureOn(t, func(r *audio.Recorder) Recorder { return r })
+}
+
+// newCaptureOn is newCapture with the manager on wrap(recorder).
+func newCaptureOn(t *testing.T, wrap func(*audio.Recorder) Recorder) *capture {
+	t.Helper()
 	dir := t.TempDir()
 	recorder := audio.NewRecorder(dir)
-	manager := NewManager(newStoreMock(), recorder, nil, nil, NewDetector(time.Hour), 0)
-	return &capture{t: t, dir: dir, recorder: recorder, manager: manager, mic: recorder.Writer(io.Discard)}
+	store := newStoreMock()
+	manager := NewManager(store, wrap(recorder), nil, nil, NewDetector(time.Hour), 0)
+	return &capture{t: t, dir: dir, store: store, recorder: recorder, manager: manager, mic: recorder.Writer(io.Discard)}
 }
 
 // say captures one labelled second of audio per label.
@@ -85,6 +104,7 @@ func (c *capture) say(labels ...uint16) {
 		if _, err := c.mic.Write(labelledSecond(label)); err != nil {
 			c.t.Fatalf("capture second %d: %v", label, err)
 		}
+		c.said += time.Second
 	}
 }
 
@@ -104,7 +124,14 @@ func (c *capture) recordedSeconds() []uint16 {
 	if sessionID == "" {
 		c.t.Fatal("no session started")
 	}
-	raw, err := os.ReadFile(recording.RawPath(c.dir, sessionID))
+	return c.secondsOf(sessionID)
+}
+
+// secondsOf returns the labels of the seconds session id's raw recording
+// holds so far, in order.
+func (c *capture) secondsOf(id string) []uint16 {
+	c.t.Helper()
+	raw, err := os.ReadFile(recording.RawPath(c.dir, id))
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -122,6 +149,28 @@ func (c *capture) recordedSeconds() []uint16 {
 	}
 	return labels
 }
+
+// textOf returns the text of session id's segments, in order.
+func (c *capture) textOf(id string) []string {
+	c.t.Helper()
+	segments, err := c.store.GetSegments(id)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	var text []string
+	for _, segment := range segments {
+		text = append(text, segment.Text)
+	}
+	return text
+}
+
+// clockStream is a live stream with no lag: a word at into the stream was
+// captured at into the capture, so it was captured said minus at ago.
+type clockStream struct{ c *capture }
+
+func (s clockStream) CapturedSince(at time.Duration) time.Duration { return max(s.c.said-at, 0) }
+
+func (clockStream) MaxBehind() time.Duration { return time.Minute }
 
 // TestALongFirstUtteranceIsAllInTheRecording fails if a session's recording
 // starts after the first words its live transcript holds. A session starts at
