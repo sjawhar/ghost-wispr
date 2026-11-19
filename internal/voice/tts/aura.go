@@ -19,6 +19,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/netdial"
+	"github.com/sjawhar/ghost-wispr/internal/spokentext"
 )
 
 const (
@@ -314,7 +315,7 @@ func (s *auraSocket) stream(ctx context.Context, text string, emit func(pcm []by
 		case <-stall.C:
 			s.abort()
 			if warning != "" {
-				return fmt.Errorf("aura: no audio for %s after Deepgram warned: %s", auraStallTimeout, warning)
+				return fmt.Errorf("aura: no audio for %s after Deepgram warned: %s", auraStallTimeout, spokentext.Withhold(warning, text))
 			}
 			return fmt.Errorf("aura: no audio for %s after a Flush", auraStallTimeout)
 		}
