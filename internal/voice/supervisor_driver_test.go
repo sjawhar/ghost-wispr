@@ -54,6 +54,28 @@ func TestADriverVoiceThatFailsEndsTheExchange(t *testing.T) {
 	}
 }
 
+// TestADriverVoiceThatFailsPlaysTheWholeErrorSound fails if a driving
+// voice's failure ends its exchange without the error sound playing to its
+// end (R10): the exchange's cut cancels the chime input, so the sound must
+// begin after it.
+func TestADriverVoiceThatFailsPlaysTheWholeErrorSound(t *testing.T) {
+	r := newDrivingRig(t, time.Minute)
+	r.heard("Wispr, what is happening?", true, true)
+	sess := r.waitSession()
+	eventually(t, "the wake sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "wake") })
+	sess.fail(errors.New("Deepgram sent an Error"))
+	want := (len(ErrorChime()) + 959) / 960
+	eventually(t, "the whole error sound", func() bool {
+		names, frames := r.speaker.chimePlaybacks()
+		for i, name := range names {
+			if name == "error" && frames[i] == want {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 // TestAVoiceThatEndsByItselfEndsTheExchange fails if a session whose events
 // end without a Close leaves its exchange holding the floor.
 func TestAVoiceThatEndsByItselfEndsTheExchange(t *testing.T) {

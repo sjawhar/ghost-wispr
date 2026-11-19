@@ -742,11 +742,14 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 			s.touchLocked(ex)
 		case EventErr:
 			s.logf("voice: %v", e.Err)
-			if s.ex == ex && !ex.ended {
-				s.errorLocked(ex.x.SessionID)
-			}
+			current := s.ex == ex && !ex.ended
 			if ex.drives && s.ex == ex {
+				// The cut first: it cancels the chime input, and the error
+				// sound begun before it would go with it.
 				s.endLocked(ex, true, "the voice failed")
+			}
+			if current {
+				s.errorLocked(ex.x.SessionID)
 			}
 		}
 		s.mu.Unlock()
