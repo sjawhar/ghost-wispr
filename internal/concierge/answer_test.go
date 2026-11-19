@@ -3,6 +3,7 @@ package concierge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -152,6 +153,22 @@ func TestAModelFailureSaysSoAndReturnsTheError(t *testing.T) {
 	}
 	if len(spoken) != 1 || spoken[0].mode != voice.Ack {
 		t.Fatalf("spoken = %+v, want one apology", spoken)
+	}
+}
+
+// TestAnUnreachableDispatchSaysSoAndWrapsErrUnreachable: when Dispatch does
+// not answer, the voice says so, and Answer's error wraps voice's
+// ErrUnreachable, so the Supervisor plays the error sound.
+func TestAnUnreachableDispatchSaysSoAndWrapsErrUnreachable(t *testing.T) {
+	r := newRig(t)
+	r.records.err = fmt.Errorf("%w: dial tcp: no route to host", dispatch.ErrUnreachable)
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what about ABC-12?", recorder(&spoken))
+	if !errors.Is(err, voice.ErrUnreachable) {
+		t.Fatalf("Answer when Dispatch does not answer = %v, want voice.ErrUnreachable", err)
+	}
+	if len(spoken) == 0 || spoken[len(spoken)-1] != (said{cannotReachDispatch, voice.Ack}) {
+		t.Fatalf("spoken = %+v, want %q last", spoken, cannotReachDispatch)
 	}
 }
 
