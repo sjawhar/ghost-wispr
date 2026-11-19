@@ -1027,6 +1027,18 @@ func main() {
 		}
 		return nil
 	}, captureFinalizeWait, captureEndRetry, log.Printf)
+	// The meeting voice. Its link is wired now, so every gate closing reaches
+	// it, the one restorePause may make included; the voice itself starts
+	// once the speaker output exists, below. Its tap is one more writer
+	// behind the gate, only while the voice is on.
+	var voiceHooks voiceLink
+	wireVoiceToCapture(capture, &voiceHooks)
+	var voiceTap *voice.Tap
+	var voiceAudio io.Writer // nil while the voice is off: the mic writes nothing more
+	if cfg.Voice.Enabled {
+		voiceTap = voice.NewTap()
+		voiceAudio = voiceTap
+	}
 
 	restoredPause, err := restorePause(store, capture)
 	var restorePauseErr error
@@ -1503,7 +1515,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		log.Printf("warning: open the microphone through ALSA's plug layer: %v", err)
 	}
 	startPowerButton(ctx, &cfg, capture, controlHooks, warningRegistry)
-	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry)
+	startJabraMuteButton(ctx, &cfg, capture, micDevice, controlHooks, warningRegistry, func() { voiceHooks.Stop("Jabra button") })
 
 	envoyEvents.configure(ctx, &cfg, appLogger)
 	envoyEvents.publishRecoveredEnds(recoveredIDs)
@@ -1744,6 +1756,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		ordered := orderedMic{micStreamer: mic, device: micDevice}
 
 		audioRecorder.SetSampleRate(sampleRate)
+		if voiceTap != nil {
+			voiceTap.SetRate(sampleRate)
+		}
 		// micRef is published before the start so the controller, woken when
 		// the start clears the forced-red hold, already sees the open mic.
 		micRef.Store(mic)
@@ -1769,7 +1784,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if cfg.DeepgramAPIKey == "" {
-			startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, nil, nil, micWait, log.Printf, hub)
+			startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, nil, voiceAudio, micWait, log.Printf, hub)
 			return nil
 		}
 
@@ -1780,9 +1795,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
-		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, transcriptCallback{manager: manager}, warningRegistry, hub)
+		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
-		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, nil, micWait, log.Printf, hub))
+		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, voiceAudio, micWait, log.Printf, hub))
 		return nil
 	}
 
@@ -1870,7 +1886,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			log.Printf("warning: TTS disabled: %v", ttsErr)
 			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
 		} else {
-			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, output, tts.OrchestratorOpts{})
+			// POST /api/tts/speak waits in its queue while a voice exchange
+			// holds the speaker.
+			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, output, tts.OrchestratorOpts{BeforePlay: voiceHooks.WaitFloor})
 			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
 		}
 	}
@@ -1894,6 +1912,36 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		controlHooks.TTSHasProvider = ttsOrchestrator.HasProvider
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
+	}
+
+	// The meeting voice: the Concierge, then the Supervisor over the speaker
+	// output. Without them the unit records as before.
+	stopConcierge := func() {}
+	if cfg.Voice.Enabled {
+		if err := func() error {
+			conc, stop, err := startConcierge(ctx, &cfg, store, appLogger)
+			if err != nil {
+				return err
+			}
+			err = startVoice(ctx, &cfg, &voiceDeps{
+				output:    output,
+				tap:       voiceTap,
+				concierge: conc,
+				link:      &voiceHooks,
+				session:   func() string { id, _ := manager.ActiveSession(); return id },
+				red:       func() bool { return capture.capturing(micStatus) },
+				notify:    hub.BroadcastVoiceEvent,
+			})
+			if err != nil {
+				stop()
+				return err
+			}
+			stopConcierge = stop
+			return nil
+		}(); err != nil {
+			log.Printf("warning: the meeting voice is off: %v", err)
+			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())
+		}
 	}
 
 	// Wire up the mic diagnostic hook. A paused instance opens the mic only on
@@ -1984,6 +2032,8 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	<-sig
 
 	log.Println("ghost-wispr: shutting down")
+	// The voice stops first: its session, its speech and the Concierge's calls.
+	voiceHooks.Close()
 	cancel()
 	manager.StopSessionStartPublishes()
 	// Each mic loop closes its microphone and ends, even if its device
@@ -2024,6 +2074,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if mic := micRef.Load(); mic != nil && micLoopsEnded {
 		_ = mic.Stop()
 	}
+	stopConcierge()
 	if ttsOrchestrator != nil {
 		ttsOrchestrator.Stop()
 	}

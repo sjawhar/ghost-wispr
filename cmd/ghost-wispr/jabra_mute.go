@@ -52,9 +52,13 @@ func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *s
 	}
 }
 
-func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) {
+// startJabraMuteButton serves the Jabra's mute button when the config turns
+// it on; onPress runs at each press, before the toggle, and stops the voice.
+func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry, onPress func()) {
 	if cfg.JabraMuteButton {
-		go newJabraMuteButton(capture, device, controls, warnings).run(ctx)
+		button := newJabraMuteButton(capture, device, controls, warnings)
+		button.onPress = onPress
+		go button.run(ctx)
 	}
 }
 
