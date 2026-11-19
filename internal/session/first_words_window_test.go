@@ -118,7 +118,7 @@ func TestWordsSpokenWhileASessionEndsOpenTheNextSession(t *testing.T) {
 	c.say(3, 4)
 	ended := make(chan error, 1)
 	go func() { ended <- c.manager.endCurrentSession(context.Background()) }() // the silence timer
-	<-slow.closed // the first session's recording is closed; its encode runs
+	<-slow.closed                                                              // the first session's recording is closed; its encode runs
 	c.say(10)
 	c.hear(liveResult(t, false, false, "Good", "morning,"))
 	c.say(11, 12, 13, 14, 15, 16, 17)
