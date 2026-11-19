@@ -526,14 +526,19 @@ func fewestWords(turn string) string {
 	// Deepgram may end a sentence at the key ("…on INFRA-4592. When …"): the
 	// question starts at its first word, in the asker's own words.
 	question = strings.TrimLeftFunc(question, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
-	// With a key named, a leading clause before a comma is the question's
-	// own ("for the demo on Friday, will it be ready"): only a clause that
-	// runs to a question word routes.
-	routing := routingClause
-	if len(issueKeysIn(turn)) > 0 {
-		routing = routingClauseToQuestion
+	// A routing clause runs to the question's first word, which stays, or
+	// to a comma. After "ask the agent on KEY", a clause up to a comma is the
+	// question's own ("for the demo on Friday, will it be ready"), unless it
+	// names a key itself.
+	if m := routingClause.FindStringSubmatchIndex(question); m != nil {
+		keyed := len(issueKeysIn(askPrefix.FindString(turn))) > 0
+		switch {
+		case m[2] >= 0:
+			question = question[m[2]:]
+		case !keyed || len(issueKeysIn(question[:m[1]])) > 0:
+			question = question[m[1]:]
+		}
 	}
-	question = routing.ReplaceAllString(question, "$1")
 	question = camelNumber.ReplaceAllStringFunc(question, func(word string) string {
 		parts := camelNumber.FindStringSubmatch(word)
 		return strings.ToLower(parts[1]) + " " + strings.ToLower(parts[2])
@@ -556,11 +561,8 @@ var (
 	// routingClause is what a person says of the holder before the question
 	// itself: "who holds the issue about X when …", "on the realtime voice
 	// whether …", "for the cache, is it …". It ends at the first comma, which
-	// goes with it, or at the question's first word, which it keeps.
+	// goes with it, or at the question's first word (group 1), which stays.
 	routingClause = regexp.MustCompile(`(?i)^(?:(?:who|that)\s+(?:holds|is\s+holding|owns|is\s+working\s+on|works\s+on)|on|for|about|of|working\s+on|holding)\s+[^,;]*?(?:[,;]\s*|\b(when|whether|if|what|how|why|where|which|who)\b)`)
-	// routingClauseToQuestion is routingClause that ends only at the
-	// question's first word, for a turn that named the issue's key.
-	routingClauseToQuestion = regexp.MustCompile(`(?i)^(?:(?:who|that)\s+(?:holds|is\s+holding|owns|is\s+working\s+on|works\s+on)|on|for|about|of|working\s+on|holding)\s+.*?\b(when|whether|if|what|how|why|where|which|who)\b`)
 	// camelNumber is Deepgram's "SliceOne" for "slice one".
 	camelNumber = regexp.MustCompile(`\b([A-Z][a-z]+)(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\b`)
 	// auxiliaries are the verbs a direct question puts before its subject.
@@ -571,7 +573,10 @@ var (
 	// questionWords start a question; clauseWords start a clause within one.
 	questionWords = set(strings.Fields("when where why how what which who whom whose whether"))
 	clauseWords   = set(strings.Fields("when where why how what whether"))
-	// adverbs join the question word before the verb: "when exactly".
+	// adverbs join the question word before the verb: "when exactly". An
+	// -ly word also does after "how", or just before the verb ("when
+	// realistically will it ship"); elsewhere it may be an adjective
+	// ("nightly builds").
 	adverbs = set(strings.Fields("exactly roughly approximately really actually probably likely precisely quickly badly"))
 )
 
@@ -592,7 +597,7 @@ func direct(question string) string {
 	auxAfter := func(from int) int {
 		for i := from; i < len(words); i++ {
 			w := word(i)
-			if auxiliaries[w] {
+			if auxiliaries[w] && (i == 0 || word(i-1) != "who" && word(i-1) != "which") {
 				return i
 			}
 			joins := strings.HasSuffix(words[i], ",") || strings.HasSuffix(words[i], ";") || w == "and" || w == "or" || w == "but"
@@ -626,8 +631,11 @@ func direct(question string) string {
 				phrase = 3
 			}
 		}
-		if phrase < len(words) && adverbs[word(phrase)] {
-			phrase++ // "when exactly"
+		if w := ""; phrase < len(words) {
+			w = word(phrase)
+			if adverbs[w] || strings.HasSuffix(w, "ly") && (first == "how" || phrase+1 < len(words) && auxiliaries[word(phrase+1)]) {
+				phrase++ // "when exactly", "how reliably"
+			}
 		}
 		if i := auxAfter(phrase); i > phrase {
 			moved := append([]string{}, words[:phrase]...)

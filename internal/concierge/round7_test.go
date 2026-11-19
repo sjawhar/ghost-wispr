@@ -1107,7 +1107,18 @@ func TestTheHoldersQuestionKeepsItsShape(t *testing.T) {
 		"when nightly builds will run again":                                "When will nightly builds run again?",
 		"why daily standups are skipped":                                    "Why are daily standups skipped?",
 		"when the tap ships, will the ring follow":                          "When the tap ships, will the ring follow?",
-		"ask the agent on ABC-12.":                                          "Ask the agent on ABC-12?",
+		// The fifth review: with a key, a routing clause still ends at its
+		// comma; a verb inside a relative clause stays there; an -ly adverb
+		// after "how", or before the verb, stays with the question word.
+		"ask the agent on ABC-12 about the tap, is it merged and if not, why":      "About the tap, is it merged and if not, why?",
+		"ask the agent on the wake word spotter, is ABC-12 merged and if not, why": "Is ABC-12 merged and if not, why?",
+		"ask the agent on the wake word spotter, is PR 80 merged and if not, why":  "Is PR 80 merged and if not, why?",
+		"ask the agent who holds ABC-12, is it merged":                             "Is it merged?",
+		"whether the agent who is working on it is done":                           "Is the agent who is working on it done?",
+		"when the agent who is on it will finish":                                  "When will the agent who is on it finish?",
+		"how reliably does the wake word fire":                                     "How reliably does the wake word fire?",
+		"when realistically will it ship":                                          "When realistically will it ship?",
+		"ask the agent on ABC-12.":                                                 "Ask the agent on ABC-12?",
 	} {
 		if got := fewestWords(turn); got != want {
 			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)
