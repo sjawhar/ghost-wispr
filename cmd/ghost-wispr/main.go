@@ -596,6 +596,15 @@ var streamMicLoopStarter = func(ctx context.Context, loops *sync.WaitGroup, capt
 // Deepgram send queues while a write waits: more than deepgramWriteTimeout.
 const deepgramSendChunks = 64
 
+// newSessionRecorder is the app's recorder: it keeps the sample rate of each
+// session's raw recording with the session in store, so a raw recording kept
+// after a stop inside its session is saved at its true duration.
+func newSessionRecorder(audioDir string, store audio.SessionRates) *audio.Recorder {
+	recorder := audio.NewRecorder(audioDir)
+	recorder.UseSessionRates(store)
+	return recorder
+}
+
 // startMicMonitoring starts the mic loop. The recorder gets each buffer
 // first, and downstream, live transcription, gets it through a bounded queue
 // that never blocks the loop (transcribe.AsyncSender), so no Deepgram
@@ -923,7 +932,7 @@ func main() {
 	hub := server.NewHub(appLogger)
 	hub.SetEventStore(store)
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
-	audioRecorder := audio.NewRecorder(cfg.AudioDir)
+	audioRecorder := newSessionRecorder(cfg.AudioDir, store)
 
 	clientFactory := func(provider, model string) (llm.Client, error) {
 		latestCfg := cfgStore.Get()
@@ -1544,10 +1553,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	capture.beforeMicOpen = micDevice.prepareLightForOpen
 	capture.onMicHeld = micHeldWarning(warningRegistry)
 	capture.capturePresent = captureDevicePresent(warningRegistry, func() bool { return audio.CaptureDevicePresent(cfg.MicDevice) })
-	// A named microphone opens through ALSA's plug layer, at the 16000 Hz the
-	// recording and Deepgram take, whatever rate its card captures at. Set
-	// before any PortAudio initialization, all of which run in a microphone
-	// start, below.
+	// A named microphone opens through ALSA's plug layer, so it opens at the
+	// first rate the start tries, 16000 Hz, whatever rate its card captures
+	// at; the recorder and Deepgram take the rate it opened at. Set before any
+	// PortAudio initialization, all of which run in a microphone start, below.
 	if err := audio.UsePlugCapture(cfg.MicDevice); err != nil {
 		log.Printf("warning: open the microphone through ALSA's plug layer: %v", err)
 	}
@@ -1792,7 +1801,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		ordered := orderedMic{micStreamer: mic, device: micDevice}
 
-		audioRecorder.SetSampleRate(sampleRate)
+		if err := audioRecorder.SetSampleRate(sampleRate); err != nil {
+			// The session's recording still saves at this rate when it ends;
+			// only a raw kept after a stop would be saved at the old one.
+			log.Printf("warning: the session under way keeps its old sample rate in the database: %v", err)
+		}
 		if voiceTap != nil {
 			voiceTap.SetRate(sampleRate)
 		}
@@ -1827,11 +1840,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := liveTranscriptionOptions(&cfg, sampleRate)
-		resilientConfig := transcribe.ResilientConfig{
-			BufferSize:            cfg.DeepgramBufferSize,
-			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
-			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
-		}
+		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
 		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
 		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)

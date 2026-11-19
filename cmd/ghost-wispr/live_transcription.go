@@ -8,9 +8,22 @@ import (
 
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 
+	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
+
+// liveTranscriptionConfig is the resilient Deepgram client's configuration
+// for a microphone opened at sampleRate: with deepgram_buffer_size unset, its
+// buffer holds transcribe.DefaultBufferSeconds at that rate.
+func liveTranscriptionConfig(cfg *config.Config, sampleRate int) transcribe.ResilientConfig {
+	return transcribe.ResilientConfig{
+		BufferSize:            cfg.DeepgramBufferSize,
+		SampleRate:            sampleRate,
+		InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
+		MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
+	}
+}
 
 // deepgramWarningKey is the "deepgram" status warning's key.
 const deepgramWarningKey = "deepgram"

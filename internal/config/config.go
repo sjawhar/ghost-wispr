@@ -125,7 +125,7 @@ type Config struct {
 	BatchTranscription            BatchTranscription `yaml:"batch_transcription"`
 	EmbeddingModel                string             `yaml:"embedding_model"`
 	DeepgramModel                 string             `yaml:"deepgram_model"`
-	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size"`
+	DeepgramBufferSize            int                `yaml:"deepgram_buffer_size,omitempty"` // bytes of live audio held while Deepgram reconnects; 0 holds 60 s at the rate the microphone opened at, and is not written back on a save
 	DeepgramReconnectInitialDelay string             `yaml:"deepgram_reconnect_initial_delay"`
 	DeepgramReconnectMaxBackoff   string             `yaml:"deepgram_reconnect_max_backoff"`
 	SpeakerEnabled                bool               `yaml:"speaker_enabled"`
@@ -183,7 +183,7 @@ func defaults() Config {
 		},
 		EmbeddingModel:                "",
 		DeepgramModel:                 "nova-3",
-		DeepgramBufferSize:            1920000,
+		DeepgramBufferSize:            0,
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
 		TTSMaxLength:                  5000,
@@ -197,6 +197,11 @@ func defaults() Config {
 		},
 	}
 }
+
+// oldDefaultDeepgramBufferSize is deepgram_buffer_size's default before it
+// followed the microphone's rate: 60 s at 16000 Hz, which a settings save
+// wrote into the file. Load reads it as 0, 60 s at the microphone's rate.
+const oldDefaultDeepgramBufferSize = 1920000
 
 // Load reads configuration from a YAML file (if it exists), applies
 // environment variable overrides, loads secrets, and validates the result.
@@ -221,6 +226,12 @@ func Load(path string) (Config, []string, error) {
 	}
 
 	warnings = append(warnings, applyEnvOverrides(&cfg)...)
+	// A settings save under a build before the default followed the
+	// microphone's rate wrote its default, 60 s at 16000 Hz, into the file;
+	// read it as the default it was meant to be.
+	if cfg.DeepgramBufferSize == oldDefaultDeepgramBufferSize {
+		cfg.DeepgramBufferSize = 0
+	}
 	// An unknown light fails closed: dropping the setting would turn the light
 	// check off and let the recorder capture with no light on.
 	cfg.IndicatorLight = strings.ToLower(strings.TrimSpace(cfg.IndicatorLight))
