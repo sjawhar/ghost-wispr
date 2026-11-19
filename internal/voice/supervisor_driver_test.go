@@ -76,6 +76,34 @@ func TestADriverVoiceThatFailsPlaysTheWholeErrorSound(t *testing.T) {
 	})
 }
 
+// TestAnAnswerReturningAsTheFollowUpWindowCloses fails if a driving voice's
+// exchange ends in the gap between its answer tool returning and the voice
+// speaking the answer, because a follow-up window the routing line opened ran
+// out then (voice C's follow_up_race: 3 of 3 runs lost the answer).
+func TestAnAnswerReturningAsTheFollowUpWindowCloses(t *testing.T) {
+	c := newFakeConcierge("The issue is in review.")
+	c.acks = []string{"Reading ABC-12."}
+	c.afterAcks = make(chan struct{})
+	r := newDrivingRigWith(t, time.Minute, c)
+	r.heard("Wispr, what is happening with ABC-12?", true, true)
+	sess := r.waitSession()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
+	}()
+	if got := waitSaid(t, sess); got != "Reading ABC-12." {
+		t.Fatalf("said %q", got)
+	}
+	r.waitSpeaking()
+	r.speaker.finish(audio.InputVoice) // the routing line ends: the window opens
+	// The answer returns just before the window (200 ms in the rig) closes.
+	time.Sleep(150 * time.Millisecond)
+	close(c.afterAcks)
+	<-done
+	never(t, "the exchange ended before the voice spoke the answer", 400*time.Millisecond, func() bool { _, _, closed := sess.state(); return closed })
+}
+
 // TestAVoiceThatEndsByItselfEndsTheExchange fails if a session whose events
 // end without a Close leaves its exchange holding the floor.
 func TestAVoiceThatEndsByItselfEndsTheExchange(t *testing.T) {

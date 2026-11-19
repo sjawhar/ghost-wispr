@@ -1522,6 +1522,11 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		t.ex.toolCalls--
+		// The voice speaks the result next: a follow-up window that a line
+		// said during the call opened closes, or it could end the exchange
+		// before that speech starts. The idle wait covers a voice that then
+		// says nothing.
+		s.disarmFollowUpLocked(t.ex)
 		s.touchLocked(t.ex)
 	}()
 	if c.Name != AnswerTool {

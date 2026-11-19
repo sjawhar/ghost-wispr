@@ -241,6 +241,17 @@ func (v *voiceSource) Voice() (voice.Voice, error) {
 	return v.built, v.err
 }
 
+// warnBuild puts why the voice the settings name cannot be built on the
+// status page while the voice is on, so the operator need not wait for a
+// call's error sound to learn it; it clears the warning otherwise.
+func (v *voiceSource) warnBuild(enabled bool, warnings *warningsRegistry) {
+	if _, err := v.Voice(); enabled && err != nil {
+		warnings.Set("voice_engine", "The meeting voice cannot take a call: "+err.Error())
+		return
+	}
+	warnings.Clear("voice_engine")
+}
+
 // voiceTiming writes the Supervisor's timing events to the journal, as the
 // acceptance driver reads them: msg "voice timing", with event, session_id
 // and at_unix_ns.

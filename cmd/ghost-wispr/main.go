@@ -1968,7 +1968,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if output != nil {
 		var voices voiceSource
 		voices.apply(ctx, &cfg)
-		onConfigChange(cfgStore, func(newCfg *config.Config) { voices.apply(ctx, newCfg) })
+		voices.warnBuild(cfg.Voice.Enabled, warningRegistry)
+		onConfigChange(cfgStore, func(newCfg *config.Config) {
+			voices.apply(ctx, newCfg)
+			voices.warnBuild(newCfg.Voice.Enabled, warningRegistry)
+		})
 		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 			current := cfgStore.Get()
 			// The session page reads a session's questions again on each change.
