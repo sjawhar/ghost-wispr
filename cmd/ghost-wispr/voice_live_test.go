@@ -127,7 +127,7 @@ func TestCaptureOpeningPlaysTheStartSound(t *testing.T) {
 	heard := &soundsHeard{}
 	link.set(heard)
 	capture := newCaptureGate(nil, nil, nil)
-	wireVoiceToCapture(capture, &link)
+	wireVoiceToCapture(capture, &link, nil)
 	capture.Pause()
 	capture.Resume()
 	waitOpen(t, capture)
@@ -144,7 +144,7 @@ func TestAFailedRedCheckPlaysTheErrorSound(t *testing.T) {
 		link.set(heard)
 		capture := newCaptureGate(nil, nil, nil)
 		capture.beforeGateOpen = func() error { return errors.New("the light reads off") }
-		wireVoiceToCapture(capture, &link)
+		wireVoiceToCapture(capture, &link, nil)
 		capture.Pause()
 		capture.Resume()
 		eventuallyTrue(t, "the error sound", func() bool { _, failed := heard.counts(); return failed == 1 })
@@ -154,7 +154,7 @@ func TestAFailedRedCheckPlaysTheErrorSound(t *testing.T) {
 		heard := &soundsHeard{}
 		link.set(heard)
 		capture := newCaptureGate(nil, nil, nil)
-		wireVoiceToCapture(capture, &link)
+		wireVoiceToCapture(capture, &link, nil)
 		guard := newLightGuard(capture, newWarningsRegistry(), time.Hour)
 		guard.apply(errors.New("the light reads blue"))
 		guard.apply(errors.New("the light reads blue"))

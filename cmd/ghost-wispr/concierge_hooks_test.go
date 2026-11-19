@@ -10,6 +10,8 @@ type recordedSessions struct {
 	mu      sync.Mutex
 	ended   []string
 	deleted []string
+	// gateClosings counts the gate closings it heard.
+	gateClosings int
 }
 
 func (r *recordedSessions) SessionEnded(id string) error {
@@ -23,6 +25,37 @@ func (r *recordedSessions) SessionDeleted(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deleted = append(r.deleted, id)
+}
+
+func (r *recordedSessions) GateClosed() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gateClosings++
+}
+
+// TestAGateClosingReachesTheConcierge fails if a pause or a light hold of the
+// real capture gate does not reach the Concierge, which drops what it read
+// before the session existed (ReviewPR89's round 2), or reaches it before it
+// runs.
+func TestAGateClosingReachesTheConcierge(t *testing.T) {
+	var link voiceLink
+	var hooks conciergeHooks
+	capture := newCaptureGate(nil, nil, nil)
+	wireVoiceToCapture(capture, &link, &hooks)
+	capture.Pause() // no Concierge yet: nothing to reach
+	capture.Resume()
+	waitOpen(t, capture)
+	c := &recordedSessions{}
+	hooks.set(c)
+	capture.Pause()
+	capture.Resume()
+	waitOpen(t, capture)
+	capture.HoldForLight()
+	eventuallyTrue(t, "two gate closings at the Concierge", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.gateClosings == 2
+	})
 }
 
 // TestConciergeSessionHooks fails if a session end or a session delete,

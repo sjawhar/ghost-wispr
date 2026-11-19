@@ -154,10 +154,11 @@ func nextEnvoyRetry(wait time.Duration) time.Duration {
 }
 
 // conciergeSessions is what the Concierge does when a session ends or is
-// deleted; *concierge.Concierge implements it.
+// deleted, and when capture closes; *concierge.Concierge implements it.
 type conciergeSessions interface {
 	SessionEnded(sessionID string) error
 	SessionDeleted(sessionID string)
+	GateClosed()
 }
 
 // conciergeHooks reaches the Concierge from the session manager and the
@@ -196,6 +197,17 @@ func (h *conciergeHooks) SessionsDeleted(sessionIDs []string) {
 		for _, id := range sessionIDs {
 			c.SessionDeleted(id)
 		}
+	}
+}
+
+// GateClosed tells the Concierge that capture closed: it drops what it read
+// before a recording session existed. A nil hooks does nothing.
+func (h *conciergeHooks) GateClosed() {
+	if h == nil {
+		return
+	}
+	if c := h.get(); c != nil {
+		c.GateClosed()
 	}
 }
 

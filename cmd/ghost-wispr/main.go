@@ -1075,7 +1075,7 @@ func main() {
 	// it, the one restorePause may make included; the voice itself starts
 	// once the speaker output exists, below. Its tap is one more writer
 	// behind the gate, while the unit has a speaker for a voice.
-	wireVoiceToCapture(capture, &voiceHooks)
+	wireVoiceToCapture(capture, &voiceHooks, &conciergeSessionHooks)
 	var voiceTap *voice.Tap
 	var voiceAudio io.Writer // nil with no speaker: the mic writes nothing more
 	if cfg.SpeakerEnabled {

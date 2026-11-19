@@ -92,7 +92,7 @@ func TestAPauseStopsTheVoiceThroughTheGate(t *testing.T) {
 	heard := &closingsHeard{}
 	link.set(heard)
 	capture := newCaptureGate(nil, nil, nil)
-	wireVoiceToCapture(capture, &link)
+	wireVoiceToCapture(capture, &link, nil)
 	capture.Pause()
 	capture.Resume()
 	waitOpen(t, capture)
