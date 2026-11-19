@@ -26,6 +26,10 @@ func TestQuotesReadsWordsNotLetters(t *testing.T) {
 		{"cannot pronounce 4592", "The issue 4592 is in review.", true},
 		{"invalid voice Ask", "Ask Priya about the budget review.", false},
 		{"permission denied", "Ask Priya about the permission notes.", false},
+		// A name that starts the text is a name too, unless it is a word
+		// that often starts a sentence (ReviewPR89's round 3).
+		{`unknown word "Priya"`, "Priya asked about the budget review.", true},
+		{"the request was invalid", "The issue is in review.", false},
 	} {
 		if got := Quotes(tc.message, tc.text); got != tc.quotes {
 			t.Errorf("Quotes(%q, %q) = %v, want %v", tc.message, tc.text, got, tc.quotes)

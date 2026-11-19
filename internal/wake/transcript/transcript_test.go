@@ -168,6 +168,11 @@ func TestSpokenKeysAreWritten(t *testing.T) {
 		// digits, as issue numbers are; a duration is not one (ReviewPR89).
 		"we're in for thirty minutes?":  "we're in for thirty minutes?",
 		"we are in for 45 more minutes": "we are in for 45 more minutes",
+		// Nor is a year (ReviewPR89's round 3); the project said as a word
+		// still reads.
+		"we're in for 2027":                "we're in for 2027",
+		"we're in for twenty twenty seven": "we're in for twenty twenty seven",
+		"what about infra 2027":            "what about INFRA-2027",
 	} {
 		if got := WriteKeys(text, projects); got != want {
 			t.Errorf("WriteKeys(%q) = %q, want %q", text, got, want)

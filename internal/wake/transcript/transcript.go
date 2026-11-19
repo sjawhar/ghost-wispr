@@ -357,8 +357,9 @@ func keySpans(tokens []token) []keySpan {
 		if i+1 < len(tokens) {
 			if project, ok := soundsLikeProject[[2]string{word, normalise(texts[i+1])}]; ok {
 				// Only before a number of three or more digits, as issue
-				// numbers are: "in for thirty minutes" is no key.
-				if digits, used := spokenNumber(texts[i+2:]); len(digits) >= 3 {
+				// numbers are, and no year: "in for thirty minutes" and "in
+				// for 2027" are no keys.
+				if digits, used := spokenNumber(texts[i+2:]); len(digits) >= 3 && !aYear(digits) {
 					spans = append(spans, keySpan{key: project + "-" + digits, from: i, to: i + 2 + used})
 					i += 1 + used
 					continue
@@ -376,6 +377,12 @@ func keySpans(tokens []token) []keySpan {
 		i += used
 	}
 	return spans
+}
+
+// aYear reports whether digits read as a year of this era (1900 to 2099),
+// which "in for" before it is not a project: "we're in for 2027".
+func aYear(digits string) bool {
+	return len(digits) == 4 && (strings.HasPrefix(digits, "19") || strings.HasPrefix(digits, "20"))
 }
 
 // keyToken reports a written key such as "INFRA-1027", with punctuation

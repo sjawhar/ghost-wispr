@@ -142,8 +142,13 @@ type session struct {
 // sayRequest is one Say: its text's audio, as synthesis gives it, waits in
 // chunks until play writes it.
 type sayRequest struct {
-	ctx    context.Context
-	cancel func(error) // ends ctx, and its tie to the caller's, once play is done with the Say
+	ctx context.Context // synthesis: ends with the generation (an Interrupt) or the caller's ctx
+	// wctx is the context of the request's writes to the playback: a child
+	// of the caller's ctx, so a stop (the exchange's ctx ending) refuses the
+	// next write synchronously, with no frame of a sentence synthesised
+	// ahead reaching the Output; it also ends with the generation.
+	wctx   context.Context
+	cancel func(error) // ends ctx and wctx, and their ties, once play is done with the Say
 	text   string
 	gen    int
 	done   chan error // the Say's result, once
@@ -203,6 +208,9 @@ func (r *sayRequest) next() (pcm []byte, more bool, err error) {
 		case r.ctx.Err() != nil:
 			r.mu.Unlock()
 			return nil, false, context.Cause(r.ctx)
+		case r.wctx.Err() != nil:
+			r.mu.Unlock()
+			return nil, false, context.Cause(r.wctx)
 		case len(r.chunks) > 0:
 			pcm, r.chunks = r.chunks[0], r.chunks[1:]
 			r.mu.Unlock()
@@ -217,6 +225,8 @@ func (r *sayRequest) next() (pcm []byte, more bool, err error) {
 		case <-r.more:
 		case <-r.ctx.Done():
 			return nil, false, context.Cause(r.ctx)
+		case <-r.wctx.Done():
+			return nil, false, context.Cause(r.wctx)
 		}
 	}
 }
@@ -265,18 +275,24 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 	s.pending++
 	s.mu.Unlock()
 
-	// The request ends with its generation, synchronously, so an Interrupt
-	// reaches it, and its audio synthesised ahead, at once. It also ends with
-	// the caller's ctx, the exchange's, until play is done with it: a stop
-	// cuts the text synthesised ahead though its Say has returned.
+	// The request's synthesis ends with its generation, synchronously, so an
+	// Interrupt reaches it, and its audio synthesised ahead, at once. Its
+	// writes end with the caller's ctx, the exchange's, synchronously, until
+	// play is done with it: a stop cuts the text synthesised ahead though its
+	// Say has returned, with no frame queued after it. Each also ends, through
+	// an AfterFunc, with the other's parent.
 	rctx, cancel := context.WithCancelCause(epoch)
-	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	stopR := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	wctx, cancelW := context.WithCancelCause(ctx)
+	stopW := context.AfterFunc(epoch, func() { cancelW(context.Cause(epoch)) })
 	release := func(err error) {
-		stop()
+		stopR()
+		stopW()
 		cancel(err)
+		cancelW(err)
 	}
 
-	r := &sayRequest{ctx: rctx, cancel: release, text: text, gen: gen, done: make(chan error, 1), more: make(chan struct{}, 1)}
+	r := &sayRequest{ctx: rctx, wctx: wctx, cancel: release, text: text, gen: gen, done: make(chan error, 1), more: make(chan struct{}, 1)}
 	select {
 	case s.says <- r:
 	case <-rctx.Done():
@@ -475,7 +491,7 @@ func (s *session) speak(r *sayRequest) error {
 				}
 			}
 			s.carry = s.carry[:0]
-			if err != nil && !errors.Is(err, ErrInterrupted) && r.ctx.Err() == nil && r.failWrite(err) {
+			if err != nil && !errors.Is(err, ErrInterrupted) && r.ctx.Err() == nil && r.wctx.Err() == nil && r.failWrite(err) {
 				// The Output ended the playback: the next Say begins another.
 				s.mu.Lock()
 				s.pb = nil
@@ -486,7 +502,7 @@ func (s *session) speak(r *sayRequest) error {
 		}
 		if err := s.write(r, pcm, &first); err != nil {
 			s.carry = s.carry[:0]
-			if r.ctx.Err() == nil && !errors.Is(err, ErrInterrupted) && r.failWrite(err) {
+			if r.ctx.Err() == nil && r.wctx.Err() == nil && !errors.Is(err, ErrInterrupted) && r.failWrite(err) {
 				s.mu.Lock()
 				s.pb = nil
 				s.mu.Unlock()
@@ -563,10 +579,10 @@ func (s *session) writeFrame(r *sayRequest, frame []byte, first *bool) error {
 		s.mu.Unlock()
 		return ErrInterrupted
 	}
-	if err := r.ctx.Err(); err != nil {
+	if err := r.wctx.Err(); err != nil {
 		// A stop ended the request: begin no playback for it.
 		s.mu.Unlock()
-		return context.Cause(r.ctx)
+		return context.Cause(r.wctx)
 	}
 	if s.pb == nil {
 		s.pb, s.pbGen = s.out.Begin(), r.gen
@@ -581,5 +597,5 @@ func (s *session) writeFrame(r *sayRequest, frame []byte, first *bool) error {
 	}
 	pb := s.pb
 	s.mu.Unlock()
-	return pb.Write(r.ctx, frame, s.format)
+	return pb.Write(r.wctx, frame, s.format)
 }

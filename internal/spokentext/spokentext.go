@@ -61,7 +61,10 @@ func Quotes(message, text string) bool {
 }
 
 // namesAndNumbers returns, in lower case, the words of text that are names
-// (capitalised, not starting a sentence) or hold a digit.
+// or hold a digit. A name is a capitalised word; one that starts a sentence
+// counts too, unless it is a word that often starts a sentence ("The", "Ask"),
+// so a vendor message that quotes only a name that opens the text is still
+// withheld.
 func namesAndNumbers(text string) []string {
 	var out []string
 	sentenceStart := true
@@ -69,7 +72,8 @@ func namesAndNumbers(text string) []string {
 		word := strings.TrimFunc(field, notWordRune)
 		if word != "" {
 			first, _ := utf8.DecodeRuneInString(word)
-			if strings.ContainsFunc(word, unicode.IsDigit) || (unicode.IsUpper(first) && !sentenceStart) {
+			name := unicode.IsUpper(first) && (!sentenceStart || !sentenceWords[strings.ToLower(word)])
+			if strings.ContainsFunc(word, unicode.IsDigit) || name {
 				out = append(out, spokenWords(word)...)
 			}
 		}
@@ -77,6 +81,16 @@ func namesAndNumbers(text string) []string {
 	}
 	return out
 }
+
+// sentenceWords are words that often start a sentence, which there are no
+// names.
+var sentenceWords = func() map[string]bool {
+	m := map[string]bool{}
+	for _, w := range strings.Fields("a an the it its i we you they he she this that these those there here what when where who why how which is are was were be do does did can could will would should and but or so yes no please ask tell say read check our my your his her their then now also") {
+		m[w] = true
+	}
+	return m
+}()
 
 func notWordRune(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }
 

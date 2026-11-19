@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -77,5 +79,37 @@ func TestAuraWithholdsAWarningThatQuotesTheText(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Say still waiting 3 s")
+	}
+}
+
+// TestAuraWithholdsACloseReasonThatQuotesTheText fails if the reason with
+// which Deepgram closes the socket, when it quotes the text to speak, reaches
+// the Say's error or its EventErr (ReviewPR89's round 3: aura.go:389).
+func TestAuraWithholdsACloseReasonThatQuotesTheText(t *testing.T) {
+	f := startSpeak(t, func(c *speakConn, typ, _ string) {
+		if typ == "Flush" {
+			c.closeWith(websocket.CloseUnsupportedData, "cannot speak purple elephant")
+		}
+	})
+	s := openSession(t, newTestAura(t, f), newFakeOutput())
+	err := s.Say(context.Background(), spokenText, voice.Fact)
+	if err == nil {
+		t.Fatal("Say succeeded on a closed socket")
+	}
+	if msg := strings.ToLower(err.Error()); strings.Contains(msg, "purple") || strings.Contains(msg, "elephant") {
+		t.Fatalf("the error quotes the text to speak: %v", err)
+	}
+	for {
+		select {
+		case e := <-s.Events():
+			if e.Kind == voice.EventErr {
+				if msg := strings.ToLower(e.Err.Error()); strings.Contains(msg, "purple") || strings.Contains(msg, "elephant") {
+					t.Fatalf("EventErr quotes the text to speak: %v", e.Err)
+				}
+				return
+			}
+		case <-time.After(2 * time.Second):
+			return
+		}
 	}
 }
