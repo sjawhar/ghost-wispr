@@ -191,6 +191,17 @@ func (r *jabraRig) attached() bool {
 // plugged in.
 func (r *jabraRig) start(t *testing.T) {
 	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := r.run(ctx)
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+// run runs the Jabra mute button against fakes until ctx ends, as start does.
+// The returned channel closes once the button's run has returned.
+func (r *jabraRig) run(ctx context.Context) <-chan struct{} {
 	button := newJabraMuteButton(r.capture, r.device, r.controls, r.warnings)
 	button.connect = func() (io.ReadWriteCloser, error) {
 		if r.connectErr != nil {
@@ -204,16 +215,12 @@ func (r *jabraRig) start(t *testing.T) {
 		}
 	}
 	button.retryEvery, button.checkEvery = time.Millisecond, r.checkEvery
-	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		button.run(ctx)
 	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
+	return done
 }
 
 func startJabraRig(t *testing.T, paused bool) *jabraRig {
@@ -279,6 +286,57 @@ func TestJabraLostDeviceEndsItsReader(t *testing.T) {
 	device.mu.Unlock()
 	close(release)
 	waitForHardware(t, "the button to report the lost Jabra", func() bool { return strings.Contains(rig.warning(), "Jabra mute button not found") })
+}
+
+// TestTheJabraButtonEndsOnlyOnceItsPressesHave fails if the Jabra button's run
+// returns while a press's resume, which runs in the background, still runs:
+// nothing would then wait for it or for the light written after it, as
+// runPowerButton waits for its own (review 5967147417 of #79).
+func TestTheJabraButtonEndsOnlyOnceItsPressesHave(t *testing.T) {
+	rig := newJabraRig(true)
+	rig.checkEvery = time.Hour
+	resuming, release := make(chan struct{}), make(chan struct{})
+	resume := rig.controls.Resume
+	rig.controls.Resume = func() error {
+		close(resuming)
+		<-release
+		return resume()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := rig.run(ctx)
+	released := false
+	t.Cleanup(func() {
+		cancel()
+		if !released {
+			close(release)
+		}
+		<-done
+	})
+	device := rig.plugIn()
+	waitForHardware(t, "the Jabra to connect", func() bool { return device.reportsSent() > 0 })
+
+	device.press(t)
+	select {
+	case <-resuming:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the press started no resume within 5s")
+	}
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("the Jabra button's run returned while its press's resume still ran")
+	case <-time.After(200 * time.Millisecond):
+	}
+	released = true
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Jabra button's run did not return within 5s of its press's resume")
+	}
+	if rig.capture.IsPaused() {
+		t.Fatal("the press's resume left capture paused")
+	}
 }
 
 // TestJabraLightFollowsEveryPauseSource fails if a pause or resume from the

@@ -33,6 +33,9 @@ type jabraMuteButton struct {
 	controls *server.ControlHooks
 	warnings *warningsRegistry
 	toggle   *buttonToggle
+	// presses counts the presses whose resume or last light write still
+	// runs; run waits for them.
+	presses sync.WaitGroup
 	// connect finds and opens the Jabra's evdev node; tests replace it.
 	connect    func() (io.ReadWriteCloser, error)
 	retryEvery time.Duration
@@ -86,8 +89,10 @@ func openJabra(procDevices, devRoot string) (*os.File, error) {
 
 // run serves the Jabra until ctx ends, and looks for it again each
 // retryEvery while it is missing or after it fails, as after an unplug. It
-// logs a warning when the warning changes, not at each retry.
+// logs a warning when the warning changes, not at each retry. It returns once
+// every press, its background resume included, is over.
 func (b *jabraMuteButton) run(ctx context.Context) {
+	defer b.presses.Wait()
 	warned := ""
 	for ctx.Err() == nil {
 		device, err := b.connect()
@@ -183,7 +188,9 @@ func (b *jabraMuteButton) press(at time.Duration) {
 		func() bool { return b.device.ownOperationAt(at) },
 		func() { b.device.refreshLight(at) },
 	)
+	b.presses.Add(1)
 	go func() {
+		defer b.presses.Done()
 		<-done
 		b.device.refreshLight(at)
 	}()
