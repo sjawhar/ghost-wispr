@@ -111,9 +111,10 @@ type EventKind int
 const (
 	EventSpeechStarted EventKind = iota + 1
 	EventSpeechEnded
-	EventUserTurn // Text holds the turn the vendor heard
-	EventToolCall // Call holds the request
-	EventErr      // Err holds the failure
+	EventUserTurn  // Text holds the turn the vendor heard
+	EventToolCall  // Call holds the request
+	EventErr       // Err holds the failure
+	EventAgentText // Text holds words the voice speaks or is about to, for the own-speech filter
 )
 
 // Event is one thing a Session reports.
