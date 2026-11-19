@@ -111,7 +111,10 @@ func earFacts(text, source, questionKey string) string {
 		tokens := earTokens(clause)
 		inRun := make([]bool, len(tokens))
 		for _, run := range numberRuns(tokens) {
-			if !known[strconv.Itoa(run.value)] {
+			// A year-shaped run ("ten thirty") is also a clock time or a
+			// list ("12, 13"): it is held either way.
+			asParts := len(run.parts) == 2 && known[strconv.Itoa(run.parts[0])] && known[strconv.Itoa(run.parts[1])]
+			if !known[strconv.Itoa(run.value)] && !asParts {
 				return "a figure the source does not hold"
 			}
 			for i := run.start; i < run.end; i++ {
@@ -139,7 +142,12 @@ func earFacts(text, source, questionKey string) string {
 }
 
 // numberRun is a run of number words, tokens[start:end], and its value.
-type numberRun struct{ start, end, value int }
+// parts, for a run read as a year ("twenty twenty-six"), are its two halves,
+// as a clock time or a list would read them.
+type numberRun struct {
+	start, end, value int
+	parts             []int
+}
 
 // numberKind is what a number word does in a figure.
 type numberKind int
@@ -231,6 +239,7 @@ func numberRuns(tokens []string) []numberRun {
 	var runs []numberRun
 	for i := 0; i < len(tokens); {
 		var figure figureWords
+		var parts []int
 		end := i
 	figureTokens:
 		for end < len(tokens) {
@@ -246,6 +255,7 @@ func numberRuns(tokens []string) []numberRun {
 					for _, word := range words {
 						rest.add(word)
 					}
+					parts = []int{figure.first.value, rest.value()}
 					figure.current = figure.first.value*100 + rest.value()
 					end++
 				}
@@ -267,7 +277,7 @@ func numberRuns(tokens []string) []numberRun {
 			continue
 		}
 		if end > i+1 || figure.value() != 1 {
-			runs = append(runs, numberRun{start: i, end: end, value: figure.value()})
+			runs = append(runs, numberRun{start: i, end: end, value: figure.value(), parts: parts})
 		}
 		i = end
 	}
@@ -275,7 +285,8 @@ func numberRuns(tokens []string) []numberRun {
 }
 
 // earFileName is a file's name, which the ear hears as "spec dot md".
-var earFileName = regexp.MustCompile(`(?i)\b[\w-]+\.(?:md|go|txt|json|ya?ml|toml|sh|py|ts|js|sql|html|css|log)\b`)
+// ".js" and ".ts" are left out: "Node.js" and "Next.js" are names.
+var earFileName = regexp.MustCompile(`(?i)\b[\w-]+\.(?:md|go|txt|json|ya?ml|toml|sh|py|sql|html|css|log)\b`)
 
 // earForm reports why text does not have the form the ear takes, or "".
 func earForm(text string) string {

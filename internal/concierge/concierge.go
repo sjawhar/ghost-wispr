@@ -58,8 +58,11 @@ func NewGenerator(ctx context.Context, options *genaiconfig.Options) (Generator,
 }
 
 // Records is Dispatch's record as the tools read it; *dispatch.Client is one.
+// Search is Dispatch's normal search, words and meaning; SearchKeywords its
+// words leg alone, far faster.
 type Records interface {
 	Search(ctx context.Context, query string, limit int) ([]dispatch.SearchHit, error)
+	SearchKeywords(ctx context.Context, query string, limit int) ([]dispatch.SearchHit, error)
 	Issue(ctx context.Context, key string) (*dispatch.Issue, error)
 	Events(ctx context.Context, key string, limit int) ([]dispatch.Event, error)
 	DocumentText(ctx context.Context, key, slug string) (string, error)
@@ -136,9 +139,10 @@ type Concierge struct {
 	// exchange (exchangeKey) and agent session, so a second question
 	// replaces the first, and the same one again sends nothing (R7).
 	lastAsk map[[2]string]sentAsk
-	// unsent is, by exchange and question (askBase), the idempotency key of
-	// a send Envoy did not confirm, which its retry reuses (R7).
-	unsent map[[2]string]string
+	// unsent is, by exchange and question (askBase), a send Envoy did not
+	// confirm: its idempotency key and its time, which its retry reuses, so
+	// the question Envoy may hold and the task name one time (R7).
+	unsent map[[2]string]unsentAsk
 	// working lists the unanswered tasks sent to each agent session, so a
 	// message from it that names no question can be met with a request to
 	// reply again.
@@ -182,17 +186,21 @@ type Concierge struct {
 	projects     map[string]bool
 	projectsRead time.Time
 	projectsBusy bool
+	// projectsDown: the last read of the projects failed.
+	projectsDown bool
 	// projectsDone is closed when the read of the projects now running
 	// ends; nil when none runs.
 	projectsDone chan struct{}
-	// fastBound, knownBound, lookupBound, callBound, searchBound and
-	// routingAfter are the constants of those names (fastAnswerBound for
-	// fastBound, knownAfter for knownBound); a test shortens them.
+	// fastBound, knownBound, lookupBound, callBound, searchBound,
+	// searchSettle and routingAfter are the constants of those names
+	// (fastAnswerBound for fastBound, knownAfter for knownBound); a test
+	// shortens them.
 	fastBound    time.Duration
 	knownBound   time.Duration
 	lookupBound  time.Duration
 	callBound    time.Duration
 	searchBound  time.Duration
+	searchSettle time.Duration
 	routingAfter time.Duration
 }
 
@@ -224,7 +232,7 @@ func New(cfg *Config) (*Concierge, error) {
 		logger:       cfg.Logger,
 		answers:      make(chan voice.PendingAnswer),
 		lastAsk:      map[[2]string]sentAsk{},
-		unsent:       map[[2]string]string{},
+		unsent:       map[[2]string]unsentAsk{},
 		working:      map[string][]string{},
 		askedAgain:   map[string]string{},
 		againFor:     map[string]string{},
@@ -242,6 +250,7 @@ func New(cfg *Config) (*Concierge, error) {
 		lookupBound:  lookupBound,
 		callBound:    callBound,
 		searchBound:  searchBound,
+		searchSettle: searchSettle,
 		routingAfter: routingAfter,
 	}
 	if c.model == "" {
@@ -501,9 +510,11 @@ func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bo
 	case refresh:
 		go c.readProjects(context.WithoutCancel(ctx))
 	case wait && stale && running != nil:
+		// A read Heard started is waited for no longer than a read's bound.
 		select {
 		case <-running:
 		case <-ctx.Done():
+		case <-time.After(c.callBound):
 		}
 		c.mu.Lock()
 		known = c.projects
@@ -519,17 +530,30 @@ func (c *Concierge) startProjectsReadLocked() {
 	c.projectsDone = make(chan struct{})
 }
 
-// readProjects reads Dispatch's project keys and keeps them. A failed read
-// keeps what was known and is tried again after a minute.
+// projectsDownNow reports whether the last read of Dispatch's projects
+// failed, so a key-shaped word cannot be told for a key.
+func (c *Concierge) projectsDownNow() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.projectsDown
+}
+
+// readProjects reads Dispatch's project keys, within a read's bound, and
+// keeps them. A failed read keeps what was known, marks Dispatch down for
+// the keys (projectsDownNow), and is tried again after a minute.
 func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
-	ctx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-	defer cancel()
-	keys, err := c.records.Projects(ctx)
+	var keys []string
+	err := boundCall(ctx, c.callBound, dispatch.ErrUnreachable, func(ctx context.Context) error {
+		var err error
+		keys, err = c.records.Projects(ctx)
+		return err
+	})
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.projectsBusy = false
 	close(c.projectsDone)
 	c.projectsDone = nil
+	c.projectsDown = err != nil
 	if err != nil {
 		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
 		c.projectsRead = c.now().Add(time.Minute - projectsFor)

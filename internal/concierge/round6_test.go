@@ -60,15 +60,15 @@ func answerTurn(t *testing.T, r *rig, turn string) []said {
 	return spoken
 }
 
-// TestOneClearMatch (c-find, R5): a search whose best issue scores at least
-// 1.5 times the second is one clear match. Below that, the first sentence
-// names the issue the Concierge took, by key and title; at 1.6 times it does
-// not.
+// TestOneClearMatch (c-find, R5, R6 as updated): a search whose best issue
+// scores at least 1.5 times the second is one clear match: the answer names
+// the issue the search chose, by key and title, then gives the facts. Below
+// that, the voice asks which of the top two the person meant.
 func TestOneClearMatch(t *testing.T) {
 	for _, c := range []struct {
 		ratio float64
-		named bool
-	}{{1.4, true}, {1.6, false}} {
+		first string
+	}{{1.4, "Did you mean ABC-12, Realtime voice, or ABC-13, Wake word?"}, {1.6, "I took ABC-12: Realtime voice."}} {
 		r := newRig(t)
 		heldIssue(r, "none", false)
 		r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13", Title: "Wake word", Status: "done"}
@@ -78,13 +78,8 @@ func TestOneClearMatch(t *testing.T) {
 		}
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
 		spoken := answerTurn(t, r, "what is happening with the realtime voice")
-		if len(spoken) == 0 {
-			t.Fatalf("ratio %v: nothing said", c.ratio)
-		}
-		first := spoken[0].text
-		named := strings.Contains(first, "ABC-12") && strings.Contains(first, "Realtime voice")
-		if named != c.named {
-			t.Errorf("ratio %v: first sentence %q names the key and title: %v, want %v", c.ratio, first, named, c.named)
+		if len(spoken) == 0 || spoken[0].text != c.first {
+			t.Errorf("ratio %v: spoken = %+v, want %q first", c.ratio, spoken, c.first)
 		}
 	}
 }
@@ -141,7 +136,8 @@ func TestFastAnswerFactsHaveSourcesAndAges(t *testing.T) {
 }
 
 // TestFastAnswerOrder (c-fast-answer, R6): with one clear match, the answer
-// is the facts; a live holder gets no line of its own.
+// gives the issue search chose, then the facts; a live holder gets no line of
+// its own.
 func TestFastAnswerOrder(t *testing.T) {
 	r := newRig(t)
 	heldIssue(r, "session", false)
@@ -149,8 +145,8 @@ func TestFastAnswerOrder(t *testing.T) {
 	r.records.issues["ABC-13"] = &dispatch.Issue{Key: "ABC-13"}
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
 	spoken := answerTurn(t, r, "what is happening with the realtime voice")
-	if len(spoken) != 1 || spoken[0].text != "PR 80 is in review." {
-		t.Fatalf("spoken = %+v, want the fact alone", spoken)
+	if len(spoken) != 2 || spoken[0].text != "I took ABC-12: Realtime voice." || spoken[1].text != "PR 80 is in review." {
+		t.Fatalf("spoken = %+v, want the issue, then the fact", spoken)
 	}
 	if len(r.agents.sent) != 0 {
 		t.Errorf("a status question to a fresh record asked the holder")
