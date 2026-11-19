@@ -19,12 +19,14 @@ var playbackUsesPortAudio = false
 // the Output writes at a time.
 const alsaPeriod = outputFrame
 
-// alsaBuffer is how much audio the speaker's ALSA PCM holds, four periods: a
-// write that finds less than one period free waits. It is what the room hears
-// after the Output mixed it, so a Cancel drops it (alsaStream.Drop), and the
-// mixer has three periods to write the next one before the device runs out
-// (TestALSAOutputKeepsUpUnderLoad).
-const alsaBuffer = 4 * alsaPeriod
+// alsaBuffer is how much audio the speaker's ALSA PCM holds, eight periods: a
+// write that finds less than one period free waits, so the mixer may be late
+// by seven periods before the device runs out and clicks. Under the load of
+// TestALSAOutputKeepsUpUnderLoad the mixer was late by up to 55 ms, and a
+// 40 ms buffer ran out in 2 of 15 runs (INFRA-4592 report). The buffer does
+// not slow a Cancel, which drops it (alsaStream.Drop); it delays only a sound
+// queued while the stream already plays, by up to its length.
+const alsaBuffer = 8 * alsaPeriod
 
 // alsaRates are the rates the speaker tries, in order: it plays at the first
 // the device takes without resampling, its native rate.

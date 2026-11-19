@@ -85,8 +85,14 @@ func TestPortAudioTeardownClosesThePlayingOutput(t *testing.T) {
 			go func() { written <- pb.WriteAll(ctx, constant(48000, time.Minute, 1000), mono48k) }()
 			playing.waitWriting(t)
 
+			began := time.Now()
 			if err := tc.teardown(); err != nil {
 				t.Fatalf("teardown: %v", err)
+			}
+			// The Output closes its stream before its next frame, not once it
+			// has been idle (OutputIdleClose): a mic reconnect waits for it.
+			if took := time.Since(began); took > 100*time.Millisecond {
+				t.Fatalf("the teardown waited %v for the speaker's stream, want it closed before the next frame", took)
 			}
 			if !terminated {
 				t.Fatal("PortAudio was not terminated")

@@ -413,7 +413,7 @@ starts paused scans only at its first resume. The speaker does not wait for it: 
 ALSA playback PCM of the card `speaker_device: J75` names (`plughw:CARD=J75,DEV=0`, the Jabra's
 `pcmC0D0p` on the office Pi), opening no microphone and needing no red light, so a unit restarted
 paused still speaks. It plays at the first of 48000, 44100, 32000, 24000 and 16000 Hz that the
-Jabra takes without resampling, with 10 ms periods and a 40 ms buffer; a cancel of the speech, as
+Jabra takes without resampling, with 10 ms periods and an 80 ms buffer; a cancel of the speech, as
 when someone talks over it, drops that buffer, so the speech stops within 20 ms. Each underrun,
 when the speaker runs out of audio and clicks, is logged as
 `speaker underrun: the device ran out of audio`. It needs no package beyond `libportaudio2`,

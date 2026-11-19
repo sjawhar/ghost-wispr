@@ -619,12 +619,17 @@ func (o *Output) play() {
 		defer outputs.end(o)
 	}
 	var stream PlaybackStream
+	// done is set once the stream is no longer in use: a panic in its close
+	// after that touches no playback, which may be one begun since.
+	done := false
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("speaker output panic recovered", "panic", r)
-			o.mu.Lock()
-			o.endAll(fmt.Errorf("speaker output: %v", r))
-			o.mu.Unlock()
+			if !done {
+				o.mu.Lock()
+				o.endAll(fmt.Errorf("speaker output: %v", r))
+				o.mu.Unlock()
+			}
 		}
 	}()
 	// The output hooks bracket the stream, from before it opens until after
@@ -651,9 +656,12 @@ func (o *Output) play() {
 		o.mu.Lock()
 		o.endAll(fmt.Errorf("open speaker stream: %w", err))
 		o.mu.Unlock()
+		done = true
 		return
 	}
-	if err := o.mix(stream, rate); err != nil {
+	err = o.mix(stream, rate)
+	done = true
+	if err != nil {
 		o.mu.Lock()
 		o.endAll(err)
 		o.mu.Unlock()

@@ -707,3 +707,30 @@ func TestOutputCloseEndsPlayback(t *testing.T) {
 		t.Fatalf("a write after Close = %v, want ErrOutputClosed", err)
 	}
 }
+
+// TestPlaybackDrainWaitsForTheStreamToTakeItsLastFrame fails if Drain returns
+// while the frame that holds the playback's last audio is still on its way to
+// the stream: a writer that drains and then reports the speech done, or reads
+// what played, would run ahead of the device.
+func TestPlaybackDrainWaitsForTheStreamToTakeItsLastFrame(t *testing.T) {
+	stream := newFakeStream(48000)
+	stream.block = make(chan struct{})
+	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
+	ctx := testContext(t)
+	pb := out.Begin(InputVoice)
+	if err := pb.Write(ctx, constant(48000, outputFrame, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	stream.waitWriting(t) // the frame that holds all of it is mixed, and its write waits
+	drained := make(chan error, 1)
+	go func() { drained <- pb.Drain(ctx) }()
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned %v while the stream's write of the playback's frame was under way", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(stream.block)
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+}

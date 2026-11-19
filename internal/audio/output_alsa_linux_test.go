@@ -117,11 +117,17 @@ func (p *fakePCM) drop() int {
 	return 0
 }
 
+// prepare refuses a running PCM with -EBUSY, as the kernel does
+// (snd_pcm_pre_prepare): a drop must stop it first.
 func (p *fakePCM) prepare() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if run := p.runs[len(p.runs)-1]; !run.stopped {
-		run.played, run.stopped = p.consumed(run, time.Now()), true
+	run := p.runs[len(p.runs)-1]
+	if run.started && !run.stopped {
+		return -int(syscall.EBUSY)
+	}
+	if !run.stopped {
+		run.played, run.stopped = 0, true // a prepared PCM that never started played nothing
 	}
 	p.runs = append(p.runs, &pcmRun{})
 	p.xrun = false
@@ -169,9 +175,9 @@ func outputOnPCM(t *testing.T, pcm *fakePCM, idle time.Duration) *Output {
 
 // TestALSAOutputCancelSilencesTheVoiceWithin20ms fails if the room still
 // hears the voice more than 20 ms after Cancel on the ALSA path, where the
-// device holds 40 ms that it has not played (alsaBuffer): the frames it holds
-// must be dropped, not played out. The chime, which plays on, must lose
-// nothing to the drop: what the device held of it plays again.
+// device holds alsaBuffer that it has not played: the frames it holds must be
+// dropped, not played out. The chime, which plays on, must lose nothing to
+// the drop: what the device held of it plays again.
 func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 	pcm := newFakePCM(48000, 48000*int(alsaBuffer/time.Millisecond)/1000)
 	out := outputOnPCM(t, pcm, 100*time.Millisecond)
@@ -214,8 +220,8 @@ func TestALSAOutputCancelSilencesTheVoiceWithin20ms(t *testing.T) {
 		t.Fatalf("the device played the voice for %v after Cancel, want silence within 20 ms", heard)
 	}
 	// avail and drop are two calls, and the device plays on between them, so
-	// up to a few frames it played can be written again; the 40 ms it held
-	// are 1920 frames.
+	// up to a few frames it played can be written again; the device holds
+	// thousands (alsaBuffer).
 	if chimeFrames < 24000 || chimeFrames > 24000+48 {
 		t.Fatalf("the device played %d frames of the chime, want all 24000 (500 ms): the drop lost what it held of the chime", chimeFrames)
 	}
