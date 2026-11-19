@@ -36,6 +36,10 @@ type fakeRecords struct {
 	err        error
 	queries    []string
 	issueCalls []string
+	// block, when set, holds each Issue call (of blockKey only, when that is
+	// set) until it is closed or the call's context ends.
+	block    chan struct{}
+	blockKey string
 }
 
 func (f *fakeRecords) Search(_ context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
@@ -45,10 +49,23 @@ func (f *fakeRecords) Search(_ context.Context, query string, _ int) ([]dispatch
 	return f.hits, f.err
 }
 
-func (f *fakeRecords) Issue(_ context.Context, key string) (*dispatch.Issue, error) {
+func (f *fakeRecords) Issue(ctx context.Context, key string) (*dispatch.Issue, error) {
+	f.mu.Lock()
+	f.issueCalls = append(f.issueCalls, key)
+	block := f.block
+	if f.blockKey != "" && key != f.blockKey {
+		block = nil
+	}
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.issueCalls = append(f.issueCalls, key)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -57,6 +74,13 @@ func (f *fakeRecords) Issue(_ context.Context, key string) (*dispatch.Issue, err
 		return nil, &dispatch.APIError{Status: 404, Code: "NOT_FOUND", Message: "not found"}
 	}
 	return issue, nil
+}
+
+// searches is a copy of the queries Search was called with.
+func (f *fakeRecords) searches() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.queries...)
 }
 
 // calls is a copy of the keys Issue was called with.
@@ -93,11 +117,16 @@ type fakeAgents struct {
 	// onSend runs inside Send before it answers, with Send's own context and
 	// the event id it is about to answer.
 	onSend func(ctx context.Context, eventID string) error
+	// onLookup runs inside Lookup before it answers.
+	onLookup func(id string)
 }
 
 func (f *fakeAgents) ID() string { return f.id }
 
 func (f *fakeAgents) Lookup(_ context.Context, id string) (envoy.SessionInfo, error) {
+	if f.onLookup != nil {
+		f.onLookup(id)
+	}
 	if info, ok := f.states[id]; ok {
 		return info, nil
 	}

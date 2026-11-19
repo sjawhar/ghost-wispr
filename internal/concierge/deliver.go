@@ -99,7 +99,11 @@ func (c *Concierge) askAgain(message *envoy.Message) {
 	}
 	for _, id := range pending {
 		task, err := c.task(id)
-		if err != nil || task.State != storage.VoiceTaskWorking {
+		if err != nil {
+			c.logger.Warn("concierge could not read a task it may ask about again", "task", id, "error", err)
+			continue
+		}
+		if task.State != storage.VoiceTaskWorking {
 			continue
 		}
 		c.mu.Lock()
@@ -111,11 +115,13 @@ func (c *Concierge) askAgain(message *envoy.Message) {
 		if asked {
 			continue
 		}
+		// The key is the task's: a request that reached Envoy before its
+		// send failed is not sent twice.
 		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 		sent, err := agents.Send(ctx, &envoy.SendRequest{
 			Target:         message.SourceSession,
 			Message:        c.askAgainMessage(&task),
-			IdempotencyKey: uuid.NewString(),
+			IdempotencyKey: uuid.NewSHA1(uuid.NameSpaceOID, []byte("ghost-wispr ask again "+task.ID)).String(),
 			InReplyTo:      message.EventID,
 		})
 		cancel()

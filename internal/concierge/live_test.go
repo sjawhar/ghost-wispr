@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"log/slog"
 	"os"
@@ -112,21 +113,47 @@ func TestLiveConciergeRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if turn := os.Getenv("GHOST_WISPR_LIVE_TURN"); turn != "" {
-		for _, heard := range []bool{false, true} {
+	turn := os.Getenv("GHOST_WISPR_LIVE_TURN")
+	if turn == "" && target == "" {
+		t.Skip("set GHOST_WISPR_LIVE_TURN, GHOST_WISPR_LIVE_TARGET or both")
+	}
+	if turn != "" {
+		// One warm-up turn opens the connections to Vertex and Dispatch and
+		// is not counted; then cold and read-ahead runs alternate, so neither
+		// always goes first.
+		runs := []struct {
+			label string
+			heard bool
+		}{{"warm-up", false}}
+		for rep := range 3 {
+			first, second := false, true
+			if rep%2 == 1 {
+				first, second = true, false
+			}
+			runs = append(runs, struct {
+				label string
+				heard bool
+			}{fmt.Sprintf("run %d", rep+1), first}, struct {
+				label string
+				heard bool
+			}{fmt.Sprintf("run %d", rep+1), second})
+		}
+		for _, run := range runs {
 			x := &voice.Exchange{SessionID: meeting, WakeAt: time.Now()}
-			if heard {
+			if run.heard {
 				// The asker says the turn at about three words a second.
 				words := strings.Fields(turn)
 				for i := range words {
-					concierge.Heard(t.Context(), x, strings.Join(words[:i+1], " "))
+					concierge.Heard(ctx, x, strings.Join(words[:i+1], " "))
 					time.Sleep(330 * time.Millisecond)
 				}
 			}
 			var spoken []string
 			ended := time.Now()
 			err := concierge.Answer(ctx, x, turn, func(_ context.Context, text string, mode voice.SayMode) error {
-				t.Logf("heard=%v said (%s) %s after the turn: %q", heard, mode, time.Since(ended).Round(time.Millisecond), text)
+				if len(spoken) == 0 {
+					t.Logf("%s heard=%v first sentence (%s) %s after the turn: %q", run.label, run.heard, mode, time.Since(ended).Round(time.Millisecond), text)
+				}
 				spoken = append(spoken, text)
 				return nil
 			})

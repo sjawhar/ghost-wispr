@@ -190,7 +190,7 @@ func TestAReplyLandsOnItsTaskAndIsAnnouncedForTheEar(t *testing.T) {
 	}
 	select {
 	case answer := <-r.concierge.Answers():
-		if answer.TaskID != "evt-1" || answer.SessionID != "meeting-1" || answer.IssueKey != "ABC-12" || answer.Text != "Yes. PR 80 merged the tap this morning." {
+		if answer.TaskID != "evt-1" || answer.SessionID != "meeting-1" || answer.IssueKey != "ABC-12" || answer.Text != "Yes. PR 80 merged the tap this morning." || !answer.AskedAt.Equal(testNow) {
 			t.Fatalf("pending answer = %+v", answer)
 		}
 	case <-time.After(5 * time.Second):
