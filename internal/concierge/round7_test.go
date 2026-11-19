@@ -1269,3 +1269,20 @@ func TestWhileTheHolderIsAskedTheModelSearchesNothing(t *testing.T) {
 		t.Fatalf("the model could call tools while the holder is asked: %+v", tc)
 	}
 }
+
+// TestTalkOfChangeNamesNoWork (R6; run at 05ced42): "what changed on the
+// issue about …" heard so far searched "changed", the read-ahead's one search
+// a turn, which the final words did not hold (ahead_words=1 held=0); the
+// answer searched again. Talk of change, like talk of status, names no work.
+func TestTalkOfChangeNamesNoWork(t *testing.T) {
+	for turn, want := range map[string]string{
+		"what changed on the issue":                                         "",
+		"what has changed on the issue about realtime spoken conversation?": "realtime spoken conversation",
+		"any changes to the wake word spotter":                              "wake word spotter",
+		"when will slice one be ready":                                      "slice",
+	} {
+		if got := searchTerms(turn); got != want {
+			t.Errorf("searchTerms(%q) = %q, want %q", turn, got, want)
+		}
+	}
+}

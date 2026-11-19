@@ -43,6 +43,7 @@ func init() {
 		not no yes ok okay right well um uh oh hey hi hello please thanks thank tell say said ask asked know knew think thought see look find
 		wispr whisper ghost agent agents issue issues ticket tickets thing things stuff work working worked works job task tasks
 		happening happen happened happens going go goes gone get got status update updates updated latest new news progress
+		change changes changed changing ready
 		now today yesterday tomorrow yet still again ever last next first days day weeks week hours hour minutes minute time
 		one two three lot lots much many more most less least other another same such own let lets like want need
 		holds holding held holder owns owned owner owning
