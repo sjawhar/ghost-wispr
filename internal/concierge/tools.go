@@ -169,7 +169,11 @@ func (r *runner) call(ctx context.Context, name string, args map[string]any) (ma
 		return nil, ctxErr
 	}
 	if err != nil {
-		r.c.logger.Warn("concierge tool failed", "tool", name, "error", err)
+		// Not-found is an answer, not a failure: a key said in the room that
+		// names no issue is no reason to log.
+		if !dispatch.IsNotFound(err) {
+			r.c.logger.Warn("concierge tool failed", "tool", name, "error", err)
+		}
 		return map[string]any{"error": toolError(err)}, nil
 	}
 	return result, nil
@@ -443,6 +447,9 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 
 	now := r.c.now()
 	localID := uuid.NewString()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := r.c.store.CreateVoiceTask(&storage.VoiceTask{
 		ID: localID, SessionID: r.x.SessionID, AskedAt: now, IssueKey: issueKey, Holder: "session:" + session,
 	}); err != nil {
@@ -452,8 +459,15 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	// find the task yet; Deliver sends such a reply back to come again.
 	r.c.sending(session, +1)
 	defer r.c.sending(session, -1)
-	// The send outlives a stop of the turn: the listener may already hold the
-	// question, and the idempotency key makes finishing it safe.
+	// A stop that came before the send keeps the room's question in the
+	// unit. A send already begun outlives a stop: the listener may already
+	// hold the question, and the idempotency key makes finishing it safe.
+	if err := ctx.Err(); err != nil {
+		if deleteErr := r.c.store.DeleteVoiceTask(localID); deleteErr != nil {
+			r.c.logger.Warn("concierge could not remove the task of a question it did not send", "task", localID, "error", deleteErr)
+		}
+		return nil, err
+	}
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	sent, err := agents.Send(sendCtx, &envoy.SendRequest{
 		Target:         session,
@@ -472,6 +486,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	taskID := sent.EventID
 	r.c.mu.Lock()
 	r.c.sentAs[taskID] = localID
+	r.c.sessionOf[taskID], r.c.sessionOf[localID] = r.x.SessionID, r.x.SessionID
 	r.c.mu.Unlock()
 	if err := r.c.store.RekeyVoiceTask(localID, taskID); err != nil {
 		// The task keeps its local id; sentAs keeps leading the question's
@@ -480,6 +495,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	} else {
 		r.c.mu.Lock()
 		delete(r.c.sentAs, taskID)
+		delete(r.c.sessionOf, localID)
 		r.c.mu.Unlock()
 	}
 	if previousID != "" {
@@ -488,8 +504,16 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 	}
 	r.c.mu.Lock()
-	r.c.lastAsk[asker] = taskID
-	r.c.working[session] = append(r.c.working[session], taskID)
+	if r.c.closedLocked(r.x.SessionID) {
+		// The meeting ended or was deleted while the question was sent:
+		// what it held is gone, and this adds nothing back.
+		delete(r.c.sentAs, taskID)
+		delete(r.c.sessionOf, taskID)
+		delete(r.c.sessionOf, localID)
+	} else {
+		r.c.lastAsk[asker] = taskID
+		r.c.working[session] = append(r.c.working[session], taskID)
+	}
 	r.c.mu.Unlock()
 	result := map[string]any{
 		"task_id":         taskID,
@@ -590,6 +614,9 @@ func (c *Concierge) remember(x *voice.Exchange, session string) {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closedLocked(x.SessionID) {
+		return
+	}
 	for key, entry := range c.named {
 		if now.Sub(entry.at) > namedFor {
 			delete(c.named, key)

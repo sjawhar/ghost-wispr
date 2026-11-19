@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,12 +20,12 @@ import (
 // first fact takes one model call and no tool round.
 
 const (
-	// prefetchWait bounds how long Answer waits for a read still running.
-	prefetchWait = 2 * time.Second
 	// prefetchTimeout bounds one read.
 	prefetchTimeout = 10 * time.Second
 	// minSearchWords is the fewest words worth a search.
 	minSearchWords = 3
+	// maxKeys is how many of a turn's keys a read tries.
+	maxKeys = 3
 )
 
 // spokenKey is an issue key as a transcript writes it: ABC-12, or "infra
@@ -42,11 +43,15 @@ func issueKeysIn(words string) []string {
 	return keys
 }
 
-// readTarget is what a turn asks the record for: "key:ABC-12" for the last
-// issue it names, else "search:<words>", else nothing.
+// readTarget is what a turn asks the record for: "keys:" and the keys it
+// names, the last first, which a read tries in that order ("the last 30
+// days" reads as LAST-30 too, so a key that names no issue gives way to the
+// one before it); else "search:<words>"; else nothing.
 func readTarget(words string) string {
 	if keys := issueKeysIn(words); len(keys) > 0 {
-		return "key:" + keys[len(keys)-1]
+		slices.Reverse(keys)
+		keys = slices.Compact(keys)
+		return "keys:" + strings.Join(keys[:min(len(keys), maxKeys)], ",")
 	}
 	if words = strings.Join(strings.Fields(words), " "); len(strings.Fields(words)) >= minSearchWords {
 		return "search:" + words
@@ -54,11 +59,13 @@ func readTarget(words string) string {
 	return ""
 }
 
-// read is one read of the record for a target.
+// read is one read of the record for a target. complete is set when it ran
+// to its end, not stopped or replaced; record is then what it found.
 type read struct {
-	done   chan struct{}
-	record string
-	cancel context.CancelFunc
+	done     chan struct{}
+	record   string
+	complete bool
+	cancel   context.CancelFunc
 }
 
 // prefetch is the record read for one exchange while its asker speaks. Each
@@ -70,19 +77,31 @@ type prefetch struct {
 	current string
 }
 
+// cancelAll ends every read of p still running.
+func (p *prefetch) cancelAll() {
+	for _, r := range p.reads {
+		r.cancel()
+	}
+}
+
 // Heard tells the Concierge the turn so far in exchange x. It returns at
-// once; the read runs in the background.
-func (c *Concierge) Heard(x *voice.Exchange, words string) {
+// once; the read runs in the background and ends when ctx, the exchange's
+// context, ends with a stop. With no Dispatch it reads nothing.
+func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) {
 	target := readTarget(words)
-	if target == "" {
+	if target == "" || ctx.Err() != nil || c.records == nil {
 		return
 	}
 	exchange := *x
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closedLocked(exchange.SessionID) {
+		return
+	}
 	for key, p := range c.prefetches {
 		if now.Sub(p.at) > namedFor {
+			p.cancelAll()
 			delete(c.prefetches, key)
 		}
 	}
@@ -103,24 +122,29 @@ func (c *Concierge) Heard(x *voice.Exchange, words string) {
 			delete(p.reads, p.current)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
+	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
 	r := &read{done: make(chan struct{}), cancel: cancel}
 	p.reads[target], p.current = r, target
 	go func() {
 		defer cancel()
-		r.record = c.readRecord(ctx, &exchange, target)
+		record := c.readRecord(readCtx, &exchange, target)
+		if readCtx.Err() == nil {
+			r.record, r.complete = record, true
+		}
 		close(r.done)
 	}()
 }
 
-// readFor is the record Answer gives the model for turn: the read Heard made
-// of exactly what the final turn asks, waited for at most prefetchWait, else
-// a read made now.
-func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) string {
+// readFor is the record Answer gives the model for turn, and whether it came
+// from a search rather than a key the turn named: the read Heard made of
+// exactly what the final turn asks, which is final once it ran to its end,
+// else a read made now.
+func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) (record string, searched bool) {
 	target := readTarget(turn)
 	if target == "" {
-		return ""
+		return "", false
 	}
+	searched = strings.HasPrefix(target, "search:")
 	c.mu.Lock()
 	var pending *read
 	if p, ok := c.prefetches[exchangeKey(x)]; ok {
@@ -128,32 +152,31 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 	}
 	c.mu.Unlock()
 	if pending != nil {
-		wait, cancel := context.WithTimeout(ctx, prefetchWait)
-		defer cancel()
 		select {
 		case <-pending.done:
-			if pending.record != "" {
-				return pending.record
+			if pending.complete {
+				return pending.record, searched
 			}
-		case <-wait.Done():
-			if ctx.Err() != nil {
-				return ""
-			}
+		case <-ctx.Done():
+			return "", searched
 		}
 	}
-	return c.readRecord(ctx, x, target)
+	return c.readRecord(ctx, x, target), searched
 }
 
 // readRecord reads target with the tools, as the model would call them, and
-// writes each call and its result on a line. A read of an issue that fails
-// (a number said that names no issue) is left out, so the model is not told
-// of an issue nobody asked about. It is empty when nothing was found.
+// writes each call and its result on a line. For keys, the first key that
+// names an issue is read with its holder, and the reads of the others are
+// left out, so the model is not told of an issue nobody asked about. For a
+// search, the hits and the top hit's issue are read, and no holder: the hit
+// may not be what the question is about, so it makes no session askable. It
+// is empty when nothing was found.
 func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string) string {
 	tools := &runner{c: c, x: x}
 	var lines []string
-	call := func(name string, args map[string]any) map[string]any {
+	call := func(name string, args map[string]any, keepErrors bool) map[string]any {
 		result, err := tools.call(ctx, name, args)
-		if err != nil {
+		if err != nil || (!keepErrors && result["error"] != nil) {
 			return nil
 		}
 		encodedArgs, _ := json.Marshal(args)
@@ -161,24 +184,24 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 		lines = append(lines, fmt.Sprintf("%s(%s) = %s", name, encodedArgs, encoded))
 		return result
 	}
-	key := ""
 	switch {
-	case strings.HasPrefix(target, "key:"):
-		key = strings.TrimPrefix(target, "key:")
+	case strings.HasPrefix(target, "keys:"):
+		for _, key := range strings.Split(strings.TrimPrefix(target, "keys:"), ",") {
+			if ctx.Err() != nil {
+				break
+			}
+			if call("read_issue", map[string]any{"key": key}, false) != nil {
+				call("issue_holder", map[string]any{"key": key}, true)
+				break
+			}
+		}
 	case strings.HasPrefix(target, "search:"):
-		found := call("search_issues", map[string]any{"query": strings.TrimPrefix(target, "search:")})
+		found := call("search_issues", map[string]any{"query": strings.TrimPrefix(target, "search:")}, true)
 		if issues, ok := found["issues"].([]map[string]any); ok && len(issues) > 0 {
-			key, _ = issues[0]["key"].(string)
+			if key, ok := issues[0]["key"].(string); ok {
+				call("read_issue", map[string]any{"key": key}, false)
+			}
 		}
 	}
-	searched := strings.Join(lines, "\n")
-	if key == "" {
-		return searched
-	}
-	issue := call("read_issue", map[string]any{"key": key})
-	if issue == nil || issue["error"] != nil {
-		return searched
-	}
-	call("issue_holder", map[string]any{"key": key})
 	return strings.Join(lines, "\n")
 }

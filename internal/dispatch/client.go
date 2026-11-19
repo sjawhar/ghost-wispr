@@ -63,18 +63,20 @@ func NewClient(baseURL, token string, httpClient *http.Client) (*Client, error) 
 }
 
 // APIError is an answer that is no success. Code is Dispatch's error code
-// (NOT_FOUND, NO_IDENTITY, ...), which callers branch on. Message is
-// Dispatch's own text, which may echo the request, such as a search's words
-// from the room, so Error leaves it out: an error reaches the log.
+// (NOT_FOUND, NO_IDENTITY, ...), which callers branch on. Route names the
+// call (search, issue, events, document). An error reaches the log, and both
+// Dispatch's own text and the request's path can hold words said in the room
+// (a search's words; a key such as LAST-24 heard in "the last 24 hours"), so
+// Error gives neither.
 type APIError struct {
 	Status  int
 	Code    string
 	Message string
-	Path    string
+	Route   string
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("dispatch: %s answered %d %s", e.Path, e.Status, e.Code)
+	return fmt.Sprintf("dispatch: %s answered %d %s", e.Route, e.Status, e.Code)
 }
 
 // IsNotFound reports whether err is Dispatch's 404.
@@ -115,7 +117,7 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchH
 			Snippet string `json:"snippet"`
 		} `json:"results"`
 	}
-	if err := c.get(ctx, "/api/v1/search", params, &answer); err != nil {
+	if err := c.get(ctx, "search", "/api/v1/search", params, &answer); err != nil {
 		return nil, err
 	}
 	hits := make([]SearchHit, 0, len(answer.Results))
@@ -200,7 +202,7 @@ func (c *Client) Issue(ctx context.Context, key string) (*Issue, error) {
 		Issue
 		OpenAsks []json.RawMessage `json:"open_asks"`
 	}
-	if err := c.get(ctx, "/api/v1/issues/"+key, nil, &answer); err != nil {
+	if err := c.get(ctx, "issue", "/api/v1/issues/"+key, nil, &answer); err != nil {
 		return nil, err
 	}
 	issue := answer.Issue
@@ -227,7 +229,7 @@ func (c *Client) Events(ctx context.Context, key string, limit int) ([]Event, er
 		params.Set("limit", strconv.Itoa(limit))
 	}
 	var events []Event
-	if err := c.get(ctx, "/api/v1/issues/"+key+"/events", params, &events); err != nil {
+	if err := c.get(ctx, "events", "/api/v1/issues/"+key+"/events", params, &events); err != nil {
 		return nil, err
 	}
 	return events, nil
@@ -245,7 +247,7 @@ func (c *Client) DocumentText(ctx context.Context, key, slug string) (string, er
 	var answer struct {
 		Markdown string `json:"markdown"`
 	}
-	if err := c.get(ctx, "/api/v1/issues/"+key+"/artifacts/"+slug+"/text", nil, &answer); err != nil {
+	if err := c.get(ctx, "document", "/api/v1/issues/"+key+"/artifacts/"+slug+"/text", nil, &answer); err != nil {
 		return "", err
 	}
 	return answer.Markdown, nil
@@ -261,23 +263,24 @@ func NormalizeIssueKey(key string) (string, error) {
 	return strings.ToUpper(key), nil
 }
 
-func (c *Client) get(ctx context.Context, path string, params url.Values, into any) error {
+// get reads path into into. Its errors name route, never path.
+func (c *Client) get(ctx context.Context, route, path string, params url.Values, into any) error {
 	target := c.base.JoinPath(path)
 	target.RawQuery = params.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), http.NoBody)
 	if err != nil {
-		return fmt.Errorf("dispatch: build %s: %w", path, withoutURL(err))
+		return fmt.Errorf("dispatch: build the %s call: %w", route, withoutURL(err))
 	}
 	request.Header.Set("Authorization", "Bearer "+c.token)
 	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)
 	if err != nil {
-		return fmt.Errorf("%w: %s: %w", ErrUnreachable, path, withoutURL(err))
+		return fmt.Errorf("%w: %s: %w", ErrUnreachable, route, withoutURL(err))
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxAnswerBytes))
 	if err != nil {
-		return fmt.Errorf("%w: read %s: %w", ErrUnreachable, path, withoutURL(err))
+		return fmt.Errorf("%w: read the %s answer: %w", ErrUnreachable, route, withoutURL(err))
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		var refusal struct {
@@ -285,10 +288,10 @@ func (c *Client) get(ctx context.Context, path string, params url.Values, into a
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(body, &refusal)
-		return &APIError{Status: response.StatusCode, Code: refusal.Code, Message: refusal.Error, Path: path}
+		return &APIError{Status: response.StatusCode, Code: refusal.Code, Message: refusal.Error, Route: route}
 	}
 	if err := json.Unmarshal(body, into); err != nil {
-		return fmt.Errorf("dispatch: decode %s: %w", path, err)
+		return fmt.Errorf("dispatch: decode the %s answer: %w", route, err)
 	}
 	return nil
 }

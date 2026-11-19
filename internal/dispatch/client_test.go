@@ -241,3 +241,25 @@ func TestARefusalCarriesNoQueryWords(t *testing.T) {
 		t.Fatalf("the error holds the query: %v", err)
 	}
 }
+
+// TestAnErrorNamesTheRouteNotTheKey: a key comes from words said in the
+// room ("the last 24 hours" reads as LAST-24), so an error that reaches the
+// log names the route it failed on, not the issue's path.
+func TestAnErrorNamesTheRouteNotTheKey(t *testing.T) {
+	_, client := newFakeDispatch(t)
+	_, err := client.Issue(context.Background(), "LAST-24")
+	if !IsNotFound(err) {
+		t.Fatalf("control: Issue of an unknown key = %v, want a 404", err)
+	}
+	if strings.Contains(err.Error(), "LAST") || strings.Contains(err.Error(), "24") {
+		t.Fatalf("the error names the key: %v", err)
+	}
+	unreachable, err := NewClient("http://127.0.0.1:1", "test-token", &http.Client{Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = unreachable.Events(context.Background(), "LAST-24", 5)
+	if !errors.Is(err, ErrUnreachable) || strings.Contains(err.Error(), "LAST") {
+		t.Fatalf("an unreachable read of LAST-24 = %v", err)
+	}
+}

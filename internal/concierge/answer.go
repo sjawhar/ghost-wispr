@@ -44,11 +44,16 @@ const sorry = "Sorry, I cannot answer that right now."
 // Answer answers one turn of x, speaking through say as sentences complete.
 // What Heard read of the record while the asker spoke goes to the model with
 // the turn, so the first fact needs no tool round; an issue the final turn
-// names that was not read yet is read first.
+// names that was not read yet is read first. A search for the turn's words
+// goes with the warning that its hits may not be what the question is about.
 func (c *Concierge) Answer(ctx context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
 	prompt := c.turnPrompt(transcriptOf(x.Recent), turn)
-	if record := c.readFor(ctx, x, turn); record != "" {
-		prompt += "\n\nThe record, read for this question while it was asked:\n" + record +
+	switch record, searched := c.readFor(ctx, x, turn); {
+	case record == "":
+	case searched:
+		prompt += "\n\nA search of the record for the question's words, made while it was asked. Its hits may not be what the question is about: use them only if they are, and call a tool for what they do not hold:\n" + record
+	default:
+		prompt += "\n\nThe record of the issue the question names, read while it was asked:\n" + record +
 			"\nAnswer from it. Call a tool only for what it does not hold."
 	}
 	return c.answer(ctx, x, prompt, say)
