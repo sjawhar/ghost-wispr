@@ -239,6 +239,9 @@ while :; do
   fi
   read -r -t 0.01 -u "$tick" _ || :
 done
+# A stop that gave up waiting before the light is free would stop the recorder without its lock.
+scan_locks
+[[ $light_waited == true ]] || fail "the Light hang step's stop stopped waiting for the blink(1)'s lock before it was free"
 # Let the light go: the holder dies, and its lock with it.
 kill "$holder"
 deadline=$((${EPOCHREALTIME//[!0-9]/} + 10000000))
