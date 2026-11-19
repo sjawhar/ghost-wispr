@@ -132,6 +132,8 @@ type runner struct {
 	// fullCut, when set, closes when a search stops waiting for the full
 	// search of a keyword result with no one clear match (searchBoth).
 	fullCut <-chan struct{}
+	// holderKnown: the answer's record holds the issue's holder (offered).
+	holderKnown bool
 }
 
 // Tools gives x's tools, for x.Tools.
