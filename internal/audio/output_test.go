@@ -722,6 +722,45 @@ func TestOutputCloseEndsPlayback(t *testing.T) {
 	}
 }
 
+// TestPlaybackQueuesNothingUnderADoneContext fails if a Write or WriteAll
+// whose context is already done queues audio: a playback begun just after its
+// exchange was stopped, so after the Cancel that ended the playbacks before
+// it, would still play up to InputQueue.
+func TestPlaybackQueuesNothingUnderADoneContext(t *testing.T) {
+	stream := newFakeStream(48000)
+	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
+	stopped, stop := context.WithCancel(context.Background())
+	stop()
+	late := out.Begin(InputVoice)
+	if err := late.Write(stopped, constant(48000, MaxWriteFrame, 1000), mono48k); !errors.Is(err, context.Canceled) {
+		t.Errorf("Write under a done context = %v, want context.Canceled", err)
+	}
+	if err := late.WriteAll(stopped, constant(48000, InputQueue, 1000), mono48k); !errors.Is(err, context.Canceled) {
+		t.Errorf("WriteAll under a done context = %v, want context.Canceled", err)
+	}
+	// Control: a playback with a live context plays, and only its audio.
+	ctx := testContext(t)
+	next := out.Begin(InputVoice)
+	if err := next.WriteAll(ctx, constant(48000, MaxWriteFrame, 7), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	queued := 0
+	for _, s := range stream.samples() {
+		if s == 1000 {
+			queued++
+		}
+	}
+	if queued > 0 {
+		t.Fatalf("the stream played %d samples written under a done context", queued)
+	}
+	if silent(stream.samples()) {
+		t.Fatal("control: the playback with a live context did not play")
+	}
+}
+
 // TestPlaybackDrainWaitsForTheStreamToTakeItsLastFrame fails if Drain returns
 // while the frame that holds the playback's last audio is still on its way to
 // the stream: a writer that drains and then reports the speech done, or reads
