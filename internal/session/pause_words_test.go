@@ -111,3 +111,36 @@ func TestWordsOfAResultThatRacesAResumeAreDropped(t *testing.T) {
 		t.Fatalf("the session opened after the resume has the live transcript %q; want %q", got, want)
 	}
 }
+
+// TestMessageKeptReturnsOnlyTheWordsAfterTheResume fails if MessageKept, the
+// result the voice's wake path reads, holds words from before a pause that the
+// live transcript drops, changes the result it was given, or returns
+// anything for a result wholly from before the pause.
+func TestMessageKeptReturnsOnlyTheWordsAfterTheResume(t *testing.T) {
+	c := newCapture(t)
+	c.manager.SetLiveStream(clockStream{c})
+	c.say(1, 2, 3)
+	c.pauseAndResume()
+	c.say(10, 11, 12)
+
+	before := timedResult(t, true, false, 0, "Orange", "tractors")
+	if kept, err := c.manager.MessageKept(before); err != nil || kept != nil {
+		t.Fatalf("MessageKept(a result from before the pause) = %v, %v; want nil", kept, err)
+	}
+	mixed := timedResult(t, true, true, 2*time.Second, "road.", "Seven", "quiet", "violins.")
+	kept, err := c.manager.MessageKept(mixed)
+	if err != nil || kept == nil {
+		t.Fatalf("MessageKept(a result with words after the resume) = %v, %v; want those words", kept, err)
+	}
+	alternative := kept.Channel.Alternatives[0]
+	if alternative.Transcript != "Seven quiet violins." || len(alternative.Words) != 3 || alternative.Words[0].PunctuatedWord != "Seven" || !kept.SpeechFinal {
+		t.Fatalf("MessageKept kept transcript %q, %d words, speech_final %t; want \"Seven quiet violins.\", 3 words from \"Seven\", speech_final", alternative.Transcript, len(alternative.Words), kept.SpeechFinal)
+	}
+	if got := mixed.Channel.Alternatives[0].Transcript; got != "road. Seven quiet violins." || len(mixed.Channel.Alternatives[0].Words) != 4 {
+		t.Fatalf("MessageKept changed the result it was given: its transcript is now %q", got)
+	}
+	after := timedResult(t, false, false, 6*time.Second, "Next")
+	if kept, err := c.manager.MessageKept(after); err != nil || kept != after {
+		t.Fatalf("MessageKept(a result wholly after the resume) = %p, %v; want that result, %p", kept, err, after)
+	}
+}

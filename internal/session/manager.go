@@ -125,26 +125,48 @@ func (m *Manager) sessionIDForBroadcast() string {
 	return m.currentSessionID
 }
 
+// Message takes a Deepgram live result (MessageKept).
 func (m *Manager) Message(mr *api.MessageResponse) error {
+	_, err := m.MessageKept(mr)
+	return err
+}
+
+// MessageKept takes a Deepgram live result into the live transcript, and
+// returns the part of it the transcript keeps: mr itself; a copy without its
+// leading words from before the latest pause (afterResumeLocked), whose
+// Transcript is rebuilt from the words kept, whose Words is a subslice of
+// mr's, and whose other fields are mr's, to be read only; or nil when it keeps
+// nothing. The voice reads the result it returns, so no word from before a
+// pause can wake it after the resume.
+func (m *Manager) MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error) {
 	if mr.FromFinalize {
 		// After the words below are buffered or saved, so a waiter ending the
 		// session on this signal saves them too.
 		defer m.finalizeReplied()
 	}
-	sentence := ""
-	if len(mr.Channel.Alternatives) > 0 {
-		sentence = strings.TrimSpace(mr.Channel.Alternatives[0].Transcript)
-	}
-	if sentence == "" {
+	if len(mr.Channel.Alternatives) == 0 || strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) == "" {
 		if mr.IsFinal {
 			m.releasePreroll()
 		}
-		return nil
+		return nil, nil
 	}
+	// Words from before the latest pause, which Deepgram can finalize after
+	// the resume, reach no session after it.
+	m.mu.Lock()
+	resumes := m.resumes
+	kept := m.afterResumeLocked(mr)
+	m.mu.Unlock()
+	if kept == nil {
+		if mr.IsFinal {
+			m.releasePreroll()
+		}
+		return nil, nil
+	}
+	sentence := strings.TrimSpace(kept.Channel.Alternatives[0].Transcript)
 
 	// Extract words from the Deepgram response.
-	words := make([]transcribe.Word, 0, len(mr.Channel.Alternatives[0].Words))
-	for _, word := range mr.Channel.Alternatives[0].Words {
+	words := make([]transcribe.Word, 0, len(kept.Channel.Alternatives[0].Words))
+	for _, word := range kept.Channel.Alternatives[0].Words {
 		words = append(words, transcribe.Word{
 			Speaker:        word.Speaker,
 			PunctuatedWord: word.PunctuatedWord,
@@ -152,19 +174,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 			End:            word.End,
 		})
 	}
-	// Words from before the latest pause, which Deepgram can finalize after
-	// the resume, reach no session after it.
-	m.mu.Lock()
-	resumes := m.resumes
-	words, sentence = m.afterResumeLocked(mr, words, sentence)
-	m.mu.Unlock()
-	if sentence == "" {
-		if mr.IsFinal {
-			m.releasePreroll()
-		}
-		return nil
-	}
-	m.holdPreroll(heardFrom(mr, words))
+	m.holdPreroll(heardFrom(kept, words))
 
 	// Interim result (not final) — prepend any buffered words for context, then broadcast.
 	if !mr.IsFinal {
@@ -199,7 +209,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 			}
 			m.hub.BroadcastLiveTranscriptInterim(m.sessionIDForBroadcast(), speaker, broadcastText, startTime)
 		}
-		return nil
+		return kept, nil
 	}
 
 	// If is_final but no word timings provided, create a fallback word (Fix #7).
@@ -213,7 +223,7 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 	m.mu.Lock()
 	if m.resumes != resumes {
 		m.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	m.buffer.AddWords(words)
 	m.mu.Unlock()
@@ -242,10 +252,10 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 
 	// If speech_final, flush the buffer and persist/broadcast.
 	if mr.SpeechFinal {
-		return m.flushBuffer()
+		return kept, m.flushBuffer()
 	}
 
-	return nil
+	return kept, nil
 }
 
 // heardFrom returns where in the live stream the words of result mr begin:
@@ -1222,41 +1232,51 @@ func (m *Manager) ResumeCapture() {
 	m.capturePaused = false
 }
 
-// afterResumeLocked drops from result mr the words captured before capture
-// last resumed, and returns the words kept and the result's text from them;
-// the text is empty when none are kept. Deepgram lags the microphone after an
+// afterResumeLocked returns result mr without its words captured before
+// capture last resumed: mr itself when it has none, nil when it has nothing
+// else, and else a copy that keeps only the later words, with its Transcript
+// rebuilt from them (MessageKept). Deepgram lags the microphone after an
 // outage, so the pause's Finalize finalizes only what it has reached, and its
 // results for the last words before the pause can come after the resume, even
 // in one result with the first words after it. A word is placed by its
 // middle, a result without word times by the middle of the audio it covers.
-// With no live stream, or before a resume, it keeps every word. It must be
-// called with m.mu held; the live stream never takes m.mu.
-func (m *Manager) afterResumeLocked(mr *api.MessageResponse, words []transcribe.Word, sentence string) ([]transcribe.Word, string) {
+// With no live stream, or before a resume, it keeps every word. mr must have
+// an alternative. It must be called with m.mu held; the live stream never
+// takes m.mu.
+func (m *Manager) afterResumeLocked(mr *api.MessageResponse) *api.MessageResponse {
 	if m.stream == nil || m.resumedAt <= 0 {
-		return words, sentence
+		return mr
 	}
 	before := func(start, end float64) bool {
 		middle := time.Duration((start + end) / 2 * float64(time.Second))
 		return m.stream.CapturedBefore(middle) < m.resumedAt
 	}
+	words := mr.Channel.Alternatives[0].Words
 	if len(words) == 0 {
 		if before(mr.Start, mr.Start+mr.Duration) {
-			return nil, ""
+			return nil
 		}
-		return words, sentence
+		return mr
 	}
 	// Deepgram gives a result's words in the order they were spoken.
-	kept := 0
-	for kept < len(words) && before(words[kept].Start, words[kept].End) {
-		kept++
+	dropped := 0
+	for dropped < len(words) && before(words[dropped].Start, words[dropped].End) {
+		dropped++
 	}
-	if kept == 0 {
-		return words, sentence
+	if dropped == 0 {
+		return mr
 	}
-	words = words[kept:]
-	text := make([]string, len(words))
-	for i, word := range words {
+	alternative := mr.Channel.Alternatives[0]
+	alternative.Words = words[dropped:]
+	text := make([]string, len(alternative.Words))
+	for i, word := range alternative.Words {
 		text[i] = word.PunctuatedWord
 	}
-	return words, strings.Join(text, " ")
+	alternative.Transcript = strings.TrimSpace(strings.Join(text, " "))
+	if alternative.Transcript == "" {
+		return nil
+	}
+	kept := *mr
+	kept.Channel.Alternatives = append([]api.Alternative{alternative}, mr.Channel.Alternatives[1:]...)
+	return &kept
 }
