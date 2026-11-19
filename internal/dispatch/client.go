@@ -133,8 +133,12 @@ func (c *Client) search(ctx context.Context, query string, limit int, keywordsOn
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
 	}
+	route, path := "search", "/api/v1/search"
 	if keywordsOnly {
+		// The route that declares keywords_only: an older Dispatch answers
+		// the plain route 200 with the member dropped, a full search.
 		params.Set("keywords_only", "true")
+		route, path = "search_keywords", "/api/v1/search/results"
 	}
 	var answer struct {
 		Results []struct {
@@ -151,7 +155,7 @@ func (c *Client) search(ctx context.Context, query string, limit int, keywordsOn
 			Rank    float64 `json:"rank"`
 		} `json:"results"`
 	}
-	if err := c.get(ctx, "search", "/api/v1/search", params, &answer); err != nil {
+	if err := c.get(ctx, route, path, params, &answer); err != nil {
 		return nil, err
 	}
 	hits := make([]SearchHit, 0, len(answer.Results))
