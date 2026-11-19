@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -290,6 +291,42 @@ func TestFailedMicStartClosesTheDevice(t *testing.T) {
 				t.Fatalf("device calls = %v, want %v", calls, tc.wantCalls)
 			}
 		})
+	}
+}
+
+// TestAPauseDuringAStartsOpenCancelsTheStart fails if a pause and a resume
+// that land while a start opens the device (audio.NewMic), before the start's
+// own light check, make that check anything but a cancelled start: the switch
+// is on but the gate is still closed until the pause settles, so the check
+// refuses with errMicStartPaused, the device is closed and withdrawn, nothing
+// starts, and the error the start returns is still errMicStartPaused once
+// wrapped. startMicPipeline returns that error before it sets a "Microphone
+// failed to start" warning or start-up status, and startMicrophone starts
+// again at the next resume. (Review 5975477041 of #93, finding 1; the branch
+// in startMicPipeline is in main's closure, which no test reaches.)
+func TestAPauseDuringAStartsOpenCancelsTheStart(t *testing.T) {
+	settle := make(chan struct{})
+	t.Cleanup(sync.OnceFunc(func() { close(settle) }))
+	capture := newCaptureGate(nil, func() { <-settle }, nil)
+	// As wireLightConsent wires it: the open's red confirmation consults the gate.
+	capture.beforeMicOpenRed = func(allowed func() error) error { return allowed() }
+	capture.Pause() // during audio.NewMic
+	capture.Resume()
+	if capture.IsPaused() || !capture.isClosed() {
+		t.Fatalf("setup: paused %v closed %v, want the switch on and the gate closed", capture.IsPaused(), capture.isClosed())
+	}
+	mic := newScriptedMic()
+	withdrawn := false
+	err := startOpenedMic(capture, mic, func() { withdrawn = true }, func(string, ...any) {})
+	if !errors.Is(err, errMicStartPaused) {
+		t.Fatalf("a start whose open a pause and a resume overlapped = %v, want errMicStartPaused", err)
+	}
+	if !withdrawn {
+		t.Error("the device a cancelled start opened was not withdrawn")
+	}
+	mic.expectEvents(t, "close")
+	if wrapped := fmt.Errorf("microphone start failed at %d Hz: %w", 16000, err); !errors.Is(wrapped, errMicStartPaused) {
+		t.Fatalf("the start's error once wrapped = %v, want errMicStartPaused, which startMicrophone takes as a cancelled start", wrapped)
 	}
 }
 
