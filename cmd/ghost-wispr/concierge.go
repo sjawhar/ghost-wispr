@@ -161,3 +161,14 @@ func (h *conciergeHooks) SessionsDeleted(sessionIDs []string) {
 		}
 	}
 }
+
+// cancelRecoveredQuestions cancels the questions still working of each session
+// the start-up recovery ended, as a session end does while the unit runs: their
+// late answers stay on the session's page and are never announced.
+func cancelRecoveredQuestions(store *storage.SQLiteStore, sessionIDs []string, logf func(string, ...any)) {
+	for _, id := range sessionIDs {
+		if _, err := store.CancelWorkingVoiceTasks(id); err != nil {
+			logf("warning: cancel the questions of recovered session %s: %v", id, err)
+		}
+	}
+}

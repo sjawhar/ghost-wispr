@@ -336,6 +336,18 @@ func (s *Supervisor) dropPendingLocked(of func(sessionID string) bool) {
 	s.pending = slices.DeleteFunc(s.pending, func(p *pendingAnswer) bool { return of(p.SessionID) })
 }
 
+// dropEndedLocked drops the held answers of every session but the one
+// recording now: their meeting ended, so they are never spoken, and they stay
+// on their session's page. SessionEnded drops them too; this closes the window
+// in which an answer is handed over just as its session ends.
+func (s *Supervisor) dropEndedLocked() {
+	if len(s.pending) == 0 {
+		return
+	}
+	current := s.cfg.Session()
+	s.dropPendingLocked(func(id string) bool { return id != current })
+}
+
 // WaitFloor waits until no exchange holds the floor, so other speech (POST
 // /api/tts/speak) never plays over an exchange.
 func (s *Supervisor) WaitFloor(ctx context.Context) error {
@@ -746,6 +758,7 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 // goAheadLocked speaks the oldest held answer, on "Wispr, go ahead" while
 // the light reads red.
 func (s *Supervisor) goAheadLocked() {
+	s.dropEndedLocked()
 	if !s.cfg.Red() || s.ex != nil || len(s.pending) == 0 {
 		return
 	}
@@ -857,6 +870,7 @@ func (s *Supervisor) offerAnswers() {
 func (s *Supervisor) offer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dropEndedLocked()
 	if s.closed || s.ex != nil || len(s.pending) == 0 || !s.cfg.Red() {
 		return
 	}

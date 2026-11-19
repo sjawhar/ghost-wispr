@@ -869,6 +869,7 @@ func main() {
 		log.Printf("warning: failed to recover stale sessions: %v", err)
 	} else if len(recoveredIDs) > 0 {
 		log.Printf("recovered %d stale session(s): %v", len(recoveredIDs), recoveredIDs)
+		cancelRecoveredQuestions(store, recoveredIDs, log.Printf)
 	}
 	// A refinement left running by the previous run stopped with it.
 	if err := store.RecoverStaleRefinements(); err != nil {

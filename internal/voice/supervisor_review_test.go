@@ -182,3 +182,31 @@ func TestAFinalThatDropsTheNameKeepsTheCall(t *testing.T) {
 		t.Fatalf("turn %q, want the final's question", got)
 	}
 }
+
+// TestAnAnswerOfASessionNoLongerRecordingIsNeverSpoken fails if a held answer
+// whose session is not the one recording now (it ended before the Supervisor
+// heard, or the answer arrived after the end) chimes or speaks, by itself or
+// on "Wispr, go ahead", or is recorded as spoken.
+func TestAnAnswerOfASessionNoLongerRecordingIsNeverSpoken(t *testing.T) {
+	for name, invite := range map[string]bool{"by itself": false, "on go ahead": true} {
+		t.Run(name, func(t *testing.T) {
+			c := newFakeConcierge()
+			r := newRig(t, c)
+			r.mu.Lock()
+			r.session = "sess-2" // sess-1 ended
+			r.mu.Unlock()
+			chimes := r.speaker.written(audio.InputChime)
+			c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow.", AskedAt: time.Now()}
+			r.waitEvent("voice_answer_ready:sess-1")
+			if invite {
+				r.heard("Wispr, go ahead.", true, true)
+			}
+			never(t, "an answer of a session no longer recording chimed or spoke", 700*time.Millisecond, func() bool {
+				return len(r.voice.opened) > 0 || r.speaker.written(audio.InputChime) > chimes
+			})
+			if got := c.spokenIDs(); len(got) != 0 {
+				t.Fatalf("recorded as spoken: %v", got)
+			}
+		})
+	}
+}
