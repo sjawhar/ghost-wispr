@@ -33,25 +33,45 @@ const (
 )
 
 // standIns are a stand-in OpenAI token endpoint and Live server. By default
-// the Live server answers a commentary append with 1.2 s of speech and its
-// words.
+// the Live server answers each commentary append with 1.2 s of speech and
+// its words, stamped on a timeline that counts the input audio it received.
 type standIns struct {
 	token, live *httptest.Server
 	bearer      chan string
 	said        chan string
 	start       chan map[string]any
 	heardAudio  atomic.Bool // the session sent input audio before its text turn
+	// leadIn counts the input samples received within 300 ms of
+	// session.started: the replayed lead-in.
+	leadIn    atomic.Int64
+	inSamples atomic.Int64
+	lastInAt  atomic.Int64
+	startedAt atomic.Int64
 	// acceptAny makes the token endpoint take any subject token, so the
 	// wrong-audience control is not refused.
 	acceptAny bool
-	// answer replies to the text turn through send; nil sends 1.2 s of
-	// speech and its words.
-	answer func(send func(any))
+	// offsets shift each turn's words on the timeline from their audio; the
+	// last one holds for later turns.
+	offsets []int64
+	// answer replies to a text turn through send, with at the timeline now;
+	// nil sends 1.2 s of speech and its words.
+	answer func(send func(any), at func() int64)
+	turns  atomic.Int32
+}
+
+// inputMs is the stand-in's timeline now: the input audio received, plus
+// the time since the last of it arrived.
+func (s *standIns) inputMs() int64 {
+	last := s.lastInAt.Load()
+	if last == 0 {
+		return time.Now().UnixMilli() - s.startedAt.Load()
+	}
+	return s.inSamples.Load()*1000/gptlive.SampleRate + time.Now().UnixMilli() - last
 }
 
 func newStandIns(t *testing.T) *standIns {
 	t.Helper()
-	s := &standIns{bearer: make(chan string, 1), said: make(chan string, 1), start: make(chan map[string]any, 1)}
+	s := &standIns{bearer: make(chan string, 1), said: make(chan string, 8), start: make(chan map[string]any, 1)}
 	s.token = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -88,6 +108,7 @@ func newStandIns(t *testing.T) *standIns {
 				Type    string         `json:"type"`
 				EventID string         `json:"event_id"`
 				Content string         `json:"content"`
+				Audio   string         `json:"audio"`
 				Session map[string]any `json:"session"`
 			}
 			if err := ws.ReadJSON(&ev); err != nil {
@@ -96,17 +117,31 @@ func newStandIns(t *testing.T) *standIns {
 			switch ev.Type {
 			case "session.start":
 				s.start <- ev.Session
+				s.startedAt.Store(time.Now().UnixMilli())
 				send(map[string]any{"type": "session.started", "event_id": "e1", "session": map[string]any{"id": "sess_probe"}})
 			case "session.input_audio.append":
 				s.heardAudio.Store(true)
+				if b, err := base64.StdEncoding.DecodeString(ev.Audio); err == nil {
+					n := int64(len(b) / 2)
+					s.inSamples.Add(n)
+					s.lastInAt.Store(time.Now().UnixMilli())
+					if time.Now().UnixMilli()-s.startedAt.Load() < 300 {
+						s.leadIn.Add(n)
+					}
+				}
 			case "session.commentary.append":
 				s.said <- ev.Content
 				send(map[string]any{"type": "session.commentary.appended", "event_id": "e2", "client_event_id": ev.EventID})
+				turn := int(s.turns.Add(1)) - 1
 				if s.answer != nil {
-					go s.answer(send)
+					go s.answer(send, s.inputMs)
 					continue
 				}
-				send(map[string]any{"type": "session.output_transcript.delta", "event_id": "e3", "delta": "Hello from the stand-in."})
+				offset := int64(0)
+				if len(s.offsets) > 0 {
+					offset = s.offsets[min(turn, len(s.offsets)-1)]
+				}
+				send(transcript("Hello from the stand-in.", s.inputMs()+offset))
 				for range 2 {
 					send(speechDelta(600 * time.Millisecond))
 				}
@@ -118,6 +153,11 @@ func newStandIns(t *testing.T) *standIns {
 	}))
 	t.Cleanup(s.live.Close)
 	return s
+}
+
+// transcript is a fragment of the model's words at startMs on the timeline.
+func transcript(text string, startMs int64) map[string]any {
+	return map[string]any{"type": "session.output_transcript.delta", "event_id": "t", "delta": text, "start_ms": startMs, "end_ms": startMs + 100}
 }
 
 // speechDelta is d of a square wave at 1,000 of 32,767: speech, not silence.
@@ -154,7 +194,7 @@ func (s *standIns) config(t *testing.T) probeConfig {
 func runProbe(t *testing.T, s *standIns, cfg *probeConfig) (string, error) {
 	t.Helper()
 	var out bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	err := probe(ctx, cfg, &out)
 	return out.String(), err
@@ -171,8 +211,10 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 	if got := <-s.bearer; got != "Bearer "+fakeAccessToken {
 		t.Errorf("the Live connection carried %q, want the exchanged token", got)
 	}
-	if got := <-s.said; got != "Say hello." {
-		t.Errorf("the probe's text turn was %q", got)
+	for range probeTurns {
+		if got := <-s.said; got != "Say hello." {
+			t.Errorf("the probe's text turn was %q", got)
+		}
 	}
 	start := <-s.start
 	if start["model"] != "gpt-live-1" || fmt.Sprint(start["delegation"]) != "map[type:client]" || start["store"] != false {
@@ -181,7 +223,15 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 	if !s.heardAudio.Load() {
 		t.Error("the probe sent GPT-Live no input audio: its timeline runs on input audio")
 	}
-	for _, want := range []string{"control: a token for another audience was refused (invalid_subject_token)", "token exchange: ok", "session: started", "audio: 1.2", "words: Hello from the stand-in.", "timeline offset:", "result: PASS"} {
+	if got := s.leadIn.Load(); got < 2*gptlive.SampleRate-1 {
+		t.Errorf("the probe sent %d samples at the session's start, want a 2 s lead-in, as the wake replay sends", got)
+	}
+	for _, want := range []string{
+		"control: a token for another audience was refused (invalid_subject_token)",
+		"token exchange: ok", "session: started", "audio: 3.60",
+		"words: Hello from the stand-in.",
+		"timeline offset: 3 speeches", "covers it", "result: PASS",
+	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report does not say %q:\n%s", want, report)
 		}
@@ -195,8 +245,34 @@ func TestTheProbeExchangesATokenAndHearsGPTLiveAnswerAText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the probe's WAV: %v", err)
 	}
-	if len(wav) != 44+2*24000*12/10 || string(wav[:4]) != "RIFF" || string(wav[8:12]) != "WAVE" {
-		t.Errorf("the probe's WAV is %d bytes, want a 44-byte header and 1.2 s of 24 kHz mono PCM16", len(wav))
+	if len(wav) != 44+2*24000*36/10 || string(wav[:4]) != "RIFF" || string(wav[8:12]) != "WAVE" {
+		t.Errorf("the probe's WAV is %d bytes, want a 44-byte header and 3.6 s of 24 kHz mono PCM16", len(wav))
+	}
+}
+
+// The probe fails when GPT-Live's words are off from their audio by more
+// than the cut-speech margin covers, early or late, or when the offset
+// varies from speech to speech by over 200 ms.
+func TestTheProbeFailsOnAnOffsetTheMarginDoesNotCover(t *testing.T) {
+	for name, c := range map[string]struct {
+		offsets []int64
+		want    string
+	}{
+		"late":     {offsets: []int64{250}, want: "raise gptlive.CutMargin"},
+		"early":    {offsets: []int64{-250}, want: "raise gptlive.CutMargin"},
+		"unstable": {offsets: []int64{0, 250, -50}, want: "unstable"},
+		"too far":  {offsets: []int64{2000}, want: "matched no speech"}, // past the 1.2 s speech and the margin
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newStandIns(t)
+			s.offsets = c.offsets
+			cfg := s.config(t)
+			cfg.Settle = time.Second
+			report, err := runProbe(t, s, &cfg)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("probe with words %v ms off their audio = %v, want a failure naming %q\n%s", c.offsets, err, c.want, report)
+			}
+		})
 	}
 }
 
@@ -223,9 +299,10 @@ func TestTheProbeFailsWhenTheWrongAudienceControlIsAccepted(t *testing.T) {
 // A long answer of many pieces plays to its end and passes.
 func TestTheProbeHearsALongAnswerToItsEnd(t *testing.T) {
 	s := newStandIns(t)
-	s.answer = func(send func(any)) {
+	s.answer = func(send func(any), at func() int64) {
+		base := at()
 		for i := range 120 {
-			send(map[string]any{"type": "session.output_transcript.delta", "event_id": fmt.Sprintf("t%d", i), "delta": fmt.Sprintf("piece%d ", i)})
+			send(transcript(fmt.Sprintf("piece%d ", i), base+int64(100*i)))
 			send(speechDelta(100 * time.Millisecond))
 		}
 	}
@@ -235,8 +312,8 @@ func TestTheProbeHearsALongAnswerToItsEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("probe: %v\n%s", err, report)
 	}
-	if !strings.Contains(report, "audio: 12.00 s") || !strings.Contains(report, "piece119") {
-		t.Fatalf("report does not hold the whole 12 s answer:\n%s", report)
+	if !strings.Contains(report, "audio: 36.00 s") || !strings.Contains(report, "piece119") {
+		t.Fatalf("report does not hold three whole 12 s answers:\n%s", report)
 	}
 }
 
@@ -244,7 +321,7 @@ func TestTheProbeHearsALongAnswerToItsEnd(t *testing.T) {
 // exchange that ends on Say: the probe fails rather than passes.
 func TestTheProbeFailsOnACutAnswer(t *testing.T) {
 	s := newStandIns(t)
-	s.answer = func(send func(any)) {
+	s.answer = func(send func(any), _ func() int64) {
 		send(speechDelta(1200 * time.Millisecond))
 		time.Sleep(1800 * time.Millisecond)
 		send(speechDelta(600 * time.Millisecond))
@@ -259,7 +336,7 @@ func TestTheProbeFailsOnACutAnswer(t *testing.T) {
 // returns: a second sentence 5 s after the first fails it.
 func TestTheProbeFailsOnASecondSentenceFiveSecondsLater(t *testing.T) {
 	s := newStandIns(t)
-	s.answer = func(send func(any)) {
+	s.answer = func(send func(any), _ func() int64) {
 		send(speechDelta(1200 * time.Millisecond))
 		time.Sleep(5 * time.Second)
 		send(speechDelta(600 * time.Millisecond))
@@ -273,7 +350,7 @@ func TestTheProbeFailsOnASecondSentenceFiveSecondsLater(t *testing.T) {
 
 func TestTheProbeFailsOnTooLittleSpeech(t *testing.T) {
 	s := newStandIns(t)
-	s.answer = func(send func(any)) { send(speechDelta(300 * time.Millisecond)) }
+	s.answer = func(send func(any), _ func() int64) { send(speechDelta(300 * time.Millisecond)) }
 	cfg := s.config(t)
 	cfg.Settle = time.Second
 	if report, err := runProbe(t, s, &cfg); err == nil {
@@ -283,7 +360,7 @@ func TestTheProbeFailsOnTooLittleSpeech(t *testing.T) {
 
 func TestTheProbeFailsOnAServerError(t *testing.T) {
 	s := newStandIns(t)
-	s.answer = func(send func(any)) {
+	s.answer = func(send func(any), _ func() int64) {
 		send(speechDelta(1200 * time.Millisecond))
 		send(map[string]any{"type": "error", "event_id": "e9", "error": map[string]any{"type": "server_error", "code": "internal_error", "message": "boom"}})
 	}
@@ -310,35 +387,40 @@ func TestTheProbeTurnsOffGoogleClientCertificatesUnlessSet(t *testing.T) {
 	}
 }
 
-// offsetSession is a session that reports the offsets it measured.
+// offsetSession is a session that reports the measure it took.
 type offsetSession struct {
 	voice.Session
-	offsets []time.Duration
+	offsets   []time.Duration
+	unmatched int
 }
 
 func (s offsetSession) TimelineOffsets() []time.Duration { return s.offsets }
+func (s offsetSession) UnmatchedWords() int              { return s.unmatched }
 
-// R4T9: a spread over 200 ms gets the sideband verdict; one within it gets
-// the margin's.
-func TestReportOffsetsNamesAnUnstableSpread(t *testing.T) {
-	var out bytes.Buffer
-	reportOffsets(&out, offsetSession{offsets: []time.Duration{-100 * time.Millisecond, 150 * time.Millisecond}})
-	if !strings.Contains(out.String(), "unstable") || !strings.Contains(out.String(), "sideband") {
-		t.Fatalf("report %q, want the unstable verdict for a 250 ms spread", out.String())
-	}
-	out.Reset()
-	reportOffsets(&out, offsetSession{offsets: []time.Duration{-50 * time.Millisecond, 50 * time.Millisecond}})
-	if !strings.Contains(out.String(), "covers it") {
-		t.Fatalf("report %q, want CutMargin to cover a 100 ms spread within 50 ms", out.String())
-	}
-	out.Reset()
-	reportOffsets(&out, offsetSession{offsets: []time.Duration{200 * time.Millisecond, 250 * time.Millisecond}})
-	if !strings.Contains(out.String(), "raise gptlive.CutMargin") {
-		t.Fatalf("report %q, want a larger margin for fragments 250 ms outside their speech", out.String())
-	}
-	out.Reset()
-	reportOffsets(&out, offsetSession{})
-	if !strings.Contains(out.String(), "UNKNOWN") {
-		t.Fatalf("report %q, want UNKNOWN with nothing measured", out.String())
+// A spread over 200 ms gets the sideband verdict, an offset the margin does
+// not cover gets the raise verdict, and both, like too little to measure,
+// fail the probe; one within both passes.
+func TestReportOffsetsNamesItsVerdict(t *testing.T) {
+	ms := time.Millisecond
+	for name, c := range map[string]struct {
+		s    offsetSession
+		want string
+		fail bool
+	}{
+		"unstable":       {s: offsetSession{offsets: []time.Duration{-100 * ms, 150 * ms}}, want: "sideband", fail: true},
+		"covered":        {s: offsetSession{offsets: []time.Duration{-50 * ms, 50 * ms}}, want: "covers it"},
+		"late":           {s: offsetSession{offsets: []time.Duration{200 * ms, 250 * ms}}, want: "raise gptlive.CutMargin", fail: true},
+		"early":          {s: offsetSession{offsets: []time.Duration{-250 * ms, -200 * ms}}, want: "raise gptlive.CutMargin", fail: true},
+		"one speech":     {s: offsetSession{offsets: []time.Duration{10 * ms}}, want: "UNKNOWN", fail: true},
+		"nothing":        {s: offsetSession{}, want: "UNKNOWN", fail: true},
+		"unmatched word": {s: offsetSession{offsets: []time.Duration{0, 10 * ms}, unmatched: 2}, want: "matched no speech", fail: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := reportOffsets(&out, c.s)
+			if !strings.Contains(out.String(), c.want) || (err != nil) != c.fail {
+				t.Fatalf("report %q, error %v; want %q and a failure %v", out.String(), err, c.want, c.fail)
+			}
+		})
 	}
 }
