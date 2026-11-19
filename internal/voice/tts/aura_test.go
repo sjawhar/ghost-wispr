@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -296,21 +295,16 @@ func TestAuraClearsOnInterruptAndTheNextSayHearsOnlyItsOwnAudio(t *testing.T) {
 	out := newFakeOutput()
 	s := openSession(t, newTestAura(t, f), out)
 
-	said := make(chan error, 1)
-	go func() { said <- s.Say(context.Background(), "a long answer", voice.Fact) }()
+	// The Say returns once its first frame is queued; the Interrupt then
+	// clears the rest of its text at Deepgram.
+	if err := s.Say(context.Background(), "a long answer", voice.Fact); err != nil {
+		t.Fatalf("Say: %v", err)
+	}
 	out.waitFirstWrite(t)
 	interrupted := time.Now()
 	s.Interrupt()
-	select {
-	case err := <-said:
-		if took := time.Since(interrupted); took > 100*time.Millisecond {
-			t.Fatalf("Say returned %v after Interrupt, want within 100 ms", took)
-		}
-		if !errors.Is(err, ErrInterrupted) {
-			t.Fatalf("interrupted Say = %v, want ErrInterrupted", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Say still running 1 s after Interrupt")
+	if took := time.Since(interrupted); took > 100*time.Millisecond {
+		t.Fatalf("Interrupt took %v, want within 100 ms", took)
 	}
 	if err := s.Say(context.Background(), "after", voice.Fact); err != nil {
 		t.Fatalf("Say after Interrupt: %v", err)
@@ -325,14 +319,18 @@ func TestAuraClearsOnInterruptAndTheNextSayHearsOnlyItsOwnAudio(t *testing.T) {
 	}
 }
 
-// TestAuraCloseSendsCloseAndEndsTheConnection fails if closing the Session
-// does not tell Deepgram with Close and end the socket.
+// TestAuraCloseSendsCloseAndEndsTheConnection fails if closing an idle
+// Session does not tell Deepgram with Close and end the socket.
 func TestAuraCloseSendsCloseAndEndsTheConnection(t *testing.T) {
 	f := startSpeak(t, speakBack(map[string][]byte{"hello": ramp(0, 1000)}))
-	s := openSession(t, newTestAura(t, f), newFakeOutput())
+	out := newFakeOutput()
+	s := openSession(t, newTestAura(t, f), out)
 	if err := s.Say(context.Background(), "hello", voice.Ack); err != nil {
 		t.Fatalf("Say: %v", err)
 	}
+	// Say returns at its first frame; the Session is idle once the text has
+	// all played.
+	out.waitPlayback(t, 1, 1000)
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

@@ -302,9 +302,9 @@ func TestSayReportsAgentTextThenSpeechStartedThenSpeechEnded(t *testing.T) {
 	}
 }
 
-// TestSayReturnsOnceSynthesisedNotOncePlayed fails if a Say waits for its
-// audio to play, or SpeechEnded comes before the playback drained.
-func TestSayReturnsOnceSynthesisedNotOncePlayed(t *testing.T) {
+// TestSayReturnsOnceItsFirstFrameIsQueued fails if a Say waits for its audio
+// to play out, or SpeechEnded comes before the playback drained.
+func TestSayReturnsOnceItsFirstFrameIsQueued(t *testing.T) {
 	out := newFakeOutput()
 	out.drainGate = make(chan struct{})
 	s := openSession(t, speaks(map[string][]byte{"One moment.": ramp(0, 3000)}), out)
@@ -317,7 +317,7 @@ func TestSayReturnsOnceSynthesisedNotOncePlayed(t *testing.T) {
 			t.Fatalf("Say: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Say still running 2 s after its audio was synthesised: it waits for playback")
+		t.Fatal("Say still running 2 s after its first frame was queued: it waits for playback")
 	}
 	expectEvents(t, s.Events(), voice.EventAgentText, voice.EventSpeechStarted, voice.EventTextAudio)
 	expectNoEvent(t, s.Events(), 50*time.Millisecond)
@@ -394,9 +394,10 @@ func TestSaysQueuedBehindASpeechPlayInOrderInOnePlayback(t *testing.T) {
 	}
 }
 
-// TestInterruptReturnsAnInFlightSayWithin100msAndTheNextSayPlays fails if a
-// Say keeps speaking more than 100 ms after Interrupt, or the Session takes
-// no Say afterwards.
+// TestInterruptReturnsAnInFlightSayWithin100msAndTheNextSayPlays fails if an
+// Interrupt of a text in flight (its Say returned once its first frame was
+// queued) takes more than 100 ms, or the Session takes no Say afterwards in
+// a fresh playback.
 func TestInterruptReturnsAnInFlightSayWithin100msAndTheNextSayPlays(t *testing.T) {
 	after := ramp(7, 1200)
 	out := newFakeOutput()
@@ -411,21 +412,14 @@ func TestInterruptReturnsAnInFlightSayWithin100msAndTheNextSayPlays(t *testing.T
 		return ctx.Err()
 	}}, out)
 
-	said := make(chan error, 1)
-	go func() { said <- s.Say(context.Background(), "a long answer", voice.Fact) }()
+	if err := s.Say(context.Background(), "a long answer", voice.Fact); err != nil {
+		t.Fatalf("Say: %v", err)
+	}
 	out.waitFirstWrite(t)
 	interrupted := time.Now()
 	s.Interrupt()
-	select {
-	case err := <-said:
-		if took := time.Since(interrupted); took > 100*time.Millisecond {
-			t.Fatalf("Say returned %v after Interrupt, want within 100 ms", took)
-		}
-		if !errors.Is(err, ErrInterrupted) {
-			t.Fatalf("interrupted Say = %v, want ErrInterrupted", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Say still running 1 s after Interrupt")
+	if took := time.Since(interrupted); took > 100*time.Millisecond {
+		t.Fatalf("Interrupt took %v, want within 100 ms", took)
 	}
 
 	if err := s.Say(context.Background(), "after", voice.Fact); err != nil {
@@ -441,13 +435,13 @@ func TestInterruptReturnsAnInFlightSayWithin100msAndTheNextSayPlays(t *testing.T
 }
 
 // TestInterruptDoesNotWaitForTheEngine fails if Interrupt, or the Say it
-// stops, waits for an engine that is slow to see its context end, as a stalled
-// network is.
+// stops before its first audio, waits for an engine that is slow to see its
+// context end, as a stalled network is.
 func TestInterruptDoesNotWaitForTheEngine(t *testing.T) {
-	release := make(chan struct{})
+	release, called := make(chan struct{}), make(chan struct{})
 	out := newFakeOutput()
-	s := openSession(t, fakeEngine{stream: func(_ context.Context, _ string, emit func([]byte) error) error {
-		_ = emit(ramp(0, frame20ms))
+	s := openSession(t, fakeEngine{stream: func(_ context.Context, _ string, _ func([]byte) error) error {
+		close(called)
 		<-release
 		return nil
 	}}, out)
@@ -455,7 +449,7 @@ func TestInterruptDoesNotWaitForTheEngine(t *testing.T) {
 
 	said := make(chan error, 1)
 	go func() { said <- s.Say(context.Background(), "stuck", voice.Fact) }()
-	out.waitFirstWrite(t)
+	<-called
 	interrupted := time.Now()
 	s.Interrupt()
 	if took := time.Since(interrupted); took > 10*time.Millisecond {
@@ -491,21 +485,24 @@ func TestInterruptCancelsQueuedSays(t *testing.T) {
 		return ctx.Err()
 	}}, out)
 
+	// The Say in flight returned once its first frame was queued; the one
+	// queued behind it waits for the synthesis stage, and Interrupt ends it.
 	first, queued := make(chan error, 1), make(chan error, 1)
 	go func() { first <- s.Say(context.Background(), "first", voice.Fact) }()
 	out.waitFirstWrite(t)
+	if err := <-first; err != nil {
+		t.Fatalf("the Say in flight: %v", err)
+	}
 	go func() { queued <- s.Say(context.Background(), "queued", voice.Fact) }()
 	time.Sleep(50 * time.Millisecond)
 	s.Interrupt()
-	for name, said := range map[string]chan error{"in-flight": first, "queued": queued} {
-		select {
-		case err := <-said:
-			if !errors.Is(err, ErrInterrupted) {
-				t.Fatalf("%s Say = %v, want ErrInterrupted", name, err)
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("%s Say still running 1 s after Interrupt", name)
+	select {
+	case err := <-queued:
+		if !errors.Is(err, ErrInterrupted) {
+			t.Fatalf("queued Say = %v, want ErrInterrupted", err)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("queued Say still running 1 s after Interrupt")
 	}
 	time.Sleep(50 * time.Millisecond)
 	mu.Lock()

@@ -151,8 +151,8 @@ var (
 	stereo48k = AudioFormat{SampleRate: 48000, Channels: 2}
 )
 
-// pcmBytes is samples as PCM16 little-endian bytes.
-func pcmBytes(samples []int16) []byte {
+// pcm16Bytes is samples as PCM16 little-endian bytes.
+func pcm16Bytes(samples []int16) []byte {
 	buf := make([]byte, 2*len(samples))
 	for i, s := range samples {
 		binary.LittleEndian.PutUint16(buf[2*i:], uint16(s))
@@ -167,7 +167,7 @@ func constant(rate int, d time.Duration, values ...int16) []byte {
 	for range frames {
 		samples = append(samples, values...)
 	}
-	return pcmBytes(samples)
+	return pcm16Bytes(samples)
 }
 
 // sine is d of a mono tone of freq Hz and amplitude amp, at rate.
@@ -177,7 +177,7 @@ func sine(rate int, d time.Duration, freq, amp float64) []byte {
 	for n := range samples {
 		samples[n] = int16(math.Round(amp * math.Sin(2*math.Pi*freq*float64(n)/float64(rate))))
 	}
-	return pcmBytes(samples)
+	return pcm16Bytes(samples)
 }
 
 func silent(samples []int16) bool {

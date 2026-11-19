@@ -122,12 +122,12 @@ func TestAStopCutsTheSentenceSynthesisedAhead(t *testing.T) {
 					}
 				}
 			}()
-			for range 2 {
-				if err := <-said; err != nil {
-					t.Fatalf("a Say: %v", err)
-				}
+			// The first Say returns once its first frame is queued; the second
+			// sentence is synthesised while the first plays, and its Say waits
+			// for its turn to play.
+			if err := <-said; err != nil {
+				t.Fatalf("the first Say: %v", err)
 			}
-			// Both Says returned: the second sentence is synthesised and waits.
 			time.Sleep(300 * time.Millisecond)
 			if tc.stop != nil {
 				tc.stop(s, out, cancelExchange)

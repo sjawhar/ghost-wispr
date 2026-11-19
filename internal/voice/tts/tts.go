@@ -153,6 +153,9 @@ type sayRequest struct {
 	gen    int
 	done   chan error // the Say's result, once
 	ended  sync.Once
+	// queued is closed once the Say's first frame is queued to the Output.
+	queued     chan struct{}
+	queuedOnce sync.Once
 
 	mu       sync.Mutex
 	chunks   [][]byte      // synthesised, not yet written
@@ -170,6 +173,9 @@ func (r *sayRequest) end(err error) { r.ended.Do(func() { r.done <- err }) }
 
 // release ends the Say's context once play is done with it.
 func (r *sayRequest) release() { r.cancel(nil) }
+
+// markQueued records that the Say's first frame is queued, once.
+func (r *sayRequest) markQueued() { r.queuedOnce.Do(func() { close(r.queued) }) }
 
 // push keeps a copy of pcm for play, unless play could not write the Say.
 func (r *sayRequest) push(pcm []byte) error {
@@ -250,10 +256,10 @@ func (r *sayRequest) writeErr() error {
 	return r.playErr
 }
 
-// Say speaks text after every Say called before it, and returns once the
-// whole text is synthesised, or synthesis failed: its audio then plays after
-// every Say before it, so the caller's next Say is synthesised while this one
-// plays. A text of no words speaks nothing.
+// Say speaks text after every Say called before it, and returns once its
+// first frame is queued to the Output, or with the reason none will be. Its
+// text is synthesised while the Say before it plays, so the caller's next Say
+// follows with no gap. A text of no words speaks nothing.
 //
 // Voice A speaks every SayMode in the same voice and style, by design: the
 // room hears one consistent voice, and a style prompt per mode would add
@@ -292,7 +298,7 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 		cancelW(err)
 	}
 
-	r := &sayRequest{ctx: rctx, wctx: wctx, cancel: release, text: text, gen: gen, done: make(chan error, 1), more: make(chan struct{}, 1)}
+	r := &sayRequest{ctx: rctx, wctx: wctx, cancel: release, text: text, gen: gen, done: make(chan error, 1), queued: make(chan struct{}), more: make(chan struct{}, 1)}
 	select {
 	case s.says <- r:
 	case <-rctx.Done():
@@ -303,13 +309,21 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 		s.mu.Unlock()
 		return context.Cause(rctx)
 	}
+	// The Say returns once its first frame is queued to the Output, as the
+	// Session contract says, so a caller that waits for the speech to play
+	// (the Supervisor's finish) finds its playback; or with its failure, or
+	// when play ends it having queued nothing (a text with no audio).
 	select {
+	case <-r.queued:
+		return nil
 	case err := <-r.done:
 		return err
 	case <-rctx.Done():
 		// play releases the request once it is done with it, which may come
-		// as its result does: the result wins.
+		// as its first frame or result does: those win.
 		select {
+		case <-r.queued:
+			return nil
 		case err := <-r.done:
 			return err
 		default:
@@ -438,11 +452,17 @@ func (s *session) run() {
 	}
 }
 
-// synthesise streams one Say into its buffer. Its Say returns once the whole
-// text is synthesised, so the caller says the next one while this one plays.
+// synthesise streams one Say into its buffer while play writes the Say
+// before it. A Say whose synthesis fails ends with that failure; one that
+// succeeds ends when its first frame is queued, or when play ends it.
 func (s *session) synthesise(r *sayRequest) {
-	if r.ctx.Err() != nil {
-		r.end(context.Cause(r.ctx))
+	if r.ctx.Err() != nil || r.wctx.Err() != nil {
+		err := context.Cause(r.ctx)
+		if err == nil {
+			err = context.Cause(r.wctx)
+		}
+		r.end(err)
+		r.synthesised(err)
 		return
 	}
 	s.emit(&voice.Event{Kind: voice.EventAgentText, Text: r.text})
@@ -459,7 +479,9 @@ func (s *session) synthesise(r *sayRequest) {
 		// play could not write the Say: its result is play's failure.
 		err = r.writeErr()
 	}
-	r.end(err)
+	if err != nil {
+		r.end(err)
+	}
 	r.synthesised(err)
 }
 
@@ -591,11 +613,19 @@ func (s *session) writeFrame(r *sayRequest, frame []byte, first *bool) error {
 		s.speaking = true
 		s.emitLocked(&voice.Event{Kind: voice.EventSpeechStarted})
 	}
-	if *first {
-		*first = false
-		s.emitLocked(&voice.Event{Kind: voice.EventTextAudio, Text: r.text})
-	}
+	firstFrame := *first
+	*first = false
 	pb := s.pb
 	s.mu.Unlock()
-	return pb.Write(r.wctx, frame, s.format)
+	if err := pb.Write(r.wctx, frame, s.format); err != nil {
+		*first = firstFrame
+		return err
+	}
+	if firstFrame {
+		// The text's first frame is queued: it begins to play, and its Say
+		// returns (sayRequest.queued).
+		s.emit(&voice.Event{Kind: voice.EventTextAudio, Text: r.text})
+		r.markQueued()
+	}
+	return nil
 }
