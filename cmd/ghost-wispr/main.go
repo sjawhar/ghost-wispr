@@ -40,6 +40,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/summary"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 	"github.com/sjawhar/ghost-wispr/internal/tts"
+	"github.com/sjawhar/ghost-wispr/internal/voice"
 
 	"google.golang.org/genai"
 )
@@ -465,13 +466,64 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 
 type transcriptCallback struct {
 	manager session.LifecycleManager
+	voice   voiceListener
+	stamp   func() (closings int, open bool)
 }
 
+// voiceListener is the voice as the transcript reader feeds it: the
+// voice.Supervisor.
+type voiceListener interface {
+	OnTranscript(t *voice.Transcript)
+	OnUtteranceEnd(closings int, gateOpen bool)
+}
+
+// Message hands a Deepgram result to the session manager, then to the voice,
+// with the capture gate's stamp taken as it arrived.
 func (c transcriptCallback) Message(mr *api.MessageResponse) error {
-	if c.manager == nil {
+	var t *voice.Transcript
+	if c.voice != nil {
+		t = voiceTranscript(mr, c.stamp)
+	}
+	var err error
+	if c.manager != nil {
+		err = c.manager.Message(mr)
+	}
+	if t != nil {
+		c.voice.OnTranscript(t)
+	}
+	return err
+}
+
+// voiceTranscript is mr as the voice reads it, or nil when it holds no text.
+func voiceTranscript(mr *api.MessageResponse, stamp func() (int, bool)) *voice.Transcript {
+	if len(mr.Channel.Alternatives) == 0 || strings.TrimSpace(mr.Channel.Alternatives[0].Transcript) == "" {
 		return nil
 	}
-	return c.manager.Message(mr)
+	alt := &mr.Channel.Alternatives[0]
+	t := &voice.Transcript{
+		Text:         alt.Transcript,
+		Words:        make([]voice.Word, 0, len(alt.Words)),
+		IsFinal:      mr.IsFinal,
+		SpeechFinal:  mr.SpeechFinal,
+		FromFinalize: mr.FromFinalize,
+		At:           time.Now(),
+	}
+	if stamp != nil {
+		t.Closings, t.GateOpen = stamp()
+	}
+	for i := range alt.Words {
+		w := &alt.Words[i]
+		speaker := -1
+		if w.Speaker != nil {
+			speaker = *w.Speaker
+		}
+		text := w.PunctuatedWord
+		if text == "" {
+			text = w.Word
+		}
+		t.Words = append(t.Words, voice.Word{Text: text, Speaker: speaker, Start: w.Start, End: w.End})
+	}
+	return t
 }
 
 // Open logs the socket. It leaves the resilient client's state alone: the
@@ -488,10 +540,19 @@ func (c transcriptCallback) Metadata(*api.MetadataResponse) error { return nil }
 func (c transcriptCallback) SpeechStarted(*api.SpeechStartedResponse) error { return nil }
 
 func (c transcriptCallback) UtteranceEnd(ur *api.UtteranceEndResponse) error {
-	if c.manager == nil {
-		return nil
+	var closings int
+	open := true
+	if c.stamp != nil {
+		closings, open = c.stamp()
 	}
-	return c.manager.UtteranceEnd(ur)
+	var err error
+	if c.manager != nil {
+		err = c.manager.UtteranceEnd(ur)
+	}
+	if c.voice != nil {
+		c.voice.OnUtteranceEnd(closings, open)
+	}
+	return err
 }
 
 func (c transcriptCallback) Close(*api.CloseResponse) error {
@@ -521,12 +582,14 @@ const deepgramSendChunks = 64
 // startMicMonitoring starts the mic loop. The recorder gets each buffer
 // first, and downstream, live transcription, gets it through a bounded queue
 // that never blocks the loop (transcribe.AsyncSender), so no Deepgram
-// trouble stops the recording. It returns that queue, whose Finalize the
-// capture pause uses, or nil without downstream.
+// trouble stops the recording. tap, the voice's room audio (voice.Tap), gets
+// each buffer after them, behind the capture gate like them; it must never
+// block. It returns the Deepgram queue, whose Finalize the capture pause
+// uses, or nil without downstream.
 func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *captureGate, streamer micStreamer, recorder *audio.Recorder, downstream interface {
 	io.Writer
 	Finalize() error
-}, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) *transcribe.AsyncSender {
+}, tap io.Writer, wait func(time.Duration), logf func(string, ...any), hub *server.Hub) *transcribe.AsyncSender {
 	if streamer == nil || recorder == nil {
 		return nil
 	}
@@ -536,8 +599,44 @@ func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *cap
 		sender = transcribe.NewAsyncSender(ctx, downstream, deepgramSendChunks, logf)
 		send = sender
 	}
-	streamMicLoopStarter(ctx, loops, capture, streamer, recorder.Writer(send), wait, logf, hub)
+	var writer io.Writer = recorder.Writer(send)
+	if tap != nil {
+		writer = tappedWriter{dst: writer, tap: tap}
+	}
+	streamMicLoopStarter(ctx, loops, capture, streamer, writer, wait, logf, hub)
 	return sender
+}
+
+// tappedWriter writes each buffer to dst, then to tap, and reports dst's
+// result.
+type tappedWriter struct {
+	dst, tap io.Writer
+}
+
+func (w tappedWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	_, _ = w.tap.Write(p)
+	return n, err
+}
+
+// liveTranscriptionOptions are the live Deepgram request's options for a
+// microphone at sampleRate.
+func liveTranscriptionOptions(cfg *config.Config, sampleRate int) *interfaces.LiveTranscriptionOptions {
+	return &interfaces.LiveTranscriptionOptions{
+		Model:          cfg.DeepgramModel,
+		Language:       "en-US",
+		Diarize:        true,
+		Punctuate:      true,
+		SmartFormat:    true,
+		Encoding:       "linear16",
+		SampleRate:     sampleRate,
+		Channels:       1,
+		Endpointing:    cfg.Transcription.Endpointing,
+		InterimResults: true,
+		UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
+		Keyterm:        voiceKeyterms(cfg),
+		VadEvents:      true,
+	}
 }
 
 // micShutdownWait is how long shutdown waits for the mic loops to end. Each
@@ -1670,33 +1769,20 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		if cfg.DeepgramAPIKey == "" {
-			startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, nil, micWait, log.Printf, hub)
+			startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, nil, nil, micWait, log.Printf, hub)
 			return nil
 		}
 
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
-		tOptions := &interfaces.LiveTranscriptionOptions{
-			Model:          cfg.DeepgramModel,
-			Language:       "en-US",
-			Diarize:        true,
-			Punctuate:      true,
-			SmartFormat:    true,
-			Encoding:       "linear16",
-			SampleRate:     sampleRate,
-			Channels:       1,
-			Endpointing:    cfg.Transcription.Endpointing,
-			InterimResults: true,
-			UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
-			VadEvents:      true,
-		}
+		tOptions := liveTranscriptionOptions(&cfg, sampleRate)
 		resilientConfig := transcribe.ResilientConfig{
 			BufferSize:            cfg.DeepgramBufferSize,
 			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
 			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
 		}
-		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, manager, warningRegistry, hub)
+		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, transcriptCallback{manager: manager}, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
-		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, micWait, log.Printf, hub))
+		deepgramSendRef.Store(startMicMonitoring(ctx, &micLoops, capture, ordered, audioRecorder, candidateResilient, nil, micWait, log.Printf, hub))
 		return nil
 	}
 
