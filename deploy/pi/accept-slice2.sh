@@ -1155,19 +1155,26 @@ EOF
   [[ -e "$summary_called" && -e "$speech_called" && -e "$refinement_called" ]] \
     || fail 'A8 self-test stopped before every provider role ran when no provider reported its model'
   rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
+  # Each negative check below passes only when run_a8 fails on the drift it plants: a run_a8 that
+  # fails for any other reason fails the self-test and prints why.
+  local a8_output
   # shellcheck disable=SC2329 # run_a8, called next, reads the deployed YAML through remote_run.
   remote_run() { printf '%s\n' "${good_config/embedding_model: gemini\/gemini-embedding-2/embedding_model: gemini/gemini-embedding-001}"; }
-  if run_a8 >/dev/null 2>&1; then
+  if a8_output=$(run_a8 2>&1); then
     fail 'A8 self-test accepted an unreported search model when the configuration names another'
   fi
+  [[ "$a8_output" == *"configuration lacks: embedding_model: gemini/$embedding_model"* ]] \
+    || fail "A8 self-test rejected a configuration that names another search model, but not for that model: $a8_output"
   # shellcheck disable=SC2329 # The run_a8 of the next check reads the deployed YAML through remote_run.
   remote_run() { printf '%s\n' "$good_config"; }
   rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
   # shellcheck disable=SC2329 # run_a8, called next, reads the running models through running_config.
   running_config() { jq -c '.models.embedding = "gemini/gemini-embedding-001"' <<<"$good_running_config"; }
-  if run_a8 >/dev/null 2>&1; then
+  if a8_output=$(run_a8 2>&1); then
     fail 'A8 self-test accepted a running process whose embedding model is not the plan'"'"'s while the YAML names it'
   fi
+  [[ "$a8_output" == *"the running process reports embedding gemini/gemini-embedding-001, want gemini/$embedding_model"* ]] \
+    || fail "A8 self-test rejected a running process with another embedding model, but not for that model: $a8_output"
   printf 'A8 self-test RAN: every role is compared with the model the running process reports\n'
   printf 'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run\n'
 

@@ -720,20 +720,21 @@ member=$(tailscale ip -4)
 pod=$(kubectl -n legion get pods -l app=hindsight-control-plane --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 ts() { kubectl -n legion exec "${pod:?}" -c tailscale -- tailscale --socket=/scratch/tailscaled.sock "$@"; }
 netmap() { jq --arg tag "$PI_DENIED_TAG" --arg ip "${recorder:?}" \
-  '{carries_denied_tag: (.Self.Tags // [] | index($tag) != null), online: .Self.Online, recorder_peers: [.Peer // {} | .[] | select(.TailscaleIPs | index($ip)) | .HostName]}'; }
+  '{carries_denied_tag: (.Self.Tags // [] | index($tag) != null), online: .Self.Online, recorder_peers: [.Peer // {} | .[] | select(.TailscaleIPs | index($ip)) | {HostName, DNSName, Tags}]}'; }
 tailscale status --json | netmap
 ts status --json | netmap
-ts ping -c 3 "${recorder:?}"
 ts ping --until-direct=false -c 3 "${member:?}"
+ts ping -c 3 "${recorder:?}"
 ```
 
 When a lookup finds nothing, each command that needs it prints `parameter null or not set` and
 does not run. The first `netmap`, of this member device, is the control for the filter: its
-`recorder_peers` must name `ghost-wispr`. The pod must carry the tag and be `online`, which means
-it is connected to the coordination server and its netmap is current. Its `recorder_peers` must
-be empty, and the first ping must say `no matching peer`. The second ping is the control for the
-pod: it must get a pong from this member device and exit 0, so kubectl prints no
-`command terminated` line. With `--until-direct=false`, pongs through a DERP relay count too.
+`recorder_peers` must hold one device, whose `DNSName` is `PI_HOST` with a final dot and whose
+`Tags` are `["tag:ghost-wispr"]`. The pod must carry the tag and be `online`, which means it is
+connected to the coordination server and its netmap is current. Its `recorder_peers` must be
+empty. The first ping is the control for the pod: it must get a pong from this member device and
+exit 0, so kubectl prints no `command terminated` line. With `--until-direct=false`, pongs through
+a DERP relay count too. The second ping must then say `no matching peer`.
 
 ## Accept slice 2
 
