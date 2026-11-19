@@ -146,6 +146,21 @@ func (d *Detector) matchAt(tokens []string, at int) (Match, bool) {
 	return Match{}, false
 }
 
+// IsName reports whether word is how Deepgram writes the first word of a wake
+// phrase: as configured, or as a sound-alike spelling.
+func (d *Detector) IsName(word string) bool {
+	n := normalise(word)
+	if n == "" {
+		return false
+	}
+	for _, p := range d.phrases {
+		if n == p.words[0] || soundsLikeWord(n, p.words[0]) {
+			return true
+		}
+	}
+	return false
+}
+
 func soundsLikeWord(got, want string) bool {
 	for _, s := range soundsLike[want] {
 		if got == s {

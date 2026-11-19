@@ -167,3 +167,18 @@ func TestOnlyAVoiceThatDrivesItsTurnGetsRoomAudio(t *testing.T) {
 		t.Error("a voice that drives its turn got no room audio")
 	}
 }
+
+// TestAFinalThatDropsTheNameKeepsTheCall fails if a final result that no
+// longer holds the name the interim heard, as Deepgram's live finals sometimes
+// drop it ("Wispr, tell me everything …" finalised as "Tell me everything …"),
+// ends the exchange instead of handing the question over.
+func TestAFinalThatDropsTheNameKeepsTheCall(t *testing.T) {
+	c := newFakeConcierge("fact")
+	r := newRig(t, c)
+	r.heard("Wispr, tell me", false, false)
+	r.waitSession()
+	r.heard("Tell me everything about the voice issue.", true, true)
+	if got := r.waitTurn(); got != "Tell me everything about the voice issue." {
+		t.Fatalf("turn %q, want the final's question", got)
+	}
+}

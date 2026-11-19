@@ -93,3 +93,17 @@ func TestKeytermOrderAndBudget(t *testing.T) {
 		seen[k] = true
 	}
 }
+
+// TestIsName fails if a word Deepgram writes for the name, as configured or as
+// a sound-alike, is not recognised as the name, or another word is.
+func TestIsName(t *testing.T) {
+	d := New([]string{"Wispr", "Ghost Wispr"})
+	for word, want := range map[string]bool{
+		"Wispr,": true, "wispr": true, "Whisper.": true, "Ghost": true,
+		"Tell": false, "whiskey": false, "": false,
+	} {
+		if got := d.IsName(word); got != want {
+			t.Errorf("IsName(%q) = %v, want %v", word, got, want)
+		}
+	}
+}

@@ -441,9 +441,11 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		return
 	}
 	s.touchLocked(ex)
-	if t.IsFinal && ex.answer == nil && !ex.answering && !ex.drives && covers(t.Words, ex.wakeStart) {
-		// The final result of the words an interim wake came from holds no
-		// wake: it was misheard, and nobody addressed Wispr.
+	if t.IsFinal && ex.answer == nil && !ex.answering && !ex.drives && s.nameAt(t.Words, ex.wakeStart) {
+		// The final still hears the name where the interim wake heard it, but
+		// not as a call ("Whisper networks are a problem."): the wake was
+		// misheard, and nobody addressed Wispr. A final that dropped the name
+		// keeps the call: Deepgram's live finals sometimes do.
 		s.endLocked(ex, true, "the wake was misheard")
 		return
 	}
@@ -1125,13 +1127,15 @@ func wakeLag(t *Transcript, m transcript.Match) time.Duration {
 	return max(0, time.Duration(lag*float64(time.Second)))
 }
 
-// covers reports whether words span the stream time at, within 50 ms: the
-// final result of the words an interim result held.
-func covers(words []Word, at float64) bool {
-	if len(words) == 0 {
-		return false
+// nameAt reports whether words hold the name at stream time at, within the
+// 0.3 s Deepgram's finals may move a word from where an interim put it.
+func (s *Supervisor) nameAt(words []Word, at float64) bool {
+	for _, w := range words {
+		if w.Start >= at-0.3 && w.Start <= at+0.3 && s.wake.IsName(w.Text) {
+			return true
+		}
 	}
-	return words[0].Start <= at+0.05 && at <= words[len(words)-1].End
+	return false
 }
 
 func sameStart(a, b float64) bool {
