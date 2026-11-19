@@ -24,8 +24,8 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"A question sent to an agent leaves the unit, and deleting the segment or the session cannot recall it",
 		"Deleting a session erases its questions and the answers the agents wrote",
 		"An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not",
-		"The unit keeps no words of the room for a question it sent",
-		"Every pause, the Jabra's Mute button and \"Wispr, stop\" stop the voice at once",
+		"The unit stores none of the room's words for a question it sent",
+		"Every pause, light hold, press of the Jabra's Mute button, \"Wispr, stop\" and shutdown stop the voice at once",
 	} {
 		if !strings.Contains(readme, words) {
 			t.Errorf("the README does not say %q", words)

@@ -11,6 +11,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/googleauth"
+	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 	voicetts "github.com/sjawhar/ghost-wispr/internal/voice/tts"
 	"github.com/sjawhar/ghost-wispr/internal/wake/transcript"
@@ -26,7 +27,7 @@ type voiceControl interface {
 	Stop(reason string)
 	OnTranscript(t *voice.Transcript)
 	OnUtteranceEnd(closings int, gateOpen bool)
-	WaitFloor(ctx context.Context) error
+	WithFloor(ctx context.Context, start func()) error
 	Close()
 }
 
@@ -79,12 +80,13 @@ func (l *voiceLink) OnUtteranceEnd(closings int, gateOpen bool) {
 	}
 }
 
-// WaitFloor holds other speech (POST /api/tts/speak) while an exchange holds
-// the floor.
-func (l *voiceLink) WaitFloor(ctx context.Context) error {
+// WithFloor begins other speech (POST /api/tts/speak) only while no exchange
+// holds the floor; with the voice off, at once.
+func (l *voiceLink) WithFloor(ctx context.Context, start func()) error {
 	if v := l.get(); v != nil {
-		return v.WaitFloor(ctx)
+		return v.WithFloor(ctx, start)
 	}
+	start()
 	return nil
 }
 
@@ -209,5 +211,35 @@ func newVoiceA(ctx context.Context, cfg *config.Config) (voice.Voice, error) {
 		return voicetts.New(engine), nil
 	default:
 		return nil, fmt.Errorf("voice.tts_engine %q is not one of %q, %q", cfg.Voice.TTSEngine, config.TTSEngineGemini, config.TTSEngineAura)
+	}
+}
+
+// wireVoiceSessionHooks makes every session end reach the Concierge and the
+// voice, and returns what a session delete (the API's and the GC's) calls to
+// make them forget it.
+func wireVoiceSessionHooks(manager interface{ SetSessionEndedHook(func(string)) }, concierge *conciergeHooks, link *voiceLink) func([]string) {
+	manager.SetSessionEndedHook(func(sessionID string) {
+		concierge.SessionEnded(sessionID)
+		link.SessionEnded(sessionID)
+	})
+	return func(sessionIDs []string) {
+		concierge.SessionsDeleted(sessionIDs)
+		link.SessionsDeleted(sessionIDs)
+	}
+}
+
+// wireVoiceSegmentDeletion makes the voice forget its recent transcript after
+// a segment delete or cut, which may have removed words it holds.
+func wireVoiceSegmentDeletion(hooks *server.ControlHooks, link *voiceLink) {
+	for _, hook := range []*func(context.Context, string, int64, int) error{&hooks.DeleteSegment, &hooks.DeleteSegmentText} {
+		deleteSegment := *hook
+		if deleteSegment == nil {
+			continue
+		}
+		*hook = func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+			err := deleteSegment(ctx, sessionID, segmentID, revision)
+			link.SegmentsDeleted(sessionID)
+			return err
+		}
 	}
 }

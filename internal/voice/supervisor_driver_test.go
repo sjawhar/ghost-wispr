@@ -41,7 +41,7 @@ func TestADriverVoiceThatFailsEndsTheExchange(t *testing.T) {
 	sess := r.waitSession()
 	sess.fail(errors.New("the vendor closed the connection"))
 	eventually(t, "the session closed after its failure", func() bool { _, _, closed := sess.state(); return closed })
-	if err := r.s.WaitFloor(t.Context()); err != nil {
+	if err := r.s.WithFloor(t.Context(), func() {}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -63,7 +63,7 @@ func TestAVoiceThatEndsByItselfEndsTheExchange(t *testing.T) {
 		}
 	})
 	done := make(chan error, 1)
-	go func() { done <- r.s.WaitFloor(t.Context()) }()
+	go func() { done <- r.s.WithFloor(t.Context(), func() {}) }()
 	select {
 	case err := <-done:
 		if err != nil {

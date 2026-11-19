@@ -18,8 +18,9 @@ const stopBound = 100 * time.Millisecond
 // running for more than 100 ms.
 func TestEveryStopSilencesTheExchangeWithin100ms(t *testing.T) {
 	stops := map[string]func(r *rig){
-		"pause":      func(r *rig) { r.closeGate() },
-		"light hold": func(r *rig) { r.closeGate() },
+		// A pause and a light hold both close the capture gate; the cmd tests
+		// prove each reaches GateClosed (TestAPauseStopsTheVoiceThroughTheGate).
+		"gate closing": func(r *rig) { r.closeGate() },
 		"jabra":      func(r *rig) { r.s.Stop("jabra button") },
 		"shutdown":   func(r *rig) { r.s.Close() },
 	}
@@ -308,20 +309,20 @@ func TestGoAheadWhileNotRedSpeaksNothing(t *testing.T) {
 	never(t, "an answer spoke while the light was not red", 400*time.Millisecond, func() bool { return len(r.voice.opened) > 0 })
 }
 
-// TestTheFloorQueuesOtherSpeech fails if WaitFloor does not hold other speech
+// TestTheFloorQueuesOtherSpeech fails if WithFloor does not hold other speech
 // while an exchange holds the floor, or does not let it go after.
 func TestTheFloorQueuesOtherSpeech(t *testing.T) {
 	c := newFakeConcierge("fact")
 	r := newRig(t, c)
-	if err := r.s.WaitFloor(t.Context()); err != nil {
-		t.Fatalf("WaitFloor with no exchange: %v", err)
+	if err := r.s.WithFloor(t.Context(), func() {}); err != nil {
+		t.Fatalf("WithFloor with no exchange: %v", err)
 	}
 	sess := r.ask("what is happening?")
 	free := make(chan error, 1)
-	go func() { free <- r.s.WaitFloor(t.Context()) }()
+	go func() { free <- r.s.WithFloor(t.Context(), func() {}) }()
 	select {
 	case <-free:
-		t.Fatal("WaitFloor returned while an exchange held the floor")
+		t.Fatal("WithFloor returned while an exchange held the floor")
 	case <-time.After(100 * time.Millisecond):
 	}
 	waitSaid(t, sess)

@@ -152,6 +152,7 @@ type Supervisor struct {
 	floor         chan struct{}
 	lastStopAt    time.Time          // when the latest stop came
 	chimeCancel   context.CancelFunc // ends the answer chime playing or about to
+	chimeCtx      context.Context    // that chime's context, nil while none plays
 	pending       []*pendingAnswer
 	voiceSpeaking bool      // the voice input plays
 	voiceEnded    time.Time // when it last stopped
@@ -310,6 +311,10 @@ func (s *Supervisor) SessionEnded(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropPendingLocked(func(id string) bool { return id == sessionID })
+	if ex := s.ex; ex != nil && ex.answer != nil && ex.answer.SessionID == sessionID {
+		ex.answer = nil // not put back: its meeting ended
+		s.endLocked(ex, true, "its session ended")
+	}
 }
 
 // SessionsDeleted forgets deleted sessions: their held answers and the recent
@@ -348,17 +353,21 @@ func (s *Supervisor) dropEndedLocked() {
 	s.dropPendingLocked(func(id string) bool { return id != current })
 }
 
-// WaitFloor waits until no exchange holds the floor, so other speech (POST
-// /api/tts/speak) never plays over an exchange.
-func (s *Supervisor) WaitFloor(ctx context.Context) error {
+// WithFloor waits until no exchange holds the floor, then runs start, which
+// begins other speech (POST /api/tts/speak) on the voice input, while no
+// exchange can take the floor: an exchange that takes it afterwards cuts that
+// speech, and none can take it in between. start runs under the Supervisor's
+// lock, so it must only begin the playback.
+func (s *Supervisor) WithFloor(ctx context.Context, start func()) error {
 	for {
 		s.mu.Lock()
-		free := s.floor
-		taken := s.ex != nil
-		s.mu.Unlock()
-		if !taken {
+		if s.ex == nil {
+			start()
+			s.mu.Unlock()
 			return nil
 		}
+		free := s.floor
+		s.mu.Unlock()
 		select {
 		case <-free:
 		case <-ctx.Done():
@@ -453,12 +462,15 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		return
 	}
 	s.touchLocked(ex)
-	if t.IsFinal && ex.answer == nil && !ex.answering && !ex.drives && s.nameAt(t.Words, ex.wakeStart) {
-		// The final still hears the name where the interim wake heard it, but
-		// not as a call ("Whisper networks are a problem."): the wake was
-		// misheard, and nobody addressed Wispr. A final that dropped the name
-		// keeps the call: Deepgram's live finals sometimes do.
-		s.endLocked(ex, true, "the wake was misheard")
+	if ex.answer == nil && !ex.answering && !ex.drives && s.nameAt(t.Words, ex.wakeStart) {
+		// The result still hears the name where the interim wake heard it, but
+		// not as a call ("Whisper networks are a problem."): not the asker's
+		// turn, so nothing of it is read for or handed over. On the final, the
+		// wake was misheard, and nobody addressed Wispr. A final that dropped
+		// the name keeps the call: Deepgram's live finals sometimes do.
+		if t.IsFinal {
+			s.endLocked(ex, true, "the wake was misheard")
+		}
 		return
 	}
 	if !ex.answering && !ex.drives {
@@ -511,10 +523,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 }
 
 // open opens ex's voice and, for a wake, plays the wake chime alongside.
-// Other speech on the voice input, such as POST /api/tts/speak, is cut
-// first, whether or not it has sounded yet.
 func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
-	s.cfg.Speaker.Cancel(audio.InputVoice)
 	if chime {
 		s.spawn(func() { s.playChime(ex.ctx, WakeChime(), ex.wakeAt) })
 	}
@@ -875,19 +884,32 @@ func (s *Supervisor) offer() {
 		return
 	}
 	now := time.Now()
+	unchimed := false
 	for _, p := range s.pending {
-		if p.chimed {
-			continue
+		if !p.chimed {
+			p.chimed, unchimed = true, true
 		}
-		p.chimed = true
+	}
+	if unchimed {
+		// One chime for every answer that has not had one: answers that land
+		// together, or while a chime plays, share it, so chimes never overlap
+		// on the one input.
 		s.chimedAt = now
-		ctx, cancel := context.WithCancel(s.ctx)
-		s.chimeCancel = cancel
-		s.spawn(func() {
-			defer cancel()
-			s.playChime(ctx, AnswerChime(), time.Time{})
-		})
-		return // one chime at a time; the next offer chimes the next
+		if s.chimeCancel == nil {
+			ctx, cancel := context.WithCancel(s.ctx)
+			s.chimeCancel = cancel
+			s.spawn(func() {
+				s.playChime(ctx, AnswerChime(), time.Time{})
+				cancel()
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if ctx == s.chimeCtx {
+					s.chimeCancel, s.chimeCtx = nil, nil
+				}
+			})
+			s.chimeCtx = ctx
+		}
+		return
 	}
 	quietSince := s.lastHeard
 	for _, t := range []time.Time{s.voiceEnded, s.chimedAt} {
@@ -915,7 +937,7 @@ func (s *Supervisor) stopLocked(reason string) {
 	}
 	if s.chimeCancel != nil {
 		s.chimeCancel() // an answer chime, even one whose playback has not begun
-		s.chimeCancel = nil
+		s.chimeCancel, s.chimeCtx = nil, nil
 	}
 	if ex := s.ex; ex != nil {
 		s.endLocked(ex, true, reason)
@@ -977,10 +999,13 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	})
 }
 
-// takeFloorLocked makes ex the exchange holding the floor.
+// takeFloorLocked makes ex the exchange holding the floor, and cuts other
+// speech on the voice input, such as POST /api/tts/speak, whether or not it
+// has sounded yet. Speech begun after this waits for the floor (WithFloor).
 func (s *Supervisor) takeFloorLocked(ex *exchange) {
 	s.ex = ex
 	s.floor = make(chan struct{})
+	s.cfg.Speaker.Cancel(audio.InputVoice)
 }
 
 // noteLocked queues a /ws event for ex, once per kind.

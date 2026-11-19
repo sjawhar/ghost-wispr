@@ -54,10 +54,11 @@ type OrchestratorOpts struct {
 	QueueDepth        int
 	MaxRequestsPerMin int
 	SynthesisTimeout  time.Duration
-	// BeforePlay waits, before each request plays, until the speaker is
-	// free for it: one voice at a time, and a voice exchange goes first. An
-	// error fails the request. Nil waits for nothing.
-	BeforePlay func(ctx context.Context) error
+	// Floor waits, before each request plays, until the speaker is free for
+	// it, then runs begin while no voice exchange can take it: one voice at a
+	// time, and an exchange goes first and cuts speech begun before it. An
+	// error fails the request. Nil begins at once.
+	Floor func(ctx context.Context, begin func()) error
 }
 
 func (o *OrchestratorOpts) withDefaults() OrchestratorOpts {
@@ -257,12 +258,15 @@ func (o *Orchestrator) play(resp *SpeechResponse) (bytesWritten, durationMs int6
 	if format.Channels > 0 {
 		pcm = pcm[:len(pcm)-len(pcm)%(2*format.Channels)] // whole frames
 	}
-	if o.opts.BeforePlay != nil {
-		if err := o.opts.BeforePlay(o.ctx); err != nil {
+	var playback *audio.Playback
+	begin := func() { playback = o.output.Begin(audio.InputVoice) }
+	if o.opts.Floor != nil {
+		if err := o.opts.Floor(o.ctx, begin); err != nil {
 			return 0, 0, err
 		}
+	} else {
+		begin()
 	}
-	playback := o.output.Begin(audio.InputVoice)
 	err = playback.WriteAll(o.ctx, pcm, format)
 	if err == nil {
 		err = playback.Drain(o.ctx)

@@ -187,8 +187,8 @@ What the voice hears, and where the room's words go:
   transcript, and its room audio is one more writer behind the same gate as the recording and
   Deepgram. While capture is paused, nothing hears the room: no wake phrase is heard, and nothing is
   sent.
-- Every pause, the Jabra's Mute button and "Wispr, stop" stop the voice at once: its speech, its
-  chime and the Concierge's calls end within 100 ms, and a question not yet sent to an agent is not
+- Every pause, light hold, press of the Jabra's Mute button, "Wispr, stop" and shutdown stop the voice at once: its speech, its
+  chimes and the Concierge's calls end within 100 ms, and a question not yet sent to an agent is not
   sent. An answer whose question a stop came after waits, silent, until the light reads red and
   someone says "Wispr, go ahead". An answer whose meeting has ended is never spoken; it stays on
   the session's page. A pause also clears the two minutes of transcript the voice keeps.
@@ -201,10 +201,10 @@ What the voice hears, and where the room's words go:
   cannot identify, with the recording session's id and time, not the transcript. A question sent to
   an agent leaves the unit, and deleting the segment or the session cannot recall it: Envoy keeps
   messages for 72 hours, and the agent keeps what it read.
-- The unit keeps no words of the room for a question it sent: its `voice_tasks` ledger holds the
-  issue, the holder, the state and the agent's written answer, which the session's page shows under
-  "Questions to agents". Deleting a session erases its questions and the answers the agents wrote.
-  An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not.
+- The unit stores none of the room's words for a question it sent: its `voice_tasks` ledger holds
+  the issue, the holder, the state and the agent's written answer, which the session's page shows
+  under "Questions to agents". Deleting a session erases its questions and the answers the agents
+  wrote. An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not.
 - The voice's `/ws` events (`voice_wake`, `voice_exchange_started`, `voice_answer_ready`,
   `voice_spoken`) carry the recording session's id and no words, and none is stored.
 

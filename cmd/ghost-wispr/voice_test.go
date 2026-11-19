@@ -22,8 +22,8 @@ func TestTheVoiceLinkIsInertUntilTheVoiceStarts(t *testing.T) {
 	link.Stop("Jabra button")
 	link.OnTranscript(&voice.Transcript{Text: "Wispr, hello", GateOpen: true})
 	link.OnUtteranceEnd(0, true)
-	if err := link.WaitFloor(t.Context()); err != nil {
-		t.Fatalf("WaitFloor with no voice: %v", err)
+	if err := link.WithFloor(t.Context(), func() {}); err != nil {
+		t.Fatalf("WithFloor with no voice: %v", err)
 	}
 	link.Close()
 }
@@ -122,13 +122,13 @@ func (c *closingsHeard) Stop(reason string) {
 	defer c.mu.Unlock()
 	c.stops = append(c.stops, reason)
 }
-func (*closingsHeard) OnTranscript(*voice.Transcript)  {}
-func (*closingsHeard) OnUtteranceEnd(int, bool)        {}
-func (*closingsHeard) WaitFloor(context.Context) error { return nil }
-func (*closingsHeard) Close()                          {}
-func (*closingsHeard) SessionEnded(string)             {}
-func (*closingsHeard) SessionsDeleted([]string)        {}
-func (*closingsHeard) SegmentsDeleted(string)          {}
+func (*closingsHeard) OnTranscript(*voice.Transcript)                  {}
+func (*closingsHeard) OnUtteranceEnd(int, bool)                        {}
+func (*closingsHeard) WithFloor(_ context.Context, start func()) error { start(); return nil }
+func (*closingsHeard) Close()                                          {}
+func (*closingsHeard) SessionEnded(string)                             {}
+func (*closingsHeard) SessionsDeleted([]string)                        {}
+func (*closingsHeard) SegmentsDeleted(string)                          {}
 
 // TestAPauseStopsTheVoiceThroughTheGate fails if a pause or a light hold of
 // the real capture gate does not reach the voice the link holds.

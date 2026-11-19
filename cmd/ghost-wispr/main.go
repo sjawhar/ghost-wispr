@@ -1011,14 +1011,7 @@ func main() {
 	// wired to the capture gate below, before anything can close it.
 	var conciergeSessionHooks conciergeHooks
 	var voiceHooks voiceLink
-	manager.SetSessionEndedHook(func(sessionID string) {
-		conciergeSessionHooks.SessionEnded(sessionID)
-		voiceHooks.SessionEnded(sessionID)
-	})
-	sessionsForgotten := func(sessionIDs []string) {
-		conciergeSessionHooks.SessionsDeleted(sessionIDs)
-		voiceHooks.SessionsDeleted(sessionIDs)
-	}
+	sessionsForgotten := wireVoiceSessionHooks(manager, &conciergeSessionHooks, &voiceHooks)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -1512,16 +1505,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletion)
-	// The voice forgets its recent transcript after a segment delete, which
-	// may have removed words it holds.
-	for _, hook := range []*func(context.Context, string, int64, int) error{&controlHooks.DeleteSegment, &controlHooks.DeleteSegmentText} {
-		deleteSegment := *hook
-		*hook = func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
-			err := deleteSegment(ctx, sessionID, segmentID, revision)
-			voiceHooks.SegmentsDeleted(sessionID)
-			return err
-		}
-	}
+	wireVoiceSegmentDeletion(controlHooks, &voiceHooks)
 
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.
@@ -1930,7 +1914,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		} else {
 			// POST /api/tts/speak waits in its queue while a voice exchange
 			// holds the speaker.
-			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, output, tts.OrchestratorOpts{BeforePlay: voiceHooks.WaitFloor})
+			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, output, tts.OrchestratorOpts{Floor: voiceHooks.WithFloor})
 			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
 		}
 	}
