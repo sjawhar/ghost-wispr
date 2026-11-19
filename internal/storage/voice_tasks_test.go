@@ -1,0 +1,221 @@
+package storage
+
+import (
+	"bytes"
+	"database/sql"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+)
+
+// askVoiceTask records a working voice task for session sessionID whose
+// written answer, once it lands, is answer.
+func askVoiceTask(t *testing.T, store *SQLiteStore, id, sessionID, answer string) {
+	t.Helper()
+	asked := time.Date(2026, 11, 19, 9, 30, 0, 0, time.UTC)
+	if err := store.CreateVoiceTask(&VoiceTask{ID: id, SessionID: sessionID, AskedAt: asked, IssueKey: "ABC-1", Holder: "session:agent-1"}); err != nil {
+		t.Fatalf("create voice task %s: %v", id, err)
+	}
+	if answer == "" {
+		return
+	}
+	if _, err := store.AnswerVoiceTask(id, answer); err != nil {
+		t.Fatalf("answer voice task %s: %v", id, err)
+	}
+}
+
+// voiceTaskIDs lists every voice task id the database holds, sorted.
+func voiceTaskIDs(t *testing.T, store *SQLiteStore) []string {
+	t.Helper()
+	rows, err := store.DB().Query(`SELECT id FROM voice_tasks ORDER BY id`)
+	if err != nil {
+		t.Fatalf("list voice tasks: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// TestAVoiceTaskKeepsItsWrittenAnswer: a task starts working, takes the
+// holder's written answer once, takes the Envoy event id as its id once the
+// question is sent, and records when its answer was spoken.
+func TestAVoiceTaskKeepsItsWrittenAnswer(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	if err := store.CreateSession("s1", time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	askVoiceTask(t, store, "local-1", "s1", "")
+	if err := store.RekeyVoiceTask("local-1", "event-1"); err != nil {
+		t.Fatalf("rekey: %v", err)
+	}
+	if _, err := store.VoiceTask("local-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("the task is still found under its local id: %v", err)
+	}
+	task, err := store.VoiceTask("event-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != VoiceTaskWorking || task.SessionID != "s1" || task.IssueKey != "ABC-1" || task.Holder != "session:agent-1" || task.AnswerWritten != "" || task.SpokenAt != nil {
+		t.Fatalf("new task = %+v", task)
+	}
+
+	answered, err := store.AnswerVoiceTask("event-1", "PR #12 merged; INFRA-7 is next.")
+	if err != nil || !answered {
+		t.Fatalf("answer = %v, %v; want answered", answered, err)
+	}
+	if again, err := store.AnswerVoiceTask("event-1", "a second answer"); err != nil || again {
+		t.Fatalf("a second answer = %v, %v; want ignored", again, err)
+	}
+	spoken := time.Date(2026, 11, 19, 9, 31, 0, 0, time.UTC)
+	if err := store.MarkVoiceTaskSpoken("event-1", spoken); err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.VoiceTask("event-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != VoiceTaskDone || task.AnswerWritten != "PR #12 merged; INFRA-7 is next." || task.SpokenAt == nil || !task.SpokenAt.Equal(spoken) {
+		t.Fatalf("answered task = %+v", task)
+	}
+	if _, err := store.AnswerVoiceTask("missing", "x"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("answer of a missing task: %v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestAWorkingVoiceTaskCanBeReplacedOrCancelled: only a working task moves to
+// replaced or cancelled; an answer still lands on a replaced one, for the
+// session's page, without making it done.
+func TestAWorkingVoiceTaskCanBeReplacedOrCancelled(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	if err := store.CreateSession("s1", time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	askVoiceTask(t, store, "old", "s1", "")
+	askVoiceTask(t, store, "gone", "s1", "")
+	if moved, err := store.EndVoiceTask("old", VoiceTaskReplaced); err != nil || !moved {
+		t.Fatalf("replace = %v, %v", moved, err)
+	}
+	if moved, err := store.EndVoiceTask("gone", VoiceTaskCancelled); err != nil || !moved {
+		t.Fatalf("cancel = %v, %v", moved, err)
+	}
+	if moved, err := store.EndVoiceTask("old", VoiceTaskCancelled); err != nil || moved {
+		t.Fatalf("cancel of a replaced task = %v, %v; want left", moved, err)
+	}
+	if _, err := store.EndVoiceTask("old", VoiceTaskDone); err == nil {
+		t.Fatal("EndVoiceTask accepted done, which only an answer sets")
+	}
+	if answered, err := store.AnswerVoiceTask("old", "late answer"); err != nil || answered {
+		t.Fatalf("late answer = %v, %v; want kept but not done", answered, err)
+	}
+	task, err := store.VoiceTask("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != VoiceTaskReplaced || task.AnswerWritten != "late answer" {
+		t.Fatalf("replaced task after a late answer = %+v", task)
+	}
+}
+
+// TestAVoiceTaskNeedsItsSession: a task names a session the database holds,
+// so no task outlives the session a delete removed.
+func TestAVoiceTaskNeedsItsSession(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	err := store.CreateVoiceTask(&VoiceTask{ID: "t", SessionID: "no-such-session", AskedAt: time.Now()})
+	if err == nil {
+		t.Fatal("a voice task was recorded for a session the database does not hold")
+	}
+}
+
+// TestDeleteSessionRemovesItsVoiceTasks: a person's delete of a merged
+// session removes the voice tasks of it and of the sessions merged into it,
+// and keeps another session's.
+func TestDeleteSessionRemovesItsVoiceTasks(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	started := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
+	for i, id := range []string{"a", "b", "kept"} {
+		at := started.Add(time.Duration(i) * 5 * time.Minute)
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, at.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	askVoiceTask(t, store, "task-a", "a", "answer a")
+	askVoiceTask(t, store, "task-b", "b", "")
+	if err := store.MergeSessions("merged", []string{"a", "b"}, started, started.Add(15*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	askVoiceTask(t, store, "task-merged", "merged", "answer merged")
+	askVoiceTask(t, store, "task-kept", "kept", "answer kept")
+
+	if _, err := store.DeleteSession("merged", t.TempDir()); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if got := voiceTaskIDs(t, store); !slices.Equal(got, []string{"task-kept"}) {
+		t.Fatalf("voice tasks after the delete = %q, want only task-kept", got)
+	}
+}
+
+// TestAgeDeleteRemovesItsVoiceTasks: GC's age delete removes the deleted
+// session's voice tasks with it.
+func TestAgeDeleteRemovesItsVoiceTasks(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	audioDir := t.TempDir()
+	endedAndSynced(t, store, "old", filepath.Join(audioDir, "old.mp3"), RefinementCompleted)
+	endedWith(t, store, "kept", filepath.Join(audioDir, "kept.mp3"), RefinementCompleted)
+	askVoiceTask(t, store, "task-old", "old", "answer old")
+	askVoiceTask(t, store, "task-kept", "kept", "")
+
+	if _, removed, err := store.DeleteEndedSessionAndSources("old", filepath.Join(audioDir, "old.mp3"), audioDir); err != nil || !removed {
+		t.Fatalf("age delete = %v, %v; want deleted", removed, err)
+	}
+	if got := voiceTaskIDs(t, store); !slices.Equal(got, []string{"task-kept"}) {
+		t.Fatalf("voice tasks after the age delete = %q, want only task-kept", got)
+	}
+}
+
+// TestTheWriteAheadLogEraseCoversVoiceTasks: a deleted session's written
+// answers are in no file of the database once the delete returns, the
+// write-ahead log included, while a kept session's answer still is.
+func TestTheWriteAheadLogEraseCoversVoiceTasks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "voice.db")
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	started := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
+	for _, id := range []string{"deleted", "kept"} {
+		if err := store.CreateSession(id, started); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EndSession(id, started.Add(time.Minute), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const secret, kept = "private voice answer token", "kept voice answer words"
+	askVoiceTask(t, store, "task-deleted", "deleted", secret)
+	askVoiceTask(t, store, "task-kept", "kept", kept)
+	if log, err := os.ReadFile(path + "-wal"); err != nil || !bytes.Contains(log, []byte(secret)) {
+		t.Fatalf("control: the write-ahead log does not hold the answer before the delete (%v)", err)
+	}
+
+	if _, err := store.DeleteSession("deleted", t.TempDir()); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	assertDatabaseFilesLack(t, path, secret, kept)
+}
