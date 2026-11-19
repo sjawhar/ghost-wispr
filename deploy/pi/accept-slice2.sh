@@ -1155,17 +1155,19 @@ EOF
   [[ -e "$summary_called" && -e "$speech_called" && -e "$refinement_called" ]] \
     || fail 'A8 self-test stopped before every provider role ran when no provider reported its model'
   rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
+  # shellcheck disable=SC2329 # run_a8, called next, reads the deployed YAML through remote_run.
   remote_run() { printf '%s\n' "${good_config/embedding_model: gemini\/gemini-embedding-2/embedding_model: gemini/gemini-embedding-001}"; }
   if run_a8 >/dev/null 2>&1; then
     fail 'A8 self-test accepted an unreported search model when the configuration names another'
   fi
+  # shellcheck disable=SC2329 # The run_a8 of the next check reads the deployed YAML through remote_run.
   remote_run() { printf '%s\n' "$good_config"; }
   rm -f -- "$summary_called" "$speech_called" "$refinement_called" "$summary_requested" "$refinement_requested" "$refinement_seen_running"
+  # shellcheck disable=SC2329 # run_a8, called next, reads the running models through running_config.
   running_config() { jq -c '.models.embedding = "gemini/gemini-embedding-001"' <<<"$good_running_config"; }
   if run_a8 >/dev/null 2>&1; then
     fail 'A8 self-test accepted a running process whose embedding model is not the plan'"'"'s while the YAML names it'
   fi
-  running_config() { printf '%s\n' "$good_running_config"; }
   printf 'A8 self-test RAN: every role is compared with the model the running process reports\n'
   printf 'A8 self-test RAN: every role passes on a model the provider did not report, and later roles still run\n'
 
