@@ -29,6 +29,13 @@ const deepgramKeepAliveEvery = 5 * time.Second
 // errDeepgramSocketClosed is a write to a socket that has been closed.
 var errDeepgramSocketClosed = errors.New("deepgram socket closed")
 
+// deepgramOptOut keeps a socket's audio and transcripts out of Deepgram's
+// Model Improvement Program, which may otherwise keep them after processing,
+// for training. The SDK's LiveTranscriptionOptions has no field for
+// mip_opt_out, so it goes in as the SDK's custom query parameters; the SDK
+// only reads the map, so every dial shares this one.
+var deepgramOptOut = map[string][]string{"mip_opt_out": {"true"}}
+
 // deepgramSocket is one live-transcription websocket to Deepgram that the app
 // dials itself, so it owns the TCP connection: the SDK's client holds its
 // connection's lock through a write that has no deadline, and a peer or path
@@ -50,7 +57,8 @@ type deepgramSocket struct {
 
 // dialDeepgramLive opens a live-transcription socket to Deepgram with
 // cOptions' host and credentials and tOptions' query, as the SDK's client
-// would.
+// would, and with mip_opt_out=true (deepgramOptOut). deepgramOptOut takes the
+// place of any custom query parameters ctx carries, so none can contradict it.
 func dialDeepgramLive(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, callback msginterfaces.LiveMessageCallback, timeout time.Duration) (*deepgramSocket, error) {
 	if apiKey != "" {
 		cOptions.APIKey = apiKey
@@ -61,7 +69,7 @@ func dialDeepgramLive(ctx context.Context, apiKey string, cOptions *interfaces.C
 	if err := tOptions.Check(); err != nil {
 		return nil, fmt.Errorf("deepgram live options: %w", err)
 	}
-	url, err := version.GetLiveAPI(ctx, cOptions.Host, cOptions.APIVersion, cOptions.Path, tOptions)
+	url, err := version.GetLiveAPI(interfaces.WithCustomParameters(ctx, deepgramOptOut), cOptions.Host, cOptions.APIVersion, cOptions.Path, tOptions)
 	if err != nil {
 		return nil, fmt.Errorf("deepgram live URL: %w", err)
 	}

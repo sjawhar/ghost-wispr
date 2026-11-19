@@ -303,7 +303,10 @@ func TestPauseClosesMicDeviceUntilResume(t *testing.T) {
 	}
 }
 
-// The UI hears that the mic is paused, and that it is back on resume.
+// The UI hears that the mic is paused, and that it is back on resume. The
+// loop reports the pause after it closes the microphone, and only while
+// capture is still paused, so the resume waits for that report: a resume
+// right after the close left the loop nothing to report, and the test failed.
 func TestPauseBroadcastsMicPausedThenResumed(t *testing.T) {
 	hub := server.NewHub()
 	events := hub.Subscribe()
@@ -316,12 +319,21 @@ func TestPauseBroadcastsMicPausedThenResumed(t *testing.T) {
 	capture.Pause()
 	mic.capture(t, []byte{1})
 	mic.expectEvents(t, "close")
+	statuses := []string{nextMicStatus(t, events)}
 	capture.Resume()
 	mic.expectEvents(t, "open", "stream")
+	statuses = append(statuses, nextMicStatus(t, events))
+	if want := []string{storage.ComponentStatusPaused, storage.ComponentStatusConnected}; !slices.Equal(statuses, want) {
+		t.Fatalf("mic statuses = %v, want %v", statuses, want)
+	}
+}
 
-	var statuses []string
+// nextMicStatus is the status of the next microphone status event the hub
+// sends.
+func nextMicStatus(t *testing.T, events <-chan []byte) string {
+	t.Helper()
 	deadline := time.After(testWait)
-	for len(statuses) < 2 {
+	for {
 		select {
 		case msg := <-events:
 			var payload map[string]any
@@ -329,14 +341,11 @@ func TestPauseBroadcastsMicPausedThenResumed(t *testing.T) {
 				t.Fatalf("unmarshal failed: %v", err)
 			}
 			if payload["type"] == "component_status" && payload["component"] == "mic" {
-				statuses = append(statuses, fmt.Sprint(payload["status"]))
+				return fmt.Sprint(payload["status"])
 			}
 		case <-deadline:
-			t.Fatalf("timed out waiting for mic status events, got %v", statuses)
+			t.Fatal("timed out waiting for a mic status event")
 		}
-	}
-	if want := []string{storage.ComponentStatusPaused, storage.ComponentStatusConnected}; !slices.Equal(statuses, want) {
-		t.Fatalf("mic statuses = %v, want %v", statuses, want)
 	}
 }
 
