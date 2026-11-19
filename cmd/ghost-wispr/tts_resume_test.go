@@ -356,7 +356,8 @@ func (w *ringCheckingRecording) Write(p []byte) (int, error) {
 // before the open, the resume opens the gate during the open's light settle,
 // and the light cannot change once the microphone is open. The microphone must
 // be closed, the Jabra darkened and the microphone opened again before audio
-// passes. The control has no pause during the open.
+// passes; the loop closes it without streaming it, since a pause came during
+// its open. The control has no pause during the open.
 func TestNoAudioPassesWhileTheJabraRingShowsMuted(t *testing.T) {
 	for _, race := range []bool{false, true} {
 		name := "control, no pause during the open"
@@ -385,32 +386,48 @@ func TestNoAudioPassesWhileTheJabraRingShowsMuted(t *testing.T) {
 				return nil
 			}
 			mic := newScriptedMic()
+			// The ring as each open began: the loop closes the open a pause
+			// came during, and darkens the ring, before the test can look.
+			ringAtOpen := make(chan bool, 4)
+			opening := ringAtOpenMic{scriptedMic: mic, ring: &ring, atOpen: ringAtOpen}
 			recording := &ringCheckingRecording{ring: &ring}
-			runMicLoopOn(t, capture, orderedMic{micStreamer: mic, device: device}, mic, recording, (&recordedWaits{}).wait)
+			runMicLoopOn(t, capture, orderedMic{micStreamer: opening, device: device}, mic, recording, (&recordedWaits{}).wait)
 			mic.expectEvents(t, "close")
 
 			capture.Resume()
 			mic.expectEvents(t, "open")
-			if race && !ring.Load() {
+			if muted := <-ringAtOpen; race && !muted {
 				t.Fatal("control: the microphone opened with the ring dark; the pause did not land before the open")
+			}
+			if race {
+				mic.expectEvents(t, "close", "open")
+				if <-ringAtOpen {
+					t.Fatal("the microphone opened again with the Jabra's ring showing Muted")
+				}
 			}
 			mic.expectEvents(t, "stream")
 			mic.capture(t, make([]byte, 320))
 			if got := recording.muted.Load(); got > 0 {
 				t.Fatalf("%d bytes reached the recording while the Jabra's ring showed Muted", got)
 			}
-			if race {
-				mic.expectEvents(t, "close", "open", "stream")
-				if ring.Load() {
-					t.Fatal("the microphone opened again with the Jabra's ring showing Muted")
-				}
-				mic.capture(t, make([]byte, 320))
-			}
 			if got := recording.bytes.Load(); got != 320 {
 				t.Fatalf("the recording got %d bytes once the ring was dark, want 320", got)
 			}
 		})
 	}
+}
+
+// ringAtOpenMic is a capture device that sends, as each Open begins, whether
+// the Jabra's ring shows Muted.
+type ringAtOpenMic struct {
+	*scriptedMic
+	ring   *atomic.Bool
+	atOpen chan<- bool
+}
+
+func (m ringAtOpenMic) Open() error {
+	m.atOpen <- m.ring.Load()
+	return m.scriptedMic.Open()
 }
 
 // TestAJabraThatConnectsWhileRecordingIsLitBeforeAudioPasses fails if audio

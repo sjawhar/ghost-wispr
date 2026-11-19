@@ -2087,14 +2087,14 @@ func streamMicWithRetry(
 				released = true
 				continue
 			}
-			closings := capture.closingCount()
 			err = streamer.Open()
 			capture.finishMicStart()
-			if err == nil && capture.closingCount() != closings {
-				// A pause, or a hold for the light, came during the open, and
-				// a resume may have opened the gate again since: the device
-				// captured through the pause. Close it, which drops what it
-				// holds, and open it again once capture is back.
+			if err == nil && capture.closedSinceMicOpen() {
+				// A pause, or a hold for the light, came during the red
+				// confirmation or the open, and a resume may have opened the
+				// gate again since: the device may have captured through the
+				// pause. Close it, which drops what it holds, and open it
+				// again once capture is back.
 				reopen, reopenWhy = true, "after a pause during its open"
 				continue
 			}
@@ -2152,6 +2152,11 @@ func streamMicWithRetry(
 			if errors.Is(err, errLightWentOff) {
 				logf("the recording light was not red while the microphone was open; reopening the microphone")
 				reopen, reopenWhy = true, "after the recording light was not red"
+				continue
+			}
+			if errors.Is(err, errClosedSinceMicOpen) {
+				logf("the capture gate closed while the microphone was open; reopening the microphone")
+				reopen, reopenWhy = true, "after a pause while it was open"
 				continue
 			}
 		}

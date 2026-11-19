@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -363,9 +364,10 @@ func TestMicStartedWhilePausedIsClosedBeforeStreaming(t *testing.T) {
 	mic.expectEvents(t, "open", "stream")
 }
 
-// pauseBufferMic is a capture device that, after a pause during its Open (its
-// onOpen pauses), holds what it captured during that pause: Stream writes it
-// first, and Close drops it, as closing a PortAudio stream drops its buffer.
+// pauseBufferMic is a capture device that can hold audio captured during a
+// pause (holdPauseAudio): Stream writes it first, and Close drops it, as
+// closing a PortAudio stream drops its buffer. onOpen runs once, at the next
+// Open or Reopen, after the device opened.
 type pauseBufferMic struct {
 	*scriptedMic
 	onOpen   func()
@@ -373,15 +375,28 @@ type pauseBufferMic struct {
 	buffered []byte
 }
 
-func (m *pauseBufferMic) Open() error {
-	err := m.scriptedMic.Open()
+func (m *pauseBufferMic) holdPauseAudio() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.buffered = []byte("captured during the pause")
+}
+
+func (m *pauseBufferMic) opened() {
 	if onOpen := m.onOpen; onOpen != nil {
 		m.onOpen = nil
 		onOpen()
-		m.mu.Lock()
-		m.buffered = []byte("captured during the pause")
-		m.mu.Unlock()
 	}
+}
+
+func (m *pauseBufferMic) Open() error {
+	err := m.scriptedMic.Open()
+	m.opened()
+	return err
+}
+
+func (m *pauseBufferMic) Reopen() error {
+	err := m.scriptedMic.Reopen()
+	m.opened()
 	return err
 }
 
@@ -405,6 +420,60 @@ func (m *pauseBufferMic) Stream(w io.Writer) error {
 	return m.scriptedMic.Stream(w)
 }
 
+// runPauseBufferMicLoop runs streamMicWithRetry on mic, with logf as its log,
+// until the test ends.
+func runPauseBufferMicLoop(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer, logf func(string, ...any)) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := goDone(func() {
+		streamMicWithRetry(ctx, capture, mic, recorded, func(time.Duration) {}, logf, nil)
+	})
+	t.Cleanup(func() {
+		cancel()
+		close(mic.chunks)
+		if !returnedWithin(done, testWait) {
+			t.Error("mic loop did not stop")
+		}
+	})
+}
+
+// waitOpenIn waits up to testWait for the gate to open, from any goroutine:
+// it reports a gate that stays closed with t.Error.
+func waitOpenIn(t *testing.T, capture *captureGate) {
+	opened, stop := context.WithTimeout(context.Background(), testWait)
+	defer stop()
+	if !capture.waitResumed(opened) {
+		t.Error("the gate did not open again")
+	}
+}
+
+// pauseAndResume pauses capture, resumes it and waits until the gate is open
+// again, as a person who pauses and resumes at once does.
+func pauseAndResume(t *testing.T, capture *captureGate) {
+	capture.Pause()
+	capture.Resume()
+	waitOpenIn(t, capture)
+}
+
+// expectEventsInOrder fails the test unless the device's next calls include
+// want in this order, within testWait; other calls between them are skipped.
+func (m *scriptedMic) expectEventsInOrder(t *testing.T, want ...string) {
+	t.Helper()
+	deadline := time.After(testWait)
+	var seen []string
+	for _, w := range want {
+		for found := false; !found; {
+			select {
+			case got := <-m.events:
+				seen = append(seen, got)
+				found = got == w
+			case <-deadline:
+				t.Fatalf("device calls %v, want %v among them, in order", seen, want)
+			}
+		}
+	}
+}
+
 // TestAPauseDuringTheMicOpenClosesTheDevice fails if the mic loop streams a
 // device it opened before a pause that came during the open, also when a
 // resume came during the open too and the gate is open again by the time
@@ -422,29 +491,15 @@ func TestAPauseDuringTheMicOpenClosesTheDevice(t *testing.T) {
 			capture.Pause()
 			mic := &pauseBufferMic{scriptedMic: newScriptedMic()}
 			recorded := &lockedBuffer{}
-			ctx, cancel := context.WithCancel(context.Background())
-			done := goDone(func() {
-				streamMicWithRetry(ctx, capture, mic, recorded, func(time.Duration) {}, nopLogf, nil)
-			})
-			t.Cleanup(func() {
-				cancel()
-				close(mic.chunks)
-				if !returnedWithin(done, testWait) {
-					t.Error("mic loop did not stop")
-				}
-			})
+			runPauseBufferMicLoop(t, capture, mic, recorded, nopLogf)
 			mic.expectEvents(t, "close")
 			mic.onOpen = func() { // the device captures from here on
-				capture.Pause()
-				if !resumeToo {
-					return
+				if resumeToo {
+					pauseAndResume(t, capture)
+				} else {
+					capture.Pause()
 				}
-				capture.Resume()
-				opened, stop := context.WithTimeout(ctx, testWait)
-				defer stop()
-				if !capture.waitResumed(opened) {
-					t.Error("the gate did not open again")
-				}
+				mic.holdPauseAudio()
 			}
 			capture.Resume()
 			mic.expectEvents(t, "open", "close")
@@ -452,6 +507,81 @@ func TestAPauseDuringTheMicOpenClosesTheDevice(t *testing.T) {
 				capture.Resume()
 			}
 			mic.expectEvents(t, "open", "stream")
+			mic.capture(t, []byte{1, 2})
+			if got := recorded.Len(); got != 2 {
+				t.Fatalf("the recording got %d bytes, want only the 2 captured after the resume", got)
+			}
+		})
+	}
+}
+
+// TestNoAudioCapturedDuringAPauseReachesTheRecording fails if audio that a
+// device captured during a pause reaches the recording, wherever the pause
+// came while the device was open or opening, and however briefly it lasted.
+// The gated writer drops audio from a microphone whose red confirmation began
+// before a closing of the gate, and the mic loop then closes the device, which
+// drops what it holds, and opens it again.
+func TestNoAudioCapturedDuringAPauseReachesTheRecording(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer)
+	}{
+		{name: "a pause during the red confirmation, a resume during the open", run: func(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer) {
+			capture.Pause()
+			runPauseBufferMicLoop(t, capture, mic, recorded, nopLogf)
+			mic.expectEvents(t, "close")
+			capture.beforeMicStart = sync.OnceValue(func() error {
+				capture.Pause()
+				return nil
+			})
+			mic.onOpen = func() { // the device opens during the pause
+				capture.Resume()
+				waitOpenIn(t, capture)
+				mic.holdPauseAudio()
+			}
+			capture.Resume()
+		}},
+		{name: "a pause and a resume during a reopen after a stream error", run: func(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer) {
+			mic.streamErrs = []error{errors.New("device disconnected")}
+			mic.onOpen = func() {
+				pauseAndResume(t, capture)
+				mic.holdPauseAudio()
+			}
+			runPauseBufferMicLoop(t, capture, mic, recorded, nopLogf)
+			mic.expectEventsInOrder(t, "reopen")
+		}},
+		{name: "a pause and a resume after the open's checks", run: func(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer) {
+			capture.Pause()
+			var once sync.Once
+			runPauseBufferMicLoop(t, capture, mic, recorded, func(format string, _ ...any) {
+				if strings.HasPrefix(format, "microphone reopened") {
+					once.Do(func() {
+						pauseAndResume(t, capture)
+						mic.holdPauseAudio()
+					})
+				}
+			})
+			mic.expectEvents(t, "close")
+			capture.Resume()
+		}},
+		{name: "a pause and a resume before the loop's first stream", run: func(t *testing.T, capture *captureGate, mic *pauseBufferMic, recorded io.Writer) {
+			// The start opened the device under a red confirmation; the
+			// loop starts streaming it later.
+			if err := capture.confirmMicOpen(); err != nil {
+				t.Fatal(err)
+			}
+			capture.finishMicStart()
+			pauseAndResume(t, capture)
+			mic.holdPauseAudio()
+			runPauseBufferMicLoop(t, capture, mic, recorded, nopLogf)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			mic := &pauseBufferMic{scriptedMic: newScriptedMic()}
+			recorded := &lockedBuffer{}
+			tc.run(t, capture, mic, recorded)
+			mic.expectEventsInOrder(t, "open", "stream")
 			mic.capture(t, []byte{1, 2})
 			if got := recorded.Len(); got != 2 {
 				t.Fatalf("the recording got %d bytes, want only the 2 captured after the resume", got)
