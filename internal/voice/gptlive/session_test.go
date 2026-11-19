@@ -386,7 +386,7 @@ func TestLongCommentaryGoesInAppendsOf500TokensOrLess(t *testing.T) {
 		t.Errorf("the appends do not add up to the text")
 	}
 	c.audioDelta(ramp(1000, 480))
-	if err := <-done; err != nil {
+	if err := returns(t, done, testWait, "Say"); err != nil {
 		t.Fatalf("Say: %v", err)
 	}
 }
@@ -481,7 +481,11 @@ func TestNoModelAudioPlaysOnceTheSessionCloses(t *testing.T) {
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		c.expect(evSessionClose)
+		for ev := range c.in {
+			if ev.Type == evSessionClose {
+				break
+			}
+		}
 		// Trailing output, as the server sends it up to session.closed.
 		c.audioDelta(ramp(30000, 2400))
 		c.send(map[string]any{"type": evSessionClosed, "event_id": "event_closed", "reason": "close_requested", "usage": map[string]any{"seconds": 3}})

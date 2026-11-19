@@ -52,7 +52,9 @@ const historyBudget = 16000
 
 // history is the session's starting text history: the meeting transcript
 // before the call, labelled by speaker and oldest first, then the asker's
-// words so far. It keeps the newest whole lines that fit historyBudget.
+// words so far. It keeps the newest whole lines that fit historyBudget, and
+// stops at the first that does not, so the transcript it keeps has no gap;
+// a newest line too long for the budget on its own keeps its last words.
 func history(x *voice.Exchange) []initialItem {
 	var tail string
 	if asker := strings.TrimSpace(x.AskerTurn); asker != "" {
@@ -67,6 +69,9 @@ func history(x *voice.Exchange) []initialItem {
 			continue
 		}
 		if room-len(line)-1 < 0 {
+			if len(lines) == 0 && room > 1 {
+				lines = append(lines, lastWords(line, room-1))
+			}
 			break
 		}
 		room -= len(line) + 1
@@ -124,6 +129,22 @@ func truncate(s string, n int) string {
 }
 
 func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
+
+// lastWords is the end of s in at most n bytes, from a word boundary where
+// it can.
+func lastWords(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := len(s) - n
+	if space := strings.IndexByte(s[cut:], ' '); space >= 0 && space < n {
+		return s[cut+space+1:]
+	}
+	for cut < len(s) && !utf8RuneStart(s[cut]) {
+		cut++
+	}
+	return s[cut:]
+}
 
 // appendLimit is the most bytes one instructions, thinking or commentary
 // append carries: Live takes 500 tokens an append, and a token of English

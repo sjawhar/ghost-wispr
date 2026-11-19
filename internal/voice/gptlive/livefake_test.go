@@ -269,12 +269,15 @@ type fakeOutput struct {
 	mu     sync.Mutex
 	speech []*fakePlayback
 	begun  chan *fakePlayback
+	// pace makes each Write take as long as its audio plays, as a device's
+	// stream does once its buffer is full.
+	pace bool
 }
 
 func newFakeOutput() *fakeOutput { return &fakeOutput{begun: make(chan *fakePlayback, 16)} }
 
 func (o *fakeOutput) Begin() voice.Playback {
-	p := &fakePlayback{wrote: make(chan struct{}, 1)}
+	p := &fakePlayback{wrote: make(chan struct{}, 1), pace: o.pace}
 	o.mu.Lock()
 	o.speech = append(o.speech, p)
 	o.mu.Unlock()
@@ -317,9 +320,17 @@ type fakePlayback struct {
 	cancelled bool
 	drained   bool
 	wrote     chan struct{}
+	pace      bool
 }
 
-func (p *fakePlayback) Write(_ context.Context, frame []byte, format audio.AudioFormat) error {
+func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
+	if p.pace {
+		select {
+		case <-time.After(time.Duration(len(frame)/2) * time.Second / time.Duration(format.SampleRate)):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cancelled {
@@ -381,17 +392,20 @@ type fakeTools struct {
 	result json.RawMessage
 	err    error
 	block  bool // Run waits for its context to end
+	// stopped closes when a blocked Run's context ends.
+	stopped chan struct{}
 }
 
 func newFakeTools(result voice.AnswerResult) *fakeTools {
 	b, _ := json.Marshal(result)
-	return &fakeTools{calls: make(chan voice.ToolCall, 8), result: b}
+	return &fakeTools{calls: make(chan voice.ToolCall, 8), result: b, stopped: make(chan struct{})}
 }
 
 func (f *fakeTools) Run(ctx context.Context, c voice.ToolCall) (json.RawMessage, error) {
 	f.calls <- c
 	if f.block {
 		<-ctx.Done()
+		close(f.stopped)
 		return nil, ctx.Err()
 	}
 	return f.result, f.err

@@ -56,9 +56,11 @@ const (
 	// ends. GPT-Live sends no event at the end of its speech.
 	speechGap = 400 * time.Millisecond
 	// earlyAudio is the most tap audio the session keeps while it starts, to
-	// send once the session has started, so the asker's first words reach it.
+	// send once the session has started: the first of it, which holds the
+	// asker's first words.
 	earlyAudio = 10 * SampleRate
-	// maxQueuedAudio is the most model speech the session holds to play.
+	// maxQueuedAudio is the most model speech the session holds to play;
+	// past it the oldest goes.
 	maxQueuedAudio = 120 * SampleRate
 	// startTimeout bounds the wait for session.started.
 	startTimeout = 10 * time.Second
@@ -708,7 +710,7 @@ func (s *session) read() {
 // lost handles the end of the connection.
 func (s *session) lost(err error, started bool) {
 	s.abort()
-	s.failPending(ErrDisconnected)
+	s.failPending(s.lostErr())
 	if !started {
 		s.startFailed(fmt.Errorf("%w before the session started: %v", ErrDisconnected, err))
 		return
@@ -1035,11 +1037,9 @@ func (s *session) pumpTap() {
 				continue
 			}
 			if started != nil {
-				early = append(early, pcm)
-				held += len(pcm)
-				for held > earlyAudio && len(early) > 1 {
-					held -= len(early[0])
-					early = early[1:]
+				if held+len(pcm) <= earlyAudio {
+					early = append(early, pcm)
+					held += len(pcm)
 				}
 				continue
 			}
