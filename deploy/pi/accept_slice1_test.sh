@@ -215,6 +215,12 @@ stopper=$!
 # nor in the 1 s the test then holds the lock. A stop that does not wait for the lock fails however
 # late it stops the recorder; one that waits for another device's lock fails within 30 s, even with
 # no time limit of its own.
+# Known limits: the fake recorder never takes the light's lock, so the test cannot see whether the stop
+# holds that lock at the moment it stops the recorder. Two faulty stops pass: one that takes the lock
+# and frees it before it stops the recorder (flock -w 5 ... true && exec kill -STOP PID), and one
+# that leaves a separate process waiting for the lock and stops the recorder later without it
+# (flock -w 5 ... true & sleep 3; exec kill -STOP PID). Catching them needs a fake recorder that
+# itself takes the lock in short bursts.
 deadline=$((${EPOCHREALTIME//[!0-9]/} + 30000000))
 waited_since=''
 while :; do
