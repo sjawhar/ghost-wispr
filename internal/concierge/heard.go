@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +36,76 @@ const (
 // 4592" as said aloud. A single digit is too often a plain number.
 var spokenKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d{2,})\b`)
 
+// keytermKey is an issue key as Deepgram writes one whose project is a
+// keyterm, so in capitals: its number after a pause ("INFRA? 4592."), with a
+// thousands comma ("INFRA 4,592"), or in words ("INFRA four thousand five
+// hundred and ninety two", "INFRA forty-five ninety-two"). Group 2 is the
+// number in digits, group 3 in words.
+var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d{1,3}(?:,\d{3})+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
+
+// spokenKeys rewrites each key keytermKey reads in words to its written form,
+// "INFRA-4592", so the rest of the turn reads as before. A number of one
+// digit stays as said.
+func spokenKeys(words string) string {
+	return keytermKey.ReplaceAllStringFunc(words, func(match string) string {
+		parts := keytermKey.FindStringSubmatch(match)
+		digits := strings.ReplaceAll(parts[2], ",", "")
+		trail := ""
+		if parts[3] != "" {
+			digits = keyDigits(parts[3])
+			if strings.HasSuffix(parts[3], " ") {
+				trail = " "
+			}
+		}
+		if len(digits) < 2 {
+			return match
+		}
+		return parts[1] + "-" + digits + trail
+	})
+}
+
+// keyDigits is an issue number said in words, in digits: a number with a
+// scale is its value ("four thousand five hundred and ninety two" is 4592);
+// one without is its groups in order ("forty-five ninety-two" and "four five
+// nine two" are 4592).
+func keyDigits(said string) string {
+	words := strings.FieldsFunc(strings.ToLower(said), func(r rune) bool { return r == ' ' || r == '-' })
+	if slices.Contains(words, "hundred") || slices.Contains(words, "thousand") {
+		total, current := 0, 0
+		for _, word := range words {
+			switch word {
+			case "and":
+			case "hundred":
+				current = max(current, 1) * 100
+			case "thousand":
+				total, current = total+max(current, 1)*1000, 0
+			default:
+				current += numberUnits[word]
+			}
+		}
+		return strconv.Itoa(total + current)
+	}
+	var digits strings.Builder
+	for i := 0; i < len(words); i++ {
+		value, ok := numberUnits[words[i]]
+		if !ok {
+			continue // "and"
+		}
+		if value >= 20 && i+1 < len(words) {
+			if unit, ok := numberUnits[words[i+1]]; ok && unit > 0 && unit < 10 {
+				value += unit
+				i++
+			}
+		}
+		digits.WriteString(strconv.Itoa(value))
+	}
+	return digits.String()
+}
+
 // issueKeysIn lists the issue keys words name, in order, upper-cased.
 func issueKeysIn(words string) []string {
 	var keys []string
-	for _, match := range spokenKey.FindAllStringSubmatch(words, -1) {
+	for _, match := range spokenKey.FindAllStringSubmatch(spokenKeys(words), -1) {
 		if key, err := dispatch.NormalizeIssueKey(match[1] + "-" + match[2]); err == nil {
 			keys = append(keys, key)
 		}
