@@ -351,3 +351,43 @@ describe('a deleted session', () => {
     expect(Object.keys(appState.componentStatuses).sort()).toEqual(['summary'])
   })
 })
+
+describe('a capture pause', () => {
+  const interim = (text: string) =>
+    applyEvent({
+      type: 'live_transcript_interim',
+      version: 1,
+      timestamp: '2026-11-19T09:00:00Z',
+      session_id: '',
+      speaker: 0,
+      text,
+      start_time: 0,
+    })
+  const paused = (value: boolean) =>
+    applyEvent({
+      type: 'status_changed',
+      version: 1,
+      timestamp: '2026-11-19T09:00:01Z',
+      paused: value,
+    })
+
+  // Words from before a pause must not show after it: an interim that no
+  // session took (the pause came before Deepgram finalized it) would stay on
+  // the page through the pause and the resume, as words of the meeting after.
+  it('clears the interim text from before the pause, and shows none after the resume', () => {
+    interim('Orange tractors climb')
+    paused(true)
+    expect(appState.interimText).toBe('')
+    expect(appState.interimSpeaker).toBe(-1)
+
+    paused(false)
+    expect(appState.interimText).toBe('')
+  })
+
+  it('still shows the interim text that comes after the resume', () => {
+    paused(true)
+    paused(false)
+    interim('Seven quiet violins')
+    expect(appState.interimText).toBe('Seven quiet violins')
+  })
+})
