@@ -55,6 +55,8 @@ type closingsHeard struct {
 	mu       sync.Mutex
 	closings []int
 	stops    []string
+	// enabledChanges counts the settings changes of voice.enabled it heard.
+	enabledChanges int
 }
 
 func (c *closingsHeard) GateClosed(n int) {
@@ -73,10 +75,15 @@ func (*closingsHeard) OnUtteranceEnd(int, bool)                        {}
 func (*closingsHeard) WithFloor(_ context.Context, start func()) error { start(); return nil }
 func (*closingsHeard) Close()                                          {}
 func (*closingsHeard) SessionEnded(string)                             {}
-func (*closingsHeard) SessionsDeleted([]string)                        {}
-func (*closingsHeard) SegmentsDeleted(string)                          {}
-func (*closingsHeard) Started()                                        {}
-func (*closingsHeard) RedCheckFailed()                                 {}
+func (c *closingsHeard) EnabledChanged() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.enabledChanges++
+}
+func (*closingsHeard) SessionsDeleted([]string) {}
+func (*closingsHeard) SegmentsDeleted(string)   {}
+func (*closingsHeard) Started()                 {}
+func (*closingsHeard) RedCheckFailed()          {}
 
 // TestAPauseStopsTheVoiceThroughTheGate fails if a pause or a light hold of
 // the real capture gate does not reach the voice the link holds.

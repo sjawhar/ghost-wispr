@@ -20,11 +20,15 @@ import (
 type Exchange struct {
 	SessionID string
 	WakeAt    time.Time
-	AskerTurn string             // the asker's words after the wake phrase, so far
-	Recent    []TurnText         // up to the last 2 minutes of labelled final segments
-	Tap       <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
-	Out       Output             // the speaker output's "voice" input
-	Tools     ToolRunner         // the Concierge
+	AskerTurn string // the asker's words after the wake phrase, so far
+	// FollowUpTurn: AskerTurn was said in the follow-up window with no wake
+	// phrase (a question; R10). The Concierge asks an agent about it only
+	// when it says "ask".
+	FollowUpTurn bool
+	Recent       []TurnText         // up to the last 2 minutes of labelled final segments
+	Tap          <-chan audio.Frame // room audio from the wake on, 16 kHz mono, only while the capture gate is open
+	Out          Output             // the speaker output's "voice" input
+	Tools        ToolRunner         // the Concierge
 }
 
 // TurnText is one final transcript segment.

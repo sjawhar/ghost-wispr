@@ -337,3 +337,56 @@ func (p heldAckSession) Say(ctx context.Context, text string, mode SayMode) erro
 	}
 	return p.Session.Say(ctx, text, mode)
 }
+
+// TestAFollowUpTurnIsMarked fails if the Concierge cannot tell a turn said in
+// the follow-up window with no wake phrase from a call, which it must not
+// ask an agent about unless the turn says "ask" (ReviewPR89's round 2).
+func TestAFollowUpTurnIsMarked(t *testing.T) {
+	t.Run("tts", func(t *testing.T) {
+		c := newFakeConcierge("The voice issue is in review.")
+		r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.FollowUpWait = time.Minute })
+		sess := r.ask("what is happening?")
+		waitSaid(t, sess)
+		r.speaker.finish(audio.InputVoice)
+		r.waitEvent("voice_spoken:sess-1")
+		r.heard(followUp, true, true)
+		r.waitTurn()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if len(c.exchanges) != 2 || c.exchanges[0].FollowUpTurn || !c.exchanges[1].FollowUpTurn {
+			t.Fatalf("the Concierge's exchanges marked %v, want the call unmarked and the follow-up marked", followUpMarks(c.exchanges))
+		}
+	})
+	t.Run("driving", func(t *testing.T) {
+		c := newFakeConcierge("It ships tomorrow.")
+		r := newDrivingRigWith(t, time.Minute, c)
+		r.s.cfg.FollowUpWait = time.Minute
+		r.heard("Wispr, what is happening?", true, true)
+		sess := r.waitSession()
+		speakAs(t, sess, "The issue is in review since this morning.")
+		r.waitSpeaking()
+		r.speaker.finish(audio.InputVoice)
+		eventually(t, "the follow-up window opened", func() bool {
+			r.s.mu.Lock()
+			defer r.s.mu.Unlock()
+			return r.s.ex != nil && r.s.ex.followUpTimer != nil
+		})
+		r.heard(followUp, true, true)
+		if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{}`)}); err != nil {
+			t.Fatalf("the answer tool: %v", err)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if len(c.exchanges) == 0 || !c.exchanges[len(c.exchanges)-1].FollowUpTurn {
+			t.Fatalf("the Concierge's exchanges marked %v, want the follow-up marked", followUpMarks(c.exchanges))
+		}
+	})
+}
+
+func followUpMarks(xs []Exchange) []bool {
+	marks := make([]bool, len(xs))
+	for i, x := range xs {
+		marks[i] = x.FollowUpTurn
+	}
+	return marks
+}

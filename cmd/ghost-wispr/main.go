@@ -1998,7 +1998,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			conciergeSessionHooks.set(c)
 		}, appLogger)
 		conc.followEnabled(cfg.Voice.Enabled) // a failed start is logged; each call then answers unreachable
-		onConfigChange(cfgStore, func(newCfg *config.Config) { conc.followEnabled(newCfg.Voice.Enabled) })
+		onConfigChange(cfgStore, followVoiceEnabled(&voiceHooks, conc))
 		if err := startVoice(&voiceDeps{
 			output:      output,
 			tap:         voiceTap,

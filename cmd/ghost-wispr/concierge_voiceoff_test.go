@@ -55,6 +55,14 @@ func TestTheConciergeStopsWhenTheVoiceIsTurnedOff(t *testing.T) {
 	if lazy.started() != nil {
 		t.Fatal("the Concierge still counts as started with the voice off")
 	}
+	// A call that still comes with the voice off starts none (ReviewPR89's
+	// round 2, finding 1).
+	if c, err := lazy.start(); c != nil || err == nil {
+		t.Fatalf("start with the voice off gave %v, %v; want no Concierge and an error", c, err)
+	}
+	if starts, _ := counts(); starts != 1 {
+		t.Fatalf("started %d times with the voice off, want once in all", starts)
+	}
 	lazy.followEnabled(true)
 	deadline := time.Now().Add(2 * time.Second)
 	for lazy.started() == nil && time.Now().Before(deadline) {
@@ -71,5 +79,28 @@ func TestTheConciergeStopsWhenTheVoiceIsTurnedOff(t *testing.T) {
 	lazy.followEnabled(false)
 	if _, stops := counts(); stops != 2 {
 		t.Fatalf("stopped %d times after two turns off, want twice", stops)
+	}
+}
+
+// TestTurningTheVoiceOffReachesTheVoiceAndTheConcierge fails if the settings
+// hook of voice.enabled, as main wires it, does not tell the voice (which
+// stops at once) and stop the Concierge.
+func TestTurningTheVoiceOffReachesTheVoiceAndTheConcierge(t *testing.T) {
+	var link voiceLink
+	heard := &closingsHeard{}
+	link.set(heard)
+	lazy, counts := countingLazyConcierge(t)
+	if _, err := lazy.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	followVoiceEnabled(&link, lazy)(&config.Config{})
+	heard.mu.Lock()
+	changes := heard.enabledChanges
+	heard.mu.Unlock()
+	if changes != 1 {
+		t.Fatalf("the voice heard %d settings changes, want 1", changes)
+	}
+	if _, stops := counts(); stops != 1 {
+		t.Fatalf("the Concierge stopped %d times, want once", stops)
 	}
 }
