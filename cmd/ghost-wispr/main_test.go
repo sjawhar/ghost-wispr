@@ -727,7 +727,7 @@ func TestStartMicMonitoringUsesRecorderWhenDownstreamMissing(t *testing.T) {
 	}
 
 	capture := newCaptureGate(nil, nil, nil)
-	startMicMonitoring(context.Background(), &sync.WaitGroup{}, capture, streamer, recorder, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
+	startMicMonitoring(context.Background(), &sync.WaitGroup{}, capture, streamer, recorder, nil, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
 
 	if capturedGate != capture {
 		t.Fatal("mic loop did not get the app's capture gate, so pausing would not reach it")
@@ -746,7 +746,7 @@ func TestMicLoopRunsInTheShutdownGroup(t *testing.T) {
 	var loops sync.WaitGroup
 	mic := newScriptedMic()
 	ctx, cancel := context.WithCancel(context.Background())
-	startMicMonitoring(ctx, &loops, newCaptureGate(nil, nil, nil), mic, audio.NewRecorder(t.TempDir()), nil, func(time.Duration) {}, func(string, ...any) {}, nil)
+	startMicMonitoring(ctx, &loops, newCaptureGate(nil, nil, nil), mic, audio.NewRecorder(t.TempDir()), nil, nil, func(time.Duration) {}, func(string, ...any) {}, nil)
 	mic.expectEvents(t, "stream")
 
 	if joinMicLoops(&loops, 50*time.Millisecond) {

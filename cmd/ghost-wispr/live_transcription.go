@@ -9,7 +9,6 @@ import (
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 
 	"github.com/sjawhar/ghost-wispr/internal/server"
-	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -30,8 +29,9 @@ const deepgramNotConnected = "Deepgram is not connected; live transcription keep
 // goes once a socket is connected and its buffered audio sent. Sessions start
 // only from live transcripts, so without this one failed dial left the unit
 // saving nothing until a restart. Each change of the client's state is
-// broadcast on hub.
-func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, manager session.LifecycleManager, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
+// broadcast on hub. callback hands each result to the session manager and
+// the voice.
+func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
 	var rc *transcribe.ResilientClient
 	// syncWarning sets the warning from the client's state as it is now. The
 	// client reports each change on a goroutine of its own, so reports can
@@ -53,7 +53,7 @@ func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfac
 			hub.BroadcastComponentStatus("deepgram", state.String(), fmt.Sprintf("Deepgram %s", state.String()))
 		}
 	})
-	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, transcriptCallback{manager: manager}, deepgramWriteTimeout)
+	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, callback, deepgramWriteTimeout)
 	// Set before the dial, so a dial that connects first clears it.
 	warnings.Set(deepgramWarningKey, deepgramNotConnected)
 	rc.ConnectInBackground()

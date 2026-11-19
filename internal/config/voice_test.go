@@ -114,14 +114,14 @@ dispatch_token: from-the-file
 func TestVoiceConfigWarnings(t *testing.T) {
 	clearVoiceEnv(t)
 	cases := map[string]string{
-		"no speaker":           "voice:\n  enabled: true\n",
-		"unknown engine":       "speaker_enabled: true\nvoice:\n  enabled: true\n  engine: telepathy\n",
-		"unknown tts engine":   "speaker_enabled: true\nvoice:\n  enabled: true\n  tts_engine: parrot\n",
-		"aura with no key":     "speaker_enabled: true\nvoice:\n  enabled: true\n  tts_engine: aura\n",
-		"gemini, no project":   "speaker_enabled: true\nvoice:\n  enabled: true\n",
-		"relative dispatch":    "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\nconcierge:\n  dispatch_url: dispatch.example.test\n",
-		"no wake phrase":       "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  wake_phrases: []\n",
-		"listener not built":   "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  paused_listener: true\n",
+		"no speaker":         "voice:\n  enabled: true\n",
+		"unknown engine":     "speaker_enabled: true\nvoice:\n  enabled: true\n  engine: telepathy\n",
+		"unknown tts engine": "speaker_enabled: true\nvoice:\n  enabled: true\n  tts_engine: parrot\n",
+		"aura with no key":   "speaker_enabled: true\nvoice:\n  enabled: true\n  tts_engine: aura\n",
+		"gemini, no project": "speaker_enabled: true\nvoice:\n  enabled: true\n",
+		"relative dispatch":  "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\nconcierge:\n  dispatch_url: dispatch.example.test\n",
+		"no wake phrase":     "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  wake_phrases: []\n",
+		"listener not built": "speaker_enabled: true\ngcp_project: p\nvoice:\n  enabled: true\n  paused_listener: true\n",
 	}
 	for name, yaml := range cases {
 		_, warnings, err := Load(writeConfig(t, yaml))

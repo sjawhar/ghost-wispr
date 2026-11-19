@@ -36,6 +36,8 @@ type jabraMuteButton struct {
 	connect    func() (io.ReadWriteCloser, error)
 	retryEvery time.Duration
 	checkEvery time.Duration
+	// onPress runs at each press, before the toggle: the voice stops.
+	onPress func()
 }
 
 func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) *jabraMuteButton {
@@ -50,9 +52,13 @@ func newJabraMuteButton(capture *captureGate, device *captureDevice, controls *s
 	}
 }
 
-func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry) {
+// startJabraMuteButton serves the Jabra's mute button when the config turns
+// it on; onPress runs at each press, before the toggle, and stops the voice.
+func startJabraMuteButton(ctx context.Context, cfg *config.Config, capture *captureGate, device *captureDevice, controls *server.ControlHooks, warnings *warningsRegistry, onPress func()) {
 	if cfg.JabraMuteButton {
-		go newJabraMuteButton(capture, device, controls, warnings).run(ctx)
+		button := newJabraMuteButton(capture, device, controls, warnings)
+		button.onPress = onPress
+		go button.run(ctx)
 	}
 }
 
@@ -174,7 +180,11 @@ func (b *jabraMuteButton) serve(ctx context.Context, device io.ReadWriteCloser) 
 // one: the Jabra sends that report by itself as its microphone stream closes,
 // and capture stays paused. A press that would pause always pauses. The pause
 // state is read once, so the guard and the toggle act on the same state.
+// Every press stops the voice first.
 func (b *jabraMuteButton) press(at time.Duration) {
+	if b.onPress != nil {
+		b.onPress()
+	}
 	paused := b.capture.IsPaused()
 	if paused && b.device.ownOperationAt(at) {
 		log.Printf("Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused")

@@ -96,6 +96,7 @@ type captureGate struct {
 	afterMicClose       func()        // runs after the mic loop closed the microphone, so the light, which follows it, can go off; must not block
 	onMicHeld           func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
 	capturePresent      func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
+	onClosed            func(int)     // runs once the gate has closed, with its closings count; must not block
 	audioStall          time.Duration // see audioStallAfter
 	stallAfter          time.Duration // see captureStallAfter
 	writeWait           time.Duration // see captureWriteWait
@@ -216,6 +217,14 @@ func (g *captureGate) isLightHeld() bool {
 	return g.lightHeld
 }
 
+// voiceStamp reports the gate's closings count and whether it is open, for a
+// transcript as it arrives: the voice acts on no wake from before a closing.
+func (g *captureGate) voiceStamp() (closings int, open bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closings, !g.closed
+}
+
 // closeGate runs onPause, closes the gate, then settles the closing in the
 // background. The caller holds control. Closing a closed gate does nothing.
 func (g *captureGate) closeGate() {
@@ -233,11 +242,15 @@ func (g *captureGate) closeGate() {
 	g.mu.Lock()
 	g.closed = true
 	g.closings++
+	closings := g.closings
 	g.resumed = make(chan struct{})
 	close(g.closing)
 	settled := make(chan struct{})
 	g.settled = settled
 	g.mu.Unlock()
+	if g.onClosed != nil {
+		g.onClosed(closings)
+	}
 
 	go func() {
 		defer close(settled)
