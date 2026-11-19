@@ -1737,36 +1737,52 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	x.FollowUpTurn = t.ex.followUpTurn
 	s.mu.Unlock()
 	var (
-		said   []string // the result's lines, in order
-		spoken bool     // a line was spoken at once
+		said     []string  // the result's lines, in order
+		spoken   bool      // a line was spoken at once
+		lead     *leadLine // that line, while its Say may not have played
+		factSaid bool      // a line of the result holds a fact
 	)
 	err := s.cfg.Concierge.Answer(ctx, &x, args.Question, func(sayCtx context.Context, text string, mode SayMode) error {
 		t.ex.saidMu.Lock()
-		lead := mode == Ack && len(said) == 0
+		first := mode == Ack && len(said) == 0 && lead == nil
 		t.ex.saidMu.Unlock()
-		if lead {
+		if first {
 			// Spoken at once, and not waited for: a vendor such as
 			// Deepgram's Voice Agent plays a line said during a call only
-			// after the call's own reply, which this answer is.
+			// after the call's own reply, which this answer is. If it has
+			// not played when the answer is ready, it leads the answer.
+			l := t.speakLead(text)
 			t.ex.saidMu.Lock()
-			spoken = true
+			spoken, lead = true, l
 			t.ex.saidMu.Unlock()
-			exCtx := t.ex.ctx
-			s.spawn(func() {
-				if err := t.speak(exCtx, text); err != nil && exCtx.Err() == nil {
-					s.logf("voice: the routing line was not spoken: %v", err)
-				}
-			})
 			return nil
 		}
 		t.ex.saidMu.Lock()
 		defer t.ex.saidMu.Unlock()
 		said = append(said, text)
+		factSaid = factSaid || mode == Fact
 		return nil
 	})
 	t.ex.saidMu.Lock()
-	lines, anySaid := append([]string(nil), said...), spoken || len(said) > 0
+	lines, anySaid, l, fact := append([]string(nil), said...), spoken || len(said) > 0, lead, factSaid
 	t.ex.saidMu.Unlock()
+	if l != nil && !t.played(l) {
+		// Main's rule on gap H: a routing line that never played is dropped
+		// when the answer is a fact ready within leadLineDropWithin of t0,
+		// the end of the asker's turn, and else leads the answer.
+		s.mu.Lock()
+		t0 := t.ex.times.lastTurnEnd
+		s.mu.Unlock()
+		if t0.IsZero() {
+			t0 = l.called
+		}
+		if err == nil && fact && time.Since(t0) <= leadLineDropWithin {
+			s.logf("voice: the routing line had not played, and the fact came in time: dropped")
+		} else {
+			s.logf("voice: the routing line had not played, so it leads the answer")
+			lines = append([]string{l.text}, lines...)
+		}
+	}
 	if err != nil {
 		if ctx.Err() == nil && t.ex.ctx.Err() == nil {
 			s.logf("voice: the Concierge did not answer: %v", err)
@@ -1792,6 +1808,74 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		s.mu.Unlock()
 	}
 	return json.Marshal(AnswerResult{Say: strings.Join(lines, " ")})
+}
+
+// leadLine is the routing line an answer tool speaks at once, in the
+// background.
+type leadLine struct {
+	text   string
+	called time.Time // when its Say was called
+	cancel context.CancelFunc
+	done   chan struct{}
+	ok     bool // its Say returned with no error; read once done is closed
+}
+
+// leadLineWait bounds how long after its call a routing line may take to
+// start, and how long played waits for a cancelled Say to return.
+const leadLineWait = 500 * time.Millisecond
+
+// leadLineDropWithin: a routing line that never played is dropped when the
+// answer is a fact ready this soon after t0, and else leads it (Main's rule
+// on gap H); a test shortens it.
+var leadLineDropWithin = 3 * time.Second
+
+// speakLead speaks text at once in the background, through the exchange's
+// session.
+func (t exchangeTools) speakLead(text string) *leadLine {
+	ctx, cancel := context.WithCancel(t.ex.ctx)
+	l := &leadLine{text: text, called: time.Now(), cancel: cancel, done: make(chan struct{})}
+	t.s.spawn(func() {
+		defer close(l.done)
+		err := t.speak(ctx, text)
+		l.ok = err == nil
+		if err != nil && ctx.Err() == nil {
+			t.s.logf("voice: the routing line was not spoken: %v", err)
+		}
+	})
+	return l
+}
+
+// played reports whether the line was heard: its Say returned with no
+// error, or the voice began to speak after it was called, within
+// leadLineWait. A Say still waiting with no speech then, as Deepgram's Voice
+// Agent holds a line behind the model's muted reply, is cancelled: the line
+// goes with the answer instead.
+func (t exchangeTools) played(l *leadLine) bool {
+	deadline := l.called.Add(leadLineWait) // a line held for long is cancelled at once
+	for {
+		select {
+		case <-l.done:
+			return l.ok
+		default:
+		}
+		t.s.mu.Lock()
+		began := !t.s.voiceStarted.Before(l.called)
+		t.s.mu.Unlock()
+		if began {
+			return true
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	l.cancel()
+	select {
+	case <-l.done:
+		return l.ok
+	case <-time.After(leadLineWait):
+		return false
+	}
 }
 
 // speak says text through the exchange's session at once, as an Ack.

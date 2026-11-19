@@ -276,32 +276,52 @@ func TestAFollowUpGetsItsWholeTurn(t *testing.T) {
 
 // TestARoutingLineDoesNotHoldTheAnswerTool fails if the answer tool waits for
 // the routing line's Say: a vendor such as Deepgram's Voice Agent plays it
-// only after the call's own reply, so waiting holds the answer until the
-// Say gives up.
+// only after the call's own reply (the model speaks in the same reply as its
+// call), so waiting holds the answer until the Say gives up. A routing line
+// that never played is dropped when the answer is a fact ready within 3 s of
+// t0, and else leads the answer as one spoken sentence (Main, on GWDgAgent's
+// gap H: the room heard 9 s of nothing).
 func TestARoutingLineDoesNotHoldTheAnswerTool(t *testing.T) {
-	c := newFakeConcierge("The issue is in review.")
-	c.acks = []string{"Reading ABC-12."}
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
-		cfg.Voice = func() (Voice, error) { return heldAckVoice{r: r, release: release}, nil }
-		cfg.IdleWait = time.Minute
-	})
-	r.heard("Wispr, what is happening with ABC-12?", true, true)
-	sess := r.waitSession()
-	out := make(chan json.RawMessage, 1)
-	go func() {
-		res, _ := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
-		out <- res
-	}()
-	select {
-	case res := <-out:
-		var got AnswerResult
-		if err := json.Unmarshal(res, &got); err != nil || got.Say != "The issue is in review." {
-			t.Fatalf("the answer tool returned %s", res)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("the answer tool waited on the routing line's Say")
+	for _, tc := range []struct {
+		name  string
+		delay time.Duration // before the Concierge's fact
+		want  string
+	}{
+		{"a fact ready within the bound", 0, "The issue is in review."},
+		{"a fact later than the bound", 1500 * time.Millisecond, "Reading ABC-12. The issue is in review."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bound := leadLineDropWithin
+			leadLineDropWithin = time.Second // above leadLineWait, the routing line's 0.5 s to start
+			t.Cleanup(func() { leadLineDropWithin = bound })
+			c := newFakeConcierge("The issue is in review.")
+			c.acks = []string{"Reading ABC-12."}
+			c.afterAcks = make(chan struct{})
+			release := make(chan struct{})
+			t.Cleanup(func() { close(release) })
+			r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
+				cfg.Voice = func() (Voice, error) { return heldAckVoice{r: r, release: release}, nil }
+				cfg.IdleWait = time.Minute
+			})
+			r.heard("Wispr, what is happening with ABC-12?", true, true)
+			sess := r.waitSession()
+			out := make(chan json.RawMessage, 1)
+			go func() {
+				res, _ := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
+				out <- res
+			}()
+			time.AfterFunc(tc.delay, func() { close(c.afterAcks) })
+			select {
+			case res := <-out:
+				var got AnswerResult
+				if err := json.Unmarshal(res, &got); err != nil || got.Say != tc.want {
+					t.Fatalf("the answer tool returned %s, want %q", res, tc.want)
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatal("the answer tool waited on the routing line's Say")
+			}
+			never(t, "the held routing line spoken as well", 200*time.Millisecond, func() bool { return slices.Contains(sess.saysCopy(), "Reading ABC-12.") })
+		})
 	}
 }
 
