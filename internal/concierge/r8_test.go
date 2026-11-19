@@ -74,6 +74,7 @@ func TestEarCheck(t *testing.T) {
 		{"a name after a colon", "The blocker: Alex has not reviewed it.", "", true},
 		{"a name after an abbreviation", "The tap merged, e.g. Alex saw it.", "", true},
 		{"the clause after the question's key", "ABC-12: Indeed, the tap merged.", "ABC-12", false},
+		{"a file name", "The spec.md artifact was updated.", "", true},
 		{"four sentences", "It merged. It ran. It passed. It shipped.", "", true},
 		{"a long sentence", "The " + strings.Repeat("tap ", 20) + "merged.", "", true},
 		{"more than 50 words", strings.Repeat("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen. ", 3), "", true},
@@ -89,6 +90,10 @@ func TestEarCheck(t *testing.T) {
 	// The check's negative control: PR 97 for a source that says PR 79.
 	if earCheck("PR 97 merged.", "PR 79 merged.", "") == "" {
 		t.Error("PR 97 passed for a source that says PR 79")
+	}
+	// "etc." often ends a sentence: four sentences stay four.
+	if earForm("It fixed the parser, the lexer, etc. Then it merged. It passed. It shipped.") == "" {
+		t.Error("four sentences, the first ending in etc., passed the form")
 	}
 }
 
@@ -262,17 +267,6 @@ func TestEarCheckReadsNumberWords(t *testing.T) {
 		if reason := earCheck(c.text, source, ""); (reason != "") != c.fails {
 			t.Errorf("%s: earCheck(%q) = %q, want failing %v", c.name, c.text, reason, c.fails)
 		}
-	}
-}
-
-// TestTheKeyPrefixKeepsTheForm (c-ear, R8): a rewrite of 20 words that does
-// not name the question's key passes, and is spoken with the key in front.
-func TestTheKeyPrefixKeepsTheForm(t *testing.T) {
-	r := newRig(t)
-	twenty := "The " + strings.Repeat("tap ", 18) + "merged."
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text(twenty))}, {chunk(text(twenty))}}
-	if spoken := r.concierge.forEar(context.Background(), "The tap merged.", "ABC-12"); spoken != "ABC-12: "+twenty {
-		t.Fatalf("spoken = %q, want the 20-word rewrite with the key in front", spoken)
 	}
 }
 

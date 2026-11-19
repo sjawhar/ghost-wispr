@@ -115,63 +115,88 @@ func (c *Concierge) askAgain(message *envoy.Message) {
 		if !asked {
 			c.askedAgain[task.ID] = ""
 		}
-		// A request Envoy did not confirm is sent again under its key, so
-		// the agent gets it once; any other request is a new message.
-		key := c.againKey[task.ID]
 		c.mu.Unlock()
 		if asked {
 			continue
 		}
-		if key == "" {
-			key = uuid.NewString()
-		}
+		c.sendAgainRequest(agents, message.SourceSession, &task, message.EventID, c.askAgainMessage(&task))
+	}
+}
+
+// sendAgainRequest sends agent the request to send task's answer as a reply
+// to it, in reply to inReplyTo when set, and leads the request's event to the
+// task. A request Envoy did not confirm keeps its key, so its retry is one
+// message to the agent. A retry that Envoy answers it held already, under an
+// event the unit never learned, is sent once more under a key of its own: the
+// agent may have answered the one the unit cannot name.
+func (c *Concierge) sendAgainRequest(agents Agents, agent string, task *storage.VoiceTask, inReplyTo, message string) {
+	c.mu.Lock()
+	key := c.againKey[task.ID]
+	c.mu.Unlock()
+	reused := key != ""
+	if !reused {
+		key = uuid.NewString()
+	}
+	for {
 		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
-		sent, err := agents.Send(ctx, &envoy.SendRequest{
-			Target:         message.SourceSession,
-			Message:        c.askAgainMessage(&task),
-			IdempotencyKey: key,
-			InReplyTo:      message.EventID,
-		})
+		sent, err := agents.Send(ctx, &envoy.SendRequest{Target: agent, Message: message, IdempotencyKey: key, InReplyTo: inReplyTo})
 		cancel()
 		c.mu.Lock()
-		_, deleted := c.closedLocked(task.SessionID)
+		closed, deleted := c.closedLocked(task.SessionID)
+		again := false
 		switch {
-		case err != nil && !deleted:
+		case err != nil && !closed:
 			delete(c.askedAgain, task.ID)
 			c.againKey[task.ID] = key
-		case err != nil, deleted:
-			// A deleted meeting's request adds nothing back.
+		case err != nil || deleted:
+			// A deleted meeting's request adds nothing back, and an ended
+			// one's gets no retry.
 			delete(c.askedAgain, task.ID)
 			delete(c.againKey, task.ID)
-		case sent.Duplicate:
-			// Envoy already held the request, under an event the unit never
-			// learned: the agent's reply to it gets a new request, under a
-			// key of its own.
-			delete(c.askedAgain, task.ID)
+		case sent.Duplicate && reused:
 			delete(c.againKey, task.ID)
+			again = true
 		default:
 			delete(c.againKey, task.ID)
 			c.askedAgain[task.ID] = sent.EventID
 			c.againFor[sent.EventID] = task.ID
 		}
 		c.mu.Unlock()
-		if err != nil {
+		switch {
+		case err != nil:
 			c.logger.Warn("concierge could not ask an agent to reply with in_reply_to", "task", task.ID, "error", err)
+		case again:
+			key, reused = uuid.NewString(), false
 			continue
+		default:
+			c.logger.Info("concierge asked an agent to reply with in_reply_to", "task", task.ID, "request", sent.EventID)
 		}
-		c.logger.Info("concierge asked an agent to reply with in_reply_to", "task", task.ID, "request", sent.EventID, "duplicate", sent.Duplicate)
+		return
 	}
 }
 
 // askAgainMessage asks the agent to send its answer to task's question again
 // as a reply. It names the question by its issue and time, not its words.
 func (c *Concierge) askAgainMessage(task *storage.VoiceTask) string {
+	return "Ghost Wispr here. I cannot tell which of my questions your message answers, so nobody in the room heard it. " +
+		"If it answers " + questionAbout(task) + ", reply to this message (envoy_send with in_reply_to) with that answer, in three sentences or fewer. Your reply is read aloud in the room."
+}
+
+// answerAgainMessage asks the agent for its answer to task's question as a
+// reply to this message, whether it answered already or not yet: the unit
+// cannot name the message that carried the question.
+func (c *Concierge) answerAgainMessage(task *storage.VoiceTask) string {
+	return "Ghost Wispr here. If you already answered " + questionAbout(task) + ", send that answer again as a reply to this message (envoy_send with in_reply_to); if not, reply to this message when you do. " +
+		"Three sentences or fewer: your reply is read aloud in the room."
+}
+
+// questionAbout names task's question by its issue and time, not its words.
+func questionAbout(task *storage.VoiceTask) string {
 	about := "my question"
 	if task.IssueKey != "" {
 		about = "my question about " + task.IssueKey
 	}
-	return "Ghost Wispr here. I cannot tell which of my questions your message answers, so nobody in the room heard it. " +
-		"If it answers " + about + " (asked " + task.AskedAt.UTC().Format("15:04:05") + " UTC), reply to this message (envoy_send with in_reply_to) with that answer, in three sentences or fewer. Your reply is read aloud in the room."
+	return about + " (asked " + task.AskedAt.UTC().Format("15:04:05") + " UTC)"
 }
 
 // forget drops answered task ids, local or event, from the agent's

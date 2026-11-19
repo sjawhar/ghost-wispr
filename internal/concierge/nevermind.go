@@ -30,17 +30,17 @@ func (c *Concierge) NeverMind(ctx context.Context, sessionID string) error {
 		c.tellChanged(sessionID)
 		agent := strings.TrimPrefix(task.Holder, "session:")
 		c.forget(agent, task.ID)
-		c.tellHolderEnded(ctx, &task, agent, "the room no longer needs it")
+		c.tellHolderEnded(ctx, &task, agent, storage.VoiceTaskCancelled, "the room no longer needs it")
 		return nil
 	}
 	return nil
 }
 
 // tellHolderEnded sends agent a short notice, asking no reply, that task's
-// question is not to be answered, and why. It names the question by its time
-// and issue, never its words, and logs one line naming the task and the
-// notice's event.
-func (c *Concierge) tellHolderEnded(ctx context.Context, task *storage.VoiceTask, agent, why string) {
+// question, now ended (cancelled or replaced), is not to be answered, and
+// why. It names the question by its time and issue, never its words, and
+// logs one line naming how it ended, the task and the notice's event.
+func (c *Concierge) tellHolderEnded(ctx context.Context, task *storage.VoiceTask, agent string, ended storage.VoiceTaskState, why string) {
 	agents := c.currentAgents()
 	if agents == nil || envoy.ValidSessionID(agent) != nil {
 		return
@@ -62,7 +62,7 @@ func (c *Concierge) tellHolderEnded(ctx context.Context, task *storage.VoiceTask
 		c.logger.Warn("concierge could not tell an agent its question ended", "task", task.ID, "error", err)
 		return
 	}
-	c.logger.Info("concierge told an agent its question was cancelled", "task", task.ID, "request", sent.EventID)
+	c.logger.Info("concierge told an agent its question was "+string(ended), "task", task.ID, "request", sent.EventID)
 }
 
 // eventOf is the Envoy event of task id's question: the id itself, or, while

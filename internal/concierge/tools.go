@@ -30,6 +30,10 @@ const cannotReachEnvoy = "I cannot reach the agents yet."
 // questionNotSent is ask_agent's answer when Envoy did not take the question.
 const questionNotSent = "The question did not reach the agent."
 
+// questionRefused is ask_agent's answer when Envoy answered and refused the
+// question: Envoy is reachable, so it is no outage (R10).
+const questionRefused = "Envoy refused the question to that agent."
+
 const (
 	// specSummaryChars is how much of an issue's spec read_issue gives.
 	specSummaryChars = 1200
@@ -268,11 +272,13 @@ func (e *toldError) Error() string { return e.text }
 
 func tell(format string, args ...any) error { return &toldError{text: fmt.Sprintf(format, args...)} }
 
+// recordsOrTell is Dispatch's record with each read bounded by callBound,
+// or a tool answer that Dispatch cannot be reached.
 func (r *runner) recordsOrTell() (Records, error) {
 	if r.c.records == nil {
 		return nil, tell(cannotReachDispatch)
 	}
-	return r.c.records, nil
+	return boundedRecords{inner: r.c.records, bound: r.c.callBound}, nil
 }
 
 func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any, error) {
@@ -357,7 +363,9 @@ func (r *runner) readIssue(ctx context.Context, key string) (map[string]any, err
 		case err == nil:
 			result["spec_summary"] = cut(spec, specSummaryChars)
 		case ctx.Err() == nil:
-			// A read a newer target or a stop cancelled is no failure.
+			// A read whose context ended (a newer target, a stop, the
+			// answer's bound) is no failure of Dispatch's; a hung Dispatch
+			// ends at callBound with an error of its own, logged here.
 			r.c.logger.Warn("concierge could not read an issue's spec", "issue", issue.Key, "error", err)
 		}
 	}
@@ -477,7 +485,7 @@ func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string
 		result["note"] = cannotReachEnvoy
 		return result
 	}
-	info, err := agents.Lookup(ctx, id)
+	info, err := r.c.lookup(ctx, agents, id)
 	if err != nil {
 		r.c.logger.Warn("concierge could not read an agent's liveness", "session", id, "error", err)
 		result["holder"], result["state"] = "unresponsive", "unknown"
@@ -525,7 +533,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		issueKey = normalized
 	}
-	info, err := agents.Lookup(ctx, session)
+	info, err := r.c.lookup(ctx, agents, session)
 	if err != nil {
 		return nil, tell(cannotReachEnvoy)
 	}
@@ -601,7 +609,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	})
 	cancel()
 	r.c.mu.Lock()
-	if err != nil {
+	if closed, _ := r.c.closedLocked(r.x.SessionID); err != nil && !closed {
 		r.c.unsent[retry] = key
 	} else {
 		delete(r.c.unsent, retry)
@@ -613,16 +621,26 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		r.c.tellChanged(r.x.SessionID)
 		r.c.logger.Warn("concierge could not send a question", "session", session, "error", err)
+		// Envoy that answered and refused is reachable: no error sound.
+		var refused *envoy.ListenerError
+		if errors.As(err, &refused) {
+			return nil, tell(questionRefused)
+		}
 		return nil, tell(questionNotSent)
 	}
 	taskID, event := localID, ""
 	if sent.Duplicate {
 		// Envoy already held this question, from a send it did not confirm:
-		// the holder has it under an event the unit never learned, and this
-		// answer's event names no message. The task keeps its local id, and
-		// the holder's reply to that event gets the request to reply again
-		// (Deliver), which names the task.
+		// the holder has it under an event the unit never learned, and may
+		// have answered it already. The task keeps its local id, the event
+		// Envoy named leads to it in case it is the stored one, and the
+		// holder is asked at once to send its answer as a reply to a
+		// request the unit can name.
 		r.c.logger.Info("concierge's question was already with the agent", "task", localID, "session", session)
+		r.c.mu.Lock()
+		r.c.sentAs[sent.EventID] = localID
+		r.c.sessionOf[sent.EventID], r.c.sessionOf[localID] = r.x.SessionID, r.x.SessionID
+		r.c.mu.Unlock()
 	} else {
 		taskID, event = sent.EventID, sent.EventID
 		r.c.mu.Lock()
@@ -647,7 +665,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		if replaced {
 			r.c.forget(session, previous.ID)
-			r.c.tellHolderEnded(ctx, previous, session, "a newer question replaces it")
+			r.c.tellHolderEnded(ctx, previous, session, storage.VoiceTaskReplaced, "a newer question replaces it")
 		}
 	}
 	r.c.mu.Lock()
@@ -668,6 +686,11 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		r.c.working[session] = append(r.c.working[session], taskID)
 	}
 	r.c.mu.Unlock()
+	if sent.Duplicate && !closed {
+		if task, err := r.c.task(localID); err == nil {
+			r.c.sendAgainRequest(agents, session, &task, "", r.c.answerAgainMessage(&task))
+		}
+	}
 	if closed && !deleted {
 		row := taskID
 		if _, err := r.c.store.VoiceTask(taskID); err != nil {

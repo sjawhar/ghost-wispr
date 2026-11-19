@@ -1,6 +1,9 @@
 package concierge
 
 import (
+	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +12,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
+	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
 // unclearSearch is a search for "the realtime voice" whose best issue, ABC-12
@@ -111,5 +115,179 @@ func TestNoFactBySixSecondsSaysWhatIsKnown(t *testing.T) {
 		if len(spoken) == 0 || spoken[0].text != c.want {
 			t.Errorf("%q: spoken = %+v, want %q first", c.turn, spoken, c.want)
 		}
+	}
+}
+
+// TestSearchTermsTakeTheDescription: a turn that describes the issue ("the
+// issue about realtime spoken conversation") searches the description's
+// words alone, not the rest of the question.
+func TestSearchTermsTakeTheDescription(t *testing.T) {
+	for turn, want := range map[string]string{
+		"please ask the agent who holds the issue about realtime spoken conversation when slice one will be ready to try.": "realtime spoken conversation",
+		"what is happening with the issue on the wake word spotter?":                                                       "wake word spotter",
+		"what is happening with the realtime voice":                                                                        "realtime voice",
+	} {
+		if got := searchTerms(turn); got != want {
+			t.Errorf("searchTerms(%q) = %q, want %q", turn, got, want)
+		}
+	}
+}
+
+// TestDidYouMeanCutsLongTitles (R5, R8): the question which issue names each
+// by its key and the start of its title, in the ear's form.
+func TestDidYouMeanCutsLongTitles(t *testing.T) {
+	line := didYouMean([]candidate{
+		{"INFRA-4592", "Ghost Wispr: realtime spoken conversation with any omp agent"},
+		{"INFRA-1027", "An office meeting recorder with a light that shows it records, a pause button, and a consent rule"},
+	})
+	if !strings.Contains(line, "INFRA-4592, Ghost Wispr") || !strings.Contains(line, "INFRA-1027, An office meeting") || earForm(line) != "" {
+		t.Fatalf("didYouMean = %q (form %q), want both keys with the start of each title", line, earForm(line))
+	}
+}
+
+// TestThePromptForbidsAGuessedWhen (R6): the model is told never to guess
+// when or whether, and, when the recorder asks the holder, that it does.
+func TestThePromptForbidsAGuessedWhen(t *testing.T) {
+	if !strings.Contains(systemPrompt, "never guess a date, a time or a duration") {
+		t.Errorf("the system prompt does not forbid a guessed when")
+	}
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	answerTurn(t, r, "ask the agent on ABC-12 when slice one will be ready")
+	if len(r.model.requests) == 0 || !strings.Contains(r.model.requests[0][0].Parts[0].Text, "The recorder is asking the agent that holds ABC-12") {
+		t.Fatalf("the prompt of an asked question does not say the recorder asks the holder")
+	}
+}
+
+// TestAHungEnvoyOrDispatchEndsAtItsBound (R6, R10): an Envoy lookup or a
+// Dispatch read that takes the connection and never answers ends at its own
+// bound, well inside the answer's 8 s: the voice says it cannot reach it,
+// speaks what Dispatch did give, and the error wraps voice.ErrUnreachable.
+func TestAHungEnvoyOrDispatchEndsAtItsBound(t *testing.T) {
+	if lookupBound != 2*time.Second || callBound != 3*time.Second {
+		t.Fatalf("bounds = %v and %v, want 2 s and 3 s", lookupBound, callBound)
+	}
+	r := newRig(t)
+	r.concierge.lookupBound = 200 * time.Millisecond
+	heldIssue(r, "session", false)
+	r.agents.lookupHang = true
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	var spoken []said
+	start := time.Now()
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with ABC-12", recorder(&spoken))
+	if took := time.Since(start); took > 1500*time.Millisecond || !errors.Is(err, voice.ErrUnreachable) {
+		t.Fatalf("a hung Envoy: Answer = %v after %v, want voice.ErrUnreachable at the 200 ms bound", err, took)
+	}
+	if !slices.ContainsFunc(spoken, func(s said) bool { return s.text == "PR 80 is in review." }) || !slices.ContainsFunc(spoken, func(s said) bool { return s.text == "I cannot reach ABC-12's agent yet." }) {
+		t.Fatalf("a hung Envoy: spoken = %+v, want the fact and the cannot-reach line", spoken)
+	}
+
+	r = newRig(t)
+	r.concierge.callBound = 200 * time.Millisecond
+	heldIssue(r, "none", false)
+	r.records.block = make(chan struct{})
+	defer close(r.records.block)
+	spoken = nil
+	start = time.Now()
+	err = r.concierge.Answer(context.Background(), &r.exchange, "what is happening with ABC-12", recorder(&spoken))
+	if took := time.Since(start); took > 1500*time.Millisecond || !errors.Is(err, voice.ErrUnreachable) {
+		t.Fatalf("a hung Dispatch: Answer = %v after %v, want voice.ErrUnreachable at the 200 ms bound", err, took)
+	}
+	if len(spoken) == 0 || spoken[0].text != cannotReachDispatch {
+		t.Fatalf("a hung Dispatch: spoken = %+v, want %q", spoken, cannotReachDispatch)
+	}
+}
+
+// TestARefusedQuestionIsNoOutage (R10): Envoy that answers and refuses the
+// question is reachable: the voice says it could not ask, and the answer
+// carries no error, so no error sound plays.
+func TestARefusedQuestionIsNoOutage(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.agents.sendErr = &envoy.ListenerError{Path: "/v1/messages/send", Status: 403, Message: "refused"}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	spoken := answerTurn(t, r, "ask the agent on ABC-12 whether the tap is merged")
+	if last := spoken[len(spoken)-1].text; last != "I could not ask the agent on ABC-12." {
+		t.Fatalf("spoken = %+v, want the could-not-ask line last", spoken)
+	}
+}
+
+// TestAFastAnswerChecksANameAfterAnAbbreviation (R8): a fast answer's
+// sentences are cut where earCheck cuts them, so a name after "e.g." is
+// checked like any other.
+func TestAFastAnswerChecksANameAfterAnAbbreviation(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("It is in review, e.g. Alex saw it."))},
+		{chunk(text("PR 80 is in review."))},
+	}
+	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {
+		if strings.Contains(s.text, "Alex") {
+			t.Fatalf("a name the record does not hold was spoken after an abbreviation: %q", s.text)
+		}
+	}
+}
+
+// TestEarCheckReadsHyphensYearsAndTimes (R8): "three-hour" is a figure; a
+// unit after a unit starts a new figure ("seven, eight" is 7 and 8); a year
+// and a time said in words are held by their digits.
+func TestEarCheckReadsHyphensYearsAndTimes(t *testing.T) {
+	const source = "A 4-hour outage at 5:30 in 2026, over two-week sprints; rows 7, 8 failed."
+	for _, c := range []struct {
+		text  string
+		fails bool
+	}{
+		{"It was a three-hour outage.", true},
+		{"It was a four-hour outage.", false},
+		{"It started at five thirty.", false},
+		{"It was in twenty twenty-six.", false},
+		{"Rows seven, eight failed.", false},
+		{"It ran over two week sprints.", false},
+	} {
+		if reason := earCheck(c.text, source, ""); (reason != "") != c.fails {
+			t.Errorf("earCheck(%q) = %q, want failing %v", c.text, reason, c.fails)
+		}
+	}
+}
+
+// TestARewriteIsToldTheKeyAndKeepsTheForm (R8 as written): the rewrite is
+// told the question's key, and the spoken text, key included, has R8's form:
+// a 20-word rewrite that the key would push to 21 words is written again.
+func TestARewriteIsToldTheKeyAndKeepsTheForm(t *testing.T) {
+	r := newRig(t)
+	twenty := "The " + strings.Repeat("tap ", 18) + "merged."
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text(twenty))}, {chunk(text("ABC-12: the tap merged."))}}
+	spoken := r.concierge.forEar(context.Background(), "The tap merged.", "ABC-12")
+	if spoken != "ABC-12: the tap merged." || earForm(spoken) != "" {
+		t.Fatalf("spoken = %q (form %q), want the second rewrite", spoken, earForm(spoken))
+	}
+	if !strings.Contains(r.model.requests[0][0].Parts[0].Text, "ABC-12") {
+		t.Fatalf("the rewrite was not told the question's key")
+	}
+}
+
+// TestAFailedSayKeepsTheOutage (R10): when Dispatch is out of reach and the
+// voice fails to say so, Answer's error still wraps voice.ErrUnreachable.
+func TestAFailedSayKeepsTheOutage(t *testing.T) {
+	r := newRig(t)
+	r.records.err = dispatch.ErrUnreachable
+	failing := func(context.Context, string, voice.SayMode) error { return errors.New("voice: session failed") }
+	if err := r.concierge.Answer(context.Background(), &r.exchange, "what about ABC-12", failing); !errors.Is(err, voice.ErrUnreachable) {
+		t.Fatalf("Answer = %v, want it to wrap voice.ErrUnreachable", err)
+	}
+}
+
+// TestAReplaceLogsAReplace: the notice for a replaced question logs that it
+// was replaced, not cancelled.
+func TestAReplaceLogsAReplace(t *testing.T) {
+	r := newRig(t)
+	logs := r.captureLogs()
+	r.name(t, "agent-7")
+	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "is the tap merged"})
+	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "who reviews it"})
+	if !strings.Contains(logs.String(), `msg="concierge told an agent its question was replaced"`) {
+		t.Fatalf("the log lacks the replace line:\n%s", logs)
 	}
 }

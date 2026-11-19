@@ -33,7 +33,7 @@ var (
 	// earSentenceEnd ends a sentence, unless an abbreviation's full stop.
 	earSentenceEnd = regexp.MustCompile(`[.!?]+(?:\s+|$)`)
 	// earAbbreviations are words whose full stop ends no sentence.
-	earAbbreviations = set([]string{"e.g", "i.e", "etc", "vs", "cf", "dr", "mr", "mrs", "ms"})
+	earAbbreviations = set([]string{"e.g", "i.e", "vs", "cf", "dr", "mr", "mrs", "ms"})
 	// numberUnits and numberScales are the words a figure is written in.
 	numberUnits = map[string]int{
 		"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
@@ -83,6 +83,13 @@ func earFacts(text, source, questionKey string) string {
 	known := make(map[string]bool, len(sourceTokens))
 	for _, token := range sourceTokens {
 		known[figure(token)] = true
+		// "4-hour" holds 4 and "5:30" holds 5 and 30, but a key's number
+		// is no figure.
+		if strings.ContainsAny(token, "-:") && earKey.FindString(token) != token {
+			for _, part := range strings.FieldsFunc(token, func(r rune) bool { return r == '-' || r == ':' }) {
+				known[figure(part)] = true
+			}
+		}
 	}
 	for _, run := range numberRuns(sourceTokens) {
 		known[strconv.Itoa(run.value)] = true
@@ -134,46 +141,141 @@ func earFacts(text, source, questionKey string) string {
 // numberRun is a run of number words, tokens[start:end], and its value.
 type numberRun struct{ start, end, value int }
 
+// numberKind is what a number word does in a figure.
+type numberKind int
+
+const (
+	kindNone numberKind = iota
+	kindUnit
+	kindTeen
+	kindTens
+	kindHundred
+	kindBig
+)
+
+// numberWord is one number word's value and kind.
+type numberWord struct {
+	value int
+	kind  numberKind
+}
+
+// numberWordsOf reads token's leading number words, split at its hyphens:
+// "twenty-five" is 20 and 5, "three-hour" is 3 with a rest (partial).
+func numberWordsOf(token string) (words []numberWord, partial bool) {
+	parts := strings.Split(strings.ToLower(token), "-")
+	for _, part := range parts {
+		value, unit := numberUnits[part]
+		scale, isScale := numberScales[part]
+		switch {
+		case unit && value < 10:
+			words = append(words, numberWord{value, kindUnit})
+		case unit && value < 20:
+			words = append(words, numberWord{value, kindTeen})
+		case unit:
+			words = append(words, numberWord{value, kindTens})
+		case isScale && scale == 100:
+			words = append(words, numberWord{scale, kindHundred})
+		case isScale:
+			words = append(words, numberWord{scale, kindBig})
+		default:
+			return words, len(words) > 0
+		}
+	}
+	return words, false
+}
+
+// figureWords adds up one figure's words.
+type figureWords struct {
+	total, current, words int
+	first, last           numberWord
+}
+
+// accepts reports whether word goes on the figure: "twenty five" is one
+// figure, "seven eight" and "five thirty" are two.
+func (f *figureWords) accepts(word numberWord) bool {
+	switch {
+	case f.words == 0:
+		return true
+	case word.kind == kindHundred || word.kind == kindBig:
+		return true
+	case f.last.kind == kindTens:
+		return word.kind == kindUnit
+	case f.last.kind == kindHundred || f.last.kind == kindBig:
+		return word.kind == kindUnit || word.kind == kindTeen || word.kind == kindTens
+	}
+	return false
+}
+
+func (f *figureWords) add(word numberWord) {
+	switch word.kind {
+	case kindHundred:
+		f.current = max(f.current, 1) * word.value
+	case kindBig:
+		f.total, f.current = f.total+max(f.current, 1)*word.value, 0
+	default:
+		f.current += word.value
+	}
+	if f.words == 0 {
+		f.first = word
+	}
+	f.last = word
+	f.words++
+}
+
+func (f *figureWords) value() int { return f.total + f.current }
+
 // numberRuns reads the figures tokens write in words: "three", "twenty-five",
-// "three hundred". "One" alone is no figure: it is as often a pronoun.
+// "three hundred", "three-hour", and a year as said, "twenty twenty-six".
+// "One" alone is no figure: it is as often a pronoun ("one of them").
 func numberRuns(tokens []string) []numberRun {
 	var runs []numberRun
-	for i := 0; i < len(tokens); i++ {
-		total, current, end := 0, 0, i
-		for ; end < len(tokens); end++ {
-			next, add, ok := current, 0, true
-			for _, part := range strings.Split(strings.ToLower(tokens[end]), "-") {
-				if value, unit := numberUnits[part]; unit {
-					next += value
-					continue
-				}
-				scale, isScale := numberScales[part]
-				if !isScale {
-					ok = false
-					break
-				}
-				next = max(next, 1)
-				if scale == 100 {
-					next *= scale
-				} else {
-					add, next = add+next*scale, 0
-				}
-			}
-			if !ok {
+	for i := 0; i < len(tokens); {
+		var figure figureWords
+		end := i
+	figureTokens:
+		for end < len(tokens) {
+			words, partial := numberWordsOf(tokens[end])
+			if len(words) == 0 {
 				break
 			}
-			total, current = total+add, next
+			if !figure.accepts(words[0]) {
+				// A year as said: "twenty twenty-six" is 2026.
+				if figure.words == 1 && (figure.first.kind == kindTeen || figure.first.kind == kindTens) &&
+					(words[0].kind == kindTens || words[0].kind == kindTeen) && !partial {
+					var rest figureWords
+					for _, word := range words {
+						rest.add(word)
+					}
+					figure.current = figure.first.value*100 + rest.value()
+					end++
+				}
+				break
+			}
+			for _, word := range words {
+				if !figure.accepts(word) {
+					break figureTokens
+				}
+				figure.add(word)
+			}
+			end++
+			if partial {
+				break
+			}
 		}
 		if end == i {
+			i++
 			continue
 		}
-		if end > i+1 || !strings.EqualFold(tokens[i], "one") {
-			runs = append(runs, numberRun{start: i, end: end, value: total + current})
+		if end > i+1 || figure.value() != 1 {
+			runs = append(runs, numberRun{start: i, end: end, value: figure.value()})
 		}
-		i = end - 1
+		i = end
 	}
 	return runs
 }
+
+// earFileName is a file's name, which the ear hears as "spec dot md".
+var earFileName = regexp.MustCompile(`(?i)\b[\w-]+\.(?:md|go|txt|json|ya?ml|toml|sh|py|ts|js|sql|html|css|log)\b`)
 
 // earForm reports why text does not have the form the ear takes, or "".
 func earForm(text string) string {
@@ -182,6 +284,9 @@ func earForm(text string) string {
 	}
 	if strings.ContainsAny(text, "`|") {
 		return "a backtick or a bar"
+	}
+	if earFileName.MatchString(text) {
+		return "a file name"
 	}
 	for _, word := range strings.Fields(text) {
 		if strings.Contains(strings.Trim(word, `.,;:!?()"'`), "/") {
@@ -210,8 +315,7 @@ func earSentences(text string) []string {
 	start := 0
 	for _, end := range earSentenceEnd.FindAllStringIndex(text, -1) {
 		part := text[start:end[0]]
-		word := strings.TrimLeft(part[strings.LastIndexFunc(part, unicode.IsSpace)+1:], `("'`)
-		if text[end[0]] == '.' && earAbbreviations[strings.ToLower(word)] {
+		if text[end[0]] == '.' && endsInAbbreviation(part) {
 			continue
 		}
 		if strings.TrimSpace(part) != "" {
@@ -223,6 +327,13 @@ func earSentences(text string) []string {
 		sentences = append(sentences, rest)
 	}
 	return sentences
+}
+
+// endsInAbbreviation reports whether text, cut just before a full stop, ends
+// in an abbreviation whose full stop ends no sentence ("e.g").
+func endsInAbbreviation(text string) bool {
+	word := strings.TrimLeft(text[strings.LastIndexFunc(text, unicode.IsSpace)+1:], `("'`)
+	return earAbbreviations[strings.ToLower(word)]
 }
 
 // earClauses splits text into the parts whose first word is no name for

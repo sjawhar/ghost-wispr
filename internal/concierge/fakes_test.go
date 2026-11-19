@@ -191,18 +191,26 @@ type fakeAgents struct {
 	lookupErr        error
 	lookupsBeforeErr int
 	lookups          int
+	// lookupHang makes every Lookup wait for its context, as a hub that
+	// takes the connection and never answers.
+	lookupHang bool
 }
 
 func (f *fakeAgents) ID() string { return f.id }
 
-func (f *fakeAgents) Lookup(_ context.Context, id string) (envoy.SessionInfo, error) {
+func (f *fakeAgents) Lookup(ctx context.Context, id string) (envoy.SessionInfo, error) {
 	if f.onLookup != nil {
 		f.onLookup(id)
 	}
 	f.mu.Lock()
 	f.lookups++
 	failing := f.lookupErr != nil && f.lookups > f.lookupsBeforeErr
+	hang := f.lookupHang
 	f.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return envoy.SessionInfo{}, ctx.Err()
+	}
 	if failing {
 		return envoy.SessionInfo{}, f.lookupErr
 	}
