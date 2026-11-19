@@ -122,6 +122,9 @@ func (d *deepgramBatchTranscriber) transcribe(ctx context.Context, audioPath str
 	q.Set("punctuate", "true")
 	q.Set("filler_words", "true")
 	q.Set("diarize", "true")
+	// Keeps the audio and its transcript out of Deepgram's Model Improvement
+	// Program, which may otherwise keep them after processing, for training.
+	q.Set("mip_opt_out", "true")
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(audioBytes))

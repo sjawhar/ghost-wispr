@@ -37,6 +37,7 @@ for line in \
   'A11 self-test RAN: planted failure rejected' \
   'A11 self-test RAN: before "Delete text and audio", every read the deletion clears needs the whole phrase, in any case and with its number as digits or words, and the title and the Drive folder name are only noted' \
   'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence' \
+  'A11 self-test RAN: every Pi-side Deepgram request sends mip_opt_out=true' \
   'A11 self-test RAN: a failed control stops the row before "Delete text and audio"' \
   'A11 self-test RAN: "Delete text and audio" sends mode=text_and_audio and its revision on its segment' \
   'Mode guard self-test RAN: planted failure rejected' \
@@ -187,6 +188,13 @@ assert_mutation_caught 'a Deepgram key passed as an argument' \
 assert_mutation_caught 'a Drive token that can write' \
   'readonly drive_scope=https://www.googleapis.com/auth/drive.readonly' \
   'readonly drive_scope=https://www.googleapis.com/auth/drive'
+# Every Pi-side Deepgram request opts out of Deepgram's Model Improvement Program, and a self-test
+# that saw no Deepgram request has checked nothing.
+assert_mutation_caught 'a Deepgram request without mip_opt_out=true' \
+  "readonly deepgram_url='https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&mip_opt_out=true'" \
+  "readonly deepgram_url='https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true'"
+assert_mutation_caught 'an opt-out check that saw no Deepgram request' \
+  "grep '^https://api\.deepgram\.com/')" "grep '^https://api\.deepgram\.invalid/')"
 
 assert_mutation_caught 'a retry refinement that rejects a 202 response' \
   'retry_http_status=202' 'retry_http_status=500'

@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -90,6 +92,43 @@ func TestBatchRequestsFillerWordsAndDiarization(t *testing.T) {
 	speaker := reflect.ValueOf(result.Words[0]).FieldByName("Speaker")
 	if !speaker.IsValid() || speaker.Kind() != reflect.Int || speaker.Int() != 3 {
 		t.Fatalf("batch word speaker = %v, want 3", speaker)
+	}
+}
+
+// TestDeepgramBatchTranscriptionOptsOutOfModelImprovement fails if a
+// pre-recorded request, with the configured model or another one (the
+// refinement and the check after a deletion's cut ask with the model a
+// recording was heard with), asks Deepgram without mip_opt_out=true. Without
+// it, Deepgram's Model Improvement Program may keep the office audio and its
+// transcript after processing, for training, and a deleted segment would live
+// on at Deepgram.
+func TestDeepgramBatchTranscriptionOptsOutOfModelImprovement(t *testing.T) {
+	audioPath := filepath.Join(t.TempDir(), "session.mp3")
+	if err := os.WriteFile(audioPath, []byte("fake-audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var query url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.Query()
+		_, _ = w.Write([]byte(`{"metadata":{"models":["nova-3"],"model_info":{"nova-3":{"name":"general-nova-3","arch":"nova-3"}}},"results":{"channels":[{"alternatives":[{"transcript":"hello"}]}]}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	configured := NewDeepgramBatchTranscriber(DeepgramBatchConfig{Model: "nova-3", BaseURL: server.URL})
+	for _, tc := range []struct {
+		name        string
+		transcriber BatchTranscriber
+	}{
+		{"the configured model", configured},
+		{"another model", configured.(ModelSelector).WithModel("nova-2")},
+	} {
+		query = nil
+		if _, err := tc.transcriber.Transcribe(context.Background(), audioPath); err != nil {
+			t.Fatalf("%s: Transcribe: %v", tc.name, err)
+		}
+		if got := query["mip_opt_out"]; !slices.Equal(got, []string{"true"}) {
+			t.Fatalf("%s: Deepgram was asked with mip_opt_out %q (query %v), want [\"true\"]", tc.name, got, query)
+		}
 	}
 }
 

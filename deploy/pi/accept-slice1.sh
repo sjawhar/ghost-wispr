@@ -285,7 +285,9 @@ deepgram_sockets_from_ss() {
 # for api.deepgram.com, checked from the Pi. The name is not resolved to find the socket: it has
 # several addresses, and a new lookup often returns none of the one the recorder is connected to.
 # On the office Pi on 2026-11-16 the recorder's socket was to 216.200.21.203 while the name
-# resolved to 208.185.49.101, and a later read found the reverse.
+# resolved to 208.185.49.101, and a later read found the reverse. The check is a GET of `/` with no
+# key, audio or transcript, so it has nothing for Deepgram's Model Improvement Program to keep and
+# sends no mip_opt_out, which every request that carries audio does.
 deepgram_peers() {
   local peer check=''
   for peer in "$@"; do

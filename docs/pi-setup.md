@@ -803,7 +803,8 @@ the phrase; and a build that does not refuse a deletion without a mode. An empty
 failed search, a database scan without one of its files, and a read without the control phrase
 must each be UNKNOWN, not PASS. The self-test also runs the database scan over planted binary
 files, and the Pi-side token, Drive and Deepgram requests against a fake `curl`; it fails if a
-token or key reaches a `curl` argument or the evidence.
+token or key reaches a `curl` argument or the evidence, or if a Deepgram request does not send
+`mip_opt_out=true`.
 
 ```bash
 deploy/pi/accept-slice3.sh --self-test
@@ -813,8 +814,9 @@ deploy/pi/accept-slice3.sh
 The driver uses `ssh ghost-wispr@ghost-wispr.tail12ec1c.ts.net`. It reaches Drive with the
 Pi's own credential: on the Pi, it exchanges the X.509 certificate for a token and impersonates
 `ghost-wispr@theorem-agent-infra.iam.gserviceaccount.com` with the read-only Drive scope. It
-transcribes recordings on the Pi with the Deepgram key in `/opt/ghost-wispr/.env`. Neither
-credential leaves the Pi, and the driver prints neither.
+transcribes recordings on the Pi with the Deepgram key in `/opt/ghost-wispr/.env`, and opts each
+request out of Deepgram's Model Improvement Program (`mip_opt_out=true`), as Ghost Wispr does.
+Neither credential leaves the Pi, and the driver prints neither.
 
 One run records one conversation for both rows:
 
