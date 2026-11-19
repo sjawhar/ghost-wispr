@@ -41,6 +41,9 @@ type fakeRecords struct {
 	// set) until it is closed or the call's context ends.
 	block    chan struct{}
 	blockKey string
+	// searchDelay, when set, is how long each Search takes, or until its
+	// context ends.
+	searchDelay time.Duration
 	// projects is Dispatch's project keys; nil is a project list that does
 	// not answer.
 	projects []string
@@ -74,11 +77,19 @@ func (f *fakeRecords) Projects(ctx context.Context) ([]string, error) {
 	return append([]string(nil), f.projects...), nil
 }
 
-func (f *fakeRecords) Search(_ context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
+func (f *fakeRecords) Search(ctx context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.queries = append(f.queries, query)
-	return f.hits, f.err
+	delay, hits, err := f.searchDelay, f.hits, f.err
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return hits, err
 }
 
 func (f *fakeRecords) Issue(ctx context.Context, key string) (*dispatch.Issue, error) {

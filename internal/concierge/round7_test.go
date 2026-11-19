@@ -105,6 +105,37 @@ func TestAnEmptySearchSpendsNoSearch(t *testing.T) {
 	}
 }
 
+// TestASlowSearchIsNoOutage (R6, R10): Dispatch's normal search takes 1 to
+// 6 s, measured live, so a search past a read's bound is slow, not out of
+// reach. One within its own bound is used; one past it has found nothing
+// yet, so the voice asks for the key, and no error sound plays.
+func TestASlowSearchIsNoOutage(t *testing.T) {
+	if searchBound != 5*time.Second {
+		t.Fatalf("searchBound = %v, want 5 s", searchBound)
+	}
+	r := newRig(t)
+	r.concierge.callBound, r.concierge.searchBound = 100*time.Millisecond, 600*time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.records.searchDelay = 300 * time.Millisecond
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the realtime voice", recorder(&spoken))
+	if err != nil || len(spoken) == 0 || spoken[len(spoken)-1].text != "PR 80 is in review." {
+		t.Fatalf("a search slower than a read's bound: %v, spoken %+v; want the fact", err, spoken)
+	}
+
+	r = newRig(t)
+	r.concierge.callBound, r.concierge.searchBound = 100*time.Millisecond, 300*time.Millisecond
+	unclearSearch(r)
+	r.records.searchDelay = time.Hour
+	spoken = nil
+	err = r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the realtime voice", recorder(&spoken))
+	if err != nil || len(spoken) == 0 || spoken[len(spoken)-1].text != noIssueFound {
+		t.Fatalf("a search past its bound: %v, spoken %+v; want %q and no error", err, spoken, noIssueFound)
+	}
+}
+
 // TestNoFactBySixSecondsSaysWhatIsKnown (c-fast-answer, R6): with no fact 6 s
 // after the turn, the model stops and the voice says what is known: the
 // status the record shows, or that it found no issue. It runs into no bound

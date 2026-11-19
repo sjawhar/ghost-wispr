@@ -265,13 +265,14 @@ func (e *toldError) Error() string { return e.text }
 
 func tell(format string, args ...any) error { return &toldError{text: fmt.Sprintf(format, args...)} }
 
-// recordsOrTell is Dispatch's record with each read bounded by callBound,
-// or a tool answer that Dispatch cannot be reached.
+// recordsOrTell is Dispatch's record with each read bounded by callBound and
+// each search by searchBound, or a tool answer that Dispatch cannot be
+// reached.
 func (r *runner) recordsOrTell() (Records, error) {
 	if r.c.records == nil {
 		return nil, tell(cannotReachDispatch)
 	}
-	return boundedRecords{inner: r.c.records, bound: r.c.callBound}, nil
+	return boundedRecords{inner: r.c.records, bound: r.c.callBound, searchBound: r.c.searchBound}, nil
 }
 
 func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any, error) {
@@ -291,6 +292,11 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 		*r.searchesLeft--
 	}
 	hits, err := records.Search(ctx, terms, 10)
+	if errors.Is(err, errSearchSlow) {
+		// Slow, not out of reach: it has found nothing yet (R6, R10).
+		r.c.logger.Info("concierge's search found nothing in its time", "bound", r.c.searchBound)
+		return map[string]any{"issues": []map[string]any{}, "clear_match": false, "note": "The search took too long. Ask for the issue's key."}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

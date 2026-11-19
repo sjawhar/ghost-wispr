@@ -54,6 +54,10 @@ const (
 	// spend the answer's 8 s (R6, R10).
 	lookupBound = 2 * time.Second
 	callBound   = 3 * time.Second
+	// searchBound bounds one search. Dispatch's normal search took 1.0 to
+	// 6.4 s live (median 1.2 s, p90 2.2 s), so a search past it is slow, not
+	// out of reach: it has found nothing yet.
+	searchBound = 5 * time.Second
 	// maxToolCalls bounds the model's tool calls in one fast answer (R6).
 	maxToolCalls = 6
 	// maxSearches bounds one answer's searches, the read's and the model's
