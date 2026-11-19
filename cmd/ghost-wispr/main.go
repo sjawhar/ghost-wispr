@@ -1761,26 +1761,30 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	case errors.Is(err, errNoCaptureDevice):
 		startupStatus.Mic = config.ComponentState{Name: "mic", Status: "unavailable", Message: "No microphone found"}
 	}
-	// Initialize the speaker. It plays through ALSA's playback device,
+	// Initialize the speaker's output. It plays through ALSA's playback device,
 	// opening no microphone and needing no red light, so it speaks while
-	// capture is paused. Its playback streams go through micDevice, so the
-	// Jabra's light never changes while one is open.
-	var speaker *audio.Speaker
+	// capture is paused. Its stream opens through micDevice and closes
+	// OutputIdleClose after the last sound, so the Jabra's light never changes
+	// while one is open.
+	var output *audio.Output
 	if cfg.SpeakerEnabled {
-		speaker = audio.NewSpeaker(cfg.SpeakerDevice)
-		speaker.SetOutputHooks(micDevice.playbackOpening, micDevice.playbackClosing)
+		output = audio.NewOutput(audio.OutputConfig{
+			Device:  cfg.SpeakerDevice,
+			Opening: micDevice.playbackOpening,
+			Closing: micDevice.playbackClosing,
+		})
 		log.Printf("speaker output enabled (device=%q)", cfg.SpeakerDevice)
 	}
 
 	// Initialize TTS orchestrator if both speaker and provider are configured.
 	var ttsOrchestrator *tts.Orchestrator
-	if speaker != nil && cfg.TTSProvider != "" {
+	if output != nil && cfg.TTSProvider != "" {
 		ttsProvider, ttsErr := newTTSProvider(ctx, &cfg)
 		if ttsErr != nil {
 			log.Printf("warning: TTS disabled: %v", ttsErr)
 			warningRegistry.Set("tts", fmt.Sprintf("TTS provider initialization failed: %v", ttsErr))
 		} else {
-			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, speaker, tts.OrchestratorOpts{})
+			ttsOrchestrator = tts.NewOrchestrator(ttsProvider, output, tts.OrchestratorOpts{})
 			log.Printf("TTS orchestrator started (provider=%s)", cfg.TTSProvider)
 		}
 	}
@@ -1937,8 +1941,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if ttsOrchestrator != nil {
 		ttsOrchestrator.Stop()
 	}
-	if speaker != nil {
-		_ = speaker.Close()
+	if output != nil {
+		if err := output.Close(); err != nil {
+			log.Printf("warning: speaker output close failed: %v", err)
+		}
 	}
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {

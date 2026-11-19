@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -79,7 +80,7 @@ type speakRequest struct {
 // Orchestrator manages an async TTS pipeline: enqueue text → synthesize → play.
 type Orchestrator struct {
 	ttsProvider Provider
-	speaker     *audio.Speaker
+	output      *audio.Output
 	opts        OrchestratorOpts
 
 	queue    chan *speakRequest
@@ -93,16 +94,16 @@ type Orchestrator struct {
 	cancel context.CancelFunc
 }
 
-// NewOrchestrator creates an Orchestrator and starts its worker goroutine.
-// The worker stops when the returned cancel function is called or when
-// the parent context is cancelled.
-func NewOrchestrator(provider Provider, speaker *audio.Speaker, opts OrchestratorOpts) *Orchestrator {
+// NewOrchestrator creates an Orchestrator that speaks through output's voice
+// input, and starts its worker goroutine. The worker stops when Stop is
+// called.
+func NewOrchestrator(provider Provider, output *audio.Output, opts OrchestratorOpts) *Orchestrator {
 	opts = opts.withDefaults()
 	ctx, cancel := context.WithCancel(context.Background())
 
 	o := &Orchestrator{
 		ttsProvider: provider,
-		speaker:     speaker,
+		output:      output,
 		opts:        opts,
 		queue:       make(chan *speakRequest, opts.QueueDepth),
 		rateSlots:   make([]time.Time, 0, opts.MaxRequestsPerMin),
@@ -187,7 +188,7 @@ func (o *Orchestrator) HasProvider() bool {
 
 // HasSpeaker reports whether a speaker is configured.
 func (o *Orchestrator) HasSpeaker() bool {
-	return o.speaker != nil
+	return o.output != nil
 }
 
 // worker processes speak requests from the queue sequentially.
@@ -233,20 +234,36 @@ func (o *Orchestrator) processRequest(req *speakRequest) {
 	o.finishSynthesis(req.id)
 	slog.Info("tts synthesized", "request_id", req.id, "provider", o.ttsProvider.Name(), "model", resp.Model, "voice", resp.Voice)
 
-	// Play through speaker.
-	result, err := o.speaker.Play(resp.Audio, resp.Format)
+	bytesWritten, durationMs, err := o.play(resp)
 	if err != nil {
 		o.updateStatus(req.id, StatusFailed, 0, 0, fmt.Sprintf("playback failed: %v", err))
 		return
 	}
-
-	var bytesWritten, durationMs int64
-	if result != nil {
-		bytesWritten = result.BytesWritten
-		durationMs = result.DurationMs
-	}
-
 	o.updateStatus(req.id, StatusCompleted, bytesWritten, durationMs, "")
+}
+
+// play speaks resp on the speaker's voice input and waits until the speaker
+// has taken all of it, or a Cancel of the voice, as a barge-in, stopped it.
+// It reports how many bytes of PCM16 played, and for how long.
+func (o *Orchestrator) play(resp *SpeechResponse) (bytesWritten, durationMs int64, err error) {
+	pcm, format, err := audio.DecodePCM16(resp.Audio, resp.Format)
+	if err != nil {
+		return 0, 0, err
+	}
+	if format.Channels > 0 {
+		pcm = pcm[:len(pcm)-len(pcm)%(2*format.Channels)] // whole frames
+	}
+	playback := o.output.Begin(audio.InputVoice)
+	err = playback.WriteAll(o.ctx, pcm, format)
+	if err == nil {
+		err = playback.Drain(o.ctx)
+	}
+	if errors.Is(err, audio.ErrCancelled) {
+		err = nil // it played until the Cancel
+	}
+	played := playback.Played()
+	frames := int64(played) * int64(format.SampleRate) / int64(time.Second)
+	return frames * int64(format.Channels) * 2, played.Milliseconds(), err
 }
 
 func (o *Orchestrator) updateStatus(id, status string, bytesWritten, durationMs int64, errMsg string) {

@@ -371,24 +371,27 @@ light as it last set it.
 
 The Jabra's mute light is on while recording is paused and off otherwise, whichever control
 paused it. Ghost Wispr never changes it while any of the Jabra's streams is open, its microphone
-or a speech playback: a Jabra Speak2 75 whose light changed while one of its streams was open
+or the speaker's stream: a Jabra Speak2 75 whose light changed while one of its streams was open
 sends Phone Mute by itself 12-15 ms after its microphone stream next closes, which reads as a tap.
-So a pause closes the microphone, then lights the Jabra, and a resume darkens the Jabra, then
-opens the microphone. Ghost Wispr also sets the light when the Jabra connects or is plugged in
-again, after each tap, and within a quarter of a second after any other pause or resume, each
-time only while no stream is open; a change during speech waits for the speech to end. A resume
-during speech waits for the speech to end, with capture shown as resuming and the blink(1) off,
-then darkens the Jabra, turns the blink(1) red and opens the microphone, so the ring never reads
-Muted while the unit records. A pause during that wait cancels the resume. If the ring may still
+The speaker's stream opens with the first sound and closes 0.3 s after the last one. So a pause
+closes the microphone, then lights the Jabra, and a resume darkens the Jabra, then opens the
+microphone. Ghost Wispr also sets the light when the Jabra connects or is plugged in again, after
+each tap, and within a quarter of a second after any other pause or resume, each time only while
+no stream is open; a change during speech waits for the speaker's stream to close. A resume
+during speech waits for the speaker's stream to close, 0.3 s after the last sound, with capture
+shown as resuming and the blink(1) off, then darkens the Jabra, turns the blink(1) red and opens
+the microphone, so the ring never reads Muted while the unit records. A pause during that wait
+cancels the resume. If the ring may still
 show Muted while recording is on, as when the Jabra is plugged in while the microphone is open,
 or when a pause and a resume come during one microphone open, no audio is recorded: Ghost Wispr
 closes the microphone, darkens the Jabra and opens the microphone again, and the log says
 `the Jabra's ring may show the pause while capture is on; reopening the microphone`. During
-speech that takes until the speech ends, with capture shown as resuming and the blink(1) off.
+speech that takes until the speaker's stream closes, with capture shown as resuming and the
+blink(1) off.
 
 A Mute press that would resume recording is ignored when the kernel stamped it during Ghost
-Wispr's own open, close or PortAudio device scan of the microphone, or the close of a speech
-playback, or within 100 ms after one: that is the Jabra's own report, and recording stays
+Wispr's own open, close or PortAudio device scan of the microphone, or the close of the speaker's
+stream, or within 100 ms after one: that is the Jabra's own report, and recording stays
 paused. Ghost Wispr has the kernel stamp the Jabra's events with the monotonic clock, so a change
 of the Pi's time does not move the stamps. The log says
 `Jabra mute report came with Ghost Wispr's own microphone operation; capture stays paused`.
@@ -409,9 +412,13 @@ seconds) and the reconnect (backing off to every 30 seconds) look again without 
 starts paused scans only at its first resume. The speaker does not wait for it: it plays through the
 ALSA playback PCM of the card `speaker_device: J75` names (`plughw:CARD=J75,DEV=0`, the Jabra's
 `pcmC0D0p` on the office Pi), opening no microphone and needing no red light, so a unit restarted
-paused still speaks. It needs no package beyond `libportaudio2`, whose dependency `libasound2t64`
-the Pi already has (`deploy/pi/baseline.txt`). A pause during an open keeps the blink(1) red until
-that open has finished.
+paused still speaks. It plays at the first of 48000, 44100, 32000, 24000 and 16000 Hz that the
+Jabra takes without resampling, with 10 ms periods and a 40 ms buffer; a cancel of the speech, as
+when someone talks over it, drops that buffer, so the speech stops within 20 ms. Each underrun,
+when the speaker runs out of audio and clicks, is logged as
+`speaker underrun: the device ran out of audio`. It needs no package beyond `libportaudio2`,
+whose dependency `libasound2t64` the Pi already has (`deploy/pi/baseline.txt`). A pause during an
+open keeps the blink(1) red until that open has finished.
 
 The microphone is never open while the blink(1) is off: the blink(1) stays red while the microphone
 is open, and goes off only once Ghost Wispr has closed it. A pause closes it at once, also while

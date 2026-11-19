@@ -33,62 +33,62 @@ func UsePlugCapture(device string) error {
 	return os.Setenv("PA_ALSA_PLUGHW", "1")
 }
 
-// outputStopWait is how long a teardown of PortAudio waits for speaker
-// playbacks to stop. A playback stops at its next 250 ms buffer.
+// outputStopWait is how long a teardown of PortAudio waits for the speaker's
+// stream to close. The Output closes it before its next frame (outputFrame).
 var outputStopWait = 5 * time.Second
 
 // errOutputStillOpen reports a speaker output stream that did not close in
 // time; PortAudio is left as it is rather than torn down under it.
 var errOutputStillOpen = errors.New("a speaker output stream is still open")
 
-// outputs keeps PortAudio from being torn down under a speaker's output
-// stream, which crashes inside PortAudio. A playback holds it from before its
+// outputs keeps PortAudio from being torn down under the speaker's output
+// stream, which crashes inside PortAudio. An Output holds it from before its
 // stream opens until after the stream closes.
 var outputs = newOutputGuard()
 
 type outputGuard struct {
 	mu          sync.Mutex
-	changed     *sync.Cond // signalled (with mu) when a playback ends or a teardown finishes
-	open        int        // playbacks holding an output stream
+	changed     *sync.Cond // signalled (with mu) when a stream closes or a teardown finishes
+	open        int        // Outputs holding an output stream
 	tearingDown bool       // PortAudio is being torn down: no stream may open
-	playing     map[*Speaker]struct{}
+	playing     map[*Output]struct{}
 }
 
 func newOutputGuard() *outputGuard {
-	g := &outputGuard{playing: map[*Speaker]struct{}{}}
+	g := &outputGuard{playing: map[*Output]struct{}{}}
 	g.changed = sync.NewCond(&g.mu)
 	return g
 }
 
-// begin waits while PortAudio is being torn down, then counts s's playback as
-// holding an output stream until end.
-func (g *outputGuard) begin(s *Speaker) {
+// begin waits while PortAudio is being torn down, then counts o as holding an
+// output stream until end.
+func (g *outputGuard) begin(o *Output) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for g.tearingDown {
 		g.changed.Wait()
 	}
 	g.open++
-	g.playing[s] = struct{}{}
+	g.playing[o] = struct{}{}
 }
 
-func (g *outputGuard) end(s *Speaker) {
+func (g *outputGuard) end(o *Output) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.open--
-	delete(g.playing, s)
+	delete(g.playing, o)
 	g.changed.Broadcast()
 }
 
-// stopAll stops every playback and waits, up to wait, until their streams have
-// closed; new playbacks wait until resume. It reports false, and lets
-// playbacks go on, if a stream is still open after wait.
+// stopAll has every Output close its stream and waits, up to wait, until the
+// streams have closed; new streams wait until resume. It reports false, and
+// lets the Outputs go on, if a stream is still open after wait.
 func (g *outputGuard) stopAll(wait time.Duration) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.tearingDown = true
-	for s := range g.playing {
-		_ = s.Stop()
+	for o := range g.playing {
+		o.stopForTeardown()
 	}
 	expired := false
 	timer := time.AfterFunc(wait, func() {
