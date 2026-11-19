@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/spokentext"
 )
 
 const (
@@ -127,7 +128,7 @@ func (p *ElevenLabsProvider) Synthesize(ctx context.Context, req SpeechRequest) 
 }
 
 // doWithRetry executes the HTTP request, retrying once on 429. text is what
-// it asks to speak, which an error leaves out (providerMessage).
+// it asks to speak, which an error leaves out (spokentext.Withhold).
 func (p *ElevenLabsProvider) doWithRetry(ctx context.Context, url string, bodyJSON []byte, text string) ([]byte, error) {
 	const maxAttempts = 2
 
@@ -174,9 +175,9 @@ func (p *ElevenLabsProvider) processResponse(resp *http.Response, text string) (
 		errBody, _ := io.ReadAll(resp.Body)
 		var apiErr elevenLabsErrorResponse
 		if json.Unmarshal(errBody, &apiErr) == nil && apiErr.Detail.Message != "" {
-			return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, providerMessage(apiErr.Detail.Message, text))
+			return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(apiErr.Detail.Message, text))
 		}
-		return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, providerMessage(string(errBody), text))
+		return nil, fmt.Errorf("elevenlabs: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(string(errBody), text))
 	}
 
 	audioBytes, err := io.ReadAll(resp.Body)

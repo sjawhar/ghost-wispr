@@ -5,6 +5,13 @@ export interface PresetDetail {
   model: string
 }
 
+// The voice that answers in a meeting: voice A (our own voice), voice B
+// (GPT-Live) or voice C (the Deepgram voice agent).
+export type VoiceEngine = 'tts' | 'gptlive' | 'dgagent'
+
+// Voice A's text-to-speech engine.
+export type TTSEngine = 'gemini' | 'aura'
+
 export interface ConfigResponse {
   silence_timeout: string
   summarization: {
@@ -30,6 +37,13 @@ export interface ConfigResponse {
   // The rules the page shows under Recording rules, each as written in the
   // unit's recording_rules; empty when it has none. Read-only.
   recording_rules: string[]
+  // The meeting voice: whether it is on, which voice answers and voice A's
+  // engine. A change applies from the next exchange, with no restart.
+  voice: {
+    enabled: boolean
+    engine: VoiceEngine
+    tts_engine: TTSEngine
+  }
 }
 
 export interface TestPresetResponse {

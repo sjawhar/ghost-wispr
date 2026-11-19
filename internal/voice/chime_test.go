@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-// TestChimesAreShortSoftAndDistinct fails if a chime lasts more than 400 ms,
-// clips, clicks at its ends, is silent, or if the two chimes share their
-// number of notes.
+// TestChimesAreShortSoftAndDistinct fails if a sound lasts more than 400 ms,
+// clips, clicks at its ends, is silent, or has another number of notes than
+// its design.
 func TestChimesAreShortSoftAndDistinct(t *testing.T) {
 	chimes := map[string]struct {
 		pcm   []byte
@@ -17,6 +17,8 @@ func TestChimesAreShortSoftAndDistinct(t *testing.T) {
 	}{
 		"wake":   {WakeChime(), 2},
 		"answer": {AnswerChime(), 3},
+		"start":  {StartChime(), 1},
+		"error":  {ErrorChime(), 2},
 	}
 	for name, c := range chimes {
 		samples := len(c.pcm) / 2

@@ -31,6 +31,9 @@ type lightGuard struct {
 	checked chan struct{} // holds one signal: a check is waiting to be applied
 
 	lastRelease time.Time // used by run alone
+	// onFault runs once per new fault, as the hold starts: the error sound
+	// of a failed red check.
+	onFault func()
 }
 
 func newLightGuard(capture *captureGate, warnings *warningsRegistry, releaseEvery time.Duration) *lightGuard {
@@ -39,6 +42,7 @@ func newLightGuard(capture *captureGate, warnings *warningsRegistry, releaseEver
 		warnings:     warnings,
 		releaseEvery: releaseEvery,
 		checked:      make(chan struct{}, 1),
+		onFault:      capture.redCheckFailed,
 	}
 }
 
@@ -71,8 +75,12 @@ func (g *lightGuard) run(ctx context.Context) {
 
 func (g *lightGuard) apply(fault error) {
 	if fault != nil {
+		fresh := !g.capture.isLightHeld()
 		g.capture.HoldForLight()
 		g.warnings.Set("recording-light", recordingLightWarning(fault))
+		if fresh && g.onFault != nil {
+			g.onFault()
+		}
 		return
 	}
 	if !g.capture.isLightHeld() || time.Since(g.lastRelease) < g.releaseEvery {

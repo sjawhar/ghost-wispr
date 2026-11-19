@@ -97,6 +97,8 @@ type captureGate struct {
 	onMicHeld           func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
 	capturePresent      func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
 	onClosed            func(int)     // runs once the gate has closed, with its closings count; must not block
+	onOpened            func()        // runs once the gate has opened into recording; must not block
+	onRedCheckFailed    func()        // runs when an opening finds the light not red; must not block
 	audioStall          time.Duration // see audioStallAfter
 	stallAfter          time.Duration // see captureStallAfter
 	writeWait           time.Duration // see captureWriteWait
@@ -394,8 +396,13 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 			g.mu.Unlock()
 			onResumeRefused := g.onResumeRefused
 			g.control.Unlock()
-			if onResumeRefused != nil && !forLight {
-				onResumeRefused(err)
+			if !forLight {
+				// A person's resume found the light not red. A light hold's
+				// retries do not sound again: its fault did once.
+				g.redCheckFailed()
+				if onResumeRefused != nil {
+					onResumeRefused(err)
+				}
 			}
 			return
 		}
@@ -418,6 +425,16 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 	g.control.Unlock()
 	if checked && g.afterGateOpen != nil {
 		g.afterGateOpen()
+	}
+	if g.onOpened != nil {
+		g.onOpened()
+	}
+}
+
+// redCheckFailed reports a failed red check: the error sound (R10).
+func (g *captureGate) redCheckFailed() {
+	if g.onRedCheckFailed != nil {
+		g.onRedCheckFailed()
 	}
 }
 

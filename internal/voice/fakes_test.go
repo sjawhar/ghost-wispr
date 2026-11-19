@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,7 @@ type fakeSpeaker struct {
 	// cancelDelay holds each Cancel of an input back, as a late cancel does.
 	cancelDelay map[string]time.Duration
 	writePace   map[string]time.Duration // each Write on an input takes this long
+	chimes      []*fakePlayback          // each playback begun on the chime input
 }
 
 func newFakeSpeaker() *fakeSpeaker {
@@ -80,7 +82,48 @@ func (s *fakeSpeaker) Begin(input string) Playback {
 	case s.began <- input:
 	default:
 	}
-	return &fakePlayback{s: s, input: input, gen: s.gen[input]}
+	pb := &fakePlayback{s: s, input: input, gen: s.gen[input]}
+	if input == audio.InputChime {
+		s.chimes = append(s.chimes, pb)
+	}
+	return pb
+}
+
+// chimePlaybacks returns the playbacks begun on the chime input that wrote a
+// frame, with their sound names and frame counts.
+func (s *fakeSpeaker) chimePlaybacks() (names []string, frames []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, pb := range s.chimes {
+		if pb.first != nil {
+			names = append(names, soundName(pb.first))
+			frames = append(frames, pb.n)
+		}
+	}
+	return names, frames
+}
+
+// soundsPlayed names each sound begun on the chime input that wrote a frame,
+// in order, by its first frame.
+func (s *fakeSpeaker) soundsPlayed() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var names []string
+	for _, pb := range s.chimes {
+		if pb.first != nil {
+			names = append(names, soundName(pb.first))
+		}
+	}
+	return names
+}
+
+func soundName(first []byte) string {
+	for name, pcm := range map[string][]byte{"wake": WakeChime(), "answer": AnswerChime(), "start": StartChime(), "error": ErrorChime()} {
+		if len(pcm) >= len(first) && bytes.Equal(pcm[:len(first)], first) {
+			return name
+		}
+	}
+	return "unknown"
 }
 
 // holdBegins makes every Begin on input wait until release is called.
@@ -191,6 +234,8 @@ type fakePlayback struct {
 	s     *fakeSpeaker
 	input string
 	gen   int
+	first []byte // its first frame written
+	n     int    // frames written
 }
 
 func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
@@ -208,6 +253,10 @@ func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.Aud
 		return errFakeCancelled
 	}
 	s.writes[p.input]++
+	p.n++
+	if p.first == nil {
+		p.first = append([]byte(nil), frame...)
+	}
 	if s.finished[p.input] == nil {
 		s.finished[p.input] = make(chan struct{})
 	}
@@ -405,6 +454,9 @@ type fakeConcierge struct {
 	spoken    []string
 	asked     chan string
 	heard     []heardCall
+	// answerErr is what each Answer returns once its lines are said.
+	answerErr  error
+	neverMinds []string
 }
 
 func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
@@ -442,7 +494,7 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 		c.cancelled <- time.Now()
 		return ctx.Err()
 	}
-	return nil
+	return c.answerErr
 }
 
 func (c *fakeConcierge) Answers() <-chan PendingAnswer { return c.answers }
@@ -452,6 +504,19 @@ func (c *fakeConcierge) Spoken(ctx context.Context, taskID string) error {
 	defer c.mu.Unlock()
 	c.spoken = append(c.spoken, taskID)
 	return nil
+}
+
+func (c *fakeConcierge) NeverMind(ctx context.Context, sessionID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.neverMinds = append(c.neverMinds, sessionID)
+	return nil
+}
+
+func (c *fakeConcierge) neverMindCalls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.neverMinds...)
 }
 
 func (c *fakeConcierge) spokenIDs() []string {
@@ -501,9 +566,12 @@ type rig struct {
 
 	mu       sync.Mutex
 	red      bool
+	enabled  bool
+	voiceErr error // the next exchanges' voice cannot be built
 	closings int
 	session  string
 	start    float64 // the next transcript's socket time
+	timings  []string
 }
 
 func newRig(t *testing.T, c *fakeConcierge) *rig {
@@ -514,9 +582,16 @@ func newRig(t *testing.T, c *fakeConcierge) *rig {
 // newRigWith is newRig with change applied to the Supervisor's config.
 func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *rig)) *rig {
 	t.Helper()
-	r := &rig{t: t, speaker: newFakeSpeaker(), voice: newFakeVoice(), concierge: c, events: newEvents(), tap: NewTap(), red: true, session: "sess-1"}
+	r := &rig{t: t, speaker: newFakeSpeaker(), voice: newFakeVoice(), concierge: c, events: newEvents(), tap: NewTap(), red: true, enabled: true, session: "sess-1"}
 	cfg := &SupervisorConfig{
-		Voice:       func() Voice { return r.voice },
+		Voice: func() (Voice, error) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.voiceErr != nil {
+				return nil, r.voiceErr
+			}
+			return r.voice, nil
+		},
 		Concierge:   c,
 		Speaker:     r.speaker,
 		WakePhrases: []string{"Wispr", "Ghost Wispr"},
@@ -530,11 +605,20 @@ func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *
 			defer r.mu.Unlock()
 			return r.red
 		},
-		Notify:      r.events.notify,
-		Tap:         r.tap,
-		TurnWait:    300 * time.Millisecond,
-		SilenceWait: 200 * time.Millisecond,
-		Logf:        t.Logf,
+		Enabled: func() bool {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return r.enabled
+		},
+		Notify:       r.events.notify,
+		Tap:          r.tap,
+		TurnWait:     300 * time.Millisecond,
+		SilenceWait:  200 * time.Millisecond,
+		SoundGap:     100 * time.Millisecond,
+		FollowUpWait: 200 * time.Millisecond,
+		ReplayWindow: 300 * time.Millisecond,
+		Timing:       r.timing,
+		Logf:         t.Logf,
 	}
 	if change != nil {
 		change(cfg, r)
@@ -542,6 +626,25 @@ func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *
 	r.s = NewSupervisor(cfg)
 	t.Cleanup(r.s.Close)
 	return r
+}
+
+// timing records the Supervisor's timing events.
+func (r *rig) timing(event, sessionID string, at time.Time, _ ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.timings = append(r.timings, event)
+}
+
+func (r *rig) timingEvents() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.timings...)
+}
+
+func (r *rig) setEnabled(on bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enabled = on
 }
 
 func (r *rig) setRed(red bool) {

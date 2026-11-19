@@ -45,9 +45,9 @@ func TestTapPassesNothingWithoutAnExchange(t *testing.T) {
 	}
 }
 
-// TestTapNeverBlocksAndCountsDrops fails if a full tap blocks the capture
-// gate's writer, or drops without counting.
-func TestTapNeverBlocksAndCountsDrops(t *testing.T) {
+// TestTapNeverBlocksTheGate fails if a full tap blocks the capture gate's
+// writer, or drops without counting.
+func TestTapNeverBlocksTheGate(t *testing.T) {
 	tap := NewTap()
 	tap.SetRate(16000)
 	tap.Open(0) // nobody reads
@@ -71,9 +71,10 @@ func TestTapNeverBlocksAndCountsDrops(t *testing.T) {
 	}
 }
 
-// TestTapResamplesToSixteenKilohertz fails if a microphone at a fallback
-// rate reaches the voice at any rate but 16 kHz.
-func TestTapResamplesToSixteenKilohertz(t *testing.T) {
+// TestTapFormat fails if room audio reaches a voice as anything but 16 kHz
+// mono PCM16 in the microphone's 250 ms buffers, from a microphone at a
+// fallback rate too.
+func TestTapFormat(t *testing.T) {
 	tap := NewTap()
 	tap.SetRate(48000)
 	frames := tap.Open(0)
@@ -81,8 +82,8 @@ func TestTapResamplesToSixteenKilohertz(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := <-frames
-	if f.Rate != 16000 || len(f.PCM) != 4000 {
-		t.Fatalf("frame %d Hz with %d samples, want 16000 Hz with 4000", f.Rate, len(f.PCM))
+	if f.Rate != 16000 || f.Channels != 1 || len(f.PCM) != 4000 {
+		t.Fatalf("frame %d Hz, %d channels, %d samples; want 16000 Hz mono with 4000 (250 ms)", f.Rate, f.Channels, len(f.PCM))
 	}
 }
 

@@ -12,11 +12,11 @@ import (
 // stopBound is how soon every stop must silence the exchange.
 const stopBound = 100 * time.Millisecond
 
-// TestEveryStopSilencesTheExchangeWithin100ms fails if a gate closing (a
-// pause or a light hold), the Jabra button or shutdown leaves the voice
-// speaking, its session open, the chime playing or the Concierge's calls
-// running for more than 100 ms.
-func TestEveryStopSilencesTheExchangeWithin100ms(t *testing.T) {
+// TestSupervisorClosesOnEveryStopEvent fails if a gate closing (a pause or a
+// light hold), the Jabra button or shutdown leaves the voice speaking, its
+// session open, the chime playing or the Concierge's calls running for more
+// than 100 ms.
+func TestSupervisorClosesOnEveryStopEvent(t *testing.T) {
 	stops := map[string]func(r *rig){
 		// A pause and a light hold both close the capture gate; the cmd tests
 		// prove each reaches GateClosed (TestAPauseStopsTheVoiceThroughTheGate).
@@ -79,34 +79,42 @@ func TestAStopEndsTheTapStream(t *testing.T) {
 	})
 }
 
-// TestWakesFromBeforeAClosingAreDropped fails if a transcript that is a
-// Finalize reply, arrived while the gate was closed, or carries the gate's
-// closings count from before the latest closing opens an exchange.
-func TestWakesFromBeforeAClosingAreDropped(t *testing.T) {
+// TestWakeDroppedFromFinalize fails if a transcript that is a Finalize reply,
+// the words a pause flushed, opens an exchange.
+func TestWakeDroppedFromFinalize(t *testing.T) {
+	assertWakeDropped(t, func(tr *Transcript) { tr.FromFinalize = true })
+}
+
+// TestWakeDroppedAfterAClosing fails if a transcript that arrived while the
+// gate was closed, or carries the gate's closings count from before the
+// latest closing, opens an exchange.
+func TestWakeDroppedAfterAClosing(t *testing.T) {
 	cases := map[string]func(tr *Transcript){
-		"finalize reply": func(tr *Transcript) { tr.FromFinalize = true },
 		"gate closed":    func(tr *Transcript) { tr.GateOpen = false },
 		"older closings": func(tr *Transcript) { tr.Closings = 0 },
 	}
 	for name, change := range cases {
-		t.Run(name, func(t *testing.T) {
-			r := newRig(t, newFakeConcierge("fact"))
-			r.closeGate() // closings is now 1
-			tr := transcriptOf("Wispr, what is happening?", 0, true, true, 1)
-			change(&tr)
-			r.s.OnTranscript(&tr)
-			never(t, "a dropped wake opened a voice session", 300*time.Millisecond, func() bool { return len(r.voice.opened) > 0 })
-			if got := r.events.all(); len(got) != 0 {
-				t.Errorf("events %v for a dropped wake, want none", got)
-			}
-		})
+		t.Run(name, func(t *testing.T) { assertWakeDropped(t, change) })
 	}
 }
 
-// TestAWakeChimesAndTheConciergeGetsTheFinalTurn fails if a wake does not
-// chime, open a voice, and hand the asker's words after the wake phrase to
-// the Concierge once Deepgram marks the turn final, then speak its answer.
-func TestAWakeChimesAndTheConciergeGetsTheFinalTurn(t *testing.T) {
+func assertWakeDropped(t *testing.T, change func(tr *Transcript)) {
+	t.Helper()
+	r := newRig(t, newFakeConcierge("fact"))
+	r.closeGate() // closings is now 1
+	tr := transcriptOf("Wispr, what is happening?", 0, true, true, 1)
+	change(&tr)
+	r.s.OnTranscript(&tr)
+	never(t, "a dropped wake opened a voice session", 300*time.Millisecond, func() bool { return len(r.voice.opened) > 0 })
+	if got := r.events.all(); len(got) != 0 {
+		t.Errorf("events %v for a dropped wake, want none", got)
+	}
+}
+
+// TestAnswersStartAtEndOfTurn fails if a wake does not chime and open a
+// voice, or the asker's words after the wake phrase reach the Concierge
+// before Deepgram marks the turn final, or its answer is not spoken.
+func TestAnswersStartAtEndOfTurn(t *testing.T) {
 	c := newFakeConcierge("INFRA-1 is in review since this morning.")
 	r := newRig(t, c)
 
@@ -140,9 +148,9 @@ func TestAWakeChimesAndTheConciergeGetsTheFinalTurn(t *testing.T) {
 	eventually(t, "the session closed after the answer", func() bool { _, _, closed := sess.state(); return closed })
 }
 
-// TestAWakeWithNoWordsAfterItEnds fails if an exchange opened on "Wispr."
+// TestExchangeEndsWithNoWordAfterWake fails if an exchange opened on "Wispr."
 // alone stays open with nobody asking anything.
-func TestAWakeWithNoWordsAfterItEnds(t *testing.T) {
+func TestExchangeEndsWithNoWordAfterWake(t *testing.T) {
 	r := newRig(t, newFakeConcierge("fact"))
 	r.heard("Wispr.", true, true)
 	sess := r.waitSession()
@@ -214,9 +222,9 @@ func TestWordsFarApartAreNotABargeIn(t *testing.T) {
 	never(t, "words 0.9 s apart stopped the voice", 200*time.Millisecond, func() bool { i, _, _ := sess.state(); return !i.IsZero() })
 }
 
-// TestOwnWordsAreNotABargeInOrAWake fails if Wispr's own words, heard back
-// while it speaks, stop it or open an exchange; "Wispr, stop" still stops it.
-func TestOwnWordsAreNotABargeInOrAWake(t *testing.T) {
+// TestOwnWordsDoNotStop fails if Wispr's own words, heard back while it
+// speaks, stop it or open an exchange; "Wispr, stop" still stops it.
+func TestOwnWordsDoNotStop(t *testing.T) {
 	fc := newFakeConcierge("Wispr here: the voice issue is in review since this morning.")
 	fc.hold = true
 	r := newRig(t, fc)

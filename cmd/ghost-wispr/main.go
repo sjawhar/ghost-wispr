@@ -26,6 +26,7 @@ import (
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
@@ -1053,11 +1054,11 @@ func main() {
 	// The meeting voice. Its link is wired now, so every gate closing reaches
 	// it, the one restorePause may make included; the voice itself starts
 	// once the speaker output exists, below. Its tap is one more writer
-	// behind the gate, only while the voice is on.
+	// behind the gate, while the unit has a speaker for a voice.
 	wireVoiceToCapture(capture, &voiceHooks)
 	var voiceTap *voice.Tap
-	var voiceAudio io.Writer // nil while the voice is off: the mic writes nothing more
-	if cfg.Voice.Enabled {
+	var voiceAudio io.Writer // nil with no speaker: the mic writes nothing more
+	if cfg.SpeakerEnabled {
 		voiceTap = voice.NewTap()
 		voiceAudio = voiceTap
 	}
@@ -1940,35 +1941,39 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		controlHooks.TTSHasSpeaker = ttsOrchestrator.HasSpeaker
 	}
 
-	// The meeting voice: the Concierge, then the Supervisor over the speaker
-	// output. Without them the unit records as before.
-	stopConcierge := func() {}
-	if cfg.Voice.Enabled {
-		if err := func() error {
+	// The meeting voice: the Supervisor over the speaker output, whenever the
+	// unit has a speaker, since a person turns the voice on and picks it on the
+	// settings page with no restart (R13). The voice for each call is built from
+	// the settings saved last; the Concierge starts at once while the voice is
+	// on, else at the first call that needs it.
+	var conc *lazyConcierge
+	if output != nil {
+		var voices voiceSource
+		voices.apply(ctx, &cfg)
+		onConfigChange(cfgStore, func(newCfg *config.Config) { voices.apply(ctx, newCfg) })
+		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+			current := cfgStore.Get()
 			// The session page reads a session's questions again on each change.
-			conc, stop, err := startConcierge(ctx, &cfg, store, appLogger, func(sessionID string) {
+			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {
 				hub.BroadcastVoiceEvent("voice_tasks_changed", sessionID)
 			})
-			if err != nil {
-				return err
-			}
-			err = startVoice(ctx, &cfg, &voiceDeps{
-				output:    output,
-				tap:       voiceTap,
-				concierge: conc,
-				link:      &voiceHooks,
-				session:   func() string { id, _ := manager.ActiveSession(); return id },
-				red:       func() bool { return capture.capturing(micStatus) },
-				notify:    hub.BroadcastVoiceEvent,
-			})
-			if err != nil {
-				stop()
-				return err
-			}
-			stopConcierge = stop
-			conciergeSessionHooks.set(conc)
-			return nil
-		}(); err != nil {
+		}, func(c *concierge.Concierge) { conciergeSessionHooks.set(c) }, appLogger)
+		if cfg.Voice.Enabled {
+			_, _ = conc.start() // a failure is logged; each call then answers unreachable
+		}
+		if err := startVoice(&voiceDeps{
+			output:      output,
+			tap:         voiceTap,
+			concierge:   conc,
+			link:        &voiceHooks,
+			voices:      voices.Voice,
+			enabled:     func() bool { return cfgStore.Get().Voice.Enabled },
+			wakePhrases: cfg.Voice.WakePhrases,
+			timing:      voiceTiming(appLogger),
+			session:     func() string { id, _ := manager.ActiveSession(); return id },
+			red:         func() bool { return capture.capturing(micStatus) },
+			notify:      hub.BroadcastVoiceEvent,
+		}); err != nil {
 			log.Printf("warning: the meeting voice is off: %v", err)
 			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())
 		}
@@ -2104,7 +2109,9 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if mic := micRef.Load(); mic != nil && micLoopsEnded {
 		_ = mic.Stop()
 	}
-	stopConcierge()
+	if conc != nil {
+		conc.Stop()
+	}
 	if ttsOrchestrator != nil {
 		ttsOrchestrator.Stop()
 	}

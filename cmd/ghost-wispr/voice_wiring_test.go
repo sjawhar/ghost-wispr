@@ -166,15 +166,16 @@ func TestVoiceAudioOnlyAfterTheGate(t *testing.T) {
 }
 
 // TestLiveOptionsCarryTheWakeKeyterms fails if the live Deepgram request
-// leaves out the wake phrases as keyterms while the voice is on, or sends
-// them while it is off.
+// leaves out the wake phrases as keyterms while a voice can run (a speaker,
+// whatever voice.enabled says, since a person turns it on with no restart),
+// or sends them with no speaker.
 func TestLiveOptionsCarryTheWakeKeyterms(t *testing.T) {
-	cfg := config.Config{DeepgramModel: "nova-3", Voice: config.Voice{Enabled: true, WakePhrases: []string{"Wispr", "Ghost Wispr"}}}
+	cfg := config.Config{DeepgramModel: "nova-3", SpeakerEnabled: true, Voice: config.Voice{WakePhrases: []string{"Wispr", "Ghost Wispr"}}}
 	if got := liveTranscriptionOptions(&cfg, 16000).Keyterm; !slices.Equal(got, []string{"Wispr", "Ghost Wispr"}) {
-		t.Errorf("keyterms %q with the voice on, want the wake phrases", got)
+		t.Errorf("keyterms %q with a speaker and the voice off, want the wake phrases", got)
 	}
-	cfg.Voice.Enabled = false
+	cfg.SpeakerEnabled = false
 	if got := liveTranscriptionOptions(&cfg, 16000).Keyterm; len(got) != 0 {
-		t.Errorf("keyterms %q with the voice off, want none", got)
+		t.Errorf("keyterms %q with no speaker, want none", got)
 	}
 }

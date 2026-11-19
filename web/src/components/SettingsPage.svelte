@@ -5,6 +5,7 @@
   import GeneralSettings from './GeneralSettings.svelte'
   import PresetEditor from './PresetEditor.svelte'
   import IntegrationsSettings from './IntegrationsSettings.svelte'
+  import VoiceSettings from './VoiceSettings.svelte'
 
   let { onBack }: { onBack: () => void } = $props()
 
@@ -42,6 +43,11 @@
     <section class="settings-section">
       <h3 class="section-heading">General Settings</h3>
       <GeneralSettings />
+    </section>
+
+    <section class="settings-section">
+      <h3 class="section-heading">Meeting voice</h3>
+      <VoiceSettings config={configState.config} />
     </section>
 
     <section class="settings-section">

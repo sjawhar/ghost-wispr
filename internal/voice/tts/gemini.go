@@ -17,6 +17,7 @@ import (
 	"cloud.google.com/go/auth"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
+	"github.com/sjawhar/ghost-wispr/internal/spokentext"
 )
 
 const (
@@ -269,7 +270,7 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return geminiStatusError(resp)
+		return geminiStatusError(resp, text)
 	}
 
 	events := bufio.NewScanner(stallReader{r: resp.Body, stall: stall})
@@ -292,7 +293,7 @@ func (g *Gemini) Stream(ctx context.Context, text string, emit func(pcm []byte) 
 		// A blank line, or the end of the stream, ends an event.
 		if len(data) > 0 {
 			stall.Stop()
-			if err := g.emitEvent(data, emit); err != nil {
+			if err := g.emitEvent(data, text, emit); err != nil {
 				return err
 			}
 			stall.Reset(geminiStallTimeout)
@@ -325,14 +326,15 @@ func (s stallReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// emitEvent decodes one event and emits its audio.
-func (*Gemini) emitEvent(data []byte, emit func(pcm []byte) error) error {
+// emitEvent decodes one event of the stream speaking text, and emits its
+// audio.
+func (*Gemini) emitEvent(data []byte, text string, emit func(pcm []byte) error) error {
 	var event geminiEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		return fmt.Errorf("gemini tts: decode event: %w", err)
 	}
 	if e := event.Error; e != nil {
-		return fmt.Errorf("gemini tts: stream error %d %s: %s", e.Code, e.Status, e.Message)
+		return fmt.Errorf("gemini tts: stream error %d %s: %s", e.Code, e.Status, spokentext.Withhold(e.Message, text))
 	}
 	for _, candidate := range event.Candidates {
 		for _, part := range candidate.Content.Parts {
@@ -347,9 +349,10 @@ func (*Gemini) emitEvent(data []byte, emit func(pcm []byte) error) error {
 	return nil
 }
 
-// geminiStatusError is the error of a refused request: Vertex AI's message
-// when the body carries one, else the body.
-func geminiStatusError(resp *http.Response) error {
+// geminiStatusError is the error of a refused request to speak text: Vertex
+// AI's message when the body carries one, else the body, either withheld
+// when it quotes text (spokentext.Withhold).
+func geminiStatusError(resp *http.Response, text string) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, geminiMaxErrorBody))
 	if err != nil {
 		return fmt.Errorf("gemini tts: api error (status %d), body unreadable: %w", resp.StatusCode, err)
@@ -358,7 +361,7 @@ func geminiStatusError(resp *http.Response) error {
 		Error geminiError `json:"error"`
 	}
 	if json.Unmarshal(body, &refusal) == nil && refusal.Error.Message != "" {
-		return fmt.Errorf("gemini tts: api error (status %d): %s", resp.StatusCode, refusal.Error.Message)
+		return fmt.Errorf("gemini tts: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(refusal.Error.Message, text))
 	}
-	return fmt.Errorf("gemini tts: api error (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	return fmt.Errorf("gemini tts: api error (status %d): %s", resp.StatusCode, spokentext.Withhold(strings.TrimSpace(string(body)), text))
 }

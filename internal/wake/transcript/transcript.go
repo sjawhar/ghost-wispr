@@ -8,6 +8,7 @@ package transcript
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -22,9 +23,10 @@ const (
 type Command int
 
 const (
-	Ask     Command = iota // a question for the Concierge
-	Stop                   // stop speaking and end the exchange
-	GoAhead                // speak the pending answer
+	Ask       Command = iota // a question for the Concierge
+	Stop                     // stop speaking and end the exchange
+	GoAhead                  // speak the pending answer
+	NeverMind                // cancel the newest question to an agent
 )
 
 func (c Command) String() string {
@@ -33,9 +35,45 @@ func (c Command) String() string {
 		return "stop"
 	case GoAhead:
 		return "go ahead"
+	case NeverMind:
+		return "never mind"
 	default:
 		return "ask"
 	}
+}
+
+// thanksWords open a thank-you.
+var thanksWords = map[string]bool{"thanks": true, "thank": true, "cheers": true}
+
+// Thanks reports whether text is a thank-you to Wispr ("Thanks, Wispr."),
+// which ends an exchange: a thanks word, an optional "you", then the name,
+// and nothing after it.
+func (d *Detector) Thanks(text string) bool {
+	tokens := strings.Fields(text)
+	if len(tokens) < 2 || !thanksWords[normalise(tokens[0])] {
+		return false
+	}
+	at := 1
+	if normalise(tokens[1]) == "you" {
+		at = 2
+	}
+	for _, p := range d.phrases {
+		if at+len(p.words) != len(tokens) {
+			continue
+		}
+		matched := true
+		for k, want := range p.words {
+			got := normalise(tokens[at+k])
+			if got != want && !soundsLikeWord(got, want) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 // Match is a wake phrase heard at the start of a sentence.
@@ -206,8 +244,130 @@ func CommandOf(rest string) Command {
 		return Stop
 	case first == "go" && (second == "ahead" || second == "on"):
 		return GoAhead
+	case first == "nevermind", first == "never" && second == "mind", first == "forget" && second == "it":
+		return NeverMind
 	}
 	return Ask
+}
+
+// IssueKeys returns the issue keys text names, in the forms people say them:
+// "INFRA-1027", "infra 1027", "infra ten twenty-seven", "infra one oh two
+// seven". A key is a word of letters and a number; the caller checks it
+// against the keys it knows.
+func IssueKeys(text string) []string {
+	var tokens []string
+	for _, t := range strings.Fields(text) {
+		// "twenty-seven" is two number words; "INFRA-1027" stays one token.
+		if strings.Contains(t, "-") && !keyToken(t) {
+			tokens = append(tokens, strings.Split(t, "-")...)
+			continue
+		}
+		tokens = append(tokens, t)
+	}
+	var keys []string
+	for i := 0; i < len(tokens); i++ {
+		word := strings.TrimSuffix(normalise(tokens[i]), "'s")
+		if keyToken(tokens[i]) {
+			prefix, digits, _ := strings.Cut(word, "-")
+			keys = append(keys, strings.ToUpper(prefix)+"-"+digits)
+			continue
+		}
+		if !lettersOnly(word) || len(word) < 2 || numberWord(word) {
+			continue
+		}
+		digits, used := spokenNumber(tokens[i+1:])
+		if digits == "" {
+			continue
+		}
+		keys = append(keys, strings.ToUpper(word)+"-"+digits)
+		i += used
+	}
+	return keys
+}
+
+// keyToken reports a written key such as "INFRA-1027", with punctuation
+// around it.
+func keyToken(t string) bool {
+	prefix, digits, ok := strings.Cut(strings.TrimSuffix(normalise(t), "'s"), "-")
+	return ok && len(prefix) >= 2 && lettersOnly(prefix) && digitsOnly(digits)
+}
+
+var (
+	ones  = map[string]int{"zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9}
+	teens = map[string]int{"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19}
+	tens  = map[string]int{"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+)
+
+func numberWord(w string) bool {
+	_, o := ones[w]
+	_, te := teens[w]
+	_, tn := tens[w]
+	return o || te || tn || w == "hundred"
+}
+
+// spokenNumber reads the digits that tokens open with: written digits, or
+// number words read in groups ("ten twenty-seven" is 10 then 27, "one oh two
+// seven" is 1, 0, 2, 7, "eleven hundred five" is 1105). It reports the digits
+// and how many tokens it read.
+func spokenNumber(tokens []string) (string, int) {
+	if len(tokens) > 0 {
+		if w := strings.TrimSuffix(normalise(tokens[0]), "'s"); digitsOnly(w) {
+			return w, 1
+		}
+	}
+	var b strings.Builder
+	used := 0
+	for used < len(tokens) {
+		w := normalise(tokens[used])
+		if w == "hundred" && b.Len() > 0 {
+			// "eleven hundred five": what follows fills the hundred's two places.
+			rest, n := spokenNumber(tokens[used+1:])
+			if len(rest) > 2 {
+				rest, n = "", 0
+			}
+			b.WriteString(strings.Repeat("0", 2-len(rest)) + rest)
+			return b.String(), used + 1 + n
+		}
+		o, isOne := ones[w]
+		te, isTeen := teens[w]
+		tn, isTens := tens[w]
+		switch {
+		case isOne:
+			b.WriteString(strconv.Itoa(o))
+		case isTeen:
+			b.WriteString(strconv.Itoa(te))
+		case isTens:
+			if used+1 < len(tokens) {
+				if next, ok := ones[normalise(tokens[used+1])]; ok && next > 0 {
+					tn += next
+					used++
+				}
+			}
+			b.WriteString(strconv.Itoa(tn))
+		default:
+			return b.String(), used
+		}
+		used++
+	}
+	return b.String(), used
+}
+
+func lettersOnly(w string) bool {
+	for _, r := range w {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return w != ""
+}
+
+func digitsOnly(w string) bool {
+	for _, r := range w {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return w != ""
 }
 
 // Keyterms returns the keyterms for Deepgram's live options: the wake
