@@ -375,6 +375,9 @@ func TestLedgerStates(t *testing.T) {
 	if task, _ := r.store.VoiceTask("evt-5"); task.State != storage.VoiceTaskWorking {
 		t.Fatalf("the question of another exchange replaced: evt-5 %s", task.State)
 	}
+	if task, _ := r.store.VoiceTask("evt-3"); task.State != storage.VoiceTaskWorking {
+		t.Fatalf("a question of another exchange replaced the earlier exchange's: evt-3 %s", task.State)
+	}
 
 	if err := r.concierge.NeverMind(context.Background(), "meeting-1"); err != nil {
 		t.Fatal(err)
