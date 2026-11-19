@@ -717,6 +717,23 @@ with the unit paused and no session active:
 4. Whatever the result, and on Ctrl-C, it pauses capture, stops the service, writes `.env` back
    byte for byte and the saved capture state it read, starts the service and checks it reads paused.
    Then unload the loopback: `sudo modprobe -r snd-aloop`.
+5. The after-merge checks of slice 1 each run one step: `bash accept-voice.sh --step NAME ...`;
+   `--help` lists the steps and what each needs. They need more inputs than the question:
+   - spoken clips made with any speech synthesizer: `--second-question`, `--never-mind` and
+     `--stop-clip` WAVs, and the `--question-dir`, `--talkover-dir` and `--backchannel-dir`
+     directories of WAVs;
+   - for `wake-sound`, `scripted`, `barge-in` and `playback-cancel`, a USB microphone about 30 cm
+     from the Jabra, named by `--rig-mic` (such as `plughw:CARD=Mic,DEV=0`). These steps play
+     through the Jabra, so run them with the room empty. The step asks you to confirm that, measures
+     the room and sets its sound threshold 10 dB above the room's peak;
+   - for `holder-cases` and `ask-holder`, scratch issues in Dispatch: one claimed by a live agent
+     session (`--issue-live`), one by a stopped session (`--issue-stopped`), one by a person
+     (`--issue-person`) and one with no session (`--issue-none`). The steps only read them, and ask
+     the live agent one question.
+
+   `reach`, `holder-cases` and `tts-first-audio` change nothing on the unit; the others restore it as
+   in point 4. The windows and thresholds of the rig steps are not yet calibrated: the first run on
+   the Pi calibrates them.
 
 ## Accept slice 1
 
