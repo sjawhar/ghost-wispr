@@ -578,3 +578,51 @@ func TestTheVoicesWordsAndWhatItHeardReachEvents(t *testing.T) {
 		t.Errorf("user turn %q, want what the model heard before it spoke", ev.Text)
 	}
 }
+
+// The Supervisor gives Open the exchange's context, which its 2-minute limit
+// and every ending cancel: the session, and the room audio it streams to
+// OpenAI, must end with it.
+func TestTheSessionEndsWithItsExchangesContext(t *testing.T) {
+	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
+	tap := make(chan audio.Frame, 4)
+	x.Tap = tap
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := newLiveServer(t)
+	s, c, _ := openSessionCtx(t, srv, ctx, x)
+	tap <- audio.Frame{PCM: ramp(0, 1600), Rate: 16000, Channels: 1}
+	c.expect(evInputAudioAppend)
+
+	cancel()
+	c.expect(evSessionClose)
+	c.closed()
+	waitClosed(t, s.Events())
+}
+
+// The Supervisor closes the tap's stream the moment an exchange ends, before
+// it cancels the exchange. Room audio held while the session started must
+// then never reach OpenAI, though the light went off after it was heard.
+func TestTapAudioHeldWhileStartingIsDroppedWhenTheExchangeEnds(t *testing.T) {
+	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{}))
+	tap := make(chan audio.Frame, 4)
+	x.Tap = tap
+	tap <- audio.Frame{PCM: ramp(0, 1600), Rate: 16000, Channels: 1}
+	close(tap)
+	srv := newLiveServer(t)
+	v := newTestVoice(t, srv)
+	opened := make(chan voice.Session, 1)
+	go func() {
+		s, err := v.Open(context.Background(), x)
+		if err != nil {
+			t.Errorf("Open: %v", err)
+		}
+		opened <- s
+	}()
+	c := srv.conn()
+	time.Sleep(100 * time.Millisecond) // the session reads the frame and the close while it starts
+	c.start()
+	s := <-opened
+	if s != nil {
+		defer func() { _ = s.Close() }()
+	}
+	c.noAudio(300 * time.Millisecond)
+}

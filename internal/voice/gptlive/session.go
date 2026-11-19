@@ -201,6 +201,12 @@ func (v *Voice) Open(ctx context.Context, x *voice.Exchange) (voice.Session, err
 	defer timer.Stop()
 	select {
 	case <-s.started:
+		// The exchange's context bounds the session: its time limit and
+		// every ending close it, and with it the room audio to OpenAI.
+		release := context.AfterFunc(ctx, func() { _ = s.Close() })
+		s.mu.Lock()
+		s.release = release
+		s.mu.Unlock()
 		return s, nil
 	case err := <-s.startErr:
 		s.teardown()
@@ -242,7 +248,8 @@ type session struct {
 
 	mu          sync.Mutex
 	closing     bool
-	over        bool // the session ended and said so on Events
+	release     func() bool // stops the close on the exchange's end
+	over        bool        // the session ended and said so on Events
 	nextID      int
 	pending     map[string]chan error // acknowledgements awaited, by client event id
 	pendingDone bool
@@ -262,7 +269,7 @@ var _ voice.Session = (*session)(nil)
 
 // newSession starts a session's goroutines on conn. It keeps a copy of x.
 func newSession(ctx context.Context, cfg Config, x *voice.Exchange, conn *websocket.Conn) *session {
-	sctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	sctx, cancel := context.WithCancel(ctx)
 	s := &session{
 		cfg:          cfg,
 		x:            *x,
@@ -400,7 +407,11 @@ func (s *session) Close() error {
 		return nil
 	}
 	s.closing = true
+	release := s.release
 	s.mu.Unlock()
+	if release != nil {
+		release()
+	}
 
 	deadline := time.Now().Add(closeGrace)
 	s.player.interrupt()
@@ -862,7 +873,9 @@ func (s *session) pumpTap() {
 			early, held = nil, 0
 		case frame, ok := <-tap:
 			if !ok {
-				tap = nil
+				// The exchange ended: what it heard while the session
+				// started must not reach OpenAI now.
+				tap, early, held = nil, nil, 0
 				continue
 			}
 			pcm := conv.convert(frame)

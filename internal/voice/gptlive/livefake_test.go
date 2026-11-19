@@ -417,17 +417,30 @@ func testExchange(out *fakeOutput, tools voice.ToolRunner) *voice.Exchange {
 // the start, and returns it with the server's side of its socket.
 func openSession(t *testing.T, srv *liveServer, x *voice.Exchange) (voice.Session, *liveConn, clientEvent) {
 	t.Helper()
+	return openSessionCtx(t, srv, context.Background(), x)
+}
+
+// newTestVoice is voice B pointed at srv, with the bearer srv expects.
+func newTestVoice(t *testing.T, srv *liveServer) *Voice {
+	t.Helper()
 	v, err := New(Config{URL: srv.url(), Token: func(context.Context) (string, error) { return "access-token", nil }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	return v
+}
+
+// openSessionCtx is openSession with Open's context.
+func openSessionCtx(t *testing.T, srv *liveServer, ctx context.Context, x *voice.Exchange) (voice.Session, *liveConn, clientEvent) {
+	t.Helper()
+	v := newTestVoice(t, srv)
 	type opened struct {
 		s   voice.Session
 		err error
 	}
 	done := make(chan opened, 1)
 	go func() {
-		s, err := v.Open(context.Background(), x)
+		s, err := v.Open(ctx, x)
 		done <- opened{s, err}
 	}()
 	c := srv.conn()
@@ -461,6 +474,38 @@ func waitEvent(t *testing.T, s voice.Session, kind voice.EventKind) voice.Event 
 		case <-deadline:
 			t.Fatalf("no event of kind %d", kind)
 			return voice.Event{}
+		}
+	}
+}
+
+// waitClosed waits for events to close, passing over what is left in it.
+func waitClosed(t *testing.T, events <-chan voice.Event) {
+	t.Helper()
+	deadline := time.After(testWait)
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("Events did not close")
+		}
+	}
+}
+
+// noAudio fails if the session sends an audio append within d.
+func (c *liveConn) noAudio(d time.Duration) {
+	c.t.Helper()
+	deadline := time.After(d)
+	for {
+		select {
+		case ev := <-c.in:
+			if ev.Type == evInputAudioAppend {
+				c.t.Fatalf("the session sent %d samples of room audio it should have dropped", len(ev.Audio)*3/8)
+			}
+		case <-deadline:
+			return
 		}
 	}
 }
