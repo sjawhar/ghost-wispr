@@ -43,7 +43,11 @@ func TestCapturedCountsAChunkTheQueueHandsOn(t *testing.T) {
 	if _, err := sender.Write(make([]byte, secondOfAudio)); err != nil {
 		t.Fatal(err)
 	}
-	<-handOff.entered
+	select {
+	case <-handOff.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the send queue did not hand the chunk to the client with writeFromQueue, which counts it as it leaves the queue")
+	}
 	during := rc.Captured()
 	close(handOff.release)
 	deadline := time.Now().Add(5 * time.Second)
