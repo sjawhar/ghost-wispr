@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sjawhar/ghost-wispr/internal/jabra"
 	"github.com/sjawhar/ghost-wispr/internal/server"
 	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
@@ -387,6 +388,195 @@ func TestAFailedResumeCheckDoesNotSayPausedWhileRecording(t *testing.T) {
 			}
 			if (err != nil) != capture.IsPaused() {
 				t.Fatalf("the resume whose check failed returned %v with capture paused %t: want its error only while the unit stays paused", err, capture.IsPaused())
+			}
+		})
+	}
+}
+
+// TestAJabraMuteAfterAResumeElsewherePauses fails if a press of the Jabra's
+// mute button, made while the unit records, does not pause it. In the office:
+// the person mutes on the Jabra; the mic loop closes the microphone, and the
+// Jabra sends Phone Mute by itself just after (jabraOwnMuteWindow), which the
+// guard keeps from resuming; the person unmutes from the web page or the power
+// button; the person mutes on the Jabra again. The button remembered the own
+// report as the person asking to stay paused, and the next press resumed the
+// recording unit (red team, review 5967147417 of #79). Controls: the Jabra
+// itself unmutes, and an unmute elsewhere with no own report before it.
+func TestAJabraMuteAfterAResumeElsewherePauses(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ownReport    bool
+		jabraResumes bool
+	}{
+		{"control: the Jabra itself unmutes after its own report", true, true},
+		{"control: the web page or power button unmutes, no own report", false, false},
+		{"the Jabra's own report, then the web page or power button unmutes", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newJabraRig(false)
+			button := newJabraMuteButton(rig.capture, rig.device, rig.controls, rig.warnings)
+			t.Cleanup(button.toggle.wait)
+			waitPaused := func(want bool, what string) {
+				t.Helper()
+				waitForHardware(t, what, func() bool { return rig.capture.IsPaused() == want })
+			}
+
+			rig.openMic(t) // recording
+			time.Sleep(2 * jabraOwnMuteWindow)
+			button.press(jabra.MonotonicNow()) // the person mutes on the Jabra
+			waitPaused(true, "the person's first Jabra press to pause")
+			rig.closeMic(t) // the mic loop closes the microphone for the pause
+			if tc.ownReport {
+				button.press(jabra.MonotonicNow()) // the Jabra's own Phone Mute, just after the close
+				time.Sleep(50 * time.Millisecond)
+				if !rig.capture.IsPaused() {
+					t.Fatal("control: the guard took the Jabra's own report for a person's unmute")
+				}
+			}
+			time.Sleep(2 * jabraOwnMuteWindow) // later presses are a person's
+			if tc.jabraResumes {
+				button.press(jabra.MonotonicNow())
+			} else if err := rig.controls.Resume(); err != nil {
+				t.Fatalf("control: the resume from the web page or power button: %v", err)
+			}
+			waitPaused(false, "the unmute")
+
+			time.Sleep(2 * jabraOwnMuteWindow)
+			button.press(jabra.MonotonicNow()) // the person mutes on the Jabra again
+			for deadline := time.Now().Add(time.Second); !rig.capture.IsPaused(); time.Sleep(time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("a Jabra press to mute while the unit records left it recording (own report first: %t, unmuted by the Jabra: %t): the button took the press for a resume", tc.ownReport, tc.jabraResumes)
+				}
+			}
+		})
+	}
+}
+
+// countingToggleRig is a button's toggle against the persistent controls of
+// a capture gate, counting the controls' pauses and resumes.
+type countingToggleRig struct {
+	capture    *captureGate
+	persistent *persistentControls
+	toggle     *buttonToggle
+	resumes    atomic.Int32
+	pauses     atomic.Int32
+}
+
+func newCountingToggleRig(t *testing.T) *countingToggleRig {
+	r := &countingToggleRig{capture: newCaptureGate(nil, nil, nil)}
+	r.persistent = newPersistentControls(&lockedPauseStore{}, r.capture.Pause, r.capture, nil)
+	r.toggle = newButtonToggle(r.capture, &server.ControlHooks{
+		Pause:  func() error { r.pauses.Add(1); return r.persistent.Pause() },
+		Resume: func() error { r.resumes.Add(1); return r.persistent.Resume() },
+	}, "test button")
+	t.Cleanup(r.toggle.wait)
+	return r
+}
+
+// press presses the button and waits for the press, its resume included.
+func (r *countingToggleRig) press(t *testing.T) {
+	t.Helper()
+	select {
+	case <-r.toggle.press(nil, nil):
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: a press did not end within 5s")
+	}
+}
+
+// TestAButtonPressAfterARefusedResumeTriesAgain fails if, after a press whose
+// resume the light refused, the next press of that button does not try to
+// resume again. The unit is still paused, and the person sees it paused, so
+// the next press is a resume; the button remembered the refused press as a
+// resume and paused the paused unit instead (review 5967147417 of #79).
+// Control: after a resume that worked, the next press pauses.
+func TestAButtonPressAfterARefusedResumeTriesAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refuse  func(r *countingToggleRig)
+		refused bool
+	}{
+		{"control: the resume is not refused", func(r *countingToggleRig) {
+			r.capture.beforeResumeRequest = func() error { return nil }
+		}, false},
+		{"the red confirmation refuses it", func(r *countingToggleRig) {
+			r.capture.beforeResumeRequest = func() error { return errors.New("recording light stayed off") }
+		}, true},
+		{"the pattern check refuses it", func(r *countingToggleRig) {
+			r.capture.beforeResumeRequest = func() error { return nil }
+			r.capture.checkLightPattern = func() error { return errors.New("blink(1) feature report: no such device") }
+		}, true},
+		{"the gate opening refuses it", func(r *countingToggleRig) {
+			r.capture.beforeGateOpen = func() error { return errors.New("recording light went off before the gate opened") }
+			r.capture.onResumeRefused = func(error) { _ = r.persistent.RefuseResume() }
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newCountingToggleRig(t)
+			if err := r.persistent.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			tc.refuse(r)
+			r.press(t)
+			if tc.refused {
+				time.Sleep(50 * time.Millisecond) // a gate opening's refusal comes after the press
+				waitForHardware(t, "the refused resume to leave the unit paused", r.capture.IsPaused)
+			} else {
+				waitForHardware(t, "the resume", func() bool { return !r.capture.IsPaused() })
+			}
+			before := r.resumes.Load()
+			r.press(t)
+			time.Sleep(50 * time.Millisecond)
+			tried := r.resumes.Load() - before
+			if !tc.refused {
+				if tried != 0 || !r.capture.IsPaused() {
+					t.Fatalf("control: the press after a resume that worked resumed %d times, paused %t; want a pause", tried, r.capture.IsPaused())
+				}
+				return
+			}
+			if tried != 1 {
+				t.Fatalf("the press after a refused resume, with the unit still paused, tried to resume %d times (and paused %d times): want 1 resume", tried, r.pauses.Load())
+			}
+		})
+	}
+}
+
+// TestAButtonPauseLeavesNoRequestedPause fails if a button's pause leaves a
+// pause counted as asked for that no Pause took: the gate then counts the unit
+// as paused from then on, and a resume of a unit that records runs the light's
+// pattern check. The button counted its pause, and the persistent controls
+// counted it again (review 5967147417 of #79). Control: the same pause from
+// the web page.
+func TestAButtonPauseLeavesNoRequestedPause(t *testing.T) {
+	for _, viaButton := range []bool{false, true} {
+		name := "control: a pause from the web page"
+		if viaButton {
+			name = "a pause from a button"
+		}
+		t.Run(name, func(t *testing.T) {
+			r := newCountingToggleRig(t)
+			if viaButton {
+				r.press(t)
+			} else if err := r.persistent.Pause(); err != nil {
+				t.Fatal(err)
+			}
+			if !r.capture.IsPaused() {
+				t.Fatal("control: the pause did not pause")
+			}
+			r.capture.mu.Lock()
+			requested := r.capture.requestedPauses
+			r.capture.mu.Unlock()
+			if err := r.persistent.Resume(); err != nil {
+				t.Fatalf("control: the resume: %v", err)
+			}
+			waitForHardware(t, "the resume", func() bool { return !r.capture.IsPaused() })
+			var checks atomic.Int32
+			r.capture.beforeResumeRequest = func() error { return nil }
+			r.capture.checkLightPattern = func() error { checks.Add(1); return nil }
+			if err := r.persistent.Resume(); err != nil { // a second click on a recording unit
+				t.Fatalf("a resume of a recording unit: %v", err)
+			}
+			if requested != 0 || checks.Load() != 0 {
+				t.Fatalf("after one pause, %d requested pauses were left that no Pause took, and a resume of a unit that records ran the light's pattern check %d times; want 0 and 0", requested, checks.Load())
 			}
 		})
 	}

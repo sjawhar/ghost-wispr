@@ -183,9 +183,10 @@ time, lets the recorder's other commands in between, and runs before a resume or
 takes the pause switch, from the web page, the power button or the Jabra alike, so a pause during it
 is not held up and turns the light off at once; the resume, gate opening or microphone open it
 overtakes lights nothing and opens nothing. A press of the power button or the Jabra that resumes
-returns at once and checks the light in the background, so the next press is taken meanwhile and
-pauses: each press acts on the state the person last asked for, not on a switch a resume has not
-moved yet. A save of the black pattern that does not reach
+returns at once and checks the light in the background. Each press reads the pause switch, except
+while that button's own resume is still checking the light with no pause since: then the press
+counts the unit as resumed and pauses. A refused resume leaves the switch off, so the next press
+resumes again. A save of the black pattern that does not reach
 the unit leaves it unknown, so it is checked again when it comes back. Programs that do not take the
 lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
 answer the recorder's.

@@ -98,18 +98,37 @@ func (r *lightRig) waitOff(t *testing.T) {
 // operations as it began, and once it had taken portAudioOpenTook.
 type openSteps struct{ begin, end []lightOp }
 
-// requireRed fails the test unless the light's last operation, as each step
-// of the open saw it, is a read-back of red.
+// requireRed fails the test unless the light, as each step of the open saw
+// it, was read back red and nothing after that read-back but red writes: the
+// controller may write red again after a red confirmation's read-back, which
+// keeps the light red (review 5967147417 of #79 saw `write ff0000 read ff0000
+// write ff0000` once in 50 runs).
 func requireRed(t *testing.T, what string, steps openSteps) {
 	t.Helper()
 	for _, step := range []struct {
 		when string
 		ops  []lightOp
 	}{{"as it began", steps.begin}, {"once it had taken " + portAudioOpenTook.String(), steps.end}} {
-		if len(step.ops) == 0 || !isRedReadBack(step.ops[len(step.ops)-1]) {
-			t.Fatalf("%s %s with light operations %v, want the last a read-back of ff0000", what, step.when, step.ops)
+		last := -1
+		for i, op := range step.ops {
+			if isRedReadBack(op) {
+				last = i
+			}
+		}
+		if last < 0 || !allRedWrites(step.ops[last+1:]) {
+			t.Fatalf("%s %s with light operations %v, want a read-back of ff0000 with only writes of ff0000 after it", what, step.when, step.ops)
 		}
 	}
+}
+
+// allRedWrites reports whether every operation in ops is a write of red.
+func allRedWrites(ops []lightOp) bool {
+	for _, op := range ops {
+		if op.read || !isRedOp(op) {
+			return false
+		}
+	}
+	return true
 }
 
 // recordingStart stands in for a microphone start (startMicPipeline): its

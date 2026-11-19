@@ -453,7 +453,8 @@ confirmation, or one a refused tickle or red write starts). That check runs befo
 takes the pause switch, from the web page, the power button or the Jabra alike, so a pause tapped
 during it is not held up, and the resume or microphone open it overtakes does not light the
 blink(1). A press of the power button or the Jabra that resumes checks the light in the background,
-so a press right after it is taken at once and pauses. Other programs
+so a press right after it is taken at once and pauses; otherwise a press reads the pause switch, so a
+refused resume is tried again by the next press. Other programs
 that open the blink(1), such as `blink1-tool`, do not take the lock: do not run them while the
 recorder runs, since their own colour read can still answer the recorder's. A process stopped while
 it holds the lock (`kill -STOP`) keeps it;

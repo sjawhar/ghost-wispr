@@ -169,26 +169,29 @@ func toggleCapture(isPaused func() bool, pause, resume func() error, onStatusCha
 }
 
 // buttonToggle is a hardware button's presses: the power button's taps and
-// the Jabra's mute presses. A press reads the state the person last asked
-// for, not the gate's switch, which a resume moves only once its light check
-// has passed. A press that pauses pauses at once; a press that resumes runs
-// in the background, so the button takes the next press while the resume's
-// light check runs, and that press pauses (review 5963682292 of #79).
+// the Jabra's mute presses. A press reads the gate's switch, except while this
+// button's latest resume still runs and no pause has come since: the switch
+// moves only once that resume's light check has passed, so the press then
+// counts the unit as resumed and pauses. A press that pauses pauses at once;
+// a press that resumes runs in the background, so the button takes the next
+// press while the resume's light check runs (review 5963682292 of #79). It
+// remembers nothing else: a resume that was refused, an own Jabra report, or a
+// pause or resume from anywhere else leaves the next press reading the switch
+// (review 5967147417 of #79).
 type buttonToggle struct {
 	capture  *captureGate
 	controls *server.ControlHooks
 	name     string
 
 	mu sync.Mutex
-	// asked is the last pause a press asked for: true after a press that
-	// paused, false after one that resumed, and the gate's switch before the
-	// first press. pauses is the gate's pause count then: a pause from
-	// anywhere else (the web page, a restored pause) changes it, and the next
-	// press reads the gate again.
-	asked   bool
-	pauses  int
-	started bool
-	running sync.WaitGroup
+	// resuming is set while the resume this button last started runs and no
+	// pause has come since. pausesAt is the gate's pause count when it
+	// started: a pause from anywhere moves it. generation tells that resume
+	// from a later one.
+	resuming   bool
+	pausesAt   int
+	generation int
+	running    sync.WaitGroup
 }
 
 func newButtonToggle(capture *captureGate, controls *server.ControlHooks, name string) *buttonToggle {
@@ -197,11 +200,11 @@ func newButtonToggle(capture *captureGate, controls *server.ControlHooks, name s
 
 // press toggles capture for one press. keepPaused, when set and true, keeps a
 // paused unit paused: the Jabra's guard for its own mute report. after runs
-// once the press has pauses or has started its resume, before the resume
+// once the press has paused or has started its resume, before the resume
 // ends. The returned channel closes once the press, its resume included, is
 // over.
 func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct{} {
-	paused := t.lastAsked()
+	paused := t.counted()
 	done := make(chan struct{})
 	switch {
 	case paused && keepPaused != nil && keepPaused():
@@ -210,11 +213,12 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 	case paused:
 		// A resume can take seconds: its light check reads the blink(1)'s
 		// stored pattern. The button must take the next press meanwhile.
-		t.setAsked(false)
+		generation := t.startResume()
 		t.running.Add(1)
 		go func() {
 			defer t.running.Done()
 			defer close(done)
+			defer t.endResume(generation)
 			if err := t.controls.Resume(); err != nil {
 				log.Printf("warning: %s toggle: %v", t.name, err)
 			} else if t.controls.OnStatusChanged != nil {
@@ -222,7 +226,7 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 			}
 		}()
 	default:
-		t.setAsked(true)
+		t.stopResume()
 		err := t.controls.Pause()
 		// A Pause error still leaves capture paused, so clients must hear of it.
 		if t.controls.OnStatusChanged != nil {
@@ -239,27 +243,42 @@ func (t *buttonToggle) press(keepPaused func() bool, after func()) <-chan struct
 	return done
 }
 
-// lastAsked is the pause the person last asked for through this button,
-// unless a pause or resume from elsewhere has changed the gate since.
-func (t *buttonToggle) lastAsked() bool {
+// counted reports the unit as paused or not for a press: resumed while this
+// button's own resume runs with no pause since, else the gate's switch.
+func (t *buttonToggle) counted() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if paused := t.capture.IsPaused(); !t.started || t.capture.pauseCount() != t.pauses || paused == t.asked {
-		t.started, t.asked, t.pauses = true, paused, t.capture.pauseCount()
+	if t.resuming && t.capture.pauseCount() == t.pausesAt {
+		return false
 	}
-	return t.asked
+	return t.capture.IsPaused()
 }
 
-// setAsked records what this press asked for, with the gate's pause count as
-// it is once the press has asked: a pause from elsewhere after it changes
-// that count, and the next press reads the gate again.
-func (t *buttonToggle) setAsked(paused bool) {
+// startResume records that this button's resume runs from now, and returns
+// its generation.
+func (t *buttonToggle) startResume() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if paused {
-		t.capture.pauseRequested()
+	t.generation++
+	t.resuming, t.pausesAt = true, t.capture.pauseCount()
+	return t.generation
+}
+
+// endResume records that the resume of generation has ended, unless a later
+// one runs.
+func (t *buttonToggle) endResume(generation int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.generation == generation {
+		t.resuming = false
 	}
-	t.started, t.asked, t.pauses = true, paused, t.capture.pauseCount()
+}
+
+// stopResume records a pause by this button: no resume of it counts any more.
+func (t *buttonToggle) stopResume() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.resuming = false
 }
 
 // wait returns once every resume this button started is over.
