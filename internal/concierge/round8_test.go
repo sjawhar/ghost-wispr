@@ -69,3 +69,27 @@ func TestAnAskTurnAsksOnceTheHolderIsKnown(t *testing.T) {
 		t.Fatalf("the voice did not say the question went out: %+v", spoken)
 	}
 }
+
+// TestTheHolderGetsACleanQuestion fails if the question sent to the holder,
+// once "please ask the agent on KEY" is taken off the turn, starts with the
+// punctuation Deepgram put after the key (end-to-end run 8f sent ". When
+// slice one will be ready to try.").
+func TestTheHolderGetsACleanQuestion(t *testing.T) {
+	for _, turn := range []string{
+		"please ask the agent on INFRA 4592. When slice one will be ready to try.",
+		"please ask the agent on INFRA-4592. When slice one will be ready to try.",
+	} {
+		if got, want := fewestWords(turn), "When slice one will be ready to try."; got != want {
+			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)
+		}
+	}
+}
+
+// TestAHistoryQuestionIsAboutTheRecord fails if a question about an issue's
+// history and recent events, which the record holds, counts as one that is
+// not about status, so R7 asks the holder (end-to-end run 8f asked).
+func TestAHistoryQuestionIsAboutTheRecord(t *testing.T) {
+	if turn := "what is the full history of the issue about real time spoken conversation with its recent events?"; !aboutStatus(turn) {
+		t.Fatalf("aboutStatus(%q) = false, want the record to answer it", turn)
+	}
+}
