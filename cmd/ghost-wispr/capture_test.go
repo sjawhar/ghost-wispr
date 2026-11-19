@@ -303,7 +303,12 @@ func TestPauseClosesMicDeviceUntilResume(t *testing.T) {
 	}
 }
 
-// The UI hears that the mic is paused, and that it is back on resume.
+// The UI hears that the mic is paused, and that it is back on resume. The
+// loop announces the pause once it has closed the microphone and found the
+// gate closed; a resume before it looks rightly reopens without announcing
+// it, so the test resumes only once the pause is announced. It resumed right
+// after the close, and that resume could land first: `got [connected]` in 9
+// of 300 runs on main b606ab7a under -race.
 func TestPauseBroadcastsMicPausedThenResumed(t *testing.T) {
 	hub := server.NewHub()
 	events := hub.Subscribe()
@@ -316,27 +321,34 @@ func TestPauseBroadcastsMicPausedThenResumed(t *testing.T) {
 	capture.Pause()
 	mic.capture(t, []byte{1})
 	mic.expectEvents(t, "close")
+	expectMicStatus(t, events, storage.ComponentStatusPaused)
 	capture.Resume()
 	mic.expectEvents(t, "open", "stream")
+	expectMicStatus(t, events, storage.ComponentStatusConnected)
+}
 
-	var statuses []string
+// expectMicStatus fails the test unless the next microphone status the hub
+// sends on events, within testWait, is want.
+func expectMicStatus(t *testing.T, events <-chan []byte, want string) {
+	t.Helper()
 	deadline := time.After(testWait)
-	for len(statuses) < 2 {
+	for {
 		select {
 		case msg := <-events:
 			var payload map[string]any
 			if err := json.Unmarshal(msg, &payload); err != nil {
 				t.Fatalf("unmarshal failed: %v", err)
 			}
-			if payload["type"] == "component_status" && payload["component"] == "mic" {
-				statuses = append(statuses, fmt.Sprint(payload["status"]))
+			if payload["type"] != "component_status" || payload["component"] != "mic" {
+				continue
 			}
+			if got := fmt.Sprint(payload["status"]); got != want {
+				t.Fatalf("mic status = %q, want %q", got, want)
+			}
+			return
 		case <-deadline:
-			t.Fatalf("timed out waiting for mic status events, got %v", statuses)
+			t.Fatalf("timed out waiting for mic status %q", want)
 		}
-	}
-	if want := []string{storage.ComponentStatusPaused, storage.ComponentStatusConnected}; !slices.Equal(statuses, want) {
-		t.Fatalf("mic statuses = %v, want %v", statuses, want)
 	}
 }
 
