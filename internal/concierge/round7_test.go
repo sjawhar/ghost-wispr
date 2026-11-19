@@ -1286,3 +1286,23 @@ func TestTalkOfChangeNamesNoWork(t *testing.T) {
 		}
 	}
 }
+
+// TestTheModelIsNotOfferedWhatTheRecordHolds (R6; run at 7cc6c51): with the
+// holder already read, the model is not offered issue_holder: live, it called
+// it first anyway (866 ms), and the routing line played before its fact.
+func TestTheModelIsNotOfferedWhatTheRecordHolds(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
+	answerTurn(t, r, "what is happening with ABC-12")
+	if len(r.model.configs) == 0 {
+		t.Fatal("no model call")
+	}
+	for _, tool := range r.model.configs[0].Tools {
+		for _, decl := range tool.FunctionDeclarations {
+			if decl.Name == "issue_holder" {
+				t.Fatalf("the model was offered issue_holder with the holder in its record")
+			}
+		}
+	}
+}

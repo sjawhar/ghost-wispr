@@ -107,6 +107,22 @@ var factTools = func() []ToolSpec {
 	return specs
 }()
 
+// offered is the fact tools the model is offered: all but issue_holder when
+// the answer's record holds the holder already, which the model, offered it,
+// still called (R6).
+func (r *runner) offered() []ToolSpec {
+	if !r.holderKnown {
+		return factTools
+	}
+	var specs []ToolSpec
+	for _, spec := range factTools {
+		if spec.Name != "issue_holder" {
+			specs = append(specs, spec)
+		}
+	}
+	return specs
+}
+
 // errOutOfReach is Answer's error when Dispatch or Envoy did not answer.
 var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 
@@ -243,7 +259,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		searchesLeft--
 	}
 	searchesLeft = max(searchesLeft, 0)
-	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut}
+	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil}
 	// With no fact by c.knownBound, the model stops and the voice says what
 	// is known (R6), rather than run into the bound.
 	factsCtx, stopFacts := context.WithCancel(ctx)
@@ -743,7 +759,7 @@ func (e *inventedError) Error() string { return "concierge: the model said " + e
 // to it with the tools' results, as Gemini requires.
 func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, facts *sentences, budget *int) error {
 	contents := []*genai.Content{genai.NewContentFromText(prompt, genai.RoleUser)}
-	config := c.generateConfig(systemPrompt, factTools)
+	config := c.generateConfig(systemPrompt, tools.offered())
 	last := *config
 	last.ToolConfig = &genai.ToolConfig{FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeNone}}
 	// A try that failed the check leaves no words of it to say.
