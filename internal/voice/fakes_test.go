@@ -207,6 +207,7 @@ type fakeSession struct {
 	interrupted time.Time
 	closedAt    time.Time
 	closed      bool
+	eventsDone  bool
 	says        []string
 	modes       []SayMode
 }
@@ -238,7 +239,7 @@ func (s *fakeSession) send(kind EventKind, text string) {
 	e := Event{Kind: kind, Text: text}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.eventsDone {
 		return
 	}
 	select {
@@ -265,9 +266,33 @@ func (s *fakeSession) Close() error {
 	if !s.closed {
 		s.closed = true
 		s.closedAt = time.Now()
-		close(s.events)
+		s.endEventsLocked()
 	}
 	return nil
+}
+
+func (s *fakeSession) endEventsLocked() {
+	if !s.eventsDone {
+		s.eventsDone = true
+		close(s.events)
+	}
+}
+
+// fail reports a failure, as a vendor whose connection dropped does.
+func (s *fakeSession) fail(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.eventsDone {
+		s.events <- Event{Kind: EventErr, Err: err}
+	}
+}
+
+// die ends the session's events with no Close, as a voice that ended by
+// itself does.
+func (s *fakeSession) die() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.endEventsLocked()
 }
 
 func (s *fakeSession) state() (interrupted, closedAt time.Time, closed bool) {
@@ -380,8 +405,14 @@ type rig struct {
 
 func newRig(t *testing.T, c *fakeConcierge) *rig {
 	t.Helper()
+	return newRigWith(t, c, nil)
+}
+
+// newRigWith is newRig with change applied to the Supervisor's config.
+func newRigWith(t *testing.T, c *fakeConcierge, change func(*SupervisorConfig, *rig)) *rig {
+	t.Helper()
 	r := &rig{t: t, speaker: newFakeSpeaker(), voice: newFakeVoice(), concierge: c, events: newEvents(), tap: NewTap(), red: true, session: "sess-1"}
-	r.s = NewSupervisor(&SupervisorConfig{
+	cfg := &SupervisorConfig{
 		Voice:       func() Voice { return r.voice },
 		Concierge:   c,
 		Speaker:     r.speaker,
@@ -401,7 +432,11 @@ func newRig(t *testing.T, c *fakeConcierge) *rig {
 		TurnWait:    300 * time.Millisecond,
 		SilenceWait: 200 * time.Millisecond,
 		Logf:        t.Logf,
-	})
+	}
+	if change != nil {
+		change(cfg, r)
+	}
+	r.s = NewSupervisor(cfg)
 	t.Cleanup(r.s.Close)
 	return r
 }

@@ -31,6 +31,9 @@ const (
 	// DefaultSilenceWait is how long the room must be silent before a holder's
 	// answer speaks by itself.
 	DefaultSilenceWait = 3 * time.Second
+	// DefaultIdleWait is how long an exchange with a voice that drives its
+	// own turn stays open with nobody and nothing speaking.
+	DefaultIdleWait = 10 * time.Second
 )
 
 const (
@@ -118,6 +121,7 @@ type SupervisorConfig struct {
 	Tap         *Tap
 	TurnWait    time.Duration // 0: DefaultTurnWait
 	SilenceWait time.Duration // 0: DefaultSilenceWait
+	IdleWait    time.Duration // 0: DefaultIdleWait
 	Logf        func(string, ...any)
 }
 
@@ -191,6 +195,7 @@ type exchange struct {
 	firstOut  sync.Once  // logs the time to first audio
 	turnAt    time.Time  // when the turn was handed to the Concierge
 	notified  map[string]bool
+	idle      *time.Timer // a driving voice's idle wait
 }
 
 // NewSupervisor starts a Supervisor; Close stops it.
@@ -201,6 +206,9 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 	}
 	if cfg.SilenceWait <= 0 {
 		cfg.SilenceWait = DefaultSilenceWait
+	}
+	if cfg.IdleWait <= 0 {
+		cfg.IdleWait = DefaultIdleWait
 	}
 	if cfg.Notify == nil {
 		cfg.Notify = func(string, string) {}
@@ -350,13 +358,26 @@ func (s *Supervisor) OnTranscript(t *Transcript) {
 	if ex == nil {
 		return
 	}
+	s.touchLocked(ex)
 	if !ex.answering && !ex.drives {
 		s.turnLocked(ex, t, t.Text)
 		return
 	}
 	if s.voiceSpeaking && bargesIn(t.Words, s.ownSetLocked(now)) {
 		s.logf("voice: barge-in")
-		s.endLocked(ex, true, "barge-in")
+		if !ex.drives {
+			s.endLocked(ex, true, "barge-in")
+			return
+		}
+		// A voice that drives its own turn stops speaking at once and stays
+		// open: its vendor hears the interruption and answers it.
+		sess := ex.session
+		go func() {
+			if sess != nil {
+				sess.Interrupt()
+			}
+			s.cfg.Speaker.Cancel(audio.InputVoice)
+		}()
 	}
 }
 
@@ -411,6 +432,10 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, preempt, chime
 		return
 	}
 	ex.session = sess
+	if ex.drives {
+		s.noteLocked(ex, EventExchangeStarted, x.SessionID)
+		s.touchLocked(ex)
+	}
 	go s.readEvents(ex, sess)
 }
 
@@ -428,24 +453,64 @@ func (s *Supervisor) playChime(ctx context.Context, pcm []byte, since time.Time)
 	}
 }
 
-// readEvents follows a session's events until it closes.
+// readEvents follows a session's events until they end. A voice that drives
+// its own turn and fails ends its exchange, as does any voice whose events
+// end before the Supervisor closed it.
 func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 	for e := range sess.Events() {
+		s.mu.Lock()
 		switch e.Kind {
 		case EventAgentText:
-			s.mu.Lock()
 			s.addOwnLocked(e.Text, time.Now())
-			s.mu.Unlock()
 		case EventSpeechStarted:
-			s.mu.Lock()
 			if ex.spokeAt.IsZero() {
 				ex.spokeAt = time.Now()
 			}
-			s.mu.Unlock()
+			s.touchLocked(ex)
+		case EventSpeechEnded:
+			if ex.drives && !ex.spokeAt.IsZero() && !ex.ended {
+				s.noteLocked(ex, EventSpoken, ex.x.SessionID)
+			}
+			s.touchLocked(ex)
 		case EventErr:
 			s.logf("voice: %v", e.Err)
+			if ex.drives && s.ex == ex {
+				s.endLocked(ex, true, "the voice failed")
+			}
 		}
+		s.mu.Unlock()
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ex == ex {
+		s.endLocked(ex, true, "the voice ended by itself")
+	}
+}
+
+// touchLocked restarts the idle wait of an exchange whose voice drives its own
+// turn: something was said, by the room or the voice.
+func (s *Supervisor) touchLocked(ex *exchange) {
+	if !ex.drives || ex.ended {
+		return
+	}
+	if ex.idle != nil {
+		ex.idle.Stop()
+	}
+	ex.idle = time.AfterFunc(s.cfg.IdleWait, func() { s.idleWaited(ex) })
+}
+
+// idleWaited ends an exchange nobody and nothing spoke in for IdleWait.
+func (s *Supervisor) idleWaited(ex *exchange) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ex != ex || ex.ended {
+		return
+	}
+	if s.voiceSpeaking {
+		s.touchLocked(ex)
+		return
+	}
+	s.endLocked(ex, false, "idle")
 }
 
 // turnLocked adds words of the asker's turn, and hands the turn to the
@@ -713,6 +778,9 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if ex.timer != nil {
 		ex.timer.Stop()
 	}
+	if ex.idle != nil {
+		ex.idle.Stop()
+	}
 	if s.ex == ex {
 		s.ex = nil
 		close(s.floor)
@@ -787,10 +855,13 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	if !e.Started {
 		s.voiceEnded = time.Now()
 	}
-	if ex := s.ex; ex != nil && e.Started && !ex.turnAt.IsZero() {
-		ex.firstOut.Do(func() {
-			s.logf("voice: first spoken audio %v after the turn ended", e.At.Sub(ex.turnAt).Round(time.Millisecond))
-		})
+	if ex := s.ex; ex != nil {
+		s.touchLocked(ex)
+		if e.Started && !ex.turnAt.IsZero() {
+			ex.firstOut.Do(func() {
+				s.logf("voice: first spoken audio %v after the turn ended", e.At.Sub(ex.turnAt).Round(time.Millisecond))
+			})
+		}
 	}
 }
 
