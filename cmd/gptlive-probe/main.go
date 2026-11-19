@@ -7,13 +7,18 @@
 // session. The session starts with a 2 s lead-in of silence sent at once, as
 // the meeting voice's wake replay does. It sends three text turns, listens
 // 10 s after each, and reports the speech that comes back and how GPT-Live's
-// words line up with their audio. It fails when an answer goes on after Say
-// returned, or when that alignment is outside what the cut-speech check
-// covers. It sends GPT-Live silence, never the room, and prints no token.
+// words line up with their audio. With --ask, it then streams a spoken
+// question from a WAV file, waits for GPT-Live to delegate it, answers from
+// its own backend, and reports the round trip. It fails when an answer goes
+// on after Say returned, when GPT-Live does not delegate the question, or
+// when the alignment is outside what the cut-speech check covers. It opens
+// no microphone and no speaker: it sends GPT-Live silence and the question
+// file, never the room, keeps GPT-Live's speech in memory, and prints no
+// token.
 //
 // Run it on the unit as the ghost-wispr user, who owns the credential's key:
 //
-//	sudo -u ghost-wispr gptlive-probe --identity-provider-id idp_… --service-account-id user-…
+//	gptlive-probe --identity-provider-id idp_… --service-account-id user-… --ask question.wav
 package main
 
 import (
@@ -97,7 +102,20 @@ type probeConfig struct {
 	Turns int
 	// Phase is the wait before each turn; nil means framePhase.
 	Phase func() time.Duration
+	// Ask is a spoken question, 16 kHz mono PCM16, streamed in after the
+	// turns for GPT-Live to delegate; empty asks none.
+	Ask []int16
+	// DelegateWait is how long the probe waits for GPT-Live to delegate the
+	// question; 0 means delegateWait.
+	DelegateWait time.Duration
 }
+
+// delegateWait is how long the probe waits, after its question ends, for
+// GPT-Live to delegate it and for the answer to start playing.
+const delegateWait = 20 * time.Second
+
+// delegationAnswer is the probe's backend answer to a delegation.
+const delegationAnswer = "The probe's backend answered, so delegation works."
 
 func main() { os.Exit(run()) }
 
@@ -110,6 +128,7 @@ func run() int {
 	voiceName := flag.String("voice", "", "GPT-Live voice, such as marin")
 	wav := flag.String("wav", "", "write GPT-Live's speech to this WAV file")
 	turns := flag.Int("turns", probeTurns, "text turns to send; the timeline offset's spread needs 2 or more")
+	ask := flag.String("ask", "", "a spoken question, a 16 kHz mono 16-bit WAV, for GPT-Live to delegate to the probe's backend")
 	timeout := flag.Duration("timeout", 3*time.Minute, "give up after this long")
 	flag.Parse()
 	clientCertificatesOff()
@@ -122,6 +141,14 @@ func run() int {
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
+	var question []int16
+	if *ask != "" {
+		var err error
+		if question, err = readQuestion(*ask); err != nil {
+			printf(os.Stderr, "gptlive-probe: %v\n", err)
+			return 2
+		}
+	}
 	err := probe(ctx, &probeConfig{
 		IdentityProviderID: *provider,
 		ServiceAccountID:   *account,
@@ -132,6 +159,7 @@ func run() int {
 		Voice:    *voiceName,
 		MinAudio: time.Second,
 		Turns:    *turns,
+		Ask:      question,
 		WAV:      *wav,
 	}, os.Stdout)
 	if err != nil {
@@ -185,15 +213,18 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 		return err
 	}
 	// The lead-in waits in the tap and goes at once when the session
-	// starts, as the wake replay does; then silence follows in real time.
+	// starts, as the wake replay does; then silence follows in real time,
+	// and the question, if any, in its place when the probe asks it.
 	tap := make(chan audio.Frame, leadIn+4)
 	for range leadIn {
 		tap <- audio.Frame{PCM: make([]int16, 4000), Rate: 16000, Channels: 1}
 	}
-	go silence(ctx, tap)
+	in := newFeeder()
+	go in.run(ctx, tap)
 	rec := &recording{}
+	tools := &probeTools{called: make(chan time.Time, 1)}
 	begin = time.Now()
-	s, err := v.Open(ctx, &voice.Exchange{SessionID: "gptlive-probe", WakeAt: begin, Tap: tap, Out: rec, Tools: probeTools{}})
+	s, err := v.Open(ctx, &voice.Exchange{SessionID: "gptlive-probe", WakeAt: begin, Tap: tap, Out: rec, Tools: tools})
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
@@ -237,6 +268,11 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 			printf(out, "first audio: %v after the text turn\n", first.Sub(turn).Round(time.Millisecond))
 		}
 		if err := listen(ctx, rec, settle); err != nil {
+			return err
+		}
+	}
+	if len(cfg.Ask) > 0 {
+		if err := delegation(ctx, cfg, in, tools, rec, out); err != nil {
 			return err
 		}
 	}
@@ -392,39 +428,163 @@ func (e *events) failure() error {
 	return e.first
 }
 
-// silence feeds the session 250 ms of silence every 250 ms, as a quiet room
-// would: GPT-Live's timeline runs on its input audio.
-func silence(ctx context.Context, tap chan<- audio.Frame) {
-	tick := time.NewTicker(250 * time.Millisecond)
+// feeder feeds the session's tap 250 ms of audio every 250 ms, as the room's
+// microphone would: silence, or the question it was given. GPT-Live's
+// timeline runs on its input audio.
+type feeder struct {
+	ask   chan []int16
+	ended chan time.Time // when the last of a question was sent
+}
+
+func newFeeder() *feeder {
+	return &feeder{ask: make(chan []int16, 1), ended: make(chan time.Time, 1)}
+}
+
+func (f *feeder) run(ctx context.Context, tap chan<- audio.Frame) {
+	tick := time.NewTicker(inputFrame)
 	defer tick.Stop()
+	var question []int16
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case q := <-f.ask:
+			question = q
+			continue
 		case <-tick.C:
-			select {
-			case tap <- audio.Frame{PCM: make([]int16, 4000), Rate: 16000, Channels: 1}:
-			default:
+		}
+		pcm := make([]int16, 4000)
+		if len(question) > 0 {
+			n := copy(pcm, question)
+			question = question[n:]
+			if len(question) == 0 {
+				select {
+				case f.ended <- time.Now():
+				default:
+				}
 			}
+		}
+		select {
+		case tap <- audio.Frame{PCM: pcm, Rate: 16000, Channels: 1}:
+		default:
 		}
 	}
 }
 
-// probeTools answers a delegation, should GPT-Live make one.
-type probeTools struct{}
+// delegation streams the question in and reports GPT-Live's delegation of
+// it: when it delegated, and when the backend's answer began to play.
+func delegation(ctx context.Context, cfg *probeConfig, in *feeder, tools *probeTools, rec *recording, out io.Writer) error {
+	wait := cfg.DelegateWait
+	if wait <= 0 {
+		wait = delegateWait
+	}
+	in.ask <- cfg.Ask
+	var ended time.Time
+	select {
+	case ended = <-in.ended:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	printf(out, "question: %.2f s of audio sent\n", float64(len(cfg.Ask))/16000)
+	var called time.Time
+	select {
+	case called = <-tools.called:
+	case <-time.After(wait):
+		return fmt.Errorf("delegation: GPT-Live did not delegate the question within %v of its end", wait)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		if at, ok := rec.firstAfter(called); ok {
+			printf(out, "delegation: GPT-Live delegated %v after the question ended; the backend answered at once, and its answer began playing %v after that\n", called.Sub(ended).Round(time.Millisecond), at.Sub(called).Round(time.Millisecond))
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("delegation: GPT-Live delegated %v after the question ended, but said nothing of the backend's answer within %v", called.Sub(ended).Round(time.Millisecond), wait)
+		}
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	// Let the answer play to its end, for its words and timeline.
+	for last := rec.duration(); ; {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if now := rec.duration(); now == last {
+			return nil
+		} else {
+			last = now
+		}
+	}
+}
 
-func (probeTools) Run(_ context.Context, c voice.ToolCall) (json.RawMessage, error) {
+// readQuestion reads a spoken question from a WAV file: mono PCM16 at 16 kHz.
+func readQuestion(path string) ([]int16, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read the question: %w", err)
+	}
+	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return nil, fmt.Errorf("the question %s is not a WAV file", path)
+	}
+	var pcm []byte
+	okFormat := false
+	for i := 12; i+8 <= len(data); {
+		id, size := string(data[i:i+4]), int(binary.LittleEndian.Uint32(data[i+4:]))
+		body := data[i+8 : min(len(data), i+8+size)]
+		switch id {
+		case "fmt ":
+			if len(body) < 16 {
+				return nil, fmt.Errorf("the question %s has a short fmt chunk", path)
+			}
+			kind, channels := binary.LittleEndian.Uint16(body), binary.LittleEndian.Uint16(body[2:])
+			rate, bits := binary.LittleEndian.Uint32(body[4:]), binary.LittleEndian.Uint16(body[14:])
+			if kind != 1 || channels != 1 || rate != 16000 || bits != 16 {
+				return nil, fmt.Errorf("the question %s is format %d, %d channels, %d Hz, %d bits; want PCM, 1 channel, 16000 Hz, 16 bits", path, kind, channels, rate, bits)
+			}
+			okFormat = true
+		case "data":
+			pcm = body
+		}
+		i += 8 + size + size%2
+	}
+	if !okFormat || len(pcm) == 0 {
+		return nil, fmt.Errorf("the question %s has no PCM audio", path)
+	}
+	out := make([]int16, len(pcm)/2)
+	for i := range out {
+		out[i] = int16(binary.LittleEndian.Uint16(pcm[2*i:]))
+	}
+	return out, nil
+}
+
+// probeTools is the probe's backend: it answers a delegation, and says when.
+type probeTools struct{ called chan time.Time }
+
+func (t *probeTools) Run(_ context.Context, c voice.ToolCall) (json.RawMessage, error) {
 	if c.Name != voice.AnswerTool {
 		return nil, fmt.Errorf("the probe has no tool %q", c.Name)
 	}
-	return json.Marshal(voice.AnswerResult{Say: "The probe's backend answered, so delegation works."})
+	select {
+	case t.called <- time.Now():
+	default:
+	}
+	return json.Marshal(voice.AnswerResult{Say: delegationAnswer})
 }
 
-// recording is the speaker output for the probe: it keeps the speech.
+// recording is the speaker output for the probe: it keeps the speech, and
+// when each piece of it arrived.
 type recording struct {
-	mu    sync.Mutex
-	pcm   []byte
-	first time.Time
+	mu     sync.Mutex
+	pcm    []byte
+	first  time.Time
+	writes []time.Time
 }
 
 func (r *recording) Begin() voice.Playback { return r }
@@ -435,11 +595,25 @@ func (r *recording) Write(_ context.Context, frame []byte, format audio.AudioFor
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 	if r.first.IsZero() {
-		r.first = time.Now()
+		r.first = now
 	}
 	r.pcm = append(r.pcm, frame...)
+	r.writes = append(r.writes, now)
 	return nil
+}
+
+// firstAfter is when the first speech after t arrived.
+func (r *recording) firstAfter(t time.Time) (time.Time, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, w := range r.writes {
+		if w.After(t) {
+			return w, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (r *recording) Drain(context.Context) error { return nil }
@@ -457,7 +631,10 @@ func (r *recording) firstAt() (time.Time, bool) {
 }
 
 // wav is the speech as a WAV file: mono PCM16 at gptlive.SampleRate.
-func (r *recording) wav() []byte {
+func (r *recording) wav() []byte { return r.wavAt(gptlive.SampleRate) }
+
+// wavAt is the speech as a WAV file of mono PCM16 at rate.
+func (r *recording) wavAt(rate int) []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	h := make([]byte, 44, 44+len(r.pcm))
@@ -467,8 +644,8 @@ func (r *recording) wav() []byte {
 	binary.LittleEndian.PutUint32(h[16:], 16)
 	binary.LittleEndian.PutUint16(h[20:], 1)
 	binary.LittleEndian.PutUint16(h[22:], 1)
-	binary.LittleEndian.PutUint32(h[24:], gptlive.SampleRate)
-	binary.LittleEndian.PutUint32(h[28:], gptlive.SampleRate*2)
+	binary.LittleEndian.PutUint32(h[24:], uint32(rate))
+	binary.LittleEndian.PutUint32(h[28:], uint32(rate*2))
 	binary.LittleEndian.PutUint16(h[32:], 2)
 	binary.LittleEndian.PutUint16(h[34:], 16)
 	copy(h[36:], "data")

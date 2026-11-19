@@ -57,7 +57,17 @@ type standIns struct {
 	// nil sends 1.2 s of speech and its words.
 	answer func(send func(any), at func() int64)
 	turns  atomic.Int32
+	// delegate makes the Live server delegate once it has heard loud input
+	// audio and then quiet, as GPT-Live does for a spoken question.
+	delegate  bool
+	loudHeard bool
+	delegated bool
+	// answered gets the commentary returned on the delegation.
+	answered chan string
 }
+
+// probeDelegation is the stand-in's delegation id.
+const probeDelegation = "item_probe"
 
 // inputMs is the stand-in's timeline now: the input audio received, plus
 // the time since the last of it arrived.
@@ -71,7 +81,7 @@ func (s *standIns) inputMs() int64 {
 
 func newStandIns(t *testing.T) *standIns {
 	t.Helper()
-	s := &standIns{bearer: make(chan string, 1), said: make(chan string, 8), start: make(chan map[string]any, 1)}
+	s := &standIns{bearer: make(chan string, 1), said: make(chan string, 8), start: make(chan map[string]any, 1), answered: make(chan string, 4)}
 	s.token = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -105,11 +115,12 @@ func newStandIns(t *testing.T) *standIns {
 		}
 		for {
 			var ev struct {
-				Type    string         `json:"type"`
-				EventID string         `json:"event_id"`
-				Content string         `json:"content"`
-				Audio   string         `json:"audio"`
-				Session map[string]any `json:"session"`
+				Type         string         `json:"type"`
+				EventID      string         `json:"event_id"`
+				Content      string         `json:"content"`
+				Audio        string         `json:"audio"`
+				DelegationID *string        `json:"delegation_id"`
+				Session      map[string]any `json:"session"`
 			}
 			if err := ws.ReadJSON(&ev); err != nil {
 				return
@@ -128,10 +139,33 @@ func newStandIns(t *testing.T) *standIns {
 					if time.Now().UnixMilli()-s.startedAt.Load() < 300 {
 						s.leadIn.Add(n)
 					}
+					if s.delegate && !s.delegated {
+						loud := false
+						for i := 0; i+1 < len(b); i += 2 {
+							if v := int16(uint16(b[i]) | uint16(b[i+1])<<8); v > 2000 || v < -2000 {
+								loud = true
+								break
+							}
+						}
+						if loud {
+							s.loudHeard = true
+						} else if s.loudHeard {
+							s.delegated = true
+							send(map[string]any{"type": "session.delegation.created", "event_id": "e5", "offset_ms": s.inputMs(), "delegation": map[string]any{"id": probeDelegation, "type": "delegation", "target": "client"}})
+						}
+					}
 				}
+			case "session.thinking.append":
+				send(map[string]any{"type": "session.thinking.appended", "event_id": "e6", "client_event_id": ev.EventID})
 			case "session.commentary.append":
-				s.said <- ev.Content
 				send(map[string]any{"type": "session.commentary.appended", "event_id": "e2", "client_event_id": ev.EventID})
+				if ev.DelegationID != nil && *ev.DelegationID == probeDelegation {
+					s.answered <- ev.Content
+					send(transcript("The backend says delegation works.", s.inputMs()))
+					send(speechDelta(time.Second))
+					continue
+				}
+				s.said <- ev.Content
 				turn := int(s.turns.Add(1)) - 1
 				if s.answer != nil {
 					go s.answer(send, s.inputMs)
@@ -452,5 +486,76 @@ func TestTheProbeStartsEachTurnAtARandomPointOfAFrame(t *testing.T) {
 	}
 	if calls != probeTurns {
 		t.Fatalf("the probe drew %d phases for %d turns", calls, probeTurns)
+	}
+}
+
+// question is d of a loud tone at 16 kHz: the stand-in takes it for speech.
+func question(d time.Duration) []int16 {
+	pcm := make([]int16, int(d*16000/time.Second))
+	for i := range pcm {
+		pcm[i] = 8000
+		if i/18%2 == 0 {
+			pcm[i] = -8000
+		}
+	}
+	return pcm
+}
+
+// The probe asks GPT-Live a spoken question, which GPT-Live delegates to
+// the client, and reports the round trip: the delegation, the backend's
+// answer and its speech.
+func TestTheProbeReportsADelegationRoundTrip(t *testing.T) {
+	s := newStandIns(t)
+	s.delegate = true
+	cfg := s.config(t)
+	cfg.Settle, cfg.Turns = time.Second, 2
+	cfg.Ask = question(time.Second)
+	report, err := runProbe(t, s, &cfg)
+	if err != nil {
+		t.Fatalf("probe: %v\n%s", err, report)
+	}
+	select {
+	case got := <-s.answered:
+		if got != delegationAnswer {
+			t.Errorf("the delegation was answered %q, want the probe's answer", got)
+		}
+	default:
+		t.Error("the probe returned no answer on the delegation")
+	}
+	for _, want := range []string{"question: 1.00 s of audio sent", "delegation: GPT-Live delegated", "the backend answered", "its answer began playing", "result: PASS"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report does not say %q:\n%s", want, report)
+		}
+	}
+}
+
+func TestTheProbeFailsWhenGPTLiveDoesNotDelegate(t *testing.T) {
+	s := newStandIns(t)
+	cfg := s.config(t)
+	cfg.Settle, cfg.Turns = time.Second, 2
+	cfg.Ask = question(time.Second)
+	cfg.DelegateWait = 2 * time.Second
+	if report, err := runProbe(t, s, &cfg); err == nil || !strings.Contains(err.Error(), "did not delegate") {
+		t.Fatalf("probe whose question GPT-Live did not delegate = %v, want that failure\n%s", err, report)
+	}
+}
+
+func TestTheProbeReadsAQuestionWAV(t *testing.T) {
+	dir := t.TempDir()
+	rec := &recording{pcm: []byte{1, 0, 2, 0, 0xff, 0xff}}
+	good := filepath.Join(dir, "q.wav")
+	if err := os.WriteFile(good, rec.wavAt(16000), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pcm, err := readQuestion(good)
+	if err != nil || fmt.Sprint(pcm) != "[1 2 -1]" {
+		t.Fatalf("readQuestion = %v, %v; want [1 2 -1]", pcm, err)
+	}
+	bad := filepath.Join(dir, "q24.wav")
+	if err := os.WriteFile(bad, rec.wavAt(24000), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readQuestion(bad); err == nil || !strings.Contains(err.Error(), "16000") {
+		t.Fatalf("readQuestion of a 24 kHz file = %v, want a refusal naming 16000 Hz", err)
 	}
 }
