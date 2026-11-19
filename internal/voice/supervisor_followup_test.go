@@ -385,8 +385,8 @@ func TestAFollowUpTurnIsMarked(t *testing.T) {
 
 func followUpMarks(xs []Exchange) []bool {
 	marks := make([]bool, len(xs))
-	for i, x := range xs {
-		marks[i] = x.FollowUpTurn
+	for i := range xs {
+		marks[i] = xs[i].FollowUpTurn
 	}
 	return marks
 }
