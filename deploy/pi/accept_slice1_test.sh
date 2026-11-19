@@ -142,9 +142,12 @@ printf 'HID_ID=0003:0000046D:0000C52B\n' >"$sysfs/class/hidraw/hidraw0/device/ue
 printf 'HID_ID=0003:000027B8:000001ED\n' >"$sysfs/class/hidraw/hidraw1/device/uevent"
 : >"$dev/hidraw0"
 : >"$dev/hidraw1"
-sleep 60 &
+# The fake recorder outlives the whole test, whose CI step stops at 10 minutes, so the EXIT trap never
+# meets a recorder that has already ended; and a kill the trap makes of a process that has ended does
+# not stop the trap under set -e.
+sleep 600 &
 recorder=$!
-trap 'kill -CONT "$recorder" 2>/dev/null; kill "$recorder" 2>/dev/null; rm -rf -- "$state_dir"' EXIT
+trap 'kill -CONT "$recorder" 2>/dev/null || :; kill "$recorder" ${holder:-} ${stopper:-} 2>/dev/null || :; rm -rf -- "$state_dir"' EXIT
 stopped() {
   local state
   for _ in {1..100}; do
@@ -154,36 +157,102 @@ stopped() {
   done
   return 1
 }
-# The stop waits at most 5 s for the light's lock (flock -w 5), the Light hang step's own bound. Of
-# those 5 s the test takes its 0.5 s hold and the start of the one flock that lets the light go,
-# however slowly processes start on a loaded runner: until then it waits with shell builtins only
-# (reads of /proc, and timed-out reads of a pipe nothing writes to), and it runs ps only after.
-mkfifo "$state_dir/tick"
-exec {tick}<>"$state_dir/tick"
+# proc_state PID sets pstate to PID's state letter, or to "gone" once PID has exited; builtins only.
+proc_state() {
+  local stat
+  if read -r stat 2>/dev/null <"/proc/$1/stat"; then
+    stat=${stat##*) }
+    pstate=${stat%% *}
+  else
+    pstate=gone
+  fi
+}
+# scan_locks reads /proc/locks once, builtins only: it sets light_id to the MAJOR:MINOR:INODE of the
+# lock the holder process holds, and light_waited to true if a process waits for that lock. It
+# matches one regular expression over the whole file, so each read stays cheap on a loaded runner,
+# whose /proc/locks can list hundreds of other locks.
+scan_locks() {
+  local locks='' re
+  read -r -d '' locks </proc/locks || :
+  if [[ -z $light_id ]]; then
+    re="(^|${nl})[0-9]+: FLOCK[[:space:]]+[A-Z]+[[:space:]]+[A-Z]+[[:space:]]+${holder}[[:space:]]+([0-9a-f]+:[0-9a-f]+:[0-9]+)[[:space:]]"
+    [[ $locks =~ $re ]] && light_id=${BASH_REMATCH[2]}
+  fi
+  light_waited=false
+  if [[ -n $light_id ]]; then
+    re="->[[:space:]]+FLOCK[^${nl}]*[[:space:]]${light_id}[[:space:]]"
+    [[ $locks =~ $re ]] && light_waited=true
+  fi
+  return 0
+}
+nl=$'\n'
+# The stop waits at most 5 s for the light's lock (flock -w 5), the Light hang step's own bound. While
+# the light's lock is held, the test starts no process, however slowly processes start on a loaded
+# runner: it waits with shell builtins only (reads of /proc, and timed-out reads of a pipe nothing
+# writes to), so of those 5 s it takes only its 1 s watch and the release.
+stop_command=$(light_locked_stop_command "$recorder" "$sysfs" "$dev")
+mkfifo "$state_dir/tick" "$state_dir/release"
+exec {tick}<>"$state_dir/tick" {release}<>"$state_dir/release"
 # The other HID device's lock is not the light's: the test holds it throughout.
 exec {other_lock}<"$dev/hidraw0"
 flock "$other_lock"
-# The recorder is inside a command to the light, so it holds the light's lock.
-exec {light_lock}<"$dev/hidraw1"
-flock "$light_lock"
-bash -c "$(light_locked_stop_command "$recorder" "$sysfs" "$dev")" &
-stopper=$!
-# Once the stop's shell has run its command, a stop that did not wait for the lock has stopped the
-# recorder within the 0.5 s the test then holds it.
-for _ in {1..1000}; do
-  read -r stopper_command <"/proc/$stopper/comm" 2>/dev/null || break
-  [[ $stopper_command == bash ]] || break
+# The recorder is inside a command to the light, so it holds the light's lock: a flock process holds
+# it until the test kills it. It is a live process because a container's /proc/locks hides the lock
+# of a process that has exited, with the processes that wait for it; -o keeps the lock from its
+# command, which ends when the test closes the release pipe.
+light_id=''
+flock -o "$dev/hidraw1" head -c 1 "$state_dir/release" >/dev/null {tick}<&- {release}<&- {other_lock}<&- &
+holder=$!
+deadline=$((${EPOCHREALTIME//[!0-9]/} + 30000000))
+until scan_locks; [[ -n $light_id ]]; do
+  ((${EPOCHREALTIME//[!0-9]/} < deadline)) || fail "could not find the test's own hold on the blink(1)'s lock in /proc/locks"
   read -r -t 0.01 -u "$tick" _ || :
 done
-read -r -t 0.5 -u "$tick" _ || :
-read -r recorder_stat <"/proc/$recorder/stat"
-recorder_state=${recorder_stat##*) }
-flock -u "$light_lock"
-[[ $recorder_state != T* ]] || fail "the Light hang step stopped the recorder while it held the blink(1)'s lock"
+bash -c "$stop_command" {tick}<&- {release}<&- {other_lock}<&- &
+stopper=$!
+# The stop must wait for the light's lock, which /proc/locks shows whether or not its shell execs
+# flock, and must not stop the recorder until the test lets the light go: neither before it waits,
+# nor in the 1 s the test then holds the lock. A stop that does not wait for the lock fails however
+# late it stops the recorder; one that waits for another device's lock fails within 30 s, even with
+# no time limit of its own.
+deadline=$((${EPOCHREALTIME//[!0-9]/} + 30000000))
+waited_since=''
+while :; do
+  proc_state "$recorder"
+  [[ $pstate != T* ]] || fail "the Light hang step stopped the recorder while it held the blink(1)'s lock"
+  now=${EPOCHREALTIME//[!0-9]/}
+  if [[ -n $waited_since ]]; then
+    ((now - waited_since < 1000000)) || break
+  else
+    scan_locks
+    if [[ $light_waited == true ]]; then
+      waited_since=$now
+    else
+      proc_state "$stopper"
+      if [[ $pstate == gone || $pstate == Z ]]; then
+        proc_state "$recorder"
+        [[ $pstate != T* ]] || fail "the Light hang step stopped the recorder while it held the blink(1)'s lock"
+        fail "the Light hang step's stop ended without waiting for the blink(1)'s lock"
+      fi
+      ((now < deadline)) || fail "the Light hang step's stop did not wait for the blink(1)'s lock within 30 s"
+    fi
+  fi
+  read -r -t 0.01 -u "$tick" _ || :
+done
+# Let the light go: the holder dies, and its lock with it.
+kill "$holder"
+deadline=$((${EPOCHREALTIME//[!0-9]/} + 10000000))
+until proc_state "$stopper"; [[ $pstate == gone || $pstate == Z ]]; do
+  ((${EPOCHREALTIME//[!0-9]/} < deadline)) || fail "the Light hang step's stop did not end within 10 s of the blink(1) being free"
+  read -r -t 0.01 -u "$tick" _ || :
+done
 wait "$stopper" || fail "the Light hang step's stop failed once the blink(1) was free"
+wait "$holder" || :
+stopper='' holder=''
 stopped || fail "the Light hang step did not stop the recorder once the blink(1) was free"
+flock -n "$dev/hidraw1" true || fail "the Light hang step's stop kept the blink(1)'s lock"
 kill -CONT "$recorder"
-exec {light_lock}<&- {other_lock}<&- {tick}<&-
+exec {other_lock}<&- {tick}<&- {release}<&-
 # With no blink(1), the stop fails and stops nothing.
 rm -- "$sysfs/class/hidraw/hidraw1/device/uevent"
 if bash -c "$(light_locked_stop_command "$recorder" "$sysfs" "$dev")"; then
