@@ -370,17 +370,14 @@ func (c *Concierge) routingLine(ctx context.Context, turn string) string {
 }
 
 // lead is what the voice says before the facts (R6): the issue a search
-// chose, by key and the start of its title. A turn that named the key hears
-// none.
+// chose, by its key. The first fact waits behind it, so it is short: live,
+// the key and the title held a fact ready at 1.2 s until 7.2 s. A turn that
+// named the key hears none.
 func (r *reading) lead() []string {
 	if r.key == "" || !r.searched {
 		return nil
 	}
-	full := "I took " + r.key + "."
-	if title := titleStart(r.title); title != "" {
-		full = "I took " + r.key + ": " + title + "."
-	}
-	return []string{spokenLine(full, "I took "+r.key+".")}
+	return []string{"I took " + r.key + "."}
 }
 
 // maxHolderWords bounds the holder's case line (R6).
@@ -534,10 +531,10 @@ func fewestWords(turn string) string {
 		parts := camelNumber.FindStringSubmatch(word)
 		return strings.ToLower(parts[1]) + " " + strings.ToLower(parts[2])
 	})
-	question = strings.TrimRight(question, " .?!,;:")
-	if question == "" {
+	if strings.Trim(question, " .?!,;:") == "" {
 		question = strings.Join(strings.Fields(turn), " ")
 	}
+	question = strings.TrimRight(question, " .?!,;:")
 	question = direct(question)
 	if runes := []rune(question); len(runes) > maxQuestionChars {
 		question = string(runes[:maxQuestionChars])
@@ -551,43 +548,69 @@ func fewestWords(turn string) string {
 var (
 	// routingClause is what a person says of the holder before the question
 	// itself: "who holds the issue about X when …", "on the realtime voice
-	// whether …". It ends at the question's first word, which it keeps.
-	routingClause = regexp.MustCompile(`(?i)^(?:(?:who|that)\s+(?:holds|is\s+holding|owns|is\s+working\s+on|works\s+on)|on|for|about|of|working\s+on|holding)\s+.*?\b(when|whether|if|what|how|why|where|which|who)\b`)
+	// whether …", "for the cache, is it …". It ends at the first comma, which
+	// goes with it, or at the question's first word, which it keeps.
+	routingClause = regexp.MustCompile(`(?i)^(?:(?:who|that)\s+(?:holds|is\s+holding|owns|is\s+working\s+on|works\s+on)|on|for|about|of|working\s+on|holding)\s+[^,;]*?(?:[,;]\s*|\b(when|whether|if|what|how|why|where|which|who)\b)`)
 	// camelNumber is Deepgram's "SliceOne" for "slice one".
 	camelNumber = regexp.MustCompile(`\b([A-Z][a-z]+)(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\b`)
 	// auxiliaries are the verbs a direct question puts before its subject.
 	auxiliaries = set(strings.Fields("is are was were will would can could should shall may might must has have had does do did"))
-	// howWords join "how" in a question's first phrase: "how long".
+	// howWords join "how" in a question's first phrase: "how long"; after
+	// "how many" and "how much", the noun joins too.
 	howWords = set(strings.Fields("long many much soon often far big old late early"))
+	// questionWords start a question.
+	questionWords = set(strings.Fields("when where why how what which who whom whose whether"))
 )
 
 // direct makes an embedded question direct, with a capital and a question
 // mark: "whether the tap is merged" is "Is the tap merged?", "when slice one
-// will be ready" is "When will slice one be ready?". After "what", "which"
-// and "who", which may be a question's subject or its noun's, the words are
-// kept in their order.
+// will be ready" is "When will slice one be ready?". The verb that moves
+// stands before any comma, "and", "or", "but" or later question word. After
+// "what", "which" and "who", which may be a question's subject or its
+// noun's, and when a later clause is the question ("when the cache is gone,
+// what breaks"), the words keep their order.
 func direct(question string) string {
 	words := strings.Fields(question)
 	if len(words) == 0 {
 		return question
 	}
+	word := func(i int) string { return strings.ToLower(strings.Trim(words[i], ",;")) }
 	auxAfter := func(from int) int {
 		for i := from; i < len(words); i++ {
-			if auxiliaries[strings.ToLower(words[i])] {
+			switch w := word(i); {
+			case auxiliaries[w]:
 				return i
+			case strings.HasSuffix(words[i], ",") || strings.HasSuffix(words[i], ";") || w == "and" || w == "or" || w == "but" || questionWords[w]:
+				return -1
 			}
 		}
 		return -1
 	}
-	switch first := strings.ToLower(words[0]); first {
-	case "whether", "if":
+	laterQuestion := false
+	for i := 1; i < len(words); i++ {
+		if strings.HasSuffix(words[i-1], ",") && questionWords[word(i)] {
+			laterQuestion = true
+		}
+	}
+	switch first := word(0); {
+	case laterQuestion:
+	case first == "whether" || first == "if":
+		if first == "whether" && len(words) > 2 && word(1) == "or" && word(2) == "not" {
+			words = append(words[:1:1], words[3:]...)
+		}
 		if i := auxAfter(2); i > 0 {
 			words = append(append([]string{words[i]}, words[1:i]...), words[i+1:]...)
 		}
-	case "when", "where", "why", "how":
+	case first == "when" || first == "where" || first == "why" || first == "how":
 		phrase := 1
-		if first == "how" && len(words) > 1 && howWords[strings.ToLower(words[1])] {
+		if first == "how" && len(words) > 1 && howWords[word(1)] {
 			phrase = 2
+			if (word(1) == "many" || word(1) == "much") && len(words) > 2 {
+				phrase = 3
+			}
+		}
+		if phrase < len(words) && strings.HasSuffix(word(phrase), "ly") {
+			phrase++ // "when exactly"
 		}
 		if i := auxAfter(phrase); i > phrase {
 			moved := append([]string{}, words[:phrase]...)

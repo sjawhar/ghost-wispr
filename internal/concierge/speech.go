@@ -45,7 +45,7 @@ func init() {
 		happening happen happened happens going go goes gone get got status update updates updated latest new news progress
 		now today yesterday tomorrow yet still again ever last next first days day weeks week hours hour minutes minute time
 		one two three lot lots much many more most less least other another same such own let lets like want need
-		hold holds holding held holder owns owned owner owning
+		holds holding held holder owns owned owner owning
 	`) {
 		searchStopwords[word] = true
 	}

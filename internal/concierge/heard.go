@@ -356,6 +356,8 @@ func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 	n := p.searches
 	p.searches = 0
 	p.cancelAll()
+	// A later answer reuses only a read made since this one.
+	p.current = ""
 	return n
 }
 
@@ -444,6 +446,11 @@ func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target st
 			key, _ := issue["key"].(string)
 			title, _ := issue["title"].(string)
 			found.candidates = append(found.candidates, candidate{key: key, title: title})
+		}
+		// With no one clear match the voice asks which issue (R5): the top
+		// hit's record would go unused.
+		if !found.clear {
+			return
 		}
 		if key, ok := issues[0]["key"].(string); ok && ctx.Err() == nil {
 			readIssue(key)

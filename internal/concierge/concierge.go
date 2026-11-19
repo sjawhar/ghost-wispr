@@ -561,7 +561,10 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 	c.projectsDown = err != nil && ctx.Err() == nil
 	if err != nil {
 		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
-		c.projectsRead = c.now().Add(time.Minute - projectsFor)
+		if ctx.Err() == nil {
+			// A stop is no failure: the next read may come at once.
+			c.projectsRead = c.now().Add(time.Minute - projectsFor)
+		}
 		return c.projects
 	}
 	known := make(map[string]bool, len(keys))
