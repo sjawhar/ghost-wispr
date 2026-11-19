@@ -56,6 +56,13 @@ type Recorder interface {
 	StartSession(sessionID string) error
 	EndSession(sessionID string) (string, error)
 	DiscardUnsaved() string
+	// HoldPreroll keeps all the audio from now on to lead the next session's
+	// recording, after the audio that leads it already, until that session
+	// starts or ReleasePreroll; it does nothing while a recording is open.
+	HoldPreroll()
+	// ReleasePreroll ends a hold whose words opened no session: only the
+	// usual preroll then leads the next session.
+	ReleasePreroll()
 }
 
 type Summarizer interface {

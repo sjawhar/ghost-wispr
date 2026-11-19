@@ -121,14 +121,17 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 		// session on this signal saves them too.
 		defer m.finalizeReplied()
 	}
-	if len(mr.Channel.Alternatives) == 0 {
-		return nil
+	sentence := ""
+	if len(mr.Channel.Alternatives) > 0 {
+		sentence = strings.TrimSpace(mr.Channel.Alternatives[0].Transcript)
 	}
-
-	sentence := strings.TrimSpace(mr.Channel.Alternatives[0].Transcript)
 	if sentence == "" {
+		if mr.IsFinal {
+			m.releasePreroll()
+		}
 		return nil
 	}
+	m.holdPreroll()
 
 	// Extract words from the Deepgram response.
 	words := make([]transcribe.Word, 0, len(mr.Channel.Alternatives[0].Words))
@@ -213,6 +216,40 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 	}
 
 	return nil
+}
+
+// holdPreroll keeps the audio for the next session's start from now on while
+// no session is open: Deepgram has heard words, which open a session only at
+// the end of their speech (flushBuffer), and the recording must hold them
+// from the first, as the live transcript does. The recorder leads the
+// session's recording with the held audio (Recorder.HoldPreroll). While
+// capture is paused it holds nothing: the resume drops that audio.
+func (m *Manager) holdPreroll() {
+	if m.recorder == nil {
+		return
+	}
+	m.mu.Lock()
+	idle := m.currentSessionID == "" && !m.capturePaused
+	m.mu.Unlock()
+	if idle {
+		m.recorder.HoldPreroll()
+	}
+}
+
+// releasePreroll ends the hold of holdPreroll once Deepgram has finalized
+// audio with no words while no session is open and none of its words wait to
+// open one: words it showed only as interim results were taken back, and they
+// open no session, so no more audio than the usual preroll leads the next.
+func (m *Manager) releasePreroll() {
+	if m.recorder == nil {
+		return
+	}
+	m.mu.Lock()
+	idle := m.currentSessionID == "" && m.buffer.Len() == 0
+	m.mu.Unlock()
+	if idle {
+		m.recorder.ReleasePreroll()
+	}
 }
 
 func (m *Manager) UtteranceEnd(_ *api.UtteranceEndResponse) error {
