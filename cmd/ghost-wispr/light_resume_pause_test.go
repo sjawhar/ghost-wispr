@@ -301,3 +301,57 @@ func TestReopenMicLogsAPauseDuringItsLightCheckAsAPause(t *testing.T) {
 		}
 	}
 }
+
+// TestAPauseDuringAMicOpensCheckLeavesTheNextResumeResuming fails if the mic
+// loop, when a pause cancels its open during the light's check, ends the
+// resuming state of a resume that came after that pause: capture then reads
+// mic_unavailable, not resuming, until the loop's next open has finished. The
+// loop called finishResume for the cancelled open (review of #93 by its
+// reviewer). Control: the state right after the later resume opened the gate.
+func TestAPauseDuringAMicOpensCheckLeavesTheNextResumeResuming(t *testing.T) {
+	capture := newCaptureGate(nil, nil, nil)
+	entered := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	release := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	var releases [2]sync.Once
+	let := func(i int) { releases[i].Do(func() { close(release[i]) }) }
+	var calls atomic.Int32
+	capture.checkLightPattern = func() error {
+		if i := int(calls.Add(1)) - 1; i < 2 {
+			close(entered[i])
+			<-release[i]
+		}
+		return nil
+	}
+	mic := newScriptedMic()
+	runMicLoop(t, capture, mic, io.Discard, func(time.Duration) {}, nil)
+	// Runs before the loop's cleanup, which waits for the loop.
+	t.Cleanup(func() { let(0); let(1) })
+	waitFor := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(testWait):
+			t.Fatalf("control: %s did not happen within %v", what, testWait)
+		}
+	}
+
+	mic.expectEvents(t, "stream")
+	capture.Pause()
+	mic.capture(t, []byte{1})
+	mic.expectEvents(t, "close")
+	capture.Resume()
+	waitFor(entered[0], "the open's light check")
+	capture.Pause() // cancels that open
+	capture.Resume()
+	waitOpen(t, capture)
+	if got := capture.MicHold(); got != captureResuming {
+		t.Fatalf("control: right after the later resume opened the gate, mic hold = %q, want %q", got, captureResuming)
+	}
+	let(0) // the cancelled open returns
+	waitFor(entered[1], "the next open's light check")
+	if got := capture.MicHold(); got != captureResuming {
+		t.Fatalf("while the open after a cancelled one checks the light, mic hold = %q, want %q: the cancelled open ended the later resume's state", got, captureResuming)
+	}
+	let(1)
+	mic.expectEvents(t, "open", "stream")
+}

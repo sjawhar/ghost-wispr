@@ -2071,8 +2071,9 @@ func streamMicWithRetry(
 			}
 			if err = capture.confirmMicOpen(); errors.Is(err, errMicStartPaused) {
 				// A pause came during the light's check: nothing is lit or
-				// opened, and the loop top waits for the next resume.
-				capture.finishResume()
+				// opened, and the loop top waits for the next resume. The
+				// resuming state is left to that resume's own open: a resume
+				// that came after the pause is still starting.
 				released = true
 				continue
 			} else if err != nil {
