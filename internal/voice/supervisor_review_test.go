@@ -152,3 +152,18 @@ func TestANewCallKeepsItsWakeChime(t *testing.T) {
 	frames := (len(WakeChime()) + 959) / 960
 	eventually(t, "the whole new wake chime", func() bool { return r.speaker.written(audio.InputChime)-before >= frames })
 }
+
+// TestOnlyAVoiceThatDrivesItsTurnGetsRoomAudio fails if voice A, which never
+// reads room audio, is given a tap (each buffer copied, then dropped and
+// logged as read too slowly), or a voice that drives its own turn is not.
+func TestOnlyAVoiceThatDrivesItsTurnGetsRoomAudio(t *testing.T) {
+	a := newRig(t, newFakeConcierge("fact"))
+	if sess := a.ask("what is happening?"); sess.x.Tap != nil {
+		t.Error("voice A got a tap of room audio it never reads")
+	}
+	b := newDrivingRig(t, time.Minute)
+	b.heard("Wispr, what is happening?", true, true)
+	if sess := b.waitSession(); sess.x.Tap == nil {
+		t.Error("a voice that drives its turn got no room audio")
+	}
+}

@@ -134,8 +134,9 @@ func TestTheTapsDropsAreLogged(t *testing.T) {
 	var mu sync.Mutex
 	var logs []string
 	c := newFakeConcierge()
-	c.hold = true
-	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) {
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
+		v := drivingVoice{r.voice} // a voice that reads room audio
+		cfg.Voice = func() Voice { return v }
 		cfg.Logf = func(format string, args ...any) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -143,7 +144,8 @@ func TestTheTapsDropsAreLogged(t *testing.T) {
 		}
 	})
 	r.tap.SetRate(16000)
-	r.ask("what is happening?")
+	r.heard("Wispr, what is happening?", true, true)
+	r.waitSession()
 	for range 2 * tapQueue {
 		if _, err := r.tap.Write(pcmBytes(4000, 0)); err != nil {
 			t.Fatal(err)

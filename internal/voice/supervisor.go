@@ -486,7 +486,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 		WakeAt:    t.At,
 		AskerTurn: strings.TrimSpace(m.Rest),
 		Recent:    s.recentLocked(),
-		Tap:       s.cfg.Tap.Open(wakeLag(t, m)),
+		Tap:       s.tapFor(voice, wakeLag(t, m)),
 		Out:       exchangeOutput{s: s, ex: ex},
 	}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
@@ -759,10 +759,10 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), answering: true, answer: p, wakeStart: -1, notified: map[string]bool{}}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
-	ex.x = Exchange{SessionID: p.SessionID, WakeAt: time.Now(), Recent: s.recentLocked(), Tap: s.cfg.Tap.Open(0), Out: exchangeOutput{s: s, ex: ex}}
+	voice := s.cfg.Voice()
+	ex.x = Exchange{SessionID: p.SessionID, WakeAt: time.Now(), Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
 	x := ex.x
-	voice := s.cfg.Voice()
 	s.spawn(func() {
 		s.open(ex, voice, &x, false)
 		select {
@@ -796,6 +796,16 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 			s.spoken(p.TaskID)
 		}
 	})
+}
+
+// tapFor opens the tap for voice when it drives its own turn and so hears the
+// room (voices B and C), replaying replay of the ring. Voice A never reads room
+// audio, so it gets none: nothing is copied or dropped for it.
+func (s *Supervisor) tapFor(voice Voice, replay time.Duration) <-chan audio.Frame {
+	if d, ok := voice.(TurnDriver); !ok || !d.DrivesTurn() {
+		return nil
+	}
+	return s.cfg.Tap.Open(replay)
 }
 
 func (s *Supervisor) spoken(taskID string) {

@@ -60,14 +60,13 @@ func TestEveryStopSilencesTheExchangeWithin100ms(t *testing.T) {
 	}
 }
 
-// TestAStopEndsTheTapStream fails if the voice's room audio keeps flowing
-// after a stop.
+// TestAStopEndsTheTapStream fails if the room audio of a voice that hears the
+// room keeps flowing after a stop.
 func TestAStopEndsTheTapStream(t *testing.T) {
-	c := newFakeConcierge()
-	c.hold = true
-	r := newRig(t, c)
+	r := newDrivingRig(t, time.Minute)
 	r.tap.SetRate(16000)
-	sess := r.ask("what is happening?")
+	r.heard("Wispr, what is happening?", true, true)
+	sess := r.waitSession()
 	r.closeGate()
 	eventually(t, "the tap stream closed", func() bool {
 		select {
