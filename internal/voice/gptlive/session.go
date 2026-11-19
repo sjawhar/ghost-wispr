@@ -929,8 +929,8 @@ func (s *session) awaitQuestion() bool {
 // questionLocked is the question for a delegation: what GPT-Live heard
 // since the last one, with the asker's words at the wake before it on the
 // first unless it heard them too. A delegation that heard nothing new asks
-// the last question again; with none, the last words heard, else the
-// meeting's last line, so a question never goes out empty.
+// the last question again; with none yet, nothing was heard at all, and it
+// asks the meeting's last line, so a question never goes out empty.
 func (s *session) questionLocked() string {
 	question := strings.TrimSpace(s.sinceAsk.String())
 	s.sinceAsk.Reset()
@@ -942,9 +942,6 @@ func (s *session) questionLocked() string {
 	}
 	if question == "" {
 		question = s.lastQuestion
-	}
-	if question == "" {
-		question = s.lastHeardLocked()
 	}
 	for i := len(s.x.Recent) - 1; question == "" && i >= 0; i-- {
 		question = strings.Join(strings.Fields(s.x.Recent[i].Text), " ")
@@ -982,16 +979,6 @@ func (s *session) answer(call voice.ToolCall) {
 	if err := s.deliver(s.ctx, call.ID, result); err != nil && s.ctx.Err() == nil {
 		s.log.Warn("gptlive: return the answer", "delegation", call.ID, "error", err)
 	}
-}
-
-// lastHeardLocked is the last thing GPT-Live heard the room say.
-func (s *session) lastHeardLocked() string {
-	for i := len(s.dialogue) - 1; i >= 0; i-- {
-		if !s.dialogue[i].wispr {
-			return strings.TrimSpace(s.dialogue[i].text.String())
-		}
-	}
-	return ""
 }
 
 // transcriptLocked is the meeting before the call, labelled by speaker, the

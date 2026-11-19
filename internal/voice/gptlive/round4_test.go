@@ -237,3 +237,55 @@ func TestAContextThatEndsAfterOpenEndsTheSession(t *testing.T) {
 	c.expect(evSessionClose)
 	waitClosed(t, s.Events())
 }
+
+// R4x3: the model's words that arrive while Close waits for session.closed
+// are not Wispr's speech: nothing of them played.
+func TestTheModelsWordsDuringCloseAreNotWisprs(t *testing.T) {
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{})))
+	got := make(chan string, 16)
+	go func() {
+		defer close(got)
+		for ev := range s.Events() {
+			if ev.Kind == voice.EventAgentText {
+				got <- ev.Text
+			}
+		}
+	}()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		for ev := range c.in {
+			if ev.Type == evSessionClose {
+				break
+			}
+		}
+		c.said("words after close")
+		c.send(map[string]any{"type": evSessionClosed, "event_id": "event_closed", "reason": "close_requested", "usage": map[string]any{"seconds": 1}})
+	}()
+	_ = s.Close()
+	<-served
+	for text := range got {
+		t.Fatalf("agent text %q arrived while the session closed", text)
+	}
+}
+
+// R4x2: an Interrupt after a speech has ended cuts nothing: that speech
+// played, and its words, however late they arrive, are Wispr's.
+func TestAnInterruptAfterASpeechEndedCutsNothing(t *testing.T) {
+	out := newFakeOutput()
+	srv := newLiveServer(t)
+	s, c, _ := openSession(t, srv, testExchange(out, newFakeTools(voice.AnswerResult{})))
+
+	at := c.sessionMs()
+	c.audioDelta(ramp(1000, 2400))
+	out.nextSpeech(t).waitSamples(t, 2400)
+	waitEvent(t, s, voice.EventSpeechEnded)
+	time.Sleep(speechGap + 100*time.Millisecond)
+	s.Interrupt()
+	c.saidAt("It is in review.", at)
+	c.said("Okay.")
+	if got := agentTexts(t, s, "Okay."); got[0] != "It is in review." {
+		t.Fatalf("agent text %q, want the ended speech's words: an Interrupt after it cut nothing", got)
+	}
+}

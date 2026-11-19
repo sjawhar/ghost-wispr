@@ -198,7 +198,9 @@ func TestASecondDelegationAsksOnlyWhatWasHeardSince(t *testing.T) {
 	}
 }
 
-func TestADelegationWithNothingNewHeardAsksTheLastWordsHeard(t *testing.T) {
+// A second delegation straight after the first, with nothing new heard,
+// asks the first question again.
+func TestASecondDelegationWithNothingNewRepeatsTheFirstQuestion(t *testing.T) {
 	x := testExchange(newFakeOutput(), newFakeTools(voice.AnswerResult{Say: "x"}))
 	x.AskerTurn = ""
 	srv := newLiveServer(t)
@@ -209,7 +211,7 @@ func TestADelegationWithNothingNewHeardAsksTheLastWordsHeard(t *testing.T) {
 	waitEvent(t, s, voice.EventToolCall)
 	c.delegate("item_2")
 	if q := answerArgs(t, waitEvent(t, s, voice.EventToolCall).Call.Args).Question; q != "Is ABC-5 done?" {
-		t.Fatalf("question %q, want the last words GPT-Live heard", q)
+		t.Fatalf("question %q, want the first question again", q)
 	}
 }
 

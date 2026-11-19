@@ -18,6 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/sjawhar/ghost-wispr/internal/voice"
 	"github.com/sjawhar/ghost-wispr/internal/voice/gptlive"
 )
 
@@ -306,5 +307,38 @@ func TestTheProbeTurnsOffGoogleClientCertificatesUnlessSet(t *testing.T) {
 	clientCertificatesOff()
 	if got := os.Getenv(clientCertificateEnv); got != "true" {
 		t.Fatalf("clientCertificatesOff changed the caller's %s=true to %q", clientCertificateEnv, got)
+	}
+}
+
+// offsetSession is a session that reports the offsets it measured.
+type offsetSession struct {
+	voice.Session
+	offsets []time.Duration
+}
+
+func (s offsetSession) TimelineOffsets() []time.Duration { return s.offsets }
+
+// R4T9: a spread over 200 ms gets the sideband verdict; one within it gets
+// the margin's.
+func TestReportOffsetsNamesAnUnstableSpread(t *testing.T) {
+	var out bytes.Buffer
+	reportOffsets(&out, offsetSession{offsets: []time.Duration{-100 * time.Millisecond, 150 * time.Millisecond}})
+	if !strings.Contains(out.String(), "unstable") || !strings.Contains(out.String(), "sideband") {
+		t.Fatalf("report %q, want the unstable verdict for a 250 ms spread", out.String())
+	}
+	out.Reset()
+	reportOffsets(&out, offsetSession{offsets: []time.Duration{-50 * time.Millisecond, 50 * time.Millisecond}})
+	if !strings.Contains(out.String(), "covers it") {
+		t.Fatalf("report %q, want CutMargin to cover a 100 ms spread within 50 ms", out.String())
+	}
+	out.Reset()
+	reportOffsets(&out, offsetSession{offsets: []time.Duration{200 * time.Millisecond, 250 * time.Millisecond}})
+	if !strings.Contains(out.String(), "raise gptlive.CutMargin") {
+		t.Fatalf("report %q, want a larger margin for fragments 250 ms outside their speech", out.String())
+	}
+	out.Reset()
+	reportOffsets(&out, offsetSession{})
+	if !strings.Contains(out.String(), "UNKNOWN") {
+		t.Fatalf("report %q, want UNKNOWN with nothing measured", out.String())
 	}
 }
