@@ -503,6 +503,10 @@ func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string
 		c.logger.Info("concierge's rewrite for the ear failed R8's check", "try", try, "reason", reason)
 	}
 	c.logger.Warn("concierge speaks the fixed sentence: no rewrite for the ear passed R8's check", "reason", reason)
+	if issueKey != "" {
+		// R8: the text holds the key the question named.
+		return issueKey + ": " + fixedSentence
+	}
 	return fixedSentence
 }
 
