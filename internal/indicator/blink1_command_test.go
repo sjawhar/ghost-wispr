@@ -175,7 +175,11 @@ func TestACommandOpenDoesNotFailForAnotherCommand(t *testing.T) {
 // So a probe sleeps recorderPoll over and over, and a read during which the
 // probe woke later than commandPoll is not counted. The test reads until 40
 // reads are counted, and fails if the runtime woke late through too many reads
-// to count 40 in 10 s: it then measured nothing.
+// to count 40 in 10 s: it then measured nothing. A read is counted only once
+// the probe has woken after it ends, since a late sleep is recorded when the
+// probe wakes from it: counted earlier, a read that a late sleep then turned
+// out to cover ended the loop short of 40 (with the load average at 400 to
+// 2,000 on sami-devbox, 1 of 50 runs).
 func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
 	sysfsRoot, devRoot, _ := fakeBlink1Sysfs(t)
 	original := featureIOCTL
@@ -224,17 +228,25 @@ func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
 	}
 	late := watchLateTimers(stop, &loops)
 
-	// A read is counted only once the probe has ended: a late sleep that
-	// spans a read's end is recorded only when the probe wakes. The loop
-	// counts as it goes, so it reads a few more than it needs.
 	const counted = 40
 	type read struct {
 		from, to  time.Time
 		contended bool
 	}
 	var done []read
+	// cleanSettled counts the reads in done that the probe has woken after
+	// and found no late sleep during.
+	cleanSettled := func() int {
+		clean := 0
+		for _, r := range done {
+			if late.settled(r.to) && !late.during(r.from, r.to) {
+				clean++
+			}
+		}
+		return clean
+	}
 	start := time.Now()
-	for deadline, seen := start.Add(10*time.Second), 0; seen < counted+5 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	for deadline := start.Add(10 * time.Second); cleanSettled() < counted && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		from := time.Now()
 		_, _, _, err := recorder.ReadRGB()
 		r := read{from: from, to: time.Now(), contended: Contended(err)}
@@ -242,9 +254,6 @@ func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
 			t.Fatalf("the recorder's read: %v", err)
 		}
 		done = append(done, r)
-		if !late.during(r.from, r.to) {
-			seen++
-		}
 	}
 	took := time.Since(start)
 	close(stop)
@@ -275,10 +284,12 @@ func TestAWaitingRecorderGoesBeforeLightState(t *testing.T) {
 }
 
 // lateTimers is the stretches in which the runtime woke a sleep of
-// recorderPoll later than commandPoll (watchLateTimers).
+// recorderPoll later than commandPoll (watchLateTimers), and when the probe
+// last woke.
 type lateTimers struct {
 	mu    sync.Mutex
 	spans [][2]time.Time
+	woke  time.Time
 }
 
 // watchLateTimers sleeps recorderPoll over and over until stop closes, and
@@ -297,14 +308,25 @@ func watchLateTimers(stop <-chan struct{}, loops *sync.WaitGroup) *lateTimers {
 			}
 			from := time.Now()
 			time.Sleep(recorderPoll)
-			if to := time.Now(); to.Sub(from) > commandPoll {
-				late.mu.Lock()
+			to := time.Now()
+			late.mu.Lock()
+			if to.Sub(from) > commandPoll {
 				late.spans = append(late.spans, [2]time.Time{from, to})
-				late.mu.Unlock()
 			}
+			late.woke = to
+			late.mu.Unlock()
 		}
 	}()
 	return late
+}
+
+// settled reports whether the probe has woken since to: every late sleep
+// that could overlap a stretch ending at to is recorded by then, as the
+// probe's next sleep starts after it wakes.
+func (l *lateTimers) settled(to time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.woke.After(to)
 }
 
 // during reports whether a late sleep overlapped the stretch from from to to.
