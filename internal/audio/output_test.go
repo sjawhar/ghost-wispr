@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 )
 
 // playedFrame is one frame a fakeStream played, with the time its Write began.
@@ -205,12 +208,16 @@ func testContext(t *testing.T) context.Context {
 	return ctx
 }
 
-// TestOutputCancelSilencesTheInputWithin20ms fails if the voice is still
-// heard more than 20 ms after Cancel: the time from Cancel to the first
-// silent frame the stream plays, on a stream that plays in real time. It is
-// the bound barge-in needs (INFRA-4592 contract 2). The voice must then stay
-// silent, and its writer must learn of the cancel.
-func TestOutputCancelSilencesTheInputWithin20ms(t *testing.T) {
+// TestOutputCancelSilencesTheNextFrameWithin20ms fails if the mixer hands the
+// stream frames of the voice for more than 20 ms after Cancel: the time from
+// Cancel to the first silent frame, counted in the stream's time, on a stream
+// that plays in real time and holds nothing (what a device holds is the ALSA
+// path's: TestALSAOutputCancelSilencesTheVoiceWithin20ms). The stream's time
+// is the frame under way when Cancel comes and each frame of the voice the
+// mixer hands it after: at most one, which it mixed before Cancel took the
+// lock. The wall-clock time, logged, adds the machine's scheduling. The voice
+// must then stay silent, and its writer must learn of the cancel.
+func TestOutputCancelSilencesTheNextFrameWithin20ms(t *testing.T) {
 	stream := newFakeStream(48000)
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
 	ctx := testContext(t)
@@ -232,20 +239,25 @@ func TestOutputCancelSilencesTheInputWithin20ms(t *testing.T) {
 		cancelled := time.Now()
 		out.Cancel(InputVoice)
 		var silentAt time.Time
+		voiceAfter := 0
 		waitFor(t, "a silent frame after the cancel", func() bool {
+			voiceAfter = 0
 			for _, f := range stream.played() {
-				if f.at.After(cancelled) && silent(f.samples) {
+				if !f.at.After(cancelled) {
+					continue
+				}
+				if silent(f.samples) {
 					silentAt = f.at
 					return true
 				}
+				voiceAfter++
 			}
 			return false
 		})
-		latency := silentAt.Sub(cancelled)
-		if latency > 20*time.Millisecond {
-			t.Fatalf("trial %d: the voice played for %v after Cancel, want silence within 20 ms", trial, latency)
+		if streamTime := time.Duration(voiceAfter+1) * outputFrame; streamTime > 20*time.Millisecond {
+			t.Fatalf("trial %d: the stream played the voice for %v after Cancel (%d frames of it after the cancel), want silence within 20 ms", trial, streamTime, voiceAfter)
 		}
-		longest = max(longest, latency)
+		longest = max(longest, silentAt.Sub(cancelled))
 		if err := <-written; !errors.Is(err, ErrCancelled) {
 			t.Fatalf("trial %d: WriteAll after Cancel = %v, want ErrCancelled", trial, err)
 		}
@@ -256,7 +268,7 @@ func TestOutputCancelSilencesTheInputWithin20ms(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("longest time from Cancel to the first silent frame: %v", longest)
+	t.Logf("longest wall-clock time from Cancel to the first silent frame: %v", longest)
 }
 
 // TestOutputMixesTwoInputs fails if the voice and the chime do not sum into
@@ -672,6 +684,8 @@ func TestPlaybackWriteTakesOnlyWholeFramesOf20msOrLess(t *testing.T) {
 		{name: "half a stereo frame", frame: []byte{1, 0}, format: stereo48k, want: ErrInvalidFormat},
 		{name: "no rate", frame: []byte{1, 0}, format: AudioFormat{Channels: 1}, want: ErrInvalidFormat},
 		{name: "no channels", frame: []byte{1, 0}, format: AudioFormat{SampleRate: 48000}, want: ErrInvalidFormat},
+		{name: "a rate above 384 kHz", frame: []byte{1, 0}, format: AudioFormat{SampleRate: 1_000_000, Channels: 1}, want: ErrInvalidFormat},
+		{name: "more than 8 channels", frame: make([]byte, 18), format: AudioFormat{SampleRate: 48000, Channels: 9}, want: ErrInvalidFormat},
 		{name: "mp3", frame: []byte{1, 0}, format: AudioFormat{SampleRate: 48000, Channels: 1, Encoding: EncodingMP3}, want: ErrInvalidFormat},
 		{name: "20 ms", frame: constant(48000, 20*time.Millisecond, 1), format: mono48k},
 	} {
@@ -705,5 +719,155 @@ func TestOutputCloseEndsPlayback(t *testing.T) {
 	}
 	if err := out.Begin(InputVoice).Write(ctx, constant(48000, 20*time.Millisecond, 1), mono48k); !errors.Is(err, ErrOutputClosed) {
 		t.Fatalf("a write after Close = %v, want ErrOutputClosed", err)
+	}
+}
+
+// TestPlaybackDrainWaitsForTheStreamToTakeItsLastFrame fails if Drain returns
+// while the frame that holds the playback's last audio is still on its way to
+// the stream: a writer that drains and then reports the speech done, or reads
+// what played, would run ahead of the device.
+func TestPlaybackDrainWaitsForTheStreamToTakeItsLastFrame(t *testing.T) {
+	stream := newFakeStream(48000)
+	stream.block = make(chan struct{})
+	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
+	ctx := testContext(t)
+	pb := out.Begin(InputVoice)
+	if err := pb.Write(ctx, constant(48000, outputFrame, 1000), mono48k); err != nil {
+		t.Fatal(err)
+	}
+	stream.waitWriting(t) // the frame that holds all of it is mixed, and its write waits
+	drained := make(chan error, 1)
+	go func() { drained <- pb.Drain(ctx) }()
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned %v while the stream's write of the playback's frame was under way", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(stream.block)
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// countingStream plays like fakeStream, in real time, but keeps nothing: it
+// only counts its frames, so it allocates nothing itself.
+type countingStream struct{ frames atomic.Int64 }
+
+func (s *countingStream) Write(frame []int16) error {
+	s.frames.Add(1)
+	time.Sleep(time.Duration(len(frame)) * time.Second / 48000)
+	return nil
+}
+func (s *countingStream) Drop() (int, error) { return 0, nil }
+func (s *countingStream) Close() error       { return nil }
+
+// TestOutputMixesWithoutAllocating fails if the mixer allocates for each
+// frame while a writer waits for room, as one does for the whole of a long
+// speech: garbage at 100 frames a second makes the collector run under the
+// speech, and a collection can make the device run out.
+func TestOutputMixesWithoutAllocating(t *testing.T) {
+	stream := &countingStream{}
+	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
+	t.Cleanup(func() { _ = out.Close() })
+	ctx := testContext(t)
+	pb := out.Begin(InputVoice)
+	go func() { _ = pb.WriteAll(ctx, constant(48000, 3*time.Second, 1000), mono48k) }()
+	time.Sleep(300 * time.Millisecond) // the queue is full and the writer waits
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	frames := stream.frames.Load()
+	time.Sleep(500 * time.Millisecond)
+	runtime.ReadMemStats(&after)
+	frames = stream.frames.Load() - frames
+	if frames < 20 {
+		t.Fatalf("control: the stream played %d frames in 500 ms", frames)
+	}
+	// A few allocations come from the runtime and the test; one a frame is
+	// the mixer's.
+	if allocs := after.Mallocs - before.Mallocs; allocs >= uint64(frames)/2 {
+		t.Fatalf("%d allocations while the mixer wrote %d frames, with a writer waiting for room", allocs, frames)
+	}
+}
+
+// stallingStream never makes a write wait, as ALSA's null PCM, except that
+// every fifth write takes 3 ms, as when the process waited for a processor.
+// It keeps the most audio it was written ahead of real time.
+type stallingStream struct {
+	mu      sync.Mutex
+	start   time.Time
+	written time.Duration
+	lead    time.Duration
+	writes  int
+}
+
+func (s *stallingStream) Write(frame []int16) error {
+	s.mu.Lock()
+	now := time.Now()
+	if s.start.IsZero() {
+		s.start = now
+	}
+	s.written += time.Duration(len(frame)) * time.Second / 48000
+	s.lead = max(s.lead, s.written-now.Sub(s.start))
+	s.writes++
+	stall := s.writes%5 == 0
+	s.mu.Unlock()
+	if stall {
+		time.Sleep(3 * time.Millisecond)
+	}
+	return nil
+}
+func (s *stallingStream) Drop() (int, error) { return 0, nil }
+func (s *stallingStream) Close() error       { return nil }
+
+// TestOutputKeepsToRealTimeOnAStreamThatNeverWaits fails if the Output runs
+// more than outputAhead ahead of real time on a stream that never makes a
+// write wait, even when some writes are slow because the process waited, or
+// when Cancel empties the stream: completion, speech ends and the stream's
+// close would come before the audio's time, and a Cancel cannot take back the
+// lead.
+func TestOutputKeepsToRealTimeOnAStreamThatNeverWaits(t *testing.T) {
+	stream := &stallingStream{}
+	out := NewOutput(OutputConfig{Open: func(string) (PlaybackStream, int, error) { return stream, 48000, nil }})
+	t.Cleanup(func() { _ = out.Close() })
+	ctx := testContext(t)
+	for range 3 {
+		pb := out.Begin(InputVoice)
+		go func() { _ = pb.WriteAll(ctx, constant(48000, time.Second, 1000), mono48k) }()
+		time.Sleep(300 * time.Millisecond)
+		out.Cancel(InputVoice)
+	}
+	stream.mu.Lock()
+	lead := stream.lead
+	stream.mu.Unlock()
+	// The stream measures as each write begins, counting the frame it is
+	// given: the pacer's bound, that frame, and the next one's scheduling.
+	if lead > outputAhead+2*outputFrame {
+		t.Fatalf("the Output ran %v ahead of real time, want at most %v", lead, outputAhead)
+	}
+}
+
+// TestOutputKeepsNoFinishedPlayback fails if the Output keeps a playback that
+// has played all its audio once the next one has played, so that a process
+// that speaks for weeks grows by one playback per speech.
+func TestOutputKeepsNoFinishedPlayback(t *testing.T) {
+	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{newFakeStream(48000)}})
+	ctx := testContext(t)
+	play := func() *Playback {
+		pb := out.Begin(InputVoice)
+		if err := pb.WriteAll(ctx, constant(48000, outputFrame, 1000), mono48k); err != nil {
+			t.Fatal(err)
+		}
+		if err := pb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return pb
+	}
+	first := weak.Make(play())
+	play()
+	for range 5 {
+		runtime.GC()
+	}
+	if first.Value() != nil {
+		t.Fatal("the Output still holds a playback that played all its audio, after the next one played")
 	}
 }

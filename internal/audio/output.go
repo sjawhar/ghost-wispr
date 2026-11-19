@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sync"
 	"time"
 )
@@ -70,9 +71,10 @@ type PlaybackStream interface {
 	// Write plays frame, mono PCM16 at the stream's rate, and waits while the
 	// device's buffer is full.
 	Write(frame []int16) error
-	// Drop discards what the device holds and has not played, and reports
-	// how many frames that was; the next Write plays at once. A stream that
-	// cannot tell drops nothing and reports 0.
+	// Drop takes back what the device holds and the room has not heard,
+	// and reports how many of the last frames written that was, for the
+	// Output to write again without a cancelled input. A stream that cannot
+	// tell takes back nothing and reports 0.
 	Drop() (frames int, err error)
 	// Close stops the stream, dropping what the device holds, and releases
 	// the device.
@@ -105,11 +107,15 @@ type OutputConfig struct {
 type SpeechEvent struct {
 	Input   string
 	Started bool // false: the speech ended
-	// At is when the speech's first audio went to the stream, or its last.
+	// At is when the speech's first audio went to the stream, or its last,
+	// on the system clock: the room hears it later, by as much as the device
+	// holds (up to alsaBuffer on Linux).
 	At time.Time
 	// Played, on an end, is how much of the input's audio the stream took in
-	// the speech, less what a Cancel dropped from the device.
-	Played    time.Duration
+	// the speech, less what a Cancel took back from the device.
+	Played time.Duration
+	// Cancelled is true when a Cancel cut the speech: it took back audio the
+	// room had not heard, or dropped audio still queued.
 	Cancelled bool
 }
 
@@ -119,8 +125,9 @@ type SpeechEvent struct {
 // passed with nothing queued on any; Opening and Closing bracket it. Each
 // input takes PCM16 at the rate its writer declares and resamples it to the
 // stream's, holds at most InputQueue, and reports its speech starting and
-// ending. Cancel silences an input before the next frame: it drops what the
-// device holds and plays the other inputs' part of it again.
+// ending. Cancel silences an input before the next frame: it takes back what
+// the device holds (PlaybackStream.Drop) and plays the other inputs' part of
+// it again.
 //
 // On Linux the stream is the ALSA playback PCM the Device setting names, and
 // nothing else: no capture device, and no PortAudio, whose initialization
@@ -136,16 +143,18 @@ type Output struct {
 	// closeNow asks the mixer to close its stream before its next frame, for
 	// a PortAudio teardown (stopForTeardown) or Close.
 	closeNow bool
-	// dropNow asks the mixer to drop what the device holds and play it again
-	// without the inputs Cancel silenced.
+	// dropNow asks the mixer to take back what the device holds and play it
+	// again without the inputs Cancel silenced.
 	dropNow bool
-	// room is closed, and replaced, when the stream takes queued audio or a
-	// playback ends, while a Write or Drain waits (waiters).
-	room    chan struct{}
-	waiters int
+	// waiting holds the wake channel of each Write and Drain that waits for
+	// the stream to take audio or a playback to end.
+	waiting []chan struct{}
 	// mixed counts the frames mixed, and written the last of them the
 	// stream has taken: a Drain waits for its playback's last frame.
 	mixed, written uint64
+	// pos is how many samples the open stream has been given, the position
+	// of the next frame.
+	pos int64
 	// wake has a value once a Write queued audio, or on Close, for the mixer
 	// waiting without a stream.
 	wake chan struct{}
@@ -161,7 +170,7 @@ type Output struct {
 // guards it.
 type outputInput struct {
 	name string
-	live map[*Playback]struct{} // playbacks begun and not ended
+	gen  *playGen // the end every playback begun since the last one shares
 
 	// ring holds the queued audio, mono at rate, from head on; segments says
 	// which playback each run of it belongs to, oldest first.
@@ -179,17 +188,20 @@ type outputInput struct {
 	seq  uint64 // the frame being mixed
 
 	speaking  bool
-	cancelled bool // Cancel silenced its speech: the mixer drops and ends it
+	cancelled bool // Cancel silenced its speech: the mixer takes it back and ends it
+	cut       bool // Cancel dropped audio of the speech still queued
 	// silenced is the playback whose audio the stream took last before
-	// Cancel: what the drop keeps from the room comes off what it played.
-	silenced  *Playback
-	lastAudio time.Time
-	quietAt   time.Time // when it ran out of audio; zero while it has some
-	spoken    playedTime
-
-	contrib []float32 // its part in the frame being mixed
-	history []float32 // its part in the stream's last outputHistory: a ring that ends at histPos
-	histPos int
+	// Cancel: what Cancel takes back from the device comes off what it played.
+	silenced *Playback
+	// audioFrom and audioTo are the stream positions the speech's audio
+	// spans, so that a Cancel takes off only the audio it took back.
+	audioFrom, audioTo int64
+	lastAudio          time.Time
+	quietAt            time.Time // when it ran out of audio; zero while it has some
+	spoken             playedTime
+	contrib            []float32 // its part in the frame being mixed
+	history            []float32 // its part in the stream's last outputHistory: a ring that ends at histPos
+	histPos            int
 }
 
 type segment struct {
@@ -202,14 +214,21 @@ type segment struct {
 // playbacks in the order it was queued, so give an input one writer at a
 // time.
 type Playback struct {
-	out *Output
-	in  *outputInput
+	out  *Output
+	in   *outputInput
+	wake chan struct{} // signalled when a Write or Drain of it may go on
 	// Guarded by out.mu:
-	err     error  // why it ended: ErrCancelled, a stream failure, ErrOutputClosed
+	gen     *playGen
 	pending int    // samples queued and not yet taken by the stream
 	seq     uint64 // the frame that took its last sample
 	played  playedTime
 }
+
+// playGen is how the playbacks begun on an input since its last end ended:
+// err is nil until Cancel (ErrCancelled), a stream failure or Close
+// (ErrOutputClosed) ends them all. An input that ends starts a new one, so it
+// keeps no list of its playbacks.
+type playGen struct{ err error }
 
 // playedTime adds up audio from its sample count at each rate, exactly.
 type playedTime struct {
@@ -254,7 +273,6 @@ func NewOutput(cfg OutputConfig) *Output {
 	o := &Output{
 		cfg:       cfg,
 		inputs:    map[string]*outputInput{},
-		room:      make(chan struct{}),
 		wake:      make(chan struct{}, 1),
 		done:      make(chan struct{}),
 		listeners: map[int]func(SpeechEvent){},
@@ -271,15 +289,13 @@ func (o *Output) Begin(input string) *Playback {
 	defer o.mu.Unlock()
 	in := o.inputs[input]
 	if in == nil {
-		in = &outputInput{name: input, live: map[*Playback]struct{}{}}
+		in = &outputInput{name: input, gen: &playGen{}}
 		o.inputs[input] = in
 		o.order = append(o.order, in)
 	}
-	p := &Playback{out: o, in: in}
+	p := &Playback{out: o, in: in, wake: make(chan struct{}, 1), gen: in.gen}
 	if o.closed {
-		p.err = ErrOutputClosed
-	} else {
-		in.live[p] = struct{}{}
+		p.gen = &playGen{err: ErrOutputClosed}
 	}
 	return p
 }
@@ -300,8 +316,8 @@ func (p *Playback) Write(ctx context.Context, frame []byte, format AudioFormat) 
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for {
-		if p.err != nil {
-			return p.err
+		if p.gen.err != nil {
+			return p.gen.err
 		}
 		if frames == 0 {
 			return nil
@@ -317,7 +333,7 @@ func (p *Playback) Write(ctx context.Context, frame []byte, format AudioFormat) 
 			}
 			return nil
 		}
-		if err := o.waitRoom(ctx); err != nil {
+		if err := o.waitRoom(ctx, p.wake); err != nil {
 			return err
 		}
 	}
@@ -338,9 +354,17 @@ func (p *Playback) WriteAll(ctx context.Context, pcm []byte, format AudioFormat)
 	return nil
 }
 
+// maxRate and maxChannels bound the PCM16 a Write takes: past them the
+// resampler's filter grows long enough to keep the mixer from real time.
+const (
+	maxRate     = 384000
+	maxChannels = 8
+)
+
 // wholeFrames reports how many whole frames pcm holds in format.
 func wholeFrames(pcm []byte, format AudioFormat) (int, error) {
-	if format.Encoding != EncodingPCM16 || format.SampleRate <= 0 || format.Channels <= 0 {
+	if format.Encoding != EncodingPCM16 || format.SampleRate <= 0 || format.SampleRate > maxRate ||
+		format.Channels <= 0 || format.Channels > maxChannels {
 		return 0, fmt.Errorf("%w: %s at %d Hz with %d channels", ErrInvalidFormat, format.Encoding, format.SampleRate, format.Channels)
 	}
 	size := 2 * format.Channels
@@ -357,20 +381,20 @@ func (p *Playback) Drain(ctx context.Context) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for {
-		if p.err != nil {
-			return p.err
+		if p.gen.err != nil {
+			return p.gen.err
 		}
 		if p.pending == 0 && (in.last != p || in.idle()) && o.written >= p.seq {
 			return nil
 		}
-		if err := o.waitRoom(ctx); err != nil {
+		if err := o.waitRoom(ctx, p.wake); err != nil {
 			return err
 		}
 	}
 }
 
 // Played reports how much of the playback's audio the stream has taken, less
-// what a Cancel dropped from the device.
+// what a Cancel took back from the device before the room heard it.
 func (p *Playback) Played() time.Duration {
 	p.out.mu.Lock()
 	defer p.out.mu.Unlock()
@@ -378,35 +402,38 @@ func (p *Playback) Played() time.Duration {
 }
 
 // waitRoom waits, with mu released, until the stream takes audio or a
-// playback ends. The caller holds mu.
-func (o *Output) waitRoom(ctx context.Context) error {
-	room := o.room
-	o.waiters++
+// playback ends, signalled on wake, the waiting playback's. The caller holds
+// mu.
+func (o *Output) waitRoom(ctx context.Context, wake chan struct{}) error {
+	o.waiting = append(o.waiting, wake)
 	o.mu.Unlock()
-	defer func() {
-		o.mu.Lock()
-		o.waiters--
-	}()
+	defer o.mu.Lock()
 	select {
-	case <-room:
+	case <-wake:
 		return nil
 	case <-ctx.Done():
+		o.mu.Lock()
+		if i := slices.Index(o.waiting, wake); i >= 0 {
+			o.waiting = slices.Delete(o.waiting, i, i+1)
+		}
+		o.mu.Unlock()
 		return ctx.Err()
 	}
 }
 
 // changed wakes every Write and Drain that waits. The caller holds mu.
 func (o *Output) changed() {
-	if o.waiters > 0 {
-		close(o.room)
-		o.room = make(chan struct{})
+	for _, wake := range o.waiting {
+		signal(wake)
 	}
+	clear(o.waiting)
+	o.waiting = o.waiting[:0]
 }
 
 // Cancel silences input: it drops what the input holds, ends each of its
-// playbacks with ErrCancelled, and has the mixer drop what the device holds
-// and play the other inputs' part of it again, before its next frame. A
-// playback begun after Cancel plays.
+// playbacks with ErrCancelled, and has the mixer take back what the device
+// holds and play the other inputs' part of it again, before its next frame
+// (PlaybackStream.Drop). A playback begun after Cancel plays.
 func (o *Output) Cancel(input string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -414,10 +441,10 @@ func (o *Output) Cancel(input string) {
 	if in == nil {
 		return
 	}
-	last := in.last
+	last, cut := in.last, !in.idle()
 	in.end(ErrCancelled)
 	if in.speaking {
-		in.cancelled, in.silenced = true, last
+		in.cancelled, in.cut, in.silenced = true, cut, last
 		o.dropNow = true
 	}
 	o.changed()
@@ -484,13 +511,12 @@ func signal(c chan struct{}) {
 	}
 }
 
-// end drops what the input holds and ends each of its playbacks with err.
-// The caller holds the Output's mu.
+// end drops what the input holds and ends each of its playbacks with err: the
+// generation they share ends, and a new one begins. The caller holds the
+// Output's mu.
 func (in *outputInput) end(err error) {
-	for p := range in.live {
-		p.err = err
-	}
-	clear(in.live)
+	in.gen.err = err
+	in.gen = &playGen{}
 	in.head, in.n, in.flush = 0, 0, 0
 	clear(in.segments)
 	in.segments = in.segments[:0]
@@ -548,31 +574,46 @@ func (in *outputInput) pull() float32 {
 	in.spoken.add(in.rate, 1)
 	in.last = seg.pb
 	if seg.n--; seg.n == 0 {
-		in.segments = in.segments[1:]
+		// Shift the rest down, so that the array keeps no finished playback
+		// and appends reuse it.
+		k := copy(in.segments, in.segments[1:])
+		in.segments[k] = segment{}
+		in.segments = in.segments[:k]
 	}
 	return float32(s)
 }
 
-// render fills the input's part of the next frame at the stream's rate.
-func (in *outputInput) render(rate int) {
+// render fills the input's part of the next frame at the stream's rate, and
+// reports where in the frame its queued audio ends: the index past its last
+// sample that came from the queue, or -1 if none did.
+func (in *outputInput) render(rate int) (audioEnd int) {
 	if in.rs.from != in.rate || in.rs.to != rate {
 		in.rs.configure(in.rate, rate)
 	}
+	audioEnd = -1
 	if in.rs.bypass() {
 		for i := range in.contrib {
+			if in.n > 0 {
+				audioEnd = i + 1
+			}
 			in.contrib[i] = in.pull()
 		}
-		return
+		return audioEnd
 	}
+	lag := in.rs.lag() * rate / in.rate // output samples a pushed sample takes to reach the output
 	for i := range in.contrib {
 		in.contrib[i] = in.rs.output()
 		for range in.rs.step() {
+			if in.n > 0 {
+				audioEnd = i + 1 + lag
+			}
 			in.rs.push(in.pull())
 		}
 	}
 	if in.idle() {
 		in.rs.reset()
 	}
+	return audioEnd
 }
 
 // run is the Output's mixer: it waits for audio, then plays a stream until
@@ -618,15 +659,14 @@ func (o *Output) play() {
 		outputs.begin(o)
 		defer outputs.end(o)
 	}
-	var stream PlaybackStream
+	// A panic in a hook or in the stream's close touches no playback: one
+	// begun once the stream closed may be playing on the next.
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("speaker output panic recovered", "panic", r)
-			o.mu.Lock()
-			o.endAll(fmt.Errorf("speaker output: %v", r))
-			o.mu.Unlock()
 		}
 	}()
+	var stream PlaybackStream
 	// The output hooks bracket the stream, from before it opens until after
 	// it closes, on every path out of play.
 	o.cfg.Opening()
@@ -635,10 +675,15 @@ func (o *Output) play() {
 			_ = stream.Close()
 		}
 	})
-	o.mu.Lock()
-	closing := o.closeNow
-	o.mu.Unlock()
-	if closing {
+	// A panic while the stream is in use ends every playback before the
+	// stream closes (deferred last, so it runs first).
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("speaker output panic recovered", "panic", r)
+			o.fail(fmt.Errorf("speaker output: %v", r))
+		}
+	}()
+	if o.closing() {
 		return
 	}
 	var rate int
@@ -648,87 +693,182 @@ func (o *Output) play() {
 		err = fmt.Errorf("the stream reports %d Hz", rate)
 	}
 	if err != nil {
-		o.mu.Lock()
-		o.endAll(fmt.Errorf("open speaker stream: %w", err))
-		o.mu.Unlock()
+		o.fail(fmt.Errorf("open speaker stream: %w", err))
 		return
 	}
 	if err := o.mix(stream, rate); err != nil {
-		o.mu.Lock()
-		o.endAll(err)
-		o.mu.Unlock()
+		o.fail(err)
 	}
 }
 
+// closing reports whether a teardown or Close asks the mixer to close.
+func (o *Output) closing() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.closeNow
+}
+
+// fail ends every playback with err, as when the stream fails.
+func (o *Output) fail(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.endAll(err)
+}
+
+// mixStep is what the mixer does next.
+type mixStep int
+
+const (
+	stepWrite mixStep = iota // write the frame just mixed
+	stepIdle                 // the inputs have been idle for IdleClose: close once the device holds only silence
+	stepDrop                 // take back what the device holds, for a Cancel
+	stepClose                // close the stream
+)
+
 // mix writes frames of the mix to stream, at rate, until the inputs have been
-// idle for IdleClose or it is asked to close.
+// idle for IdleClose or it is asked to close. Each step that touches the
+// inputs runs under mu in a method of its own that unlocks on every path, a
+// panic's included.
 func (o *Output) mix(stream PlaybackStream, rate int) error {
 	n := rate * int(outputFrame/time.Millisecond) / 1000
 	frame := make([]int16, n)
 	sum := make([]float32, n)
 	hist := rate * int(outputHistory/time.Millisecond) / 1000
+	if b, ok := stream.(interface{ bufferFrames() int }); ok {
+		hist = max(hist, b.bufferFrames()+n) // what a granted buffer holds, and more
+	}
 	redo := make([]int16, hist)
+	o.startStream()
 	var idleSince time.Time
-	// The stream time written since a write last waited, at anchor.
-	anchor, ahead := time.Now(), time.Duration(0)
+	p := pacer{anchor: time.Now()}
+	// quiet is how many frames of silence the stream has been given since
+	// the last audio: once it holds no more than that, it plays only silence.
+	quiet := 0
 	for {
-		o.mu.Lock()
-		if o.closeNow {
-			o.endSpeeches(time.Now(), false)
-			o.mu.Unlock()
+		step, seq, active := o.next(frame, sum, rate, hist, &idleSince)
+		switch step {
+		case stepClose:
 			return nil
-		}
-		if o.dropNow {
-			o.dropNow = false
-			o.mu.Unlock()
-			dropped, err := stream.Drop()
-			if err != nil {
-				return fmt.Errorf("drop speaker stream: %w", err)
+		case stepIdle:
+			if q, ok := stream.(interface{ queuedFrames() int }); !ok || quiet >= q.queuedFrames() {
+				o.closeIdle()
+				return nil
 			}
-			o.mu.Lock()
-			dropped = min(max(dropped, 0), hist)
-			o.remix(redo[:dropped], sum, rate)
-			o.mu.Unlock()
-			for off := 0; off < dropped; off += n {
-				if err := stream.Write(redo[off:min(off+n, dropped)]); err != nil {
+		case stepDrop:
+			back, err := stream.Drop()
+			if err != nil {
+				return fmt.Errorf("take back speaker stream: %w", err)
+			}
+			if back > hist {
+				slog.Warn("speaker stream took back more than the Output keeps; the rest of the other inputs is lost", "frames", back, "kept", hist)
+				back = hist
+			}
+			o.retake(redo[:max(back, 0)], sum, rate)
+			// What the stream took back plays again: the stream time written
+			// is as before, so the pacer is not touched.
+			for off := 0; off < back; off += n {
+				if err := stream.Write(redo[off:min(off+n, back)]); err != nil {
 					return fmt.Errorf("write speaker stream: %w", err)
 				}
 			}
-			anchor, ahead = time.Now(), 0
 			continue
 		}
-		now := time.Now()
-		active := o.mixFrame(frame, sum, rate, hist, now)
-		switch {
-		case active:
-			idleSince = time.Time{}
-		case idleSince.IsZero():
-			idleSince = now
-		case now.Sub(idleSince) >= o.cfg.IdleClose:
-			o.endSpeeches(now, false)
-			o.mu.Unlock()
-			return nil
-		}
-		seq := o.mixed
-		o.mu.Unlock()
-
 		began := time.Now()
 		if err := stream.Write(frame); err != nil {
 			return fmt.Errorf("write speaker stream: %w", err)
 		}
-		o.mu.Lock()
-		o.written = seq
-		o.changed()
-		o.mu.Unlock()
-		// Keep to real time on a stream that never makes a write wait.
-		if time.Since(began) >= outputFrame/4 {
-			anchor, ahead = time.Now(), 0
-		} else if ahead += outputFrame; ahead > outputAhead {
-			if wait := ahead - outputAhead - time.Since(anchor); wait > 0 {
-				time.Sleep(wait)
-			}
+		o.wrote(seq)
+		p.wrote(time.Since(began), time.Now())
+		if active {
+			quiet = 0
+		} else {
+			quiet += n
 		}
 	}
+}
+
+// pacer keeps the mixer to real time on a stream that never makes a write
+// wait, as ALSA's null PCM: it holds a write back once the stream time
+// written since anchor runs more than outputAhead ahead of the time passed.
+// A stream that makes writes wait keeps time itself: after a run of such
+// writes the pacer takes its clock as the anchor, so that a device whose
+// clock runs a little fast is never held back. One slow write, as when the
+// process waited for a processor, does not count as the stream waiting.
+type pacer struct {
+	anchor  time.Time
+	written time.Duration
+	waited  int // writes in a row the stream made wait
+}
+
+// pacerWaits is how many writes in a row a stream must make wait, by half a
+// frame or more, before the pacer takes it to keep time.
+const pacerWaits = 4
+
+func (p *pacer) wrote(took time.Duration, now time.Time) {
+	p.written += outputFrame
+	if took >= outputFrame/2 {
+		p.waited++
+	} else {
+		p.waited = 0
+	}
+	if p.waited >= pacerWaits {
+		p.anchor, p.written = now, 0
+		return
+	}
+	if ahead := p.written - now.Sub(p.anchor); ahead > outputAhead {
+		time.Sleep(ahead - outputAhead)
+	}
+}
+
+// startStream starts the stream positions of a new stream.
+func (o *Output) startStream() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.pos = 0
+}
+
+// next decides the mixer's next step: close, take back for a Cancel, or
+// write the frame it mixes into frame, whose number it returns, with whether
+// any input had audio in it. It returns stepIdle, with a frame of silence to
+// write, once the inputs have been idle for IdleClose.
+func (o *Output) next(frame []int16, sum []float32, rate, hist int, idleSince *time.Time) (step mixStep, seq uint64, active bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	now := time.Now()
+	if o.closeNow {
+		o.endSpeeches(now, false)
+		return stepClose, 0, false
+	}
+	if o.dropNow {
+		o.dropNow = false
+		return stepDrop, 0, false
+	}
+	active = o.mixFrame(frame, sum, rate, hist, now)
+	switch {
+	case active:
+		*idleSince = time.Time{}
+	case idleSince.IsZero():
+		*idleSince = now
+	case now.Sub(*idleSince) >= o.cfg.IdleClose:
+		return stepIdle, o.mixed, false
+	}
+	return stepWrite, o.mixed, active
+}
+
+// closeIdle ends every speech as the stream closes for being idle.
+func (o *Output) closeIdle() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.endSpeeches(time.Now(), false)
+}
+
+// wrote records that the stream has taken frame seq, and wakes every Write
+// and Drain that waits.
+func (o *Output) wrote(seq uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.written = seq
+	o.changed()
 }
 
 // mixFrame mixes the inputs' next frame into frame, keeps each one's part in
@@ -752,15 +892,16 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 		} else {
 			queued := in.n > 0
 			in.seq = o.mixed
-			in.render(rate)
+			audioEnd := in.render(rate)
 			for i, c := range in.contrib {
 				sum[i] += c
 			}
-			if queued {
-				if !in.speaking {
-					in.speaking = true
-					o.emit(SpeechEvent{Input: in.name, Started: true, At: now})
-				}
+			if queued && !in.speaking {
+				in.speaking, in.audioFrom = true, o.pos
+				o.emit(SpeechEvent{Input: in.name, Started: true, At: now})
+			}
+			if audioEnd >= 0 {
+				in.audioTo = o.pos + int64(audioEnd)
 			}
 			in.lastAudio, in.quietAt = now, time.Time{}
 			active = true
@@ -775,27 +916,33 @@ func (o *Output) mixFrame(frame []int16, sum []float32, rate, hist int, now time
 	for i, s := range sum {
 		frame[i] = clip(s)
 	}
+	o.pos += int64(len(frame))
 	return active
 }
 
-// remix mixes again, into redo, the last len(redo) samples the stream took,
-// without the inputs Cancel silenced: it forgets their part, takes what the
-// drop kept from the room off what they played, and ends their speeches. sum
-// is scratch of at least a frame. The caller holds mu.
-func (o *Output) remix(redo []int16, sum []float32, rate int) {
-	dropped := time.Duration(len(redo)) * time.Second / time.Duration(rate)
+// retake mixes again, into redo, the last len(redo) samples the stream took
+// back, without the inputs Cancel silenced: it forgets their part, takes the
+// part of their audio the room will not hear off what they played, and ends
+// their speeches. sum is scratch of at least a frame.
+func (o *Output) retake(redo []int16, sum []float32, rate int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	back := int64(len(redo))
 	now := time.Now()
 	for _, in := range o.order {
 		if !in.cancelled {
 			continue
 		}
 		clear(in.history)
-		in.spoken.sub(dropped)
+		// The stream took back [pos-back, pos); of the speech's audio, the
+		// room will not hear what lies there.
+		lost := max(0, min(o.pos, in.audioTo)-max(o.pos-back, in.audioFrom))
+		unheard := time.Duration(lost) * time.Second / time.Duration(rate)
+		in.spoken.sub(unheard)
 		if in.silenced != nil {
-			in.silenced.played.sub(dropped)
-			in.silenced = nil
+			in.silenced.played.sub(unheard)
 		}
-		o.endSpeech(in, now, true)
+		o.endSpeech(in, now, in.cut || lost > 0)
 	}
 	for start := 0; start < len(redo); start += len(sum) {
 		part := redo[start:min(start+len(sum), len(redo))]
@@ -832,7 +979,7 @@ func (o *Output) endSpeech(in *outputInput, now time.Time, cancelled bool) {
 		at = now
 	}
 	o.emit(SpeechEvent{Input: in.name, At: at, Played: in.spoken.total(), Cancelled: cancelled})
-	in.speaking, in.cancelled, in.silenced, in.spoken, in.quietAt = false, false, nil, playedTime{}, time.Time{}
+	in.speaking, in.cancelled, in.cut, in.silenced, in.spoken, in.quietAt = false, false, false, nil, playedTime{}, time.Time{}
 }
 
 func clip(s float32) int16 {

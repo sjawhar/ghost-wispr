@@ -170,6 +170,37 @@ func TestOrchestrator_SpeakAndStatus(t *testing.T) {
 	}
 }
 
+// TestOrchestratorReportsEveryBytePlayed fails if a speech that played all of
+// its audio reports fewer bytes than it had: 2401 frames at 24 kHz last a
+// duration that is no whole number of nanoseconds, and truncating it loses a
+// frame.
+func TestOrchestratorReportsEveryBytePlayed(t *testing.T) {
+	provider := &mockProvider{
+		audio:  make([]byte, 2*2401),
+		format: audio.AudioFormat{SampleRate: 24000, Channels: 1, Encoding: audio.EncodingPCM16},
+	}
+	o := NewOrchestrator(provider, newTestSpeaker(t), OrchestratorOpts{MaxRequestsPerMin: 100})
+	defer o.Stop()
+	id, err := o.Speak("hello", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		status, _ := o.Status(id)
+		if status.Status == StatusCompleted {
+			if status.BytesWritten != 2*2401 {
+				t.Fatalf("bytes_written = %d, want all %d", status.BytesWritten, 2*2401)
+			}
+			return
+		}
+		if status.Status == StatusFailed || time.Now().After(deadline) {
+			t.Fatalf("status = %s (%s), want completed", status.Status, status.Error)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestOrchestratorWaitForSynthesisUsesProviderModelBeforePlaybackEnds(t *testing.T) {
 	provider := &mockProvider{
 		audio:  []byte{0x01, 0x00},

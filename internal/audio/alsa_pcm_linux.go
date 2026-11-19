@@ -101,6 +101,17 @@ func (p *cgoPCM) recover(rc int) int { return int(C.snd_pcm_recover(p.pcm, C.int
 func (p *cgoPCM) avail() int         { return int(C.snd_pcm_avail(p.pcm)) }
 func (p *cgoPCM) drop() int          { return int(C.snd_pcm_drop(p.pcm)) }
 func (p *cgoPCM) prepare() int       { return int(C.snd_pcm_prepare(p.pcm)) }
+func (p *cgoPCM) rewindable() int    { return int(C.snd_pcm_rewindable(p.pcm)) }
+
+func (p *cgoPCM) rewind(frames int) int {
+	return int(C.snd_pcm_rewind(p.pcm, C.snd_pcm_uframes_t(frames)))
+}
+
+func (p *cgoPCM) delay() (frames, rc int) {
+	var d C.snd_pcm_sframes_t
+	rc = int(C.snd_pcm_delay(p.pcm, &d))
+	return int(d), rc
+}
 
 func (p *cgoPCM) close() int {
 	if p.pcm == nil {
