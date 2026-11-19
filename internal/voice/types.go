@@ -64,9 +64,10 @@ type AnswerResult struct {
 	Context string `json:"context,omitempty"` // silent facts for the voice's model
 }
 
-// Voice opens a Session for an Exchange.
+// Voice opens a Session for an Exchange. Each call gets an Exchange of its own,
+// which the Supervisor does not change afterwards.
 type Voice interface {
-	Open(ctx context.Context, x Exchange) (Session, error)
+	Open(ctx context.Context, x *Exchange) (Session, error)
 }
 
 // SayMode says what a spoken text is, for the voice's style and the log.
@@ -149,11 +150,11 @@ type Playback interface {
 type Concierge interface {
 	// Tools gives x's tools, for x.Tools: ask_agent's pointer names x's
 	// session and span. x.SessionID names a session the store already has.
-	Tools(x Exchange) ToolRunner
+	Tools(x *Exchange) ToolRunner
 	// Answer answers one turn of x. It speaks through say as it goes (an
 	// acknowledgement, then the facts) and returns once the turn is done. The
 	// Supervisor cancels ctx to stop its model and tool calls.
-	Answer(ctx context.Context, x Exchange, turn string, say SayFunc) error
+	Answer(ctx context.Context, x *Exchange, turn string, say SayFunc) error
 	// Answers reports each holder's answer once it lands. The Supervisor
 	// plays the answer sound and speaks it on invitation.
 	Answers() <-chan PendingAnswer
