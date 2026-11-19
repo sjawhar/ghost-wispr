@@ -526,10 +526,19 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 	} else {
 		ex.interim = words
 	}
+	// The recording session starts with Deepgram's first final, often after
+	// the wake: the exchange takes its id as soon as there is one.
+	if ex.x.SessionID == "" {
+		ex.x.SessionID = s.cfg.Session()
+	}
+	turn := s.turnOf(ex)
+	ex.x.AskerTurn = turn
+	if turn != "" {
+		x := ex.x
+		s.cfg.Concierge.Heard(&x, turn)
+	}
 	if ex.drives {
-		// The vendor drives the turn; its tools still read what was asked.
-		ex.x.AskerTurn = s.turnOf(ex)
-		return
+		return // the vendor drives the turn
 	}
 	if t.IsFinal && t.SpeechFinal && s.turnOf(ex) != "" {
 		s.handTurnLocked(ex)

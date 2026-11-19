@@ -154,6 +154,10 @@ type Concierge interface {
 	// Tools gives x's tools, for x.Tools: ask_agent's pointer names x's
 	// session and span. x.SessionID names a session the store already has.
 	Tools(x *Exchange) ToolRunner
+	// Heard tells it the asker's turn so far, on each result after the wake,
+	// so it can read the record while the asker speaks. It returns at once. x
+	// carries the SessionID and WakeAt the later Tools and Answer calls carry.
+	Heard(x *Exchange, words string)
 	// Answer answers one turn of x. It speaks through say as it goes (an
 	// acknowledgement, then the facts) and returns once the turn is done. The
 	// Supervisor cancels ctx to stop its model and tool calls.

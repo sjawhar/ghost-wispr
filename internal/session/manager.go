@@ -35,6 +35,7 @@ type Manager struct {
 	batchTranscriber   transcribe.BatchTranscriber
 	refinementWait     time.Duration
 	refinementWarning  func(sessionID, warning string)
+	sessionEnded       func(sessionID string)
 
 	mu                             sync.Mutex
 	currentSessionID               string
@@ -784,6 +785,15 @@ func (m *Manager) SetRefinementWarningHook(hook func(sessionID, warning string))
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.refinementWarning = hook
+}
+
+// SetSessionEndedHook sets what runs, in its own goroutine, each time a
+// session ends, kept or discarded: the meeting voice cancels the questions
+// the ended meeting still waits on.
+func (m *Manager) SetSessionEndedHook(hook func(sessionID string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionEnded = hook
 }
 
 func (m *Manager) SetBatchTranscriber(t transcribe.BatchTranscriber) {

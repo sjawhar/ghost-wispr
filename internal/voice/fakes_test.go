@@ -326,6 +326,24 @@ type fakeConcierge struct {
 	cancelled chan time.Time
 	spoken    []string
 	asked     chan string
+	heard     []heardCall
+}
+
+type heardCall struct {
+	x     Exchange
+	words string
+}
+
+func (c *fakeConcierge) Heard(x *Exchange, words string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.heard = append(c.heard, heardCall{x: *x, words: words})
+}
+
+func (c *fakeConcierge) heardCalls() []heardCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]heardCall(nil), c.heard...)
 }
 
 func newFakeConcierge(lines ...string) *fakeConcierge {

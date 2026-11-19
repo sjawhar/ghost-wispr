@@ -989,6 +989,10 @@ func main() {
 	if indexer != nil {
 		manager.SetIndexer(indexer)
 	}
+	// The meeting voice's Concierge, once it runs, cancels the questions an
+	// ended session still waits on and forgets a deleted session.
+	var conciergeSessionHooks conciergeHooks
+	manager.SetSessionEndedHook(conciergeSessionHooks.SessionEnded)
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -1225,7 +1229,10 @@ func main() {
 		ActiveSession: manager.ActiveSession,
 		// Warnings, DeleteSegment and DeleteSegmentText: wireSegmentDeletion,
 		// below.
-		OnSessionDeleted: sessionsDeletedHook(store, warningRegistry),
+		OnSessionDeleted: func(sessionIDs []string) {
+			sessionsDeletedHook(store, warningRegistry)(sessionIDs)
+			conciergeSessionHooks.SessionsDeleted(sessionIDs)
+		},
 		OnSessionsMerged: func(sessionIDs []string) {
 			warningRegistry.WithRecordingMismatch(func() {
 				for _, sessionID := range sessionIDs {
@@ -1937,6 +1944,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 				return err
 			}
 			stopConcierge = stop
+			conciergeSessionHooks.set(conc)
 			return nil
 		}(); err != nil {
 			log.Printf("warning: the meeting voice is off: %v", err)
@@ -1986,7 +1994,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// sessions above) are saved now, not at the first sweep.
 	go kept.run(ctx)
 	if cfg.GCEnabled {
-		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
+		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: conciergeSessionHooks.SessionsDeleted}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
 
 	// Create health checker with actual component references. With no Deepgram

@@ -31,6 +31,7 @@ func TestTheVoiceLinkIsInertUntilTheVoiceStarts(t *testing.T) {
 type stubConcierge struct{ answers chan voice.PendingAnswer }
 
 func (stubConcierge) Tools(*voice.Exchange) voice.ToolRunner { return nil }
+func (stubConcierge) Heard(*voice.Exchange, string)          {}
 func (stubConcierge) Answer(context.Context, *voice.Exchange, string, voice.SayFunc) error {
 	return nil
 }
