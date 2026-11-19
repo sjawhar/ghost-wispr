@@ -298,20 +298,20 @@ func TestWhenToAskTheHolder(t *testing.T) {
 		asked      string
 	}{
 		{"status on a fresh record", "what is happening with ABC-12", false, false, ""},
-		{"ask", "ask the agent on ABC-12 whether the tap is merged", false, false, "whether the tap is merged"},
-		{"not about status", "is the tap on ABC-12 merged", false, false, "is the tap on ABC-12 merged"},
-		{"a stale record", "what is happening with ABC-12", true, false, "what is happening with ABC-12"},
+		{"ask", "ask the agent on ABC-12 whether the tap is merged", false, false, "Is the tap merged?"},
+		{"not about status", "is the tap on ABC-12 merged", false, false, "Is the tap on ABC-12 merged?"},
+		{"a stale record", "what is happening with ABC-12", true, false, "What is happening with ABC-12?"},
 		{"a search with no clear match", "ask the agent on the realtime voice whether the tap is merged", false, true, ""},
 		{"asks as a noun", "what is the status of the open asks on ABC-12", false, false, ""},
 		{"who holds it", "who holds ABC-12", false, false, ""},
 		{"its priority", "what is the priority of ABC-12", false, false, ""},
 		{"its assignee", "is ABC-12 assigned to anyone", false, false, ""},
-		{"where, not about status", "where does ABC-12 keep the session tokens", false, false, "where does ABC-12 keep the session tokens"},
-		{"state, not about status", "what state does the parser of ABC-12 keep", false, false, "what state does the parser of ABC-12 keep"},
-		{"new, not about status", "is the new retry on ABC-12 safe to run twice", false, false, "is the new retry on ABC-12 safe to run twice"},
-		{"who, not about the holder", "who decided to drop the cache on ABC-12", false, false, "who decided to drop the cache on ABC-12"},
-		{"can you ask", "can you ask ABC-12 for a status update", false, false, "can you ask ABC-12 for a status update"},
-		{"going to, not about status", "is the migration on ABC-12 going to drop the old table", false, false, "is the migration on ABC-12 going to drop the old table"},
+		{"where, not about status", "where does ABC-12 keep the session tokens", false, false, "Where does ABC-12 keep the session tokens?"},
+		{"state, not about status", "what state does the parser of ABC-12 keep", false, false, "What state does the parser of ABC-12 keep?"},
+		{"new, not about status", "is the new retry on ABC-12 safe to run twice", false, false, "Is the new retry on ABC-12 safe to run twice?"},
+		{"who, not about the holder", "who decided to drop the cache on ABC-12", false, false, "Who decided to drop the cache on ABC-12?"},
+		{"can you ask", "can you ask ABC-12 for a status update", false, false, "Can you ask ABC-12 for a status update?"},
+		{"going to, not about status", "is the migration on ABC-12 going to drop the old table", false, false, "Is the migration on ABC-12 going to drop the old table?"},
 	} {
 		r := newRig(t)
 		heldIssue(r, "session", c.stale)

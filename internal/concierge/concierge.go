@@ -201,6 +201,7 @@ type Concierge struct {
 	callBound    time.Duration
 	searchBound  time.Duration
 	searchSettle time.Duration
+	fullWait     time.Duration
 	routingAfter time.Duration
 }
 
@@ -251,6 +252,7 @@ func New(cfg *Config) (*Concierge, error) {
 		callBound:    callBound,
 		searchBound:  searchBound,
 		searchSettle: searchSettle,
+		fullWait:     fullWaitAfterTurn,
 		routingAfter: routingAfter,
 	}
 	if c.model == "" {
@@ -553,7 +555,8 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 	c.projectsBusy = false
 	close(c.projectsDone)
 	c.projectsDone = nil
-	c.projectsDown = err != nil
+	// A stop is no failure of Dispatch's.
+	c.projectsDown = err != nil && ctx.Err() == nil
 	if err != nil {
 		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
 		c.projectsRead = c.now().Add(time.Minute - projectsFor)

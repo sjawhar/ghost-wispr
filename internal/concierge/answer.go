@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"google.golang.org/genai"
 
@@ -29,7 +30,7 @@ The recorder tells the room who holds the issue when that matters, and asks the 
 How you answer:
 - Say the facts of the record that answer the question, the conclusion first. Do not say who holds the issue unless the question asks who holds it.
 - Say how old the fact is, using the ages the tools give, such as "updated two hours ago".
-- Use the record you are given. Call a tool only for what it does not hold.
+- Use the record you are given. Call a tool only for what it does not hold. Call list_joined_agents only when the question asks which agents joined this meeting.
 - Speak for the ear: one to three short sentences, at most 50 words, and at most 20 words a sentence. No lists, tables, file paths, links, code or markdown.
 - Say issue keys, pull request numbers, names and figures exactly as written in the record, such as ABC-12 or PR 80. Say nothing the record does not hold.
 - When the record does not say when or whether something happens, say that the record does not say; never guess a date, a time or a duration.
@@ -58,6 +59,11 @@ const (
 	// 6.4 s live (median 1.2 s, p90 2.2 s), so a search past it is slow, not
 	// out of reach: it has found nothing yet.
 	searchBound = 5 * time.Second
+	// fullWaitAfterTurn is how long after the turn an answer waits for the
+	// full search when the keyword result has no one clear match; then the
+	// voice asks which of the keyword result's top two the person meant
+	// (R5, Main's rule).
+	fullWaitAfterTurn = 2 * time.Second
 	// maxToolCalls bounds the model's tool calls in one fast answer (R6).
 	maxToolCalls = 6
 	// maxSearches bounds one answer's searches, the read's and the model's
@@ -172,12 +178,20 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			}
 		}
 	}
+	// A keyword result with no one clear match waits for the full search
+	// until c.fullWait after the turn (Main's rule).
+	fullCut := make(chan struct{})
+	cutTimer := time.AfterFunc(c.fullWait-time.Since(start), func() { close(fullCut) })
+	defer cutTimer.Stop()
 	var found *reading
 	if target != "" {
-		found = c.readRecord(ctx, x, target, onHolder)
+		found = c.readRecord(ctx, x, target, onHolder, fullCut)
 	} else {
-		found = c.readFor(ctx, x, turn, onHolder)
+		found = c.readFor(ctx, x, turn, onHolder, fullCut)
 	}
+	// R6: at most two searches an answer, the read-ahead's counted; the count
+	// is taken here, so an answer that ends early starts it over too.
+	aheadSearches := c.takeAheadSearches(x)
 	switch {
 	case parent.Err() != nil:
 		return parent.Err()
@@ -208,10 +222,11 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		c.offerPick(x, turn, found.candidates)
 		return sp.sayText(ctx, didYouMean(found.candidates), voice.Ack)
 	}
-	// R6: the issue a search chose, then the facts.
+	// R6: the issue a search chose, then the facts. The line is an Ack: it
+	// names the issue and holds no fact of it.
 	lead := found.lead()
 	for _, line := range lead {
-		if err := sp.sayText(ctx, line, voice.Fact); err != nil {
+		if err := sp.sayText(ctx, line, voice.Ack); err != nil {
 			return err
 		}
 	}
@@ -219,20 +234,19 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	if session := c.askPlan(turn, found); session != "" {
 		startAsk(session, found)
 	}
-	// R6: at most two searches an answer, the read-ahead's counted.
-	searchesLeft := maxSearches - c.takeAheadSearches(x)
+	searchesLeft := maxSearches - aheadSearches
 	if found.searched && !found.ahead {
 		searchesLeft--
 	}
 	searchesLeft = max(searchesLeft, 0)
-	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft}
+	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut}
 	// With no fact by c.knownBound, the model stops and the voice says what
 	// is known (R6), rather than run into the bound.
 	factsCtx, stopFacts := context.WithCancel(ctx)
 	defer stopFacts()
 	var knownCut atomic.Bool
 	knownTimer := time.AfterFunc(c.knownBound-time.Since(start), func() {
-		if sp.count() == 0 {
+		if sp.count() == len(lead) {
 			knownCut.Store(true)
 			stopFacts()
 		}
@@ -254,7 +268,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		}
 	case errors.Is(err, errNoWords) && (len(lead) > 0 || holderCase != "" || askStarted.Load()):
 		err = nil
-	case err != nil && ctx.Err() != nil && sp.count() == 0:
+	case err != nil && ctx.Err() != nil && sp.count() == len(lead):
 		if !askStarted.Load() {
 			return c.failed(parent, sp, errors.New("concierge: the answer took more than its 8 s"))
 		}
@@ -499,17 +513,27 @@ func aboutStatus(turn string) bool {
 	return false
 }
 
-// fewestWords is the question the holder gets (R7): the turn, without what a
-// person says to send it on ("ask the agent on ABC-12"), cut to 300
-// characters at a word.
+// fewestWords is the question the holder gets (R7), as one clean sentence
+// in the asker's intent: the turn without what a person says to send it on
+// ("ask the agent on ABC-12", "who holds the issue about X"), an embedded
+// question made direct ("when slice one will be ready" becomes "When will
+// slice one be ready?"), cut to 300 characters at a word. The issue's key
+// goes in the message's header, not here.
 func fewestWords(turn string) string {
 	question := strings.Join(strings.Fields(askPrefix.ReplaceAllString(turn, "")), " ")
 	// Deepgram may end a sentence at the key ("…on INFRA-4592. When …"): the
 	// question starts at its first word, in the asker's own words.
 	question = strings.TrimLeftFunc(question, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	question = routingClause.ReplaceAllString(question, "$1")
+	question = camelNumber.ReplaceAllStringFunc(question, func(word string) string {
+		parts := camelNumber.FindStringSubmatch(word)
+		return strings.ToLower(parts[1]) + " " + strings.ToLower(parts[2])
+	})
+	question = strings.TrimRight(question, " .?!,;:")
 	if question == "" {
 		question = strings.Join(strings.Fields(turn), " ")
 	}
+	question = direct(question)
 	if runes := []rune(question); len(runes) > maxQuestionChars {
 		question = string(runes[:maxQuestionChars])
 		if cut := strings.LastIndex(question, " "); cut > 0 {
@@ -517,6 +541,59 @@ func fewestWords(turn string) string {
 		}
 	}
 	return question
+}
+
+var (
+	// routingClause is what a person says of the holder before the question
+	// itself: "who holds the issue about X when …", "on the realtime voice
+	// whether …". It ends at the question's first word, which it keeps.
+	routingClause = regexp.MustCompile(`(?i)^(?:(?:who|that)\s+(?:holds|is\s+holding|owns|is\s+working\s+on|works\s+on)|on|for|about|of|working\s+on|holding)\s+.*?\b(when|whether|if|what|how|why|where|which|who)\b`)
+	// camelNumber is Deepgram's "SliceOne" for "slice one".
+	camelNumber = regexp.MustCompile(`\b([A-Z][a-z]+)(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\b`)
+	// auxiliaries are the verbs a direct question puts before its subject.
+	auxiliaries = set(strings.Fields("is are was were will would can could should shall may might must has have had does do did"))
+	// howWords join "how" in a question's first phrase: "how long".
+	howWords = set(strings.Fields("long many much soon often far big old late early"))
+)
+
+// direct makes an embedded question direct, with a capital and a question
+// mark: "whether the tap is merged" is "Is the tap merged?", "when slice one
+// will be ready" is "When will slice one be ready?". After "what", "which"
+// and "who", which may be a question's subject or its noun's, the words are
+// kept in their order.
+func direct(question string) string {
+	words := strings.Fields(question)
+	if len(words) == 0 {
+		return question
+	}
+	auxAfter := func(from int) int {
+		for i := from; i < len(words); i++ {
+			if auxiliaries[strings.ToLower(words[i])] {
+				return i
+			}
+		}
+		return -1
+	}
+	switch first := strings.ToLower(words[0]); first {
+	case "whether", "if":
+		if i := auxAfter(2); i > 0 {
+			words = append(append([]string{words[i]}, words[1:i]...), words[i+1:]...)
+		}
+	case "when", "where", "why", "how":
+		phrase := 1
+		if first == "how" && len(words) > 1 && howWords[strings.ToLower(words[1])] {
+			phrase = 2
+		}
+		if i := auxAfter(phrase); i > phrase {
+			moved := append([]string{}, words[:phrase]...)
+			moved = append(moved, words[i])
+			moved = append(moved, words[phrase:i]...)
+			words = append(moved, words[i+1:]...)
+		}
+	}
+	sentence := strings.Join(words, " ")
+	first, size := utf8.DecodeRuneInString(sentence)
+	return string(unicode.ToUpper(first)) + sentence[size:] + "?"
 }
 
 // facts has the model say the facts of the record, with the answer's tools.
@@ -527,6 +604,11 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
+	case found.searched && found.clear && found.key != "":
+		// One clear match (R5): the voice said the issue it took, and the
+		// model answers from its record rather than search again.
+		prompt += "\n\nThe record of " + found.key + ", the issue a search of the question's words chose, read while it was asked:\n" + found.text +
+			"\nAnswer from it. Call a tool only for what it does not hold."
 	case found.searched:
 		prompt += "\n\nA search of the record for the question's words, made while it was asked. Its hits may not be what the question is about: use them only if they are, and call a tool for what they do not hold:\n" + found.text
 	default:
@@ -541,7 +623,7 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	}
 	source := &strings.Builder{}
 	source.WriteString(found.text)
-	said := &sentences{sp: sp, source: source}
+	said := &sentences{sp: sp, source: source, asked: turn}
 	budget := maxToolCalls
 	reason := ""
 	for try := 1; try <= earTries; try++ {
@@ -559,6 +641,12 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 		}
 		reason = invented.reason
 		c.logger.Info("concierge's fast answer failed R8's check", "try", try, "reason", reason)
+	}
+	if asking {
+		// The asked line follows; this one would only hold the holder's
+		// answer back.
+		c.logger.Info("concierge leaves its facts to the holder: no fast answer passed R8's check", "reason", reason)
+		return nil
 	}
 	c.logger.Warn("concierge says it can only say what the record holds: no fast answer passed R8's check", "reason", reason)
 	return sp.sayText(ctx, notInRecord, voice.Fact)
@@ -971,8 +1059,10 @@ func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line func(
 // sentences speaks the model's text as each sentence completes, once it
 // holds only what source does (R8), and stops at R8's bounds.
 type sentences struct {
-	sp      *speaker
-	source  *strings.Builder
+	sp     *speaker
+	source *strings.Builder
+	// asked is the question, whose names a sentence may say back.
+	asked   string
 	pending strings.Builder
 	// spoken and words count the sentences and words said.
 	spoken, words int
@@ -1020,7 +1110,7 @@ func (s *sentences) speak(ctx context.Context, sentence string) error {
 	if s.spoken >= maxFactSentences || s.words+words > maxFactWords {
 		return errEnough
 	}
-	if reason := earCheck(sentence, s.source.String()+"\n"+strings.Join(s.sp.said(), " "), ""); reason != "" {
+	if reason := earCheckAsked(sentence, s.source.String()+"\n"+strings.Join(s.sp.said(), " "), s.asked, ""); reason != "" {
 		return &inventedError{reason: reason}
 	}
 	if err := s.sp.sayText(ctx, sentence, voice.Fact); err != nil {

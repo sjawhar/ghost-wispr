@@ -129,6 +129,9 @@ type runner struct {
 	// searchesLeft, when set, is how many more searches the answer may
 	// make (R6); nil is no bound.
 	searchesLeft *int
+	// fullCut, when set, closes when a search stops waiting for the full
+	// search of a keyword result with no one clear match (searchBoth).
+	fullCut <-chan struct{}
 }
 
 // Tools gives x's tools, for x.Tools.
@@ -291,17 +294,18 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 	if r.searchesLeft != nil {
 		*r.searchesLeft--
 	}
-	return r.c.searchBoth(ctx, records, terms)
+	return r.c.searchBoth(ctx, records, terms, r.fullCut)
 }
 
 // searchBoth runs Dispatch's keyword-only search and its full search, words
 // and meaning, at once; together they are one search. A keyword result with
 // one clear match (R5) is taken at once and the full search is stopped:
 // keywords answer in about 0.15 s, the full search in 1 to 6 s. Otherwise
-// the full result is taken, or, when it fails or runs past its bound, the
-// keyword result. A search that found nothing in its time is slow, not out
-// of reach (R6, R10).
-func (c *Concierge) searchBoth(ctx context.Context, records Records, terms string) (map[string]any, error) {
+// the full result is taken, until cut closes (2 s after the turn ended);
+// then, or when the full search fails or runs past its bound, the keyword
+// result is, whose top two the voice offers (Main's rule). A search that
+// found nothing in its time is slow, not out of reach (R6, R10).
+func (c *Concierge) searchBoth(ctx context.Context, records Records, terms string, cut <-chan struct{}) (map[string]any, error) {
 	type found struct {
 		hits []dispatch.SearchHit
 		err  error
@@ -314,20 +318,32 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 		full <- found{hits, err}
 	}()
 	kwHits, kwErr := records.SearchKeywords(ctx, terms, 10)
-	if kwErr == nil {
-		if issues, clear := issuesOf(kwHits); clear {
-			return map[string]any{"issues": issues, "clear_match": true}, nil
-		}
+	kwIssues, kwClear := issuesOf(kwHits)
+	if kwErr == nil && kwClear {
+		return map[string]any{"issues": kwIssues, "clear_match": true}, nil
 	}
-	got := <-full
+	if kwErr != nil || len(kwIssues) == 0 {
+		cut = nil // nothing to offer: the full search decides
+	}
+	var got found
+	select {
+	case got = <-full:
+	case <-cut:
+		c.logger.Info("concierge took the keyword result: the full search had not answered by its mark")
+		return map[string]any{"issues": kwIssues, "clear_match": false}, nil
+	}
 	if got.err == nil {
 		issues, clear := issuesOf(got.hits)
 		return map[string]any{"issues": issues, "clear_match": clear}, nil
 	}
-	if kwErr == nil && ctx.Err() == nil {
+	if kwErr == nil && len(kwIssues) > 0 && ctx.Err() == nil {
 		c.logger.Info("concierge took the keyword result: the full search failed", "error", got.err)
-		issues, clear := issuesOf(kwHits)
-		return map[string]any{"issues": issues, "clear_match": clear}, nil
+		return map[string]any{"issues": kwIssues, "clear_match": false}, nil
+	}
+	if errors.Is(kwErr, errSearchSlow) && errors.Is(got.err, errSearchSlow) {
+		// The keyword search answers in about 0.15 s: both past their bound
+		// is Dispatch out of reach (R10).
+		return nil, fmt.Errorf("%w: neither search answered in %v", dispatch.ErrUnreachable, c.searchBound)
 	}
 	if errors.Is(got.err, errSearchSlow) {
 		c.logger.Info("concierge's search found nothing in its time", "bound", c.searchBound)

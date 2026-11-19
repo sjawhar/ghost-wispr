@@ -45,6 +45,7 @@ func init() {
 		happening happen happened happens going go goes gone get got status update updates updated latest new news progress
 		now today yesterday tomorrow yet still again ever last next first days day weeks week hours hour minutes minute time
 		one two three lot lots much many more most less least other another same such own let lets like want need
+		hold holds holding held holder owns owned owner owning
 	`) {
 		searchStopwords[word] = true
 	}
@@ -70,6 +71,10 @@ func searchTerms(words string) string {
 	return workWords(words)
 }
 
+// compound is a word Deepgram may write as two, or hyphened, where Dispatch's
+// titles write one: "real time" and "real-time" are "realtime".
+var compound = regexp.MustCompile(`(?i)\breal[- ]time\b`)
+
 // workWords is the words of text that name work, at most maxSearchTerms.
 func workWords(text string) string {
 	var terms []string
@@ -80,7 +85,7 @@ func workWords(text string) string {
 			terms = append(terms, term)
 		}
 	}
-	rest := spokenKey.ReplaceAllString(text, " ")
+	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(text, " "), "realtime")
 	for _, word := range strings.FieldsFunc(strings.ToLower(rest), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	}) {

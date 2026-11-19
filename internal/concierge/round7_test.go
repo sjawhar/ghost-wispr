@@ -123,7 +123,7 @@ func TestAPickAnswersTheQuestionAsked(t *testing.T) {
 		answerTurn(t, r, "ask the agent on the realtime voice whether the tap is merged")
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is open."))}}
 		spoken := answerTurn(t, r, c.pick)
-		if len(r.agents.sent) != 1 || r.agents.sent[0].Target != c.holder || !strings.Contains(r.agents.sent[0].Message, "whether the tap is merged") {
+		if len(r.agents.sent) != 1 || r.agents.sent[0].Target != c.holder || !strings.Contains(r.agents.sent[0].Message, ": Is the tap merged?\n") {
 			t.Errorf("%q: sent %+v, want the first question to %s", c.pick, r.agents.sent, c.holder)
 			continue
 		}
@@ -134,10 +134,10 @@ func TestAPickAnswersTheQuestionAsked(t *testing.T) {
 }
 
 // TestAReplyThatPicksNothingIsItsOwnQuestion (c-find, R5): "one" alone picks
-// nothing, nor do words of both titles or of neither; such a turn is a
-// question of its own, and asks nobody unasked.
+// nothing, nor do words both titles share or words of neither; such a turn
+// is a question of its own, and asks nobody unasked.
 func TestAReplyThatPicksNothingIsItsOwnQuestion(t *testing.T) {
-	for _, reply := range []string{"that one", "the voice word", "never mind the tap"} {
+	for _, reply := range []string{"that one", "the word one", "never mind the tap"} {
 		r := newRig(t)
 		unclearSearch(r)
 		r.records.issues["ABC-12"].Title, r.records.hits[0].Title = "Voice word", "Voice word"
@@ -145,7 +145,7 @@ func TestAReplyThatPicksNothingIsItsOwnQuestion(t *testing.T) {
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is open."))}}
 		answerTurn(t, r, reply)
 		for _, m := range r.agents.sent {
-			if strings.Contains(m.Message, "whether the tap is merged") {
+			if strings.Contains(m.Message, "the tap merged") {
 				t.Errorf("%q picked an issue: sent %+v", reply, m)
 			}
 		}
@@ -644,5 +644,267 @@ func TestARetriedQuestionKeepsItsFirstTime(t *testing.T) {
 	task, err := r.store.VoiceTask(taskID)
 	if err != nil || !task.AskedAt.Equal(testNow) {
 		t.Fatalf("the retried task = %+v, %v; want it asked at %v", task, err, testNow)
+	}
+}
+
+// TestAnAskedQuestionNeedsNoFallbackLine (R6, R7): when the question already
+// went to the holder and the model's facts fail R8's check twice, the voice
+// says the asked line alone: "I can only say what the record holds" would
+// only hold the holder's answer back.
+func TestAnAskedQuestionNeedsNoFallbackLine(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("It went to Alex."))},
+		{chunk(text("It went to Blake."))},
+	}
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
+	if err != nil || len(spoken) != 1 || !strings.Contains(spoken[0].text, "asked the agent on ABC-12") {
+		t.Fatalf("Answer = %v, spoken %+v; want the asked line alone", err, spoken)
+	}
+}
+
+// TestAnUnclearKeywordResultWaitsTwoSecondsAtMost (R5, R6; Main's rule): when
+// the keyword result has no one clear match, the full search is waited for
+// until 2 s after the turn ended, then the voice asks which of the keyword
+// result's top two the person meant, and says nothing more when the full
+// search lands. A full result in time still wins.
+func TestAnUnclearKeywordResultWaitsTwoSecondsAtMost(t *testing.T) {
+	if fullWaitAfterTurn != 2*time.Second {
+		t.Fatalf("fullWaitAfterTurn = %v, want 2 s", fullWaitAfterTurn)
+	}
+	unclearKeywords := []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.5}, {Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.4}}
+	r := newRig(t)
+	r.concierge.fullWait = 200 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.records.kwHits = unclearKeywords
+	r.records.searchDelay = 900 * time.Millisecond
+	start := time.Now()
+	spoken := answerTurn(t, r, "what is happening with the realtime voice")
+	if took := time.Since(start); took > 700*time.Millisecond {
+		t.Fatalf("the answer took %v, want the question which issue at the 200 ms mark", took)
+	}
+	time.Sleep(time.Second)
+	if len(spoken) != 1 || spoken[0].text != "Did you mean ABC-13, Wake word, or ABC-12, Realtime voice?" {
+		t.Fatalf("spoken = %+v, want only the keyword result's top two", spoken)
+	}
+
+	r = newRig(t)
+	r.concierge.fullWait = 500 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.records.kwHits = unclearKeywords
+	r.records.searchDelay = 50 * time.Millisecond
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	if spoken := answerTurn(t, r, "what is happening with the realtime voice"); len(spoken) == 0 || spoken[0].text != "I took ABC-12: Realtime voice." {
+		t.Fatalf("a full result in time: spoken = %+v, want it to win", spoken)
+	}
+}
+
+// TestAnswerReusesTheReadAheadsSearch (R6; Main's rule): when the final
+// turn's search words hold all of the words the read-ahead searched, Answer
+// takes the read-ahead's search, keyword and full, and searches no more.
+func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
+	r := newRig(t)
+	r.concierge.searchSettle = 50 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the realtime voice")
+	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	spoken := answerTurn(t, r, "what is happening with the realtime voice rollout")
+	if full, kw := len(r.records.searches()), len(r.records.kwQueries); full != 1 || kw != 1 {
+		t.Fatalf("full searches %d, keyword %d; want the read-ahead's one of each, reused", full, kw)
+	}
+	if len(spoken) == 0 || spoken[0].text != "I took ABC-12: Realtime voice." {
+		t.Fatalf("spoken = %+v, want the read-ahead's issue", spoken)
+	}
+}
+
+// TestTheHolderGetsAQuestionInTheAskersIntent (R7, run 8g): the holder gets
+// the asker's question as one clean sentence: no routing clause ("who holds
+// the issue about …"), an embedded question made direct, Deepgram's
+// "SliceOne" said as words; the issue's key goes in the header.
+func TestTheHolderGetsAQuestionInTheAskersIntent(t *testing.T) {
+	for turn, want := range map[string]string{
+		"please ask the agent who holds the issue about real time spoken conversation when SliceOne will be ready to try": "When will slice one be ready to try?",
+		"please ask the agent on INFRA 4592. When slice one will be ready to try.":                                        "When will slice one be ready to try?",
+		"ask the agent on ABC-12 whether the tap is merged":                                                               "Is the tap merged?",
+		"ask the agent on the issue about the cache if it can be dropped":                                                 "Can it be dropped?",
+		"is the tap on ABC-12 merged":                  "Is the tap on ABC-12 merged?",
+		"ask the agent on ABC-12 why the build failed": "Why the build failed?",
+	} {
+		if got := fewestWords(turn); got != want {
+			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)
+		}
+	}
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	answerTurn(t, r, "please ask the agent on ABC-12 when SliceOne will be ready to try")
+	if len(r.agents.sent) != 1 || !strings.Contains(r.agents.sent[0].Message, "Question about ABC-12: When will slice one be ready to try?\n") {
+		t.Fatalf("sent %+v, want the clean question under the key", r.agents.sent)
+	}
+}
+
+// TestTheQuestionsOwnWordsAreNoInvention (R6, R8; run 8g): a name the asker
+// said, such as Deepgram's "SliceOne", is no name the model invented when
+// the fast answer says it back.
+func TestTheQuestionsOwnWordsAreNoInvention(t *testing.T) {
+	const turn = "please ask the agent who holds the issue about real time spoken conversation when SliceOne will be ready to try"
+	if reason := earCheckAsked("The record does not say when SliceOne will be ready to try.", "INFRA-4592 is in progress.", turn, ""); reason != "" {
+		t.Fatalf("a name from the question was refused: %q", reason)
+	}
+	if earCheckAsked("It says Blake will try SliceOne.", "INFRA-4592 is in progress.", turn, "") == "" {
+		t.Fatal("control: a name neither the record nor the question holds passed")
+	}
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("The record does not say when SliceOne will be ready to try."))}}
+	spoken := answerTurn(t, r, "please ask the agent on ABC-12 when SliceOne will be ready to try")
+	if len(spoken) == 0 || spoken[0].text != "The record does not say when SliceOne will be ready to try." {
+		t.Fatalf("spoken = %+v, want the sentence that says the question's name back", spoken)
+	}
+}
+
+// TestASearchedTurnSaysWhatIsKnownAtTheMark (R6): the line that names the
+// issue a search chose is no fact; with no fact by the 6 s mark, the voice
+// still says what is known, and the answer has no error.
+func TestASearchedTurnSaysWhatIsKnownAtTheMark(t *testing.T) {
+	r := newRig(t)
+	r.concierge.knownBound = 300 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.model.block = make(chan struct{})
+	defer close(r.model.block)
+	spoken := answerTurn(t, r, "what is happening with the realtime voice")
+	if len(spoken) != 2 || spoken[0].mode != voice.Ack || spoken[1].text != "ABC-12 is in progress." {
+		t.Fatalf("spoken = %+v, want the issue (an Ack), then what is known", spoken)
+	}
+}
+
+// TestBothSearchesHungIsAnOutage (R10): the keyword search answers in about
+// 0.15 s; when it and the full search both run past their bound, Dispatch is
+// out of reach, with the error sound.
+func TestBothSearchesHungIsAnOutage(t *testing.T) {
+	r := newRig(t)
+	r.concierge.searchBound = 200 * time.Millisecond
+	unclearSearch(r)
+	r.records.kwDelay, r.records.searchDelay = time.Hour, time.Hour
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the realtime voice", recorder(&spoken))
+	if !errors.Is(err, voice.ErrUnreachable) || len(spoken) == 0 || spoken[len(spoken)-1].text != cannotReachDispatch {
+		t.Fatalf("Answer = %v, spoken %+v; want %q and voice.ErrUnreachable", err, spoken, cannotReachDispatch)
+	}
+}
+
+// TestAnUncountedReadAheadSearchIsCounted (R6): a read-ahead of a key that
+// names no issue searches the turn's words; that search counts toward the
+// answer's two like any other.
+func TestAnUncountedReadAheadSearchIsCounted(t *testing.T) {
+	r := newRig(t)
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	const turn = "what about abc 99 and the realtime voice"
+	r.concierge.Heard(context.Background(), &r.exchange, turn)
+	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	search := func(id string) []*genai.GenerateContentResponse {
+		return []*genai.GenerateContentResponse{chunk(call(id, "search_issues", map[string]any{"query": "wake word " + id}, ""))}
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{search("a"), search("b"), {chunk(text("PR 80 is in review."))}}
+	answerTurn(t, r, turn)
+	if n := len(r.records.searches()); n > 2 {
+		t.Fatalf("searches = %q, want at most two", r.records.searches())
+	}
+}
+
+// TestTheReadAheadMaySearchAfterNoIssueFound (R6): an answer that found no
+// issue takes the read-ahead's count all the same, so the reply, which names
+// the issue another way, is searched ahead.
+func TestTheReadAheadMaySearchAfterNoIssueFound(t *testing.T) {
+	r := newRig(t)
+	r.concierge.searchSettle = 50 * time.Millisecond
+	r.records.hits = nil
+	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the purple submarine")
+	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	answerTurn(t, r, "what is happening with the purple submarine")
+	r.concierge.Heard(context.Background(), &r.exchange, "the realtime voice one")
+	eventually(t, "the reply's read-ahead searched", func() bool { return len(r.records.searches()) == 2 })
+}
+
+// TestTheReadAheadCountStartsOverEachAnswer (R6): an answer that ends early,
+// as "Did you mean" does, still takes the read-ahead's count, so the next
+// turn's read-ahead may search; a reply that only picks searches nothing.
+func TestTheReadAheadCountStartsOverEachAnswer(t *testing.T) {
+	r := newRig(t)
+	r.concierge.searchSettle = 50 * time.Millisecond
+	unclearSearch(r)
+	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the realtime voice")
+	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	answerTurn(t, r, "what is happening with the realtime voice")
+	r.concierge.Heard(context.Background(), &r.exchange, "the second one")
+	time.Sleep(200 * time.Millisecond)
+	if n := len(r.records.searches()); n != 1 {
+		t.Fatalf("a reply to Did you mean searched ahead: searches %q", r.records.searches())
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is done."))}}
+	answerTurn(t, r, "the second one")
+	r.concierge.Heard(context.Background(), &r.exchange, "and what about the wake word")
+	eventually(t, "the next turn's read-ahead searched", func() bool { return len(r.records.searches()) == 2 })
+}
+
+// TestAPickByTheWordThatTellsTheTitlesApart (R5): words both offered titles
+// share tell nothing; the word only one holds picks it.
+func TestAPickByTheWordThatTellsTheTitlesApart(t *testing.T) {
+	r := newRig(t)
+	r.concierge.offerPick(&r.exchange, "what is the state of the wake word", []candidate{{"ABC-12", "Wake word spotter"}, {"ABC-13", "Wake word false wakes"}})
+	if _, key, ok := r.concierge.takePick(&r.exchange, "the wake word spotter"); !ok || key != "ABC-12" {
+		t.Fatalf("takePick = %q, %v; want ABC-12", key, ok)
+	}
+}
+
+// TestAStoppedProjectReadMarksNothingDown (R10): a read of the projects that
+// a stop ended is no failure of Dispatch's.
+func TestAStoppedProjectReadMarksNothingDown(t *testing.T) {
+	r := newRig(t)
+	r.records.mu.Lock()
+	r.records.projectsBlock = make(chan struct{})
+	r.records.mu.Unlock()
+	defer close(r.records.projectsBlock)
+	r.concierge.mu.Lock()
+	r.concierge.startProjectsReadLocked()
+	r.concierge.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.concierge.readProjects(ctx)
+	if r.concierge.projectsDownNow() {
+		t.Fatal("a stopped read marked the projects down")
+	}
+}
+
+// TestSearchTermsJoinCompoundsAndDropRoutingVerbs (run 8g): Deepgram writes
+// "real time" or "real-time" where titles say "realtime", and "who holds"
+// names no work, so a read-ahead never spends its one search on "holds".
+func TestSearchTermsJoinCompoundsAndDropRoutingVerbs(t *testing.T) {
+	for turn, want := range map[string]string{
+		"what is happening with the issue about real time spoken conversation?": "realtime spoken conversation",
+		"what is happening with the issue about real-time spoken conversation?": "realtime spoken conversation",
+		"please ask the agent who holds":                                        "",
+		"who owns the wake word work":                                           "wake word",
+	} {
+		if got := searchTerms(turn); got != want {
+			t.Errorf("searchTerms(%q) = %q, want %q", turn, got, want)
+		}
+	}
+}
+
+// TestThePromptKeepsTheAgentsToolForAgentQuestions (run 8g): the model
+// called list_joined_agents first on every turn; it is for questions about
+// the agents that joined the meeting.
+func TestThePromptKeepsTheAgentsToolForAgentQuestions(t *testing.T) {
+	if !strings.Contains(systemPrompt, "Call list_joined_agents only when the question asks which agents joined this meeting.") {
+		t.Fatal("the system prompt does not keep list_joined_agents for agent questions")
 	}
 }

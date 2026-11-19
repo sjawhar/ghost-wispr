@@ -187,7 +187,7 @@ func TestANotFoundOutsideAnIssueReadIsLogged(t *testing.T) {
 func TestAnUnreachableDispatchEndsTheKeyReads(t *testing.T) {
 	r := newRig(t)
 	r.records.err = fmt.Errorf("%w: dial tcp: no route to host", dispatch.ErrUnreachable)
-	r.concierge.readRecord(context.Background(), &r.exchange, r.concierge.readTarget(context.Background(), "what about abc 12 and xyz 34 and def 56", true), nil)
+	r.concierge.readRecord(context.Background(), &r.exchange, r.concierge.readTarget(context.Background(), "what about abc 12 and xyz 34 and def 56", true), nil, nil)
 	// The first key's issue and holder are read side by side: one key, read
 	// once by each.
 	if calls := slices.Compact(r.records.calls()); len(calls) != 1 {
@@ -210,7 +210,7 @@ func TestANumberThatNamesNoIssueGivesWayToASearch(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompt := r.model.requests[0][0].Parts[0].Text
-	if !strings.Contains(prompt, "may not be what the question is about") || !strings.Contains(prompt, "Realtime voice") {
+	if !strings.Contains(prompt, "the issue a search of the question's words chose") || !strings.Contains(prompt, "Realtime voice") {
 		t.Fatalf("the prompt for a turn whose only key names no issue:\n%s", prompt)
 	}
 	if !slices.Contains(r.records.calls(), "AT-10") || len(r.records.searches()) != 1 {

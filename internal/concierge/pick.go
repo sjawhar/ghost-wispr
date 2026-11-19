@@ -69,6 +69,19 @@ func (c *Concierge) takePick(x *voice.Exchange, turn string) (asked, key string,
 		}
 	}
 	said := set(strings.Fields(workWords(turn)))
+	// Words every offered title holds tell them apart no better than none.
+	for word := range said {
+		shared := true
+		for _, candidate := range p.candidates {
+			if !set(strings.Fields(workWords(candidate.title)))[word] {
+				shared = false
+				break
+			}
+		}
+		if shared {
+			delete(said, word)
+		}
+	}
 	picked := ""
 	for _, candidate := range p.candidates {
 		for _, word := range strings.Fields(workWords(candidate.title)) {
