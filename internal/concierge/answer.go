@@ -13,7 +13,6 @@ import (
 
 	"google.golang.org/genai"
 
-	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
@@ -110,7 +109,7 @@ func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn strin
 		if err := sp.sayText(parent, cannotReachDispatch, voice.Ack); err != nil {
 			return err
 		}
-		return fmt.Errorf("concierge: %w", dispatch.ErrUnreachable)
+		return fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 	case found.noResult:
 		return sp.sayText(ctx, noIssueFound, voice.Ack)
 	}
