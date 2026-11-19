@@ -187,9 +187,9 @@ scan_locks() {
 }
 nl=$'\n'
 # The stop waits at most 5 s for the light's lock (flock -w 5), the Light hang step's own bound. While
-# the light's lock is held, the test starts no process, however slowly processes start on a loaded
-# runner: it waits with shell builtins only (reads of /proc, and timed-out reads of a pipe nothing
-# writes to), so of those 5 s it takes only its 1 s watch and the release.
+# the light's lock is held, the test starts no process but the stop, however slowly processes start on
+# a loaded runner: it waits with shell builtins only (reads of /proc, and timed-out reads of a pipe
+# nothing writes to), so of those 5 s it takes only its 1 s watch and the release.
 stop_command=$(light_locked_stop_command "$recorder" "$sysfs" "$dev")
 mkfifo "$state_dir/tick" "$state_dir/release"
 exec {tick}<>"$state_dir/tick" {release}<>"$state_dir/release"
