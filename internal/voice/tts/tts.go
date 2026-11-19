@@ -83,8 +83,10 @@ func (v voiceA) Open(ctx context.Context, x *voice.Exchange) (voice.Session, err
 		out:    x.Out,
 		stream: v.engine.Stream,
 		says:   make(chan *sayRequest),
+		plays:  make(chan *sayRequest, 1),
 		events: make(chan voice.Event, eventBuffer),
 		worker: make(chan struct{}),
+		player: make(chan struct{}),
 		carry:  make([]byte, 0, frame),
 	}
 	if c, ok := v.engine.(Connector); ok {
@@ -100,10 +102,12 @@ func (v voiceA) Open(ctx context.Context, x *voice.Exchange) (voice.Session, err
 	return s, nil
 }
 
-// session is one open voice A. Say hands each text to one worker goroutine,
-// which streams it, writes its frames and owns the Playback; an Interrupt
-// moves the session to a new generation, which ends every Say of the old one
-// at once, whatever the engine is doing.
+// session is one open voice A. Say hands each text to the synthesis stage
+// (run), which streams it into the Say's buffer, and the playback stage
+// (play) writes each buffer in order and owns the Playback, so a text is
+// synthesised while the one before it plays. An Interrupt moves the session
+// to a new generation, which ends every Say of the old one at once, its
+// audio synthesised ahead included, whatever the engine is doing.
 type session struct {
 	format audio.AudioFormat
 	sample int // bytes in one sample of every channel
@@ -114,7 +118,9 @@ type session struct {
 	ctx    context.Context // ends at Close
 	cancel context.CancelCauseFunc
 	says   chan *sayRequest
-	worker chan struct{} // closed when the worker returns
+	plays  chan *sayRequest // from run to play: one Say may wait for play
+	worker chan struct{}    // closed when run returns
+	player chan struct{}    // closed when play returns
 	events chan voice.Event
 
 	mu           sync.Mutex
@@ -133,15 +139,108 @@ type session struct {
 	carry []byte // worker only: the start of a frame not yet written
 }
 
+// sayRequest is one Say: its text's audio, as synthesis gives it, waits in
+// chunks until play writes it.
 type sayRequest struct {
-	ctx  context.Context
-	text string
-	gen  int
-	done chan error
+	ctx    context.Context
+	cancel context.CancelCauseFunc // ends ctx once play is done with the Say
+	text   string
+	gen    int
+	done   chan error // the Say's result, once
+	ended  sync.Once
+
+	mu       sync.Mutex
+	chunks   [][]byte      // synthesised, not yet written
+	finished bool          // synthesis ended
+	synthErr error         // why synthesis ended, when it failed
+	playErr  error         // play's write failure, which stops synthesis
+	more     chan struct{} // signalled when chunks grow or synthesis ends
 }
 
-// Say speaks text after every Say called before it, and returns once its last
-// frame is queued to the Output. A text of no words speaks nothing.
+// errPlaybackEnded stops a Say's synthesis once play could not write it.
+var errPlaybackEnded = errors.New("tts: the playback ended")
+
+// end hands the Say its result, once.
+func (r *sayRequest) end(err error) { r.ended.Do(func() { r.done <- err }) }
+
+// release ends the Say's context once play is done with it.
+func (r *sayRequest) release() { r.cancel(nil) }
+
+// push keeps a copy of pcm for play, unless play could not write the Say.
+func (r *sayRequest) push(pcm []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.playErr != nil {
+		return errPlaybackEnded
+	}
+	r.chunks = append(r.chunks, append([]byte(nil), pcm...))
+	r.signal()
+	return nil
+}
+
+// synthesised marks synthesis ended, with err when it failed.
+func (r *sayRequest) synthesised(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.finished, r.synthErr = true, err
+	r.signal()
+}
+
+// signal wakes play; r.mu is held.
+func (r *sayRequest) signal() {
+	select {
+	case r.more <- struct{}{}:
+	default:
+	}
+}
+
+// next waits for the Say's next chunk: more is false once synthesis ended
+// and every chunk was taken. It returns early when the Say's context ends.
+func (r *sayRequest) next() (pcm []byte, more bool, err error) {
+	for {
+		r.mu.Lock()
+		switch {
+		case len(r.chunks) > 0:
+			pcm, r.chunks = r.chunks[0], r.chunks[1:]
+			r.mu.Unlock()
+			return pcm, true, nil
+		case r.finished:
+			err := r.synthErr
+			r.mu.Unlock()
+			return nil, false, err
+		}
+		r.mu.Unlock()
+		select {
+		case <-r.more:
+		case <-r.ctx.Done():
+			return nil, false, context.Cause(r.ctx)
+		}
+	}
+}
+
+// failWrite records play's write failure, which stops synthesis; it reports
+// whether it was the first failure of the Say.
+func (r *sayRequest) failWrite(err error) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.playErr != nil || r.synthErr != nil {
+		return false
+	}
+	r.playErr = err
+	r.chunks = nil
+	return true
+}
+
+func (r *sayRequest) writeErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.playErr
+}
+
+// Say speaks text after every Say called before it, and returns once the
+// whole text is synthesised, or synthesis failed: its audio then plays after
+// every Say before it, so the caller's next Say is synthesised while this one
+// plays. A text of no words speaks nothing.
 //
 // Voice A speaks every SayMode in the same voice and style, by design: the
 // room hears one consistent voice, and a style prompt per mode would add
@@ -160,16 +259,18 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 	s.mu.Unlock()
 
 	// The request ends with its generation, synchronously, so an Interrupt
-	// reaches it at once; the caller's ctx ends it too.
+	// reaches it, and its audio synthesised ahead, at once. The caller's ctx
+	// ends it until Say returns; after that its audio is the session's to
+	// play, and play releases it.
 	rctx, cancel := context.WithCancelCause(epoch)
-	defer cancel(nil)
 	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
 	defer stop()
 
-	r := &sayRequest{ctx: rctx, text: text, gen: gen, done: make(chan error, 1)}
+	r := &sayRequest{ctx: rctx, cancel: cancel, text: text, gen: gen, done: make(chan error, 1), more: make(chan struct{}, 1)}
 	select {
 	case s.says <- r:
 	case <-rctx.Done():
+		cancel(nil)
 		s.mu.Lock()
 		s.pending--
 		s.settleLocked()
@@ -180,7 +281,14 @@ func (s *session) Say(ctx context.Context, text string, _ voice.SayMode) error {
 	case err := <-r.done:
 		return err
 	case <-rctx.Done():
-		// The worker finishes the request when the engine lets it go.
+		// play releases the request once it is done with it, which may come
+		// as its result does: the result wins.
+		select {
+		case err := <-r.done:
+			return err
+		default:
+		}
+		// The stages finish the request when the engine lets it go.
 		return context.Cause(rctx)
 	}
 }
@@ -241,6 +349,7 @@ func (s *session) Close() error {
 		}
 	}
 	<-s.worker
+	<-s.player
 	s.mu.Lock()
 	s.eventsClosed = true
 	close(s.events)
@@ -274,11 +383,61 @@ func (s *session) settleLocked() {
 	}
 }
 
+// run is the synthesis stage: it streams each Say's text, in order, into the
+// Say's buffer, while play writes the Say before it. It hands a Say to play
+// before it streams it, so a Say's first audio plays as soon as it comes, and
+// it streams at most one Say ahead of the one playing.
 func (s *session) run() {
 	defer close(s.worker)
+	go s.play()
 	for {
 		select {
 		case r := <-s.says:
+			select {
+			case s.plays <- r:
+			case <-s.ctx.Done():
+				r.end(context.Cause(s.ctx))
+				return
+			}
+			s.synthesise(r)
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// synthesise streams one Say into its buffer. Its Say returns once the whole
+// text is synthesised, so the caller says the next one while this one plays.
+func (s *session) synthesise(r *sayRequest) {
+	if r.ctx.Err() != nil {
+		r.end(context.Cause(r.ctx))
+		return
+	}
+	s.emit(&voice.Event{Kind: voice.EventAgentText, Text: r.text})
+	err := s.stream(r.ctx, r.text, func(pcm []byte) error {
+		return r.push(pcm)
+	})
+	if err != nil && r.ctx.Err() == nil && !errors.Is(err, errPlaybackEnded) {
+		s.emit(&voice.Event{Kind: voice.EventErr, Err: err})
+	}
+	if err != nil && r.ctx.Err() != nil {
+		err = context.Cause(r.ctx)
+	}
+	if errors.Is(err, errPlaybackEnded) || (err == nil && r.writeErr() != nil) {
+		// play could not write the Say: its result is play's failure.
+		err = r.writeErr()
+	}
+	r.end(err)
+	r.synthesised(err)
+}
+
+// play is the playback stage: it writes each Say's audio, in order, as its
+// synthesis gives it, and owns the Playback.
+func (s *session) play() {
+	defer close(s.player)
+	for {
+		select {
+		case r := <-s.plays:
 			s.finish(r, s.speak(r))
 		case <-s.ctx.Done():
 			return
@@ -286,49 +445,47 @@ func (s *session) run() {
 	}
 }
 
-// speak streams one Say into the playback.
+// speak writes one Say's audio into the playback.
 func (s *session) speak(r *sayRequest) error {
-	if r.ctx.Err() != nil {
-		return context.Cause(r.ctx)
-	}
-	s.emit(&voice.Event{Kind: voice.EventAgentText, Text: r.text})
-	var writeErr error
-	err := s.stream(r.ctx, r.text, func(pcm []byte) error {
-		if err := s.write(r, pcm); err != nil {
-			writeErr = err
+	first := true
+	for {
+		pcm, more, err := r.next()
+		if err != nil || !more {
+			if err == nil {
+				// The last frame of a text may be short; a byte that is
+				// not a whole sample is not audio.
+				if n := len(s.carry) - len(s.carry)%s.sample; n > 0 {
+					err = s.writeFrame(r, s.carry[:n], &first)
+				}
+			}
+			s.carry = s.carry[:0]
+			if err != nil && !errors.Is(err, ErrInterrupted) && r.ctx.Err() == nil && r.failWrite(err) {
+				// The Output ended the playback: the next Say begins another.
+				s.mu.Lock()
+				s.pb = nil
+				s.mu.Unlock()
+				s.emit(&voice.Event{Kind: voice.EventErr, Err: err})
+			}
 			return err
 		}
-		return nil
-	})
-	if err == nil {
-		// The last frame of a text may be short; a byte that is not a whole
-		// sample is not audio.
-		if n := len(s.carry) - len(s.carry)%s.sample; n > 0 {
-			err = s.writeFrame(r, s.carry[:n])
-			writeErr = err
+		if err := s.write(r, pcm, &first); err != nil {
+			s.carry = s.carry[:0]
+			if r.ctx.Err() == nil && !errors.Is(err, ErrInterrupted) && r.failWrite(err) {
+				s.mu.Lock()
+				s.pb = nil
+				s.mu.Unlock()
+				s.emit(&voice.Event{Kind: voice.EventErr, Err: err})
+			}
+			return err
 		}
 	}
-	s.carry = s.carry[:0]
-	if err == nil {
-		return nil
-	}
-	if writeErr != nil {
-		// The Output ended the playback: the next Say begins another.
-		s.mu.Lock()
-		s.pb = nil
-		s.mu.Unlock()
-	}
-	if r.ctx.Err() != nil {
-		return context.Cause(r.ctx)
-	}
-	s.emit(&voice.Event{Kind: voice.EventErr, Err: err})
-	return err
 }
 
-// finish hands a Say its result and, when no Say follows it, drains its
+// finish ends a Say's playback stage and, when no Say follows it, drains its
 // playback in the background.
 func (s *session) finish(r *sayRequest, err error) {
-	r.done <- err
+	r.end(err)
+	r.release()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pending--
@@ -359,11 +516,11 @@ func (s *session) drain(pb voice.Playback, gen int) {
 
 // write splits pcm into whole frames of at most audio.MaxWriteFrame, carrying
 // a partial frame, or an odd byte, to the next chunk.
-func (s *session) write(r *sayRequest, pcm []byte) error {
+func (s *session) write(r *sayRequest, pcm []byte, first *bool) error {
 	size := cap(s.carry)
 	for len(pcm) > 0 {
 		if len(s.carry) == 0 && len(pcm) >= size {
-			if err := s.writeFrame(r, pcm[:size]); err != nil {
+			if err := s.writeFrame(r, pcm[:size], first); err != nil {
 				return err
 			}
 			pcm = pcm[size:]
@@ -374,7 +531,7 @@ func (s *session) write(r *sayRequest, pcm []byte) error {
 		if len(s.carry) < size {
 			return nil
 		}
-		if err := s.writeFrame(r, s.carry); err != nil {
+		if err := s.writeFrame(r, s.carry, first); err != nil {
 			return err
 		}
 		s.carry = s.carry[:0]
@@ -383,8 +540,8 @@ func (s *session) write(r *sayRequest, pcm []byte) error {
 }
 
 // writeFrame queues one frame, beginning a playback, and the speech, at the
-// first frame.
-func (s *session) writeFrame(r *sayRequest, frame []byte) error {
+// first frame; the first frame of a text reports EventTextAudio.
+func (s *session) writeFrame(r *sayRequest, frame []byte, first *bool) error {
 	s.mu.Lock()
 	if r.gen != s.gen {
 		s.mu.Unlock()
@@ -396,6 +553,10 @@ func (s *session) writeFrame(r *sayRequest, frame []byte) error {
 	if !s.speaking {
 		s.speaking = true
 		s.emitLocked(&voice.Event{Kind: voice.EventSpeechStarted})
+	}
+	if *first {
+		*first = false
+		s.emitLocked(&voice.Event{Kind: voice.EventTextAudio, Text: r.text})
 	}
 	pb := s.pb
 	s.mu.Unlock()

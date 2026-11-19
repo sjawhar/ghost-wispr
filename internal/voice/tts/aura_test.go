@@ -164,12 +164,27 @@ func newTestAura(t *testing.T, f *fakeSpeak) *Aura {
 	return a
 }
 
+// playedAudio is every frame the Output was given, once play stopped writing
+// (no new frame for 50 ms): a Say returns once its text is synthesised,
+// before its audio is all written.
 func playedAudio(out *fakeOutput) []byte {
-	var all [][]byte
-	for _, p := range out.begun() {
-		all = append(all, p.audio())
+	read := func() []byte {
+		var all [][]byte
+		for _, p := range out.begun() {
+			all = append(all, p.audio())
+		}
+		return bytes.Join(all, nil)
 	}
-	return bytes.Join(all, nil)
+	got, deadline := read(), time.Now().Add(2*time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		next := read()
+		if len(next) == len(got) {
+			return next
+		}
+		got = next
+	}
+	return got
 }
 
 // TestAuraConnectsWhenTheSessionOpens fails if an Aura-2 Session dials only at
@@ -304,7 +319,7 @@ func TestAuraClearsOnInterruptAndTheNextSayHearsOnlyItsOwnAudio(t *testing.T) {
 	if got := f.received(); !slices.Equal(got, want) {
 		t.Fatalf("Deepgram got %q, want %q", got, want)
 	}
-	pbs := out.begun()
+	pbs := out.waitPlayback(t, len(out.begun()), len(after))
 	if got := pbs[len(pbs)-1].audio(); !bytes.Equal(got, after) {
 		t.Fatalf("the Say after Interrupt played %d bytes, want only its own %d", len(got), len(after))
 	}

@@ -101,7 +101,7 @@ func TestGeminiPlaysTheFirstAudioBeforeTheStreamEnds(t *testing.T) {
 		t.Fatal("the first frame was written only after the stream ended, want it written as the first chunk arrives")
 	}
 	want := append(bytes.Clone(first), rest...)
-	if got := out.begun()[0].audio(); !bytes.Equal(got, want) {
+	if got := out.waitPlayback(t, 1, len(want))[0].audio(); !bytes.Equal(got, want) {
 		t.Fatalf("played %d bytes, want the stream's %d in order", len(got), len(want))
 	}
 }
