@@ -728,7 +728,7 @@ func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
 // the final words, takes that search and searches no more.
 func TestAnswerReusesAnEarlyReadAheadsSearch(t *testing.T) {
 	r := newRig(t)
-	r.concierge.searchSettle = 30 * time.Millisecond
+	r.concierge.searchSettle = 300 * time.Millisecond
 	unclearSearch(r)
 	r.records.hits[0].Score = 0.012
 	early := r.exchange
@@ -1154,7 +1154,11 @@ func TestTheHoldersQuestionKeepsItsShape(t *testing.T) {
 		"when Emily will be back":                                                "When will Emily be back?",
 		"why nightly is failing":                                                 "Why is nightly failing?",
 		"how Kelly is doing":                                                     "How is Kelly doing?",
-		"ask the agent on ABC-12.":                                               "Ask the agent on ABC-12?",
+		// The seventh review: a clause that names the holder routes, after
+		// a pause or a key alike.
+		"ask the agent, who holds the issue about the wake word, is it merged": "Is it merged?",
+		"ask the agent on ABC-12 who is working on the cache, is it merged":    "Is it merged?",
+		"ask the agent on ABC-12.": "Ask the agent on ABC-12?",
 	} {
 		if got := fewestWords(turn); got != want {
 			t.Errorf("fewestWords(%q) = %q, want %q", turn, got, want)

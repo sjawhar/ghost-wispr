@@ -536,11 +536,14 @@ func fewestWords(turn string) string {
 		prefix := strings.TrimSpace(askPrefix.FindString(turn))
 		named, inClause := issueKeysIn(prefix), issueKeysIn(question[:m[1]])
 		paused := strings.HasSuffix(prefix, ",") || strings.HasSuffix(prefix, ":")
+		// A clause that names the holder ("who holds …") always routes.
+		lead, _, _ := strings.Cut(strings.ToLower(question), " ")
+		routes := lead == "who" || lead == "that" || lead == "working" || lead == "holding"
 		switch {
 		case m[2] >= 0:
 			question = question[m[2]:]
-		case len(named) > 0 && !slices.Contains(inClause, named[0]):
-		case paused && len(named) == 0 && len(inClause) == 0:
+		case !routes && len(named) > 0 && !slices.Contains(inClause, named[0]):
+		case !routes && paused && len(named) == 0 && len(inClause) == 0:
 		default:
 			question = question[m[1]:]
 		}
