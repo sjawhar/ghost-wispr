@@ -28,6 +28,7 @@ import (
 	"github.com/sjawhar/ghost-wispr/internal/audio"
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/dispatch"
 	"github.com/sjawhar/ghost-wispr/internal/embedding"
 	"github.com/sjawhar/ghost-wispr/internal/gc"
 	"github.com/sjawhar/ghost-wispr/internal/gdrive"
@@ -646,8 +647,8 @@ func (w tappedWriter) Write(p []byte) (int, error) {
 }
 
 // liveTranscriptionOptions are the live Deepgram request's options for a
-// microphone at sampleRate.
-func liveTranscriptionOptions(cfg *config.Config, sampleRate int) *interfaces.LiveTranscriptionOptions {
+// microphone at sampleRate, with Dispatch's project keys as keyterms.
+func liveTranscriptionOptions(cfg *config.Config, sampleRate int, projects []string) *interfaces.LiveTranscriptionOptions {
 	return &interfaces.LiveTranscriptionOptions{
 		Model:          cfg.DeepgramModel,
 		Language:       "en-US",
@@ -660,7 +661,7 @@ func liveTranscriptionOptions(cfg *config.Config, sampleRate int) *interfaces.Li
 		Endpointing:    cfg.Transcription.Endpointing,
 		InterimResults: true,
 		UtteranceEndMs: cfg.Transcription.UtteranceEndMs,
-		Keyterm:        voiceKeyterms(cfg),
+		Keyterm:        voiceKeyterms(cfg, projects),
 		VadEvents:      true,
 	}
 }
@@ -1100,6 +1101,16 @@ func main() {
 		log.Printf("warning: raw erase reservations: %v", err)
 	}
 	startCertificateExpiryChecks(ctx, cfgStore, warningRegistry, certificateExpiryCheckEvery, googleauth.CertExpiry)
+	// Dispatch's project keys: keyterms of the live transcript, and the
+	// projects whose spoken keys the voice writes as keys (R4).
+	var dispatchProjects projectKeys
+	if cfg.SpeakerEnabled && cfg.DispatchToken != "" && cfg.Concierge.DispatchURL != "" {
+		if client, err := dispatch.NewClient(cfg.Concierge.DispatchURL, cfg.DispatchToken, newDispatchHTTP(appLogger)); err != nil {
+			log.Printf("warning: Dispatch's project keys: %v", err)
+		} else {
+			watchProjectKeys(ctx, client.Projects, projectKeysEvery, &dispatchProjects, log.Printf)
+		}
+	}
 	if restorePauseErr != nil {
 		warningRegistry.Set(captureStateWarningKey, "Capture pause state could not be restored; the recorder started paused")
 	}
@@ -1839,7 +1850,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
-		tOptions := liveTranscriptionOptions(&cfg, sampleRate)
+		tOptions := liveTranscriptionOptions(&cfg, sampleRate, dispatchProjects.Get())
 		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
 		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
 		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
@@ -1968,7 +1979,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	if output != nil {
 		var voices voiceSource
 		voices.apply(ctx, &cfg)
-		onConfigChange(cfgStore, func(newCfg *config.Config) { voices.apply(ctx, newCfg) })
+		voices.warnBuild(cfg.Voice.Enabled, warningRegistry)
+		onConfigChange(cfgStore, func(newCfg *config.Config) {
+			voices.apply(ctx, newCfg)
+			voices.warnBuild(newCfg.Voice.Enabled, warningRegistry)
+		})
 		conc = newLazyConcierge(func() (*concierge.Concierge, func(), error) {
 			current := cfgStore.Get()
 			// The session page reads a session's questions again on each change.
@@ -1996,6 +2011,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			session:     func() string { id, _ := manager.ActiveSession(); return id },
 			red:         func() bool { return capture.capturing(micStatus) },
 			notify:      hub.BroadcastVoiceEvent,
+			projects:    dispatchProjects.Get,
 		}); err != nil {
 			log.Printf("warning: the meeting voice is off: %v", err)
 			warningRegistry.Set("voice", "The meeting voice is off: "+err.Error())

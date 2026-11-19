@@ -135,10 +135,38 @@ func TestIssueKeyForms(t *testing.T) {
 		"what is happening with the voice work?": nil,
 		"go ahead":                               nil,
 		"I will be there in a minute":            nil,
+		// As Deepgram wrote Aura's "infra 4592" in end-to-end run 8c, and as
+		// people say it.
+		"ask the agent on in for forty five hundred and two": {"INFRA-4502"},
+		"infra forty-five ninety-two":                        {"INFRA-4592"},
+		"infra four five nine two":                           {"INFRA-4592"},
+		"in for forty five ninety two please":                {"INFRA-4592"},
+		"I am in for a minute":                               nil,
+		// End-to-end run 8e: smart formatting writes "4,592".
+		"ask the agent on in For 4,592 when": {"INFRA-4592"},
 	}
 	for text, want := range cases {
 		if got := IssueKeys(text); !slices.Equal(got, want) {
 			t.Errorf("IssueKeys(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
+// TestSpokenKeysAreWritten fails if a key of a known project, said in a
+// common form, is not written as the key in the turn the Concierge gets, or
+// if words that name no known project's issue change.
+func TestSpokenKeysAreWritten(t *testing.T) {
+	projects := []string{"INFRA", "ABC"}
+	for text, want := range map[string]string{
+		"please ask the agent on in for forty five ninety two when it ships?": "please ask the agent on INFRA-4592 when it ships?",
+		"what about infra ten twenty-seven today":                             "what about INFRA-1027 today",
+		"is abc 12 done":                     "is ABC-12 done",
+		"what changed in the last 30 days":   "what changed in the last 30 days",
+		"I am in for a minute":               "I am in for a minute",
+		"what is happening with INFRA-1027?": "what is happening with INFRA-1027?",
+	} {
+		if got := WriteKeys(text, projects); got != want {
+			t.Errorf("WriteKeys(%q) = %q, want %q", text, got, want)
 		}
 	}
 }

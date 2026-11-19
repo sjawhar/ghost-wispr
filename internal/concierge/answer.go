@@ -413,9 +413,10 @@ var (
 	askPrefix = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\s+(?:the\s+)?(?:agent|holder|session)\b(?:\s+(?:on|for|of|working\s+on|holding)\s+(?:issue\s+)?(?:[A-Za-z][A-Za-z0-9]*[- ]\d{2,}))?[\s,:]*`)
 	// statusWords are the words of a question about status, or about what
 	// the record holds: who holds the issue, its priority, its assignee, its
-	// asks (R7). Words that as often start another question ("where",
-	// "state", "new", "who") are none; "going to" is no status (aboutStatus).
-	statusWords = set(strings.Fields("status happening going progress update updates updated latest news moving stuck blocked doing done finished changed changes next holds holding held holder priority assigned assignee asks review"))
+	// asks, its history and recent events (R7). Words that as often start
+	// another question ("where", "state", "new", "who") are none; "going to"
+	// is no status (aboutStatus).
+	statusWords = set(strings.Fields("status happening going progress update updates updated latest news moving stuck blocked doing done finished changed changes next holds holding held holder priority assigned assignee asks review history events recent"))
 )
 
 // askResult is what the voice says of an ask, and whether Envoy was out of
@@ -478,6 +479,9 @@ func aboutStatus(turn string) bool {
 // characters at a word.
 func fewestWords(turn string) string {
 	question := strings.Join(strings.Fields(askPrefix.ReplaceAllString(turn, "")), " ")
+	// Deepgram may end a sentence at the key ("…on INFRA-4592. When …"): the
+	// question starts at its first word, in the asker's own words.
+	question = strings.TrimLeftFunc(question, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
 	if question == "" {
 		question = strings.Join(strings.Fields(turn), " ")
 	}

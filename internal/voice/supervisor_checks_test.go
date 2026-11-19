@@ -459,6 +459,52 @@ func TestFactAudioOfASayThatPlayedBeforeItReturned(t *testing.T) {
 	waitTimings(t, r, "first_audio", "speech_end", "fact_audio")
 }
 
+// TestFactAudioIsTheSpeechStart fails if the first fact's audio is reported
+// when its Say returns rather than when its speech started. Voice A's Say
+// returns once the last of its audio is queued, about as long as it plays
+// (end-to-end run 8 reported a fact 7 s late).
+func TestFactAudioIsTheSpeechStart(t *testing.T) {
+	c := newFakeConcierge("The voice issue is in review.")
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
+		cfg.Voice = func() (Voice, error) { return slowSayVoice{r: r}, nil }
+	})
+	r.ask("what is happening?")
+	waitTimings(t, r, "first_audio", "fact_audio")
+	if late := r.timingOf("fact_audio").Sub(r.timingOf("first_audio")); late > 50*time.Millisecond {
+		t.Fatalf("fact_audio came %v after the speech started, want its start", late)
+	}
+}
+
+// slowSayVoice opens the rig's fake sessions, and returns from each Say
+// 300 ms after its speech started, while it still plays.
+type slowSayVoice struct{ r *rig }
+
+func (v slowSayVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
+	s, err := v.r.voice.Open(ctx, x)
+	if err != nil {
+		return nil, err
+	}
+	return slowSaySession{Session: s, r: v.r}, nil
+}
+
+type slowSaySession struct {
+	Session
+	r *rig
+}
+
+func (p slowSaySession) Say(ctx context.Context, text string, mode SayMode) error {
+	if err := p.Session.Say(ctx, text, mode); err != nil {
+		return err
+	}
+	eventually(p.r.t, "the speech started", func() bool {
+		p.r.s.mu.Lock()
+		defer p.r.s.mu.Unlock()
+		return p.r.s.voiceSpeaking
+	})
+	time.Sleep(300 * time.Millisecond)
+	return nil
+}
+
 // playedVoice opens the rig's fake sessions, and returns from each Say only
 // once its speech has played.
 type playedVoice struct{ r *rig }

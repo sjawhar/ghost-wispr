@@ -3,7 +3,10 @@ package voice
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -74,6 +77,66 @@ func TestADriverVoiceThatFailsPlaysTheWholeErrorSound(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// TestAnAnswerReturningAsTheFollowUpWindowCloses fails if a driving voice's
+// exchange ends in the gap between its answer tool returning and the voice
+// speaking the answer, because a follow-up window the routing line opened ran
+// out then (voice C's follow_up_race: 3 of 3 runs lost the answer).
+func TestAnAnswerReturningAsTheFollowUpWindowCloses(t *testing.T) {
+	c := newFakeConcierge("The issue is in review.")
+	c.acks = []string{"Reading ABC-12."}
+	c.afterAcks = make(chan struct{})
+	r := newDrivingRigWith(t, time.Minute, c)
+	r.heard("Wispr, what is happening with ABC-12?", true, true)
+	sess := r.waitSession()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)})
+	}()
+	if got := waitSaid(t, sess); got != "Reading ABC-12." {
+		t.Fatalf("said %q", got)
+	}
+	r.waitSpeaking()
+	r.speaker.finish(audio.InputVoice) // the routing line ends: the window opens
+	// The answer returns just before the window (200 ms in the rig) closes.
+	time.Sleep(150 * time.Millisecond)
+	close(c.afterAcks)
+	<-done
+	never(t, "the exchange ended before the voice spoke the answer", 400*time.Millisecond, func() bool { _, _, closed := sess.state(); return closed })
+}
+
+// TestAnExchangeAtItsCapSaysSo fails if an exchange that reaches its
+// exchangeMax is not ended by the Supervisor, or ends logged as something
+// else, such as "the voice ended by itself" (GWGptLive's proof run).
+func TestAnExchangeAtItsCapSaysSo(t *testing.T) {
+	cap := exchangeMax
+	exchangeMax = 300 * time.Millisecond
+	t.Cleanup(func() { exchangeMax = cap })
+	var mu sync.Mutex
+	var logs []string
+	r := newRigWith(t, newFakeConcierge(), func(cfg *SupervisorConfig, r *rig) {
+		v := drivingVoice{r.voice}
+		cfg.Voice = func() (Voice, error) { return v, nil }
+		cfg.IdleWait = time.Minute
+		cfg.Logf = func(format string, args ...any) {
+			mu.Lock()
+			defer mu.Unlock()
+			logs = append(logs, fmt.Sprintf(format, args...))
+		}
+	})
+	r.heard("Wispr, what is happening?", true, true)
+	sess := r.waitSession()
+	eventually(t, "the exchange ended at its cap", func() bool { _, _, closed := sess.state(); return closed })
+	mu.Lock()
+	defer mu.Unlock()
+	for _, line := range logs {
+		if strings.Contains(line, "exchange ended") && strings.Contains(line, "limit of 300ms") {
+			return
+		}
+	}
+	t.Fatalf("no log line names the cap: %q", logs)
 }
 
 // TestAVoiceThatEndsByItselfEndsTheExchange fails if a session whose events
@@ -267,9 +330,11 @@ func TestAFailedAnswerToolSpeaksTheConciergesLine(t *testing.T) {
 	if _, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: AnswerTool, Args: json.RawMessage(`{"question":"q"}`)}); !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("the answer tool returned %v, want ErrUnreachable", err)
 	}
-	if says := sess.saysCopy(); !slices.Equal(says, []string{"I cannot reach Dispatch yet."}) {
-		t.Fatalf("the session spoke %q, want the Concierge's line", says)
-	}
+	// The Concierge's line led, so it is spoken at once in the background,
+	// not waited for.
+	eventually(t, "the Concierge's line spoken once", func() bool {
+		return slices.Equal(sess.saysCopy(), []string{"I cannot reach Dispatch yet."})
+	})
 	eventually(t, "the error sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "error") })
 }
 
