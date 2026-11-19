@@ -80,8 +80,10 @@ const (
 	questionWait = 1500 * time.Millisecond
 	// nothingFound answers a delegation the Concierge had nothing to say on.
 	nothingFound = "There is nothing to report on this. Say so in one short sentence."
-	// lookupFailed answers a delegation whose answer tool failed.
-	lookupFailed = "The lookup failed. Say in one short sentence that you could not get the answer just now."
+	// lookupFailed closes a delegation whose answer tool failed, as silent
+	// context: the Supervisor has already spoken the failure, so the voice
+	// says nothing of its own.
+	lookupFailed = "The lookup failed, and the room has already been told. Do not mention it again unless someone asks."
 )
 
 // stopInstruction is what Interrupt tells GPT-Live when someone talks over it.
@@ -987,7 +989,7 @@ func (s *session) answer(call voice.ToolCall) {
 		// The tool's error can quote the asker's words (a search query), and
 		// the journal is outside every delete path, so its text stays out.
 		s.log.Warn("gptlive: the answer tool failed", "delegation", call.ID, "timeout", errors.Is(err, context.DeadlineExceeded))
-		result, _ = json.Marshal(voice.AnswerResult{Say: lookupFailed})
+		result, _ = json.Marshal(voice.AnswerResult{Context: lookupFailed})
 	}
 	if err := s.deliver(s.ctx, call.ID, result); err != nil && s.ctx.Err() == nil {
 		s.log.Warn("gptlive: return the answer", "delegation", call.ID, "error", err)

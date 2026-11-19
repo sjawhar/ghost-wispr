@@ -158,16 +158,26 @@ func TestADelegationForAnotherTargetRunsNoTool(t *testing.T) {
 	}
 }
 
-func TestAFailedAnswerToolStillAnswersItsDelegation(t *testing.T) {
+// When the answer tool fails, the Supervisor speaks the failure itself (its
+// own sorry, and the error sound): the voice must not say a second one. The
+// delegation still gets silent context, so GPT-Live does not guess.
+func TestAFailedAnswerToolClosesItsDelegationSilently(t *testing.T) {
 	tools := newFakeTools(voice.AnswerResult{})
 	tools.err = errors.New("search failed")
 	srv := newLiveServer(t)
 	_, c, _ := openSession(t, srv, testExchange(newFakeOutput(), tools))
 
 	c.delegate("item_f")
-	ev := c.expect(evCommentaryAppend)
-	if ev.DelegationID == nil || *ev.DelegationID != "item_f" || ev.Content != lookupFailed {
-		t.Fatalf("append %s, want the lookup's failure said on item_f", ev.raw)
+	ev := c.next()
+	if ev.Type != evThinkingAppend || ev.DelegationID == nil || *ev.DelegationID != "item_f" || ev.Content != lookupFailed {
+		t.Fatalf("append %s, want silent context on item_f that the lookup failed", ev.raw)
+	}
+	select {
+	case more := <-c.in:
+		if more.Type == evCommentaryAppend {
+			t.Fatalf("the session spoke a second apology: %s", more.raw)
+		}
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 
@@ -641,7 +651,7 @@ func TestNoTokenAndNoRoomWordsReachTheLog(t *testing.T) {
 
 	c.heard("Wispr, tell me the secret plan.")
 	c.delegate("item_s")
-	c.expect(evCommentaryAppend)
+	c.expect(evThinkingAppend)                                            // the failed tool's silent context
 	_ = s.Say(context.Background(), "Say the secret plan.", voice.Answer) // fails: nobody speaks
 	c.send(map[string]any{"type": evError, "event_id": "event_err", "error": map[string]any{"type": "invalid_request_error", "code": "bad", "message": "you sent the secret plan"}})
 	waitEvent(t, s, voice.EventErr)

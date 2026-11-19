@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"strings"
@@ -60,6 +61,18 @@ const leadIn = 8
 // text turn.
 const leadInWait = time.Second
 
+// inputFrame is how much audio each input frame carries, the unit's and the
+// probe's alike.
+const inputFrame = 250 * time.Millisecond
+
+// framePhase is a random point of an input frame. The probe waits that
+// long before each turn, so that should GPT-Live's timeline count input
+// frames as steps, the spread it measures shows the up to 250 ms they put
+// between its timeline and the session's clock.
+func framePhase() time.Duration {
+	return time.Duration(rand.Int64N(int64(inputFrame)))
+}
+
 // offsetSpread is the most the transcript's offset from the audio may vary
 // for the cut-speech check to match fragments by their place on the session
 // timeline; past it, the check needs a sideband connection, whose output
@@ -82,6 +95,8 @@ type probeConfig struct {
 	Settle time.Duration
 	// Turns is how many text turns to send; 0 means probeTurns.
 	Turns int
+	// Phase is the wait before each turn; nil means framePhase.
+	Phase func() time.Duration
 }
 
 func main() { os.Exit(run()) }
@@ -202,7 +217,16 @@ func probe(ctx context.Context, cfg *probeConfig, out io.Writer) error {
 	if turns <= 0 {
 		turns = probeTurns
 	}
+	phase := cfg.Phase
+	if phase == nil {
+		phase = framePhase
+	}
 	for i := range turns {
+		select {
+		case <-time.After(phase()):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		// Say returns once GPT-Live has spoken the turn's answer and it
 		// played.
 		turn := time.Now()

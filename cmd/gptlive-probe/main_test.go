@@ -424,3 +424,33 @@ func TestReportOffsetsNamesItsVerdict(t *testing.T) {
 		})
 	}
 }
+
+// The probe and the unit send input in 250 ms frames. Should GPT-Live's
+// timeline count those frames as steps, the session's clock runs up to
+// 250 ms ahead of it; the probe starts each turn at a random point of a
+// frame so that the spread it measures shows those steps.
+func TestTheProbeStartsEachTurnAtARandomPointOfAFrame(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for range 50 {
+		d := framePhase()
+		if d < 0 || d >= 250*time.Millisecond {
+			t.Fatalf("phase %v, want within one 250 ms frame", d)
+		}
+		seen[d.Round(10*time.Millisecond)] = true
+	}
+	if len(seen) < 5 {
+		t.Fatalf("50 phases took %d values, want them spread over the frame", len(seen))
+	}
+
+	s := newStandIns(t)
+	cfg := s.config(t)
+	cfg.Settle = time.Second
+	calls := 0
+	cfg.Phase = func() time.Duration { calls++; return 10 * time.Millisecond }
+	if report, err := runProbe(t, s, &cfg); err != nil {
+		t.Fatalf("probe: %v\n%s", err, report)
+	}
+	if calls != probeTurns {
+		t.Fatalf("the probe drew %d phases for %d turns", calls, probeTurns)
+	}
+}
