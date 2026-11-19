@@ -2087,8 +2087,17 @@ func streamMicWithRetry(
 				released = true
 				continue
 			}
+			closings := capture.closingCount()
 			err = streamer.Open()
 			capture.finishMicStart()
+			if err == nil && capture.closingCount() != closings {
+				// A pause, or a hold for the light, came during the open, and
+				// a resume may have opened the gate again since: the device
+				// captured through the pause. Close it, which drops what it
+				// holds, and open it again once capture is back.
+				reopen, reopenWhy = true, "after a pause during its open"
+				continue
+			}
 			// This start, whether it works or not, ends the resume's
 			// "resuming" state: readiness then reports what came back.
 			capture.finishResume()

@@ -628,6 +628,15 @@ func (g *captureGate) lightWentOff() bool {
 	return g.lightOffs != nil && g.lightOffs() != g.redMark.Load()
 }
 
+// closingCount is the number of times the gate has closed. A closing that came
+// while the caller waited changes it, also when the gate has opened again and
+// isClosed reads open.
+func (g *captureGate) closingCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closings
+}
+
 // closingSignal returns a channel that is closed once the gate is closed: at
 // once if it is closed now, else at its next closing.
 func (g *captureGate) closingSignal() <-chan struct{} {

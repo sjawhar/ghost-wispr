@@ -363,6 +363,103 @@ func TestMicStartedWhilePausedIsClosedBeforeStreaming(t *testing.T) {
 	mic.expectEvents(t, "open", "stream")
 }
 
+// pauseBufferMic is a capture device that, after a pause during its Open (its
+// onOpen pauses), holds what it captured during that pause: Stream writes it
+// first, and Close drops it, as closing a PortAudio stream drops its buffer.
+type pauseBufferMic struct {
+	*scriptedMic
+	onOpen   func()
+	mu       sync.Mutex
+	buffered []byte
+}
+
+func (m *pauseBufferMic) Open() error {
+	err := m.scriptedMic.Open()
+	if onOpen := m.onOpen; onOpen != nil {
+		m.onOpen = nil
+		onOpen()
+		m.mu.Lock()
+		m.buffered = []byte("captured during the pause")
+		m.mu.Unlock()
+	}
+	return err
+}
+
+func (m *pauseBufferMic) Close() error {
+	m.mu.Lock()
+	m.buffered = nil
+	m.mu.Unlock()
+	return m.scriptedMic.Close()
+}
+
+func (m *pauseBufferMic) Stream(w io.Writer) error {
+	m.mu.Lock()
+	held := m.buffered
+	m.buffered = nil
+	m.mu.Unlock()
+	if held != nil {
+		if _, err := w.Write(held); err != nil {
+			return err
+		}
+	}
+	return m.scriptedMic.Stream(w)
+}
+
+// TestAPauseDuringTheMicOpenClosesTheDevice fails if the mic loop streams a
+// device it opened before a pause that came during the open, also when a
+// resume came during the open too and the gate is open again by the time
+// Open returns: what the device captured during the pause would reach the
+// recording. The loop must close that device, which drops what it holds,
+// and open it again once capture resumes.
+func TestAPauseDuringTheMicOpenClosesTheDevice(t *testing.T) {
+	for _, resumeToo := range []bool{false, true} {
+		name := "control, a pause alone during the open"
+		if resumeToo {
+			name = "a pause and a resume during the open"
+		}
+		t.Run(name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			capture.Pause()
+			mic := &pauseBufferMic{scriptedMic: newScriptedMic()}
+			recorded := &lockedBuffer{}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := goDone(func() {
+				streamMicWithRetry(ctx, capture, mic, recorded, func(time.Duration) {}, nopLogf, nil)
+			})
+			t.Cleanup(func() {
+				cancel()
+				close(mic.chunks)
+				if !returnedWithin(done, testWait) {
+					t.Error("mic loop did not stop")
+				}
+			})
+			mic.expectEvents(t, "close")
+			mic.onOpen = func() { // the device captures from here on
+				capture.Pause()
+				if !resumeToo {
+					return
+				}
+				capture.Resume()
+				opened, stop := context.WithTimeout(ctx, testWait)
+				defer stop()
+				if !capture.waitResumed(opened) {
+					t.Error("the gate did not open again")
+				}
+			}
+			capture.Resume()
+			mic.expectEvents(t, "open", "close")
+			if !resumeToo {
+				capture.Resume()
+			}
+			mic.expectEvents(t, "open", "stream")
+			mic.capture(t, []byte{1, 2})
+			if got := recorded.Len(); got != 2 {
+				t.Fatalf("the recording got %d bytes, want only the 2 captured after the resume", got)
+			}
+		})
+	}
+}
+
 // Shutting down while paused ends the mic loop instead of leaving it waiting.
 func TestPausedMicLoopStopsOnShutdown(t *testing.T) {
 	capture := newCaptureGate(nil, nil, nil)
