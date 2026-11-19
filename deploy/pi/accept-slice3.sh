@@ -17,7 +17,7 @@ given_session=
 readonly deploy_dir=/opt/ghost-wispr
 readonly drive_api=https://www.googleapis.com/drive/v3
 readonly drive_scope=https://www.googleapis.com/auth/drive.readonly
-readonly deepgram_url='https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true'
+readonly deepgram_url='https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&mip_opt_out=true'
 readonly google_doc_type=application/vnd.google-apps.document
 # The mode guard probes a session id that matches the API's pattern and does not exist: the
 # handler checks the mode before it reads the session, and a build without modes answers 404
@@ -2603,7 +2603,8 @@ $(session_field "$detail" summary)"
   # The Pi-side requests themselves, run as the Pi runs them, against a fake curl that answers
   # as the token service, IAM, Drive and Deepgram would.
   local fake_bin="$controls_dir/bin" fake_log="$controls_dir/fake-curl.log" sent_log="$controls_dir/fake-curl.requests"
-  local evidence sts_request field
+  local evidence sts_request field deepgram_requests deepgram_request
+  local opt_out_query='[?&]mip_opt_out=true(&|$)'
   mkdir -p "$fake_bin"
   fake_curl >"$fake_bin/curl"
   fake_openssl >"$fake_bin/openssl"
@@ -2645,6 +2646,16 @@ $(session_field "$detail" summary)"
   done
   grep -Fq '"scope":["https://www.googleapis.com/auth/drive.readonly"]' <<<"$(grep '^https://iam.test/' "$sent_log")" \
     || fail 'self-test: the impersonation did not ask for the read-only Drive scope'
+  # Every Deepgram request opts out of Deepgram's Model Improvement Program, which may otherwise keep
+  # the office audio and its transcript after processing, for training. A run that sent Deepgram
+  # nothing has checked nothing.
+  deepgram_requests=$(cut -f 1 "$sent_log" | grep '^https://api\.deepgram\.com/')
+  [[ -n "$deepgram_requests" ]] || fail 'self-test: no request reached Deepgram, so its opt-out was not checked'
+  while IFS= read -r deepgram_request; do
+    [[ "$deepgram_request" =~ $opt_out_query ]] \
+      || fail "self-test: a Deepgram request does not opt out of model improvement: $deepgram_request"
+  done <<<"$deepgram_requests"
+  printf 'A11 self-test RAN: every Pi-side Deepgram request sends mip_opt_out=true\n'
   expect 0 'the evidence the Pi-side requests return passes A11' evaluated evaluate_audio_after "$evidence" "$detail" '[]' "$found"
   printf 'A11 self-test RAN: the Pi-side token, Drive and Deepgram requests, run against a fake curl, give the evidence the checks read, and no token or key reaches an argument or the evidence\n'
 

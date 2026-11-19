@@ -37,9 +37,13 @@ func (s ConnectionState) String() string {
 
 // ResilientConfig holds configuration for the ResilientClient.
 type ResilientConfig struct {
-	// BufferSize is the ring buffer capacity in bytes.
-	// Default: 60 * 32000 = 1,920,000 (60 seconds at 16kHz 16-bit mono PCM = 32 KB/sec)
+	// BufferSize is the ring buffer capacity in bytes. Zero holds
+	// DefaultBufferSeconds of 16-bit mono audio at SampleRate.
 	BufferSize int
+
+	// SampleRate is the rate of the audio written, which sizes the default
+	// buffer. Zero is 16000 Hz.
+	SampleRate int
 
 	// MaxReconnectBackoff is the maximum delay between reconnection attempts.
 	// Default: 30 seconds

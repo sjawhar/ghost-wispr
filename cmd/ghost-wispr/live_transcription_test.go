@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -87,11 +88,13 @@ func TestLiveTranscriptionConnectsAfterATransientFirstDialFailure(t *testing.T) 
 }
 
 // switchableDeepgram is a Deepgram live endpoint whose answer the test sets:
-// accept and read, accept and close at once, or refuse with HTTP 503.
+// accept and read, accept and close at once, or refuse with HTTP 503. It
+// keeps the query of every handshake it is asked.
 type switchableDeepgram struct {
-	mode  atomic.Int32
-	mu    sync.Mutex
-	conns []*websocket.Conn
+	mode    atomic.Int32
+	mu      sync.Mutex
+	conns   []*websocket.Conn
+	queries []url.Values
 }
 
 const (
@@ -104,6 +107,9 @@ func startSwitchableDeepgram(t *testing.T) (*switchableDeepgram, string) {
 	peer := &switchableDeepgram{}
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer.mu.Lock()
+		peer.queries = append(peer.queries, r.URL.Query())
+		peer.mu.Unlock()
 		c, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -133,6 +139,20 @@ func (p *switchableDeepgram) dropAll() {
 		_ = c.Close()
 	}
 	p.conns = nil
+}
+
+// held is how many connections the peer holds.
+func (p *switchableDeepgram) held() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.conns)
+}
+
+// handshakes is the query of every handshake the peer was asked, in order.
+func (p *switchableDeepgram) handshakes() []url.Values {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.queries)
 }
 
 func notConnectedWarning(warnings *warningsRegistry) bool {
@@ -190,6 +210,41 @@ func TestDeepgramWarningFollowsLaterDisconnects(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if !rc.IsConnected() || notConnectedWarning(warnings) {
 		t.Fatalf("300 ms after reconnecting: connected=%t, warnings %q; want connected and no warning", rc.IsConnected(), warnings.List())
+	}
+}
+
+// TestEveryLiveSocketOptsOutOfDeepgramModelImprovement fails if a live
+// socket, the first or one a reconnect dials, asks Deepgram without
+// mip_opt_out=true. Without it, Deepgram's Model Improvement Program may keep
+// the office audio and its transcripts after processing, for training, and a
+// deleted segment would live on at Deepgram. It dials through
+// newLiveTranscription, as main does.
+func TestEveryLiveSocketOptsOutOfDeepgramModelImprovement(t *testing.T) {
+	peer, host := startSwitchableDeepgram(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := newLiveTranscription(ctx, "test-key",
+		&interfaces.ClientOptions{Host: host, EnableKeepAlive: true},
+		&interfaces.LiveTranscriptionOptions{Model: "nova-3", Language: "en-US", Encoding: "linear16", SampleRate: 16000, Channels: 1},
+		transcribe.ResilientConfig{BufferSize: 1 << 16, InitialReconnectDelay: 20 * time.Millisecond, MaxReconnectBackoff: 50 * time.Millisecond},
+		nil, newWarningsRegistry(), nil)
+	t.Cleanup(func() { _ = rc.Close() })
+	// The peer keeps a connection only after its handshake reply, which can
+	// reach the client first: wait for both, so the drop closes it.
+	waitForHardwareWithin(t, 3*time.Second, "the first socket to connect", func() bool {
+		return rc.IsConnected() && peer.held() == 1
+	})
+
+	// Deepgram drops the socket: the next write fails, and the client dials again.
+	peer.dropAll()
+	waitForHardwareWithin(t, 5*time.Second, "a reconnect's socket", func() bool {
+		_, _ = rc.Write(make([]byte, 3200))
+		return len(peer.handshakes()) >= 2 && rc.IsConnected()
+	})
+	for i, query := range peer.handshakes() {
+		if got := query["mip_opt_out"]; !slices.Equal(got, []string{"true"}) {
+			t.Fatalf("socket %d asked Deepgram with mip_opt_out %q (query %v), want [\"true\"]", i+1, got, query)
+		}
 	}
 }
 

@@ -118,6 +118,12 @@ recording_rules:
   - Ask the office manager to delete a segment.
 ```
 
+Ghost Wispr opts out of Deepgram's
+[Model Improvement Program](https://developers.deepgram.com/docs/the-deepgram-model-improvement-partnership-program)
+on every request: the live stream and each pre-recorded transcription send `mip_opt_out=true`.
+Deepgram then keeps the audio and its transcript only as long as it needs to process the request,
+and does not use them to train its models.
+
 ## Recording light
 
 With `indicator_light: blink1` the recorder captures only while the blink(1) reads back red.

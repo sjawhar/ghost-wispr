@@ -21,10 +21,20 @@ import (
 )
 
 const (
+	// defaultSampleRate is the rate the recorder takes before the microphone
+	// opens.
 	defaultSampleRate = 16000
 	pcmChannels       = 1
 	pcmBitDepth       = 16
+	// prerollSeconds is how much audio before a session's start leads its
+	// recording.
+	prerollSeconds = 5
 )
+
+// pcmBytesPerSecond is the byte rate of the recorder's PCM at sampleRate.
+func pcmBytesPerSecond(sampleRate int) int {
+	return sampleRate * pcmChannels * pcmBitDepth / 8
+}
 
 // encodeTimeout is how long the MP3 encoders (ffmpeg, then lame) together may
 // take for a recording of pcmBytes at sampleRate before the recording is kept
@@ -32,7 +42,7 @@ const (
 // than either encoder runs. A wedged encoder then cannot hold a session end,
 // or a capture pause waiting on it, open for good.
 var encodeTimeout = func(pcmBytes int64, sampleRate int) time.Duration {
-	bytesPerSecond := int64(sampleRate * pcmChannels * pcmBitDepth / 8)
+	bytesPerSecond := int64(pcmBytesPerSecond(sampleRate))
 	length := time.Duration(pcmBytes/bytesPerSecond) * time.Second
 	return time.Minute + length/10
 }
@@ -46,18 +56,25 @@ type Recorder struct {
 	rawFile    *os.File
 	sampleRate int
 	preroll    *transcribe.RingBuf
+	// sessionRate is the rate the recording under way is captured at, as
+	// StartSession recorded it.
+	sessionRate int
 	// unsavedID and unsavedPath name a recording EndSession closed but could
-	// not save; EndSession for that session saves it, unless DiscardUnsaved
-	// gave up on it first.
+	// not save, captured at unsavedRate; EndSession for that session saves it,
+	// unless DiscardUnsaved gave up on it first.
 	unsavedID   string
 	unsavedPath string
+	unsavedRate int
 	// savingPath is the raw recording EndSession is saving now.
 	savingPath string
+	// rates keeps the rate of each session's raw recording, which the raw
+	// file does not (UseSessionRates); nil keeps none.
+	rates SessionRates
 
-	// encode saves the raw recording at rawPath under name (without its
-	// extension) in the audio directory and returns the saved file
-	// (defaultEncode).
-	encode func(ctx context.Context, rawPath, name string) (string, error)
+	// encode saves the raw recording at rawPath, captured at sampleRate,
+	// under name (without its extension) in the audio directory and returns
+	// the saved file (defaultEncode).
+	encode func(ctx context.Context, rawPath, name string, sampleRate int) (string, error)
 	// createRaw creates a session's raw recording, refusing one that exists
 	// (createRawFile).
 	createRaw func(path string) (*os.File, error)
@@ -71,20 +88,69 @@ func NewRecorder(audioDir string) *Recorder {
 	r := &Recorder{
 		audioDir:   audioDir,
 		sampleRate: defaultSampleRate,
-		preroll:    transcribe.NewRingBuf(5 * defaultSampleRate * pcmBitDepth / 8 * pcmChannels),
+		preroll:    transcribe.NewRingBuf(prerollSeconds * pcmBytesPerSecond(defaultSampleRate)),
 	}
 	r.encode = r.defaultEncode
 	r.createRaw = createRawFile
 	return r
 }
 
-func (r *Recorder) SetSampleRate(sampleRate int) {
+// SetSampleRate sets the rate the microphone opened at, which the audio the
+// recorder takes from now on has. The preroll then holds prerollSeconds at
+// that rate, and drops audio it held at another rate: that cannot lead a
+// recording at this one. A recording already open takes the new rate too,
+// and with session rates kept (UseSessionRates) its session's row does: a
+// session can start before the microphone first opens (a manual start during
+// the start-up retry, or while the light is not confirmed red), and the rate
+// changes only before audio first flows, so all of its audio is at the new
+// rate. It returns the error of that row's write; the recording itself still
+// saves at the new rate when its session ends.
+func (r *Recorder) SetSampleRate(sampleRate int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if sampleRate > 0 {
-		r.sampleRate = sampleRate
+	if sampleRate <= 0 || sampleRate == r.sampleRate {
+		return nil
 	}
+	r.sampleRate = sampleRate
+	r.preroll = transcribe.NewRingBuf(prerollSeconds * pcmBytesPerSecond(sampleRate))
+	if r.rawFile == nil {
+		return nil
+	}
+	r.sessionRate = sampleRate
+	// The row is written outside the lock, as StartSession writes it, and
+	// again while the recording's rate changed meanwhile.
+	for id := r.sessionID; r.rates != nil; {
+		rates, rate := r.rates, r.sessionRate
+		r.mu.Unlock()
+		err := rates.SetSessionSampleRate(id, rate)
+		r.mu.Lock()
+		if err != nil {
+			return fmt.Errorf("record the sample rate of session %s: %w", id, err)
+		}
+		if r.sessionID != id || r.sessionRate == rate {
+			return nil
+		}
+	}
+	return nil
+}
+
+// SessionRates keeps the sample rate each session's raw recording is captured
+// at, which a raw .pcm does not store (storage.SQLiteStore). A session from a
+// build that kept none reads as 0, and its raw recording is taken as captured
+// at the rate the recorder has now (SaveKept).
+type SessionRates interface {
+	SetSessionSampleRate(id string, rate int) error
+	SessionSampleRate(id string) (int, error)
+}
+
+// UseSessionRates makes the recorder record the rate of each session it
+// starts in rates, and encode each kept raw recording (SaveKept) at the rate
+// rates has for its session.
+func (r *Recorder) UseSessionRates(rates SessionRates) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rates = rates
 }
 
 func (r *Recorder) Writer(dst io.Writer) io.Writer {
@@ -101,10 +167,31 @@ func createRawFile(path string) (*os.File, error) {
 // never reuses the id of a recording on disk, raw or saved as MP3 or WAV:
 // that is another session's audio (a clock set back can name a new session
 // as an earlier one), so it refuses with an error that wraps os.ErrExist,
-// leaving the file as it is and starting nothing.
+// leaving the file as it is and starting nothing. With session rates kept
+// (UseSessionRates), it first records the rate the recording is captured at,
+// and starts nothing if it cannot: a raw recording whose rate is not kept
+// would be recovered at the wrong one.
 func (r *Recorder) StartSession(sessionID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	rate := r.sampleRate
+	for r.rates != nil {
+		// The lock is released for the write, which can wait on the
+		// database, and the rate read again after it: the microphone can
+		// open at another meanwhile.
+		rates := r.rates
+		r.mu.Unlock()
+		err := rates.SetSessionSampleRate(sessionID, rate)
+		r.mu.Lock()
+		if err != nil {
+			return fmt.Errorf("record the sample rate of session %s: %w", sessionID, err)
+		}
+		if r.sampleRate == rate {
+			break
+		}
+		rate = r.sampleRate
+	}
 
 	if err := os.MkdirAll(r.audioDir, 0o755); err != nil {
 		return fmt.Errorf("create audio directory: %w", err)
@@ -133,6 +220,7 @@ func (r *Recorder) StartSession(sessionID string) error {
 	r.sessionID = sessionID
 	r.rawPath = rawPath
 	r.rawFile = rawFile
+	r.sessionRate = rate
 
 	// Flush preroll buffer into the new file
 	if n := r.preroll.Len(); n > 0 {
@@ -160,15 +248,15 @@ func (r *Recorder) EndSession(sessionID string) (string, error) {
 	r.mu.Lock()
 	if sessionID == "" || sessionID != r.sessionID || r.rawFile == nil {
 		retry := sessionID != "" && sessionID == r.unsavedID
-		rawPath := r.unsavedPath
+		rawPath, rate := r.unsavedPath, r.unsavedRate
 		r.mu.Unlock()
 		if !retry {
 			return "", nil
 		}
-		return r.save(sessionID, rawPath)
+		return r.save(sessionID, rawPath, rate)
 	}
 
-	rawPath, rawFile := r.rawPath, r.rawFile
+	rawPath, rawFile, rate := r.rawPath, r.rawFile, r.sessionRate
 	r.sessionID = ""
 	r.rawPath = ""
 	r.rawFile = nil
@@ -177,26 +265,27 @@ func (r *Recorder) EndSession(sessionID string) (string, error) {
 
 	if err := rawFile.Close(); err != nil {
 		r.mu.Lock()
-		r.unsavedID, r.unsavedPath = sessionID, rawPath
+		r.unsavedID, r.unsavedPath, r.unsavedRate = sessionID, rawPath, rate
 		r.savingPath = ""
 		r.mu.Unlock()
 		return "", fmt.Errorf("close raw pcm file: %w", err)
 	}
-	return r.save(sessionID, rawPath)
+	return r.save(sessionID, rawPath, rate)
 }
 
-// save encodes the closed recording of sessionID and removes its raw file. If
-// it cannot, the recording is kept for that session's next EndSession to save.
-func (r *Recorder) save(sessionID, rawPath string) (string, error) {
-	audioPath, err := r.encode(context.Background(), rawPath, sessionID)
+// save encodes the closed recording of sessionID, captured at sampleRate, and
+// removes its raw file. If it cannot, the recording is kept for that
+// session's next EndSession to save.
+func (r *Recorder) save(sessionID, rawPath string, sampleRate int) (string, error) {
+	audioPath, err := r.encode(context.Background(), rawPath, sessionID, sampleRate)
 	r.mu.Lock()
 	if r.savingPath == rawPath {
 		r.savingPath = ""
 	}
 	if err != nil {
-		r.unsavedID, r.unsavedPath = sessionID, rawPath
+		r.unsavedID, r.unsavedPath, r.unsavedRate = sessionID, rawPath, sampleRate
 	} else if r.unsavedID == sessionID {
-		r.unsavedID, r.unsavedPath = "", ""
+		r.unsavedID, r.unsavedPath, r.unsavedRate = "", "", 0
 	}
 	r.mu.Unlock()
 	if err != nil {
@@ -255,8 +344,12 @@ func (r *Recorder) KeptRawSessions() []string {
 
 // SaveKept saves the raw recording kept in the audio directory for session
 // sessionID as EndSession saves a session's recording (MP3, else WAV), and
-// returns the saved file. It saves it under a temporary name
-// (recording.KeptTempPaths), never the session's own, and keeps the raw
+// returns the saved file. It encodes it at the rate the session rates have
+// for it (UseSessionRates). A session from a build that kept no rate has
+// none, and its raw recording is encoded at the rate the recorder has now,
+// the rate this run's microphone opened at (else defaultSampleRate), as
+// those builds encoded it. It saves it under a temporary
+// name (recording.KeptTempPaths), never the session's own, and keeps the raw
 // file: its caller renames the saved file into place only as the session
 // takes it, and erases the raw file once the saved recording is safe. So a
 // session deleted while this runs, then a stop, leaves no <id>.mp3 or
@@ -267,6 +360,7 @@ func (r *Recorder) SaveKept(ctx context.Context, sessionID string) (string, erro
 	rawPath := recording.RawPath(r.audioDir, sessionID)
 	r.mu.Lock()
 	inUse := rawPath == r.rawPath || rawPath == r.savingPath || rawPath == r.unsavedPath
+	rates, rate := r.rates, r.sampleRate
 	r.mu.Unlock()
 	if inUse {
 		return "", fmt.Errorf("raw recording %s is in use by the recorder", rawPath)
@@ -278,7 +372,16 @@ func (r *Recorder) SaveKept(ctx context.Context, sessionID string) (string, erro
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("raw recording %s is not a regular file", rawPath)
 	}
-	return r.encode(ctx, rawPath, recording.KeptTempName(sessionID))
+	if rates != nil {
+		recorded, err := rates.SessionSampleRate(sessionID)
+		if err != nil {
+			return "", fmt.Errorf("read the sample rate of the raw recording %s: %w", rawPath, err)
+		}
+		if recorded > 0 {
+			rate = recorded
+		}
+	}
+	return r.encode(ctx, rawPath, recording.KeptTempName(sessionID), rate)
 }
 
 // DiscardUnsaved gives up on a recording EndSession closed but could not save:
@@ -288,7 +391,7 @@ func (r *Recorder) SaveKept(ctx context.Context, sessionID string) (string, erro
 func (r *Recorder) DiscardUnsaved() string {
 	r.mu.Lock()
 	rawPath := r.unsavedPath
-	r.unsavedID, r.unsavedPath = "", ""
+	r.unsavedID, r.unsavedPath, r.unsavedRate = "", "", 0
 	r.mu.Unlock()
 	if rawPath == "" {
 		return ""
@@ -308,15 +411,12 @@ func (r *Recorder) DiscardPreroll() {
 	r.preroll.Reset()
 }
 
-// defaultEncode saves the raw recording at rawPath as <name>.mp3 in the audio
-// directory, else, once the MP3 encoders failed or ran out of time, as
-// <name>.wav, and returns the saved file. A failed encoder or WAV write leaves
-// no partial file. Once ctx is cancelled it saves nothing more: no WAV
-// fallback runs after a cancelled encoder.
-func (r *Recorder) defaultEncode(ctx context.Context, rawPath, name string) (string, error) {
-	r.mu.Lock()
-	sampleRate := r.sampleRate
-	r.mu.Unlock()
+// defaultEncode saves the raw recording at rawPath, captured at sampleRate,
+// as <name>.mp3 in the audio directory, else, once the MP3 encoders failed or
+// ran out of time, as <name>.wav, and returns the saved file. A failed encoder
+// or WAV write leaves no partial file. Once ctx is cancelled it saves nothing
+// more: no WAV fallback runs after a cancelled encoder.
+func (r *Recorder) defaultEncode(ctx context.Context, rawPath, name string, sampleRate int) (string, error) {
 	if sampleRate <= 0 {
 		sampleRate = defaultSampleRate
 	}
