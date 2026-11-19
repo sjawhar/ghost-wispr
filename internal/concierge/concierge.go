@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,6 +82,7 @@ type Store interface {
 	AnswerVoiceTask(id, written string) (bool, error)
 	EndVoiceTask(id string, state storage.VoiceTaskState) (bool, error)
 	MarkVoiceTaskSpoken(id string, at time.Time) error
+	CancelWorkingVoiceTasks(sessionID string) (int64, error)
 }
 
 // JoinedAgent is an agent that joined the meeting.
@@ -125,8 +128,13 @@ type Concierge struct {
 	// and agent session, so a second question replaces the first.
 	lastAsk map[[2]string]string
 	// working lists the unanswered tasks sent to each agent session, so a
-	// reply that names no message it answers still finds its task.
+	// message from it that names no question can be met with a request to
+	// reply again.
 	working map[string][]string
+	// askedAgain is, per task, the event of the one request its agent got to
+	// reply again with in_reply_to; againFor leads that event to the task.
+	askedAgain map[string]string
+	againFor   map[string]string
 	// sentAs leads a sent question's Envoy event to its task's local id
 	// until the task takes the event as its id.
 	sentAs map[string]string
@@ -134,6 +142,13 @@ type Concierge struct {
 	inflight map[string]int
 	// named is, per exchange, the agent sessions ask_agent may ask.
 	named map[string]*named
+	// queue holds announcements not yet handed to Answers, oldest first;
+	// offering is the one being handed over now. queued wakes the pump.
+	queue    []voice.PendingAnswer
+	offering *voice.PendingAnswer
+	queued   chan struct{}
+	// prefetches is, per exchange, the record read while its asker speaks.
+	prefetches map[string]*prefetch
 }
 
 var _ voice.Concierge = (*Concierge)(nil)
@@ -147,20 +162,24 @@ func New(cfg *Config) (*Concierge, error) {
 		return nil, errors.New("concierge: no store")
 	}
 	c := &Concierge{
-		model:     cfg.Model,
-		generator: cfg.Generator,
-		records:   cfg.Records,
-		store:     cfg.Store,
-		publicURL: cfg.PublicURL,
-		joined:    cfg.Joined,
-		now:       cfg.Now,
-		logger:    cfg.Logger,
-		answers:   make(chan voice.PendingAnswer, 16),
-		lastAsk:   map[[2]string]string{},
-		working:   map[string][]string{},
-		sentAs:    map[string]string{},
-		inflight:  map[string]int{},
-		named:     map[string]*named{},
+		model:      cfg.Model,
+		generator:  cfg.Generator,
+		records:    cfg.Records,
+		store:      cfg.Store,
+		publicURL:  cfg.PublicURL,
+		joined:     cfg.Joined,
+		now:        cfg.Now,
+		logger:     cfg.Logger,
+		answers:    make(chan voice.PendingAnswer),
+		lastAsk:    map[[2]string]string{},
+		working:    map[string][]string{},
+		askedAgain: map[string]string{},
+		againFor:   map[string]string{},
+		sentAs:     map[string]string{},
+		inflight:   map[string]int{},
+		named:      map[string]*named{},
+		queued:     make(chan struct{}, 1),
+		prefetches: map[string]*prefetch{},
 	}
 	if c.model == "" {
 		c.model = DefaultModel
@@ -171,6 +190,7 @@ func New(cfg *Config) (*Concierge, error) {
 	if c.logger == nil {
 		c.logger = slog.Default()
 	}
+	go c.offerAnswers()
 	return c, nil
 }
 
@@ -189,7 +209,128 @@ func (c *Concierge) currentAgents() Agents {
 }
 
 // Answers reports each holder's answer once it lands, rewritten for the ear.
+// No announcement is dropped: they queue until read.
 func (c *Concierge) Answers() <-chan voice.PendingAnswer { return c.answers }
+
+// offerAnswers hands queued announcements to Answers, oldest first, as the
+// Supervisor reads them. Before each hand-over, and again every
+// offerRecheck while it waits, it drops an announcement whose task is gone
+// (its meeting was deleted) or no longer done (its meeting ended).
+func (c *Concierge) offerAnswers() {
+	for {
+		c.mu.Lock()
+		for len(c.queue) == 0 {
+			c.mu.Unlock()
+			<-c.queued
+			c.mu.Lock()
+		}
+		next := c.queue[0]
+		c.queue = c.queue[1:]
+		c.offering = &next
+		c.mu.Unlock()
+		for c.stillOwed(&next) {
+			select {
+			case c.answers <- next:
+			case <-time.After(offerRecheck):
+				continue
+			}
+			break
+		}
+		c.mu.Lock()
+		c.offering = nil
+		c.mu.Unlock()
+	}
+}
+
+// offerRecheck is how often a waiting announcement checks that its task is
+// still owed.
+const offerRecheck = 100 * time.Millisecond
+
+// stillOwed reports whether an announcement's task still exists and is done.
+func (c *Concierge) stillOwed(answer *voice.PendingAnswer) bool {
+	task, err := c.store.VoiceTask(answer.TaskID)
+	if err != nil || task.State != storage.VoiceTaskDone {
+		c.logger.Info("concierge dropped the announcement of an answer no longer owed", "task", answer.TaskID, "error", err)
+		return false
+	}
+	return true
+}
+
+// enqueue queues an announcement for offerAnswers.
+func (c *Concierge) enqueue(answer voice.PendingAnswer) {
+	c.mu.Lock()
+	c.queue = append(c.queue, answer)
+	c.mu.Unlock()
+	select {
+	case c.queued <- struct{}{}:
+	default:
+	}
+}
+
+// SessionEnded cancels the questions its meeting still waits on: their
+// answers are kept for the session's page and not announced.
+func (c *Concierge) SessionEnded(sessionID string) error {
+	cancelled, err := c.store.CancelWorkingVoiceTasks(sessionID)
+	if err != nil {
+		return err
+	}
+	if cancelled > 0 {
+		c.logger.Info("concierge cancelled the questions of an ended session", "session", sessionID, "cancelled", cancelled)
+	}
+	return nil
+}
+
+// SessionDeleted drops what the Concierge holds of a deleted session: its
+// queued announcements, the agents it named and asked, and what it read for
+// it. Its tasks went with its rows, so a late reply finds nothing.
+func (c *Concierge) SessionDeleted(sessionID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queue = slices.DeleteFunc(c.queue, func(answer voice.PendingAnswer) bool { return answer.SessionID == sessionID })
+	for key := range c.lastAsk {
+		if key[0] == sessionID {
+			delete(c.lastAsk, key)
+		}
+	}
+	prefix := sessionID + "|"
+	for key := range c.named {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.named, key)
+		}
+	}
+	for key := range c.prefetches {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.prefetches, key)
+		}
+	}
+	// The tasks went with the session's rows: drop every id that names one.
+	gone := func(id string) bool {
+		if local, ok := c.sentAs[id]; ok {
+			id = local
+		}
+		_, err := c.store.VoiceTask(id)
+		return err != nil
+	}
+	for agent, ids := range c.working {
+		ids = slices.DeleteFunc(ids, gone)
+		if len(ids) == 0 {
+			delete(c.working, agent)
+		} else {
+			c.working[agent] = ids
+		}
+	}
+	for request, taskID := range c.againFor {
+		if gone(taskID) {
+			delete(c.againFor, request)
+			delete(c.askedAgain, taskID)
+		}
+	}
+	for event, local := range c.sentAs {
+		if _, err := c.store.VoiceTask(local); err != nil {
+			delete(c.sentAs, event)
+		}
+	}
+}
 
 // Spoken records that a pending answer was spoken.
 func (c *Concierge) Spoken(_ context.Context, taskID string) error {

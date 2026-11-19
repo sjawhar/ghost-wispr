@@ -2,7 +2,6 @@ package concierge
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -175,27 +174,6 @@ func TestAStoppedAnswerSaysNothingMore(t *testing.T) {
 	}
 }
 
-func TestTheAnswerToolReturnsWhatTheConciergeWouldSay(t *testing.T) {
-	r := newRig(t)
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is done. "), text("It closed today."))}}
-	args, _ := json.Marshal(voice.AnswerArgs{Question: "is ABC-12 done", Transcript: "Speaker 0: is ABC-12 done"})
-	raw, err := r.concierge.Tools(&r.exchange).Run(context.Background(), voice.ToolCall{ID: "d1", Name: voice.AnswerTool, Args: args})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var result voice.AnswerResult
-	if err := json.Unmarshal(raw, &result); err != nil {
-		t.Fatal(err)
-	}
-	if result.Say != "ABC-12 is done. It closed today." {
-		t.Fatalf("answer result = %+v", result)
-	}
-	prompt := r.model.requests[0][0].Parts[0].Text
-	if !strings.Contains(prompt, "is ABC-12 done") || !strings.Contains(prompt, "Speaker 0: is ABC-12 done") {
-		t.Errorf("the prompt lacks the question or the transcript:\n%s", prompt)
-	}
-}
-
 func TestAReplyLandsOnItsTaskAndIsAnnouncedForTheEar(t *testing.T) {
 	r := newRig(t)
 	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateLive}
@@ -246,19 +224,6 @@ func TestWhenTheRewriteFailsTheWrittenAnswerIsSpokenPlain(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no pending answer")
-	}
-}
-
-func TestAReplyWithoutInReplyToFindsTheOnlyWorkingTaskOfItsSender(t *testing.T) {
-	r := newRig(t)
-	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateLive}
-	r.ask(t, "agent-7", "q", "")
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("pong"))}}
-	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "r", SourceSession: "agent-7", Text: "pong"}); err != nil {
-		t.Fatal(err)
-	}
-	if task, err := r.store.VoiceTask("evt-1"); err != nil || task.State != storage.VoiceTaskDone || task.AnswerWritten != "pong" {
-		t.Fatalf("task = %+v, %v", task, err)
 	}
 }
 

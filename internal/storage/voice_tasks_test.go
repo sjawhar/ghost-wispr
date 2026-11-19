@@ -129,6 +129,30 @@ func TestAWorkingVoiceTaskCanBeReplacedOrCancelled(t *testing.T) {
 	}
 }
 
+// TestEndingASessionCancelsItsWorkingTasks: when a meeting ends with a
+// question still out, its task becomes cancelled; an answered task and
+// another session's working task stay as they are.
+func TestEndingASessionCancelsItsWorkingTasks(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	for _, id := range []string{"s1", "s2"} {
+		if err := store.CreateSession(id, time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	askVoiceTask(t, store, "open", "s1", "")
+	askVoiceTask(t, store, "answered", "s1", "It merged.")
+	askVoiceTask(t, store, "other", "s2", "")
+	cancelled, err := store.CancelWorkingVoiceTasks("s1")
+	if err != nil || cancelled != 1 {
+		t.Fatalf("CancelWorkingVoiceTasks = %d, %v; want 1", cancelled, err)
+	}
+	for id, want := range map[string]VoiceTaskState{"open": VoiceTaskCancelled, "answered": VoiceTaskDone, "other": VoiceTaskWorking} {
+		if task, err := store.VoiceTask(id); err != nil || task.State != want {
+			t.Errorf("task %s = %+v, %v; want %s", id, task, err, want)
+		}
+	}
+}
+
 // TestAVoiceTaskNeedsItsSession: a task names a session the database holds,
 // so no task outlives the session a delete removed.
 func TestAVoiceTaskNeedsItsSession(t *testing.T) {

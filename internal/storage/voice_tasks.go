@@ -40,6 +40,20 @@ type VoiceTask struct {
 
 const voiceTaskColumns = `id, session_id, asked_at, issue_key, holder, state, answer_written, spoken_at`
 
+// CancelWorkingVoiceTasks cancels the tasks of session sessionID still
+// waiting for an answer, as its meeting ends, and reports how many.
+func (s *SQLiteStore) CancelWorkingVoiceTasks(sessionID string) (int64, error) {
+	result, err := s.db.Exec(`UPDATE voice_tasks SET state = ? WHERE session_id = ? AND state = ?`, VoiceTaskCancelled, sessionID, VoiceTaskWorking)
+	if err != nil {
+		return 0, fmt.Errorf("cancel the working voice tasks of session %s: %w", sessionID, err)
+	}
+	cancelled, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("cancel the working voice tasks of session %s: %w", sessionID, err)
+	}
+	return cancelled, nil
+}
+
 // CreateVoiceTask records a working task. Its session must exist.
 func (s *SQLiteStore) CreateVoiceTask(task *VoiceTask) error {
 	if _, err := s.db.Exec(`INSERT INTO voice_tasks(id, session_id, asked_at, issue_key, holder, state) VALUES(?, ?, ?, ?, ?, ?)`,

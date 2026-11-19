@@ -33,13 +33,16 @@ func (noModel) GenerateContentStream(context.Context, string, []*genai.Content, 
 
 // TestLiveConciergeRoundTrip drives the Concierge against a real Dispatch,
 // a real Envoy hub and, when GHOST_WISPR_LIVE_GCP_PROJECT names a project,
-// real Gemini on Vertex (Google's default credentials). It answers one
-// spoken turn with the model (before the Envoy session exists, so that turn
-// can ask no agent), then searches for an issue by its description, reads
-// who holds it, registers as an Envoy session, asks the target session one
-// question, waits for its reply and reads the answer rewritten for the ear.
-// It runs only when GHOST_WISPR_LIVE_CONCIERGE=1, and reads everything from
-// the environment:
+// real Gemini on Vertex (Google's default credentials). With
+// GHOST_WISPR_LIVE_TURN it answers that spoken turn twice with the model,
+// before the Envoy session exists so the turn can ask no agent: cold, and
+// with Heard told the turn word by word while it is "spoken", and logs how
+// long after the turn's end each first sentence came. With
+// GHOST_WISPR_LIVE_TARGET it then searches for an issue by its description,
+// reads who holds it, registers as an Envoy session, asks the target session
+// one question, waits for its reply and reads the answer rewritten for the
+// ear. It runs only when GHOST_WISPR_LIVE_CONCIERGE=1, and reads everything
+// from the environment:
 //
 //	GHOST_WISPR_DISPATCH_URL, GHOST_WISPR_DISPATCH_TOKEN, GHOST_WISPR_ENVOY_URL,
 //	GHOST_WISPR_LIVE_QUERY, GHOST_WISPR_LIVE_ISSUE, GHOST_WISPR_LIVE_TARGET,
@@ -94,10 +97,15 @@ func TestLiveConciergeRoundTrip(t *testing.T) {
 	if err := store.CreateSession(meeting, time.Now().Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	target := need("GHOST_WISPR_LIVE_TARGET")
+	target := strings.TrimSpace(os.Getenv("GHOST_WISPR_LIVE_TARGET"))
 	concierge, err := New(&Config{
 		Model: os.Getenv("GHOST_WISPR_LIVE_MODEL"), Generator: generator, Records: records, Store: store,
-		Joined: func() []JoinedAgent { return []JoinedAgent{{SessionID: target, Title: "the live test's target"}} },
+		Joined: func() []JoinedAgent {
+			if target == "" {
+				return nil
+			}
+			return []JoinedAgent{{SessionID: target, Title: "the live test's target"}}
+		},
 		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	})
 	if err != nil {
@@ -105,19 +113,33 @@ func TestLiveConciergeRoundTrip(t *testing.T) {
 	}
 
 	if turn := os.Getenv("GHOST_WISPR_LIVE_TURN"); turn != "" {
-		var spoken []string
-		started := time.Now()
-		err := concierge.Answer(ctx, &voice.Exchange{SessionID: meeting, WakeAt: started}, turn, func(_ context.Context, text string, mode voice.SayMode) error {
-			t.Logf("said (%s) %s after the turn: %q", mode, time.Since(started).Round(time.Millisecond), text)
-			spoken = append(spoken, text)
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("Answer(%q): %v", turn, err)
+		for _, heard := range []bool{false, true} {
+			x := &voice.Exchange{SessionID: meeting, WakeAt: time.Now()}
+			if heard {
+				// The asker says the turn at about three words a second.
+				words := strings.Fields(turn)
+				for i := range words {
+					concierge.Heard(x, strings.Join(words[:i+1], " "))
+					time.Sleep(330 * time.Millisecond)
+				}
+			}
+			var spoken []string
+			ended := time.Now()
+			err := concierge.Answer(ctx, x, turn, func(_ context.Context, text string, mode voice.SayMode) error {
+				t.Logf("heard=%v said (%s) %s after the turn: %q", heard, mode, time.Since(ended).Round(time.Millisecond), text)
+				spoken = append(spoken, text)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("Answer(%q): %v", turn, err)
+			}
+			if len(spoken) == 0 || spoken[0] == sorry {
+				t.Fatalf("the turn said %q", spoken)
+			}
 		}
-		if len(spoken) == 0 || spoken[0] == sorry {
-			t.Fatalf("the turn said %q", spoken)
-		}
+	}
+	if target == "" {
+		return
 	}
 
 	state, err := LoadEnvoyState(store)

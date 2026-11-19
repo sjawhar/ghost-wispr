@@ -28,13 +28,14 @@ var testNow = time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
 var meetingStart = testNow.Add(-20 * time.Minute)
 
 type fakeRecords struct {
-	mu      sync.Mutex
-	hits    []dispatch.SearchHit
-	issues  map[string]*dispatch.Issue
-	events  map[string][]dispatch.Event
-	docs    map[string]string
-	err     error
-	queries []string
+	mu         sync.Mutex
+	hits       []dispatch.SearchHit
+	issues     map[string]*dispatch.Issue
+	events     map[string][]dispatch.Event
+	docs       map[string]string
+	err        error
+	queries    []string
+	issueCalls []string
 }
 
 func (f *fakeRecords) Search(_ context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
@@ -45,6 +46,9 @@ func (f *fakeRecords) Search(_ context.Context, query string, _ int) ([]dispatch
 }
 
 func (f *fakeRecords) Issue(_ context.Context, key string) (*dispatch.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issueCalls = append(f.issueCalls, key)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -53,6 +57,13 @@ func (f *fakeRecords) Issue(_ context.Context, key string) (*dispatch.Issue, err
 		return nil, &dispatch.APIError{Status: 404, Code: "NOT_FOUND", Message: "not found"}
 	}
 	return issue, nil
+}
+
+// calls is a copy of the keys Issue was called with.
+func (f *fakeRecords) calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.issueCalls...)
 }
 
 func (f *fakeRecords) Events(_ context.Context, key string, _ int) ([]dispatch.Event, error) {
@@ -100,7 +111,7 @@ func (f *fakeAgents) Send(ctx context.Context, request *envoy.SendRequest) (envo
 		return envoy.SendResult{}, f.sendErr
 	}
 	f.sent = append(f.sent, *request)
-	eventID := "evt-" + string(rune('0'+len(f.sent)))
+	eventID := fmt.Sprintf("evt-%d", len(f.sent))
 	onSend := f.onSend
 	f.mu.Unlock()
 	if onSend != nil {
