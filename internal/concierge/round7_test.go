@@ -90,6 +90,21 @@ func TestAnAnswerMakesAtMostTwoSearches(t *testing.T) {
 	}
 }
 
+// TestAnEmptySearchSpendsNoSearch (R6): a search the model asks with no
+// words never reaches Dispatch, so it spends none of the answer's two.
+func TestAnEmptySearchSpendsNoSearch(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "none", false)
+	search := func(id, query string) []*genai.GenerateContentResponse {
+		return []*genai.GenerateContentResponse{chunk(call(id, "search_issues", map[string]any{"query": query}, ""))}
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{search("a", ""), search("b", ""), search("c", "voice"), {chunk(text("PR 80 is in review."))}}
+	answerTurn(t, r, "what is happening with ABC-12")
+	if n := len(r.records.searches()); n != 1 {
+		t.Fatalf("Dispatch was searched %d times, want once: the empty searches spend nothing", n)
+	}
+}
+
 // TestNoFactBySixSecondsSaysWhatIsKnown (c-fast-answer, R6): with no fact 6 s
 // after the turn, the model stops and the voice says what is known: the
 // status the record shows, or that it found no issue. It runs into no bound

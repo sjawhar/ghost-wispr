@@ -188,13 +188,6 @@ func (r *runner) call(ctx context.Context, name string, args map[string]any) (ma
 	)
 	switch name {
 	case "search_issues":
-		if r.searchesLeft != nil && *r.searchesLeft <= 0 {
-			err = tell("This answer has made its searches; answer from what you have.")
-			break
-		}
-		if r.searchesLeft != nil {
-			*r.searchesLeft--
-		}
 		result, err = r.searchIssues(ctx, arg("query"))
 	case "read_issue":
 		result, err = r.readIssue(ctx, arg("key"))
@@ -290,6 +283,12 @@ func (r *runner) searchIssues(ctx context.Context, query string) (map[string]any
 	terms := searchTerms(query)
 	if terms == "" {
 		return nil, tell("Search for what? Give a few keywords.")
+	}
+	if r.searchesLeft != nil && *r.searchesLeft <= 0 {
+		return nil, tell("This answer has made its searches; answer from what you have.")
+	}
+	if r.searchesLeft != nil {
+		*r.searchesLeft--
 	}
 	hits, err := records.Search(ctx, terms, 10)
 	if err != nil {
