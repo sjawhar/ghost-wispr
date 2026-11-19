@@ -56,6 +56,11 @@ func TestCommands(t *testing.T) {
 		"go ahead":                     GoAhead,
 		"Go ahead.":                    GoAhead,
 		"go on":                        GoAhead,
+		"go ahead, INFRA 1027":         GoAhead,
+		"never mind":                   NeverMind,
+		"Never mind.":                  NeverMind,
+		"nevermind":                    NeverMind,
+		"forget it":                    NeverMind,
 		"what is happening with this?": Ask,
 		"":                             Ask,
 	}
@@ -66,7 +71,9 @@ func TestCommands(t *testing.T) {
 	}
 }
 
-func TestKeytermOrderAndBudget(t *testing.T) {
+// TestKeyterms fails if the keyterms do not start with the wake phrases, once
+// each, or pass Deepgram's limits.
+func TestKeyterms(t *testing.T) {
 	keys := make([]string, 0, 400)
 	for i := range 400 {
 		keys = append(keys, "KEY-"+strings.Repeat("1", 1+i%3)+string(rune('A'+i%26)))
@@ -104,6 +111,53 @@ func TestIsName(t *testing.T) {
 	} {
 		if got := d.IsName(word); got != want {
 			t.Errorf("IsName(%q) = %v, want %v", word, got, want)
+		}
+	}
+}
+
+// TestIssueKeyForms fails if a key spoken in a common form does not read as
+// its written key, or a phrase with no key reads as one.
+func TestIssueKeyForms(t *testing.T) {
+	cases := map[string][]string{
+		"what is happening with INFRA-1027?":     {"INFRA-1027"},
+		"go ahead, infra 1027":                   {"INFRA-1027"},
+		"INFRA 1027 and ABC-12":                  {"INFRA-1027", "ABC-12"},
+		"infra ten twenty-seven":                 {"INFRA-1027"},
+		"infra ten twenty seven please":          {"INFRA-1027"},
+		"infra one zero two seven":               {"INFRA-1027"},
+		"infra one oh two seven":                 {"INFRA-1027"},
+		"Infra-1027.":                            {"INFRA-1027"},
+		"infra 1027's spec":                      {"INFRA-1027"},
+		"infra fifteen":                          {"INFRA-15"},
+		"infra forty":                            {"INFRA-40"},
+		"infra eleven hundred":                   {"INFRA-1100"},
+		"infra eleven hundred five":              {"INFRA-1105"},
+		"what is happening with the voice work?": nil,
+		"go ahead":                               nil,
+		"I will be there in a minute":            nil,
+	}
+	for text, want := range cases {
+		if got := IssueKeys(text); !slices.Equal(got, want) {
+			t.Errorf("IssueKeys(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
+// TestThanksEndsAnExchange fails if a thank-you to Wispr is not read as one,
+// or other words are.
+func TestThanksEndsAnExchange(t *testing.T) {
+	d := New([]string{"Wispr", "Ghost Wispr"})
+	for text, want := range map[string]bool{
+		"Thanks, Wispr.":         true,
+		"thank you Wispr":        true,
+		"Thanks Ghost Wispr!":    true,
+		"thanks, whisper":        true,
+		"thanks":                 false,
+		"Wispr, thanks for that": false,
+		"thanks, now the budget": false,
+	} {
+		if got := d.Thanks(text); got != want {
+			t.Errorf("Thanks(%q) = %v, want %v", text, got, want)
 		}
 	}
 }

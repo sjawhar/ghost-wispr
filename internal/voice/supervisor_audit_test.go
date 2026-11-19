@@ -136,7 +136,7 @@ func TestTheTapsDropsAreLogged(t *testing.T) {
 	c := newFakeConcierge()
 	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
 		v := drivingVoice{r.voice} // a voice that reads room audio
-		cfg.Voice = func() Voice { return v }
+		cfg.Voice = func() (Voice, error) { return v, nil }
 		cfg.Logf = func(format string, args ...any) {
 			mu.Lock()
 			defer mu.Unlock()

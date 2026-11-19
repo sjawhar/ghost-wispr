@@ -10,6 +10,7 @@ package voice
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/sjawhar/ghost-wispr/internal/audio"
@@ -163,14 +164,23 @@ type Concierge interface {
 	Heard(ctx context.Context, x *Exchange, words string)
 	// Answer answers one turn of x. It speaks through say as it goes (an
 	// acknowledgement, then the facts) and returns once the turn is done. The
-	// Supervisor cancels ctx to stop its model and tool calls.
+	// Supervisor cancels ctx to stop its model and tool calls. When Dispatch or
+	// Envoy cannot be reached, it says so and returns an error that wraps
+	// ErrUnreachable; the Supervisor then plays the error sound.
 	Answer(ctx context.Context, x *Exchange, turn string, say SayFunc) error
 	// Answers reports each holder's answer once it lands. The Supervisor
 	// plays the answer sound and speaks it on invitation.
 	Answers() <-chan PendingAnswer
 	// Spoken records that a pending answer was spoken.
 	Spoken(ctx context.Context, taskID string) error
+	// NeverMind cancels the newest working question of sessionID, on "Wispr,
+	// never mind", and tells its holder so.
+	NeverMind(ctx context.Context, sessionID string) error
 }
+
+// ErrUnreachable marks a Concierge answer that could not reach Dispatch or
+// Envoy.
+var ErrUnreachable = errors.New("the Concierge cannot reach Dispatch or Envoy")
 
 // SayFunc speaks text in the open exchange.
 type SayFunc func(ctx context.Context, text string, mode SayMode) error
@@ -181,5 +191,5 @@ type PendingAnswer struct {
 	SessionID string
 	IssueKey  string
 	Text      string    // rewritten for the ear
-	AskedAt   time.Time // when the question was sent; a stop since then makes it wait for "Wispr, go ahead"
+	AskedAt   time.Time // when the question was sent; a room word or a stop since then makes it wait for "Wispr, go ahead"
 }

@@ -35,6 +35,15 @@ const (
 	// DefaultIdleWait is how long an exchange with a voice that drives its
 	// own turn stays open with nobody and nothing speaking.
 	DefaultIdleWait = 10 * time.Second
+	// DefaultSoundGap is the gap with no transcript word the answer sound
+	// waits for (R10).
+	DefaultSoundGap = time.Second
+	// DefaultFollowUpWait is how long an exchange stays open after Wispr's
+	// answer for a follow-up with no wake phrase (R10).
+	DefaultFollowUpWait = 6 * time.Second
+	// DefaultReplayWindow is how early in a held answer a stop keeps it
+	// pending; cut later, it counts as heard (R11).
+	DefaultReplayWindow = 2 * time.Second
 )
 
 const (
@@ -50,18 +59,17 @@ const (
 	// recentKept is how much of the transcript an exchange gets as Recent.
 	recentKept = 2 * time.Minute
 	// exchangeMax bounds one exchange, whatever its voice or Concierge do.
-	exchangeMax = 2 * time.Minute
-	// cutKeepsPending is how early in a held answer a stop keeps it pending;
-	// cut later, it counts as heard.
-	cutKeepsPending = 2 * time.Second
+	exchangeMax = 5 * time.Minute
 )
 
-// backchannels are the words that alone never stop the voice.
+// backchannels are R11's words that alone never stop the voice: "mm-hm",
+// "uh-huh", "yeah", "right" and "okay", in the spellings Deepgram writes.
 var backchannels = map[string]bool{
-	"mm": true, "mmm": true, "mhm": true, "mm-hm": true, "mm-hmm": true, "mmhmm": true, "hmm": true,
-	"uh-huh": true, "uh": true, "um": true, "ah": true, "oh": true, "huh": true,
-	"yeah": true, "yep": true, "yes": true, "ok": true, "okay": true, "right": true, "sure": true,
-	"cool": true, "nice": true, "great": true, "alright": true, "gotcha": true, "thanks": true,
+	"mm-hm": true, "mm-hmm": true, "mhm": true, "mmhmm": true, "mm": true, "mmm": true,
+	"uh-huh": true, "uh-uh": true, "uhhuh": true,
+	"yeah": true, "yea": true,
+	"right": true,
+	"okay":  true, "ok": true,
 }
 
 // Speaker is the speaker output as the Supervisor uses it; SpeakerOf adapts
@@ -112,18 +120,28 @@ type Word struct {
 
 // SupervisorConfig wires a Supervisor.
 type SupervisorConfig struct {
-	Voice       func() Voice // the voice for the next exchange
+	// Voice builds the voice for the next exchange: it is read at each
+	// exchange, so a change of voice applies from the next one.
+	Voice       func() (Voice, error)
 	Concierge   Concierge
 	Speaker     Speaker
 	WakePhrases []string
 	Session     func() string // the recording session now, "" before one starts
 	Red         func() bool   // the light reads red and room audio passes the gate
-	Notify      func(kind, sessionID string)
-	Tap         *Tap
-	TurnWait    time.Duration // 0: DefaultTurnWait
-	SilenceWait time.Duration // 0: DefaultSilenceWait
-	IdleWait    time.Duration // 0: DefaultIdleWait
-	Logf        func(string, ...any)
+	// Enabled reports voice.enabled, read on each result; nil is always on.
+	Enabled      func() bool
+	Notify       func(kind, sessionID string)
+	Tap          *Tap
+	TurnWait     time.Duration // 0: DefaultTurnWait
+	SilenceWait  time.Duration // 0: DefaultSilenceWait
+	IdleWait     time.Duration // 0: DefaultIdleWait
+	SoundGap     time.Duration // 0: DefaultSoundGap
+	FollowUpWait time.Duration // 0: DefaultFollowUpWait
+	ReplayWindow time.Duration // 0: DefaultReplayWindow
+	// Timing gets the timing events the acceptance driver reads; nil drops
+	// them.
+	Timing func(event, sessionID string, at time.Time, kv ...any)
+	Logf   func(string, ...any)
 }
 
 // Supervisor owns every exchange's lifetime: it opens one on the wake phrase,
@@ -159,6 +177,7 @@ type Supervisor struct {
 	own           []ownWords
 	recent        []TurnText
 	lastHeard     time.Time // the last word heard
+	lastRoomWord  time.Time // the last word heard that was not Wispr's own
 	chimedAt      time.Time
 	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
 	wg            sync.WaitGroup // the goroutines Close waits for
@@ -173,7 +192,7 @@ type heardCall struct {
 
 type pendingAnswer struct {
 	PendingAnswer
-	needsInvite bool // a stop came after its question: only "Wispr, go ahead" speaks it
+	needsInvite bool // a stop or a room word came after its question: only "Wispr, go ahead" speaks it
 	chimed      bool
 }
 
@@ -185,28 +204,31 @@ type ownWords struct {
 // exchange is one exchange: a wake, or a held answer spoken. Its fields are
 // guarded by the Supervisor's mu.
 type exchange struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	x         Exchange
-	session   Session
-	opened    chan struct{} // closed once Open returned, or failed
-	drives    bool          // the voice drives its own turn
-	answering bool          // the turn went to the Concierge (or a held answer is spoken)
-	answer    *pendingAnswer
-	wakeStart float64 // the wake word's start on the socket; later results of its utterance repeat it
-	wakeAt    time.Time
-	turn      []string // final words of the asker's turn
-	interim   string   // the turn's words not final yet
-	timer     *time.Timer
-	said      bool
-	spokeAt   time.Time  // when its speech first started
-	last      Playback   // its latest playback on the voice input
-	ended     bool       // torn down
-	saidMu    sync.Mutex // guards said texts for the answer tool
-	firstOut  sync.Once  // logs the time to first audio
-	turnAt    time.Time  // when the turn was handed to the Concierge
-	notified  map[string]bool
-	idle      *time.Timer // a driving voice's idle wait
+	ctx          context.Context
+	cancel       context.CancelFunc
+	x            Exchange
+	session      Session
+	opened       chan struct{} // closed once Open returned, or failed
+	drives       bool          // the voice drives its own turn
+	answering    bool          // the turn went to the Concierge (or a held answer is spoken)
+	answer       *pendingAnswer
+	wakeStart    float64 // the wake word's start on the socket; later results of its utterance repeat it
+	wakeAt       time.Time
+	turn         []string // final words of the asker's turn
+	interim      string   // the turn's words not final yet
+	timer        *time.Timer
+	said         bool
+	spokeAt      time.Time  // when its speech first started
+	last         Playback   // its latest playback on the voice input
+	ended        bool       // torn down
+	saidMu       sync.Mutex // guards said texts for the answer tool
+	firstOutDone bool       // the turn's first audio was reported
+	factPending  bool       // a fact was queued while nothing played: its audio is the next start
+	factDone     bool       // the turn's first fact audio was reported
+	followUp     bool       // the exchange waits for a follow-up after Wispr's answer
+	turnAt       time.Time  // when the turn was handed to the Concierge
+	notified     map[string]bool
+	idle         *time.Timer // a driving voice's idle wait
 	// dropsAtOpen is the tap's drop count when the exchange opened.
 	dropsAtOpen uint64
 }
@@ -222,6 +244,15 @@ func NewSupervisor(c *SupervisorConfig) *Supervisor {
 	}
 	if cfg.IdleWait <= 0 {
 		cfg.IdleWait = DefaultIdleWait
+	}
+	if cfg.SoundGap <= 0 {
+		cfg.SoundGap = DefaultSoundGap
+	}
+	if cfg.FollowUpWait <= 0 {
+		cfg.FollowUpWait = DefaultFollowUpWait
+	}
+	if cfg.ReplayWindow <= 0 {
+		cfg.ReplayWindow = DefaultReplayWindow
 	}
 	if cfg.Notify == nil {
 		cfg.Notify = func(string, string) {}
@@ -305,12 +336,57 @@ func (s *Supervisor) Stop(reason string) {
 	s.stopLocked(reason)
 }
 
-// SessionEnded drops the held answers of a session that ended: the Concierge
-// keeps them for its page and never announces them in a later meeting.
+// Started plays the start sound: capture moved into recording, from any
+// control. It plays with the voice off too (R13).
+func (s *Supervisor) Started() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.soundLocked(StartChime(), "start_sound", "")
+}
+
+// RedCheckFailed plays the error sound: the light did not read back red. It
+// plays with the voice off too (R13).
+func (s *Supervisor) RedCheckFailed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.soundLocked(ErrorChime(), "error_sound", "")
+}
+
+// errorLocked plays the error sound, for a failed voice, a failed vendor or a
+// Concierge that cannot reach Dispatch or Envoy (R10).
+func (s *Supervisor) errorLocked(sessionID string) {
+	s.soundLocked(ErrorChime(), "error_sound", sessionID)
+}
+
+// soundLocked plays pcm on the chime input at once, unless the Supervisor is
+// closed.
+func (s *Supervisor) soundLocked(pcm []byte, event, sessionID string) {
+	if s.closed {
+		return
+	}
+	s.spawn(func() { s.playChime(s.ctx, pcm, event, sessionID) })
+}
+
+// timing reports a timing event, for the acceptance driver.
+func (s *Supervisor) timing(event, sessionID string, at time.Time, kv ...any) {
+	if s.cfg.Timing != nil {
+		s.cfg.Timing(event, sessionID, at, kv...)
+	}
+}
+
+// enabled reports voice.enabled now.
+func (s *Supervisor) enabled() bool {
+	return s.cfg.Enabled == nil || s.cfg.Enabled()
+}
+
+// SessionEnded drops the held answers of a session that ended, and the recent
+// transcript: the Concierge keeps the answers for its page and never
+// announces them in a later meeting.
 func (s *Supervisor) SessionEnded(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropPendingLocked(func(id string) bool { return id == sessionID })
+	s.recent = nil // the next meeting gets none of this one's words
 	if ex := s.ex; ex != nil && ex.answer != nil && ex.answer.SessionID == sessionID {
 		ex.answer = nil // not put back: its meeting ended
 		s.endLocked(ex, true, "its session ended")
@@ -411,9 +487,16 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 	if s.closed || t.FromFinalize || !t.GateOpen || t.Closings < s.closings || strings.TrimSpace(t.Text) == "" {
 		return
 	}
+	// With the voice off, nothing reads the transcript for it (R13).
+	if !s.enabled() {
+		return
+	}
 	now := time.Now()
 	s.lastHeard = now
 	own := s.ownLocked(t.Words, now)
+	if !own {
+		s.lastRoomWord = now
+	}
 	if t.IsFinal && !own {
 		s.keepRecentLocked(t, now)
 	}
@@ -433,16 +516,33 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		switch {
 		case cmd == transcript.GoAhead:
 			if ex != nil && ex.answer == nil && !ex.answering && !ex.drives {
-				// The wake that this invitation's own interim opened.
+				// The wake that this invitation's own interim opened, or the
+				// follow-up window of the last call.
 				s.endLocked(ex, true, "Wispr, go ahead")
 			}
-			s.goAheadLocked()
+			s.goAheadLocked(transcript.IssueKeys(m.Rest))
+		case cmd == transcript.NeverMind:
+			if !t.IsFinal {
+				return // once, on the final: it cancels a question
+			}
+			if ex != nil && ex.answer == nil {
+				s.endLocked(ex, true, "Wispr, never mind")
+			}
+			sessionID := s.cfg.Session()
+			s.spawn(func() {
+				ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+				defer cancel()
+				if err := s.cfg.Concierge.NeverMind(ctx, sessionID); err != nil {
+					s.logf("voice: cancel the newest question: %v", err)
+				}
+			})
 		case same && !ex.answering:
 			s.turnLocked(ex, t, m.Rest)
 		case same:
 			// More of the utterance the exchange already answers.
 		case ex != nil && !ex.answering && ex.answer == nil:
-			// "Wispr." then "Wispr, what …": the same call.
+			// "Wispr." then "Wispr, what …", or a call in the follow-up
+			// window: the same exchange.
 			ex.wakeStart = wakeStart(t, m)
 			ex.turn, ex.interim = nil, ""
 			s.turnLocked(ex, t, m.Rest)
@@ -462,6 +562,10 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		return
 	}
 	s.touchLocked(ex)
+	if t.IsFinal && ex.answer == nil && s.wake.Thanks(t.Text) {
+		s.endLocked(ex, true, "thanks")
+		return
+	}
 	if ex.answer == nil && !ex.answering && !ex.drives && s.nameAt(t.Words, ex.wakeStart) {
 		// The result still hears the name where the interim wake heard it, but
 		// not as a call ("Whisper networks are a problem."): not the asker's
@@ -498,15 +602,24 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	if !s.cfg.Red() {
 		return
 	}
+	voice, err := s.cfg.Voice()
+	if err != nil || voice == nil {
+		if err == nil {
+			err = errors.New("no voice")
+		}
+		s.logf("voice: no voice for a call: %v", err)
+		s.errorLocked(s.cfg.Session())
+		return
+	}
 	ctx, cancel := context.WithTimeout(s.ctx, exchangeMax)
 	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeAt: t.At, notified: map[string]bool{}}
-	voice := s.cfg.Voice()
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
 	}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
 	sessionID := s.cfg.Session()
+	s.timing("wake_heard", sessionID, t.At)
 	ex.x = Exchange{
 		SessionID: sessionID,
 		WakeAt:    t.At,
@@ -525,7 +638,8 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 // open opens ex's voice and, for a wake, plays the wake chime alongside.
 func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 	if chime {
-		s.spawn(func() { s.playChime(ex.ctx, WakeChime(), ex.wakeAt) })
+		sessionID := x.SessionID
+		s.spawn(func() { s.playChime(ex.ctx, WakeChime(), "wake_chime_queued", sessionID) })
 	}
 	sess, err := voice.Open(ex.ctx, x)
 	s.mu.Lock()
@@ -533,6 +647,9 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 	defer close(ex.opened)
 	if err != nil {
 		s.logf("voice: open the voice: %v", err)
+		if ex.ctx.Err() == nil {
+			s.errorLocked(x.SessionID)
+		}
 		if p := ex.answer; p != nil && !ex.ended {
 			// Not heard: it waits for "Wispr, go ahead" again.
 			p.needsInvite = true
@@ -553,16 +670,17 @@ func (s *Supervisor) open(ex *exchange, voice Voice, x *Exchange, chime bool) {
 	s.spawn(func() { s.readEvents(ex, sess) })
 }
 
-// playChime plays pcm on the chime input, in 20 ms frames.
-func (s *Supervisor) playChime(ctx context.Context, pcm []byte, since time.Time) {
+// playChime plays pcm on the chime input, in 20 ms frames, and reports event
+// at its first frame.
+func (s *Supervisor) playChime(ctx context.Context, pcm []byte, event, sessionID string) {
 	pb := s.cfg.Speaker.Begin(audio.InputChime)
 	const frame = 960 // 20 ms at 24 kHz mono PCM16
 	for off := 0; off < len(pcm); off += frame {
-		if off == 0 && !since.IsZero() {
-			s.logf("voice: chime queued %v after the wake transcript", time.Since(since).Round(time.Millisecond))
-		}
 		if err := pb.Write(ctx, pcm[off:min(off+frame, len(pcm))], ChimeFormat); err != nil {
 			return
+		}
+		if off == 0 {
+			s.timing(event, sessionID, time.Now())
 		}
 	}
 }
@@ -588,6 +706,9 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 			s.touchLocked(ex)
 		case EventErr:
 			s.logf("voice: %v", e.Err)
+			if s.ex == ex && !ex.ended {
+				s.errorLocked(ex.x.SessionID)
+			}
 			if ex.drives && s.ex == ex {
 				s.endLocked(ex, true, "the voice failed")
 			}
@@ -675,7 +796,11 @@ func (s *Supervisor) turnWaited(ex *exchange) {
 		return
 	}
 	if s.turnOf(ex) == "" {
-		s.endLocked(ex, false, "no question after the wake phrase")
+		reason := "no question after the wake phrase"
+		if ex.followUp {
+			reason = "no follow-up"
+		}
+		s.endLocked(ex, false, reason)
 		return
 	}
 	s.handTurnLocked(ex)
@@ -691,12 +816,14 @@ func (s *Supervisor) handTurnLocked(ex *exchange) {
 	}
 	ex.answering = true
 	ex.turnAt = time.Now()
+	ex.firstOutDone, ex.factPending, ex.factDone = false, false, false
 	turn := s.turnOf(ex)
 	ex.x.AskerTurn = turn
 	if ex.x.SessionID == "" {
 		ex.x.SessionID = s.cfg.Session()
 	}
 	ex.x.Recent = s.recentLocked()
+	s.timing("turn_end", ex.x.SessionID, ex.turnAt)
 	s.noteLocked(ex, EventExchangeStarted, ex.x.SessionID)
 	x := ex.x
 	s.spawn(func() { s.answer(ex, &x, turn) })
@@ -724,15 +851,28 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 			return err
 		}
 		s.mu.Lock()
+		defer s.mu.Unlock()
 		ex.said = true
-		s.mu.Unlock()
+		if mode == Fact && !ex.factDone && !ex.factPending {
+			// The first fact's audio: now if speech already plays, else at
+			// its start.
+			if s.voiceSpeaking {
+				ex.factDone = true
+				s.timing("fact_audio", x.SessionID, time.Now())
+			} else {
+				ex.factPending = true
+			}
+		}
 		return nil
 	}
 	err := s.cfg.Concierge.Answer(ex.ctx, x, turn, say)
 	if err != nil && ex.ctx.Err() == nil {
+		// A Concierge that cannot reach Dispatch or Envoy has said so; any
+		// other failure is a vendor's. Both get the error sound (R10).
 		s.logf("voice: the Concierge did not answer: %v", err)
 		s.mu.Lock()
 		said := ex.said
+		s.errorLocked(x.SessionID)
 		s.mu.Unlock()
 		if !said {
 			_ = say(ex.ctx, "Sorry, I could not answer that.", Ack)
@@ -760,30 +900,60 @@ func (s *Supervisor) finish(ex *exchange, sessionID string) bool {
 	if spoken {
 		s.noteLocked(ex, EventSpoken, sessionID)
 	}
+	if spoken && ex.answer == nil && !ex.drives {
+		s.followUpLocked(ex)
+		return spoken
+	}
 	s.endLocked(ex, false, "done")
 	return spoken
 }
 
-// goAheadLocked speaks the oldest held answer, on "Wispr, go ahead" while
-// the light reads red.
-func (s *Supervisor) goAheadLocked() {
+// followUpLocked keeps ex open after Wispr's answer for FollowUpWait: an
+// utterance in it is the next turn, with no wake phrase (R10).
+func (s *Supervisor) followUpLocked(ex *exchange) {
+	ex.followUp = true
+	ex.answering = false
+	ex.turn, ex.interim = nil, ""
+	ex.said, ex.last = false, nil
+	delete(ex.notified, EventSpoken) // each spoken answer reports itself
+	if ex.timer != nil {
+		ex.timer.Stop()
+	}
+	ex.timer = time.AfterFunc(s.cfg.FollowUpWait, func() { s.turnWaited(ex) })
+}
+
+// goAheadLocked speaks a held answer on "Wispr, go ahead" while the light
+// reads red: the one whose key the invitation names, else the oldest (R11).
+func (s *Supervisor) goAheadLocked(keys []string) {
 	s.dropEndedLocked()
 	if !s.cfg.Red() || s.ex != nil || len(s.pending) == 0 {
 		return
 	}
 	p := s.pending[0]
+	for _, q := range s.pending {
+		if q.IssueKey != "" && slices.Contains(keys, q.IssueKey) {
+			p = q
+			break
+		}
+	}
 	p.needsInvite = false
 	s.speakLocked(p)
 }
 
 // speakLocked speaks a held answer in an exchange of its own.
 func (s *Supervisor) speakLocked(p *pendingAnswer) {
+	voice, err := s.cfg.Voice()
+	if err != nil || voice == nil {
+		s.logf("voice: no voice for a held answer: %v", err)
+		s.errorLocked(p.SessionID)
+		p.needsInvite = true
+		return
+	}
 	s.pending = slices.DeleteFunc(s.pending, func(q *pendingAnswer) bool { return q == p })
 	ctx, cancel := context.WithTimeout(s.ctx, exchangeMax)
 	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), answering: true, answer: p, wakeStart: -1, notified: map[string]bool{}}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
-	voice := s.cfg.Voice()
 	ex.x = Exchange{SessionID: p.SessionID, WakeAt: time.Now(), Recent: s.recentLocked(), Tap: s.tapFor(voice, 0), Out: exchangeOutput{s: s, ex: ex}}
 	ex.x.Tools = exchangeTools{s: s, ex: ex}
 	x := ex.x
@@ -803,6 +973,11 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 		}
 		if err := sess.Say(ex.ctx, p.Text, Answer); err != nil {
 			s.logf("voice: speak a held answer: %v", err)
+			s.mu.Lock()
+			if ex.ctx.Err() == nil {
+				s.errorLocked(p.SessionID)
+			}
+			s.mu.Unlock()
 			// Not heard: it waits for "Wispr, go ahead" again, unless a stop
 			// already put it back.
 			s.mu.Lock()
@@ -857,10 +1032,13 @@ func (s *Supervisor) offerAnswers() {
 			}
 			s.mu.Lock()
 			if !s.closed {
-				// It waits for "Wispr, go ahead" when a stop came after its
-				// question, or it does not say when that was.
+				// It waits for "Wispr, go ahead" unless the floor stayed free
+				// since its question (R7): no stop and no room word since it was
+				// asked. One that does not say when it was asked waits too.
 				stoppedSince := !s.lastStopAt.IsZero() && !s.lastStopAt.Before(a.AskedAt)
-				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, needsInvite: a.AskedAt.IsZero() || stoppedSince})
+				talkedSince := !s.lastRoomWord.IsZero() && s.lastRoomWord.After(a.AskedAt)
+				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, needsInvite: a.AskedAt.IsZero() || stoppedSince || talkedSince})
+				s.timing("answer_ready", a.SessionID, time.Now())
 				select {
 				case s.notes <- [2]string{EventAnswerReady, a.SessionID}:
 				default:
@@ -884,22 +1062,25 @@ func (s *Supervisor) offer() {
 		return
 	}
 	now := time.Now()
-	unchimed := false
-	for _, p := range s.pending {
-		if !p.chimed {
-			p.chimed, unchimed = true, true
-		}
-	}
+	unchimed := slices.ContainsFunc(s.pending, func(p *pendingAnswer) bool { return !p.chimed })
 	if unchimed {
-		// One chime for every answer that has not had one: answers that land
-		// together, or while a chime plays, share it, so chimes never overlap
+		// The answer sound waits for a gap with no transcript word (R10).
+		// One sound for every answer that has not had one: answers that land
+		// together, or while a sound plays, share it, so sounds never overlap
 		// on the one input.
+		if s.voiceSpeaking || now.Sub(s.lastHeard) < s.cfg.SoundGap {
+			return
+		}
+		for _, p := range s.pending {
+			p.chimed = true
+		}
 		s.chimedAt = now
 		if s.chimeCancel == nil {
 			ctx, cancel := context.WithCancel(s.ctx)
 			s.chimeCancel = cancel
+			sessionID := s.pending[len(s.pending)-1].SessionID
 			s.spawn(func() {
-				s.playChime(ctx, AnswerChime(), time.Time{})
+				s.playChime(ctx, AnswerChime(), "answer_chime", sessionID)
 				cancel()
 				s.mu.Lock()
 				defer s.mu.Unlock()
@@ -931,7 +1112,13 @@ func (s *Supervisor) offer() {
 // stopLocked ends the exchange holding the floor for reason, and makes every
 // held answer wait for an invitation.
 func (s *Supervisor) stopLocked(reason string) {
-	s.lastStopAt = time.Now()
+	now := time.Now()
+	s.lastStopAt = now
+	sessionID := s.cfg.Session()
+	if s.ex != nil && s.ex.x.SessionID != "" {
+		sessionID = s.ex.x.SessionID
+	}
+	s.timing("stop", sessionID, now, "reason", reason)
 	for _, p := range s.pending {
 		p.needsInvite = true
 	}
@@ -947,7 +1134,7 @@ func (s *Supervisor) stopLocked(reason string) {
 }
 
 // endLocked ends ex. cut says a stop or a barge-in ended it: its voice and
-// chime are cut at once. A held answer cut in its first 2 s stays pending.
+// chime are cut at once. A held answer cut within ReplayWindow stays pending.
 func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	if ex.ended {
 		return
@@ -968,7 +1155,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 		s.logf("voice: the tap dropped %d frames of room audio the voice read too slowly", dropped)
 	}
 	if cut && ex.answer != nil {
-		if ex.spokeAt.IsZero() || time.Since(ex.spokeAt) < cutKeepsPending {
+		if ex.spokeAt.IsZero() || time.Since(ex.spokeAt) < s.cfg.ReplayWindow {
 			ex.answer.needsInvite = true
 			s.pending = append([]*pendingAnswer{ex.answer}, s.pending...)
 		} else {
@@ -1005,7 +1192,12 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 func (s *Supervisor) takeFloorLocked(ex *exchange) {
 	s.ex = ex
 	s.floor = make(chan struct{})
+	if s.chimeCancel != nil { // the answer sound gives way to the exchange
+		s.chimeCancel()
+		s.chimeCancel, s.chimeCtx = nil, nil
+	}
 	s.cfg.Speaker.Cancel(audio.InputVoice)
+	s.cfg.Speaker.Cancel(audio.InputChime)
 }
 
 // noteLocked queues a /ws event for ex, once per kind.
@@ -1041,16 +1233,30 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.voiceSpeaking = e.Started
+	ex := s.ex
+	sessionID := ""
+	if ex != nil {
+		sessionID = ex.x.SessionID
+	}
 	if !e.Started {
 		s.voiceEnded = time.Now()
+		s.timing("speech_end", sessionID, e.At)
 	}
-	if ex := s.ex; ex != nil {
-		s.touchLocked(ex)
-		if e.Started && !ex.turnAt.IsZero() {
-			ex.firstOut.Do(func() {
-				s.logf("voice: first spoken audio %v after the turn ended", e.At.Sub(ex.turnAt).Round(time.Millisecond))
-			})
-		}
+	if ex == nil {
+		return
+	}
+	s.touchLocked(ex)
+	if !e.Started {
+		return
+	}
+	if !ex.turnAt.IsZero() && !ex.firstOutDone {
+		ex.firstOutDone = true
+		s.timing("first_audio", sessionID, e.At)
+		s.logf("voice: first spoken audio %v after the turn ended", e.At.Sub(ex.turnAt).Round(time.Millisecond))
+	}
+	if ex.factPending {
+		ex.factPending, ex.factDone = false, true
+		s.timing("fact_audio", sessionID, e.At)
 	}
 }
 

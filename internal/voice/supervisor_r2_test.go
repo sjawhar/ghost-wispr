@@ -61,10 +61,10 @@ func TestAnEndedSessionsAnswerStopsWhileSpeaking(t *testing.T) {
 	}
 }
 
-// TestOtherSpeechBeginsOnlyWhileNoExchangeHoldsTheFloor fails if speech begun
-// through WithFloor can begin while an exchange holds the floor, or survives
-// an exchange that takes the floor after it began.
-func TestOtherSpeechBeginsOnlyWhileNoExchangeHoldsTheFloor(t *testing.T) {
+// TestExchangePreemptsTTSSpeak fails if other speech (POST /api/tts/speak)
+// begun through WithFloor can begin while an exchange holds the floor, or
+// survives an exchange that takes the floor after it began.
+func TestExchangePreemptsTTSSpeak(t *testing.T) {
 	r := newRig(t, newFakeConcierge("fact"))
 	var pb Playback
 	if err := r.s.WithFloor(t.Context(), func() { pb = r.speaker.Begin(audio.InputVoice) }); err != nil {

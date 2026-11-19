@@ -15,10 +15,16 @@ func (drivingVoice) DrivesTurn() bool { return true }
 
 func newDrivingRig(t *testing.T, idle time.Duration) *rig {
 	t.Helper()
-	r := newRigWith(t, newFakeConcierge(), func(c *SupervisorConfig, r *rig) {
+	return newDrivingRigWith(t, idle, newFakeConcierge())
+}
+
+// newDrivingRigWith is newDrivingRig over the Concierge c.
+func newDrivingRigWith(t *testing.T, idle time.Duration, c *fakeConcierge) *rig {
+	t.Helper()
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
 		v := drivingVoice{r.voice}
-		c.Voice = func() Voice { return v }
-		c.IdleWait = idle
+		cfg.Voice = func() (Voice, error) { return v, nil }
+		cfg.IdleWait = idle
 	})
 	return r
 }
