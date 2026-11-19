@@ -155,9 +155,10 @@ type Concierge interface {
 	// session and span. x.SessionID names a session the store already has.
 	Tools(x *Exchange) ToolRunner
 	// Heard tells it the asker's turn so far, on each result after the wake,
-	// so it can read the record while the asker speaks. It returns at once. x
+	// so it can read the record while the asker speaks. It returns at once;
+	// the read ends with ctx, the exchange's, which every stop cancels. x
 	// carries the SessionID and WakeAt the later Tools and Answer calls carry.
-	Heard(x *Exchange, words string)
+	Heard(ctx context.Context, x *Exchange, words string)
 	// Answer answers one turn of x. It speaks through say as it goes (an
 	// acknowledgement, then the facts) and returns once the turn is done. The
 	// Supervisor cancels ctx to stop its model and tool calls.
@@ -177,5 +178,6 @@ type PendingAnswer struct {
 	TaskID    string
 	SessionID string
 	IssueKey  string
-	Text      string // rewritten for the ear
+	Text      string    // rewritten for the ear
+	AskedAt   time.Time // when the question was sent; a stop since then makes it wait for "Wispr, go ahead"
 }

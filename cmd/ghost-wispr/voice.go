@@ -19,6 +19,9 @@ import (
 // voiceControl is the voice as the rest of the unit drives it; the
 // voice.Supervisor is one.
 type voiceControl interface {
+	SessionEnded(sessionID string)
+	SessionsDeleted(sessionIDs []string)
+	SegmentsDeleted(sessionID string)
 	GateClosed(closings int)
 	Stop(reason string)
 	OnTranscript(t *voice.Transcript)
@@ -89,6 +92,27 @@ func (l *voiceLink) WaitFloor(ctx context.Context) error {
 func (l *voiceLink) Close() {
 	if v := l.get(); v != nil {
 		v.Close()
+	}
+}
+
+// SessionEnded drops the held answers of an ended session.
+func (l *voiceLink) SessionEnded(sessionID string) {
+	if v := l.get(); v != nil {
+		v.SessionEnded(sessionID)
+	}
+}
+
+// SessionsDeleted forgets deleted sessions.
+func (l *voiceLink) SessionsDeleted(sessionIDs []string) {
+	if v := l.get(); v != nil {
+		v.SessionsDeleted(sessionIDs)
+	}
+}
+
+// SegmentsDeleted forgets the recent transcript after a segment delete.
+func (l *voiceLink) SegmentsDeleted(sessionID string) {
+	if v := l.get(); v != nil {
+		v.SegmentsDeleted(sessionID)
 	}
 }
 

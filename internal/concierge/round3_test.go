@@ -221,7 +221,7 @@ func voiceIssue(r *rig) {
 func TestHeardReadsTheRecordBeforeTheTurnEnds(t *testing.T) {
 	r := newRig(t)
 	voiceIssue(r)
-	r.concierge.Heard(&r.exchange, "what about ABC-12")
+	r.concierge.Heard(t.Context(), &r.exchange, "what about ABC-12")
 	eventually(t, "the read of ABC-12", func() bool { return slices.Contains(r.records.calls(), "ABC-12") })
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 	var spoken []said
@@ -242,7 +242,7 @@ func TestHeardReadsTheRecordBeforeTheTurnEnds(t *testing.T) {
 func TestHeardSearchesWhenNoKeyIsSaid(t *testing.T) {
 	r := newRig(t)
 	voiceIssue(r)
-	r.concierge.Heard(&r.exchange, "what is happening with the realtime voice")
+	r.concierge.Heard(t.Context(), &r.exchange, "what is happening with the realtime voice")
 	eventually(t, "the read of the best hit", func() bool { return slices.Contains(r.records.calls(), "ABC-12") })
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
 	var spoken []said
@@ -260,7 +260,7 @@ func TestHeardSearchesWhenNoKeyIsSaid(t *testing.T) {
 func TestAFinalTurnThatNamesAnotherIssueReadsThatOne(t *testing.T) {
 	r := newRig(t)
 	voiceIssue(r)
-	r.concierge.Heard(&r.exchange, "what about ABC-12")
+	r.concierge.Heard(t.Context(), &r.exchange, "what about ABC-12")
 	eventually(t, "the read of ABC-12", func() bool { return slices.Contains(r.records.calls(), "ABC-12") })
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-13 is done."))}}
 	var spoken []said

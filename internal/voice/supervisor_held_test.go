@@ -33,7 +33,7 @@ func TestAHeldAnswerWhoseSpeechFailsStaysPending(t *testing.T) {
 	c := newFakeConcierge()
 	r := newRig(t, c)
 	r.voice.failSays(errors.New("the vendor stayed silent"))
-	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow."}
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow.", AskedAt: time.Now()}
 	failed := r.waitSession() // the answer's own exchange, after the chime and the silence
 	eventually(t, "the failed exchange ended", func() bool { _, _, closed := failed.state(); return closed })
 	if got := c.spokenIDs(); len(got) != 0 {

@@ -989,10 +989,19 @@ func main() {
 	if indexer != nil {
 		manager.SetIndexer(indexer)
 	}
-	// The meeting voice's Concierge, once it runs, cancels the questions an
-	// ended session still waits on and forgets a deleted session.
+	// The meeting voice and its Concierge, once they run, drop what an ended
+	// session still waits on and forget a deleted session. The voice link is
+	// wired to the capture gate below, before anything can close it.
 	var conciergeSessionHooks conciergeHooks
-	manager.SetSessionEndedHook(conciergeSessionHooks.SessionEnded)
+	var voiceHooks voiceLink
+	manager.SetSessionEndedHook(func(sessionID string) {
+		conciergeSessionHooks.SessionEnded(sessionID)
+		voiceHooks.SessionEnded(sessionID)
+	})
+	sessionsForgotten := func(sessionIDs []string) {
+		conciergeSessionHooks.SessionsDeleted(sessionIDs)
+		voiceHooks.SessionsDeleted(sessionIDs)
+	}
 
 	// Summarize recovered sessions (and any with pending/empty summaries).
 	// Launched after ctx is created so SIGTERM cancels in-flight LLM calls.
@@ -1035,7 +1044,6 @@ func main() {
 	// it, the one restorePause may make included; the voice itself starts
 	// once the speaker output exists, below. Its tap is one more writer
 	// behind the gate, only while the voice is on.
-	var voiceHooks voiceLink
 	wireVoiceToCapture(capture, &voiceHooks)
 	var voiceTap *voice.Tap
 	var voiceAudio io.Writer // nil while the voice is off: the mic writes nothing more
@@ -1231,7 +1239,7 @@ func main() {
 		// below.
 		OnSessionDeleted: func(sessionIDs []string) {
 			sessionsDeletedHook(store, warningRegistry)(sessionIDs)
-			conciergeSessionHooks.SessionsDeleted(sessionIDs)
+			sessionsForgotten(sessionIDs)
 		},
 		OnSessionsMerged: func(sessionIDs []string) {
 			warningRegistry.WithRecordingMismatch(func() {
@@ -1487,6 +1495,16 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		},
 	}
 	wireSegmentDeletion(controlHooks, warningRegistry, refusedCuts, deletion)
+	// The voice forgets its recent transcript after a segment delete, which
+	// may have removed words it holds.
+	for _, hook := range []*func(context.Context, string, int64, int) error{&controlHooks.DeleteSegment, &controlHooks.DeleteSegmentText} {
+		deleteSegment := *hook
+		*hook = func(ctx context.Context, sessionID string, segmentID int64, revision int) error {
+			err := deleteSegment(ctx, sessionID, segmentID, revision)
+			voiceHooks.SegmentsDeleted(sessionID)
+			return err
+		}
+	}
 
 	// A refinement that cannot use the model a "Delete text" was recorded
 	// under publishes nothing and says so here, until the session refines.
@@ -1994,7 +2012,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// sessions above) are saved now, not at the first sweep.
 	go kept.run(ctx)
 	if cfg.GCEnabled {
-		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: conciergeSessionHooks.SessionsDeleted}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
+		go collectGarbage(ctx, cfgStore, deletionNoticeGCStore{SQLiteStore: store, hub: hub, onDeleted: sessionsForgotten}, drive, gcHealthState, warningRegistry, appLogger, gcEvery)
 	}
 
 	// Create health checker with actual component references. With no Deepgram

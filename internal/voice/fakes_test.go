@@ -27,7 +27,8 @@ type fakeSpeaker struct {
 	finished  map[string]chan struct{}
 	listeners map[int]func(audio.SpeechEvent)
 	nextID    int
-	began     chan string // each Begin's input
+	began     chan string              // each Begin's input
+	hold      map[string]chan struct{} // a Begin on this input waits until it closes
 }
 
 func newFakeSpeaker() *fakeSpeaker {
@@ -44,6 +45,12 @@ func newFakeSpeaker() *fakeSpeaker {
 
 func (s *fakeSpeaker) Begin(input string) Playback {
 	s.mu.Lock()
+	hold := s.hold[input]
+	s.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.finished[input] == nil {
 		s.finished[input] = make(chan struct{})
@@ -53,6 +60,23 @@ func (s *fakeSpeaker) Begin(input string) Playback {
 	default:
 	}
 	return &fakePlayback{s: s, input: input, gen: s.gen[input]}
+}
+
+// holdBegins makes every Begin on input wait until release is called.
+func (s *fakeSpeaker) holdBegins(input string) (release func()) {
+	ch := make(chan struct{})
+	s.mu.Lock()
+	if s.hold == nil {
+		s.hold = map[string]chan struct{}{}
+	}
+	s.hold[input] = ch
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		delete(s.hold, input)
+		s.mu.Unlock()
+		close(ch)
+	}
 }
 
 func (s *fakeSpeaker) Cancel(input string) {
@@ -133,6 +157,9 @@ type fakePlayback struct {
 
 func (p *fakePlayback) Write(ctx context.Context, frame []byte, format audio.AudioFormat) error {
 	s := p.s
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if s.gen[p.input] != p.gen {
 		s.mu.Unlock()
@@ -330,14 +357,15 @@ type fakeConcierge struct {
 }
 
 type heardCall struct {
+	ctx   context.Context
 	x     Exchange
 	words string
 }
 
-func (c *fakeConcierge) Heard(x *Exchange, words string) {
+func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.heard = append(c.heard, heardCall{x: *x, words: words})
+	c.heard = append(c.heard, heardCall{ctx: ctx, x: *x, words: words})
 }
 
 func (c *fakeConcierge) heardCalls() []heardCall {

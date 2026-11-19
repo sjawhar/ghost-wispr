@@ -30,8 +30,8 @@ func TestTheVoiceLinkIsInertUntilTheVoiceStarts(t *testing.T) {
 
 type stubConcierge struct{ answers chan voice.PendingAnswer }
 
-func (stubConcierge) Tools(*voice.Exchange) voice.ToolRunner { return nil }
-func (stubConcierge) Heard(*voice.Exchange, string)          {}
+func (stubConcierge) Tools(*voice.Exchange) voice.ToolRunner         { return nil }
+func (stubConcierge) Heard(context.Context, *voice.Exchange, string) {}
 func (stubConcierge) Answer(context.Context, *voice.Exchange, string, voice.SayFunc) error {
 	return nil
 }
@@ -126,6 +126,9 @@ func (*closingsHeard) OnTranscript(*voice.Transcript)  {}
 func (*closingsHeard) OnUtteranceEnd(int, bool)        {}
 func (*closingsHeard) WaitFloor(context.Context) error { return nil }
 func (*closingsHeard) Close()                          {}
+func (*closingsHeard) SessionEnded(string)             {}
+func (*closingsHeard) SessionsDeleted([]string)        {}
+func (*closingsHeard) SegmentsDeleted(string)          {}
 
 // TestAPauseStopsTheVoiceThroughTheGate fails if a pause or a light hold of
 // the real capture gate does not reach the voice the link holds.

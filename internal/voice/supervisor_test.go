@@ -246,7 +246,7 @@ func TestHeldAnswerSpeaksAfterSilenceWhileRed(t *testing.T) {
 
 	r.setRed(false)
 	chimes := r.speaker.written(audio.InputChime)
-	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", IssueKey: "INFRA-1", Text: "It ships tomorrow."}
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", IssueKey: "INFRA-1", Text: "It ships tomorrow.", AskedAt: time.Now()}
 	never(t, "an answer spoke or chimed while the light was not red", 400*time.Millisecond, func() bool {
 		return len(r.voice.opened) > 0 || r.speaker.written(audio.InputChime) > chimes
 	})
@@ -273,10 +273,11 @@ func TestAnswerAfterAStopWaitsForAnInvitation(t *testing.T) {
 	r := newRig(t, c)
 	sess := r.ask("what is happening?")
 	waitSaid(t, sess)
+	asked := time.Now()
 	r.closeGate()
 	eventually(t, "the session closed", func() bool { _, _, closed := sess.state(); return closed })
 
-	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow."}
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "It ships tomorrow.", AskedAt: asked}
 	r.waitEvent("voice_answer_ready:sess-1")
 	never(t, "an answer spoke with no invitation after a stop", 500*time.Millisecond, func() bool { return len(r.voice.opened) > 0 })
 

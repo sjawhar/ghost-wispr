@@ -119,7 +119,7 @@ func TestLiveConciergeRoundTrip(t *testing.T) {
 				// The asker says the turn at about three words a second.
 				words := strings.Fields(turn)
 				for i := range words {
-					concierge.Heard(x, strings.Join(words[:i+1], " "))
+					concierge.Heard(t.Context(), x, strings.Join(words[:i+1], " "))
 					time.Sleep(330 * time.Millisecond)
 				}
 			}

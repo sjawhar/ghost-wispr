@@ -257,9 +257,9 @@ func (c *Concierge) stillOwed(answer *voice.PendingAnswer) bool {
 }
 
 // enqueue queues an announcement for offerAnswers.
-func (c *Concierge) enqueue(answer voice.PendingAnswer) {
+func (c *Concierge) enqueue(answer *voice.PendingAnswer) {
 	c.mu.Lock()
-	c.queue = append(c.queue, answer)
+	c.queue = append(c.queue, *answer)
 	c.mu.Unlock()
 	select {
 	case c.queued <- struct{}{}:

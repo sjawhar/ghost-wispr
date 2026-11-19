@@ -71,8 +71,9 @@ type prefetch struct {
 }
 
 // Heard tells the Concierge the turn so far in exchange x. It returns at
-// once; the read runs in the background.
-func (c *Concierge) Heard(x *voice.Exchange, words string) {
+// once; the read runs in the background and ends with ctx, the exchange's,
+// which every stop cancels.
+func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) {
 	target := readTarget(words)
 	if target == "" {
 		return
@@ -103,7 +104,7 @@ func (c *Concierge) Heard(x *voice.Exchange, words string) {
 			delete(p.reads, p.current)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
+	ctx, cancel := context.WithTimeout(ctx, prefetchTimeout)
 	r := &read{done: make(chan struct{}), cancel: cancel}
 	p.reads[target], p.current = r, target
 	go func() {

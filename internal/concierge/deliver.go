@@ -169,5 +169,5 @@ func (c *Concierge) announce(task *storage.VoiceTask, written string) {
 	ctx, cancel := context.WithTimeout(context.Background(), earTimeout)
 	defer cancel()
 	spoken := c.forEar(ctx, strings.TrimSpace(written))
-	c.enqueue(voice.PendingAnswer{TaskID: task.ID, SessionID: task.SessionID, IssueKey: task.IssueKey, Text: spoken})
+	c.enqueue(&voice.PendingAnswer{TaskID: task.ID, SessionID: task.SessionID, IssueKey: task.IssueKey, Text: spoken, AskedAt: task.AskedAt})
 }
