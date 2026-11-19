@@ -59,7 +59,11 @@ type GeminiConfig struct {
 // streamGenerateContent with alt=sse, which streams headerless PCM16 at 24 kHz
 // mono as base64 inline data, one server-sent event at a time. Each event is
 // decoded once, straight into the audio it carries.
+//
+// Gemini is a Connector: a Session warms its way to Vertex AI as it opens, so
+// the first Say pays neither the token nor the TLS dial.
 type Gemini struct {
+	host        string // the Vertex AI host, scheme included
 	endpoint    string
 	voice       string
 	credentials *auth.Credentials
@@ -82,6 +86,7 @@ func NewGemini(cfg *GeminiConfig) (*Gemini, error) {
 	model := cmp.Or(strings.TrimSpace(cfg.Model), geminiDefaultModel)
 	base := strings.TrimRight(cmp.Or(strings.TrimSpace(cfg.BaseURL), vertexHost(location)), "/")
 	return &Gemini{
+		host: base,
 		endpoint: fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
 			base, url.PathEscape(project), url.PathEscape(location), url.PathEscape(model)),
 		voice:       cmp.Or(strings.TrimSpace(cfg.Voice), geminiDefaultVoice),
@@ -109,6 +114,63 @@ func (*Gemini) Name() string { return "gemini" }
 // Format is PCM16 mono at 24 kHz, the only output Gemini TTS streams.
 func (*Gemini) Format() audio.AudioFormat {
 	return audio.AudioFormat{SampleRate: geminiRate, Channels: 1, Encoding: audio.EncodingPCM16}
+}
+
+// geminiWarmTimeout bounds a Session's warm-up.
+const geminiWarmTimeout = 10 * time.Second
+
+// Connect warms the Session's way to Vertex AI and never fails: in the
+// background it fetches a token, which the credentials cache, and opens a
+// connection with a request whose answer it drops, which the engine's HTTP
+// client keeps in its pool for the first Say. A warm-up that fails leaves
+// that Say to fetch and dial as it would have. Close stops the warm-up.
+func (g *Gemini) Connect(context.Context) (Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), geminiWarmTimeout)
+	c := &geminiConn{gemini: g, cancel: cancel, warmed: make(chan struct{})}
+	go func() {
+		defer close(c.warmed)
+		g.warm(ctx)
+	}()
+	return c, nil
+}
+
+// warm fetches a token and opens a connection to the Vertex AI host at once.
+func (g *Gemini) warm(ctx context.Context) {
+	token := make(chan struct{})
+	go func() {
+		defer close(token)
+		_, _ = g.credentials.Token(ctx)
+	}()
+	defer func() { <-token }()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, g.host+"/", nil)
+	if err != nil {
+		return
+	}
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, geminiMaxErrorBody))
+	_ = resp.Body.Close()
+}
+
+// geminiConn is a Session's warmed way to Vertex AI.
+type geminiConn struct {
+	gemini *Gemini
+	cancel context.CancelFunc
+	warmed chan struct{} // closed when the warm-up is over
+}
+
+// Stream is Gemini's Stream; the warm-up only readied the way.
+func (c *geminiConn) Stream(ctx context.Context, text string, emit func(pcm []byte) error) error {
+	return c.gemini.Stream(ctx, text, emit)
+}
+
+// Close stops the warm-up and waits for it.
+func (c *geminiConn) Close() error {
+	c.cancel()
+	<-c.warmed
+	return nil
 }
 
 type geminiRequest struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"slices"
 	"sync/atomic"
@@ -53,12 +54,46 @@ func (firstFramePlayback) Drain(context.Context) error { return nil }
 // opens the voice: it opens at the wake phrase, 1 to 2 s before.
 const liveWakeToTurn = time.Second
 
+// streamConns notes whether each streaming request went out on a connection
+// that was already open, as the Session's warm-up leaves one.
+type streamConns struct {
+	base   http.RoundTripper
+	reused atomic.Bool
+	seen   atomic.Bool
+}
+
+func (c *streamConns) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodPost {
+		r = r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				c.reused.Store(info.Reused)
+				c.seen.Store(true)
+			},
+		}))
+	}
+	return c.base.RoundTrip(r)
+}
+
+// describe says how the last streaming request got its connection.
+func (c *streamConns) describe() string {
+	switch {
+	case c == nil:
+		return "a socket of its own"
+	case !c.seen.Load():
+		return "no stream request seen"
+	case c.reused.Load():
+		return "a reused connection"
+	default:
+		return "a new connection"
+	}
+}
+
 // liveEngine builds the engine GHOST_WISPR_LIVE_TTS names, with nothing
 // shared with an earlier one: Gemini gets credentials and a connection pool
 // of its own, so its first request pays the token and the dial as the first
-// exchange after a long quiet does. It skips the test when no engine is
-// named.
-func liveEngine(t *testing.T, logCredentials bool) Engine {
+// exchange after a long quiet does, and the pool is traced (nil for Aura).
+// It skips the test when no engine is named.
+func liveEngine(t *testing.T, logCredentials bool) (Engine, *streamConns) {
 	t.Helper()
 	switch name := os.Getenv("GHOST_WISPR_LIVE_TTS"); name {
 	case "":
@@ -71,7 +106,7 @@ func liveEngine(t *testing.T, logCredentials bool) Engine {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return a
+		return a, nil
 	case "gemini":
 		credentials, err := googleauth.Detect(context.Background(), os.Getenv("GHOST_WISPR_GOOGLE_CREDENTIALS_FILE"), googleauth.CloudPlatformScope)
 		if err != nil {
@@ -92,22 +127,23 @@ func liveEngine(t *testing.T, logCredentials bool) Engine {
 		}
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		t.Cleanup(transport.CloseIdleConnections)
+		conns := &streamConns{base: transport}
 		g, err := NewGemini(&GeminiConfig{
 			Project:     os.Getenv("GHOST_WISPR_GCP_PROJECT"),
 			Location:    os.Getenv("GHOST_WISPR_LIVE_TTS_LOCATION"),
 			Model:       os.Getenv("GHOST_WISPR_LIVE_TTS_MODEL"),
 			Voice:       os.Getenv("GHOST_WISPR_LIVE_TTS_VOICE"),
 			Credentials: credentials,
-			HTTPClient:  &http.Client{Transport: transport},
+			HTTPClient:  &http.Client{Transport: conns},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		return g
+		return g, conns
 	default:
 		t.Fatalf("GHOST_WISPR_LIVE_TTS=%q, want aura or gemini", name)
 	}
-	return nil
+	return nil, nil
 }
 
 // sayFirstFrame says text and returns the time from the call to its first
@@ -148,7 +184,7 @@ func logMedian(t *testing.T, name, what string, waits []time.Duration) {
 // chooses its location ("us" by default; "global" to compare). Each engine
 // takes GHOST_WISPR_LIVE_TTS_MODEL and, for Gemini, GHOST_WISPR_LIVE_TTS_VOICE.
 func TestLiveTimeToFirstAudio(t *testing.T) {
-	engine := liveEngine(t, true)
+	engine, _ := liveEngine(t, true)
 	out := &firstFrameOutput{first: make(chan time.Time, 1)}
 	opened := time.Now()
 	s, err := New(engine).Open(context.Background(), &voice.Exchange{Out: out})
@@ -174,7 +210,7 @@ func TestLiveTimeToFirstAudio(t *testing.T) {
 func TestLiveFirstSayTimeToFirstAudio(t *testing.T) {
 	waits := make([]time.Duration, 0, len(liveSentences))
 	for i, text := range liveSentences {
-		engine := liveEngine(t, i == 0)
+		engine, conns := liveEngine(t, i == 0)
 		out := &firstFrameOutput{first: make(chan time.Time, 1)}
 		opened := time.Now()
 		s, err := New(engine).Open(context.Background(), &voice.Exchange{Out: out})
@@ -186,8 +222,8 @@ func TestLiveFirstSayTimeToFirstAudio(t *testing.T) {
 		wait := sayFirstFrame(t, s, out, text)
 		_ = s.Close()
 		waits = append(waits, wait)
-		t.Logf("%s: Session %2d: Open took %v, first frame %v after its first Say (%q)",
-			engine.Name(), i+1, open.Round(time.Millisecond), wait.Round(time.Millisecond), text)
+		t.Logf("%s: Session %2d: Open took %v, first frame %v after its first Say, which went out on %s (%q)",
+			engine.Name(), i+1, open.Round(time.Millisecond), wait.Round(time.Millisecond), conns.describe(), text)
 	}
 	logMedian(t, "first Say", "time to first audio", waits)
 }

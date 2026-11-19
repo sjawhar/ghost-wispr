@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,7 +72,11 @@ func TestGeminiPlaysTheFirstAudioBeforeTheStreamEnds(t *testing.T) {
 	first, rest := ramp(0, 1501), ramp(40, 1999)
 	out := newFakeOutput()
 	var endedFirst atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStream(r) {
+			http.NotFound(w, r) // the Session's warm-up, answered at once as Vertex AI does
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, sseAudio(first))
 		w.(http.Flusher).Flush()
@@ -325,6 +330,151 @@ func BenchmarkGeminiStream(b *testing.B) {
 		if err := g.Stream(context.Background(), "hello", func([]byte) error { return nil }); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// countingToken is a token source that counts its calls.
+type countingToken struct{ calls atomic.Int32 }
+
+func (c *countingToken) Token(context.Context) (*auth.Token, error) {
+	c.calls.Add(1)
+	return &auth.Token{Value: "test-token", Type: "Bearer", Expiry: time.Now().Add(time.Hour)}, nil
+}
+
+// failingToken is a token source that always fails.
+type failingToken struct{}
+
+func (failingToken) Token(context.Context) (*auth.Token, error) {
+	return nil, errors.New("no token today")
+}
+
+// isStream reports whether r asks for streamed speech, not a warm-up.
+func isStream(r *http.Request) bool {
+	return strings.HasSuffix(r.URL.Path, ":streamGenerateContent")
+}
+
+// TestGeminiWarmsItsConnectionWhenTheSessionOpens fails if a Gemini Session
+// does not, as it opens, fetch a token and open a connection to Vertex AI
+// that its first Say then uses, so that Say pays neither: the Supervisor
+// opens the voice at the wake, a second or two before it speaks.
+func TestGeminiWarmsItsConnectionWhenTheSessionOpens(t *testing.T) {
+	var conns atomic.Int32
+	warmed := make(chan struct{}, 4)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isStream(r) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, sseAudio(ramp(0, 960)))
+			return
+		}
+		warmed <- struct{}{}
+		http.NotFound(w, r)
+	}))
+	srv.EnableHTTP2 = true
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	tokens := &countingToken{}
+	g, err := NewGemini(&GeminiConfig{
+		Project:     "example-project",
+		Credentials: auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: tokens}),
+		BaseURL:     srv.URL,
+		HTTPClient:  srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewGemini: %v", err)
+	}
+	s := openSession(t, g, newFakeOutput())
+	select {
+	case <-warmed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no warm-up request reached Vertex AI 2 s after Open")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for tokens.calls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Open fetched no token in 2 s, want it ready for the first Say")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := s.Say(context.Background(), "hello", voice.Fact); err != nil {
+		t.Fatalf("Say: %v", err)
+	}
+	if n := conns.Load(); n != 1 {
+		t.Fatalf("Vertex AI saw %d connections, want the first Say on the one the warm-up opened", n)
+	}
+}
+
+// TestGeminiOpensWhenTheWarmUpFails fails if a warm-up that cannot reach
+// Vertex AI, or get a token, fails Open: the Say would only dial itself.
+func TestGeminiOpensWhenTheWarmUpFails(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := "http://" + ln.Addr().String()
+	_ = ln.Close()
+	g, err := NewGemini(&GeminiConfig{
+		Project:     "example-project",
+		Credentials: auth.NewCredentials(&auth.CredentialsOptions{TokenProvider: failingToken{}}),
+		BaseURL:     gone,
+	})
+	if err != nil {
+		t.Fatalf("NewGemini: %v", err)
+	}
+	s, err := New(g).Open(context.Background(), &voice.Exchange{Out: newFakeOutput()})
+	if err != nil {
+		t.Fatalf("Open = %v, want the Session even though its warm-up fails", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestGeminiCloseStopsTheWarmUp fails if closing a Session leaves its
+// warm-up running, or waits for a warm-up Vertex AI does not answer.
+func TestGeminiCloseStopsTheWarmUp(t *testing.T) {
+	warmed, ended := make(chan struct{}, 1), make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isStream(r) {
+			http.Error(w, "not in this test", http.StatusBadRequest)
+			return
+		}
+		warmed <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			ended <- struct{}{}
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	t.Cleanup(srv.Close)
+	g, err := NewGemini(&GeminiConfig{Project: "example-project", Credentials: testCredentials(), BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewGemini: %v", err)
+	}
+	s, err := New(g).Open(context.Background(), &voice.Exchange{Out: newFakeOutput()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	select {
+	case <-warmed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no warm-up request reached Vertex AI 2 s after Open")
+	}
+	closed := time.Now()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if took := time.Since(closed); took > time.Second {
+		t.Fatalf("Close took %v with a warm-up unanswered, want it to stop the warm-up", took)
+	}
+	select {
+	case <-ended:
+	case <-time.After(time.Second):
+		t.Fatal("the warm-up request was still open 1 s after Close")
 	}
 }
 
