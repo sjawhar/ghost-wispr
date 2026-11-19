@@ -181,3 +181,44 @@ func TestASpokenKeyReachesTheConciergeWritten(t *testing.T) {
 		t.Fatalf("the Concierge got %q, want %q", turns, want)
 	}
 }
+
+// TestAReplyToWisprsQuestionKeepsTheFloorFree fails if a person's reply to
+// Wispr's own question ("The first one.") counts as room speech against R7's
+// free floor: it is part of the exchange, whose last turn is R7's t0, so the
+// holder's answer must speak by itself (end-to-end run 8d needed "Wispr, go
+// ahead").
+func TestAReplyToWisprsQuestionKeepsTheFloorFree(t *testing.T) {
+	c := newFakeConcierge()
+	c.acks = []string{didYouMean}
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.FollowUpWait = time.Minute })
+	sess := r.ask("please ask the agent who holds the voice work when it ships?")
+	asked := time.Now() // the Concierge's task: its question, in this exchange
+	waitSaid(t, sess)
+	r.speaker.finish(audio.InputVoice)
+	r.waitEvent("voice_spoken:sess-1")
+	c.acks = nil
+	r.heard("The first one.", true, true)
+	r.waitTurn()
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", IssueKey: "ABC-12", Text: "It ships tomorrow.", AskedAt: asked}
+	if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {
+		t.Fatalf("said %q, want the holder's answer by itself", got)
+	}
+}
+
+// TestAnAnswerInTheFollowUpWindowNeedNotWaitForItsEnd fails if a holder's
+// answer that lands while an exchange only waits in its follow-up window, with
+// nobody speaking, waits for that window to run out before its sound plays
+// and it speaks (run 8d: the answer sound came 13.5 s after the answer).
+func TestAnAnswerInTheFollowUpWindowNeedNotWaitForItsEnd(t *testing.T) {
+	c := newFakeConcierge("I asked the agent on ABC-12.")
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, _ *rig) { cfg.FollowUpWait = time.Minute })
+	sess := r.ask("please ask the agent on ABC-12 when it ships?")
+	waitSaid(t, sess)
+	r.speaker.finish(audio.InputVoice)
+	r.waitEvent("voice_spoken:sess-1") // the window opens, for a minute
+	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", IssueKey: "ABC-12", Text: "It ships tomorrow.", AskedAt: time.Now()}
+	eventually(t, "the answer sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "answer") })
+	if got := waitSaid(t, r.waitSession()); got != "It ships tomorrow." {
+		t.Fatalf("said %q, want the holder's answer", got)
+	}
+}

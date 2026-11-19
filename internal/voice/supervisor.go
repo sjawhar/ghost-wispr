@@ -203,6 +203,7 @@ type Supervisor struct {
 	recent        []TurnText
 	lastHeard     time.Time // the last word heard
 	lastRoomWord  time.Time // the last word heard that was not Wispr's own
+	lastExchange  *exchange // the newest exchange a wake opened
 	chimedAt      time.Time
 	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
 	wg            sync.WaitGroup // the goroutines Close waits for
@@ -258,9 +259,12 @@ type exchange struct {
 	// askedBack: Wispr's last line asked a question ("Did you mean A or
 	// B?"), so the next utterance answers it and continues the exchange.
 	askedBack bool
-	turnAt    time.Time // when the turn was handed to the Concierge
-	notified  map[string]bool
-	idle      *time.Timer // a driving voice's idle wait
+	// lastTurnEnd is when the exchange's last turn ended: R7's t0 for an
+	// answer to a question it asked.
+	lastTurnEnd time.Time
+	turnAt      time.Time // when the turn was handed to the Concierge
+	notified    map[string]bool
+	idle        *time.Timer // a driving voice's idle wait
 	// A driving voice's follow-up window: armed when its speech ends, unless
 	// a barge-in cut it; a person's word disarms it (R10).
 	followUpTimer *time.Timer
@@ -687,6 +691,7 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 	}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
+	s.lastExchange = ex
 	sessionID := s.cfg.Session()
 	s.timing("wake_heard", sessionID, t.At)
 	ex.x = Exchange{
@@ -871,6 +876,9 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		}
 		ex.interim = ""
 		ex.turnFinal = true
+		if ex.drives {
+			ex.lastTurnEnd = time.Now()
+		}
 	} else {
 		ex.interim = words
 	}
@@ -971,6 +979,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange) {
 	ex.followUpTurn = false
 	ex.answering = true
 	ex.turnAt = time.Now()
+	ex.lastTurnEnd = ex.turnAt
 	ex.firstOutDone, ex.factPending, ex.factDone = false, false, false
 	turn := s.turnOf(ex)
 	ex.x.AskerTurn = turn
@@ -1199,10 +1208,17 @@ func (s *Supervisor) offerAnswers() {
 			s.mu.Lock()
 			if !s.closed {
 				// It waits for "Wispr, go ahead" unless the floor stayed free
-				// since its question (R7): no stop and no room word since it was
-				// asked. One that does not say when it was asked waits too.
+				// since its question (R7): no stop and no room word since t0.
+				// t0 is the end of the last turn of the exchange that asked,
+				// so a reply to Wispr's own question ("The first one.") is part
+				// of the exchange, not room speech. One that does not say when
+				// it was asked waits too.
+				t0 := a.AskedAt
+				if le := s.lastExchange; le != nil && !le.wakeAt.After(a.AskedAt) && le.lastTurnEnd.After(t0) {
+					t0 = le.lastTurnEnd
+				}
 				stoppedSince := !s.lastStopAt.IsZero() && !s.lastStopAt.Before(a.AskedAt)
-				talkedSince := !s.lastRoomWord.IsZero() && s.lastRoomWord.After(a.AskedAt)
+				talkedSince := !s.lastRoomWord.IsZero() && s.lastRoomWord.After(t0)
 				s.pending = append(s.pending, &pendingAnswer{PendingAnswer: a, needsInvite: a.AskedAt.IsZero() || stoppedSince || talkedSince})
 				s.timing("answer_ready", a.SessionID, time.Now())
 				select {
@@ -1224,7 +1240,10 @@ func (s *Supervisor) offer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropEndedLocked()
-	if s.closed || s.ex != nil || len(s.pending) == 0 || !s.cfg.Red() {
+	if s.closed || len(s.pending) == 0 || !s.cfg.Red() {
+		return
+	}
+	if ex := s.ex; ex != nil && !s.idleLocked(ex) {
 		return
 	}
 	now := time.Now()
@@ -1269,10 +1288,26 @@ func (s *Supervisor) offer() {
 	}
 	for _, p := range s.pending {
 		if !p.needsInvite {
+			if ex := s.ex; ex != nil {
+				s.endLocked(ex, false, "a holder's answer takes the floor")
+			}
 			s.speakLocked(p)
 			return
 		}
 	}
+}
+
+// idleLocked reports whether ex holds the floor only by its follow-up window,
+// with no turn begun, no tool call and no speech: a held answer may then
+// sound and speak without waiting for the window to run out.
+func (s *Supervisor) idleLocked(ex *exchange) bool {
+	if ex.ended || ex.answer != nil || s.voiceSpeaking {
+		return false
+	}
+	if ex.drives {
+		return ex.followUpTimer != nil && ex.toolCalls == 0
+	}
+	return ex.followUp && !ex.answering && s.turnOf(ex) == ""
 }
 
 // stopLocked ends the exchange holding the floor for reason, and makes every
