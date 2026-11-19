@@ -88,9 +88,9 @@ type Store interface {
 	AnswerVoiceTask(id, written string) (bool, error)
 	EndVoiceTask(id string, state storage.VoiceTaskState) (bool, error)
 	MarkVoiceTaskSpoken(id string, at time.Time) error
-	CancelWorkingVoiceTasks(sessionID string) (int64, error)
-	CancelWorkingVoiceTasksOfEndedSessions() ([]string, error)
-	CancelAllWorkingVoiceTasks() ([]string, error)
+	CancelWorkingVoiceTasks(sessionID string) ([]storage.VoiceTask, error)
+	CancelWorkingVoiceTasksOfEndedSessions() ([]storage.VoiceTask, error)
+	CancelAllWorkingVoiceTasks() ([]storage.VoiceTask, error)
 }
 
 // JoinedAgent is an agent that joined the meeting.
@@ -131,6 +131,7 @@ type Concierge struct {
 	publicURL string
 	joined    func() []JoinedAgent
 	changed   func(sessionID string)
+	untold    []storage.VoiceTask
 	now       func() time.Time
 	logger    *slog.Logger
 	answers   chan voice.PendingAnswer
@@ -283,7 +284,9 @@ func New(cfg *Config) (*Concierge, error) {
 	if ended, err := c.store.CancelWorkingVoiceTasksOfEndedSessions(); err != nil {
 		c.logger.Warn("concierge could not cancel the questions of meetings that ended while it was off", "error", err)
 	} else {
-		for _, id := range ended {
+		// Their holders are told once the Envoy session opens (SetAgents).
+		c.untold = ended
+		for _, id := range sessionsOf(ended) {
 			c.tellChanged(id)
 		}
 	}
@@ -332,30 +335,70 @@ func (c *Concierge) Stop() {
 
 // VoiceOff ends the Concierge as Stop does, as the voice is turned off, then
 // cancels every question still working, of a meeting still recording too,
-// and tells each page: no one hears an answer while the voice is off, and a
-// working question's late reply would be offered once it is on again. As
-// after a meeting's end, a late reply still lands in the ledger, for the
-// page. Stop alone, at shutdown, keeps them: the unit's Envoy session is the
-// same after a restart, so a reply can still land.
+// tells each page, and tells each holder not to answer: no one hears an
+// answer while the voice is off, and a working question's late reply would
+// be offered once it is on again. As after a meeting's end, a late reply
+// still lands in the ledger, for the page. Call it before the Envoy session
+// closes. Stop alone, at shutdown, keeps them: the unit's Envoy session is
+// the same after a restart, so a reply can still land.
 func (c *Concierge) VoiceOff() {
 	c.Stop()
-	sessions, err := c.store.CancelAllWorkingVoiceTasks()
+	cancelled, err := c.store.CancelAllWorkingVoiceTasks()
 	if err != nil {
 		c.logger.Warn("concierge could not cancel its questions as the voice went off", "error", err)
 		return
 	}
-	for _, id := range sessions {
+	for _, id := range sessionsOf(cancelled) {
 		c.logger.Info("concierge cancelled the questions of a session as the voice went off", "session", id)
 		c.tellChanged(id)
 	}
+	c.tellHoldersEnded(cancelled, "the voice was turned off")
+}
+
+// sessionsOf is the meetings of tasks, each once, in order.
+func sessionsOf(tasks []storage.VoiceTask) []string {
+	var ids []string
+	for i := range tasks {
+		if !slices.Contains(ids, tasks[i].SessionID) {
+			ids = append(ids, tasks[i].SessionID)
+		}
+	}
+	return ids
 }
 
 // SetAgents gives the Concierge the unit's Envoy session once it is open.
 // The session's Deliver is the Concierge's, so the Concierge exists first.
+// The holders of the questions cancelled at the start are told then.
 func (c *Concierge) SetAgents(agents Agents) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.agents = agents
+	var untold []storage.VoiceTask
+	if agents != nil {
+		untold, c.untold = c.untold, nil
+	}
+	c.mu.Unlock()
+	if len(untold) > 0 {
+		c.background(func(context.Context) { c.tellHoldersEnded(untold, "the meeting ended") })
+	}
+}
+
+// tellHoldersEnded tells the agent of each cancelled task not to answer
+// (tellHolderEnded), all at once, and waits for the sends. It forgets no
+// reply route: a late reply still lands in the ledger, for the page.
+func (c *Concierge) tellHoldersEnded(tasks []storage.VoiceTask, why string) {
+	var wg sync.WaitGroup
+	for i := range tasks {
+		agent, ok := strings.CutPrefix(tasks[i].Holder, "session:")
+		if !ok {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.tellHolderEnded(context.Background(), &tasks[i], agent, storage.VoiceTaskCancelled, why)
+		}()
+	}
+	wg.Wait()
 }
 
 func (c *Concierge) currentAgents() Agents {
@@ -677,9 +720,10 @@ func (c *Concierge) SessionEnded(sessionID string) error {
 	if err != nil {
 		return err
 	}
-	if cancelled > 0 {
-		c.logger.Info("concierge cancelled the questions of an ended session", "session", sessionID, "cancelled", cancelled)
+	if len(cancelled) > 0 {
+		c.logger.Info("concierge cancelled the questions of an ended session", "session", sessionID, "cancelled", len(cancelled))
 		c.tellChanged(sessionID)
+		c.background(func(context.Context) { c.tellHoldersEnded(cancelled, "the meeting ended") })
 	}
 	return nil
 }

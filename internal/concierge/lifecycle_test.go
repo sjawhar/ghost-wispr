@@ -3,6 +3,7 @@ package concierge
 import (
 	"context"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +86,44 @@ func TestANewConciergeCancelsTheQuestionsOfEndedMeetings(t *testing.T) {
 	if len(changed) != 1 || changed[0] != "meeting-1" {
 		t.Fatalf("pages told = %q, want meeting-1", changed)
 	}
+	// PR #89's review, round 5: the holder is told, once the unit's Envoy
+	// session is open; the recording meeting's holder is not.
+	next.SetAgents(r.agents)
+	eventually(t, "the ended meeting's holder was told", func() bool { return notices(r, "agent-7") == 1 })
+	if n := notices(r, "agent-9"); n != 0 {
+		t.Fatalf("notices to the recording meeting's holder = %d, want 0", n)
+	}
+}
+
+// notices counts the notices, asking no reply, sent to agent.
+func notices(r *rig, agent string) int {
+	r.agents.mu.Lock()
+	defer r.agents.mu.Unlock()
+	n := 0
+	for _, sent := range r.agents.sent {
+		if sent.NoReply && sent.Target == agent {
+			n++
+		}
+	}
+	return n
+}
+
+// TestAMeetingsEndTellsTheHolder (PR #89's review, round 5): a meeting's end
+// cancels its questions and tells each holder not to answer, by time and
+// issue, never the question's words.
+func TestAMeetingsEndTellsTheHolder(t *testing.T) {
+	r := newRig(t)
+	r.ask(t, "agent-7", "is the tap merged", "ABC-12")
+	if err := r.concierge.SessionEnded("meeting-1"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the holder was told", func() bool { return notices(r, "agent-7") == 1 })
+	r.agents.mu.Lock()
+	last := r.agents.sent[len(r.agents.sent)-1]
+	r.agents.mu.Unlock()
+	if !strings.Contains(last.Message, "about ABC-12") || strings.Contains(last.Message, "tap") {
+		t.Fatalf("notice = %q, want the issue and none of the question's words", last.Message)
+	}
 }
 
 // TestTurningTheVoiceOffCancelsItsQuestions (PR #89's review, round 4):
@@ -128,6 +167,10 @@ func TestTurningTheVoiceOffCancelsItsQuestions(t *testing.T) {
 	mu.Unlock()
 	if !slices.Equal(pages, []string{"meeting-1"}) {
 		t.Fatalf("pages told = %q, want meeting-1", pages)
+	}
+	// PR #89's review, round 5: the holder is told not to answer.
+	if n := notices(r, "agent-7"); n != 1 {
+		t.Fatalf("notices to the holder = %d, want 1", n)
 	}
 
 	// The voice is on again: a new Concierge on the same ledger.

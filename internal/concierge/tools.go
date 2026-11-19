@@ -560,9 +560,10 @@ func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string
 	if err != nil {
 		r.c.logger.Warn("concierge could not read an agent's liveness", "session", id, "error", err)
 		var refused *envoy.ListenerError
-		if errors.As(err, &refused) && refused.Status >= 400 && refused.Status < 500 {
-			// Envoy answered: the holder is no session it holds, such as a
-			// daemon's actor. It cannot be asked, and nothing is out of reach.
+		if errors.As(err, &refused) && refused.Status == http.StatusBadRequest {
+			// Envoy's registry refused the id: the holder is no session it
+			// can hold, such as a daemon's actor. It cannot be asked, and
+			// nothing is out of reach. A 401, 403 or 429 refuses the unit.
 			result["holder"], result["state"] = "unresponsive", "not an agent session"
 			return result
 		}

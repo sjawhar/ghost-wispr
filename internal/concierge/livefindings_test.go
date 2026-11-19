@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"google.golang.org/genai"
 
@@ -60,6 +61,39 @@ func TestAHolderThatIsNoEnvoySessionIsNoOutage(t *testing.T) {
 	}
 }
 
+// TestTheKnownStatusSaysItsAge (PR #89's review, round 5; R6): the status
+// said when no fact came says the age of the record's newest event, as each
+// fact does.
+func TestTheKnownStatusSaysItsAge(t *testing.T) {
+	for _, c := range []struct {
+		newest time.Time
+		want   string
+	}{
+		{testNow.Add(-5 * time.Minute), "ABC-12 is in review, updated 5 minutes ago."},
+		{testNow.Add(-3 * time.Hour), "ABC-12 was in review as of 3 hours ago."},
+		{time.Time{}, "ABC-12 is in review."},
+	} {
+		r := reading{key: "ABC-12", status: "in_review", newest: c.newest}
+		if got := r.known(testNow); got != c.want {
+			t.Errorf("known = %q, want %q", got, c.want)
+		}
+	}
+}
+
+// TestARefusalOfTheUnitIsAnOutage (PR #89's review, round 5): only the
+// registry's refusal of the id (400) means the holder is no agent session;
+// a 401, 403 or 429 refuses the unit, so the agents are out of reach.
+func TestARefusalOfTheUnitIsAnOutage(t *testing.T) {
+	for _, status := range []int{401, 403, 429} {
+		r := newRig(t)
+		r.records.issues["ABC-12"] = claimed("ABC-12", "session", "agent-8", "")
+		r.agents.lookupErr = &envoy.ListenerError{Path: "/v1/registry/agent-8", Status: status, Message: "refused"}
+		if holder := r.run(t, "issue_holder", map[string]string{"key": "ABC-12"}); holder["note"] != cannotReachEnvoy {
+			t.Errorf("%d: issue_holder = %v, want the out-of-reach note", status, holder)
+		}
+	}
+}
+
 // TestNoWordsFromTheModelSaysWhatIsKnown (R6; live at 30ce413): when the
 // model says nothing and nothing was said, the voice says what the record
 // holds, the issue's status, or that no issue was found, rather than sorry.
@@ -70,7 +104,7 @@ func TestNoWordsFromTheModelSaysWhatIsKnown(t *testing.T) {
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(thought("Nothing to say.")), {Candidates: nil}}, {chunk(thought("Still nothing."))}}
 	var spoken []said
 	err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with ABC-12", recorder(&spoken))
-	if err != nil || len(spoken) == 0 || spoken[0] != (said{"ABC-12 is in progress.", voice.Fact}) {
+	if err != nil || len(spoken) == 0 || spoken[0] != (said{"ABC-12 is in progress, updated 5 minutes ago.", voice.Fact}) {
 		t.Fatalf("Answer = %v, spoken %+v; want the status, no error", err, spoken)
 	}
 

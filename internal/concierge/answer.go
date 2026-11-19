@@ -300,14 +300,14 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			if found.key == "" {
 				mode = voice.Ack
 			}
-			if sayErr := sp.sayText(parent, found.known(), mode); sayErr != nil {
+			if sayErr := sp.sayText(parent, found.known(c.now()), mode); sayErr != nil {
 				return sayErr
 			}
 		case errors.Is(err, errNoWords) && found.key != "" && sp.count() == 0:
 			// The model said nothing: the voice says what the record holds,
 			// its status (R6), rather than sorry.
 			err = nil
-			if sayErr := sp.sayText(parent, found.known(), voice.Fact); sayErr != nil {
+			if sayErr := sp.sayText(parent, found.known(c.now()), voice.Fact); sayErr != nil {
 				return sayErr
 			}
 		case errors.Is(err, errNoWords) && (len(lead) > 0 || holderCase != "" || askStarted.Load()):
@@ -388,15 +388,21 @@ func titleStart(title string) string {
 }
 
 // known is what the voice says when no fact came by the mark (R6): the
-// chosen issue's status as the record shows it, or that it found no issue.
-func (r *reading) known() string {
+// chosen issue's status as the record shows it, with the age of its newest
+// event, or that it found no issue.
+func (r *reading) known(now time.Time) string {
+	status := strings.ReplaceAll(r.status, "_", " ")
 	switch {
 	case r.key == "":
 		return noIssueFound
 	case r.status == "":
 		return "I found " + r.key + ", and no fact of it yet."
+	case r.newest.IsZero():
+		return r.key + " is " + status + "."
+	case now.Sub(r.newest) > staleRecord:
+		return r.agedStatus(now)
 	default:
-		return r.key + " is " + strings.ReplaceAll(r.status, "_", " ") + "."
+		return r.key + " is " + status + ", updated " + ago(now, r.newest) + "."
 	}
 }
 

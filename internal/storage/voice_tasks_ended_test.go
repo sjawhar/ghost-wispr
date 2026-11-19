@@ -24,7 +24,7 @@ func TestCancelWorkingVoiceTasksOfEndedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, task := range []VoiceTask{
-		{ID: "e1", SessionID: "ended"}, {ID: "e2", SessionID: "ended"},
+		{ID: "e1", SessionID: "ended", Holder: "session:agent-7"}, {ID: "e2", SessionID: "ended"},
 		{ID: "l1", SessionID: "live"}, {ID: "d1", SessionID: "discarded"}, {ID: "e3", SessionID: "ended"},
 	} {
 		task.AskedAt = at
@@ -35,12 +35,12 @@ func TestCancelWorkingVoiceTasksOfEndedSessions(t *testing.T) {
 	if _, err := store.AnswerVoiceTask("e3", "Done."); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := store.CancelWorkingVoiceTasksOfEndedSessions()
+	cancelled, err := store.CancelWorkingVoiceTasksOfEndedSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions) != 2 || sessions[0] != "discarded" || sessions[1] != "ended" {
-		t.Fatalf("sessions = %q, want discarded and ended", sessions)
+	if ids := taskIDs(cancelled); !slices.Equal(ids, []string{"d1", "e1", "e2"}) || cancelled[1].Holder != "session:agent-7" || cancelled[1].State != VoiceTaskCancelled {
+		t.Fatalf("cancelled = %+v, want d1, e1 (with its holder) and e2, cancelled", cancelled)
 	}
 	for id, want := range map[string]VoiceTaskState{"e1": VoiceTaskCancelled, "e2": VoiceTaskCancelled, "d1": VoiceTaskCancelled, "l1": VoiceTaskWorking, "e3": VoiceTaskDone} {
 		if task, err := store.VoiceTask(id); err != nil || task.State != want {
@@ -53,7 +53,7 @@ func TestCancelWorkingVoiceTasksOfEndedSessions(t *testing.T) {
 }
 
 // TestCancelAllWorkingVoiceTasks: every working question, of any session, is
-// cancelled, and its sessions named in order; an answered one stays done.
+// cancelled and returned, by session; an answered one stays done.
 func TestCancelAllWorkingVoiceTasks(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	at := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
@@ -71,13 +71,21 @@ func TestCancelAllWorkingVoiceTasks(t *testing.T) {
 	if _, err := store.AnswerVoiceTask("b2", "Done."); err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := store.CancelAllWorkingVoiceTasks()
-	if err != nil || !slices.Equal(sessions, []string{"a", "b"}) {
-		t.Fatalf("sessions = %q, %v; want a and b", sessions, err)
+	cancelled, err := store.CancelAllWorkingVoiceTasks()
+	if ids := taskIDs(cancelled); err != nil || !slices.Equal(ids, []string{"a1", "b1"}) || cancelled[0].Holder != "session:agent-7" {
+		t.Fatalf("cancelled = %+v, %v; want a1 (with its holder) and b1", cancelled, err)
 	}
 	for id, want := range map[string]VoiceTaskState{"a1": VoiceTaskCancelled, "b1": VoiceTaskCancelled, "b2": VoiceTaskDone} {
 		if task, err := store.VoiceTask(id); err != nil || task.State != want {
 			t.Errorf("%s = %+v, %v; want %s", id, task, err, want)
 		}
 	}
+}
+
+func taskIDs(tasks []VoiceTask) []string {
+	ids := make([]string, len(tasks))
+	for i := range tasks {
+		ids[i] = tasks[i].ID
+	}
+	return ids
 }

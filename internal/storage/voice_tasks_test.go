@@ -163,8 +163,8 @@ func TestEndingASessionCancelsItsWorkingTasks(t *testing.T) {
 	askVoiceTask(t, store, "answered", "s1", "It merged.")
 	askVoiceTask(t, store, "other", "s2", "")
 	cancelled, err := store.CancelWorkingVoiceTasks("s1")
-	if err != nil || cancelled != 1 {
-		t.Fatalf("CancelWorkingVoiceTasks = %d, %v; want 1", cancelled, err)
+	if err != nil || len(cancelled) != 1 || cancelled[0].ID != "open" {
+		t.Fatalf("CancelWorkingVoiceTasks = %+v, %v; want the open task", cancelled, err)
 	}
 	for id, want := range map[string]VoiceTaskState{"open": VoiceTaskCancelled, "answered": VoiceTaskDone, "other": VoiceTaskWorking} {
 		if task, err := store.VoiceTask(id); err != nil || task.State != want {
