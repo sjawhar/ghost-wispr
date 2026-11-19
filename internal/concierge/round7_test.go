@@ -793,12 +793,14 @@ func TestTheQuestionsOwnWordsAreNoInvention(t *testing.T) {
 	}
 }
 
-// TestASearchedTurnSaysWhatIsKnownAtTheMark (R6): the line that names the
-// issue a search chose is no fact; with no fact by the 6 s mark, the voice
-// still says what is known, and the answer has no error.
+// TestASearchedTurnSaysWhatIsKnownAtTheMark (R5, R6): the line that names
+// the issue a search chose is no fact; with no fact by the routing mark it
+// plays then, and with no fact by the 6 s mark, the voice still says what is
+// known, and the answer has no error. The marks keep their order: 1.5 s,
+// then 6 s.
 func TestASearchedTurnSaysWhatIsKnownAtTheMark(t *testing.T) {
 	r := newRig(t)
-	r.concierge.knownBound = 300 * time.Millisecond
+	r.concierge.routingAfter, r.concierge.knownBound = 100*time.Millisecond, 400*time.Millisecond
 	unclearSearch(r)
 	r.records.hits[0].Score = 0.012
 	r.model.block = make(chan struct{})
@@ -1188,6 +1190,38 @@ func TestAFullResultInTimeBeatsTheMark(t *testing.T) {
 		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
 		if spoken := answerTurn(t, r, "what is happening with the realtime voice"); len(spoken) == 0 || strings.HasPrefix(spoken[0].text, "Did you mean ") {
 			t.Fatalf("spoken = %+v, want the full result, ready before the keyword one", spoken)
+		}
+	}
+}
+
+// TestTheFirstFactNamesTheIssue (R5 as updated): when a search chose the
+// issue and the first fact is ready within 1.5 s of t0 and begins with the
+// key, that fact names the issue, and "I took KEY." is not said; a first
+// fact that does not begin with the key comes after "I took KEY."; with no
+// fact by 1.5 s, "I took KEY." is said then, in place of the routing line.
+func TestTheFirstFactNamesTheIssue(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		fact  string
+		delay time.Duration
+		want  []said
+	}{
+		{"a fact that names the key", "ABC-12 is in review.", 0, []said{{"ABC-12 is in review.", voice.Fact}}},
+		{"a fact that does not", "PR 80 is in review.", 0, []said{{"I took ABC-12.", voice.Lead}, {"PR 80 is in review.", voice.Fact}}},
+		{"no fact by 1.5 s", "ABC-12 is in review.", 2200 * time.Millisecond, []said{{"I took ABC-12.", voice.Lead}, {"ABC-12 is in review.", voice.Fact}}},
+	} {
+		r := newRig(t)
+		unclearSearch(r)
+		r.records.hits[0].Score = 0.012
+		r.records.issues["ABC-12"].Status = "in_review"
+		if c.delay > 0 {
+			delay := c.delay
+			r.model.onCall = func(int) { time.Sleep(delay) }
+		}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text(c.fact))}}
+		spoken := answerTurn(t, r, "what is happening with the realtime voice")
+		if !slices.Equal(spoken, c.want) {
+			t.Errorf("%s: spoken = %+v, want %+v", c.name, spoken, c.want)
 		}
 	}
 }
