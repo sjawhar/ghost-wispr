@@ -2,7 +2,9 @@ package tts
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,5 +148,37 @@ func TestAStopCutsTheSentenceSynthesisedAhead(t *testing.T) {
 				t.Fatalf("%d frames (%d ms) of the second sentence reached a playback begun after the stop", after, after*20)
 			}
 		})
+	}
+}
+
+// TestASynthesisAfterAStopSendsNoText fails if a Say whose writes a stop
+// already ended (wctx, a child of the caller's ctx) still sends its text to
+// the vendor because its synthesis context, which follows the caller's
+// through an AfterFunc on its own goroutine, has not ended yet.
+func TestASynthesisAfterAStopSendsNoText(t *testing.T) {
+	var streamed atomic.Int32
+	v, err := New(fakeEngine{stream: func(context.Context, string, func([]byte) error) error {
+		streamed.Add(1)
+		return nil
+	}}).Open(context.Background(), &voice.Exchange{Out: newFakeOutput()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = v.Close() })
+	s := v.(*session)
+
+	stopped := errors.New("the exchange stopped")
+	wctx, cancelW := context.WithCancelCause(context.Background())
+	cancelW(stopped)
+	// The synthesis context, whose AfterFunc has not run yet.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	r := &sayRequest{ctx: ctx, wctx: wctx, cancel: func(error) {}, text: "after the stop", done: make(chan error, 1), more: make(chan struct{}, 1)}
+	s.synthesise(r)
+	if n := streamed.Load(); n != 0 {
+		t.Fatalf("the vendor got %d texts after the stop, want none", n)
+	}
+	if err := <-r.done; !errors.Is(err, stopped) {
+		t.Fatalf("the Say's result = %v, want the stop's cause", err)
 	}
 }

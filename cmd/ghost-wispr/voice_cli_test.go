@@ -221,13 +221,14 @@ func TestTTSFirstAudioAuraReportsTheOptOutItsSocketCarried(t *testing.T) {
 }
 
 // fakeVertex is Vertex AI for both Gemini engines. A stream sends one event
-// of audio, then holds the rest for hold; a whole clip answers after
-// clipDelay. It keeps each request's path.
+// of audio, then holds the rest for hold, or ends with none when silent; a
+// whole clip answers after clipDelay. It keeps each request's path.
 type fakeVertex struct {
 	url       string
 	hold      time.Duration
 	clipDelay time.Duration
-	status    int // a refusal of every speech request, when not 0
+	status    int  // a refusal of every speech request, when not 0
+	silent    bool // a stream that ends with no audio
 	mu        sync.Mutex
 	paths     []string
 }
@@ -255,6 +256,9 @@ func startFakeVertex(t *testing.T, f *fakeVertex) *fakeVertex {
 		switch {
 		case strings.HasSuffix(r.URL.Path, ":streamGenerateContent"):
 			w.Header().Set("Content-Type", "text/event-stream")
+			if f.silent {
+				return
+			}
 			_, _ = fmt.Fprint(w, event(firstAudioPCM))
 			w.(http.Flusher).Flush()
 			select {
@@ -447,6 +451,24 @@ func TestTTSFirstAudioEngineErrorExitsNonzero(t *testing.T) {
 				t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and Vertex AI's refusal on stderr", run.code, run.stdout, run.stderr)
 			}
 		})
+	}
+}
+
+// TestTTSFirstAudioAnEngineWithNoAudioExitsNonzeroAtOnce fails if a sentence
+// the engine answers with no audio leaves tts-first-audio exiting 0, or
+// waiting seconds before it says so: voice A's Say returns once the text's
+// first frame is queued, or once the text ended with none.
+func TestTTSFirstAudioAnEngineWithNoAudioExitsNonzeroAtOnce(t *testing.T) {
+	vertex := startFakeVertex(t, &fakeVertex{silent: true})
+	unit := firstAudioUnit(t, "")
+	start := time.Now()
+	run := runFirstAudio(t, unit, &voiceAOptions{vertexBaseURL: vertex.url}, "One fact.\n", "--engine", "gemini")
+	took := time.Since(start)
+	if run.code == 0 || !strings.Contains(run.stderr, "the engine gave no audio") || run.stdout != "" {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want nonzero, nothing printed, and no audio on stderr", run.code, run.stdout, run.stderr)
+	}
+	if took > 2*time.Second {
+		t.Fatalf("took %v to report a sentence with no audio, want within 2 s", took)
 	}
 }
 

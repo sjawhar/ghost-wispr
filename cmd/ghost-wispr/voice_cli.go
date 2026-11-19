@@ -183,9 +183,16 @@ func (t *voiceATimer) firstFrame(ctx context.Context, text string) (time.Duratio
 	if err := t.session.Say(ctx, text, voice.Fact); err != nil {
 		return 0, nil, err
 	}
-	first, ok := t.sink.firstWrite(ctx)
-	if !ok {
+	// Voice A's Say returns once the text's first frame is queued, so the
+	// sink holds it, unless the text had no audio.
+	first := t.sink.firstAt()
+	if first.IsZero() {
 		return 0, nil, errors.New("the engine gave no audio")
+	}
+	// The next sentence's request starts once this one has all played, so
+	// the first frame the sink takes after it is that sentence's own.
+	if err := t.waitSpoken(ctx); err != nil {
+		return 0, nil, err
 	}
 	if !t.aura {
 		return first.Sub(start), nil, nil
@@ -200,6 +207,28 @@ func (t *voiceATimer) firstFrame(ctx context.Context, text string) (time.Duratio
 	return first.Sub(start), &optedOut, nil
 }
 
+// waitSpoken waits for the speech of the sentence in flight to end: its
+// synthesis ended and its audio is all written. A synthesis that fails after
+// the first frame ends it with that failure.
+func (t *voiceATimer) waitSpoken(ctx context.Context) error {
+	for {
+		select {
+		case e, ok := <-t.session.Events():
+			if !ok {
+				return errors.New("voice A closed before the sentence ended")
+			}
+			switch e.Kind {
+			case voice.EventErr:
+				return e.Err
+			case voice.EventSpeechEnded:
+				return nil
+			}
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
+}
+
 func (t *voiceATimer) close() { _ = t.session.Close() }
 
 // firstFrameSink is the Output tts-first-audio speaks into: it plays nothing,
@@ -207,7 +236,6 @@ func (t *voiceATimer) close() { _ = t.session.Close() }
 type firstFrameSink struct {
 	mu    sync.Mutex
 	first time.Time
-	got   chan struct{} // closed at the first frame since arm
 }
 
 func (s *firstFrameSink) Begin() voice.Playback { return s }
@@ -218,9 +246,6 @@ func (s *firstFrameSink) Write(context.Context, []byte, audio.AudioFormat) error
 	defer s.mu.Unlock()
 	if s.first.IsZero() {
 		s.first = now
-		if s.got != nil {
-			close(s.got)
-		}
 	}
 	return nil
 }
@@ -230,27 +255,14 @@ func (*firstFrameSink) Drain(context.Context) error { return nil }
 func (s *firstFrameSink) arm() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.first, s.got = time.Time{}, make(chan struct{})
+	s.first = time.Time{}
 }
 
-// firstFrameWait bounds how long after its Say returns a text's first frame
-// may take: voice A's Say returns once the text is synthesised, and its
-// playback stage writes the first frame just after.
-const firstFrameWait = 5 * time.Second
-
-// firstWrite waits for the first frame since arm, up to firstFrameWait.
-func (s *firstFrameSink) firstWrite(ctx context.Context) (time.Time, bool) {
-	s.mu.Lock()
-	got := s.got
-	s.mu.Unlock()
-	select {
-	case <-got:
-	case <-ctx.Done():
-	case <-time.After(firstFrameWait):
-	}
+// firstAt is the time of the first frame since arm; zero when none came.
+func (s *firstFrameSink) firstAt() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.first, !s.first.IsZero()
+	return s.first
 }
 
 // clipTimer times today's whole-clip Gemini provider: its first byte of

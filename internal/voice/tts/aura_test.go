@@ -164,7 +164,7 @@ func newTestAura(t *testing.T, f *fakeSpeak) *Aura {
 }
 
 // playedAudio is every frame the Output was given, once play stopped writing
-// (no new frame for 50 ms): a Say returns once its text is synthesised,
+// (no new frame for 50 ms): a Say returns once its first frame is queued,
 // before its audio is all written.
 func playedAudio(out *fakeOutput) []byte {
 	read := func() []byte {

@@ -159,7 +159,7 @@ func (p *fakePlayback) audio() []byte {
 }
 
 // waitPlayback waits until the Output began want playbacks and the last one
-// got n bytes, since a Say returns once its text is synthesised, before
+// got n bytes, since a Say returns once its first frame is queued, before
 // its audio is all written.
 func (o *fakeOutput) waitPlayback(t *testing.T, want, n int) []*fakePlayback {
 	t.Helper()
@@ -579,10 +579,10 @@ func TestAFailedWriteIsReportedAndTheNextSayBeginsAnotherPlayback(t *testing.T) 
 	go func() { nextSaid <- s.Say(context.Background(), "next", voice.Fact) }()
 	time.Sleep(50 * time.Millisecond)
 	close(queued)
-	// The Say ends with its synthesis: a write failure before then fails it,
-	// one after is reported as EventErr only (the Say returned already).
-	if err := <-failed; err != nil && !errors.Is(err, audio.ErrCancelled) {
-		t.Fatalf("Say whose playback ended = %v, want nil or the Output's ErrCancelled", err)
+	// The Say returned at its first frame: the write failure after it is
+	// reported as EventErr only.
+	if err := <-failed; err != nil {
+		t.Fatalf("Say whose playback ended after its first frame = %v, want nil", err)
 	}
 	if err := <-nextSaid; err != nil {
 		t.Fatalf("the Say queued behind it: %v", err)
@@ -600,6 +600,34 @@ func TestAFailedWriteIsReportedAndTheNextSayBeginsAnotherPlayback(t *testing.T) 
 			if !errors.Is(e.Err, audio.ErrCancelled) {
 				t.Fatalf("EventErr = %v, want the Output's ErrCancelled", e.Err)
 			}
+			return
+		}
+	}
+}
+
+// refusingOutput is an Output whose every playback refuses each write, as
+// the Supervisor's playback begun after its exchange ended does.
+type refusingOutput struct{}
+
+var errRefused = errors.New("the exchange ended")
+
+func (refusingOutput) Begin() voice.Playback                                  { return refusingOutput{} }
+func (refusingOutput) Write(context.Context, []byte, audio.AudioFormat) error { return errRefused }
+func (refusingOutput) Drain(context.Context) error                            { return nil }
+
+// TestNoTextAudioForAFrameTheOutputRefused fails if voice A reports a text's
+// first audio (EventTextAudio, which the Supervisor logs as fact_audio for
+// R6's timing) for a frame the Output refused: none of the text played.
+func TestNoTextAudioForAFrameTheOutputRefused(t *testing.T) {
+	s := openSession(t, speaks(map[string][]byte{"the fact": ramp(0, 2*frame20ms)}), refusingOutput{})
+	if err := s.Say(context.Background(), "the fact", voice.Fact); !errors.Is(err, errRefused) {
+		t.Fatalf("Say = %v, want the Output's refusal", err)
+	}
+	for {
+		switch e := nextEvent(t, s.Events()); e.Kind {
+		case voice.EventTextAudio:
+			t.Fatalf("EventTextAudio %q for a frame the Output refused", e.Text)
+		case voice.EventSpeechEnded:
 			return
 		}
 	}
