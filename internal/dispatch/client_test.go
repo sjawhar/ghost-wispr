@@ -87,11 +87,10 @@ func TestSearchSendsTheQueryAndTheBearerToken(t *testing.T) {
 	if got := request.URL.Query().Get("limit"); got != "5" {
 		t.Errorf("limit = %q", got)
 	}
-	// A search without keywords_only sends its words to Dispatch's
-	// embedding model, outside Dispatch; the unit's searches come from the
-	// room, so every one is keywords only.
-	if got := request.URL.Query().Get("keywords_only"); got != "true" {
-		t.Errorf("keywords_only = %q, want true", got)
+	// A search is Dispatch's normal one, words and meaning: the unit sends
+	// it a question's few keywords, never the sentence (searchTerms).
+	if _, set := request.URL.Query()["keywords_only"]; set {
+		t.Errorf("keywords_only = %q, want Dispatch's normal search", request.URL.Query().Get("keywords_only"))
 	}
 	if len(hits) != 3 {
 		t.Fatalf("hits = %+v, want 3", hits)

@@ -167,6 +167,9 @@ type Concierge struct {
 	queued    chan struct{}
 	// prefetches is, per exchange, the record read while its asker speaks.
 	prefetches map[string]*prefetch
+	// picks is, per exchange's wake, the two issues an answer offered and
+	// the question asked, for the turn that picks one (R5).
+	picks map[string]offeredPick
 	// sessionOf names the meeting of each task id the maps above hold, local
 	// or event, so a meeting's state goes without a read of the store.
 	sessionOf map[string]string
@@ -185,6 +188,7 @@ type Concierge struct {
 	// fastBound and routingAfter are fastAnswerBound and routingAfter; a
 	// test shortens them.
 	fastBound    time.Duration
+	knownBound   time.Duration
 	routingAfter time.Duration
 }
 
@@ -226,9 +230,11 @@ func New(cfg *Config) (*Concierge, error) {
 		named:        map[string]*named{},
 		queued:       make(chan struct{}, 1),
 		prefetches:   map[string]*prefetch{},
+		picks:        map[string]offeredPick{},
 		sessionOf:    map[string]string{},
 		closed:       map[string]closure{},
 		fastBound:    fastAnswerBound,
+		knownBound:   knownAfter,
 		routingAfter: routingAfter,
 	}
 	if c.model == "" {
@@ -395,6 +401,11 @@ func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 		if strings.HasPrefix(key, prefix) {
 			p.cancelAll()
 			delete(c.prefetches, key)
+		}
+	}
+	for key, p := range c.picks {
+		if p.sessionID == sessionID {
+			delete(c.picks, key)
 		}
 	}
 	of := func(id string) bool { return c.sessionOf[id] == sessionID }

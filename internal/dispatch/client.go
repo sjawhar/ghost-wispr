@@ -114,13 +114,12 @@ func (c *Client) Projects(ctx context.Context) ([]string, error) {
 	return keys, nil
 }
 
-// Search runs a full-text search and returns up to limit hits, best first.
-// It searches keywords only: a search without keywords_only sends its words
-// to the embedding model Dispatch's meaning search calls, outside Dispatch
-// (its search handler's embedQuery), and the unit's searches are words said
-// in a room.
+// Search runs Dispatch's normal search, words and meaning, and returns up to
+// limit hits, best first. Its meaning leg sends the query to Dispatch's
+// embedding model, outside Dispatch, so a caller sends the fewest words that
+// name the work, never a sentence said in a room.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
-	params := url.Values{"q": {query}, "keywords_only": {"true"}}
+	params := url.Values{"q": {query}}
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
 	}

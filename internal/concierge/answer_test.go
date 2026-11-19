@@ -181,7 +181,7 @@ func TestAnUnreachableEnvoySaysSoAndWrapsErrUnreachable(t *testing.T) {
 	const (
 		status   = "what is happening with ABC-12"
 		ask      = "ask the agent on ABC-12 whether the tap is merged"
-		heldLine = "ABC-12 is held by an agent session, and I cannot reach the agents yet."
+		heldLine = "I cannot reach ABC-12's agent yet."
 		askLine  = "I could not ask the agent on ABC-12: I cannot reach the agents yet."
 	)
 	down := errors.New("envoy: dial tcp: no route to host")

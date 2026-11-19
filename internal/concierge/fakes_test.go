@@ -50,6 +50,9 @@ type fakeRecords struct {
 	// holderEventsErr, when set, is the answer of issue_holder's read of
 	// events (holderEvents), and of no other read.
 	holderEventsErr error
+	// docBlock, when set, holds each DocumentText call (a spec read) until
+	// it is closed or the call's context ends: a slow read_issue.
+	docBlock chan struct{}
 }
 
 func (f *fakeRecords) Projects(ctx context.Context) ([]string, error) {
@@ -143,6 +146,15 @@ func (f *fakeRecords) eventLimits() []int {
 func (f *fakeRecords) DocumentText(ctx context.Context, key, slug string) (string, error) {
 	if f.err != nil {
 		return "", f.err
+	}
+	f.mu.Lock()
+	block := f.docBlock
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err

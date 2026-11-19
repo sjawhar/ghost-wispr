@@ -31,7 +31,7 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 		logger.Warn("concierge: no concierge.envoy_url; the voice cannot ask an issue's agent")
 		return c, func() {}, nil
 	}
-	listener, err := envoy.NewListener(cfg.Concierge.EnvoyURL, nil)
+	listener, err := envoy.NewListener(cfg.Concierge.EnvoyURL, newEnvoyHTTP(logger))
 	if err != nil {
 		return nil, nil, fmt.Errorf("concierge: %w", err)
 	}
@@ -107,7 +107,7 @@ func newConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLite
 	case cfg.Concierge.DispatchURL == "":
 		logger.Warn("concierge: no concierge.dispatch_url; the voice says it cannot reach Dispatch yet")
 	default:
-		client, err := dispatch.NewClient(cfg.Concierge.DispatchURL, cfg.DispatchToken, nil)
+		client, err := dispatch.NewClient(cfg.Concierge.DispatchURL, cfg.DispatchToken, newDispatchHTTP(logger))
 		if err != nil {
 			return nil, fmt.Errorf("concierge: %w", err)
 		}

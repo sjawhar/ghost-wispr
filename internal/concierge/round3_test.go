@@ -467,28 +467,35 @@ func TestAnAnswerOfAnEndedSessionIsNotAnnounced(t *testing.T) {
 	}
 }
 
-// TestADescribedTurnAsksNoHolderUnasked: a turn with no key is searched; the
-// model is told the hits may not be what the question is about, and a search
-// with no one clear match makes the Concierge ask no holder, even on "ask":
-// the room heard which issue it took and can name it.
+// TestADescribedTurnAsksNoHolderUnasked: a turn with no key is searched. With
+// one clear match, the model is told the hits may not be what the question is
+// about; with none, the Concierge asks no holder, even on "ask", and calls no
+// model: the voice asks which issue the person meant (R5).
 func TestADescribedTurnAsksNoHolderUnasked(t *testing.T) {
-	r := newRig(t)
-	voiceIssue(r)
-	r.records.issues["ABC-12"].Claim = &dispatch.Claim{Actor: actor("session", "agent-9", "Worker")}
-	r.agents.states["agent-9"] = envoy.SessionInfo{SessionID: "agent-9", State: envoy.StateLive}
-	r.records.hits = append(r.records.hits, dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word"})
-	r.records.hits[0].Score, r.records.hits[1].Score = 0.007, 0.006
-	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
-	var spoken []said
-	if err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on the realtime voice whether it shipped", recorder(&spoken)); err != nil {
-		t.Fatal(err)
-	}
-	prompt := r.model.requests[0][0].Parts[0].Text
-	if !strings.Contains(prompt, "may not be what the question is about") {
-		t.Fatalf("the prompt for a described turn:\n%s", prompt)
-	}
-	if len(r.agents.sent) != 0 {
-		t.Fatalf("a search with no clear match asked %+v", r.agents.sent)
+	for _, clear := range []bool{true, false} {
+		r := newRig(t)
+		voiceIssue(r)
+		r.records.issues["ABC-12"].Claim = &dispatch.Claim{Actor: actor("session", "agent-9", "Worker")}
+		r.agents.states["agent-9"] = envoy.SessionInfo{SessionID: "agent-9", State: envoy.StateLive}
+		r.records.hits = append(r.records.hits, dispatch.SearchHit{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word"})
+		r.records.hits[0].Score, r.records.hits[1].Score = 0.007, 0.006
+		if clear {
+			r.records.hits[0].Score = 0.012
+		}
+		r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in progress."))}}
+		var spoken []said
+		if err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the realtime voice", recorder(&spoken)); err != nil {
+			t.Fatal(err)
+		}
+		if !clear {
+			if len(r.model.requests) != 0 || len(r.agents.sent) != 0 || len(spoken) != 1 || !strings.HasPrefix(spoken[0].text, "Did you mean ") {
+				t.Fatalf("no clear match: model calls %d, sent %d, spoken %+v; want only the question which issue", len(r.model.requests), len(r.agents.sent), spoken)
+			}
+			continue
+		}
+		if len(r.model.requests) == 0 || !strings.Contains(r.model.requests[0][0].Parts[0].Text, "may not be what the question is about") {
+			t.Fatalf("one clear match: the prompt lacks the warning about search hits")
+		}
 	}
 }
 
@@ -509,8 +516,10 @@ func TestAReadThatFoundNothingIsNotReadAgain(t *testing.T) {
 	if err := r.concierge.Answer(context.Background(), &r.exchange, turn, recorder(&spoken)); err != nil {
 		t.Fatal(err)
 	}
-	if reads := len(slices.DeleteFunc(r.records.calls(), func(key string) bool { return key != "LAST-24" })); reads != 1 {
-		t.Fatalf("LAST-24 was read %d times, want once", reads)
+	// Heard's one read asks for the issue and its holder side by side; the
+	// Answer adds no read.
+	if reads := len(slices.DeleteFunc(r.records.calls(), func(key string) bool { return key != "LAST-24" })); reads > 2 {
+		t.Fatalf("LAST-24 was read %d times, want the one read's two calls", reads)
 	}
 }
 
