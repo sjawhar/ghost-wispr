@@ -97,9 +97,28 @@ type SearchHit struct {
 	Snippet  string `json:"snippet,omitempty"`
 }
 
+// Projects lists Dispatch's project keys.
+func (c *Client) Projects(ctx context.Context) ([]string, error) {
+	var projects []struct {
+		Key string `json:"key"`
+	}
+	if err := c.get(ctx, "projects", "/api/v1/projects", nil, &projects); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(projects))
+	for _, project := range projects {
+		keys = append(keys, project.Key)
+	}
+	return keys, nil
+}
+
 // Search runs a full-text search and returns up to limit hits, best first.
+// It searches keywords only: a search without keywords_only sends its words
+// to the embedding model Dispatch's meaning search calls, outside Dispatch
+// (its search handler's embedQuery), and the unit's searches are words said
+// in a room.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
-	params := url.Values{"q": {query}}
+	params := url.Values{"q": {query}, "keywords_only": {"true"}}
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
 	}

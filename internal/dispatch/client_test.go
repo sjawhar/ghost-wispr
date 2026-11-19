@@ -87,6 +87,12 @@ func TestSearchSendsTheQueryAndTheBearerToken(t *testing.T) {
 	if got := request.URL.Query().Get("limit"); got != "5" {
 		t.Errorf("limit = %q", got)
 	}
+	// A search without keywords_only sends its words to Dispatch's
+	// embedding model, outside Dispatch; the unit's searches come from the
+	// room, so every one is keywords only.
+	if got := request.URL.Query().Get("keywords_only"); got != "true" {
+		t.Errorf("keywords_only = %q, want true", got)
+	}
 	if len(hits) != 3 {
 		t.Fatalf("hits = %+v, want 3", hits)
 	}
@@ -98,6 +104,18 @@ func TestSearchSendsTheQueryAndTheBearerToken(t *testing.T) {
 	}
 	if hits[2].IssueKey != "" {
 		t.Errorf("a hit with no issue names one: %+v", hits[2])
+	}
+}
+
+func TestProjectsListsTheKeys(t *testing.T) {
+	fake, client := newFakeDispatch(t)
+	fake.answer("/api/v1/projects", `[{"key":"ABC","name":"A project"},{"key":"INFRA","name":"Another"}]`)
+	keys, err := client.Projects(context.Background())
+	if err != nil {
+		t.Fatalf("Projects: %v", err)
+	}
+	if len(keys) != 2 || keys[0] != "ABC" || keys[1] != "INFRA" {
+		t.Fatalf("keys = %q", keys)
 	}
 }
 

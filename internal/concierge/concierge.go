@@ -63,6 +63,7 @@ type Records interface {
 	Issue(ctx context.Context, key string) (*dispatch.Issue, error)
 	Events(ctx context.Context, key string, limit int) ([]dispatch.Event, error)
 	DocumentText(ctx context.Context, key, slug string) (string, error)
+	Projects(ctx context.Context) ([]string, error)
 }
 
 // Agents is the unit's Envoy session as the tools use it; *envoy.Session is
@@ -107,8 +108,12 @@ type Config struct {
 	PublicURL string
 	// Joined lists the agents that joined the meeting; nil is none.
 	Joined func() []JoinedAgent
-	Now    func() time.Time
-	Logger *slog.Logger
+	// Changed is told the meeting whose questions to agents changed, as the
+	// session page lists them, after each such write; nil tells nobody. It
+	// is called without the Concierge's lock held.
+	Changed func(sessionID string)
+	Now     func() time.Time
+	Logger  *slog.Logger
 }
 
 // Concierge implements voice.Concierge.
@@ -119,6 +124,7 @@ type Concierge struct {
 	store     Store
 	publicURL string
 	joined    func() []JoinedAgent
+	changed   func(sessionID string)
 	now       func() time.Time
 	logger    *slog.Logger
 	answers   chan voice.PendingAnswer
@@ -159,7 +165,18 @@ type Concierge struct {
 	// closed holds, for namedFor, each meeting that ended or was deleted, so
 	// an answer still being rewritten, a read or a send still running for it
 	// adds nothing back.
-	closed map[string]time.Time
+	closed map[string]closure
+	// projects is Dispatch's project keys, as last read (projectsRead), so a
+	// number said after a word that is no project is no issue key.
+	projects     map[string]bool
+	projectsRead time.Time
+	projectsBusy bool
+}
+
+// closure is a meeting's end or delete.
+type closure struct {
+	at      time.Time
+	deleted bool
 }
 
 var _ voice.Concierge = (*Concierge)(nil)
@@ -179,6 +196,7 @@ func New(cfg *Config) (*Concierge, error) {
 		store:      cfg.Store,
 		publicURL:  cfg.PublicURL,
 		joined:     cfg.Joined,
+		changed:    cfg.Changed,
 		now:        cfg.Now,
 		logger:     cfg.Logger,
 		answers:    make(chan voice.PendingAnswer),
@@ -192,7 +210,7 @@ func New(cfg *Config) (*Concierge, error) {
 		queued:     make(chan struct{}, 1),
 		prefetches: map[string]*prefetch{},
 		sessionOf:  map[string]string{},
-		closed:     map[string]time.Time{},
+		closed:     map[string]closure{},
 	}
 	if c.model == "" {
 		c.model = DefaultModel
@@ -297,7 +315,7 @@ func (c *Concierge) stillOwed(answer *voice.PendingAnswer) bool {
 // or was deleted.
 func (c *Concierge) enqueue(answer *voice.PendingAnswer) {
 	c.mu.Lock()
-	if c.closedLocked(answer.SessionID) {
+	if closed, _ := c.closedLocked(answer.SessionID); closed {
 		c.mu.Unlock()
 		return
 	}
@@ -311,22 +329,27 @@ func (c *Concierge) enqueue(answer *voice.PendingAnswer) {
 
 // withdrawLocked drops the announcements of meeting sessionID: the queued
 // ones, and the one being offered, whose hand-over the returned channel
-// closes on (nil when none is offered). c.mu is held.
+// closes on (nil when none of the meeting's is offered). A second withdraw
+// of the same meeting, an end and a delete together, waits on the same
+// hand-over. c.mu is held.
 func (c *Concierge) withdrawLocked(sessionID string) chan struct{} {
 	c.queue = slices.DeleteFunc(c.queue, func(answer voice.PendingAnswer) bool { return answer.SessionID == sessionID })
-	if c.offering == nil || c.offering.SessionID != sessionID || c.offerDrop == nil {
+	if c.offering == nil || c.offering.SessionID != sessionID {
 		return nil
 	}
-	close(c.offerDrop)
-	c.offerDrop = nil
+	if c.offerDrop != nil {
+		close(c.offerDrop)
+		c.offerDrop = nil
+	}
 	return c.offerDone
 }
 
 // forgetLocked drops what the Concierge holds of meeting sessionID: the
-// agents it named and asked, what it read for it, and its unanswered tasks;
-// with tasks, also the leads from its questions' events to their tasks.
-// c.mu is held.
-func (c *Concierge) forgetLocked(sessionID string, tasks bool) {
+// agents it named and asked, what it read for it, and its unanswered tasks.
+// With deleted, also the leads from its questions' events and its requests
+// to reply again to their tasks; after an end they stay, so a late reply
+// still lands in the ledger. c.mu is held.
+func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 	for key := range c.lastAsk {
 		if key[0] == sessionID {
 			delete(c.lastAsk, key)
@@ -352,20 +375,21 @@ func (c *Concierge) forgetLocked(sessionID string, tasks bool) {
 			c.working[agent] = ids
 		}
 	}
+	if !deleted {
+		for id, session := range c.sessionOf {
+			_, lead := c.sentAs[id]
+			_, asked := c.askedAgain[id]
+			if session == sessionID && !lead && !asked {
+				delete(c.sessionOf, id)
+			}
+		}
+		return
+	}
 	for taskID, request := range c.askedAgain {
 		if of(taskID) {
 			delete(c.againFor, request)
 			delete(c.askedAgain, taskID)
 		}
-	}
-	if !tasks {
-		// The leads from events to tasks stay, for a late reply's sake.
-		for id, session := range c.sessionOf {
-			if _, lead := c.sentAs[id]; session == sessionID && !lead {
-				delete(c.sessionOf, id)
-			}
-		}
-		return
 	}
 	for event := range c.sentAs {
 		if of(event) {
@@ -379,23 +403,71 @@ func (c *Concierge) forgetLocked(sessionID string, tasks bool) {
 	}
 }
 
-// closedLocked reports whether meeting sessionID ended or was deleted; c.mu
-// is held.
-func (c *Concierge) closedLocked(sessionID string) bool {
+// closedLocked reports whether meeting sessionID ended or was deleted, and
+// whether it was deleted; c.mu is held.
+func (c *Concierge) closedLocked(sessionID string) (closed, deleted bool) {
 	now := c.now()
-	for id, at := range c.closed {
-		if now.Sub(at) > namedFor {
+	for id, closure := range c.closed {
+		if now.Sub(closure.at) > namedFor {
 			delete(c.closed, id)
 		}
 	}
-	_, closed := c.closed[sessionID]
-	return closed
+	closure, closed := c.closed[sessionID]
+	return closed, closure.deleted
 }
 
-// closeLocked marks meeting sessionID ended or deleted; c.mu is held.
-func (c *Concierge) closeLocked(sessionID string) {
-	c.closedLocked(sessionID)
-	c.closed[sessionID] = c.now()
+// closeLocked marks meeting sessionID ended, or deleted; c.mu is held.
+func (c *Concierge) closeLocked(sessionID string, deleted bool) {
+	_, wasDeleted := c.closedLocked(sessionID)
+	c.closed[sessionID] = closure{at: c.now(), deleted: deleted || wasDeleted}
+}
+
+// projectsFor is how long a read of Dispatch's project keys is kept.
+const projectsFor = 10 * time.Minute
+
+// isProject reports whether key names one of Dispatch's projects. Until the
+// projects are known, every key does. With wait, a stale or missing list is
+// read first; without, it is read in the background and this call answers
+// from what is known.
+func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bool {
+	c.mu.Lock()
+	stale := c.now().Sub(c.projectsRead) > projectsFor
+	refresh := stale && !c.projectsBusy && c.records != nil
+	if refresh {
+		c.projectsBusy = true
+	}
+	known := c.projects
+	c.mu.Unlock()
+	if refresh {
+		if wait {
+			known = c.readProjects(ctx)
+		} else {
+			go c.readProjects(context.WithoutCancel(ctx))
+		}
+	}
+	return known == nil || known[strings.ToUpper(project)]
+}
+
+// readProjects reads Dispatch's project keys and keeps them. A failed read
+// keeps what was known and is tried again after a minute.
+func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
+	ctx, cancel := context.WithTimeout(ctx, prefetchTimeout)
+	defer cancel()
+	keys, err := c.records.Projects(ctx)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.projectsBusy = false
+	if err != nil {
+		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
+		c.projectsRead = c.now().Add(time.Minute - projectsFor)
+		return c.projects
+	}
+	known := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		known[strings.ToUpper(key)] = true
+	}
+	c.projects, c.projectsRead = known, c.now()
+	return known
 }
 
 // SessionEnded cancels the questions its meeting still waits on and
@@ -405,7 +477,7 @@ func (c *Concierge) closeLocked(sessionID string) {
 func (c *Concierge) SessionEnded(sessionID string) error {
 	cancelled, err := c.store.CancelWorkingVoiceTasks(sessionID)
 	c.mu.Lock()
-	c.closeLocked(sessionID)
+	c.closeLocked(sessionID, false)
 	handed := c.withdrawLocked(sessionID)
 	c.forgetLocked(sessionID, false)
 	c.mu.Unlock()
@@ -417,6 +489,7 @@ func (c *Concierge) SessionEnded(sessionID string) error {
 	}
 	if cancelled > 0 {
 		c.logger.Info("concierge cancelled the questions of an ended session", "session", sessionID, "cancelled", cancelled)
+		c.tellChanged(sessionID)
 	}
 	return nil
 }
@@ -428,7 +501,7 @@ func (c *Concierge) SessionEnded(sessionID string) error {
 // its rows, so a late reply finds nothing.
 func (c *Concierge) SessionDeleted(sessionID string) {
 	c.mu.Lock()
-	c.closeLocked(sessionID)
+	c.closeLocked(sessionID, true)
 	handed := c.withdrawLocked(sessionID)
 	c.forgetLocked(sessionID, true)
 	c.mu.Unlock()
@@ -439,7 +512,20 @@ func (c *Concierge) SessionDeleted(sessionID string) {
 
 // Spoken records that a pending answer was spoken.
 func (c *Concierge) Spoken(_ context.Context, taskID string) error {
-	return c.store.MarkVoiceTaskSpoken(taskID, c.now())
+	if err := c.store.MarkVoiceTaskSpoken(taskID, c.now()); err != nil {
+		return err
+	}
+	if task, err := c.task(taskID); err == nil {
+		c.tellChanged(task.SessionID)
+	}
+	return nil
+}
+
+// tellChanged tells Changed that meeting sessionID's questions changed.
+func (c *Concierge) tellChanged(sessionID string) {
+	if c.changed != nil && sessionID != "" {
+		c.changed(sessionID)
+	}
 }
 
 // ago says how long before now t was, for the ear.

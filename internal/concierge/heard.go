@@ -22,8 +22,6 @@ import (
 const (
 	// prefetchTimeout bounds one read.
 	prefetchTimeout = 10 * time.Second
-	// minSearchWords is the fewest words worth a search.
-	minSearchWords = 3
 	// maxKeys is how many of a turn's keys a read tries.
 	maxKeys = 3
 )
@@ -43,27 +41,13 @@ func issueKeysIn(words string) []string {
 	return keys
 }
 
-// readTarget is what a turn asks the record for: "keys:" and the keys it
-// names, the last first, which a read tries in that order ("the last 30
-// days" reads as LAST-30 too, so a key that names no issue gives way to the
-// one before it); else "search:<words>"; else nothing.
-func readTarget(words string) string {
-	if keys := issueKeysIn(words); len(keys) > 0 {
-		slices.Reverse(keys)
-		keys = slices.Compact(keys)
-		return "keys:" + strings.Join(keys[:min(len(keys), maxKeys)], ",")
-	}
-	if words = strings.Join(strings.Fields(words), " "); len(strings.Fields(words)) >= minSearchWords {
-		return "search:" + words
-	}
-	return ""
-}
-
 // read is one read of the record for a target. complete is set when it ran
-// to its end, not stopped or replaced; record is then what it found.
+// to its end, not stopped or replaced; record is then what it found, and
+// searched whether it came from a search.
 type read struct {
 	done     chan struct{}
 	record   string
+	searched bool
 	complete bool
 	cancel   context.CancelFunc
 }
@@ -84,19 +68,52 @@ func (p *prefetch) cancelAll() {
 	}
 }
 
+// readTarget is what a turn asks the record for:
+//   - "keys:K1,K2|terms" when it names issue keys of Dispatch's projects, the
+//     last first, which a read tries in that order, then searches terms when
+//     none names an issue;
+//   - "search:terms" when it names none;
+//   - nothing when its words name no work either.
+//
+// terms is searchTerms's, the fewest words. With wait, Dispatch's projects
+// are read first when they are not known; Heard, which must not wait, uses
+// what is known.
+func (c *Concierge) readTarget(ctx context.Context, words string, wait bool) string {
+	var keys []string
+	for _, key := range issueKeysIn(words) {
+		project, _, _ := strings.Cut(key, "-")
+		if c.isProject(ctx, project, wait) {
+			keys = append(keys, key)
+		}
+	}
+	terms := searchTerms(words)
+	if len(keys) > 0 {
+		slices.Reverse(keys)
+		keys = slices.Compact(keys)
+		return "keys:" + strings.Join(keys[:min(len(keys), maxKeys)], ",") + "|" + terms
+	}
+	if terms != "" {
+		return "search:" + terms
+	}
+	return ""
+}
+
 // Heard tells the Concierge the turn so far in exchange x. It returns at
 // once; the read runs in the background and ends when ctx, the exchange's
 // context, ends with a stop. With no Dispatch it reads nothing.
 func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) {
-	target := readTarget(words)
-	if target == "" || ctx.Err() != nil || c.records == nil {
+	if ctx.Err() != nil || c.records == nil {
+		return
+	}
+	target := c.readTarget(ctx, words, false)
+	if target == "" {
 		return
 	}
 	exchange := *x
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closedLocked(exchange.SessionID) {
+	if closed, _ := c.closedLocked(exchange.SessionID); closed {
 		return
 	}
 	for key, p := range c.prefetches {
@@ -127,9 +144,9 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 	p.reads[target], p.current = r, target
 	go func() {
 		defer cancel()
-		record := c.readRecord(readCtx, &exchange, target)
+		record, searched := c.readRecord(readCtx, &exchange, target)
 		if readCtx.Err() == nil {
-			r.record, r.complete = record, true
+			r.record, r.searched, r.complete = record, searched, true
 		}
 		close(r.done)
 	}()
@@ -138,13 +155,12 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 // readFor is the record Answer gives the model for turn, and whether it came
 // from a search rather than a key the turn named: the read Heard made of
 // exactly what the final turn asks, which is final once it ran to its end,
-// else a read made now.
+// else a read made now, bounded as Heard's are.
 func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string) (record string, searched bool) {
-	target := readTarget(turn)
+	target := c.readTarget(ctx, turn, true)
 	if target == "" {
 		return "", false
 	}
-	searched = strings.HasPrefix(target, "search:")
 	c.mu.Lock()
 	var pending *read
 	if p, ok := c.prefetches[exchangeKey(x)]; ok {
@@ -155,53 +171,73 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string)
 		select {
 		case <-pending.done:
 			if pending.complete {
-				return pending.record, searched
+				return pending.record, pending.searched
 			}
 		case <-ctx.Done():
-			return "", searched
+			return "", false
 		}
 	}
-	return c.readRecord(ctx, x, target), searched
+	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
+	defer cancel()
+	return c.readRecord(readCtx, x, target)
 }
 
 // readRecord reads target with the tools, as the model would call them, and
-// writes each call and its result on a line. For keys, the first key that
-// names an issue is read with its holder, and the reads of the others are
-// left out, so the model is not told of an issue nobody asked about. For a
+// writes each call and its result on a line, and reports whether it searched.
+// For keys, the first key that names an issue is read with its holder, and
+// the reads of the others are left out, so the model is not told of an issue
+// nobody asked about; when none names one, the terms are searched. A failure
+// other than not-found, such as Dispatch out of reach, ends the read. For a
 // search, the hits and the top hit's issue are read, and no holder: the hit
 // may not be what the question is about, so it makes no session askable. It
 // is empty when nothing was found.
-func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string) string {
+func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string) (string, bool) {
 	tools := &runner{c: c, x: x}
 	var lines []string
 	call := func(name string, args map[string]any, keepErrors bool) map[string]any {
 		result, err := tools.call(ctx, name, args)
 		if err != nil || (!keepErrors && result["error"] != nil) {
-			return nil
+			return result
 		}
 		encodedArgs, _ := json.Marshal(args)
 		encoded, _ := json.Marshal(result)
 		lines = append(lines, fmt.Sprintf("%s(%s) = %s", name, encodedArgs, encoded))
 		return result
 	}
-	switch {
-	case strings.HasPrefix(target, "keys:"):
-		for _, key := range strings.Split(strings.TrimPrefix(target, "keys:"), ",") {
-			if ctx.Err() != nil {
-				break
-			}
-			if call("read_issue", map[string]any{"key": key}, false) != nil {
-				call("issue_holder", map[string]any{"key": key}, true)
-				break
-			}
-		}
-	case strings.HasPrefix(target, "search:"):
-		found := call("search_issues", map[string]any{"query": strings.TrimPrefix(target, "search:")}, true)
+	search := func(terms string) {
+		found := call("search_issues", map[string]any{"query": terms}, true)
 		if issues, ok := found["issues"].([]map[string]any); ok && len(issues) > 0 {
 			if key, ok := issues[0]["key"].(string); ok {
 				call("read_issue", map[string]any{"key": key}, false)
 			}
 		}
 	}
-	return strings.Join(lines, "\n")
+	switch {
+	case strings.HasPrefix(target, "keys:"):
+		list, terms, _ := strings.Cut(strings.TrimPrefix(target, "keys:"), "|")
+		for _, key := range strings.Split(list, ",") {
+			if ctx.Err() != nil {
+				return strings.Join(lines, "\n"), false
+			}
+			read := call("read_issue", map[string]any{"key": key}, false)
+			switch {
+			case read == nil:
+				return strings.Join(lines, "\n"), false
+			case read["error"] == nil:
+				call("issue_holder", map[string]any{"key": key}, true)
+				return strings.Join(lines, "\n"), false
+			case read["error"] != noSuchIssue:
+				return strings.Join(lines, "\n"), false
+			}
+		}
+		if terms == "" || ctx.Err() != nil {
+			return strings.Join(lines, "\n"), false
+		}
+		search(terms)
+		return strings.Join(lines, "\n"), true
+	case strings.HasPrefix(target, "search:"):
+		search(strings.TrimPrefix(target, "search:"))
+		return strings.Join(lines, "\n"), true
+	}
+	return "", false
 }

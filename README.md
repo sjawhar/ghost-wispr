@@ -193,9 +193,14 @@ What the voice hears, and where the room's words go:
   someone says "Wispr, go ahead". An answer whose meeting has ended is never spoken; it stays on
   the session's page. A pause also clears the two minutes of transcript the voice keeps.
 - Voice A sends no room audio anywhere. The asker's words after the wake phrase go to the
-  Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript, and its
-  searches go to Dispatch. The text Wispr speaks goes to the text-to-speech engine: Gemini TTS on
-  Vertex AI, or Deepgram Aura-2 with `mip_opt_out=true`.
+  Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
+  Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
+  `mip_opt_out=true`.
+- Dispatch gets a question's words only as a few search keywords, never the whole sentence, and
+  only as a keyword search, which Dispatch sends to no embedding model. An issue key the asker says
+  ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's access log
+  records. A number said after a word that is no project of Dispatch ("the last 30 days") is not
+  read as a key.
 - When the record cannot answer, the Concierge asks the agent that holds the issue, over Envoy.
   The message carries the asker's question, framed as a read-only question from someone the unit
   cannot identify, with the recording session's id and time, not the transcript. A question sent to
