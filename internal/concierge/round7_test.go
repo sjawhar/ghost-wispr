@@ -1251,3 +1251,21 @@ func TestALongerKeyDoesNotNameTheIssue(t *testing.T) {
 		}
 	}
 }
+
+// TestWhileTheHolderIsAskedTheModelSearchesNothing (R6, R7): when the
+// recorder asks the holder, the model says what the record it was given
+// holds, with no tool: live, it searched for what only the holder knows, and
+// its first fact came after 4.8 s.
+func TestWhileTheHolderIsAskedTheModelSearchesNothing(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("ABC-12 is in review."))}}
+	answerTurn(t, r, "ask the agent on ABC-12 when slice one will be ready")
+	if len(r.model.configs) == 0 {
+		t.Fatal("no model call")
+	}
+	tc := r.model.configs[0].ToolConfig
+	if tc == nil || tc.FunctionCallingConfig == nil || tc.FunctionCallingConfig.Mode != genai.FunctionCallingConfigModeNone {
+		t.Fatalf("the model could call tools while the holder is asked: %+v", tc)
+	}
+}

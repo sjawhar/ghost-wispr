@@ -690,6 +690,11 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	source.WriteString(found.text)
 	said := &sentences{sp: sp, source: source, asked: turn}
 	budget := maxToolCalls
+	if asking {
+		// The holder answers what the record does not: the model says what
+		// it was given, with no tool (R6, R7).
+		budget = 0
+	}
 	reason := ""
 	for try := 1; try <= earTries; try++ {
 		note := ""
