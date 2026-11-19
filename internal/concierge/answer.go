@@ -480,14 +480,41 @@ func (c *Concierge) failed(ctx context.Context, sp *speaker, err error) error {
 // sentence.
 const earTries = 2
 
-// forEar rewrites an agent's written answer to be spoken, and checks the
+// EarRewrite is one rewrite of an agent's written answer for the ear: the
+// text the voice says, how many rewrites it took, and whether one passed
+// R8's check. Passed false means the text is the fixed sentence.
+type EarRewrite struct {
+	Text   string
+	Tries  int
+	Passed bool
+}
+
+// RewriteForEar rewrites an agent's written answer for the ear, as a
+// holder's answer is before the voice says it, and says how. issueKey is the
+// key the question named, or "". Its error is a stop.
+func (c *Concierge) RewriteForEar(ctx context.Context, written, issueKey string) (EarRewrite, error) {
+	rewrite := c.rewrite(ctx, written, issueKey)
+	if err := ctx.Err(); err != nil {
+		return EarRewrite{}, err
+	}
+	return rewrite, nil
+}
+
+// forEar is the text the voice says for an agent's written answer.
+func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string {
+	return c.rewrite(ctx, written, issueKey).Text
+}
+
+// rewrite rewrites an agent's written answer to be spoken, and checks the
 // rewrite against it (R8, earCheck). The issue key the question named is put
 // in front when the rewrite does not hold it. A rewrite that fails the check,
 // or a model that fails, gets one more try, told why; after the second the
 // voice says the fixed sentence. The log says only why, never the words.
-func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string {
+func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRewrite {
 	reason := ""
+	tries := 0
 	for try := 1; try <= earTries && ctx.Err() == nil; try++ {
+		tries = try
 		text, err := c.rewriteForEar(ctx, written, reason)
 		if err != nil {
 			c.logger.Warn("concierge could not rewrite an answer for the ear", "try", try, "error", quiet(err))
@@ -498,16 +525,16 @@ func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string
 			text = issueKey + ": " + text
 		}
 		if reason = earCheck(text, written, issueKey); reason == "" {
-			return text
+			return EarRewrite{Text: text, Tries: try, Passed: true}
 		}
 		c.logger.Info("concierge's rewrite for the ear failed R8's check", "try", try, "reason", reason)
 	}
 	c.logger.Warn("concierge speaks the fixed sentence: no rewrite for the ear passed R8's check", "reason", reason)
 	if issueKey != "" {
 		// R8: the text holds the key the question named.
-		return issueKey + ": " + fixedSentence
+		return EarRewrite{Text: issueKey + ": " + fixedSentence, Tries: tries}
 	}
-	return fixedSentence
+	return EarRewrite{Text: fixedSentence, Tries: tries}
 }
 
 // rewriteForEar asks the model for one rewrite; reason, when set, is why the

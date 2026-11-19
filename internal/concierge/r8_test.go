@@ -203,3 +203,30 @@ func TestAKeyIsNotReadBeforeTheProjectsAreKnown(t *testing.T) {
 		t.Fatalf("issue reads = %q, want no LAST-30", calls)
 	}
 }
+
+// TestRewriteForEarReportsItsTries: the exported rewrite, for the ear-corpus
+// tool, is the holder's-answer path, and says whether the check passed and
+// on which try.
+func TestRewriteForEarReportsItsTries(t *testing.T) {
+	r := newRig(t)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("Pong."))},
+		{chunk(text("PR 81 merged."))}, {chunk(text("Pong, PR 80."))},
+		{chunk(text("PR 81 merged."))}, {chunk(text("PR 82 merged."))},
+	}
+	for _, want := range []EarRewrite{
+		{Text: "Pong.", Tries: 1, Passed: true},
+		{Text: "Pong, PR 80.", Tries: 2, Passed: true},
+		{Text: fixedSentence, Tries: 2, Passed: false},
+	} {
+		got, err := r.concierge.RewriteForEar(context.Background(), "Pong. PR #80 merged.", "")
+		if err != nil || got != want {
+			t.Fatalf("RewriteForEar = %+v, %v; want %+v", got, err, want)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := r.concierge.RewriteForEar(ctx, "x", ""); err == nil {
+		t.Fatal("a stopped rewrite reported no error")
+	}
+}
