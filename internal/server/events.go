@@ -82,6 +82,14 @@ type SessionDeletedEvent struct {
 	SourceSessionIDs []string `json:"source_session_ids"`
 }
 
+// VoiceEvent tells a web client what the voice did (voice_wake,
+// voice_exchange_started, voice_answer_ready, voice_spoken, agent_joined,
+// agent_left): a session id and no words. It is never stored.
+type VoiceEvent struct {
+	Event
+	SessionID string `json:"session_id"`
+}
+
 func newEvent(eventType string, now time.Time) Event {
 	if now.IsZero() {
 		now = time.Now().UTC()

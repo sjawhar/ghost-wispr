@@ -270,6 +270,28 @@ func (h *Hub) BroadcastSessionDeleted(sessionID string, sourceIDs []string) {
 	})
 }
 
+// voiceEventTypes are the voice's /ws events. Each carries a session id and
+// never words, and none is stored: they go to open pages only.
+var voiceEventTypes = map[string]bool{
+	"voice_wake":             true,
+	"voice_exchange_started": true,
+	"voice_answer_ready":     true,
+	"voice_spoken":           true,
+	"agent_joined":           true,
+	"agent_left":             true,
+}
+
+// BroadcastVoiceEvent tells open pages about the voice: kind is one of
+// voiceEventTypes, about recording session sessionID ("" before one started).
+// Any other kind is dropped.
+func (h *Hub) BroadcastVoiceEvent(kind, sessionID string) {
+	if !voiceEventTypes[kind] {
+		h.logger.Warn("dropped an unknown voice event", "operation", "broadcast_voice_event", "event_type", kind)
+		return
+	}
+	h.broadcastEvent(VoiceEvent{Event: newEvent(kind, time.Now().UTC()), SessionID: sessionID})
+}
+
 // storedEventTypes is the set of event types persisted to the event queue.
 var storedEventTypes = map[string]struct{}{
 	"session_started":  {},

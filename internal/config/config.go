@@ -52,6 +52,42 @@ type BatchTranscription struct {
 	Model    string `yaml:"model"`
 }
 
+// The voices, voice.engine's values.
+const (
+	VoiceEngineTTS     = "tts"     // voice A: our own streaming text-to-speech
+	VoiceEngineGPTLive = "gptlive" // voice B
+	VoiceEngineDGAgent = "dgagent" // voice C
+)
+
+// Voice A's text-to-speech engines, voice.tts_engine's values.
+const (
+	TTSEngineGemini = "gemini" // Gemini TTS streamed from Vertex AI
+	TTSEngineAura   = "aura"   // Deepgram Aura-2, with the Deepgram key
+)
+
+// Voice configures Wispr's meeting voice: a person says a wake phrase on the
+// live transcript, and a voice answers through the speaker.
+type Voice struct {
+	Enabled     bool     `yaml:"enabled"`
+	Engine      string   `yaml:"engine"`       // tts, gptlive or dgagent
+	WakePhrases []string `yaml:"wake_phrases"` // said at the start of a sentence
+	// PausedListener is the wake listener that holds the microphone while
+	// paused (slice 4). It is not built yet; true is ignored, with a warning.
+	PausedListener bool   `yaml:"paused_listener"`
+	TTSEngine      string `yaml:"tts_engine"`   // voice A's engine: gemini or aura
+	TTSModel       string `yaml:"tts_model"`    // "" is the engine's default
+	TTSVoice       string `yaml:"tts_voice"`    // "" is the engine's default
+	TTSLocation    string `yaml:"tts_location"` // the Vertex AI location Gemini streams from
+}
+
+// Concierge configures the agent loop that answers the voice from Dispatch
+// and asks the agents that hold issues, through Envoy.
+type Concierge struct {
+	Model       string `yaml:"model"`
+	DispatchURL string `yaml:"dispatch_url"`
+	EnvoyURL    string `yaml:"envoy_url"`
+}
+
 type Config struct {
 	DBPath                        string             `yaml:"db_path"`
 	AudioDir                      string             `yaml:"audio_dir"`
@@ -92,6 +128,8 @@ type Config struct {
 	TTSModel                      string             `yaml:"tts_model"`
 	TTSVoice                      string             `yaml:"tts_voice"`
 	TTSMaxLength                  int                `yaml:"tts_max_length"`
+	Voice                         Voice              `yaml:"voice"`
+	Concierge                     Concierge          `yaml:"concierge"`
 
 	// Secrets — env vars only, never serialized to YAML.
 	DeepgramAPIKey  string `yaml:"-"`
@@ -99,6 +137,7 @@ type Config struct {
 	AnthropicAPIKey string `yaml:"-"`
 	GeminiAPIKey    string `yaml:"-"`
 	TTSAPIKey       string `yaml:"-"`
+	DispatchToken   string `yaml:"-"` // the unit's own Dispatch credential, for the Concierge
 }
 
 func defaults() Config {
@@ -139,6 +178,14 @@ func defaults() Config {
 		DeepgramReconnectInitialDelay: "500ms",
 		DeepgramReconnectMaxBackoff:   "30s",
 		TTSMaxLength:                  5000,
+		Voice: Voice{
+			Engine:      VoiceEngineTTS,
+			WakePhrases: []string{"Wispr", "Ghost Wispr"},
+			TTSEngine:   TTSEngineGemini,
+			// Google: the us multi-region gives a lower time to first audio
+			// than global.
+			TTSLocation: "us",
+		},
 	}
 }
 
@@ -401,6 +448,23 @@ func applyEnvOverrides(cfg *Config) []string {
 			cfg.TTSMaxLength = n
 		}
 	}
+	if v := os.Getenv(EnvPrefix + "VOICE_ENABLED"); v != "" {
+		cfg.Voice.Enabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	for key, field := range map[string]*string{
+		"VOICE_ENGINE":           &cfg.Voice.Engine,
+		"VOICE_TTS_ENGINE":       &cfg.Voice.TTSEngine,
+		"VOICE_TTS_MODEL":        &cfg.Voice.TTSModel,
+		"VOICE_TTS_VOICE":        &cfg.Voice.TTSVoice,
+		"VOICE_TTS_LOCATION":     &cfg.Voice.TTSLocation,
+		"CONCIERGE_MODEL":        &cfg.Concierge.Model,
+		"CONCIERGE_DISPATCH_URL": &cfg.Concierge.DispatchURL,
+		"CONCIERGE_ENVOY_URL":    &cfg.Concierge.EnvoyURL,
+	} {
+		if v := strings.TrimSpace(os.Getenv(EnvPrefix + key)); v != "" {
+			*field = v
+		}
+	}
 	return warnings
 }
 
@@ -423,6 +487,7 @@ func loadSecrets(cfg *Config) {
 	cfg.AnthropicAPIKey = os.Getenv(EnvPrefix + "ANTHROPIC_API_KEY")
 	cfg.GeminiAPIKey = os.Getenv(EnvPrefix + "GEMINI_API_KEY")
 	cfg.TTSAPIKey = os.Getenv(EnvPrefix + "TTS_API_KEY")
+	cfg.DispatchToken = os.Getenv(EnvPrefix + "DISPATCH_TOKEN")
 }
 
 type googleCredentialInfo struct {
@@ -608,7 +673,60 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 			cfg.TTSMaxLength = 5000
 		}
 	}
+	warnings = append(warnings, validateVoice(cfg)...)
+	return warnings
+}
 
+// validateVoice warns about a voice that cannot speak as configured.
+func validateVoice(cfg *Config) []string {
+	v := &cfg.Voice
+	v.Engine = strings.ToLower(strings.TrimSpace(v.Engine))
+	v.TTSEngine = strings.ToLower(strings.TrimSpace(v.TTSEngine))
+	var warnings []string
+	if v.PausedListener {
+		warnings = append(warnings, "voice.paused_listener is not built yet; it is ignored, and a pause closes the microphone.")
+	}
+	if !v.Enabled {
+		return warnings
+	}
+	if !cfg.SpeakerEnabled {
+		warnings = append(warnings, "voice.enabled needs speaker_enabled: true — the voice is off.")
+	}
+	switch v.Engine {
+	case VoiceEngineTTS, VoiceEngineGPTLive, VoiceEngineDGAgent:
+	default:
+		warnings = append(warnings, fmt.Sprintf("Invalid voice.engine %q — supported engines are tts, gptlive, dgagent.", v.Engine))
+	}
+	switch v.TTSEngine {
+	case TTSEngineGemini:
+		if v.Engine == VoiceEngineTTS && strings.TrimSpace(cfg.GCPProject) == "" {
+			warnings = append(warnings, "voice.tts_engine gemini needs gcp_project for Vertex AI.")
+		}
+	case TTSEngineAura:
+		if v.Engine == VoiceEngineTTS && cfg.DeepgramAPIKey == "" {
+			warnings = append(warnings, "voice.tts_engine aura needs the Deepgram key — set "+EnvPrefix+"DEEPGRAM_API_KEY.")
+		}
+	default:
+		warnings = append(warnings, fmt.Sprintf("Invalid voice.tts_engine %q — supported engines are gemini, aura.", v.TTSEngine))
+	}
+	phrases := v.WakePhrases[:0]
+	for _, p := range v.WakePhrases {
+		if p = strings.TrimSpace(p); p != "" {
+			phrases = append(phrases, p)
+		}
+	}
+	v.WakePhrases = phrases
+	if len(v.WakePhrases) == 0 {
+		warnings = append(warnings, "voice.wake_phrases is empty — nothing can call the voice.")
+	}
+	for name, raw := range map[string]string{"concierge.dispatch_url": cfg.Concierge.DispatchURL, "concierge.envoy_url": cfg.Concierge.EnvoyURL} {
+		if raw == "" {
+			continue
+		}
+		if u, err := url.Parse(raw); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			warnings = append(warnings, name+" must be an absolute http or https URL — the Concierge cannot reach it.")
+		}
+	}
 	return warnings
 }
 
