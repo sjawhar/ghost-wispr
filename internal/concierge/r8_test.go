@@ -2,6 +2,7 @@ package concierge
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/sjawhar/ghost-wispr/internal/envoy"
+	"github.com/sjawhar/ghost-wispr/internal/voice"
 )
 
 // TestAQuestionToAnAgentIsAtMost300Characters: R7 bounds the words a
@@ -69,6 +71,9 @@ func TestEarCheck(t *testing.T) {
 		{"a slash in a word", "The tap and/or the mixer merged.", "", true},
 		{"a backtick", "The `tap` merged.", "", true},
 		{"a bar", "The tap | merged.", "", true},
+		{"a name after a colon", "The blocker: Alex has not reviewed it.", "", true},
+		{"a name after an abbreviation", "The tap merged, e.g. Alex saw it.", "", true},
+		{"the clause after the question's key", "ABC-12: Indeed, the tap merged.", "ABC-12", false},
 		{"four sentences", "It merged. It ran. It passed. It shipped.", "", true},
 		{"a long sentence", "The " + strings.Repeat("tap ", 20) + "merged.", "", true},
 		{"more than 50 words", strings.Repeat("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen. ", 3), "", true},
@@ -228,5 +233,119 @@ func TestRewriteForEarReportsItsTries(t *testing.T) {
 	cancel()
 	if _, err := r.concierge.RewriteForEar(ctx, "x", ""); err == nil {
 		t.Fatal("a stopped rewrite reported no error")
+	}
+}
+
+// TestEarCheckReadsNumberWords (c-ear, R8): a figure written as words is a
+// figure: it is held when the source has its value, in words or digits.
+// "One" is no figure. "Pull request number 81" names PR 81.
+func TestEarCheckReadsNumberWords(t *testing.T) {
+	const source = "3 of 5 shards ran; 60% passed, 300 tests in all, for twenty-five agents. Pull request number 81 merged."
+	for _, c := range []struct {
+		name, text string
+		fails      bool
+	}{
+		{"three of five", "Three of five shards ran.", false},
+		{"four of five", "Four of five shards ran.", true},
+		{"sixty percent", "Sixty percent passed.", false},
+		{"seventy percent", "Seventy percent passed.", true},
+		{"three hundred", "Three hundred tests ran.", false},
+		{"four hundred", "Four hundred tests ran.", true},
+		{"twenty-five in words", "Twenty-five agents ran.", false},
+		{"twenty-five in digits", "25 agents ran.", false},
+		{"twenty-six", "Twenty-six agents ran.", true},
+		{"one is no figure", "One of the shards ran.", false},
+		{"control: a changed digit", "4 of 5 shards ran.", true},
+		{"a pull request said with its number", "PR 81 merged.", false},
+		{"control: a changed pull request", "PR 82 merged.", true},
+	} {
+		if reason := earCheck(c.text, source, ""); (reason != "") != c.fails {
+			t.Errorf("%s: earCheck(%q) = %q, want failing %v", c.name, c.text, reason, c.fails)
+		}
+	}
+}
+
+// TestTheKeyPrefixKeepsTheForm (c-ear, R8): a rewrite of 20 words that does
+// not name the question's key passes, and is spoken with the key in front.
+func TestTheKeyPrefixKeepsTheForm(t *testing.T) {
+	r := newRig(t)
+	twenty := "The " + strings.Repeat("tap ", 18) + "merged."
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text(twenty))}, {chunk(text(twenty))}}
+	if spoken := r.concierge.forEar(context.Background(), "The tap merged.", "ABC-12"); spoken != "ABC-12: "+twenty {
+		t.Fatalf("spoken = %q, want the 20-word rewrite with the key in front", spoken)
+	}
+}
+
+// TestFactsBoundsHoldAcrossARewrite (c-fast-answer, R8): a fast answer's
+// facts are at most 3 sentences across both of the model's tries.
+func TestFactsBoundsHoldAcrossARewrite(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("PR 80 is in review. It is in review. It went to Alex."))},
+		{chunk(text("It is open. It is still open. It is open today. It is open now."))},
+	}
+	facts := 0
+	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {
+		if s.mode == voice.Fact && !strings.HasPrefix(s.text, "No agent session") {
+			facts++
+		}
+	}
+	if facts > maxFactSentences {
+		t.Fatalf("the model's facts were %d sentences, want at most %d", facts, maxFactSentences)
+	}
+}
+
+// TestARetryIsToldTheCheckItFailed: a fast answer whose sentence fails R8's
+// form is written again, told the reason as a check it failed, not as a fact.
+func TestARetryIsToldTheCheckItFailed(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("It " + strings.Repeat("is ", 20) + "open."))},
+		{chunk(text("PR 80 is in review."))},
+	}
+	answerTurn(t, r, "what is happening with ABC-12")
+	if len(r.model.requests) < 2 {
+		t.Fatalf("model calls = %d, want a second try", len(r.model.requests))
+	}
+	second := r.model.requests[1][0].Parts[0].Text
+	if !strings.Contains(second, "failed R8's check: a sentence of more than 20 words") || strings.Contains(second, "held a fact") {
+		t.Fatalf("the second request ends %q, want the check it failed", second[max(0, len(second)-200):])
+	}
+}
+
+// TestAKeyWaitsForAProjectsReadRunning: a key read with wait waits for the
+// read of Dispatch's projects already running, rather than answer from the
+// old list.
+func TestAKeyWaitsForAProjectsReadRunning(t *testing.T) {
+	r := newRig(t)
+	release := make(chan struct{})
+	r.records.mu.Lock()
+	r.records.projectsBlock, r.records.projects = release, append(r.records.projects, "NEW")
+	r.records.mu.Unlock()
+	r.concierge.mu.Lock()
+	r.concierge.projectsRead = time.Time{}
+	r.concierge.mu.Unlock()
+	r.concierge.isProject(context.Background(), "ABC", false)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(release)
+	}()
+	if !r.concierge.isProject(context.Background(), "NEW", true) {
+		t.Fatal("a read with wait answered from the old list while a read of the projects ran")
+	}
+}
+
+// TestAFastAnswerNamesTheQuestionsKey (c-fast-answer, R8): when the holder
+// cannot be read, the answer still names the issue key the question named.
+func TestAFastAnswerNamesTheQuestionsKey(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "none", false)
+	r.records.holderEventsErr = errors.New("dispatch: the events page broke")
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("It is in review."))}}
+	spoken := answerTurn(t, r, "what is happening with ABC-12")
+	if !slices.ContainsFunc(spoken, func(s said) bool { return strings.Contains(s.text, "ABC-12") }) {
+		t.Fatalf("spoken = %+v, want the question's key", spoken)
 	}
 }

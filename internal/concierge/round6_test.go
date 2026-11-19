@@ -236,8 +236,9 @@ func TestConciergeBounds(t *testing.T) {
 // TestWhenToAskTheHolder (c-ask-holder, R7): the Concierge asks a live holder
 // when the person says "ask", when the question is not about status, and when
 // the record has no event in the last 60 minutes; it does not for a status
-// question on a fresh record, or for an issue a search took without a clear
-// match.
+// question on a fresh record, nor for one the record answers (who holds it,
+// its priority, its assignee), nor for an issue a search took without a
+// clear match, which it says. "Asks" as a noun is no "ask".
 func TestWhenToAskTheHolder(t *testing.T) {
 	for _, c := range []struct {
 		name, turn string
@@ -250,6 +251,13 @@ func TestWhenToAskTheHolder(t *testing.T) {
 		{"not about status", "is the tap on ABC-12 merged", false, false, "is the tap on ABC-12 merged"},
 		{"a stale record", "what is happening with ABC-12", true, false, "what is happening with ABC-12"},
 		{"a search with no clear match", "ask the agent on the realtime voice whether the tap is merged", false, true, ""},
+		{"asks as a noun", "what is the status of the open asks on ABC-12", false, false, ""},
+		{"who holds it", "who holds ABC-12", false, false, ""},
+		{"its priority", "what is the priority of ABC-12", false, false, ""},
+		{"its assignee", "is ABC-12 assigned to anyone", false, false, ""},
+		{"where, not about status", "where does ABC-12 keep the session tokens", false, false, "where does ABC-12 keep the session tokens"},
+		{"state, not about status", "what state does the parser of ABC-12 keep", false, false, "what state does the parser of ABC-12 keep"},
+		{"new, not about status", "is the new retry on ABC-12 safe to run twice", false, false, "is the new retry on ABC-12 safe to run twice"},
 	} {
 		r := newRig(t)
 		heldIssue(r, "session", c.stale)
@@ -263,6 +271,9 @@ func TestWhenToAskTheHolder(t *testing.T) {
 			if len(r.agents.sent) != 0 {
 				t.Errorf("%s: asked %+v", c.name, r.agents.sent)
 			}
+			if withheld := spoken[len(spoken)-1].text == askWithheld; withheld != c.search {
+				t.Errorf("%s: spoken = %+v; want the withheld ask said %v", c.name, spoken, c.search)
+			}
 			continue
 		}
 		if len(r.agents.sent) != 1 || r.agents.sent[0].Target != "agent-7" || !strings.Contains(r.agents.sent[0].Message, ": "+c.asked+"\n") {
@@ -272,6 +283,109 @@ func TestWhenToAskTheHolder(t *testing.T) {
 		if last := spoken[len(spoken)-1].text; !strings.Contains(last, "asked the agent on ABC-12") {
 			t.Errorf("%s: spoken = %+v, want the asked line last", c.name, spoken)
 		}
+	}
+}
+
+// TestTheAskRunsBesideTheFacts (c-fast-answer, R6): the ask runs beside the
+// facts, so a slow Envoy holds no fact of the record back.
+func TestTheAskRunsBesideTheFacts(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	factSaid := make(chan struct{})
+	var once sync.Once
+	r.agents.onSend = func(context.Context, string) error {
+		select {
+		case <-factSaid:
+			return nil
+		case <-time.After(3 * time.Second):
+			return errors.New("envoy: no answer in 3 s")
+		}
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	var mu sync.Mutex
+	var spoken []said
+	say := func(_ context.Context, text string, mode voice.SayMode) error {
+		mu.Lock()
+		spoken = append(spoken, said{text, mode})
+		mu.Unlock()
+		if text == "PR 80 is in review." {
+			once.Do(func() { close(factSaid) })
+		}
+		return nil
+	}
+	if err := r.concierge.Answer(context.Background(), &r.exchange, "is the tap on ABC-12 merged", say); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if last := spoken[len(spoken)-1].text; !strings.Contains(last, "asked the agent on ABC-12") {
+		t.Fatalf("spoken = %+v, want the facts while the ask was sent, then the asked line", spoken)
+	}
+}
+
+// TestTheRoutingLineOnlyWhenNothingWasSaid (c-fast-answer, R6): a holder's
+// case said before 1.5 s keeps the routing line silent, however long the
+// facts then take.
+func TestTheRoutingLineOnlyWhenNothingWasSaid(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "person", false)
+	r.model.block = make(chan struct{})
+	go func() {
+		time.Sleep(2200 * time.Millisecond)
+		close(r.model.block)
+	}()
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {
+		if s.mode == voice.Ack {
+			t.Fatalf("a routing line after the holder's case was said: %q", s.text)
+		}
+	}
+}
+
+// TestSpeechDoesNotSpendTheAnswersBound (c-fast-answer, R6): a voice's Say
+// returns once a sentence's audio is queued, at playback speed. The answer's
+// 8 s bound the Concierge's work, not the room's listening: the model starts
+// while the holder's case still plays, and a slow voice cuts no fact. Run 7
+// of the end-to-end test lost every fast answer this way.
+func TestSpeechDoesNotSpendTheAnswersBound(t *testing.T) {
+	r := newRig(t)
+	r.concierge.fastBound = time.Second
+	heldIssue(r, "none", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review. It is in review."))}}
+	var mu sync.Mutex
+	var modelAt, leadPlayed time.Time
+	r.model.onCall = func(int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if modelAt.IsZero() {
+			modelAt = time.Now()
+		}
+	}
+	var spoken []string
+	say := func(ctx context.Context, text string, _ voice.SayMode) error {
+		select {
+		case <-time.After(600 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		spoken = append(spoken, text)
+		if len(spoken) == 1 {
+			leadPlayed = time.Now()
+		}
+		return nil
+	}
+	if err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with ABC-12", say); err != nil {
+		t.Fatalf("Answer with a voice that plays 600 ms a sentence and a 1 s bound: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(spoken) != 3 {
+		t.Fatalf("spoken = %q, want the holder's case and both facts", spoken)
+	}
+	if !modelAt.Before(leadPlayed) {
+		t.Fatalf("the model started %v after the holder's case played, want before", modelAt.Sub(leadPlayed))
 	}
 }
 
@@ -305,6 +419,74 @@ func TestAskAgentMessage(t *testing.T) {
 		"Reply to this message (envoy_send with in_reply_to) in three sentences or fewer. Your reply is read aloud in the room."
 	if sent.Message != want {
 		t.Fatalf("message =\n%s\nwant\n%s", sent.Message, want)
+	}
+}
+
+// TestARepeatedQuestionKeepsItsAnswer (c-ask-holder, R7): Envoy stores
+// nothing for a key it already holds, and answers with an event id that
+// names no message.
+//   - The same question again in one exchange, while the first waits, sends
+//     nothing and replaces nothing.
+//   - A retry after a send that Envoy stored but did not confirm reuses its
+//     key; its task keeps its local id, and the holder's reply to the event
+//     the unit never learned gets the request to reply again, whose reply
+//     lands on the task.
+//   - A new question after a replace gets a key of its own, so it reaches
+//     the holder.
+func TestARepeatedQuestionKeepsItsAnswer(t *testing.T) {
+	ask := map[string]string{"session": "agent-7", "question": "is the tap merged"}
+	r := newRig(t)
+	r.name(t, "agent-7")
+	first := r.run(t, "ask_agent", ask)
+	again := r.run(t, "ask_agent", ask)
+	if len(r.agents.attempts) != 1 || again["task_id"] != first["task_id"] {
+		t.Fatalf("the same question twice: attempts %d, tasks %v then %v; want one send and one task", len(r.agents.attempts), first["task_id"], again["task_id"])
+	}
+	if task, err := r.store.VoiceTask("evt-1"); err != nil || task.State != storage.VoiceTaskWorking {
+		t.Fatalf("the first task = %+v, %v; want working", task, err)
+	}
+	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "who reviews it"})
+	r.run(t, "ask_agent", ask)
+	asked := 0
+	for _, m := range r.agents.sent {
+		if !m.NoReply && strings.Contains(m.Message, ": is the tap merged\n") {
+			asked++
+		}
+	}
+	if asked != 2 {
+		t.Fatalf("the question reached the holder %d times; want twice, the second after its replace", asked)
+	}
+
+	r = newRig(t)
+	r.name(t, "agent-7")
+	r.agents.landedErr = errors.New("envoy: context deadline exceeded")
+	if result := r.run(t, "ask_agent", ask); result["error"] != questionNotSent {
+		t.Fatalf("control: a send that failed answered %v", result)
+	}
+	r.agents.landedErr = nil
+	result := r.run(t, "ask_agent", ask)
+	if keys := r.agents.attempts; len(keys) != 2 || keys[0].IdempotencyKey != keys[1].IdempotencyKey {
+		t.Fatalf("attempts %+v, want one key reused", keys)
+	}
+	taskID, _ := result["task_id"].(string)
+	if strings.HasPrefix(taskID, "unstored-") || taskID == "" {
+		t.Fatalf("the retry's task is %q, an event Envoy never stored", taskID)
+	}
+	if task, err := r.store.VoiceTask(taskID); err != nil || task.State != storage.VoiceTaskWorking {
+		t.Fatalf("the retry's task = %+v, %v; want working", task, err)
+	}
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-1", SourceSession: "agent-7", InReplyTo: "evt-1", Text: "Yes."}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.agents.sent) != 2 || r.agents.sent[1].InReplyTo != "reply-1" {
+		t.Fatalf("sent %+v; want the request to reply again, in reply to reply-1", r.agents.sent)
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Yes."))}}
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-2", SourceSession: "agent-7", InReplyTo: "evt-2", Text: "Yes."}); err != nil {
+		t.Fatal(err)
+	}
+	if task, _ := r.store.VoiceTask(taskID); task.State != storage.VoiceTaskDone || task.AnswerWritten != "Yes." {
+		t.Fatalf("the task after the reply = %+v, want done with the answer", task)
 	}
 }
 

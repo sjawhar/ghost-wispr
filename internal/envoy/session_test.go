@@ -207,7 +207,7 @@ func TestSendAsksForAReplyAsThisSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if result.EventID != "evt-9" || result.RecipientState != "live" || result.State != "connected" {
+	if result.EventID != "evt-9" || result.RecipientState != "live" || result.State != "connected" || result.Duplicate {
 		t.Errorf("result = %+v", result)
 	}
 	body := fake.lastBody(t, "/v1/messages/send")
@@ -219,11 +219,19 @@ func TestSendAsksForAReplyAsThisSession(t *testing.T) {
 			t.Errorf("send %s = %v, want %v", field, body[field], want)
 		}
 	}
+	// The listener reads expects_reply as the JSON literal false, or
+	// "optional" or "required"; the string "false" is refused.
 	if _, err := session.Send(context.Background(), &SendRequest{Target: "agent-7", Message: "Do not answer.", IdempotencyKey: "key-2", NoReply: true}); err != nil {
 		t.Fatal(err)
 	}
-	if notice := fake.lastBody(t, "/v1/messages/send"); notice["expects_reply"] != "false" {
-		t.Errorf("a notice's expects_reply = %v, want false", notice["expects_reply"])
+	if notice := fake.lastBody(t, "/v1/messages/send"); notice["expects_reply"] != false {
+		t.Errorf("a notice's expects_reply = %#v, want the JSON literal false", notice["expects_reply"])
+	}
+	// A send the stream already holds under its idempotency key stores
+	// nothing, and its event id names no message.
+	fake.answer("/v1/messages/send", http.StatusOK, `{"event_id":"evt-10","recipient":"agent-7","recipient_state":"live","state":"connected","duplicate":true}`)
+	if again, err := session.Send(context.Background(), &SendRequest{Target: "agent-7", Message: "What is left?", IdempotencyKey: "key-1"}); err != nil || !again.Duplicate {
+		t.Errorf("a repeated send = %+v, %v; want Duplicate", again, err)
 	}
 }
 

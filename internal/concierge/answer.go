@@ -68,6 +68,9 @@ const (
 	// usualWait is the wait the voice names after asking the holder (R6).
 	// Measurement 4 has not run; the live replies seen took 4 to 19 s.
 	usualWait = "Its answer usually comes within a minute, with a chime."
+	// askWithheld is what the voice says when the person said "ask" of an
+	// issue a search took with no one clear match: it asks nobody (R7).
+	askWithheld = "I did not ask its agent. Say the issue's key to ask it."
 )
 
 // factTools are the tools the model of a fast answer may call: all but
@@ -100,9 +103,22 @@ var errOutOfReach = fmt.Errorf("concierge: %w", voice.ErrUnreachable)
 // a read, a lookup or the ask, the voice says so and the error wraps
 // voice.ErrUnreachable, for R10's error sound.
 func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn string, say voice.SayFunc) error {
+	sp := newSpeaker(parent, say)
+	err := c.answer(parent, x, turn, sp)
+	spokenErr := sp.wait()
+	switch {
+	case parent.Err() != nil:
+		return parent.Err()
+	case spokenErr != nil && !errors.Is(err, spokenErr):
+		return errors.Join(err, spokenErr)
+	}
+	return err
+}
+
+// answer is Answer's work, bounded by c.fastBound; sp speaks it.
+func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn string, sp *speaker) error {
 	ctx, cancel := context.WithTimeout(parent, c.fastBound)
 	defer cancel()
-	sp := &speaker{say: say}
 	defer sp.routeAfter(ctx, c.routingAfter, c.routingLine(ctx, turn))()
 	found := c.readFor(ctx, x, turn)
 	switch {
@@ -124,8 +140,14 @@ func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn strin
 			return err
 		}
 	}
+	// The ask runs beside the facts, so Envoy's time holds no fact back.
+	session, asked := c.askPlan(turn, found)
+	var asking chan askResult
+	if session != "" {
+		asking = make(chan askResult, 1)
+		go func() { asking <- c.ask(ctx, x, session, turn, found) }()
+	}
 	tools := &runner{c: c, x: x}
-	asked := c.askIfNeeded(ctx, tools, turn, found)
 	err := c.facts(ctx, tools, turn, found, sp)
 	switch {
 	case parent.Err() != nil:
@@ -137,12 +159,27 @@ func (c *Concierge) Answer(parent context.Context, x *voice.Exchange, turn strin
 	case err != nil:
 		err = c.failed(parent, sp, err)
 	}
+	unreachable := tools.unreachable || outOfReach(found.holder)
+	if asking != nil {
+		// An ask the bound cut says nothing: whether it was sent is unknown,
+		// and an answer that comes plays its chime all the same.
+		var result askResult
+		select {
+		case result = <-asking:
+		case <-ctx.Done():
+			select {
+			case result = <-asking:
+			default:
+			}
+		}
+		asked, unreachable = result.line, unreachable || result.unreachable
+	}
 	if asked != "" {
 		if sayErr := sp.sayText(parent, asked, voice.Ack); sayErr != nil {
 			return errors.Join(err, sayErr)
 		}
 	}
-	if tools.unreachable || outOfReach(found.holder) {
+	if unreachable {
 		// R10: the Supervisor plays the error sound.
 		err = errors.Join(err, errOutOfReach)
 	}
@@ -164,7 +201,8 @@ func (c *Concierge) routingLine(ctx context.Context, turn string) string {
 
 // lead is what the Concierge says before the facts: the issue a search took,
 // by key and title, when the search had no one clear match (R5), then the
-// holder's case (R5, R6).
+// holder's case (R5, R6), or that it could not be read, which names the key
+// (R8).
 func (r *reading) lead() []string {
 	if r.key == "" {
 		return nil
@@ -172,6 +210,9 @@ func (r *reading) lead() []string {
 	var lead []string
 	if r.searched && !r.clear {
 		lead = append(lead, spokenLine("I took "+r.key+": "+spokenName(r.title)+".", "I took "+r.key+"."))
+	}
+	if r.holder == nil {
+		return append(lead, "I could not read who holds "+r.key+".")
 	}
 	if line := holderLine(r.key, r.holder); line != "" {
 		lead = append(lead, line)
@@ -210,38 +251,62 @@ func holderLine(key string, holder map[string]any) string {
 }
 
 var (
-	// askWord is "ask" as a person says it to send the question on.
-	askWord = regexp.MustCompile(`(?i)\bask(s|ed|ing)?\b`)
+	// askWord is "ask" as a person says it to send the question on: at the
+	// turn's start, or before whom or what to ask. "The open asks" is none.
+	askWord = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\b|\bask\s+(?:the|its|it|agent|holder|session|whether|if|them|him|her)\b`)
 	// askPrefix is what a person says before the question itself: "ask the
 	// agent on ABC-12".
 	askPrefix = regexp.MustCompile(`(?i)^\s*(?:please\s+)?ask\s+(?:the\s+)?(?:agent|holder|session)\b(?:\s+(?:on|for|of|working\s+on|holding)\s+(?:issue\s+)?(?:[A-Za-z][A-Za-z0-9]*[- ]\d{2,}))?[\s,:]*`)
-	// statusWords are the words of a question about status (R7).
-	statusWords = set(strings.Fields("status happening going progress update updates updated latest news moving stuck blocked state doing done finished where new changed changes next"))
+	// statusWords are the words of a question about status, or about what
+	// the record holds: who holds the issue, its priority, its assignee, its
+	// asks (R7). Words that as often start another question ("where",
+	// "state", "new") are none.
+	statusWords = set(strings.Fields("status happening going progress update updates updated latest news moving stuck blocked doing done finished changed changes next who holds holding held holder priority assigned assignee asks review"))
 )
 
-// askIfNeeded asks the live holder the question when R7 says to: the person
-// said "ask", the question is not about status, or the record has no event
-// from the last 60 minutes. It asks nothing for a holder that is a person,
-// nobody, or a session not answering, nor for an issue a search took with no
-// one clear match. It returns what the voice says after the facts.
-func (c *Concierge) askIfNeeded(ctx context.Context, tools *runner, turn string, found *reading) string {
-	session, _ := found.holder["session"].(string)
-	if found.holder["holder"] != "session" || found.holder["live"] != true || session == "" || (found.searched && !found.clear) {
-		return ""
+// askResult is what the voice says of an ask, and whether Envoy was out of
+// reach for it.
+type askResult struct {
+	line        string
+	unreachable bool
+}
+
+// askPlan says whether R7 asks the live holder now: when the person said
+// "ask", the question is not about status, or the record has no event from
+// the last 60 minutes. It names the session to ask, or none, and what the
+// voice says of an "ask" it withholds. It asks nothing for a holder that is a
+// person, nobody, or a session not answering, nor for an issue a search took
+// with no one clear match, which it says when the person said "ask".
+func (c *Concierge) askPlan(turn string, found *reading) (session, withheld string) {
+	session, _ = found.holder["session"].(string)
+	switch {
+	case found.holder["holder"] != "session" || found.holder["live"] != true || session == "":
+		return "", ""
+	case found.searched && !found.clear:
+		if askWord.MatchString(turn) {
+			return "", askWithheld
+		}
+		return "", ""
+	case !askWord.MatchString(turn) && aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord:
+		return "", ""
 	}
-	if !askWord.MatchString(turn) && aboutStatus(turn) && c.now().Sub(found.newest) <= staleRecord {
-		return ""
-	}
-	result, err := tools.call(ctx, "ask_agent", map[string]any{"session": session, "question": fewestWords(turn), "issue_key": found.key})
+	return session, ""
+}
+
+// ask sends the question to the holder, session, and says how it went. An
+// ask that a stop or the bound cut says nothing: whether it was sent is
+// unknown.
+func (c *Concierge) ask(ctx context.Context, x *voice.Exchange, session, turn string, found *reading) askResult {
+	result, err := (&runner{c: c, x: x}).call(ctx, "ask_agent", map[string]any{"session": session, "question": fewestWords(turn), "issue_key": found.key})
 	switch {
 	case err != nil:
-		return ""
+		return askResult{}
 	case outOfReach(result):
-		return "I could not ask the agent on " + found.key + ": " + cannotReachEnvoy
+		return askResult{line: "I could not ask the agent on " + found.key + ": " + cannotReachEnvoy, unreachable: true}
 	case result["error"] != nil:
-		return "I could not ask the agent on " + found.key + "."
+		return askResult{line: "I could not ask the agent on " + found.key + "."}
 	default:
-		return "I asked the agent on " + found.key + ". " + usualWait
+		return askResult{line: "I asked the agent on " + found.key + ". " + usualWait}
 	}
 }
 
@@ -273,9 +338,9 @@ func fewestWords(turn string) string {
 }
 
 // facts has the model say the facts of the record, with the answer's tools.
-// A sentence that holds a fact the record does not is not spoken (R8): the
-// model writes once more, told why, and after a second failure the voice
-// says it can only say what the record holds.
+// A sentence that fails R8's check is not spoken: the model writes once
+// more, told why, and after a second failure the voice says it can only say
+// what the record holds. R8's bounds hold across both tries.
 func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found *reading, sp *speaker) error {
 	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
@@ -288,6 +353,7 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	}
 	source := &strings.Builder{}
 	source.WriteString(found.text)
+	said := &sentences{sp: sp, source: source}
 	budget := maxToolCalls
 	reason := ""
 	for try := 1; try <= earTries; try++ {
@@ -296,9 +362,9 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 			note += "\n\nAlready said to the room: " + strings.Join(said, " ")
 		}
 		if reason != "" {
-			note += "\n\nYour last answer held a fact the record does not: " + reason + ". Answer again from the record only."
+			note += "\n\nYour last answer failed R8's check: " + reason + ". Answer again from the record only, in the form asked."
 		}
-		err := c.generate(ctx, tools, prompt+note, source, &budget, sp)
+		err := c.generate(ctx, tools, prompt+note, said, &budget)
 		var invented *inventedError
 		if !errors.As(err, &invented) {
 			return err
@@ -324,17 +390,18 @@ type inventedError struct{ reason string }
 func (e *inventedError) Error() string { return "concierge: the model said " + e.reason }
 
 // generate runs the model with the fact tools until it answers in words,
-// speaking each sentence as it completes and holds only what source does.
-// Each tool result joins source. The model makes at most budget tool calls;
-// the round after the last may call none. Thoughts are never spoken. The
-// model's own turn, its thought signatures included, goes back to it with
-// the tools' results, as Gemini requires.
-func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, source *strings.Builder, budget *int, sp *speaker) error {
+// speaking each sentence as it completes and holds only what facts' source
+// does. Each tool result joins that source. The model makes at most budget
+// tool calls; the round after the last may call none. Thoughts are never
+// spoken. The model's own turn, its thought signatures included, goes back
+// to it with the tools' results, as Gemini requires.
+func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, facts *sentences, budget *int) error {
 	contents := []*genai.Content{genai.NewContentFromText(prompt, genai.RoleUser)}
 	config := c.generateConfig(systemPrompt, factTools)
 	last := *config
 	last.ToolConfig = &genai.ToolConfig{FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeNone}}
-	facts := &sentences{sp: sp, source: source}
+	// A try that failed the check leaves no words of it to say.
+	facts.pending.Reset()
 	enough := func(err error) error {
 		if errors.Is(err, errEnough) {
 			return nil
@@ -398,8 +465,8 @@ func (c *Concierge) generate(ctx context.Context, tools *runner, prompt string, 
 					result = map[string]any{"error": err.Error()}
 				}
 				if encoded, err := json.Marshal(result); err == nil {
-					source.WriteString("\n")
-					source.Write(encoded)
+					facts.source.WriteString("\n")
+					facts.source.Write(encoded)
 				}
 			}
 			results = append(results, &genai.Part{FunctionResponse: &genai.FunctionResponse{ID: functionCall.ID, Name: functionCall.Name, Response: result}})
@@ -520,9 +587,10 @@ func (c *Concierge) forEar(ctx context.Context, written, issueKey string) string
 
 // rewrite rewrites an agent's written answer to be spoken, and checks the
 // rewrite against it (R8, earCheck). The issue key the question named is put
-// in front when the rewrite does not hold it. A rewrite that fails the check,
-// or a model that fails, gets one more try, told why; after the second the
-// voice says the fixed sentence. The log says only why, never the words.
+// in front when the rewrite does not hold it; the form is checked before, so
+// that word counts against no bound. A rewrite that fails the check, or a
+// model that fails, gets one more try, told why; after the second the voice
+// says the fixed sentence. The log says only why, never the words.
 func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRewrite {
 	reason := ""
 	tries := 0
@@ -534,11 +602,13 @@ func (c *Concierge) rewrite(ctx context.Context, written, issueKey string) EarRe
 			reason = "the rewrite was empty or failed"
 			continue
 		}
-		if issueKey != "" && !set(earKey.FindAllString(text, -1))[issueKey] {
-			text = issueKey + ": " + text
-		}
-		if reason = earCheck(text, written, issueKey); reason == "" {
-			return EarRewrite{Text: text, Tries: try, Passed: true}
+		if reason = earForm(text); reason == "" {
+			if issueKey != "" && !set(earKey.FindAllString(text, -1))[issueKey] {
+				text = issueKey + ": " + text
+			}
+			if reason = earFacts(text, written, issueKey); reason == "" {
+				return EarRewrite{Text: text, Tries: try, Passed: true}
+			}
 		}
 		c.logger.Info("concierge's rewrite for the ear failed R8's check", "try", try, "reason", reason)
 	}
@@ -575,45 +645,119 @@ func (c *Concierge) rewriteForEar(ctx context.Context, written, reason string) (
 	return text, nil
 }
 
-// speaker says texts one at a time, through say, and keeps what it said. Its
-// routing line plays only when nothing else was said first.
+// speaker says texts in order, on a goroutine of its own, and keeps what it
+// queued. A voice's Say returns once a text's audio is queued, at playback
+// speed, so the speech runs under the exchange's context, apart from the
+// answer's work: the 8 s bound the Concierge's work (R6), and the model
+// writes while the room listens. Its routing line plays only when nothing
+// else was queued first.
 type speaker struct {
-	say    voice.SayFunc
-	mu     sync.Mutex
-	texts  []string
+	say voice.SayFunc
+	// ctx is the exchange's: a stop ends the speech.
+	ctx context.Context
+	mu  sync.Mutex
+	// texts are the texts queued, the routing line not counted.
+	texts []string
+	// queue waits for say; drained, while the goroutine runs, closes when
+	// it stops.
+	queue   []queuedText
+	drained chan struct{}
+	// err is the first Say that failed: nothing after it is said.
+	err    error
 	closed bool
 }
 
-// sayText says text as mode and keeps it.
+type queuedText struct {
+	text string
+	mode voice.SayMode
+}
+
+func newSpeaker(ctx context.Context, say voice.SayFunc) *speaker {
+	return &speaker{ctx: ctx, say: say}
+}
+
+// sayText queues text as mode and keeps it. ctx is the work's: nothing is
+// queued once it ended. The error is that of a Say that already failed.
 func (s *speaker) sayText(ctx context.Context, text string, mode voice.SayMode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.say(ctx, text, mode); err != nil {
-		return err
-	}
 	s.texts = append(s.texts, text)
+	s.enqueueLocked(text, mode)
 	return nil
 }
 
-// count is how many texts were said, the routing line not counted.
+// enqueueLocked queues text, and starts the goroutine that says the queue
+// when none runs. s.mu is held.
+func (s *speaker) enqueueLocked(text string, mode voice.SayMode) {
+	s.queue = append(s.queue, queuedText{text, mode})
+	if s.drained == nil {
+		s.drained = make(chan struct{})
+		go s.speak(s.drained)
+	}
+}
+
+// speak says the queue until it is empty, or a Say failed.
+func (s *speaker) speak(drained chan struct{}) {
+	for {
+		s.mu.Lock()
+		if len(s.queue) == 0 || s.err != nil {
+			s.queue, s.drained = nil, nil
+			s.mu.Unlock()
+			close(drained)
+			return
+		}
+		next := s.queue[0]
+		s.queue = s.queue[1:]
+		s.mu.Unlock()
+		err := s.ctx.Err()
+		if err == nil {
+			err = s.say(s.ctx, next.text, next.mode)
+		}
+		if err != nil {
+			s.mu.Lock()
+			s.err = err
+			s.mu.Unlock()
+		}
+	}
+}
+
+// wait returns once everything queued was said, or a Say failed, with that
+// failure.
+func (s *speaker) wait() error {
+	s.mu.Lock()
+	drained := s.drained
+	s.mu.Unlock()
+	if drained != nil {
+		<-drained
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// count is how many texts were queued, the routing line not counted.
 func (s *speaker) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.texts)
 }
 
-// said is a copy of the texts said, the routing line not counted.
+// said is a copy of the texts queued, the routing line not counted.
 func (s *speaker) said() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.texts...)
 }
 
-// routeAfter says line after the wait when nothing was said by then (R6). The
-// returned stop ends it; once stop returns, the line is not said.
+// routeAfter queues line after the wait when nothing was queued by then
+// (R6). The returned stop ends it; once stop returns, the line is not
+// queued.
 func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line string) (stop func()) {
 	timer := time.AfterFunc(wait, func() {
 		s.mu.Lock()
@@ -622,7 +766,7 @@ func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line strin
 			return
 		}
 		s.closed = true
-		_ = s.say(ctx, line, voice.Ack)
+		s.enqueueLocked(line, voice.Ack)
 	})
 	return func() {
 		timer.Stop()

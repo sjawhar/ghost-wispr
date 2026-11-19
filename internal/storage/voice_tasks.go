@@ -54,10 +54,14 @@ func (s *SQLiteStore) CancelWorkingVoiceTasks(sessionID string) (int64, error) {
 	return cancelled, nil
 }
 
+// voiceTaskTime is the text form of a task's times: fixed width, so text
+// order is time order ("…00.500000000Z" before "…00.550000000Z").
+const voiceTaskTime = "2006-01-02T15:04:05.000000000Z07:00"
+
 // CreateVoiceTask records a working task. Its session must exist.
 func (s *SQLiteStore) CreateVoiceTask(task *VoiceTask) error {
 	if _, err := s.db.Exec(`INSERT INTO voice_tasks(id, session_id, asked_at, issue_key, holder, state) VALUES(?, ?, ?, ?, ?, ?)`,
-		task.ID, task.SessionID, task.AskedAt.UTC().Format(time.RFC3339Nano), task.IssueKey, task.Holder, VoiceTaskWorking); err != nil {
+		task.ID, task.SessionID, task.AskedAt.UTC().Format(voiceTaskTime), task.IssueKey, task.Holder, VoiceTaskWorking); err != nil {
 		return fmt.Errorf("record voice task %s of session %s: %w", task.ID, task.SessionID, err)
 	}
 	return nil
@@ -149,7 +153,7 @@ func (s *SQLiteStore) EndVoiceTask(id string, state VoiceTaskState) (bool, error
 
 // MarkVoiceTaskSpoken records when the task's answer was spoken.
 func (s *SQLiteStore) MarkVoiceTaskSpoken(id string, at time.Time) error {
-	result, err := s.db.Exec(`UPDATE voice_tasks SET spoken_at = ? WHERE id = ?`, at.UTC().Format(time.RFC3339Nano), id)
+	result, err := s.db.Exec(`UPDATE voice_tasks SET spoken_at = ? WHERE id = ?`, at.UTC().Format(voiceTaskTime), id)
 	if err != nil {
 		return fmt.Errorf("mark voice task %s spoken: %w", id, err)
 	}

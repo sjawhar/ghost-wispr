@@ -588,6 +588,9 @@ type SendResult struct {
 	// State is connected or stopped: whether the recipient's process held
 	// its subscription when the message was stored.
 	State string
+	// Duplicate: Envoy already held a message under the request's
+	// idempotency key, so it stored nothing, and EventID names no message.
+	Duplicate bool
 }
 
 // Send sends a message from this session that requires a reply, or, with
@@ -606,7 +609,8 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 		"urgency":         "high",
 	}
 	if request.NoReply {
-		body["expects_reply"], body["urgency"] = "false", "med"
+		// The listener reads the JSON literal false, never the string.
+		body["expects_reply"], body["urgency"] = false, "med"
 	}
 	if request.InReplyTo != "" {
 		body["in_reply_to"] = request.InReplyTo
@@ -618,6 +622,7 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 		EventID        string `json:"event_id"`
 		RecipientState string `json:"recipient_state"`
 		State          string `json:"state"`
+		Duplicate      bool   `json:"duplicate"`
 	}
 	if err := s.do(ctx, http.MethodPost, "/v1/messages/send", nil, body, &answer); err != nil {
 		return SendResult{}, err
@@ -625,7 +630,7 @@ func (s *Session) Send(ctx context.Context, request *SendRequest) (SendResult, e
 	if answer.EventID == "" {
 		return SendResult{}, errors.New("envoy: the send answered no event id")
 	}
-	return SendResult{EventID: answer.EventID, RecipientState: SessionState(answer.RecipientState), State: answer.State}, nil
+	return SendResult{EventID: answer.EventID, RecipientState: SessionState(answer.RecipientState), State: answer.State, Duplicate: answer.Duplicate}, nil
 }
 
 // Close stops the heartbeat, removes this process's registration and closes

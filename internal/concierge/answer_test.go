@@ -34,13 +34,13 @@ func TestAnswerRunsToolsThenSpeaksTheFactSentenceBySentence(t *testing.T) {
 	r.records.hits = []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Status: "in_progress"}}
 	r.model.turns = [][]*genai.GenerateContentResponse{
 		{chunk(thought("The room asks about voice work; search first.")), chunk(call("c1", "search_issues", map[string]any{"query": "voice work"}, "sig-1"))},
-		{chunk(text("ABC-12 is in progress. It was updat")), chunk(text("ed two hours ago."))},
+		{chunk(text("ABC-12 is in progress. It was updat")), chunk(text("ed this morning."))},
 	}
 	var spoken []said
 	if err := r.concierge.Answer(context.Background(), &r.exchange, "what is happening with the voice work", recorder(&spoken)); err != nil {
 		t.Fatalf("Answer: %v", err)
 	}
-	if len(spoken) != 2 || spoken[0].text != "ABC-12 is in progress." || spoken[1].text != "It was updated two hours ago." {
+	if len(spoken) != 2 || spoken[0].text != "ABC-12 is in progress." || spoken[1].text != "It was updated this morning." {
 		t.Fatalf("spoken = %+v", spoken)
 	}
 	for _, s := range spoken {

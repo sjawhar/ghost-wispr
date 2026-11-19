@@ -44,9 +44,25 @@ type fakeRecords struct {
 	// projects is Dispatch's project keys; nil is a project list that does
 	// not answer.
 	projects []string
+	// projectsBlock, when set, holds each Projects call until it is closed
+	// or the call's context ends.
+	projectsBlock chan struct{}
+	// holderEventsErr, when set, is the answer of issue_holder's read of
+	// events (holderEvents), and of no other read.
+	holderEventsErr error
 }
 
-func (f *fakeRecords) Projects(context.Context) ([]string, error) {
+func (f *fakeRecords) Projects(ctx context.Context) ([]string, error) {
+	f.mu.Lock()
+	block := f.projectsBlock
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.projects == nil {
@@ -106,9 +122,13 @@ func (f *fakeRecords) calls() []string {
 func (f *fakeRecords) Events(_ context.Context, key string, limit int) ([]dispatch.Event, error) {
 	f.mu.Lock()
 	f.limits = append(f.limits, limit)
+	holderErr := f.holderEventsErr
 	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
+	}
+	if limit == holderEvents && holderErr != nil {
+		return nil, holderErr
 	}
 	return f.events[key], nil
 }
@@ -120,9 +140,12 @@ func (f *fakeRecords) eventLimits() []int {
 	return append([]int(nil), f.limits...)
 }
 
-func (f *fakeRecords) DocumentText(_ context.Context, key, slug string) (string, error) {
+func (f *fakeRecords) DocumentText(ctx context.Context, key, slug string) (string, error) {
 	if f.err != nil {
 		return "", f.err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	text, ok := f.docs[key+"/"+slug]
 	if !ok {
@@ -139,6 +162,13 @@ type fakeAgents struct {
 	// attempts is every send asked, the failed ones too.
 	attempts []envoy.SendRequest
 	sendErr  error
+	// landedErr, when set, is the answer of a send whose message Envoy
+	// stored all the same.
+	landedErr error
+	// stored holds the idempotency key of each message stored. A send of a
+	// stored key stores nothing and answers Duplicate, with an event id that
+	// names no message, as Envoy does.
+	stored map[string]bool
 	// onSend runs inside Send before it answers, with Send's own context and
 	// the event id it is about to answer.
 	onSend func(ctx context.Context, eventID string) error
@@ -177,10 +207,21 @@ func (f *fakeAgents) Send(ctx context.Context, request *envoy.SendRequest) (envo
 		f.mu.Unlock()
 		return envoy.SendResult{}, f.sendErr
 	}
+	if f.stored[request.IdempotencyKey] {
+		f.mu.Unlock()
+		return envoy.SendResult{EventID: fmt.Sprintf("unstored-%d", len(f.attempts)), RecipientState: envoy.StateLive, State: "connected", Duplicate: true}, nil
+	}
+	if f.stored == nil {
+		f.stored = map[string]bool{}
+	}
+	f.stored[request.IdempotencyKey] = true
 	f.sent = append(f.sent, *request)
 	eventID := fmt.Sprintf("evt-%d", len(f.sent))
-	onSend := f.onSend
+	onSend, landedErr := f.onSend, f.landedErr
 	f.mu.Unlock()
+	if landedErr != nil {
+		return envoy.SendResult{}, landedErr
+	}
 	if onSend != nil {
 		if err := onSend(ctx, eventID); err != nil {
 			return envoy.SendResult{}, err

@@ -132,18 +132,24 @@ type Concierge struct {
 
 	mu     sync.Mutex
 	agents Agents
-	// lastAsk is the newest task each exchange sent each agent, by exchange
-	// (exchangeKey) and agent session, so a second question replaces the
-	// first (R7).
-	lastAsk map[[2]string]string
+	// lastAsk is the newest question each exchange sent each agent, by
+	// exchange (exchangeKey) and agent session, so a second question
+	// replaces the first, and the same one again sends nothing (R7).
+	lastAsk map[[2]string]sentAsk
+	// unsent is, by exchange and question (askBase), the idempotency key of
+	// a send Envoy did not confirm, which its retry reuses (R7).
+	unsent map[[2]string]string
 	// working lists the unanswered tasks sent to each agent session, so a
 	// message from it that names no question can be met with a request to
 	// reply again.
 	working map[string][]string
 	// askedAgain is, per task, the event of the one request its agent got to
 	// reply again with in_reply_to; againFor leads that event to the task.
+	// againKey is, per task, the idempotency key of a request Envoy did not
+	// confirm, which its retry reuses.
 	askedAgain map[string]string
 	againFor   map[string]string
+	againKey   map[string]string
 	// sentAs leads a sent question's Envoy event to its task's local id
 	// until the task takes the event as its id.
 	sentAs map[string]string
@@ -173,6 +179,9 @@ type Concierge struct {
 	projects     map[string]bool
 	projectsRead time.Time
 	projectsBusy bool
+	// projectsDone is closed when the read of the projects now running
+	// ends; nil when none runs.
+	projectsDone chan struct{}
 	// fastBound and routingAfter are fastAnswerBound and routingAfter; a
 	// test shortens them.
 	fastBound    time.Duration
@@ -206,10 +215,12 @@ func New(cfg *Config) (*Concierge, error) {
 		now:          cfg.Now,
 		logger:       cfg.Logger,
 		answers:      make(chan voice.PendingAnswer),
-		lastAsk:      map[[2]string]string{},
+		lastAsk:      map[[2]string]sentAsk{},
+		unsent:       map[[2]string]string{},
 		working:      map[string][]string{},
 		askedAgain:   map[string]string{},
 		againFor:     map[string]string{},
+		againKey:     map[string]string{},
 		sentAs:       map[string]string{},
 		inflight:     map[string]int{},
 		named:        map[string]*named{},
@@ -233,7 +244,7 @@ func New(cfg *Config) (*Concierge, error) {
 	if c.records != nil {
 		// The project list is read at once, so the first question's keys
 		// are known (isProject).
-		c.projectsBusy = true
+		c.startProjectsReadLocked()
 		go c.readProjects(context.Background())
 	}
 	return c, nil
@@ -370,6 +381,11 @@ func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 			delete(c.lastAsk, key)
 		}
 	}
+	for key := range c.unsent {
+		if strings.HasPrefix(key[0], prefix) {
+			delete(c.unsent, key)
+		}
+	}
 	for key := range c.named {
 		if strings.HasPrefix(key, prefix) {
 			delete(c.named, key)
@@ -387,6 +403,12 @@ func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 			delete(c.working, agent)
 		} else {
 			c.working[agent] = ids
+		}
+	}
+	// An ended meeting's tasks get no request to reply again.
+	for taskID := range c.againKey {
+		if of(taskID) {
+			delete(c.againKey, taskID)
 		}
 	}
 	if !deleted {
@@ -442,25 +464,41 @@ const projectsFor = 10 * time.Minute
 // isProject reports whether key names one of Dispatch's projects. Until the
 // projects are known, or while their read fails, none does: a "word NN" said
 // in the room is no key, so it never reaches Dispatch in an address. With
-// wait, a stale or missing list is read first; without, it is read in the
-// background and this call answers from what is known.
+// wait, a stale or missing list is read first, or the read already running
+// is waited for; without, it is read in the background and this call
+// answers from what is known.
 func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bool {
 	c.mu.Lock()
 	stale := c.now().Sub(c.projectsRead) > projectsFor
 	refresh := stale && !c.projectsBusy && c.records != nil
 	if refresh {
-		c.projectsBusy = true
+		c.startProjectsReadLocked()
 	}
+	running := c.projectsDone
 	known := c.projects
 	c.mu.Unlock()
-	if refresh {
-		if wait {
-			known = c.readProjects(ctx)
-		} else {
-			go c.readProjects(context.WithoutCancel(ctx))
+	switch {
+	case refresh && wait:
+		known = c.readProjects(ctx)
+	case refresh:
+		go c.readProjects(context.WithoutCancel(ctx))
+	case wait && stale && running != nil:
+		select {
+		case <-running:
+		case <-ctx.Done():
 		}
+		c.mu.Lock()
+		known = c.projects
+		c.mu.Unlock()
 	}
 	return known[strings.ToUpper(project)]
+}
+
+// startProjectsReadLocked marks a read of the projects as running. c.mu is
+// held.
+func (c *Concierge) startProjectsReadLocked() {
+	c.projectsBusy = true
+	c.projectsDone = make(chan struct{})
 }
 
 // readProjects reads Dispatch's project keys and keeps them. A failed read
@@ -472,6 +510,8 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.projectsBusy = false
+	close(c.projectsDone)
+	c.projectsDone = nil
 	if err != nil {
 		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
 		c.projectsRead = c.now().Add(time.Minute - projectsFor)
