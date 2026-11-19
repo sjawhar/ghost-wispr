@@ -252,37 +252,127 @@ func CommandOf(rest string) Command {
 
 // IssueKeys returns the issue keys text names, in the forms people say them:
 // "INFRA-1027", "infra 1027", "infra ten twenty-seven", "infra one oh two
-// seven". A key is a word of letters and a number; the caller checks it
-// against the keys it knows.
+// seven", and "in for" before a number, as Deepgram writes "infra". A key is
+// a word of letters and a number; the caller checks it against the keys it
+// knows.
 func IssueKeys(text string) []string {
-	var tokens []string
-	for _, t := range strings.Fields(text) {
-		// "twenty-seven" is two number words; "INFRA-1027" stays one token.
-		if strings.Contains(t, "-") && !keyToken(t) {
-			tokens = append(tokens, strings.Split(t, "-")...)
+	var keys []string
+	for _, span := range keySpans(keyTokens(text)) {
+		keys = append(keys, span.key)
+	}
+	return keys
+}
+
+// WriteKeys writes each key of projects that text says in a spoken form as
+// the key ("in for forty five ninety two" as INFRA-4592), so the Concierge
+// and Dispatch read it; other words stay as they were.
+func WriteKeys(text string, projects []string) string {
+	known := make(map[string]bool, len(projects))
+	for _, p := range projects {
+		known[strings.ToUpper(p)] = true
+	}
+	tokens := keyTokens(text)
+	var out []string
+	next := 0
+	for _, span := range keySpans(tokens) {
+		project, _, _ := strings.Cut(span.key, "-")
+		if !known[project] {
 			continue
 		}
-		tokens = append(tokens, t)
+		out = append(out, joinTokens(tokens[next:span.from])...)
+		// The key keeps the punctuation its last word had ("…ninety two?").
+		last := tokens[span.to-1].text
+		out = append(out, span.key+last[len(strings.TrimRightFunc(last, notWordRune)):])
+		next = span.to
 	}
-	var keys []string
-	for i := 0; i < len(tokens); i++ {
-		word := strings.TrimSuffix(normalise(tokens[i]), "'s")
-		if keyToken(tokens[i]) {
-			prefix, digits, _ := strings.Cut(word, "-")
-			keys = append(keys, strings.ToUpper(prefix)+"-"+digits)
+	if next == 0 {
+		return text
+	}
+	out = append(out, joinTokens(tokens[next:])...)
+	return strings.Join(out, " ")
+}
+
+func notWordRune(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }
+
+// token is a word of text; hyphen marks one that was split from the word
+// before it at a hyphen ("twenty-seven").
+type token struct {
+	text   string
+	hyphen bool
+}
+
+// keyTokens splits text into words, and "twenty-seven" into two number
+// words; "INFRA-1027" stays one word.
+func keyTokens(text string) []token {
+	var tokens []token
+	for _, t := range strings.Fields(text) {
+		if strings.Contains(t, "-") && !keyToken(t) {
+			for i, part := range strings.Split(t, "-") {
+				tokens = append(tokens, token{text: part, hyphen: i > 0})
+			}
 			continue
+		}
+		tokens = append(tokens, token{text: t})
+	}
+	return tokens
+}
+
+// joinTokens gives tokens back as words, rejoining those split at a hyphen.
+func joinTokens(tokens []token) []string {
+	var words []string
+	for _, t := range tokens {
+		if t.hyphen && len(words) > 0 {
+			words[len(words)-1] += "-" + t.text
+			continue
+		}
+		words = append(words, t.text)
+	}
+	return words
+}
+
+// keySpan is a key text says, over tokens [from, to).
+type keySpan struct {
+	key      string
+	from, to int
+}
+
+// soundsLikeProject lists the two words Deepgram writes for a project word
+// it does not know; they read as the project only before a number.
+var soundsLikeProject = map[[2]string]string{{"in", "for"}: "INFRA"}
+
+func keySpans(tokens []token) []keySpan {
+	texts := make([]string, len(tokens))
+	for i, t := range tokens {
+		texts[i] = t.text
+	}
+	var spans []keySpan
+	for i := 0; i < len(tokens); i++ {
+		word := strings.TrimSuffix(normalise(texts[i]), "'s")
+		if keyToken(texts[i]) {
+			prefix, digits, _ := strings.Cut(word, "-")
+			spans = append(spans, keySpan{key: strings.ToUpper(prefix) + "-" + digits, from: i, to: i + 1})
+			continue
+		}
+		if i+1 < len(tokens) {
+			if project, ok := soundsLikeProject[[2]string{word, normalise(texts[i+1])}]; ok {
+				if digits, used := spokenNumber(texts[i+2:]); digits != "" {
+					spans = append(spans, keySpan{key: project + "-" + digits, from: i, to: i + 2 + used})
+					i += 1 + used
+					continue
+				}
+			}
 		}
 		if !lettersOnly(word) || len(word) < 2 || numberWord(word) {
 			continue
 		}
-		digits, used := spokenNumber(tokens[i+1:])
+		digits, used := spokenNumber(texts[i+1:])
 		if digits == "" {
 			continue
 		}
-		keys = append(keys, strings.ToUpper(word)+"-"+digits)
+		spans = append(spans, keySpan{key: strings.ToUpper(word) + "-" + digits, from: i, to: i + 1 + used})
 		i += used
 	}
-	return keys
+	return spans
 }
 
 // keyToken reports a written key such as "INFRA-1027", with punctuation
@@ -320,13 +410,19 @@ func spokenNumber(tokens []string) (string, int) {
 	for used < len(tokens) {
 		w := normalise(tokens[used])
 		if w == "hundred" && b.Len() > 0 {
-			// "eleven hundred five": what follows fills the hundred's two places.
-			rest, n := spokenNumber(tokens[used+1:])
-			if len(rest) > 2 {
-				rest, n = "", 0
+			// "eleven hundred five": what follows fills the hundred's two
+			// places; "forty five hundred and two" says "and" first.
+			after := tokens[used+1:]
+			skip := 0
+			if len(after) > 1 && normalise(after[0]) == "and" {
+				after, skip = after[1:], 1
+			}
+			rest, n := spokenNumber(after)
+			if len(rest) > 2 || n == 0 {
+				rest, n, skip = "", 0, 0
 			}
 			b.WriteString(strings.Repeat("0", 2-len(rest)) + rest)
-			return b.String(), used + 1 + n
+			return b.String(), used + 1 + skip + n
 		}
 		o, isOne := ones[w]
 		te, isTeen := teens[w]
