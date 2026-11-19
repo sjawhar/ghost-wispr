@@ -44,9 +44,25 @@ type fakeRecords struct {
 	// projects is Dispatch's project keys; nil is a project list that does
 	// not answer.
 	projects []string
+	// projectsBlock, when set, holds each Projects call until it is closed
+	// or the call's context ends.
+	projectsBlock chan struct{}
+	// holderEventsErr, when set, is the answer of issue_holder's read of
+	// events (holderEvents), and of no other read.
+	holderEventsErr error
 }
 
-func (f *fakeRecords) Projects(context.Context) ([]string, error) {
+func (f *fakeRecords) Projects(ctx context.Context) ([]string, error) {
+	f.mu.Lock()
+	block := f.projectsBlock
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.projects == nil {
@@ -106,9 +122,13 @@ func (f *fakeRecords) calls() []string {
 func (f *fakeRecords) Events(_ context.Context, key string, limit int) ([]dispatch.Event, error) {
 	f.mu.Lock()
 	f.limits = append(f.limits, limit)
+	holderErr := f.holderEventsErr
 	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
+	}
+	if limit == holderEvents && holderErr != nil {
+		return nil, holderErr
 	}
 	return f.events[key], nil
 }

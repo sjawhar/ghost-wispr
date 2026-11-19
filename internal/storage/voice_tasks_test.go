@@ -50,6 +50,25 @@ func voiceTaskIDs(t *testing.T, store *SQLiteStore) []string {
 	return ids
 }
 
+// TestVoiceTasksListInAskedOrderWithinASecond: two tasks asked 0.5 s and
+// 0.55 s into one second list in the order they were asked.
+func TestVoiceTasksListInAskedOrderWithinASecond(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	if err := store.CreateSession("s1", time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	for id, nanos := range map[string]int{"b-first": 500_000_000, "a-second": 550_000_000} {
+		asked := time.Date(2026, 11, 19, 9, 30, 0, nanos, time.UTC)
+		if err := store.CreateVoiceTask(&VoiceTask{ID: id, SessionID: "s1", AskedAt: asked}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tasks, err := store.VoiceTasks("s1")
+	if err != nil || len(tasks) != 2 || tasks[0].ID != "b-first" || !tasks[0].AskedAt.Equal(time.Date(2026, 11, 19, 9, 30, 0, 500_000_000, time.UTC)) {
+		t.Fatalf("tasks = %+v, %v; want b-first, asked at .5 s, before a-second", tasks, err)
+	}
+}
+
 // TestAVoiceTaskKeepsItsWrittenAnswer: a task starts working, takes the
 // holder's written answer once, takes the Envoy event id as its id once the
 // question is sent, and records when its answer was spoken.

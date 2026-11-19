@@ -179,6 +179,9 @@ type Concierge struct {
 	projects     map[string]bool
 	projectsRead time.Time
 	projectsBusy bool
+	// projectsDone is closed when the read of the projects now running
+	// ends; nil when none runs.
+	projectsDone chan struct{}
 	// fastBound and routingAfter are fastAnswerBound and routingAfter; a
 	// test shortens them.
 	fastBound    time.Duration
@@ -241,7 +244,7 @@ func New(cfg *Config) (*Concierge, error) {
 	if c.records != nil {
 		// The project list is read at once, so the first question's keys
 		// are known (isProject).
-		c.projectsBusy = true
+		c.startProjectsReadLocked()
 		go c.readProjects(context.Background())
 	}
 	return c, nil
@@ -461,25 +464,41 @@ const projectsFor = 10 * time.Minute
 // isProject reports whether key names one of Dispatch's projects. Until the
 // projects are known, or while their read fails, none does: a "word NN" said
 // in the room is no key, so it never reaches Dispatch in an address. With
-// wait, a stale or missing list is read first; without, it is read in the
-// background and this call answers from what is known.
+// wait, a stale or missing list is read first, or the read already running
+// is waited for; without, it is read in the background and this call
+// answers from what is known.
 func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bool {
 	c.mu.Lock()
 	stale := c.now().Sub(c.projectsRead) > projectsFor
 	refresh := stale && !c.projectsBusy && c.records != nil
 	if refresh {
-		c.projectsBusy = true
+		c.startProjectsReadLocked()
 	}
+	running := c.projectsDone
 	known := c.projects
 	c.mu.Unlock()
-	if refresh {
-		if wait {
-			known = c.readProjects(ctx)
-		} else {
-			go c.readProjects(context.WithoutCancel(ctx))
+	switch {
+	case refresh && wait:
+		known = c.readProjects(ctx)
+	case refresh:
+		go c.readProjects(context.WithoutCancel(ctx))
+	case wait && stale && running != nil:
+		select {
+		case <-running:
+		case <-ctx.Done():
 		}
+		c.mu.Lock()
+		known = c.projects
+		c.mu.Unlock()
 	}
 	return known[strings.ToUpper(project)]
+}
+
+// startProjectsReadLocked marks a read of the projects as running. c.mu is
+// held.
+func (c *Concierge) startProjectsReadLocked() {
+	c.projectsBusy = true
+	c.projectsDone = make(chan struct{})
 }
 
 // readProjects reads Dispatch's project keys and keeps them. A failed read
@@ -491,6 +510,8 @@ func (c *Concierge) readProjects(ctx context.Context) map[string]bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.projectsBusy = false
+	close(c.projectsDone)
+	c.projectsDone = nil
 	if err != nil {
 		c.logger.Warn("concierge could not read Dispatch's projects", "error", err)
 		c.projectsRead = c.now().Add(time.Minute - projectsFor)

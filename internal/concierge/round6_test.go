@@ -236,8 +236,9 @@ func TestConciergeBounds(t *testing.T) {
 // TestWhenToAskTheHolder (c-ask-holder, R7): the Concierge asks a live holder
 // when the person says "ask", when the question is not about status, and when
 // the record has no event in the last 60 minutes; it does not for a status
-// question on a fresh record, or for an issue a search took without a clear
-// match.
+// question on a fresh record, nor for one the record answers (who holds it,
+// its priority, its assignee), nor for an issue a search took without a
+// clear match, which it says. "Asks" as a noun is no "ask".
 func TestWhenToAskTheHolder(t *testing.T) {
 	for _, c := range []struct {
 		name, turn string
@@ -250,6 +251,13 @@ func TestWhenToAskTheHolder(t *testing.T) {
 		{"not about status", "is the tap on ABC-12 merged", false, false, "is the tap on ABC-12 merged"},
 		{"a stale record", "what is happening with ABC-12", true, false, "what is happening with ABC-12"},
 		{"a search with no clear match", "ask the agent on the realtime voice whether the tap is merged", false, true, ""},
+		{"asks as a noun", "what is the status of the open asks on ABC-12", false, false, ""},
+		{"who holds it", "who holds ABC-12", false, false, ""},
+		{"its priority", "what is the priority of ABC-12", false, false, ""},
+		{"its assignee", "is ABC-12 assigned to anyone", false, false, ""},
+		{"where, not about status", "where does ABC-12 keep the session tokens", false, false, "where does ABC-12 keep the session tokens"},
+		{"state, not about status", "what state does the parser of ABC-12 keep", false, false, "what state does the parser of ABC-12 keep"},
+		{"new, not about status", "is the new retry on ABC-12 safe to run twice", false, false, "is the new retry on ABC-12 safe to run twice"},
 	} {
 		r := newRig(t)
 		heldIssue(r, "session", c.stale)
@@ -263,6 +271,9 @@ func TestWhenToAskTheHolder(t *testing.T) {
 			if len(r.agents.sent) != 0 {
 				t.Errorf("%s: asked %+v", c.name, r.agents.sent)
 			}
+			if withheld := spoken[len(spoken)-1].text == askWithheld; withheld != c.search {
+				t.Errorf("%s: spoken = %+v; want the withheld ask said %v", c.name, spoken, c.search)
+			}
 			continue
 		}
 		if len(r.agents.sent) != 1 || r.agents.sent[0].Target != "agent-7" || !strings.Contains(r.agents.sent[0].Message, ": "+c.asked+"\n") {
@@ -271,6 +282,62 @@ func TestWhenToAskTheHolder(t *testing.T) {
 		}
 		if last := spoken[len(spoken)-1].text; !strings.Contains(last, "asked the agent on ABC-12") {
 			t.Errorf("%s: spoken = %+v, want the asked line last", c.name, spoken)
+		}
+	}
+}
+
+// TestTheAskRunsBesideTheFacts (c-fast-answer, R6): the ask runs beside the
+// facts, so a slow Envoy holds no fact of the record back.
+func TestTheAskRunsBesideTheFacts(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	factSaid := make(chan struct{})
+	var once sync.Once
+	r.agents.onSend = func(context.Context, string) error {
+		select {
+		case <-factSaid:
+			return nil
+		case <-time.After(3 * time.Second):
+			return errors.New("envoy: no answer in 3 s")
+		}
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	var mu sync.Mutex
+	var spoken []said
+	say := func(_ context.Context, text string, mode voice.SayMode) error {
+		mu.Lock()
+		spoken = append(spoken, said{text, mode})
+		mu.Unlock()
+		if text == "PR 80 is in review." {
+			once.Do(func() { close(factSaid) })
+		}
+		return nil
+	}
+	if err := r.concierge.Answer(context.Background(), &r.exchange, "is the tap on ABC-12 merged", say); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if last := spoken[len(spoken)-1].text; !strings.Contains(last, "asked the agent on ABC-12") {
+		t.Fatalf("spoken = %+v, want the facts while the ask was sent, then the asked line", spoken)
+	}
+}
+
+// TestTheRoutingLineOnlyWhenNothingWasSaid (c-fast-answer, R6): a holder's
+// case said before 1.5 s keeps the routing line silent, however long the
+// facts then take.
+func TestTheRoutingLineOnlyWhenNothingWasSaid(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "person", false)
+	r.model.block = make(chan struct{})
+	go func() {
+		time.Sleep(2200 * time.Millisecond)
+		close(r.model.block)
+	}()
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	for _, s := range answerTurn(t, r, "what is happening with ABC-12") {
+		if s.mode == voice.Ack {
+			t.Fatalf("a routing line after the holder's case was said: %q", s.text)
 		}
 	}
 }
