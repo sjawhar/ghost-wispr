@@ -30,6 +30,20 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini",
 		"a held answer also opens voice C without one",
 		"Between exchanges nothing goes to the Voice Agent",
+		// R7 and R10: when an answer may speak, and the sounds.
+		"It speaks by itself only when nobody has spoken since the question and the light still reads red",
+		"Wispr plays a three-note sound after a second in which nobody speaks",
+		"For 6 s after Wispr's answer, a follow-up needs no wake phrase",
+		"\"Wispr, never mind\" cancels the newest question to an agent",
+		"a single high note when capture starts recording",
+		"a falling two-note sound when Wispr cannot do what was asked",
+		// R13: the settings page.
+		"The settings page turns the voice on or off and picks its engine, with no restart",
+		"With the voice off, the unit reads no wake phrase and runs no Concierge",
+		// R20: every text recipient, and vendor errors.
+		"so the question also reaches that model's vendor",
+		"A speech vendor's error message that quotes the text to speak is left out of the journal",
+		"`voice_tasks_changed`",
 	} {
 		if !strings.Contains(readme, words) {
 			t.Errorf("the README does not say %q", words)
