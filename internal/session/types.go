@@ -81,6 +81,12 @@ type LiveStream interface {
 	// CapturedSince returns how much audio has been captured after the
 	// point at into the stream.
 	CapturedSince(at time.Duration) time.Duration
+	// Captured returns how much audio has been captured in all, on a count
+	// no reconnect moves.
+	Captured() time.Duration
+	// CapturedBefore returns how much audio had been captured before the
+	// point at into the stream, on the count Captured gives.
+	CapturedBefore(at time.Duration) time.Duration
 	// MaxBehind returns how far the stream can fall behind the microphone.
 	MaxBehind() time.Duration
 }

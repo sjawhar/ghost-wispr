@@ -135,9 +135,11 @@ type ResilientClient struct {
 	accepted int64
 	origin   int64
 	// queuedAhead reports the bytes an AsyncSender in front of the client
-	// holds (watchSendQueue), nil without one, and drops the audio it dropped
-	// that a word on the current socket can still come before
-	// (sendQueueDropped). Guarded by Mu.
-	queuedAhead func() int64
-	drops       []streamDrop
+	// holds (watchSendQueue), nil without one; drops the audio it dropped that
+	// a word on the current socket can still come before (sendQueueDropped);
+	// and forgottenDrops the bytes of the drops before the current socket's
+	// stream, which Captured still counts. Guarded by Mu.
+	queuedAhead    func() int64
+	drops          []streamDrop
+	forgottenDrops int64
 }

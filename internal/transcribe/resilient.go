@@ -293,14 +293,49 @@ func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 	return rc.streamDuration(since)
 }
 
+// Captured returns how much audio has been captured in all: the audio the
+// client took, the audio queued in front of it, and the audio that queue
+// dropped. CapturedBefore places a point of the current socket's stream on
+// the same count, which no reconnect, Finalize or drop moves.
+func (rc *ResilientClient) Captured() time.Duration {
+	rc.Mu.Lock()
+	total := rc.accepted + rc.forgottenDrops
+	if rc.queuedAhead != nil {
+		total += rc.queuedAhead()
+	}
+	for _, drop := range rc.drops {
+		total += drop.n
+	}
+	rc.Mu.Unlock()
+	return rc.streamDuration(total)
+}
+
+// CapturedBefore returns how much audio had been captured before the point
+// at into the current socket's stream, on the count Captured gives: the audio
+// the client took before it, Finalize's dropped audio included, and the audio
+// the send queue dropped before it.
+func (rc *ResilientClient) CapturedBefore(at time.Duration) time.Duration {
+	rc.Mu.Lock()
+	point := rc.origin + rc.streamBytes(at)
+	before := point + rc.forgottenDrops
+	for _, drop := range rc.drops {
+		if drop.at <= point {
+			before += drop.n
+		}
+	}
+	rc.Mu.Unlock()
+	return rc.streamDuration(max(before, 0))
+}
+
 // streamDrop is audio a send queue in front of the client dropped: n bytes
 // that would have come at, in the count of the bytes Write takes.
 type streamDrop struct{ at, n int64 }
 
 // maxStreamDrops bounds the drops the client remembers: past it, the oldest
 // two merge into one at the later place, which counts the earlier one's
-// bytes after a few more words than it should, and so only lengthens a
-// recording's lead.
+// bytes after a few more words than it should. That only lengthens a
+// recording's lead, and can only place a word between them earlier than it
+// was captured.
 const maxStreamDrops = 1024
 
 // watchSendQueue makes CapturedSince count the audio an AsyncSender in
@@ -333,13 +368,16 @@ func (rc *ResilientClient) sendQueueDropped(n int64) {
 }
 
 // keepDropsAfterLocked forgets the drops at or before from, the start of a
-// new socket's stream: no word Deepgram hears on it comes before them. It
-// must be called with Mu held.
+// new socket's stream: no word Deepgram hears on it comes before them. Their
+// bytes still count in Captured and CapturedBefore. It must be called with Mu
+// held.
 func (rc *ResilientClient) keepDropsAfterLocked(from int64) {
 	kept := rc.drops[:0]
 	for _, drop := range rc.drops {
 		if drop.at > from {
 			kept = append(kept, drop)
+		} else {
+			rc.forgottenDrops += drop.n
 		}
 	}
 	rc.drops = kept

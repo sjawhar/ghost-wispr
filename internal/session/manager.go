@@ -50,6 +50,8 @@ type Manager struct {
 	finalizeWaiter                 chan struct{} // closed by Deepgram's next Finalize reply; see AwaitFinalize
 	lastIDTime                     time.Time     // the start second the latest session ID names
 	stream                         LiveStream    // the live transcription's audio stream (SetLiveStream); nil until set
+	resumedAt                      time.Duration // the stream's Captured() at the latest capture resume; 0 before one
+	resumes                        int           // capture resumes so far
 	lifecyclePublishes             sync.WaitGroup
 	lifecycleStartPublishesStopped bool
 }
@@ -150,6 +152,18 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 			End:            word.End,
 		})
 	}
+	// Words from before the latest pause, which Deepgram can finalize after
+	// the resume, reach no session after it.
+	m.mu.Lock()
+	resumes := m.resumes
+	words, sentence = m.afterResumeLocked(mr, words, sentence)
+	m.mu.Unlock()
+	if sentence == "" {
+		if mr.IsFinal {
+			m.releasePreroll()
+		}
+		return nil
+	}
 	m.holdPreroll(heardFrom(mr, words))
 
 	// Interim result (not final) — prepend any buffered words for context, then broadcast.
@@ -193,8 +207,16 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 		words = []transcribe.Word{{PunctuatedWord: sentence, Start: 0, End: 0}}
 	}
 
-	// Final result — buffer words until speech_final.
+	// Final result — buffer words until speech_final. A resume since the
+	// result came means its audio is all from before the resume, and so from
+	// before the pause: no audio is captured during one.
+	m.mu.Lock()
+	if m.resumes != resumes {
+		m.mu.Unlock()
+		return nil
+	}
 	m.buffer.AddWords(words)
+	m.mu.Unlock()
 	m.detector.OnSpeech()
 
 	// After buffering, broadcast an interim event with full buffer contents
@@ -281,6 +303,7 @@ const lateResultMargin = 30 * time.Second
 func (m *Manager) SetLiveStream(stream LiveStream) {
 	m.mu.Lock()
 	m.stream = stream
+	m.resumedAt = 0 // a mark on the old stream's count
 	m.mu.Unlock()
 	if m.recorder == nil {
 		return
@@ -1185,9 +1208,55 @@ func (m *Manager) finalizeReplied() {
 // ResumeCapture lets sessions start again after PauseCapture. It drops words
 // Deepgram finalized during the pause that no utterance end flushed: they are
 // from audio before the pause and must not open the first session after it.
+// It marks where the pause falls in the live stream's audio, so the words
+// Deepgram finalizes after the resume for audio from before the pause are
+// dropped too (afterResumeLocked). It must run before audio flows again.
 func (m *Manager) ResumeCapture() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.buffer.Flush()
+	if m.stream != nil {
+		m.resumedAt = m.stream.Captured()
+	}
+	m.resumes++
 	m.capturePaused = false
+}
+
+// afterResumeLocked drops from result mr the words captured before capture
+// last resumed, and returns the words kept and the result's text from them;
+// the text is empty when none are kept. Deepgram lags the microphone after an
+// outage, so the pause's Finalize finalizes only what it has reached, and its
+// results for the last words before the pause can come after the resume, even
+// in one result with the first words after it. A word is placed by its
+// middle, a result without word times by the middle of the audio it covers.
+// With no live stream, or before a resume, it keeps every word. It must be
+// called with m.mu held; the live stream never takes m.mu.
+func (m *Manager) afterResumeLocked(mr *api.MessageResponse, words []transcribe.Word, sentence string) ([]transcribe.Word, string) {
+	if m.stream == nil || m.resumedAt <= 0 {
+		return words, sentence
+	}
+	before := func(start, end float64) bool {
+		middle := time.Duration((start + end) / 2 * float64(time.Second))
+		return m.stream.CapturedBefore(middle) < m.resumedAt
+	}
+	if len(words) == 0 {
+		if before(mr.Start, mr.Start+mr.Duration) {
+			return nil, ""
+		}
+		return words, sentence
+	}
+	// Deepgram gives a result's words in the order they were spoken.
+	kept := 0
+	for kept < len(words) && before(words[kept].Start, words[kept].End) {
+		kept++
+	}
+	if kept == 0 {
+		return words, sentence
+	}
+	words = words[kept:]
+	text := make([]string, len(words))
+	for i, word := range words {
+		text[i] = word.PunctuatedWord
+	}
+	return words, strings.Join(text, " ")
 }

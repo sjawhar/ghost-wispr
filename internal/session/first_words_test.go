@@ -170,6 +170,10 @@ type clockStream struct{ c *capture }
 
 func (s clockStream) CapturedSince(at time.Duration) time.Duration { return max(s.c.said-at, 0) }
 
+func (s clockStream) Captured() time.Duration { return s.c.said }
+
+func (clockStream) CapturedBefore(at time.Duration) time.Duration { return at }
+
 func (clockStream) MaxBehind() time.Duration { return time.Minute }
 
 // TestALongFirstUtteranceIsAllInTheRecording fails if a session's recording
@@ -217,10 +221,15 @@ func TestWordsDeepgramTookBackDoNotLeadTheNextSession(t *testing.T) {
 }
 
 // fixedStream is a live stream that says every word was captured ago before
-// its result, and that can fall behind by behind.
+// its result, at the start of the capture, and that can fall behind by
+// behind.
 type fixedStream struct{ ago, behind time.Duration }
 
 func (s fixedStream) CapturedSince(time.Duration) time.Duration { return s.ago }
+
+func (fixedStream) Captured() time.Duration { return 0 }
+
+func (fixedStream) CapturedBefore(time.Duration) time.Duration { return 0 }
 
 func (s fixedStream) MaxBehind() time.Duration { return s.behind }
 
