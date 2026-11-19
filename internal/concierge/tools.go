@@ -559,6 +559,13 @@ func (r *runner) sessionHolder(ctx context.Context, id, title string) map[string
 	info, err := r.c.lookup(ctx, agents, id)
 	if err != nil {
 		r.c.logger.Warn("concierge could not read an agent's liveness", "session", id, "error", err)
+		var refused *envoy.ListenerError
+		if errors.As(err, &refused) && refused.Status >= 400 && refused.Status < 500 {
+			// Envoy answered: the holder is no session it holds, such as a
+			// daemon's actor. It cannot be asked, and nothing is out of reach.
+			result["holder"], result["state"] = "unresponsive", "not an agent session"
+			return result
+		}
 		result["holder"], result["state"] = "unresponsive", "unknown"
 		result["note"] = cannotReachEnvoy
 		return result

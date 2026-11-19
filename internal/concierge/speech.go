@@ -86,7 +86,7 @@ func workWords(text string) string {
 			terms = append(terms, term)
 		}
 	}
-	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(text, " "), "realtime")
+	rest := compound.ReplaceAllString(spokenKey.ReplaceAllString(spokenKeys(text), " "), "realtime")
 	for _, word := range strings.FieldsFunc(strings.ToLower(rest), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\''
 	}) {

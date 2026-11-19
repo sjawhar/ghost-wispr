@@ -54,41 +54,57 @@ func (s *SQLiteStore) CancelWorkingVoiceTasks(sessionID string) (int64, error) {
 	return cancelled, nil
 }
 
+// CancelAllWorkingVoiceTasks cancels the working tasks of every session, of
+// one still recording too, as the voice is turned off, and names those
+// sessions in order.
+func (s *SQLiteStore) CancelAllWorkingVoiceTasks() ([]string, error) {
+	return s.cancelWorkingVoiceTasksWhere("", "")
+}
+
 // CancelWorkingVoiceTasksOfEndedSessions cancels the working tasks of every
 // session no longer recording, as each session's end would have, and names
 // those sessions in order. It is for a start: a session that ended while no
 // one was told keeps no working question.
 func (s *SQLiteStore) CancelWorkingVoiceTasksOfEndedSessions() ([]string, error) {
+	return s.cancelWorkingVoiceTasksWhere(" of ended sessions", ` AND session_id IN (SELECT id FROM sessions WHERE status != 'active')`)
+}
+
+// cancelWorkingVoiceTasksWhere cancels the working tasks that also meet
+// where, an SQL condition that is empty or begins with AND, and names their
+// sessions in order. what names those tasks in an error.
+func (s *SQLiteStore) cancelWorkingVoiceTasksWhere(what, where string) ([]string, error) {
+	fail := func(step string, err error) ([]string, error) {
+		return nil, fmt.Errorf("%s the working voice tasks%s: %w", step, what, err)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("cancel the working voice tasks of ended sessions: %w", err)
+		return fail("cancel", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	const ended = `session_id IN (SELECT id FROM sessions WHERE status != 'active')`
-	rows, err := tx.Query(`SELECT DISTINCT session_id FROM voice_tasks WHERE state = ? AND `+ended+` ORDER BY session_id`, VoiceTaskWorking)
+	rows, err := tx.Query(`SELECT DISTINCT session_id FROM voice_tasks WHERE state = ?`+where+` ORDER BY session_id`, VoiceTaskWorking)
 	if err != nil {
-		return nil, fmt.Errorf("list the ended sessions with working voice tasks: %w", err)
+		return fail("list the sessions of", err)
 	}
 	var sessions []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("list the ended sessions with working voice tasks: %w", err)
+			return fail("list the sessions of", err)
 		}
 		sessions = append(sessions, id)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("list the ended sessions with working voice tasks: %w", err)
+		return fail("list the sessions of", err)
 	}
 	if len(sessions) == 0 {
 		return nil, nil
 	}
-	if _, err := tx.Exec(`UPDATE voice_tasks SET state = ? WHERE state = ? AND `+ended, VoiceTaskCancelled, VoiceTaskWorking); err != nil {
-		return nil, fmt.Errorf("cancel the working voice tasks of ended sessions: %w", err)
+	if _, err := tx.Exec(`UPDATE voice_tasks SET state = ? WHERE state = ?`+where, VoiceTaskCancelled, VoiceTaskWorking); err != nil {
+		return fail("cancel", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("cancel the working voice tasks of ended sessions: %w", err)
+		return fail("cancel", err)
 	}
 	return sessions, nil
 }

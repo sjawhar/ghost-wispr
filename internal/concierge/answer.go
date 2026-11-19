@@ -251,8 +251,23 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	}
 	defer sp.flushLead(parent)
 	holderCase := found.holderCase()
+	staleSaid := false
 	if session := c.askPlan(turn, found, x.FollowUpTurn); session != "" {
 		startAsk(session, found)
+		// R6: a status question whose record is stale is answered first from
+		// the record, with its age, then the routing line says the Concierge
+		// asks the holder. The line begins with the key, so it names the
+		// issue (R5). The record's other facts are as old, and the holder
+		// answers what is new: no model writes more.
+		if line := found.agedStatus(c.now()); line != "" && !saysAsk(turn) && aboutStatus(turn) {
+			if err := sp.sayText(ctx, line, voice.Fact); err != nil {
+				return err
+			}
+			if err := sp.sayText(ctx, "Asking the agent on "+found.key+".", voice.Ack); err != nil {
+				return err
+			}
+			staleSaid = true
+		}
 	}
 	searchesLeft := maxSearches - aheadSearches
 	if found.searched && !found.ahead {
@@ -260,41 +275,51 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	}
 	searchesLeft = max(searchesLeft, 0)
 	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut, holderKnown: found.holder != nil}
-	// With no fact by c.knownBound, the model stops and the voice says what
-	// is known (R6), rather than run into the bound.
-	factsCtx, stopFacts := context.WithCancel(ctx)
-	defer stopFacts()
-	var knownCut atomic.Bool
-	knownTimer := time.AfterFunc(c.knownBound-time.Since(start), func() {
-		if sp.count() == 0 {
-			knownCut.Store(true)
-			stopFacts()
+	var err error
+	if !staleSaid {
+		// With no fact by c.knownBound, the model stops and the voice says
+		// what is known (R6), rather than run into the bound.
+		factsCtx, stopFacts := context.WithCancel(ctx)
+		defer stopFacts()
+		var knownCut atomic.Bool
+		knownTimer := time.AfterFunc(c.knownBound-time.Since(start), func() {
+			if sp.count() == 0 {
+				knownCut.Store(true)
+				stopFacts()
+			}
+		})
+		err = c.facts(factsCtx, tools, turn, found, askStarted.Load(), sp)
+		knownTimer.Stop()
+		switch {
+		case parent.Err() != nil:
+			return parent.Err()
+		case knownCut.Load():
+			c.logger.Info("concierge said what it knew: no fact by its mark", "after", c.knownBound)
+			err = nil
+			mode := voice.Fact
+			if found.key == "" {
+				mode = voice.Ack
+			}
+			if sayErr := sp.sayText(parent, found.known(), mode); sayErr != nil {
+				return sayErr
+			}
+		case errors.Is(err, errNoWords) && found.key != "" && sp.count() == 0:
+			// The model said nothing: the voice says what the record holds,
+			// its status (R6), rather than sorry.
+			err = nil
+			if sayErr := sp.sayText(parent, found.known(), voice.Fact); sayErr != nil {
+				return sayErr
+			}
+		case errors.Is(err, errNoWords) && (len(lead) > 0 || holderCase != "" || askStarted.Load()):
+			err = nil
+		case err != nil && ctx.Err() != nil && sp.count() == 0:
+			if !askStarted.Load() {
+				return c.failed(parent, sp, errors.New("concierge: the answer took more than its 8 s"))
+			}
+			err = nil // the question went out: the voice says so below
+		case err != nil:
+			err = c.failed(parent, sp, err)
 		}
-	})
-	err := c.facts(factsCtx, tools, turn, found, askStarted.Load(), sp)
-	knownTimer.Stop()
-	switch {
-	case parent.Err() != nil:
-		return parent.Err()
-	case knownCut.Load():
-		c.logger.Info("concierge said what it knew: no fact by its mark", "after", c.knownBound)
-		err = nil
-		mode := voice.Fact
-		if found.key == "" {
-			mode = voice.Ack
-		}
-		if sayErr := sp.sayText(parent, found.known(), mode); sayErr != nil {
-			return sayErr
-		}
-	case errors.Is(err, errNoWords) && (len(lead) > 0 || holderCase != "" || askStarted.Load()):
-		err = nil
-	case err != nil && ctx.Err() != nil && sp.count() == 0:
-		if !askStarted.Load() {
-			return c.failed(parent, sp, errors.New("concierge: the answer took more than its 8 s"))
-		}
-		err = nil // the question went out: the voice says so below
-	case err != nil:
-		err = c.failed(parent, sp, err)
 	}
 	if holderCase != "" {
 		// R6: after the facts, only when it changes what happens next.
@@ -373,6 +398,17 @@ func (r *reading) known() string {
 	default:
 		return r.key + " is " + strings.ReplaceAll(r.status, "_", " ") + "."
 	}
+}
+
+// agedStatus is the chosen issue's status with the age of its newest event,
+// "ABC-12 was in review as of 2 hours ago.", when the record is stale (R6,
+// R7); "" when it is fresh, or holds no status or event. It begins with the
+// key, so on a searched turn it names the issue (R5).
+func (r *reading) agedStatus(now time.Time) string {
+	if r.key == "" || r.status == "" || r.newest.IsZero() || now.Sub(r.newest) <= staleRecord {
+		return ""
+	}
+	return r.key + " was " + strings.ReplaceAll(r.status, "_", " ") + " as of " + ago(now, r.newest) + "."
 }
 
 // routingLine is the routing line for turn: the issue key it names, when it
@@ -698,7 +734,7 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	}
 	switch {
 	case asking:
-		prompt += "\n\nThe recorder is asking the agent that holds " + found.key + " this question. Say only what the record holds; the agent's answer comes later."
+		prompt += "\n\nThe recorder is asking the agent that holds " + found.key + " this question. Say only what the record holds; the agent's answer comes later. Do not say that the agent is asked: the recorder says it."
 	case saysAsk(turn) && found.key != "":
 		prompt += "\n\nThe recorder cannot ask the agent that holds " + found.key + " now. Say only what the record holds, and ask nobody to change anything."
 	}

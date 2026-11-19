@@ -90,6 +90,7 @@ type Store interface {
 	MarkVoiceTaskSpoken(id string, at time.Time) error
 	CancelWorkingVoiceTasks(sessionID string) (int64, error)
 	CancelWorkingVoiceTasksOfEndedSessions() ([]string, error)
+	CancelAllWorkingVoiceTasks() ([]string, error)
 }
 
 // JoinedAgent is an agent that joined the meeting.
@@ -314,11 +315,11 @@ func (c *Concierge) background(work func(ctx context.Context)) {
 	}()
 }
 
-// Stop ends the Concierge, when the voice is turned off or the unit stops:
-// the goroutine that offers answers, a rewrite of an answer for the ear, and
-// any other background work end, and Stop waits for them. An answer that
-// lands after it is kept in the ledger, for its session's page, and not
-// announced. A second Stop does nothing.
+// Stop ends the Concierge, when the unit stops (VoiceOff, when the voice is
+// turned off): the goroutine that offers answers, a rewrite of an answer for
+// the ear, and any other background work end, and Stop waits for them. An
+// answer that lands after it is kept in the ledger, for its session's page,
+// and not announced. A second Stop does nothing.
 func (c *Concierge) Stop() {
 	c.stopOnce.Do(func() {
 		c.mu.Lock()
@@ -327,6 +328,26 @@ func (c *Concierge) Stop() {
 		<-c.done
 		c.work.Wait()
 	})
+}
+
+// VoiceOff ends the Concierge as Stop does, as the voice is turned off, then
+// cancels every question still working, of a meeting still recording too,
+// and tells each page: no one hears an answer while the voice is off, and a
+// working question's late reply would be offered once it is on again. As
+// after a meeting's end, a late reply still lands in the ledger, for the
+// page. Stop alone, at shutdown, keeps them: the unit's Envoy session is the
+// same after a restart, so a reply can still land.
+func (c *Concierge) VoiceOff() {
+	c.Stop()
+	sessions, err := c.store.CancelAllWorkingVoiceTasks()
+	if err != nil {
+		c.logger.Warn("concierge could not cancel its questions as the voice went off", "error", err)
+		return
+	}
+	for _, id := range sessions {
+		c.logger.Info("concierge cancelled the questions of a session as the voice went off", "session", id)
+		c.tellChanged(id)
+	}
 }
 
 // SetAgents gives the Concierge the unit's Envoy session once it is open.

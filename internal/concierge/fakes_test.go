@@ -250,6 +250,11 @@ func (f *fakeAgents) Lookup(ctx context.Context, id string) (envoy.SessionInfo, 
 	if failing {
 		return envoy.SessionInfo{}, f.lookupErr
 	}
+	// Envoy's registry answers 400 for an id that is no NATS key, as it did
+	// live for "legion-daemon:INFRA".
+	if strings.ContainsAny(id, ": ") || envoy.ValidSessionID(id) != nil {
+		return envoy.SessionInfo{}, &envoy.ListenerError{Path: "/v1/registry/" + id, Status: 400, Message: "invalid key"}
+	}
 	if info, ok := f.states[id]; ok {
 		return info, nil
 	}
