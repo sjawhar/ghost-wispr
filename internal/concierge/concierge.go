@@ -132,18 +132,24 @@ type Concierge struct {
 
 	mu     sync.Mutex
 	agents Agents
-	// lastAsk is the newest task each exchange sent each agent, by exchange
-	// (exchangeKey) and agent session, so a second question replaces the
-	// first (R7).
-	lastAsk map[[2]string]string
+	// lastAsk is the newest question each exchange sent each agent, by
+	// exchange (exchangeKey) and agent session, so a second question
+	// replaces the first, and the same one again sends nothing (R7).
+	lastAsk map[[2]string]sentAsk
+	// unsent is, by exchange and question (askBase), the idempotency key of
+	// a send Envoy did not confirm, which its retry reuses (R7).
+	unsent map[[2]string]string
 	// working lists the unanswered tasks sent to each agent session, so a
 	// message from it that names no question can be met with a request to
 	// reply again.
 	working map[string][]string
 	// askedAgain is, per task, the event of the one request its agent got to
 	// reply again with in_reply_to; againFor leads that event to the task.
+	// againKey is, per task, the idempotency key of a request Envoy did not
+	// confirm, which its retry reuses.
 	askedAgain map[string]string
 	againFor   map[string]string
+	againKey   map[string]string
 	// sentAs leads a sent question's Envoy event to its task's local id
 	// until the task takes the event as its id.
 	sentAs map[string]string
@@ -206,10 +212,12 @@ func New(cfg *Config) (*Concierge, error) {
 		now:          cfg.Now,
 		logger:       cfg.Logger,
 		answers:      make(chan voice.PendingAnswer),
-		lastAsk:      map[[2]string]string{},
+		lastAsk:      map[[2]string]sentAsk{},
+		unsent:       map[[2]string]string{},
 		working:      map[string][]string{},
 		askedAgain:   map[string]string{},
 		againFor:     map[string]string{},
+		againKey:     map[string]string{},
 		sentAs:       map[string]string{},
 		inflight:     map[string]int{},
 		named:        map[string]*named{},
@@ -370,6 +378,11 @@ func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 			delete(c.lastAsk, key)
 		}
 	}
+	for key := range c.unsent {
+		if strings.HasPrefix(key[0], prefix) {
+			delete(c.unsent, key)
+		}
+	}
 	for key := range c.named {
 		if strings.HasPrefix(key, prefix) {
 			delete(c.named, key)
@@ -387,6 +400,12 @@ func (c *Concierge) forgetLocked(sessionID string, deleted bool) {
 			delete(c.working, agent)
 		} else {
 			c.working[agent] = ids
+		}
+	}
+	// An ended meeting's tasks get no request to reply again.
+	for taskID := range c.againKey {
+		if of(taskID) {
+			delete(c.againKey, taskID)
 		}
 	}
 	if !deleted {

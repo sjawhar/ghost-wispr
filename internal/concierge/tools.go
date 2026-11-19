@@ -522,18 +522,32 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	}
 
 	// A new question to the same holder in the same exchange replaces the
-	// older one (R7).
+	// older one; the same question again, while the first waits, is the
+	// first (R7).
 	asker := [2]string{exchangeKey(r.x), session}
+	base := askBase(r.x, session, question)
+	retry := [2]string{asker[0], base}
 	r.c.mu.Lock()
-	supersedes := r.c.lastAsk[asker]
+	last := r.c.lastAsk[asker]
+	key := r.c.unsent[retry]
 	r.c.mu.Unlock()
 	var previous *storage.VoiceTask
-	if supersedes != "" {
-		if task, err := r.c.task(supersedes); err != nil || task.State != storage.VoiceTaskWorking {
-			supersedes = ""
-		} else {
+	if last.task != "" {
+		if task, err := r.c.task(last.task); err == nil && task.State == storage.VoiceTaskWorking {
+			if last.base == base {
+				return map[string]any{"task_id": last.task, "note": "Already asked. The answer comes later, with a chime."}, nil
+			}
 			previous = &task
 		}
+	}
+	supersedes := ""
+	if previous != nil {
+		supersedes = last.event
+	}
+	// A retry of a send Envoy did not confirm reuses its key, so a question
+	// Envoy stored is not stored twice; any other send is a new message.
+	if key == "" {
+		key = uuid.NewString()
 	}
 
 	now := r.c.now()
@@ -570,10 +584,17 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	sent, err := agents.Send(sendCtx, &envoy.SendRequest{
 		Target:         session,
 		Message:        r.c.askMessage(r.x, now, question, issueKey),
-		IdempotencyKey: r.c.askKey(r.x, session, question),
+		IdempotencyKey: key,
 		Supersedes:     supersedes,
 	})
 	cancel()
+	r.c.mu.Lock()
+	if err != nil {
+		r.c.unsent[retry] = key
+	} else {
+		delete(r.c.unsent, retry)
+	}
+	r.c.mu.Unlock()
 	if err != nil {
 		if deleteErr := r.c.store.DeleteVoiceTask(localID); deleteErr != nil {
 			r.c.logger.Warn("concierge could not remove the task of a question it did not send", "task", localID, "error", deleteErr)
@@ -582,20 +603,30 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		r.c.logger.Warn("concierge could not send a question", "session", session, "error", err)
 		return nil, tell(questionNotSent)
 	}
-	taskID := sent.EventID
-	r.c.mu.Lock()
-	r.c.sentAs[taskID] = localID
-	r.c.sessionOf[taskID], r.c.sessionOf[localID] = r.x.SessionID, r.x.SessionID
-	r.c.mu.Unlock()
-	if err := r.c.store.RekeyVoiceTask(localID, taskID); err != nil {
-		// The task keeps its local id; sentAs keeps leading the question's
-		// event to it, for the reply and for task_status.
-		r.c.logger.Warn("concierge could not key a task by its Envoy event", "task", localID, "event", taskID, "error", err)
+	taskID, event := localID, ""
+	if sent.Duplicate {
+		// Envoy already held this question, from a send it did not confirm:
+		// the holder has it under an event the unit never learned, and this
+		// answer's event names no message. The task keeps its local id, and
+		// the holder's reply to that event gets the request to reply again
+		// (Deliver), which names the task.
+		r.c.logger.Info("concierge's question was already with the agent", "task", localID, "session", session)
 	} else {
+		taskID, event = sent.EventID, sent.EventID
 		r.c.mu.Lock()
-		delete(r.c.sentAs, taskID)
-		delete(r.c.sessionOf, localID)
+		r.c.sentAs[taskID] = localID
+		r.c.sessionOf[taskID], r.c.sessionOf[localID] = r.x.SessionID, r.x.SessionID
 		r.c.mu.Unlock()
+		if err := r.c.store.RekeyVoiceTask(localID, taskID); err != nil {
+			// The task keeps its local id; sentAs keeps leading the question's
+			// event to it, for the reply and for task_status.
+			r.c.logger.Warn("concierge could not key a task by its Envoy event", "task", localID, "event", taskID, "error", err)
+		} else {
+			r.c.mu.Lock()
+			delete(r.c.sentAs, taskID)
+			delete(r.c.sessionOf, localID)
+			r.c.mu.Unlock()
+		}
 	}
 	if previous != nil {
 		replaced, err := r.c.store.EndVoiceTask(previous.ID, storage.VoiceTaskReplaced)
@@ -621,7 +652,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		// task stays for a late reply, and the question is cancelled like
 		// the meeting's others.
 	default:
-		r.c.lastAsk[asker] = taskID
+		r.c.lastAsk[asker] = sentAsk{task: taskID, event: event, base: base}
 		r.c.working[session] = append(r.c.working[session], taskID)
 	}
 	r.c.mu.Unlock()
@@ -648,10 +679,13 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 	return result, nil
 }
 
-// askKey is the idempotency key of question to agent session in exchange x:
-// the same question resent in the same exchange, after a send that failed or
-// timed out, is one message to the agent.
-func (c *Concierge) askKey(x *voice.Exchange, session, question string) string {
+// sentAsk is an exchange's newest question to an agent: its task, its Envoy
+// event ("" when Envoy did not name it), and its askBase.
+type sentAsk struct{ task, event, base string }
+
+// askBase names question to agent session in exchange x, so the same
+// question asked again there is known as such.
+func askBase(x *voice.Exchange, session, question string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("ghost-wispr ask "+exchangeKey(x)+" "+session+" "+question)).String()
 }
 

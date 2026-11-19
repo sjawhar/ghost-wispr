@@ -529,7 +529,9 @@ func TestWithoutDispatchHeardReadsNothing(t *testing.T) {
 
 // TestARequestToReplyAgainKeepsItsKey: a request to reply again that may
 // have reached Envoy before its send failed is sent again under the same
-// idempotency key, so the agent gets it once.
+// idempotency key, so the agent gets it once. Envoy then answers that it
+// already held it, under an event the unit never learned: the agent's reply
+// to that event gets a request under a key of its own, whose reply lands.
 func TestARequestToReplyAgainKeepsItsKey(t *testing.T) {
 	r := newRig(t)
 	r.ask(t, "agent-7", "q", "")
@@ -546,10 +548,23 @@ func TestARequestToReplyAgainKeepsItsKey(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(r.agents.sent) != 3 {
-		t.Fatalf("sent %d messages, want the question and the request twice", len(r.agents.sent))
+	if len(r.agents.attempts) != 3 || len(r.agents.sent) != 2 {
+		t.Fatalf("attempts %d, sent %d; want the question and the request tried twice and stored once", len(r.agents.attempts), len(r.agents.sent))
 	}
-	if first, second := r.agents.sent[1].IdempotencyKey, r.agents.sent[2].IdempotencyKey; first == "" || first != second {
+	if first, second := r.agents.attempts[1].IdempotencyKey, r.agents.attempts[2].IdempotencyKey; first == "" || first != second {
 		t.Fatalf("the request's keys = %q and %q, want one key", first, second)
+	}
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "m3", SourceSession: "agent-7", InReplyTo: "evt-2", Text: "pong"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.agents.sent) != 3 || r.agents.sent[2].IdempotencyKey == r.agents.attempts[1].IdempotencyKey {
+		t.Fatalf("sent %+v; want a new request, under a key of its own, after a reply to the request the unit never learned", r.agents.sent)
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Pong."))}}
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "m4", SourceSession: "agent-7", InReplyTo: "evt-3", Text: "pong"}); err != nil {
+		t.Fatal(err)
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskDone {
+		t.Fatalf("the task after the reply to the new request = %+v, want done", task)
 	}
 }

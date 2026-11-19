@@ -139,6 +139,13 @@ type fakeAgents struct {
 	// attempts is every send asked, the failed ones too.
 	attempts []envoy.SendRequest
 	sendErr  error
+	// landedErr, when set, is the answer of a send whose message Envoy
+	// stored all the same.
+	landedErr error
+	// stored holds the idempotency key of each message stored. A send of a
+	// stored key stores nothing and answers Duplicate, with an event id that
+	// names no message, as Envoy does.
+	stored map[string]bool
 	// onSend runs inside Send before it answers, with Send's own context and
 	// the event id it is about to answer.
 	onSend func(ctx context.Context, eventID string) error
@@ -177,10 +184,21 @@ func (f *fakeAgents) Send(ctx context.Context, request *envoy.SendRequest) (envo
 		f.mu.Unlock()
 		return envoy.SendResult{}, f.sendErr
 	}
+	if f.stored[request.IdempotencyKey] {
+		f.mu.Unlock()
+		return envoy.SendResult{EventID: fmt.Sprintf("unstored-%d", len(f.attempts)), RecipientState: envoy.StateLive, State: "connected", Duplicate: true}, nil
+	}
+	if f.stored == nil {
+		f.stored = map[string]bool{}
+	}
+	f.stored[request.IdempotencyKey] = true
 	f.sent = append(f.sent, *request)
 	eventID := fmt.Sprintf("evt-%d", len(f.sent))
-	onSend := f.onSend
+	onSend, landedErr := f.onSend, f.landedErr
 	f.mu.Unlock()
+	if landedErr != nil {
+		return envoy.SendResult{}, landedErr
+	}
 	if onSend != nil {
 		if err := onSend(ctx, eventID); err != nil {
 			return envoy.SendResult{}, err

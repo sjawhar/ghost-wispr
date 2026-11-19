@@ -308,6 +308,74 @@ func TestAskAgentMessage(t *testing.T) {
 	}
 }
 
+// TestARepeatedQuestionKeepsItsAnswer (c-ask-holder, R7): Envoy stores
+// nothing for a key it already holds, and answers with an event id that
+// names no message.
+//   - The same question again in one exchange, while the first waits, sends
+//     nothing and replaces nothing.
+//   - A retry after a send that Envoy stored but did not confirm reuses its
+//     key; its task keeps its local id, and the holder's reply to the event
+//     the unit never learned gets the request to reply again, whose reply
+//     lands on the task.
+//   - A new question after a replace gets a key of its own, so it reaches
+//     the holder.
+func TestARepeatedQuestionKeepsItsAnswer(t *testing.T) {
+	ask := map[string]string{"session": "agent-7", "question": "is the tap merged"}
+	r := newRig(t)
+	r.name(t, "agent-7")
+	first := r.run(t, "ask_agent", ask)
+	again := r.run(t, "ask_agent", ask)
+	if len(r.agents.attempts) != 1 || again["task_id"] != first["task_id"] {
+		t.Fatalf("the same question twice: attempts %d, tasks %v then %v; want one send and one task", len(r.agents.attempts), first["task_id"], again["task_id"])
+	}
+	if task, err := r.store.VoiceTask("evt-1"); err != nil || task.State != storage.VoiceTaskWorking {
+		t.Fatalf("the first task = %+v, %v; want working", task, err)
+	}
+	r.run(t, "ask_agent", map[string]string{"session": "agent-7", "question": "who reviews it"})
+	r.run(t, "ask_agent", ask)
+	asked := 0
+	for _, m := range r.agents.sent {
+		if !m.NoReply && strings.Contains(m.Message, ": is the tap merged\n") {
+			asked++
+		}
+	}
+	if asked != 2 {
+		t.Fatalf("the question reached the holder %d times; want twice, the second after its replace", asked)
+	}
+
+	r = newRig(t)
+	r.name(t, "agent-7")
+	r.agents.landedErr = errors.New("envoy: context deadline exceeded")
+	if result := r.run(t, "ask_agent", ask); result["error"] != questionNotSent {
+		t.Fatalf("control: a send that failed answered %v", result)
+	}
+	r.agents.landedErr = nil
+	result := r.run(t, "ask_agent", ask)
+	if keys := r.agents.attempts; len(keys) != 2 || keys[0].IdempotencyKey != keys[1].IdempotencyKey {
+		t.Fatalf("attempts %+v, want one key reused", keys)
+	}
+	taskID, _ := result["task_id"].(string)
+	if strings.HasPrefix(taskID, "unstored-") || taskID == "" {
+		t.Fatalf("the retry's task is %q, an event Envoy never stored", taskID)
+	}
+	if task, err := r.store.VoiceTask(taskID); err != nil || task.State != storage.VoiceTaskWorking {
+		t.Fatalf("the retry's task = %+v, %v; want working", task, err)
+	}
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-1", SourceSession: "agent-7", InReplyTo: "evt-1", Text: "Yes."}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.agents.sent) != 2 || r.agents.sent[1].InReplyTo != "reply-1" {
+		t.Fatalf("sent %+v; want the request to reply again, in reply to reply-1", r.agents.sent)
+	}
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("Yes."))}}
+	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "reply-2", SourceSession: "agent-7", InReplyTo: "evt-2", Text: "Yes."}); err != nil {
+		t.Fatal(err)
+	}
+	if task, _ := r.store.VoiceTask(taskID); task.State != storage.VoiceTaskDone || task.AnswerWritten != "Yes." {
+		t.Fatalf("the task after the reply = %+v, want done with the answer", task)
+	}
+}
+
 // TestNothingSentToAPersonOrNone (c-ask-holder, R7): with {person} or
 // {none}, the Concierge sends nothing, even on "ask", and answers from the
 // record.

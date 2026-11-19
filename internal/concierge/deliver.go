@@ -57,7 +57,9 @@ func (c *Concierge) Deliver(_ context.Context, message *envoy.Message) error {
 // taskOf finds the task message answers. A reply that names an event the
 // ledger does not hold while a question to its sender is still being sent is
 // errAskStillSending: that event is the question's, which its task takes once
-// the send returns.
+// the send returns. A reply that names an event the unit never learned, such
+// as a question Envoy stored from a send it did not confirm, is met like a
+// message that names nothing.
 func (c *Concierge) taskOf(message *envoy.Message) (storage.VoiceTask, bool, error) {
 	holder := "session:" + message.SourceSession
 	if message.InReplyTo != "" {
@@ -70,6 +72,7 @@ func (c *Concierge) taskOf(message *envoy.Message) (storage.VoiceTask, bool, err
 				return storage.VoiceTask{}, false, errAskStillSending
 			}
 			c.logger.Info("concierge took a reply to no question it holds", "in_reply_to", message.InReplyTo, "from", message.SourceSession)
+			c.askAgain(message)
 			return storage.VoiceTask{}, false, nil
 		}
 		if err != nil {
@@ -112,27 +115,42 @@ func (c *Concierge) askAgain(message *envoy.Message) {
 		if !asked {
 			c.askedAgain[task.ID] = ""
 		}
+		// A request Envoy did not confirm is sent again under its key, so
+		// the agent gets it once; any other request is a new message.
+		key := c.againKey[task.ID]
 		c.mu.Unlock()
 		if asked {
 			continue
 		}
-		// The key is the task's: a request that reached Envoy before its
-		// send failed is not sent twice.
+		if key == "" {
+			key = uuid.NewString()
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 		sent, err := agents.Send(ctx, &envoy.SendRequest{
 			Target:         message.SourceSession,
 			Message:        c.askAgainMessage(&task),
-			IdempotencyKey: uuid.NewSHA1(uuid.NameSpaceOID, []byte("ghost-wispr ask again "+task.ID)).String(),
+			IdempotencyKey: key,
 			InReplyTo:      message.EventID,
 		})
 		cancel()
 		c.mu.Lock()
 		_, deleted := c.closedLocked(task.SessionID)
 		switch {
-		case err != nil || deleted:
+		case err != nil && !deleted:
+			delete(c.askedAgain, task.ID)
+			c.againKey[task.ID] = key
+		case err != nil, deleted:
 			// A deleted meeting's request adds nothing back.
 			delete(c.askedAgain, task.ID)
+			delete(c.againKey, task.ID)
+		case sent.Duplicate:
+			// Envoy already held the request, under an event the unit never
+			// learned: the agent's reply to it gets a new request, under a
+			// key of its own.
+			delete(c.askedAgain, task.ID)
+			delete(c.againKey, task.ID)
 		default:
+			delete(c.againKey, task.ID)
 			c.askedAgain[task.ID] = sent.EventID
 			c.againFor[sent.EventID] = task.ID
 		}
@@ -141,7 +159,7 @@ func (c *Concierge) askAgain(message *envoy.Message) {
 			c.logger.Warn("concierge could not ask an agent to reply with in_reply_to", "task", task.ID, "error", err)
 			continue
 		}
-		c.logger.Info("concierge asked an agent to reply with in_reply_to", "task", task.ID, "request", sent.EventID)
+		c.logger.Info("concierge asked an agent to reply with in_reply_to", "task", task.ID, "request", sent.EventID, "duplicate", sent.Duplicate)
 	}
 }
 
@@ -152,7 +170,7 @@ func (c *Concierge) askAgainMessage(task *storage.VoiceTask) string {
 	if task.IssueKey != "" {
 		about = "my question about " + task.IssueKey
 	}
-	return "Ghost Wispr here. Your message has no in_reply_to, so I cannot tell which of my questions it answers, and nobody in the room heard it. " +
+	return "Ghost Wispr here. I cannot tell which of my questions your message answers, so nobody in the room heard it. " +
 		"If it answers " + about + " (asked " + task.AskedAt.UTC().Format("15:04:05") + " UTC), reply to this message (envoy_send with in_reply_to) with that answer, in three sentences or fewer. Your reply is read aloud in the room."
 }
 
@@ -170,6 +188,7 @@ func (c *Concierge) forget(agent string, ids ...string) {
 			delete(c.againFor, request)
 			delete(c.askedAgain, id)
 		}
+		delete(c.againKey, id)
 	}
 }
 
