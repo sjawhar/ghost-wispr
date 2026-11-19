@@ -115,6 +115,7 @@ type Config struct {
 	GenAIBackend                  string             `yaml:"genai_backend"`
 	GDriveSyncEnabled             bool               `yaml:"gdrive_sync_enabled"`
 	EnvoyEnabled                  bool               `yaml:"envoy_enabled"`
+	EnvoyHubURL                   string             `yaml:"envoy_hub_url"`
 	EnvoyWebhookURL               string             `yaml:"envoy_webhook_url"`
 	EnvoyWebhookSecretName        string             `yaml:"envoy_webhook_secret_name"`
 	GCEnabled                     bool               `yaml:"gc_enabled"`
@@ -406,6 +407,9 @@ func applyEnvOverrides(cfg *Config) []string {
 	if v := os.Getenv(EnvPrefix + "ENVOY_ENABLED"); v != "" {
 		cfg.EnvoyEnabled = strings.EqualFold(v, "true") || v == "1"
 	}
+	if v := os.Getenv(EnvPrefix + "ENVOY_HUB_URL"); v != "" {
+		cfg.EnvoyHubURL = strings.TrimSpace(v)
+	}
 	if v := os.Getenv(EnvPrefix + "ENVOY_WEBHOOK_URL"); v != "" {
 		cfg.EnvoyWebhookURL = strings.TrimSpace(v)
 	}
@@ -628,12 +632,18 @@ func validate(cfg *Config, hasExternalAccount bool) []string {
 	if cfg.BatchTranscription.Provider == "" {
 		cfg.BatchTranscription.Provider = "deepgram"
 	}
+	cfg.EnvoyHubURL = strings.TrimSpace(cfg.EnvoyHubURL)
 	cfg.EnvoyWebhookSecretName = strings.TrimSpace(cfg.EnvoyWebhookSecretName)
-	if cfg.EnvoyEnabled {
+	if cfg.EnvoyEnabled && cfg.EnvoyHubURL != "" {
+		parsedURL, err := url.Parse(cfg.EnvoyHubURL)
+		if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+			warnings = append(warnings, "Envoy hub URL must be an absolute URL.")
+		}
+	} else if cfg.EnvoyEnabled {
 		webhookURL := strings.TrimSpace(cfg.EnvoyWebhookURL)
 		switch webhookURL {
 		case "":
-			warnings = append(warnings, "Envoy enabled but webhook URL not configured — set "+EnvPrefix+"ENVOY_WEBHOOK_URL or disable Envoy publishing.")
+			warnings = append(warnings, "Envoy enabled but neither hub URL nor webhook URL is configured — set "+EnvPrefix+"ENVOY_HUB_URL or the transitional "+EnvPrefix+"ENVOY_WEBHOOK_URL, or disable Envoy publishing.")
 		default:
 			parsedURL, err := url.Parse(webhookURL)
 			if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" {

@@ -36,7 +36,8 @@ type envoyPublishing struct {
 	// openSecrets opens Secret Manager with the unit's Google credential.
 	openSecrets func(context.Context, *config.Config) (*secrets.Reader, error)
 
-	current atomic.Pointer[envoy.Publisher]
+	current    atomic.Pointer[envoy.Publisher]
+	currentHub atomic.Pointer[envoy.HubPublisher]
 }
 
 // openSecretManager opens Secret Manager with the Google credential Drive and
@@ -53,6 +54,19 @@ func openSecretManager(ctx context.Context, cfg *config.Config) (*secrets.Reader
 // with no webhook URL, or no signing key secret to read, sends nothing; the
 // startup warning names the missing setting.
 func (e *envoyPublishing) configure(ctx context.Context, cfg *config.Config, logger *slog.Logger) {
+	if cfg.EnvoyEnabled && strings.TrimSpace(cfg.EnvoyHubURL) != "" {
+		pub, err := envoy.NewHubPublisher(cfg.EnvoyHubURL, e.store, envoy.WithLogger(logger), envoy.WithPublicURL(cfg.PublicURL))
+		if err != nil {
+			e.warnings.Set(envoyWarningKey, fmt.Sprintf("Envoy events are not sent: %v", err))
+			e.set(nil)
+			return
+		}
+		e.warnings.Clear(envoyWarningKey)
+		e.setHub(pub)
+		log.Printf("envoy hub publishing enabled")
+		go e.sweepHubWith(ctx, pub)
+		return
+	}
 	if !cfg.EnvoyEnabled || strings.TrimSpace(cfg.EnvoyWebhookURL) == "" || strings.TrimSpace(cfg.EnvoyWebhookSecretName) == "" {
 		e.warnings.Clear(envoyWarningKey)
 		e.set(nil)
@@ -93,6 +107,7 @@ func (e *envoyPublishing) reportKey(pub *envoy.Publisher, name string, err error
 }
 
 func (e *envoyPublishing) set(pub *envoy.Publisher) {
+	e.currentHub.Store(nil)
 	e.current.Store(pub)
 	if pub == nil {
 		// A nil *Publisher in the interface would not compare equal to nil.
@@ -102,11 +117,21 @@ func (e *envoyPublishing) set(pub *envoy.Publisher) {
 	e.manager.SetEventPublisher(pub)
 }
 
+func (e *envoyPublishing) setHub(pub *envoy.HubPublisher) {
+	e.current.Store(nil)
+	e.currentHub.Store(pub)
+	e.manager.SetEventPublisher(pub)
+}
+
 // sweep reads the signing key again while its last read failed, so
 // /api/status shows within one sweep whether it reads, and then sends what
 // Envoy has not received: lifecycle events and completed summaries, from
 // before an outage or a key that could not be read.
 func (e *envoyPublishing) sweep(ctx context.Context) {
+	if pub := e.currentHub.Load(); pub != nil {
+		e.sweepHubWith(ctx, pub)
+		return
+	}
 	if pub := e.current.Load(); pub != nil {
 		e.sweepWith(ctx, pub)
 	}
@@ -131,8 +156,32 @@ func (e *envoyPublishing) sweepWith(ctx context.Context, pub *envoy.Publisher) {
 	}
 }
 
+func (e *envoyPublishing) sweepHubWith(ctx context.Context, pub *envoy.HubPublisher) {
+	if err := pub.PublishPendingLifecycleEvents(ctx); err != nil {
+		log.Printf("envoy lifecycle sweep error: %v", err)
+	}
+	ids, err := e.store.GetSessionsNeedingEnvoyPublish()
+	if err != nil {
+		log.Printf("envoy sweep error: %v", err)
+		return
+	}
+	for _, id := range ids {
+		if err := pub.PublishSummaryReady(ctx, id); err != nil {
+			log.Printf("envoy sweep: session %s: %v", id, err)
+		}
+	}
+}
+
 // publishSummaryReady sends a session's summary_ready in the background.
 func (e *envoyPublishing) publishSummaryReady(sessionID string) {
+	if pub := e.currentHub.Load(); pub != nil {
+		go func() {
+			if err := pub.PublishSummaryReady(context.Background(), sessionID); err != nil {
+				log.Printf("warning: envoy publish failed for %s: %v", sessionID, err)
+			}
+		}()
+		return
+	}
 	pub := e.current.Load()
 	if pub == nil {
 		return
@@ -147,11 +196,24 @@ func (e *envoyPublishing) publishSummaryReady(sessionID string) {
 // publishRecoveredEnds sends session_ended, in the background, for sessions a
 // restart found still active and ended.
 func (e *envoyPublishing) publishRecoveredEnds(ids []string) {
-	pub := e.current.Load()
-	if pub == nil || len(ids) == 0 {
+	if len(ids) == 0 {
 		return
 	}
 	ids = slices.Clone(ids)
+	if pub := e.currentHub.Load(); pub != nil {
+		go func() {
+			for _, sessionID := range ids {
+				if err := pub.PublishSessionEnded(context.Background(), sessionID); err != nil {
+					log.Printf("warning: failed to publish recovered session end for %s: %v", sessionID, err)
+				}
+			}
+		}()
+		return
+	}
+	pub := e.current.Load()
+	if pub == nil {
+		return
+	}
 	go func() {
 		for _, sessionID := range ids {
 			if err := pub.PublishSessionEnded(context.Background(), sessionID); err != nil {

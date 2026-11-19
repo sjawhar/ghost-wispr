@@ -207,6 +207,30 @@ func TestEnvoyEventsAreSignedWithTheKeyInSecretManager(t *testing.T) {
 	}
 }
 
+// TestEnvoyHubConfigSelectsTheCredentialFreePublisher fails if a recorder
+// configured for the tailnet hub falls back to the webhook and its signing
+// key instead of publishing directly on NATS.
+func TestEnvoyHubConfigSelectsTheCredentialFreePublisher(t *testing.T) {
+	publishing, warnings := testEnvoyPublishing(t, fakeSecretManager(t, "unused", http.StatusOK, false))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	publishing.configure(ctx, &config.Config{
+		EnvoyEnabled: true,
+		EnvoyHubURL:  "http://hub.example.test:9020",
+	}, discardLogger)
+
+	if publishing.currentHub.Load() == nil {
+		t.Fatal("hub configuration built no hub publisher")
+	}
+	if publishing.current.Load() != nil {
+		t.Fatal("hub configuration retained the webhook publisher")
+	}
+	if got := warnings.List(); len(got) != 0 {
+		t.Fatalf("warnings = %q, want none", got)
+	}
+}
+
 // TestASweepDuringAPublishSendsTheEventOnce fails if a session_started that a
 // sweep posts while the direct publish of it is still posting reaches Envoy as
 // two events. The event stays pending until its post returns, so a sweep in

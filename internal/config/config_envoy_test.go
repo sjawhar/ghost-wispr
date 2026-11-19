@@ -54,6 +54,26 @@ func TestEnvoySigningKeySecretIsNamedNotHeld(t *testing.T) {
 	}
 }
 
+// TestEnvoyHubURLNeedsNoWebhookSecret fails if a recorder configured to
+// publish on the tailnet hub still requires the public webhook's URL or its
+// signing key secret.
+func TestEnvoyHubURLNeedsNoWebhookSecret(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvPrefix+"ENVOY_ENABLED", "true")
+	t.Setenv(EnvPrefix+"ENVOY_HUB_URL", " http://hub.example.test:9020 ")
+
+	cfg, warnings, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.EnvoyHubURL != "http://hub.example.test:9020" {
+		t.Fatalf("hub URL = %q, want trimmed environment value", cfg.EnvoyHubURL)
+	}
+	if text := strings.Join(warnings, "\n"); strings.Contains(text, "Envoy") || strings.Contains(text, "ENVOY") {
+		t.Fatalf("warnings = %q, want no Envoy warning for a hub URL", warnings)
+	}
+}
+
 // TestALeftoverSigningKeyWarns fails if a signing key an earlier provisioner
 // put in the environment or in .env is taken, or left there unmentioned.
 func TestALeftoverSigningKeyWarns(t *testing.T) {

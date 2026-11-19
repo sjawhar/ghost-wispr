@@ -60,9 +60,18 @@ const keyReadTimeout = 30 * time.Second
 type Option func(*options)
 
 type options struct {
-	logger    *slog.Logger
-	publicURL string
-	keyStatus func(error)
+	logger     *slog.Logger
+	publicURL  string
+	keyStatus  func(error)
+	httpClient *http.Client
+}
+
+// WithHTTPClient sets the HTTP client a hub publisher calls the listener
+// with; nil keeps the default, with a 10 s timeout.
+func WithHTTPClient(client *http.Client) Option {
+	return func(o *options) {
+		o.httpClient = client
+	}
 }
 
 // WithKeyStatus calls report after every read of the signing key, with nil
