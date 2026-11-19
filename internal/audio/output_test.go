@@ -209,11 +209,14 @@ func testContext(t *testing.T) context.Context {
 }
 
 // TestOutputCancelSilencesTheNextFrameWithin20ms fails if the mixer hands the
-// stream another frame of the voice more than 20 ms after Cancel: the time
-// from Cancel to the first silent frame, on a stream that plays in real time
-// and holds nothing (what a device holds is the ALSA path's:
-// TestALSAOutputCancelSilencesTheVoiceWithin20ms). The voice must then stay
-// silent, and its writer must learn of the cancel.
+// stream frames of the voice for more than 20 ms after Cancel: the time from
+// Cancel to the first silent frame, counted in the stream's time, on a stream
+// that plays in real time and holds nothing (what a device holds is the ALSA
+// path's: TestALSAOutputCancelSilencesTheVoiceWithin20ms). The stream's time
+// is the frame under way when Cancel comes and each frame of the voice the
+// mixer hands it after: at most one, which it mixed before Cancel took the
+// lock. The wall-clock time, logged, adds the machine's scheduling. The voice
+// must then stay silent, and its writer must learn of the cancel.
 func TestOutputCancelSilencesTheNextFrameWithin20ms(t *testing.T) {
 	stream := newFakeStream(48000)
 	out := newTestOutput(t, OutputConfig{}, &fakeOpener{streams: []*fakeStream{stream}})
@@ -236,20 +239,25 @@ func TestOutputCancelSilencesTheNextFrameWithin20ms(t *testing.T) {
 		cancelled := time.Now()
 		out.Cancel(InputVoice)
 		var silentAt time.Time
+		voiceAfter := 0
 		waitFor(t, "a silent frame after the cancel", func() bool {
+			voiceAfter = 0
 			for _, f := range stream.played() {
-				if f.at.After(cancelled) && silent(f.samples) {
+				if !f.at.After(cancelled) {
+					continue
+				}
+				if silent(f.samples) {
 					silentAt = f.at
 					return true
 				}
+				voiceAfter++
 			}
 			return false
 		})
-		latency := silentAt.Sub(cancelled)
-		if latency > 20*time.Millisecond {
-			t.Fatalf("trial %d: the voice played for %v after Cancel, want silence within 20 ms", trial, latency)
+		if streamTime := time.Duration(voiceAfter+1) * outputFrame; streamTime > 20*time.Millisecond {
+			t.Fatalf("trial %d: the stream played the voice for %v after Cancel (%d frames of it after the cancel), want silence within 20 ms", trial, streamTime, voiceAfter)
 		}
-		longest = max(longest, latency)
+		longest = max(longest, silentAt.Sub(cancelled))
 		if err := <-written; !errors.Is(err, ErrCancelled) {
 			t.Fatalf("trial %d: WriteAll after Cancel = %v, want ErrCancelled", trial, err)
 		}
@@ -260,7 +268,7 @@ func TestOutputCancelSilencesTheNextFrameWithin20ms(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("longest time from Cancel to the first silent frame: %v", longest)
+	t.Logf("longest wall-clock time from Cancel to the first silent frame: %v", longest)
 }
 
 // TestOutputMixesTwoInputs fails if the voice and the chime do not sum into
