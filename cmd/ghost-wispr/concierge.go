@@ -21,7 +21,7 @@ import (
 // startConcierge builds the voice's Concierge (newConcierge) and, in the
 // background, the unit's Envoy session for asking an issue's agent. With no
 // Envoy the Concierge answers from the record alone until the session opens.
-// stop closes the Envoy session.
+// stop closes the Envoy session and stops the Concierge.
 func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLiteStore, logger *slog.Logger, changed func(sessionID string)) (*concierge.Concierge, func(), error) {
 	c, err := newConcierge(ctx, cfg, store, logger, changed)
 	if err != nil {
@@ -29,14 +29,16 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 	}
 	if cfg.Concierge.EnvoyURL == "" {
 		logger.Warn("concierge: no concierge.envoy_url; the voice cannot ask an issue's agent")
-		return c, func() {}, nil
+		return c, c.Stop, nil
 	}
 	listener, err := envoy.NewListener(cfg.Concierge.EnvoyURL, newEnvoyHTTP(logger))
 	if err != nil {
+		c.Stop()
 		return nil, nil, fmt.Errorf("concierge: %w", err)
 	}
 	state, err := concierge.LoadEnvoyState(store)
 	if err != nil {
+		c.Stop()
 		return nil, nil, fmt.Errorf("concierge: the Envoy session's state: %w", err)
 	}
 	sessions := make(chan envoySession, 1)
@@ -81,6 +83,7 @@ func startConcierge(ctx context.Context, cfg *config.Config, store *storage.SQLi
 				logger.Warn("concierge: close the Envoy session", "error", err)
 			}
 		}
+		c.Stop()
 	}
 	return c, stop, nil
 }

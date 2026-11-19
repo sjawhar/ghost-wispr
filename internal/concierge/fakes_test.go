@@ -295,6 +295,8 @@ type scriptedModel struct {
 	requests [][]*genai.Content
 	configs  []*genai.GenerateContentConfig
 	models   []string
+	// ctxs are the calls' contexts.
+	ctxs []context.Context
 	// onCall runs at the start of each call, numbered from 0.
 	onCall func(call int)
 	// block, when set, holds every call until it is closed or the call's
@@ -308,6 +310,7 @@ func (m *scriptedModel) GenerateContentStream(ctx context.Context, model string,
 	m.requests = append(m.requests, append([]*genai.Content(nil), contents...))
 	m.configs = append(m.configs, config)
 	m.models = append(m.models, model)
+	m.ctxs = append(m.ctxs, ctx)
 	var chunks []*genai.GenerateContentResponse
 	if call < len(m.turns) {
 		chunks = m.turns[call]

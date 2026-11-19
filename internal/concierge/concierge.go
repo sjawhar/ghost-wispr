@@ -89,6 +89,7 @@ type Store interface {
 	EndVoiceTask(id string, state storage.VoiceTaskState) (bool, error)
 	MarkVoiceTaskSpoken(id string, at time.Time) error
 	CancelWorkingVoiceTasks(sessionID string) (int64, error)
+	CancelWorkingVoiceTasksOfEndedSessions() ([]string, error)
 }
 
 // JoinedAgent is an agent that joined the meeting.
@@ -132,6 +133,15 @@ type Concierge struct {
 	now       func() time.Time
 	logger    *slog.Logger
 	answers   chan voice.PendingAnswer
+	// life ends with Stop (stop): its background work, the rewrite of an
+	// answer for the ear, the read of the projects and the sends after a
+	// reply, runs under it, and work counts it. done closes when the
+	// goroutine that offers answers ends.
+	life     context.Context
+	stop     context.CancelFunc
+	work     sync.WaitGroup
+	done     chan struct{}
+	stopOnce sync.Once
 
 	mu     sync.Mutex
 	agents Agents
@@ -232,6 +242,7 @@ func New(cfg *Config) (*Concierge, error) {
 		now:          cfg.Now,
 		logger:       cfg.Logger,
 		answers:      make(chan voice.PendingAnswer),
+		done:         make(chan struct{}),
 		lastAsk:      map[[2]string]sentAsk{},
 		unsent:       map[[2]string]unsentAsk{},
 		working:      map[string][]string{},
@@ -264,14 +275,58 @@ func New(cfg *Config) (*Concierge, error) {
 	if c.logger == nil {
 		c.logger = slog.Default()
 	}
-	go c.offerAnswers()
+	c.life, c.stop = context.WithCancel(context.Background())
+	// A meeting that ended while no Concierge ran (the voice was off) was
+	// told nothing: its working questions are cancelled now, as its end
+	// would have, and its page told.
+	if ended, err := c.store.CancelWorkingVoiceTasksOfEndedSessions(); err != nil {
+		c.logger.Warn("concierge could not cancel the questions of meetings that ended while it was off", "error", err)
+	} else {
+		for _, id := range ended {
+			c.tellChanged(id)
+		}
+	}
+	go func() {
+		defer close(c.done)
+		c.offerAnswers()
+	}()
 	if c.records != nil {
 		// The project list is read at once, so the first question's keys
 		// are known (isProject).
 		c.startProjectsReadLocked()
-		go c.readProjects(context.Background())
+		c.background(func(ctx context.Context) { c.readProjects(ctx) })
 	}
 	return c, nil
+}
+
+// background runs work under the Concierge's life, which Stop ends and
+// waits for. After Stop it runs nothing.
+func (c *Concierge) background(work func(ctx context.Context)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.life.Err() != nil {
+		return
+	}
+	c.work.Add(1)
+	go func() {
+		defer c.work.Done()
+		work(c.life)
+	}()
+}
+
+// Stop ends the Concierge, when the voice is turned off or the unit stops:
+// the goroutine that offers answers, a rewrite of an answer for the ear, and
+// any other background work end, and Stop waits for them. An answer that
+// lands after it is kept in the ledger, for its session's page, and not
+// announced. A second Stop does nothing.
+func (c *Concierge) Stop() {
+	c.stopOnce.Do(func() {
+		c.mu.Lock()
+		c.stop()
+		c.mu.Unlock()
+		<-c.done
+		c.work.Wait()
+	})
 }
 
 // SetAgents gives the Concierge the unit's Envoy session once it is open.
@@ -296,13 +351,17 @@ func (c *Concierge) Answers() <-chan voice.PendingAnswer { return c.answers }
 // offerAnswers hands queued announcements to Answers as the Supervisor reads
 // them. It drops one whose task is gone, which it checks before the hand-over
 // and every offerRecheck while it waits, and one SessionEnded or
-// SessionDeleted withdraws.
+// SessionDeleted withdraws. It ends with the Concierge's life (Stop).
 func (c *Concierge) offerAnswers() {
 	for {
 		c.mu.Lock()
 		for len(c.queue) == 0 {
 			c.mu.Unlock()
-			<-c.queued
+			select {
+			case <-c.queued:
+			case <-c.life.Done():
+				return
+			}
 			c.mu.Lock()
 		}
 		next := c.queue[0]
@@ -311,7 +370,7 @@ func (c *Concierge) offerAnswers() {
 		c.offering, c.offerDrop, c.offerDone = &next, drop, done
 		c.mu.Unlock()
 	offer:
-		for c.stillOwed(&next) {
+		for c.life.Err() == nil && c.stillOwed(&next) {
 			select {
 			case <-drop:
 				break offer
@@ -321,6 +380,8 @@ func (c *Concierge) offerAnswers() {
 			case c.answers <- next:
 				break offer
 			case <-drop:
+				break offer
+			case <-c.life.Done():
 				break offer
 			case <-time.After(offerRecheck):
 			}
@@ -515,7 +576,7 @@ func (c *Concierge) isProject(ctx context.Context, project string, wait bool) bo
 	case refresh && wait:
 		known = c.readProjects(ctx)
 	case refresh:
-		go c.readProjects(context.WithoutCancel(ctx))
+		c.background(func(life context.Context) { c.readProjects(life) })
 	case wait && stale && running != nil:
 		// A read Heard started is waited for no longer than a read's bound.
 		select {
