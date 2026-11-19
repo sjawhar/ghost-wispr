@@ -1885,7 +1885,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Log structured startup banner.
 	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)
-	slog.Info("deepgram API key", "status", config.MaskAPIKey(cfg.DeepgramAPIKey))
+	slog.Info("deepgram API key", "status", config.APIKeyStatus(cfg.DeepgramAPIKey))
 	uiAddr := addr
 	if strings.HasPrefix(uiAddr, ":") {
 		uiAddr = "127.0.0.1" + uiAddr
