@@ -2,6 +2,8 @@ package concierge
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -83,4 +85,64 @@ func TestANewConciergeCancelsTheQuestionsOfEndedMeetings(t *testing.T) {
 	if len(changed) != 1 || changed[0] != "meeting-1" {
 		t.Fatalf("pages told = %q, want meeting-1", changed)
 	}
+}
+
+// TestTurningTheVoiceOffCancelsItsQuestions (PR #89's review, round 4):
+// turning the voice off cancels every question still working, in a meeting
+// still recording too, and tells each page; else a late reply plays the
+// answer sound once the voice is back on. As after a meeting's end, the late
+// reply still lands in the ledger, for the page, and is not announced. A stop
+// alone, at shutdown, keeps them: the unit's Envoy session survives a
+// restart, and the reply lands then.
+func TestTurningTheVoiceOffCancelsItsQuestions(t *testing.T) {
+	r := newRig(t)
+	r.ask(t, "agent-7", "is the tap merged", "ABC-12")
+	r.concierge.Stop()
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskWorking {
+		t.Fatalf("a stop at shutdown: the question = %+v, want working", task)
+	}
+
+	r = newRig(t)
+	var mu sync.Mutex
+	var told []string
+	r.concierge.changed = func(sessionID string) {
+		mu.Lock()
+		defer mu.Unlock()
+		told = append(told, sessionID)
+	}
+	r.ask(t, "agent-7", "is the tap merged", "ABC-12")
+	mu.Lock()
+	told = nil
+	mu.Unlock()
+	r.concierge.VoiceOff()
+	select {
+	case <-r.concierge.done:
+	default:
+		t.Fatal("VoiceOff did not stop the Concierge")
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskCancelled {
+		t.Fatalf("the question after the voice went off = %+v, want cancelled", task)
+	}
+	mu.Lock()
+	pages := slices.Clone(told)
+	mu.Unlock()
+	if !slices.Equal(pages, []string{"meeting-1"}) {
+		t.Fatalf("pages told = %q, want meeting-1", pages)
+	}
+
+	// The voice is on again: a new Concierge on the same ledger.
+	next, err := New(&Config{Generator: r.model, Store: r.store, Now: r.concierge.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(next.Stop)
+	next.SetAgents(r.agents)
+	r.concierge = next
+	if err := next.Deliver(context.Background(), &envoy.Message{EventID: "late", SourceSession: "agent-7", InReplyTo: "evt-1", Text: "Merged."}); err != nil {
+		t.Fatal(err)
+	}
+	if task, _ := r.store.VoiceTask("evt-1"); task.State != storage.VoiceTaskCancelled || task.AnswerWritten != "Merged." {
+		t.Fatalf("the late reply = %+v, want it kept and the question cancelled", task)
+	}
+	noAnnouncement(t, r, 400*time.Millisecond, "a reply to a question asked before the voice went off")
 }

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -48,5 +49,35 @@ func TestCancelWorkingVoiceTasksOfEndedSessions(t *testing.T) {
 	}
 	if again, err := store.CancelWorkingVoiceTasksOfEndedSessions(); err != nil || len(again) != 0 {
 		t.Fatalf("a second pass = %q, %v; want none", again, err)
+	}
+}
+
+// TestCancelAllWorkingVoiceTasks: every working question, of any session, is
+// cancelled, and its sessions named in order; an answered one stays done.
+func TestCancelAllWorkingVoiceTasks(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	at := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
+	for _, id := range []string{"a", "b"} {
+		if err := store.CreateSession(id, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, task := range []VoiceTask{{ID: "a1", SessionID: "a", Holder: "session:agent-7"}, {ID: "b1", SessionID: "b"}, {ID: "b2", SessionID: "b"}} {
+		task.AskedAt = at
+		if err := store.CreateVoiceTask(&task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.AnswerVoiceTask("b2", "Done."); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.CancelAllWorkingVoiceTasks()
+	if err != nil || !slices.Equal(sessions, []string{"a", "b"}) {
+		t.Fatalf("sessions = %q, %v; want a and b", sessions, err)
+	}
+	for id, want := range map[string]VoiceTaskState{"a1": VoiceTaskCancelled, "b1": VoiceTaskCancelled, "b2": VoiceTaskDone} {
+		if task, err := store.VoiceTask(id); err != nil || task.State != want {
+			t.Errorf("%s = %+v, %v; want %s", id, task, err, want)
+		}
 	}
 }

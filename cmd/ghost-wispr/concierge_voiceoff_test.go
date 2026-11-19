@@ -8,6 +8,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/concierge"
 	"github.com/sjawhar/ghost-wispr/internal/config"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
 )
 
 // countingLazyConcierge is a lazy Concierge over the real startConcierge that
@@ -79,6 +80,41 @@ func TestTheConciergeStopsWhenTheVoiceIsTurnedOff(t *testing.T) {
 	lazy.followEnabled(false)
 	if _, stops := counts(); stops != 2 {
 		t.Fatalf("stopped %d times after two turns off, want twice", stops)
+	}
+}
+
+// TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps fails if a
+// turn-off leaves a question of a meeting still recording working (PR #89's
+// review, round 4: its late reply would play the answer sound once the voice
+// is on again), or if a shutdown cancels it (the unit's Envoy session is the
+// same after a restart, so its reply can still land).
+func TestTurningTheVoiceOffCancelsTheQuestionsAShutdownKeeps(t *testing.T) {
+	cfg := config.Config{GenAIBackend: "gemini", GeminiAPIKey: strings.Repeat("k", 8)}
+	store := conciergeStore(t)
+	at := time.Now()
+	if err := store.CreateSession("meeting", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateVoiceTask(&storage.VoiceTask{ID: "q1", SessionID: "meeting", AskedAt: at, Holder: "session:agent-7"}); err != nil {
+		t.Fatal(err)
+	}
+	newLazy := func() *lazyConcierge {
+		lazy := newLazyConcierge(func() (*concierge.Concierge, func(), error) {
+			return startConcierge(t.Context(), &cfg, store, discardLogger, nil)
+		}, nil, discardLogger)
+		t.Cleanup(lazy.Stop)
+		if _, err := lazy.start(); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		return lazy
+	}
+	newLazy().Stop()
+	if task, err := store.VoiceTask("q1"); err != nil || task.State != storage.VoiceTaskWorking {
+		t.Fatalf("after a shutdown the question = %+v, %v; want working", task, err)
+	}
+	newLazy().followEnabled(false)
+	if task, err := store.VoiceTask("q1"); err != nil || task.State != storage.VoiceTaskCancelled {
+		t.Fatalf("after the voice went off the question = %+v, %v; want cancelled", task, err)
 	}
 }
 
