@@ -36,7 +36,9 @@ jobs:
 
       # The same apt package cache as CI's Go job (ci.yml), which says why; copied, since the pin
       # test (deploy/pi/workflow_pins_test.sh) admits no local composite action. This install
-      # timed out six times on 2026-11-11.
+      # timed out six times on 2026-11-11. This runner image gets packages from ports.ubuntu.com
+      # alone, with no mirror to fail over to, and keeps apt's 3 retries of 30 s: 5 retries give a
+      # host that answers 503 for a while 31 s of growing pauses to recover, not 7 s.
       - name: Name the apt package cache
         id: apt-key
         run: |
@@ -60,7 +62,8 @@ jobs:
           archives="$HOME/apt-archives"
           mkdir -p "$archives/partial"
           sudo chmod o+x "$HOME" # so apt's _apt user reaches the directory, and downloads stay sandboxed
-          apt_get=(sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives="$archives")
+          apt_get=(sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives="$archives"
+            -o Acquire::Retries=5)
           "${apt_get[@]}" update
           "${apt_get[@]}" install -y --no-install-recommends ffmpeg portaudio19-dev
           installed=$(dpkg-query -W -f='${Package}_${Version}\n' | sed 's/:/%3a/g')
