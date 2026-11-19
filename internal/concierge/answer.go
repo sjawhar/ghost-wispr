@@ -223,11 +223,11 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		c.offerPick(x, turn, found.candidates)
 		return sp.sayText(ctx, didYouMean(found.candidates), voice.Ack)
 	}
-	// R6: the issue a search chose, then the facts. The line is an Ack: it
-	// names the issue and holds no fact of it.
+	// R6: the issue a search chose, then the facts. The line is a Lead: it
+	// always leads, and names the issue with no fact of it to time.
 	lead := found.lead()
 	for _, line := range lead {
-		if err := sp.sayText(ctx, line, voice.Ack); err != nil {
+		if err := sp.sayText(ctx, line, voice.Lead); err != nil {
 			return err
 		}
 	}

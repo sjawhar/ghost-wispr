@@ -780,8 +780,8 @@ func TestASearchedTurnSaysWhatIsKnownAtTheMark(t *testing.T) {
 	r.model.block = make(chan struct{})
 	defer close(r.model.block)
 	spoken := answerTurn(t, r, "what is happening with the realtime voice")
-	if len(spoken) != 2 || spoken[0].mode != voice.Ack || spoken[1].text != "ABC-12 is in progress." {
-		t.Fatalf("spoken = %+v, want the issue (an Ack), then what is known", spoken)
+	if len(spoken) != 2 || spoken[0].mode != voice.Lead || spoken[1].text != "ABC-12 is in progress." {
+		t.Fatalf("spoken = %+v, want the issue (voice.Lead: it always leads, holds no fact), then what is known", spoken)
 	}
 }
 
