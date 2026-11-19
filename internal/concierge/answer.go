@@ -673,7 +673,7 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 		// One clear match (R5): the voice said the issue it took, and the
 		// model answers from its record rather than search again.
 		prompt += "\n\nThe record of " + found.key + ", the issue a search of the question's words chose, read while it was asked:\n" + found.text +
-			"\nAnswer from it. Call a tool only for what it does not hold."
+			"\nAnswer from it. Call a tool only for what it does not hold. Begin your first sentence with " + found.key + ", as in \"" + found.key + " is …\", so the room hears which issue it is."
 	case found.searched:
 		prompt += "\n\nA search of the record for the question's words, made while it was asked. Its hits may not be what the question is about: use them only if they are, and call a tool for what they do not hold:\n" + found.text
 	default:
