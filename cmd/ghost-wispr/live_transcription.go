@@ -10,6 +10,7 @@ import (
 
 	"github.com/sjawhar/ghost-wispr/internal/config"
 	"github.com/sjawhar/ghost-wispr/internal/server"
+	"github.com/sjawhar/ghost-wispr/internal/session"
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
 )
 
@@ -31,6 +32,13 @@ const deepgramWarningKey = "deepgram"
 // deepgramNotConnected is the "deepgram" status warning.
 const deepgramNotConnected = "Deepgram is not connected; live transcription keeps retrying, and no session starts by itself until it connects"
 
+// liveManager is the session manager live transcription feeds: it takes the
+// results (session.LifecycleManager), and the client is its live stream.
+type liveManager interface {
+	session.LifecycleManager
+	SetLiveStream(stream session.LiveStream)
+}
+
 // newLiveTranscription makes the resilient Deepgram client a microphone start
 // sends its audio to, and dials the first socket in the background: it returns
 // at once, because the start holds the recording light red until it returns,
@@ -43,7 +51,9 @@ const deepgramNotConnected = "Deepgram is not connected; live transcription keep
 // only from live transcripts, so without this one failed dial left the unit
 // saving nothing until a restart. Each change of the client's state is
 // broadcast on hub. callback hands each result to the session manager and
-// the voice.
+// the voice. The client is the manager's live stream (SetLiveStream) when the
+// manager takes one, so a session's recording starts before the first words
+// Deepgram hears, even when it hears them late after a reconnect.
 func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfaces.ClientOptions, tOptions *interfaces.LiveTranscriptionOptions, config transcribe.ResilientConfig, callback transcriptCallback, warnings *warningsRegistry, hub *server.Hub) *transcribe.ResilientClient {
 	var rc *transcribe.ResilientClient
 	// syncWarning sets the warning from the client's state as it is now. The
@@ -67,6 +77,9 @@ func newLiveTranscription(ctx context.Context, apiKey string, cOptions *interfac
 		}
 	})
 	rc.Factory = makeDeepgramClientFactory(ctx, apiKey, cOptions, tOptions, callback, deepgramWriteTimeout)
+	if manager, ok := callback.manager.(liveManager); ok && manager != nil {
+		manager.SetLiveStream(rc)
+	}
 	// Set before the dial, so a dial that connects first clears it.
 	warnings.Set(deepgramWarningKey, deepgramNotConnected)
 	rc.ConnectInBackground()

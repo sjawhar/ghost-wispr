@@ -314,21 +314,19 @@ const micRetryEvery = 15 * time.Second
 
 // resumeWaiter is the part of the capture gate a microphone start waits on:
 // waitResumed blocks until the gate is open, prepareMicOpen readies the
-// hardware before the start opens the microphone, openUnderRed runs the start
-// with the recording light confirmed and held red, and finishResume ends a
-// resume's "resuming" state once the start that brings capture back has
-// finished.
+// hardware before the start opens the microphone, and startUnderRed runs the
+// start with the recording light confirmed and held red, then ends a resume's
+// "resuming" state unless a pause cancelled the start.
 type resumeWaiter interface {
 	waitResumed(ctx context.Context) bool
 	prepareMicOpen(ctx context.Context) bool
-	openUnderRed(open func() error) error
-	finishResume()
+	startUnderRed(start func() error) error
 }
 
 // retryMicStartup runs start every retryInterval until it succeeds or ctx
 // ends. A paused instance opens no input device: a retry that comes due
 // while capture is paused waits (capture.waitResumed) until capture resumes.
-// Each attempt runs under a red hold (openUnderRed): the PortAudio scan and the
+// Each attempt runs under a red hold (startUnderRed): the PortAudio scan and the
 // device open it makes both open capture streams. A light that cannot be
 // confirmed red fails the attempt before either.
 func retryMicStartup(
@@ -359,8 +357,9 @@ func retryMicStartup(
 			return
 		}
 		// A pause while it waits for the Jabra (prepareMicOpen) cancels the
-		// attempt; the next comes once capture resumes.
+		// attempt; the next comes once capture resumes, without the interval.
 		if !capture.prepareMicOpen(ctx) {
+			wait = false
 			continue
 		}
 
@@ -374,16 +373,13 @@ func retryMicStartup(
 			return
 		}
 
-		// The attempt, whether it works or not, ends a resume's "resuming"
-		// state: readiness then reports what came back.
-		err := capture.openUnderRed(start)
+		err := capture.startUnderRed(start)
 		if errors.Is(err, errMicStartPaused) {
-			// A pause cancelled the attempt: the next resume tries again,
-			// and the resuming state is left to it.
+			// A pause cancelled the attempt: the next resume tries again, and
+			// that attempt ends the resume's "resuming" state.
 			wait = false
 			continue
 		}
-		capture.finishResume()
 		if err != nil {
 			if onError != nil {
 				onError(err)
@@ -400,19 +396,20 @@ func retryMicStartup(
 
 // startMicrophone opens the input device and starts capture with start, and
 // runs retry in loops if start fails. start runs only under a red hold
-// (openUnderRed): the light is confirmed red before it, and held red until it
+// (startUnderRed): the light is confirmed red before it, and held red until it
 // returns, so every capture stream it opens, the PortAudio scan's included,
 // opens while the light last read red. A paused instance opens no input device
 // until it resumes: while the capture gate is closed, start runs in loops once
 // the gate opens and the hardware is ready for it (prepareMicOpen), with atBoot
-// false, and startMicrophone returns deferred true; that start, whether it
-// works or not, ends the resume's "resuming" state (finishResume). A pause
-// while it waits for the hardware, or one that cancels the start before it
-// opens a device (errMicStartPaused), cancels that resume, and the next
-// resume starts the microphone. Otherwise start runs at once with atBoot true,
-// so it can write the start-up status, and startMicrophone returns its error:
-// one that wraps errLightNotConfirmed if the light refused it, or
-// errNoCaptureDevice, and start did not run.
+// false, and startMicrophone returns deferred true. A pause while it waits for
+// the hardware, or one that cancels the start before it opens a device
+// (errMicStartPaused), cancels that resume, and the next resume starts the
+// microphone. Otherwise start runs at once with atBoot true, so it can write
+// the start-up status, and startMicrophone returns its error: one that wraps
+// errLightNotConfirmed if the light refused it, or errNoCaptureDevice, and
+// start did not run. Every start, whether it works or not, ends the "resuming"
+// state of a resume that came before or during it, unless a pause cancelled
+// it: that resume is then resuming until the start after it finishes.
 //
 // Nothing runs in loops before booted closes, once start-up has sent its
 // component statuses: a power-button resume can come during start-up, and
@@ -439,17 +436,13 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 					break
 				}
 			}
-			err := capture.openUnderRed(func() error { return start(false) })
+			err := capture.startUnderRed(func() error { return start(false) })
 			if errors.Is(err, errMicStartPaused) {
-				// A pause cancelled the start: the resuming state is left to
-				// the next start, for a resume that came after the pause.
 				continue
 			}
-			capture.finishResume()
-			if err == nil {
-				return
+			if err != nil {
+				retry()
 			}
-			retry()
 			return
 		}
 	}
@@ -457,7 +450,7 @@ func startMicrophone(ctx context.Context, loops *sync.WaitGroup, capture *captur
 		afterBoot(startOnResume)
 		return true, nil
 	}
-	err = capture.openUnderRed(func() error { return start(true) })
+	err = capture.startUnderRed(func() error { return start(true) })
 	switch {
 	case err == nil:
 		return false, nil
@@ -488,6 +481,11 @@ type voiceListener interface {
 type keptMessager interface {
 	MessageKept(mr *api.MessageResponse) (*api.MessageResponse, error)
 }
+
+// The build fails if the session manager stops reporting what its transcript
+// keeps: the voice would then read every live result, a late wake from before
+// a pause included (contract 4, R4).
+var _ keptMessager = (*session.Manager)(nil)
 
 // Message hands a Deepgram result to the session manager, then what the
 // manager's transcript kept of it to the voice, with the capture gate's stamp
@@ -609,8 +607,8 @@ func newSessionRecorder(audioDir string, store audio.SessionRates) *audio.Record
 	return recorder
 }
 
-// startMicMonitoring starts the mic loop. The recorder gets each buffer
-// first, and downstream, live transcription, gets it through a bounded queue
+// startMicMonitoring starts the mic loop. Live transcription, downstream,
+// gets each buffer just before the recorder, through a bounded queue
 // that never blocks the loop (transcribe.AsyncSender), so no Deepgram
 // trouble stops the recording. tap, the voice's room audio (voice.Tap), gets
 // each buffer after them, behind the capture gate like them; it must never
@@ -2095,7 +2093,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 	// Log structured startup banner.
 	config.LogStartupBanner(appLogger, &startupStatus, Version, Commit, BuildTime)
-	slog.Info("deepgram API key", "status", config.MaskAPIKey(cfg.DeepgramAPIKey))
+	slog.Info("deepgram API key", "status", config.APIKeyStatus(cfg.DeepgramAPIKey))
 	uiAddr := addr
 	if strings.HasPrefix(uiAddr, ":") {
 		uiAddr = "127.0.0.1" + uiAddr
@@ -2306,6 +2304,15 @@ func streamMicWithRetry(
 			}
 			err = streamer.Open()
 			capture.finishMicStart()
+			if err == nil && capture.closedSinceMicOpen() {
+				// A pause, or a hold for the light, came during the red
+				// confirmation or the open, and a resume may have opened the
+				// gate again since: the device may have captured through the
+				// pause. Close it, which drops what it holds, and open it
+				// again once capture is back.
+				reopen, reopenWhy = true, "after a pause during its open"
+				continue
+			}
 			// This start, whether it works or not, ends the resume's
 			// "resuming" state: readiness then reports what came back.
 			capture.finishResume()
@@ -2360,6 +2367,11 @@ func streamMicWithRetry(
 			if errors.Is(err, errLightWentOff) {
 				logf("the recording light was not red while the microphone was open; reopening the microphone")
 				reopen, reopenWhy = true, "after the recording light was not red"
+				continue
+			}
+			if errors.Is(err, errClosedSinceMicOpen) {
+				logf("the capture gate closed while the microphone was open; reopening the microphone")
+				reopen, reopenWhy = true, "after a pause while it was open"
 				continue
 			}
 		}

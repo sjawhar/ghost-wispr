@@ -301,6 +301,10 @@ export function applyEvent(event: WebSocketEvent): void {
       return
     case 'status_changed':
       setPaused(event.paused)
+      // Interim text from before a pause, which no session took, must not
+      // show after it as words of the meeting that follows.
+      appState.interimText = ''
+      appState.interimSpeaker = -1
       return
     case 'session_started':
       appState.activeSessionId = event.session_id

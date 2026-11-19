@@ -112,16 +112,13 @@ func ValidateStartup(cfg *Config) StartupStatus {
 	return status
 }
 
-// MaskAPIKey masks an API key for safe logging. Shows the first 4 and last 4
-// characters for keys longer than 12 chars, otherwise just "****".
-func MaskAPIKey(key string) string {
+// APIKeyStatus says whether an API key is configured, for the startup log:
+// "configured" or "missing". It shows no part of the key.
+func APIKeyStatus(key string) string {
 	if key == "" {
 		return "missing"
 	}
-	if len(key) <= 12 {
-		return "****"
-	}
-	return key[:4] + "****" + key[len(key)-4:]
+	return "configured"
 }
 
 // LogStartupBanner logs a structured startup summary at INFO level.

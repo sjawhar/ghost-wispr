@@ -391,17 +391,41 @@ func (h *hardwareControl) CheckLight() error {
 // pattern: CheckLight comes first, and a unit still unchecked is refused
 // (errLightUnchecked).
 func (h *hardwareControl) EnsureRed() error {
+	return h.EnsureRedWhile(nil)
+}
+
+// EnsureRedWhile is EnsureRed for a microphone open: it calls allowed, if not
+// nil, under the light's lock just before the red write, and if allowed
+// returns an error it writes nothing, takes no hold and returns that error.
+// A pause after allowed returned does not stop the write (captureGate's
+// confirmMicOpenRed says why, and how soon the light then goes off).
+func (h *hardwareControl) EnsureRedWhile(allowed func() error) error {
 	if h.stopped.Load() {
 		return fmt.Errorf("recording light stopped")
 	}
 	if h.light == nil {
 		return nil
 	}
-	// Hold red before the write: reconnectingLight.SetRGB then refuses an off
-	// write the controller decided before this confirmation.
-	h.redHolds.Add(1)
-	if err := h.light.ConfirmRed(); err != nil {
-		h.ReleaseRedHold()
+	held := false
+	err := h.light.ConfirmRedWhile(func() error {
+		if allowed != nil {
+			if err := allowed(); err != nil {
+				return err
+			}
+		}
+		// Hold red before the write, under the light's lock:
+		// reconnectingLight.SetRGB then refuses an off write the controller
+		// decided before this confirmation. A refused confirmation takes no
+		// hold, so the controller, which keeps the light red while one is
+		// held, does not light it for that confirmation either.
+		h.redHolds.Add(1)
+		held = true
+		return nil
+	})
+	if err != nil {
+		if held {
+			h.ReleaseRedHold()
+		}
 		return err
 	}
 	h.light.warnings.Clear("recording-light")
@@ -446,6 +470,7 @@ func wireLightConsent(capture *captureGate, hardware *hardwareControl, warnings 
 		return nil
 	}
 	capture.beforeMicStart = hardware.EnsureRed
+	capture.beforeMicOpenRed = hardware.EnsureRedWhile
 	capture.afterMicStart = hardware.ReleaseRedHold
 	capture.afterGateOpen = hardware.ReleaseRedHold
 	capture.onLightUnconfirmed = hardware.LightUnconfirmed
@@ -796,8 +821,20 @@ func (l *reconnectingLight) BlackPattern() error {
 }
 
 func (l *reconnectingLight) ConfirmRed() error {
+	return l.ConfirmRedWhile(nil)
+}
+
+// ConfirmRedWhile is ConfirmRed, but first calls before, if not nil, under the
+// light's lock, and returns before's error, having written nothing, unless it
+// is nil.
+func (l *reconnectingLight) ConfirmRedWhile(before func() error) error {
 	l.deviceMu.Lock()
 	defer l.deviceMu.Unlock()
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
 	light, err := l.currentForConfirmation()
 	if err != nil {
 		return err

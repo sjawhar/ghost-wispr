@@ -556,6 +556,51 @@ func TestDeferredMicStartEndsTheResumeWindow(t *testing.T) {
 	}
 }
 
+// TestBootMicStartEndsTheResumeWindow fails if a pause and a resume that land
+// while the boot start runs leave capture resuming once that start has
+// finished, whether it opened the microphone or failed: capture would report
+// resuming for the stall limit, also while the unit records.
+func TestBootMicStartEndsTheResumeWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		startErr error
+	}{
+		{name: "started"},
+		{name: "start failed", startErr: errors.New("microphone unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := newCaptureGate(nil, nil, nil)
+			var loops sync.WaitGroup
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(func() {
+				cancel()
+				if !joinMicLoops(&loops, testWait) {
+					t.Error("microphone start-up still running after shutdown")
+				}
+			})
+			deferred, _ := startMicrophone(ctx, &loops, capture, alreadyBooted(), func(atBoot bool) error {
+				if !atBoot {
+					t.Error("a start ran after the boot start, which no pause cancelled")
+				}
+				capture.Pause() // during the boot scan
+				capture.Resume()
+				opened, stop := context.WithTimeout(ctx, testWait)
+				defer stop()
+				if !capture.waitResumed(opened) {
+					t.Error("the gate did not open after the resume")
+				}
+				return tc.startErr
+			}, func() {})
+			if deferred {
+				t.Fatal("the boot start was deferred, but the gate was open")
+			}
+			if got := capture.MicHold(); got != "" {
+				t.Fatalf("mic hold once the boot start returned = %q, want none", got)
+			}
+		})
+	}
+}
+
 // TestRetryMicStartupEndsTheResumeWindow fails if a start-up retry that runs
 // after a resume does not end the resume's resuming state with its attempt,
 // whether the attempt worked or failed.

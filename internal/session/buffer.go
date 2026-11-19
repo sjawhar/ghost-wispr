@@ -1,6 +1,7 @@
 package session
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/sjawhar/ghost-wispr/internal/transcribe"
@@ -50,6 +51,17 @@ func (b *UtteranceBuffer) Flush() []transcribe.Word {
 	out := b.words
 	b.words = nil
 	return out
+}
+
+// PutBack returns words a Flush took to the front of the buffer, ahead of
+// any words added since.
+func (b *UtteranceBuffer) PutBack(words []transcribe.Word) {
+	if len(words) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.words = append(slices.Clone(words), b.words...)
 }
 
 // Len returns the number of words currently in the buffer.

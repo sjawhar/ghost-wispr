@@ -74,6 +74,17 @@ func (rb *RingBuf) Len() int {
 	return rb.len
 }
 
+// Discard drops the n oldest buffered bytes, or all of them when fewer are
+// buffered.
+func (rb *RingBuf) Discard(n int) {
+	n = min(n, rb.len)
+	if n <= 0 {
+		return
+	}
+	rb.read = (rb.read + n) % len(rb.buf)
+	rb.len -= n
+}
+
 // Cap returns the total capacity of the buffer.
 func (rb *RingBuf) Cap() int {
 	return len(rb.buf)

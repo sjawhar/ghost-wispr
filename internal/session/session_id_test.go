@@ -36,6 +36,16 @@ func (*takenRecorder) EndSession(string) (string, error) { return "", nil }
 
 func (*takenRecorder) DiscardUnsaved() string { return "" }
 
+func (*takenRecorder) HoldPreroll(time.Duration) {}
+
+func (*takenRecorder) ReleasePreroll() {}
+
+func (*takenRecorder) SetLookback(time.Duration) {}
+
+func (*takenRecorder) Pending() time.Duration { return 0 }
+
+func (*takenRecorder) SinceClose() (time.Duration, bool) { return 0, false }
+
 func openIDStore(t *testing.T) *storage.SQLiteStore {
 	t.Helper()
 	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "ghost-wispr.db"))
