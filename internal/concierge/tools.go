@@ -29,14 +29,16 @@ const cannotReachEnvoy = "I cannot reach the agents yet."
 const (
 	// specSummaryChars is how much of an issue's spec read_issue gives.
 	specSummaryChars = 1200
-	// recentEvents is how many of an issue's newest events read_issue gives.
-	recentEvents = 8
+	// recentEvents is how many of an issue's newest events read_issue gives
+	// (R6).
+	recentEvents = 10
 	// eventTextChars bounds each event's text.
 	eventTextChars = 240
 	// holderEvents is how far back issue_holder looks for a session.
 	holderEvents = 50
-	// maxQuestionChars bounds an ask_agent question: the fewest words.
-	maxQuestionChars = 400
+	// maxQuestionChars bounds an ask_agent question, the room's words that
+	// leave the unit (R7).
+	maxQuestionChars = 300
 )
 
 // sendTimeout bounds one ask_agent send. The send does not stop with the

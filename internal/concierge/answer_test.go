@@ -135,7 +135,7 @@ func TestTheEarRewriteAddsNothing(t *testing.T) {
 	}
 	r := newRig(t)
 	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("pong"))}}
-	r.concierge.forEar(context.Background(), "pong")
+	r.concierge.forEar(context.Background(), "pong", "")
 	prompt := r.model.requests[0][0].Parts[0].Text
 	if strings.Contains(prompt, "about") {
 		t.Errorf("the rewrite is asked to talk about something: %q", prompt)
@@ -190,7 +190,7 @@ func TestAReplyLandsOnItsTaskAndIsAnnouncedForTheEar(t *testing.T) {
 	}
 	select {
 	case answer := <-r.concierge.Answers():
-		if answer.TaskID != "evt-1" || answer.SessionID != "meeting-1" || answer.IssueKey != "ABC-12" || answer.Text != "Yes. PR 80 merged the tap this morning." || !answer.AskedAt.Equal(testNow) {
+		if answer.TaskID != "evt-1" || answer.SessionID != "meeting-1" || answer.IssueKey != "ABC-12" || answer.Text != "ABC-12: Yes. PR 80 merged the tap this morning." || !answer.AskedAt.Equal(testNow) {
 			t.Fatalf("pending answer = %+v", answer)
 		}
 	case <-time.After(5 * time.Second):
@@ -209,18 +209,21 @@ func TestAReplyLandsOnItsTaskAndIsAnnouncedForTheEar(t *testing.T) {
 	}
 }
 
-func TestWhenTheRewriteFailsTheWrittenAnswerIsSpokenPlain(t *testing.T) {
+// TestAModelThatFailsTwiceSpeaksTheFixedSentence: with no rewrite to check,
+// the voice says R8's fixed sentence, not the written answer, which may hold
+// paths and code.
+func TestAModelThatFailsTwiceSpeaksTheFixedSentence(t *testing.T) {
 	r := newRig(t)
 	r.agents.states["agent-7"] = envoy.SessionInfo{SessionID: "agent-7", State: envoy.StateLive}
 	r.ask(t, "agent-7", "q", "")
-	r.model.errs = []error{errors.New("vertex: 503")}
+	r.model.errs = []error{errors.New("vertex: 503"), errors.New("vertex: 503")}
 	if err := r.concierge.Deliver(context.Background(), &envoy.Message{EventID: "r", SourceSession: "agent-7", InReplyTo: "evt-1", Text: "**Done.** See `PR #80`."}); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case answer := <-r.concierge.Answers():
-		if answer.Text != "Done. See PR #80." {
-			t.Fatalf("plain answer = %q", answer.Text)
+		if answer.Text != fixedSentence {
+			t.Fatalf("spoken = %q, want the fixed sentence", answer.Text)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no pending answer")

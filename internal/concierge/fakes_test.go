@@ -247,7 +247,7 @@ func newRig(t *testing.T) *rig {
 		t.Fatal(err)
 	}
 	r := &rig{
-		records: &fakeRecords{issues: map[string]*dispatch.Issue{}, events: map[string][]dispatch.Event{}, docs: map[string]string{}},
+		records: &fakeRecords{issues: map[string]*dispatch.Issue{}, events: map[string][]dispatch.Event{}, docs: map[string]string{}, projects: []string{"ABC", "XYZ", "DEF", "INFRA"}},
 		agents:  &fakeAgents{id: "unit-session", states: map[string]envoy.SessionInfo{}},
 		model:   &scriptedModel{},
 		store:   store,
@@ -269,6 +269,11 @@ func newRig(t *testing.T) *rig {
 		t.Fatal(err)
 	}
 	r.concierge.SetAgents(r.agents)
+	eventually(t, "the project list was read", func() bool {
+		r.concierge.mu.Lock()
+		defer r.concierge.mu.Unlock()
+		return r.concierge.projects != nil
+	})
 	return r
 }
 
