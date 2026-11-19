@@ -787,7 +787,9 @@ func (s *session) answer(call voice.ToolCall) {
 		return
 	}
 	if err != nil {
-		s.log.Warn("gptlive: the answer tool failed", "delegation", call.ID, "error", err)
+		// The tool's error can quote the asker's words (a search query), and
+		// the journal is outside every delete path, so its text stays out.
+		s.log.Warn("gptlive: the answer tool failed", "delegation", call.ID, "timeout", errors.Is(err, context.DeadlineExceeded))
 		result, _ = json.Marshal(voice.AnswerResult{Say: "The lookup failed. Say in one short sentence that you could not get the answer just now."})
 	}
 	if err := s.deliver(s.ctx, call.ID, result); err != nil && s.ctx.Err() == nil {
