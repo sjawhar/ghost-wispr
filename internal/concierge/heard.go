@@ -37,11 +37,11 @@ const (
 var spokenKey = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9]*)[- ](\d{2,})\b`)
 
 // keytermKey is an issue key as Deepgram writes one whose project is a
-// keyterm, so in capitals: its number after a pause ("INFRA? 4592."), with a
-// thousands comma ("INFRA 4,592"), or in words ("INFRA four thousand five
-// hundred and ninety two", "INFRA forty-five ninety-two"). Group 2 is the
-// number in digits, group 3 in words.
-var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d{1,3}(?:,\d{3})+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
+// keyterm, so in capitals: its number after a pause ("INFRA? 4592."), split
+// by a thousands comma or a decimal point ("INFRA 4,592", "INFRA 45.92"), or
+// in words ("INFRA four thousand five hundred and ninety two", "INFRA
+// forty-five ninety-two"). Group 2 is the number in digits, group 3 in words.
+var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d+(?:[.,]\d+)+|\d{2,})\b|((?:(?i:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b[\s-]*(?:(?i:and)\s+)?)+))`)
 
 // spokenKeys rewrites each key keytermKey reads in words to its written form,
 // "INFRA-4592", so the rest of the turn reads as before. A number of one
@@ -49,7 +49,7 @@ var keytermKey = regexp.MustCompile(`\b([A-Z][A-Z0-9]+)[?.,:;!]?[\s-]+(?:(\d{1,3
 func spokenKeys(words string) string {
 	return keytermKey.ReplaceAllStringFunc(words, func(match string) string {
 		parts := keytermKey.FindStringSubmatch(match)
-		digits := strings.ReplaceAll(parts[2], ",", "")
+		digits := strings.NewReplacer(",", "", ".", "").Replace(parts[2])
 		trail := ""
 		if parts[3] != "" {
 			digits = keyDigits(parts[3])

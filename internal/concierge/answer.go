@@ -303,6 +303,13 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			if sayErr := sp.sayText(parent, found.known(), mode); sayErr != nil {
 				return sayErr
 			}
+		case errors.Is(err, errNoWords) && found.key != "" && sp.count() == 0:
+			// The model said nothing: the voice says what the record holds,
+			// its status (R6), rather than sorry.
+			err = nil
+			if sayErr := sp.sayText(parent, found.known(), voice.Fact); sayErr != nil {
+				return sayErr
+			}
 		case errors.Is(err, errNoWords) && (len(lead) > 0 || holderCase != "" || askStarted.Load()):
 			err = nil
 		case err != nil && ctx.Err() != nil && sp.count() == 0:
