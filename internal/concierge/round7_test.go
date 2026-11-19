@@ -646,3 +646,79 @@ func TestARetriedQuestionKeepsItsFirstTime(t *testing.T) {
 		t.Fatalf("the retried task = %+v, %v; want it asked at %v", task, err, testNow)
 	}
 }
+
+// TestAnAskedQuestionNeedsNoFallbackLine (R6, R7): when the question already
+// went to the holder and the model's facts fail R8's check twice, the voice
+// says the asked line alone: "I can only say what the record holds" would
+// only hold the holder's answer back.
+func TestAnAskedQuestionNeedsNoFallbackLine(t *testing.T) {
+	r := newRig(t)
+	heldIssue(r, "session", false)
+	r.model.turns = [][]*genai.GenerateContentResponse{
+		{chunk(text("It went to Alex."))},
+		{chunk(text("It went to Blake."))},
+	}
+	var spoken []said
+	err := r.concierge.Answer(context.Background(), &r.exchange, "ask the agent on ABC-12 whether the tap is merged", recorder(&spoken))
+	if err != nil || len(spoken) != 1 || !strings.Contains(spoken[0].text, "asked the agent on ABC-12") {
+		t.Fatalf("Answer = %v, spoken %+v; want the asked line alone", err, spoken)
+	}
+}
+
+// TestAnUnclearKeywordResultWaitsTwoSecondsAtMost (R5, R6; Main's rule): when
+// the keyword result has no one clear match, the full search is waited for
+// until 2 s after the turn ended, then the voice asks which of the keyword
+// result's top two the person meant, and says nothing more when the full
+// search lands. A full result in time still wins.
+func TestAnUnclearKeywordResultWaitsTwoSecondsAtMost(t *testing.T) {
+	if fullWaitAfterTurn != 2*time.Second {
+		t.Fatalf("fullWaitAfterTurn = %v, want 2 s", fullWaitAfterTurn)
+	}
+	unclearKeywords := []dispatch.SearchHit{{Kind: "issue", IssueKey: "ABC-13", Title: "Wake word", Score: 0.5}, {Kind: "issue", IssueKey: "ABC-12", Title: "Realtime voice", Score: 0.4}}
+	r := newRig(t)
+	r.concierge.fullWait = 200 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.records.kwHits = unclearKeywords
+	r.records.searchDelay = 900 * time.Millisecond
+	start := time.Now()
+	spoken := answerTurn(t, r, "what is happening with the realtime voice")
+	if took := time.Since(start); took > 700*time.Millisecond {
+		t.Fatalf("the answer took %v, want the question which issue at the 200 ms mark", took)
+	}
+	time.Sleep(time.Second)
+	if len(spoken) != 1 || spoken[0].text != "Did you mean ABC-13, Wake word, or ABC-12, Realtime voice?" {
+		t.Fatalf("spoken = %+v, want only the keyword result's top two", spoken)
+	}
+
+	r = newRig(t)
+	r.concierge.fullWait = 500 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.records.kwHits = unclearKeywords
+	r.records.searchDelay = 50 * time.Millisecond
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	if spoken := answerTurn(t, r, "what is happening with the realtime voice"); len(spoken) == 0 || spoken[0].text != "I took ABC-12: Realtime voice." {
+		t.Fatalf("a full result in time: spoken = %+v, want it to win", spoken)
+	}
+}
+
+// TestAnswerReusesTheReadAheadsSearch (R6; Main's rule): when the final
+// turn's search words hold all of the words the read-ahead searched, Answer
+// takes the read-ahead's search, keyword and full, and searches no more.
+func TestAnswerReusesTheReadAheadsSearch(t *testing.T) {
+	r := newRig(t)
+	r.concierge.searchSettle = 50 * time.Millisecond
+	unclearSearch(r)
+	r.records.hits[0].Score = 0.012
+	r.concierge.Heard(context.Background(), &r.exchange, "what is happening with the realtime voice")
+	eventually(t, "the read-ahead searched", func() bool { return len(r.records.searches()) == 1 })
+	r.model.turns = [][]*genai.GenerateContentResponse{{chunk(text("PR 80 is in review."))}}
+	spoken := answerTurn(t, r, "what is happening with the realtime voice rollout")
+	if full, kw := len(r.records.searches()), len(r.records.kwQueries); full != 1 || kw != 1 {
+		t.Fatalf("full searches %d, keyword %d; want the read-ahead's one of each, reused", full, kw)
+	}
+	if len(spoken) == 0 || spoken[0].text != "I took ABC-12: Realtime voice." {
+		t.Fatalf("spoken = %+v, want the read-ahead's issue", spoken)
+	}
+}

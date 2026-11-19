@@ -468,9 +468,10 @@ func TestAnAnswerOfAnEndedSessionIsNotAnnounced(t *testing.T) {
 }
 
 // TestADescribedTurnAsksNoHolderUnasked: a turn with no key is searched. With
-// one clear match, the model is told the hits may not be what the question is
-// about; with none, the Concierge asks no holder, even on "ask", and calls no
-// model: the voice asks which issue the person meant (R5).
+// one clear match, the model gets the record of the issue the search chose,
+// to answer from, not hits to doubt; with none, the Concierge asks no holder,
+// even on "ask", and calls no model: the voice asks which issue the person
+// meant (R5).
 func TestADescribedTurnAsksNoHolderUnasked(t *testing.T) {
 	for _, clear := range []bool{true, false} {
 		r := newRig(t)
@@ -493,8 +494,12 @@ func TestADescribedTurnAsksNoHolderUnasked(t *testing.T) {
 			}
 			continue
 		}
-		if len(r.model.requests) == 0 || !strings.Contains(r.model.requests[0][0].Parts[0].Text, "may not be what the question is about") {
-			t.Fatalf("one clear match: the prompt lacks the warning about search hits")
+		prompt := ""
+		if len(r.model.requests) > 0 {
+			prompt = r.model.requests[0][0].Parts[0].Text
+		}
+		if !strings.Contains(prompt, "The record of ABC-12, the issue a search of the question's words chose") || strings.Contains(prompt, "may not be what the question is about") {
+			t.Fatalf("one clear match: the prompt does not give the chosen issue's record to answer from")
 		}
 	}
 }

@@ -58,6 +58,11 @@ const (
 	// 6.4 s live (median 1.2 s, p90 2.2 s), so a search past it is slow, not
 	// out of reach: it has found nothing yet.
 	searchBound = 5 * time.Second
+	// fullWaitAfterTurn is how long after the turn an answer waits for the
+	// full search when the keyword result has no one clear match; then the
+	// voice asks which of the keyword result's top two the person meant
+	// (R5, Main's rule).
+	fullWaitAfterTurn = 2 * time.Second
 	// maxToolCalls bounds the model's tool calls in one fast answer (R6).
 	maxToolCalls = 6
 	// maxSearches bounds one answer's searches, the read's and the model's
@@ -172,11 +177,16 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 			}
 		}
 	}
+	// A keyword result with no one clear match waits for the full search
+	// until c.fullWait after the turn (Main's rule).
+	fullCut := make(chan struct{})
+	cutTimer := time.AfterFunc(c.fullWait-time.Since(start), func() { close(fullCut) })
+	defer cutTimer.Stop()
 	var found *reading
 	if target != "" {
-		found = c.readRecord(ctx, x, target, onHolder)
+		found = c.readRecord(ctx, x, target, onHolder, fullCut)
 	} else {
-		found = c.readFor(ctx, x, turn, onHolder)
+		found = c.readFor(ctx, x, turn, onHolder, fullCut)
 	}
 	switch {
 	case parent.Err() != nil:
@@ -225,7 +235,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		searchesLeft--
 	}
 	searchesLeft = max(searchesLeft, 0)
-	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft}
+	tools := &runner{c: c, x: x, searchesLeft: &searchesLeft, fullCut: fullCut}
 	// With no fact by c.knownBound, the model stops and the voice says what
 	// is known (R6), rather than run into the bound.
 	factsCtx, stopFacts := context.WithCancel(ctx)
@@ -527,6 +537,11 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 	prompt := c.turnPrompt(transcriptOf(tools.x.Recent), turn)
 	switch {
 	case found.text == "":
+	case found.searched && found.clear && found.key != "":
+		// One clear match (R5): the voice said the issue it took, and the
+		// model answers from its record rather than search again.
+		prompt += "\n\nThe record of " + found.key + ", the issue a search of the question's words chose, read while it was asked:\n" + found.text +
+			"\nAnswer from it. Call a tool only for what it does not hold."
 	case found.searched:
 		prompt += "\n\nA search of the record for the question's words, made while it was asked. Its hits may not be what the question is about: use them only if they are, and call a tool for what they do not hold:\n" + found.text
 	default:
@@ -559,6 +574,12 @@ func (c *Concierge) facts(ctx context.Context, tools *runner, turn string, found
 		}
 		reason = invented.reason
 		c.logger.Info("concierge's fast answer failed R8's check", "try", try, "reason", reason)
+	}
+	if asking {
+		// The asked line follows; this one would only hold the holder's
+		// answer back.
+		c.logger.Info("concierge leaves its facts to the holder: no fast answer passed R8's check", "reason", reason)
+		return nil
 	}
 	c.logger.Warn("concierge says it can only say what the record holds: no fast answer passed R8's check", "reason", reason)
 	return sp.sayText(ctx, notInRecord, voice.Fact)

@@ -201,6 +201,7 @@ type Concierge struct {
 	callBound    time.Duration
 	searchBound  time.Duration
 	searchSettle time.Duration
+	fullWait     time.Duration
 	routingAfter time.Duration
 }
 
@@ -251,6 +252,7 @@ func New(cfg *Config) (*Concierge, error) {
 		callBound:    callBound,
 		searchBound:  searchBound,
 		searchSettle: searchSettle,
+		fullWait:     fullWaitAfterTurn,
 		routingAfter: routingAfter,
 	}
 	if c.model == "" {

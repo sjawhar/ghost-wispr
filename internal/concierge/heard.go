@@ -50,7 +50,8 @@ func issueKeysIn(words string) []string {
 // to its end, not stopped or replaced; found is then what it found. seen is
 // closed once its issue's holder is known, which early then holds. A search
 // read waits for its words to settle, or for start, which an answer closes
-// (begin) when it needs the read now.
+// (begin) when it needs the read now; cut closes (cutNow) when the answer
+// stops waiting for its full search.
 type read struct {
 	done      chan struct{}
 	found     *reading
@@ -61,11 +62,18 @@ type read struct {
 	once      sync.Once
 	start     chan struct{}
 	startOnce sync.Once
+	cut       chan struct{}
+	cutOnce   sync.Once
 }
 
 // begin starts r now if it waits for its words to settle.
 func (r *read) begin() {
 	r.startOnce.Do(func() { close(r.start) })
+}
+
+// cutNow stops r waiting for its full search (searchBoth).
+func (r *read) cutNow() {
+	r.cutOnce.Do(func() { close(r.cut) })
 }
 
 // reading is what a read of the record found for a turn.
@@ -192,7 +200,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		}
 	}
 	readCtx, cancel := context.WithTimeout(ctx, prefetchTimeout)
-	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel, start: make(chan struct{})}
+	r := &read{done: make(chan struct{}), seen: make(chan struct{}), cancel: cancel, start: make(chan struct{}), cut: make(chan struct{})}
 	p.reads[target], p.current = r, target
 	settle := c.searchSettle
 	go func() {
@@ -215,7 +223,7 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 				return
 			}
 		}
-		found := c.readRecord(readCtx, &exchange, target, r.heldBy)
+		found := c.readRecord(readCtx, &exchange, target, r.heldBy, r.cut)
 		if readCtx.Err() == nil {
 			found.ahead = true
 			r.found, r.complete = found, true
@@ -233,9 +241,11 @@ func (r *read) heldBy(early *reading) {
 }
 
 // readFor is what the record holds for turn: the read Heard made of exactly
-// what the final turn asks, which is final once it ran to its end, else a
-// read made now. ctx, the answer's, bounds both.
-func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading)) *reading {
+// what the final turn asks, or of a search whose words the turn's all hold,
+// which is final once it ran to its end, else a read made now. ctx, the
+// answer's, bounds both; cut, when it closes, ends the wait for a full
+// search (searchBoth).
+func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string, onHolder func(*reading), cut <-chan struct{}) *reading {
 	target := c.readTarget(ctx, turn, true)
 	if target == "" {
 		// A key-shaped word with no list of projects to tell it by: Dispatch
@@ -249,11 +259,24 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 	var pending *read
 	if p := c.prefetchLocked(x); p != nil {
 		pending = p.reads[target]
+		if pending == nil && wordsHeldBy(p.current, target) {
+			// The read-ahead searched words the final turn holds: its search,
+			// keyword and full, is this answer's (Main's rule).
+			pending = p.reads[p.current]
+		}
 	}
 	c.mu.Unlock()
 	if pending != nil {
-		// The answer needs the read now: a search still settling starts.
+		// The answer needs the read now: a search still settling starts, and
+		// stops waiting for its full search when the answer does.
 		pending.begin()
+		go func() {
+			select {
+			case <-cut:
+				pending.cutNow()
+			case <-pending.done:
+			}
+		}()
 		if onHolder != nil {
 			go func() {
 				select {
@@ -278,7 +301,24 @@ func (c *Concierge) readFor(ctx context.Context, x *voice.Exchange, turn string,
 			return &reading{}
 		}
 	}
-	return c.readRecord(ctx, x, target, onHolder)
+	return c.readRecord(ctx, x, target, onHolder, cut)
+}
+
+// wordsHeldBy reports whether ahead, a read-ahead's search target, searched
+// words that target, the final turn's search, all holds.
+func wordsHeldBy(ahead, target string) bool {
+	aheadTerms, ok := strings.CutPrefix(ahead, "search:")
+	finalTerms, final := strings.CutPrefix(target, "search:")
+	if !ok || !final || aheadTerms == "" {
+		return false
+	}
+	held := set(strings.Fields(finalTerms))
+	for _, word := range strings.Fields(aheadTerms) {
+		if !held[word] {
+			return false
+		}
+	}
+	return true
 }
 
 // prefetchLocked is exchange x's read-ahead. An exchange whose wake came
@@ -319,11 +359,12 @@ func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 // reads of the others are left out, so the model is not told of an issue
 // nobody asked about; when none names one, the terms are searched. For a
 // search, the top hit's issue is read with its holder, and whether it is one
-// clear match (R5) is kept: the voice names the issue it took when it is not,
-// and asks its holder nothing unasked. A failure other than not-found, such as
+// clear match (R5) is kept: with none, the voice asks which issue the person
+// meant, and asks its holder nothing. cut, when it closes, ends the search's
+// wait for its full search. A failure other than not-found, such as
 // Dispatch out of reach, ends the read.
-func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string, onHolder func(*reading)) *reading {
-	tools := &runner{c: c, x: x}
+func (c *Concierge) readRecord(ctx context.Context, x *voice.Exchange, target string, onHolder func(*reading), cut <-chan struct{}) *reading {
+	tools := &runner{c: c, x: x, fullCut: cut}
 	found := &reading{}
 	var lines []string
 	// record keeps name's call and result for the model and R8's check.
