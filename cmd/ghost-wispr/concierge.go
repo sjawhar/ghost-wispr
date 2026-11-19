@@ -230,6 +230,7 @@ type lazyConcierge struct {
 	err      error         // why the last start failed
 	gen      int           // each turn-off and the shutdown change it
 	closed   bool
+	off      bool // the voice is turned off: no call starts a Concierge
 }
 
 var errConciergeOff = errors.New("the voice was turned off")
@@ -254,7 +255,7 @@ func (l *lazyConcierge) start() (*concierge.Concierge, error) {
 	l.mu.Unlock()
 	c, stop, err := l.startFn()
 	l.mu.Lock()
-	if l.gen != gen || l.closed { // turned off or shut down meanwhile
+	if l.gen != gen || l.closed || l.off { // turned off or shut down meanwhile
 		l.mu.Unlock()
 		if err == nil {
 			stop()
@@ -285,6 +286,8 @@ func (l *lazyConcierge) current() (c *concierge.Concierge, known bool, err error
 	switch {
 	case l.closed:
 		return nil, true, errors.New("the unit is shutting down")
+	case l.off:
+		return nil, true, errConciergeOff
 	case l.c != nil, l.err != nil:
 		return l.c, true, l.err
 	}
@@ -307,7 +310,7 @@ func (l *lazyConcierge) followEnabled(on bool) {
 		return
 	}
 	l.mu.Lock()
-	l.err = nil
+	l.err, l.off = nil, false
 	l.mu.Unlock()
 	go func() { _, _ = l.start() }()
 }
@@ -321,6 +324,7 @@ func (l *lazyConcierge) halt(shutdown bool) {
 		return
 	}
 	l.closed = shutdown
+	l.off = true // until followEnabled(true): a call with the voice off starts none
 	l.gen++
 	c, stop, fwd := l.c, l.stop, l.fwd
 	l.c, l.stop, l.fwd, l.err = nil, nil, nil, nil

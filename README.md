@@ -175,8 +175,9 @@ With `voice.enabled`, people in the room can ask Wispr about the work tracked in
 say the wake phrase at the start of a sentence: "Wispr, what is happening with the issue about
 the meeting voice?" ("Ghost Wispr" and "Hey Wispr" work too; "I will whisper it to you" does not).
 Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and the voice speaks the
-answer. For 6 s after Wispr's answer, a follow-up needs no wake phrase; "Thanks, Wispr" ends the
-exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
+answer. For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase, and so does a reply when Wispr asked ("Did you mean ABC-12, or
+ABC-13?"). Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch.
+"Thanks, Wispr" ends the exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
 its answer lands, Wispr plays a three-note sound after a second in which nobody speaks, and speaks
 the answer on "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several). It speaks by
 itself only when nobody has spoken since the question and the light still reads red. "Wispr, never
@@ -243,7 +244,7 @@ What the voice hears, and where the room's words go:
 |---------|---------|-------------|
 | `voice.enabled` (`GHOST_WISPR_VOICE_ENABLED`) | `false` | Turn the meeting voice on; it needs `speaker_enabled` |
 | `voice.engine` | `tts` | The voice: `tts` (voice A, our own streaming speech). `gptlive` and `dgagent` are not in this build |
-| `voice.wake_phrases` | `[Wispr, Ghost Wispr]` | The phrases that call Wispr; the live Deepgram request carries them as Nova-3 keyterms |
+| `voice.wake_phrases` | `[Wispr, Ghost Wispr]` | The phrases that call Wispr; the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms |
 | `voice.tts_engine` | `gemini` | Voice A's engine: `gemini` (Vertex AI, `gcp_project`) or `aura` (the Deepgram key) |
 | `voice.tts_model`, `voice.tts_voice` | the engine's | Gemini: `gemini-3.8-flash-tts`, `Kore`; Aura: the voice `aura-2-harmonia-en` |
 | `voice.tts_location` | `us` | The Vertex AI location Gemini streams from; `us` is faster to first audio than `global` |

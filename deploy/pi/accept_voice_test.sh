@@ -287,10 +287,11 @@ def service():
             xruns = [i for i in items if i["kind"] == "xrun"]
         t = now_ms()
         # The kernel computes /proc status as it is read; this file is written by a loop that a
-        # loaded machine can hold back by tens of milliseconds. So a dropped stream shows as dropped
-        # from 100 ms before its stop line, and a reading 20 ms after the stop sees it dropped
-        # however stale the file is, up to 120 ms. A draining stream shows its true queue.
-        active = [s for s in sounds if s["start"] <= t < s["end"] and (s.get("drain", True) or t < s["cut_at"] - 100)]
+        # loaded machine can hold back. So a dropped stream shows as dropped as soon as its cut is
+        # known, well before its stop line, and journalctl shows the stop line only once this loop
+        # has applied the timeline that holds the cut (status.applied). A draining stream shows its
+        # true queue.
+        active = [s for s in sounds if s["start"] <= t < s["end"] and s.get("drain", True)]
         if any(x["start"] <= t < x["end"] for x in xruns):
             text = "state: XRUN\nowner_pid   : 1\ndelay       : 0\n"
         elif active:
@@ -305,6 +306,7 @@ def service():
         with open(tmp, "w") as f:
             f.write(text)
         os.replace(tmp, status)
+        write("status.applied", str(size))
         time.sleep(0.003)
 
 
@@ -413,9 +415,10 @@ def react(kind, key, start, end):
         for item in timeline():
             if item["kind"] == "sound" and item["tag"].startswith("speech-") and item["start"] <= stop_at < item["end"]:
                 drain = "drain" in SCENARIO
-                emit(kind="timing", due=stop_at, event="stop", session_id="session-1", reason="talk-over" if kind != "stop" else "stop phrase")
-                # The Output drops its queue within 5 ms; today's path drains 800 ms more.
+                # The Output drops its queue within 5 ms; today's path drains 800 ms more. The cut
+                # comes first, so a stop line shows once the status file has its cut (journalctl).
                 emit(kind="cut", tag=item["tag"], at=stop_at, sound_end=stop_at + (800 if drain else 5), drain=drain)
+                emit(kind="timing", due=stop_at, event="stop", session_id="session-1", reason="talk-over" if kind != "stop" else "stop phrase")
                 break
     if kind in ("question", "ask", "second") and n == 1:
         first = end + 700
@@ -546,7 +549,24 @@ def journalctl(args):
         return 0
     t = now_ms()
     lines = []
+    # The kernel's /proc status is current when it is read; the fake's is a file its writer
+    # rewrites, which a loaded machine can hold back. So a stop line shows only once the status
+    # writer has applied the timeline that holds it, with its cut just before it: a reading after
+    # the stop line then sees the cut, however long the writer was held back.
+    applied, gated = int(read("status.applied") or "-1") if ASOUND else None, set()
+    if applied is not None:
+        offset = 0
+        for raw in read("timeline.jsonl").splitlines(keepends=True):
+            offset += len(raw.encode())
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if item.get("kind") == "timing" and item.get("event") == "stop" and offset > applied:
+                gated.add(item["id"])
     for item in timeline():
+        if item["id"] in gated:
+            continue
         due = item.get("due", 0)
         if not (since <= due <= t):
             continue

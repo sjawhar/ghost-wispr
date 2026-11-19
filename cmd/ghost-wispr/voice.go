@@ -24,6 +24,7 @@ import (
 // voice.Supervisor is one.
 type voiceControl interface {
 	SessionEnded(sessionID string)
+	EnabledChanged()
 	SessionsDeleted(sessionIDs []string)
 	SegmentsDeleted(sessionID string)
 	GateClosed(closings int)
@@ -70,6 +71,23 @@ func (l *voiceLink) GateClosed(closings int) {
 func (l *voiceLink) Stop(reason string) {
 	if v := l.get(); v != nil {
 		v.Stop(reason)
+	}
+}
+
+// EnabledChanged tells the voice a settings change of voice.enabled; turned
+// off, it stops at once.
+func (l *voiceLink) EnabledChanged() {
+	if v := l.get(); v != nil {
+		v.EnabledChanged()
+	}
+}
+
+// followVoiceEnabled is the settings hook of voice.enabled: turned off, the
+// voice stops at once, then its Concierge (R13).
+func followVoiceEnabled(link *voiceLink, conc *lazyConcierge) func(*config.Config) {
+	return func(cfg *config.Config) {
+		link.EnabledChanged()
+		conc.followEnabled(cfg.Voice.Enabled)
 	}
 }
 

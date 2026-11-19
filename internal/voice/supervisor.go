@@ -189,6 +189,7 @@ type Supervisor struct {
 
 	mu            sync.Mutex
 	closed        bool
+	off           bool      // the voice is turned off, and offLocked has stopped it
 	closings      int       // the gate's closings count after the latest closing
 	ex            *exchange // the exchange holding the floor
 	floor         chan struct{}
@@ -262,9 +263,12 @@ type exchange struct {
 	// lastTurnEnd is when the exchange's last turn ended: R7's t0 for an
 	// answer to a question it asked.
 	lastTurnEnd time.Time
-	turnAt      time.Time // when the turn was handed to the Concierge
-	notified    map[string]bool
-	idle        *time.Timer // a driving voice's idle wait
+	// unspokenAnswer: the answer tool returned words the driving voice has
+	// not begun to speak.
+	unspokenAnswer bool
+	turnAt         time.Time // when the turn was handed to the Concierge
+	notified       map[string]bool
+	idle           *time.Timer // a driving voice's idle wait
 	// A driving voice's follow-up window: armed when its speech ends, unless
 	// a barge-in cut it; a person's word disarms it (R10).
 	followUpTimer *time.Timer
@@ -422,6 +426,32 @@ func (s *Supervisor) enabled() bool {
 	return s.cfg.Enabled == nil || s.cfg.Enabled()
 }
 
+// EnabledChanged follows a settings change of voice.enabled: turned off, the
+// voice stops at once (offLocked).
+func (s *Supervisor) EnabledChanged() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.offLocked()
+}
+
+// offLocked reports whether the voice is turned off (R13). The first call
+// that sees it off ends every exchange and sound, as a stop does, and drops
+// the held answers, which stay in writing on their session's page; every
+// path that could speak, sound or hand a turn asks it first.
+func (s *Supervisor) offLocked() bool {
+	if s.enabled() {
+		s.off = false
+		return false
+	}
+	if !s.off {
+		s.off = true
+		s.stopLocked("voice turned off")
+		s.pending = nil
+		s.lastExchange = nil
+	}
+	return true
+}
+
 // SessionEnded drops the held answers of a session that ended, and the recent
 // transcript: the Concierge keeps the answers for its page and never
 // announces them in a later meeting.
@@ -500,7 +530,7 @@ func (s *Supervisor) WithFloor(ctx context.Context, start func()) error {
 func (s *Supervisor) OnUtteranceEnd(closings int, gateOpen bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || !gateOpen || closings < s.closings {
+	if s.closed || !gateOpen || closings < s.closings || s.offLocked() {
 		return
 	}
 	if ex := s.ex; ex != nil && !ex.answering && s.turnOf(ex) != "" {
@@ -530,8 +560,9 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 	if s.closed || t.FromFinalize || !t.GateOpen || t.Closings < s.closings || strings.TrimSpace(t.Text) == "" {
 		return
 	}
-	// With the voice off, nothing reads the transcript for it (R13).
-	if !s.enabled() {
+	// With the voice off, nothing reads the transcript for it (R13), and the
+	// first result heard with it off stops what still runs.
+	if s.offLocked() {
 		return
 	}
 	now := time.Now()
@@ -822,7 +853,14 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 		s.touchLocked(ex)
 		return
 	}
+	unspoken := ex.unspokenAnswer
 	s.endLocked(ex, false, "idle")
+	if unspoken {
+		// The voice got an answer to speak and never began it: the room
+		// hears that it failed (R10), not silence.
+		s.logf("voice: the voice did not speak the answer it got")
+		s.errorLocked(ex.x.SessionID)
+	}
 }
 
 // driverSpeechLocked follows the speech of ex's voice, which drives its own
@@ -831,6 +869,9 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
 	s.disarmFollowUpLocked(ex)
 	ex.newTurn = true
+	if started {
+		ex.unspokenAnswer = false
+	}
 	if started || ex.ended {
 		return
 	}
@@ -952,7 +993,7 @@ func (t exchangeTools) followUpTurn(ctx context.Context) (side bool, turn string
 func (s *Supervisor) turnWaited(ex *exchange) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ex != ex || ex.answering || ex.drives {
+	if s.ex != ex || ex.answering || ex.drives || s.offLocked() {
 		return
 	}
 	if s.turnOf(ex) == "" {
@@ -968,7 +1009,7 @@ func (s *Supervisor) turnWaited(ex *exchange) {
 
 // handTurnLocked hands the asker's turn to the Concierge.
 func (s *Supervisor) handTurnLocked(ex *exchange) {
-	if ex.answering || ex.drives {
+	if ex.answering || ex.drives || s.offLocked() {
 		return
 	}
 	if ex.timer != nil {
@@ -978,6 +1019,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange) {
 		s.endLocked(ex, false, "side talk in the follow-up window")
 		return
 	}
+	ex.x.FollowUpTurn = ex.followUpTurn
 	ex.followUpTurn = false
 	ex.answering = true
 	ex.turnAt = time.Now()
@@ -1242,7 +1284,7 @@ func (s *Supervisor) offer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropEndedLocked()
-	if s.closed || len(s.pending) == 0 || !s.cfg.Red() {
+	if s.closed || s.offLocked() || len(s.pending) == 0 || !s.cfg.Red() {
 		return
 	}
 	if ex := s.ex; ex != nil && !s.idleLocked(ex) {
@@ -1685,6 +1727,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// followUpTurn waited for it.
 	s.mu.Lock()
 	x = t.ex.x
+	x.FollowUpTurn = t.ex.followUpTurn
 	s.mu.Unlock()
 	var (
 		said   []string // the result's lines, in order
@@ -1738,6 +1781,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	if len(lines) > 0 {
 		s.mu.Lock()
 		t.ex.askedBack = isQuestion(lines[len(lines)-1])
+		t.ex.unspokenAnswer = true // until the voice's speech starts
 		s.mu.Unlock()
 	}
 	return json.Marshal(AnswerResult{Say: strings.Join(lines, " ")})
