@@ -266,3 +266,23 @@ func TestAFailedAnswerToolWithNoLineSaysSorry(t *testing.T) {
 		t.Fatalf("the session spoke %q, want one sorry", says)
 	}
 }
+
+// TestAToolThatCannotReachDispatchPlaysTheErrorSound fails if a driving
+// voice's tool call that finds Dispatch or Envoy out of reach plays no error
+// sound (R10), or keeps the Concierge's result from the vendor, which must
+// say it.
+func TestAToolThatCannotReachDispatchPlaysTheErrorSound(t *testing.T) {
+	c := newFakeConcierge()
+	c.toolsUnreachable = true
+	r := newDrivingRigWith(t, time.Minute, c)
+	r.heard("Wispr, what is happening with ABC-12?", true, true)
+	sess := r.waitSession()
+	out, err := sess.x.Tools.Run(t.Context(), ToolCall{ID: "d1", Name: "read_issue", Args: json.RawMessage(`{"key":"ABC-12"}`)})
+	if err != nil {
+		t.Fatalf("the tool returned %v to the vendor, want its result", err)
+	}
+	if string(out) != `{"error":"I cannot reach Dispatch yet."}` {
+		t.Fatalf("the vendor got %s, want the Concierge's result", out)
+	}
+	eventually(t, "the error sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "error") })
+}

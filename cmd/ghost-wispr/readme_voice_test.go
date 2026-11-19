@@ -32,6 +32,8 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"Between exchanges nothing goes to the Voice Agent",
 		// R7 and R10: when an answer may speak, and the sounds.
 		"It speaks by itself only when nobody has spoken since the question and the light still reads red",
+		"A pause ends the recording session, and an ended session's answers are never spoken: they stay in writing on that session's page",
+		"During a light hold the session goes on, and an answer stays silent until the light reads red and someone says \"Wispr, go ahead\"",
 		"Wispr plays a three-note sound after a second in which nobody speaks",
 		"For 6 s after Wispr's answer, a follow-up needs no wake phrase",
 		"\"Wispr, never mind\" cancels the newest question to an agent",

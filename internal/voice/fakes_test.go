@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -468,6 +469,8 @@ type fakeConcierge struct {
 	// when it is set.
 	acks      []string
 	afterAcks chan struct{}
+	// toolsUnreachable makes every tool answer as with Dispatch out of reach.
+	toolsUnreachable bool
 }
 
 func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
@@ -486,7 +489,9 @@ func newFakeConcierge(lines ...string) *fakeConcierge {
 	return &fakeConcierge{lines: lines, answers: make(chan PendingAnswer, 8), cancelled: make(chan time.Time, 8), asked: make(chan string, 8)}
 }
 
-func (c *fakeConcierge) Tools(x *Exchange) ToolRunner { return fakeTools{} }
+func (c *fakeConcierge) Tools(x *Exchange) ToolRunner {
+	return fakeTools{unreachable: c.toolsUnreachable}
+}
 
 func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, say SayFunc) error {
 	c.mu.Lock()
@@ -512,12 +517,22 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 			return err
 		}
 	}
-	if c.hold {
+	c.mu.Lock()
+	hold := c.hold
+	c.mu.Unlock()
+	if hold {
 		<-ctx.Done()
 		c.cancelled <- time.Now()
 		return ctx.Err()
 	}
 	return c.answerErr
+}
+
+// setHold sets hold while answers may run.
+func (c *fakeConcierge) setHold(on bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hold = on
 }
 
 func (c *fakeConcierge) Answers() <-chan PendingAnswer { return c.answers }
@@ -548,9 +563,15 @@ func (c *fakeConcierge) spokenIDs() []string {
 	return append([]string(nil), c.spoken...)
 }
 
-type fakeTools struct{}
+// fakeTools answers every tool with {}, or, with unreachable set, as the
+// Concierge answers when Dispatch is out of reach: its result and an error
+// that wraps ErrUnreachable.
+type fakeTools struct{ unreachable bool }
 
-func (fakeTools) Run(context.Context, ToolCall) (json.RawMessage, error) {
+func (t fakeTools) Run(context.Context, ToolCall) (json.RawMessage, error) {
+	if t.unreachable {
+		return json.RawMessage(`{"error":"I cannot reach Dispatch yet."}`), fmt.Errorf("concierge: %w", ErrUnreachable)
+	}
 	return json.RawMessage(`{}`), nil
 }
 

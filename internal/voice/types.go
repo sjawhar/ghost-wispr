@@ -41,7 +41,11 @@ type ToolCall struct {
 }
 
 // ToolRunner runs the Concierge's tools for a voice that drives its own turn
-// (voices B and C).
+// (voices B and C). The Concierge's Run returns an error for an unknown tool
+// or a stop; when a tool finds Dispatch or Envoy out of reach, it returns the
+// tool's result, which says so, with an error that wraps ErrUnreachable. The
+// Supervisor's runner, the one a voice gets as Exchange.Tools, plays the error
+// sound then, and gives the voice the result with a nil error.
 type ToolRunner interface {
 	Run(ctx context.Context, c ToolCall) (json.RawMessage, error)
 }

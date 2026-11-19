@@ -534,7 +534,7 @@ func TestEachVoicePassesTheScriptedExchange(t *testing.T) {
 		r.heard("Wispr, stop.", false, false)
 		eventually(t, "the stop", func() bool { _, _, closed := sess.state(); return closed })
 
-		c.hold = true
+		c.setHold(true) // the follow-up's answer may still be running
 		paused := r.ask("what changed today?")
 		waitSaid(t, paused)
 		asked := time.Now()

@@ -1519,7 +1519,19 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		s.touchLocked(t.ex)
 	}()
 	if c.Name != AnswerTool {
-		return s.cfg.Concierge.Tools(&x).Run(ctx, c)
+		out, err := s.cfg.Concierge.Tools(&x).Run(ctx, c)
+		if errors.Is(err, ErrUnreachable) {
+			// The result says so, for the vendor to speak; the room hears
+			// the error sound (R10).
+			s.logf("voice: a tool could not reach Dispatch or Envoy: %v", err)
+			s.mu.Lock()
+			if t.ex.ctx.Err() == nil {
+				s.errorLocked(x.SessionID)
+			}
+			s.mu.Unlock()
+			return out, nil
+		}
+		return out, err
 	}
 	var args AnswerArgs
 	if err := json.Unmarshal(c.Args, &args); err != nil {
