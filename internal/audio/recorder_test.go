@@ -70,7 +70,7 @@ func TestRecorderProducesOutputFile(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
 
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		data, err := os.ReadFile(rawPath)
 		if err != nil {
 			return "", err
@@ -111,7 +111,7 @@ func TestRecorderProducesOutputFile(t *testing.T) {
 func TestTeeWriterWritesToBothDestinations(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		return filepath.Join(dir, sessionID+".wav"), os.WriteFile(filepath.Join(dir, sessionID+".wav"), []byte("ok"), 0o644)
 	}
 
@@ -144,7 +144,7 @@ func TestTeeWriterWritesToBothDestinations(t *testing.T) {
 func TestRecorderPrerollCapturesBeforeSessionStart(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		data, err := os.ReadFile(rawPath)
 		if err != nil {
 			return "", err
@@ -195,7 +195,7 @@ func TestRecorderPrerollCapturesBeforeSessionStart(t *testing.T) {
 func TestRecorderDiscardPrerollDropsBufferedAudio(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		data, err := os.ReadFile(rawPath)
 		if err != nil {
 			return "", err
@@ -236,7 +236,7 @@ func TestRecorderEndSessionRetriesARecordingItCouldNotSave(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
 	full := true
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		if full {
 			return "", errors.New("no space left on device")
 		}
@@ -285,7 +285,7 @@ func TestRecorderZeroesTheRawRecordingItSaved(t *testing.T) {
 	dir := t.TempDir()
 	recorder := NewRecorder(dir)
 	var held *os.File
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		var err error
 		if held, err = os.Open(rawPath); err != nil {
 			return "", err
@@ -380,7 +380,7 @@ func TestRecorderDiscardUnsavedKeepsTheRawAudio(t *testing.T) {
 			dir := t.TempDir()
 			recorder := NewRecorder(dir)
 			encodes := 0
-			recorder.encode = func(context.Context, string, string) (string, error) {
+			recorder.encode = func(context.Context, string, string, int) (string, error) {
 				encodes++
 				return "", errors.New("no space left on device")
 			}
@@ -452,7 +452,7 @@ func TestRecorderStartSessionLeavesNoSessionOpenWhenThePrerollCannotBeWritten(t 
 // saveAsWAV makes recorder save a recording by copying its raw audio to
 // <session>.wav in dir, failing while *full is set.
 func saveAsWAV(recorder *Recorder, dir string, full *bool) {
-	recorder.encode = func(_ context.Context, rawPath, sessionID string) (string, error) {
+	recorder.encode = func(_ context.Context, rawPath, sessionID string, _ int) (string, error) {
 		if *full {
 			return "", errors.New("no space left on device")
 		}
@@ -543,7 +543,7 @@ func TestRecorderKeptRawSessionsWhileSaving(t *testing.T) {
 	}
 	expect("while recording", "20261106100000", "20261106120000")
 
-	recorder.encode = func(context.Context, string, string) (string, error) {
+	recorder.encode = func(context.Context, string, string, int) (string, error) {
 		expect("while saving", "20261106100000", "20261106120000")
 		return "", errors.New("no space left on device")
 	}

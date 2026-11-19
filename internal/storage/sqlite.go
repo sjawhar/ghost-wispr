@@ -538,6 +538,10 @@ func (s *SQLiteStore) init(dbPath string) error {
 		// the next sync of either updates them in place
 		// (DriveDocumentsOwed, ClearDriveDocumentsPending).
 		`ALTER TABLE sessions ADD COLUMN drive_documents_pending INTEGER NOT NULL DEFAULT 0`,
+		// The sample rate the session's raw recording is captured at
+		// (SetSessionSampleRate); 0 for a session from before it was kept,
+		// which was captured at 16000 Hz.
+		`ALTER TABLE sessions ADD COLUMN sample_rate INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migration failed: %w", err)
@@ -1016,6 +1020,37 @@ func (s *SQLiteStore) runOnce(name, stmt string) error {
 // an id a session already has, or a deleted session still recorded in
 // deleted_session_files.
 var ErrSessionExists = errors.New("a session with this id exists")
+
+// SetSessionSampleRate records rate as the sample rate session id's raw
+// recording is captured at: a raw .pcm stores no rate, and a recording saved
+// from it later (a kept raw recording, after a stop inside the session) must
+// be encoded at that rate. An unknown session is refused with sql.ErrNoRows.
+func (s *SQLiteStore) SetSessionSampleRate(id string, rate int) error {
+	res, err := s.db.Exec(`UPDATE sessions SET sample_rate = ? WHERE id = ?`, rate, id)
+	if err != nil {
+		return fmt.Errorf("record the sample rate of session %s: %w", id, err)
+	}
+	if rows, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("record the sample rate of session %s: %w", id, err)
+	} else if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// SessionSampleRate returns the sample rate session id's raw recording was
+// captured at (SetSessionSampleRate), or 0 for a session a build before that
+// recorded none for. An unknown session is refused with sql.ErrNoRows.
+func (s *SQLiteStore) SessionSampleRate(id string) (int, error) {
+	var rate int
+	if err := s.db.QueryRow(`SELECT sample_rate FROM sessions WHERE id = ?`, id).Scan(&rate); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, sql.ErrNoRows
+		}
+		return 0, fmt.Errorf("read the sample rate of session %s: %w", id, err)
+	}
+	return rate, nil
+}
 
 // CreateSession creates session id, active since startedAt. An id a session
 // already has is refused with ErrSessionExists, and that session is left as
