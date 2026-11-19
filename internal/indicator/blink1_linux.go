@@ -116,60 +116,103 @@ func (b *blink1) PatternKnownBlack() bool {
 	return known
 }
 
-// saveRecordFresh is how long a save of a unit's black pattern, recorded by
-// RecordSavesIn, spares a later check that finds the pattern black its own
-// save. Each check of a unit not known black yet ends in a save, and the
-// recorder checks its unit at each start: without the record, a recorder that
-// failed and was restarted every 10 s (ghost-wispr.service: Restart=always,
+// saveRecordFresh is how long the records of RecordSavesIn stand. Each check
+// of a unit not known black yet ends in a save of the black pattern, and the
+// recorder checks its unit at each start: without them, a recorder that failed
+// and was restarted every 10 s (ghost-wispr.service: Restart=always,
 // RestartSec=10, no start limit) would write the unit's flash about 8,600
-// times a day. With it, a unit whose pattern reads black is saved at most
-// once per saveRecordFresh, across processes.
+// times a day. With them, a unit's flash is written at most once per
+// saveRecordFresh, across processes.
 const saveRecordFresh = 24 * time.Hour
+
+// The records RecordSavesIn keeps per unit serial number, as file name
+// suffixes.
+const (
+	// attemptRecord: a save was about to be sent. It is written before the
+	// save, and spares the flash another for saveRecordFresh, whether the
+	// save then reached the unit, missed it, failed or never went out.
+	attemptRecord = ".attempt"
+	// savedRecord: a save that this process saw reach the unit, of a pattern
+	// shown black. Only it makes a later check know the unit black.
+	savedRecord = ".saved"
+)
 
 var (
 	saveRecordMu  sync.Mutex
 	saveRecordDir string
 )
 
-// RecordSavesIn makes the black pattern check record in dir, one file per
-// unit serial number, when a save of that unit's black pattern last reached
-// it. A check that finds a unit's pattern black then skips its own save, and
-// takes the unit as known black, while a save recorded less than
-// saveRecordFresh ago stands: Ghost Wispr saves nothing but the black pattern,
-// and a save that missed the unit leaves its flash as the last save left it.
-// dir must last across restarts. "" records nothing, and every such check
-// saves.
+// RecordSavesIn makes the black pattern check keep two records per unit
+// serial number in dir, which must last across restarts. Before it writes the
+// unit's flash ('W'), it records the attempt; if it cannot, it writes nothing,
+// and the unit is not known black. While an attempt recorded less than
+// saveRecordFresh ago stands, no check writes that unit's flash again. Once a
+// save is seen to reach the unit, it records the save; while a save recorded
+// less than saveRecordFresh ago stands, a check that finds the unit's pattern
+// black knows the unit black without a save: Ghost Wispr saves nothing but the
+// black pattern, and a save that missed leaves flash as the last save left it.
+// An attempt with no save recorded after it, as when the process ended before
+// its save went out or before it was confirmed, or the transfer failed,
+// leaves the unit unknown, so it is checked whenever it is opened. "" keeps no
+// records: every check that needs a save sends one.
 func RecordSavesIn(dir string) {
 	saveRecordMu.Lock()
 	defer saveRecordMu.Unlock()
 	saveRecordDir = dir
 }
 
-// saveRecordPath is the file that records serial's last save, "" when no
-// record is kept.
-func saveRecordPath(serial string) string {
+// saveRecordPath is the file of serial's record kind (attemptRecord or
+// savedRecord), "" when no record is kept.
+func saveRecordPath(serial, kind string) string {
 	saveRecordMu.Lock()
 	defer saveRecordMu.Unlock()
 	if saveRecordDir == "" || serial == "" {
 		return ""
 	}
-	return filepath.Join(saveRecordDir, hex.EncodeToString([]byte(serial)))
+	return filepath.Join(saveRecordDir, hex.EncodeToString([]byte(serial))+kind)
 }
 
-// recordSave records that a save of serial's black pattern reached it now. A
-// record it cannot write leaves the next check to save again.
+// claimSave reports whether a save of serial's flash may be sent now: no
+// attempt was recorded less than saveRecordFresh ago, and this one is
+// recorded first. With no record kept (a unit with no serial number, or no
+// RecordSavesIn), it may always be sent.
+func claimSave(serial string) bool {
+	path := saveRecordPath(serial, attemptRecord)
+	if path == "" {
+		return true
+	}
+	now := time.Now()
+	if recordedRecently(path, now) {
+		return false
+	}
+	if err := writeSaveRecord(path, now); err != nil {
+		slog.Warn("record the blink(1)'s save attempt; the flash is not written, and the unit is checked at each open", "serial", serial, "error", err)
+		return false
+	}
+	return true
+}
+
+// recordSave records that a save of serial's black pattern was seen to reach
+// it now. A record it cannot write leaves the unit unknown to later processes.
 func recordSave(serial string) {
-	path := saveRecordPath(serial)
+	path := saveRecordPath(serial, savedRecord)
 	if path == "" {
 		return
 	}
 	if err := writeSaveRecord(path, time.Now()); err != nil {
-		slog.Warn("record the blink(1)'s black pattern save; the next check saves it again", "serial", serial, "error", err)
+		slog.Warn("record the blink(1)'s black pattern save; later processes check the unit", "serial", serial, "error", err)
 	}
 }
 
-// writeSaveRecord writes the save time at to path, through a rename so a
-// reader sees the old record or the new one.
+// savedRecently reports whether a save of serial's black pattern was recorded
+// as reaching it less than saveRecordFresh before now.
+func savedRecently(serial string, now time.Time) bool {
+	path := saveRecordPath(serial, savedRecord)
+	return path != "" && recordedRecently(path, now)
+}
+
+// writeSaveRecord writes the time at to path, through a rename so a reader
+// sees the old record or the new one.
 func writeSaveRecord(path string, at time.Time) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -190,14 +233,10 @@ func writeSaveRecord(path string, at time.Time) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// savedRecently reports whether a save of serial's black pattern was recorded
-// less than saveRecordFresh before now. A record from the future, as after
-// the clock was set back, does not count.
-func savedRecently(serial string, now time.Time) bool {
-	path := saveRecordPath(serial)
-	if path == "" {
-		return false
-	}
+// recordedRecently reports whether the record at path holds a time less than
+// saveRecordFresh before now. A time in the future, as after the clock was
+// set back, does not count.
+func recordedRecently(path string, now time.Time) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
@@ -462,19 +501,21 @@ func (b *blink1) BlackPattern() error {
 // flash, which a power-up loads.
 //
 // A read of RAM cannot show what flash holds, so a unit is made known black
-// (checkedUnits) only by a save of the black pattern that reached it: this
-// check's, after its read-back, or one recorded less than saveRecordFresh ago
-// (RecordSavesIn). A check that finds the pattern black on a unit with a
-// serial number that is not known yet, and has no such record, sends one 'W'
-// to end with. A save that missed earlier, in this check, another check, on
-// another handle or in a process that has since ended, leaves RAM black and
-// flash lit: only a save that reaches the unit puts it right (review
-// 5983673477 of #99). A save that did not reach the unit (another open held
-// the lock past its wait, or the transfer failed) still passes the check, as
-// the pattern the watchdog plays is black, but the unit is not known: plugged
-// in again, it loads the saved pattern and is checked (review 5958478401 of
-// #79). Each check sends at most one save, and a read error leaves what it
-// has learned as it was.
+// (checkedUnits) only by a save of the black pattern seen to reach it: this
+// check's, after its read-back, or one recorded as confirmed less than
+// saveRecordFresh ago (RecordSavesIn). A check that finds the pattern black on
+// a unit with a serial number that is not known yet, and has no such record,
+// sends one 'W' to end with. A save that missed earlier, in this check,
+// another check, on another handle or in a process that has since ended,
+// leaves RAM black and flash lit: only a save that reaches the unit puts it
+// right (review 5983673477 of #99). A save that did not reach the unit (another
+// open held the lock past its wait, or the transfer failed) still passes the
+// check, as the pattern the watchdog plays is black, but the unit is not
+// known: plugged in again, it loads the saved pattern and is checked (review
+// 5958478401 of #79). Each check sends at most one save, and none while a save
+// attempt recorded less than saveRecordFresh ago stands or when it cannot
+// record its own (RecordSavesIn); the unit then stays unknown. A read error
+// leaves what the check has learned as it was.
 func (b *blink1) PatternCheck() PatternCheck { return &blink1PatternCheck{b: b} }
 
 type blink1PatternCheck struct {
@@ -483,9 +524,9 @@ type blink1PatternCheck struct {
 	phase   int   // checkRead, checkSelectLEDs, checkWrite or checkSave
 	line    uint8 // the next line to read or write
 	written bool  // the black pattern is written: the reads check it
-	sent    bool  // the check has sent its save, or tried to
+	sent    bool  // the check has sent its save, tried to, or may send none
 	// saved: a save of the black pattern reached the unit, this check's or
-	// one recorded less than saveRecordFresh ago (RecordSavesIn).
+	// one recorded as confirmed less than saveRecordFresh ago.
 	saved bool
 	done  bool
 }
@@ -536,6 +577,11 @@ func (c *blink1PatternCheck) Step() (bool, error) {
 				c.saved = true
 				return c.finish(), nil
 			}
+			if !claimSave(c.b.serial) {
+				// No save now: the unit stays unknown.
+				c.sent = true
+				return c.finish(), nil
+			}
 			c.phase = checkSave
 			return false, nil
 		}
@@ -552,7 +598,14 @@ func (c *blink1PatternCheck) Step() (bool, error) {
 			return false, err
 		}
 		if c.line++; c.line == c.lines {
-			c.phase, c.written = checkSave, true
+			c.written = true
+			if claimSave(c.b.serial) {
+				c.phase = checkSave
+			} else {
+				// No save now: the read-back shows the written pattern,
+				// and the unit stays unknown.
+				c.sent, c.phase, c.line = true, checkRead, 0
+			}
 		}
 	case checkSave:
 		save := Blink1Report('W', [6]byte{0xbe, 0xef, 0xca, 0xfe})
@@ -586,8 +639,8 @@ func (c *blink1PatternCheck) finish() bool {
 	return true
 }
 
-// forgetUnit makes serial's unit not known black, here and in the save
-// record.
+// forgetUnit makes serial's unit not known black, here and in the record of
+// its last confirmed save.
 func forgetUnit(serial string) {
 	if serial == "" {
 		return
@@ -595,7 +648,7 @@ func forgetUnit(serial string) {
 	checkedMu.Lock()
 	delete(checkedUnits, serial)
 	checkedMu.Unlock()
-	if path := saveRecordPath(serial); path != "" {
+	if path := saveRecordPath(serial, savedRecord); path != "" {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			slog.Warn("drop the blink(1)'s save record", "serial", serial, "error", err)
 		}

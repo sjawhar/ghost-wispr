@@ -755,7 +755,8 @@ func main() {
 	}
 	// The recording light's pattern check saves the black pattern at each
 	// start unless a save recorded here is less than a day old, so a recorder
-	// restarted over and over does not wear the light's flash.
+	// restarted over and over does not wear the light's flash: the check
+	// records each save's attempt here before it sends it.
 	indicator.RecordSavesIn(filepath.Join(filepath.Dir(dbPath), "blink1-saves"))
 
 	// Recover any sessions left as 'active' from a previous crash/restart:

@@ -197,9 +197,13 @@ off and lights the Jabra's mute light again, so the next press resumes again. Th
 pattern the light plays, not the one it saves, so a unit is known black only once a save of the
 black pattern reached it: a check that finds the pattern black saves it once more first, and a save
 that does not reach the unit leaves it unknown, so it is checked again when it comes back, in this
-process or the next. Each save that reached a unit is recorded in `blink1-saves/` next to the
-database; for a day after one, a check that finds that unit's pattern black takes the record for its
-save, so a recorder restarted over and over writes the blink(1)'s flash at most once a day. Programs that do not take the
+process or the next. Two records per serial number in `blink1-saves/` next to the database bound
+the flash writes: each save's attempt is recorded before it is sent, and no save is sent for a day
+after one, nor when the attempt cannot be recorded; and a save seen to reach the unit is recorded
+after it, which for a day lets a check that finds that unit's pattern black know it black without
+a save. An attempt with no confirmed save after it, as after a crash or a failed transfer, leaves
+the unit unknown. So a recorder restarted over and over writes the blink(1)'s flash at most once a
+day. Programs that do not take the
 lock, such as `blink1-tool`, must not run while the recorder runs: their own colour read can still
 answer the recorder's.
 
