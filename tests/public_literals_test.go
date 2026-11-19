@@ -27,6 +27,8 @@ var companyLiterals = []string{
 	"envoy" + "-hub",
 	"envoy" + "-cluster",
 	"envoy" + "-host",
+	"tag:hind" + "sight",
+	"hindsight" + "-control-plane",
 	"ghostWispr" + "AccountUniqueId",
 	"ghostWispr" + "TailnetClientId",
 	"Pulumi" + `\.prod`,
