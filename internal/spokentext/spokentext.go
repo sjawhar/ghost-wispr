@@ -7,6 +7,7 @@ package spokentext
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Withheld stands in an error for a vendor's message that quotes the text it
@@ -23,23 +24,29 @@ func Withhold(message, text string) string {
 	return message
 }
 
-// Quotes reports whether message holds text, or two of its words in a row,
-// compared as words (letters and digits) whatever the case, spacing or
-// punctuation. One shared word is not a quote: an error such as "permission
-// denied" stays readable when the text says "permission".
+// Quotes reports whether message holds text, two of its words in a row, or
+// one of its names or numbers, compared as words (letters and digits)
+// whatever the case, spacing or punctuation. A name is a capitalised word
+// that does not start a sentence, as R8 counts names. Another single shared
+// word is not a quote: an error such as "permission denied" stays readable
+// when the text says "permission".
 func Quotes(message, text string) bool {
 	words := spokenWords(text)
 	said := spokenWords(message)
 	if len(words) == 0 || len(said) == 0 {
 		return false
 	}
+	saidSet := make(map[string]bool, len(said))
+	for _, word := range said {
+		saidSet[word] = true
+	}
 	if len(words) == 1 {
-		for _, word := range said {
-			if word == words[0] {
-				return true
-			}
+		return saidSet[words[0]]
+	}
+	for _, word := range namesAndNumbers(text) {
+		if saidSet[word] {
+			return true
 		}
-		return false
 	}
 	pairs := make(map[[2]string]bool, len(said))
 	for i := 1; i < len(said); i++ {
@@ -53,9 +60,27 @@ func Quotes(message, text string) bool {
 	return false
 }
 
+// namesAndNumbers returns, in lower case, the words of text that are names
+// (capitalised, not starting a sentence) or hold a digit.
+func namesAndNumbers(text string) []string {
+	var out []string
+	sentenceStart := true
+	for _, field := range strings.Fields(text) {
+		word := strings.TrimFunc(field, notWordRune)
+		if word != "" {
+			first, _ := utf8.DecodeRuneInString(word)
+			if strings.ContainsFunc(word, unicode.IsDigit) || (unicode.IsUpper(first) && !sentenceStart) {
+				out = append(out, spokenWords(word)...)
+			}
+		}
+		sentenceStart = strings.ContainsAny(field[len(field)-1:], ".!?")
+	}
+	return out
+}
+
+func notWordRune(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }
+
 // spokenWords returns the words of s, in lower case.
 func spokenWords(s string) []string {
-	return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
+	return strings.FieldsFunc(strings.ToLower(s), notWordRune)
 }

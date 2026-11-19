@@ -164,6 +164,10 @@ func TestSpokenKeysAreWritten(t *testing.T) {
 		"what changed in the last 30 days":   "what changed in the last 30 days",
 		"I am in for a minute":               "I am in for a minute",
 		"what is happening with INFRA-1027?": "what is happening with INFRA-1027?",
+		// "in for" reads as INFRA only before a number of three or more
+		// digits, as issue numbers are; a duration is not one (ReviewPR89).
+		"we're in for thirty minutes?":  "we're in for thirty minutes?",
+		"we are in for 45 more minutes": "we are in for 45 more minutes",
 	} {
 		if got := WriteKeys(text, projects); got != want {
 			t.Errorf("WriteKeys(%q) = %q, want %q", text, got, want)

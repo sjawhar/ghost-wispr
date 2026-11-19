@@ -337,7 +337,8 @@ type keySpan struct {
 }
 
 // soundsLikeProject lists the two words Deepgram writes for a project word
-// it does not know; they read as the project only before a number.
+// it does not know; they read as the project only before a number of three or
+// more digits.
 var soundsLikeProject = map[[2]string]string{{"in", "for"}: "INFRA"}
 
 func keySpans(tokens []token) []keySpan {
@@ -355,7 +356,9 @@ func keySpans(tokens []token) []keySpan {
 		}
 		if i+1 < len(tokens) {
 			if project, ok := soundsLikeProject[[2]string{word, normalise(texts[i+1])}]; ok {
-				if digits, used := spokenNumber(texts[i+2:]); digits != "" {
+				// Only before a number of three or more digits, as issue
+				// numbers are: "in for thirty minutes" is no key.
+				if digits, used := spokenNumber(texts[i+2:]); len(digits) >= 3 {
 					spans = append(spans, keySpan{key: project + "-" + digits, from: i, to: i + 2 + used})
 					i += 1 + used
 					continue

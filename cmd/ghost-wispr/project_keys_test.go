@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"sync"
 	"testing"
 	"time"
 
@@ -22,36 +21,63 @@ func TestLiveOptionsCarryTheProjectKeys(t *testing.T) {
 }
 
 // TestProjectKeysAreReadDaily fails if the project keys are not read at
-// once and again each refresh, or a failed read drops the keys known.
+// once and again each refresh, or a failed read drops the keys known. The
+// test lets each read answer in turn, since the first read runs in the
+// background (TestProjectKeysDoNotHoldTheStart).
 func TestProjectKeysAreReadDaily(t *testing.T) {
-	var mu sync.Mutex
 	answers := [][]string{{"INFRA"}, nil, {"INFRA", "OSSV"}}
-	calls := 0
-	read := func(context.Context) ([]string, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		i := min(calls, len(answers)-1)
-		calls++
-		if answers[i] == nil {
-			return nil, errors.New("dispatch: no answer")
+	step := make(chan []string)
+	read := func(ctx context.Context) ([]string, error) {
+		select {
+		case got := <-step:
+			if got == nil {
+				return nil, errors.New("dispatch: no answer")
+			}
+			return got, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		return answers[i], nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	var keys projectKeys
-	watchProjectKeys(ctx, read, 50*time.Millisecond, &keys, t.Logf)
-	if got := keys.Get(); !slices.Equal(got, []string{"INFRA"}) {
-		t.Fatalf("keys at start %q, want the first read's", got)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !slices.Equal(keys.Get(), []string{"INFRA", "OSSV"}) && time.Now().Before(deadline) {
-		if got := keys.Get(); len(got) == 0 {
-			t.Fatal("a failed read dropped the keys known")
+	watchProjectKeys(ctx, read, 10*time.Millisecond, &keys, t.Logf)
+	waitKeys := func(want []string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for !slices.Equal(keys.Get(), want) && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
-		time.Sleep(5 * time.Millisecond)
+		if got := keys.Get(); !slices.Equal(got, want) {
+			t.Fatalf("keys %q, want %q", got, want)
+		}
 	}
-	if got := keys.Get(); !slices.Equal(got, []string{"INFRA", "OSSV"}) {
-		t.Fatalf("keys after the refreshes %q, want the newest read's", got)
+	step <- answers[0] // the first read, at once
+	waitKeys(answers[0])
+	step <- answers[1] // a refresh that fails keeps the keys known
+	step <- answers[2] // the next refresh
+	waitKeys(answers[2])
+}
+
+// TestProjectKeysDoNotHoldTheStart fails if a Dispatch that does not answer
+// holds the unit's start while the project keys are read (ReviewPR89's round
+// 2: up to 5 s).
+func TestProjectKeysDoNotHoldTheStart(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	read := func(ctx context.Context) ([]string, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil, errors.New("dispatch: no answer")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var keys projectKeys
+	start := time.Now()
+	watchProjectKeys(ctx, read, time.Hour, &keys, t.Logf)
+	if took := time.Since(start); took > 100*time.Millisecond {
+		t.Fatalf("reading the project keys held the start %v", took)
 	}
 }

@@ -31,9 +31,10 @@ func (p *projectKeys) set(keys []string) {
 	p.keys = slices.Clone(keys)
 }
 
-// watchProjectKeys reads the keys at once, within a few seconds, then every
-// every in the background until ctx ends. A read that fails keeps the keys
-// known.
+// watchProjectKeys reads the keys at once, then every every, in the
+// background until ctx ends, so a Dispatch out of reach never holds the
+// start; a live request dialled before the first read answers carries no
+// project keys. A read that fails keeps the keys known.
 func watchProjectKeys(ctx context.Context, read func(context.Context) ([]string, error), every time.Duration, keys *projectKeys, logf func(string, ...any)) {
 	refresh := func() {
 		readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -45,8 +46,8 @@ func watchProjectKeys(ctx context.Context, read func(context.Context) ([]string,
 		}
 		keys.set(got)
 	}
-	refresh()
 	go func() {
+		refresh()
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
 		for {

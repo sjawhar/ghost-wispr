@@ -202,9 +202,9 @@ type Supervisor struct {
 	voiceEnded    time.Time // when it last stopped
 	own           []ownWords
 	recent        []TurnText
-	lastHeard     time.Time // the last word heard
-	lastRoomWord  time.Time // the last word heard that was not Wispr's own
-	lastExchange  *exchange // the newest exchange a wake opened
+	lastHeard     time.Time      // the last word heard
+	lastRoomWord  time.Time      // the last word heard that was not Wispr's own
+	lastTimes     *exchangeTimes // the newest exchange a wake opened: its times, no words
 	chimedAt      time.Time
 	heard         []heardCall    // Heard calls OnTranscript makes once it unlocks
 	wg            sync.WaitGroup // the goroutines Close waits for
@@ -226,6 +226,12 @@ type pendingAnswer struct {
 type ownWords struct {
 	words map[string]bool
 	at    time.Time
+}
+
+// exchangeTimes are when an exchange's wake and its last turn were; they hold
+// no words, so they may outlive the exchange and a delete.
+type exchangeTimes struct {
+	wakeAt, lastTurnEnd time.Time
 }
 
 // exchange is one exchange: a wake, or a held answer spoken. Its fields are
@@ -260,9 +266,10 @@ type exchange struct {
 	// askedBack: Wispr's last line asked a question ("Did you mean A or
 	// B?"), so the next utterance answers it and continues the exchange.
 	askedBack bool
-	// lastTurnEnd is when the exchange's last turn ended: R7's t0 for an
-	// answer to a question it asked.
-	lastTurnEnd time.Time
+	// times are when its wake and last turn were: R7's t0 for an answer to a
+	// question it asked. The Supervisor keeps the newest exchange's after it
+	// ends, and they hold no words.
+	times *exchangeTimes
 	// unspokenAnswer: the answer tool returned words the driving voice has
 	// not begun to speak.
 	unspokenAnswer bool
@@ -447,7 +454,7 @@ func (s *Supervisor) offLocked() bool {
 		s.off = true
 		s.stopLocked("voice turned off")
 		s.pending = nil
-		s.lastExchange = nil
+		s.lastTimes = nil
 	}
 	return true
 }
@@ -715,14 +722,14 @@ func (s *Supervisor) startLocked(t *Transcript, m transcript.Match) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, exchangeMax)
-	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeAt: t.At, notified: map[string]bool{}}
+	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), wakeStart: wakeStart(t, m), wakeAt: t.At, notified: map[string]bool{}, times: &exchangeTimes{wakeAt: t.At}}
 	s.capExchange(ex)
 	if d, ok := voice.(TurnDriver); ok && d.DrivesTurn() {
 		ex.drives = true
 	}
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
-	s.lastExchange = ex
+	s.lastTimes = ex.times
 	sessionID := s.cfg.Session()
 	s.timing("wake_heard", sessionID, t.At)
 	ex.x = Exchange{
@@ -913,7 +920,7 @@ func (s *Supervisor) turnLocked(ex *exchange, t *Transcript, words string) {
 		ex.interim = ""
 		ex.turnFinal = true
 		if ex.drives {
-			ex.lastTurnEnd = time.Now()
+			ex.times.lastTurnEnd = time.Now()
 		}
 	} else {
 		ex.interim = words
@@ -1023,7 +1030,7 @@ func (s *Supervisor) handTurnLocked(ex *exchange) {
 	ex.followUpTurn = false
 	ex.answering = true
 	ex.turnAt = time.Now()
-	ex.lastTurnEnd = ex.turnAt
+	ex.times.lastTurnEnd = ex.turnAt
 	ex.firstOutDone, ex.factPending, ex.factDone = false, false, false
 	turn := s.turnOf(ex)
 	ex.x.AskerTurn = turn
@@ -1169,7 +1176,7 @@ func (s *Supervisor) speakLocked(p *pendingAnswer) {
 	}
 	s.pending = slices.DeleteFunc(s.pending, func(q *pendingAnswer) bool { return q == p })
 	ctx, cancel := context.WithTimeout(s.ctx, exchangeMax)
-	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), answering: true, answer: p, wakeStart: -1, notified: map[string]bool{}}
+	ex := &exchange{ctx: ctx, cancel: cancel, opened: make(chan struct{}), answering: true, answer: p, wakeStart: -1, notified: map[string]bool{}, times: &exchangeTimes{}}
 	s.capExchange(ex)
 	ex.dropsAtOpen = s.cfg.Tap.Dropped()
 	s.takeFloorLocked(ex)
@@ -1258,8 +1265,8 @@ func (s *Supervisor) offerAnswers() {
 				// of the exchange, not room speech. One that does not say when
 				// it was asked waits too.
 				t0 := a.AskedAt
-				if le := s.lastExchange; le != nil && !le.wakeAt.After(a.AskedAt) && le.lastTurnEnd.After(t0) {
-					t0 = le.lastTurnEnd
+				if lt := s.lastTimes; lt != nil && !lt.wakeAt.After(a.AskedAt) && lt.lastTurnEnd.After(t0) {
+					t0 = lt.lastTurnEnd
 				}
 				stoppedSince := !s.lastStopAt.IsZero() && !s.lastStopAt.Before(a.AskedAt)
 				talkedSince := !s.lastRoomWord.IsZero() && s.lastRoomWord.After(t0)

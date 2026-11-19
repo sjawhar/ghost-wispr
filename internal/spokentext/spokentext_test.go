@@ -19,6 +19,13 @@ func TestQuotesReadsWordsNotLetters(t *testing.T) {
 		{"permission denied", "Please read the permission notes.", false},
 		{"robotic voice unavailable", spokenText, false},
 		{"", spokenText, false},
+		// One word of the text is a quote when it is a name (a capitalised
+		// word that does not start a sentence) or a number: those are what a
+		// meeting's words reveal alone (ReviewPR89's round 2).
+		{`unknown word "Priya"`, "Ask Priya about the budget review.", true},
+		{"cannot pronounce 4592", "The issue 4592 is in review.", true},
+		{"invalid voice Ask", "Ask Priya about the budget review.", false},
+		{"permission denied", "Ask Priya about the permission notes.", false},
 	} {
 		if got := Quotes(tc.message, tc.text); got != tc.quotes {
 			t.Errorf("Quotes(%q, %q) = %v, want %v", tc.message, tc.text, got, tc.quotes)
