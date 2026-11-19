@@ -82,7 +82,7 @@ type racingRecorder struct {
 func (r *racingRecorder) HoldPreroll(ago time.Duration) {
 	r.once.Do(func() {
 		r.manager.PauseCapture()
-		r.Recorder.DiscardPreroll()
+		r.DiscardPreroll()
 		r.manager.ResumeCapture()
 	})
 	r.Recorder.HoldPreroll(ago)
