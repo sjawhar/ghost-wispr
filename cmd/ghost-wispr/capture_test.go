@@ -740,12 +740,19 @@ func TestCaptureGatePauseCancelsPendingResume(t *testing.T) {
 }
 
 // A Resume left waiting from an earlier pause must not open the gate during a
-// later pause that has not settled yet.
+// later pause that has not settled yet. The first pause settles only once both
+// Resumes wait on it: had the first Resume opened the gate before the second
+// Pause, that Pause would have been the later pause, whose settle the test
+// holds, and the gate could not open (`gate did not open after Resume`, seen
+// in go test -race ./... for #79).
 func TestCaptureGateStaleResumeDoesNotOpenALaterPause(t *testing.T) {
-	release := make(chan struct{})
+	first, release := make(chan struct{}), make(chan struct{})
 	var settles atomic.Int32
 	capture := newCaptureGate(nil, func() {
-		if settles.Add(1) == 2 {
+		switch settles.Add(1) {
+		case 1:
+			<-first
+		case 2:
 			<-release
 		}
 	}, nil)
@@ -755,6 +762,7 @@ func TestCaptureGateStaleResumeDoesNotOpenALaterPause(t *testing.T) {
 	capture.Resume()
 	capture.Pause()
 	capture.Resume()
+	close(first)
 	waitOpen(t, capture)
 
 	capture.Pause()
