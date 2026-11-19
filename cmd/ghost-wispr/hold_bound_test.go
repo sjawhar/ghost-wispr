@@ -486,6 +486,81 @@ func TestAPauseJustBeforeAStartOpensNothing(t *testing.T) {
 	}
 }
 
+// TestAPauseBeforeAStartsLightCheckLeavesTheLightOff fails if a pause that
+// lands after a start found the gate open, but before its red confirmation
+// writes the light, lets that confirmation turn the light red. Red says the
+// unit records, and nothing records then: the start opens nothing. The pause
+// lands during the capture-device check (capturePresent), which runs between
+// the two. The next resume starts the microphone under a red light.
+func TestAPauseBeforeAStartsLightCheckLeavesTheLightOff(t *testing.T) {
+	for _, tc := range resumeStartLoops {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startLightRig(t, false)
+			var armed atomic.Bool
+			var arm sync.Once // only the first start meets the pause
+			r.capture.beforeMicOpen = func(context.Context, <-chan struct{}) bool {
+				arm.Do(func() { armed.Store(true) }) // the start is ready; its light check comes next
+				return true
+			}
+			pausedAt := make(chan int, 1) // the blink(1)'s operations at the pause
+			var paused atomic.Bool
+			r.capture.capturePresent = func() bool {
+				if armed.CompareAndSwap(true, false) {
+					pauseCapture(r.capture, r.hardware)
+					paused.Store(true)
+					pausedAt <- len(r.device.snapshot())
+				}
+				return true
+			}
+			// confirmed closes once the start's red confirmation, after the
+			// pause, has returned, through whichever hook it takes.
+			confirmed := make(chan struct{})
+			var confirmedOnce sync.Once
+			afterPause := func() {
+				if paused.Load() {
+					confirmedOnce.Do(func() { close(confirmed) })
+				}
+			}
+			openRed, startRed := r.capture.beforeMicOpenRed, r.capture.beforeMicStart
+			r.capture.beforeMicOpenRed = func(allowed func() error) error {
+				defer afterPause()
+				holds := r.hardware.redHolds.Load()
+				return openRed(func() error {
+					// A hold makes the light controller light the light,
+					// so a refused confirmation must not have taken one.
+					err := allowed()
+					if err != nil && r.hardware.redHolds.Load() > holds {
+						t.Error("a red confirmation the gate refused held the light red")
+					}
+					return err
+				})
+			}
+			r.capture.beforeMicStart = func() error { defer afterPause(); return startRed() }
+			starts := tc.runOn(t, r.capture, func(int) error { return nil })
+			var from int
+			select {
+			case from = <-pausedAt:
+			case <-time.After(testWait):
+				t.Fatal("no start checked for a capture device")
+			}
+			if !returnedWithin(confirmed, testWait) {
+				t.Fatal("the start's red confirmation never returned")
+			}
+			r.waitOff(t)
+			if ops := r.device.snapshot(); slices.ContainsFunc(ops[from:], func(op lightOp) bool { return !op.read && isRedOp(op) }) {
+				t.Fatalf("the light was written red after a pause that came before the start's light check: operations since the pause %v", ops[from:])
+			}
+			select {
+			case got := <-starts:
+				t.Fatalf("start %d ran after a pause that came before its light check", got)
+			default:
+			}
+			r.capture.Resume()
+			nextStart(t, starts, 1, "after the resume that followed the pause")
+		})
+	}
+}
+
 func receiveWithin(t *testing.T, ch <-chan int) int {
 	t.Helper()
 	select {

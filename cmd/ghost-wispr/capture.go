@@ -144,6 +144,12 @@ type captureGate struct {
 	// or start left it (confirmMicOpen). While lightOffs still reads it, the
 	// light has been red since that microphone opened.
 	redMark atomic.Uint64
+	// beforeMicOpenRed confirms the light red for a microphone open, as
+	// beforeMicStart does, but calls allowed under the light's lock just
+	// before it writes the light, and writes nothing, returning allowed's
+	// error, unless allowed returns nil (confirmMicOpenRed). Nil uses
+	// beforeMicStart.
+	beforeMicOpenRed func(allowed func() error) error
 	// openMark is the gate's closing count as the microphone's last red
 	// confirmation began (markMicOpen), or -1 if the gate was closed then;
 	// openMarked says one has begun. Audio passes the gate only while no
@@ -562,15 +568,17 @@ func (g *captureGate) captureMissing() bool {
 // confirmMicStart does, holding it red until finishMicStart, and marks the
 // light as red from then on: audio passes the gate only while the light has
 // stayed red since (lightWentOff). Before anything else it marks the gate
-// (markMicOpen): audio passes only while the gate has not closed since. It
-// first looks for a capture device, without opening one (capturePresent):
-// with none it lights nothing and returns errNoCaptureDevice, so the light
-// stays off while the microphone is missing. It checks the light's stored
-// pattern next (checkLightPattern), which can take seconds and holds no lock
-// of the gate; a Pause, or a closing for the light, during that check cancels
-// the open: it lights nothing and returns errMicStartPaused (review
-// 5961636823 of #79). A light that cannot be confirmed red returns an error
-// that wraps errLightNotConfirmed.
+// (markMicOpen): audio passes only while the gate has not closed since, and
+// the light is written red only while it has not (confirmMicOpenRed): a
+// closing before the write returns errMicStartPaused, with the light left as
+// it was. It first looks for a capture device, without opening one
+// (capturePresent): with none it lights nothing and returns
+// errNoCaptureDevice, so the light stays off while the microphone is missing.
+// It checks the light's stored pattern next (checkLightPattern), which can
+// take seconds and holds no lock of the gate; a Pause, or a closing for the
+// light, during that check cancels the open: it lights nothing and returns
+// errMicStartPaused (review 5961636823 of #79). A light that cannot be
+// confirmed red returns an error that wraps errLightNotConfirmed.
 func (g *captureGate) confirmMicOpen() error {
 	g.markMicOpen()
 	if g.captureMissing() {
@@ -590,13 +598,38 @@ func (g *captureGate) confirmMicOpen() error {
 			return errMicStartPaused
 		}
 	}
-	if err := g.confirmMicStart(); err != nil {
+	if err := g.confirmMicOpenRed(); errors.Is(err, errMicStartPaused) {
+		return err
+	} else if err != nil {
 		return fmt.Errorf("%w: %w", errLightNotConfirmed, err)
 	}
 	if g.lightRedMark != nil {
 		// Read under the light's lock by the confirmation itself, so no
 		// failure counted after it is taken into the mark.
 		g.redMark.Store(g.lightRedMark())
+	}
+	return nil
+}
+
+// confirmMicOpenRed confirms the light red for a microphone open. Through
+// beforeMicOpenRed it writes the light only while the gate has not closed
+// since the open's mark (openAllowed), checked under the light's lock just
+// before the write: red says the unit records, so a pause never meets a light
+// lit red after it for an open that then opens nothing. Without
+// beforeMicOpenRed it is confirmMicStart.
+func (g *captureGate) confirmMicOpenRed() error {
+	if g.beforeMicOpenRed == nil {
+		return g.confirmMicStart()
+	}
+	return g.beforeMicOpenRed(g.openAllowed)
+}
+
+// openAllowed returns errMicStartPaused once the gate has closed since the
+// microphone open's mark, or was closed then (closedSinceMicOpen), and nil
+// otherwise.
+func (g *captureGate) openAllowed() error {
+	if g.closedSinceMicOpen() {
+		return errMicStartPaused
 	}
 	return nil
 }
