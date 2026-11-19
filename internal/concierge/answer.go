@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -527,15 +528,20 @@ func fewestWords(turn string) string {
 	// question starts at its first word, in the asker's own words.
 	question = strings.TrimLeftFunc(question, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
 	// A routing clause runs to the question's first word, which stays, or
-	// to a comma. After "ask the agent on KEY", a clause up to a comma is the
-	// question's own ("for the demo on Friday, will it be ready"), unless it
-	// names a key itself.
+	// to a comma. A clause up to a comma is the question's own ("for the demo
+	// on Friday, will it be ready") after "ask the agent on KEY" unless it
+	// names that key again, and after a pause ("ask the agent, …") unless it
+	// names any key.
 	if m := routingClause.FindStringSubmatchIndex(question); m != nil {
-		keyed := len(issueKeysIn(askPrefix.FindString(turn))) > 0
+		prefix := strings.TrimSpace(askPrefix.FindString(turn))
+		named, inClause := issueKeysIn(prefix), issueKeysIn(question[:m[1]])
+		paused := strings.HasSuffix(prefix, ",") || strings.HasSuffix(prefix, ":")
 		switch {
 		case m[2] >= 0:
 			question = question[m[2]:]
-		case !keyed || len(issueKeysIn(question[:m[1]])) > 0:
+		case len(named) > 0 && !slices.Contains(inClause, named[0]):
+		case paused && len(named) == 0 && len(inClause) == 0:
+		default:
 			question = question[m[1]:]
 		}
 	}
@@ -573,11 +579,11 @@ var (
 	// questionWords start a question; clauseWords start a clause within one.
 	questionWords = set(strings.Fields("when where why how what which who whom whose whether"))
 	clauseWords   = set(strings.Fields("when where why how what whether"))
-	// adverbs join the question word before the verb: "when exactly". An
-	// -ly word also does after "how", or just before the verb ("when
-	// realistically will it ship"); elsewhere it may be an adjective
-	// ("nightly builds").
-	adverbs = set(strings.Fields("exactly roughly approximately really actually probably likely precisely quickly badly"))
+	// adverbs join the question word before the verb: "when exactly". A
+	// lowercase -ly word also does right after a bare "how" ("how
+	// reliably"); elsewhere it may be an adjective ("nightly builds") or a
+	// name ("Emily").
+	adverbs = set(strings.Fields("exactly roughly approximately really actually probably likely precisely quickly badly realistically"))
 )
 
 // direct makes an embedded question direct, with a capital and a question
@@ -631,9 +637,10 @@ func direct(question string) string {
 				phrase = 3
 			}
 		}
-		if w := ""; phrase < len(words) {
-			w = word(phrase)
-			if adverbs[w] || strings.HasSuffix(w, "ly") && (first == "how" || phrase+1 < len(words) && auxiliaries[word(phrase+1)]) {
+		if phrase < len(words) {
+			w := word(phrase)
+			lowercaseLy := strings.HasSuffix(w, "ly") && strings.Trim(words[phrase], ",;") == w
+			if adverbs[w] || first == "how" && phrase == 1 && lowercaseLy {
 				phrase++ // "when exactly", "how reliably"
 			}
 		}
