@@ -32,8 +32,8 @@ func TestCapturedSinceCountsFromTheSocketsFirstByte(t *testing.T) {
 	_, _ = rc.Write(make([]byte, secondOfAudio))
 	// 1 s into the socket's stream is the second second it was sent; 2 s
 	// were captured after that point.
-	if got := rc.CapturedSince(1); got != 2*time.Second {
-		t.Fatalf("CapturedSince(1) = %v, want 2s", got)
+	if got := rc.CapturedSince(time.Second); got != 2*time.Second {
+		t.Fatalf("CapturedSince(1s) = %v, want 2s", got)
 	}
 	if got := rc.MaxBehind(); got != DefaultBufferSeconds*time.Second {
 		t.Fatalf("MaxBehind() = %v, want %ds, the default buffer", got, DefaultBufferSeconds)
@@ -61,7 +61,7 @@ func TestFinalizeTakesTheAudioItDropsOutOfTheStream(t *testing.T) {
 	}
 	// The socket's next audio is captured after the resume.
 	_, _ = rc.Write(make([]byte, secondOfAudio))
-	if got := rc.CapturedSince(1); got != time.Second {
-		t.Fatalf("CapturedSince(1) = %v, want 1s: the stream's second second is the audio after the resume", got)
+	if got := rc.CapturedSince(time.Second); got != time.Second {
+		t.Fatalf("CapturedSince(1s) = %v, want 1s: the stream's second second is the audio after the resume", got)
 	}
 }

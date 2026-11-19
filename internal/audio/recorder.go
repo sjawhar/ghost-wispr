@@ -42,9 +42,10 @@ func pcmBytesPerSecond(sampleRate int) int {
 }
 
 // pcmBytes is the size of d of the recorder's PCM at sampleRate, in whole
-// samples.
+// samples. It splits d at the second, so a long d does not overflow it.
 func pcmBytes(d time.Duration, sampleRate int) int {
-	samples := int64(d) * int64(sampleRate) / int64(time.Second)
+	rate := int64(sampleRate)
+	samples := int64(d/time.Second)*rate + int64(d%time.Second)*rate/int64(time.Second)
 	return int(samples) * pcmChannels * pcmBitDepth / 8
 }
 
@@ -299,8 +300,7 @@ func (r *Recorder) takeLeadLocked() (before, held []byte) {
 	}
 	r.history.Discard(r.history.Len() - n)
 	before = make([]byte, n)
-	_, _ = r.history.Read(before)
-	r.history.Reset()
+	_, _ = r.history.Read(before) // all that is left: history is empty after
 	held = r.held
 	r.holding, r.holdBack, r.held = false, 0, nil
 	return before, held
@@ -511,7 +511,10 @@ func (r *Recorder) HoldPreroll(ago time.Duration) {
 		r.holding, r.holdBack, r.held = true, 0, nil
 	}
 	reach := pcmBytes(max(ago, 0), r.sampleRate) + prerollSeconds*pcmBytesPerSecond(r.sampleRate)
-	r.holdBack = max(r.holdBack, min(reach-len(r.held), r.history.Len()))
+	// No further back than maxHeldSeconds: a hold at its bound has dropped
+	// its oldest audio (writePCM), and history no longer joins what it holds.
+	bound := maxHeldSeconds*pcmBytesPerSecond(r.sampleRate) - len(r.held)
+	r.holdBack = max(r.holdBack, min(reach-len(r.held), r.history.Len(), bound))
 }
 
 // ReleasePreroll ends a hold (HoldPreroll) whose words opened no session,

@@ -3,10 +3,8 @@ package audio
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"os"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -67,14 +65,6 @@ func startedWith(t *testing.T, dir string, r *Recorder) []uint16 {
 	return labels
 }
 
-func labelString(labels []uint16) string {
-	parts := make([]string, len(labels))
-	for i, label := range labels {
-		parts[i] = fmt.Sprint(label)
-	}
-	return "[" + strings.Join(parts, " ") + "]"
-}
-
 // TestAHoldReachesBackToWordsHeardLate fails if a hold (HoldPreroll) for
 // words captured long before Deepgram heard them does not start the
 // recording prerollSeconds before them, within the lookback, and keep all
@@ -89,7 +79,7 @@ func TestAHoldReachesBackToWordsHeardLate(t *testing.T) {
 	takeSeconds(t, r, 21, 22)
 	r.HoldPreroll(time.Second)
 	if got, want := startedWith(t, dir, r), secondsFrom(4, 22); !slices.Equal(got, want) {
-		t.Fatalf("the recording opened with seconds %s, want %s: from 5 s before the first words", labelString(got), labelString(want))
+		t.Fatalf("the recording opened with seconds %v, want %v: from 5 s before the first words", got, want)
 	}
 }
 
@@ -103,7 +93,7 @@ func TestAHoldReachesNoFurtherThanTheLookback(t *testing.T) {
 	takeSeconds(t, r, secondsFrom(1, 30)...)
 	r.HoldPreroll(25 * time.Second)
 	if got, want := startedWith(t, dir, r), secondsFrom(16, 30); !slices.Equal(got, want) {
-		t.Fatalf("the recording opened with seconds %s, want %s: the last 15 s", labelString(got), labelString(want))
+		t.Fatalf("the recording opened with seconds %v, want %v: the last 15 s", got, want)
 	}
 }
 
@@ -120,7 +110,7 @@ func TestAResumeDropsTheAudioAHoldKept(t *testing.T) {
 	r.DiscardPreroll()
 	takeSeconds(t, r, 50)
 	if got, want := startedWith(t, dir, r), []uint16{50}; !slices.Equal(got, want) {
-		t.Fatalf("the recording opened with seconds %s, want %s: only audio from after the resume", labelString(got), labelString(want))
+		t.Fatalf("the recording opened with seconds %v, want %v: only audio from after the resume", got, want)
 	}
 }
 
@@ -137,7 +127,7 @@ func TestAReleasedHoldLeadsWithOnlyThePreroll(t *testing.T) {
 	r.ReleasePreroll()
 	takeSeconds(t, r, 13)
 	if got, want := startedWith(t, dir, r), secondsFrom(9, 13); !slices.Equal(got, want) {
-		t.Fatalf("the recording opened with seconds %s, want %s: the last 5 s", labelString(got), labelString(want))
+		t.Fatalf("the recording opened with seconds %v, want %v: the last 5 s", got, want)
 	}
 }
 
@@ -151,6 +141,6 @@ func TestAHoldKeepsAtMostMaxHeldSeconds(t *testing.T) {
 	r.HoldPreroll(5 * time.Second)
 	takeSeconds(t, r, secondsFrom(11, maxHeldSeconds+20)...)
 	if got, want := startedWith(t, dir, r), secondsFrom(21, maxHeldSeconds+20); !slices.Equal(got, want) {
-		t.Fatalf("the recording opened with %d seconds, %s to %s; want the last %d", len(got), labelString(got[:1]), labelString(got[len(got)-1:]), maxHeldSeconds)
+		t.Fatalf("the recording opened with %d seconds, %d to %d; want the last %d", len(got), got[0], got[len(got)-1], maxHeldSeconds)
 	}
 }

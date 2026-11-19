@@ -64,33 +64,32 @@ func (rc *ResilientClient) Write(p []byte) (int, error) {
 
 	rc.Mu.Lock()
 	rc.accepted += int64(len(p))
-	state := rc.State
 	client := rc.Client
+	if rc.State != StateConnected || client == nil {
+		// Buffered under the lock that counted p and read the state: a
+		// reconnect in between would start its socket's stream len(p) too
+		// late (CapturedSince), and a drain that ended in between would
+		// leave p in the buffer, behind the audio sent after it.
+		if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
+			rc.log("failed to buffer audio while disconnected: %v", writeErr)
+		}
+		rc.Mu.Unlock()
+		return len(p), nil
+	}
 	rc.Mu.Unlock()
 
-	if state == StateConnected && client != nil {
-		_, err := client.Write(p)
-		if err == nil {
-			return len(p), nil
-		}
-
-		rc.Mu.Lock()
-		if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
-			rc.log("failed to buffer audio after write error: %v", writeErr)
-		}
-		rc.setStateLocked(StateDisconnected)
-		rc.Mu.Unlock()
-
-		rc.startReconnect()
-
+	if _, err := client.Write(p); err == nil {
 		return len(p), nil
 	}
 
 	rc.Mu.Lock()
 	if _, writeErr := rc.Buffer.Write(p); writeErr != nil {
-		rc.log("failed to buffer audio while disconnected: %v", writeErr)
+		rc.log("failed to buffer audio after write error: %v", writeErr)
 	}
+	rc.setStateLocked(StateDisconnected)
 	rc.Mu.Unlock()
+
+	rc.startReconnect()
 
 	return len(p), nil
 }
@@ -193,7 +192,6 @@ func (rc *ResilientClient) reconnect(wait time.Duration) {
 		}
 
 		rc.Mu.Lock()
-		rc.setStateLocked(StateConnected)
 		rc.reconnectDelay = rc.Config.InitialReconnectDelay
 		rc.Mu.Unlock()
 
@@ -218,6 +216,9 @@ func (rc *ResilientClient) drainBuffer() error {
 }
 
 // drainChunk writes one buffered chunk and reports whether to drain another.
+// It makes the client connected under the lock that finds the buffer empty:
+// a write before that is buffered for this drain and a write after it goes
+// to the socket, so no audio is left in a buffer nothing drains.
 func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	rc.drainMu.Lock()
 	defer rc.drainMu.Unlock()
@@ -225,6 +226,9 @@ func (rc *ResilientClient) drainChunk(buf []byte) (bool, error) {
 	rc.Mu.Lock()
 	n, _ := rc.Buffer.Read(buf)
 	client := rc.Client
+	if n == 0 || client == nil {
+		rc.setStateLocked(StateConnected)
+	}
 	rc.Mu.Unlock()
 
 	if n == 0 || client == nil {
@@ -244,26 +248,42 @@ func (rc *ResilientClient) IsConnected() bool {
 }
 
 // CapturedSince returns how much audio was written to the client after the
-// point at seconds into the current socket's stream, the time Deepgram gives
-// the words it hears: the audio sent to that socket since, and the audio
+// point at into the current socket's stream, the time Deepgram gives the
+// words it hears: the audio sent to that socket since, and the audio
 // buffered for it or for the next. Audio Finalize drops from the buffer is
 // taken out of the stream, as it never reaches the socket.
-func (rc *ResilientClient) CapturedSince(at float64) time.Duration {
-	rate := int64(rc.Config.SampleRate)
+func (rc *ResilientClient) CapturedSince(at time.Duration) time.Duration {
 	rc.Mu.Lock()
-	since := rc.accepted - rc.origin - int64(at*float64(rate))*bytesPerSample
+	since := rc.accepted - rc.origin - rc.streamBytes(at)
 	rc.Mu.Unlock()
 	if since <= 0 {
 		return 0
 	}
-	return time.Duration(since) * time.Second / time.Duration(rate*bytesPerSample)
+	return rc.streamDuration(since)
 }
 
 // MaxBehind returns how far the stream Deepgram hears can fall behind the
 // audio written: the most audio the client buffers while it is not
 // connected.
 func (rc *ResilientClient) MaxBehind() time.Duration {
-	return time.Duration(rc.Buffer.Cap()) * time.Second / time.Duration(rc.Config.SampleRate*bytesPerSample)
+	return rc.streamDuration(int64(rc.Buffer.Cap()))
+}
+
+// streamBytes is the size of d of the audio written, in whole samples. It
+// splits d at the second, so a socket's stream of any length does not
+// overflow it.
+func (rc *ResilientClient) streamBytes(d time.Duration) int64 {
+	rate := int64(rc.Config.SampleRate)
+	samples := int64(d/time.Second)*rate + int64(d%time.Second)*rate/int64(time.Second)
+	return samples * bytesPerSample
+}
+
+// streamDuration is how long n bytes of the audio written last. It splits n
+// at the second, so a count of bytes the client can take does not overflow
+// it.
+func (rc *ResilientClient) streamDuration(n int64) time.Duration {
+	perSecond := int64(rc.Config.SampleRate) * bytesPerSample
+	return time.Duration(n/perSecond)*time.Second + time.Duration(n%perSecond)*time.Second/time.Duration(perSecond)
 }
 
 // Finalize ends the current stretch of audio. It drops the audio buffered

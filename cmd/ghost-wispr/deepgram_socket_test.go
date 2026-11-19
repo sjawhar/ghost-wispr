@@ -20,8 +20,6 @@ import (
 	api "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v1/websocket/interfaces"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
 	"github.com/dvonthenen/websocket"
-
-	"github.com/sjawhar/ghost-wispr/internal/session"
 )
 
 // deepgramEndpoint is a Deepgram live endpoint that takes one connection.
@@ -124,8 +122,6 @@ func (m *recordingManager) UtteranceEnd(*api.UtteranceEndResponse) error {
 }
 
 func (m *recordingManager) ForceEndSession(context.Context) error { return nil }
-
-func (m *recordingManager) SetLiveStream(session.LiveStream) {}
 
 func dialDeepgramEndpoint(t *testing.T, host string, manager *recordingManager) *deepgramSocket {
 	t.Helper()

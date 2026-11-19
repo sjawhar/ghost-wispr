@@ -220,23 +220,25 @@ func (m *Manager) Message(mr *api.MessageResponse) error {
 }
 
 // heardFrom returns where in the live stream the words of result mr begin:
-// its first word's start, else the start of the audio it covers.
-func heardFrom(mr *api.MessageResponse, words []transcribe.Word) float64 {
+// its first word's start, else the start of the audio it covers. Deepgram
+// gives both in seconds.
+func heardFrom(mr *api.MessageResponse, words []transcribe.Word) time.Duration {
+	start := mr.Start
 	if len(words) > 0 {
-		return words[0].Start
+		start = words[0].Start
 	}
-	return mr.Start
+	return time.Duration(start * float64(time.Second))
 }
 
 // holdPreroll makes the next session's recording start before the words
-// Deepgram heard from at seconds into the live stream, while no session is
-// open: the words open a session only at the end of their speech
-// (flushBuffer), Deepgram can hear them late, as after a reconnect, and the
-// recording must hold them from the first, as the live transcript does. The
-// live stream (SetLiveStream) says how long ago they were captured; without
-// one, they are taken as captured now. While capture is paused it holds
-// nothing: the resume drops that audio.
-func (m *Manager) holdPreroll(at float64) {
+// Deepgram heard from at into the live stream, while no session is open: the
+// words open a session only at the end of their speech (flushBuffer),
+// Deepgram can hear them late, as after a reconnect, and the recording must
+// hold them from the first, as the live transcript does. The live stream
+// (SetLiveStream) says how long ago they were captured; without one, they are
+// taken as captured now. While capture is paused it holds nothing: the
+// resume drops that audio.
+func (m *Manager) holdPreroll(at time.Duration) {
 	if m.recorder == nil {
 		return
 	}
@@ -257,14 +259,20 @@ func (m *Manager) holdPreroll(at float64) {
 // SetLiveStream sets the stream of audio live transcription sends Deepgram,
 // whose results Message takes, and makes the recorder keep as much audio as
 // the stream can fall behind, so a recording can start before words Deepgram
-// hears late.
+// hears late. A nil stream unsets it: words are then taken as captured when
+// their result comes, and the recorder keeps no audio besides the preroll.
 func (m *Manager) SetLiveStream(stream LiveStream) {
 	m.mu.Lock()
 	m.stream = stream
 	m.mu.Unlock()
-	if m.recorder != nil {
-		m.recorder.SetLookback(stream.MaxBehind())
+	if m.recorder == nil {
+		return
 	}
+	var lookback time.Duration
+	if stream != nil {
+		lookback = stream.MaxBehind()
+	}
+	m.recorder.SetLookback(lookback)
 }
 
 // releasePreroll ends the hold of holdPreroll once Deepgram has finalized

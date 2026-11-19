@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -199,14 +198,6 @@ func recordedLabels(t *testing.T, path string) []uint16 {
 	return labels
 }
 
-func labelsString(labels []uint16) string {
-	parts := make([]string, len(labels))
-	for i, label := range labels {
-		parts[i] = fmt.Sprint(label)
-	}
-	return "[" + strings.Join(parts, " ") + "]"
-}
-
 // TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording fails if a
 // session's recording starts after the first words its live transcript holds
 // when Deepgram transcribes them late. While Deepgram is not connected, the
@@ -286,6 +277,6 @@ func TestFirstWordsDeepgramHearsAfterAReconnectAreAllInTheRecording(t *testing.T
 	got := recordedLabels(t, recording.RawPath(audioDir, id))
 	utterance := []uint16{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
 	if len(got) < len(utterance) || !slices.Equal(got[len(got)-len(utterance):], utterance) {
-		t.Fatalf("the recording holds seconds %s; want it to end with %s, from the first words the live transcript holds", labelsString(got), labelsString(utterance))
+		t.Fatalf("the recording holds seconds %v; want it to end with %v, from the first words the live transcript holds", got, utterance)
 	}
 }

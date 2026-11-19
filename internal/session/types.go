@@ -73,8 +73,8 @@ type Recorder interface {
 // times the words in its results from the stream's start.
 type LiveStream interface {
 	// CapturedSince returns how much audio has been captured after the
-	// point at seconds into the stream.
-	CapturedSince(at float64) time.Duration
+	// point at into the stream.
+	CapturedSince(at time.Duration) time.Duration
 	// MaxBehind returns how far the stream can fall behind the microphone.
 	MaxBehind() time.Duration
 }
@@ -122,6 +122,4 @@ type LifecycleManager interface {
 	Message(mr *api.MessageResponse) error
 	UtteranceEnd(ur *api.UtteranceEndResponse) error
 	ForceEndSession(ctx context.Context) error
-	// SetLiveStream sets the stream whose results Message takes.
-	SetLiveStream(stream LiveStream)
 }

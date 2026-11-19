@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"slices"
@@ -124,14 +123,6 @@ func (c *capture) recordedSeconds() []uint16 {
 	return labels
 }
 
-func secondsString(labels []uint16) string {
-	parts := make([]string, len(labels))
-	for i, label := range labels {
-		parts[i] = fmt.Sprint(label)
-	}
-	return "[" + strings.Join(parts, " ") + "]"
-}
-
 // TestALongFirstUtteranceIsAllInTheRecording fails if a session's recording
 // starts after the first words its live transcript holds. A session starts at
 // Deepgram's first end of speech, and its recording opened with only the last
@@ -154,7 +145,7 @@ func TestALongFirstUtteranceIsAllInTheRecording(t *testing.T) {
 	got := c.recordedSeconds()
 	utterance := []uint16{10, 11, 12, 13, 14, 15, 16, 17, 18}
 	if len(got) < len(utterance) || !slices.Equal(got[len(got)-len(utterance):], utterance) {
-		t.Fatalf("the recording holds seconds %s; want it to end with the whole first utterance %s, whose words the live transcript holds", secondsString(got), secondsString(utterance))
+		t.Fatalf("the recording holds seconds %v; want it to end with the whole first utterance %v, whose words the live transcript holds", got, utterance)
 	}
 }
 
@@ -172,6 +163,33 @@ func TestWordsDeepgramTookBackDoNotLeadTheNextSession(t *testing.T) {
 	c.hear(liveResult(t, true, true, "Hello."))
 
 	if got, want := c.recordedSeconds(), []uint16{9, 10, 11, 12, 13}; !slices.Equal(got, want) {
-		t.Fatalf("the recording holds seconds %s; want %s, the last 5 s before its first words", secondsString(got), secondsString(want))
+		t.Fatalf("the recording holds seconds %v; want %v, the last 5 s before its first words", got, want)
+	}
+}
+
+// fixedStream is a live stream that says every word was captured ago before
+// its result, and that can fall behind by behind.
+type fixedStream struct{ ago, behind time.Duration }
+
+func (s fixedStream) CapturedSince(time.Duration) time.Duration { return s.ago }
+
+func (s fixedStream) MaxBehind() time.Duration { return s.behind }
+
+// TestAnUnsetLiveStreamTakesWordsAsCapturedNow fails if unsetting the live
+// stream (SetLiveStream with nil) panics, or leaves the old stream timing the
+// words: they are then taken as captured when their result comes, and the
+// recording opens the usual 5 s before that.
+func TestAnUnsetLiveStreamTakesWordsAsCapturedNow(t *testing.T) {
+	c := newCapture(t)
+	c.manager.SetLiveStream(fixedStream{ago: 20 * time.Second, behind: 30 * time.Second})
+	c.manager.SetLiveStream(nil)
+	c.say(1, 2, 3, 4, 5, 6, 7, 8)
+	c.say(10)
+	c.hear(liveResult(t, false, false, "Good", "morning,"))
+	c.say(11, 12)
+	c.hear(liveResult(t, true, true, "Good", "morning,", "everyone."))
+
+	if got, want := c.recordedSeconds(), []uint16{5, 6, 7, 8, 10, 11, 12}; !slices.Equal(got, want) {
+		t.Fatalf("the recording holds seconds %v; want %v, from 5 s before the words' first result", got, want)
 	}
 }
