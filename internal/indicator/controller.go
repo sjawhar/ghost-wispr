@@ -37,9 +37,11 @@ func Contended(err error) bool {
 }
 
 // KnownBlack reports whether light can tell, without sending a command, that
-// its unit's stored pattern is black: this process checked that unit, by its
-// serial number, and opened it again, as after a device error. Its watchdog
-// may then be armed at once. A light that cannot tell needs BlackPattern.
+// its unit's stored pattern is black: a check in this process found that
+// unit, by its serial number, saved black (a save of the black pattern
+// reached it), and the unit was opened again, as after a device error. Its
+// watchdog may then be armed at once. A light that cannot tell needs
+// BlackPattern.
 func KnownBlack(light Light) bool {
 	known, ok := light.(interface{ PatternKnownBlack() bool })
 	return ok && known.PatternKnownBlack()
