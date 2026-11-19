@@ -599,7 +599,7 @@ func startMicMonitoring(ctx context.Context, loops *sync.WaitGroup, capture *cap
 		sender = transcribe.NewAsyncSender(ctx, downstream, deepgramSendChunks, logf)
 		send = sender
 	}
-	var writer io.Writer = recorder.Writer(send)
+	writer := recorder.Writer(send)
 	if tap != nil {
 		writer = tappedWriter{dst: writer, tap: tap}
 	}

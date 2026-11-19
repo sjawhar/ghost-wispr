@@ -35,7 +35,7 @@ func (stubConcierge) Answer(context.Context, *voice.Exchange, string, voice.SayF
 	return nil
 }
 func (c stubConcierge) Answers() <-chan voice.PendingAnswer { return c.answers }
-func (stubConcierge) Spoken(context.Context, string) error   { return nil }
+func (stubConcierge) Spoken(context.Context, string) error  { return nil }
 
 // TestTheVoiceStartsOnlyWhenItCanSpeak fails if the voice starts while it is
 // off, with no speaker, with no Concierge, or on an engine this build does
@@ -121,10 +121,10 @@ func (c *closingsHeard) Stop(reason string) {
 	defer c.mu.Unlock()
 	c.stops = append(c.stops, reason)
 }
-func (*closingsHeard) OnTranscript(*voice.Transcript)       {}
-func (*closingsHeard) OnUtteranceEnd(int, bool)             {}
-func (*closingsHeard) WaitFloor(context.Context) error      { return nil }
-func (*closingsHeard) Close()                               {}
+func (*closingsHeard) OnTranscript(*voice.Transcript)  {}
+func (*closingsHeard) OnUtteranceEnd(int, bool)        {}
+func (*closingsHeard) WaitFloor(context.Context) error { return nil }
+func (*closingsHeard) Close()                          {}
 
 // TestAPauseStopsTheVoiceThroughTheGate fails if a pause or a light hold of
 // the real capture gate does not reach the voice the link holds.
