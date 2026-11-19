@@ -75,7 +75,7 @@ func (s *alsaStream) queuedFrames() int {
 
 // Write plays frame, waiting while the PCM is full. After an underrun, when
 // the PCM ran out of audio and stopped, it prepares the PCM and plays on, and
-// counts and logs the underrun: each is a click in the room.
+// counts and logs the underrun.
 func (s *alsaStream) Write(frame []int16) error {
 	channels := s.params.channels
 	samples := frame
@@ -97,9 +97,12 @@ func (s *alsaStream) Write(frame []int16) error {
 			continue
 		}
 		if rc == -int(syscall.EPIPE) {
-			if s.xruns++; s.xruns == 1 || s.xruns%100 == 0 {
-				slog.Warn("speaker underrun: the device ran out of audio", "underruns", s.xruns)
-			}
+			// Every underrun is a click in the room, and the Pi's playback
+			// check counts them from these lines: a reader of /proc/asound
+			// can miss a short one between its polls.
+			s.xruns++
+			slog.Warn("speaker underrun", "device", s.device, "underruns", s.xruns,
+				"buffer", frameTime(s.params.buffer, s.params.rate))
 		}
 		if s.pcm.recover(rc) < 0 {
 			return alsaErr("write", rc)

@@ -615,27 +615,49 @@ func TestALSAOutputKeepsUpUnderLoad(t *testing.T) {
 	}
 }
 
-// TestALSAStreamRecoversFromAnUnderrun fails if a write after an underrun
-// gives up instead of preparing the PCM and playing on, or if the underrun is
-// not counted.
-func TestALSAStreamRecoversFromAnUnderrun(t *testing.T) {
+// TestALSAStreamLogsEveryUnderrunItRecoversFrom fails if a write after an
+// underrun gives up instead of preparing the PCM and playing on, or if the
+// underrun is not counted, or if any underrun goes unlogged. The Pi's
+// playback check reads these lines: a reader of /proc/asound can miss a short
+// underrun between its polls, so the count it trusts is the one each line
+// carries.
+func TestALSAStreamLogsEveryUnderrunItRecoversFrom(t *testing.T) {
+	var logs strings.Builder
+	var mu sync.Mutex
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil)))
+	defer slog.SetDefault(original)
+
 	pcm := newFakePCM(48000, 960) // two writes fill it and start it
 	stream := streamOn(pcm)
 	frame := make([]int16, 480)
 	for i := range frame {
 		frame[i] = 7
 	}
-	for range 2 {
+	for run := range 3 {
+		for range 2 {
+			if err := stream.Write(frame); err != nil {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(50 * time.Millisecond) // the device runs dry
 		if err := stream.Write(frame); err != nil {
-			t.Fatal(err)
+			t.Fatalf("a write after underrun %d = %v, want it to recover and play", run+1, err)
+		}
+		if got := stream.underruns(); got != run+1 {
+			t.Fatalf("underruns counted = %d, want %d", got, run+1)
 		}
 	}
-	time.Sleep(50 * time.Millisecond) // the device runs dry
-	if err := stream.Write(frame); err != nil {
-		t.Fatalf("a write after an underrun = %v, want it to recover and play", err)
+	mu.Lock()
+	got := logs.String()
+	mu.Unlock()
+	if n := strings.Count(got, `msg="speaker underrun"`); n != 3 {
+		t.Errorf("3 underruns logged %d lines, want one each: %q", n, got)
 	}
-	if got := stream.underruns(); got != 1 {
-		t.Fatalf("underruns counted = %d, want 1", got)
+	for _, want := range []string{"underruns=1", "underruns=2", "underruns=3", "device=fake"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the underrun lines lack %s: %q", want, got)
+		}
 	}
 }
 
