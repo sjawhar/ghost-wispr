@@ -420,9 +420,11 @@ already taken still plays. If that is more than a period, or the device cannot r
 drops the buffer instead. Each time the speaker opens, the log says
 `speaker stream` with the rate, period and buffer the Jabra granted, and `rewind=true` if it can
 rewind. Each cancel logs `speaker cancel` with `way=rewind` or `way=drop`, so the log shows what
-the Jabra did. The first underrun of a stream and every 100th after it, when the speaker runs out
-of audio and clicks, are logged as `speaker underrun: the device ran out of audio`, and their count
-as `speaker stream closed after underruns`. It needs no package beyond `libportaudio2`,
+the Jabra did. Each underrun, when the speaker runs out of audio and clicks, is logged as
+`speaker underrun` with the device, the count so far in that stream and the buffer the device
+granted, and the count again at the close as `speaker stream closed after underruns`. A check that
+counts underruns reads those lines: a reader of `/proc/asound` can miss a short one between its
+polls. The speaker needs no package beyond `libportaudio2`,
 whose dependency `libasound2t64` the Pi already has (`deploy/pi/baseline.txt`). A pause during an
 open keeps the blink(1) red until that open has finished.
 
