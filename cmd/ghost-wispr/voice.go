@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -252,17 +253,37 @@ func voiceTiming(logger *slog.Logger) func(event, sessionID string, at time.Time
 
 // newVoiceA builds voice A on the text-to-speech engine cfg names.
 func newVoiceA(ctx context.Context, cfg *config.Config) (voice.Voice, error) {
+	engine, err := voiceAEngine(ctx, cfg, nil)
+	if err != nil {
+		return nil, err
+	}
+	return voicetts.New(engine), nil
+}
+
+// voiceAOptions is what ghost-wispr tts-first-audio adds to voice A's engine.
+// The unit's voice adds nothing (nil).
+type voiceAOptions struct {
+	deepgramBaseURL string         // replaces Deepgram's address, for tests
+	vertexBaseURL   string         // replaces Vertex AI's host, for tests
+	auraDialed      func(*url.URL) // told the URL of each Aura socket
+}
+
+// voiceAEngine builds the text-to-speech engine of voice A that cfg names.
+func voiceAEngine(ctx context.Context, cfg *config.Config, opts *voiceAOptions) (voicetts.Engine, error) {
+	if opts == nil {
+		opts = &voiceAOptions{}
+	}
 	switch cfg.Voice.TTSEngine {
 	case config.TTSEngineAura:
 		model := cfg.Voice.TTSVoice
 		if model == "" {
 			model = cfg.Voice.TTSModel
 		}
-		engine, err := voicetts.NewAura(voicetts.AuraConfig{APIKey: cfg.DeepgramAPIKey, Model: model})
+		engine, err := voicetts.NewAura(voicetts.AuraConfig{APIKey: cfg.DeepgramAPIKey, Model: model, BaseURL: opts.deepgramBaseURL, Dialed: opts.auraDialed})
 		if err != nil {
 			return nil, fmt.Errorf("voice A on Aura: %w", err)
 		}
-		return voicetts.New(engine), nil
+		return engine, nil
 	case config.TTSEngineGemini:
 		credentials, err := googleauth.Detect(ctx, cfg.GoogleCredentialsFile, googleauth.CloudPlatformScope)
 		if err != nil {
@@ -274,11 +295,12 @@ func newVoiceA(ctx context.Context, cfg *config.Config) (voice.Voice, error) {
 			Model:       cfg.Voice.TTSModel,
 			Voice:       cfg.Voice.TTSVoice,
 			Credentials: credentials,
+			BaseURL:     opts.vertexBaseURL,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("voice A on Gemini: %w", err)
 		}
-		return voicetts.New(engine), nil
+		return engine, nil
 	default:
 		return nil, fmt.Errorf("voice.tts_engine %q is not one of %q, %q", cfg.Voice.TTSEngine, config.TTSEngineGemini, config.TTSEngineAura)
 	}

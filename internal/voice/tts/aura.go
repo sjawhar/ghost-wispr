@@ -60,6 +60,11 @@ type AuraConfig struct {
 	Model string
 	// BaseURL replaces "wss://api.deepgram.com", for tests.
 	BaseURL string
+	// Dialed, when set, is told the URL of each socket's handshake request,
+	// as it went to Deepgram, once Deepgram accepted it: ghost-wispr
+	// tts-first-audio reads from it whether the request carried
+	// mip_opt_out=true.
+	Dialed func(*url.URL)
 }
 
 // Aura synthesises speech with Deepgram Aura-2 over its streaming WebSocket,
@@ -73,6 +78,7 @@ type AuraConfig struct {
 type Aura struct {
 	apiKey string
 	url    string
+	dialed func(*url.URL)
 }
 
 // NewAura returns an Aura-2 engine for cfg.
@@ -88,7 +94,7 @@ func NewAura(cfg AuraConfig) (*Aura, error) {
 		"mip_opt_out": {"true"},
 	}
 	base := strings.TrimRight(cmp.Or(strings.TrimSpace(cfg.BaseURL), auraDefaultBaseURL), "/")
-	return &Aura{apiKey: key, url: base + "/v1/speak?" + query.Encode()}, nil
+	return &Aura{apiKey: key, url: base + "/v1/speak?" + query.Encode(), dialed: cfg.Dialed}, nil
 }
 
 // Name names the engine.
@@ -254,6 +260,9 @@ func (a *Aura) dial(ctx context.Context) (*auraSocket, error) {
 			return nil, fmt.Errorf("aura: connect: %w (%s %s)", err, response.Status, response.Header.Get("dg-error"))
 		}
 		return nil, fmt.Errorf("aura: connect: %w", err)
+	}
+	if a.dialed != nil && response != nil && response.Request != nil {
+		a.dialed(response.Request.URL)
 	}
 	s := &auraSocket{
 		conn: conn,
