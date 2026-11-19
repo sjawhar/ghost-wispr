@@ -224,14 +224,16 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		c.offerPick(x, turn, found.candidates)
 		return sp.sayText(ctx, didYouMean(found.candidates), voice.Ack)
 	}
-	// R6: the issue a search chose, then the facts. The line is a Lead: it
-	// always leads, and names the issue with no fact of it to time.
+	// R5, R6: the issue a search chose, then the facts. Its line is held
+	// until the first fact or the routing mark (speaker.holdLead), as a Lead:
+	// it always leads, and names the issue with no fact of it to time.
 	lead := found.lead()
 	for _, line := range lead {
-		if err := sp.sayText(ctx, line, voice.Lead); err != nil {
+		if err := sp.holdLead(ctx, found.key, line); err != nil {
 			return err
 		}
 	}
+	defer sp.flushLead(parent)
 	holderCase := found.holderCase()
 	if session := c.askPlan(turn, found, x.FollowUpTurn); session != "" {
 		startAsk(session, found)
@@ -248,7 +250,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	defer stopFacts()
 	var knownCut atomic.Bool
 	knownTimer := time.AfterFunc(c.knownBound-time.Since(start), func() {
-		if sp.count() == len(lead) {
+		if sp.count() == 0 {
 			knownCut.Store(true)
 			stopFacts()
 		}
@@ -270,7 +272,7 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 		}
 	case errors.Is(err, errNoWords) && (len(lead) > 0 || holderCase != "" || askStarted.Load()):
 		err = nil
-	case err != nil && ctx.Err() != nil && sp.count() == len(lead):
+	case err != nil && ctx.Err() != nil && sp.count() == 0:
 		if !askStarted.Load() {
 			return c.failed(parent, sp, errors.New("concierge: the answer took more than its 8 s"))
 		}
@@ -536,11 +538,14 @@ func fewestWords(turn string) string {
 		prefix := strings.TrimSpace(askPrefix.FindString(turn))
 		named, inClause := issueKeysIn(prefix), issueKeysIn(question[:m[1]])
 		paused := strings.HasSuffix(prefix, ",") || strings.HasSuffix(prefix, ":")
+		// A clause that names the holder ("who holds …") always routes.
+		lead, _, _ := strings.Cut(strings.ToLower(question), " ")
+		routes := lead == "who" || lead == "that" || lead == "working" || lead == "holding"
 		switch {
 		case m[2] >= 0:
 			question = question[m[2]:]
-		case len(named) > 0 && !slices.Contains(inClause, named[0]):
-		case paused && len(named) == 0 && len(inClause) == 0:
+		case !routes && len(named) > 0 && !slices.Contains(inClause, named[0]):
+		case !routes && paused && len(named) == 0 && len(inClause) == 0:
 		default:
 			question = question[m[1]:]
 		}
@@ -989,14 +994,19 @@ func (c *Concierge) rewriteForEar(ctx context.Context, written, issueKey, reason
 // speed, so the speech runs under the exchange's context, apart from the
 // answer's work: the 8 s bound the Concierge's work (R6), and the model
 // writes while the room listens. Its routing line plays only when nothing
-// else was queued first.
+// else was queued first. It holds the line that names the issue a search
+// chose (R5): the first text, when ready by the routing mark and it begins
+// with the issue's key, names the issue itself; else the line goes first, or
+// at the mark in place of the routing line.
 type speaker struct {
 	say voice.SayFunc
 	// ctx is the exchange's: a stop ends the speech.
 	ctx context.Context
 	mu  sync.Mutex
-	// texts are the texts queued, the routing line not counted.
+	// texts are the texts queued, the routing line not counted; leads is
+	// how many of them name the issue.
 	texts []string
+	leads int
 	// queue waits for say; drained, while the goroutine runs, closes when
 	// it stops.
 	queue   []queuedText
@@ -1004,6 +1014,10 @@ type speaker struct {
 	// err is the first Say that failed: nothing after it is said.
 	err    error
 	closed bool
+	// lead is the held line that names the issue, leadKey its key; due:
+	// the routing mark passed, so a line held now is said at once.
+	lead, leadKey string
+	due           bool
 }
 
 type queuedText struct {
@@ -1015,11 +1029,49 @@ func newSpeaker(ctx context.Context, say voice.SayFunc) *speaker {
 	return &speaker{ctx: ctx, say: say}
 }
 
+// holdLead holds line, which names the issue key (R5), until the first text
+// or the routing mark; past the mark it is queued at once.
+func (s *speaker) holdLead(ctx context.Context, key, line string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.due || len(s.texts) > 0 {
+		return s.queueLocked(ctx, line, voice.Lead)
+	}
+	s.lead, s.leadKey = line, key
+	return nil
+}
+
+// flushLead queues a line still held: nothing else was said.
+func (s *speaker) flushLead(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lead != "" {
+		_ = s.queueLocked(ctx, s.lead, voice.Lead)
+		s.lead = ""
+	}
+}
+
 // sayText queues text as mode and keeps it. ctx is the work's: nothing is
-// queued once it ended. The error is that of a Say that already failed.
+// queued once it ended. The error is that of a Say that already failed. A
+// held line that names the issue goes first, unless text begins with the
+// issue's key (R5).
 func (s *speaker) sayText(ctx context.Context, text string, mode voice.SayMode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.lead != "" {
+		lead := s.lead
+		s.lead = ""
+		if !strings.HasPrefix(text, s.leadKey) {
+			if err := s.queueLocked(ctx, lead, voice.Lead); err != nil {
+				return err
+			}
+		}
+	}
+	return s.queueLocked(ctx, text, mode)
+}
+
+// queueLocked queues text as mode and keeps it. s.mu is held.
+func (s *speaker) queueLocked(ctx context.Context, text string, mode voice.SayMode) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -1027,6 +1079,9 @@ func (s *speaker) sayText(ctx context.Context, text string, mode voice.SayMode) 
 		return err
 	}
 	s.texts = append(s.texts, text)
+	if mode == voice.Lead {
+		s.leads++
+	}
 	s.enqueueLocked(text, mode)
 	return nil
 }
@@ -1080,11 +1135,12 @@ func (s *speaker) wait() error {
 	return s.err
 }
 
-// count is how many texts were queued, the routing line not counted.
+// count is how many texts were queued, the routing line and the line that
+// names the issue not counted.
 func (s *speaker) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.texts)
+	return len(s.texts) - s.leads
 }
 
 // said is a copy of the texts queued, the routing line not counted.
@@ -1095,17 +1151,25 @@ func (s *speaker) said() []string {
 }
 
 // routeAfter queues the routing line after the wait when nothing was queued
-// by then (R6); line chooses it then. The returned stop ends it; once stop
-// returns, the line is not queued.
+// by then (R6); line chooses it then. A held line that names the issue is
+// queued in its place (R5). The returned stop ends it; once stop returns,
+// the line is not queued.
 func (s *speaker) routeAfter(ctx context.Context, wait time.Duration, line func() string) (stop func()) {
 	timer := time.AfterFunc(wait, func() {
 		text := line()
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		s.due = true
 		if s.closed || len(s.texts) > 0 || ctx.Err() != nil {
 			return
 		}
 		s.closed = true
+		if s.lead != "" {
+			lead := s.lead
+			s.lead = ""
+			_ = s.queueLocked(ctx, lead, voice.Lead)
+			return
+		}
 		s.enqueueLocked(text, voice.Ack)
 	})
 	return func() {
