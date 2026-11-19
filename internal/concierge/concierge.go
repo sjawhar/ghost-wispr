@@ -185,13 +185,14 @@ type Concierge struct {
 	// projectsDone is closed when the read of the projects now running
 	// ends; nil when none runs.
 	projectsDone chan struct{}
-	// fastBound, knownBound, lookupBound, callBound and routingAfter are
-	// fastAnswerBound, knownAfter, lookupBound, callBound and routingAfter;
-	// a test shortens them.
+	// fastBound, knownBound, lookupBound, callBound, searchBound and
+	// routingAfter are the constants of those names (fastAnswerBound for
+	// fastBound, knownAfter for knownBound); a test shortens them.
 	fastBound    time.Duration
 	knownBound   time.Duration
 	lookupBound  time.Duration
 	callBound    time.Duration
+	searchBound  time.Duration
 	routingAfter time.Duration
 }
 
@@ -240,6 +241,7 @@ func New(cfg *Config) (*Concierge, error) {
 		knownBound:   knownAfter,
 		lookupBound:  lookupBound,
 		callBound:    callBound,
+		searchBound:  searchBound,
 		routingAfter: routingAfter,
 	}
 	if c.model == "" {
