@@ -196,6 +196,14 @@ What the voice hears, and where the room's words go:
   Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
   Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
   `mip_opt_out=true`.
+- With `voice.engine: dgagent` (voice C), during an exchange only, the unit streams the room's
+  audio and the last two minutes of the meeting's transcript to Deepgram's Voice Agent, with
+  `mip_opt_out` set so Deepgram does not use them to train its models. Deepgram's model keeps the
+  turn: Deepgram's own model, or the provider `voice.dgagent.think_model` names (such as Google);
+  when that model fails a turn, Deepgram hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini.
+  Each question goes to the Concierge on the unit, whose own model (Gemini on Vertex AI) words the
+  answer, and Deepgram speaks it word for word. An exchange opens at the wake phrase; a held answer also opens voice C without one, but only on "Wispr, go ahead" or once the room has been silent
+  for 3 s while the light reads red. Between exchanges nothing goes to the Voice Agent.
 - Dispatch gets a question's words only as a few search keywords, never the whole sentence, and
   only as a keyword search, which Dispatch sends to no embedding model. An issue key the asker says
   ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's access log

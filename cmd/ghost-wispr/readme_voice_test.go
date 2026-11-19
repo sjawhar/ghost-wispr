@@ -26,6 +26,10 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not",
 		"The unit stores none of the room's words for a question it sent",
 		"Every pause, light hold, press of the Jabra's Mute button, \"Wispr, stop\" and shutdown stop the voice at once",
+		"With `voice.engine: dgagent` (voice C), during an exchange only",
+		"hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini",
+		"a held answer also opens voice C without one",
+		"Between exchanges nothing goes to the Voice Agent",
 	} {
 		if !strings.Contains(readme, words) {
 			t.Errorf("the README does not say %q", words)
