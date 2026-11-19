@@ -1,0 +1,288 @@
+package concierge
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"iter"
+	"log/slog"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"google.golang.org/genai"
+
+	"github.com/sjawhar/ghost-wispr/internal/dispatch"
+	"github.com/sjawhar/ghost-wispr/internal/envoy"
+	"github.com/sjawhar/ghost-wispr/internal/storage"
+	"github.com/sjawhar/ghost-wispr/internal/voice"
+)
+
+// testNow is the clock every test runs at.
+var testNow = time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
+
+// meetingStart is when the test meeting's session started.
+var meetingStart = testNow.Add(-20 * time.Minute)
+
+type fakeRecords struct {
+	mu      sync.Mutex
+	hits    []dispatch.SearchHit
+	issues  map[string]*dispatch.Issue
+	events  map[string][]dispatch.Event
+	docs    map[string]string
+	err     error
+	queries []string
+}
+
+func (f *fakeRecords) Search(_ context.Context, query string, _ int) ([]dispatch.SearchHit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queries = append(f.queries, query)
+	return f.hits, f.err
+}
+
+func (f *fakeRecords) Issue(_ context.Context, key string) (*dispatch.Issue, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	issue, ok := f.issues[key]
+	if !ok {
+		return nil, &dispatch.APIError{Status: 404, Code: "NOT_FOUND", Message: "not found"}
+	}
+	return issue, nil
+}
+
+func (f *fakeRecords) Events(_ context.Context, key string, _ int) ([]dispatch.Event, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.events[key], nil
+}
+
+func (f *fakeRecords) DocumentText(_ context.Context, key, slug string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	text, ok := f.docs[key+"/"+slug]
+	if !ok {
+		return "", &dispatch.APIError{Status: 404, Code: "NOT_FOUND"}
+	}
+	return text, nil
+}
+
+type fakeAgents struct {
+	mu      sync.Mutex
+	id      string
+	states  map[string]envoy.SessionInfo
+	sent    []envoy.SendRequest
+	sendErr error
+	// onSend runs inside Send before it answers, with Send's own context and
+	// the event id it is about to answer.
+	onSend func(ctx context.Context, eventID string) error
+}
+
+func (f *fakeAgents) ID() string { return f.id }
+
+func (f *fakeAgents) Lookup(_ context.Context, id string) (envoy.SessionInfo, error) {
+	if info, ok := f.states[id]; ok {
+		return info, nil
+	}
+	return envoy.SessionInfo{SessionID: id, State: envoy.StateGone}, nil
+}
+
+func (f *fakeAgents) Send(ctx context.Context, request *envoy.SendRequest) (envoy.SendResult, error) {
+	f.mu.Lock()
+	if f.sendErr != nil {
+		f.mu.Unlock()
+		return envoy.SendResult{}, f.sendErr
+	}
+	f.sent = append(f.sent, *request)
+	eventID := "evt-" + string(rune('0'+len(f.sent)))
+	onSend := f.onSend
+	f.mu.Unlock()
+	if onSend != nil {
+		if err := onSend(ctx, eventID); err != nil {
+			return envoy.SendResult{}, err
+		}
+	}
+	return envoy.SendResult{EventID: eventID, RecipientState: envoy.StateLive, State: "connected"}, nil
+}
+
+// scriptedModel answers each GenerateContentStream call with the next turn's
+// chunks, and records what it was sent.
+type scriptedModel struct {
+	mu       sync.Mutex
+	turns    [][]*genai.GenerateContentResponse
+	errs     []error
+	requests [][]*genai.Content
+	configs  []*genai.GenerateContentConfig
+	models   []string
+	// onCall runs at the start of each call, numbered from 0.
+	onCall func(call int)
+}
+
+func (m *scriptedModel) GenerateContentStream(_ context.Context, model string, contents []*genai.Content, config *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
+	m.mu.Lock()
+	call := len(m.requests)
+	m.requests = append(m.requests, append([]*genai.Content(nil), contents...))
+	m.configs = append(m.configs, config)
+	m.models = append(m.models, model)
+	var chunks []*genai.GenerateContentResponse
+	if call < len(m.turns) {
+		chunks = m.turns[call]
+	}
+	var err error
+	if call < len(m.errs) {
+		err = m.errs[call]
+	}
+	m.mu.Unlock()
+	if m.onCall != nil {
+		m.onCall(call)
+	}
+	return func(yield func(*genai.GenerateContentResponse, error) bool) {
+		for _, chunk := range chunks {
+			if !yield(chunk, nil) {
+				return
+			}
+		}
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		if call >= len(m.turns) {
+			yield(nil, errors.New("scripted model: no turn left"))
+		}
+	}
+}
+
+func chunk(parts ...*genai.Part) *genai.GenerateContentResponse {
+	return &genai.GenerateContentResponse{Candidates: []*genai.Candidate{{Content: &genai.Content{Role: genai.RoleModel, Parts: parts}}}}
+}
+
+func text(s string) *genai.Part { return &genai.Part{Text: s} }
+
+func thought(s string) *genai.Part { return &genai.Part{Text: s, Thought: true} }
+
+func call(id, name string, args map[string]any, signature string) *genai.Part {
+	part := &genai.Part{FunctionCall: &genai.FunctionCall{ID: id, Name: name, Args: args}}
+	if signature != "" {
+		part.ThoughtSignature = []byte(signature)
+	}
+	return part
+}
+
+// rig is a Concierge on fakes and a real store holding one meeting.
+type rig struct {
+	concierge *Concierge
+	records   *fakeRecords
+	agents    *fakeAgents
+	model     *scriptedModel
+	store     *storage.SQLiteStore
+	exchange  voice.Exchange
+}
+
+func newRig(t *testing.T) *rig {
+	t.Helper()
+	store, err := storage.NewSQLiteStore(filepath.Join(t.TempDir(), "unit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CreateSession("meeting-1", meetingStart); err != nil {
+		t.Fatal(err)
+	}
+	r := &rig{
+		records: &fakeRecords{issues: map[string]*dispatch.Issue{}, events: map[string][]dispatch.Event{}, docs: map[string]string{}},
+		agents:  &fakeAgents{id: "unit-session", states: map[string]envoy.SessionInfo{}},
+		model:   &scriptedModel{},
+		store:   store,
+		exchange: voice.Exchange{
+			SessionID: "meeting-1",
+			WakeAt:    testNow.Add(-8 * time.Second),
+			AskerTurn: "what is happening with the voice work",
+		},
+	}
+	r.concierge, err = New(&Config{
+		Model:     "test-model",
+		Generator: r.model,
+		Records:   r.records,
+		Store:     store,
+		PublicURL: "https://unit.example",
+		Now:       func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.concierge.SetAgents(r.agents)
+	return r
+}
+
+// run calls one tool through the exchange's runner and decodes its result.
+func (r *rig) run(t *testing.T, name string, args any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := r.concierge.Tools(&r.exchange).Run(context.Background(), voice.ToolCall{ID: "call-1", Name: name, Args: raw})
+	if err != nil {
+		t.Fatalf("Run(%s): %v", name, err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result, &decoded); err != nil {
+		t.Fatalf("Run(%s) answered no JSON object: %s", name, result)
+	}
+	return decoded
+}
+
+// name makes issue_holder name agent session id, live, in r's exchange, as
+// ask_agent requires before it asks that session.
+func (r *rig) name(t *testing.T, id string) {
+	t.Helper()
+	key := fmt.Sprintf("NAMED-%d", len(r.records.issues)+1)
+	r.records.issues[key] = claimed(key, "session", id, "Agent "+id)
+	if _, ok := r.agents.states[id]; !ok {
+		r.agents.states[id] = envoy.SessionInfo{SessionID: id, State: envoy.StateLive}
+	}
+	if holder := r.run(t, "issue_holder", map[string]string{"key": key}); holder["session"] != id {
+		t.Fatalf("issue_holder did not name %s: %v", id, holder)
+	}
+}
+
+// ask names agent session id and asks it question.
+func (r *rig) ask(t *testing.T, id, question, issueKey string) map[string]any {
+	t.Helper()
+	r.name(t, id)
+	args := map[string]string{"session": id, "question": question}
+	if issueKey != "" {
+		args["issue_key"] = issueKey
+	}
+	return r.run(t, "ask_agent", args)
+}
+
+// captureLogs sends the Concierge's log to a buffer the test reads.
+func (r *rig) captureLogs() *lockedBuffer {
+	buffer := &lockedBuffer{}
+	r.concierge.logger = slog.New(slog.NewTextHandler(buffer, nil))
+	return buffer
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
