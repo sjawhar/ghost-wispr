@@ -340,6 +340,11 @@ func (c *Concierge) searchBoth(ctx context.Context, records Records, terms strin
 		c.logger.Info("concierge took the keyword result: the full search failed", "error", got.err)
 		return map[string]any{"issues": kwIssues, "clear_match": false}, nil
 	}
+	if errors.Is(kwErr, errSearchSlow) && errors.Is(got.err, errSearchSlow) {
+		// The keyword search answers in about 0.15 s: both past their bound
+		// is Dispatch out of reach (R10).
+		return nil, fmt.Errorf("%w: neither search answered in %v", dispatch.ErrUnreachable, c.searchBound)
+	}
 	if errors.Is(got.err, errSearchSlow) {
 		c.logger.Info("concierge's search found nothing in its time", "bound", c.searchBound)
 		return map[string]any{"issues": []map[string]any{}, "clear_match": false, "note": "The search took too long. Ask for the issue's key."}, nil

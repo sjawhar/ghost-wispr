@@ -49,15 +49,23 @@ var (
 // key the question named, which the text must hold and which counts as
 // source.
 func earCheck(text, source, questionKey string) string {
+	return earCheckAsked(text, source, "", questionKey)
+}
+
+// earCheckAsked is earCheck for an answer to the question asked, whose own
+// words, such as Deepgram's "SliceOne", count as held names: a name the asker
+// said is no name the model invented. Its figures and keys do not count.
+func earCheckAsked(text, source, asked, questionKey string) string {
 	if reason := earForm(text); reason != "" {
 		return reason
 	}
-	return earFacts(text, source, questionKey)
+	return earFacts(text, source, asked, questionKey)
 }
 
 // earFacts reports why text holds a fact source does not, by R8's rule, or
-// "".
-func earFacts(text, source, questionKey string) string {
+// "". A name in asked is held.
+func earFacts(text, source, asked, questionKey string) string {
+	askedNames := set(earTokens(asked))
 	allowed := source + "\n" + questionKey
 	sourceKeys := set(earKey.FindAllString(allowed, -1))
 	textKeys := earKey.FindAllString(text, -1)
@@ -132,7 +140,7 @@ func earFacts(text, source, questionKey string) string {
 					return "a figure the source does not hold"
 				}
 			case i > 0 && isName(token):
-				if !held(token) {
+				if !held(token) && !askedNames[token] {
 					return "a name the source does not hold"
 				}
 			}

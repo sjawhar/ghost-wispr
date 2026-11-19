@@ -186,9 +186,10 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		return
 	}
 	// A search waits for its words to settle, and the read-ahead makes one
-	// a turn: every search reaches Dispatch and its embedding model (R6).
+	// a turn: every search reaches Dispatch and its embedding model (R6). A
+	// reply to "Did you mean" picks; it is not searched.
 	search := strings.HasPrefix(target, "search:")
-	if search && p.searches > 0 {
+	if _, offered := c.picks[wakeKey(&exchange)]; search && (p.searches > 0 || offered) {
 		return
 	}
 	if running, ok := p.reads[p.current]; ok {
@@ -225,7 +226,9 @@ func (c *Concierge) Heard(ctx context.Context, x *voice.Exchange, words string) 
 		}
 		found := c.readRecord(readCtx, &exchange, target, r.heldBy, r.cut)
 		if readCtx.Err() == nil {
-			found.ahead = true
+			// Only a counted search is the read-ahead's: a key that names no
+			// issue searches too, uncounted, and the answer counts it.
+			found.ahead = search
 			r.found, r.complete = found, true
 		}
 	}()
@@ -341,7 +344,8 @@ func (c *Concierge) prefetchLocked(x *voice.Exchange) *prefetch {
 }
 
 // takeAheadSearches is how many searches x's read-ahead made since its last
-// answer, which count toward this answer's two (R6); the count starts over.
+// answer, which count toward this answer's two (R6). The count starts over,
+// and a read still waiting or running ends: the answer has its reading.
 func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -351,6 +355,7 @@ func (c *Concierge) takeAheadSearches(x *voice.Exchange) int {
 	}
 	n := p.searches
 	p.searches = 0
+	p.cancelAll()
 	return n
 }
 
