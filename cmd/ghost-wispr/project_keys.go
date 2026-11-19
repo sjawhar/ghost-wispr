@@ -41,6 +41,9 @@ func watchProjectKeys(ctx context.Context, read func(context.Context) ([]string,
 		defer cancel()
 		got, err := read(readCtx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return // stopped, as at shutdown: nothing to warn of
+			}
 			logf("warning: read Dispatch's project keys, for the voice's keyterms: %v", err)
 			return
 		}

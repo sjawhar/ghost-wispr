@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,5 +81,32 @@ func TestProjectKeysDoNotHoldTheStart(t *testing.T) {
 	watchProjectKeys(ctx, read, time.Hour, &keys, t.Logf)
 	if took := time.Since(start); took > 100*time.Millisecond {
 		t.Fatalf("reading the project keys held the start %v", took)
+	}
+}
+
+// TestProjectKeysLogNothingOnceStopped fails if the watcher logs a read that
+// failed because its context ended, as at shutdown: the log is no warning
+// then, and in tests it ran past the test's end (the data race seen once at
+// 8e6a143 and again in a 10-run pass, project_keys.go:44).
+func TestProjectKeysLogNothingOnceStopped(t *testing.T) {
+	var mu sync.Mutex
+	var logs []string
+	read := func(ctx context.Context) ([]string, error) {
+		<-ctx.Done()
+		return nil, errors.New("dispatch: no answer")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var keys projectKeys
+	watchProjectKeys(ctx, read, time.Hour, &keys, func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(logs) != 0 {
+		t.Fatalf("the stopped watcher logged %q", logs)
 	}
 }
