@@ -253,6 +253,17 @@ func (c *Concierge) answer(parent context.Context, x *voice.Exchange, turn strin
 	holderCase := found.holderCase()
 	if session := c.askPlan(turn, found, x.FollowUpTurn); session != "" {
 		startAsk(session, found)
+		// R6: a status question whose record is stale is answered first from
+		// the record, with its age, then the routing line says the Concierge
+		// asks the holder.
+		if line := found.agedStatus(c.now()); line != "" && !saysAsk(turn) && aboutStatus(turn) {
+			if err := sp.sayText(ctx, line, voice.Fact); err != nil {
+				return err
+			}
+			if err := sp.sayText(ctx, "Asking the agent on "+found.key+".", voice.Ack); err != nil {
+				return err
+			}
+		}
 	}
 	searchesLeft := maxSearches - aheadSearches
 	if found.searched && !found.ahead {
@@ -373,6 +384,16 @@ func (r *reading) known() string {
 	default:
 		return r.key + " is " + strings.ReplaceAll(r.status, "_", " ") + "."
 	}
+}
+
+// agedStatus is the chosen issue's status with the age of its newest event,
+// "As of 2 hours ago, ABC-12 was in review.", when the record is stale (R6,
+// R7); "" when it is fresh, or holds no status or event.
+func (r *reading) agedStatus(now time.Time) string {
+	if r.key == "" || r.status == "" || r.newest.IsZero() || now.Sub(r.newest) <= staleRecord {
+		return ""
+	}
+	return "As of " + ago(now, r.newest) + ", " + r.key + " was " + strings.ReplaceAll(r.status, "_", " ") + "."
 }
 
 // routingLine is the routing line for turn: the issue key it names, when it
