@@ -148,7 +148,9 @@ whatever rate the card takes; unset, any capture device counts and the default i
 A unit that starts paused scans only at its first resume. The speaker does not need the scan: on
 Linux it plays through the ALSA playback device that `speaker_device` names (a PCM such as
 `plughw:CARD=J75,DEV=0`, or a sound card's id or name, as `Jabra`), opening no microphone and
-needing no red light, so it speaks while capture is paused.
+needing no red light, so it speaks while capture is paused. It opens one stream at the device's
+native rate when the first sound is queued, mixes the voice and the chimes into it, and closes it
+0.3 s after the last sound.
 
 The microphone is never open while the blink(1) is off. The light stays red while the microphone is
 open, and goes off only once the recorder has closed it: after a pause, once no audio has reached
