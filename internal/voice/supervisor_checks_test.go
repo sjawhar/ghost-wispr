@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -434,15 +435,66 @@ func TestTimingEvents(t *testing.T) {
 	c := newFakeConcierge("The voice issue is in review.")
 	r := newRig(t, c)
 	sess := r.ask("what is happening?")
-	// The whole exchange can end within a millisecond here, before the wake
-	// sound's first frame; a stop then rightly cuts it.
-	eventually(t, "the wake sound", func() bool { return slices.Contains(r.speaker.soundsPlayed(), "wake") })
 	waitSaid(t, sess)
 	r.speaker.finish(audio.InputVoice)
 	r.waitEvent("voice_spoken:sess-1")
+	// The whole exchange can end within a millisecond here, before the wake
+	// sound's first frame or before the speaker's events reach the
+	// Supervisor; a stop then rightly cuts them. So the stop waits for them.
+	waitTimings(t, r, "wake_heard", "wake_chime_queued", "turn_end", "first_audio", "fact_audio", "speech_end")
 	r.s.Stop("Jabra button")
 	c.answers <- PendingAnswer{TaskID: "t1", SessionID: "sess-1", Text: "x"}
-	want := []string{"wake_heard", "wake_chime_queued", "turn_end", "first_audio", "fact_audio", "speech_end", "stop", "answer_ready", "answer_chime"}
+	waitTimings(t, r, "stop", "answer_ready", "answer_chime")
+}
+
+// TestFactAudioOfASayThatPlayedBeforeItReturned fails if the first fact's
+// audio goes unreported when its speech started and ended before Say
+// returned, as a vendor voice's Say may.
+func TestFactAudioOfASayThatPlayedBeforeItReturned(t *testing.T) {
+	c := newFakeConcierge("The voice issue is in review.")
+	r := newRigWith(t, c, func(cfg *SupervisorConfig, r *rig) {
+		cfg.Voice = func() (Voice, error) { return playedVoice{r: r}, nil }
+	})
+	r.ask("what is happening?")
+	waitTimings(t, r, "first_audio", "speech_end", "fact_audio")
+}
+
+// playedVoice opens the rig's fake sessions, and returns from each Say only
+// once its speech has played.
+type playedVoice struct{ r *rig }
+
+func (v playedVoice) Open(ctx context.Context, x *Exchange) (Session, error) {
+	s, err := v.r.voice.Open(ctx, x)
+	if err != nil {
+		return nil, err
+	}
+	return playedSession{Session: s, r: v.r}, nil
+}
+
+type playedSession struct {
+	Session
+	r *rig
+}
+
+func (p playedSession) Say(ctx context.Context, text string, mode SayMode) error {
+	if err := p.Session.Say(ctx, text, mode); err != nil {
+		return err
+	}
+	speaking := func() bool {
+		p.r.s.mu.Lock()
+		defer p.r.s.mu.Unlock()
+		return p.r.s.voiceSpeaking
+	}
+	eventually(p.r.t, "the speech started", speaking)
+	p.r.speaker.finish(audio.InputVoice)
+	eventually(p.r.t, "the speech ended", func() bool { return !speaking() })
+	return nil
+}
+
+// waitTimings waits until the rig saw each timing event of want, and names
+// those it did not see.
+func waitTimings(t *testing.T, r *rig, want ...string) {
+	t.Helper()
 	missing := func() []string {
 		got := r.timingEvents()
 		var out []string
@@ -482,7 +534,7 @@ func TestEachVoicePassesTheScriptedExchange(t *testing.T) {
 		r.heard("Wispr, stop.", false, false)
 		eventually(t, "the stop", func() bool { _, _, closed := sess.state(); return closed })
 
-		c.hold = true
+		c.setHold(true) // the follow-up's answer may still be running
 		paused := r.ask("what changed today?")
 		waitSaid(t, paused)
 		asked := time.Now()

@@ -1,0 +1,10 @@
+{"key": "ABC-12", "written": "After two rounds of review and a rebase on Tuesday, the tests ran green twice in a row. So ABC-12 is merged."}
+{"key": "QRS-40", "written": "The vendor sent the new certificate on Monday, and Mira checked it on the staging host this morning. The renewal for QRS-40 is done."}
+{"key": "TUV-7", "written": "Three of the five shards moved last night, and the last two moved an hour ago without errors. In short, the migration in TUV-7 is finished."}
+{"key": "", "written": "Odette asked for one more test, and the build had to run again because of a flaky check. That is why PR 88 is still open."}
+{"key": "XYZ-3", "written": "The design doc lists two options for the schema, and the team met twice to compare them. Nobody has decided yet, so XYZ-3 is blocked."}
+{"key": "LMN-21", "written": "The benchmark ran twelve times on the new hardware, and the numbers stayed close on each run. The median latency for LMN-21 is now 180 ms."}
+{"key": "DEF-9", "written": "First the cache was turned on, and then the old cron job was removed. The bill was checked at the end of the month. The cost of DEF-9 went down by half."}
+{"key": "GHI-55", "written": "I tried the steps in the issue on two laptops and on the test server. I could not reproduce the bug in GHI-55."}
+{"key": "JKL-6", "written": "The release notes were written on Friday, the tag was pushed this morning, and the deploy finished at noon. Version 2.14 of JKL-6 is live."}
+{"key": "MNO-17", "written": "Rafael wanted the retention question settled first, and he answered the ask an hour ago with 90 days. So the work on MNO-17 can start now."}

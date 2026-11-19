@@ -596,6 +596,15 @@ var streamMicLoopStarter = func(ctx context.Context, loops *sync.WaitGroup, capt
 // Deepgram send queues while a write waits: more than deepgramWriteTimeout.
 const deepgramSendChunks = 64
 
+// newSessionRecorder is the app's recorder: it keeps the sample rate of each
+// session's raw recording with the session in store, so a raw recording kept
+// after a stop inside its session is saved at its true duration.
+func newSessionRecorder(audioDir string, store audio.SessionRates) *audio.Recorder {
+	recorder := audio.NewRecorder(audioDir)
+	recorder.UseSessionRates(store)
+	return recorder
+}
+
 // startMicMonitoring starts the mic loop. The recorder gets each buffer
 // first, and downstream, live transcription, gets it through a bounded queue
 // that never blocks the loop (transcribe.AsyncSender), so no Deepgram
@@ -780,8 +789,9 @@ func ttsStatusResponse(status *tts.SpeakStatus) map[string]any {
 	}
 }
 
-// newTTSProvider builds the TTS provider cfg names.
-func newTTSProvider(ctx context.Context, cfg *config.Config) (tts.Provider, error) {
+// newTTSProvider builds the TTS provider cfg names. geminiOptions go to the
+// Gemini provider: ghost-wispr tts-first-audio's tests point it at a fake.
+func newTTSProvider(ctx context.Context, cfg *config.Config, geminiOptions ...tts.GeminiOption) (tts.Provider, error) {
 	switch cfg.TTSProvider {
 	case "elevenlabs":
 		if cfg.TTSAPIKey == "" {
@@ -802,7 +812,7 @@ func newTTSProvider(ctx context.Context, cfg *config.Config) (tts.Provider, erro
 		if err != nil {
 			return nil, fmt.Errorf("detect Google credentials: %w", err)
 		}
-		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, tts.WithGeminiAuthCredentials(credentials))
+		return tts.NewGeminiProvider(cfg.GCPProject, cfg.TTSModel, cfg.TTSVoice, append([]tts.GeminiOption{tts.WithGeminiAuthCredentials(credentials)}, geminiOptions...)...)
 	default:
 		return nil, fmt.Errorf("unsupported TTS provider: %s", cfg.TTSProvider)
 	}
@@ -829,6 +839,15 @@ func main() {
 			log.Fatalf("seed-paused-state: %v", err)
 		}
 		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "tts-first-audio" {
+		os.Exit(runTTSFirstAudioCommand(context.Background(), os.Args[1:], configPath, nil, os.Stdin, os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "issue-holder" {
+		// Its stderr is for why it failed: the scratch ledger's start-up notes
+		// would crowd the cause out of the 300 bytes accept-voice.sh keeps.
+		slog.SetDefault(logging.New(os.Stderr, "warn"))
+		os.Exit(runIssueHolderCommand(context.Background(), os.Args[1:], configPath, os.Stdout, os.Stderr))
 	}
 	if len(os.Args) > 1 {
 		if exitCode := runLightCommand(os.Args[1:], os.Stdout, os.Stderr); exitCode != 0 {
@@ -913,7 +932,7 @@ func main() {
 	hub := server.NewHub(appLogger)
 	hub.SetEventStore(store)
 	detector := session.NewDetector(cfg.ParsedSilenceTimeout())
-	audioRecorder := audio.NewRecorder(cfg.AudioDir)
+	audioRecorder := newSessionRecorder(cfg.AudioDir, store)
 
 	clientFactory := func(provider, model string) (llm.Client, error) {
 		latestCfg := cfgStore.Get()
@@ -1534,10 +1553,10 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	capture.beforeMicOpen = micDevice.prepareLightForOpen
 	capture.onMicHeld = micHeldWarning(warningRegistry)
 	capture.capturePresent = captureDevicePresent(warningRegistry, func() bool { return audio.CaptureDevicePresent(cfg.MicDevice) })
-	// A named microphone opens through ALSA's plug layer, at the 16000 Hz the
-	// recording and Deepgram take, whatever rate its card captures at. Set
-	// before any PortAudio initialization, all of which run in a microphone
-	// start, below.
+	// A named microphone opens through ALSA's plug layer, so it opens at the
+	// first rate the start tries, 16000 Hz, whatever rate its card captures
+	// at; the recorder and Deepgram take the rate it opened at. Set before any
+	// PortAudio initialization, all of which run in a microphone start, below.
 	if err := audio.UsePlugCapture(cfg.MicDevice); err != nil {
 		log.Printf("warning: open the microphone through ALSA's plug layer: %v", err)
 	}
@@ -1782,7 +1801,11 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 		}
 		ordered := orderedMic{micStreamer: mic, device: micDevice}
 
-		audioRecorder.SetSampleRate(sampleRate)
+		if err := audioRecorder.SetSampleRate(sampleRate); err != nil {
+			// The session's recording still saves at this rate when it ends;
+			// only a raw kept after a stop would be saved at the old one.
+			log.Printf("warning: the session under way keeps its old sample rate in the database: %v", err)
+		}
 		if voiceTap != nil {
 			voiceTap.SetRate(sampleRate)
 		}
@@ -1817,11 +1840,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 
 		cOptions := &interfaces.ClientOptions{EnableKeepAlive: true}
 		tOptions := liveTranscriptionOptions(&cfg, sampleRate)
-		resilientConfig := transcribe.ResilientConfig{
-			BufferSize:            cfg.DeepgramBufferSize,
-			InitialReconnectDelay: cfg.ParsedDeepgramReconnectInitialDelay(),
-			MaxReconnectBackoff:   cfg.ParsedDeepgramReconnectMaxBackoff(),
-		}
+		resilientConfig := liveTranscriptionConfig(&cfg, sampleRate)
 		callback := transcriptCallback{manager: manager, voice: &voiceHooks, stamp: capture.voiceStamp}
 		candidateResilient := newLiveTranscription(ctx, cfg.DeepgramAPIKey, cOptions, tOptions, resilientConfig, callback, warningRegistry, hub)
 		resilientRef.Store(candidateResilient)
@@ -1944,8 +1963,7 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 	// The meeting voice: the Supervisor over the speaker output, whenever the
 	// unit has a speaker, since a person turns the voice on and picks it on the
 	// settings page with no restart (R13). The voice for each call is built from
-	// the settings saved last; the Concierge starts at once while the voice is
-	// on, else at the first call that needs it.
+	// the settings saved last; the Concierge runs only while the voice is on.
 	var conc *lazyConcierge
 	if output != nil {
 		var voices voiceSource
@@ -1957,10 +1975,15 @@ User feedback: %s`, current.Description, current.SystemPrompt, current.UserTempl
 			return startConcierge(ctx, &current, store, appLogger, func(sessionID string) {
 				hub.BroadcastVoiceEvent("voice_tasks_changed", sessionID)
 			})
-		}, func(c *concierge.Concierge) { conciergeSessionHooks.set(c) }, appLogger)
-		if cfg.Voice.Enabled {
-			_, _ = conc.start() // a failure is logged; each call then answers unreachable
-		}
+		}, func(c *concierge.Concierge) {
+			if c == nil { // it stopped: the session hooks reach nothing
+				conciergeSessionHooks.set(nil)
+				return
+			}
+			conciergeSessionHooks.set(c)
+		}, appLogger)
+		conc.followEnabled(cfg.Voice.Enabled) // a failed start is logged; each call then answers unreachable
+		onConfigChange(cfgStore, func(newCfg *config.Config) { conc.followEnabled(newCfg.Voice.Enabled) })
 		if err := startVoice(&voiceDeps{
 			output:      output,
 			tap:         voiceTap,

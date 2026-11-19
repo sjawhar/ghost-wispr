@@ -174,12 +174,21 @@ again under a new red check.
 With `voice.enabled`, people in the room can ask Wispr about the work tracked in Dispatch. They
 say the wake phrase at the start of a sentence: "Wispr, what is happening with the issue about
 the meeting voice?" ("Ghost Wispr" and "Hey Wispr" work too; "I will whisper it to you" does not).
-Wispr plays a short two-note chime, the Concierge reads Dispatch's record, and the voice speaks the
-answer. When the record cannot answer, the Concierge asks the agent that holds the issue; when its
-answer lands, Wispr plays a three-note chime and speaks the answer on "Wispr, go ahead", or by
-itself once the room has been silent for 3 s and the light still reads red. "Wispr, stop" stops
-it, and so does talking over it with real words; "mm-hm" or "yeah" alone does not. Other speech
-(`POST /api/tts/speak`) waits in its queue while the voice speaks.
+Wispr plays a short two-note sound, the Concierge reads Dispatch's record, and the voice speaks the
+answer. For 6 s after Wispr's answer, a follow-up needs no wake phrase; "Thanks, Wispr" ends the
+exchange. When the record cannot answer, the Concierge asks the agent that holds the issue. When
+its answer lands, Wispr plays a three-note sound after a second in which nobody speaks, and speaks
+the answer on "Wispr, go ahead" ("Wispr, go ahead, ABC-12" picks one of several). It speaks by
+itself only when nobody has spoken since the question and the light still reads red. "Wispr, never
+mind" cancels the newest question to an agent. "Wispr, stop" stops it, and so does talking over it
+with real words; "mm-hm" or "yeah" alone does not. Other speech (`POST /api/tts/speak`) waits in
+its queue while the voice speaks. Two more sounds: a single high note when capture starts
+recording, and a falling two-note sound when Wispr cannot do what was asked (Dispatch or Envoy out
+of reach, a voice that fails, or a failed red check).
+
+The settings page turns the voice on or off and picks its engine, with no restart; the change
+applies from the next exchange. With the voice off, the unit reads no wake phrase and runs no
+Concierge, and plays only the start sound and the error sound of a failed red check.
 
 What the voice hears, and where the room's words go:
 
@@ -189,9 +198,11 @@ What the voice hears, and where the room's words go:
   sent.
 - Every pause, light hold, press of the Jabra's Mute button, "Wispr, stop" and shutdown stop the voice at once: its speech, its
   chimes and the Concierge's calls end within 100 ms, and a question not yet sent to an agent is not
-  sent. An answer whose question a stop came after waits, silent, until the light reads red and
-  someone says "Wispr, go ahead". An answer whose meeting has ended is never spoken; it stays on
-  the session's page. A pause also clears the two minutes of transcript the voice keeps.
+  sent. A pause ends the recording session, and an ended session's answers are never spoken: they
+  stay in writing on that session's page. During a light hold the session goes on, and an answer
+  stays silent until the light reads red and someone says "Wispr, go ahead"; so does an answer when
+  anyone spoke or a stop came after its question. A pause also clears the two minutes of transcript
+  the voice keeps.
 - Voice A sends no room audio anywhere. The asker's words after the wake phrase go to the
   Concierge's model (Gemini on Vertex AI), with the last two minutes of the transcript. The text
   Wispr speaks goes to the text-to-speech engine: Gemini TTS on Vertex AI, or Deepgram Aura-2 with
@@ -202,8 +213,8 @@ What the voice hears, and where the room's words go:
   turn: Deepgram's own model, or the provider `voice.dgagent.think_model` names (such as Google);
   when that model fails a turn, Deepgram hands the turn, with the same transcript, to OpenAI's gpt-4.1-mini.
   Each question goes to the Concierge on the unit, whose own model (Gemini on Vertex AI) words the
-  answer, and Deepgram speaks it word for word. An exchange opens at the wake phrase; a held answer also opens voice C without one, but only on "Wispr, go ahead" or once the room has been silent
-  for 3 s while the light reads red. Between exchanges nothing goes to the Voice Agent.
+  answer, and Deepgram speaks it word for word. An exchange opens at the wake phrase; a held answer also opens voice C without one, but only on "Wispr, go ahead", or when nobody has
+  spoken since its question and the light reads red. Between exchanges nothing goes to the Voice Agent.
 - Dispatch gets a question's words only as a few search keywords, never the whole sentence, and
   only as a keyword search, which Dispatch sends to no embedding model. An issue key the asker says
   ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's access log
@@ -213,13 +224,18 @@ What the voice hears, and where the room's words go:
   The message carries the asker's question, framed as a read-only question from someone the unit
   cannot identify, with the recording session's id and time, not the transcript. A question sent to
   an agent leaves the unit, and deleting the segment or the session cannot recall it: Envoy keeps
-  messages for 72 hours, and the agent keeps what it read.
+  messages for 72 hours, and the agent keeps what it read. The agent reads the question with its
+  own model, so the question also reaches that model's vendor.
 - The unit stores none of the room's words for a question it sent: its `voice_tasks` ledger holds
   the issue, the holder, the state and the agent's written answer, which the session's page shows
   under "Questions to agents". Deleting a session erases its questions and the answers the agents
   wrote. An agent's written answer may quote the asker, and only a session delete erases it: a segment delete does not.
 - The voice's `/ws` events (`voice_wake`, `voice_exchange_started`, `voice_answer_ready`,
-  `voice_spoken`) carry the recording session's id and no words, and none is stored.
+  `voice_spoken` and `voice_tasks_changed`; `agent_joined` and `agent_left` come with agents that
+  join a meeting, which this build does not have) carry the recording session's id and no words,
+  and none is stored.
+- A speech vendor's error message that quotes the text to speak is left out of the journal; the
+  unit logs the vendor's status, and a note that the message was left out.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

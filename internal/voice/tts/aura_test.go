@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -443,6 +444,40 @@ func TestAuraStreamWithoutASessionUsesItsOwnSocket(t *testing.T) {
 	f.waitEnded(t, 1)
 	if want := []string{"Speak hello", "Flush", "Close"}; !slices.Equal(f.received(), want) {
 		t.Fatalf("Deepgram got %q, want %q", f.received(), want)
+	}
+}
+
+// TestAuraTellsDialedTheURLOfEachSocket fails if Dialed is not told, for each
+// socket Aura opens (a Session's and a Stream's own), the URL its handshake
+// asked Deepgram on: ghost-wispr tts-first-audio reports from it whether the
+// request carried mip_opt_out=true.
+func TestAuraTellsDialedTheURLOfEachSocket(t *testing.T) {
+	f := startSpeak(t, speakBack(map[string][]byte{"hello": ramp(0, 1000)}))
+	var mu sync.Mutex
+	var dialed []*url.URL
+	a, err := NewAura(AuraConfig{APIKey: fakeAuraKey, BaseURL: f.url, Dialed: func(u *url.URL) {
+		mu.Lock()
+		defer mu.Unlock()
+		dialed = append(dialed, u)
+	}})
+	if err != nil {
+		t.Fatalf("NewAura: %v", err)
+	}
+	openSession(t, a, newFakeOutput())
+	if err := a.Stream(context.Background(), "hello", func([]byte) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(dialed) != 2 || len(f.queries) != 2 {
+		t.Fatalf("Dialed was told %d URLs for %d sockets Deepgram saw, want 2 and 2", len(dialed), len(f.queries))
+	}
+	for i, u := range dialed {
+		if u.Path != "/v1/speak" || !maps.EqualFunc(u.Query(), f.queries[i], slices.Equal) {
+			t.Errorf("socket %d: Dialed was told path %q query %v; Deepgram saw path /v1/speak query %v", i+1, u.Path, u.Query(), f.queries[i])
+		}
 	}
 }
 

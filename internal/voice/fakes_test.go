@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -440,6 +441,13 @@ func (s *fakeSession) state() (interrupted, closedAt time.Time, closed bool) {
 	return s.interrupted, s.closedAt, s.closed
 }
 
+// saysCopy returns the texts the session was asked to say, in order.
+func (s *fakeSession) saysCopy() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.says...)
+}
+
 // fakeConcierge answers each turn with its lines, or holds the turn until
 // its context ends when hold is set.
 type fakeConcierge struct {
@@ -457,6 +465,12 @@ type fakeConcierge struct {
 	// answerErr is what each Answer returns once its lines are said.
 	answerErr  error
 	neverMinds []string
+	// acks are said in Ack mode before the lines, which wait for afterAcks
+	// when it is set.
+	acks      []string
+	afterAcks chan struct{}
+	// toolsUnreachable makes every tool answer as with Dispatch out of reach.
+	toolsUnreachable bool
 }
 
 func (c *fakeConcierge) Heard(ctx context.Context, x *Exchange, words string) {
@@ -475,7 +489,9 @@ func newFakeConcierge(lines ...string) *fakeConcierge {
 	return &fakeConcierge{lines: lines, answers: make(chan PendingAnswer, 8), cancelled: make(chan time.Time, 8), asked: make(chan string, 8)}
 }
 
-func (c *fakeConcierge) Tools(x *Exchange) ToolRunner { return fakeTools{} }
+func (c *fakeConcierge) Tools(x *Exchange) ToolRunner {
+	return fakeTools{unreachable: c.toolsUnreachable}
+}
 
 func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, say SayFunc) error {
 	c.mu.Lock()
@@ -483,18 +499,40 @@ func (c *fakeConcierge) Answer(ctx context.Context, x *Exchange, turn string, sa
 	c.exchanges = append(c.exchanges, *x)
 	c.mu.Unlock()
 	c.asked <- turn
+	for _, a := range c.acks {
+		if err := say(ctx, a, Ack); err != nil {
+			return err
+		}
+	}
+	if c.afterAcks != nil {
+		select {
+		case <-c.afterAcks:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	for _, l := range c.lines {
 		if err := say(ctx, l, Fact); err != nil {
 			c.cancelled <- time.Now()
 			return err
 		}
 	}
-	if c.hold {
+	c.mu.Lock()
+	hold := c.hold
+	c.mu.Unlock()
+	if hold {
 		<-ctx.Done()
 		c.cancelled <- time.Now()
 		return ctx.Err()
 	}
 	return c.answerErr
+}
+
+// setHold sets hold while answers may run.
+func (c *fakeConcierge) setHold(on bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hold = on
 }
 
 func (c *fakeConcierge) Answers() <-chan PendingAnswer { return c.answers }
@@ -525,9 +563,15 @@ func (c *fakeConcierge) spokenIDs() []string {
 	return append([]string(nil), c.spoken...)
 }
 
-type fakeTools struct{}
+// fakeTools answers every tool with {}, or, with unreachable set, as the
+// Concierge answers when Dispatch is out of reach: its result and an error
+// that wraps ErrUnreachable.
+type fakeTools struct{ unreachable bool }
 
-func (fakeTools) Run(context.Context, ToolCall) (json.RawMessage, error) {
+func (t fakeTools) Run(context.Context, ToolCall) (json.RawMessage, error) {
+	if t.unreachable {
+		return json.RawMessage(`{"error":"I cannot reach Dispatch yet."}`), fmt.Errorf("concierge: %w", ErrUnreachable)
+	}
 	return json.RawMessage(`{}`), nil
 }
 

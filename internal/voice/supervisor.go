@@ -60,6 +60,8 @@ const (
 	recentKept = 2 * time.Minute
 	// exchangeMax bounds one exchange, whatever its voice or Concierge do.
 	exchangeMax = 5 * time.Minute
+	// sorryLine is said for a failed answer when the Concierge said nothing.
+	sorryLine = "Sorry, I could not answer that."
 )
 
 // backchannels are R11's words that alone never stop the voice: "mm-hm",
@@ -148,8 +150,8 @@ type SupervisorConfig struct {
 // hands the asker's turn to the Concierge, and stops it all on a gate closing
 // (a pause or a light hold), the Jabra button, "Wispr, stop", barge-in and
 // shutdown. One exchange holds the floor at a time, and other speech waits
-// for it (WaitFloor). Holders' answers wait for a red light and silence, or,
-// after any stop, for a person's "Wispr, go ahead".
+// for it (WithFloor). Holders' answers wait for a red light and a free floor,
+// or for a person's "Wispr, go ahead" (R7).
 //
 // Its methods never block on a voice, the Concierge or the speaker: those run
 // in goroutines, so a capture pause and the transcript reader are never held.
@@ -230,6 +232,13 @@ type exchange struct {
 	turnAt       time.Time  // when the turn was handed to the Concierge
 	notified     map[string]bool
 	idle         *time.Timer // a driving voice's idle wait
+	// A driving voice's follow-up window: armed when its speech ends, unless
+	// a barge-in cut it; a person's word disarms it (R10).
+	followUpTimer *time.Timer
+	followUpGen   int  // a stale window's timer finds it changed
+	cutSpeech     bool // a barge-in cut the driving voice's speech
+	newTurn       bool // the driving voice spoke: the room's next words are a new turn
+	toolCalls     int  // answer tools still running: the exchange stays open
 	// dropsAtOpen is the tap's drop count when the exchange opened.
 	dropsAtOpen uint64
 }
@@ -543,9 +552,19 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			// More of the utterance the exchange already answers.
 		case ex != nil && !ex.answering && ex.answer == nil:
 			// "Wispr." then "Wispr, what …", or a call in the follow-up
-			// window: the same exchange.
+			// window: the same exchange. Over a driving voice's speech, it is
+			// a barge-in with new words.
 			ex.wakeStart = wakeStart(t, m)
 			ex.turn, ex.interim = nil, ""
+			if ex.drives {
+				s.touchLocked(ex)
+				s.disarmFollowUpLocked(ex)
+				ex.newTurn = false
+				if s.voiceSpeaking {
+					s.logf("voice: barge-in with a call")
+					s.cutDriverLocked(ex)
+				}
+			}
 			s.turnLocked(ex, t, m.Rest)
 		default:
 			if ex != nil {
@@ -578,6 +597,16 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 		}
 		return
 	}
+	if ex.drives && ex.answer == nil {
+		// A person spoke: the follow-up window holds for the vendor's answer,
+		// and after the voice spoke, the words are the asker's next turn.
+		s.disarmFollowUpLocked(ex)
+		if ex.newTurn {
+			ex.newTurn = false
+			ex.turn, ex.interim = nil, ""
+		}
+		s.turnLocked(ex, t, t.Text)
+	}
 	if !ex.answering && !ex.drives {
 		s.turnLocked(ex, t, t.Text)
 		return
@@ -588,12 +617,18 @@ func (s *Supervisor) onTranscriptLocked(t *Transcript) {
 			s.endLocked(ex, true, "barge-in")
 			return
 		}
-		// A voice that drives its own turn stops speaking at once and stays
-		// open: its vendor hears the interruption and answers it.
-		s.cfg.Speaker.Cancel(audio.InputVoice)
-		if sess := ex.session; sess != nil {
-			s.spawn(sess.Interrupt)
-		}
+		s.cutDriverLocked(ex)
+	}
+}
+
+// cutDriverLocked stops the speech of ex's voice, which drives its own turn,
+// at once, and keeps it open: its vendor hears the interruption and answers
+// it.
+func (s *Supervisor) cutDriverLocked(ex *exchange) {
+	ex.cutSpeech = true
+	s.cfg.Speaker.Cancel(audio.InputVoice)
+	if sess := ex.session; sess != nil {
+		s.spawn(sess.Interrupt)
 	}
 }
 
@@ -707,11 +742,14 @@ func (s *Supervisor) readEvents(ex *exchange, sess Session) {
 			s.touchLocked(ex)
 		case EventErr:
 			s.logf("voice: %v", e.Err)
-			if s.ex == ex && !ex.ended {
-				s.errorLocked(ex.x.SessionID)
-			}
+			current := s.ex == ex && !ex.ended
 			if ex.drives && s.ex == ex {
+				// The cut first: it cancels the chime input, and the error
+				// sound begun before it would go with it.
 				s.endLocked(ex, true, "the voice failed")
+			}
+			if current {
+				s.errorLocked(ex.x.SessionID)
 			}
 		}
 		s.mu.Unlock()
@@ -742,11 +780,47 @@ func (s *Supervisor) idleWaited(ex *exchange) {
 	if s.ex != ex || ex.ended {
 		return
 	}
-	if s.voiceSpeaking {
+	if s.voiceSpeaking || ex.toolCalls > 0 {
 		s.touchLocked(ex)
 		return
 	}
 	s.endLocked(ex, false, "idle")
+}
+
+// driverSpeechLocked follows the speech of ex's voice, which drives its own
+// turn: the room's next words are a new turn, and once its speech ends by
+// itself, the follow-up window opens (R10).
+func (s *Supervisor) driverSpeechLocked(ex *exchange, started bool) {
+	s.disarmFollowUpLocked(ex)
+	ex.newTurn = true
+	if started || ex.ended {
+		return
+	}
+	if ex.cutSpeech { // a barge-in: the person speaks now
+		ex.cutSpeech = false
+		return
+	}
+	gen := ex.followUpGen
+	ex.followUpTimer = time.AfterFunc(s.cfg.FollowUpWait, func() { s.driverFollowUpWaited(ex, gen) })
+}
+
+// disarmFollowUpLocked closes ex's follow-up window without ending ex.
+func (s *Supervisor) disarmFollowUpLocked(ex *exchange) {
+	ex.followUpGen++
+	if ex.followUpTimer != nil {
+		ex.followUpTimer.Stop()
+		ex.followUpTimer = nil
+	}
+}
+
+// driverFollowUpWaited ends ex when nobody spoke in its follow-up window.
+func (s *Supervisor) driverFollowUpWaited(ex *exchange, gen int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ex != ex || ex.ended || ex.followUpGen != gen || s.voiceSpeaking || ex.toolCalls > 0 {
+		return
+	}
+	s.endLocked(ex, false, "no follow-up")
 }
 
 // turnLocked adds words of the asker's turn, and hands the turn to the
@@ -857,7 +931,7 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		ex.said = true
 		if mode == Fact && !ex.factDone && !ex.factPending {
 			// The first fact's audio: now if speech already plays, at its
-			// start if it began and ended during Say, else at its start.
+			// start if it began and ended during Say, else when it starts.
 			switch {
 			case s.voiceSpeaking:
 				ex.factDone = true
@@ -881,7 +955,7 @@ func (s *Supervisor) answer(ex *exchange, x *Exchange, turn string) {
 		s.errorLocked(x.SessionID)
 		s.mu.Unlock()
 		if !said {
-			_ = say(ex.ctx, "Sorry, I could not answer that.", Ack)
+			_ = say(ex.ctx, sorryLine, Ack)
 		}
 	}
 	s.finish(ex, x.SessionID)
@@ -1254,6 +1328,9 @@ func (s *Supervisor) onSpeech(e audio.SpeechEvent) {
 		return
 	}
 	s.touchLocked(ex)
+	if ex.drives {
+		s.driverSpeechLocked(ex, e.Started)
+	}
 	if !e.Started {
 		return
 	}
@@ -1422,6 +1499,12 @@ type exchangeTools struct {
 	ex *exchange
 }
 
+// Run runs c for the exchange's voice, and keeps the exchange open while it
+// runs. For the answer tool, the Concierge's Ack lines said before any other
+// line (its routing line) are spoken at once through the session; the rest
+// is the result, in order, for the voice to speak word for word. When the
+// answer fails, the Supervisor speaks the Concierge's own lines for it, or one
+// sorry, and plays the error sound: the voice says nothing of its own.
 func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, error) {
 	s := t.s
 	s.mu.Lock()
@@ -1429,9 +1512,29 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		t.ex.x.SessionID = s.cfg.Session()
 	}
 	x := t.ex.x
+	t.ex.toolCalls++
+	s.disarmFollowUpLocked(t.ex)
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		t.ex.toolCalls--
+		s.touchLocked(t.ex)
+	}()
 	if c.Name != AnswerTool {
-		return s.cfg.Concierge.Tools(&x).Run(ctx, c)
+		out, err := s.cfg.Concierge.Tools(&x).Run(ctx, c)
+		if errors.Is(err, ErrUnreachable) {
+			// The result says so, for the vendor to speak; the room hears
+			// the error sound (R10).
+			s.logf("voice: a tool could not reach Dispatch or Envoy: %v", err)
+			s.mu.Lock()
+			if t.ex.ctx.Err() == nil {
+				s.errorLocked(x.SessionID)
+			}
+			s.mu.Unlock()
+			return out, nil
+		}
+		return out, err
 	}
 	var args AnswerArgs
 	if err := json.Unmarshal(c.Args, &args); err != nil {
@@ -1441,17 +1544,58 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 		// A vendor may delegate before its own transcript of the turn.
 		args.Question = x.AskerTurn
 	}
-	var said []string
-	err := s.cfg.Concierge.Answer(ctx, &x, args.Question, func(_ context.Context, text string, _ SayMode) error {
+	var (
+		said   []string // the result's lines, in order
+		spoken bool     // a line was spoken at once
+	)
+	err := s.cfg.Concierge.Answer(ctx, &x, args.Question, func(sayCtx context.Context, text string, mode SayMode) error {
+		t.ex.saidMu.Lock()
+		lead := mode == Ack && len(said) == 0
+		t.ex.saidMu.Unlock()
+		if lead && t.speak(sayCtx, text) == nil {
+			t.ex.saidMu.Lock()
+			spoken = true
+			t.ex.saidMu.Unlock()
+			return nil
+		}
 		t.ex.saidMu.Lock()
 		defer t.ex.saidMu.Unlock()
 		said = append(said, text)
 		return nil
 	})
+	t.ex.saidMu.Lock()
+	lines, anySaid := append([]string(nil), said...), spoken || len(said) > 0
+	t.ex.saidMu.Unlock()
 	if err != nil {
+		if ctx.Err() == nil && t.ex.ctx.Err() == nil {
+			s.logf("voice: the Concierge did not answer: %v", err)
+			s.mu.Lock()
+			s.errorLocked(x.SessionID)
+			s.mu.Unlock()
+			if !anySaid {
+				lines = []string{sorryLine}
+			}
+			for _, line := range lines {
+				if sayErr := t.speak(ctx, line); sayErr != nil {
+					s.logf("voice: speak the Concierge's line for a failed answer: %v", sayErr)
+					break
+				}
+			}
+		}
 		return nil, err
 	}
-	t.ex.saidMu.Lock()
-	defer t.ex.saidMu.Unlock()
-	return json.Marshal(AnswerResult{Say: strings.Join(said, " ")})
+	return json.Marshal(AnswerResult{Say: strings.Join(lines, " ")})
+}
+
+// speak says text through the exchange's session at once, as an Ack.
+func (t exchangeTools) speak(ctx context.Context, text string) error {
+	s := t.s
+	s.mu.Lock()
+	sess := t.ex.session
+	s.addOwnLocked(text, time.Now())
+	s.mu.Unlock()
+	if sess == nil {
+		return errors.New("the voice is not open")
+	}
+	return sess.Say(ctx, text, Ack)
 }
