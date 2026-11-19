@@ -38,6 +38,7 @@ func TestReadmeStatesVoiceConsent(t *testing.T) {
 		"For 6 s after Wispr's answer, a follow-up that the transcript ends with a question mark needs no wake phrase",
 		"Anything else said in those 6 s is side talk: no voice answers it, and nothing of it goes to Dispatch",
 		"the live Deepgram request carries them, and Dispatch's project keys, as Nova-3 keyterms",
+		"\"In for\" reads as INFRA only before a number of three or more digits",
 		"\"Wispr, never mind\" cancels the newest question to an agent",
 		"a single high note when capture starts recording",
 		"a falling two-note sound when Wispr cannot do what was asked",

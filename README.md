@@ -222,7 +222,8 @@ What the voice hears, and where the room's words go:
   keyword search answers first. An issue key the asker says
   ("infra 4592") goes to Dispatch in the address of that issue's read, which Dispatch's access log
   records. A number said after a word that is no project of Dispatch ("the last 30 days") is not
-  read as a key.
+  read as a key. "In for" reads as INFRA only before a number of three or more digits, as Deepgram
+  sometimes writes "infra 4592"; "in for thirty minutes" is no key.
 - When the record cannot answer, the Concierge asks the agent that holds the issue, over Envoy.
   The message carries the asker's question, framed as a read-only question from someone the unit
   cannot identify, with the recording session's id and time, not the transcript. A question sent to
