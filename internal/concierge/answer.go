@@ -1061,13 +1061,20 @@ func (s *speaker) sayText(ctx context.Context, text string, mode voice.SayMode) 
 	if s.lead != "" {
 		lead := s.lead
 		s.lead = ""
-		if !strings.HasPrefix(text, s.leadKey) {
+		if !beginsWithKey(text, s.leadKey) {
 			if err := s.queueLocked(ctx, lead, voice.Lead); err != nil {
 				return err
 			}
 		}
 	}
 	return s.queueLocked(ctx, text, mode)
+}
+
+// beginsWithKey reports whether text begins with the issue key key as a
+// whole key: "ABC-1's agent" does for ABC-1, "ABC-12 is" does not.
+func beginsWithKey(text, key string) bool {
+	loc := earKey.FindStringIndex(text)
+	return len(loc) == 2 && loc[0] == 0 && text[:loc[1]] == key
 }
 
 // queueLocked queues text as mode and keeps it. s.mu is held.

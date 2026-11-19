@@ -1225,3 +1225,26 @@ func TestTheFirstFactNamesTheIssue(t *testing.T) {
 		}
 	}
 }
+
+// TestALongerKeyDoesNotNameTheIssue (R5; the lead-hold review): a first fact
+// that begins with a longer key ("ABC-12" for "ABC-1") names another issue,
+// so "I took ABC-1." still goes first; the chosen key followed by "'s" names
+// it.
+func TestALongerKeyDoesNotNameTheIssue(t *testing.T) {
+	for fact, lead := range map[string]bool{"ABC-12 is merged.": true, "ABC-1's agent merged it.": false, "ABC-1 is merged.": false} {
+		var spoken []said
+		sp := newSpeaker(context.Background(), recorder(&spoken))
+		if err := sp.holdLead(context.Background(), "ABC-1", "I took ABC-1."); err != nil {
+			t.Fatal(err)
+		}
+		if err := sp.sayText(context.Background(), fact, voice.Fact); err != nil {
+			t.Fatal(err)
+		}
+		if err := sp.wait(); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(spoken) > 0 && spoken[0].text == "I took ABC-1."; got != lead {
+			t.Errorf("%q: spoken = %+v, want the line first %v", fact, spoken, lead)
+		}
+	}
+}
