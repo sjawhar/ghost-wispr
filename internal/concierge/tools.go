@@ -23,8 +23,12 @@ import (
 // or the unit has no token for it: words the voice can say as they are.
 const cannotReachDispatch = "I cannot reach Dispatch yet."
 
-// cannotReachEnvoy is ask_agent's answer when the unit has no Envoy session.
+// cannotReachEnvoy is a tool's answer when the unit has no Envoy session, or
+// Envoy does not answer a lookup.
 const cannotReachEnvoy = "I cannot reach the agents yet."
+
+// questionNotSent is ask_agent's answer when Envoy did not take the question.
+const questionNotSent = "The question did not reach the agent."
 
 const (
 	// specSummaryChars is how much of an issue's spec read_issue gives.
@@ -115,6 +119,9 @@ type runner struct {
 	x *voice.Exchange
 	// newest is, per issue read_issue read, its newest event's time.
 	newest map[string]time.Time
+	// unreachable: a tool's answer said Dispatch or Envoy did not answer
+	// (outOfReach).
+	unreachable bool
 }
 
 // Tools gives x's tools, for x.Tools.
@@ -193,9 +200,22 @@ func (r *runner) call(ctx context.Context, name string, args map[string]any) (ma
 		if !errors.As(err, &refused) || refused.Status != http.StatusNotFound || refused.Route != "issue" {
 			r.c.logger.Warn("concierge tool failed", "tool", name, "error", err)
 		}
-		return map[string]any{"error": toolError(err)}, nil
+		result = map[string]any{"error": toolError(err)}
+	}
+	if outOfReach(result) {
+		r.unreachable = true
 	}
 	return result, nil
+}
+
+// outOfReach reports whether a tool's answer says Dispatch or Envoy did not
+// answer: R10's error sound.
+func outOfReach(result map[string]any) bool {
+	switch result["error"] {
+	case cannotReachDispatch, cannotReachEnvoy, questionNotSent:
+		return true
+	}
+	return result["note"] == cannotReachEnvoy
 }
 
 // somethingWrong is a tool's answer for a failure on the recorder itself.
@@ -553,7 +573,7 @@ func (r *runner) askAgent(ctx context.Context, session, question, issueKey strin
 		}
 		r.c.tellChanged(r.x.SessionID)
 		r.c.logger.Warn("concierge could not send a question", "session", session, "error", err)
-		return nil, tell("The question did not reach the agent.")
+		return nil, tell(questionNotSent)
 	}
 	taskID := sent.EventID
 	r.c.mu.Lock()

@@ -144,6 +144,11 @@ type fakeAgents struct {
 	onSend func(ctx context.Context, eventID string) error
 	// onLookup runs inside Lookup before it answers.
 	onLookup func(id string)
+	// lookupErr, when set, is the answer of every Lookup after the first
+	// lookupsBeforeErr.
+	lookupErr        error
+	lookupsBeforeErr int
+	lookups          int
 }
 
 func (f *fakeAgents) ID() string { return f.id }
@@ -151,6 +156,13 @@ func (f *fakeAgents) ID() string { return f.id }
 func (f *fakeAgents) Lookup(_ context.Context, id string) (envoy.SessionInfo, error) {
 	if f.onLookup != nil {
 		f.onLookup(id)
+	}
+	f.mu.Lock()
+	f.lookups++
+	failing := f.lookupErr != nil && f.lookups > f.lookupsBeforeErr
+	f.mu.Unlock()
+	if failing {
+		return envoy.SessionInfo{}, f.lookupErr
 	}
 	if info, ok := f.states[id]; ok {
 		return info, nil
