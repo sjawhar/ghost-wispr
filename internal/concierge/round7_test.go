@@ -883,3 +883,28 @@ func TestAStoppedProjectReadMarksNothingDown(t *testing.T) {
 		t.Fatal("a stopped read marked the projects down")
 	}
 }
+
+// TestSearchTermsJoinCompoundsAndDropRoutingVerbs (run 8g): Deepgram writes
+// "real time" or "real-time" where titles say "realtime", and "who holds"
+// names no work, so a read-ahead never spends its one search on "holds".
+func TestSearchTermsJoinCompoundsAndDropRoutingVerbs(t *testing.T) {
+	for turn, want := range map[string]string{
+		"what is happening with the issue about real time spoken conversation?": "realtime spoken conversation",
+		"what is happening with the issue about real-time spoken conversation?": "realtime spoken conversation",
+		"please ask the agent who holds":                                        "",
+		"who owns the wake word work":                                           "wake word",
+	} {
+		if got := searchTerms(turn); got != want {
+			t.Errorf("searchTerms(%q) = %q, want %q", turn, got, want)
+		}
+	}
+}
+
+// TestThePromptKeepsTheAgentsToolForAgentQuestions (run 8g): the model
+// called list_joined_agents first on every turn; it is for questions about
+// the agents that joined the meeting.
+func TestThePromptKeepsTheAgentsToolForAgentQuestions(t *testing.T) {
+	if !strings.Contains(systemPrompt, "Call list_joined_agents only when the question asks which agents joined this meeting.") {
+		t.Fatal("the system prompt does not keep list_joined_agents for agent questions")
+	}
+}
