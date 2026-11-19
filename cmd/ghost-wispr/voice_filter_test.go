@@ -47,7 +47,7 @@ func (f *resumeFilter) Message(mr *api.MessageResponse) error {
 	return err
 }
 func (*resumeFilter) UtteranceEnd(*api.UtteranceEndResponse) error { return nil }
-func (*resumeFilter) ForceEndSession(context.Context) error         { return nil }
+func (*resumeFilter) ForceEndSession(context.Context) error        { return nil }
 
 func deepgramResult(t *testing.T, raw string) *api.MessageResponse {
 	t.Helper()
