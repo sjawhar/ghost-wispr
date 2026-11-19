@@ -156,15 +156,16 @@ func (l *voiceLink) RedCheckFailed() {
 }
 
 // wireVoiceToCapture stops the voice on every capture gate closing, and plays
-// the start sound on every opening into recording and the error sound on
-// every failed red check (R10). It must run before anything can close the
-// gate.
+// the start sound at the first audio each opening into recording records, so
+// it never holds the Jabra's light before the microphone opens, and the error
+// sound on every failed red check (R10). It must run before anything can
+// close the gate.
 func wireVoiceToCapture(capture *captureGate, link *voiceLink, conc *conciergeHooks) {
 	capture.onClosed = func(closings int) {
 		link.GateClosed(closings)
 		conc.GateClosed() // what the Concierge read before a session existed goes too
 	}
-	capture.onOpened = link.Started
+	capture.onRecording = link.Started
 	capture.onRedCheckFailed = link.RedCheckFailed
 }
 

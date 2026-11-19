@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -120,18 +121,48 @@ func TestEachSettingBuildsItsVoice(t *testing.T) {
 	}
 }
 
-// TestCaptureOpeningPlaysTheStartSound fails if capture moving into recording
-// does not ask the voice for the start sound (R10).
-func TestCaptureOpeningPlaysTheStartSound(t *testing.T) {
+// TestTheStartSoundPlaysAtTheFirstAudioRecorded fails if capture moving into
+// recording asks the voice for the start sound before any audio reaches the
+// recording, more than once for one opening, or not at all (R10: the note
+// says "recording"). On the Jabra a sound that plays before the microphone
+// opens holds the light (prepareLightForOpen), so the microphone opened only
+// once the sound and the speaker's idle close had passed (ReviewPR89's round
+// 4).
+func TestTheStartSoundPlaysAtTheFirstAudioRecorded(t *testing.T) {
 	var link voiceLink
 	heard := &soundsHeard{}
 	link.set(heard)
 	capture := newCaptureGate(nil, nil, nil)
 	wireVoiceToCapture(capture, &link, nil)
+	recording := capture.Writer(io.Discard)
+	started := func() int { n, _ := heard.counts(); return n }
+
 	capture.Pause()
 	capture.Resume()
 	waitOpen(t, capture)
-	eventuallyTrue(t, "the start sound", func() bool { started, _ := heard.counts(); return started == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if n := started(); n != 0 {
+		t.Fatalf("the start sound was asked %d times before any audio reached the recording, want none", n)
+	}
+	for range 2 {
+		if _, err := recording.Write(make([]byte, 320)); err != nil {
+			t.Fatalf("a write through the open gate: %v", err)
+		}
+	}
+	if n := started(); n != 1 {
+		t.Fatalf("the start sound was asked %d times for one opening's audio, want once", n)
+	}
+
+	// The next opening plays it again, at its own first audio.
+	capture.Pause()
+	capture.Resume()
+	waitOpen(t, capture)
+	if _, err := recording.Write(make([]byte, 320)); err != nil {
+		t.Fatalf("a write through the reopened gate: %v", err)
+	}
+	if n := started(); n != 2 {
+		t.Fatalf("the start sound was asked %d times over two openings, want twice", n)
+	}
 }
 
 // TestAFailedRedCheckPlaysTheErrorSound fails if the light failing its red

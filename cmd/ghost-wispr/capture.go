@@ -113,7 +113,7 @@ type captureGate struct {
 	onMicHeld          func(bool)    // true when a pause could not release the microphone, false once it is released; must not block
 	capturePresent     func() bool   // reports whether a capture device exists, without opening one; nil when it cannot tell
 	onClosed           func(int)     // runs once the gate has closed, with its closings count; must not block
-	onOpened           func()        // runs once the gate has opened into recording; must not block
+	onRecording        func()        // runs at the first audio that reaches the recording after each opening into recording; must not block
 	onRedCheckFailed   func()        // runs when an opening finds the light not red; must not block
 	audioStall         time.Duration // see audioStallAfter
 	stallAfter         time.Duration // see captureStallAfter
@@ -129,6 +129,7 @@ type captureGate struct {
 	starting           bool          // that Resume's start of the microphone has not finished (finishResume)
 	preparing          bool          // a start waits in beforeMicOpen (prepareMicOpen)
 	closed             bool          // no audio passes the gate
+	recordingDue       bool          // the gate opened into recording, and no audio has reached the recording since (onRecording)
 	closings           int           // counts closings, so a Resume left from an earlier one does nothing
 	resumed            chan struct{} // closed while the gate is open
 	closing            chan struct{} // closed while the gate is closed
@@ -546,6 +547,7 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 		return
 	}
 	g.closed = false
+	g.recordingDue = true
 	close(g.resumed)
 	g.closing = make(chan struct{})
 	g.mu.Unlock()
@@ -553,9 +555,6 @@ func (g *captureGate) openAfter(closing int, settled <-chan struct{}, forLight b
 	g.control.Unlock()
 	if checked && g.afterGateOpen != nil {
 		g.afterGateOpen()
-	}
-	if g.onOpened != nil {
-		g.onOpened()
 	}
 }
 
@@ -940,6 +939,7 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 		g.mu.Unlock()
 		return 0, errClosedSinceMicOpen
 	}
+	closings := g.closings
 	g.writing++
 	g.mu.Unlock()
 	defer g.finishWrite()
@@ -952,8 +952,24 @@ func (w *gatedWriter) Write(p []byte) (int, error) {
 	n, err := w.dst.Write(p)
 	if err == nil {
 		g.audioAt.Store(time.Now().UnixNano())
+		g.noteRecording(closings)
 	}
 	return n, err
+}
+
+// noteRecording runs onRecording at the first audio that reached the
+// recording since the gate opened into recording, unless the gate has closed
+// since that audio passed it.
+func (g *captureGate) noteRecording(closings int) {
+	g.mu.Lock()
+	due := g.recordingDue && !g.closed && g.closings == closings
+	if due {
+		g.recordingDue = false
+	}
+	g.mu.Unlock()
+	if due && g.onRecording != nil {
+		g.onRecording()
+	}
 }
 
 // captureReadiness is what /healthz/ready reads of capture: the gate's
